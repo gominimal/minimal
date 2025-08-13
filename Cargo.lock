@@ -925,6 +925,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
+name = "graph"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "fxhash",
+ "generational-arena",
+ "indoc",
+ "nickel-lang-core",
+ "serde",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1289,7 +1301,7 @@ dependencies = [
  "build-sandbox",
  "clap",
  "generational-arena",
- "nickel-proto",
+ "graph",
  "petgraph 0.6.5",
  "tracing",
  "tracing-subscriber",
@@ -1384,18 +1396,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "870c323d81061fc47db4aa7346f6f3492f3e4bb8bd5dd8b7c85ac9d0c9709f0c"
 dependencies = [
  "imbl-sized-chunks",
- "serde",
-]
-
-[[package]]
-name = "nickel-proto"
-version = "0.0.1"
-dependencies = [
- "blake3",
- "fxhash",
- "generational-arena",
- "indoc",
- "nickel-lang-core",
  "serde",
 ]
 

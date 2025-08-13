@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 "build-sandbox" = { workspace = true }
-"nickel-proto" = { workspace = true }
+graph = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 petgraph = "0.6"

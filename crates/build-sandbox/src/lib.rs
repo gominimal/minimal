@@ -24,7 +24,7 @@ pub fn run_build(
     info!("Starting build execution");
     let executor = BuildExecutor::new()?;
     let build_result = executor.execute(config, verbose)?;
-    
+
     let outputs = if config.debug_shell {
         // In debug mode, skip output validation
         info!("Debug mode: skipping output validation");
@@ -36,7 +36,11 @@ pub fn run_build(
             output_dir,
             verbose,
         )?;
-        info!("Build completed with exit code {}, {} outputs", build_result.exit_code, outputs.len());
+        info!(
+            "Build completed with exit code {}, {} outputs",
+            build_result.exit_code,
+            outputs.len()
+        );
         outputs
     };
 

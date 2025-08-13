@@ -3,7 +3,7 @@ mod execution_graph;
 use build_sandbox::{BuildConfig, Result, config::BuildScript, run_build};
 use clap::Parser;
 use execution_graph::ExecutionGraph;
-use nickel_proto::{
+use graph::{
     SpecReader, SpecReaderOptions,
     dep_graph::{BuildOutput, DepGraph},
 };
@@ -103,12 +103,13 @@ fn main() -> Result<()> {
         // Add host paths from this build's own inputs
         debug!("Build {} has {} inputs", build.name, build.inputs.len());
         for (i, input) in build.inputs.iter().enumerate() {
+            use graph::BuildSpecInput;
             match input {
-                nickel_proto::BuildSpecInput::Path(path) => {
+                BuildSpecInput::Path(path) => {
                     debug!("  Input {}: HostPath({})", i, path.display());
                     dependencies.push(PathBuf::from(path));
                 }
-                nickel_proto::BuildSpecInput::Build(_build_ref) => {
+                BuildSpecInput::Build(_build_ref) => {
                     debug!("  Input {}: BuildSpec dependency", i);
                     // Build dependencies are handled by execution order -
                     // their outputs are already available in output_base_dir
@@ -117,7 +118,7 @@ fn main() -> Result<()> {
                         .unwrap_or_else(|_| output_base_dir.to_path_buf());
                     dependencies.push(abs_output_dir);
                 }
-                nickel_proto::BuildSpecInput::Source(_) => todo!(),
+                BuildSpecInput::Source(_) => todo!(),
             }
         }
 

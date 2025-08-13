@@ -1,4 +1,4 @@
-use nickel_proto::dep_graph::{BuildSpec, BuildSpecInput, DepGraph};
+use graph::dep_graph::{BuildSpec, BuildSpecInput, DepGraph};
 use petgraph::Graph;
 use petgraph::graph::NodeIndex;
 use std::collections::HashMap;

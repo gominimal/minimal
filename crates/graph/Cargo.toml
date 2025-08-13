@@ -1,6 +1,6 @@
 [package]
 edition = "2021"
-name = "nickel-proto"
+name = "graph"
 version = "0.0.1"
 license = "MIT OR Apache-2.0"
 

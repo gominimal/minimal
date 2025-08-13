@@ -118,7 +118,6 @@ impl OutputValidator {
             search_dir.join(pattern).to_string_lossy().to_string()
         };
 
-
         if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
             Self::resolve_glob_pattern(&search_pattern)
         } else {

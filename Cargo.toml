@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/build-sandbox", "crates/minimal", "crates/nickel-proto"]
+members = ["crates/build-sandbox", "crates/minimal", "crates/graph"]
 resolver = "3"
 
 [workspace.dependencies]
@@ -15,4 +15,4 @@ serde = { version = "1.0", features = ["derive"] }
 
 # our crates
 build-sandbox = { path = "crates/build-sandbox" }
-nickel-proto = { version = "0.0.1", path = "crates/nickel-proto" }
+graph = { version = "0.0.1", path = "crates/graph" }
