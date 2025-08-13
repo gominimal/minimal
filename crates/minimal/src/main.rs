@@ -1,10 +1,7 @@
-mod execution_graph;
-
 use build_sandbox::{BuildConfig, Result, config::BuildScript, run_build};
 use clap::Parser;
-use execution_graph::ExecutionGraph;
 use graph::{
-    SpecReader, SpecReaderOptions,
+    ExecPlan, SpecReader, SpecReaderOptions,
     dep_graph::{BuildOutput, DepGraph},
 };
 use std::path::{Path, PathBuf};
@@ -66,104 +63,99 @@ fn main() -> Result<()> {
     let sr = sr.unwrap();
 
     let dp = DepGraph::new(sr).unwrap();
-
-    let execution_graph = ExecutionGraph::from_dep_graph(dp);
-    let execution_order = execution_graph
-        .execution_order()
-        .expect("Failed to determine execution order - circular dependency detected");
+    let plan = ExecPlan::new(&dp);
 
     let output_base_dir = Path::new(&args.output);
 
     // Execute builds in dependency order - each build runs in isolation
     // and can only access outputs from previously completed builds
-    for build_name in execution_order {
-        let build = execution_graph
-            .get_build_spec(&build_name)
-            .expect("Build spec not found");
-
-        // In debug mode, only debug the requested package, not its dependencies
-        if args.debug {
-            if build.name != *package_name {
-                println!("Skipping dependency build in debug mode: {}", build.name);
-                continue;
-            }
-            println!("Launching debug shell for: {}", build.name);
-        } else {
-            println!("Executing build: {} (isolated)", build.name);
-        }
-
-        // For this build, only include:
-        // 1. Host paths from its own inputs
-        // 2. Output directories from already-completed dependency builds
-        let mut dependencies = Vec::new();
-
-        // Add host paths from this build's own inputs
-        debug!("Build {} has {} inputs", build.name, build.inputs.len());
-        for (i, input) in build.inputs.iter().enumerate() {
-            use graph::BuildSpecInput;
-            match input {
-                BuildSpecInput::Path(path) => {
-                    debug!("  Input {}: HostPath({})", i, path.display());
-                    dependencies.push(PathBuf::from(path));
+    for phase in plan {
+        for bsr in phase.iter() {
+            let build = dp.get(bsr).unwrap();
+            // In debug mode, only debug the requested package, not its dependencies
+            if args.debug {
+                if build.name != *package_name {
+                    println!("Skipping dependency build in debug mode: {}", build.name);
+                    continue;
                 }
-                BuildSpecInput::Build(_build_ref) => {
-                    debug!("  Input {}: BuildSpec dependency", i);
-                    // Build dependencies are handled by execution order -
-                    // their outputs are already available in output_base_dir
-                    let abs_output_dir = output_base_dir
-                        .canonicalize()
-                        .unwrap_or_else(|_| output_base_dir.to_path_buf());
-                    dependencies.push(abs_output_dir);
-                }
-                BuildSpecInput::Source(_) => todo!(),
+                println!("Launching debug shell for: {}", build.name);
+            } else {
+                println!("Executing build: {} (isolated)", build.name);
             }
+
+            // For this build, only include:
+            // 1. Host paths from its own inputs
+            // 2. Output directories from already-completed dependency builds
+            let mut dependencies = Vec::new();
+
+            // Add host paths from this build's own inputs
+            debug!("Build {} has {} inputs", build.name, build.inputs.len());
+            for (i, input) in build.inputs.iter().enumerate() {
+                use graph::BuildSpecInput;
+                match input {
+                    BuildSpecInput::Path(path) => {
+                        debug!("  Input {}: HostPath({})", i, path.display());
+                        dependencies.push(PathBuf::from(path));
+                    }
+                    BuildSpecInput::Build(_build_ref) => {
+                        debug!("  Input {}: BuildSpec dependency", i);
+                        // Build dependencies are handled by execution order -
+                        // their outputs are already available in output_base_dir
+                        let abs_output_dir = output_base_dir
+                            .canonicalize()
+                            .unwrap_or_else(|_| output_base_dir.to_path_buf());
+                        dependencies.push(abs_output_dir);
+                    }
+                    BuildSpecInput::Source(_) => todo!(),
+                }
+            }
+
+            // Add toolchain and scripts (always needed)
+            dependencies.push(
+                PathBuf::from("toolchains/x86_64-unknown-linux-gnu")
+                    .canonicalize()
+                    .unwrap(),
+            );
+            dependencies.push(PathBuf::from("scripts").canonicalize().unwrap());
+
+            debug!(
+                "Dependencies for isolated build {}: {:?}",
+                build.name, dependencies
+            );
+
+            let build_package_dir = base_package_dir.join(&build.name);
+
+            // Collect inputs - the package directory plus any build dependencies' outputs
+            let inputs = vec![build_package_dir];
+
+            // For build dependencies, we don't copy to inputs anymore -
+            // they will be bind mounted directly into the sandbox root
+            // Just keep inputs as the package directory only
+
+            let config = BuildConfig {
+                dependencies,
+                inputs,
+                build_script: BuildScript {
+                    executable: PathBuf::from("/bin/bash"),
+                    args: vec![build.cmd.clone()],
+                },
+                outputs: build
+                    .outputs
+                    .values()
+                    .map(|output| match output {
+                        BuildOutput::Library { glob } => glob.clone(),
+                        BuildOutput::Binary { .. } => todo!(),
+                    })
+                    .collect(),
+                debug_shell: args.debug,
+            };
+
+            // Each build runs in complete isolation and outputs to the shared directory
+            // Later builds can access outputs from earlier builds via the shared directory
+            let _build_result = run_build(&config, output_base_dir, true)?;
+
+            println!("Completed isolated build: {}", build.name);
         }
-
-        // Add toolchain and scripts (always needed)
-        dependencies.push(
-            PathBuf::from("toolchains/x86_64-unknown-linux-gnu")
-                .canonicalize()
-                .unwrap(),
-        );
-        dependencies.push(PathBuf::from("scripts").canonicalize().unwrap());
-
-        debug!(
-            "Dependencies for isolated build {}: {:?}",
-            build_name, dependencies
-        );
-
-        let build_package_dir = base_package_dir.join(&build.name);
-
-        // Collect inputs - the package directory plus any build dependencies' outputs
-        let inputs = vec![build_package_dir];
-
-        // For build dependencies, we don't copy to inputs anymore -
-        // they will be bind mounted directly into the sandbox root
-        // Just keep inputs as the package directory only
-
-        let config = BuildConfig {
-            dependencies,
-            inputs,
-            build_script: BuildScript {
-                executable: PathBuf::from("/bin/bash"),
-                args: vec![build.cmd.clone()],
-            },
-            outputs: build
-                .outputs
-                .values()
-                .map(|output| match output {
-                    BuildOutput::Library { glob } => glob.clone(),
-                    BuildOutput::Binary { .. } => todo!(),
-                })
-                .collect(),
-            debug_shell: args.debug,
-        };
-
-        // Each build runs in complete isolation and outputs to the shared directory
-        // Later builds can access outputs from earlier builds via the shared directory
-        let _build_result = run_build(&config, output_base_dir, true)?;
-
-        println!("Completed isolated build: {}", build.name);
     }
 
     Ok(())

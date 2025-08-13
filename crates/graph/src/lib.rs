@@ -65,3 +65,4 @@ pub use dep_graph::{BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGra
 pub(crate) mod term_hasher;
 
 mod planner;
+pub use planner::ExecPlan;

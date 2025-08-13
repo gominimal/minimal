@@ -23,18 +23,6 @@ type OutputMap = nickel_lang_core::term::IndexMap<String, BuildOutput>;
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 pub struct BuildSpecRef(pub(crate) generational_arena::Index);
 
-impl BuildSpecRef {
-    /// Get the BuildSpec this reference points to in the given DepGraph
-    pub fn resolve<'a>(&self, graph: &'a DepGraph) -> Option<&'a BuildSpec> {
-        graph.builds.get(self.0)
-    }
-
-    /// Get the underlying arena index (useful for creating edges in external graphs)
-    pub fn index(&self) -> generational_arena::Index {
-        self.0
-    }
-}
-
 /// A description of pulling source code regardless of form.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceFetch {
