@@ -1,3 +1,0 @@
-[submodule "crates/proto"]
-	path = crates/proto
-	url = git@github.com:gominimal/nickel-proto.git

@@ -58,7 +58,7 @@ fn main() -> Result<()> {
     let sr = SpecReader::new(
         &build_ncl_content,
         &SpecReaderOptions {
-            minimal_lib_path: "crates/proto/crates/nickel-proto/minimal-ncl".into(),
+            minimal_lib_path: "crates/nickel-proto/minimal-ncl".into(),
         },
     );
 

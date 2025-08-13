@@ -1,0 +1,17 @@
+[package]
+edition = "2021"
+name = "nickel-proto"
+version = "0.0.1"
+license = "MIT OR Apache-2.0"
+
+rust-version = "1.78"
+
+[dev-dependencies]
+indoc.workspace = true
+
+[dependencies]
+nickel-lang-core.workspace = true
+serde.workspace = true
+blake3.workspace = true
+fxhash.workspace = true
+generational-arena.workspace = true
