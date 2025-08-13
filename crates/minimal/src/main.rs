@@ -155,6 +155,7 @@ fn main() -> Result<()> {
                 .values()
                 .map(|output| match output {
                     BuildOutput::Library { glob } => glob.clone(),
+                    BuildOutput::Binary { .. } => todo!(),
                 })
                 .collect(),
             debug_shell: args.debug,
