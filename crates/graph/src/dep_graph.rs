@@ -20,8 +20,8 @@ use serde::Deserialize;
 type OutputMap = nickel_lang_core::term::IndexMap<String, BuildOutput>;
 
 /// A reference to some other [BuildSpec] in a [DepGraph].
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct BuildSpecRef(generational_arena::Index);
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+pub struct BuildSpecRef(pub(crate) generational_arena::Index);
 
 impl BuildSpecRef {
     /// Get the BuildSpec this reference points to in the given DepGraph
@@ -157,6 +157,7 @@ impl crate::SpecHash for BuildSpec {
 #[allow(dead_code)]
 pub struct DepGraph {
     pub builds: Arena<BuildSpec>,
+    pub top_level: BuildSpecRef,
 }
 
 impl DepGraph {
@@ -168,8 +169,41 @@ impl DepGraph {
             term_hasher: TermHasher::new(),
         };
 
-        graph.read_buildspec(&sr.finish()?)?;
-        Ok(graph.finish())
+        let top_level = graph.read_buildspec(&sr.finish()?)?;
+        Ok(graph.finish(top_level))
+    }
+    pub fn get(&self, bsr: &BuildSpecRef) -> Option<&BuildSpec> {
+        self.builds.get(bsr.0)
+    }
+
+    /// Returns the unique set of transitive build-spec dependencies of the given toplevel.
+    pub fn transitive_specs_of(&self, toplevel: &BuildSpecRef) -> Vec<BuildSpecRef> {
+        let mut seen: HashMap<BuildSpecRef, ()> = HashMap::with_capacity(self.builds.len());
+        let mut reachable = Vec::with_capacity(self.builds.len());
+        self.collect_transitive_buildspecs(toplevel, &mut seen, &mut reachable);
+
+        reachable
+    }
+
+    fn collect_transitive_buildspecs(
+        &self,
+        bsr: &BuildSpecRef,
+        seen: &mut HashMap<BuildSpecRef, ()>,
+        reachable: &mut Vec<BuildSpecRef>,
+    ) {
+        let build_spec = self.get(bsr).unwrap();
+
+        use BuildSpecInput::*;
+        build_spec.inputs.iter().for_each(|input| match input {
+            Build(bsr) => {
+                if !seen.contains_key(bsr) {
+                    seen.insert(bsr.clone(), ());
+                    reachable.push(bsr.clone());
+                    self.collect_transitive_buildspecs(bsr, seen, reachable);
+                }
+            }
+            Source(_) | Path(_) => {}
+        })
     }
 }
 
@@ -190,9 +224,9 @@ struct GraphBuilder {
 }
 
 impl GraphBuilder {
-    fn finish(self) -> DepGraph {
+    fn finish(self, top_level: BuildSpecRef) -> DepGraph {
         let Self { builds, .. } = self;
-        DepGraph { builds }
+        DepGraph { builds, top_level }
     }
 
     /// Recursively processes and inserts a buildspec into the graph, returning
@@ -691,6 +725,61 @@ mod tests {
                 .unwrap()
                 .1
                 .spec_hash(&dp),
+        );
+    }
+
+    #[test]
+    fn transitive_specs_of() {
+        let sr = SpecReader::new(
+            indoc! {
+                "
+                let {BuildSpec, Source, ..} = import \"minimal.ncl\" in
+
+                let shared = {
+                    name = \"shared\",
+                    inputs = [
+                        {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
+                    ],
+                    cmd = \"\",
+                } | BuildSpec
+                in
+
+                {
+                    name = \"top build\",
+                    inputs = [
+                        shared,
+                        {
+                            name = \"second build\",
+                            inputs = [],
+                            cmd = \"\",
+                        } | BuildSpec,
+                    ],
+                    cmd = \"\",
+                } | BuildSpec"
+            }
+            .to_string(),
+            &SpecReaderOptions::for_test(),
+        );
+        // So we can see the actual error when parsing fails
+        sr.as_ref().err().into_iter().for_each(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+        let sr = sr.unwrap();
+
+        let dp = DepGraph::new(sr).unwrap();
+        assert_eq!(
+            dp.transitive_specs_of(&dp.top_level),
+            vec![
+                BuildSpecRef(dp.builds.iter().find(|b| b.1.name == "shared").unwrap().0),
+                BuildSpecRef(
+                    dp.builds
+                        .iter()
+                        .find(|b| b.1.name == "second build")
+                        .unwrap()
+                        .0
+                )
+            ]
         );
     }
 }
