@@ -6,6 +6,7 @@ use nickel_lang_core::error::Error as NclError;
 use nickel_lang_core::files::Files;
 use nickel_lang_core::term::RichTerm;
 use nickel_lang_core::{error::NullReporter, eval::cache::CacheImpl, program::Program};
+use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 
@@ -66,7 +67,7 @@ pub struct SpecReader {
 }
 
 impl SpecReader {
-    /// Processes the resulting build-spec universe, given options and source representing the top level.
+    /// Processes the resulting build-spec universe, given options and literal source representing the top level.
     pub fn new<S: Into<String>>(src: S, opts: &SpecReaderOptions) -> Result<Self, SpecError> {
         let mut program = Program::new_from_source(
             io::Cursor::new(src.into()),
@@ -74,6 +75,20 @@ impl SpecReader {
             std::io::stderr(),
             NullReporter {},
         )?;
+        program.add_import_paths([&opts.minimal_lib_path].iter());
+
+        program
+            .typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk)
+            .map_err(|e| SpecError::Nickel(program.files(), e))?;
+        Ok(Self { p: program })
+    }
+
+    /// Processes the resulting build-spec universe, given options and a path to source representing the top level.
+    pub fn new_with_path<P: Into<OsString>>(
+        src: P,
+        opts: &SpecReaderOptions,
+    ) -> Result<Self, SpecError> {
+        let mut program = Program::new_from_file(src, std::io::stderr(), NullReporter {})?;
         program.add_import_paths([&opts.minimal_lib_path].iter());
 
         program

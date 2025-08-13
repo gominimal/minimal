@@ -52,11 +52,8 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let build_ncl_content =
-        std::fs::read_to_string(&build_ncl_path).expect("Failed to read build.ncl");
-
-    let sr = SpecReader::new(
-        &build_ncl_content,
+    let sr = SpecReader::new_with_path(
+        build_ncl_path,
         &SpecReaderOptions {
             minimal_lib_path: "crates/graph/minimal-ncl".into(),
         },
