@@ -1,9 +1,8 @@
 let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
-let readline = import "packages/readline/build.ncl" in 
+let readline = import "../readline/build.ncl" in 
 {
     name = "bc",
     inputs = [
-        {path = "/bin"} | HostPath,
         {path = "/usr/bin/bash"} | HostPath,
         {path = "/usr/bin/make"} | HostPath,
         {path = "/usr/bin/tar"} | HostPath,
@@ -12,7 +11,7 @@ let readline = import "packages/readline/build.ncl" in
         {path = "/usr/bin/gawk"} | HostPath,
         readline,
     ],
-    cmd = "build.sh",
+    cmd = "./build.sh",
     outputs = {
         bc_bin = { glob = "bin/bc" },
         dc_bin = { glob = "bin/dc" },

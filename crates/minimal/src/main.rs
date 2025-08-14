@@ -28,12 +28,9 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize tracing
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-
     tracing_subscriber::registry()
         .with(fmt::layer())
-        .with(filter)
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
     let base_package_dir = Path::new("packages");
@@ -112,7 +109,7 @@ fn main() -> Result<()> {
 
             // Add toolchain and scripts (always needed)
             dependencies.push(
-                PathBuf::from("toolchains/x86_64-unknown-linux-gnu")
+                PathBuf::from("toolchains/x86_64-buildroot-linux-gnu")
                     .canonicalize()
                     .unwrap(),
             );
@@ -136,8 +133,8 @@ fn main() -> Result<()> {
                 dependencies,
                 inputs,
                 build_script: BuildScript {
-                    executable: PathBuf::from("/bin/bash"),
-                    args: vec![build.cmd.clone()],
+                    executable: build.cmd.clone().into(),
+                    args: vec![],
                 },
                 outputs: build
                     .outputs

@@ -2,13 +2,9 @@ let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
 {
     name = "m4",
     inputs = [
-        {path = "/bin"} | HostPath,
-        {path = "/usr/bin/bash"} | HostPath,
-        {path = "/usr/bin/make"} | HostPath,
-        {path = "/usr/bin/tar"} | HostPath,
-        {path = "/usr/bin/xz"} | HostPath,
+        {path = "/usr"} | HostPath,
     ],
-    cmd = "build.sh",
+    cmd = "./build.sh",
     outputs = {
         m4_bin = { glob = "bin/m4" } | OutputLib,
         m4_man = { glob = "share/man/man1/m4.1" } | OutputLib,

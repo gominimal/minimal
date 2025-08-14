@@ -2,14 +2,9 @@ let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
 {
     name = "grep",
     inputs = [
-        {path = "/bin"} | HostPath,
-        {path = "/usr/bin/bash"} | HostPath,
-        {path = "/usr/bin/tar"} | HostPath,
-        {path = "/usr/bin/xz"} | HostPath,
-        {path = "/usr/bin/sed"} | HostPath,
-        {path = "/usr/bin/make"} | HostPath,
+        {path = "/usr"} | HostPath,
     ],
-    cmd = "build.sh",
+    cmd = "/.build.sh",
     outputs = {
         grep_bin = { glob = "bin/grep" } | OutputLib,
         egrep_bin = { glob = "bin/egrep" } | OutputLib,

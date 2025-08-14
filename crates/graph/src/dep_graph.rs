@@ -185,8 +185,8 @@ impl DepGraph {
         build_spec.inputs.iter().for_each(|input| match input {
             Build(bsr) => {
                 if !seen.contains_key(bsr) {
-                    seen.insert(bsr.clone(), ());
-                    reachable.push(bsr.clone());
+                    seen.insert(*bsr, ());
+                    reachable.push(*bsr);
                     self.collect_transitive_buildspecs(bsr, seen, reachable);
                 }
             }

@@ -2,20 +2,9 @@ let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
 {
     name = "flex",
     inputs = [
-        {path = "/bin"} | HostPath,
-        {path = "/usr/bin/bash"} | HostPath,
-        {path = "/usr/bin/make"} | HostPath,
-        {path = "/usr/bin/tar"} | HostPath,
-        {path = "/usr/bin/gzip"} | HostPath,
-        {path = "/usr/bin/awk"} | HostPath,
-        {path = "/usr/bin/gawk"} | HostPath,
-        {path = "/usr/bin/file"} | HostPath,
-        {path = "/lib/cpp"} | HostPath,
-        {path = "/usr/bin/cpp"} | HostPath,
-        {path = "/usr/lib"} | HostPath,
-        {path = "/lib"} | HostPath,
+        {path = "/usr"} | HostPath,
     ],
-    cmd = "build.sh",
+    cmd = "./build.sh",
     outputs = {
         flex_bin = { glob = "bin/flex" } | OutputLib,
         flex_pp = { glob = "bin/flex++" } | OutputLib,

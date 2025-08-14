@@ -34,7 +34,7 @@ let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
 
 ### Build Script Template (build.sh)
 ```bash
-#!/bin/bash
+#!/usr/bin/bash
 set -e
 
 # Source shared toolchain setup

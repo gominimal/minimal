@@ -54,12 +54,12 @@ impl BuildExecutor {
             info!("  Type 'exit' to leave the debug shell");
 
             if cfg!(target_os = "linux") {
-                let mut c = Command::new("/bin/bash");
+                let mut c = Command::new("/usr/bin/bash");
                 sandbox.execute(&mut c)?;
                 c.arg("-i"); // Interactive shell
                 c
             } else {
-                let mut c = Command::new("/bin/bash");
+                let mut c = Command::new("/usr/bin/bash");
                 c.arg("-i");
                 c
             }
@@ -93,7 +93,7 @@ impl BuildExecutor {
 
         for dep in &config.dependencies {
             let dep_str = dep.to_string_lossy();
-            if dep_str.contains("toolchains/x86_64-unknown-linux-gnu") {
+            if dep_str.contains("toolchains/x86_64-buildroot-linux-gnu") {
                 cmd.env("TOOLCHAIN_DIR", dep);
                 info!("Set TOOLCHAIN_DIR to {}", dep.display());
             } else if dep_str.ends_with("/scripts") {
@@ -118,7 +118,7 @@ impl BuildExecutor {
                 stderr: Vec::new(),
             }
         } else {
-            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
 
             info!(
                 "Executing: {} {}",
@@ -126,7 +126,14 @@ impl BuildExecutor {
                 config.build_script.args.join(" ")
             );
 
-            cmd.output().map_err(|_| ExecutionError::ProcessSpawn)?
+            let status = cmd.status().map_err(|_| ExecutionError::ProcessSpawn)?;
+
+            // Create a fake output for compatibility since we inherited stdio
+            std::process::Output {
+                status,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            }
         };
 
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();

@@ -2,17 +2,9 @@ let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
 {
     name = "bison",
     inputs = [
-        {path = "/bin"} | HostPath,
-        {path = "/usr/bin/bash"} | HostPath,
-        {path = "/usr/bin/make"} | HostPath,
-        {path = "/usr/bin/tar"} | HostPath,
-        {path = "/usr/bin/xz"} | HostPath,
-        {path = "/usr/bin/unxz"} | HostPath,
-        {path = "/usr/bin/sed"} | HostPath,
-        {path = "/usr/bin/install"} | HostPath,
-        {path = "/usr/bin/m4"} | HostPath,
+        {path = "/usr"} | HostPath,
     ],
-    cmd = "build.sh",
+    cmd = "./build.sh",
     outputs = {
         bison_bin = { glob = "bin/bison" } | OutputLib,
         yacc_bin = { glob = "bin/yacc" } | OutputLib,

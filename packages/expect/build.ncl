@@ -2,16 +2,9 @@ let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
 {
     name = "expect",
     inputs = [
-        {path = "/bin"} | HostPath,
-        {path = "/usr/bin/bash"} | HostPath,
-        {path = "/usr/bin/make"} | HostPath,
-        {path = "/usr/bin/tar"} | HostPath,
-        {path = "/usr/bin/gzip"} | HostPath,
-        {path = "/usr/bin/ln"} | HostPath,
-        {path = "/usr/bin/sed"} | HostPath,
-        {path = "/usr/bin/patch"} | HostPath,
+        {path = "/usr"} | HostPath,
     ],
-    cmd = "build.sh",
+    cmd = "./build.sh",
     outputs = {
         expect_bin = { glob = "bin/expect" } | OutputLib,
         expect_lib = { glob = "lib/expect*" } | OutputLib,

@@ -48,7 +48,7 @@ impl<'a> Iterator for ExecPlan<'a> {
             // As a final step, emit the toplevel in question.
             if !self.emitted_toplevel {
                 self.emitted_toplevel = true;
-                return Some(vec![self.toplevel.clone()]);
+                return Some(vec![self.toplevel]);
             }
             return None;
         }
@@ -77,8 +77,8 @@ impl<'a> Iterator for ExecPlan<'a> {
                 }
             }
             // If we got this far, all build-spec input dependencies have been built. It can be emitted this phase.
-            met.push(candidate.clone());
-            built_this_phase.insert(candidate.clone(), ());
+            met.push(*candidate);
+            built_this_phase.insert(*candidate, ());
         }
 
         // Update the built set with stuff build this phase.
