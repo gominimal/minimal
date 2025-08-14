@@ -11,6 +11,7 @@ let host_make = import "../host_make/build.ncl" in
         host_bash,
         host_coreutils,
         host_gawk,
+        host_grep,
         host_make,
     ],
     cmd = "./build.sh",
