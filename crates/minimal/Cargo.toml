@@ -9,4 +9,4 @@ graph = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 clap = { version = "4.4", features = ["derive"] }
-generational-arena = "0.2"
+generational-arena.workspace = true

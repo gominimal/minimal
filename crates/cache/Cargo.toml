@@ -1,0 +1,15 @@
+[package]
+edition = "2021"
+name = "cache"
+version = "0.0.1"
+license = "MIT OR Apache-2.0"
+
+rust-version = "1.78"
+
+[dev-dependencies]
+indoc.workspace = true
+tempdir = {version = "0.3"}
+
+[dependencies]
+blake3.workspace = true
+path-absolutize.workspace = true

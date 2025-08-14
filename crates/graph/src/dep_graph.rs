@@ -23,6 +23,8 @@ type OutputMap = nickel_lang_core::term::IndexMap<String, BuildOutput>;
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 pub struct BuildSpecRef(pub(crate) generational_arena::Index);
 
+pub type SpecHash = blake3::Hash;
+
 /// A description of pulling source code regardless of form.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceFetch {
@@ -46,7 +48,7 @@ pub enum BuildSpecInput {
 }
 
 impl crate::SpecHash for BuildSpecInput {
-    fn spec_hash(&self, g: &DepGraph) -> blake3::Hash {
+    fn spec_hash(&self, g: &DepGraph) -> SpecHash {
         let mut h = blake3::Hasher::new();
 
         use BuildSpecInput::*;
@@ -114,7 +116,7 @@ pub struct BuildSpec {
 }
 
 impl crate::SpecHash for BuildSpec {
-    fn spec_hash(&self, g: &DepGraph) -> blake3::Hash {
+    fn spec_hash(&self, g: &DepGraph) -> SpecHash {
         let mut h = blake3::Hasher::new();
 
         h.write_all(b"build spec").unwrap();
