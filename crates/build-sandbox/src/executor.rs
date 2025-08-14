@@ -61,24 +61,9 @@ impl BuildExecutor {
             info!("  OUTPUT_DIR: {}", self.output_staging_path.display());
             info!("  Type 'exit' to leave the debug shell");
 
-            if cfg!(target_os = "linux") {
-                let mut c = Command::new("/bin/sh");
-                sandbox.execute(&mut c)?;
-                c.arg("-i");
-                c
-            } else {
-                let mut c = Command::new("/bin/sh");
-                c.arg("-i");
-                c
-            }
-        } else if cfg!(target_os = "macos") {
-            let mut c = Command::new("sandbox-exec");
+            let mut c = Command::new("/bin/sh");
             sandbox.execute(&mut c)?;
-            c.arg(format!(
-                "-D_TMPDIR=/private{}",
-                self.temp_dir_path.display()
-            ))
-            .arg(&config.build_script.executable);
+            c.arg("-i");
             c
         } else if cfg!(target_os = "linux") {
             // For Linux, create the command and let the sandbox set up mount namespaces via pre_exec
