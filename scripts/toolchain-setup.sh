@@ -1,10 +1,3 @@
-if [ -d "/opt/toolchain/bin" ]; then
-    TOOLCHAIN_DIR="/opt/toolchain"
-else
-    TOOLCHAIN_DIR="${TOOLCHAIN_DIR:-toolchains/x86_64-buildroot-linux-gnu}"
-fi
-export PATH="${TOOLCHAIN_DIR}/bin:${PATH}"
-
 export CC="x86_64-buildroot-linux-gnu-gcc"
 export CXX="x86_64-buildroot-linux-gnu-g++"
 export AR="x86_64-buildroot-linux-gnu-ar"

@@ -1,8 +1,8 @@
-#!/usr/bin/bash
+#!/bin/sh
 
 set -e
 
-source "${SCRIPTS_DIR}/toolchain-setup.sh"
+. "${SCRIPTS_DIR}/toolchain-setup.sh"
 
 tar xf bzip2-1.0.8.tar.gz
 cd bzip2-1.0.8

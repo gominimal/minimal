@@ -91,15 +91,49 @@ impl BuildExecutor {
         cmd.env("TMPDIR", &self.temp_dir_path);
         cmd.env("OUTPUT_DIR", &self.output_staging_path);
 
+        // Build PATH from dependencies, prioritizing toolchain and build outputs
+        let mut path_components = Vec::new();
+
         for dep in &config.dependencies {
             let dep_str = dep.to_string_lossy();
             if dep_str.contains("toolchains/x86_64-buildroot-linux-gnu") {
                 cmd.env("TOOLCHAIN_DIR", dep);
                 info!("Set TOOLCHAIN_DIR to {}", dep.display());
+                // Add toolchain bin directory to PATH (mounted at /opt/toolchain/bin in sandbox)
+                path_components.push(std::path::PathBuf::from("/opt/toolchain/bin"));
             } else if dep_str.ends_with("/scripts") {
                 cmd.env("SCRIPTS_DIR", dep);
                 info!("Set SCRIPTS_DIR to {}", dep.display());
             }
+        }
+
+        // Add minimal output bin directory to PATH (mounted at /opt/minimal/bin in sandbox)
+        for dep in &config.dependencies {
+            let dep_str = dep.to_string_lossy();
+            if dep_str.ends_with("minimal-out") {
+                path_components.push(std::path::PathBuf::from("/opt/minimal/bin"));
+                break;
+            }
+        }
+
+        // Include system PATH as fallback
+        if let Ok(system_path) = std::env::var("PATH") {
+            for component in system_path.split(':') {
+                if !component.is_empty() {
+                    path_components.push(std::path::PathBuf::from(component));
+                }
+            }
+        }
+
+        // Set the combined PATH
+        if !path_components.is_empty() {
+            let path_string = path_components
+                .iter()
+                .map(|p| p.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(":");
+            cmd.env("PATH", &path_string);
+            info!("Set PATH to {}", path_string);
         }
         let output = if config.debug_shell {
             // For interactive shell, inherit stdio
