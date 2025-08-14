@@ -1,12 +1,12 @@
 let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
+let host_bash = import "../host_bash/build.ncl" in
+let host_coreutils = import "../host_coreutils/build.ncl" in
 {
     name = "host_make",
     inputs = [
         {path = "/usr/bin/make"} | HostPath,
-        {path = "/bin/sh"} | HostPath,
-        {path = "/usr/bin/mkdir"} | HostPath,
-        {path = "/usr/bin/cp"} | HostPath,
-        {path = "/usr/bin/echo"} | HostPath,
+        host_bash,
+        host_coreutils,
     ],
     cmd = "./build.sh",
     outputs = {

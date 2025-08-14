@@ -2,13 +2,14 @@ let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
 let host_coreutils = import "../host_coreutils/build.ncl" in
 let host_bash = import "../host_bash/build.ncl" in
 let host_patch = import "../host_patch/build.ncl" in
+let host_tar = import "../host_tar/build.ncl" in
 {
     name = "bzip2",
     inputs = [
-        {path = "/usr/bin/sh"} | HostPath,
         host_coreutils,
         host_bash,
         host_patch,
+        host_tar,
     ],
     cmd = "./build.sh",
     outputs = {

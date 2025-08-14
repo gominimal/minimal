@@ -1,4 +1,5 @@
 let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
+let host_bash = import "../host_bash/build.ncl" in
 {
     name = "host_coreutils",
     inputs = [
@@ -107,7 +108,7 @@ let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
         {path = "/usr/bin/who"} | HostPath,
         {path = "/usr/bin/whoami"} | HostPath,
         {path = "/usr/bin/yes"} | HostPath,
-        {path = "/usr/bin/bash"} | HostPath,
+        host_bash,
     ],
     cmd = "./build.sh",
     outputs = {

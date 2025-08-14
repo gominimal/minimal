@@ -1,6 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
-let host_coreutils = import "../host_coreutils/build.ncl" in
-{
+let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in{
     name = "host_bash",
     inputs = [
         {path = "/usr/bin/bash"} | HostPath,

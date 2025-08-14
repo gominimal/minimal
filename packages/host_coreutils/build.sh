@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 
 set -euo pipefail
 
@@ -68,6 +68,7 @@ cp /usr/bin/pinky "${OUTPUT_DIR}/bin/"
 cp /usr/bin/pr "${OUTPUT_DIR}/bin/"
 cp /usr/bin/printenv "${OUTPUT_DIR}/bin/"
 cp /usr/bin/printf "${OUTPUT_DIR}/bin/"
+cp /usr/bin/mkdir "${OUTPUT_DIR}/bin/"
 cp /usr/bin/ptx "${OUTPUT_DIR}/bin/"
 cp /usr/bin/pwd "${OUTPUT_DIR}/bin/"
 cp /usr/bin/readlink "${OUTPUT_DIR}/bin/"
