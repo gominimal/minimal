@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 "build-sandbox" = { workspace = true }
 graph = { workspace = true }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-clap = { version = "4.4", features = ["derive"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
 generational-arena.workspace = true

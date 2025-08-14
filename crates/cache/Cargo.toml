@@ -8,7 +8,7 @@ rust-version = "1.78"
 
 [dev-dependencies]
 indoc.workspace = true
-tempdir = {version = "0.3"}
+tempdir.workspace = true
 
 [dependencies]
 blake3.workspace = true
