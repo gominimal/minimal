@@ -1,8 +1,8 @@
-#!/usr/bin/bash
+#!/bin/sh
 
 set -e
 
-source "${SCRIPTS_DIR}/toolchain-setup.sh"
+. ./toolchain-setup.sh
 
 tar xf readline-8.3.tar.gz
 cd readline-8.3

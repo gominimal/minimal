@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-source "${SCRIPTS_DIR}/toolchain-setup.sh"
+. ./toolchain-setup.sh
 
 tar -xf flex-2.6.4.tar.gz
 cd flex-2.6.4

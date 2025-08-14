@@ -2,7 +2,7 @@
 
 set -e
 
-source "${SCRIPTS_DIR}/toolchain-setup.sh"
+. ./toolchain-setup.sh
 
 tar xf grep-3.12.tar.xz
 cd grep-3.12

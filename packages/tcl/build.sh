@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-source "${SCRIPTS_DIR}/toolchain-setup.sh"
+. ./toolchain-setup.sh
 
 tar -xf tcl8.6.16-src.tar.gz
 cd tcl8.6.16

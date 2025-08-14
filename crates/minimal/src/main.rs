@@ -109,7 +109,7 @@ fn main() -> Result<()> {
 
             // Add toolchain and scripts (always needed)
             dependencies.push(
-                PathBuf::from("toolchains/x86_64-buildroot-linux-gnu")
+                PathBuf::from("toolchains/x86_64-unknown-linux-gnu")
                     .canonicalize()
                     .unwrap(),
             );

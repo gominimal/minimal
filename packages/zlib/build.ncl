@@ -8,7 +8,6 @@ let host_tar = import "../host_tar/build.ncl" in
 {
     name = "zlib",
     inputs = [
-        {path = "/usr/bin/sh"} | HostPath,
         host_coreutils,
         host_bash,
         host_gzip,

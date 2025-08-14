@@ -1,8 +1,13 @@
 let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
+let host_bash = import "../host_bash/build.ncl" in
+let host_diffutils = import "../host_diffutils/build.ncl" in
+let file = import "../file/build.ncl" in
 {
     name = "flex",
     inputs = [
-        {path = "/usr"} | HostPath,
+        file,
+        host_bash,
+        host_diffutils,
     ],
     cmd = "./build.sh",
     outputs = {

@@ -2,7 +2,7 @@
 
 set -e
 
-source "${SCRIPTS_DIR}/toolchain-setup.sh"
+. ./toolchain-setup.sh
 
 tar xf xz-5.8.1.tar.xz
 cd xz-5.8.1

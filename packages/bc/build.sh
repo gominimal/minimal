@@ -1,7 +1,7 @@
-#!/usr/bin/bash
+#!/bin/sh
 set -e
 
-source "${SCRIPTS_DIR}/toolchain-setup.sh"
+. ./toolchain-setup.sh
 
 tar -xf bc-7.0.3.tar.xz
 cd bc-7.0.3

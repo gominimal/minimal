@@ -1,12 +1,9 @@
 let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
+let host_bash = import "../host_bash/build.ncl" in
 {
     name = "host_sed",
     inputs = [
-        {path = "/usr/bin/sed"} | HostPath,
-        {path = "/bin/sh"} | HostPath,
-        {path = "/usr/bin/mkdir"} | HostPath,
-        {path = "/usr/bin/cp"} | HostPath,
-        {path = "/usr/bin/echo"} | HostPath,
+        host_sed,
     ],
     cmd = "./build.sh",
     outputs = {

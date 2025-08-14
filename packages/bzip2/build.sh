@@ -2,7 +2,7 @@
 
 set -e
 
-. "${SCRIPTS_DIR}/toolchain-setup.sh"
+. ./toolchain-setup.sh
 
 tar xf bzip2-1.0.8.tar.gz
 cd bzip2-1.0.8

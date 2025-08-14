@@ -1,9 +1,12 @@
 let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
+let host_bash = import "../host_bash/build.ncl" in
+let m4 = import "../m4/build.ncl" in
 {
     name = "bison",
-    inputs = [
-        {path = "/usr"} | HostPath,
-    ],
+    inputs = [  
+        host_bash,
+        m4,
+     ],
     cmd = "./build.sh",
     outputs = {
         bison_bin = { glob = "bin/bison" } | OutputLib,

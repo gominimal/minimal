@@ -4,7 +4,6 @@ let host_coreutils = import "../host_coreutils/build.ncl" in
     name = "host_bash",
     inputs = [
         {path = "/usr/bin/bash"} | HostPath,
-        {path = "/bin/sh"} | HostPath,
         {path = "/usr/bin/mkdir"} | HostPath,
         {path = "/usr/bin/cp"} | HostPath,
         {path = "/usr/bin/ln"} | HostPath,

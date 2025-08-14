@@ -39,7 +39,16 @@ impl BuildExecutor {
             self.copy_to_tmpdir(input)?;
         }
 
-        // If debug shell mode, write a helper script
+        // Always copy toolchain-setup.sh to every build environment
+        let toolchain_script = Path::new("scripts/toolchain-setup.sh");
+        if toolchain_script.exists() {
+            info!(
+                "  Copying toolchain setup script: {}",
+                toolchain_script.display()
+            );
+            self.copy_to_tmpdir(toolchain_script)?;
+        }
+
         if config.debug_shell {
             self.create_debug_helper()?;
         }
@@ -47,19 +56,18 @@ impl BuildExecutor {
         let mut sandbox = sandbox::create_sandbox(config)?;
 
         let mut cmd = if config.debug_shell {
-            // Debug mode: launch interactive bash shell
             info!("Launching debug shell in sandbox environment");
             info!("  TMPDIR: {}", self.temp_dir_path.display());
             info!("  OUTPUT_DIR: {}", self.output_staging_path.display());
             info!("  Type 'exit' to leave the debug shell");
 
             if cfg!(target_os = "linux") {
-                let mut c = Command::new("/usr/bin/bash");
+                let mut c = Command::new("/bin/sh");
                 sandbox.execute(&mut c)?;
-                c.arg("-i"); // Interactive shell
+                c.arg("-i");
                 c
             } else {
-                let mut c = Command::new("/usr/bin/bash");
+                let mut c = Command::new("/bin/sh");
                 c.arg("-i");
                 c
             }
@@ -91,41 +99,12 @@ impl BuildExecutor {
         cmd.env("TMPDIR", &self.temp_dir_path);
         cmd.env("OUTPUT_DIR", &self.output_staging_path);
 
-        // Build PATH from dependencies, prioritizing toolchain and build outputs
-        let mut path_components = Vec::new();
+        let path_components = [
+            PathBuf::from("/opt/toolchain/bin"),
+            PathBuf::from("/opt/minimal/bin"),
+            PathBuf::from("/usr/bin/"),
+        ];
 
-        for dep in &config.dependencies {
-            let dep_str = dep.to_string_lossy();
-            if dep_str.contains("toolchains/x86_64-buildroot-linux-gnu") {
-                cmd.env("TOOLCHAIN_DIR", dep);
-                info!("Set TOOLCHAIN_DIR to {}", dep.display());
-                // Add toolchain bin directory to PATH (mounted at /opt/toolchain/bin in sandbox)
-                path_components.push(std::path::PathBuf::from("/opt/toolchain/bin"));
-            } else if dep_str.ends_with("/scripts") {
-                cmd.env("SCRIPTS_DIR", dep);
-                info!("Set SCRIPTS_DIR to {}", dep.display());
-            }
-        }
-
-        // Add minimal output bin directory to PATH (mounted at /opt/minimal/bin in sandbox)
-        for dep in &config.dependencies {
-            let dep_str = dep.to_string_lossy();
-            if dep_str.ends_with("minimal-out") {
-                path_components.push(std::path::PathBuf::from("/opt/minimal/bin"));
-                break;
-            }
-        }
-
-        // Include system PATH as fallback
-        if let Ok(system_path) = std::env::var("PATH") {
-            for component in system_path.split(':') {
-                if !component.is_empty() {
-                    path_components.push(std::path::PathBuf::from(component));
-                }
-            }
-        }
-
-        // Set the combined PATH
         if !path_components.is_empty() {
             let path_string = path_components
                 .iter()
@@ -135,6 +114,7 @@ impl BuildExecutor {
             cmd.env("PATH", &path_string);
             info!("Set PATH to {}", path_string);
         }
+
         let output = if config.debug_shell {
             // For interactive shell, inherit stdio
             cmd.stdin(Stdio::inherit())

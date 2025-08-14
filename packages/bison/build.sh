@@ -1,7 +1,7 @@
-#!/usr/bin/bash
+#!/bin/sh
 set -e
 
-source "${SCRIPTS_DIR}/toolchain-setup.sh"
+. ./toolchain-setup.sh
 
 tar -xf bison-3.8.2.tar.xz
 cd bison-3.8.2

@@ -1,8 +1,13 @@
 let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
+let host_bash = import "../host_bash/build.ncl" in
+let host_patch = import "../host_patch/build.ncl" in
+let tcl = import "../tcl/build.ncl" in
 {
     name = "expect",
     inputs = [
-        {path = "/usr"} | HostPath,
+        host_bash,
+        host_patch,
+        tcl,
     ],
     cmd = "./build.sh",
     outputs = {

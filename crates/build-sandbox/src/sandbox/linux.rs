@@ -59,8 +59,8 @@ fn create_isolated_root() -> std::io::Result<String> {
             .map_err(|e| std::io::Error::other(format!("mkdir failed: {}", e)))?;
     }
 
-    std::os::unix::fs::symlink("usr/bin", format!("{}/bin", new_root))
-        .map_err(|e| std::io::Error::other(format!("symlink /bin -> /usr/bin failed: {}", e)))?;
+    std::os::unix::fs::symlink("opt/minimal/bin", format!("{}/bin", new_root))
+        .map_err(|e| std::io::Error::other(format!("symlink /bin -> /opt/minimal/bin failed: {}", e)))?;
 
     Ok(new_root)
 }
@@ -116,7 +116,7 @@ fn bind_dependencies(config: &BuildConfig, new_root: &str) -> std::io::Result<()
     for dep in &config.dependencies {
         let dep_str = dep.to_string_lossy();
 
-        if dep_str.contains("toolchains/x86_64-buildroot-linux-gnu") {
+        if dep_str.contains("toolchains/x86_64-unknown-linux-gnu") {
             bind_buildroot_toolchain(&dep_str, new_root)?;
             continue;
         }

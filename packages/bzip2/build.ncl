@@ -1,7 +1,7 @@
 let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
 let host_coreutils = import "../host_coreutils/build.ncl" in
 let host_bash = import "../host_bash/build.ncl" in
-let host_patch = import "../host_bash/build.ncl" in
+let host_patch = import "../host_patch/build.ncl" in
 {
     name = "bzip2",
     inputs = [
