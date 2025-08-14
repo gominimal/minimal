@@ -39,7 +39,6 @@ impl BuildExecutor {
             self.copy_to_tmpdir(input)?;
         }
 
-        // Always copy toolchain-setup.sh to every build environment
         let toolchain_script = Path::new("scripts/toolchain-setup.sh");
         if toolchain_script.exists() {
             info!(
@@ -66,9 +65,8 @@ impl BuildExecutor {
             c.arg("-i");
             c
         } else if cfg!(target_os = "linux") {
-            // For Linux, create the command and let the sandbox set up mount namespaces via pre_exec
             let mut c = Command::new(&config.build_script.executable);
-            sandbox.execute(&mut c)?; // This sets up the pre_exec hook for mount namespace setup
+            sandbox.execute(&mut c)?;
             c
         } else {
             Command::new(&config.build_script.executable)
@@ -101,16 +99,16 @@ impl BuildExecutor {
         }
 
         let output = if config.debug_shell {
-            // For interactive shell, inherit stdio
             cmd.stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit());
 
             info!("Starting interactive debug shell...");
 
-            let status = cmd.status().map_err(|_| ExecutionError::ProcessSpawn)?;
+            let status = cmd.status().map_err(|e| ExecutionError::ProcessSpawn {
+                context: format!("Failed to start debug shell: {}", e),
+            })?;
 
-            // Create a fake output for compatibility
             std::process::Output {
                 status,
                 stdout: Vec::new(),
@@ -125,9 +123,14 @@ impl BuildExecutor {
                 config.build_script.args.join(" ")
             );
 
-            let status = cmd.status().map_err(|_| ExecutionError::ProcessSpawn)?;
+            let status = cmd.status().map_err(|e| ExecutionError::ProcessSpawn {
+                context: format!(
+                    "Failed to execute build script '{}': {}",
+                    config.build_script.executable.display(),
+                    e
+                ),
+            })?;
 
-            // Create a fake output for compatibility since we inherited stdio
             std::process::Output {
                 status,
                 stdout: Vec::new(),
@@ -173,9 +176,22 @@ impl BuildExecutor {
 
     fn copy_to_tmpdir(&self, input: &Path) -> Result<()> {
         if input.is_file() {
-            let file_name = input.file_name().ok_or(ExecutionError::ProcessSpawn)?;
+            let file_name = input
+                .file_name()
+                .ok_or_else(|| ExecutionError::FileOperation {
+                    operation: "get file name".to_string(),
+                    path: input.display().to_string(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Path has no file name",
+                    ),
+                })?;
             let dest = self.temp_dir_path.join(file_name);
-            fs::copy(input, &dest).map_err(|_| ExecutionError::ProcessSpawn)?;
+            fs::copy(input, &dest).map_err(|e| ExecutionError::CopyFailed {
+                source: input.display().to_string(),
+                destination: dest.display().to_string(),
+                error: e,
+            })?;
         } else if input.is_dir() {
             Self::copy_dir_contents(input, &self.temp_dir_path)?;
         }
@@ -184,17 +200,42 @@ impl BuildExecutor {
     }
 
     fn copy_dir_contents(src: &Path, dst: &Path) -> Result<()> {
-        for entry in fs::read_dir(src).map_err(|_| ExecutionError::ProcessSpawn)? {
-            let entry = entry.map_err(|_| ExecutionError::ProcessSpawn)?;
+        for entry in fs::read_dir(src).map_err(|e| ExecutionError::FileOperation {
+            operation: "read directory".to_string(),
+            path: src.display().to_string(),
+            source: e,
+        })? {
+            let entry = entry.map_err(|e| ExecutionError::FileOperation {
+                operation: "read directory entry".to_string(),
+                path: src.display().to_string(),
+                source: e,
+            })?;
             let path = entry.path();
-            let file_name = path.file_name().ok_or(ExecutionError::ProcessSpawn)?;
+            let file_name = path
+                .file_name()
+                .ok_or_else(|| ExecutionError::FileOperation {
+                    operation: "get file name".to_string(),
+                    path: path.display().to_string(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Path has no file name",
+                    ),
+                })?;
             let dest_path = dst.join(file_name);
 
             if path.is_dir() {
-                fs::create_dir_all(&dest_path).map_err(|_| ExecutionError::ProcessSpawn)?;
+                fs::create_dir_all(&dest_path).map_err(|e| ExecutionError::FileOperation {
+                    operation: "create directory".to_string(),
+                    path: dest_path.display().to_string(),
+                    source: e,
+                })?;
                 Self::copy_dir_contents(&path, &dest_path)?;
             } else {
-                fs::copy(&path, &dest_path).map_err(|_| ExecutionError::ProcessSpawn)?;
+                fs::copy(&path, &dest_path).map_err(|e| ExecutionError::CopyFailed {
+                    source: path.display().to_string(),
+                    destination: dest_path.display().to_string(),
+                    error: e,
+                })?;
             }
         }
         Ok(())
@@ -229,12 +270,19 @@ echo ""
 "#;
 
         let helper_path = self.temp_dir_path.join("debug-helper.sh");
-        fs::write(&helper_path, helper_script).map_err(|_| ExecutionError::ProcessSpawn)?;
+        fs::write(&helper_path, helper_script).map_err(|e| ExecutionError::FileOperation {
+            operation: "write debug helper script".to_string(),
+            path: helper_path.display().to_string(),
+            source: e,
+        })?;
 
-        // Also create a .bashrc to run the helper on shell start
         let bashrc = format!("source {}/debug-helper.sh\n", self.temp_dir_path.display());
         let bashrc_path = self.temp_dir_path.join(".bashrc");
-        fs::write(&bashrc_path, bashrc).map_err(|_| ExecutionError::ProcessSpawn)?;
+        fs::write(&bashrc_path, bashrc).map_err(|e| ExecutionError::FileOperation {
+            operation: "write .bashrc".to_string(),
+            path: bashrc_path.display().to_string(),
+            source: e,
+        })?;
 
         Ok(())
     }

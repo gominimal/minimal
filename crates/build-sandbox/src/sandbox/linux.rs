@@ -59,8 +59,9 @@ fn create_isolated_root() -> std::io::Result<String> {
             .map_err(|e| std::io::Error::other(format!("mkdir failed: {}", e)))?;
     }
 
-    std::os::unix::fs::symlink("opt/minimal/bin", format!("{}/bin", new_root))
-        .map_err(|e| std::io::Error::other(format!("symlink /bin -> /opt/minimal/bin failed: {}", e)))?;
+    std::os::unix::fs::symlink("opt/minimal/bin", format!("{}/bin", new_root)).map_err(|e| {
+        std::io::Error::other(format!("symlink /bin -> /opt/minimal/bin failed: {}", e))
+    })?;
 
     Ok(new_root)
 }

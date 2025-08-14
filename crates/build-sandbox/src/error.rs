@@ -59,8 +59,23 @@ pub enum ExecutionError {
     #[error("Failed to create temporary directory")]
     TempDirCreation,
 
-    #[error("Process spawn failed")]
-    ProcessSpawn,
+    #[error("Failed to spawn process: {context}")]
+    ProcessSpawn { context: String },
+
+    #[error("File operation failed: {operation} on {path}: {source}")]
+    FileOperation {
+        operation: String,
+        path: String,
+        source: std::io::Error,
+    },
+
+    #[error("Failed to copy {source} to {destination}: {error}")]
+    CopyFailed {
+        source: String,
+        destination: String,
+        #[source]
+        error: std::io::Error,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
