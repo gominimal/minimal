@@ -15,8 +15,10 @@ echo "Building all packages..."
 for pkg_dir in "$PACKAGES_DIR"/*; do
     if [ -d "$pkg_dir" ]; then
         pkg_name=$(basename "$pkg_dir")
+        echo "Cleaning minimal-out/"
+        rm -rf minimal-out/
         echo "Building package: $pkg_name"
-        cargo run --package minimal -- --package "$pkg_name"
+        cargo run --release -- --package "$pkg_name"
         echo "Completed: $pkg_name"
         echo "---"
     fi
