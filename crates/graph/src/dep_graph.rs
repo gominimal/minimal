@@ -45,7 +45,7 @@ pub struct SourceInput {
 pub enum BuildSpecInput {
     Build(BuildSpecRef),
     Source(SourceInput),
-    Path(PathBuf),
+    HostPath(PathBuf),
     Local((PathBuf, blake3::Hash)),
 }
 
@@ -70,8 +70,8 @@ impl crate::SpecHash for BuildSpecInput {
                 };
                 h.write_all(s.sha256.as_bytes()).unwrap()
             }
-            Path(p) => {
-                h.write_all(b"library").unwrap();
+            HostPath(p) => {
+                h.write_all(b"host path").unwrap();
                 h.write_all(p.as_path().to_string_lossy().as_bytes())
                     .unwrap();
             }
@@ -213,7 +213,7 @@ impl DepGraph {
                     self.collect_transitive_buildspecs(bsr, seen, reachable);
                 }
             }
-            Source(_) | Path(_) | Local(_) => {}
+            Source(_) | HostPath(_) | Local(_) => {}
         })
     }
 }
@@ -354,7 +354,7 @@ impl GraphBuilder {
             }
             ObjTy::Path => {
                 let host_path = ObjHostPath::deserialize(rt.clone()).unwrap();
-                Ok(BuildSpecInput::Path(host_path.path.into()))
+                Ok(BuildSpecInput::HostPath(host_path.path.into()))
             }
             ObjTy::Local => {
                 let local = ObjLocal::deserialize(rt.clone()).unwrap();
@@ -459,7 +459,7 @@ mod tests {
         // We expect that buildspec to have one HostPath input
         assert!(matches!(
             dp.builds.iter().next().unwrap().1.inputs[0],
-            BuildSpecInput::Path(_)
+            BuildSpecInput::HostPath(_)
         ));
     }
 

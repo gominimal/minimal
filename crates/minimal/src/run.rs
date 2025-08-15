@@ -61,7 +61,7 @@ impl Run {
 
                             dependencies.insert(cache_path, PathBuf::from("/"));
                         }
-                        Path(path) => {
+                        HostPath(path) => {
                             debug!("  Input {}: HostPath({})", i, path.display());
                             let host_path = PathBuf::from(path);
                             dependencies.insert(host_path.clone(), host_path);

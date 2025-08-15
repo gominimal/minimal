@@ -73,7 +73,7 @@ impl<'a> Iterator for ExecPlan<'a> {
                             continue 'candidate_loop;
                         }
                     }
-                    Source(_) | Path(_) | Local(_) => {}
+                    Source(_) | HostPath(_) | Local(_) => {}
                 }
             }
             // If we got this far, all build-spec input dependencies have been built. It can be emitted this phase.
