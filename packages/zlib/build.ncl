@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
 let host_coreutils = import "../host_coreutils/build.ncl" in
 let host_bash = import "../host_bash/build.ncl" in
 let host_gzip = import "../host_gzip/build.ncl" in
@@ -8,6 +8,7 @@ let host_tar = import "../host_tar/build.ncl" in
 {
     name = "zlib",
     inputs = [
+        {file = "build.sh"} | Local,
         host_coreutils,
         host_bash,
         host_gzip,

@@ -85,7 +85,8 @@ impl BuildExecutor {
         let path_components = [
             PathBuf::from("/opt/toolchain/bin"),
             PathBuf::from("/opt/minimal/bin"),
-            PathBuf::from("/usr/bin/"),
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
         ];
 
         if !path_components.is_empty() {

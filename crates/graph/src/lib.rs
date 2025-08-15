@@ -50,7 +50,7 @@ impl From<SpecError> for Error {
 /// This hash should change if any semantics change, but stay the same for anything immaterial (i.e, should
 /// not change with comments, line numbers, locations in different files etc).
 #[allow(dead_code)]
-trait SpecHash {
+pub trait SpecHash {
     fn spec_hash(&self, _: &DepGraph) -> blake3::Hash;
 }
 

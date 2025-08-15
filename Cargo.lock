@@ -1309,9 +1309,11 @@ name = "minimal"
 version = "0.1.0"
 dependencies = [
  "build-sandbox",
+ "cache",
  "clap",
  "generational-arena",
  "graph",
+ "tempdir",
  "tracing",
  "tracing-subscriber",
 ]

@@ -1,8 +1,9 @@
-let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
 let host_bash = import "../host_bash/build.ncl" in
 {
     name = "host_coreutils",
     inputs = [
+        {file = "build.sh"} | Local,
         {path = "/usr/bin/["} | HostPath,
         {path = "/usr/bin/arch"} | HostPath,
         {path = "/usr/bin/b2sum"} | HostPath,

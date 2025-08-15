@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 mod fs;
 pub use fs::FSError;
 pub use fs::FileSystem;
-use fs::LocalDir;
+pub use fs::LocalDir;
 
 /// A directory tree in the cache you can read or write.
 #[derive(Debug, Clone)]

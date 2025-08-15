@@ -2,6 +2,7 @@
 
 #![allow(clippy::result_large_err)]
 
+use nickel_lang_core::files::Files;
 use nickel_lang_core::position::TermPos;
 use nickel_lang_core::term::{RichTerm, SharedTerm, Term};
 
@@ -9,7 +10,7 @@ use crate::term_hasher::TermHasher;
 use generational_arena::Arena;
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{Error, SpecReader};
 
@@ -45,6 +46,7 @@ pub enum BuildSpecInput {
     Build(BuildSpecRef),
     Source(SourceInput),
     Path(PathBuf),
+    Local(PathBuf),
 }
 
 impl crate::SpecHash for BuildSpecInput {
@@ -70,6 +72,11 @@ impl crate::SpecHash for BuildSpecInput {
             }
             Path(p) => {
                 h.write_all(b"library").unwrap();
+                h.write_all(p.as_path().to_string_lossy().as_bytes())
+                    .unwrap();
+            }
+            Local(p) => {
+                h.write_all(b"local").unwrap();
                 h.write_all(p.as_path().to_string_lossy().as_bytes())
                     .unwrap();
             }
@@ -159,11 +166,19 @@ impl DepGraph {
             term_hasher: TermHasher::new(),
         };
 
-        let top_level = graph.read_buildspec(&sr.finish()?)?;
+        let (ncl_tree, files) = sr.finish()?;
+        let top_level = graph.read_buildspec(&ncl_tree, &files)?;
         Ok(graph.finish(top_level))
     }
     pub fn get(&self, bsr: &BuildSpecRef) -> Option<&BuildSpec> {
         self.builds.get(bsr.0)
+    }
+    pub fn by_name<S: AsRef<str>>(&self, name: S) -> impl Iterator<Item=BuildSpecRef> + use<'_, S> {
+        self.builds.iter().filter_map(move |(bsr, b)| if b.name == name.as_ref() {
+            Some(BuildSpecRef(bsr))
+        } else {
+            None
+        })
     }
 
     /// Returns the unique set of transitive build-spec dependencies of the given toplevel.
@@ -192,7 +207,7 @@ impl DepGraph {
                     self.collect_transitive_buildspecs(bsr, seen, reachable);
                 }
             }
-            Source(_) | Path(_) => {}
+            Source(_) | Path(_) | Local(_) => {}
         })
     }
 }
@@ -221,7 +236,7 @@ impl GraphBuilder {
 
     /// Recursively processes and inserts a buildspec into the graph, returning
     /// a handle to it in the build graph.
-    fn read_buildspec(&mut self, rt: &RichTerm) -> Result<BuildSpecRef, Error> {
+    fn read_buildspec(&mut self, rt: &RichTerm, files: &Files) -> Result<BuildSpecRef, Error> {
         // Read out the simple attributes
         let base = ObjBaseBuildSpec::deserialize(rt.clone()).unwrap();
         if base.ty != ObjTy::Builder {
@@ -271,7 +286,7 @@ impl GraphBuilder {
                             {
                                 bs.inputs = a
                                     .iter()
-                                    .map(|input| self.read_input(input).unwrap())
+                                    .map(|input| self.read_input(input, files).unwrap())
                                     .collect();
                             } else {
                                 todo!("handle value being non-array {:?}", field.value);
@@ -318,12 +333,12 @@ impl GraphBuilder {
     }
 
     /// Recursively reads a buildspec input, inserting it into the graph.
-    fn read_input(&mut self, rt: &RichTerm) -> Result<BuildSpecInput, Error> {
+    fn read_input(&mut self, rt: &RichTerm, files: &Files) -> Result<BuildSpecInput, Error> {
         let obj = OnlyObj::deserialize(rt.clone()).unwrap();
 
         // The type hint ty identifies which input variant this term represents
         match obj.ty {
-            ObjTy::Builder => Ok(BuildSpecInput::Build(self.read_buildspec(rt)?)),
+            ObjTy::Builder => Ok(BuildSpecInput::Build(self.read_buildspec(rt, files)?)),
             ObjTy::Source => {
                 let src = ObjSource::deserialize(rt.clone()).unwrap();
                 Ok(BuildSpecInput::Source(SourceInput {
@@ -334,6 +349,34 @@ impl GraphBuilder {
             ObjTy::Path => {
                 let host_path = ObjHostPath::deserialize(rt.clone()).unwrap();
                 Ok(BuildSpecInput::Path(host_path.path.into()))
+            }
+            ObjTy::Local => {
+                let local = ObjLocal::deserialize(rt.clone()).unwrap();
+
+                // We need to get at where path was defined to figure out the
+                // path its relative to.
+                // Aside: I really wish there was a better way to get at the term for 'path'
+                let src_id = match rt.term.as_ref() {
+                    Term::Record(r) => r
+                        .fields
+                        .iter()
+                        .filter_map(|(ident_and_loc, field)| match ident_and_loc.label() {
+                            "file" => Some(field.value.as_ref().unwrap().pos.src_id().unwrap()),
+                            _ => None,
+                        })
+                        .next()
+                        .unwrap(),
+                    _ => unreachable!(),
+                };
+
+                // TODO: FILE HASH NEEDS TO BE PART OF THE SPEC HASH
+
+                Ok(BuildSpecInput::Local(
+                    Path::new(files.name(src_id))
+                        .parent()
+                        .unwrap()
+                        .join(local.file),
+                ))
             }
             ObjTy::OutputLib | ObjTy::OutputBin => Err(Error::UnexpectedObject {
                 got: obj.ty,
@@ -446,6 +489,37 @@ mod tests {
                 from: SourceFetch::URL(url),
                 sha256: sha,
             }) if url == "http://uwu.com" && sha == "abcdef",
+        ));
+    }
+    #[test]
+    fn local_input() {
+        let sr = SpecReader::new(
+            indoc! {
+                "
+                let {BuildSpec, Local, ..} = import \"minimal.ncl\" in
+                {
+                    name = \"single buildspec\",
+                    inputs = [
+                        {file = \"thing\"} | Local,
+                    ],
+                    cmd = \"\",
+                } | BuildSpec"
+            }
+            .to_string(),
+            &SpecReaderOptions::for_test(),
+        );
+        // So we can see the actual error when parsing fails
+        sr.as_ref().err().into_iter().for_each(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+        let sr = sr.unwrap();
+
+        let dp = DepGraph::new(sr).unwrap();
+        // We expect that buildspec to have one Local input
+        assert!(matches!(
+            dp.builds.iter().next().unwrap().1.inputs[0].clone(),
+            BuildSpecInput::Local(p) if p == PathBuf::from("thing"),
         ));
     }
 

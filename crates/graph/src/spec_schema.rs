@@ -11,6 +11,7 @@ pub enum ObjTy {
     OutputLib,
     OutputBin,
     Source,
+    Local,
 }
 
 /// A structure with just the type hint field.
@@ -47,6 +48,14 @@ pub struct ObjSource {
     pub url: String,
     pub sha256: String,
     pub ty: ObjTy,
+}
+
+/// The Local object.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ObjLocal {
+    pub ty: ObjTy,
+    pub file: String,
 }
 
 /// A library output.

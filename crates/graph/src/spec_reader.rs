@@ -97,10 +97,11 @@ impl SpecReader {
         Ok(Self { p: program })
     }
 
-    pub fn finish(self) -> Result<RichTerm, SpecError> {
+    pub fn finish(self) -> Result<(RichTerm, Files), SpecError> {
         let Self { mut p, .. } = self;
         p.eval_full_for_export()
             .map_err(|e| SpecError::Nickel(p.files(), e))
+            .map(|rt| (rt, p.files()))
     }
 }
 
