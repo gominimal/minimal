@@ -2,6 +2,9 @@
 members = ["crates/build-sandbox", "crates/minimal", "crates/graph", "crates/cache"]
 resolver = "3"
 
+[profile.release]
+debug = true
+
 [workspace.dependencies]
 indoc = "^2.0"
 generational-arena = "^0.2"
@@ -23,3 +26,6 @@ serde = { version = "1.0", features = ["derive"] }
 build-sandbox = { path = "crates/build-sandbox" }
 graph = { version = "0.0.1", path = "crates/graph" }
 cache = { version = "0.0.1", path = "crates/cache" }
+
+[patch.crates-io]
+nickel-lang-core = { git = 'https://github.com/tweag/nickel.git' }
