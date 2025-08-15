@@ -2,7 +2,7 @@ use build_sandbox::Result;
 use cache::Cache;
 use clap::Parser;
 use graph::{SpecReader, SpecReaderOptions, dep_graph::DepGraph};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 mod run;
@@ -19,6 +19,10 @@ struct Args {
     /// Launch debug shell instead of building
     #[arg(short, long)]
     debug: bool,
+
+    /// Path to a directory to cache build outputs in
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -59,7 +63,19 @@ fn main() -> Result<()> {
 
     let debug_bsr = if args.debug { Some(dp.top_level) } else { None };
 
-    let cache = Cache::at_dir("/tmp/mc").unwrap();
+    let cache = Cache::at_dir(args.cache_dir.unwrap_or_else(|| {
+        let dir = dirs::cache_dir().unwrap().join("minimal-builds");
+        match std::fs::create_dir(&dir) {
+            Ok(_) => {}
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
+                    panic!("failed to create build cache dir: {}", e);
+                }
+            }
+        };
+        dir
+    }))
+    .unwrap();
 
     let mut run = Run::new(dp, cache);
     run.execute(debug_bsr).unwrap();

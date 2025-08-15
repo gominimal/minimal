@@ -26,6 +26,16 @@ impl Run {
             for bsr in phase.iter() {
                 let build = self.graph.get(bsr).unwrap();
                 let bsh = build.spec_hash(&self.graph);
+
+                if self.cache.read_dir(bsh).is_ok() {
+                    println!(
+                        "Skipping already-cached build {} [{}]",
+                        build.name,
+                        bsh.to_hex()
+                    );
+                    continue;
+                }
+
                 println!("Executing build: {} [{}]", build.name, bsh.to_hex());
 
                 let mut dependencies = HashMap::new();

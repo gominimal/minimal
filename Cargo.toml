@@ -18,6 +18,7 @@ tempdir = {version = "0.3"}
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 clap = { version = "4.4", features = ["derive"] }
+dirs = "6"
 
 # Keep within the same minor version as nickel-lang-core
 serde = { version = "1.0", features = ["derive"] }
