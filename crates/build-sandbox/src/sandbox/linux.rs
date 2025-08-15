@@ -108,7 +108,6 @@ fn recursively_mount_files(
 
 fn bind_dependencies(config: &BuildConfig, new_root: &str) -> std::io::Result<()> {
     for (host_path, namespace_path) in &config.dependencies {
-        eprintln!("bind: {host_path:?} to {namespace_path:?}");
         let host_str = host_path.to_string_lossy();
         let namespace_str = namespace_path.to_string_lossy();
 

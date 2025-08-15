@@ -1,15 +1,14 @@
-let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
-let host_bash = import "../host_bash/build.ncl" in
-let host_coreutils = import "../host_coreutils/build.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let busybox_static = import "../busybox_static/build.ncl" in
 {
     name = "host_make",
     inputs = [
         {path = "/usr/bin/make"} | HostPath,
-        host_bash,
-        host_coreutils,
+        {file = "build.sh"} | Local,
+        busybox_static
     ],
     cmd = "./build.sh",
     outputs = {
-        make = { glob = "bin/*" } | OutputLib,
+        make = { glob = "usr/bin/make" } | OutputLib,
     },
 } | BuildSpec

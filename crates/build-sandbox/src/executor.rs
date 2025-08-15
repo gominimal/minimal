@@ -1,11 +1,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::info;
 
 use crate::config::BuildConfig;
 use crate::error::{ExecutionError, Result};
 use crate::sandbox;
+
+static BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct BuildExecutor {
     pub temp_dir_path: PathBuf,
@@ -14,8 +17,9 @@ pub struct BuildExecutor {
 
 impl BuildExecutor {
     pub fn new() -> Result<Self> {
-        let temp_dir_path =
-            std::env::temp_dir().join(format!("build-sandbox-{}", std::process::id()));
+        let build_id = BUILD_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let unique_id = format!("{}-{}", std::process::id(), build_id);
+        let temp_dir_path = std::env::temp_dir().join(format!("build-sandbox-{}", unique_id));
         fs::create_dir_all(&temp_dir_path).map_err(|_| ExecutionError::TempDirCreation)?;
 
         let output_staging_path = temp_dir_path.join("output");
@@ -60,9 +64,9 @@ impl BuildExecutor {
             info!("  OUTPUT_DIR: {}", self.output_staging_path.display());
             info!("  Type 'exit' to leave the debug shell");
 
-            let mut c = Command::new("/usr/bin/bash");
+            let mut c = Command::new("/usr/bin/busybox");
             sandbox.execute(&mut c)?;
-            c.arg("-i");
+            c.arg("sh");
             c
         } else if cfg!(target_os = "linux") {
             let mut c = Command::new(&config.build_script.executable);
@@ -83,10 +87,11 @@ impl BuildExecutor {
         cmd.env("OUTPUT_DIR", &self.output_staging_path);
 
         let path_components = [
-            // Cross-compilation toolchain (gcc, etc.) - highest priority
             PathBuf::from("/opt/toolchain/bin"),
-            // Build dependencies and host system utilities
+            PathBuf::from("/bin"),
+            PathBuf::from("/sbin"),
             PathBuf::from("/usr/bin"),
+            PathBuf::from("/usr/sbin"),
         ];
 
         if !path_components.is_empty() {
@@ -176,28 +181,65 @@ impl BuildExecutor {
     }
 
     fn copy_to_tmpdir(&self, input: &Path) -> Result<()> {
+        // Determine the destination path by finding if this is a package file
+        let dest_path = self.compute_dest_path(input);
+
         if input.is_file() {
-            let file_name = input
-                .file_name()
-                .ok_or_else(|| ExecutionError::FileOperation {
-                    operation: "get file name".to_string(),
-                    path: input.display().to_string(),
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "Path has no file name",
-                    ),
+            // Create parent directories if they don't exist
+            if let Some(parent) = dest_path.parent() {
+                fs::create_dir_all(parent).map_err(|e| ExecutionError::FileOperation {
+                    operation: "create parent directory".to_string(),
+                    path: parent.display().to_string(),
+                    source: e,
                 })?;
-            let dest = self.temp_dir_path.join(file_name);
-            fs::copy(input, &dest).map_err(|e| ExecutionError::CopyFailed {
+            }
+
+            fs::copy(input, &dest_path).map_err(|e| ExecutionError::CopyFailed {
                 source: input.display().to_string(),
-                destination: dest.display().to_string(),
+                destination: dest_path.display().to_string(),
                 error: e,
             })?;
         } else if input.is_dir() {
-            Self::copy_dir_contents(input, &self.temp_dir_path)?;
+            Self::copy_dir_with_structure(input, &dest_path)?;
         }
 
         Ok(())
+    }
+
+    /// Compute the destination path for an input file, preserving structure relative to package directory
+    fn compute_dest_path(&self, input: &Path) -> PathBuf {
+        // Look for "packages/" in the path to determine package structure
+        let path_str = input.to_string_lossy();
+        if let Some(packages_pos) = path_str.rfind("packages/") {
+            // Extract everything after "packages/"
+            let after_packages = &path_str[packages_pos + "packages/".len()..];
+
+            // Find the next path separator to get the package name
+            if let Some(slash_pos) = after_packages.find('/') {
+                let relative_path = &after_packages[slash_pos + 1..];
+
+                // Copy to temp_dir preserving just the relative path within the package
+                return self.temp_dir_path.join(relative_path);
+            }
+        }
+
+        // Fallback: just use the filename if we can't determine package structure
+        if let Some(file_name) = input.file_name() {
+            self.temp_dir_path.join(file_name)
+        } else {
+            self.temp_dir_path.join("unknown")
+        }
+    }
+
+    fn copy_dir_with_structure(src: &Path, dst: &Path) -> Result<()> {
+        // Create the destination directory
+        fs::create_dir_all(dst).map_err(|e| ExecutionError::FileOperation {
+            operation: "create directory".to_string(),
+            path: dst.display().to_string(),
+            source: e,
+        })?;
+
+        Self::copy_dir_contents(src, dst)
     }
 
     fn copy_dir_contents(src: &Path, dst: &Path) -> Result<()> {

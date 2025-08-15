@@ -1356,6 +1356,7 @@ dependencies = [
  "dirs",
  "generational-arena",
  "graph",
+ "shlex",
  "tempdir",
  "tracing",
  "tracing-subscriber",

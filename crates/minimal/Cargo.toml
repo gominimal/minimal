@@ -14,3 +14,4 @@ clap.workspace = true
 generational-arena.workspace = true
 tempdir.workspace = true
 dirs.workspace = true
+shlex = "1.3"

@@ -87,12 +87,22 @@ impl Run {
                     build.name, dependencies
                 );
 
+                let cmd_parts: Vec<String> =
+                    shlex::split(&build.cmd).unwrap_or_else(|| vec![build.cmd.clone()]);
+                let (executable, args) = if !cmd_parts.is_empty() {
+                    let exe = cmd_parts[0].clone();
+                    let args = cmd_parts[1..].to_vec();
+                    (exe, args)
+                } else {
+                    (build.cmd.clone(), vec![])
+                };
+
                 let config = BuildConfig {
                     dependencies,
                     inputs,
                     build_script: BuildScript {
-                        executable: build.cmd.clone().into(),
-                        args: vec![],
+                        executable: executable.into(),
+                        args,
                     },
                     outputs: build
                         .outputs
