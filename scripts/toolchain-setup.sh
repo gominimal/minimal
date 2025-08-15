@@ -7,3 +7,5 @@ export STRIP="x86_64-unknown-linux-gnu-strip"
 export OBJCOPY="x86_64-unknown-linux-gnu-objcopy"
 export OBJDUMP="x86_64-unknown-linux-gnu-objdump"
 export NM="x86_64-unknown-linux-gnu-nm"
+
+export MAKEFLAGS="-j 8"
