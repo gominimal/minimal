@@ -247,7 +247,7 @@ mod tests {
         let test_key = blake3::hash("swiggity swooty".as_bytes());
 
         let mut w = cache.write_file(test_key).unwrap();
-        w.write("uwu".as_bytes()).unwrap();
+        w.write_all("uwu".as_bytes()).unwrap();
         drop(w);
 
         let r = cache.read_file(test_key).unwrap();
@@ -265,7 +265,7 @@ mod tests {
         use std::io::Write;
         w.open_write("file_name")
             .unwrap()
-            .write("uwu".as_bytes())
+            .write_all("uwu".as_bytes())
             .unwrap();
         drop(w);
 

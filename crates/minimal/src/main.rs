@@ -5,8 +5,6 @@ use graph::{SpecReader, SpecReaderOptions, dep_graph::DepGraph};
 use std::path::Path;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-use tempdir::TempDir;
-
 mod run;
 use run::Run;
 
@@ -59,13 +57,8 @@ fn main() -> Result<()> {
 
     let dp = DepGraph::new(sr).unwrap();
 
-    let debug_bsr = if args.debug {
-        Some(dp.top_level)
-    } else {
-        None
-    };
+    let debug_bsr = if args.debug { Some(dp.top_level) } else { None };
 
-    //let tmp_dir = TempDir::new("minimal").unwrap();
     let cache = Cache::at_dir("/tmp/mc").unwrap();
 
     let mut run = Run::new(dp, cache);

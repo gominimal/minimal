@@ -60,7 +60,7 @@ impl BuildExecutor {
             info!("  OUTPUT_DIR: {}", self.output_staging_path.display());
             info!("  Type 'exit' to leave the debug shell");
 
-            let mut c = Command::new("/bin/sh");
+            let mut c = Command::new("/usr/bin/bash");
             sandbox.execute(&mut c)?;
             c.arg("-i");
             c
@@ -83,10 +83,10 @@ impl BuildExecutor {
         cmd.env("OUTPUT_DIR", &self.output_staging_path);
 
         let path_components = [
+            // Cross-compilation toolchain (gcc, etc.) - highest priority
             PathBuf::from("/opt/toolchain/bin"),
-            PathBuf::from("/opt/minimal/bin"),
+            // Build dependencies and host system utilities
             PathBuf::from("/usr/bin"),
-            PathBuf::from("/bin"),
         ];
 
         if !path_components.is_empty() {
@@ -243,7 +243,7 @@ impl BuildExecutor {
     }
 
     fn create_debug_helper(&self) -> Result<()> {
-        let helper_script = r#"#!/bin/bash
+        let helper_script = r#"#!/usr/bin/bash
 echo "==================================================================="
 echo "Build Sandbox Debug Shell"
 echo "==================================================================="

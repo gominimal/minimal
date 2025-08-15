@@ -1,6 +1,7 @@
 use build_sandbox::{BuildConfig, config::BuildScript, run_build};
 use cache::{Cache, LocalDir};
 use graph::{BuildOutput, BuildSpecRef, DepGraph, ExecPlan, SpecHash};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::debug;
 
@@ -27,19 +28,13 @@ impl Run {
                 let bsh = build.spec_hash(&self.graph);
                 println!("Executing build: {} [{}]", build.name, bsh.to_hex());
 
-                // Dependencies are bind-mounted, inputs are copied to wd
-                let mut dependencies = Vec::new();
+                let mut dependencies = HashMap::new();
                 let mut inputs = Vec::new();
 
-                // Add host paths from this build's own inputs
                 debug!("Build {} has {} inputs", build.name, build.inputs.len());
                 for (i, input) in build.inputs.iter().enumerate() {
                     use graph::BuildSpecInput::*;
                     match input {
-                        Path(path) => {
-                            debug!("  Input {}: HostPath({})", i, path.display());
-                            dependencies.push(PathBuf::from(path));
-                        }
                         Build(dep_ref) => {
                             let dep_build = self.graph.get(dep_ref).unwrap();
                             let dep_hash = dep_build.spec_hash(&self.graph);
@@ -50,8 +45,16 @@ impl Run {
                                 dep_build.name,
                                 dep_hash.to_hex()
                             );
-                            dependencies
-                                .push(self.cache.read_dir(dep_hash).unwrap().path().to_path_buf());
+
+                            let cache_path =
+                                self.cache.read_dir(dep_hash).unwrap().path().to_path_buf();
+
+                            dependencies.insert(cache_path, PathBuf::from("/"));
+                        }
+                        Path(path) => {
+                            debug!("  Input {}: HostPath({})", i, path.display());
+                            let host_path = PathBuf::from(path);
+                            dependencies.insert(host_path.clone(), host_path);
                         }
                         Local(path) => {
                             debug!("  Input {}: Local file from {}", i, path.display());
@@ -61,13 +64,13 @@ impl Run {
                     }
                 }
 
-                // Add toolchain and scripts (always needed)
-                dependencies.push(
-                    PathBuf::from("toolchains/x86_64-unknown-linux-gnu")
-                        .canonicalize()
-                        .unwrap(),
-                );
-                dependencies.push(PathBuf::from("scripts").canonicalize().unwrap());
+                let toolchain_path = PathBuf::from("toolchains/x86_64-unknown-linux-gnu")
+                    .canonicalize()
+                    .unwrap();
+                dependencies.insert(toolchain_path.clone(), toolchain_path);
+
+                let scripts_path = PathBuf::from("scripts").canonicalize().unwrap();
+                dependencies.insert(scripts_path.clone(), scripts_path);
 
                 debug!(
                     "Dependencies for isolated build {}: {:?}",
@@ -92,7 +95,6 @@ impl Run {
                     debug_shell: matches!(debug, Some(debug_bsr) if bsr == &debug_bsr),
                 };
 
-                // Each build runs in complete isolation and outputs to the directory for itself
                 run_build(&config, self.cache.write_dir(bsh).unwrap().path(), true)?;
 
                 println!("Completed isolated build: {}", build.name);

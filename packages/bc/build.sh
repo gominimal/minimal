@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/sh
 set -e
 
 . ./toolchain-setup.sh

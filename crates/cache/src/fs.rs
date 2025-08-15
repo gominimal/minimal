@@ -99,7 +99,7 @@ impl FileSystem for LocalDir {
             return Err(std::io::Error::other("outside local dir"));
         }
 
-        Ok(std::fs::File::open(p.canonicalize()?)?)
+        std::fs::File::open(p.canonicalize()?)
     }
 
     fn open_write<P: AsRef<Path>>(&self, path: P) -> Result<Self::File, FSError> {
@@ -109,7 +109,7 @@ impl FileSystem for LocalDir {
             return Err(std::io::Error::other("outside local dir"));
         }
 
-        Ok(std::fs::File::create(p)?)
+        std::fs::File::create(p)
     }
 
     fn read_dir<P: AsRef<Path>>(&self, _path: P) -> Result<Vec<Self::DirEntry>, FSError> {
@@ -123,7 +123,7 @@ impl FileSystem for LocalDir {
             return Err(std::io::Error::other("outside local dir"));
         }
 
-        std::fs::create_dir(p)
+        std::fs::create_dir_all(p)
     }
 
     fn subtree<P: AsRef<Path>>(&self, path: P) -> Result<Self::Subtree, FSError> {

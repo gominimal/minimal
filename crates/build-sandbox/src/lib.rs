@@ -26,7 +26,6 @@ pub fn run_build(
     let build_result = executor.execute(config, verbose)?;
 
     let outputs = if config.debug_shell {
-        // In debug mode, skip output validation
         info!("Debug mode: skipping output validation");
         Vec::new()
     } else {

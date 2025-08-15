@@ -1,9 +1,12 @@
-use std::os::unix::process::CommandExt;
-use std::process::Command;
-use tracing::info;
+use std::{
+    fs::{File, create_dir_all, read_dir, remove_dir, write},
+    os::unix::process::CommandExt,
+    process::Command,
+};
 
 use nix::mount::{MsFlags, mount};
 use nix::sched::{CloneFlags, unshare};
+use tracing::info;
 
 use super::Sandbox;
 use crate::config::BuildConfig;
@@ -24,15 +27,15 @@ fn setup_uid_gid_mapping() -> std::io::Result<()> {
 
     let parent_uid = 1000;
     let uid_mapping = format!("{} {} 1", current_uid, parent_uid);
-    std::fs::write("/proc/self/uid_map", &uid_mapping)
+    write("/proc/self/uid_map", &uid_mapping)
         .map_err(|e| std::io::Error::other(format!("UID mapping failed: {}", e)))?;
 
     // Try to deny setgroups, but don't fail if it doesn't work
-    let _ = std::fs::write("/proc/self/setgroups", "deny");
+    let _ = write("/proc/self/setgroups", "deny");
 
     let parent_gid = 1000;
     let gid_mapping = format!("{} {} 1", current_gid, parent_gid);
-    std::fs::write("/proc/self/gid_map", &gid_mapping)
+    write("/proc/self/gid_map", &gid_mapping)
         .map_err(|e| std::io::Error::other(format!("GID mapping failed: {}", e)))?;
 
     Ok(())
@@ -40,8 +43,7 @@ fn setup_uid_gid_mapping() -> std::io::Result<()> {
 
 fn create_isolated_root() -> std::io::Result<String> {
     let new_root = format!("/tmp/build_sandbox_root_{}", std::process::id());
-    std::fs::create_dir_all(&new_root)
-        .map_err(|e| std::io::Error::other(format!("mkdir failed: {}", e)))?;
+    create_dir_all(&new_root).map_err(|e| std::io::Error::other(format!("mkdir failed: {}", e)))?;
 
     mount(
         Some("tmpfs"),
@@ -52,23 +54,12 @@ fn create_isolated_root() -> std::io::Result<String> {
     )
     .map_err(|e| std::io::Error::other(format!("tmpfs mount failed: {}", e)))?;
 
-    let essential_dirs = ["tmp", "proc", "dev", "lib", "lib64", "opt"];
-    for dir in essential_dirs {
-        let new_dir = format!("{}/{}", new_root, dir);
-        std::fs::create_dir_all(&new_dir)
-            .map_err(|e| std::io::Error::other(format!("mkdir failed: {}", e)))?;
-    }
-
-    std::os::unix::fs::symlink("opt/minimal/bin", format!("{}/bin", new_root)).map_err(|e| {
-        std::io::Error::other(format!("symlink /bin -> /opt/minimal/bin failed: {}", e))
-    })?;
-
     Ok(new_root)
 }
 
 fn bind_buildroot_toolchain(dep_str: &str, new_root: &str) -> std::io::Result<()> {
     let dest_path = format!("{}/opt/toolchain", new_root);
-    std::fs::create_dir_all(&dest_path)?;
+    create_dir_all(&dest_path)?;
 
     mount(
         Some(dep_str),
@@ -82,71 +73,70 @@ fn bind_buildroot_toolchain(dep_str: &str, new_root: &str) -> std::io::Result<()
     Ok(())
 }
 
-fn bind_minimal_out(
-    dep: &std::path::Path,
+fn recursively_mount_files(
+    host_dir: &std::path::Path,
+    namespace_dir: &std::path::Path,
     new_root: &str,
-    _all_dependencies: &[std::path::PathBuf],
 ) -> std::io::Result<()> {
-    if let Ok(entries) = std::fs::read_dir(dep) {
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            let entry_name = entry.file_name();
-            let entry_name_str = entry_name.to_string_lossy();
+    for entry in read_dir(host_dir)? {
+        let entry = entry?;
+        let host_path = entry.path();
+        let file_name = entry.file_name();
+        let namespace_path = namespace_dir.join(&file_name);
+        let dest_path = format!("{}{}", new_root, namespace_path.to_string_lossy());
 
-            // Mount directories under /opt/minimal instead of root to avoid conflicts
-            let dest_path = format!("{}/opt/minimal/{}", new_root, entry_name_str);
-
-            if entry_path.is_dir() {
-                std::fs::create_dir_all(&dest_path)?;
-
-                mount(
-                    Some(entry_path.to_str().unwrap()),
-                    dest_path.as_str(),
-                    None::<&str>,
-                    MsFlags::MS_BIND | MsFlags::MS_REC,
-                    None::<&str>,
-                )
-                .map_err(|e| std::io::Error::other(format!("mount failed: {}", e)))?;
+        if host_path.is_dir() {
+            create_dir_all(&dest_path)?;
+            recursively_mount_files(&host_path, &namespace_path, new_root)?;
+        } else {
+            if let Some(parent) = std::path::Path::new(&dest_path).parent() {
+                create_dir_all(parent)?;
             }
+            File::create(&dest_path)?;
+            mount(
+                Some(host_path.to_str().unwrap()),
+                dest_path.as_str(),
+                None::<&str>,
+                MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+                None::<&str>,
+            )
+            .map_err(|e| std::io::Error::other(format!("mount failed for {}: {}", dest_path, e)))?;
         }
     }
     Ok(())
 }
 
 fn bind_dependencies(config: &BuildConfig, new_root: &str) -> std::io::Result<()> {
-    for dep in &config.dependencies {
-        let dep_str = dep.to_string_lossy();
+    for (host_path, namespace_path) in &config.dependencies {
+        eprintln!("bind: {host_path:?} to {namespace_path:?}");
+        let host_str = host_path.to_string_lossy();
+        let namespace_str = namespace_path.to_string_lossy();
 
-        if dep_str.contains("toolchains/x86_64-unknown-linux-gnu") {
-            bind_buildroot_toolchain(&dep_str, new_root)?;
+        if host_str.contains("toolchains/x86_64-unknown-linux-gnu") {
+            bind_buildroot_toolchain(&host_str, new_root)?;
             continue;
         }
 
-        if dep_str.ends_with("minimal-out") {
-            bind_minimal_out(dep, new_root, &config.dependencies)?;
-            continue;
+        if host_path.is_dir() {
+            recursively_mount_files(host_path, namespace_path, new_root)?;
+        } else {
+            let dest_path = format!("{}{}", new_root, namespace_str);
+
+            if let Some(parent) = std::path::Path::new(&dest_path).parent() {
+                create_dir_all(parent)?;
+            }
+
+            File::create(&dest_path)?;
+
+            mount(
+                Some(host_str.as_ref()),
+                dest_path.as_str(),
+                None::<&str>,
+                MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+                None::<&str>,
+            )
+            .map_err(|e| std::io::Error::other(format!("mount failed: {}", e)))?;
         }
-
-        let dest_path = format!("{}{}", new_root, dep_str);
-
-        if let Some(parent) = std::path::Path::new(&dest_path).parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        if dep.is_file() {
-            std::fs::File::create(&dest_path)?;
-        } else if dep.is_dir() {
-            std::fs::create_dir_all(&dest_path)?;
-        }
-
-        mount(
-            Some(dep_str.as_ref()),
-            dest_path.as_str(),
-            None::<&str>,
-            MsFlags::MS_BIND | MsFlags::MS_REC | MsFlags::MS_RDONLY,
-            None::<&str>,
-        )
-        .map_err(|e| std::io::Error::other(format!("mount failed: {}", e)))?;
     }
 
     Ok(())
@@ -163,14 +153,16 @@ fn bind_essential_directories(new_root: &str) -> std::io::Result<()> {
 
     for (src, dest_rel) in essential_dirs {
         let dest_path = format!("{}/{}", new_root, dest_rel);
-        // Try to mount, but don't fail if it doesn't work for some directories
-        let _ = mount(
+        create_dir_all(&dest_path)
+            .map_err(|e| std::io::Error::other(format!("mkdir failed: {}", e)))?;
+        mount(
             Some(src),
             dest_path.as_str(),
             None::<&str>,
             MsFlags::MS_BIND | MsFlags::MS_REC,
             None::<&str>,
-        );
+        )
+        .unwrap();
     }
 
     Ok(())
@@ -178,7 +170,7 @@ fn bind_essential_directories(new_root: &str) -> std::io::Result<()> {
 
 fn pivot_to_new_root(new_root: &str, working_dir: Option<&str>) -> std::io::Result<()> {
     let old_root = format!("{}/old_root", new_root);
-    std::fs::create_dir_all(&old_root)
+    create_dir_all(&old_root)
         .map_err(|e| std::io::Error::other(format!("mkdir old_root failed: {}", e)))?;
 
     nix::unistd::pivot_root(new_root, &*old_root)
@@ -192,7 +184,7 @@ fn pivot_to_new_root(new_root: &str, working_dir: Option<&str>) -> std::io::Resu
 
     // Try to unmount and remove old root, but don't fail if it doesn't work
     if nix::mount::umount("/old_root").is_ok() {
-        let _ = std::fs::remove_dir("/old_root");
+        let _ = remove_dir("/old_root");
     }
 
     Ok(())

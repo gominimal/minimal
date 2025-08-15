@@ -173,11 +173,16 @@ impl DepGraph {
     pub fn get(&self, bsr: &BuildSpecRef) -> Option<&BuildSpec> {
         self.builds.get(bsr.0)
     }
-    pub fn by_name<S: AsRef<str>>(&self, name: S) -> impl Iterator<Item=BuildSpecRef> + use<'_, S> {
-        self.builds.iter().filter_map(move |(bsr, b)| if b.name == name.as_ref() {
-            Some(BuildSpecRef(bsr))
-        } else {
-            None
+    pub fn by_name<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> impl Iterator<Item = BuildSpecRef> + use<'_, S> {
+        self.builds.iter().filter_map(move |(bsr, b)| {
+            if b.name == name.as_ref() {
+                Some(BuildSpecRef(bsr))
+            } else {
+                None
+            }
         })
     }
 
