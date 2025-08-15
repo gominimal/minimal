@@ -56,7 +56,7 @@ impl Run {
                             let host_path = PathBuf::from(path);
                             dependencies.insert(host_path.clone(), host_path);
                         }
-                        Local(path) => {
+                        Local((path, _hash)) => {
                             debug!("  Input {}: Local file from {}", i, path.display());
                             inputs.push(path.to_path_buf());
                         }

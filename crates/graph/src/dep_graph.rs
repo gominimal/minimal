@@ -46,7 +46,7 @@ pub enum BuildSpecInput {
     Build(BuildSpecRef),
     Source(SourceInput),
     Path(PathBuf),
-    Local(PathBuf),
+    Local((PathBuf, blake3::Hash)),
 }
 
 impl crate::SpecHash for BuildSpecInput {
@@ -77,8 +77,9 @@ impl crate::SpecHash for BuildSpecInput {
             }
             Local(p) => {
                 h.write_all(b"local").unwrap();
-                h.write_all(p.as_path().to_string_lossy().as_bytes())
+                h.write_all(p.0.as_path().to_string_lossy().as_bytes())
                     .unwrap();
+                h.write_all(p.1.as_bytes()).unwrap();
             }
         }
 
@@ -373,15 +374,15 @@ impl GraphBuilder {
                         .unwrap(),
                     _ => unreachable!(),
                 };
+                let full_path = Path::new(files.name(src_id))
+                    .parent()
+                    .unwrap()
+                    .join(local.file);
 
-                // TODO: FILE HASH NEEDS TO BE PART OF THE SPEC HASH
-
-                Ok(BuildSpecInput::Local(
-                    Path::new(files.name(src_id))
-                        .parent()
-                        .unwrap()
-                        .join(local.file),
-                ))
+                let file_hash = blake3::hash(
+                    &std::fs::read(&full_path).expect("Local input could not be read"),
+                );
+                Ok(BuildSpecInput::Local((full_path, file_hash)))
             }
             ObjTy::OutputLib | ObjTy::OutputBin => Err(Error::UnexpectedObject {
                 got: obj.ty,
@@ -498,19 +499,9 @@ mod tests {
     }
     #[test]
     fn local_input() {
-        let sr = SpecReader::new(
-            indoc! {
-                "
-                let {BuildSpec, Local, ..} = import \"minimal.ncl\" in
-                {
-                    name = \"single buildspec\",
-                    inputs = [
-                        {file = \"thing\"} | Local,
-                    ],
-                    cmd = \"\",
-                } | BuildSpec"
-            }
-            .to_string(),
+        let sr = SpecReader::new_with_path(
+            std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                .join("testdata/local_input.ncl"),
             &SpecReaderOptions::for_test(),
         );
         // So we can see the actual error when parsing fails
@@ -524,7 +515,7 @@ mod tests {
         // We expect that buildspec to have one Local input
         assert!(matches!(
             dp.builds.iter().next().unwrap().1.inputs[0].clone(),
-            BuildSpecInput::Local(p) if p == PathBuf::from("thing"),
+            BuildSpecInput::Local((p, _)) if p.ends_with("testdata/local_input.txt"),
         ));
     }
 
