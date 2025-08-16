@@ -1,8 +1,6 @@
 use crate::run::Run;
 use build_sandbox::Result;
-use cache::Cache;
-use graph::{SpecReader, SpecReaderOptions, dep_graph::DepGraph};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(clap::Args)]
 pub struct BuildArgs {
@@ -20,33 +18,7 @@ pub struct BuildArgs {
 }
 
 pub fn cmd_build(args: BuildArgs) -> Result<()> {
-    let base_package_dir = Path::new("packages");
-    let package_name = &args.package;
-    let package_dir = base_package_dir.join(package_name);
-
-    let build_ncl_path = package_dir.join("build.ncl");
-    if !build_ncl_path.exists() {
-        eprintln!(
-            "Error: build.ncl not found in package directory: {}",
-            package_dir.display()
-        );
-        std::process::exit(1);
-    }
-
-    let sr = SpecReader::new_with_path(
-        build_ncl_path,
-        &SpecReaderOptions {
-            minimal_lib_path: "crates/graph/minimal-ncl".into(),
-        },
-    );
-
-    sr.as_ref().err().into_iter().for_each(|e| {
-        e.report_to_stderr();
-        panic!("spec parsing failed");
-    });
-    let sr = sr.unwrap();
-
-    let dp = DepGraph::new(sr).unwrap();
+    let dp = super::graph_from_package_name(&args.package);
 
     let debug_bsr = if args.debug { Some(dp.top_level) } else { None };
 
