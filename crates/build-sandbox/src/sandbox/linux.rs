@@ -142,13 +142,7 @@ fn bind_dependencies(config: &BuildConfig, new_root: &str) -> std::io::Result<()
 }
 
 fn bind_essential_directories(new_root: &str) -> std::io::Result<()> {
-    let essential_dirs = [
-        ("/tmp", "tmp"),
-        ("/proc", "proc"),
-        ("/dev", "dev"),
-        ("/lib", "lib"),
-        ("/lib64", "lib64"),
-    ];
+    let essential_dirs = [("/tmp", "tmp"), ("/proc", "proc"), ("/dev", "dev")];
 
     for (src, dest_rel) in essential_dirs {
         let dest_path = format!("{}/{}", new_root, dest_rel);
