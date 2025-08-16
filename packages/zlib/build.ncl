@@ -1,23 +1,13 @@
 let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
-# let host_coreutils = import "../host_coreutils/build.ncl" in
-# let host_bash = import "../host_bash/build.ncl" in
-# let host_gzip = import "../host_gzip/build.ncl" in
-let host_make = import "../host_make/build.ncl" in
-# let host_sed = import "../host_sed/build.ncl" in
-# let host_tar = import "../host_tar/build.ncl" in
 let busybox_static = import "../busybox_static/build.ncl" in
+let host_make = import "../host_make/build.ncl" in
 {
     name = "zlib",
     inputs = [
         {file = "build.sh"} | Local,
         {file = "zlib-1.3.1.tar.gz"} | Local,
-        # host_coreutils,
-        # host_bash,
-        # host_gzip,
-        host_make,
-        # host_sed,
-        # host_tar,
         busybox_static,
+        host_make,
     ],
     cmd = "./build.sh",
     outputs = {

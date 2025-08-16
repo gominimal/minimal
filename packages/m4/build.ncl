@@ -1,15 +1,13 @@
-let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
-let host_bash = import "../host_bash/build.ncl" in
-let host_tar = import "../host_tar/build.ncl" in
-let host_sed = import "../host_sed/build.ncl" in
-let xz = import "../host_xz/build.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let busybox_static = import "../busybox_static/build.ncl" in
+let host_make = import "../host_make/build.ncl" in
 {
     name = "m4",
     inputs = [
-        host_bash,
-        host_tar,
-        host_sed,
-        xz,
+        {file = "build.sh"} | Local,
+        {file = "m4-1.4.19.tar.xz"} | Local,
+        busybox_static,
+        host_make,
     ],
     cmd = "./build.sh",
     outputs = {

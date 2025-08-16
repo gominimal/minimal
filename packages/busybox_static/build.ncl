@@ -23,6 +23,7 @@ let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in{
         {file = "_install/bin/ed"} | Local,
         {file = "_install/bin/false"} | Local,
         {file = "_install/bin/fsync"} | Local,
+        {file = "_install/bin/grep"} | Local,
         {file = "_install/bin/gunzip"} | Local,
         {file = "_install/bin/gzip"} | Local,
         {file = "_install/bin/link"} | Local,

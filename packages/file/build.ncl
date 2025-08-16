@@ -1,31 +1,19 @@
-let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
-let bzip2 = import "../bzip2/build.ncl" in
-let host_bash = import "../host_bash/build.ncl" in
-let host_coreutils = import "../host_coreutils/build.ncl" in
-let host_gawk = import "../host_gawk/build.ncl" in
-let host_grep = import "../host_grep/build.ncl" in
-let host_gzip = import "../host_gzip/build.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let busybox_static = import "../busybox_static/build.ncl" in
 let host_make = import "../host_make/build.ncl" in
-let host_sed = import "../host_sed/build.ncl" in
-let host_tar = import "../host_tar/build.ncl" in
 {
     name = "file",
     inputs = [
-        bzip2,
-        host_bash,
-        host_coreutils,
-        host_gawk,
-        host_grep,
-        host_gzip,
-        host_make,
-        host_sed,
-        host_tar,
+        {file = "build.sh"} | Local,
+        {file = "file-5.46.tar.gz"} | Local,
+        busybox_static,
+        host_make
     ],
     cmd = "./build.sh",
     outputs = {
-        file_bin = { glob = "bin/file" } | OutputLib,
-        libmagic = { glob = "lib/libmagic.so*" } | OutputLib,
-        headers = { glob = "include/magic.h" } | OutputLib,
-        magic_data = { glob = "share/misc/magic*" } | OutputLib,
+        file_bin = { glob = "usr/bin/file" } | OutputLib,
+        libmagic = { glob = "usr/lib/libmagic.so*" } | OutputLib,
+        headers = { glob = "usr/include/magic.h" } | OutputLib,
+        magic_data = { glob = "usr/share/misc/magic*" } | OutputLib,
     },
 } | BuildSpec

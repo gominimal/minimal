@@ -1,21 +1,14 @@
-let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
-let host_bash = import "../host_bash/build.ncl" in
-let host_coreutils = import "../host_coreutils/build.ncl" in
-let host_gzip  = import "../host_gzip/build.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let busybox_static = import "../busybox_static/build.ncl" in
 let host_make = import "../host_make/build.ncl" in
-let host_patch = import "../host_patch/build.ncl" in
-let host_sed = import "../host_sed/build.ncl" in
-let host_tar = import "../host_tar/build.ncl" in
 {
     name = "bzip2",
     inputs = [
-        host_bash,
-        host_coreutils,
-        host_gzip,
+        {file = "build.sh"} | Local,
+        {file = "bzip2-1.0.8-install_docs-1.patch"} | Local,
+        {file = "bzip2-1.0.8.tar.gz"} | Local,
+        busybox_static,
         host_make,
-        host_patch,
-        host_sed,
-        host_tar,
     ],
     cmd = "./build.sh",
     outputs = {

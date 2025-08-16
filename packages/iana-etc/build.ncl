@@ -1,9 +1,11 @@
-let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
-let host_bash = import "../host_bash/build.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let busybox_static = import "../busybox_static/build.ncl" in
 {
     name = "iana-etc",
     inputs = [
-        host_bash,
+        {file = "build.sh"} | Local,
+        {file = "iana-etc-20250618.tar.gz"} | Local,
+        busybox_static,
     ],
     cmd = "./build.sh",
     outputs = {
