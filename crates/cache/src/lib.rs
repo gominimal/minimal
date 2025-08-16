@@ -46,6 +46,12 @@ impl<FS: FileSystem<Subtree = ST>, ST: FileSystem> FileSystem for DirCacheEntry<
     fn subtree<P: AsRef<Path>>(&self, path: P) -> Result<Self::Subtree, FSError> {
         self.tree.subtree(path)
     }
+    fn remove_file<P: AsRef<Path>>(&self, _: P) -> Result<(), std::io::Error> {
+        todo!()
+    }
+    fn remove_dir<P: AsRef<Path>>(&self, _: P) -> Result<(), std::io::Error> {
+        todo!()
+    }
 }
 
 /// A blob in the cache you can read or write.
@@ -162,6 +168,15 @@ impl<FS: FileSystem> Cache<FS> {
     fn with_inner<T>(&self, f: impl FnOnce(&CacheInner<FS>) -> T) -> T {
         let guard = self.inner.lock().unwrap();
         f(&*guard)
+    }
+    pub fn invalidate_dir(&self, hash: blake3::Hash) -> Result<(), CacheErr> {
+        let hash_hex = hash.to_hex();
+        // Entries on disk are at <root>/<first byte as hex>/<remaining bytes as hex>
+        let subpath: PathBuf = [&hash_hex.as_str()[0..2], &hash_hex.as_str()[2..]]
+            .iter()
+            .collect();
+
+        self.inner().fs.remove_dir(subpath).map_err(CacheErr::from)
     }
 
     pub fn read_file(&self, hash: blake3::Hash) -> Result<FileCacheEntry<FS>, CacheErr> {

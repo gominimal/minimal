@@ -25,6 +25,9 @@ pub trait FileSystem: std::fmt::Debug {
     fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Vec<Self::DirEntry>, FSError>;
 
     fn subtree<P: AsRef<Path>>(&self, path: P) -> Result<Self::Subtree, FSError>;
+
+    fn remove_file<P: AsRef<Path>>(&self, path: P) -> Result<(), FSError>;
+    fn remove_dir<P: AsRef<Path>>(&self, path: P) -> Result<(), FSError>;
 }
 
 /// Describes the type representing some open file.
@@ -128,5 +131,23 @@ impl FileSystem for LocalDir {
 
     fn subtree<P: AsRef<Path>>(&self, path: P) -> Result<Self::Subtree, FSError> {
         self.extend(path)
+    }
+    fn remove_file<P: AsRef<Path>>(&self, path: P) -> Result<(), FSError> {
+        let p = Path::new(&self.base).join(path);
+        let p = p.absolutize()?;
+        if !p.starts_with(&self.base) {
+            return Err(std::io::Error::other("outside local dir"));
+        }
+
+        std::fs::remove_file(p)
+    }
+    fn remove_dir<P: AsRef<Path>>(&self, path: P) -> Result<(), FSError> {
+        let p = Path::new(&self.base).join(path);
+        let p = p.absolutize()?;
+        if !p.starts_with(&self.base) {
+            return Err(std::io::Error::other("outside local dir"));
+        }
+
+        std::fs::remove_dir(p)
     }
 }

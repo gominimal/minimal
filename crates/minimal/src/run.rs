@@ -105,7 +105,12 @@ impl Run {
                     debug_shell: matches!(debug, Some(debug_bsr) if bsr == &debug_bsr),
                 };
 
-                run_build(&config, self.cache.write_dir(bsh).unwrap().path(), true)?;
+                run_build(&config, self.cache.write_dir(bsh).unwrap().path(), true).map_err(
+                    |e| {
+                        self.cache.invalidate_dir(bsh).unwrap();
+                        e
+                    },
+                )?;
 
                 println!("Completed isolated build: {}", build.name);
             }
