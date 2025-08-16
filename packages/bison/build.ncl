@@ -1,7 +1,7 @@
 let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
 let busybox_static = import "../busybox_static/build.ncl" in
 let m4 = import "../m4/build.ncl" in
-let host_make = import "../host_make/build.ncl" in
+let make_static = import "../make_static/build.ncl" in
 {
     name = "bison",
     inputs = [  
@@ -9,7 +9,7 @@ let host_make = import "../host_make/build.ncl" in
         {file = "build.sh"} | Local,
         busybox_static,
         m4,
-        host_make,
+        make_static,
      ],
     cmd = "./build.sh",
     outputs = {
