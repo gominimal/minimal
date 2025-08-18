@@ -55,14 +55,14 @@ source "${SCRIPTS_DIR}/toolchain-setup.sh"
 ### Testing
 Each package should be tested with:
 ```bash
-cargo run --package minimal -- build --package {package-name}
+cargo run -- build --package {package-name}
 ```
 
 **Mark as Complete**: After successful build testing, mark the package as complete in the progress tracker below.
 
 ## Package Status
 
-### ✅ Completed (14/79)
+### ✅ Completed (15/79)
 - [x] Zlib (compression library)
 - [x] Grep (text search utility)
 - [x] Iana-Etc (protocols and services files)
@@ -77,12 +77,13 @@ cargo run --package minimal -- build --package {package-name}
 - [x] Readline (command line editing library)
 - [x] Lz4 (fast compression algorithm) - LZ4 1.10.0 with lossless compression, binaries and library
 - [x] Make (build tool) - GNU Make 4.4.1 for controlling package compilation
+- [x] Sed (stream editor) - GNU Sed 4.9 for filtering and transforming text
 
 ### 🔄 In Progress (2/79)
 - [ ] Man-pages (manual pages for Linux kernel and C library) - moved back from completed, not in packages/
 - [ ] Flex (lexical analyzer generator) - moved back from completed, not in packages/
 
-### ⏳ Pending (63/79)
+### ⏳ Pending (62/79)
 3. **Expect** - Automate interactive applications
 4. **DejaGNU** - Testing framework
 5. **Pkgconf** - Package configuration system
@@ -96,7 +97,6 @@ cargo run --package minimal -- build --package {package-name}
 13. **Libxcrypt** - Extended crypt library
 14. **Shadow** - Password and account management tools
 16. **Ncurses** - Terminal handling library
-17. **Sed** - Stream editor
 18. **Psmisc** - Process utilities
 19. **Gettext** - Internationalization library
 20. **Bash** - Bourne Again Shell
