@@ -13,7 +13,7 @@ fxhash = "0.2"
 nickel-lang-core = "0.13"
 
 path-absolutize = "^3.1"
-tempdir = {version = "0.3"}
+tempfile = {version = "3.0"}
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

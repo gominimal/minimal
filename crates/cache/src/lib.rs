@@ -252,11 +252,11 @@ impl<FS: FileSystem> Cache<FS> {
 mod tests {
     use super::*;
     use std::io::Write;
-    use tempdir::TempDir;
+    use tempfile::TempDir;
 
     #[test]
     fn smoketest_files() {
-        let tmp_dir = TempDir::new("cache-smoketest").unwrap();
+        let tmp_dir = TempDir::new().unwrap();
 
         let cache = Cache::at_dir(tmp_dir.path()).unwrap();
         let test_key = blake3::hash("swiggity swooty".as_bytes());
@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn smoketest_folder() {
-        let tmp_dir = TempDir::new("cache-smoketest").unwrap();
+        let tmp_dir = TempDir::new().unwrap();
 
         let cache = Cache::at_dir(tmp_dir.path()).unwrap();
         let test_key = blake3::hash("direct-tory".as_bytes());
