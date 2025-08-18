@@ -90,7 +90,6 @@ Package Spec (build.ncl) → SpecReader → DepGraph → ExecutionGraph → Sand
 
 - `packages/`: Contains package definitions (`.ncl` and build scripts)
 - `toolchains/`: Cross-compilation toolchain (x86_64-unknown-linux-gnu)
-- `minimal-out/`: Default build output directory
 - `crates/nickel-proto/minimal-ncl/`: Nickel schema definitions
 
 ### Critical Implementation Details

@@ -16,18 +16,25 @@ packages/{package-name}/
 
 ### Build Specification Template (build.ncl)
 ```nickel
-let {BuildSpec, HostPath, OutputLib, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let busybox_static = import "../busybox_static/build.ncl" in
+let make_static = import "../make_static/build.ncl" in
 {
     name = "{package-name}",
     inputs = [
-        {path = "/bin"} | HostPath,
-        {path = "/usr/bin/bash"} | HostPath,
-        # Add other required system tools based on LFS instructions
+        {file = "build.sh"} | Local,
+        {file = "{source-archive}"} | Local,
+        # Add any patch files: {file = "package.patch"} | Local,
+        busybox_static,
+        make_static,
+        # Add other build dependencies as needed
     ],
-    cmd = "build.sh",
+    cmd = "./build.sh",
     outputs = {
-        # Define outputs based on what the package installs
-        # Use glob patterns like "bin/*", "lib/lib*.so*", etc.
+        # Define specific outputs with glob patterns
+        # Example: binary = { glob = "bin/program" } | OutputLib,
+        # Example: library = { glob = "lib/lib*.so*" } | OutputLib,
+        # Example: headers = { glob = "include/*.h" } | OutputLib,
     },
 } | BuildSpec
 ```
@@ -48,15 +55,16 @@ source "${SCRIPTS_DIR}/toolchain-setup.sh"
 ### Testing
 Each package should be tested with:
 ```bash
-cargo run --bin minimal -- --package {package-name}
+cargo run --package minimal -- build --package {package-name}
 ```
+
+**Mark as Complete**: After successful build testing, mark the package as complete in the progress tracker below.
 
 ## Package Status
 
 ### ✅ Completed (13/79)
 - [x] Zlib (compression library)
 - [x] Grep (text search utility)
-- [x] Man-pages (3,007 manual pages installed)
 - [x] Iana-Etc (protocols and services files)
 - [x] Bzip2 (compression library and utilities)
 - [x] Xz (LZMA compression library and utilities)  
@@ -66,110 +74,85 @@ cargo run --bin minimal -- --package {package-name}
 - [x] BC (basic calculator) - BC 7.0.3 with DC, arbitrary precision math
 - [x] Tcl (Tool Command Language) - Tcl 8.6.16, scripting language with extensive API
 - [x] Bison (parser generator) - Bison 3.8.2, yacc replacement with GLR/LALR parsers
-- [x] Flex (lexical analyzer generator) - Flex 2.6.4, generates lexical analyzers with libfl
+- [x] Readline (command line editing library)
+- [x] Lz4 (fast compression algorithm) - LZ4 1.10.0 with lossless compression, binaries and library
 
-### 🔄 In Progress (0/79)
+### 🔄 In Progress (2/79)
+- [ ] Man-pages (manual pages for Linux kernel and C library) - moved back from completed, not in packages/
+- [ ] Flex (lexical analyzer generator) - moved back from completed, not in packages/
 
-### ⏳ Pending (66/79)
-
-1. **Man-pages** - Manual pages for Linux kernel and C library
-2. **Iana-Etc** - Data for /etc/protocols and /etc/services  
-3. **Glibc** - GNU C Library (critical system component)
-4. **Bzip2** - Compression library and utilities
-5. **Xz** - LZMA compression library and utilities
-6. **Lz4** - Fast compression algorithm
-7. **Zstd** - Zstandard compression
-8. **File** - File type identification utility
-9. **Readline** - Command line editing library
-10. **M4** - Macro processor
-11. **Bc** - Arbitrary precision calculator language
-12. **Tcl** - Tool Command Language
-13. **Expect** - Automate interactive applications
-14. **DejaGNU** - Testing framework
-15. **Pkgconf** - Package configuration system
-16. **Binutils** - Binary utilities (assembler, linker, etc.)
-17. **GMP** - GNU Multiple Precision Arithmetic Library
-18. **MPFR** - Multiple-precision floating-point library
-19. **MPC** - Multiple-precision complex number library
-20. **Attr** - Extended attribute library
-21. **Acl** - Access Control List library
-22. **Libcap** - POSIX capabilities library
-23. **Libxcrypt** - Extended crypt library
-24. **Shadow** - Password and account management tools
-25. **GCC** - GNU Compiler Collection
-26. **Ncurses** - Terminal handling library
-27. **Sed** - Stream editor
-28. **Psmisc** - Process utilities
-29. **Gettext** - Internationalization library
-30. **Bison** - Parser generator
-31. **Bash** - Bourne Again Shell
-32. **Libtool** - Generic library support script
-33. **GDBM** - GNU database library
-34. **Gperf** - Perfect hash function generator
-35. **Expat** - XML parser library
-36. **Inetutils** - Network utilities
-37. **Less** - Text pager
-38. **Perl** - Practical Extraction and Report Language
-39. **XML::Parser** - Perl XML parser module
-40. **Intltool** - Internationalization tool
-41. **Autoconf** - Automatic configure script builder
-42. **Automake** - Automatic Makefile generator
-43. **OpenSSL** - Cryptography library
-44. **Libelf** - ELF file access library
-45. **Libffi** - Foreign Function Interface library
-46. **Python** - Python programming language
-47. **Flit-Core** - Python packaging build backend
-48. **Packaging** - Python packaging library
-49. **Wheel** - Python wheel packaging format
-50. **Setuptools** - Python package build system
-51. **Ninja** - Small build system
-52. **Meson** - Build system
-53. **Kmod** - Kernel module utilities
-54. **Coreutils** - Core utilities (ls, cp, mv, etc.)
-55. **Diffutils** - File comparison utilities
-56. **Gawk** - GNU Awk
-57. **Findutils** - File finding utilities
-58. **Groff** - Document formatting system
-59. **GRUB** - Boot loader
-60. **Gzip** - Compression utility
-61. **IPRoute2** - Network routing utilities
-62. **Kbd** - Keyboard utilities
-63. **Libpipeline** - Pipeline manipulation library
-64. **Make** - Build tool
-65. **Patch** - File patching utility
-66. **Tar** - Archive utility
-67. **Texinfo** - Documentation system
-68. **Vim** - Text editor
-69. **MarkupSafe** - Python HTML/XML markup library
-70. **Jinja2** - Python templating engine
-71. **Systemd** - System and service manager
-72. **D-Bus** - Message bus system
-73. **Man-DB** - Manual page database
-74. **Procps-ng** - Process monitoring utilities
-75. **Util-linux** - System utilities
-76. **E2fsprogs** - Ext2/3/4 filesystem utilities
+### ⏳ Pending (64/79)
+3. **Expect** - Automate interactive applications
+4. **DejaGNU** - Testing framework
+5. **Pkgconf** - Package configuration system
+6. **Binutils** - Binary utilities (assembler, linker, etc.)
+7. **GMP** - GNU Multiple Precision Arithmetic Library
+8. **MPFR** - Multiple-precision floating-point library
+9. **MPC** - Multiple-precision complex number library
+10. **Attr** - Extended attribute library
+11. **Acl** - Access Control List library
+12. **Libcap** - POSIX capabilities library
+13. **Libxcrypt** - Extended crypt library
+14. **Shadow** - Password and account management tools
+15. **GCC** - GNU Compiler Collection
+16. **Ncurses** - Terminal handling library
+17. **Sed** - Stream editor
+18. **Psmisc** - Process utilities
+19. **Gettext** - Internationalization library
+20. **Bash** - Bourne Again Shell
+21. **Libtool** - Generic library support script
+22. **GDBM** - GNU database library
+23. **Gperf** - Perfect hash function generator
+24. **Expat** - XML parser library
+25. **Inetutils** - Network utilities
+26. **Less** - Text pager
+27. **Perl** - Practical Extraction and Report Language
+28. **XML::Parser** - Perl XML parser module
+29. **Intltool** - Internationalization tool
+30. **Autoconf** - Automatic configure script builder
+31. **Automake** - Automatic Makefile generator
+32. **OpenSSL** - Cryptography library
+33. **Libelf** - ELF file access library
+34. **Libffi** - Foreign Function Interface library
+35. **Python** - Python programming language
+36. **Flit-Core** - Python packaging build backend
+37. **Packaging** - Python packaging library
+38. **Wheel** - Python wheel packaging format
+39. **Setuptools** - Python package build system
+40. **Ninja** - Small build system
+41. **Meson** - Build system
+42. **Kmod** - Kernel module utilities
+43. **Coreutils** - Core utilities (ls, cp, mv, etc.)
+44. **Diffutils** - File comparison utilities
+45. **Gawk** - GNU Awk
+46. **Findutils** - File finding utilities
+47. **Groff** - Document formatting system
+48. **GRUB** - Boot loader
+49. **Gzip** - Compression utility
+50. **IPRoute2** - Network routing utilities
+51. **Kbd** - Keyboard utilities
+52. **Libpipeline** - Pipeline manipulation library
+53. **Make** - Build tool
+54. **Patch** - File patching utility
+55. **Tar** - Archive utility
+56. **Texinfo** - Documentation system
+57. **Vim** - Text editor
+58. **MarkupSafe** - Python HTML/XML markup library
+59. **Jinja2** - Python templating engine
+60. **Systemd** - System and service manager
+61. **D-Bus** - Message bus system
+62. **Man-DB** - Manual page database
+63. **Procps-ng** - Process monitoring utilities
+64. **Util-linux** - System utilities
+65. **E2fsprogs** - Ext2/3/4 filesystem utilities
 
 ## Priority Order
-1. **System Libraries**: Glibc, Zlib (done), Bzip2, Xz, Readline
-2. **Build Tools**: M4, Autoconf, Automake, Make, GCC, Binutils
+1. **System Libraries**: Glibc, Zlib (done), Bzip2 (done), Xz (done), Readline (done)
+2. **Build Tools**: M4 (done), Autoconf, Automake, Make, GCC, Binutils
 3. **Core Utilities**: Coreutils, Bash, Sed, Grep (done)
 4. **Package Management**: Pkgconf
-5. **Development Tools**: Flex, Bison, Perl, Python
+5. **Development Tools**: Flex, Bison (done), Perl, Python
 6. **System Components**: Systemd, D-Bus, Shadow
-
-## Known Issues / Blockers
-
-### 1. Package Dependency Resolution (Critical)
-**Issue**: The current system doesn't properly handle package-to-package dependencies. While the ExecutionGraph framework exists, BuildSpecInput::Build dependencies aren't fully functional.
-
-**Impact**: Complex packages like Glibc, GCC, and other system components that depend on previously built packages cannot be properly built.
-
-**Required Solution**: 
-- Implement proper BuildSpecInput::Build dependency resolution in ExecutionGraph
-- Ensure dependency outputs are available to dependent builds
-- Verify dependency ordering works correctly
-
-**Workaround**: Continue with simple packages that don't have complex dependencies first
 
 ## Package Sources
 - **Official LFS Package List**: https://www.linuxfromscratch.org/lfs/view/systemd/chapter08/chapter08.html
@@ -180,8 +163,3 @@ cargo run --bin minimal -- --package {package-name}
 - Each package should be built in dependency order
 - Some packages may require patches or modifications from stock LFS instructions
 - All packages use the same toolchain located at `./toolchains/x86_64-unknown-linux-gnu`
-- Output files are installed to `./minimal-out` with flattened directory structure
-
-## Session Notes
-- **Session 1**: Created progress tracker, identified 79 packages total with 2 already completed
-- **Session 1 (continued)**: Successfully packaged Man-pages (3,007 files) and Iana-Etc (2 files). Identified critical tooling issue with package dependency resolution that will block complex packages.
