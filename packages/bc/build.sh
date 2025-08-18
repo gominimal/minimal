@@ -6,7 +6,7 @@ set -e
 tar -xf bc-7.0.3.tar.xz
 cd bc-7.0.3
 
-CC="${CC}" CFLAGS="${CFLAGS} -std=c99 -D_GNU_SOURCE" ./configure --prefix="${OUTPUT_DIR}" -G -O3 -r
+CFLAGS="${CFLAGS} -std=c99 -Wl,--dynamic-linker=$DYNAMIC_LINKER" ./configure --prefix="${OUTPUT_DIR}" --disable-generated-tests --enable-readline
 
 make
 make test || echo "Some tests may fail - this is expected"

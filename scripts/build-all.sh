@@ -18,7 +18,7 @@ for pkg_dir in "$PACKAGES_DIR"/*; do
         echo "Cleaning minimal-out/"
         rm -rf minimal-out/
         echo "Building package: $pkg_name"
-        cargo run --release -- --package "$pkg_name"
+        cargo run -- build --package "$pkg_name"
         echo "Completed: $pkg_name"
         echo "---"
     fi
