@@ -4,7 +4,7 @@ name = "cache"
 version = "0.0.1"
 license = "MIT OR Apache-2.0"
 
-rust-version = "1.78"
+rust-version = "1.85"
 
 [dev-dependencies]
 indoc.workspace = true
