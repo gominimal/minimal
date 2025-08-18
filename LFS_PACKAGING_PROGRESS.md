@@ -62,7 +62,7 @@ cargo run --package minimal -- build --package {package-name}
 
 ## Package Status
 
-### ✅ Completed (13/79)
+### ✅ Completed (14/79)
 - [x] Zlib (compression library)
 - [x] Grep (text search utility)
 - [x] Iana-Etc (protocols and services files)
@@ -76,12 +76,13 @@ cargo run --package minimal -- build --package {package-name}
 - [x] Bison (parser generator) - Bison 3.8.2, yacc replacement with GLR/LALR parsers
 - [x] Readline (command line editing library)
 - [x] Lz4 (fast compression algorithm) - LZ4 1.10.0 with lossless compression, binaries and library
+- [x] Make (build tool) - GNU Make 4.4.1 for controlling package compilation
 
 ### 🔄 In Progress (2/79)
 - [ ] Man-pages (manual pages for Linux kernel and C library) - moved back from completed, not in packages/
 - [ ] Flex (lexical analyzer generator) - moved back from completed, not in packages/
 
-### ⏳ Pending (64/79)
+### ⏳ Pending (63/79)
 3. **Expect** - Automate interactive applications
 4. **DejaGNU** - Testing framework
 5. **Pkgconf** - Package configuration system
@@ -94,7 +95,6 @@ cargo run --package minimal -- build --package {package-name}
 12. **Libcap** - POSIX capabilities library
 13. **Libxcrypt** - Extended crypt library
 14. **Shadow** - Password and account management tools
-15. **GCC** - GNU Compiler Collection
 16. **Ncurses** - Terminal handling library
 17. **Sed** - Stream editor
 18. **Psmisc** - Process utilities
@@ -132,8 +132,7 @@ cargo run --package minimal -- build --package {package-name}
 50. **IPRoute2** - Network routing utilities
 51. **Kbd** - Keyboard utilities
 52. **Libpipeline** - Pipeline manipulation library
-53. **Make** - Build tool
-54. **Patch** - File patching utility
+53. **Patch** - File patching utility
 55. **Tar** - Archive utility
 56. **Texinfo** - Documentation system
 57. **Vim** - Text editor

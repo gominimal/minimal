@@ -1,7 +1,7 @@
 let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
 let busybox_static = import "../busybox_static/build.ncl" in
 {
-    name = "make_static",
+    name = "make",
     inputs = [
         {file = "build.sh"} | Local,
         {file = "output/bin/make"} | Local,
