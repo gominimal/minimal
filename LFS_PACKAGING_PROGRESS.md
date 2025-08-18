@@ -62,7 +62,7 @@ cargo run -- build --package {package-name}
 
 ## Package Status
 
-### ✅ Completed (15/79)
+### ✅ Completed (20/79)
 - [x] Zlib (compression library)
 - [x] Grep (text search utility)
 - [x] Iana-Etc (protocols and services files)
@@ -78,12 +78,17 @@ cargo run -- build --package {package-name}
 - [x] Lz4 (fast compression algorithm) - LZ4 1.10.0 with lossless compression, binaries and library
 - [x] Make (build tool) - GNU Make 4.4.1 for controlling package compilation
 - [x] Sed (stream editor) - GNU Sed 4.9 for filtering and transforming text
+- [x] Bash (shell) - Bash 5.3, the Bourne Again Shell
+- [x] Tar (archive utility) - Tar 1.35 for creating and extracting archives
+- [x] Gzip (compression utility) - Gzip 1.14 for compressing and decompressing files
+- [x] Gawk (GNU Awk) - Gawk 5.3.2 for pattern scanning and processing
+- [x] Diffutils (file comparison utilities) - Diffutils 3.12 for comparing files and directories
 
-### 🔄 In Progress (2/79)
+### 🔄 In Progress (0/79)
 - [ ] Man-pages (manual pages for Linux kernel and C library) - moved back from completed, not in packages/
 - [ ] Flex (lexical analyzer generator) - moved back from completed, not in packages/
 
-### ⏳ Pending (62/79)
+### ⏳ Pending (57/79)
 3. **Expect** - Automate interactive applications
 4. **DejaGNU** - Testing framework
 5. **Pkgconf** - Package configuration system
@@ -99,7 +104,6 @@ cargo run -- build --package {package-name}
 16. **Ncurses** - Terminal handling library
 18. **Psmisc** - Process utilities
 19. **Gettext** - Internationalization library
-20. **Bash** - Bourne Again Shell
 21. **Libtool** - Generic library support script
 22. **GDBM** - GNU database library
 23. **Gperf** - Perfect hash function generator
@@ -123,17 +127,13 @@ cargo run -- build --package {package-name}
 41. **Meson** - Build system
 42. **Kmod** - Kernel module utilities
 43. **Coreutils** - Core utilities (ls, cp, mv, etc.)
-44. **Diffutils** - File comparison utilities
-45. **Gawk** - GNU Awk
 46. **Findutils** - File finding utilities
 47. **Groff** - Document formatting system
 48. **GRUB** - Boot loader
-49. **Gzip** - Compression utility
 50. **IPRoute2** - Network routing utilities
 51. **Kbd** - Keyboard utilities
 52. **Libpipeline** - Pipeline manipulation library
 53. **Patch** - File patching utility
-55. **Tar** - Archive utility
 56. **Texinfo** - Documentation system
 57. **Vim** - Text editor
 58. **MarkupSafe** - Python HTML/XML markup library

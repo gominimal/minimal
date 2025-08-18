@@ -31,10 +31,7 @@ cargo test --package nickel-proto experimenting_with_manual_api
 ### Running Applications
 ```bash
 # Run the minimal package manager (executes zlib build)
-cargo run --package minimal
-
-# Run build-sandbox CLI with config
-cargo run --package build-sandbox -- --config path/to/config.json --output /path/to/output
+cargo run
 ```
 
 ### Checking Code

@@ -1,15 +1,29 @@
 let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
-let busybox_static = import "../busybox_static/build.ncl" in
+let bash = import "../bash/build.ncl" in
+let coreutils = import "../coreutils/build.ncl" in
+let diffutils = import "../diffutils/build.ncl" in
+let gawk = import "../gawk/build.ncl" in
+let grep = import "../grep/build.ncl" in
 let m4 = import "../m4/build.ncl" in
 let make = import "../make/build.ncl" in
+let sed = import "../sed/build.ncl" in
+let tar = import "../tar/build.ncl" in
+let xz = import "../xz/build.ncl" in
 {
     name = "bison",
     inputs = [  
         {file = "bison-3.8.2.tar.xz"} | Local,
         {file = "build.sh"} | Local,
-        busybox_static,
+        bash,
+        coreutils,
+        diffutils,
+        gawk,
+        grep,
         m4,
         make,
+        sed,
+        tar,
+        xz,
      ],
     cmd = "./build.sh",
     outputs = {
