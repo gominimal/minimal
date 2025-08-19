@@ -6,41 +6,30 @@ set -e
 tar -xf tcl8.6.16-src.tar.gz
 cd tcl8.6.16
 
-# Navigate to unix directory as per LFS instructions
+SRCDIR=$(pwd)
 cd unix
-
-./configure --prefix="${OUTPUT_DIR}" \
-            --mandir="${OUTPUT_DIR}/share/man" \
+./configure --prefix="${OUTPUT_DIR}/usr" \
+            --mandir="${OUTPUT_DIR}/usr/share/man" \
             --disable-rpath
 
 make
 
-# Apply sed modifications to configuration files as per LFS
-sed -e "s|${OUTPUT_DIR}/lib|/usr/lib|" \
-    -e "s|${OUTPUT_DIR}/include|/usr/include|" \
+sed -e "s|$SRCDIR/unix|/usr/lib|" \
+    -e "s|$SRCDIR|/usr/include|"  \
     -i tclConfig.sh
 
-sed -e "s|${OUTPUT_DIR}/lib|/usr/lib|" \
-    -e "s|${OUTPUT_DIR}/include|/usr/include|" \
-    -i tkConfig.sh 2>/dev/null || true
+sed -e "s|$SRCDIR/unix/pkgs/tdbc1.1.10|/usr/lib/tdbc1.1.10|" \
+    -e "s|$SRCDIR/pkgs/tdbc1.1.10/generic|/usr/include|"     \
+    -e "s|$SRCDIR/pkgs/tdbc1.1.10/library|/usr/lib/tcl8.6|"  \
+    -e "s|$SRCDIR/pkgs/tdbc1.1.10|/usr/include|"             \
+    -i pkgs/tdbc1.1.10/tdbcConfig.sh
 
-# Skip lengthy test suite for now
-echo "Skipping tests to save time during initial packaging"
+sed -e "s|$SRCDIR/unix/pkgs/itcl4.3.2|/usr/lib/itcl4.3.2|" \
+    -e "s|$SRCDIR/pkgs/itcl4.3.2/generic|/usr/include|"    \
+    -e "s|$SRCDIR/pkgs/itcl4.3.2|/usr/include|"            \
+    -i pkgs/itcl4.3.2/itclConfig.sh
+
+unset SRCDIR
 
 make install
-
-# Make the library files writeable
-chmod -v 755 "${OUTPUT_DIR}/lib/libtcl8.6.so"
-
-# Install the private headers
 make install-private-headers
-
-# Create symbolic link as per LFS instructions  
-ln -sfv tclsh8.6 "${OUTPUT_DIR}/bin/tclsh"
-
-# Rename the man page as per LFS instructions (if it exists)
-if [ -f "${OUTPUT_DIR}/share/man/man1/tclsh8.6.1" ]; then
-    mv "${OUTPUT_DIR}/share/man/man1/tclsh8.6.1" "${OUTPUT_DIR}/share/man/man1/tclsh.1"
-else
-    echo "Warning: tclsh8.6.1 man page not found to rename"
-fi

@@ -64,9 +64,8 @@ impl BuildExecutor {
             info!("  OUTPUT_DIR: {}", self.output_staging_path.display());
             info!("  Type 'exit' to leave the debug shell");
 
-            let mut c = Command::new("/usr/bin/busybox");
+            let mut c = Command::new("/bin/sh");
             sandbox.execute(&mut c)?;
-            c.arg("sh");
             c
         } else if cfg!(target_os = "linux") {
             let mut c = Command::new(&config.build_script.executable);

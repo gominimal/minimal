@@ -11,9 +11,9 @@ let make = import "../make/build.ncl" in
     ],
     cmd = "./build.sh",
     outputs = {
-        libz = { glob = "lib/libz.so*" } | OutputLib,
-        libz_static = { glob = "lib/libz.a" } | OutputLib,
-        headers = { glob = "include/*.h" } | OutputLib,
-        pkgconfig = { glob = "lib/pkgconfig/zlib.pc" } | OutputLib,
+        libz = { glob = "usr/lib/libz.so*" } | OutputLib,
+        libz_static = { glob = "usr/lib/libz.a" } | OutputLib,
+        headers = { glob = "usr/include/*.h" } | OutputLib,
+        pkgconfig = { glob = "usr/lib/pkgconfig/zlib.pc" } | OutputLib,
     },
 } | BuildSpec

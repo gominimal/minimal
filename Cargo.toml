@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/build-sandbox", "crates/minimal", "crates/graph", "crates/cache"]
+members = [
+    "crates/build-sandbox",
+    "crates/minimal",
+    "crates/graph",
+    "crates/cache",
+]
 resolver = "3"
 
 [profile.release]
@@ -13,7 +18,7 @@ fxhash = "0.2"
 nickel-lang-core = "0.13"
 
 path-absolutize = "^3.1"
-tempfile = {version = "3.0"}
+tempfile = { version = "3.0" }
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -29,4 +34,4 @@ graph = { version = "0.0.1", path = "crates/graph" }
 cache = { version = "0.0.1", path = "crates/cache" }
 
 [patch.crates-io]
-nickel-lang-core = { git = 'https://github.com/tweag/nickel.git' }
+nickel-lang-core = { git = 'https://github.com/tweag/nickel.git', rev = "817dca3f6a477f2b6604caabcb05199c10d5c223" }

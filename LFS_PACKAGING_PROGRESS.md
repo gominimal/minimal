@@ -62,7 +62,7 @@ cargo run -- build --package {package-name}
 
 ## Package Status
 
-### ✅ Completed (20/79)
+### ✅ Completed (27/79)
 - [x] Zlib (compression library)
 - [x] Grep (text search utility)
 - [x] Iana-Etc (protocols and services files)
@@ -83,21 +83,22 @@ cargo run -- build --package {package-name}
 - [x] Gzip (compression utility) - Gzip 1.14 for compressing and decompressing files
 - [x] Gawk (GNU Awk) - Gawk 5.3.2 for pattern scanning and processing
 - [x] Diffutils (file comparison utilities) - Diffutils 3.12 for comparing files and directories
+- [x] Attr (extended attribute library) - Attr 2.5.2 for managing filesystem extended attributes
+- [x] Acl (Access Control List library) - ACL 2.3.2 for managing POSIX access control lists
+- [x] Autoconf (automatic configure script builder) - Autoconf 2.72 for generating configure scripts
+- [x] Automake (automatic Makefile generator) - Automake 1.17 for generating Makefile.in files
+- [x] Coreutils (core utilities) - Coreutils 9.7 with essential utilities like ls, cp, mv, etc.
+- [x] Perl (Practical Extraction and Report Language) - Perl 5.42.0 scripting language
+- [x] Binutils (binary utilities) - Binutils 2.45 with assembler, linker, and other binary tools
 
 ### 🔄 In Progress (0/79)
 - [ ] Man-pages (manual pages for Linux kernel and C library) - moved back from completed, not in packages/
 - [ ] Flex (lexical analyzer generator) - moved back from completed, not in packages/
 
-### ⏳ Pending (57/79)
+### ⏳ Pending (50/79)
 3. **Expect** - Automate interactive applications
 4. **DejaGNU** - Testing framework
 5. **Pkgconf** - Package configuration system
-6. **Binutils** - Binary utilities (assembler, linker, etc.)
-7. **GMP** - GNU Multiple Precision Arithmetic Library
-8. **MPFR** - Multiple-precision floating-point library
-9. **MPC** - Multiple-precision complex number library
-10. **Attr** - Extended attribute library
-11. **Acl** - Access Control List library
 12. **Libcap** - POSIX capabilities library
 13. **Libxcrypt** - Extended crypt library
 14. **Shadow** - Password and account management tools
@@ -110,11 +111,8 @@ cargo run -- build --package {package-name}
 24. **Expat** - XML parser library
 25. **Inetutils** - Network utilities
 26. **Less** - Text pager
-27. **Perl** - Practical Extraction and Report Language
 28. **XML::Parser** - Perl XML parser module
 29. **Intltool** - Internationalization tool
-30. **Autoconf** - Automatic configure script builder
-31. **Automake** - Automatic Makefile generator
 32. **OpenSSL** - Cryptography library
 33. **Libelf** - ELF file access library
 34. **Libffi** - Foreign Function Interface library
@@ -126,7 +124,6 @@ cargo run -- build --package {package-name}
 40. **Ninja** - Small build system
 41. **Meson** - Build system
 42. **Kmod** - Kernel module utilities
-43. **Coreutils** - Core utilities (ls, cp, mv, etc.)
 46. **Findutils** - File finding utilities
 47. **Groff** - Document formatting system
 48. **GRUB** - Boot loader

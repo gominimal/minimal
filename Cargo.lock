@@ -1395,7 +1395,7 @@ dependencies = [
 [[package]]
 name = "nickel-lang-core"
 version = "0.13.0"
-source = "git+https://github.com/tweag/nickel.git#83e55a564954a2eac3be6a98d3cc57ca6d176622"
+source = "git+https://github.com/tweag/nickel.git?rev=817dca3f6a477f2b6604caabcb05199c10d5c223#817dca3f6a477f2b6604caabcb05199c10d5c223"
 dependencies = [
  "ansi_term",
  "bumpalo",
@@ -1440,7 +1440,7 @@ dependencies = [
 [[package]]
 name = "nickel-lang-vector"
 version = "0.1.0"
-source = "git+https://github.com/tweag/nickel.git#83e55a564954a2eac3be6a98d3cc57ca6d176622"
+source = "git+https://github.com/tweag/nickel.git?rev=817dca3f6a477f2b6604caabcb05199c10d5c223#817dca3f6a477f2b6604caabcb05199c10d5c223"
 dependencies = [
  "imbl-sized-chunks",
  "serde",

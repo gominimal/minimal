@@ -6,7 +6,7 @@ set -ex
 tar xf zlib-1.3.1.tar.gz
 cd zlib-1.3.1
 
-./configure --prefix="$OUTPUT_DIR"
+./configure --prefix="$OUTPUT_DIR/usr"
 make
 make check
 make install
