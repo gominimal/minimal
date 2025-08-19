@@ -17,7 +17,9 @@ let texinfo = import "../texinfo/build.ncl" in
     ],
     cmd = "./build.sh",
     outputs = {
-        tar = { glob = "bin/tar" } | OutputLib,
-        info = { glob = "share/info/tar.info*" } | OutputLib,
+        tar = { glob = "usr/bin/tar" } | OutputLib,
+        rmt = { glob = "usr/libexec/rmt" } | OutputLib,
+        info = { glob = "usr/share/info/tar.info*" } | OutputLib,
+        locale_files = { glob = "usr/share/locale/**/*" } | OutputLib,
     },
 } | BuildSpec

@@ -16,7 +16,7 @@ for pkg_dir in "$PACKAGES_DIR"/*; do
     if [ -d "$pkg_dir" ]; then
         pkg_name=$(basename "$pkg_dir")
         echo "Building package: $pkg_name"
-        cargo run -- build --package "$pkg_name"
+        cargo run --release -- build --package "$pkg_name"
         echo "Completed: $pkg_name"
         echo "---"
     fi

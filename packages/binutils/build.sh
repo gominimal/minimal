@@ -9,21 +9,16 @@ cd binutils-2.45
 mkdir -v build
 cd build
 
-# Configure with LFS settings  
-# Disable gprofng since it requires C++ and causes build issues
-../configure --prefix=/usr \
-             --sysconfdir=/etc \
+../configure --prefix="$OUTPUT_DIR/usr"         \
+             --sysconfdir=/etc   \
              --enable-ld=default \
-             --enable-plugins \
-             --enable-shared \
-             --disable-werror \
+             --enable-plugins    \
+             --enable-shared     \
+             --disable-werror    \
              --enable-64-bit-bfd \
-             --enable-new-dtags \
-             --with-system-zlib \
-             --enable-default-hash-style=gnu \
-             --disable-gprofng
+             --enable-new-dtags  \
+             --with-system-zlib  \
+             --enable-default-hash-style=gnu
 
-make tooldir=/usr
+make tooldir="$OUTPUT_DIR/usr"
 make tooldir=/usr install
-
-rm -fv "$OUTPUT_DIR/usr/lib/lib"{bfd,ctf,ctf-nobfd,opcodes,sframe}.a

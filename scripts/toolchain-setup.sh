@@ -13,7 +13,6 @@ export OBJDUMP="x86_64-unknown-linux-gnu-objdump"
 export NM="x86_64-unknown-linux-gnu-nm"
 
 export CFLAGS="-I/usr/include --sysroot=$TOOLCHAIN_SYSROOT"
-export CXXFLAGS="--sysroot=$TOOLCHAIN_SYSROOT"
+export CXXFLAGS="-I/usr/include --sysroot=$TOOLCHAIN_SYSROOT"
 export LDFLAGS="-L/usr/lib --sysroot=$TOOLCHAIN_SYSROOT -Wl,--dynamic-linker=$DYNAMIC_LINKER -Wl,-rpath=$TOOLCHAIN_SYSROOT/lib64"
-
 export MAKEFLAGS="-j 8"

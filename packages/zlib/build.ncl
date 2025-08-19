@@ -13,7 +13,8 @@ let make = import "../make/build.ncl" in
     outputs = {
         libz = { glob = "usr/lib/libz.so*" } | OutputLib,
         libz_static = { glob = "usr/lib/libz.a" } | OutputLib,
-        headers = { glob = "usr/include/*.h" } | OutputLib,
+        zconf_h = { glob = "usr/include/zconf.h" } | OutputLib,
+        zlib_h = { glob = "usr/include/zlib.h" } | OutputLib,
         pkgconfig = { glob = "usr/lib/pkgconfig/zlib.pc" } | OutputLib,
     },
 } | BuildSpec

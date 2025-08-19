@@ -1,5 +1,8 @@
 let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
-let busybox_static = import "../busybox_static/build.ncl" in
+# coreutils depends on acl
+# acl depends on attr
+# attr cannot depend on coreutils
+let busybox_static = import "../busybox_static/build.ncl" in 
 let make = import "../make/build.ncl" in
 {
     name = "attr",

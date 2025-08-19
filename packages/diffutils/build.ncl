@@ -11,11 +11,13 @@ let make = import "../make/build.ncl" in
     ],
     cmd = "./build.sh",
     outputs = {
-        cmp = { glob = "bin/cmp" } | OutputLib,
-        diff = { glob = "bin/diff" } | OutputLib,
-        diff3 = { glob = "bin/diff3" } | OutputLib,
-        sdiff = { glob = "bin/sdiff" } | OutputLib,
-        info = { glob = "share/info/*.info*" } | OutputLib,
-        man = { glob = "share/man/man1/*.1" } | OutputLib,
+        cmp = { glob = "usr/bin/cmp" } | OutputLib,
+        diff = { glob = "usr/bin/diff" } | OutputLib,
+        diff3 = { glob = "usr/bin/diff3" } | OutputLib,
+        sdiff = { glob = "usr/bin/sdiff" } | OutputLib,
+
+        info = { glob = "usr/share/info/*.info*" } | OutputLib,
+        man = { glob = "usr/share/man/man1/*.1" } | OutputLib,
+        locales = { glob = "usr/share/locale/**/*" } | OutputLib,
     },
 } | BuildSpec

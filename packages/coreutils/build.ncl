@@ -1,54 +1,54 @@
 let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
 let busybox_static = import "../busybox_static/build.ncl" in
 let make = import "../make/build.ncl" in
+let acl = import "../acl/build.ncl" in
 {
     name = "coreutils",
     inputs = [
         {file = "build.sh"} | Local,
         {file = "coreutils-9.7.tar.xz"} | Local,
-        {file = "coreutils-9.7-upstream_fix-1.patch"} | Local,
-        {file = "coreutils-9.7-i18n-1.patch"} | Local,
+        acl,
         busybox_static,
         make,
     ],
     cmd = "./build.sh",
     outputs = {
         # Core file operations
-        ls = { glob = "bin/ls" } | OutputLib,
-        cp = { glob = "bin/cp" } | OutputLib,
-        mv = { glob = "bin/mv" } | OutputLib,
-        rm = { glob = "bin/rm" } | OutputLib,
-        mkdir = { glob = "bin/mkdir" } | OutputLib,
-        rmdir = { glob = "bin/rmdir" } | OutputLib,
-        ln = { glob = "bin/ln" } | OutputLib,
-        chmod = { glob = "bin/chmod" } | OutputLib,
-        chown = { glob = "bin/chown" } | OutputLib,
-        chgrp = { glob = "bin/chgrp" } | OutputLib,
+        ls = { glob = "usr/bin/ls" } | OutputLib,
+        cp = { glob = "usr/bin/cp" } | OutputLib,
+        mv = { glob = "usr/bin/mv" } | OutputLib,
+        rm = { glob = "usr/bin/rm" } | OutputLib,
+        mkdir = { glob = "usr/bin/mkdir" } | OutputLib,
+        rmdir = { glob = "usr/bin/rmdir" } | OutputLib,
+        ln = { glob = "usr/bin/ln" } | OutputLib,
+        chmod = { glob = "usr/bin/chmod" } | OutputLib,
+        chown = { glob = "usr/bin/chown" } | OutputLib,
+        chgrp = { glob = "usr/bin/chgrp" } | OutputLib,
         
         # Text utilities
-        cat = { glob = "bin/cat" } | OutputLib,
-        head = { glob = "bin/head" } | OutputLib,
-        tail = { glob = "bin/tail" } | OutputLib,
-        sort = { glob = "bin/sort" } | OutputLib,
-        uniq = { glob = "bin/uniq" } | OutputLib,
-        cut = { glob = "bin/cut" } | OutputLib,
-        tr = { glob = "bin/tr" } | OutputLib,
-        wc = { glob = "bin/wc" } | OutputLib,
+        cat = { glob = "usr/bin/cat" } | OutputLib,
+        head = { glob = "usr/bin/head" } | OutputLib,
+        tail = { glob = "usr/bin/tail" } | OutputLib,
+        sort = { glob = "usr/bin/sort" } | OutputLib,
+        uniq = { glob = "usr/bin/uniq" } | OutputLib,
+        cut = { glob = "usr/bin/cut" } | OutputLib,
+        tr = { glob = "usr/bin/tr" } | OutputLib,
+        wc = { glob = "usr/bin/wc" } | OutputLib,
         
         # System utilities
-        date = { glob = "bin/date" } | OutputLib,
-        whoami = { glob = "bin/whoami" } | OutputLib,
-        id = { glob = "bin/id" } | OutputLib,
-        pwd = { glob = "bin/pwd" } | OutputLib,
-        uname = { glob = "bin/uname" } | OutputLib,
+        date = { glob = "usr/bin/date" } | OutputLib,
+        whoami = { glob = "usr/bin/whoami" } | OutputLib,
+        id = { glob = "usr/bin/id" } | OutputLib,
+        pwd = { glob = "usr/bin/pwd" } | OutputLib,
+        uname = { glob = "usr/bin/uname" } | OutputLib,
         
         # All binaries (catch remaining utilities)
-        all_binaries = { glob = "bin/*" } | OutputLib,
+        all_binaries = { glob = "usr/bin/*" } | OutputLib,
         
         # Library and documentation
-        libstdbuf = { glob = "lib/coreutils/libstdbuf.so" } | OutputLib,
-        man_pages = { glob = "share/man/man1/*.1" } | OutputLib,
-        info_pages = { glob = "share/info/*.info*" } | OutputLib,
-        locale_files = { glob = "share/locale/*/LC_MESSAGES/*.mo" } | OutputLib,
+        libstdbuf = { glob = "usr/libexec/coreutils/libstdbuf.so" } | OutputLib,
+        man_pages = { glob = "usr/share/man/man1/*.1" } | OutputLib,
+        info_pages = { glob = "usr/share/info/*.info*" } | OutputLib,
+        locale_files = { glob = "usr/share/locale/**/*" } | OutputLib,
     },
 } | BuildSpec

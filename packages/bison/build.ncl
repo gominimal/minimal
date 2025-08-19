@@ -6,8 +6,10 @@ let gawk = import "../gawk/build.ncl" in
 let grep = import "../grep/build.ncl" in
 let m4 = import "../m4/build.ncl" in
 let make = import "../make/build.ncl" in
+let perl = import "../perl/build.ncl" in
 let sed = import "../sed/build.ncl" in
 let tar = import "../tar/build.ncl" in
+let texinfo = import "../texinfo/build.ncl" in
 let xz = import "../xz/build.ncl" in
 {
     name = "bison",
@@ -21,8 +23,10 @@ let xz = import "../xz/build.ncl" in
         grep,
         m4,
         make,
+        perl,
         sed,
         tar,
+        texinfo,
         xz,
      ],
     cmd = "./build.sh",
