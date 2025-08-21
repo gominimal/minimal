@@ -1,8 +1,6 @@
 #!/bin/sh
 set -e
 
-. ./toolchain-setup.sh
-
 tar -xf ncurses-6.5.tar.gz
 cd ncurses-6.5
 
@@ -13,11 +11,11 @@ cd ncurses-6.5
             --with-shared \
             --without-debug \
             --without-normal \
-            --without-cxx \
+            --with-cxx-shared \
             --without-cxx-binding \
             --enable-pc-files \
             --with-pkg-config-libdir=/usr/lib/pkgconfig \
             --disable-stripping
 
-make
+make -j8
 make DESTDIR="$OUTPUT_DIR" install

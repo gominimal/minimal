@@ -1,13 +1,11 @@
 #!/bin/sh
 set -e
 
-. ./toolchain-setup.sh
+tar -xf m4-1.4.20.tar.xz
+cd m4-1.4.20
 
-tar -xf m4-1.4.19.tar.xz
-cd m4-1.4.19
-
-CFLAGS="-O2 -std=gnu11" ./configure --prefix="${OUTPUT_DIR}"
+./configure --prefix="/usr"
 
 make
-# make check || echo "Some tests may fail - this is expected"
-make install
+
+make DESTDIR=$OUTPUT_DIR install

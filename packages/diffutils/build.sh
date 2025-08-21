@@ -2,14 +2,13 @@
 
 set -e
 
-. ./toolchain-setup.sh
 
 tar xf diffutils-3.12.tar.xz
 cd diffutils-3.12
 
-./configure --prefix="$OUTPUT_DIR/usr"
+./configure --prefix=/usr
 
-make
-make install
+make -j8
+make DESTDIR=$OUTPUT_DIR install
 
 echo "Diffutils build complete"

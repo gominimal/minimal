@@ -18,20 +18,33 @@ enum Cli {
     Plan(PlanArgs),
 }
 
-pub fn graph_from_package_name(package_name: &String) -> DepGraph {
+pub fn graph_from_package_name(package_name: &String, source: bool) -> DepGraph {
     let package_dir = Path::new("packages").join(package_name);
 
-    let build_ncl_path = package_dir.join("build.ncl");
-    if !build_ncl_path.exists() {
-        eprintln!(
-            "Error: build.ncl not found in package directory: {}",
-            package_dir.display()
-        );
-        std::process::exit(1);
-    }
+    let build_ncl_path = if source {
+        let source_path = package_dir.join("build.source.ncl");
+        if !source_path.exists() {
+            eprintln!(
+                "Error: build.source.ncl not found in package directory: {}",
+                package_dir.display()
+            );
+            std::process::exit(1);
+        }
+        source_path
+    } else {
+        let normal_path = package_dir.join("build.ncl");
+        if !normal_path.exists() {
+            eprintln!(
+                "Error: build.ncl not found in package directory: {}",
+                package_dir.display()
+            );
+            std::process::exit(1);
+        }
+        normal_path
+    };
 
     let sr = SpecReader::new_with_path(
-        build_ncl_path,
+        &build_ncl_path,
         &SpecReaderOptions {
             minimal_lib_path: "crates/graph/minimal-ncl".into(),
         },

@@ -111,7 +111,7 @@ fn bind_dependencies(config: &BuildConfig, new_root: &str) -> std::io::Result<()
         let host_str = host_path.to_string_lossy();
         let namespace_str = namespace_path.to_string_lossy();
 
-        if host_str.contains("toolchains/x86_64-unknown-linux-gnu") {
+        if host_str.contains("/home/bweeks/x-tools/x86_64-minimal-linux-gnu") {
             bind_buildroot_toolchain(&host_str, new_root)?;
             continue;
         }
@@ -142,7 +142,9 @@ fn bind_dependencies(config: &BuildConfig, new_root: &str) -> std::io::Result<()
 }
 
 fn bind_essential_directories(new_root: &str) -> std::io::Result<()> {
-    let essential_dirs = [("/tmp", "tmp"), ("/proc", "proc"), ("/dev", "dev")];
+    let essential_dirs = [
+        ("/tmp", "tmp"), ("/proc", "proc"), ("/dev", "dev")
+    ];
 
     for (src, dest_rel) in essential_dirs {
         let dest_path = format!("{}/{}", new_root, dest_rel);

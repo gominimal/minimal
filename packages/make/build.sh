@@ -1,16 +1,6 @@
 #!/bin/sh
+set -ex
 
-set -e
-
-. ./toolchain-setup.sh
-
-tar xf make-4.4.1.tar.gz
-cd make-4.4.1
-
-./configure --prefix="$OUTPUT_DIR"
-
-make
-
-make install
-
-echo "Make build complete"
+mkdir -p $OUTPUT_DIR/usr/bin
+cp prebuilt/usr/bin/make $OUTPUT_DIR/usr/bin/make
+chmod +x $OUTPUT_DIR/usr/bin/make

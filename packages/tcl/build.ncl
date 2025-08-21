@@ -1,21 +1,39 @@
 let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
-let busybox_static = import "../busybox_static/build.ncl" in
+let bash = import "../bash/build.ncl" in
+let coreutils = import "../coreutils/build.ncl" in
 let make = import "../make/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
+let gcc = import "../gcc/build.ncl" in
+let binutils = import "../binutils/build.ncl" in
+let linux_headers = import "../linux_headers/build.ncl" in
+let sed = import "../sed/build.ncl" in
+let grep = import "../grep/build.ncl" in
+let tar = import "../tar/build.ncl" in
+let gzip = import "../gzip/build.ncl" in
+let gawk = import "../gawk/build.ncl" in
 {
     name = "tcl",
     inputs = [
         {file = "build.sh"} | Local,
         {file = "tcl8.6.16-src.tar.gz"} | Local,
-        busybox_static,
+        bash,
+        coreutils,
         make,
+        gcc,
+        glibc,
+        binutils,
+        linux_headers,
+        sed,
+        grep,
+        tar,
+        gzip,
+        gawk,
     ],
     cmd = "./build.sh",
     outputs = {
-        tcl_bin = { glob = "usr/bin/tclsh*" } | OutputLib,
-        tcl_lib = { glob = "usr/lib/libtcl*.so*" } | OutputLib,
-        tcl_libdir = { glob = "usr/lib/tcl*" } | OutputLib,
-        tcl_headers = { glob = "usr/include/tcl*.h" } | OutputLib,
-        tcl_man = { glob = "usr/share/man/man1/tclsh*.1" } | OutputLib,
-        tcl_man3 = { glob = "usr/share/man/man3/Tcl*.3" } | OutputLib,
+        usr_bin = { glob = "usr/bin/**/*" } | OutputLib,
+        usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
+        usr_include = { glob = "usr/include/**/*" } | OutputLib,
+        usr_share = { glob = "usr/share/**/*" } | OutputLib,
     },
 } | BuildSpec

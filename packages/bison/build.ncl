@@ -6,11 +6,15 @@ let gawk = import "../gawk/build.ncl" in
 let grep = import "../grep/build.ncl" in
 let m4 = import "../m4/build.ncl" in
 let make = import "../make/build.ncl" in
-let perl = import "../perl/build.ncl" in
+#let perl = import "../perl/build.ncl" in
 let sed = import "../sed/build.ncl" in
 let tar = import "../tar/build.ncl" in
-let texinfo = import "../texinfo/build.ncl" in
+# let texinfo = import "../texinfo/build.ncl" in
 let xz = import "../xz/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
+let gcc = import "../gcc/build.ncl" in
+let binutils = import "../binutils/build.ncl" in
+let linux_headers = import "../linux_headers/build.ncl" in
 {
     name = "bison",
     inputs = [  
@@ -23,22 +27,26 @@ let xz = import "../xz/build.ncl" in
         grep,
         m4,
         make,
-        perl,
+#        perl,
         sed,
         tar,
-        texinfo,
+        # texinfo,
         xz,
+        glibc,
+        gcc,
+        binutils,
+        linux_headers,
      ],
     cmd = "./build.sh",
     outputs = {
-        bison_bin = { glob = "bin/bison" } | OutputLib,
-        yacc_bin = { glob = "bin/yacc" } | OutputLib,
-        liby = { glob = "lib/liby.a" } | OutputLib,
-        bison_share = { glob = "share/bison/**/*" } | OutputLib,
-        bison_man = { glob = "share/man/man1/bison.1" } | OutputLib,
-        yacc_man = { glob = "share/man/man1/yacc.1" } | OutputLib,
-        bison_info = { glob = "share/info/bison.info*" } | OutputLib,
-        bison_locale = { glob = "share/locale/*/LC_MESSAGES/bison.mo" } | OutputLib,
-        bison_aclocal = { glob = "share/aclocal/bison*.m4" } | OutputLib,
+        bison_bin = { glob = "usr/bin/bison" } | OutputLib,
+        yacc_bin = { glob = "usr/bin/yacc" } | OutputLib,
+        liby = { glob = "usr/lib/liby.a" } | OutputLib,
+        bison_share = { glob = "usr/share/bison/**/*" } | OutputLib,
+        bison_man = { glob = "usr/share/man/man1/bison.1" } | OutputLib,
+        yacc_man = { glob = "usr/share/man/man1/yacc.1" } | OutputLib,
+        bison_info = { glob = "usr/share/info/bison.info*" } | OutputLib,
+        bison_locale = { glob = "usr/share/locale/*/LC_MESSAGES/bison.mo" } | OutputLib,
+        bison_aclocal = { glob = "usr/share/aclocal/bison*.m4" } | OutputLib,
     },
 } | BuildSpec

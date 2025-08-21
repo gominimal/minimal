@@ -14,7 +14,7 @@ pub struct PlanArgs {
 }
 
 pub fn cmd_plan(args: PlanArgs) -> Result<()> {
-    let graph = super::graph_from_package_name(&args.package);
+    let graph = super::graph_from_package_name(&args.package, false);
     let cache = super::load_cache(args.cache_dir).unwrap();
     println!("✓ = Already built, ⚙️ = To be built");
 

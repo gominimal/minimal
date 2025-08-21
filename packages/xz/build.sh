@@ -1,17 +1,4 @@
 #!/bin/sh
+set -ex
 
-set -e
-
-. ./toolchain-setup.sh
-
-tar xf xz-5.8.1.tar.xz
-cd xz-5.8.1
-
-./configure --prefix="$OUTPUT_DIR/usr" \
-            --disable-static \
-            --docdir="$OUTPUT_DIR/share/doc/xz-5.8.1"
-
-make
-make install
-
-echo "Xz build complete"
+cp -R prebuilt/* $OUTPUT_DIR

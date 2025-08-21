@@ -44,11 +44,9 @@ let make_static = import "../make_static/build.ncl" in
 #!/usr/bin/bash
 set -e
 
-# Source shared toolchain setup
-source "${SCRIPTS_DIR}/toolchain-setup.sh"
-
 # Extract and build following LFS instructions
-# Use $OUTPUT_DIR as installation prefix
+# Use /usr as the prefix
+# Use $OUTPUT_DIR as DESTDIR
 # Follow exact LFS steps from the relevant page
 ```
 
@@ -62,7 +60,7 @@ cargo run -- build --package {package-name}
 
 ## Package Status
 
-### ✅ Completed (27/79)
+### ✅ Completed (29/79)
 - [x] Zlib (compression library)
 - [x] Grep (text search utility)
 - [x] Iana-Etc (protocols and services files)
@@ -90,15 +88,16 @@ cargo run -- build --package {package-name}
 - [x] Coreutils (core utilities) - Coreutils 9.7 with essential utilities like ls, cp, mv, etc.
 - [x] Perl (Practical Extraction and Report Language) - Perl 5.42.0 scripting language
 - [x] Binutils (binary utilities) - Binutils 2.45 with assembler, linker, and other binary tools
+- [x] Expat (XML parser library) - Expat 2.7.1 for parsing XML documents
+- [x] Pkgconf (package configuration system) - Pkgconf 2.5.1, successor to pkg-config
 
 ### 🔄 In Progress (0/79)
 - [ ] Man-pages (manual pages for Linux kernel and C library) - moved back from completed, not in packages/
 - [ ] Flex (lexical analyzer generator) - moved back from completed, not in packages/
 
-### ⏳ Pending (50/79)
+### ⏳ Pending (48/79)
 3. **Expect** - Automate interactive applications
 4. **DejaGNU** - Testing framework
-5. **Pkgconf** - Package configuration system
 12. **Libcap** - POSIX capabilities library
 13. **Libxcrypt** - Extended crypt library
 14. **Shadow** - Password and account management tools

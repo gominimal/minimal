@@ -1,0 +1,40 @@
+#!/bin/bash
+
+echo "let {BuildSpec, HostPath, OutputLib, Local, ..} = import \"minimal.ncl\" in"
+echo "let busybox_static = import \"../busybox_static/build.ncl\" in"
+echo "{"
+echo "    name = \"linux_headers\","
+echo "    inputs = ["
+echo "        {file = \"build.sh\"} | Local,"
+
+# All header files
+find prebuilt/usr/include \( -type f -o -type l \) | sort | while read f; do
+    echo "        {file = \"$f\"} | Local,"
+done
+
+echo "        busybox_static,"
+echo "    ],"
+echo "    cmd = \"./build.sh\","
+echo "    outputs = {"
+echo "        # Core Linux headers"
+echo "        linux_headers = { glob = \"usr/include/linux/**/*\" } | OutputLib,"
+echo "        # Architecture-specific headers"
+echo "        asm_headers = { glob = \"usr/include/asm/**/*\" } | OutputLib,"
+echo "        asm_generic_headers = { glob = \"usr/include/asm-generic/**/*\" } | OutputLib,"
+echo "        # DRM headers"
+echo "        drm_headers = { glob = \"usr/include/drm/**/*\" } | OutputLib,"
+echo "        # RDMA headers"
+echo "        rdma_headers = { glob = \"usr/include/rdma/**/*\" } | OutputLib,"
+echo "        # SCSI headers"
+echo "        scsi_headers = { glob = \"usr/include/scsi/**/*\" } | OutputLib,"
+echo "        # Sound headers"
+echo "        sound_headers = { glob = \"usr/include/sound/**/*\" } | OutputLib,"
+echo "        # Video headers"
+echo "        video_headers = { glob = \"usr/include/video/**/*\" } | OutputLib,"
+echo "        # Miscellaneous headers"
+echo "        misc_headers = { glob = \"usr/include/misc/**/*\" } | OutputLib,"
+echo "        mtd_headers = { glob = \"usr/include/mtd/**/*\" } | OutputLib,"
+echo "        regulator_headers = { glob = \"usr/include/regulator/**/*\" } | OutputLib,"
+echo "        xen_headers = { glob = \"usr/include/xen/**/*\" } | OutputLib,"
+echo "    },"
+echo "} | BuildSpec"

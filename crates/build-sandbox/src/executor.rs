@@ -43,15 +43,6 @@ impl BuildExecutor {
             self.copy_to_tmpdir(input)?;
         }
 
-        let toolchain_script = Path::new("scripts/toolchain-setup.sh");
-        if toolchain_script.exists() {
-            info!(
-                "  Copying toolchain setup script: {}",
-                toolchain_script.display()
-            );
-            self.copy_to_tmpdir(toolchain_script)?;
-        }
-
         if config.debug_shell {
             self.create_debug_helper()?;
         }
@@ -64,7 +55,7 @@ impl BuildExecutor {
             info!("  OUTPUT_DIR: {}", self.output_staging_path.display());
             info!("  Type 'exit' to leave the debug shell");
 
-            let mut c = Command::new("/bin/sh");
+            let mut c = Command::new("/usr/bin/bash");
             sandbox.execute(&mut c)?;
             c
         } else if cfg!(target_os = "linux") {
@@ -86,7 +77,6 @@ impl BuildExecutor {
         cmd.env("OUTPUT_DIR", &self.output_staging_path);
 
         let path_components = [
-            PathBuf::from("/opt/toolchain/bin"),
             PathBuf::from("/bin"),
             PathBuf::from("/sbin"),
             PathBuf::from("/usr/bin"),

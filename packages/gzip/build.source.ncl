@@ -1,0 +1,32 @@
+let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let bash = import "../bash/build.ncl" in
+let coreutils = import "../coreutils/build.ncl" in
+let make = import "../make/build.ncl" in
+let sed = import "../sed/build.ncl" in
+let grep = import "../grep/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
+let gcc = import "../gcc/build.ncl" in
+let binutils = import "../binutils/build.ncl" in
+let linux_headers = import "../linux_headers/build.ncl" in
+{
+    name = "gzip",
+    inputs = [
+        {file = "build.source.sh"} | Local,
+        {file = "gzip-1.14.tar.xz"} | Local,
+        bash,
+        coreutils,
+        make,
+        sed,
+        grep,
+        glibc,
+        gcc,
+        binutils,
+        linux_headers,
+    ],
+    cmd = "./build.source.sh",
+    outputs = {
+        binaries = { glob = "usr/bin/*" } | OutputLib,
+        info = { glob = "usr/share/info/*.info" } | OutputLib,
+        man = { glob = "usr/share/man/man1/*.1" } | OutputLib,
+    },
+} | BuildSpec

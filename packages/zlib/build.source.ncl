@@ -1,0 +1,35 @@
+let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let binutils = import "../binutils/build.ncl" in
+let bash = import "../bash/build.ncl" in
+let coreutils = import "../coreutils/build.ncl" in
+let gcc = import "../gcc/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
+let gzip = import "../gzip/build.ncl" in
+let linux_headers = import "../linux_headers/build.ncl" in
+let make = import "../make/build.ncl" in
+let sed = import "../sed/build.ncl" in
+let tar = import "../tar/build.ncl" in
+{
+    name = "zlib",
+    inputs = [
+        {file = "build.source.sh"} | Local,
+        {file = "zlib-1.3.1.tar.gz"} | Local,
+        binutils,
+        bash,
+        coreutils,
+        gcc,
+        glibc,
+        gzip,
+        linux_headers,
+        make,
+        sed,
+        tar,
+    ],
+    cmd = "./build.source.sh",
+    outputs = {
+        libz = { glob = "usr/lib/libz.so*" } | OutputLib,
+        zconf_h = { glob = "usr/include/zconf.h" } | OutputLib,
+        zlib_h = { glob = "usr/include/zlib.h" } | OutputLib,
+        pkgconfig = { glob = "usr/lib/pkgconfig/zlib.pc" } | OutputLib,
+    },
+} | BuildSpec

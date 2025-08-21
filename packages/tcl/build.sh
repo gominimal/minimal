@@ -1,15 +1,13 @@
 #!/bin/sh
 set -e
 
-. ./toolchain-setup.sh
-
 tar -xf tcl8.6.16-src.tar.gz
 cd tcl8.6.16
 
 SRCDIR=$(pwd)
 cd unix
-./configure --prefix="${OUTPUT_DIR}/usr" \
-            --mandir="${OUTPUT_DIR}/usr/share/man" \
+./configure --prefix=/usr \
+            --mandir=/usr/share/man \
             --disable-rpath
 
 make
@@ -31,5 +29,5 @@ sed -e "s|$SRCDIR/unix/pkgs/itcl4.3.2|/usr/lib/itcl4.3.2|" \
 
 unset SRCDIR
 
-make install
-make install-private-headers
+make DESTDIR=$OUTPUT_DIR install
+make DESTDIR=$OUTPUT_DIR install-private-headers

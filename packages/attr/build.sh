@@ -1,8 +1,6 @@
 #!/bin/sh
 set -e
 
-. ./toolchain-setup.sh
-
 tar -xf attr-2.5.2.tar.gz
 cd attr-2.5.2
 

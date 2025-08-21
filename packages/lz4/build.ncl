@@ -1,21 +1,39 @@
 let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
-let busybox_static = import "../busybox_static/build.ncl" in
+let binutils = import "../binutils/build.ncl" in
+let bash = import "../bash/build.ncl" in
+let coreutils = import "../coreutils/build.ncl" in
+let gcc = import "../gcc/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
+let gzip = import "../gzip/build.ncl" in
+let linux_headers = import "../linux_headers/build.ncl" in
 let make = import "../make/build.ncl" in
+let sed = import "../sed/build.ncl" in
+let tar = import "../tar/build.ncl" in
+let gzip = import "../gzip/build.ncl" in
 {
     name = "lz4",
     inputs = [
         {file = "build.sh"} | Local,
         {file = "lz4-1.10.0.tar.gz"} | Local,
-        busybox_static,
+        bash,
+        coreutils,
         make,
+        binutils,
+        gcc,
+        glibc,
+        gzip,
+        linux_headers,
+        sed,
+        tar,
+        gzip,
     ],
     cmd = "./build.sh",
     outputs = {
-        lz4_bin = { glob = "bin/lz4" } | OutputLib,
-        lz4c_bin = { glob = "bin/lz4c" } | OutputLib,
-        lz4cat_bin = { glob = "bin/lz4cat" } | OutputLib,
-        unlz4_bin = { glob = "bin/unlz4" } | OutputLib,
-        liblz4 = { glob = "lib/liblz4.so*" } | OutputLib,
-        headers = { glob = "include/*.h" } | OutputLib,
+        lz4_bin = { glob = "usr/bin/lz4" } | OutputLib,
+        lz4c_bin = { glob = "usr/bin/lz4c" } | OutputLib,
+        lz4cat_bin = { glob = "usr/bin/lz4cat" } | OutputLib,
+        unlz4_bin = { glob = "usr/bin/unlz4" } | OutputLib,
+        liblz4 = { glob = "usr/lib/liblz4.so*" } | OutputLib,
+        headers = { glob = "usr/include/*.h" } | OutputLib,
     },
 } | BuildSpec
