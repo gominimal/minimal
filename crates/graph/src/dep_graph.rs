@@ -379,11 +379,13 @@ impl GraphBuilder {
                     .unwrap()
                     .join(local.file);
 
-                let file_hash = blake3::hash(
-                    &std::fs::read(&full_path).unwrap_or_else(|err| panic!(
-                        "Local input could not be read: {} (file: {})", err, full_path.display()
-                    )),
-                );
+                let file_hash = blake3::hash(&std::fs::read(&full_path).unwrap_or_else(|err| {
+                    panic!(
+                        "Local input could not be read: {} (file: {})",
+                        err,
+                        full_path.display()
+                    )
+                }));
                 Ok(BuildSpecInput::Local((full_path, file_hash)))
             }
             ObjTy::OutputLib | ObjTy::OutputBin => Err(Error::UnexpectedObject {

@@ -14,8 +14,18 @@ pub struct Run {
 }
 
 impl Run {
-    pub fn new(graph: DepGraph, cache: Cache<LocalDir>, is_source_build: bool, package_name: String) -> Self {
-        Self { graph, cache, is_source_build, package_name }
+    pub fn new(
+        graph: DepGraph,
+        cache: Cache<LocalDir>,
+        is_source_build: bool,
+        package_name: String,
+    ) -> Self {
+        Self {
+            graph,
+            cache,
+            is_source_build,
+            package_name,
+        }
     }
 
     pub fn execute(
@@ -136,13 +146,19 @@ impl Run {
         Ok(())
     }
 
-    fn update_prebuilt_binaries(&self, bsh: blake3::Hash) -> Result<(), Box<dyn std::error::Error>> {
+    fn update_prebuilt_binaries(
+        &self,
+        bsh: blake3::Hash,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let cache_handle = self.cache.read_dir(bsh).unwrap();
         let cache_dir = cache_handle.path();
         let package_dir = PathBuf::from("packages").join(&self.package_name);
         let prebuilt_dir = package_dir.join("prebuilt");
 
-        println!("Updating prebuilt binaries for package: {}", self.package_name);
+        println!(
+            "Updating prebuilt binaries for package: {}",
+            self.package_name
+        );
 
         // Clear existing prebuilt directory
         if prebuilt_dir.exists() {
@@ -179,7 +195,10 @@ impl Run {
             }
         }
 
-        println!("Successfully updated prebuilt binaries for {}", self.package_name);
+        println!(
+            "Successfully updated prebuilt binaries for {}",
+            self.package_name
+        );
         Ok(())
     }
 }
@@ -190,7 +209,7 @@ fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
         let entry = entry?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        
+
         if src_path.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
