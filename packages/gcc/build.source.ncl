@@ -20,7 +20,6 @@ let perl = import "../perl/build.ncl" in
 let python = import "../python/build.ncl" in
 let sed = import "../sed/build.ncl" in
 let tar = import "../tar/build.ncl" in
-let texinfo = import "../texinfo/build.ncl" in
 let xz = import "../xz/build.ncl" in
 let zlib = import "../zlib/build.ncl" in
 let zstd = import "../zstd/build.ncl" in
@@ -31,12 +30,10 @@ let zstd = import "../zstd/build.ncl" in
         {file = "gcc-15.2.0.tar.xz"} | Local,
         bash,
         binutils,
-        # bison,
         coreutils,
         diffutils,
         file,
         findutils,
-        # flex,
         gawk,
         gcc,
         glibc,
@@ -50,9 +47,7 @@ let zstd = import "../zstd/build.ncl" in
         python,
         sed,
         tar,
-        # texinfo,
         xz,
-        # zlib,
         zstd,
     ],
     cmd = "./build.source.sh",

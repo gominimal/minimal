@@ -15,6 +15,10 @@ let glibc = import "../glibc/build.ncl" in
 let gcc = import "../gcc/build.ncl" in
 let binutils = import "../binutils/build.ncl" in
 let linux_headers = import "../linux_headers/build.ncl" in
+let mpc = import "../mpc/build.ncl" in
+let mpfr = import "../mpfr/build.ncl" in
+let gmp = import "../gmp/build.ncl" in
+let zstd = import "../zstd/build.ncl" in
 {
     name = "patch",
     inputs = [
@@ -32,6 +36,10 @@ let linux_headers = import "../linux_headers/build.ncl" in
         gcc,
         binutils,
         linux_headers,
+        mpc,
+        mpfr,
+        gmp,
+        zstd,
     ],
     cmd = "./build.sh",
     outputs = {

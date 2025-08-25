@@ -11,6 +11,10 @@ let grep = import "../grep/build.ncl" in
 let tar = import "../tar/build.ncl" in
 let gzip = import "../gzip/build.ncl" in
 let gawk = import "../gawk/build.ncl" in
+let mpc = import "../mpc/build.ncl" in
+let mpfr = import "../mpfr/build.ncl" in
+let gmp = import "../gmp/build.ncl" in
+let zstd = import "../zstd/build.ncl" in
 {
     name = "tcl",
     inputs = [
@@ -28,6 +32,10 @@ let gawk = import "../gawk/build.ncl" in
         tar,
         gzip,
         gawk,
+        mpc,
+        mpfr,
+        gmp,
+        zstd,
     ],
     cmd = "./build.sh",
     outputs = {

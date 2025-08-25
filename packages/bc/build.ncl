@@ -15,6 +15,10 @@ let sed = import "../sed/build.ncl" in
 let tar = import "../tar/build.ncl" in 
 let xz = import "../xz/build.ncl" in 
 let zlib = import "../zlib/build.ncl" in
+let mpc = import "../mpc/build.ncl" in
+let mpfr = import "../mpfr/build.ncl" in
+let gmp = import "../gmp/build.ncl" in
+let zstd = import "../zstd/build.ncl" in
 {
     name = "bc",
     inputs = [
@@ -36,6 +40,10 @@ let zlib = import "../zlib/build.ncl" in
         tar,
         xz,
         zlib,
+        mpc,
+        mpfr,
+        gmp,
+        zstd,
     ],
     cmd = "./build.sh",
     outputs = {

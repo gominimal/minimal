@@ -1,9 +1,6 @@
 #!/bin/sh
 set -e
 
-# TODO
-# cc=gcc, why?
-
 tar xf perl-5.42.0.tar.xz
 cd perl-5.42.0
 
@@ -26,7 +23,7 @@ sh Configure -des                                           \
              -D useshrplib                                 \
              -D usethreads
 
-make
+make -j$(nprocs)
 make DESTDIR=$OUTPUT_DIR install
 
 echo "Perl build complete"
