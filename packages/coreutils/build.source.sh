@@ -5,11 +5,11 @@ set -e
 tar xf coreutils-9.7.tar.xz
 cd coreutils-9.7
 
-./configure \
+FORCE_UNSAFE_CONFIGURE=1 ./configure \
     --prefix=/usr \
     --enable-no-install-program=kill,uptime
 
-make
+make -j$(nproc)
 
 make DESTDIR=$OUTPUT_DIR install
 

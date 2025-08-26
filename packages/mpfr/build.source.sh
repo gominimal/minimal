@@ -1,7 +1,7 @@
 #!/bin/sh
 set -ex
 
-tar xf mpfr-4.2.2.tar.xz
+tar xfo mpfr-4.2.2.tar.xz
 cd mpfr-4.2.2
 
 ./configure --prefix=/usr        \

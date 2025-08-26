@@ -1,14 +1,14 @@
 #!/bin/sh
 set -e
 
-tar xf gawk-5.3.2.tar.xz
+tar xfo gawk-5.3.2.tar.xz
 cd gawk-5.3.2
 
 sed -i 's/extras//' Makefile.in
 
 ./configure --prefix=/usr
 
-make
+make -j$(nproc)
 
 make DESTDIR=$OUTPUT_DIR install
 

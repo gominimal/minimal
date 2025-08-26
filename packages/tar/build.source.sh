@@ -1,10 +1,10 @@
 #!/bin/sh
 set -e
 
-tar xf tar-1.35.tar.xz
+tar xfo tar-1.35.tar.xz
 cd tar-1.35
 
-./configure --prefix=/usr
+FORCE_UNSAFE_CONFIGURE=1 ./configure --prefix=/usr
 
 make -j$(nproc)
 make DESTDIR=$OUTPUT_DIR install

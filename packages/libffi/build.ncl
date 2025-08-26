@@ -21,7 +21,7 @@ let gawk = import "../gawk/build.ncl" in
         {file = "build.sh"} | Local,
         {
             url = "gs://minimal-staging-archives/libffi-3.5.2.tar.gz",
-            sha256 = "intentionally_bad_value"
+            sha256 = "f3a3082a23b37c293a4fcd1053147b371f2ff91fa7ea1b2a52e335676bac82dc"
         } | Source,
         bash,
         coreutils,

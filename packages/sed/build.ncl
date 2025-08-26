@@ -1,13 +1,10 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
-let busybox_static = import "../busybox_static/build.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Prebuilt, ..} = import "minimal.ncl" in
 {
     name = "sed",
     inputs = [
-        {file = "build.sh"} | Local,
-        {file = "prebuilt/usr/bin/sed"} | Local,
-        busybox_static,
+        {package = "sed"} | Prebuilt,
     ],
-    cmd = "./build.sh",
+    cmd = "",
     outputs = {
         sed_bin = { glob = "usr/bin/sed" } | OutputLib,
     },

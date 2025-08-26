@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, Prebuilt, ..} = import "minimal.ncl" in
 let attr = import "../attr/build.ncl" in
 let bash = import "../bash/build.ncl" in
 let binutils = import "../binutils/build.ncl" in
@@ -22,7 +22,7 @@ let zstd = import "../zstd/build.ncl" in
         {file = "build.sh"} | Local,
         {
             url = "gs://minimal-staging-archives/acl-2.3.2.tar.xz",
-            sha256 = "intentionally_bad_value"
+            sha256 = "97203a72cae99ab89a067fe2210c1cbf052bc492b479eca7d226d9830883b0bd"
         } | Source,
         attr,
         bash,

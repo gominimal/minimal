@@ -2,54 +2,49 @@ let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" i
 let bash = import "../bash/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
 let make = import "../make/build.ncl" in
-let tar = import "../tar/build.ncl" in
-let xz = import "../xz/build.ncl" in
-let sed = import "../sed/build.ncl" in
 let grep = import "../grep/build.ncl" in
-let libffi = import "../libffi/build.ncl" in
-let ncurses = import "../ncurses/build.ncl" in
-let binutils = import "../binutils/build.ncl" in
-let gcc = import "../gcc/build.ncl" in
+let tar = import "../tar/build.ncl" in
+let gzip = import "../gzip/build.ncl" in
+let sed = import "../sed/build.ncl" in
 let glibc = import "../glibc/build.ncl" in
+let gcc = import "../gcc/build.ncl" in
+let binutils = import "../binutils/build.ncl" in
 let linux_headers = import "../linux_headers/build.ncl" in
-let pkgconf = import "../pkgconf/build.ncl" in
+let gawk = import "../gawk/build.ncl" in
 let mpc = import "../mpc/build.ncl" in
 let mpfr = import "../mpfr/build.ncl" in
 let gmp = import "../gmp/build.ncl" in
 let zstd = import "../zstd/build.ncl" in
-let gawk = import "../gawk/build.ncl" in
 {
-    name = "python",
+    name = "file",
     inputs = [
         {file = "build.source.sh"} | Local,
         {
-            url = "gs://minimal-staging-archives/Python-3.13.7.tar.xz",
-            sha256 = "5462f9099dfd30e238def83c71d91897d8caa5ff6ebc7a50f14d4802cdaaa79a"
+            url = "gs://minimal-staging-archives/file-5.46.tar.gz",
+            sha256 = "c9cc77c7c560c543135edc555af609d5619dbef011997e988ce40a3d75d86088"
         } | Source,
         bash,
         coreutils,
         make,
-        tar,
-        xz,
-        sed,
         grep,
-        libffi,
-        binutils,
+        tar,
+        gzip,
+        sed,
         gcc,
         glibc,
+        binutils,
         linux_headers,
-        ncurses,
-        pkgconf,
+        gawk,
         mpc,
         mpfr,
         gmp,
         zstd,
-        gawk,
     ],
     cmd = "./build.source.sh",
     outputs = {
-        usr_bin = { glob = "usr/bin/**/*" } | OutputLib,
-        usr_include = { glob = "usr/include/**/*" } | OutputLib,
-        usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
+        file_bin = { glob = "usr/bin/file" } | OutputLib,
+        libmagic = { glob = "usr/lib/libmagic.so*" } | OutputLib,
+        headers = { glob = "usr/include/magic.h" } | OutputLib,
+        magic_data = { glob = "usr/share/misc/magic*" } | OutputLib,
     },
 } | BuildSpec

@@ -1,8 +1,10 @@
 use clap::Parser;
+use build_sandbox::error::ConfigError;
 use graph::{DepGraph, SpecReader, SpecReaderOptions};
 use std::path::{Path, PathBuf};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
+mod lockfile;
 mod remote_storage;
 mod run;
 
@@ -10,6 +12,8 @@ mod cmd_build;
 use cmd_build::{BuildArgs, cmd_build};
 mod cmd_plan;
 use cmd_plan::{PlanArgs, cmd_plan};
+mod cmd_upload_prebuilt;
+use cmd_upload_prebuilt::{UploadPrebuiltArgs, cmd_upload_prebuilt};
 
 #[derive(Parser)]
 #[command(name = "minimal")]
@@ -17,6 +21,7 @@ use cmd_plan::{PlanArgs, cmd_plan};
 enum Cli {
     Build(BuildArgs),
     Plan(PlanArgs),
+    UploadPrebuilt(UploadPrebuiltArgs),
 }
 
 pub fn graph_from_package_name(package_name: &String, source: bool) -> DepGraph {
@@ -65,7 +70,7 @@ pub fn load_cache(
 ) -> Result<cache::Cache<cache::LocalDir>, std::io::Error> {
     cache::Cache::at_dir(cache_dir.unwrap_or_else(|| {
         let dir = dirs::cache_dir().unwrap().join("minimal-builds");
-        match std::fs::create_dir(&dir) {
+        match std::fs::create_dir_all(&dir) {
             Ok(_) => {}
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::AlreadyExists {
@@ -87,5 +92,13 @@ async fn main() -> build_sandbox::Result<()> {
     match Cli::parse() {
         Cli::Build(args) => cmd_build(args).await,
         Cli::Plan(args) => cmd_plan(args),
+        Cli::UploadPrebuilt(args) => {
+            cmd_upload_prebuilt(args).await.map_err(|e| {
+                eprintln!("Upload prebuilt failed: {}", e);
+                build_sandbox::Error::Config(ConfigError::InvalidExecutable {
+                    path: std::path::PathBuf::from("upload-prebuilt")
+                })
+            })
+        },
     }
 }

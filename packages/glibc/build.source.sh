@@ -17,7 +17,7 @@ cd build
 # TODO
 # --enable-stack-protector=strong
 
-make -j 8
+make -j$(nproc)
 
 make DESTDIR=$OUTPUT_DIR install
 

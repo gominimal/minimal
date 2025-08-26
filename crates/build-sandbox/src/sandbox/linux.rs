@@ -16,25 +16,24 @@ pub struct LinuxSandbox {
     config: BuildConfig,
 }
 
-fn create_namespaces() -> std::io::Result<()> {
+fn create_namespaces() -> std::io::Result<(u32, u32)> {
+    let original_uid = unsafe { libc::getuid() };
+    let original_gid = unsafe { libc::getgid() };
+
     unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS)
-        .map_err(|e| std::io::Error::other(format!("unshare failed: {}", e)))
+        .map_err(|e| std::io::Error::other(format!("unshare failed: {}", e)))?;
+
+    Ok((original_uid, original_gid))
 }
 
-fn setup_uid_gid_mapping() -> std::io::Result<()> {
-    let current_uid = unsafe { libc::getuid() };
-    let current_gid = unsafe { libc::getgid() };
+fn setup_uid_gid_mapping(original_uid: u32, original_gid: u32) -> std::io::Result<()> {
+    write("/proc/self/setgroups", "deny").unwrap();
 
-    let parent_uid = 1000;
-    let uid_mapping = format!("{} {} 1", current_uid, parent_uid);
+    let uid_mapping = format!("0 {} 1", original_uid);
     write("/proc/self/uid_map", &uid_mapping)
         .map_err(|e| std::io::Error::other(format!("UID mapping failed: {}", e)))?;
 
-    // Try to deny setgroups, but don't fail if it doesn't work
-    let _ = write("/proc/self/setgroups", "deny");
-
-    let parent_gid = 1000;
-    let gid_mapping = format!("{} {} 1", current_gid, parent_gid);
+    let gid_mapping = format!("0 {} 1", original_gid);
     write("/proc/self/gid_map", &gid_mapping)
         .map_err(|e| std::io::Error::other(format!("GID mapping failed: {}", e)))?;
 
@@ -55,22 +54,6 @@ fn create_isolated_root() -> std::io::Result<String> {
     .map_err(|e| std::io::Error::other(format!("tmpfs mount failed: {}", e)))?;
 
     Ok(new_root)
-}
-
-fn bind_buildroot_toolchain(dep_str: &str, new_root: &str) -> std::io::Result<()> {
-    let dest_path = format!("{}/opt/toolchain", new_root);
-    create_dir_all(&dest_path)?;
-
-    mount(
-        Some(dep_str),
-        dest_path.as_str(),
-        None::<&str>,
-        MsFlags::MS_BIND | MsFlags::MS_REC,
-        None::<&str>,
-    )
-    .map_err(|e| std::io::Error::other(format!("mount failed: {}", e)))?;
-
-    Ok(())
 }
 
 fn recursively_mount_files(
@@ -97,7 +80,7 @@ fn recursively_mount_files(
                 Some(host_path.to_str().unwrap()),
                 dest_path.as_str(),
                 None::<&str>,
-                MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+                MsFlags::MS_BIND,
                 None::<&str>,
             )
             .map_err(|e| std::io::Error::other(format!("mount failed for {}: {}", dest_path, e)))?;
@@ -110,11 +93,6 @@ fn bind_dependencies(config: &BuildConfig, new_root: &str) -> std::io::Result<()
     for (host_path, namespace_path) in &config.dependencies {
         let host_str = host_path.to_string_lossy();
         let namespace_str = namespace_path.to_string_lossy();
-
-        if host_str.contains("/home/bweeks/x-tools/x86_64-minimal-linux-gnu") {
-            bind_buildroot_toolchain(&host_str, new_root)?;
-            continue;
-        }
 
         if host_path.is_dir() {
             recursively_mount_files(host_path, namespace_path, new_root)?;
@@ -131,7 +109,7 @@ fn bind_dependencies(config: &BuildConfig, new_root: &str) -> std::io::Result<()
                 Some(host_str.as_ref()),
                 dest_path.as_str(),
                 None::<&str>,
-                MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+                MsFlags::MS_BIND,
                 None::<&str>,
             )
             .map_err(|e| std::io::Error::other(format!("mount failed: {}", e)))?;
@@ -157,6 +135,23 @@ fn bind_essential_directories(new_root: &str) -> std::io::Result<()> {
         )
         .unwrap();
     }
+
+    let etc_path = format!("{}/etc", new_root);
+    create_dir_all(&etc_path)
+        .map_err(|e| std::io::Error::other(format!("mkdir /etc failed: {}", e)))?;
+    mount(
+        Some("tmpfs"),
+        etc_path.as_str(),
+        Some("tmpfs"),
+        MsFlags::empty(),
+        Some("size=10m"),
+    )
+    .map_err(|e| std::io::Error::other(format!("tmpfs mount /etc failed: {}", e)))?;
+
+    // // Create symlink from /bin to /usr/bin for compatibility
+    // let bin_path = format!("{}/bin", new_root);
+    // symlink("/usr/bin", &bin_path)
+    //     .map_err(|e| std::io::Error::other(format!("symlink /bin -> /usr/bin failed: {}", e)))?;
 
     Ok(())
 }
@@ -202,8 +197,8 @@ impl Sandbox for LinuxSandbox {
                     .ok()
                     .and_then(|p| p.to_str().map(|s| s.to_string()));
 
-                create_namespaces()?;
-                setup_uid_gid_mapping()?;
+                let (original_uid, original_gid) = create_namespaces()?;
+                setup_uid_gid_mapping(original_uid, original_gid)?;
                 let new_root = create_isolated_root()?;
                 bind_dependencies(&config, &new_root)?;
                 bind_essential_directories(&new_root)?;

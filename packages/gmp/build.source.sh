@@ -1,7 +1,7 @@
 #!/bin/sh
 set -ex
 
-tar xf gmp-6.3.0.tar.xz
+tar xfo gmp-6.3.0.tar.xz
 cd gmp-6.3.0
 
 sed -i '/long long t1;/,+1s/()/(...)/' configure

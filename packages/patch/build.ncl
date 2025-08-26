@@ -25,7 +25,7 @@ let zstd = import "../zstd/build.ncl" in
         {file = "build.sh"} | Local,
         {
             url = "gs://minimal-staging-archives/patch-2.8.tar.xz",
-            sha256 = "intentionally_bad_value"
+            sha256 = "f87cee69eec2b4fcbf60a396b030ad6aa3415f192aa5f7ee84cad5e11f7f5ae3"
         } | Source,
         bash,
         coreutils,

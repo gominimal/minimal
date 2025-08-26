@@ -1,14 +1,14 @@
 use build_sandbox::{BuildConfig, config::BuildScript, run_build};
 use cache::{Cache, LocalDir};
 use graph::dep_graph::SourceFetch;
-use graph::{BuildOutput, BuildSpecRef, DepGraph, ExecPlan, SpecHash};
+use graph::{BuildOutput, BuildSpecInput, BuildSpecRef, DepGraph, ExecPlan, SpecHash};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::debug;
 use url::Url;
 
-use crate::remote_storage::RemoteStorage;
+use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage};
 
 /// A run executes builds.
 pub struct Run {
@@ -17,6 +17,7 @@ pub struct Run {
     is_source_build: bool,
     package_name: String,
     remote_storage: RemoteStorage,
+    lockfile: PrebuiltsLock,
 }
 
 impl Run {
@@ -26,6 +27,7 @@ impl Run {
         is_source_build: bool,
         package_name: String,
         remote_storage: RemoteStorage,
+        lockfile: PrebuiltsLock,
     ) -> Self {
         Self {
             graph,
@@ -33,6 +35,7 @@ impl Run {
             is_source_build,
             package_name,
             remote_storage,
+            lockfile,
         }
     }
 
@@ -42,6 +45,8 @@ impl Run {
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Execute builds in dependency order - each build runs in isolation
         // and can only access outputs from previously completed builds
+        let mut lockfile_updates = Vec::new(); // Track what needs lockfile updates
+
         for phase in ExecPlan::new(&self.graph) {
             for bsr in phase.iter() {
                 let build = self.graph.get(bsr).unwrap();
@@ -152,63 +157,164 @@ impl Run {
                                 }
                             }
                         }
+                        Prebuilt(package_name) => {
+                            debug!("  Input {}: Prebuilt({})", i, package_name);
+
+                            // First check if we have a locked hash for this package
+                            let package_hash = if let Some(locked_hash) =
+                                self.lockfile.get_hash(package_name)
+                            {
+                                debug!("  Using locked hash for {}: {}", package_name, locked_hash);
+                                blake3::Hash::from_hex(locked_hash).map_err(|e| {
+                                    format!(
+                                        "Invalid hex hash in lockfile for {}: {}",
+                                        package_name, e
+                                    )
+                                })?
+                            } else {
+                                debug!(
+                                    "  No locked hash found, computing from source spec for {}",
+                                    package_name
+                                );
+                                // Fall back to computing the hash (may fail with circular dependency)
+                                self.compute_package_hash(package_name)?
+                            };
+
+                            let bucket_id = "minimal-staging-archives";
+                            let file_path = format!(
+                                "prebuilts/{}/{}.tar.zst",
+                                package_name,
+                                package_hash.to_hex()
+                            );
+
+                            let temp_base = std::env::temp_dir()
+                                .join(format!("minpkgs-prebuilt-{}", build.name.replace('/', "-")));
+                            std::fs::create_dir_all(&temp_base)?;
+
+                            let temp_archive_path =
+                                temp_base.join(format!("{}.tar.zst", package_name));
+
+                            // Download the prebuilt archive
+                            let content = self
+                                .remote_storage
+                                .download(bucket_id.to_string(), &file_path)
+                                .await
+                                .map_err(|e| {
+                                    format!(
+                                        "Failed to download prebuilt archive for {}: {}",
+                                        package_name, e
+                                    )
+                                })?;
+
+                            std::fs::write(&temp_archive_path, content)?;
+
+                            // Extract the archive
+                            let extract_dir = temp_base.join("extracted");
+                            std::fs::create_dir_all(&extract_dir)?;
+
+                            self.extract_prebuilt_archive(&temp_archive_path, &extract_dir)?;
+
+                            debug!(
+                                "  Downloaded and extracted prebuilt archive for {} to {}",
+                                package_name,
+                                extract_dir.display()
+                            );
+                            inputs.push(extract_dir);
+                        }
                     }
                 }
-
-                let toolchain_path = PathBuf::from("/home/bweeks/x-tools/x86_64-minimal-linux-gnu")
-                    .canonicalize()
-                    .unwrap();
-                dependencies.insert(toolchain_path.clone(), toolchain_path);
-
-                let scripts_path = PathBuf::from("scripts").canonicalize().unwrap();
-                dependencies.insert(scripts_path.clone(), scripts_path);
 
                 debug!(
                     "Dependencies for isolated build {}: {:?}",
                     build.name, dependencies
                 );
 
-                let cmd_parts: Vec<String> =
-                    shlex::split(&build.cmd).unwrap_or_else(|| vec![build.cmd.clone()]);
-                let (executable, args) = if !cmd_parts.is_empty() {
-                    let exe = cmd_parts[0].clone();
-                    let args = cmd_parts[1..].to_vec();
-                    (exe, args)
+                // Check if this is a pure prebuilt package (only has Prebuilt inputs + system dependencies)
+                let has_prebuilt = build
+                    .inputs
+                    .iter()
+                    .any(|input| matches!(input, BuildSpecInput::Prebuilt(_)));
+                let has_local_or_source = build.inputs.iter().any(|input| {
+                    matches!(input, BuildSpecInput::Local(_) | BuildSpecInput::Source(_))
+                });
+
+                if has_prebuilt && !has_local_or_source {
+                    // Pure prebuilt package - just copy the prebuilt files directly
+                    println!(
+                        "Pure prebuilt package: {}, copying files directly",
+                        build.name
+                    );
+
+                    let cache_handle = self.cache.write_dir(bsh).unwrap();
+                    let output_dir = cache_handle.path();
+
+                    // Find the prebuilt input and copy its contents
+                    for input in inputs.iter() {
+                        // Copy all contents from the prebuilt extraction directory
+                        for entry in std::fs::read_dir(input)? {
+                            let entry = entry?;
+                            let src = entry.path();
+                            let filename = src.file_name().unwrap();
+                            let dst = output_dir.join(filename);
+
+                            if src.is_dir() {
+                                copy_dir_recursive(&src, &dst)?;
+                            } else {
+                                std::fs::copy(&src, &dst)?;
+                            }
+                        }
+                    }
                 } else {
-                    (build.cmd.clone(), vec![])
-                };
+                    // Regular build with build script
+                    let cmd_parts: Vec<String> =
+                        shlex::split(&build.cmd).unwrap_or_else(|| vec![build.cmd.clone()]);
+                    let (executable, args) = if !cmd_parts.is_empty() {
+                        let exe = cmd_parts[0].clone();
+                        let args = cmd_parts[1..].to_vec();
+                        (exe, args)
+                    } else {
+                        (build.cmd.clone(), vec![])
+                    };
 
-                let config = BuildConfig {
-                    dependencies,
-                    inputs,
-                    build_script: BuildScript {
-                        executable: executable.into(),
-                        args,
-                    },
-                    outputs: build
-                        .outputs
-                        .values()
-                        .map(|output| match output {
-                            BuildOutput::Library { glob } => glob.clone(),
-                            BuildOutput::Binary { .. } => todo!(),
-                        })
-                        .collect(),
-                    debug_shell: matches!(debug, Some(debug_bsr) if bsr == &debug_bsr),
-                };
+                    let config = BuildConfig {
+                        dependencies,
+                        inputs,
+                        build_script: BuildScript {
+                            executable: executable.into(),
+                            args,
+                        },
+                        outputs: build
+                            .outputs
+                            .values()
+                            .map(|output| match output {
+                                BuildOutput::Library { glob } => glob.clone(),
+                                BuildOutput::Binary { .. } => todo!(),
+                            })
+                            .collect(),
+                        debug_shell: matches!(debug, Some(debug_bsr) if bsr == &debug_bsr),
+                    };
 
-                run_build(&config, self.cache.write_dir(bsh).unwrap().path(), true).inspect_err(
-                    |_| {
-                        self.cache.invalidate_dir(bsh).unwrap();
-                    },
-                )?;
+                    run_build(&config, self.cache.write_dir(bsh).unwrap().path(), true)
+                        .inspect_err(|_| {
+                            self.cache.invalidate_dir(bsh).unwrap();
+                        })?;
+                }
 
                 println!("Completed isolated build: {}", build.name);
 
                 // If this is a source build of the requested package, copy outputs to prebuilt
                 if self.is_source_build && build.name == self.package_name {
                     self.update_prebuilt_binaries(bsh)?;
+                    // Store info for later upload (to avoid borrow checker issues)
+                    lockfile_updates.push((build.name.clone(), bsh));
                 }
             }
+        }
+
+        // Handle uploads and lockfile updates after the main build loop
+        for (package_name, bsh) in lockfile_updates {
+            println!("Processing upload for {}", package_name);
+            self.upload_prebuilt_archive(bsh).await?;
         }
 
         Ok(())
@@ -269,6 +375,142 @@ impl Run {
         );
         Ok(())
     }
+
+    async fn upload_prebuilt_archive(
+        &mut self,
+        _bsh: blake3::Hash,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        println!("Auto-uploading prebuilt archive for {}", self.package_name);
+
+        // Compute the package hash for the upload path
+        let package_hash = self.compute_package_hash(&self.package_name)?;
+
+        // Create the archive from the prebuilt directory
+        let prebuilt_dir = PathBuf::from("packages")
+            .join(&self.package_name)
+            .join("prebuilt");
+
+        if !prebuilt_dir.exists() {
+            return Err(format!("Prebuilt directory not found: {}", prebuilt_dir.display()).into());
+        }
+
+        // Create temporary archive file
+        let temp_dir = std::env::temp_dir();
+        let archive_name = format!("{}.tar.zst", package_hash.to_hex());
+        let temp_archive_path = temp_dir.join(&archive_name);
+
+        // Create the tar.zst archive
+        create_prebuilt_archive(&prebuilt_dir, &temp_archive_path)?;
+
+        // Upload to GCS
+        let bucket_id = "minimal-staging-archives";
+        let gcs_path = format!("prebuilts/{}/{}", self.package_name, archive_name);
+
+        let archive_data = std::fs::read(&temp_archive_path)?;
+        self.remote_storage
+            .upload(bucket_id.to_string(), &gcs_path, &archive_data)
+            .await?;
+
+        // Clean up temp file
+        std::fs::remove_file(&temp_archive_path)?;
+
+        println!(
+            "Automatically uploaded prebuilt to gs://{}/{}",
+            bucket_id, gcs_path
+        );
+
+        // Update lockfile with the new hash
+        self.lockfile
+            .update_hash(self.package_name.clone(), package_hash.to_hex().to_string());
+        let lockfile_path = std::path::Path::new("prebuilts.lock");
+        self.lockfile.save(lockfile_path)?;
+        println!(
+            "Updated prebuilts.lock with new hash for {}",
+            self.package_name
+        );
+
+        Ok(())
+    }
+
+    fn compute_package_hash(
+        &self,
+        package_name: &str,
+    ) -> Result<blake3::Hash, Box<dyn std::error::Error>> {
+        // For prebuilt packages, we need to compute the hash based on the SOURCE build spec,
+        // not the current build spec (which would cause circular reference).
+
+        // Load the source build spec for this package
+        use graph::{SpecReader, SpecReaderOptions};
+        use std::path::Path;
+
+        let package_dir = Path::new("packages").join(package_name);
+        let source_spec_path = package_dir.join("build.source.ncl");
+
+        if !source_spec_path.exists() {
+            return Err(format!(
+                "Source build spec not found for package '{}': {}",
+                package_name,
+                source_spec_path.display()
+            )
+            .into());
+        }
+
+        let sr = SpecReader::new_with_path(
+            &source_spec_path,
+            &SpecReaderOptions {
+                minimal_lib_path: "crates/graph/minimal-ncl".into(),
+            },
+        )
+        .map_err(|e| format!("Failed to load source spec for {}: {:?}", package_name, e))?;
+
+        let source_graph = graph::DepGraph::new(sr).map_err(|e| {
+            format!(
+                "Failed to build source dependency graph for {}: {:?}",
+                package_name, e
+            )
+        })?;
+
+        // The top-level build spec should be for this package
+        let source_spec = source_graph
+            .get(&source_graph.top_level)
+            .ok_or_else(|| format!("Source spec not found for package '{}'", package_name))?;
+
+        if source_spec.name != package_name {
+            return Err(format!(
+                "Source spec name mismatch: expected '{}', got '{}'",
+                package_name, source_spec.name
+            )
+            .into());
+        }
+
+        Ok(source_spec.spec_hash(&source_graph))
+    }
+
+    fn extract_prebuilt_archive(
+        &self,
+        archive_path: &PathBuf,
+        extract_dir: &PathBuf,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let file = std::fs::File::open(archive_path)?;
+        let decoder = zstd::stream::Decoder::new(file)?;
+        let mut archive = tar::Archive::new(decoder);
+        archive.unpack(extract_dir)?;
+        Ok(())
+    }
+}
+
+fn create_prebuilt_archive(prebuilt_dir: &PathBuf, archive_path: &PathBuf) -> std::io::Result<()> {
+    let file = std::fs::File::create(archive_path)?;
+    let encoder = zstd::stream::Encoder::new(file, 3)?; // Compression level 3
+    let mut tar_builder = tar::Builder::new(encoder);
+
+    // Add all files from the prebuilt directory to the archive
+    tar_builder.append_dir_all(".", prebuilt_dir)?;
+
+    let encoder = tar_builder.into_inner()?;
+    encoder.finish()?;
+
+    Ok(())
 }
 
 fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {

@@ -1,13 +1,10 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
-let busybox_static = import "../busybox_static/build.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Prebuilt, ..} = import "minimal.ncl" in
 {
     name = "tar",
     inputs = [
-        {file = "build.sh"} | Local,
-        {file = "prebuilt/usr/bin/tar"} | Local,
-        busybox_static,
+        {package = "tar"} | Prebuilt,
     ],
-    cmd = "./build.sh",
+    cmd = "",
     outputs = {
         tar = { glob = "usr/bin/tar" } | OutputLib,
     },

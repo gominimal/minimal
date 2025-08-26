@@ -20,7 +20,7 @@ let zstd = import "../zstd/build.ncl" in
         {file = "build.sh"} | Local,
         {
             url = "gs://minimal-staging-archives/lz4-1.10.0.tar.gz",
-            sha256 = "intentionally_bad_value"
+            sha256 = "537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b"
         } | Source,
         bash,
         coreutils,

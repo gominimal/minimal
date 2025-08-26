@@ -1,7 +1,7 @@
 #!/bin/sh
 set -ex
 
-tar xf mpc-1.3.1.tar.gz
+tar xfo mpc-1.3.1.tar.gz
 cd mpc-1.3.1
 
 ./configure --prefix=/usr     \

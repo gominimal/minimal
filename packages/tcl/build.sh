@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-tar -xf tcl8.6.16-src.tar.gz
+tar xfo tcl8.6.16-src.tar.gz
 cd tcl8.6.16
 
 SRCDIR=$(pwd)

@@ -1,5 +1,4 @@
 #!/bin/sh
-
 set -e
 
 tar xf make-4.4.1.tar.gz

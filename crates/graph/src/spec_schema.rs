@@ -12,6 +12,7 @@ pub enum ObjTy {
     OutputBin,
     Source,
     Local,
+    Prebuilt,
 }
 
 /// A structure with just the type hint field.
@@ -56,6 +57,14 @@ pub struct ObjSource {
 pub struct ObjLocal {
     pub ty: ObjTy,
     pub file: String,
+}
+
+/// The Prebuilt object.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ObjPrebuilt {
+    pub ty: ObjTy,
+    pub package: String,
 }
 
 /// A library output.

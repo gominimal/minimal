@@ -1,7 +1,7 @@
 #!/bin/sh
 set -ex
 
-tar xf zlib-1.3.1.tar.gz
+tar xfo zlib-1.3.1.tar.gz
 cd zlib-1.3.1
 
 ./configure --prefix=/usr

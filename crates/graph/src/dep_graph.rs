@@ -47,6 +47,7 @@ pub enum BuildSpecInput {
     Source(SourceInput),
     HostPath(PathBuf),
     Local((PathBuf, blake3::Hash)),
+    Prebuilt(String), // Package name
 }
 
 impl crate::SpecHash for BuildSpecInput {
@@ -80,6 +81,10 @@ impl crate::SpecHash for BuildSpecInput {
                 h.write_all(p.0.as_path().to_string_lossy().as_bytes())
                     .unwrap();
                 h.write_all(p.1.as_bytes()).unwrap();
+            }
+            Prebuilt(package) => {
+                h.write_all(b"prebuilt").unwrap();
+                h.write_all(package.as_bytes()).unwrap();
             }
         }
 
@@ -213,7 +218,7 @@ impl DepGraph {
                     self.collect_transitive_buildspecs(bsr, seen, reachable);
                 }
             }
-            Source(_) | HostPath(_) | Local(_) => {}
+            Source(_) | HostPath(_) | Local(_) | Prebuilt(_) => {}
         })
     }
 }
@@ -387,6 +392,10 @@ impl GraphBuilder {
                     )
                 }));
                 Ok(BuildSpecInput::Local((full_path, file_hash)))
+            }
+            ObjTy::Prebuilt => {
+                let prebuilt = ObjPrebuilt::deserialize(rt.clone()).unwrap();
+                Ok(BuildSpecInput::Prebuilt(prebuilt.package))
             }
             ObjTy::OutputLib | ObjTy::OutputBin => Err(Error::UnexpectedObject {
                 got: obj.ty,

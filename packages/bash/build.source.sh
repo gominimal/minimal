@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-tar xf bash-5.3.tar.gz
+tar xfo bash-5.3.tar.gz
 cd bash-5.3
 
 ./configure --prefix=/usr \
@@ -16,7 +16,7 @@ make -j$(nproc)
 
 make DESTDIR=$OUTPUT_DIR install
 
-# Create bin/sh symlink
 mkdir -p $OUTPUT_DIR/bin
-ln -sf ../usr/bin/bash $OUTPUT_DIR/bin/sh
-ln -sf ../usr/bin/bash $OUTPUT_DIR/usr/bin/sh
+ln -sf $OUTPUT_DIR/usr/bin/bash $OUTPUT_DIR/bin/bash
+ln -sf $OUTPUT_DIR/usr/bin/bash $OUTPUT_DIR/bin/sh
+ln -sf $OUTPUT_DIR/usr/bin/bash $OUTPUT_DIR/usr/bin/sh

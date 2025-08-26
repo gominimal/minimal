@@ -1,15 +1,11 @@
-#!/bin/sh
+#!/usr/bin/bash
 set -e
 
-tar -xf gcc-15.2.0.tar.xz
+tar xfo gcc-15.2.0.tar.xz
 cd gcc-15.2.0
 
-# tar -xf ../mpfr-4.2.2.tar.xz
-# mv -v mpfr-4.2.2 mpfr
-# tar -xf ../gmp-6.3.0.tar.xz
-# mv -v gmp-6.3.0 gmp
-# tar -xf ../mpc-1.3.1.tar.gz
-# mv -v mpc-1.3.1 mpc
+# tar xfo gcc-14.3.0.tar.xz
+# cd gcc-14.3.0
 
 case $(uname -m) in
   x86_64)
@@ -24,35 +20,19 @@ cd build
 ../configure \
              --prefix=/usr             \
              --enable-languages=c,c++ \
-             --enable-default-pie     \
-             --enable-default-ssp     \
-             --enable-host-pie        \
              --disable-multilib       \
-             --disable-bootstrap      \
              --disable-fixincludes     \
              --disable-lto            \
-             --disable-nls
-             
-
-# CXXFLAGS="-std=gnu++14" 
-#              --with-system-zlib       \
-
-# ../configure                   \
-#     --prefix=/usr              \
-#     --disable-nls              \
-#     --disable-multilib         \
-#     --disable-libatomic        \
-#     --disable-libgomp          \
-#     --disable-libquadmath      \
-#     --disable-libsanitizer     \
-#     --disable-libssp           \
-#     --disable-libvtv           \
-#     --enable-languages=c,c++   \
-#     --disable-bootstrap
+             --disable-nls            \
+             --disable-bootstrap      \
 
 # TODO
-# --enable-bootstrap
+# --with-system-zlib 
+# --enable-default-pie
+# --enable-default-ssp
+# --enable-lto
+# --enable-nls
 
-make -j7
+make -j$(nproc)
 
 make DESTDIR=$OUTPUT_DIR install

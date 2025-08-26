@@ -23,7 +23,7 @@ let zstd = import "../zstd/build.ncl" in
         {file = "build.sh"} | Local,
         {
             url = "gs://minimal-staging-archives/flex-2.6.4.tar.gz",
-            sha256 = "intentionally_bad_value"
+            sha256 = "e87aae032bf07c26f85ac0ed3250998c37621d95f8bd748b31f15b33c45ee995"
         } | Source,
         binutils,
         bash,

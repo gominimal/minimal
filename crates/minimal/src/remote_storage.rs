@@ -8,6 +8,7 @@ pub struct RemoteStorage {
 
 impl RemoteStorage {
     pub async fn new() -> Result<Self> {
+        // Use Application Default Credentials with proper scopes
         let client = Storage::builder().build().await?;
         Ok(Self { client })
     }
@@ -24,5 +25,24 @@ impl RemoteStorage {
             contents.extend_from_slice(&chunk);
         }
         Ok(Bytes::from(contents))
+    }
+
+    pub async fn upload(&self, bucket_id: String, file_path: &str, data: &[u8]) -> Result<()> {
+        eprintln!("Uploading {} to bucket {}", file_path, bucket_id);
+        
+        // Upload object using the correct GCS API
+        let bytes_data = bytes::Bytes::copy_from_slice(data);
+        let _response = self.client
+            .upload_object(
+                format!("projects/_/buckets/{bucket_id}"), 
+                file_path, 
+                bytes_data
+            )
+            .send_buffered()
+            .await?;
+        
+        println!("Successfully uploaded {} bytes to gs://{}/{}", data.len(), bucket_id, file_path);
+        
+        Ok(())
     }
 }
