@@ -1,0 +1,28 @@
+use anyhow::Result;
+use bytes::Bytes;
+use google_cloud_storage::client::Storage;
+
+pub struct RemoteStorage {
+    client: Storage,
+}
+
+impl RemoteStorage {
+    pub async fn new() -> Result<Self> {
+        let client = Storage::builder().build().await?;
+        Ok(Self { client })
+    }
+
+    pub async fn download(&self, bucket_id: String, file: &str) -> Result<Bytes> {
+        eprintln!("Fetching {} from bucket {}", file, bucket_id);
+        let mut reader = self
+            .client
+            .read_object(format!("projects/_/buckets/{bucket_id}"), file)
+            .send()
+            .await?;
+        let mut contents = Vec::new();
+        while let Some(chunk) = reader.next().await.transpose()? {
+            contents.extend_from_slice(&chunk);
+        }
+        Ok(Bytes::from(contents))
+    }
+}

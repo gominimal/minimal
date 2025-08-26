@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 let bash = import "../bash/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
 let make = import "../make/build.ncl" in
@@ -19,7 +19,10 @@ let zstd = import "../zstd/build.ncl" in
     name = "pkgconf",
     inputs = [
         {file = "build.sh"} | Local,
-        {file = "pkgconf-2.5.1.tar.xz"} | Local,
+        {
+            url = "gs://minimal-staging-archives/pkgconf-2.5.1.tar.xz",
+            sha256 = "intentionally_bad_value"
+        } | Source,
         bash,
         coreutils,
         make,

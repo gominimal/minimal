@@ -35,8 +35,8 @@ pub enum SourceFetch {
 /// A description of source code thats used as an input.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceInput {
-    from: SourceFetch,
-    sha256: String,
+    pub from: SourceFetch,
+    pub sha256: String,
 }
 
 /// An input to a build spec.

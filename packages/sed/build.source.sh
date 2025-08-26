@@ -7,7 +7,7 @@ cd sed-4.9
 
 ./configure --prefix="/usr"
 
-make -j8
+make -j$(nproc)
 
 make DESTDIR=$OUTPUT_DIR install
 

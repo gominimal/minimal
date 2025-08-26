@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 let bash = import "../bash/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
 let make = import "../make/build.ncl" in
@@ -20,7 +20,10 @@ let zstd = import "../zstd/build.ncl" in
     name = "readline",
     inputs = [
         {file = "build.sh"} | Local,
-        {file = "readline-8.3.tar.gz"} | Local,
+        {
+            url = "gs://minimal-staging-archives/readline-8.3.tar.gz",
+            sha256 = "intentionally_bad_value"
+        } | Source,
         bash,
         coreutils,
         make,

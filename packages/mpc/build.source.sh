@@ -8,6 +8,6 @@ cd mpc-1.3.1
             --disable-static  \
             --docdir=/usr/share/doc/mpc-1.3.1
 
-make -j8
+make -j$(nproc)
 
 make DESTDIR=$OUTPUT_DIR install

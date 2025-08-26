@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 let bash = import "../bash/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
 let make = import "../make/build.ncl" in
@@ -17,7 +17,10 @@ let pkgconf = import "../pkgconf/build.ncl" in
     name = "python",
     inputs = [
         {file = "build.source.sh"} | Local,
-        {file = "Python-3.13.7.tar.xz"} | Local,
+        {
+            url = "gs://minimal-staging-archives/Python-3.13.7.tar.xz",
+            sha256 = "intentionally_bad_value"
+        } | Source,
         bash,
         coreutils,
         make,

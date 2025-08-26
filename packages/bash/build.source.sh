@@ -12,7 +12,7 @@ cd bash-5.3
 # TODO
 # --with-installed-readline 
 
-make -j8
+make -j$(nproc)
 
 make DESTDIR=$OUTPUT_DIR install
 

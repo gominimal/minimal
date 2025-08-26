@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 let binutils = import "../binutils/build.ncl" in
 let bash = import "../bash/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
@@ -16,7 +16,10 @@ let xz = import "../xz/build.ncl" in
     name = "mpfr",
     inputs = [
         {file = "build.source.sh"} | Local,
-        {file = "mpfr-4.2.2.tar.xz"} | Local,
+        {
+            url = "gs://minimal-staging-archives/mpfr-4.2.2.tar.xz",
+            sha256 = "b67ba0383ef7e8a8563734e2e889ef5ec3c3b898a01d00fa0a6869ad81c6ce01"
+        } | Source,
         binutils,
         bash,
         coreutils,

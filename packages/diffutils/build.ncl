@@ -1,51 +1,59 @@
 let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
-let binutils = import "../binutils/build.ncl" in
-let bash = import "../bash/build.ncl" in
-let coreutils = import "../coreutils/build.ncl" in
-let gawk = import "../gawk/build.ncl" in
-let gcc = import "../gcc/build.ncl" in
-let glibc = import "../glibc/build.ncl" in
-let grep = import "../grep/build.ncl" in
-let linux_headers = import "../linux_headers/build.ncl" in
-let make = import "../make/build.ncl" in
-let sed = import "../sed/build.ncl" in
-let tar = import "../tar/build.ncl" in
-let xz = import "../xz/build.ncl" in
-let mpc = import "../mpc/build.ncl" in
-let mpfr = import "../mpfr/build.ncl" in
-let gmp = import "../gmp/build.ncl" in
-let zstd = import "../zstd/build.ncl" in
+let busybox_static = import "../busybox_static/build.ncl" in
 {
     name = "diffutils",
     inputs = [
         {file = "build.sh"} | Local,
-        {file = "diffutils-3.12.tar.xz"} | Local,
-        binutils,
-        bash,
-        coreutils,
-        gawk,
-        gcc,
-        glibc,
-        grep,
-        linux_headers,
-        make,
-        sed,
-        tar,
-        xz,
-        mpc,
-        mpfr,
-        gmp,
-        zstd,
+        {file = "prebuilt/usr/bin/cmp"} | Local,
+        {file = "prebuilt/usr/bin/diff"} | Local,
+        {file = "prebuilt/usr/bin/diff3"} | Local,
+        {file = "prebuilt/usr/bin/sdiff"} | Local,
+        {file = "prebuilt/usr/share/info/diffutils.info"} | Local,
+        {file = "prebuilt/usr/share/locale/bg/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/ca/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/cs/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/da/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/de/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/el/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/eo/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/es/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/fi/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/fr/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/ga/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/gl/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/he/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/hr/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/hu/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/id/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/it/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/ja/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/ka/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/ko/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/lv/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/ms/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/nb/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/nl/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/pl/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/pt_BR/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/pt/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/ro/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/ru/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/sr/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/sv/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/tr/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/uk/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/vi/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/zh_CN/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/zh_TW/LC_MESSAGES/diffutils.mo"} | Local,
+        {file = "prebuilt/usr/share/man/man1/cmp.1"} | Local,
+        {file = "prebuilt/usr/share/man/man1/diff.1"} | Local,
+        {file = "prebuilt/usr/share/man/man1/diff3.1"} | Local,
+        {file = "prebuilt/usr/share/man/man1/sdiff.1"} | Local,
+        busybox_static,
     ],
     cmd = "./build.sh",
     outputs = {
-        cmp = { glob = "usr/bin/cmp" } | OutputLib,
-        diff = { glob = "usr/bin/diff" } | OutputLib,
-        diff3 = { glob = "usr/bin/diff3" } | OutputLib,
-        sdiff = { glob = "usr/bin/sdiff" } | OutputLib,
-
-        info = { glob = "usr/share/info/*.info*" } | OutputLib,
-        man = { glob = "usr/share/man/man1/*.1" } | OutputLib,
-        locales = { glob = "usr/share/locale/**/*" } | OutputLib,
+        usr_bin = { glob = "usr/bin/**/*" } | OutputLib,
+        usr_share = { glob = "usr/share/**/*" } | OutputLib,
     },
 } | BuildSpec

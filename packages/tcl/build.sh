@@ -29,5 +29,6 @@ sed -e "s|$SRCDIR/unix/pkgs/itcl4.3.2|/usr/lib/itcl4.3.2|" \
 
 unset SRCDIR
 
+make -j$(nproc)
 make DESTDIR=$OUTPUT_DIR install
 make DESTDIR=$OUTPUT_DIR install-private-headers

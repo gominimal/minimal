@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 let bash = import "../bash/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
 let make = import "../make/build.ncl" in
@@ -19,7 +19,10 @@ let gawk = import "../gawk/build.ncl" in
     name = "libffi",
     inputs = [
         {file = "build.sh"} | Local,
-        {file = "libffi-3.5.2.tar.gz"} | Local,
+        {
+            url = "gs://minimal-staging-archives/libffi-3.5.2.tar.gz",
+            sha256 = "intentionally_bad_value"
+        } | Source,
         bash,
         coreutils,
         make,

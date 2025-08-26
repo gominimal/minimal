@@ -17,5 +17,5 @@ cd ncurses-6.5
             --with-pkg-config-libdir=/usr/lib/pkgconfig \
             --disable-stripping
 
-make -j8
+make -j$(nproc)
 make DESTDIR="$OUTPUT_DIR" install

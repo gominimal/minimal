@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 let bash = import "../bash/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
 let binutils = import "../binutils/build.ncl" in
@@ -9,12 +9,12 @@ let glibc = import "../glibc/build.ncl" in
 let grep = import "../grep/build.ncl" in 
 let linux_headers = import "../linux_headers/build.ncl" in
 let make = import "../make/build.ncl" in 
-let ncurses = import "../ncurses/build.ncl" in # TODO needed by readline
-let readline = import "../readline/build.ncl" in
+# let ncurses = import "../ncurses/build.ncl" in # TODO needed by readline
+# let readline = import "../readline/build.ncl" in
 let sed = import "../sed/build.ncl" in 
 let tar = import "../tar/build.ncl" in 
 let xz = import "../xz/build.ncl" in 
-let zlib = import "../zlib/build.ncl" in
+# let zlib = import "../zlib/build.ncl" in
 let mpc = import "../mpc/build.ncl" in
 let mpfr = import "../mpfr/build.ncl" in
 let gmp = import "../gmp/build.ncl" in
@@ -22,7 +22,10 @@ let zstd = import "../zstd/build.ncl" in
 {
     name = "bc",
     inputs = [
-        {file = "bc-7.0.3.tar.xz"} | Local,
+        {
+            url = "gs://minimal-staging-archives/bc-7.0.3.tar.xz",
+            sha256 = "91eb74caed0ee6655b669711a4f350c25579778694df248e28363318e03c7fc4"
+        } | Source,
         {file = "build.sh"} | Local,
         bash,
         coreutils,
@@ -34,12 +37,12 @@ let zstd = import "../zstd/build.ncl" in
         grep,
         linux_headers,
         make,
-        ncurses,
-        readline,
+        # ncurses,
+        # readline,
         sed,
         tar,
         xz,
-        zlib,
+        # zlib,
         mpc,
         mpfr,
         gmp,

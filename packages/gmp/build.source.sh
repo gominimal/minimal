@@ -10,6 +10,6 @@ sed -i '/long long t1;/,+1s/()/(...)/' configure
             --enable-cxx     \
             --disable-static \
             --docdir=/usr/share/doc/gmp-6.3.0
-make -j8
+make -j$(nproc)
 
 make DESTDIR=$OUTPUT_DIR install

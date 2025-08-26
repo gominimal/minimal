@@ -15,6 +15,6 @@ cd Python-3.13.7
 
 echo -e "*disabled*\n_curses\n_curses_panel" >> Modules/Setup.local
 
-make -j8
+make -j$(nproc)
 
 make DESTDIR=$OUTPUT_DIR install

@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 let bash = import "../bash/build.ncl" in
 let binutils = import "../binutils/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
@@ -20,7 +20,10 @@ let zstd = import "../zstd/build.ncl" in
 {
     name = "bison",
     inputs = [  
-        {file = "bison-3.8.2.tar.xz"} | Local,
+        {
+            url = "gs://minimal-staging-archives/bison-3.8.2.tar.xz",
+            sha256 = "intentionally_bad_value"
+        } | Source,
         {file = "build.sh"} | Local,
         bash,
         binutils,

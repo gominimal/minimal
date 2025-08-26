@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 let bash = import "../bash/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
 let diffutils = import "../diffutils/build.ncl" in
@@ -18,7 +18,10 @@ let zstd = import "../zstd/build.ncl" in
     name = "bzip2",
     inputs = [
         {file = "build.sh"} | Local,
-        {file = "bzip2-1.0.8.tar.gz"} | Local,
+        {
+            url = "gs://minimal-staging-archives/bzip2-1.0.8.tar.gz",
+            sha256 = "ab5a03176ee106d3f0fa90e381da478ddae405918153cca248e682cd0c4a2269"
+        } | Source,
         bash,
         coreutils,
         diffutils,

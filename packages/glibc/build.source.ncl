@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 let binutils = import "../binutils/build.ncl" in
 let bison = import "../bison/build.ncl" in
 let bash = import "../bash/build.ncl" in
@@ -19,7 +19,10 @@ let xz = import "../xz/build.ncl" in
     name = "glibc",
     inputs = [
         {file = "build.source.sh"} | Local,
-        {file = "glibc-2.42.tar.xz"} | Local,
+        {
+            url = "gs://minimal-staging-archives/glibc-2.42.tar.xz",
+            sha256 = "intentionally_bad_value"
+        } | Source,
         binutils,
         bison,
         bash,

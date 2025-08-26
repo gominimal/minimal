@@ -22,7 +22,7 @@ cd build
 # --enable-shared
 # --enable-64-bit-bfd
 
-make -j8 tooldir=/usr
+make -j$(nproc) tooldir=/usr
 
 make -k check
 

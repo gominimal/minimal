@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 let bash = import "../bash/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
 let make = import "../make/build.ncl" in
@@ -10,12 +10,19 @@ let glibc = import "../glibc/build.ncl" in
 let gcc = import "../gcc/build.ncl" in
 let binutils = import "../binutils/build.ncl" in
 let linux_headers = import "../linux_headers/build.ncl" in
+let mpc = import "../mpc/build.ncl" in
+let mpfr = import "../mpfr/build.ncl" in
+let gmp = import "../gmp/build.ncl" in
+let zstd = import "../zstd/build.ncl" in
+let gawk = import "../gawk/build.ncl" in
 {
     name = "xz",
     inputs = [
         {file = "build.source.sh"} | Local,
-        # {file = "xz-5.8.1.tar.xz"} | Local,
-        {file = "xz-5.8.1.tar"} | Local,
+        {
+            url = "gs://minimal-staging-archives/xz-5.8.1.tar.xz", 
+            sha256 = "0b54f79df85912504de0b14aec7971e3f964491af1812d83447005807513cd9e"
+        } | Source,
         bash,
         coreutils,
         make,
@@ -27,6 +34,11 @@ let linux_headers = import "../linux_headers/build.ncl" in
         gcc,
         binutils,
         linux_headers,
+        mpc,
+        mpfr,
+        gmp,
+        zstd,
+        gawk,
     ],
     cmd = "./build.source.sh",
     outputs = {

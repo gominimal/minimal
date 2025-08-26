@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 let autoconf = import "../autoconf/build.ncl" in
 let binutils = import "../binutils/build.ncl" in
 let bash = import "../bash/build.ncl" in
@@ -17,7 +17,10 @@ let xz = import "../xz/build.ncl" in
 {
     name = "automake",
     inputs = [
-        {file = "automake-1.17.tar.xz"} | Local,
+        {
+            url = "gs://minimal-staging-archives/automake-1.17.tar.xz",
+            sha256 = "intentionally_bad_value"
+        } | Source,
         {file = "build.sh"} | Local,
         autoconf,
         binutils,

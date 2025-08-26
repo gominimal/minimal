@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 # let acl = import "../acl/build.ncl" in # dangerous unless acl is a prebuilt
 # let attr = import "../attr/build.ncl" in # TODO required for attr
 let binutils = import "../binutils/build.ncl" in
@@ -15,7 +15,10 @@ let sed = import "build.ncl" in
     name = "sed",
     inputs = [
         {file = "build.source.sh"} | Local,
-        {file = "sed-4.9.tar.xz"} | Local,
+        {
+            url = "gs://minimal-staging-archives/sed-4.9.tar.xz",
+            sha256 = "6e226b732e1cd739464ad6862bd1a1aba42d7982922da7a53519631d24975181"
+        } | Source,
         # acl,
         # attr,
         binutils,

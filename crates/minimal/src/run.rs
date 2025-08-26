@@ -1,9 +1,14 @@
 use build_sandbox::{BuildConfig, config::BuildScript, run_build};
 use cache::{Cache, LocalDir};
+use graph::dep_graph::SourceFetch;
 use graph::{BuildOutput, BuildSpecRef, DepGraph, ExecPlan, SpecHash};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::debug;
+use url::Url;
+
+use crate::remote_storage::RemoteStorage;
 
 /// A run executes builds.
 pub struct Run {
@@ -11,6 +16,7 @@ pub struct Run {
     cache: Cache<LocalDir>,
     is_source_build: bool,
     package_name: String,
+    remote_storage: RemoteStorage,
 }
 
 impl Run {
@@ -19,16 +25,18 @@ impl Run {
         cache: Cache<LocalDir>,
         is_source_build: bool,
         package_name: String,
+        remote_storage: RemoteStorage,
     ) -> Self {
         Self {
             graph,
             cache,
             is_source_build,
             package_name,
+            remote_storage,
         }
     }
 
-    pub fn execute(
+    pub async fn execute(
         &mut self,
         debug: Option<BuildSpecRef>,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -82,7 +90,68 @@ impl Run {
                             debug!("  Input {}: Local file from {}", i, path.display());
                             inputs.push(path.to_path_buf());
                         }
-                        Source(_) => todo!(),
+                        Source(source) => {
+                            debug!("  Input {}: Source({:?})", i, source.from);
+
+                            match &source.from {
+                                SourceFetch::URL(url_str) => {
+                                    let url = Url::parse(url_str).map_err(|e| {
+                                        format!("Failed to parse URL '{}': {}", url_str, e)
+                                    })?;
+
+                                    match url.scheme() {
+                                        "gs" => {
+                                            let bucket_id = url.host_str().ok_or_else(|| {
+                                        format!(
+                                            "Invalid gs:// URL: missing bucket name in '{}'",
+                                            url_str
+                                        )
+                                    })?;
+
+                                            let file_name = url.path().trim_start_matches('/');
+
+                                            let temp_base = std::env::temp_dir().join(format!(
+                                                "minpkgs-sources-{}",
+                                                build.name.replace('/', "-")
+                                            ));
+                                            std::fs::create_dir_all(&temp_base)?;
+
+                                            let local_filename =
+                                                file_name.rsplit('/').next().unwrap_or(file_name);
+                                            let temp_path = temp_base.join(local_filename);
+
+                                            let content = self
+                                                .remote_storage
+                                                .download(bucket_id.to_string(), file_name)
+                                                .await?;
+
+                                            std::fs::write(&temp_path, content)?;
+
+                                            // Verify SHA256 hash
+                                            let mut hasher = Sha256::new();
+                                            hasher.update(&std::fs::read(&temp_path)?);
+                                            let computed_hash = hasher.finalize();
+                                            let computed_hex = hex::encode(computed_hash);
+
+                                            if computed_hex != source.sha256 {
+                                                return Err(format!(
+                                                    "SHA256 mismatch for {}: expected {}, got {}",
+                                                    url_str, source.sha256, computed_hex
+                                                )
+                                                .into());
+                                            }
+
+                                            debug!(
+                                                "  Downloaded and verified source from gs://{}/{}",
+                                                bucket_id, file_name
+                                            );
+                                            inputs.push(temp_path);
+                                        }
+                                        _ => todo!(),
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -127,10 +196,9 @@ impl Run {
                     debug_shell: matches!(debug, Some(debug_bsr) if bsr == &debug_bsr),
                 };
 
-                run_build(&config, self.cache.write_dir(bsh).unwrap().path(), true).map_err(
-                    |e| {
+                run_build(&config, self.cache.write_dir(bsh).unwrap().path(), true).inspect_err(
+                    |_| {
                         self.cache.invalidate_dir(bsh).unwrap();
-                        e
                     },
                 )?;
 
@@ -179,7 +247,7 @@ impl Run {
         }
 
         // Handle all outputs - copy entire directory structure
-        for entry in std::fs::read_dir(&cache_dir)? {
+        for entry in std::fs::read_dir(cache_dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {

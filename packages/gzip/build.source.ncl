@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 let bash = import "../bash/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
 let make = import "../make/build.ncl" in
@@ -12,7 +12,10 @@ let linux_headers = import "../linux_headers/build.ncl" in
     name = "gzip",
     inputs = [
         {file = "build.source.sh"} | Local,
-        {file = "gzip-1.14.tar.xz"} | Local,
+        {
+            url = "gs://minimal-staging-archives/gzip-1.14.tar.xz",
+            sha256 = "01a7b881bd220bfdf615f97b8718f80bdfd3f6add385b993dcf6efd14e8c0ac6"
+        } | Source,
         bash,
         coreutils,
         make,

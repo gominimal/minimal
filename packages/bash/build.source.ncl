@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 let bash = import "build.ncl" in
 let binutils = import "../binutils/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
@@ -16,7 +16,10 @@ let tar = import "../tar/build.ncl" in
     name = "bash",
     inputs = [
         {file = "build.source.sh"} | Local,
-        {file = "bash-5.3.tar.gz"} | Local,
+        {
+            url = "gs://minimal-staging-archives/bash-5.3.tar.gz",
+            sha256 = "4d62ff37342ec7aed748535323930c7cf94acf71c3591882b26a7ea50f3edc16"
+        } | Source,
         bash,
         binutils,
         coreutils,

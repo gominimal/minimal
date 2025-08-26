@@ -1,13 +1,44 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
-let busybox_static = import "../busybox_static/build.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
+let bash = import "../bash/build.ncl" in
 let make = import "../make/build.ncl" in
+let mpc = import "../mpc/build.ncl" in
+let mpfr = import "../mpfr/build.ncl" in
+let gmp = import "../gmp/build.ncl" in
+let zstd = import "../zstd/build.ncl" in
+let binutils = import "../binutils/build.ncl" in
+let coreutils = import "../coreutils/build.ncl" in
+let gcc = import "../gcc/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
+let linux_headers = import "../linux_headers/build.ncl" in
+let tar = import "../tar/build.ncl" in
+let xz = import "../xz/build.ncl" in
+let sed = import "../sed/build.ncl" in
+let grep = import "../grep/build.ncl" in
+let gawk = import "../gawk/build.ncl" in
 {
     name = "grep",
     inputs = [
         {file = "build.source.sh"} | Local,
-        {file = "grep-3.12.tar.xz"} | Local,
-        busybox_static,
+        {
+            url = "gs://minimal-staging-archives/grep-3.12.tar.xz",
+            sha256 = "2649b27c0e90e632eadcd757be06c6e9a4f48d941de51e7c0f83ff76408a07b9"
+        } | Source,
+        bash,
+        binutils,
+        coreutils,
+        gcc,
+        glibc,
+        linux_headers,
         make,
+        mpc,
+        mpfr,
+        gmp,
+        zstd,
+        tar,
+        xz,
+        sed,
+        grep,
+        gawk,
     ],
     cmd = "./build.source.sh",
     outputs = {

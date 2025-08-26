@@ -1,15 +1,14 @@
 #!/bin/sh
-
 set -e
 
-tar xf xz-5.8.1.tar
+tar xf xz-5.8.1.tar.xz
 cd xz-5.8.1
 
-./configure --prefix="$OUTPUT_DIR/usr" \
+./configure --prefix=/usr \
             --disable-static \
-            --docdir="$OUTPUT_DIR/share/doc/xz-5.8.1"
+            --docdir=/usr/share/doc/xz-5.8.1
 
-make
-make install
+make -j$(nproc)
+make DESTDIR="$OUTPUT_DIR" install
 
 echo "Xz build complete"

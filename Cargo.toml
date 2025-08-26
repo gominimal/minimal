@@ -32,6 +32,3 @@ serde = { version = "1.0", features = ["derive"] }
 build-sandbox = { path = "crates/build-sandbox" }
 graph = { version = "0.0.1", path = "crates/graph" }
 cache = { version = "0.0.1", path = "crates/cache" }
-
-[patch.crates-io]
-nickel-lang-core = { git = 'https://github.com/tweag/nickel.git', rev = "817dca3f6a477f2b6604caabcb05199c10d5c223" }

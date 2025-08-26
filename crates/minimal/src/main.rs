@@ -3,6 +3,7 @@ use graph::{DepGraph, SpecReader, SpecReaderOptions};
 use std::path::{Path, PathBuf};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
+mod remote_storage;
 mod run;
 
 mod cmd_build;
@@ -76,14 +77,15 @@ pub fn load_cache(
     }))
 }
 
-fn main() -> build_sandbox::Result<()> {
+#[tokio::main]
+async fn main() -> build_sandbox::Result<()> {
     tracing_subscriber::registry()
         .with(fmt::layer())
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")))
         .init();
 
     match Cli::parse() {
-        Cli::Build(args) => cmd_build(args),
+        Cli::Build(args) => cmd_build(args).await,
         Cli::Plan(args) => cmd_plan(args),
     }
 }

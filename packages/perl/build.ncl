@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 let binutils = import "../binutils/build.ncl" in
 let bash = import "../bash/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
@@ -21,7 +21,10 @@ let zstd = import "../zstd/build.ncl" in
     name = "perl",
     inputs = [
         {file = "build.sh"} | Local,
-        {file = "perl-5.42.0.tar.xz"} | Local,
+        {
+            url = "gs://minimal-staging-archives/perl-5.42.0.tar.xz",
+            sha256 = "intentionally_bad_value"
+        } | Source,
         binutils,
         bash,
         coreutils,

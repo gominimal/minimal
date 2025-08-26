@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 let binutils = import "../binutils/build.ncl" in 
 let bash = import "../bash/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
@@ -18,7 +18,10 @@ let zstd = import "../zstd/build.ncl" in
 {
     name = "findutils",
     inputs = [
-        {file = "findutils-4.10.0.tar.xz"} | Local,
+        {
+            url = "gs://minimal-staging-archives/findutils-4.10.0.tar.xz",
+            sha256 = "1387e0b67ff247d2abde998f90dfbf70c1491391a59ddfecb8ae698789f0a4f5"
+        } | Source,
         {file = "build.sh"} | Local,
         binutils,
         bash,

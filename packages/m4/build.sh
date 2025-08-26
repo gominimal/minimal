@@ -1,11 +1,4 @@
 #!/bin/sh
-set -e
+set -ex
 
-tar -xf m4-1.4.20.tar.xz
-cd m4-1.4.20
-
-./configure --prefix="/usr"
-
-make
-
-make DESTDIR=$OUTPUT_DIR install
+cp -R prebuilt/* $OUTPUT_DIR

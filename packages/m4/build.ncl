@@ -1,46 +1,45 @@
 let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
-let bash = import "../bash/build.ncl" in
-let binutils = import "../binutils/build.ncl" in
-let coreutils = import "../coreutils/build.ncl" in
-let gawk = import "../gawk/build.ncl" in
-let gcc = import "../gcc/build.ncl" in
-let glibc = import "../glibc/build.ncl" in
-let gmp = import "../gmp/build.ncl" in
-let grep = import "../grep/build.ncl" in
-let linux_headers = import "../linux_headers/build.ncl" in
-let make = import "../make/build.ncl" in
-let mpc = import "../mpc/build.ncl" in
-let mpfr = import "../mpfr/build.ncl" in
-let sed = import "../sed/build.ncl" in
-let tar = import "../tar/build.ncl" in
-let xz = import "../xz/build.ncl" in
-let zstd = import "../zstd/build.ncl" in
+let busybox_static = import "../busybox_static/build.ncl" in
 {
     name = "m4",
     inputs = [
         {file = "build.sh"} | Local,
-        {file = "m4-1.4.20.tar.xz"} | Local,
-        bash,
-        binutils,
-        coreutils,
-        gawk,
-        gcc,
-        glibc,
-        gmp,
-        grep,
-        linux_headers,
-        make,
-        mpc,
-        mpfr,
-        sed,
-        tar,
-        xz,
-        zstd,
+        {file = "prebuilt/usr/bin/m4"} | Local,
+        {file = "prebuilt/usr/share/info/m4.info"} | Local,
+        {file = "prebuilt/usr/share/info/m4.info-1"} | Local,
+        {file = "prebuilt/usr/share/info/m4.info-2"} | Local,
+        {file = "prebuilt/usr/share/locale/bg/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/cs/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/da/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/de/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/el/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/eo/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/es/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/fi/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/fr/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/ga/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/gl/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/hr/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/id/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/ja/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/ka/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/ko/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/nl/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/pl/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/pt_BR/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/ro/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/ru/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/sr/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/sv/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/uk/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/vi/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/zh_CN/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/locale/zh_TW/LC_MESSAGES/m4.mo"} | Local,
+        {file = "prebuilt/usr/share/man/man1/m4.1"} | Local,
+        busybox_static,
     ],
     cmd = "./build.sh",
     outputs = {
-        m4_bin = { glob = "usr/bin/m4" } | OutputLib,
-        m4_man = { glob = "usr/share/man/man1/m4.1" } | OutputLib,
-        m4_info = { glob = "usr/share/info/m4.info*" } | OutputLib,
+        usr = { glob = "usr/**/*" } | OutputLib,
     },
 } | BuildSpec

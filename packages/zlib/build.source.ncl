@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 let binutils = import "../binutils/build.ncl" in
 let bash = import "../bash/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
@@ -9,11 +9,18 @@ let linux_headers = import "../linux_headers/build.ncl" in
 let make = import "../make/build.ncl" in
 let sed = import "../sed/build.ncl" in
 let tar = import "../tar/build.ncl" in
+let mpc = import "../mpc/build.ncl" in
+let mpfr = import "../mpfr/build.ncl" in
+let gmp = import "../gmp/build.ncl" in
+let zstd = import "../zstd/build.ncl" in
 {
     name = "zlib",
     inputs = [
         {file = "build.source.sh"} | Local,
-        {file = "zlib-1.3.1.tar.gz"} | Local,
+        {
+            url = "gs://minimal-staging-archives/zlib-1.3.1.tar.gz", 
+            sha256 = "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
+        } | Source,
         binutils,
         bash,
         coreutils,
@@ -24,6 +31,10 @@ let tar = import "../tar/build.ncl" in
         make,
         sed,
         tar,
+        mpc,
+        mpfr,
+        gmp,
+        zstd,
     ],
     cmd = "./build.source.sh",
     outputs = {

@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 let bash = import "../bash/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
 let make = import "../make/build.ncl" in
@@ -16,7 +16,10 @@ let linux_headers = import "../linux_headers/build.ncl" in
     name = "coreutils",
     inputs = [
         {file = "build.source.sh"} | Local,
-        {file = "coreutils-9.7.tar.xz"} | Local,
+        {
+            url = "gs://minimal-staging-archives/coreutils-9.7.tar.xz",
+            sha256 = "intentionally_bad_value"
+        } | Source,
         acl,
         bash,
         coreutils,

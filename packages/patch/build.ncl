@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 # TODO depend on attr once runtime deps are functional
 # otherwise every usage of patch requires importing attr
 # let attr = import "../attr/build.ncl" in
@@ -23,7 +23,10 @@ let zstd = import "../zstd/build.ncl" in
     name = "patch",
     inputs = [
         {file = "build.sh"} | Local,
-        {file = "patch-2.8.tar.xz"} | Local,
+        {
+            url = "gs://minimal-staging-archives/patch-2.8.tar.xz",
+            sha256 = "intentionally_bad_value"
+        } | Source,
         bash,
         coreutils,
         gawk,

@@ -1,4 +1,4 @@
-use crate::run::Run;
+use crate::{remote_storage::RemoteStorage, run::Run};
 use build_sandbox::Result;
 use std::path::PathBuf;
 
@@ -21,14 +21,17 @@ pub struct BuildArgs {
     cache_dir: Option<PathBuf>,
 }
 
-pub fn cmd_build(args: BuildArgs) -> Result<()> {
+pub async fn cmd_build(args: BuildArgs) -> Result<()> {
     let dp = super::graph_from_package_name(&args.package, args.source);
 
     let debug_bsr = if args.debug { Some(dp.top_level) } else { None };
 
     let cache = super::load_cache(args.cache_dir).unwrap();
-    let mut run = Run::new(dp, cache, args.source, args.package.clone());
-    run.execute(debug_bsr).unwrap();
+    let remote_storage = RemoteStorage::new()
+        .await
+        .unwrap();
+    let mut run = Run::new(dp, cache, args.source, args.package.clone(), remote_storage);
+    run.execute(debug_bsr).await.unwrap();
 
     Ok(())
 }

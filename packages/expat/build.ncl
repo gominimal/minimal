@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 let bash = import "../bash/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
 let make = import "../make/build.ncl" in
@@ -19,7 +19,10 @@ let zstd = import "../zstd/build.ncl" in
     name = "expat",
     inputs = [
         {file = "build.sh"} | Local,
-        {file = "expat-2.7.1.tar.xz"} | Local,
+        {
+            url = "gs://minimal-staging-archives/expat-2.7.1.tar.xz",
+            sha256 = "intentionally_bad_value"
+        } | Source,
         bash,
         coreutils,
         make,

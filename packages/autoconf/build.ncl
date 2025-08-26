@@ -1,4 +1,4 @@
-let {BuildSpec, HostPath, OutputLib, Local, ..} = import "minimal.ncl" in
+let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 let bash = import "../bash/build.ncl" in
 let binutils = import "../binutils/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
@@ -20,7 +20,10 @@ let xz = import "../xz/build.ncl" in
     name = "autoconf",
     inputs = [
         {file = "build.sh"} | Local,
-        {file = "autoconf-2.72.tar.xz"} | Local,
+        {
+            url = "gs://minimal-staging-archives/autoconf-2.72.tar.xz",
+            sha256 = "intentionally_bad_value"
+        } | Source,
         bash,
         binutils,
         coreutils,
