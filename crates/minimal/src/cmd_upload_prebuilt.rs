@@ -13,33 +13,39 @@ pub struct UploadPrebuiltArgs {
     cache_dir: Option<PathBuf>,
 }
 
-pub async fn cmd_upload_prebuilt(args: UploadPrebuiltArgs) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn cmd_upload_prebuilt(
+    args: UploadPrebuiltArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
     let package_name = &args.package;
-    
+
     // Load the package spec to compute its hash
     let spec_file = format!("packages/{}/build.ncl", package_name);
     let spec_path = std::path::Path::new(&spec_file);
-    
+
     if !spec_path.exists() {
         return Err(format!("Package spec file not found: {}", spec_file).into());
     }
 
     // Load the SOURCE dependency graph for this package to get the correct hash
     let dp = super::graph_from_package_name(package_name, true);
-    
+
     // Get the spec hash for the package
-    let package_spec = dp.builds.iter()
+    let package_spec = dp
+        .builds
+        .iter()
         .find(|(_, spec)| spec.name == *package_name)
         .map(|(_, spec)| spec)
         .ok_or_else(|| format!("Package '{}' not found in dependency graph", package_name))?;
-    
+
     let spec_hash = package_spec.spec_hash(&dp);
-    
+
     println!("Package: {}", package_name);
     println!("Spec hash: {}", spec_hash.to_hex());
 
     // Check if prebuilt directory exists
-    let prebuilt_dir = PathBuf::from("packages").join(package_name).join("prebuilt");
+    let prebuilt_dir = PathBuf::from("packages")
+        .join(package_name)
+        .join("prebuilt");
     if !prebuilt_dir.exists() {
         return Err(format!("Prebuilt directory not found: {}", prebuilt_dir.display()).into());
     }
@@ -60,10 +66,12 @@ pub async fn cmd_upload_prebuilt(args: UploadPrebuiltArgs) -> Result<(), Box<dyn
     let remote_storage = RemoteStorage::new().await?;
     let bucket_id = "minimal-staging-archives";
     let gcs_path = format!("prebuilts/{}/{}", package_name, archive_name);
-    
+
     let archive_data = std::fs::read(&temp_archive_path)?;
-    remote_storage.upload(bucket_id.to_string(), &gcs_path, &archive_data).await?;
-    
+    remote_storage
+        .upload(bucket_id.to_string(), &gcs_path, &archive_data)
+        .await?;
+
     println!("Uploaded to: gs://{}/{}", bucket_id, gcs_path);
 
     // Clean up temp file
@@ -80,12 +88,12 @@ fn create_prebuilt_archive(prebuilt_dir: &PathBuf, archive_path: &PathBuf) -> st
     let file = std::fs::File::create(archive_path)?;
     let encoder = zstd::stream::Encoder::new(file, 3)?; // Compression level 3
     let mut tar_builder = tar::Builder::new(encoder);
-    
+
     // Add all files from the prebuilt directory to the archive
     tar_builder.append_dir_all(".", prebuilt_dir)?;
-    
+
     let encoder = tar_builder.into_inner()?;
     encoder.finish()?;
-    
+
     Ok(())
 }

@@ -1,5 +1,5 @@
 use std::{
-    fs::{File, create_dir_all, read_dir, remove_dir, write},
+    fs::{create_dir_all, remove_dir, write},
     os::unix::process::CommandExt,
     process::Command,
 };
@@ -27,7 +27,8 @@ fn create_namespaces() -> std::io::Result<(u32, u32)> {
 }
 
 fn setup_uid_gid_mapping(original_uid: u32, original_gid: u32) -> std::io::Result<()> {
-    write("/proc/self/setgroups", "deny").unwrap();
+    write("/proc/self/setgroups", "deny")
+        .map_err(|e| std::io::Error::other(format!("setgroups deny failed: {}", e)))?;
 
     let uid_mapping = format!("0 {} 1", original_uid);
     write("/proc/self/uid_map", &uid_mapping)
@@ -56,64 +57,49 @@ fn create_isolated_root() -> std::io::Result<String> {
     Ok(new_root)
 }
 
-fn recursively_mount_files(
-    host_dir: &std::path::Path,
-    namespace_dir: &std::path::Path,
-    new_root: &str,
-) -> std::io::Result<()> {
-    for entry in read_dir(host_dir)? {
-        let entry = entry?;
-        let host_path = entry.path();
-        let file_name = entry.file_name();
-        let namespace_path = namespace_dir.join(&file_name);
-        let dest_path = format!("{}{}", new_root, namespace_path.to_string_lossy());
-
-        if host_path.is_dir() {
-            create_dir_all(&dest_path)?;
-            recursively_mount_files(&host_path, &namespace_path, new_root)?;
-        } else {
-            if let Some(parent) = std::path::Path::new(&dest_path).parent() {
-                create_dir_all(parent)?;
-            }
-            File::create(&dest_path)?;
-            mount(
-                Some(host_path.to_str().unwrap()),
-                dest_path.as_str(),
-                None::<&str>,
-                MsFlags::MS_BIND,
-                None::<&str>,
-            )
-            .map_err(|e| std::io::Error::other(format!("mount failed for {}: {}", dest_path, e)))?;
-        }
-    }
-    Ok(())
+fn is_cache_directory(path: &std::path::Path) -> bool {
+    path.to_string_lossy().contains("/.cache/minimal-builds/")
 }
 
-fn bind_dependencies(config: &BuildConfig, new_root: &str) -> std::io::Result<()> {
-    for (host_path, namespace_path) in &config.dependencies {
-        let host_str = host_path.to_string_lossy();
-        let namespace_str = namespace_path.to_string_lossy();
+fn setup_overlayfs(config: &BuildConfig, new_root: &str) -> std::io::Result<()> {
+    let cache_dirs: Vec<String> = config
+        .dependencies
+        .iter()
+        .filter(|(path, namespace_path)| {
+            is_cache_directory(path) && namespace_path.as_os_str() == "/"
+        })
+        .map(|(path, _)| path.to_string_lossy().to_string())
+        .collect();
 
-        if host_path.is_dir() {
-            recursively_mount_files(host_path, namespace_path, new_root)?;
-        } else {
-            let dest_path = format!("{}{}", new_root, namespace_str);
+    if !cache_dirs.is_empty() {
+        info!(
+            "Setting up OverlayFS with {} cache directories as read-only lower layers",
+            cache_dirs.len()
+        );
 
-            if let Some(parent) = std::path::Path::new(&dest_path).parent() {
-                create_dir_all(parent)?;
-            }
+        let overlay_base = format!("{}/overlay", new_root);
+        let upper_dir = format!("{}/upper", overlay_base);
+        let work_dir = format!("{}/work", overlay_base);
+        create_dir_all(&upper_dir)
+            .map_err(|e| std::io::Error::other(format!("create upper dir failed: {}", e)))?;
+        create_dir_all(&work_dir)
+            .map_err(|e| std::io::Error::other(format!("create work dir failed: {}", e)))?;
 
-            File::create(&dest_path)?;
+        let mount_opts = format!(
+            "lowerdir={},upperdir={},workdir={}",
+            cache_dirs.join(":"),
+            upper_dir,
+            work_dir
+        );
 
-            mount(
-                Some(host_str.as_ref()),
-                dest_path.as_str(),
-                None::<&str>,
-                MsFlags::MS_BIND,
-                None::<&str>,
-            )
-            .map_err(|e| std::io::Error::other(format!("mount failed: {}", e)))?;
-        }
+        mount(
+            Some("overlay"),
+            new_root,
+            Some("overlay"),
+            MsFlags::empty(),
+            Some(mount_opts.as_str()),
+        )
+        .map_err(|e| std::io::Error::other(format!("OverlayFS mount failed: {}", e)))?;
     }
 
     Ok(())
@@ -133,7 +119,7 @@ fn bind_essential_directories(new_root: &str) -> std::io::Result<()> {
             MsFlags::MS_BIND | MsFlags::MS_REC,
             None::<&str>,
         )
-        .unwrap();
+        .map_err(|e| std::io::Error::other(format!("bind mount {} failed: {}", src, e)))?;
     }
 
     let etc_path = format!("{}/etc", new_root);
@@ -148,11 +134,6 @@ fn bind_essential_directories(new_root: &str) -> std::io::Result<()> {
     )
     .map_err(|e| std::io::Error::other(format!("tmpfs mount /etc failed: {}", e)))?;
 
-    // // Create symlink from /bin to /usr/bin for compatibility
-    // let bin_path = format!("{}/bin", new_root);
-    // symlink("/usr/bin", &bin_path)
-    //     .map_err(|e| std::io::Error::other(format!("symlink /bin -> /usr/bin failed: {}", e)))?;
-
     Ok(())
 }
 
@@ -164,16 +145,12 @@ fn pivot_to_new_root(new_root: &str, working_dir: Option<&str>) -> std::io::Resu
     nix::unistd::pivot_root(new_root, &*old_root)
         .map_err(|e| std::io::Error::other(format!("pivot_root failed: {}", e)))?;
 
-    // Change to the working directory if specified
     if let Some(wd) = working_dir {
         std::env::set_current_dir(wd)
             .map_err(|e| std::io::Error::other(format!("chdir failed: {}", e)))?;
     }
 
-    // Try to unmount and remove old root, but don't fail if it doesn't work
-    if nix::mount::umount("/old_root").is_ok() {
-        let _ = remove_dir("/old_root");
-    }
+    remove_dir("/old_root").unwrap();
 
     Ok(())
 }
@@ -200,7 +177,7 @@ impl Sandbox for LinuxSandbox {
                 let (original_uid, original_gid) = create_namespaces()?;
                 setup_uid_gid_mapping(original_uid, original_gid)?;
                 let new_root = create_isolated_root()?;
-                bind_dependencies(&config, &new_root)?;
+                setup_overlayfs(&config, &new_root)?;
                 bind_essential_directories(&new_root)?;
                 pivot_to_new_root(&new_root, working_dir.as_deref())?;
 

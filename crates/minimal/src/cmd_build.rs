@@ -1,4 +1,4 @@
-use crate::{remote_storage::RemoteStorage, run::Run, lockfile::PrebuiltsLock};
+use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage, run::Run};
 use build_sandbox::Result;
 use std::path::PathBuf;
 
@@ -28,16 +28,27 @@ pub async fn cmd_build(args: BuildArgs) -> Result<()> {
 
     let cache = super::load_cache(args.cache_dir).unwrap();
     let remote_storage = RemoteStorage::new().await.unwrap();
-    
+
     // Load the lockfile
     let lockfile_path = std::path::Path::new("prebuilts.lock");
     let lockfile = PrebuiltsLock::load(lockfile_path).unwrap_or_else(|e| {
-        eprintln!("Warning: Failed to load lockfile {}: {}", lockfile_path.display(), e);
+        eprintln!(
+            "Warning: Failed to load lockfile {}: {}",
+            lockfile_path.display(),
+            e
+        );
         eprintln!("Using empty lockfile...");
         PrebuiltsLock::default()
     });
-    
-    let mut run = Run::new(dp, cache, args.source, args.package.clone(), remote_storage, lockfile);
+
+    let mut run = Run::new(
+        dp,
+        cache,
+        args.source,
+        args.package.clone(),
+        remote_storage,
+        lockfile,
+    );
     run.execute(debug_bsr).await.unwrap();
 
     Ok(())

@@ -1,5 +1,5 @@
-use clap::Parser;
 use build_sandbox::error::ConfigError;
+use clap::Parser;
 use graph::{DepGraph, SpecReader, SpecReaderOptions};
 use std::path::{Path, PathBuf};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -92,13 +92,11 @@ async fn main() -> build_sandbox::Result<()> {
     match Cli::parse() {
         Cli::Build(args) => cmd_build(args).await,
         Cli::Plan(args) => cmd_plan(args),
-        Cli::UploadPrebuilt(args) => {
-            cmd_upload_prebuilt(args).await.map_err(|e| {
-                eprintln!("Upload prebuilt failed: {}", e);
-                build_sandbox::Error::Config(ConfigError::InvalidExecutable {
-                    path: std::path::PathBuf::from("upload-prebuilt")
-                })
+        Cli::UploadPrebuilt(args) => cmd_upload_prebuilt(args).await.map_err(|e| {
+            eprintln!("Upload prebuilt failed: {}", e);
+            build_sandbox::Error::Config(ConfigError::InvalidExecutable {
+                path: std::path::PathBuf::from("upload-prebuilt"),
             })
-        },
+        }),
     }
 }
