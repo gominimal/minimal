@@ -66,7 +66,7 @@ impl<'a> Iterator for ExecPlan<'a> {
                     self.toplevels
                         .iter()
                         .filter_map(|bsr| match self.built.get(bsr) {
-                            None => Some(bsr.clone()),
+                            None => Some(*bsr),
                             Some(_) => None, // already emitted
                         })
                         .collect(),
