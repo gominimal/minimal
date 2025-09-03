@@ -215,4 +215,64 @@ mod tests {
             ],
         );
     }
+
+    #[test]
+    fn with_runtime_deps() {
+        let sr = SpecReader::new(
+            indoc! {
+                "
+                let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
+
+                let no_deps_spec = {
+                    name = \"no deps\",
+                    inputs = [],
+                    cmd = \"\",
+                } | BuildSpec
+                in
+                let runtime_dep_spec = {
+                    name = \"runtime dep\",
+                    inputs = [],
+                    cmd = \"\",
+                } | BuildSpec
+                in
+                let depends_one_spec = {
+                    name = \"depends one\",
+                    inputs = [no_deps_spec],
+                    cmd = \"\",
+                } | BuildSpec
+                in
+
+                {
+                    name = \"top\",
+                    inputs = [depends_one_spec],
+                    runtime_deps = [runtime_dep_spec],
+                    cmd = \"\",
+                } | BuildSpec
+                "
+            }
+            .to_string(),
+            &SpecReaderOptions::for_test(),
+        );
+        // So we can see the actual error when parsing fails
+        sr.as_ref().err().into_iter().for_each(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+        let sr = sr.unwrap();
+
+        let dp = DepGraph::new(sr).unwrap();
+        let plan: Vec<Vec<BuildSpecRef>> = ExecPlan::new(&dp).collect();
+
+        assert_eq!(
+            plan,
+            vec![
+                vec![
+                    dp.by_name("no deps").next().unwrap(),
+                    dp.by_name("runtime dep").next().unwrap()
+                ],
+                vec![dp.by_name("depends one").next().unwrap(),],
+                vec![dp.by_name("top").next().unwrap()],
+            ],
+        );
+    }
 }

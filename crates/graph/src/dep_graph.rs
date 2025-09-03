@@ -92,6 +92,16 @@ impl crate::SpecHash for BuildSpecInput {
     }
 }
 
+#[allow(dead_code)]
+impl BuildSpecInput {
+    fn as_build(&self) -> Option<&BuildSpecRef> {
+        match self {
+            BuildSpecInput::Build(bsr) => Some(bsr),
+            _ => None,
+        }
+    }
+}
+
 /// An output from a build.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
@@ -125,6 +135,7 @@ pub struct BuildSpec {
     pub cmd: String,
 
     pub inputs: Vec<BuildSpecInput>,
+    pub runtime_deps: Vec<BuildSpecRef>,
     pub outputs: OutputMap,
 }
 
@@ -136,16 +147,28 @@ impl crate::SpecHash for BuildSpec {
         h.write_all(self.name.as_bytes()).unwrap();
         h.write_all(self.cmd.as_bytes()).unwrap();
 
-        // We don't want the spec hash to change if the order of the inputs change, so lets sort
-        // the hashes before they are updated to our spec hash.
+        // We don't want the spec hash to change if the order of the inputs or runtime_deps change,
+        // so lets sort the hashes before they are updated to our spec hash.
         // TODO: Consider performance implications of linear sort
+        h.write_all(b"-inputs").unwrap();
         let mut input_hashes: Vec<blake3::Hash> =
             self.inputs.iter().map(|i| i.spec_hash(g)).collect();
         input_hashes.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         for hash in input_hashes.drain(..) {
             h.write_all(hash.as_bytes()).unwrap();
         }
+        h.write_all(b"-runtime_deps").unwrap();
+        let mut runtime_dep_hashes: Vec<blake3::Hash> = self
+            .runtime_deps
+            .iter()
+            .map(|bsr| g.builds.get(bsr.0).unwrap().spec_hash(g))
+            .collect();
+        runtime_dep_hashes.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        for hash in runtime_dep_hashes.drain(..) {
+            h.write_all(hash.as_bytes()).unwrap();
+        }
 
+        h.write_all(b"-outputs").unwrap();
         for (name, output) in self.outputs.iter() {
             h.write_all(name.as_bytes()).unwrap();
             output.partial_spec_hash(&mut h);
@@ -193,6 +216,8 @@ impl DepGraph {
     }
 
     /// Returns the unique set of transitive build-spec dependencies of the given toplevel.
+    ///
+    /// Dependencies of a build-spec are its inputs and its runtime dependencies.
     pub fn transitive_specs_of(&self, toplevel: &BuildSpecRef) -> Vec<BuildSpecRef> {
         let mut seen: HashMap<BuildSpecRef, ()> = HashMap::with_capacity(self.builds.len());
         let mut reachable = Vec::with_capacity(self.builds.len());
@@ -210,16 +235,21 @@ impl DepGraph {
         let build_spec = self.get(bsr).unwrap();
 
         use BuildSpecInput::*;
-        build_spec.inputs.iter().for_each(|input| match input {
-            Build(bsr) => {
+        build_spec
+            .inputs
+            .iter()
+            .filter_map(|input| match input {
+                Build(bsr) => Some(bsr),
+                Source(_) | HostPath(_) | Local(_) | Prebuilt(_) => None,
+            })
+            .chain(build_spec.runtime_deps.iter())
+            .for_each(|bsr| {
                 if !seen.contains_key(bsr) {
                     seen.insert(*bsr, ());
                     reachable.push(*bsr);
                     self.collect_transitive_buildspecs(bsr, seen, reachable);
                 }
-            }
-            Source(_) | HostPath(_) | Local(_) | Prebuilt(_) => {}
-        })
+            })
     }
 }
 
@@ -282,6 +312,7 @@ impl GraphBuilder {
             name: base.name,
             cmd: base.cmd,
             inputs: Vec::new(),
+            runtime_deps: Vec::new(),
             outputs: OutputMap::new(),
         };
 
@@ -298,6 +329,18 @@ impl GraphBuilder {
                                 bs.inputs = a
                                     .iter()
                                     .map(|input| self.read_input(input, files).unwrap())
+                                    .collect();
+                            } else {
+                                todo!("handle value being non-array {:?}", field.value);
+                            };
+                        }
+                        "runtime_deps" => {
+                            if let Term::Array(a, _attrs) =
+                                field.value.as_ref().unwrap().term.as_ref()
+                            {
+                                bs.runtime_deps = a
+                                    .iter()
+                                    .map(|input| self.read_buildspec(input, files).unwrap())
                                     .collect();
                             } else {
                                 todo!("handle value being non-array {:?}", field.value);
@@ -798,6 +841,62 @@ mod tests {
                 .unwrap()
                 .1
                 .spec_hash(&dp),
+        );
+    }
+
+    #[test]
+    fn runtime_deps() {
+        let sr = SpecReader::new(
+            indoc! {
+                "
+                let {BuildSpec, ..} = import \"minimal.ncl\" in
+                let our_runtime_dep = {
+                    name = \"runtime dep\",
+                    inputs = [],
+                    cmd = \"\",
+                } | BuildSpec in
+                {
+                    name = \"top build\",
+                    inputs = [our_runtime_dep],
+                    runtime_deps = [our_runtime_dep],
+                    cmd = \"\",
+                } | BuildSpec"
+            }
+            .to_string(),
+            &SpecReaderOptions::for_test(),
+        );
+        // So we can see the actual error when parsing fails
+        sr.as_ref().err().into_iter().for_each(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+        let sr = sr.unwrap();
+
+        let dp = DepGraph::new(sr).unwrap();
+        // We expect two buildspecs - deeper first
+        assert_eq!(
+            vec!["runtime dep".to_string(), "top build".to_string()],
+            dp.builds
+                .iter()
+                .map(|b| b.1.name.clone())
+                .collect::<Vec<String>>()
+        );
+
+        // We expect the runtime_dep to be the same as the input
+        assert_eq!(
+            dp.builds
+                .iter()
+                .map(|b| b.1.clone())
+                .collect::<Vec<BuildSpec>>()[1]
+                .inputs[0]
+                .as_build()
+                .unwrap()
+                .clone(),
+            dp.builds
+                .iter()
+                .map(|b| b.1.clone())
+                .collect::<Vec<BuildSpec>>()[1]
+                .runtime_deps[0]
         );
     }
 

@@ -5,6 +5,8 @@
           | String,
         inputs
           | Array Input,
+        runtime_deps
+          | Array BuildSpec | optional,
 
         cmd | String,
 
