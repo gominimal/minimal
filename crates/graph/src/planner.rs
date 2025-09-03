@@ -62,15 +62,20 @@ impl<'a> Iterator for ExecPlan<'a> {
             // been emitted.
             if !self.emitted_toplevel {
                 self.emitted_toplevel = true;
-                return Some(
-                    self.toplevels
-                        .iter()
-                        .filter_map(|bsr| match self.built.get(bsr) {
-                            None => Some(*bsr),
-                            Some(_) => None, // already emitted
-                        })
-                        .collect(),
-                );
+                let remaining: Vec<_> = self
+                    .toplevels
+                    .iter()
+                    .filter_map(|bsr| match self.built.get(bsr) {
+                        None => Some(*bsr),
+                        Some(_) => None, // already emitted
+                    })
+                    .collect();
+
+                return if remaining.len() > 0 {
+                    Some(remaining)
+                } else {
+                    None
+                };
             }
             return None;
         }
