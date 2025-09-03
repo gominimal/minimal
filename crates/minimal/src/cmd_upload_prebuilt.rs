@@ -1,5 +1,4 @@
 use crate::remote_storage::RemoteStorage;
-use graph::SpecHashable;
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
@@ -30,13 +29,13 @@ pub async fn cmd_upload_prebuilt(
     let dp = super::graph_from_package_name(package_name, true);
 
     // Get the spec hash for the package
-    let package_spec = dp
+    let package_ref = dp
         .iter()
         .find(|(_, spec)| spec.name == *package_name)
-        .map(|(_, spec)| spec)
+        .map(|(bsr, _spec)| bsr)
         .ok_or_else(|| format!("Package '{}' not found in dependency graph", package_name))?;
 
-    let spec_hash = package_spec.spec_hash(&dp);
+    let spec_hash = dp.spec_hash(&package_ref);
 
     println!("Package: {}", package_name);
     println!("Spec hash: {}", spec_hash.0.to_hex());

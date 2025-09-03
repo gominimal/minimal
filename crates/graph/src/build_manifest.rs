@@ -1,4 +1,4 @@
-use crate::{BuildSpecInput, BuildSpecRef, DepGraph, SpecHash, SpecHashable};
+use crate::{BuildSpecInput, BuildSpecRef, DepGraph, SpecHash};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -39,8 +39,7 @@ impl BuildManifest {
             // all inputs.
             match input {
                 Build(bsr) => {
-                    let dep_build = g.get(bsr).unwrap();
-                    let dep_hash = dep_build.spec_hash(g);
+                    let dep_hash = g.spec_hash(bsr);
 
                     for (hash, source) in BuildManifest::make(g, bsr, &dep_hash)
                         .transitive_runtime_deps
@@ -68,8 +67,7 @@ impl BuildManifest {
         }
         // Lastly lets add runtime deps declared on this build.
         for bsr in build.runtime_deps.iter() {
-            let dep_build = g.get(bsr).unwrap();
-            let dep_hash = dep_build.spec_hash(g);
+            let dep_hash = g.spec_hash(bsr);
             match out.transitive_runtime_deps.get_mut(&dep_hash) {
                 Some(source_list) => source_list.push(DepInfo::Ours),
                 None => {
@@ -86,6 +84,7 @@ impl BuildManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SpecHashable;
     use crate::{DepGraph, SpecReader, SpecReaderOptions};
     use indoc::indoc;
 

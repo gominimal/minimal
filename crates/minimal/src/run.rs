@@ -3,7 +3,7 @@ use cache::{Cache, LocalDir};
 use graph::dep_graph::SourceFetch;
 use graph::{
     BuildManifest, BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, ExecPlan,
-    SpecHash, SpecHashable,
+    SpecHash,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -54,8 +54,8 @@ impl Run {
             use BuildSpecInput::*;
             match input {
                 Build(dep_ref) => {
+                    let dep_hash = self.graph.spec_hash(dep_ref);
                     let dep_build = self.graph.get(dep_ref).unwrap();
-                    let dep_hash = dep_build.spec_hash(&self.graph);
 
                     debug!(
                         "  Input {}: Build({}) -- [{}]",
@@ -217,8 +217,8 @@ impl Run {
             }
         }
         for (i, bsr) in build.runtime_deps.iter().enumerate() {
+            let dep_hash = self.graph.spec_hash(bsr);
             let dep_build = self.graph.get(bsr).unwrap();
-            let dep_hash = dep_build.spec_hash(&self.graph);
 
             debug!(
                 "  Runtime dep {}: Build({}) -- [{}]",
@@ -267,8 +267,8 @@ impl Run {
 
         for phase in ExecPlan::new(&self.graph) {
             for bsr in phase.iter() {
+                let bsh = self.graph.spec_hash(bsr);
                 let build = self.graph.get(bsr).unwrap();
-                let bsh = build.spec_hash(&self.graph);
 
                 if self.cache.read_dir(&bsh).is_ok() {
                     println!(
@@ -466,7 +466,7 @@ impl Run {
             .into());
         }
 
-        Ok(source_spec.spec_hash(&source_graph))
+        Ok(source_graph.spec_hash(&source_graph.top_level))
     }
 
     fn extract_prebuilt_archive(

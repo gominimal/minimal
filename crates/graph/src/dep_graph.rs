@@ -11,6 +11,7 @@ use generational_arena::Arena;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use crate::{Error, SpecHash, SpecHashable, SpecReader};
 
@@ -56,8 +57,8 @@ impl SpecHashable for BuildSpecInput {
         match self {
             Build(bsr) => {
                 h.write_all(b"input").unwrap();
-                h.write_all(g.builds.get(bsr.0).unwrap().spec_hash(g).as_bytes())
-                    .unwrap();
+                let hash = g.spec_hash(bsr);
+                h.write_all(hash.as_bytes()).unwrap();
             }
             Source(s) => {
                 h.write_all(b"source").unwrap();
@@ -158,7 +159,7 @@ impl SpecHashable for BuildSpec {
         let mut runtime_dep_hashes: Vec<SpecHash> = self
             .runtime_deps
             .iter()
-            .map(|bsr| g.builds.get(bsr.0).unwrap().spec_hash(g))
+            .map(|bsr| g.spec_hash(bsr))
             .collect();
         runtime_dep_hashes.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         for hash in runtime_dep_hashes.drain(..) {
@@ -181,6 +182,8 @@ impl SpecHashable for BuildSpec {
 pub struct DepGraph {
     builds: Arena<BuildSpec>,
     pub top_level: BuildSpecRef,
+
+    hash_cache: Arc<RwLock<HashMap<BuildSpecRef, SpecHash>>>,
 }
 
 impl DepGraph {
@@ -196,9 +199,13 @@ impl DepGraph {
         let top_level = graph.read_buildspec(&ncl_tree, &files)?;
         Ok(graph.finish(top_level))
     }
+
+    /// Fetches a build-spec by reference.
     pub fn get(&self, bsr: &BuildSpecRef) -> Option<&BuildSpec> {
         self.builds.get(bsr.0)
     }
+
+    /// Returns an iterator over all build-spec references with the given name.
     pub fn by_name<S: AsRef<str>>(
         &self,
         name: S,
@@ -211,12 +218,31 @@ impl DepGraph {
             }
         })
     }
+
+    /// Returns the specification hash of the given build spec.
+    pub fn spec_hash(&self, bsr: &BuildSpecRef) -> SpecHash {
+        {
+            if let Some(hash) = self.hash_cache.read().unwrap().get(bsr) {
+                return hash.clone();
+            }
+        }
+
+        let build = self.get(bsr).unwrap();
+        let hash = build.spec_hash(self);
+
+        self.hash_cache.write().unwrap().insert(*bsr, hash.clone());
+        hash
+    }
+
+    /// Returns an iterator over all build-spec references.
     pub fn all(&self) -> impl Iterator<Item = BuildSpecRef> + use<'_> {
         self.builds.iter().map(|e| BuildSpecRef(e.0))
     }
+    /// Returns the number of build-specs in the graph.
     pub fn len(&self) -> usize {
         self.builds.len()
     }
+    /// Iterates over all build specs and their keys.
     pub fn iter(&self) -> impl Iterator<Item = (BuildSpecRef, &BuildSpec)> + use<'_> {
         self.builds
             .iter()
@@ -280,7 +306,12 @@ struct GraphBuilder {
 impl GraphBuilder {
     fn finish(self, top_level: BuildSpecRef) -> DepGraph {
         let Self { builds, .. } = self;
-        DepGraph { builds, top_level }
+        let hash_cache = Arc::new(RwLock::new(HashMap::with_capacity(builds.len())));
+        DepGraph {
+            builds,
+            top_level,
+            hash_cache,
+        }
     }
 
     /// Recursively processes and inserts a buildspec into the graph, returning
