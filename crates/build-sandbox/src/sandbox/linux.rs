@@ -4,7 +4,7 @@ use std::{
     process::Command,
 };
 
-use nix::mount::{MsFlags, mount};
+use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::{CloneFlags, unshare};
 use tracing::info;
 
@@ -150,7 +150,11 @@ fn pivot_to_new_root(new_root: &str, working_dir: Option<&str>) -> std::io::Resu
             .map_err(|e| std::io::Error::other(format!("chdir failed: {}", e)))?;
     }
 
-    remove_dir("/old_root").unwrap();
+    umount2("/old_root", MntFlags::MNT_DETACH)
+        .map_err(|e| std::io::Error::other(format!("umount2 old_root failed: {}", e)))?;
+
+    remove_dir("/old_root")
+        .map_err(|e| std::io::Error::other(format!("remove old_root failed: {}", e)))?;
 
     Ok(())
 }
@@ -169,7 +173,6 @@ impl Sandbox for LinuxSandbox {
 
         unsafe {
             command.pre_exec(move || {
-                // Get the current working directory before pivot_root
                 let working_dir = std::env::current_dir()
                     .ok()
                     .and_then(|p| p.to_str().map(|s| s.to_string()));
