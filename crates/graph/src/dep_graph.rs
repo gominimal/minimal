@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::{Error, SpecReader};
+use crate::{Error, SpecHash, SpecHashable, SpecReader};
 
 use crate::spec_schema::*;
 use serde::Deserialize;
@@ -23,8 +23,6 @@ type OutputMap = nickel_lang_core::term::IndexMap<String, BuildOutput>;
 /// A reference to some other [BuildSpec] in a [DepGraph].
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 pub struct BuildSpecRef(pub(crate) generational_arena::Index);
-
-pub type SpecHash = blake3::Hash;
 
 /// A description of pulling source code regardless of form.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,7 +48,7 @@ pub enum BuildSpecInput {
     Prebuilt(String), // Package name
 }
 
-impl crate::SpecHash for BuildSpecInput {
+impl SpecHashable for BuildSpecInput {
     fn spec_hash(&self, g: &DepGraph) -> SpecHash {
         let mut h = blake3::Hasher::new();
 
@@ -88,7 +86,7 @@ impl crate::SpecHash for BuildSpecInput {
             }
         }
 
-        h.finalize()
+        SpecHash(h.finalize())
     }
 }
 
@@ -139,7 +137,7 @@ pub struct BuildSpec {
     pub outputs: OutputMap,
 }
 
-impl crate::SpecHash for BuildSpec {
+impl SpecHashable for BuildSpec {
     fn spec_hash(&self, g: &DepGraph) -> SpecHash {
         let mut h = blake3::Hasher::new();
 
@@ -151,14 +149,13 @@ impl crate::SpecHash for BuildSpec {
         // so lets sort the hashes before they are updated to our spec hash.
         // TODO: Consider performance implications of linear sort
         h.write_all(b"-inputs").unwrap();
-        let mut input_hashes: Vec<blake3::Hash> =
-            self.inputs.iter().map(|i| i.spec_hash(g)).collect();
+        let mut input_hashes: Vec<SpecHash> = self.inputs.iter().map(|i| i.spec_hash(g)).collect();
         input_hashes.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         for hash in input_hashes.drain(..) {
             h.write_all(hash.as_bytes()).unwrap();
         }
         h.write_all(b"-runtime_deps").unwrap();
-        let mut runtime_dep_hashes: Vec<blake3::Hash> = self
+        let mut runtime_dep_hashes: Vec<SpecHash> = self
             .runtime_deps
             .iter()
             .map(|bsr| g.builds.get(bsr.0).unwrap().spec_hash(g))
@@ -174,7 +171,7 @@ impl crate::SpecHash for BuildSpec {
             output.partial_spec_hash(&mut h);
         }
 
-        h.finalize()
+        SpecHash(h.finalize())
     }
 }
 
@@ -814,7 +811,6 @@ mod tests {
 
         let mut dp = DepGraph::new(sr).unwrap();
 
-        use crate::SpecHash;
         let top_hash = dp
             .builds
             .iter()

@@ -1,5 +1,5 @@
 use build_sandbox::Result;
-use graph::{ExecPlan, SpecHash};
+use graph::{ExecPlan, SpecHashable};
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
@@ -23,10 +23,10 @@ pub fn cmd_plan(args: PlanArgs) -> Result<()> {
         for bsr in phase.iter() {
             let build = graph.get(bsr).unwrap();
             let bsh = build.spec_hash(&graph);
-            let is_cached = cache.read_dir(bsh).is_ok();
+            let is_cached = cache.read_dir(&bsh).is_ok();
             let cached_emoji = if is_cached { "✓" } else { "⚙️" };
 
-            println!(" - {} {} [{}]", cached_emoji, build.name, bsh.to_hex());
+            println!(" - {} {} [{}]", cached_emoji, build.name, bsh.0.to_hex());
         }
     }
 

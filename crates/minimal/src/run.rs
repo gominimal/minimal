@@ -1,7 +1,10 @@
 use build_sandbox::{BuildConfig, config::BuildScript, run_build};
 use cache::{Cache, LocalDir};
 use graph::dep_graph::SourceFetch;
-use graph::{BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, ExecPlan, SpecHash};
+use graph::{
+    BuildManifest, BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, ExecPlan,
+    SpecHash, SpecHashable,
+};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -58,12 +61,29 @@ impl Run {
                         "  Input {}: Build({}) -- [{}]",
                         i,
                         dep_build.name,
-                        dep_hash.to_hex()
+                        dep_hash.0.to_hex()
                     );
 
-                    let cache_path = self.cache.read_dir(dep_hash).unwrap().path().to_path_buf();
-
+                    let cache_path = self.cache.read_dir(&dep_hash).unwrap().path().to_path_buf();
                     dependencies.insert(cache_path, PathBuf::from("/"));
+
+                    for (bsh, _attribution) in BuildManifest::make(&self.graph, &dep_ref, &dep_hash)
+                        .transitive_runtime_deps
+                        .into_iter()
+                    {
+                        debug!("   - Transitive runtime dep -- [{}]", dep_hash.0.to_hex());
+
+                        let cache_path = self.cache.read_dir(&bsh).unwrap().path().to_path_buf();
+                        if dependencies
+                            .insert(cache_path, PathBuf::from("/"))
+                            .is_some()
+                        {
+                            warn!(
+                                "Transitive dependency [{}] was already present - probably fine",
+                                dep_hash.0.to_hex(),
+                            );
+                        }
+                    }
                 }
                 HostPath(path) => {
                     debug!("  Input {}: HostPath({})", i, path.display());
@@ -142,9 +162,9 @@ impl Run {
                     let package_hash =
                         if let Some(locked_hash) = self.lockfile.get_hash(package_name) {
                             debug!("  Using locked hash for {}: {}", package_name, locked_hash);
-                            blake3::Hash::from_hex(locked_hash).map_err(|e| {
+                            SpecHash(blake3::Hash::from_hex(locked_hash).map_err(|e| {
                                 format!("Invalid hex hash in lockfile for {}: {}", package_name, e)
-                            })?
+                            })?)
                         } else {
                             debug!(
                                 "  No locked hash found, computing from source spec for {}",
@@ -158,7 +178,7 @@ impl Run {
                     let file_path = format!(
                         "prebuilts/{}/{}.tar.zst",
                         package_name,
-                        package_hash.to_hex()
+                        package_hash.0.to_hex()
                     );
 
                     let temp_base = std::env::temp_dir()
@@ -204,18 +224,28 @@ impl Run {
                 "  Runtime dep {}: Build({}) -- [{}]",
                 i,
                 dep_build.name,
-                dep_hash.to_hex()
+                dep_hash.0.to_hex()
             );
 
-            let cache_path = self.cache.read_dir(dep_hash).unwrap().path().to_path_buf();
-            if dependencies
-                .insert(cache_path, PathBuf::from("/"))
-                .is_some()
+            let cache_path = self.cache.read_dir(&dep_hash).unwrap().path().to_path_buf();
+            dependencies.insert(cache_path, PathBuf::from("/"));
+
+            for (bsh, _attribution) in BuildManifest::make(&self.graph, &bsr, &dep_hash)
+                .transitive_runtime_deps
+                .into_iter()
             {
-                warn!(
-                    "Dependency {} was already present - probably fine",
-                    dep_build.name
-                );
+                debug!("   - Transitive runtime dep -- [{}]", dep_hash.0.to_hex());
+
+                let cache_path = self.cache.read_dir(&bsh).unwrap().path().to_path_buf();
+                if dependencies
+                    .insert(cache_path, PathBuf::from("/"))
+                    .is_some()
+                {
+                    warn!(
+                        "Transitive dependency [{}] was already present - probably fine",
+                        dep_hash.0.to_hex(),
+                    );
+                }
             }
         }
 
@@ -240,16 +270,16 @@ impl Run {
                 let build = self.graph.get(bsr).unwrap();
                 let bsh = build.spec_hash(&self.graph);
 
-                if self.cache.read_dir(bsh).is_ok() {
+                if self.cache.read_dir(&bsh).is_ok() {
                     println!(
                         "Skipping already-cached build {} [{}]",
                         build.name,
-                        bsh.to_hex()
+                        bsh.0.to_hex()
                     );
                     continue;
                 }
 
-                println!("Executing build: {} [{}]", build.name, bsh.to_hex());
+                println!("Executing build: {} [{}]", build.name, bsh.0.to_hex());
                 let (dependencies, inputs) = self.sandbox_paths_from_buildspec(build).await?;
 
                 // Check if this is a pure prebuilt package (only has Prebuilt inputs + system dependencies)
@@ -268,7 +298,7 @@ impl Run {
                         build.name
                     );
 
-                    let cache_handle = self.cache.write_dir(bsh).unwrap();
+                    let cache_handle = self.cache.write_dir(&bsh).unwrap();
                     let output_dir = cache_handle.path();
 
                     // Find the prebuilt input and copy its contents
@@ -317,9 +347,9 @@ impl Run {
                         debug_shell: matches!(debug, Some(debug_bsr) if bsr == &debug_bsr),
                     };
 
-                    run_build(&config, self.cache.write_dir(bsh).unwrap().path(), true)
+                    run_build(&config, self.cache.write_dir(&bsh).unwrap().path(), true)
                         .inspect_err(|_| {
-                            self.cache.invalidate_dir(bsh).unwrap();
+                            self.cache.invalidate_dir(&bsh).unwrap();
                         })?;
                 }
 
@@ -336,7 +366,7 @@ impl Run {
         // Handle uploads and lockfile updates after the main build loop
         for (package_name, bsh) in lockfile_updates {
             println!("Processing upload for {}", package_name);
-            self.upload_prebuilt_archive(bsh).await?;
+            self.upload_prebuilt_archive(&bsh).await?;
         }
 
         Ok(())
@@ -344,14 +374,14 @@ impl Run {
 
     async fn upload_prebuilt_archive(
         &mut self,
-        bsh: blake3::Hash,
+        bsh: &SpecHash,
     ) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Auto-uploading prebuilt archive for {}", self.package_name);
 
         let package_hash = self.compute_package_hash(&self.package_name)?;
         let cache_handle = self.cache.read_dir(bsh).unwrap();
         let cache_dir = cache_handle.path();
-        let archive_name = format!("{}.tar.zst", package_hash.to_hex());
+        let archive_name = format!("{}.tar.zst", package_hash.0.to_hex());
         let temp_archive_path = std::env::temp_dir().join(&archive_name);
 
         create_prebuilt_archive(&cache_dir.to_path_buf(), &temp_archive_path)?;
@@ -371,8 +401,10 @@ impl Run {
             bucket_id, gcs_path
         );
 
-        self.lockfile
-            .update_hash(self.package_name.clone(), package_hash.to_hex().to_string());
+        self.lockfile.update_hash(
+            self.package_name.clone(),
+            package_hash.0.to_hex().to_string(),
+        );
         let lockfile_path = std::path::Path::new("prebuilts.lock");
         self.lockfile.save(lockfile_path)?;
         eprintln!(
@@ -386,7 +418,7 @@ impl Run {
     fn compute_package_hash(
         &self,
         package_name: &str,
-    ) -> Result<blake3::Hash, Box<dyn std::error::Error>> {
+    ) -> Result<SpecHash, Box<dyn std::error::Error>> {
         // For prebuilt packages, we need to compute the hash based on the SOURCE build spec,
         // not the current build spec (which would cause circular reference).
 

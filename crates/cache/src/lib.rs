@@ -1,3 +1,4 @@
+use graph::SpecHash;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -12,7 +13,7 @@ pub use fs::LocalDir;
 #[allow(dead_code)]
 pub struct DirCacheEntry<FS: FileSystem> {
     c: Cache<FS>,
-    hash: blake3::Hash,
+    hash: SpecHash,
     tree: FS::Subtree,
 }
 
@@ -59,7 +60,7 @@ impl<FS: FileSystem<Subtree = ST>, ST: FileSystem> FileSystem for DirCacheEntry<
 #[allow(dead_code)]
 pub struct FileCacheEntry<FS: FileSystem> {
     c: Cache<FS>,
-    hash: blake3::Hash,
+    hash: SpecHash,
     file: FS::File,
 }
 
@@ -101,8 +102,8 @@ impl<FS: FileSystem> CacheInner<FS> {
         Ok(())
     }
 
-    fn dir(&self, hash: blake3::Hash) -> Result<FS::Subtree, CacheErr> {
-        let hash_hex = hash.to_hex();
+    fn dir(&self, hash: &SpecHash) -> Result<FS::Subtree, CacheErr> {
+        let hash_hex = hash.0.to_hex();
         // Entries on disk are at <root>/<first byte as hex>/<remaining bytes as hex>
         let subpath: PathBuf = [&hash_hex.as_str()[0..2], &hash_hex.as_str()[2..]]
             .iter()
@@ -169,8 +170,8 @@ impl<FS: FileSystem> Cache<FS> {
         let guard = self.inner.lock().unwrap();
         f(&*guard)
     }
-    pub fn invalidate_dir(&self, hash: blake3::Hash) -> Result<(), CacheErr> {
-        let hash_hex = hash.to_hex();
+    pub fn invalidate_dir(&self, hash: &SpecHash) -> Result<(), CacheErr> {
+        let hash_hex = hash.0.to_hex();
         // Entries on disk are at <root>/<first byte as hex>/<remaining bytes as hex>
         let subpath: PathBuf = [&hash_hex.as_str()[0..2], &hash_hex.as_str()[2..]]
             .iter()
@@ -179,8 +180,8 @@ impl<FS: FileSystem> Cache<FS> {
         self.inner().fs.remove_dir(subpath).map_err(CacheErr::from)
     }
 
-    pub fn read_file(&self, hash: blake3::Hash) -> Result<FileCacheEntry<FS>, CacheErr> {
-        let hash_hex = hash.to_hex();
+    pub fn read_file(&self, hash: &SpecHash) -> Result<FileCacheEntry<FS>, CacheErr> {
+        let hash_hex = hash.0.to_hex();
         // Entries on disk are at <root>/<first byte as hex>/<remaining bytes as hex>
         let subpath: PathBuf = [&hash_hex.as_str()[0..2], &hash_hex.as_str()[2..]]
             .iter()
@@ -197,22 +198,22 @@ impl<FS: FileSystem> Cache<FS> {
         Ok(FileCacheEntry {
             c: self.clone(),
             file,
-            hash,
+            hash: hash.clone(),
         })
     }
 
-    pub fn read_dir(&self, hash: blake3::Hash) -> Result<DirCacheEntry<FS>, CacheErr> {
+    pub fn read_dir(&self, hash: &SpecHash) -> Result<DirCacheEntry<FS>, CacheErr> {
         Ok(DirCacheEntry {
             c: self.clone(),
-            tree: self.inner().dir(hash)?,
-            hash,
+            tree: self.inner().dir(&hash)?,
+            hash: hash.clone(),
         })
     }
-    pub fn write_dir(&self, hash: blake3::Hash) -> Result<DirCacheEntry<FS>, CacheErr> {
+    pub fn write_dir(&self, hash: &SpecHash) -> Result<DirCacheEntry<FS>, CacheErr> {
         let mut inner = self.inner();
         inner.ensure_hash_dir_exists(hash.as_bytes()[0])?;
 
-        let hash_hex = hash.to_hex();
+        let hash_hex = hash.0.to_hex();
         // Entries on disk are at <root>/<first byte as hex>/<remaining bytes as hex>
         let subpath: PathBuf = [&hash_hex.as_str()[0..2], &hash_hex.as_str()[2..]]
             .iter()
@@ -221,15 +222,15 @@ impl<FS: FileSystem> Cache<FS> {
 
         Ok(DirCacheEntry {
             c: self.clone(),
-            tree: inner.dir(hash)?,
-            hash,
+            tree: inner.dir(&hash)?,
+            hash: hash.clone(),
         })
     }
 
-    pub fn write_file(&self, hash: blake3::Hash) -> Result<FileCacheEntry<FS>, CacheErr> {
+    pub fn write_file(&self, hash: &SpecHash) -> Result<FileCacheEntry<FS>, CacheErr> {
         let file = {
             let mut inner = self.inner();
-            let hash_hex = hash.to_hex();
+            let hash_hex = hash.0.to_hex();
             inner.ensure_hash_dir_exists(hash.as_bytes()[0])?;
 
             // Entries on disk are at <root>/<first byte as hex>/<remaining bytes as hex>
@@ -243,7 +244,7 @@ impl<FS: FileSystem> Cache<FS> {
         Ok(FileCacheEntry {
             c: self.clone(),
             file,
-            hash,
+            hash: hash.clone(),
         })
     }
 }
@@ -259,13 +260,13 @@ mod tests {
         let tmp_dir = TempDir::new().unwrap();
 
         let cache = Cache::at_dir(tmp_dir.path()).unwrap();
-        let test_key = blake3::hash("swiggity swooty".as_bytes());
+        let test_key = SpecHash(blake3::hash("swiggity swooty".as_bytes()));
 
-        let mut w = cache.write_file(test_key).unwrap();
+        let mut w = cache.write_file(&test_key).unwrap();
         w.write_all("uwu".as_bytes()).unwrap();
         drop(w);
 
-        let r = cache.read_file(test_key).unwrap();
+        let r = cache.read_file(&test_key).unwrap();
         assert_eq!("uwu", std::io::read_to_string(r).unwrap());
     }
 
@@ -274,9 +275,9 @@ mod tests {
         let tmp_dir = TempDir::new().unwrap();
 
         let cache = Cache::at_dir(tmp_dir.path()).unwrap();
-        let test_key = blake3::hash("direct-tory".as_bytes());
+        let test_key = SpecHash(blake3::hash("direct-tory".as_bytes()));
 
-        let w = cache.write_dir(test_key).unwrap();
+        let w = cache.write_dir(&test_key).unwrap();
         use std::io::Write;
         w.open_write("file_name")
             .unwrap()
@@ -285,7 +286,7 @@ mod tests {
         drop(w);
 
         let r = cache
-            .read_dir(test_key)
+            .read_dir(&test_key)
             .unwrap()
             .open_read("file_name")
             .unwrap();

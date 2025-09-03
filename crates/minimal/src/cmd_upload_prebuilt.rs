@@ -1,5 +1,5 @@
 use crate::remote_storage::RemoteStorage;
-use graph::SpecHash;
+use graph::SpecHashable;
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
@@ -40,7 +40,7 @@ pub async fn cmd_upload_prebuilt(
     let spec_hash = package_spec.spec_hash(&dp);
 
     println!("Package: {}", package_name);
-    println!("Spec hash: {}", spec_hash.to_hex());
+    println!("Spec hash: {}", spec_hash.0.to_hex());
 
     // Check if prebuilt directory exists
     let prebuilt_dir = PathBuf::from("packages")
@@ -54,7 +54,7 @@ pub async fn cmd_upload_prebuilt(
 
     // Create temporary archive file
     let temp_dir = std::env::temp_dir();
-    let archive_name = format!("{}.tar.zst", spec_hash.to_hex());
+    let archive_name = format!("{}.tar.zst", spec_hash.0.to_hex());
     let temp_archive_path = temp_dir.join(&archive_name);
 
     // Create the tar.zst archive
