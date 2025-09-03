@@ -214,6 +214,9 @@ impl DepGraph {
             }
         })
     }
+    pub fn all(&self) -> impl Iterator<Item = BuildSpecRef> + use<'_> {
+        self.builds.iter().map(|e| BuildSpecRef(e.0))
+    }
 
     /// Returns the unique set of transitive build-spec dependencies of the given toplevel.
     ///

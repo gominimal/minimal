@@ -9,7 +9,7 @@ pub struct ExecPlan<'a> {
     dep_graph: &'a DepGraph,
 
     // the apex of the build graph - the ultimate build-spec we want compiled.
-    toplevel: BuildSpecRef,
+    toplevels: Vec<BuildSpecRef>,
 
     // built tracks the build-specs which were compiled in a previous phase.
     built: HashMap<BuildSpecRef, ()>,
@@ -31,9 +31,22 @@ impl<'a> ExecPlan<'a> {
 
         Self {
             dep_graph,
-            toplevel,
+            toplevels: vec![toplevel],
             built,
             reachable,
+            emitted_toplevel: false,
+        }
+    }
+
+    pub fn new_with_all(dep_graph: &'a DepGraph) -> Self {
+        let built = HashMap::with_capacity(dep_graph.builds.len());
+        let all: Vec<BuildSpecRef> = dep_graph.all().collect();
+
+        Self {
+            dep_graph,
+            toplevels: all.clone(),
+            built,
+            reachable: all,
             emitted_toplevel: false,
         }
     }
@@ -45,10 +58,19 @@ impl<'a> Iterator for ExecPlan<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         if self.reachable.len() == self.built.len() {
             // All dependent build-specs have been emitted as phases.
-            // As a final step, emit the toplevel in question.
+            // As a final step, emit any toplevels that haven't already
+            // been emitted.
             if !self.emitted_toplevel {
                 self.emitted_toplevel = true;
-                return Some(vec![self.toplevel]);
+                return Some(
+                    self.toplevels
+                        .iter()
+                        .filter_map(|bsr| match self.built.get(bsr) {
+                            None => Some(bsr.clone()),
+                            Some(_) => None, // already emitted
+                        })
+                        .collect(),
+                );
             }
             return None;
         }
@@ -61,7 +83,8 @@ impl<'a> Iterator for ExecPlan<'a> {
                 continue;
             }
 
-            // This build spec has all its dependencies met if all its build-spec inputs have been built.
+            // This build spec has all its dependencies met if all its build-spec inputs have been built, as well
+            // as all of its runtime dependencies.
             // Stuff thats built this phase is not considered met, as that would mean builds within a phase cannot
             // be executed in parallel.
             let bs = self.dep_graph.get(candidate).unwrap();
@@ -76,7 +99,12 @@ impl<'a> Iterator for ExecPlan<'a> {
                     Source(_) | HostPath(_) | Local(_) | Prebuilt(_) => {}
                 }
             }
-            // If we got this far, all build-spec input dependencies have been built. It can be emitted this phase.
+            for bsr in bs.runtime_deps.iter() {
+                if !self.built.contains_key(bsr) {
+                    continue 'candidate_loop;
+                }
+            }
+            // If we got this far, all build-spec dependencies have been built. It can be emitted this phase.
             met.push(*candidate);
             built_this_phase.insert(*candidate, ());
         }
