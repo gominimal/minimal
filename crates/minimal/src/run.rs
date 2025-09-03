@@ -325,9 +325,8 @@ impl Run {
 
                 println!("Completed isolated build: {}", build.name);
 
-                // If this is a source build of the requested package, copy outputs to prebuilt
+                // If this is a source build of the requested package, handle upload
                 if self.is_source_build && build.name == self.package_name {
-                    self.update_prebuilt_binaries(bsh)?;
                     // Store info for later upload (to avoid borrow checker issues)
                     lockfile_updates.push((build.name.clone(), bsh));
                 }
@@ -343,89 +342,20 @@ impl Run {
         Ok(())
     }
 
-    fn update_prebuilt_binaries(
-        &self,
-        bsh: blake3::Hash,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let cache_handle = self.cache.read_dir(bsh).unwrap();
-        let cache_dir = cache_handle.path();
-        let package_dir = PathBuf::from("packages").join(&self.package_name);
-        let prebuilt_dir = package_dir.join("prebuilt");
-
-        println!(
-            "Updating prebuilt binaries for package: {}",
-            self.package_name
-        );
-
-        // Clear existing prebuilt directory
-        if prebuilt_dir.exists() {
-            std::fs::remove_dir_all(&prebuilt_dir)?;
-        }
-        std::fs::create_dir_all(&prebuilt_dir)?;
-
-        // Copy built files to prebuilt
-        // Special handling for make - bin/make goes to usr/bin/make
-        if self.package_name == "make" {
-            let make_bin_src = cache_dir.join("bin/make");
-            if make_bin_src.exists() {
-                let make_bin_dst = prebuilt_dir.join("usr/bin");
-                std::fs::create_dir_all(&make_bin_dst)?;
-                std::fs::copy(&make_bin_src, make_bin_dst.join("make"))?;
-                println!("  Copied bin/make -> prebuilt/usr/bin/make");
-            }
-        }
-
-        // Handle all outputs - copy entire directory structure
-        for entry in std::fs::read_dir(cache_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                let dir_name = path.file_name().unwrap().to_str().unwrap();
-                // Skip bin directory for make package (already handled above)
-                if self.package_name == "make" && dir_name == "bin" {
-                    continue;
-                }
-                // Copy entire directory structure
-                let dest = prebuilt_dir.join(dir_name);
-                copy_dir_recursive(&path, &dest)?;
-                println!("  Copied {} -> prebuilt/{}", dir_name, dir_name);
-            }
-        }
-
-        println!(
-            "Successfully updated prebuilt binaries for {}",
-            self.package_name
-        );
-        Ok(())
-    }
-
     async fn upload_prebuilt_archive(
         &mut self,
-        _bsh: blake3::Hash,
+        bsh: blake3::Hash,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        println!("Auto-uploading prebuilt archive for {}", self.package_name);
+        eprintln!("Auto-uploading prebuilt archive for {}", self.package_name);
 
-        // Compute the package hash for the upload path
         let package_hash = self.compute_package_hash(&self.package_name)?;
-
-        // Create the archive from the prebuilt directory
-        let prebuilt_dir = PathBuf::from("packages")
-            .join(&self.package_name)
-            .join("prebuilt");
-
-        if !prebuilt_dir.exists() {
-            return Err(format!("Prebuilt directory not found: {}", prebuilt_dir.display()).into());
-        }
-
-        // Create temporary archive file
-        let temp_dir = std::env::temp_dir();
+        let cache_handle = self.cache.read_dir(bsh).unwrap();
+        let cache_dir = cache_handle.path();
         let archive_name = format!("{}.tar.zst", package_hash.to_hex());
-        let temp_archive_path = temp_dir.join(&archive_name);
+        let temp_archive_path = std::env::temp_dir().join(&archive_name);
 
-        // Create the tar.zst archive
-        create_prebuilt_archive(&prebuilt_dir, &temp_archive_path)?;
+        create_prebuilt_archive(&cache_dir.to_path_buf(), &temp_archive_path)?;
 
-        // Upload to GCS
         let bucket_id = "minimal-staging-archives";
         let gcs_path = format!("prebuilts/{}/{}", self.package_name, archive_name);
 
@@ -434,20 +364,18 @@ impl Run {
             .upload(bucket_id.to_string(), &gcs_path, &archive_data)
             .await?;
 
-        // Clean up temp file
         std::fs::remove_file(&temp_archive_path)?;
 
-        println!(
+        eprintln!(
             "Automatically uploaded prebuilt to gs://{}/{}",
             bucket_id, gcs_path
         );
 
-        // Update lockfile with the new hash
         self.lockfile
             .update_hash(self.package_name.clone(), package_hash.to_hex().to_string());
         let lockfile_path = std::path::Path::new("prebuilts.lock");
         self.lockfile.save(lockfile_path)?;
-        println!(
+        eprintln!(
             "Updated prebuilts.lock with new hash for {}",
             self.package_name
         );
