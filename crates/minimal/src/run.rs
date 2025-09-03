@@ -1,11 +1,11 @@
 use build_sandbox::{BuildConfig, config::BuildScript, run_build};
 use cache::{Cache, LocalDir};
 use graph::dep_graph::SourceFetch;
-use graph::{BuildOutput, BuildSpecInput, BuildSpecRef, DepGraph, ExecPlan, SpecHash};
+use graph::{BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, ExecPlan, SpecHash};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tracing::debug;
+use tracing::{debug, warn};
 use url::Url;
 
 use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage};
@@ -39,6 +39,194 @@ impl Run {
         }
     }
 
+    async fn sandbox_paths_from_buildspec(
+        &self,
+        build: &BuildSpec,
+    ) -> Result<(HashMap<PathBuf, PathBuf>, Vec<PathBuf>), Box<dyn std::error::Error>> {
+        let mut dependencies = HashMap::new();
+        let mut inputs = Vec::new();
+
+        debug!("Build {} has {} inputs", build.name, build.inputs.len());
+        for (i, input) in build.inputs.iter().enumerate() {
+            use BuildSpecInput::*;
+            match input {
+                Build(dep_ref) => {
+                    let dep_build = self.graph.get(dep_ref).unwrap();
+                    let dep_hash = dep_build.spec_hash(&self.graph);
+
+                    debug!(
+                        "  Input {}: Build({}) -- [{}]",
+                        i,
+                        dep_build.name,
+                        dep_hash.to_hex()
+                    );
+
+                    let cache_path = self.cache.read_dir(dep_hash).unwrap().path().to_path_buf();
+
+                    dependencies.insert(cache_path, PathBuf::from("/"));
+                }
+                HostPath(path) => {
+                    debug!("  Input {}: HostPath({})", i, path.display());
+                    let host_path = PathBuf::from(path);
+                    dependencies.insert(host_path.clone(), host_path);
+                }
+                Local((path, _hash)) => {
+                    debug!("  Input {}: Local file from {}", i, path.display());
+                    inputs.push(path.to_path_buf());
+                }
+                Source(source) => {
+                    debug!("  Input {}: Source({:?})", i, source.from);
+
+                    match &source.from {
+                        SourceFetch::URL(url_str) => {
+                            let url = Url::parse(url_str)
+                                .map_err(|e| format!("Failed to parse URL '{}': {}", url_str, e))?;
+
+                            match url.scheme() {
+                                "gs" => {
+                                    let bucket_id = url.host_str().ok_or_else(|| {
+                                        format!(
+                                            "Invalid gs:// URL: missing bucket name in '{}'",
+                                            url_str
+                                        )
+                                    })?;
+
+                                    let file_name = url.path().trim_start_matches('/');
+
+                                    let temp_base = std::env::temp_dir().join(format!(
+                                        "minpkgs-sources-{}",
+                                        build.name.replace('/', "-")
+                                    ));
+                                    std::fs::create_dir_all(&temp_base)?;
+
+                                    let local_filename =
+                                        file_name.rsplit('/').next().unwrap_or(file_name);
+                                    let temp_path = temp_base.join(local_filename);
+
+                                    let content = self
+                                        .remote_storage
+                                        .download(bucket_id.to_string(), file_name)
+                                        .await?;
+
+                                    std::fs::write(&temp_path, content)?;
+
+                                    // Verify SHA256 hash
+                                    let mut hasher = Sha256::new();
+                                    hasher.update(&std::fs::read(&temp_path)?);
+                                    let computed_hash = hasher.finalize();
+                                    let computed_hex = hex::encode(computed_hash);
+
+                                    if computed_hex != source.sha256 {
+                                        return Err(format!(
+                                            "SHA256 mismatch for {}: expected {}, got {}",
+                                            url_str, source.sha256, computed_hex
+                                        )
+                                        .into());
+                                    }
+
+                                    debug!(
+                                        "  Downloaded and verified source from gs://{}/{}",
+                                        bucket_id, file_name
+                                    );
+                                    inputs.push(temp_path);
+                                }
+                                _ => todo!(),
+                            }
+                        }
+                    }
+                }
+                Prebuilt(package_name) => {
+                    debug!("  Input {}: Prebuilt({})", i, package_name);
+
+                    // First check if we have a locked hash for this package
+                    let package_hash =
+                        if let Some(locked_hash) = self.lockfile.get_hash(package_name) {
+                            debug!("  Using locked hash for {}: {}", package_name, locked_hash);
+                            blake3::Hash::from_hex(locked_hash).map_err(|e| {
+                                format!("Invalid hex hash in lockfile for {}: {}", package_name, e)
+                            })?
+                        } else {
+                            debug!(
+                                "  No locked hash found, computing from source spec for {}",
+                                package_name
+                            );
+                            // Fall back to computing the hash (may fail with circular dependency)
+                            self.compute_package_hash(package_name)?
+                        };
+
+                    let bucket_id = "minimal-staging-archives";
+                    let file_path = format!(
+                        "prebuilts/{}/{}.tar.zst",
+                        package_name,
+                        package_hash.to_hex()
+                    );
+
+                    let temp_base = std::env::temp_dir()
+                        .join(format!("minpkgs-prebuilt-{}", build.name.replace('/', "-")));
+                    std::fs::create_dir_all(&temp_base)?;
+
+                    let temp_archive_path = temp_base.join(format!("{}.tar.zst", package_name));
+
+                    // Download the prebuilt archive
+                    let content = self
+                        .remote_storage
+                        .download(bucket_id.to_string(), &file_path)
+                        .await
+                        .map_err(|e| {
+                            format!(
+                                "Failed to download prebuilt archive for {}: {}",
+                                package_name, e
+                            )
+                        })?;
+
+                    std::fs::write(&temp_archive_path, content)?;
+
+                    // Extract the archive
+                    let extract_dir = temp_base.join("extracted");
+                    std::fs::create_dir_all(&extract_dir)?;
+
+                    self.extract_prebuilt_archive(&temp_archive_path, &extract_dir)?;
+
+                    debug!(
+                        "  Downloaded and extracted prebuilt archive for {} to {}",
+                        package_name,
+                        extract_dir.display()
+                    );
+                    inputs.push(extract_dir);
+                }
+            }
+        }
+        for (i, bsr) in build.runtime_deps.iter().enumerate() {
+            let dep_build = self.graph.get(bsr).unwrap();
+            let dep_hash = dep_build.spec_hash(&self.graph);
+
+            debug!(
+                "  Runtime dep {}: Build({}) -- [{}]",
+                i,
+                dep_build.name,
+                dep_hash.to_hex()
+            );
+
+            let cache_path = self.cache.read_dir(dep_hash).unwrap().path().to_path_buf();
+            if dependencies
+                .insert(cache_path, PathBuf::from("/"))
+                .is_some()
+            {
+                warn!(
+                    "Dependency {} was already present - probably fine",
+                    dep_build.name
+                );
+            }
+        }
+
+        debug!(
+            "Dependencies for isolated build {}: {:?}",
+            build.name, dependencies
+        );
+
+        Ok((dependencies, inputs))
+    }
+
     pub async fn execute(
         &mut self,
         debug: Option<BuildSpecRef>,
@@ -62,172 +250,7 @@ impl Run {
                 }
 
                 println!("Executing build: {} [{}]", build.name, bsh.to_hex());
-
-                let mut dependencies = HashMap::new();
-                let mut inputs = Vec::new();
-
-                debug!("Build {} has {} inputs", build.name, build.inputs.len());
-                for (i, input) in build.inputs.iter().enumerate() {
-                    use graph::BuildSpecInput::*;
-                    match input {
-                        Build(dep_ref) => {
-                            let dep_build = self.graph.get(dep_ref).unwrap();
-                            let dep_hash = dep_build.spec_hash(&self.graph);
-
-                            debug!(
-                                "  Input {}: Build({}) -- [{}]",
-                                i,
-                                dep_build.name,
-                                dep_hash.to_hex()
-                            );
-
-                            let cache_path =
-                                self.cache.read_dir(dep_hash).unwrap().path().to_path_buf();
-
-                            dependencies.insert(cache_path, PathBuf::from("/"));
-                        }
-                        HostPath(path) => {
-                            debug!("  Input {}: HostPath({})", i, path.display());
-                            let host_path = PathBuf::from(path);
-                            dependencies.insert(host_path.clone(), host_path);
-                        }
-                        Local((path, _hash)) => {
-                            debug!("  Input {}: Local file from {}", i, path.display());
-                            inputs.push(path.to_path_buf());
-                        }
-                        Source(source) => {
-                            debug!("  Input {}: Source({:?})", i, source.from);
-
-                            match &source.from {
-                                SourceFetch::URL(url_str) => {
-                                    let url = Url::parse(url_str).map_err(|e| {
-                                        format!("Failed to parse URL '{}': {}", url_str, e)
-                                    })?;
-
-                                    match url.scheme() {
-                                        "gs" => {
-                                            let bucket_id = url.host_str().ok_or_else(|| {
-                                        format!(
-                                            "Invalid gs:// URL: missing bucket name in '{}'",
-                                            url_str
-                                        )
-                                    })?;
-
-                                            let file_name = url.path().trim_start_matches('/');
-
-                                            let temp_base = std::env::temp_dir().join(format!(
-                                                "minpkgs-sources-{}",
-                                                build.name.replace('/', "-")
-                                            ));
-                                            std::fs::create_dir_all(&temp_base)?;
-
-                                            let local_filename =
-                                                file_name.rsplit('/').next().unwrap_or(file_name);
-                                            let temp_path = temp_base.join(local_filename);
-
-                                            let content = self
-                                                .remote_storage
-                                                .download(bucket_id.to_string(), file_name)
-                                                .await?;
-
-                                            std::fs::write(&temp_path, content)?;
-
-                                            // Verify SHA256 hash
-                                            let mut hasher = Sha256::new();
-                                            hasher.update(&std::fs::read(&temp_path)?);
-                                            let computed_hash = hasher.finalize();
-                                            let computed_hex = hex::encode(computed_hash);
-
-                                            if computed_hex != source.sha256 {
-                                                return Err(format!(
-                                                    "SHA256 mismatch for {}: expected {}, got {}",
-                                                    url_str, source.sha256, computed_hex
-                                                )
-                                                .into());
-                                            }
-
-                                            debug!(
-                                                "  Downloaded and verified source from gs://{}/{}",
-                                                bucket_id, file_name
-                                            );
-                                            inputs.push(temp_path);
-                                        }
-                                        _ => todo!(),
-                                    }
-                                }
-                            }
-                        }
-                        Prebuilt(package_name) => {
-                            debug!("  Input {}: Prebuilt({})", i, package_name);
-
-                            // First check if we have a locked hash for this package
-                            let package_hash = if let Some(locked_hash) =
-                                self.lockfile.get_hash(package_name)
-                            {
-                                debug!("  Using locked hash for {}: {}", package_name, locked_hash);
-                                blake3::Hash::from_hex(locked_hash).map_err(|e| {
-                                    format!(
-                                        "Invalid hex hash in lockfile for {}: {}",
-                                        package_name, e
-                                    )
-                                })?
-                            } else {
-                                debug!(
-                                    "  No locked hash found, computing from source spec for {}",
-                                    package_name
-                                );
-                                // Fall back to computing the hash (may fail with circular dependency)
-                                self.compute_package_hash(package_name)?
-                            };
-
-                            let bucket_id = "minimal-staging-archives";
-                            let file_path = format!(
-                                "prebuilts/{}/{}.tar.zst",
-                                package_name,
-                                package_hash.to_hex()
-                            );
-
-                            let temp_base = std::env::temp_dir()
-                                .join(format!("minpkgs-prebuilt-{}", build.name.replace('/', "-")));
-                            std::fs::create_dir_all(&temp_base)?;
-
-                            let temp_archive_path =
-                                temp_base.join(format!("{}.tar.zst", package_name));
-
-                            // Download the prebuilt archive
-                            let content = self
-                                .remote_storage
-                                .download(bucket_id.to_string(), &file_path)
-                                .await
-                                .map_err(|e| {
-                                    format!(
-                                        "Failed to download prebuilt archive for {}: {}",
-                                        package_name, e
-                                    )
-                                })?;
-
-                            std::fs::write(&temp_archive_path, content)?;
-
-                            // Extract the archive
-                            let extract_dir = temp_base.join("extracted");
-                            std::fs::create_dir_all(&extract_dir)?;
-
-                            self.extract_prebuilt_archive(&temp_archive_path, &extract_dir)?;
-
-                            debug!(
-                                "  Downloaded and extracted prebuilt archive for {} to {}",
-                                package_name,
-                                extract_dir.display()
-                            );
-                            inputs.push(extract_dir);
-                        }
-                    }
-                }
-
-                debug!(
-                    "Dependencies for isolated build {}: {:?}",
-                    build.name, dependencies
-                );
+                let (dependencies, inputs) = self.sandbox_paths_from_buildspec(build).await?;
 
                 // Check if this is a pure prebuilt package (only has Prebuilt inputs + system dependencies)
                 let has_prebuilt = build
