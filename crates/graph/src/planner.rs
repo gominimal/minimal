@@ -26,7 +26,7 @@ impl<'a> ExecPlan<'a> {
     }
 
     pub fn with_toplevel(dep_graph: &'a DepGraph, toplevel: BuildSpecRef) -> Self {
-        let built = HashMap::with_capacity(dep_graph.builds.len());
+        let built = HashMap::with_capacity(dep_graph.len());
         let reachable = dep_graph.transitive_specs_of(&toplevel);
 
         Self {
@@ -39,7 +39,7 @@ impl<'a> ExecPlan<'a> {
     }
 
     pub fn new_with_all(dep_graph: &'a DepGraph) -> Self {
-        let built = HashMap::with_capacity(dep_graph.builds.len());
+        let built = HashMap::with_capacity(dep_graph.len());
         let all: Vec<BuildSpecRef> = dep_graph.all().collect();
 
         Self {
@@ -159,12 +159,8 @@ mod tests {
         assert_eq!(
             plan,
             vec![
-                vec![BuildSpecRef(
-                    dp.builds.iter().find(|b| b.1.name == "no deps").unwrap().0
-                )],
-                vec![BuildSpecRef(
-                    dp.builds.iter().find(|b| b.1.name == "top").unwrap().0
-                )],
+                vec![dp.iter().find(|b| b.1.name == "no deps").unwrap().0],
+                vec![dp.iter().find(|b| b.1.name == "top").unwrap().0],
             ],
         );
     }
@@ -218,28 +214,15 @@ mod tests {
         assert_eq!(
             plan,
             vec![
-                vec![BuildSpecRef(
-                    dp.builds.iter().find(|b| b.1.name == "no deps").unwrap().0
-                )],
+                vec![dp.iter().find(|b| b.1.name == "no deps").unwrap().0],
                 vec![
-                    BuildSpecRef(
-                        dp.builds
-                            .iter()
-                            .find(|b| b.1.name == "depends one")
-                            .unwrap()
-                            .0
-                    ),
-                    BuildSpecRef(
-                        dp.builds
-                            .iter()
-                            .find(|b| b.1.name == "depends one other")
-                            .unwrap()
-                            .0
-                    ),
+                    dp.iter().find(|b| b.1.name == "depends one").unwrap().0,
+                    dp.iter()
+                        .find(|b| b.1.name == "depends one other")
+                        .unwrap()
+                        .0,
                 ],
-                vec![BuildSpecRef(
-                    dp.builds.iter().find(|b| b.1.name == "top").unwrap().0
-                )],
+                vec![dp.iter().find(|b| b.1.name == "top").unwrap().0],
             ],
         );
     }

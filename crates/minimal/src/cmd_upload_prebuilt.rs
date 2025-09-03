@@ -31,7 +31,6 @@ pub async fn cmd_upload_prebuilt(
 
     // Get the spec hash for the package
     let package_spec = dp
-        .builds
         .iter()
         .find(|(_, spec)| spec.name == *package_name)
         .map(|(_, spec)| spec)

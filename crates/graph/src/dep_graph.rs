@@ -179,7 +179,7 @@ impl SpecHashable for BuildSpec {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct DepGraph {
-    pub builds: Arena<BuildSpec>,
+    builds: Arena<BuildSpec>,
     pub top_level: BuildSpecRef,
 }
 
@@ -213,6 +213,14 @@ impl DepGraph {
     }
     pub fn all(&self) -> impl Iterator<Item = BuildSpecRef> + use<'_> {
         self.builds.iter().map(|e| BuildSpecRef(e.0))
+    }
+    pub fn len(&self) -> usize {
+        self.builds.len()
+    }
+    pub fn iter(&self) -> impl Iterator<Item = (BuildSpecRef, &BuildSpec)> + use<'_> {
+        self.builds
+            .iter()
+            .map(|(index, spec)| (BuildSpecRef(index), spec))
     }
 
     /// Returns the unique set of transitive build-spec dependencies of the given toplevel.
