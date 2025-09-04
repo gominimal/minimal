@@ -238,10 +238,17 @@ impl DepGraph {
     pub fn all(&self) -> impl Iterator<Item = BuildSpecRef> + use<'_> {
         self.builds.iter().map(|e| BuildSpecRef(e.0))
     }
+
     /// Returns the number of build-specs in the graph.
     pub fn len(&self) -> usize {
         self.builds.len()
     }
+    /// Returns true if the graph contains no build-specs.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Iterates over all build specs and their keys.
     pub fn iter(&self) -> impl Iterator<Item = (BuildSpecRef, &BuildSpec)> + use<'_> {
         self.builds

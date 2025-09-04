@@ -67,7 +67,7 @@ impl Run {
                     let cache_path = self.cache.read_dir(&dep_hash).unwrap().path().to_path_buf();
                     dependencies.insert(cache_path, PathBuf::from("/"));
 
-                    for (bsh, _attribution) in BuildManifest::make(&self.graph, &dep_ref, &dep_hash)
+                    for (bsh, _attribution) in BuildManifest::make(&self.graph, dep_ref, &dep_hash)
                         .transitive_runtime_deps
                         .into_iter()
                     {
@@ -230,7 +230,7 @@ impl Run {
             let cache_path = self.cache.read_dir(&dep_hash).unwrap().path().to_path_buf();
             dependencies.insert(cache_path, PathBuf::from("/"));
 
-            for (bsh, _attribution) in BuildManifest::make(&self.graph, &bsr, &dep_hash)
+            for (bsh, _attribution) in BuildManifest::make(&self.graph, bsr, &dep_hash)
                 .transitive_runtime_deps
                 .into_iter()
             {

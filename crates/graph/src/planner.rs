@@ -71,7 +71,7 @@ impl<'a> Iterator for ExecPlan<'a> {
                     })
                     .collect();
 
-                return if remaining.len() > 0 {
+                return if !remaining.is_empty() {
                     Some(remaining)
                 } else {
                     None

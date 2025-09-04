@@ -22,7 +22,7 @@ pub fn cmd_plan(args: PlanArgs) -> Result<()> {
         println!("Phase {}", i + 1);
         for bsr in phase.iter() {
             let build = graph.get(bsr).unwrap();
-            let bsh = graph.spec_hash(&bsr);
+            let bsh = graph.spec_hash(bsr);
             let is_cached = cache.read_dir(&bsh).is_ok();
             let cached_emoji = if is_cached { "✓" } else { "⚙️" };
 

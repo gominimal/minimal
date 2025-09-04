@@ -205,7 +205,7 @@ impl<FS: FileSystem> Cache<FS> {
     pub fn read_dir(&self, hash: &SpecHash) -> Result<DirCacheEntry<FS>, CacheErr> {
         Ok(DirCacheEntry {
             c: self.clone(),
-            tree: self.inner().dir(&hash)?,
+            tree: self.inner().dir(hash)?,
             hash: hash.clone(),
         })
     }
@@ -222,7 +222,7 @@ impl<FS: FileSystem> Cache<FS> {
 
         Ok(DirCacheEntry {
             c: self.clone(),
-            tree: inner.dir(&hash)?,
+            tree: inner.dir(hash)?,
             hash: hash.clone(),
         })
     }

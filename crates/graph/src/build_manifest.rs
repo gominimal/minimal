@@ -42,9 +42,7 @@ impl BuildManifest {
                     let dep_hash = g.spec_hash(bsr);
 
                     for (hash, source) in BuildManifest::make(g, bsr, &dep_hash)
-                        .transitive_runtime_deps
-                        .iter()
-                        .map(|(runtime_dep, _sources)| {
+                        .transitive_runtime_deps.keys().map(|runtime_dep| {
                             (
                                 runtime_dep.clone(),
                                 DepInfo::Inherited {
