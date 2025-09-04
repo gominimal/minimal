@@ -341,7 +341,8 @@ impl Run {
                             .values()
                             .map(|output| match output {
                                 BuildOutput::Library { glob } => glob.clone(),
-                                BuildOutput::Binary { .. } => todo!(),
+                                BuildOutput::Data { glob } => glob.clone(),
+                                BuildOutput::Binary { path } => path.clone(),
                             })
                             .collect(),
                         debug_shell: matches!(debug, Some(debug_bsr) if bsr == &debug_bsr),

@@ -10,6 +10,7 @@ pub enum ObjTy {
     Path,
     OutputLib,
     OutputBin,
+    OutputData,
     Source,
     Local,
     Prebuilt,
@@ -80,5 +81,13 @@ pub struct ObjLibraryOutput {
 #[allow(dead_code)]
 pub struct ObjBinaryOutput {
     pub path: String,
+    pub ty: ObjTy,
+}
+
+/// A data output.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ObjDataOutput {
+    pub data: String,
     pub ty: ObjTy,
 }

@@ -106,6 +106,7 @@ impl BuildSpecInput {
 #[allow(dead_code)]
 pub enum BuildOutput {
     Library { glob: String },
+    Data { glob: String },
     Binary { path: String },
 }
 
@@ -116,6 +117,10 @@ impl BuildOutput {
         match self {
             Library { glob } => {
                 h.write_all(b"library").unwrap();
+                h.write_all(glob.as_bytes()).unwrap();
+            }
+            Data { glob } => {
+                h.write_all(b"data").unwrap();
                 h.write_all(glob.as_bytes()).unwrap();
             }
             Binary { path } => {
@@ -486,11 +491,13 @@ impl GraphBuilder {
                 let prebuilt = ObjPrebuilt::deserialize(rt.clone()).unwrap();
                 Ok(BuildSpecInput::Prebuilt(prebuilt.package))
             }
-            ObjTy::OutputLib | ObjTy::OutputBin => Err(Error::UnexpectedObject {
-                got: obj.ty,
-                want: ObjTy::Builder,
-                pos: rt.pos,
-            }),
+            ObjTy::OutputLib | ObjTy::OutputBin | ObjTy::OutputData => {
+                Err(Error::UnexpectedObject {
+                    got: obj.ty,
+                    want: ObjTy::Builder,
+                    pos: rt.pos,
+                })
+            }
         }
     }
 
@@ -502,6 +509,10 @@ impl GraphBuilder {
             ObjTy::OutputLib => {
                 let lib = ObjLibraryOutput::deserialize(rt.clone()).unwrap();
                 Ok(BuildOutput::Library { glob: lib.glob })
+            }
+            ObjTy::OutputData => {
+                let data = ObjDataOutput::deserialize(rt.clone()).unwrap();
+                Ok(BuildOutput::Data { glob: data.data })
             }
             ObjTy::OutputBin => {
                 let bin = ObjBinaryOutput::deserialize(rt.clone()).unwrap();
@@ -626,7 +637,7 @@ mod tests {
         let sr = SpecReader::new(
             indoc! {
                 "
-                let {BuildSpec, HostPath, OutputLib, OutputBin, Source, ..} = import \"minimal.ncl\" in
+                let {BuildSpec, HostPath, OutputLib, OutputData, OutputBin, Source, ..} = import \"minimal.ncl\" in
                 {
                     name = \"single buildspec\",
                     inputs = [
@@ -635,6 +646,7 @@ mod tests {
                     outputs = {
                         something = { glob = \"/usr/lib/something.*.so\" } | OutputLib,
                         uwu_tool = { path = \"/bin/uwu\" } | OutputBin,
+                        some_data = { data = \"/data/locale/*\"  } | OutputData,
                     },
                     cmd = \"\",
                 } | BuildSpec"
@@ -662,6 +674,13 @@ mod tests {
             dp.builds.iter().next().unwrap().1.outputs["uwu_tool"],
             BuildOutput::Binary {
                 path: "/bin/uwu".to_string()
+            },
+        );
+        // We expect that buildspec to have one Data output
+        assert_eq!(
+            dp.builds.iter().next().unwrap().1.outputs["some_data"],
+            BuildOutput::Data {
+                glob: "/data/locale/*".to_string()
             },
         );
     }
