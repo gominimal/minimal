@@ -11,13 +11,9 @@ let grep = import "../grep/build.ncl" in
 let linux_headers = import "../linux_headers/build.ncl" in
 let make = import "../make/build.ncl" in
 let sed = import "build.ncl" in
-let mpc = import "../mpc/build.ncl" in
-let mpfr = import "../mpfr/build.ncl" in
 let sed = import "../sed/build.ncl" in
 let tar = import "../tar/build.ncl" in
-let zstd = import "../zstd/build.ncl" in
 let xz = import "../xz/build.ncl" in
-let gmp = import "../gmp/build.ncl" in
 {
     name = "sed",
     inputs = [
@@ -38,12 +34,8 @@ let gmp = import "../gmp/build.ncl" in
         linux_headers,
         make,
         sed,
-        mpc,
-        mpfr,
         tar,
-        zstd,
         xz,
-        gmp,
     ],
     cmd = "./build.source.sh",
     outputs = {

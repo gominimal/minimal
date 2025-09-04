@@ -11,10 +11,6 @@ let gcc = import "../gcc/build.ncl" in
 let binutils = import "../binutils/build.ncl" in
 let linux_headers = import "../linux_headers/build.ncl" in
 let gawk = import "../gawk/build.ncl" in
-let mpc = import "../mpc/build.ncl" in
-let mpfr = import "../mpfr/build.ncl" in
-let gmp = import "../gmp/build.ncl" in
-let zstd = import "../zstd/build.ncl" in
 {
     name = "file",
     inputs = [
@@ -35,10 +31,6 @@ let zstd = import "../zstd/build.ncl" in
         binutils,
         linux_headers,
         gawk,
-        mpc,
-        mpfr,
-        gmp,
-        zstd,
     ],
     cmd = "./build.source.sh",
     outputs = {

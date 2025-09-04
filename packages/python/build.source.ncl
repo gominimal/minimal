@@ -13,10 +13,6 @@ let gcc = import "../gcc/build.ncl" in
 let glibc = import "../glibc/build.ncl" in
 let linux_headers = import "../linux_headers/build.ncl" in
 let pkgconf = import "../pkgconf/build.ncl" in
-let mpc = import "../mpc/build.ncl" in
-let mpfr = import "../mpfr/build.ncl" in
-let gmp = import "../gmp/build.ncl" in
-let zstd = import "../zstd/build.ncl" in
 let gawk = import "../gawk/build.ncl" in
 {
     name = "python",
@@ -40,10 +36,6 @@ let gawk = import "../gawk/build.ncl" in
         linux_headers,
         ncurses,
         pkgconf,
-        mpc,
-        mpfr,
-        gmp,
-        zstd,
         gawk,
     ],
     cmd = "./build.source.sh",

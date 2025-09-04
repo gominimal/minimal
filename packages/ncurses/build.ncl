@@ -11,10 +11,6 @@ let linux_headers = import "../linux_headers/build.ncl" in
 let make = import "../make/build.ncl" in
 let sed = import "../sed/build.ncl" in
 let tar = import "../tar/build.ncl" in
-let mpc = import "../mpc/build.ncl" in
-let mpfr = import "../mpfr/build.ncl" in
-let gmp = import "../gmp/build.ncl" in
-let zstd = import "../zstd/build.ncl" in
 {
     name = "ncurses",
     inputs = [
@@ -35,10 +31,6 @@ let zstd = import "../zstd/build.ncl" in
         make,
         sed,
         tar,
-        mpc,
-        mpfr,
-        gmp,
-        zstd,
     ],
     cmd = "./build.sh",
     outputs = {

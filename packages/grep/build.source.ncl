@@ -1,10 +1,6 @@
 let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 let bash = import "../bash/build.ncl" in
 let make = import "../make/build.ncl" in
-let mpc = import "../mpc/build.ncl" in
-let mpfr = import "../mpfr/build.ncl" in
-let gmp = import "../gmp/build.ncl" in
-let zstd = import "../zstd/build.ncl" in
 let binutils = import "../binutils/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
 let gcc = import "../gcc/build.ncl" in
@@ -30,10 +26,6 @@ let gawk = import "../gawk/build.ncl" in
         glibc,
         linux_headers,
         make,
-        mpc,
-        mpfr,
-        gmp,
-        zstd,
         tar,
         xz,
         sed,
