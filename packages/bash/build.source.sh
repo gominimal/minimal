@@ -7,10 +7,7 @@ cd bash-5.3
 ./configure --prefix=/usr \
             --without-bash-malloc \
             --docdir=/usr/share/doc/bash-5.3 \
-            --disable-readline
-
-# TODO
-# --with-installed-readline 
+            --with-installed-readline
 
 make -j$(nproc)
 

@@ -9,6 +9,7 @@ let grep = import "../grep/build.ncl" in
 let gzip = import "../gzip/build.ncl" in
 let linux_headers = import "../linux_headers/build.ncl" in
 let make = import "../make/build.ncl" in
+let readline = import "../readline/build.ncl" in
 let sed = import "../sed/build.ncl" in
 let tar = import "../tar/build.ncl" in
 {
@@ -29,6 +30,7 @@ let tar = import "../tar/build.ncl" in
         gzip,
         linux_headers,
         make,
+        readline,
         sed,
         tar,
     ],
