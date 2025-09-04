@@ -999,4 +999,52 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    #[ignore]
+    fn circular_ref_doesnt_crash() {
+        let sr = SpecReader::new(
+            indoc! {
+                "
+                let {BuildSpec, ..} = import \"minimal.ncl\" in
+
+                let rec b1 = {
+                    name = \"build 1\",
+                    inputs = [b2],
+                    cmd = \"\",
+                } | BuildSpec,
+                b2 = {
+                    name = \"build 2\",
+                    inputs = [b1],
+                    cmd = \"\",
+                } | BuildSpec,
+                in
+                b1
+                "
+            }
+            .to_string(),
+            &SpecReaderOptions::for_test(),
+        );
+        // So we can see the actual error when parsing fails
+        sr.as_ref().err().into_iter().for_each(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+        let sr = sr.unwrap();
+        println!("spec parsing has finished");
+
+        let dp = DepGraph::new(sr).unwrap();
+        // We expect three buildspecs - four buildspecs would mean that `shared` (referenced twice) was duplicated
+        assert_eq!(
+            vec![
+                "sharing is caringgggg".to_string(),
+                "nested build".to_string(),
+                "top build".to_string()
+            ],
+            dp.builds
+                .into_iter()
+                .map(|b| b.name)
+                .collect::<Vec<String>>()
+        );
+    }
 }
