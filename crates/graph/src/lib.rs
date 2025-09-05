@@ -64,6 +64,18 @@ trait SpecHashable {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SpecHash(pub blake3::Hash);
 
+impl PartialOrd for SpecHash {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.as_bytes().cmp(other.as_bytes()))
+    }
+}
+
+impl Ord for SpecHash {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_bytes().cmp(other.as_bytes())
+    }
+}
+
 impl SpecHash {
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()

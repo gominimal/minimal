@@ -270,11 +270,14 @@ mod tests {
             .unwrap()
             .spec_hash(&dg);
 
+        let mut deps = toplevel_manifest
+            .transitive_runtime_deps
+            .into_iter()
+            .collect::<Vec<_>>();
+        deps.sort_by(|(a, _), (b, _)| a.cmp(b));
+
         assert_eq!(
-            toplevel_manifest
-                .transitive_runtime_deps
-                .into_iter()
-                .collect::<Vec<_>>(),
+            deps,
             vec![
                 (top_dep_hash.clone(), vec![DepInfo::Ours],),
                 (

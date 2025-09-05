@@ -15,7 +15,7 @@ indoc = "^2.0"
 generational-arena = "^0.2"
 blake3 = "1"
 fxhash = "0.2"
-nickel-lang-core = "0.13"
+nickel-lang-core = "0.14"
 
 path-absolutize = "^3.1"
 tempfile = { version = "3.0" }
