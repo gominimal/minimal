@@ -4,7 +4,7 @@ use nickel_lang_core::{error::NullReporter, eval::cache::CacheImpl, program::Pro
 
 use std::io;
 
-const SRC: &'static str = indoc! {
+const SRC: &str = indoc! {
     "
 let {BuildSpec, ..} = import \"minimal.ncl\" in
 

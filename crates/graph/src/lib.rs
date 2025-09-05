@@ -66,7 +66,7 @@ pub struct SpecHash(pub blake3::Hash);
 
 impl PartialOrd for SpecHash {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.as_bytes().cmp(other.as_bytes()))
+        Some(self.cmp(other))
     }
 }
 
