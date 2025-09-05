@@ -33,49 +33,46 @@ impl BuildManifest {
                 2 * (build.inputs.len() + build.runtime_deps.len()),
             ),
         };
-        for input in build.inputs.iter() {
-            use BuildSpecInput::*;
-            // Collect all transitive runtime_deps by recursing into the [BuildManifest] of
-            // all inputs.
-            match input {
-                Build(bsr) => {
-                    let dep_hash = g.spec_hash(bsr);
 
-                    for (hash, source) in BuildManifest::make(g, bsr, &dep_hash)
-                        .transitive_runtime_deps
-                        .keys()
-                        .map(|runtime_dep| {
-                            (
-                                runtime_dep.clone(),
-                                DepInfo::Inherited {
-                                    from: dep_hash.clone(),
-                                },
-                            )
-                        })
-                    {
-                        match out.transitive_runtime_deps.get_mut(&hash) {
-                            Some(source_list) => source_list.push(source),
-                            None => {
-                                out.transitive_runtime_deps.insert(hash, vec![source]);
-                            }
+        for bsr in build.runtime_deps.iter() {
+            let dep_hash = g.spec_hash(bsr);
+            out.transitive_runtime_deps
+                .insert(dep_hash, vec![DepInfo::Ours]);
+        }
+
+        // Collect all transitive runtime_deps by recursing into the [BuildManifest] of
+        // all inputs, as well as all runtime_deps.
+        use BuildSpecInput::*;
+        build
+            .inputs
+            .iter()
+            .filter_map(|input| match input {
+                Build(bsr) => Some(bsr),
+                Source(_) | HostPath(_) | Local(_) | Prebuilt(_) => None,
+            })
+            .chain(build.runtime_deps.iter())
+            .for_each(|bsr| {
+                let dep_hash = g.spec_hash(bsr);
+                for (hash, source) in BuildManifest::make(g, bsr, &dep_hash)
+                    .transitive_runtime_deps
+                    .keys()
+                    .map(|runtime_dep| {
+                        (
+                            runtime_dep.clone(),
+                            DepInfo::Inherited {
+                                from: dep_hash.clone(),
+                            },
+                        )
+                    })
+                {
+                    match out.transitive_runtime_deps.get_mut(&hash) {
+                        Some(source_list) => source_list.push(source),
+                        None => {
+                            out.transitive_runtime_deps.insert(hash, vec![source]);
                         }
                     }
                 }
-
-                Source(_) | HostPath(_) | Local(_) | Prebuilt(_) => {}
-            }
-        }
-        // Lastly lets add runtime deps declared on this build.
-        for bsr in build.runtime_deps.iter() {
-            let dep_hash = g.spec_hash(bsr);
-            match out.transitive_runtime_deps.get_mut(&dep_hash) {
-                Some(source_list) => source_list.push(DepInfo::Ours),
-                None => {
-                    out.transitive_runtime_deps
-                        .insert(dep_hash, vec![DepInfo::Ours]);
-                }
-            }
-        }
+            });
 
         out
     }
@@ -214,6 +211,77 @@ mod tests {
                     from: nested_input_hash
                 }]
             )],
+        );
+    }
+
+    #[test]
+    fn runtime_deps_nested_runtime_deps() {
+        let sr = SpecReader::new(
+            indoc! {
+                "
+                let {BuildSpec, Source, ..} = import \"minimal.ncl\" in
+
+                let nested_dep = {
+                    name = \"nested dep\",
+                    inputs = [
+                        {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
+                    ],
+                    cmd = \"\",
+                } | BuildSpec
+                in
+                let top_dep = {
+                    name = \"top dep\",
+                    inputs = [],
+                    runtime_deps = [nested_dep],
+                    cmd = \"\",
+                } | BuildSpec
+                in
+
+                {
+                    name = \"top build\",
+                    inputs = [],
+                    runtime_deps = [top_dep],
+                    cmd = \"\",
+                } | BuildSpec"
+            }
+            .to_string(),
+            &SpecReaderOptions::for_test(),
+        );
+        // So we can see the actual error when parsing fails
+        sr.as_ref().err().into_iter().for_each(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+        let sr = sr.unwrap();
+
+        let dg = DepGraph::new(sr).unwrap();
+        let build = dg.get(&dg.by_name("top build").next().unwrap()).unwrap();
+        let bsh = build.spec_hash(&dg);
+
+        let toplevel_manifest = BuildManifest::make(&dg, &dg.top_level, &bsh);
+        assert_eq!(toplevel_manifest.hash, bsh);
+
+        let nested_dep_hash = dg
+            .get(&dg.by_name("nested dep").next().unwrap())
+            .unwrap()
+            .spec_hash(&dg);
+        let top_dep_hash = dg
+            .get(&dg.by_name("top dep").next().unwrap())
+            .unwrap()
+            .spec_hash(&dg);
+
+        assert_eq!(
+            toplevel_manifest
+                .transitive_runtime_deps
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![
+                (top_dep_hash.clone(), vec![DepInfo::Ours],),
+                (
+                    nested_dep_hash,
+                    vec![DepInfo::Inherited { from: top_dep_hash }]
+                )
+            ],
         );
     }
 }

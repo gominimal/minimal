@@ -71,7 +71,7 @@ impl Run {
                         .transitive_runtime_deps
                         .into_iter()
                     {
-                        debug!("   - Transitive runtime dep -- [{}]", dep_hash.0.to_hex());
+                        debug!("   - Transitive runtime dep -- [{}]", bsh.0.to_hex());
 
                         let cache_path = self.cache.read_dir(&bsh).unwrap().path().to_path_buf();
                         if dependencies
@@ -80,7 +80,7 @@ impl Run {
                         {
                             warn!(
                                 "Transitive dependency [{}] was already present - probably fine",
-                                dep_hash.0.to_hex(),
+                                bsh.0.to_hex(),
                             );
                         }
                     }
