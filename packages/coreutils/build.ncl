@@ -1,5 +1,6 @@
 let {BuildSpec, HostPath, OutputLib, Local, Prebuilt, ..} = import "minimal.ncl" in
 let acl = import "../acl/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
 let libcap = import "../libcap/build.ncl" in
 {
     name = "coreutils",
@@ -8,6 +9,7 @@ let libcap = import "../libcap/build.ncl" in
     ],
     runtime_deps = [
         acl,
+        glibc,
         libcap,
     ],
     cmd = "",

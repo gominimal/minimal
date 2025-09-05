@@ -2,16 +2,13 @@ let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" i
 let bash = import "../bash/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
 let diffutils = import "../diffutils/build.ncl" in
-let make = import "../make/build.ncl" in
-let grep = import "../grep/build.ncl" in
-let tar = import "../tar/build.ncl" in
-let gzip = import "../gzip/build.ncl" in
-let sed = import "../sed/build.ncl" in
-let glibc = import "../glibc/build.ncl" in
-let gcc = import "../gcc/build.ncl" in
-let binutils = import "../binutils/build.ncl" in
-let linux_headers = import "../linux_headers/build.ncl" in
 let gawk = import "../gawk/build.ncl" in
+let grep = import "../grep/build.ncl" in
+let gzip = import "../gzip/build.ncl" in
+let make = import "../make/build.ncl" in
+let sed = import "../sed/build.ncl" in
+let tar = import "../tar/build.ncl" in
+let toolchain = import "../toolchain/build.ncl" in
 {
     name = "file",
     inputs = [
@@ -23,16 +20,13 @@ let gawk = import "../gawk/build.ncl" in
         bash,
         coreutils,
         diffutils,
-        make,
-        grep,
-        tar,
-        gzip,
-        sed,
-        gcc,
-        glibc,
-        binutils,
-        linux_headers,
         gawk,
+        grep,
+        gzip,
+        make,
+        sed,
+        tar,
+        toolchain,
     ],
     cmd = "./build.source.sh",
     outputs = {

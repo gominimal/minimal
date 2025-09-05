@@ -1,17 +1,14 @@
 let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 let bash = import "../bash/build.ncl" in
-let binutils = import "../binutils/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
 let diffutils = import "../diffutils/build.ncl" in
 let gawk = import "../gawk/build.ncl" in
-let gcc = import "../gcc/build.ncl" in
-let glibc = import "../glibc/build.ncl" in
 let grep = import "../grep/build.ncl" in
-let linux_headers = import "../linux_headers/build.ncl" in
 let make = import "../make/build.ncl" in
 let pcre2 = import "../pcre2/build.ncl" in
 let sed = import "../sed/build.ncl" in
 let tar = import "../tar/build.ncl" in
+let toolchain = import "../toolchain/build.ncl" in
 let xz = import "../xz/build.ncl" in
 {
     name = "grep",
@@ -22,18 +19,15 @@ let xz = import "../xz/build.ncl" in
             sha256 = "2649b27c0e90e632eadcd757be06c6e9a4f48d941de51e7c0f83ff76408a07b9"
         } | Source,
         bash,
-        binutils,
         coreutils,
         diffutils,
         gawk,
-        gcc,
-        glibc,
         grep,
-        linux_headers,
         make,
         pcre2,
         sed,
         tar,
+        toolchain,
         xz,
     ],
     cmd = "./build.source.sh",
