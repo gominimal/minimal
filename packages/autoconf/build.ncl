@@ -2,6 +2,8 @@ let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" i
 let bash = import "../bash/build.ncl" in
 let binutils = import "../binutils/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
+let diffutils = import "../diffutils/build.ncl" in
+let findutils = import "../findutils/build.ncl" in
 let gawk = import "../gawk/build.ncl" in
 let gcc = import "../gcc/build.ncl" in
 let glibc = import "../glibc/build.ncl" in
@@ -24,6 +26,8 @@ let xz = import "../xz/build.ncl" in
         bash,
         binutils,
         coreutils,
+        diffutils,
+        findutils,
         gawk,
         gcc,
         glibc,

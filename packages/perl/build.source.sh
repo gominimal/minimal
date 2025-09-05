@@ -4,7 +4,10 @@ set -e
 tar xfo perl-5.42.0.tar.xz
 cd perl-5.42.0
 
-sh Configure -des                                           \
+export BUILD_ZLIB=False
+export BUILD_BZIP2=0
+
+sh Configure  -des                                          \
              -D cc=gcc                                     \
              -D prefix=/usr                                 \
              -D vendorprefix=/usr                           \
@@ -20,7 +23,6 @@ sh Configure -des                                           \
              -D useshrplib                                 \
              -D usethreads
 
-make -j$(nprocs)
+make -j$(nproc)
+# TEST_JOBS=$(nproc) make test_harness # TODO there are failures
 make DESTDIR=$OUTPUT_DIR install
-
-echo "Perl build complete"

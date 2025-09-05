@@ -7,4 +7,5 @@ cd patch-2.8
 ./configure --prefix=/usr
 
 make
+make check
 make DESTDIR="$OUTPUT_DIR" install

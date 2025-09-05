@@ -4,9 +4,6 @@ set -e
 tar xfo gcc-15.2.0.tar.xz
 cd gcc-15.2.0
 
-# tar xfo gcc-14.3.0.tar.xz
-# cd gcc-14.3.0
-
 case $(uname -m) in
   x86_64)
     sed -e '/m64=/s/lib64/lib/' \
@@ -17,22 +14,21 @@ esac
 mkdir -v build
 cd build
 
+# TODO
+# --enable-host-pie
+# --enable-nls
+
 ../configure \
              --prefix=/usr             \
              --enable-languages=c,c++ \
+             --enable-default-pie     \
+             --enable-default-ssp     \
              --disable-multilib       \
-             --disable-fixincludes     \
-             --disable-lto            \
-             --disable-nls            \
              --disable-bootstrap      \
-
-# TODO
-# --with-system-zlib 
-# --enable-default-pie
-# --enable-default-ssp
-# --enable-lto
-# --enable-nls
+             --disable-fixincludes     \
+             --with-system-zlib       \
+             --disable-nls
 
 make -j$(nproc)
-
+# TODO make -k check
 make DESTDIR=$OUTPUT_DIR install

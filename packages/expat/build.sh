@@ -9,7 +9,5 @@ cd expat-2.7.1
             --docdir="/usr/share/doc/expat-2.7.1"
 
 make -j$(nproc)
-
+make check
 make DESTDIR=$OUTPUT_DIR install
-
-echo "Expat build complete"

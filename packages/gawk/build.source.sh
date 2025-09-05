@@ -9,7 +9,6 @@ sed -i 's/extras//' Makefile.in
 ./configure --prefix=/usr
 
 make -j$(nproc)
-
+# TODO
+# make check
 make DESTDIR=$OUTPUT_DIR install
-
-echo "Gawk build complete"

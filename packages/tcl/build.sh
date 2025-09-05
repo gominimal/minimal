@@ -6,11 +6,11 @@ cd tcl8.6.16
 
 SRCDIR=$(pwd)
 cd unix
-./configure --prefix=/usr \
+./configure  --prefix=/usr            \
             --mandir=/usr/share/man \
             --disable-rpath
 
-make
+make -j$(nproc)
 
 sed -e "s|$SRCDIR/unix|/usr/lib|" \
     -e "s|$SRCDIR|/usr/include|"  \
@@ -29,6 +29,6 @@ sed -e "s|$SRCDIR/unix/pkgs/itcl4.3.2|/usr/lib/itcl4.3.2|" \
 
 unset SRCDIR
 
-make -j$(nproc)
+# make test
 make DESTDIR=$OUTPUT_DIR install
 make DESTDIR=$OUTPUT_DIR install-private-headers

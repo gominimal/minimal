@@ -3,6 +3,7 @@ let bash = import "../bash/build.ncl" in
 let binutils = import "../binutils/build.ncl" in
 let bison = import "../bison/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
+let diffutils = import "../diffutils/build.ncl" in
 let gawk = import "../gawk/build.ncl" in
 let gcc = import "../gcc/build.ncl" in
 let glibc = import "../glibc/build.ncl" in 
@@ -27,6 +28,7 @@ let xz = import "../xz/build.ncl" in
         binutils,
         bison,
         coreutils,
+        diffutils,
         gawk,
         gcc,
         glibc,
@@ -44,7 +46,6 @@ let xz = import "../xz/build.ncl" in
     outputs = {
         etc = { glob = "etc/**/*" } | OutputLib,
         lib64 = { glob = "lib64/**/*" } | OutputLib,
-        sbin = { glob = "sbin/**/*" } | OutputLib,
         usr = { glob = "usr/**/*" } | OutputLib,
         var = { glob = "var/**/*" } | OutputLib,
     },

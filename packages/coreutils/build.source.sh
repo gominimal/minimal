@@ -1,5 +1,4 @@
 #!/bin/sh
-
 set -e
 
 tar xf coreutils-9.7.tar.xz
@@ -10,7 +9,4 @@ FORCE_UNSAFE_CONFIGURE=1 ./configure \
     --enable-no-install-program=kill,uptime
 
 make -j$(nproc)
-
 make DESTDIR=$OUTPUT_DIR install
-
-echo "Coreutils build complete"

@@ -2,6 +2,7 @@ let {BuildSpec, HostPath, OutputLib, Local, Prebuilt, ..} = import "minimal.ncl"
 let gmp = import "../gmp/build.ncl" in
 let mpc = import "../mpc/build.ncl" in
 let mpfr = import "../mpfr/build.ncl" in
+let zlib = import "../zlib/build.ncl" in
 let zstd = import "../zstd/build.ncl" in
 {
     name = "gcc",
@@ -12,6 +13,7 @@ let zstd = import "../zstd/build.ncl" in
         gmp,
         mpc,
         mpfr,
+        zlib,
         zstd,
     ],
     cmd = "",

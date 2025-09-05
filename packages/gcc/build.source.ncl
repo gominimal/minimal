@@ -18,6 +18,7 @@ let perl = import "../perl/build.ncl" in
 let sed = import "../sed/build.ncl" in
 let tar = import "../tar/build.ncl" in
 let xz = import "../xz/build.ncl" in
+let zlib = import "../zlib/build.ncl" in
 let zstd = import "../zstd/build.ncl" in
 {
     name = "gcc",
@@ -27,10 +28,6 @@ let zstd = import "../zstd/build.ncl" in
             url = "gs://minimal-staging-archives/gcc-15.2.0.tar.xz", 
             sha256 = "438fd996826b0c82485a29da03a72d71d6e3541a83ec702df4271f6fe025d24e"
         } | Source,
-        # {
-        #     url = "gs://minimal-staging-archives/gcc-14.3.0.tar.xz", 
-        #     sha256 = "e0dc77297625631ac8e50fa92fffefe899a4eb702592da5c32ef04e2293aca3a"
-        # } | Source,
         bash,
         binutils,
         coreutils,
@@ -50,6 +47,7 @@ let zstd = import "../zstd/build.ncl" in
         sed,
         tar,
         xz,
+        zlib,
         zstd,
     ],
     cmd = "./build.source.sh",

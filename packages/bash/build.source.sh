@@ -10,7 +10,7 @@ cd bash-5.3
             --with-installed-readline
 
 make -j$(nproc)
-
+# TODO make tests
 make DESTDIR=$OUTPUT_DIR install
 
 mkdir -p $OUTPUT_DIR/bin

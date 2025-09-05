@@ -122,18 +122,6 @@ fn bind_essential_directories(new_root: &str) -> std::io::Result<()> {
         .map_err(|e| std::io::Error::other(format!("bind mount {} failed: {}", src, e)))?;
     }
 
-    let etc_path = format!("{}/etc", new_root);
-    create_dir_all(&etc_path)
-        .map_err(|e| std::io::Error::other(format!("mkdir /etc failed: {}", e)))?;
-    mount(
-        Some("tmpfs"),
-        etc_path.as_str(),
-        Some("tmpfs"),
-        MsFlags::empty(),
-        Some("size=10m"),
-    )
-    .map_err(|e| std::io::Error::other(format!("tmpfs mount /etc failed: {}", e)))?;
-
     Ok(())
 }
 

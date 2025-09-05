@@ -1,6 +1,8 @@
 let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
 let bash = import "../bash/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
+let diffutils = import "../diffutils/build.ncl" in
+let file = import "../file/build.ncl" in
 let make = import "../make/build.ncl" in
 let m4 = import "../m4/build.ncl" in
 let gcc = import "../gcc/build.ncl" in
@@ -24,6 +26,8 @@ let gzip = import "../gzip/build.ncl" in
         binutils,
         bash,
         coreutils,
+        diffutils,
+        file,
         gcc,
         glibc,
         linux_headers,

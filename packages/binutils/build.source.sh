@@ -7,23 +7,20 @@ cd binutils-2.45
 mkdir -v build
 cd build
 
-../configure --prefix=/usr         \
-             --sysconfdir=/etc   \
-             --disable-nls \
-             --enable-gprofng=no \
-             --disable-werror    \
-             --enable-new-dtags  \
-             --enable-default-hash-style=gnu
-             
 # TODO 
-# --with-system-zlib
-# --enable-ld=default
-# --enable-plugins
-# --enable-shared
-# --enable-64-bit-bfd
+# --enable-nls
+
+../configure  --prefix=/usr        \
+             --sysconfdir=/etc   \
+             --enable-ld=default \
+             --enable-plugins    \
+             --enable-shared     \
+             --disable-werror    \
+             --disable-nls       \
+             --enable-new-dtags  \
+             --with-system-zlib  \
+             --enable-default-hash-style=gnu
 
 make -j$(nproc) tooldir=/usr
-
-make -k check
-
+# make -k check # TODO
 make tooldir=/usr DESTDIR=$OUTPUT_DIR install

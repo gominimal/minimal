@@ -49,13 +49,14 @@ impl BuildExecutor {
 
         let mut sandbox = sandbox::create_sandbox(config)?;
 
+        // Create the command and apply sandbox modifications first
         let mut cmd = if config.debug_shell {
             info!("Launching debug shell in sandbox environment");
             info!("  TMPDIR: {}", self.temp_dir_path.display());
             info!("  OUTPUT_DIR: {}", self.output_staging_path.display());
             info!("  Type 'exit' to leave the debug shell");
 
-            let mut c = Command::new("/bin/sh");
+            let mut c = Command::new("/bin/bash");
             sandbox.execute(&mut c)?;
             c
         } else if cfg!(target_os = "linux") {
@@ -66,22 +67,24 @@ impl BuildExecutor {
             Command::new(&config.build_script.executable)
         };
 
-        if !config.debug_shell {
-            for arg in &config.build_script.args {
-                cmd.arg(arg);
+        cmd.env_clear();
+        cmd.current_dir(&self.temp_dir_path);
+        cmd.env("HOME", &self.temp_dir_path);
+        cmd.env("LANG", "en_US.utf8");
+        cmd.env("LC_ALL", "en_US.utf8");
+        cmd.env("OUTPUT_DIR", &self.output_staging_path);
+        cmd.env("PWD", &self.temp_dir_path);
+        cmd.env("TMPDIR", &self.temp_dir_path);
+
+        if config.debug_shell {
+            cmd.env("SHELL", "/bin/bash");
+            cmd.env("TERM", "xterm");
+            if let Ok(user) = std::env::var("USER") {
+                cmd.env("USER", user);
             }
         }
 
-        cmd.current_dir(&self.temp_dir_path);
-        cmd.env("TMPDIR", &self.temp_dir_path);
-        cmd.env("OUTPUT_DIR", &self.output_staging_path);
-
-        let path_components = [
-            PathBuf::from("/bin"),
-            PathBuf::from("/sbin"),
-            PathBuf::from("/usr/bin"),
-            PathBuf::from("/usr/sbin"),
-        ];
+        let path_components = [PathBuf::from("/usr/bin"), PathBuf::from("/usr/sbin")];
 
         if !path_components.is_empty() {
             let path_string = path_components
@@ -91,6 +94,12 @@ impl BuildExecutor {
                 .join(":");
             cmd.env("PATH", &path_string);
             info!("Set PATH to {}", path_string);
+        }
+
+        if !config.debug_shell {
+            for arg in &config.build_script.args {
+                cmd.arg(arg);
+            }
         }
 
         let output = if config.debug_shell {

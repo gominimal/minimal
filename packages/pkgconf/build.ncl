@@ -34,9 +34,10 @@ let xz = import "../xz/build.ncl" in
     ],
     cmd = "./build.sh",
     outputs = {
-        pkgconf = { glob = "usr/bin/pkgconf" } | OutputLib,
-        library = { glob = "usr/lib/libpkgconf.so*" } | OutputLib,
-        headers = { glob = "usr/include/pkgconf/libpkgconf/*.h" } | OutputLib,
-        man_pages = { glob = "usr/share/man/man1/*.1" } | OutputLib,
+        usr_bin = { glob = "usr/bin/*" } | OutputLib,
+        usr_include_pkgconf_libpkgconf = { glob = "usr/include/pkgconf/libpkgconf/*" } | OutputLib,
+        usr_lib = { glob = "usr/lib/*" } | OutputLib,
+        usr_lib_pkgconfig = { glob = "usr/lib/pkgconfig/*" } | OutputLib,
+        usr_share_aclocal = { glob = "usr/share/aclocal/*" } | OutputLib,
     },
 } | BuildSpec

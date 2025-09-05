@@ -1,13 +1,14 @@
 #!/bin/sh
 set -e
 
-tar -xf attr-2.5.2.tar.gz --no-same-owner --no-same-permissions
+tar xfo attr-2.5.2.tar.gz
 cd attr-2.5.2
 
-./configure --prefix=/usr \
-            --disable-static \
+./configure  --prefix=/usr      \
+            --disable-static  \
             --sysconfdir=/etc \
             --docdir=/usr/share/doc/attr-2.5.2
 
-make
+make -j$(nproc)
+# make check # TODO
 make DESTDIR="$OUTPUT_DIR" install

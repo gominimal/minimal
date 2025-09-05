@@ -1,5 +1,4 @@
 #!/bin/sh
-
 set -e
 
 tar xfo bzip2-1.0.8.tar.gz
@@ -10,16 +9,14 @@ sed -i "s@(PREFIX)/man@(PREFIX)/share/man@g" Makefile
 
 make -f Makefile-libbz2_so
 make clean
-make
-PREFIX="$OUTPUT_DIR/usr"
-make PREFIX="$PREFIX" install
 
-cp -av libbz2.so.* "$PREFIX/lib/"
-ln -sv libbz2.so.1.0.8 "$PREFIX/lib/libbz2.so"
+make -j$(nproc)
+make PREFIX="$OUTPUT_DIR/usr" install
 
-cp -v bzip2-shared "$PREFIX/bin/bzip2"
-ln -sfv bzip2 "$PREFIX/bin/bzcat"
-ln -sfv bzip2 "$PREFIX/bin/bunzip2"
-rm -fv "$PREFIX/lib/libbz2.a"
+cp -av libbz2.so.* "$OUTPUT_DIR/usr/lib/"
+ln -sv libbz2.so.1.0.8 "$OUTPUT_DIR/usr/lib/libbz2.so"
 
-echo "Bzip2 build complete"
+cp -v bzip2-shared "$OUTPUT_DIR/usr/bin/bzip2"
+for i in "$OUTPUT_DIR/usr/bin/"{bzcat,bunzip2}; do
+  ln -sfv bzip2 $i
+done

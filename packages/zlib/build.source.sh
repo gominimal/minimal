@@ -6,6 +6,6 @@ cd zlib-1.3.1
 
 ./configure --prefix=/usr
 
-make
-
+make -j$(nproc)
+make check
 make DESTDIR=$OUTPUT_DIR install

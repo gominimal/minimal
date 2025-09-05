@@ -2,14 +2,19 @@ let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" i
 let bash = import "../bash/build.ncl" in
 let binutils = import "../binutils/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
+let diffutils = import "../diffutils/build.ncl" in
+let file = import "../file/build.ncl" in
 let gcc = import "../gcc/build.ncl" in
 let glibc = import "../glibc/build.ncl" in
 let grep = import "../grep/build.ncl" in
 let gzip = import "../gzip/build.ncl" in
 let linux_headers = import "../linux_headers/build.ncl" in
+let lz4 = import "../lz4/build.ncl" in
 let make = import "../make/build.ncl" in
 let sed = import "../sed/build.ncl" in
 let tar = import "../tar/build.ncl" in
+let xz = import "../xz/build.ncl" in
+let zlib = import "../zlib/build.ncl" in
 {
     name = "zstd",
     inputs = [
@@ -21,14 +26,19 @@ let tar = import "../tar/build.ncl" in
         bash,
         binutils,
         coreutils,
+        diffutils,
+        file,
         gcc,
         glibc,
         grep,
         gzip,
         linux_headers,
+        lz4,
         make,
         sed,
         tar,
+        xz,
+        zlib,
     ],
     cmd = "./build.source.sh",
     outputs = {

@@ -3,6 +3,8 @@ let bash = import "../bash/build.ncl" in
 let binutils = import "../binutils/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
 let diffutils = import "../diffutils/build.ncl" in
+let findutils = import "../findutils/build.ncl" in
+let flex = import "../flex/build.ncl" in
 let gawk = import "../gawk/build.ncl" in
 let gcc = import "../gcc/build.ncl" in
 let glibc = import "../glibc/build.ncl" in
@@ -25,6 +27,8 @@ let xz = import "../xz/build.ncl" in
         binutils,
         coreutils,
         diffutils,
+        findutils,
+        flex,
         gawk,
         gcc,
         glibc,
@@ -45,7 +49,7 @@ let xz = import "../xz/build.ncl" in
         bison_man = { glob = "usr/share/man/man1/bison.1" } | OutputLib,
         yacc_man = { glob = "usr/share/man/man1/yacc.1" } | OutputLib,
         bison_info = { glob = "usr/share/info/bison.info*" } | OutputLib,
-        bison_locale = { glob = "usr/share/locale/*/LC_MESSAGES/bison.mo" } | OutputLib,
+        bison_locale = { glob = "usr/share/locale/**/*" } | OutputLib,
         bison_aclocal = { glob = "usr/share/aclocal/bison*.m4" } | OutputLib,
     },
 } | BuildSpec
