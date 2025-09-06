@@ -1,5 +1,6 @@
 use crate::spec_schema::ObjTy;
 use nickel_lang_core::position::TermPos;
+use std::collections::HashMap;
 
 use serde::{de, de::Visitor, Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -58,7 +59,7 @@ impl From<SpecError> for Error {
 /// not change with comments, line numbers, locations in different files etc).
 #[allow(dead_code)]
 trait SpecHashable {
-    fn spec_hash(&self, _: &DepGraph) -> SpecHash;
+    fn spec_hash(&self, _graph: &DepGraph, _seen: &mut HashMap<BuildSpecRef, ()>) -> SpecHash;
 }
 
 /// A hash describing the object (specificatino hash), including everything it is dependent on.

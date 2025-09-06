@@ -50,15 +50,20 @@ pub enum BuildSpecInput {
 }
 
 impl SpecHashable for BuildSpecInput {
-    fn spec_hash(&self, g: &DepGraph) -> SpecHash {
+    fn spec_hash(&self, g: &DepGraph, seen: &mut HashMap<BuildSpecRef, ()>) -> SpecHash {
         let mut h = blake3::Hasher::new();
 
         use BuildSpecInput::*;
         match self {
             Build(bsr) => {
                 h.write_all(b"input").unwrap();
-                let hash = g.spec_hash(bsr);
-                h.write_all(hash.as_bytes()).unwrap();
+                if seen.contains_key(bsr) {
+                    // theres a cycle, so lets just mark that to avoid an infinite loop.
+                    h.write_all(b"cycle").unwrap();
+                } else {
+                    let hash = g.spec_hash_impl(bsr, seen);
+                    h.write_all(hash.as_bytes()).unwrap();
+                }
             }
             Source(s) => {
                 h.write_all(b"source").unwrap();
@@ -144,7 +149,7 @@ pub struct BuildSpec {
 }
 
 impl SpecHashable for BuildSpec {
-    fn spec_hash(&self, g: &DepGraph) -> SpecHash {
+    fn spec_hash(&self, g: &DepGraph, seen: &mut HashMap<BuildSpecRef, ()>) -> SpecHash {
         let mut h = blake3::Hasher::new();
 
         h.write_all(b"build spec").unwrap();
@@ -155,7 +160,8 @@ impl SpecHashable for BuildSpec {
         // so lets sort the hashes before they are updated to our spec hash.
         // TODO: Consider performance implications of linear sort
         h.write_all(b"-inputs").unwrap();
-        let mut input_hashes: Vec<SpecHash> = self.inputs.iter().map(|i| i.spec_hash(g)).collect();
+        let mut input_hashes: Vec<SpecHash> =
+            self.inputs.iter().map(|i| i.spec_hash(g, seen)).collect();
         input_hashes.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         for hash in input_hashes.drain(..) {
             h.write_all(hash.as_bytes()).unwrap();
@@ -224,6 +230,13 @@ impl DepGraph {
 
     /// Returns the specification hash of the given build spec.
     pub fn spec_hash(&self, bsr: &BuildSpecRef) -> SpecHash {
+        // TODO: use smol/starts-on-stack type for hashmap?
+        let mut seen = HashMap::with_capacity(32);
+        self.spec_hash_impl(bsr, &mut seen)
+    }
+
+    fn spec_hash_impl(&self, bsr: &BuildSpecRef, seen: &mut HashMap<BuildSpecRef, ()>) -> SpecHash {
+        seen.insert(bsr.clone(), ());
         {
             if let Some(hash) = self.hash_cache.read().unwrap().get(bsr) {
                 return hash.clone();
@@ -231,7 +244,7 @@ impl DepGraph {
         }
 
         let build = self.get(bsr).unwrap();
-        let hash = build.spec_hash(self);
+        let hash = build.spec_hash(self, seen);
 
         self.hash_cache.write().unwrap().insert(*bsr, hash.clone());
         hash
@@ -1161,7 +1174,7 @@ mod tests {
             .find(|b| b.1.name == "top build")
             .unwrap()
             .1
-            .spec_hash(&dp);
+            .spec_hash(&dp, &mut HashMap::new());
 
         {
             let (mut input1, mut input2) = dp
@@ -1183,7 +1196,47 @@ mod tests {
                 .find(|b| b.1.name == "top build")
                 .unwrap()
                 .1
-                .spec_hash(&dp),
+                .spec_hash(&dp, &mut HashMap::new()),
+        );
+    }
+
+    #[test]
+    fn spec_hash_doesnt_explode_on_cycles() {
+        let sr = SpecReader::new(
+            indoc! {
+                "
+                let {BuildSpec, Source, ..} = import \"minimal.ncl\" in
+
+                let rec b1 = {
+                    name = \"b1\",
+                    inputs = [
+                        {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
+                        b2,
+                    ],
+                    cmd = \"\",
+                } | BuildSpec,
+                b2 = {
+                    name = \"b2\",
+                    inputs = [
+                        {url = \"http://other.com\", sha256 = \"abcdef\"} | Source,
+                    ],
+                    cmd = \"\",
+                } | BuildSpec,
+                in
+                b1"
+            }
+            .to_string(),
+            &SpecReaderOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        let dp = DepGraph::new(sr).unwrap();
+        assert!(
+            dp.spec_hash(&dp.by_name("b1").next().unwrap())
+                != dp.spec_hash(&dp.by_name("b2").next().unwrap()),
         );
     }
 

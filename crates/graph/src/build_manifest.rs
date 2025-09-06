@@ -81,7 +81,6 @@ impl BuildManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SpecHashable;
     use crate::{DepGraph, SpecReader, SpecReaderOptions};
     use indoc::indoc;
 
@@ -125,16 +124,12 @@ mod tests {
         let sr = sr.unwrap();
 
         let dg = DepGraph::new(sr).unwrap();
-        let build = dg.get(&dg.by_name("top build").next().unwrap()).unwrap();
-        let bsh = build.spec_hash(&dg);
+        let bsh = dg.spec_hash(&dg.by_name("top build").next().unwrap());
 
         let toplevel_manifest = BuildManifest::make(&dg, &dg.top_level, &bsh);
         assert_eq!(toplevel_manifest.hash, bsh);
 
-        let runtime_dep_hash = dg
-            .get(&dg.by_name("runtime dep").next().unwrap())
-            .unwrap()
-            .spec_hash(&dg);
+        let runtime_dep_hash = dg.spec_hash(&dg.by_name("runtime dep").next().unwrap());
 
         assert_eq!(
             toplevel_manifest
@@ -185,20 +180,13 @@ mod tests {
         let sr = sr.unwrap();
 
         let dg = DepGraph::new(sr).unwrap();
-        let build = dg.get(&dg.by_name("top build").next().unwrap()).unwrap();
-        let bsh = build.spec_hash(&dg);
+        let bsh = dg.spec_hash(&dg.by_name("top build").next().unwrap());
 
         let toplevel_manifest = BuildManifest::make(&dg, &dg.top_level, &bsh);
         assert_eq!(toplevel_manifest.hash, bsh);
 
-        let runtime_dep_hash = dg
-            .get(&dg.by_name("runtime dep").next().unwrap())
-            .unwrap()
-            .spec_hash(&dg);
-        let nested_input_hash = dg
-            .get(&dg.by_name("nested input").next().unwrap())
-            .unwrap()
-            .spec_hash(&dg);
+        let runtime_dep_hash = dg.spec_hash(&dg.by_name("runtime dep").next().unwrap());
+        let nested_input_hash = dg.spec_hash(&dg.by_name("nested input").next().unwrap());
 
         assert_eq!(
             toplevel_manifest
@@ -255,20 +243,13 @@ mod tests {
         let sr = sr.unwrap();
 
         let dg = DepGraph::new(sr).unwrap();
-        let build = dg.get(&dg.by_name("top build").next().unwrap()).unwrap();
-        let bsh = build.spec_hash(&dg);
+        let bsh = dg.spec_hash(&dg.by_name("top build").next().unwrap());
 
         let toplevel_manifest = BuildManifest::make(&dg, &dg.top_level, &bsh);
         assert_eq!(toplevel_manifest.hash, bsh);
 
-        let nested_dep_hash = dg
-            .get(&dg.by_name("nested dep").next().unwrap())
-            .unwrap()
-            .spec_hash(&dg);
-        let top_dep_hash = dg
-            .get(&dg.by_name("top dep").next().unwrap())
-            .unwrap()
-            .spec_hash(&dg);
+        let nested_dep_hash = dg.spec_hash(&dg.by_name("nested dep").next().unwrap());
+        let top_dep_hash = dg.spec_hash(&dg.by_name("top dep").next().unwrap());
 
         let mut deps = toplevel_manifest
             .transitive_runtime_deps
