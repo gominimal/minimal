@@ -14,6 +14,8 @@ pub enum Error {
         want: ObjTy,
         pos: TermPos,
     },
+    InvalidObject(String),
+    MissingID,
 }
 
 impl Error {
@@ -38,6 +40,8 @@ impl Error {
                     nickel_lang_core::error::report::ColorOpt::Auto,
                 );
             }
+            MissingID => todo!(),
+            Error::InvalidObject(_) => todo!(),
         }
     }
 }
@@ -161,8 +165,6 @@ mod spec_schema;
 
 pub mod dep_graph;
 pub use dep_graph::{BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph};
-
-pub(crate) mod term_hasher;
 
 mod planner;
 pub use planner::ExecPlan;

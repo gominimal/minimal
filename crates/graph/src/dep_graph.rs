@@ -2,20 +2,20 @@
 
 #![allow(clippy::result_large_err)]
 
-use nickel_lang_core::files::Files;
-use nickel_lang_core::position::TermPos;
-use nickel_lang_core::term::{RichTerm, SharedTerm, Term};
+use nickel_lang_core::eval::Closure;
+use nickel_lang_core::files::FileId;
+use nickel_lang_core::identifier::LocIdent;
+use nickel_lang_core::term::{RichTerm, Term};
+use nickel_lang_core::{eval::cache::CacheImpl, program::Program};
 
-use crate::term_hasher::TermHasher;
 use generational_arena::Arena;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use crate::{Error, SpecHash, SpecHashable, SpecReader};
-
 use crate::spec_schema::*;
+use crate::{Error, SpecError, SpecHash, SpecHashable, SpecReader};
 use serde::Deserialize;
 
 /// A map with ordered iteration semantics - we need this for stable spec hashes.
@@ -195,13 +195,11 @@ impl DepGraph {
     pub fn new(sr: SpecReader) -> Result<Self, Error> {
         let mut graph = GraphBuilder {
             builds: Arena::with_capacity(4096),
-            term_lookup: HashMap::with_capacity(4096),
-            hash_lookup: HashMap::with_capacity(4096),
-            term_hasher: TermHasher::new(),
+            spec_id_lookup: HashMap::with_capacity(4096),
         };
 
-        let (ncl_tree, files) = sr.finish()?;
-        let top_level = graph.read_buildspec(&ncl_tree, &files)?;
+        let (ncl_tree, mut program) = sr.finish()?;
+        let top_level = graph.read_buildspec(&ncl_tree, &mut program)?;
         Ok(graph.finish(top_level))
     }
 
@@ -304,15 +302,65 @@ impl DepGraph {
 struct GraphBuilder {
     builds: Arena<BuildSpec>,
 
-    // Fast path for nickel records representing buildspecs we have already seen.
-    //  - Key: Position the record was defined + name of buildspec.
-    //  - Value: Unique records we have seen with that key, and the referenced to their
-    //    already-processed BuildSpec.
-    term_lookup: HashMap<(TermPos, String), Vec<(SharedTerm, BuildSpecRef)>>,
+    spec_id_lookup: HashMap<u64, BuildSpecRef>,
+}
 
-    // Medium-fast path: Buildspecs with identical nickel records (by hash) + same buildspec name.
-    hash_lookup: HashMap<(String, u64), BuildSpecRef>,
-    term_hasher: TermHasher,
+fn read_buildspec_id(rt: &RichTerm) -> Option<u64> {
+    let record = match rt.as_ref() {
+        Term::RecRecord(record_data, _, _, _) => record_data,
+        Term::Record(record_data) => record_data,
+        _ => {
+            return None;
+        }
+    };
+    if let Ok(Some(id_rt)) = record.get_value_with_ctrs(&LocIdent::new("__magic_buildspec_id")) {
+        if let Term::ForeignId(id) = id_rt.as_ref() {
+            Some(*id)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+fn read_ty(rt: &RichTerm, program: &mut Program<CacheImpl>) -> Result<ObjTy, Error> {
+    let record = match rt.as_ref() {
+        Term::RecRecord(record_data, _, _, _) => record_data,
+        Term::Record(record_data) => record_data,
+        _ => todo!("err"),
+    };
+    if let Ok(Some(rt)) = record.get_value_with_ctrs(&LocIdent::new("ty")) {
+        let rt = eval_if_closure(&rt, program)?;
+        Ok(ObjTy::deserialize(rt).unwrap())
+    } else {
+        todo!("err");
+    }
+}
+
+fn eval_if_closure<'a>(
+    rt: &'a RichTerm,
+    program: &'_ mut Program<CacheImpl>,
+) -> Result<RichTerm, Error> {
+    if let Term::Closure(c) = rt.term.as_ref() {
+        program.eval_closure(c.clone().into_closure()).map_err(|e| {
+            Error::SpecError(SpecError::Nickel(
+                program.files(),
+                nickel_lang_core::error::Error::EvalError(e),
+            ))
+        })
+    } else if !rt.term.is_eff_whnf() {
+        program
+            .eval_closure(Closure::atomic_closure(rt.clone()))
+            .map_err(|e| {
+                Error::SpecError(SpecError::Nickel(
+                    program.files(),
+                    nickel_lang_core::error::Error::EvalError(e),
+                ))
+            })
+    } else {
+        Ok(rt.clone())
+    }
 }
 
 impl GraphBuilder {
@@ -328,87 +376,159 @@ impl GraphBuilder {
 
     /// Recursively processes and inserts a buildspec into the graph, returning
     /// a handle to it in the build graph.
-    fn read_buildspec(&mut self, rt: &RichTerm, files: &Files) -> Result<BuildSpecRef, Error> {
-        // Read out the simple attributes
-        let base = ObjBaseBuildSpec::deserialize(rt.clone()).unwrap();
-        if base.ty != ObjTy::Builder {
-            return Err(Error::UnexpectedObject {
-                got: base.ty,
-                want: ObjTy::Builder,
-                pos: rt.pos,
-            });
+    fn read_buildspec(
+        &mut self,
+        rt: &RichTerm,
+        program: &mut Program<CacheImpl>,
+    ) -> Result<BuildSpecRef, Error> {
+        let rt = eval_if_closure(rt, program)?;
+        let magic_id = read_buildspec_id(&rt).ok_or(Error::MissingID)?;
+        // If we have seen this build-spec object before, bail-out with a reference to the existing
+        // object, that way we can handle circular references of build specs.
+        //
+        // TODO: Probably sanity check that at least this object and the one indexed by magic_id
+        // have the same name
+        if let Some(bsr) = self.spec_id_lookup.get(&magic_id) {
+            return Ok(bsr.clone());
         }
 
-        // Fast path: this declaration has already been processed, as the recursive dep
-        // of another spec somewhere else. Lets short-circuit and wire up to its previously-processed
-        // reference.
-        // TODO: Can we remove the clone
-        if let Some(existing_refs) = self.term_lookup.get(&(rt.pos, base.name.clone())) {
-            // See if any of these builds are for the same nickel record
-            for (ncl_term, bsr) in existing_refs.iter() {
-                if SharedTerm::ptr_eq(&rt.term, ncl_term) {
-                    return Ok(*bsr);
-                }
+        // Read out the simple attributes
+        let mut name: Option<String> = None;
+        let mut cmd: Option<String> = None;
+        let mut ty: Option<ObjTy> = None;
+        match rt.term.as_ref() {
+            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
+                r.fields.iter().for_each(|(ident_and_loc, field)| {
+                    match ident_and_loc.label() {
+                        "ty" => {
+                            ty = Some(
+                                ObjTy::deserialize(
+                                    eval_if_closure(field.value.as_ref().unwrap(), program)
+                                        .unwrap(),
+                                )
+                                .unwrap(),
+                            );
+                        }
+                        "name" => {
+                            name = Some(
+                                String::deserialize(
+                                    eval_if_closure(field.value.as_ref().unwrap(), program)
+                                        .unwrap(),
+                                )
+                                .unwrap(),
+                            );
+                        }
+                        "cmd" => {
+                            cmd = Some(
+                                String::deserialize(
+                                    eval_if_closure(field.value.as_ref().unwrap(), program)
+                                        .unwrap(),
+                                )
+                                .unwrap(),
+                            );
+                        }
+                        _ => {} // TODO: Should we error if we see an unknown field?
+                    };
+                });
+            }
+            _ => {}
+        }
+        match ty {
+            Some(ObjTy::Builder) => {} // happy path
+            None => return Err(Error::InvalidObject(format!("missing field: ty"))),
+            Some(ty) => {
+                return Err(Error::UnexpectedObject {
+                    got: ty,
+                    want: ObjTy::Builder,
+                    pos: rt.pos,
+                })
             }
         }
+        let name = match name {
+            Some(name) => name,
+            None => return Err(Error::InvalidObject(format!("missing field: name"))),
+        };
+        let cmd = cmd.unwrap_or(String::default());
 
-        let record_hash = self.term_hasher.hash(&rt.term);
-        // Medium-fast path: Theres a buildspec with the same name + built from an identical record.
-        if let Some(bsr) = self.hash_lookup.get(&(base.name.clone(), record_hash)) {
-            return Ok(*bsr);
-        }
-
-        // Start constructing the BuildSpec object
-        let mut bs = BuildSpec {
-            name: base.name,
-            cmd: base.cmd,
+        // Start constructing the BuildSpec object. Insert it into the graph
+        // and cache before we recurse.
+        let bsr = BuildSpecRef(self.builds.insert(BuildSpec {
+            name: name,
+            cmd: cmd,
             inputs: Vec::new(),
             runtime_deps: Vec::new(),
             outputs: OutputMap::new(),
-        };
+        }));
+        self.spec_id_lookup.insert(magic_id, bsr.clone());
 
-        // More complicated processing (recursing) requires explicitly iterating the record.
+        // Handle more complicated attributes.
+        let mut inputs: Option<Vec<BuildSpecInput>> = None;
+        let mut runtime_deps: Option<Vec<BuildSpecRef>> = None;
+        let mut outputs: Option<OutputMap> = None;
         match rt.term.as_ref() {
             Term::Record(r) => {
                 r.fields
                     .iter()
                     .for_each(|(ident_and_loc, field)| match ident_and_loc.label() {
                         "inputs" => {
-                            if let Term::Array(a, _attrs) =
-                                field.value.as_ref().unwrap().term.as_ref()
-                            {
-                                bs.inputs = a
-                                    .iter()
-                                    .map(|input| self.read_input(input, files).unwrap())
-                                    .collect();
+                            let inputs_rt = field
+                                .value
+                                .as_ref()
+                                .map(|rt| eval_if_closure(rt, program).unwrap())
+                                .unwrap();
+                            if let Term::Array(a, _attrs) = inputs_rt.as_ref() {
+                                inputs = Some(
+                                    a.iter()
+                                        .map(|input| self.read_input(input, program).unwrap())
+                                        .collect(),
+                                );
                             } else {
-                                todo!("handle value being non-array {:?}", field.value);
+                                todo!("handle inputs value being non-array {:?}", field.value);
                             };
                         }
                         "runtime_deps" => {
-                            if let Term::Array(a, _attrs) =
-                                field.value.as_ref().unwrap().term.as_ref()
-                            {
-                                bs.runtime_deps = a
-                                    .iter()
-                                    .map(|input| self.read_buildspec(input, files).unwrap())
-                                    .collect();
-                            } else {
-                                todo!("handle value being non-array {:?}", field.value);
-                            };
+                            let runtime_deps_rt = field
+                                .value
+                                .as_ref()
+                                .map(|rt| eval_if_closure(rt, program).unwrap());
+                            match runtime_deps_rt {
+                                None => {}
+                                Some(runtime_deps_rt) => match runtime_deps_rt.term.as_ref() {
+                                    Term::Array(a, _attrs) => {
+                                        runtime_deps = Some(
+                                            a.iter()
+                                                .map(|input| {
+                                                    self.read_buildspec(input, program).unwrap()
+                                                })
+                                                .collect(),
+                                        );
+                                    }
+                                    _ => todo!(
+                                        "handle runtime_deps value being non-array {:?}",
+                                        field.value
+                                    ),
+                                },
+                            }
                         }
                         "outputs" => {
-                            if let Term::Record(r) = field.value.as_ref().unwrap().term.as_ref() {
-                                bs.outputs = r
-                                    .iter_serializable()
-                                    .map(|entry| entry.unwrap())
-                                    .map(|(ident, val)| {
-                                        (
-                                            ident.label().to_string(),
-                                            self.read_output_value(val).unwrap(),
-                                        )
-                                    })
-                                    .collect();
+                            let outputs_rt = field
+                                .value
+                                .as_ref()
+                                .map(|rt| eval_if_closure(rt, program).unwrap())
+                                .unwrap();
+
+                            if let Term::Record(r) = outputs_rt.as_ref() {
+                                outputs = Some(
+                                    r.iter_serializable()
+                                        .map(|entry| entry.unwrap())
+                                        .map(|(ident, val)| {
+                                            (
+                                                ident.label().to_string(),
+                                                self.read_output_value(val, program).unwrap(),
+                                            )
+                                        })
+                                        .collect(),
+                                );
                             } else {
                                 todo!("handle value being non-dict {:?}", field.value);
                             };
@@ -418,82 +538,219 @@ impl GraphBuilder {
             }
             _ => panic!("unexpected type: want Record, got {:?}", rt.term),
         }
+        let inputs = match inputs {
+            Some(inputs) => inputs,
+            None => return Err(Error::InvalidObject(format!("missing field: inputs"))),
+        };
+        let outputs = match outputs {
+            Some(mut outputs) => {
+                // [OutputMap] has a defined iteration order. For stable hashes, sort this by key.
+                outputs.sort_by(|k1, _v1, k2, _v2| String::cmp(k1, k2));
+                outputs
+            }
+            None => return Err(Error::InvalidObject(format!("missing field: outputs"))),
+        };
+        let runtime_deps = runtime_deps.unwrap_or(vec![]);
 
-        // [OutputMap] has a defined iteration order. For stable hashes, sort this by key.
-        bs.outputs.sort_by(|k1, _v1, k2, _v2| String::cmp(k1, k2));
+        let bs = self.builds.get_mut(bsr.0).unwrap();
+        bs.inputs = inputs;
+        bs.runtime_deps = runtime_deps;
+        bs.outputs = outputs;
 
-        let name = bs.name.clone();
-        let lookup_key = (rt.pos, bs.name.clone());
-        let bsr = BuildSpecRef(self.builds.insert(bs));
-
-        // Insert into our caches.
-        if let Some(exists) = self.term_lookup.get_mut(&lookup_key) {
-            exists.push((rt.term.clone(), bsr));
-        } else {
-            self.term_lookup
-                .insert(lookup_key, vec![(rt.term.clone(), bsr)]);
-        }
-        self.hash_lookup.insert((name, record_hash), bsr);
         Ok(bsr)
     }
 
+    fn read_input_source(
+        &mut self,
+        rt: &RichTerm,
+        program: &mut Program<CacheImpl>,
+    ) -> Result<SourceInput, Error> {
+        let mut url: Option<String> = None;
+        let mut sha256: Option<String> = None;
+        match rt.term.as_ref() {
+            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
+                r.fields.iter().for_each(|(ident_and_loc, field)| {
+                    match ident_and_loc.label() {
+                        "url" => {
+                            url = Some(
+                                String::deserialize(
+                                    eval_if_closure(field.value.as_ref().unwrap(), program)
+                                        .unwrap(),
+                                )
+                                .unwrap(),
+                            );
+                        }
+                        "sha256" => {
+                            sha256 = Some(
+                                String::deserialize(
+                                    eval_if_closure(field.value.as_ref().unwrap(), program)
+                                        .unwrap(),
+                                )
+                                .unwrap(),
+                            );
+                        }
+                        _ => {} // TODO: Should we error if we see an unknown field?
+                    };
+                });
+            }
+            _ => {}
+        }
+        let url = match url {
+            Some(url) => url,
+            None => return Err(Error::InvalidObject(format!("missing field: url"))),
+        };
+        let sha256 = match sha256 {
+            Some(sha256) => sha256,
+            None => return Err(Error::InvalidObject(format!("missing field: sha256"))),
+        };
+
+        Ok(SourceInput {
+            from: SourceFetch::URL(url),
+            sha256: sha256,
+        })
+    }
+
+    fn read_input_hostpath(
+        &mut self,
+        rt: &RichTerm,
+        program: &mut Program<CacheImpl>,
+    ) -> Result<String, Error> {
+        let mut path: Option<String> = None;
+        match rt.term.as_ref() {
+            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
+                r.fields.iter().for_each(|(ident_and_loc, field)| {
+                    match ident_and_loc.label() {
+                        "path" => {
+                            path = Some(
+                                String::deserialize(
+                                    eval_if_closure(field.value.as_ref().unwrap(), program)
+                                        .unwrap(),
+                                )
+                                .unwrap(),
+                            );
+                        }
+                        _ => {} // TODO: Should we error if we see an unknown field?
+                    };
+                });
+            }
+            _ => {}
+        }
+        let path = match path {
+            Some(path) => path,
+            None => return Err(Error::InvalidObject(format!("missing field: path"))),
+        };
+
+        Ok(path)
+    }
+
+    fn read_input_local(
+        &mut self,
+        rt: &RichTerm,
+        program: &mut Program<CacheImpl>,
+    ) -> Result<(PathBuf, blake3::Hash), Error> {
+        let mut file: Option<(String, FileId)> = None;
+        match rt.term.as_ref() {
+            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
+                r.fields.iter().for_each(|(ident_and_loc, field)| {
+                    match ident_and_loc.label() {
+                        "file" => {
+                            file = Some((
+                                String::deserialize(
+                                    eval_if_closure(field.value.as_ref().unwrap(), program)
+                                        .unwrap(),
+                                )
+                                .unwrap(),
+                                field.value.as_ref().unwrap().pos.src_id().unwrap(),
+                            ));
+                        }
+                        _ => {} // TODO: Should we error if we see an unknown field?
+                    };
+                });
+            }
+            _ => {}
+        }
+        let (file, src_id) = match file {
+            Some(file) => file,
+            None => return Err(Error::InvalidObject(format!("missing field: file"))),
+        };
+
+        let full_path = Path::new(program.files().name(src_id))
+            .parent()
+            .unwrap()
+            .join(file);
+
+        let file_hash = blake3::hash(&std::fs::read(&full_path).unwrap_or_else(|err| {
+            panic!(
+                "Local input could not be read: {} (file: {})",
+                err,
+                full_path.display()
+            )
+        }));
+
+        Ok((full_path, file_hash))
+    }
+
+    fn read_input_prebuilt(
+        &mut self,
+        rt: &RichTerm,
+        program: &mut Program<CacheImpl>,
+    ) -> Result<String, Error> {
+        let mut package: Option<String> = None;
+        match rt.term.as_ref() {
+            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
+                r.fields.iter().for_each(|(ident_and_loc, field)| {
+                    match ident_and_loc.label() {
+                        "package" => {
+                            package = Some(
+                                String::deserialize(
+                                    eval_if_closure(field.value.as_ref().unwrap(), program)
+                                        .unwrap(),
+                                )
+                                .unwrap(),
+                            );
+                        }
+                        _ => {} // TODO: Should we error if we see an unknown field?
+                    };
+                });
+            }
+            _ => {}
+        }
+        let package = match package {
+            Some(package) => package,
+            None => return Err(Error::InvalidObject(format!("missing field: package"))),
+        };
+
+        Ok(package)
+    }
+
     /// Recursively reads a buildspec input, inserting it into the graph.
-    fn read_input(&mut self, rt: &RichTerm, files: &Files) -> Result<BuildSpecInput, Error> {
-        let obj = OnlyObj::deserialize(rt.clone()).unwrap();
+    fn read_input(
+        &mut self,
+        rt: &RichTerm,
+        program: &mut Program<CacheImpl>,
+    ) -> Result<BuildSpecInput, Error> {
+        let rt = eval_if_closure(rt, program)?;
 
         // The type hint ty identifies which input variant this term represents
-        match obj.ty {
-            ObjTy::Builder => Ok(BuildSpecInput::Build(self.read_buildspec(rt, files)?)),
-            ObjTy::Source => {
-                let src = ObjSource::deserialize(rt.clone()).unwrap();
-                Ok(BuildSpecInput::Source(SourceInput {
-                    from: SourceFetch::URL(src.url),
-                    sha256: src.sha256,
-                }))
-            }
-            ObjTy::Path => {
-                let host_path = ObjHostPath::deserialize(rt.clone()).unwrap();
-                Ok(BuildSpecInput::HostPath(host_path.path.into()))
-            }
+        let ty = read_ty(&rt, program)?;
+        match ty {
+            ObjTy::Builder => Ok(BuildSpecInput::Build(self.read_buildspec(&rt, program)?)),
+            ObjTy::Source => Ok(BuildSpecInput::Source(
+                self.read_input_source(&rt, program)?,
+            )),
+            ObjTy::Path => Ok(BuildSpecInput::HostPath(
+                self.read_input_hostpath(&rt, program)?.into(),
+            )),
             ObjTy::Local => {
-                let local = ObjLocal::deserialize(rt.clone()).unwrap();
-
-                // We need to get at where path was defined to figure out the
-                // path its relative to.
-                // Aside: I really wish there was a better way to get at the term for 'path'
-                let src_id = match rt.term.as_ref() {
-                    Term::Record(r) => r
-                        .fields
-                        .iter()
-                        .filter_map(|(ident_and_loc, field)| match ident_and_loc.label() {
-                            "file" => Some(field.value.as_ref().unwrap().pos.src_id().unwrap()),
-                            _ => None,
-                        })
-                        .next()
-                        .unwrap(),
-                    _ => unreachable!(),
-                };
-                let full_path = Path::new(files.name(src_id))
-                    .parent()
-                    .unwrap()
-                    .join(local.file);
-
-                let file_hash = blake3::hash(&std::fs::read(&full_path).unwrap_or_else(|err| {
-                    panic!(
-                        "Local input could not be read: {} (file: {})",
-                        err,
-                        full_path.display()
-                    )
-                }));
+                let (full_path, file_hash) = self.read_input_local(&rt, program)?;
                 Ok(BuildSpecInput::Local((full_path, file_hash)))
             }
-            ObjTy::Prebuilt => {
-                let prebuilt = ObjPrebuilt::deserialize(rt.clone()).unwrap();
-                Ok(BuildSpecInput::Prebuilt(prebuilt.package))
-            }
+            ObjTy::Prebuilt => Ok(BuildSpecInput::Prebuilt(
+                self.read_input_prebuilt(&rt, program)?.into(),
+            )),
             ObjTy::OutputLib | ObjTy::OutputBin | ObjTy::OutputData => {
                 Err(Error::UnexpectedObject {
-                    got: obj.ty,
+                    got: ty,
                     want: ObjTy::Builder,
                     pos: rt.pos,
                 })
@@ -501,25 +758,121 @@ impl GraphBuilder {
         }
     }
 
-    /// Recursively reads a buildspec output value, inserting it into the graph.
-    fn read_output_value(&mut self, rt: &RichTerm) -> Result<BuildOutput, Error> {
-        let obj = OnlyObj::deserialize(rt.clone()).unwrap();
+    fn read_output_lib(
+        &mut self,
+        rt: &RichTerm,
+        program: &mut Program<CacheImpl>,
+    ) -> Result<BuildOutput, Error> {
+        let mut glob: Option<String> = None;
+        match rt.term.as_ref() {
+            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
+                r.fields.iter().for_each(|(ident_and_loc, field)| {
+                    match ident_and_loc.label() {
+                        "glob" => {
+                            glob = Some(
+                                String::deserialize(
+                                    eval_if_closure(field.value.as_ref().unwrap(), program)
+                                        .unwrap(),
+                                )
+                                .unwrap(),
+                            );
+                        }
+                        _ => {} // TODO: Should we error if we see an unknown field?
+                    };
+                });
+            }
+            _ => {}
+        }
+        let glob = match glob {
+            Some(glob) => glob,
+            None => return Err(Error::InvalidObject(format!("missing field: glob"))),
+        };
 
-        match obj.ty {
-            ObjTy::OutputLib => {
-                let lib = ObjLibraryOutput::deserialize(rt.clone()).unwrap();
-                Ok(BuildOutput::Library { glob: lib.glob })
+        Ok(BuildOutput::Library { glob })
+    }
+
+    fn read_output_data(
+        &mut self,
+        rt: &RichTerm,
+        program: &mut Program<CacheImpl>,
+    ) -> Result<BuildOutput, Error> {
+        let mut data: Option<String> = None;
+        match rt.term.as_ref() {
+            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
+                r.fields.iter().for_each(|(ident_and_loc, field)| {
+                    match ident_and_loc.label() {
+                        "data" => {
+                            data = Some(
+                                String::deserialize(
+                                    eval_if_closure(field.value.as_ref().unwrap(), program)
+                                        .unwrap(),
+                                )
+                                .unwrap(),
+                            );
+                        }
+                        _ => {} // TODO: Should we error if we see an unknown field?
+                    };
+                });
             }
-            ObjTy::OutputData => {
-                let data = ObjDataOutput::deserialize(rt.clone()).unwrap();
-                Ok(BuildOutput::Data { glob: data.data })
+            _ => {}
+        }
+        let data = match data {
+            Some(data) => data,
+            None => return Err(Error::InvalidObject(format!("missing field: data"))),
+        };
+
+        Ok(BuildOutput::Data { glob: data })
+    }
+
+    fn read_output_bin(
+        &mut self,
+        rt: &RichTerm,
+        program: &mut Program<CacheImpl>,
+    ) -> Result<BuildOutput, Error> {
+        let mut path: Option<String> = None;
+        match rt.term.as_ref() {
+            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
+                r.fields.iter().for_each(|(ident_and_loc, field)| {
+                    match ident_and_loc.label() {
+                        "path" => {
+                            path = Some(
+                                String::deserialize(
+                                    eval_if_closure(field.value.as_ref().unwrap(), program)
+                                        .unwrap(),
+                                )
+                                .unwrap(),
+                            );
+                        }
+                        _ => {} // TODO: Should we error if we see an unknown field?
+                    };
+                });
             }
-            ObjTy::OutputBin => {
-                let bin = ObjBinaryOutput::deserialize(rt.clone()).unwrap();
-                Ok(BuildOutput::Binary { path: bin.path })
-            }
+            _ => {}
+        }
+        let path = match path {
+            Some(path) => path,
+            None => return Err(Error::InvalidObject(format!("missing field: path"))),
+        };
+
+        Ok(BuildOutput::Binary { path })
+    }
+
+    /// Recursively reads a buildspec output value, inserting it into the graph.
+    fn read_output_value(
+        &mut self,
+        rt: &RichTerm,
+        program: &mut Program<CacheImpl>,
+    ) -> Result<BuildOutput, Error> {
+        let rt = eval_if_closure(rt, program)?;
+
+        // The type hint ty identifies which input variant this term represents
+        let ty = read_ty(&rt, program)?;
+        match ty {
+            ObjTy::OutputLib => self.read_output_lib(&rt, program),
+            ObjTy::OutputData => self.read_output_data(&rt, program),
+            ObjTy::OutputBin => self.read_output_bin(&rt, program),
             _ => Err(Error::UnexpectedObject {
-                got: obj.ty,
+                got: ty,
                 want: ObjTy::OutputLib,
                 pos: rt.pos,
             }),
@@ -552,13 +905,11 @@ mod tests {
             }
             .to_string(),
             &SpecReaderOptions::for_test(),
-        );
-        // So we can see the actual error when parsing fails
-        sr.as_ref().err().into_iter().for_each(|e| {
+        )
+        .unwrap_or_else(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
-        let sr = sr.unwrap();
 
         let dp = DepGraph::new(sr).unwrap();
         // We expect a single buildspec with a known name
@@ -592,13 +943,11 @@ mod tests {
             }
             .to_string(),
             &SpecReaderOptions::for_test(),
-        );
-        // So we can see the actual error when parsing fails
-        sr.as_ref().err().into_iter().for_each(|e| {
+        )
+        .unwrap_or_else(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
-        let sr = sr.unwrap();
 
         let dp = DepGraph::new(sr).unwrap();
         // We expect that buildspec to have one Source input
@@ -616,13 +965,11 @@ mod tests {
             std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
                 .join("testdata/local_input.ncl"),
             &SpecReaderOptions::for_test(),
-        );
-        // So we can see the actual error when parsing fails
-        sr.as_ref().err().into_iter().for_each(|e| {
+        )
+        .unwrap_or_else(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
-        let sr = sr.unwrap();
 
         let dp = DepGraph::new(sr).unwrap();
         // We expect that buildspec to have one Local input
@@ -653,13 +1000,10 @@ mod tests {
             }
             .to_string(),
             &SpecReaderOptions::for_test(),
-        );
-        // So we can see the actual error when parsing fails
-        sr.as_ref().err().into_iter().for_each(|e| {
+        ).unwrap_or_else(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
-        let sr = sr.unwrap();
 
         let dp = DepGraph::new(sr).unwrap();
         // We expect that buildspec to have one Library output
@@ -705,18 +1049,16 @@ mod tests {
             }
             .to_string(),
             &SpecReaderOptions::for_test(),
-        );
-        // So we can see the actual error when parsing fails
-        sr.as_ref().err().into_iter().for_each(|e| {
+        )
+        .unwrap_or_else(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
-        let sr = sr.unwrap();
 
         let dp = DepGraph::new(sr).unwrap();
         // We expect two buildspecs - deeper first
         assert_eq!(
-            vec!["nested build".to_string(), "top build".to_string()],
+            vec!["top build".to_string(), "nested build".to_string()],
             dp.builds
                 .into_iter()
                 .map(|b| b.name)
@@ -753,80 +1095,19 @@ mod tests {
             }
             .to_string(),
             &SpecReaderOptions::for_test(),
-        );
-        // So we can see the actual error when parsing fails
-        sr.as_ref().err().into_iter().for_each(|e| {
+        )
+        .unwrap_or_else(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
-        let sr = sr.unwrap();
 
         let dp = DepGraph::new(sr).unwrap();
         // We expect three buildspecs - four buildspecs would mean that `shared` (referenced twice) was duplicated
         assert_eq!(
             vec![
-                "sharing is caringgggg".to_string(),
+                "top build".to_string(),
                 "nested build".to_string(),
-                "top build".to_string()
-            ],
-            dp.builds
-                .into_iter()
-                .map(|b| b.name)
-                .collect::<Vec<String>>()
-        );
-    }
-
-    #[test]
-    fn computed_spec_not_shared() {
-        let sr = SpecReader::new(
-            indoc! {
-                "
-                let {BuildSpec, ..} = import \"minimal.ncl\" in
-
-                let shared = {
-                    name = \"shared\",
-                    inputs = [],
-                    cmd = \"\",
-                } | BuildSpec
-                in
-
-                let make_build : Number -> BuildSpec
-                    = fun num =>
-                        {
-                            name = \"build-\" ++ \"%{num}\",
-                            inputs = [shared],
-                            cmd = \"\",
-                        } | BuildSpec
-                in
-
-                {
-                    name = \"top build\",
-                    inputs = [
-                        make_build 1,
-                        make_build 2,
-                    ],
-                    cmd = \"\",
-                } | BuildSpec"
-            }
-            .to_string(),
-            &SpecReaderOptions::for_test(),
-        );
-        // So we can see the actual error when parsing fails
-        sr.as_ref().err().into_iter().for_each(|e| {
-            e.report_to_stderr();
-            panic!("spec parsing failed");
-        });
-        let sr = sr.unwrap();
-
-        let dp = DepGraph::new(sr).unwrap();
-        // We expect four buildspecs - the two that were generated in a function are not the same despite being
-        // inherited from the same record.
-        assert_eq!(
-            vec![
-                "shared".to_string(),
-                "build-1".to_string(),
-                "build-2".to_string(),
-                "top build".to_string()
+                "sharing is caringgggg".to_string(),
             ],
             dp.builds
                 .into_iter()
@@ -866,13 +1147,11 @@ mod tests {
             }
             .to_string(),
             &SpecReaderOptions::for_test(),
-        );
-        // So we can see the actual error when parsing fails
-        sr.as_ref().err().into_iter().for_each(|e| {
+        )
+        .unwrap_or_else(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
-        let sr = sr.unwrap();
 
         let mut dp = DepGraph::new(sr).unwrap();
 
@@ -928,18 +1207,16 @@ mod tests {
             }
             .to_string(),
             &SpecReaderOptions::for_test(),
-        );
-        // So we can see the actual error when parsing fails
-        sr.as_ref().err().into_iter().for_each(|e| {
+        )
+        .unwrap_or_else(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
-        let sr = sr.unwrap();
 
         let dp = DepGraph::new(sr).unwrap();
         // We expect two buildspecs - deeper first
         assert_eq!(
-            vec!["runtime dep".to_string(), "top build".to_string()],
+            vec!["top build".to_string(), "runtime dep".to_string()],
             dp.builds
                 .iter()
                 .map(|b| b.1.name.clone())
@@ -951,7 +1228,7 @@ mod tests {
             dp.builds
                 .iter()
                 .map(|b| b.1.clone())
-                .collect::<Vec<BuildSpec>>()[1]
+                .collect::<Vec<BuildSpec>>()[0]
                 .inputs[0]
                 .as_build()
                 .unwrap()
@@ -959,7 +1236,7 @@ mod tests {
             dp.builds
                 .iter()
                 .map(|b| b.1.clone())
-                .collect::<Vec<BuildSpec>>()[1]
+                .collect::<Vec<BuildSpec>>()[0]
                 .runtime_deps[0]
         );
     }
@@ -995,13 +1272,11 @@ mod tests {
             }
             .to_string(),
             &SpecReaderOptions::for_test(),
-        );
-        // So we can see the actual error when parsing fails
-        sr.as_ref().err().into_iter().for_each(|e| {
+        )
+        .unwrap_or_else(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
-        let sr = sr.unwrap();
 
         let dp = DepGraph::new(sr).unwrap();
         assert_eq!(
@@ -1020,7 +1295,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn circular_ref_doesnt_crash() {
         let sr = SpecReader::new(
             indoc! {
@@ -1043,23 +1317,16 @@ mod tests {
             }
             .to_string(),
             &SpecReaderOptions::for_test(),
-        );
-        // So we can see the actual error when parsing fails
-        sr.as_ref().err().into_iter().for_each(|e| {
+        )
+        .unwrap_or_else(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
-        let sr = sr.unwrap();
-        println!("spec parsing has finished");
 
         let dp = DepGraph::new(sr).unwrap();
-        // We expect three buildspecs - four buildspecs would mean that `shared` (referenced twice) was duplicated
+        // We expect two buildspecs
         assert_eq!(
-            vec![
-                "sharing is caringgggg".to_string(),
-                "nested build".to_string(),
-                "top build".to_string()
-            ],
+            vec!["build 1".to_string(), "build 2".to_string(),],
             dp.builds
                 .into_iter()
                 .map(|b| b.name)

@@ -2,9 +2,12 @@
 
 #![allow(clippy::result_large_err)]
 
+use nickel_lang_core::cache::CacheError;
 use nickel_lang_core::error::Error as NclError;
 use nickel_lang_core::files::Files;
-use nickel_lang_core::term::RichTerm;
+use nickel_lang_core::identifier::LocIdent;
+use nickel_lang_core::term::{RichTerm, Term};
+use nickel_lang_core::typ::TypeF;
 use nickel_lang_core::{error::NullReporter, eval::cache::CacheImpl, program::Program};
 use std::ffi::OsString;
 use std::io;
@@ -15,6 +18,7 @@ use std::path::PathBuf;
 pub enum SpecError {
     IO(io::Error),
     Nickel(Files, NclError),
+    AnnotationFailed,
 }
 
 impl SpecError {
@@ -24,6 +28,7 @@ impl SpecError {
 
         match self {
             IO(e) => eprintln!("IO Error: {}", e),
+            AnnotationFailed => eprintln!("Annotation failed"),
             Nickel(files, e) => {
                 let mut files = files.clone();
                 report(
@@ -80,7 +85,10 @@ impl SpecReader {
         program
             .typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk)
             .map_err(|e| SpecError::Nickel(program.files(), e))?;
-        Ok(Self { p: program })
+
+        let mut out = Self { p: program };
+        out.annotate()?;
+        Ok(out)
     }
 
     /// Processes the resulting build-spec universe, given options and a path to source representing the top level.
@@ -94,14 +102,69 @@ impl SpecReader {
         program
             .typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk)
             .map_err(|e| SpecError::Nickel(program.files(), e))?;
-        Ok(Self { p: program })
+
+        let mut out = Self { p: program };
+        out.annotate()?;
+        Ok(out)
     }
 
-    pub fn finish(self) -> Result<(RichTerm, Files), SpecError> {
+    /// Walks the AST to find unique build-spec declarations, annotating them with a unique ID.
+    fn annotate(&mut self) -> Result<(), SpecError> {
+        use nickel_lang_core::traverse::{Traverse as _, TraverseOrder};
+
+        let mut id: u64 = 0;
+        let mut traversal = |rt: RichTerm| -> Result<RichTerm, CacheError<()>> {
+            if let Term::Annotated(annotation, inner) = rt.as_ref() {
+                let is_buildspec = annotation.contracts.iter().any(|lt| {
+                    if let TypeF::Contract(c) = &lt.typ.typ {
+                        if let Term::Var(v) = c.as_ref() {
+                            v.label() == "BuildSpec"
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                });
+
+                if is_buildspec {
+                    let new_inner = match inner.term.as_ref().clone() {
+                        Term::RecRecord(mut record_data, includes, dyn_fields, deps) => {
+                            record_data.fields.insert(
+                                LocIdent::new("__magic_buildspec_id"),
+                                RichTerm::from(Term::ForeignId(id)).into(),
+                            );
+                            Term::RecRecord(record_data, includes, dyn_fields, deps).into()
+                        }
+                        Term::Record(mut record_data) => {
+                            record_data.fields.insert(
+                                LocIdent::new("__magic_buildspec_id"),
+                                RichTerm::from(Term::ForeignId(id)).into(),
+                            );
+                            Term::Record(record_data).into()
+                        }
+                        _ => unreachable!(),
+                    };
+                    id += 1;
+                    return Ok(Term::Annotated(annotation.clone(), new_inner).into());
+                }
+            }
+
+            Ok(rt)
+        };
+
+        self.p
+            .custom_transform(|_cache, rt| rt.traverse(&mut traversal, TraverseOrder::TopDown))
+            .map_err(|_| SpecError::AnnotationFailed)
+    }
+
+    pub fn finish(self) -> Result<(RichTerm, Program<CacheImpl>), SpecError> {
         let Self { mut p, .. } = self;
-        p.eval_full_for_export()
-            .map_err(|e| SpecError::Nickel(p.files(), e))
-            .map(|rt| (rt, p.files()))
+        let root_term = p
+            .eval_record_spine()
+            .map_err(|e| SpecError::Nickel(p.files(), e))?;
+
+        Ok((root_term, p))
     }
 }
 

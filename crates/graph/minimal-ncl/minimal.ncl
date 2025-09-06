@@ -10,6 +10,9 @@
 
         cmd | String,
 
+        # Do NOT set this yourself
+        __magic_buildspec_id | optional,
+
         outputs
           | {_ : Output} | optional = {},
     },
