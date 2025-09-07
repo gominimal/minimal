@@ -13,6 +13,8 @@
         # Do NOT set this yourself
         __magic_buildspec_id | optional,
 
+        replace_on_cycle | BuildSpec | optional,
+
         outputs
           | {_ : Output} | optional = {},
     },

@@ -140,6 +140,8 @@ pub struct BuildSpec {
     pub inputs: Vec<BuildSpecInput>,
     pub runtime_deps: Vec<BuildSpecRef>,
     pub outputs: OutputMap,
+
+    pub replace_on_cycle: Option<BuildSpecRef>,
 }
 
 impl SpecHashable for BuildSpec {
@@ -175,6 +177,12 @@ impl SpecHashable for BuildSpec {
         for (name, output) in self.outputs.iter() {
             h.write_all(name.as_bytes()).unwrap();
             output.partial_spec_hash(&mut h);
+        }
+
+        if let Some(replace_on_cycle) = self.replace_on_cycle {
+            h.write_all(b"replace on cycle").unwrap();
+            h.write_all(g.spec_hash_impl(&replace_on_cycle, seen).as_bytes())
+                .unwrap();
         }
 
         SpecHash(h.finalize())
@@ -472,6 +480,7 @@ impl GraphBuilder {
             inputs: Vec::new(),
             runtime_deps: Vec::new(),
             outputs: OutputMap::new(),
+            replace_on_cycle: None,
         }));
         self.spec_id_lookup.insert(magic_id, bsr.clone());
 
@@ -479,6 +488,7 @@ impl GraphBuilder {
         let mut inputs: Option<Vec<BuildSpecInput>> = None;
         let mut runtime_deps: Option<Vec<BuildSpecRef>> = None;
         let mut outputs: Option<OutputMap> = None;
+        let mut replace_on_cycle: Option<BuildSpecRef> = None;
         match rt.term.as_ref() {
             Term::Record(r) => {
                 r.fields
@@ -547,6 +557,11 @@ impl GraphBuilder {
                                 todo!("handle value being non-dict {:?}", field.value);
                             };
                         }
+                        "replace_on_cycle" => {
+                            if let Some(value) = &field.value {
+                                replace_on_cycle = Some(self.read_buildspec(value, program).unwrap());
+                            }
+                        }
                         _ => (),
                     });
             }
@@ -570,6 +585,7 @@ impl GraphBuilder {
         bs.inputs = inputs;
         bs.runtime_deps = runtime_deps;
         bs.outputs = outputs;
+        bs.replace_on_cycle = replace_on_cycle;
 
         Ok(bsr)
     }
