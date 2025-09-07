@@ -57,13 +57,7 @@ impl SpecHashable for BuildSpecInput {
         match self {
             Build(bsr) => {
                 h.write_all(b"input").unwrap();
-                if seen.contains_key(bsr) {
-                    // theres a cycle, so lets just mark that to avoid an infinite loop.
-                    h.write_all(b"cycle").unwrap();
-                } else {
-                    let hash = g.spec_hash_impl(bsr, seen);
-                    h.write_all(hash.as_bytes()).unwrap();
-                }
+                h.write_all(g.spec_hash_impl(bsr, seen).as_bytes()).unwrap();
             }
             Source(s) => {
                 h.write_all(b"source").unwrap();
@@ -170,7 +164,7 @@ impl SpecHashable for BuildSpec {
         let mut runtime_dep_hashes: Vec<SpecHash> = self
             .runtime_deps
             .iter()
-            .map(|bsr| g.spec_hash(bsr))
+            .map(|bsr| g.spec_hash_impl(bsr, seen))
             .collect();
         runtime_dep_hashes.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         for hash in runtime_dep_hashes.drain(..) {
@@ -230,23 +224,30 @@ impl DepGraph {
 
     /// Returns the specification hash of the given build spec.
     pub fn spec_hash(&self, bsr: &BuildSpecRef) -> SpecHash {
-        // TODO: use smol/starts-on-stack type for hashmap?
-        let mut seen = HashMap::with_capacity(32);
-        self.spec_hash_impl(bsr, &mut seen)
-    }
-
-    fn spec_hash_impl(&self, bsr: &BuildSpecRef, seen: &mut HashMap<BuildSpecRef, ()>) -> SpecHash {
-        seen.insert(bsr.clone(), ());
         {
             if let Some(hash) = self.hash_cache.read().unwrap().get(bsr) {
                 return hash.clone();
             }
         }
 
-        let build = self.get(bsr).unwrap();
-        let hash = build.spec_hash(self, seen);
+        // TODO: use smol/starts-on-stack type for hashmap?
+        let mut seen = HashMap::with_capacity(32);
+        let hash = self.spec_hash_impl(bsr, &mut seen);
 
         self.hash_cache.write().unwrap().insert(*bsr, hash.clone());
+        hash
+    }
+
+    fn spec_hash_impl(&self, bsr: &BuildSpecRef, seen: &mut HashMap<BuildSpecRef, ()>) -> SpecHash {
+        if seen.contains_key(bsr) {
+            return SpecHash::cycle();
+        }
+
+        let build = self.get(bsr).unwrap();
+
+        seen.insert(bsr.clone(), ());
+        let hash = build.spec_hash(self, seen);
+        seen.remove(bsr);
         hash
     }
 
@@ -1210,7 +1211,6 @@ mod tests {
                 let rec b1 = {
                     name = \"b1\",
                     inputs = [
-                        {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
                         b2,
                     ],
                     cmd = \"\",
@@ -1218,7 +1218,7 @@ mod tests {
                 b2 = {
                     name = \"b2\",
                     inputs = [
-                        {url = \"http://other.com\", sha256 = \"abcdef\"} | Source,
+                        b1,
                     ],
                     cmd = \"\",
                 } | BuildSpec,

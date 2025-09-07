@@ -85,6 +85,11 @@ impl SpecHash {
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }
+
+    /// symbolic hash to represent a cycle when computing a SpecHash.
+    fn cycle() -> Self {
+        Self(blake3::Hash::from_bytes([1u8; 32]))
+    }
 }
 
 impl PartialEq<blake3::Hash> for SpecHash {
