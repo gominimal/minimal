@@ -456,7 +456,7 @@ impl GraphBuilder {
         }
         match ty {
             Some(ObjTy::Builder) => {} // happy path
-            None => return Err(Error::InvalidObject("missing field: ty".to_string())),
+            None => return Err(Error::MissingTy(program.files(), rt.pos)),
             Some(ty) => {
                 return Err(Error::UnexpectedObject {
                     files: program.files(),
@@ -468,7 +468,14 @@ impl GraphBuilder {
         }
         let name = match name {
             Some(name) => name,
-            None => return Err(Error::InvalidObject("missing field: name".to_string())),
+            None => {
+                return Err(Error::MissingField {
+                    files: program.files(),
+                    obj: ObjTy::Builder,
+                    pos: rt.pos,
+                    field: "name",
+                })
+            }
         };
         let cmd = cmd.unwrap_or_default();
 
@@ -575,7 +582,14 @@ impl GraphBuilder {
         }
         let inputs = match inputs {
             Some(inputs) => inputs,
-            None => return Err(Error::InvalidObject("missing field: inputs".to_string())),
+            None => {
+                return Err(Error::MissingField {
+                    files: program.files(),
+                    obj: ObjTy::Builder,
+                    pos: rt.pos,
+                    field: "inputs",
+                })
+            }
         };
         let outputs = match outputs {
             Some(mut outputs) => {
@@ -583,7 +597,14 @@ impl GraphBuilder {
                 outputs.sort_by(|k1, _v1, k2, _v2| String::cmp(k1, k2));
                 outputs
             }
-            None => return Err(Error::InvalidObject("missing field: outputs".to_string())),
+            None => {
+                return Err(Error::MissingField {
+                    files: program.files(),
+                    obj: ObjTy::Builder,
+                    pos: rt.pos,
+                    field: "outputs",
+                })
+            }
         };
         let runtime_deps = runtime_deps.unwrap_or_default();
 
@@ -633,11 +654,25 @@ impl GraphBuilder {
         }
         let url = match url {
             Some(url) => url,
-            None => return Err(Error::InvalidObject("missing field: url".to_string())),
+            None => {
+                return Err(Error::MissingField {
+                    files: program.files(),
+                    obj: ObjTy::Source,
+                    pos: rt.pos,
+                    field: "url",
+                })
+            }
         };
         let sha256 = match sha256 {
             Some(sha256) => sha256,
-            None => return Err(Error::InvalidObject("missing field: sha256".to_string())),
+            None => {
+                return Err(Error::MissingField {
+                    files: program.files(),
+                    obj: ObjTy::Source,
+                    pos: rt.pos,
+                    field: "sha256",
+                })
+            }
         };
 
         Ok(SourceInput {
@@ -673,7 +708,14 @@ impl GraphBuilder {
         }
         let path = match path {
             Some(path) => path,
-            None => return Err(Error::InvalidObject("missing field: path".to_string())),
+            None => {
+                return Err(Error::MissingField {
+                    files: program.files(),
+                    obj: ObjTy::Path,
+                    pos: rt.pos,
+                    field: "path",
+                })
+            }
         };
 
         Ok(path)
@@ -707,7 +749,14 @@ impl GraphBuilder {
         }
         let (file, src_id) = match file {
             Some(file) => file,
-            None => return Err(Error::InvalidObject("missing field: file".to_string())),
+            None => {
+                return Err(Error::MissingField {
+                    files: program.files(),
+                    obj: ObjTy::Local,
+                    pos: rt.pos,
+                    field: "file",
+                })
+            }
         };
 
         let full_path = Path::new(program.files().name(src_id))
@@ -753,7 +802,14 @@ impl GraphBuilder {
         }
         let package = match package {
             Some(package) => package,
-            None => return Err(Error::InvalidObject("missing field: package".to_string())),
+            None => {
+                return Err(Error::MissingField {
+                    files: program.files(),
+                    obj: ObjTy::Prebuilt,
+                    pos: rt.pos,
+                    field: "package",
+                })
+            }
         };
 
         Ok(package)
@@ -822,7 +878,14 @@ impl GraphBuilder {
         }
         let glob = match glob {
             Some(glob) => glob,
-            None => return Err(Error::InvalidObject("missing field: glob".to_string())),
+            None => {
+                return Err(Error::MissingField {
+                    files: program.files(),
+                    obj: ObjTy::OutputLib,
+                    pos: rt.pos,
+                    field: "glob",
+                })
+            }
         };
 
         Ok(BuildOutput::Library { glob })
@@ -855,7 +918,14 @@ impl GraphBuilder {
         }
         let data = match data {
             Some(data) => data,
-            None => return Err(Error::InvalidObject("missing field: data".to_string())),
+            None => {
+                return Err(Error::MissingField {
+                    files: program.files(),
+                    obj: ObjTy::OutputData,
+                    pos: rt.pos,
+                    field: "data",
+                })
+            }
         };
 
         Ok(BuildOutput::Data { glob: data })
@@ -888,7 +958,14 @@ impl GraphBuilder {
         }
         let path = match path {
             Some(path) => path,
-            None => return Err(Error::InvalidObject("missing field: path".to_string())),
+            None => {
+                return Err(Error::MissingField {
+                    files: program.files(),
+                    obj: ObjTy::OutputBin,
+                    pos: rt.pos,
+                    field: "path",
+                })
+            }
         };
 
         Ok(BuildOutput::Binary { path })

@@ -17,7 +17,12 @@ pub enum Error {
         want: ObjTy,
         pos: TermPos,
     },
-    InvalidObject(String),
+    MissingField {
+        files: Files,
+        obj: ObjTy,
+        pos: TermPos,
+        field: &'static str,
+    },
     MissingID(Files, TermPos),
     MissingTy(Files, TermPos),
 }
@@ -90,7 +95,27 @@ impl Error {
                     nickel_lang_core::error::report::ColorOpt::Auto,
                 );
             }
-            Error::InvalidObject(_) => todo!(),
+            Error::MissingField {
+                files,
+                obj,
+                pos,
+                field,
+            } => {
+                let mut files = files.clone();
+                let diagnostic = Diagnostic::error()
+                    .with_message(format!(
+                        "missing field {} for record of type {:?}",
+                        field, obj
+                    ))
+                    .with_label(primary(&pos.into_opt().unwrap()));
+
+                report(
+                    &mut files,
+                    diagnostic,
+                    nickel_lang_core::error::report::ErrorFormat::Text,
+                    nickel_lang_core::error::report::ColorOpt::Auto,
+                );
+            }
         }
     }
 }
