@@ -2,7 +2,6 @@ pub mod config;
 pub mod error;
 pub mod executor;
 pub mod output;
-pub mod sandbox;
 
 pub use config::BuildConfig;
 pub use error::{BuildSandboxError as Error, Result};
