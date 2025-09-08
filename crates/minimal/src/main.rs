@@ -62,7 +62,12 @@ pub fn graph_from_package_name(package_name: &String, source: bool) -> DepGraph 
     });
     let sr = sr.unwrap();
 
-    DepGraph::new(sr).unwrap()
+    DepGraph::new(sr)
+        .map_err(|e| {
+            e.report_to_stderr();
+            Err::<DepGraph, ()>(())
+        })
+        .unwrap()
 }
 
 pub fn load_cache(

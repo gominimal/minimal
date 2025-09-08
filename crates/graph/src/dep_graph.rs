@@ -357,7 +357,7 @@ fn read_ty(rt: &RichTerm, program: &mut Program<CacheImpl>) -> Result<ObjTy, Err
         let rt = eval_if_closure(&rt, program)?;
         Ok(ObjTy::deserialize(rt).unwrap())
     } else {
-        todo!("err");
+        Err(Error::MissingTy(program.files(), rt.pos))
     }
 }
 
@@ -402,7 +402,8 @@ impl GraphBuilder {
         program: &mut Program<CacheImpl>,
     ) -> Result<BuildSpecRef, Error> {
         let rt = eval_if_closure(rt, program)?;
-        let magic_id = read_buildspec_id(&rt).ok_or(Error::MissingID)?;
+        let magic_id =
+            read_buildspec_id(&rt).ok_or_else(|| Error::MissingID(program.files(), rt.pos))?;
         // If we have seen this build-spec object before, bail-out with a reference to the existing
         // object, that way we can handle circular references of build specs.
         //
@@ -458,6 +459,7 @@ impl GraphBuilder {
             None => return Err(Error::InvalidObject("missing field: ty".to_string())),
             Some(ty) => {
                 return Err(Error::UnexpectedObject {
+                    files: program.files(),
                     got: ty,
                     want: ObjTy::Builder,
                     pos: rt.pos,
@@ -491,78 +493,83 @@ impl GraphBuilder {
             Term::Record(r) => {
                 r.fields
                     .iter()
-                    .for_each(|(ident_and_loc, field)| match ident_and_loc.label() {
-                        "inputs" => {
-                            let inputs_rt = field
-                                .value
-                                .as_ref()
-                                .map(|rt| eval_if_closure(rt, program).unwrap())
-                                .unwrap();
-                            if let Term::Array(a, _attrs) = inputs_rt.as_ref() {
-                                inputs = Some(
-                                    a.iter()
-                                        .map(|input| self.read_input(input, program).unwrap())
-                                        .collect(),
-                                );
-                            } else {
-                                todo!("handle inputs value being non-array {:?}", field.value);
-                            };
-                        }
-                        "runtime_deps" => {
-                            let runtime_deps_rt = field
-                                .value
-                                .as_ref()
-                                .map(|rt| eval_if_closure(rt, program).unwrap());
-                            match runtime_deps_rt {
-                                None => {}
-                                Some(runtime_deps_rt) => match runtime_deps_rt.term.as_ref() {
-                                    Term::Array(a, _attrs) => {
-                                        runtime_deps = Some(
-                                            a.iter()
-                                                .map(|input| {
-                                                    self.read_buildspec(input, program).unwrap()
-                                                })
-                                                .collect(),
-                                        );
-                                    }
-                                    _ => todo!(
-                                        "handle runtime_deps value being non-array {:?}",
-                                        field.value
-                                    ),
-                                },
+                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                        match ident_and_loc.label() {
+                            "inputs" => {
+                                let inputs_rt = field
+                                    .value
+                                    .as_ref()
+                                    .map(|rt| eval_if_closure(rt, program).unwrap())
+                                    .unwrap();
+                                if let Term::Array(a, _attrs) = inputs_rt.as_ref() {
+                                    inputs = Some(
+                                        a.iter()
+                                            .map(|input| Ok(self.read_input(input, program)?))
+                                            .collect::<Result<Vec<_>, Error>>()?,
+                                    );
+                                } else {
+                                    todo!("handle inputs value being non-array {:?}", field.value);
+                                };
+                                Ok(())
                             }
-                        }
-                        "outputs" => {
-                            let outputs_rt = field
-                                .value
-                                .as_ref()
-                                .map(|rt| eval_if_closure(rt, program).unwrap())
-                                .unwrap();
+                            "runtime_deps" => {
+                                let runtime_deps_rt = field
+                                    .value
+                                    .as_ref()
+                                    .map(|rt| eval_if_closure(rt, program).unwrap());
+                                match runtime_deps_rt {
+                                    None => {}
+                                    Some(runtime_deps_rt) => match runtime_deps_rt.term.as_ref() {
+                                        Term::Array(a, _attrs) => {
+                                            runtime_deps = Some(
+                                                a.iter()
+                                                    .map(|input| {
+                                                        Ok(self.read_buildspec(input, program)?)
+                                                    })
+                                                    .collect::<Result<Vec<_>, Error>>()?,
+                                            );
+                                        }
+                                        _ => todo!(
+                                            "handle runtime_deps value being non-array {:?}",
+                                            field.value
+                                        ),
+                                    },
+                                }
+                                Ok(())
+                            }
+                            "outputs" => {
+                                let outputs_rt = field
+                                    .value
+                                    .as_ref()
+                                    .map(|rt| eval_if_closure(rt, program).unwrap())
+                                    .unwrap();
 
-                            if let Term::Record(r) = outputs_rt.as_ref() {
-                                outputs = Some(
-                                    r.iter_serializable()
-                                        .map(|entry| entry.unwrap())
-                                        .map(|(ident, val)| {
-                                            (
-                                                ident.label().to_string(),
-                                                self.read_output_value(val, program).unwrap(),
-                                            )
-                                        })
-                                        .collect(),
-                                );
-                            } else {
-                                todo!("handle value being non-dict {:?}", field.value);
-                            };
-                        }
-                        "replace_on_cycle" => {
-                            if let Some(value) = &field.value {
-                                replace_on_cycle =
-                                    Some(self.read_buildspec(value, program).unwrap());
+                                if let Term::Record(r) = outputs_rt.as_ref() {
+                                    outputs = Some(
+                                        r.iter_serializable()
+                                            .map(|entry| entry.unwrap())
+                                            .map(|(ident, val)| {
+                                                Ok((
+                                                    ident.label().to_string(),
+                                                    self.read_output_value(val, program)?,
+                                                ))
+                                            })
+                                            .collect::<Result<_, Error>>()?,
+                                    );
+                                } else {
+                                    todo!("handle value being non-dict {:?}", field.value);
+                                };
+                                Ok(())
                             }
+                            "replace_on_cycle" => {
+                                if let Some(value) = &field.value {
+                                    replace_on_cycle = Some(self.read_buildspec(value, program)?);
+                                }
+                                Ok(())
+                            }
+                            _ => Ok(()),
                         }
-                        _ => (),
-                    });
+                    })?;
             }
             _ => panic!("unexpected type: want Record, got {:?}", rt.term),
         }
@@ -779,6 +786,7 @@ impl GraphBuilder {
             )),
             ObjTy::OutputLib | ObjTy::OutputBin | ObjTy::OutputData => {
                 Err(Error::UnexpectedObject {
+                    files: program.files(),
                     got: ty,
                     want: ObjTy::Builder,
                     pos: rt.pos,
@@ -901,6 +909,7 @@ impl GraphBuilder {
             ObjTy::OutputData => self.read_output_data(&rt, program),
             ObjTy::OutputBin => self.read_output_bin(&rt, program),
             _ => Err(Error::UnexpectedObject {
+                files: program.files(),
                 got: ty,
                 want: ObjTy::OutputLib,
                 pos: rt.pos,

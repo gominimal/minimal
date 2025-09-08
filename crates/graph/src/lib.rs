@@ -1,4 +1,5 @@
 use crate::spec_schema::ObjTy;
+use nickel_lang_core::files::Files;
 use nickel_lang_core::position::TermPos;
 use std::collections::HashMap;
 
@@ -11,28 +12,49 @@ use std::fmt;
 pub enum Error {
     SpecError(SpecError),
     UnexpectedObject {
+        files: Files,
         got: ObjTy,
         want: ObjTy,
         pos: TermPos,
     },
     InvalidObject(String),
-    MissingID,
+    MissingID(Files, TermPos),
+    MissingTy(Files, TermPos),
 }
 
 impl Error {
     pub fn report_to_stderr(&self) {
+        use nickel_lang_core::error::{report::report, Diagnostic, Label};
+        use nickel_lang_core::files::FileId;
+        use nickel_lang_core::position::RawSpan;
         use Error::*;
+
+        /// Create a primary label from a span.
+        fn primary(span: &RawSpan) -> Label<FileId> {
+            Label::primary(span.src_id, span.start.to_usize()..span.end.to_usize())
+        }
+
+        /// Create a secondary label from a span.
+        #[allow(dead_code)]
+        fn secondary(span: &RawSpan) -> Label<FileId> {
+            Label::secondary(span.src_id, span.start.to_usize()..span.end.to_usize())
+        }
+
         match self {
             SpecError(se) => se.report_to_stderr(),
-            UnexpectedObject { got, want, pos: _ } => {
-                use nickel_lang_core::error::{report::report, Diagnostic};
-                use nickel_lang_core::files::Files;
-                let mut files = Files::new();
-
-                let diagnostic = Diagnostic::error().with_message(format!(
-                    "unexpected object: found {:?} when looking for {:?}",
-                    got, want
-                ));
+            UnexpectedObject {
+                files,
+                got,
+                want,
+                pos,
+            } => {
+                let mut files = files.clone();
+                let diagnostic = Diagnostic::error()
+                    .with_message(format!(
+                        "unexpected record: found {:?} when looking for {:?}",
+                        got, want
+                    ))
+                    .with_label(primary(&pos.into_opt().unwrap()).with_message("at this record"));
 
                 report(
                     &mut files,
@@ -41,7 +63,33 @@ impl Error {
                     nickel_lang_core::error::report::ColorOpt::Auto,
                 );
             }
-            MissingID => todo!(),
+            MissingID(files, pos) => {
+                let mut files = files.clone();
+                let diagnostic = Diagnostic::error()
+                    .with_message("record was not declared a build spec")
+                    .with_label(primary(&pos.into_opt().unwrap()));
+
+                report(
+                    &mut files,
+                    diagnostic,
+                    nickel_lang_core::error::report::ErrorFormat::Text,
+                    nickel_lang_core::error::report::ColorOpt::Auto,
+                );
+            }
+            MissingTy(files, pos) => {
+                let mut files = files.clone();
+                let diagnostic = Diagnostic::error()
+                    .with_message("record was not given a type")
+                    .with_label(primary(&pos.into_opt().unwrap()))
+                    .with_note("Perhaps you meant to apply ('|' operator) a type such as BuildSpec, OutputLib, Source, etc etc");
+
+                report(
+                    &mut files,
+                    diagnostic,
+                    nickel_lang_core::error::report::ErrorFormat::Text,
+                    nickel_lang_core::error::report::ColorOpt::Auto,
+                );
+            }
             Error::InvalidObject(_) => todo!(),
         }
     }
