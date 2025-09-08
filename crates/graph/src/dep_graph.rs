@@ -511,12 +511,12 @@ impl GraphBuilder {
                                 let inputs_rt = field
                                     .value
                                     .as_ref()
-                                    .map(|rt| Ok::<_, Error>(eval_if_closure(rt, program)?))
+                                    .map(|rt| eval_if_closure(rt, program))
                                     .unwrap()?;
                                 if let Term::Array(a, _attrs) = inputs_rt.as_ref() {
                                     inputs = Some(
                                         a.iter()
-                                            .map(|input| Ok(self.read_input(input, program)?))
+                                            .map(|input| self.read_input(input, program))
                                             .collect::<Result<Vec<_>, Error>>()?,
                                     );
                                 } else {
@@ -525,10 +525,8 @@ impl GraphBuilder {
                                 Ok(())
                             }
                             "runtime_deps" => {
-                                let runtime_deps_rt = field
-                                    .value
-                                    .as_ref()
-                                    .map(|rt| Ok::<_, Error>(eval_if_closure(rt, program)?));
+                                let runtime_deps_rt =
+                                    field.value.as_ref().map(|rt| eval_if_closure(rt, program));
                                 match runtime_deps_rt {
                                     None => {}
                                     Some(runtime_deps_rt) => match runtime_deps_rt?.term.as_ref() {
@@ -536,7 +534,7 @@ impl GraphBuilder {
                                             runtime_deps = Some(
                                                 a.iter()
                                                     .map(|input| {
-                                                        Ok(self.read_buildspec(input, program)?)
+                                                        self.read_buildspec(input, program)
                                                     })
                                                     .collect::<Result<Vec<_>, Error>>()?,
                                             );
@@ -553,7 +551,7 @@ impl GraphBuilder {
                                 let outputs_rt = field
                                     .value
                                     .as_ref()
-                                    .map(|rt| Ok::<_, Error>(eval_if_closure(rt, program)?))
+                                    .map(|rt| eval_if_closure(rt, program))
                                     .unwrap()?;
 
                                 if let Term::Record(r) = outputs_rt.as_ref() {
