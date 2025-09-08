@@ -1,20 +1,20 @@
-let {BuildSpec, HostPath, OutputLib, Local, Prebuilt, ..} = import "minimal.ncl" in
+let { BuildSpec, HostPath, OutputLib, Local, Prebuilt, .. } = import "minimal.ncl" in
+let base = import "../base/build.ncl" in
 let binutils = import "../binutils/build.ncl" in
-let coreutils = import "../coreutils/build.ncl" in
 let gcc = import "../gcc/build.ncl" in
 let glibc = import "../glibc/build.ncl" in
 let linux_headers = import "../linux_headers/build.ncl" in
 {
-    name = "toolchain",
-    inputs = [
-        coreutils,
-    ],
-    runtime_deps = [
-       binutils,
-       gcc,
-       glibc,
-       linux_headers,
-    ],
-    cmd = "true",
-    outputs = {},
+  name = "toolchain",
+  inputs = [
+    base,
+  ],
+  runtime_deps = [
+    binutils,
+    gcc,
+    glibc,
+    linux_headers,
+  ],
+  cmd = "true",
+  outputs = {},
 } | BuildSpec

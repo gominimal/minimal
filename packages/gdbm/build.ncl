@@ -1,13 +1,5 @@
 let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
-let bash = import "../bash/build.ncl" in
-let coreutils = import "../coreutils/build.ncl" in
-let diffutils = import "../diffutils/build.ncl" in
-let gawk = import "../gawk/build.ncl" in
-let grep = import "../grep/build.ncl" in
-let gzip = import "../gzip/build.ncl" in
-let make = import "../make/build.ncl" in
-let sed = import "../sed/build.ncl" in
-let tar = import "../tar/build.ncl" in
+let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
     name = "gdbm",
@@ -17,15 +9,7 @@ let toolchain = import "../toolchain/build.ncl" in
             url = "gs://minimal-staging-archives/gdbm-1.26.tar.gz",
             sha256 = "6a24504a14de4a744103dcb936be976df6fbe88ccff26065e54c1c47946f4a5e"
         } | Source,
-        bash,
-        coreutils,
-        diffutils,
-        gawk,
-        grep,
-        gzip,
-        make,
-        sed,
-        tar,
+        base,
         toolchain,
     ],
     cmd = "./build.sh",

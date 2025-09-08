@@ -1,39 +1,23 @@
-let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
-let bash = import "../bash/build.ncl" in
-let bzip2 = import "../bzip2/build.ncl" in
-let coreutils = import "../coreutils/build.ncl" in
-let gawk = import "../gawk/build.ncl" in
-let grep = import "../grep/build.ncl" in
-let make = import "../make/build.ncl" in
-let sed = import "../sed/build.ncl" in
-let tar = import "../tar/build.ncl" in
+let { BuildSpec, HostPath, OutputLib, Local, Source, .. } = import "minimal.ncl" in
+let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
-let xz = import "../xz/build.ncl" in
 let zlib = import "../zlib/build.ncl" in
 {
-    name = "perl",
-    inputs = [
-        {file = "build.source.sh"} | Local,
-        {
-            url = "gs://minimal-staging-archives/perl-5.42.0.tar.xz",
-            sha256 = "73cf6cc1ea2b2b1c110a18c14bbbc73a362073003893ffcedc26d22ebdbdd0c3"
-        } | Source,
-        bash,
-        bzip2,
-        coreutils,
-        gawk,
-        grep,
-        make,
-        sed,
-        tar,
-        toolchain,
-        xz,
-        zlib,
-    ],
-    cmd = "./build.source.sh",
-    outputs = {
-        usr_bin = { glob = "usr/bin/**/*" } | OutputLib,
-        usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
-        usr_share = { glob = "usr/share/**/*" } | OutputLib,
-    },
+  name = "perl",
+  inputs = [
+    { file = "build.source.sh" } | Local,
+    {
+      url = "gs://minimal-staging-archives/perl-5.42.0.tar.xz",
+      sha256 = "73cf6cc1ea2b2b1c110a18c14bbbc73a362073003893ffcedc26d22ebdbdd0c3"
+    } | Source,
+    base,
+    toolchain,
+    zlib,
+  ],
+  cmd = "./build.source.sh",
+  outputs = {
+    usr_bin = { glob = "usr/bin/**/*" } | OutputLib,
+    usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
+    usr_share = { glob = "usr/share/**/*" } | OutputLib,
+  },
 } | BuildSpec

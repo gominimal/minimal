@@ -1,38 +1,22 @@
-let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
-let bash = import "../bash/build.ncl" in
-let coreutils = import "../coreutils/build.ncl" in
-let diffutils = import "../diffutils/build.ncl" in
-let gawk = import "../gawk/build.ncl" in
-let grep = import "../grep/build.ncl" in
-let gzip = import "../gzip/build.ncl" in
-let make = import "../make/build.ncl" in
-let sed = import "../sed/build.ncl" in
-let tar = import "../tar/build.ncl" in
+let { BuildSpec, HostPath, OutputLib, Local, Source, .. } = import "minimal.ncl" in
+let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
-    name = "file",
-    inputs = [
-        {file = "build.source.sh"} | Local,
-        {
-            url = "gs://minimal-staging-archives/file-5.46.tar.gz",
-            sha256 = "c9cc77c7c560c543135edc555af609d5619dbef011997e988ce40a3d75d86088"
-        } | Source,
-        bash,
-        coreutils,
-        diffutils,
-        gawk,
-        grep,
-        gzip,
-        make,
-        sed,
-        tar,
-        toolchain,
-    ],
-    cmd = "./build.source.sh",
-    outputs = {
-        file_bin = { glob = "usr/bin/file" } | OutputLib,
-        libmagic = { glob = "usr/lib/libmagic.so*" } | OutputLib,
-        headers = { glob = "usr/include/magic.h" } | OutputLib,
-        magic_data = { glob = "usr/share/misc/magic*" } | OutputLib,
-    },
+  name = "file",
+  inputs = [
+    { file = "build.source.sh" } | Local,
+    {
+      url = "gs://minimal-staging-archives/file-5.46.tar.gz",
+      sha256 = "c9cc77c7c560c543135edc555af609d5619dbef011997e988ce40a3d75d86088"
+    } | Source,
+    base,
+    toolchain,
+  ],
+  cmd = "./build.source.sh",
+  outputs = {
+    file_bin = { glob = "usr/bin/file" } | OutputLib,
+    libmagic = { glob = "usr/lib/libmagic.so*" } | OutputLib,
+    headers = { glob = "usr/include/magic.h" } | OutputLib,
+    magic_data = { glob = "usr/share/misc/magic*" } | OutputLib,
+  },
 } | BuildSpec
