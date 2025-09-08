@@ -419,38 +419,43 @@ impl GraphBuilder {
         let mut ty: Option<ObjTy> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                r.fields.iter().for_each(|(ident_and_loc, field)| {
-                    match ident_and_loc.label() {
-                        "ty" => {
-                            ty = Some(
-                                ObjTy::deserialize(
-                                    eval_if_closure(field.value.as_ref().unwrap(), program)
-                                        .unwrap(),
-                                )
-                                .unwrap(),
-                            );
+                r.fields
+                    .iter()
+                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                        match ident_and_loc.label() {
+                            "ty" => {
+                                ty = Some(
+                                    ObjTy::deserialize(eval_if_closure(
+                                        field.value.as_ref().unwrap(),
+                                        program,
+                                    )?)
+                                    .unwrap(),
+                                );
+                                Ok(())
+                            }
+                            "name" => {
+                                name = Some(
+                                    String::deserialize(eval_if_closure(
+                                        field.value.as_ref().unwrap(),
+                                        program,
+                                    )?)
+                                    .unwrap(),
+                                );
+                                Ok(())
+                            }
+                            "cmd" => {
+                                cmd = Some(
+                                    String::deserialize(eval_if_closure(
+                                        field.value.as_ref().unwrap(),
+                                        program,
+                                    )?)
+                                    .unwrap(),
+                                );
+                                Ok(())
+                            }
+                            _ => Ok(()), // TODO: Should we error if we see an unknown field?
                         }
-                        "name" => {
-                            name = Some(
-                                String::deserialize(
-                                    eval_if_closure(field.value.as_ref().unwrap(), program)
-                                        .unwrap(),
-                                )
-                                .unwrap(),
-                            );
-                        }
-                        "cmd" => {
-                            cmd = Some(
-                                String::deserialize(
-                                    eval_if_closure(field.value.as_ref().unwrap(), program)
-                                        .unwrap(),
-                                )
-                                .unwrap(),
-                            );
-                        }
-                        _ => {} // TODO: Should we error if we see an unknown field?
-                    };
-                });
+                    })?;
             }
             _ => {}
         }
@@ -506,8 +511,8 @@ impl GraphBuilder {
                                 let inputs_rt = field
                                     .value
                                     .as_ref()
-                                    .map(|rt| eval_if_closure(rt, program).unwrap())
-                                    .unwrap();
+                                    .map(|rt| Ok::<_, Error>(eval_if_closure(rt, program)?))
+                                    .unwrap()?;
                                 if let Term::Array(a, _attrs) = inputs_rt.as_ref() {
                                     inputs = Some(
                                         a.iter()
@@ -523,10 +528,10 @@ impl GraphBuilder {
                                 let runtime_deps_rt = field
                                     .value
                                     .as_ref()
-                                    .map(|rt| eval_if_closure(rt, program).unwrap());
+                                    .map(|rt| Ok::<_, Error>(eval_if_closure(rt, program)?));
                                 match runtime_deps_rt {
                                     None => {}
-                                    Some(runtime_deps_rt) => match runtime_deps_rt.term.as_ref() {
+                                    Some(runtime_deps_rt) => match runtime_deps_rt?.term.as_ref() {
                                         Term::Array(a, _attrs) => {
                                             runtime_deps = Some(
                                                 a.iter()
@@ -548,8 +553,8 @@ impl GraphBuilder {
                                 let outputs_rt = field
                                     .value
                                     .as_ref()
-                                    .map(|rt| eval_if_closure(rt, program).unwrap())
-                                    .unwrap();
+                                    .map(|rt| Ok::<_, Error>(eval_if_closure(rt, program)?))
+                                    .unwrap()?;
 
                                 if let Term::Record(r) = outputs_rt.as_ref() {
                                     outputs = Some(
@@ -626,29 +631,33 @@ impl GraphBuilder {
         let mut sha256: Option<String> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                r.fields.iter().for_each(|(ident_and_loc, field)| {
-                    match ident_and_loc.label() {
-                        "url" => {
-                            url = Some(
-                                String::deserialize(
-                                    eval_if_closure(field.value.as_ref().unwrap(), program)
-                                        .unwrap(),
-                                )
-                                .unwrap(),
-                            );
+                r.fields
+                    .iter()
+                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                        match ident_and_loc.label() {
+                            "url" => {
+                                url = Some(
+                                    String::deserialize(eval_if_closure(
+                                        field.value.as_ref().unwrap(),
+                                        program,
+                                    )?)
+                                    .unwrap(),
+                                );
+                                Ok(())
+                            }
+                            "sha256" => {
+                                sha256 = Some(
+                                    String::deserialize(eval_if_closure(
+                                        field.value.as_ref().unwrap(),
+                                        program,
+                                    )?)
+                                    .unwrap(),
+                                );
+                                Ok(())
+                            }
+                            _ => Ok(()), // TODO: Should we error if we see an unknown field?
                         }
-                        "sha256" => {
-                            sha256 = Some(
-                                String::deserialize(
-                                    eval_if_closure(field.value.as_ref().unwrap(), program)
-                                        .unwrap(),
-                                )
-                                .unwrap(),
-                            );
-                        }
-                        _ => {} // TODO: Should we error if we see an unknown field?
-                    };
-                });
+                    })?;
             }
             _ => {}
         }
@@ -689,20 +698,23 @@ impl GraphBuilder {
         let mut path: Option<String> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                r.fields.iter().for_each(|(ident_and_loc, field)| {
-                    match ident_and_loc.label() {
-                        "path" => {
-                            path = Some(
-                                String::deserialize(
-                                    eval_if_closure(field.value.as_ref().unwrap(), program)
-                                        .unwrap(),
-                                )
-                                .unwrap(),
-                            );
+                r.fields
+                    .iter()
+                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                        match ident_and_loc.label() {
+                            "path" => {
+                                path = Some(
+                                    String::deserialize(eval_if_closure(
+                                        field.value.as_ref().unwrap(),
+                                        program,
+                                    )?)
+                                    .unwrap(),
+                                );
+                                Ok(())
+                            }
+                            _ => Ok(()), // TODO: Should we error if we see an unknown field?
                         }
-                        _ => {} // TODO: Should we error if we see an unknown field?
-                    };
-                });
+                    })?;
             }
             _ => {}
         }
@@ -729,21 +741,24 @@ impl GraphBuilder {
         let mut file: Option<(String, FileId)> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                r.fields.iter().for_each(|(ident_and_loc, field)| {
-                    match ident_and_loc.label() {
-                        "file" => {
-                            file = Some((
-                                String::deserialize(
-                                    eval_if_closure(field.value.as_ref().unwrap(), program)
-                                        .unwrap(),
-                                )
-                                .unwrap(),
-                                field.value.as_ref().unwrap().pos.src_id().unwrap(),
-                            ));
+                r.fields
+                    .iter()
+                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                        match ident_and_loc.label() {
+                            "file" => {
+                                file = Some((
+                                    String::deserialize(eval_if_closure(
+                                        field.value.as_ref().unwrap(),
+                                        program,
+                                    )?)
+                                    .unwrap(),
+                                    field.value.as_ref().unwrap().pos.src_id().unwrap(),
+                                ));
+                                Ok(())
+                            }
+                            _ => Ok(()), // TODO: Should we error if we see an unknown field?
                         }
-                        _ => {} // TODO: Should we error if we see an unknown field?
-                    };
-                });
+                    })?;
             }
             _ => {}
         }
@@ -783,20 +798,23 @@ impl GraphBuilder {
         let mut package: Option<String> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                r.fields.iter().for_each(|(ident_and_loc, field)| {
-                    match ident_and_loc.label() {
-                        "package" => {
-                            package = Some(
-                                String::deserialize(
-                                    eval_if_closure(field.value.as_ref().unwrap(), program)
-                                        .unwrap(),
-                                )
-                                .unwrap(),
-                            );
+                r.fields
+                    .iter()
+                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                        match ident_and_loc.label() {
+                            "package" => {
+                                package = Some(
+                                    String::deserialize(eval_if_closure(
+                                        field.value.as_ref().unwrap(),
+                                        program,
+                                    )?)
+                                    .unwrap(),
+                                );
+                                Ok(())
+                            }
+                            _ => Ok(()), // TODO: Should we error if we see an unknown field?
                         }
-                        _ => {} // TODO: Should we error if we see an unknown field?
-                    };
-                });
+                    })?;
             }
             _ => {}
         }
@@ -859,20 +877,23 @@ impl GraphBuilder {
         let mut glob: Option<String> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                r.fields.iter().for_each(|(ident_and_loc, field)| {
-                    match ident_and_loc.label() {
-                        "glob" => {
-                            glob = Some(
-                                String::deserialize(
-                                    eval_if_closure(field.value.as_ref().unwrap(), program)
-                                        .unwrap(),
-                                )
-                                .unwrap(),
-                            );
+                r.fields
+                    .iter()
+                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                        match ident_and_loc.label() {
+                            "glob" => {
+                                glob = Some(
+                                    String::deserialize(eval_if_closure(
+                                        field.value.as_ref().unwrap(),
+                                        program,
+                                    )?)
+                                    .unwrap(),
+                                );
+                                Ok(())
+                            }
+                            _ => Ok(()), // TODO: Should we error if we see an unknown field?
                         }
-                        _ => {} // TODO: Should we error if we see an unknown field?
-                    };
-                });
+                    })?;
             }
             _ => {}
         }
@@ -899,20 +920,23 @@ impl GraphBuilder {
         let mut data: Option<String> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                r.fields.iter().for_each(|(ident_and_loc, field)| {
-                    match ident_and_loc.label() {
-                        "data" => {
-                            data = Some(
-                                String::deserialize(
-                                    eval_if_closure(field.value.as_ref().unwrap(), program)
-                                        .unwrap(),
-                                )
-                                .unwrap(),
-                            );
+                r.fields
+                    .iter()
+                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                        match ident_and_loc.label() {
+                            "data" => {
+                                data = Some(
+                                    String::deserialize(eval_if_closure(
+                                        field.value.as_ref().unwrap(),
+                                        program,
+                                    )?)
+                                    .unwrap(),
+                                );
+                                Ok(())
+                            }
+                            _ => Ok(()), // TODO: Should we error if we see an unknown field?
                         }
-                        _ => {} // TODO: Should we error if we see an unknown field?
-                    };
-                });
+                    })?;
             }
             _ => {}
         }
@@ -939,20 +963,23 @@ impl GraphBuilder {
         let mut path: Option<String> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                r.fields.iter().for_each(|(ident_and_loc, field)| {
-                    match ident_and_loc.label() {
-                        "path" => {
-                            path = Some(
-                                String::deserialize(
-                                    eval_if_closure(field.value.as_ref().unwrap(), program)
-                                        .unwrap(),
-                                )
-                                .unwrap(),
-                            );
+                r.fields
+                    .iter()
+                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                        match ident_and_loc.label() {
+                            "path" => {
+                                path = Some(
+                                    String::deserialize(eval_if_closure(
+                                        field.value.as_ref().unwrap(),
+                                        program,
+                                    )?)
+                                    .unwrap(),
+                                );
+                                Ok(())
+                            }
+                            _ => Ok(()), // TODO: Should we error if we see an unknown field?
                         }
-                        _ => {} // TODO: Should we error if we see an unknown field?
-                    };
-                });
+                    })?;
             }
             _ => {}
         }
