@@ -1,6 +1,7 @@
 //! The machinery for processing build specs into a dependency graph.
 
 #![allow(clippy::result_large_err)]
+#![allow(clippy::single_match)]
 
 use nickel_lang_core::eval::Closure;
 use nickel_lang_core::files::FileId;
@@ -253,7 +254,7 @@ impl DepGraph {
 
         let build = self.get(bsr).unwrap();
 
-        seen.insert(bsr.clone(), ());
+        seen.insert(*bsr, ());
         let hash = build.spec_hash(self, seen);
         seen.remove(bsr);
         hash
@@ -360,10 +361,7 @@ fn read_ty(rt: &RichTerm, program: &mut Program<CacheImpl>) -> Result<ObjTy, Err
     }
 }
 
-fn eval_if_closure<'a>(
-    rt: &'a RichTerm,
-    program: &'_ mut Program<CacheImpl>,
-) -> Result<RichTerm, Error> {
+fn eval_if_closure(rt: &RichTerm, program: &'_ mut Program<CacheImpl>) -> Result<RichTerm, Error> {
     if let Term::Closure(c) = rt.term.as_ref() {
         program.eval_closure(c.clone().into_closure()).map_err(|e| {
             Error::SpecError(SpecError::Nickel(
@@ -411,7 +409,7 @@ impl GraphBuilder {
         // TODO: Probably sanity check that at least this object and the one indexed by magic_id
         // have the same name
         if let Some(bsr) = self.spec_id_lookup.get(&magic_id) {
-            return Ok(bsr.clone());
+            return Ok(*bsr);
         }
 
         // Read out the simple attributes
@@ -457,7 +455,7 @@ impl GraphBuilder {
         }
         match ty {
             Some(ObjTy::Builder) => {} // happy path
-            None => return Err(Error::InvalidObject(format!("missing field: ty"))),
+            None => return Err(Error::InvalidObject("missing field: ty".to_string())),
             Some(ty) => {
                 return Err(Error::UnexpectedObject {
                     got: ty,
@@ -468,21 +466,21 @@ impl GraphBuilder {
         }
         let name = match name {
             Some(name) => name,
-            None => return Err(Error::InvalidObject(format!("missing field: name"))),
+            None => return Err(Error::InvalidObject("missing field: name".to_string())),
         };
-        let cmd = cmd.unwrap_or(String::default());
+        let cmd = cmd.unwrap_or_default();
 
         // Start constructing the BuildSpec object. Insert it into the graph
         // and cache before we recurse.
         let bsr = BuildSpecRef(self.builds.insert(BuildSpec {
-            name: name,
-            cmd: cmd,
+            name,
+            cmd,
             inputs: Vec::new(),
             runtime_deps: Vec::new(),
             outputs: OutputMap::new(),
             replace_on_cycle: None,
         }));
-        self.spec_id_lookup.insert(magic_id, bsr.clone());
+        self.spec_id_lookup.insert(magic_id, bsr);
 
         // Handle more complicated attributes.
         let mut inputs: Option<Vec<BuildSpecInput>> = None;
@@ -559,7 +557,8 @@ impl GraphBuilder {
                         }
                         "replace_on_cycle" => {
                             if let Some(value) = &field.value {
-                                replace_on_cycle = Some(self.read_buildspec(value, program).unwrap());
+                                replace_on_cycle =
+                                    Some(self.read_buildspec(value, program).unwrap());
                             }
                         }
                         _ => (),
@@ -569,7 +568,7 @@ impl GraphBuilder {
         }
         let inputs = match inputs {
             Some(inputs) => inputs,
-            None => return Err(Error::InvalidObject(format!("missing field: inputs"))),
+            None => return Err(Error::InvalidObject("missing field: inputs".to_string())),
         };
         let outputs = match outputs {
             Some(mut outputs) => {
@@ -577,9 +576,9 @@ impl GraphBuilder {
                 outputs.sort_by(|k1, _v1, k2, _v2| String::cmp(k1, k2));
                 outputs
             }
-            None => return Err(Error::InvalidObject(format!("missing field: outputs"))),
+            None => return Err(Error::InvalidObject("missing field: outputs".to_string())),
         };
-        let runtime_deps = runtime_deps.unwrap_or(vec![]);
+        let runtime_deps = runtime_deps.unwrap_or_default();
 
         let bs = self.builds.get_mut(bsr.0).unwrap();
         bs.inputs = inputs;
@@ -627,16 +626,16 @@ impl GraphBuilder {
         }
         let url = match url {
             Some(url) => url,
-            None => return Err(Error::InvalidObject(format!("missing field: url"))),
+            None => return Err(Error::InvalidObject("missing field: url".to_string())),
         };
         let sha256 = match sha256 {
             Some(sha256) => sha256,
-            None => return Err(Error::InvalidObject(format!("missing field: sha256"))),
+            None => return Err(Error::InvalidObject("missing field: sha256".to_string())),
         };
 
         Ok(SourceInput {
             from: SourceFetch::URL(url),
-            sha256: sha256,
+            sha256,
         })
     }
 
@@ -667,7 +666,7 @@ impl GraphBuilder {
         }
         let path = match path {
             Some(path) => path,
-            None => return Err(Error::InvalidObject(format!("missing field: path"))),
+            None => return Err(Error::InvalidObject("missing field: path".to_string())),
         };
 
         Ok(path)
@@ -701,7 +700,7 @@ impl GraphBuilder {
         }
         let (file, src_id) = match file {
             Some(file) => file,
-            None => return Err(Error::InvalidObject(format!("missing field: file"))),
+            None => return Err(Error::InvalidObject("missing field: file".to_string())),
         };
 
         let full_path = Path::new(program.files().name(src_id))
@@ -747,7 +746,7 @@ impl GraphBuilder {
         }
         let package = match package {
             Some(package) => package,
-            None => return Err(Error::InvalidObject(format!("missing field: package"))),
+            None => return Err(Error::InvalidObject("missing field: package".to_string())),
         };
 
         Ok(package)
@@ -776,7 +775,7 @@ impl GraphBuilder {
                 Ok(BuildSpecInput::Local((full_path, file_hash)))
             }
             ObjTy::Prebuilt => Ok(BuildSpecInput::Prebuilt(
-                self.read_input_prebuilt(&rt, program)?.into(),
+                self.read_input_prebuilt(&rt, program)?,
             )),
             ObjTy::OutputLib | ObjTy::OutputBin | ObjTy::OutputData => {
                 Err(Error::UnexpectedObject {
@@ -815,7 +814,7 @@ impl GraphBuilder {
         }
         let glob = match glob {
             Some(glob) => glob,
-            None => return Err(Error::InvalidObject(format!("missing field: glob"))),
+            None => return Err(Error::InvalidObject("missing field: glob".to_string())),
         };
 
         Ok(BuildOutput::Library { glob })
@@ -848,7 +847,7 @@ impl GraphBuilder {
         }
         let data = match data {
             Some(data) => data,
-            None => return Err(Error::InvalidObject(format!("missing field: data"))),
+            None => return Err(Error::InvalidObject("missing field: data".to_string())),
         };
 
         Ok(BuildOutput::Data { glob: data })
@@ -881,7 +880,7 @@ impl GraphBuilder {
         }
         let path = match path {
             Some(path) => path,
-            None => return Err(Error::InvalidObject(format!("missing field: path"))),
+            None => return Err(Error::InvalidObject("missing field: path".to_string())),
         };
 
         Ok(BuildOutput::Binary { path })

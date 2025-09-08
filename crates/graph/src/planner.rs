@@ -79,12 +79,11 @@ impl<'a> ExecPlan<'a> {
             }
 
             path.clear();
-            path.push(cursor.clone());
-            match Self::dfs_iter(self.dep_graph, cursor, generation, &mut colors, &mut path) {
-                Ok(()) => {
-                    cycles.push(path.clone());
-                }
-                Err(()) => {}
+            path.push(*cursor);
+            if let Ok(()) =
+                Self::dfs_iter(self.dep_graph, cursor, generation, &mut colors, &mut path)
+            {
+                cycles.push(path.clone());
             }
             generation += 1;
         }
@@ -106,7 +105,7 @@ impl<'a> ExecPlan<'a> {
             let color = colors.get(bsr).unwrap_or(&DFSColor::Pristine).clone();
 
             let mut recurse = |bsr: &BuildSpecRef| -> Result<(), ()> {
-                let bsr = bsr.clone();
+                let bsr = *bsr;
                 path.push(bsr);
                 colors.insert(bsr, DFSColor::Marred(generation));
                 match Self::dfs_iter(g, &bsr, generation, colors, path) {
@@ -217,7 +216,7 @@ impl<'a> Iterator for ExecPlan<'a> {
             built_this_phase.insert(*candidate, ());
         }
 
-        if met.len() == 0 {
+        if met.is_empty() {
             // If this happened, theres a cycle preventing further progress. We need to do a depth-first search to find it.
             let cycles_with_named_specs = self
                 .find_cycles()
