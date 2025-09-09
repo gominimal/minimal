@@ -1,17 +1,6 @@
 use crate::{BuildSpecInput, BuildSpecRef, DepGraph};
+use nickel_lang_core::term::IndexMap;
 use std::collections::HashMap;
-
-/// The 'color' of a build spec in the context of a depth-first search to identify cycles.
-///
-/// I know these aren't colors bruh, dont @ me.
-#[derive(Debug, Clone, PartialEq)]
-enum DFSColor {
-    /// The build-spec has no color: that is, it has not been visited by any DFS iteration.
-    Pristine,
-    /// The build-spec has been visited at the stored generation. This should be considered
-    /// to be Pristine if the generation is less than the current generation.
-    Marred(usize),
-}
 
 /// Describes the ordered set of builds required to materialize some top-level build spec.
 ///
@@ -25,11 +14,22 @@ pub struct ExecPlan<'a> {
 
     // built tracks the build-specs which were compiled in a previous phase.
     built: HashMap<BuildSpecRef, ()>,
+
     // emitted_toplevel tracks if the final phase for building the toplevel was emitted.
     emitted_toplevel: bool,
 
     // all build-specs which are transitive dependencies of toplevel.
     reachable: Vec<BuildSpecRef>,
+
+    // additional build-specs made reachable to break cycles in the dependency graph.
+    cycle_breakers: IndexMap<BuildSpecRef, ()>,
+
+    // lets a build-spec consider one of its dependencies met if any of the build-specs
+    // in value are built.
+    //
+    // key: (build-spec in question, dependency in question)
+    // value: [build-spec which if built allows the dependency to be considered built]
+    met_dependency_overrides: IndexMap<(BuildSpecRef, BuildSpecRef), Vec<BuildSpecRef>>,
 }
 
 impl<'a> ExecPlan<'a> {
@@ -50,6 +50,8 @@ impl<'a> ExecPlan<'a> {
             built,
             reachable,
             emitted_toplevel: false,
+            cycle_breakers: IndexMap::with_capacity(32),
+            met_dependency_overrides: IndexMap::with_capacity(32),
         }
     }
 
@@ -63,7 +65,27 @@ impl<'a> ExecPlan<'a> {
             built,
             reachable: all,
             emitted_toplevel: false,
+            cycle_breakers: IndexMap::with_capacity(32),
+            met_dependency_overrides: IndexMap::with_capacity(32),
         }
+    }
+
+    /// Returns true if the given dependency should be considered built in an earlier phase.
+    ///
+    /// Takes into account overrides.
+    fn is_built(&self, dependency: BuildSpecRef, used_by: Option<BuildSpecRef>) -> bool {
+        return self.built.contains_key(&dependency)
+            || used_by
+                .map(|used_by| {
+                    if let Some(overrides) =
+                        self.met_dependency_overrides.get(&(used_by, dependency))
+                    {
+                        overrides.iter().any(|x| self.built.contains_key(x))
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
     }
 
     fn find_cycles(&mut self) -> Vec<Vec<BuildSpecRef>> {
@@ -71,18 +93,15 @@ impl<'a> ExecPlan<'a> {
 
         let mut generation: usize = 0;
         let mut path: Vec<BuildSpecRef> = Vec::with_capacity(self.reachable.len() + 256);
-        let mut colors = HashMap::with_capacity(self.reachable.len());
 
         for cursor in self.reachable.iter() {
-            if self.built.contains_key(cursor) {
+            if self.is_built(cursor.clone(), None) {
                 continue;
             }
 
             path.clear();
             path.push(*cursor);
-            if let Ok(()) =
-                Self::dfs_iter(self.dep_graph, cursor, generation, &mut colors, &mut path)
-            {
+            if let Ok(()) = Self::dfs_iter(self.dep_graph, cursor, generation, &mut path) {
                 cycles.push(path.clone());
             }
             generation += 1;
@@ -95,20 +114,26 @@ impl<'a> ExecPlan<'a> {
         g: &DepGraph,
         cursor: &BuildSpecRef,
         generation: usize,
-        colors: &mut HashMap<BuildSpecRef, DFSColor>,
         path: &mut Vec<BuildSpecRef>,
     ) -> Result<(), ()> {
         let bs = g.get(cursor).unwrap();
+        // println!(
+        //     "dfs_iter(): {}, {:?}",
+        //     bs.name,
+        //     path.iter()
+        //         .map(|bsr| g.get(bsr).unwrap().name.clone())
+        //         .collect::<Vec<_>>()
+        // );
 
         // Look at a node which is a dependency of cursor.
         let mut process = |bsr| -> Result<(), ()> {
-            let color = colors.get(bsr).unwrap_or(&DFSColor::Pristine).clone();
+            let found_cycle = path.contains(bsr);
+            // println!("-process: {}", g.get(bsr).unwrap().name.clone());
 
             let mut recurse = |bsr: &BuildSpecRef| -> Result<(), ()> {
                 let bsr = *bsr;
                 path.push(bsr);
-                colors.insert(bsr, DFSColor::Marred(generation));
-                match Self::dfs_iter(g, &bsr, generation, colors, path) {
+                match Self::dfs_iter(g, &bsr, generation, path) {
                     Err(()) => {
                         path.pop();
                         Err(())
@@ -117,18 +142,15 @@ impl<'a> ExecPlan<'a> {
                 }
             };
 
-            match color {
-                // This node hasn't been seen in this search, marr it as seen and recurse.
-                DFSColor::Pristine => recurse(bsr),
-                // If this node has been seen, check the generation to see if its valid, marring it again
-                // and recursing if so.
-                DFSColor::Marred(marred_gen) => {
-                    if generation == marred_gen {
-                        Ok(())
-                    } else {
-                        recurse(bsr)
-                    }
-                }
+            // We've seen this build-spec before, therefore theres a cycle in our path.
+            if found_cycle {
+                // Trim off path so its just representative of the cycle (and not the path to get to the cycle)
+                let cycle_start_idx = path.iter().position(|x| x == bsr).unwrap();
+                path.drain(..cycle_start_idx);
+
+                Ok(())
+            } else {
+                recurse(bsr)
             }
         };
 
@@ -158,7 +180,7 @@ impl<'a> Iterator for ExecPlan<'a> {
     type Item = Vec<BuildSpecRef>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.reachable.len() == self.built.len() {
+        if self.reachable.len() + self.cycle_breakers.len() == self.built.len() {
             // All dependent build-specs have been emitted as phases.
             // As a final step, emit any toplevels that haven't already
             // been emitted.
@@ -185,8 +207,8 @@ impl<'a> Iterator for ExecPlan<'a> {
 
         // Check every reachable build, and add them to this phase if all their dependencies are met.
         let mut met: Vec<BuildSpecRef> = Vec::new();
-        'candidate_loop: for candidate in self.reachable.iter() {
-            if self.built.contains_key(candidate) {
+        'candidate_loop: for candidate in self.reachable.iter().chain(self.cycle_breakers.keys()) {
+            if self.is_built(candidate.clone(), None) {
                 continue;
             }
 
@@ -199,7 +221,7 @@ impl<'a> Iterator for ExecPlan<'a> {
                 use BuildSpecInput::*;
                 match input {
                     Build(bsr) => {
-                        if !self.built.contains_key(bsr) {
+                        if !self.is_built(bsr.clone(), Some(candidate.clone())) {
                             continue 'candidate_loop;
                         }
                     }
@@ -207,7 +229,7 @@ impl<'a> Iterator for ExecPlan<'a> {
                 }
             }
             for bsr in bs.runtime_deps.iter() {
-                if !self.built.contains_key(bsr) {
+                if !self.is_built(bsr.clone(), Some(candidate.clone())) {
                     continue 'candidate_loop;
                 }
             }
@@ -218,16 +240,77 @@ impl<'a> Iterator for ExecPlan<'a> {
 
         if met.is_empty() {
             // If this happened, theres a cycle preventing further progress. We need to do a depth-first search to find it.
-            let cycles_with_named_specs = self
-                .find_cycles()
-                .into_iter()
-                .map(|c| {
-                    c.into_iter()
-                        .map(|bsr| self.dep_graph.get(&bsr).unwrap().name.clone())
+            let cycles = self.find_cycles().into_iter().collect::<Vec<_>>();
+
+            let mut at_least_one_cycle_breaker = false;
+
+            for path in &cycles {
+                let cycling_build = path.last().unwrap();
+
+                if let Some(replace_on_cycle) =
+                    self.dep_graph.get(cycling_build).unwrap().replace_on_cycle
+                {
+                    if !self.cycle_breakers.contains_key(&replace_on_cycle)
+                        && !self.reachable.contains(&replace_on_cycle)
+                    {
+                        // A cycle was for a build-spec which 1) declared a cycle breaker, and 2) hasnt been used yet.
+                        at_least_one_cycle_breaker = true;
+                        // Bring the cycle-breaker into scope along with all its transitive dependencies
+                        self.cycle_breakers.insert(replace_on_cycle.clone(), ());
+                        self.dep_graph
+                            .transitive_specs_of(&replace_on_cycle)
+                            .into_iter()
+                            .filter(|bsr| {
+                                !self.reachable.contains(bsr)
+                                    && !self.cycle_breakers.contains_key(bsr)
+                            })
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .for_each(|bsr| {
+                                self.cycle_breakers.insert(bsr.clone(), ());
+                            });
+                    }
+
+                    // Make sure the satisfaction of the cycle-breaker counts for resolving the previous dependent in the cycle chain.
+                    let used_by = path
+                        .iter()
+                        .rev()
+                        .nth(1)
+                        .unwrap_or_else(|| cycling_build)
+                        .to_owned();
+                    match self
+                        .met_dependency_overrides
+                        .get_mut(&(used_by, *cycling_build))
+                    {
+                        Some(v) => {
+                            if !v.contains(&replace_on_cycle) {
+                                v.push(replace_on_cycle);
+                            }
+                        }
+                        None => {
+                            self.met_dependency_overrides
+                                .insert((used_by, *cycling_build), vec![replace_on_cycle]);
+                        }
+                    }
+                }
+            }
+
+            if !at_least_one_cycle_breaker {
+                panic!(
+                    "cycle(s) detected! {:?}",
+                    cycles
+                        .into_iter()
+                        .map(|c| {
+                            c.into_iter()
+                                .map(|bsr| self.dep_graph.get(&bsr).unwrap().name.clone())
+                                .collect::<Vec<_>>()
+                        })
                         .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>();
-            panic!("cycle(s) detected! {:?}", cycles_with_named_specs);
+                );
+            } else {
+                // Recurse so we don't have to emit an empty phase
+                return self.next();
+            }
         }
 
         // Update the built set with stuff build this phase.
@@ -450,12 +533,63 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        // We expect two phases - one for the transistive dep, and a second for the toplevel.
         assert_eq!(
             cycles,
+            vec![vec!["build 2", "build 1"], vec!["build 1", "build 2"],],
+        );
+    }
+
+    #[test]
+    fn cycle_breaking_easy() {
+        let sr = SpecReader::new(
+            indoc! {
+                "
+                let {BuildSpec, ..} = import \"minimal.ncl\" in
+
+                let rec self_ref = {
+                    name = \"self ref\",
+                    inputs = [self_ref],
+                    cmd = \"\",
+                    replace_on_cycle = {
+                        name = \"breaker\",
+                        inputs = [breaker_dep],
+                        cmd = \"\",
+                    } | BuildSpec,
+                } | BuildSpec,
+                breaker_dep = {
+                    name = \"breaker dep\",
+                    inputs = [],
+                    cmd = \"\",
+                } | BuildSpec,
+                top = {
+                    name = \"top\",
+                    inputs = [self_ref],
+                    cmd = \"\",
+                } | BuildSpec,
+                in
+                top
+                "
+            }
+            .to_string(),
+            &SpecReaderOptions::for_test(),
+        );
+        // So we can see the actual error when parsing fails
+        sr.as_ref().err().into_iter().for_each(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+        let sr = sr.unwrap();
+
+        let dp = DepGraph::new(sr).unwrap();
+        let plan: Vec<Vec<BuildSpecRef>> = ExecPlan::new(&dp).collect();
+
+        assert_eq!(
+            plan,
             vec![
-                vec!["build 2", "build 1", "build 2"],
-                vec!["build 1", "build 2", "build 1"],
+                vec![dp.by_name("breaker dep").next().unwrap(),],
+                vec![dp.by_name("breaker").next().unwrap(),],
+                vec![dp.by_name("self ref").next().unwrap(),],
+                vec![dp.by_name("top").next().unwrap()],
             ],
         );
     }
