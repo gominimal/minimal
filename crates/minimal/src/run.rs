@@ -317,6 +317,7 @@ impl Run {
                             }
                         }
                     }
+                    cache_handle.finalize().unwrap();
                 } else {
                     // Regular build with build script
                     let cmd_parts: Vec<String> =
@@ -348,10 +349,9 @@ impl Run {
                         debug_shell: matches!(debug, Some(debug_bsr) if bsr == &debug_bsr),
                     };
 
-                    run_build(&config, self.cache.write_dir(&bsh).unwrap().path(), true)
-                        .inspect_err(|_| {
-                            self.cache.invalidate_dir(&bsh).unwrap();
-                        })?;
+                    let out_dir = self.cache.write_dir(&bsh).unwrap();
+                    run_build(&config, out_dir.path(), true)?;
+                    out_dir.finalize().unwrap();
                 }
 
                 println!("Completed isolated build: {}", build.name);

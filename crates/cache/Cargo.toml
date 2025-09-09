@@ -8,10 +8,10 @@ rust-version = "1.85"
 
 [dev-dependencies]
 indoc.workspace = true
-tempfile.workspace = true
 
 [dependencies]
 blake3.workspace = true
 path-absolutize.workspace = true
+tempfile.workspace = true
 
 graph = { workspace = true }

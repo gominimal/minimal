@@ -55,6 +55,70 @@ impl<FS: FileSystem<Subtree = ST>, ST: FileSystem> FileSystem for DirCacheEntry<
     }
 }
 
+// A writeable directory that will end up in the cache when finalized.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct PendingDir {
+    c: Cache<LocalDir>,
+    hash: SpecHash,
+    tempdir: tempfile::TempDir,
+    temp_tree: LocalDir,
+}
+
+impl PendingDir {
+    /// The path on the filesystem representing this pending cache entry.
+    pub fn path(&self) -> &Path {
+        self.tempdir.path()
+    }
+
+    pub fn finalize(self) -> Result<(), CacheErr> {
+        let hash_hex = self.hash.0.to_hex();
+        // Entries on disk are at <root>/<first byte as hex>/<remaining bytes as hex>
+        let subpath: PathBuf = [&hash_hex.as_str()[0..2], &hash_hex.as_str()[2..]]
+            .iter()
+            .collect();
+
+        let inner = self.c.inner();
+        inner.fs.mkdir(&subpath)?;
+
+        let st = inner.fs.subtree(subpath)?;
+        std::fs::remove_dir_all(st.path())?;
+        std::fs::rename(self.tempdir.keep(), st.path())?;
+        Ok(())
+    }
+}
+
+impl FileSystem for PendingDir {
+    type File = <LocalDir as fs::FileSystem>::File;
+    type DirEntry = <LocalDir as fs::FileSystem>::DirEntry;
+    type Subtree = <LocalDir as fs::FileSystem>::Subtree;
+
+    fn open_read<P: AsRef<Path>>(&self, path: P) -> Result<Self::File, FSError> {
+        self.temp_tree.open_read(path)
+    }
+    fn open_write<P: AsRef<Path>>(&self, path: P) -> Result<Self::File, FSError> {
+        self.temp_tree.open_write(path)
+    }
+
+    fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Vec<Self::DirEntry>, FSError> {
+        self.temp_tree.read_dir(path)
+    }
+
+    fn mkdir<P: AsRef<Path>>(&self, path: P) -> Result<(), FSError> {
+        self.temp_tree.mkdir(path)
+    }
+
+    fn subtree<P: AsRef<Path>>(&self, path: P) -> Result<Self::Subtree, FSError> {
+        self.temp_tree.subtree(path)
+    }
+    fn remove_file<P: AsRef<Path>>(&self, _: P) -> Result<(), std::io::Error> {
+        todo!()
+    }
+    fn remove_dir<P: AsRef<Path>>(&self, _: P) -> Result<(), std::io::Error> {
+        todo!()
+    }
+}
+
 /// A blob in the cache you can read or write.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -155,8 +219,33 @@ impl Cache<LocalDir> {
             fs: LocalDir::with_base(p)?,
         };
 
+        match inner.fs.mkdir("temp") {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let std::io::ErrorKind::AlreadyExists = e.kind() {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }?;
+
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
+        })
+    }
+
+    pub fn write_dir(&self, hash: &SpecHash) -> Result<PendingDir, CacheErr> {
+        let mut inner = self.inner();
+        inner.ensure_hash_dir_exists(hash.as_bytes()[0])?;
+
+        let tempdir = tempfile::tempdir_in(inner.fs.path().join("temp"))?;
+
+        Ok(PendingDir {
+            c: self.clone(),
+            temp_tree: LocalDir::with_base(tempdir.path())?,
+            tempdir,
+            hash: hash.clone(),
         })
     }
 }
@@ -206,23 +295,6 @@ impl<FS: FileSystem> Cache<FS> {
         Ok(DirCacheEntry {
             c: self.clone(),
             tree: self.inner().dir(hash)?,
-            hash: hash.clone(),
-        })
-    }
-    pub fn write_dir(&self, hash: &SpecHash) -> Result<DirCacheEntry<FS>, CacheErr> {
-        let mut inner = self.inner();
-        inner.ensure_hash_dir_exists(hash.as_bytes()[0])?;
-
-        let hash_hex = hash.0.to_hex();
-        // Entries on disk are at <root>/<first byte as hex>/<remaining bytes as hex>
-        let subpath: PathBuf = [&hash_hex.as_str()[0..2], &hash_hex.as_str()[2..]]
-            .iter()
-            .collect();
-        inner.fs.mkdir(subpath)?;
-
-        Ok(DirCacheEntry {
-            c: self.clone(),
-            tree: inner.dir(hash)?,
             hash: hash.clone(),
         })
     }
@@ -283,6 +355,37 @@ mod tests {
             .unwrap()
             .write_all("uwu".as_bytes())
             .unwrap();
+        w.finalize().unwrap();
+
+        let r = cache
+            .read_dir(&test_key)
+            .unwrap()
+            .open_read("file_name")
+            .unwrap();
+        assert_eq!("uwu", std::io::read_to_string(r).unwrap());
+    }
+
+    #[test]
+    fn unfinalized_pending_doesnt_writeback() {
+        use std::io::Write;
+        let tmp_dir = TempDir::new().unwrap();
+
+        let cache = Cache::at_dir(tmp_dir.path()).unwrap();
+        let test_key = SpecHash(blake3::hash("direct-tory".as_bytes()));
+
+        let w = cache.write_dir(&test_key).unwrap();
+        w.open_write("file_name")
+            .unwrap()
+            .write_all("uwu".as_bytes())
+            .unwrap();
+        w.finalize().unwrap();
+
+        // Write again and change the data in the file, but don't call finalize
+        let w = cache.write_dir(&test_key).unwrap();
+        w.open_write("file_name")
+            .unwrap()
+            .write_all("new data".as_bytes())
+            .unwrap();
         drop(w);
 
         let r = cache
@@ -291,5 +394,36 @@ mod tests {
             .open_read("file_name")
             .unwrap();
         assert_eq!("uwu", std::io::read_to_string(r).unwrap());
+    }
+
+    #[test]
+    fn writeback_dir_overwrites_fine() {
+        use std::io::Write;
+        let tmp_dir = TempDir::new().unwrap();
+
+        let cache = Cache::at_dir(tmp_dir.path()).unwrap();
+        let test_key = SpecHash(blake3::hash("direct-tory".as_bytes()));
+
+        let w = cache.write_dir(&test_key).unwrap();
+        w.open_write("file_name")
+            .unwrap()
+            .write_all("bad data".as_bytes())
+            .unwrap();
+        w.finalize().unwrap();
+
+        // Write again and change the data in the file
+        let w = cache.write_dir(&test_key).unwrap();
+        w.open_write("file_name")
+            .unwrap()
+            .write_all("good data".as_bytes())
+            .unwrap();
+        w.finalize().unwrap();
+
+        let r = cache
+            .read_dir(&test_key)
+            .unwrap()
+            .open_read("file_name")
+            .unwrap();
+        assert_eq!("good data", std::io::read_to_string(r).unwrap());
     }
 }
