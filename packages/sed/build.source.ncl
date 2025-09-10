@@ -1,6 +1,6 @@
 let { BuildSpec, HostPath, OutputLib, Local, Source, .. } = import "minimal.ncl" in
 let acl = import "../acl/build.ncl" in
-let base = import "../bash/build.ncl" in
+let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
   name = "sed",
