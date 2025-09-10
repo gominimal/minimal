@@ -91,7 +91,6 @@ impl<'a> ExecPlan<'a> {
     fn find_cycles(&mut self) -> Vec<Vec<BuildSpecRef>> {
         let mut cycles: Vec<Vec<BuildSpecRef>> = Vec::with_capacity(32);
 
-        let mut generation: usize = 0;
         let mut path: Vec<BuildSpecRef> = Vec::with_capacity(self.reachable.len() + 256);
 
         for cursor in self.reachable.iter() {
@@ -101,10 +100,9 @@ impl<'a> ExecPlan<'a> {
 
             path.clear();
             path.push(*cursor);
-            if let Ok(()) = Self::dfs_iter(self.dep_graph, cursor, generation, &mut path) {
+            if let Ok(()) = Self::dfs_iter(self.dep_graph, cursor, &mut path) {
                 cycles.push(path.clone());
             }
-            generation += 1;
         }
 
         cycles
@@ -113,7 +111,6 @@ impl<'a> ExecPlan<'a> {
     fn dfs_iter(
         g: &DepGraph,
         cursor: &BuildSpecRef,
-        generation: usize,
         path: &mut Vec<BuildSpecRef>,
     ) -> Result<(), ()> {
         let bs = g.get(cursor).unwrap();
@@ -133,7 +130,7 @@ impl<'a> ExecPlan<'a> {
             let mut recurse = |bsr: &BuildSpecRef| -> Result<(), ()> {
                 let bsr = *bsr;
                 path.push(bsr);
-                match Self::dfs_iter(g, &bsr, generation, path) {
+                match Self::dfs_iter(g, &bsr, path) {
                     Err(()) => {
                         path.pop();
                         Err(())
