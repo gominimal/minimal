@@ -11,7 +11,7 @@ use nickel_lang_core::typ::TypeF;
 use nickel_lang_core::{error::NullReporter, eval::cache::CacheImpl, program::Program};
 use std::ffi::OsString;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
@@ -91,6 +91,50 @@ impl SpecReader {
         Ok(out)
     }
 
+    /// Processes the resulting build-spec universe, given options and a path to a packages directory.
+    pub fn new_with_all_pkgs<P: AsRef<Path>>(
+        pkg_dir: P,
+        opts: &SpecReaderOptions,
+    ) -> Result<Self, SpecError> {
+        let mut src = String::with_capacity(2048);
+        src.push_str("[\n");
+
+        fn visit_dirs(src: &mut String, dir: &Path) -> Result<(), SpecError> {
+            if dir.is_dir() {
+                for entry in std::fs::read_dir(dir)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if path.is_dir() {
+                        visit_dirs(src, &path)?;
+                    } else if entry.file_name().to_string_lossy().ends_with("build.ncl") {
+                        src.push_str("  import \"");
+                        src.push_str(path.to_str().unwrap());
+                        src.push_str("\",\n");
+                    }
+                }
+            }
+            Ok(())
+        }
+        visit_dirs(&mut src, pkg_dir.as_ref())?;
+        src.push_str("]");
+
+        let mut program = Program::new_from_source(
+            io::Cursor::new(src),
+            "toplevel",
+            std::io::stderr(),
+            NullReporter {},
+        )?;
+        program.add_import_paths([&opts.minimal_lib_path].iter());
+
+        program
+            .typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk)
+            .map_err(|e| SpecError::Nickel(program.files(), e))?;
+
+        let mut out = Self { p: program };
+        out.annotate()?;
+        Ok(out)
+    }
+
     /// Processes the resulting build-spec universe, given options and a path to source representing the top level.
     pub fn new_with_path<P: Into<OsString>>(
         src: P,
@@ -130,22 +174,35 @@ impl SpecReader {
                 if is_buildspec {
                     let new_inner = match inner.term.as_ref().clone() {
                         Term::RecRecord(mut record_data, includes, dyn_fields, deps) => {
-                            record_data.fields.insert(
-                                LocIdent::new("__magic_buildspec_id"),
-                                RichTerm::from(Term::ForeignId(id)).into(),
-                            );
+                            if record_data
+                                .fields
+                                .get(&LocIdent::new("__magic_buildspec_id"))
+                                .is_none()
+                            {
+                                record_data.fields.insert(
+                                    LocIdent::new("__magic_buildspec_id"),
+                                    RichTerm::from(Term::ForeignId(id)).into(),
+                                );
+                                id += 1;
+                            }
                             Term::RecRecord(record_data, includes, dyn_fields, deps).into()
                         }
                         Term::Record(mut record_data) => {
-                            record_data.fields.insert(
-                                LocIdent::new("__magic_buildspec_id"),
-                                RichTerm::from(Term::ForeignId(id)).into(),
-                            );
+                            if record_data
+                                .fields
+                                .get(&LocIdent::new("__magic_buildspec_id"))
+                                .is_none()
+                            {
+                                record_data.fields.insert(
+                                    LocIdent::new("__magic_buildspec_id"),
+                                    RichTerm::from(Term::ForeignId(id)).into(),
+                                );
+                                id += 1;
+                            }
                             Term::Record(record_data).into()
                         }
                         _ => unreachable!(),
                     };
-                    id += 1;
                     return Ok(Term::Annotated(annotation.clone(), new_inner).into());
                 }
             }

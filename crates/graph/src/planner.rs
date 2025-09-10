@@ -34,36 +34,28 @@ pub struct ExecPlan<'a> {
 
 impl<'a> ExecPlan<'a> {
     pub fn new(dep_graph: &'a DepGraph) -> Self {
-        ExecPlan::with_toplevel(dep_graph, dep_graph.top_level)
+        ExecPlan::with_toplevels(dep_graph, &dep_graph.top_levels)
     }
 
-    pub fn with_toplevel(dep_graph: &'a DepGraph, toplevel: BuildSpecRef) -> Self {
+    pub fn with_toplevels(dep_graph: &'a DepGraph, toplevels: &Vec<BuildSpecRef>) -> Self {
         let built = HashMap::with_capacity(dep_graph.len());
-        let reachable = dep_graph
-            .transitive_specs_of(&toplevel)
-            .into_iter()
+        let mut reachable: Vec<_> = toplevels
+            .iter()
+            .map(|toplevel| dep_graph.transitive_specs_of(&toplevel))
+            .flatten()
             .collect();
+        reachable.sort();
+        reachable.dedup();
+
+        let mut toplevels = toplevels.clone();
+        toplevels.sort();
+        toplevels.dedup();
 
         Self {
             dep_graph,
-            toplevels: vec![toplevel],
+            toplevels,
             built,
             reachable,
-            emitted_toplevel: false,
-            cycle_breakers: IndexMap::with_capacity(32),
-            met_dependency_overrides: IndexMap::with_capacity(32),
-        }
-    }
-
-    pub fn new_with_all(dep_graph: &'a DepGraph) -> Self {
-        let built = HashMap::with_capacity(dep_graph.len());
-        let all: Vec<BuildSpecRef> = dep_graph.all().collect();
-
-        Self {
-            dep_graph,
-            toplevels: all.clone(),
-            built,
-            reachable: all,
             emitted_toplevel: false,
             cycle_breakers: IndexMap::with_capacity(32),
             met_dependency_overrides: IndexMap::with_capacity(32),
@@ -177,7 +169,14 @@ impl<'a> Iterator for ExecPlan<'a> {
     type Item = Vec<BuildSpecRef>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.reachable.len() + self.cycle_breakers.len() == self.built.len() {
+        let unique_reachable_len = self.reachable.iter().fold(0, |acc, x| {
+            acc + if self.cycle_breakers.contains_key(x) {
+                0
+            } else {
+                1
+            }
+        });
+        if unique_reachable_len + self.cycle_breakers.len() == self.built.len() {
             // All dependent build-specs have been emitted as phases.
             // As a final step, emit any toplevels that haven't already
             // been emitted.
@@ -247,9 +246,7 @@ impl<'a> Iterator for ExecPlan<'a> {
                 if let Some(replace_on_cycle) =
                     self.dep_graph.get(cycling_build).unwrap().replace_on_cycle
                 {
-                    if !self.cycle_breakers.contains_key(&replace_on_cycle)
-                        && !self.reachable.contains(&replace_on_cycle)
-                    {
+                    if !self.cycle_breakers.contains_key(&replace_on_cycle) {
                         // A cycle was for a build-spec which 1) declared a cycle breaker, and 2) hasnt been used yet.
                         at_least_one_cycle_breaker = true;
                         // Bring the cycle-breaker into scope along with all its transitive dependencies

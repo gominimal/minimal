@@ -4,7 +4,7 @@ let python = import "../python/build.ncl" in
 let setuptools = import "../setuptools/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
-  name = "libunistring",
+  name = "meson",
   inputs = [
     { file = "build.sh" } | Local,
     {

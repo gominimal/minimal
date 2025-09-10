@@ -452,7 +452,7 @@ impl Run {
 
         // The top-level build spec should be for this package
         let source_spec = source_graph
-            .get(&source_graph.top_level)
+            .get(&source_graph.top_levels[0])
             .with_context(|| format!("Source spec not found for package '{}'", package_name))?;
 
         if source_spec.name != package_name {
@@ -463,7 +463,7 @@ impl Run {
             );
         }
 
-        Ok(source_graph.spec_hash(&source_graph.top_level))
+        Ok(source_graph.spec_hash(&source_graph.top_levels[0]))
     }
 
     fn extract_prebuilt_archive(

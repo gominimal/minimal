@@ -126,7 +126,7 @@ mod tests {
         let dg = DepGraph::new(sr).unwrap();
         let bsh = dg.spec_hash(&dg.by_name("top build").next().unwrap());
 
-        let toplevel_manifest = BuildManifest::make(&dg, &dg.top_level, &bsh);
+        let toplevel_manifest = BuildManifest::make(&dg, &dg.top_levels[0], &bsh);
         assert_eq!(toplevel_manifest.hash, bsh);
 
         let runtime_dep_hash = dg.spec_hash(&dg.by_name("runtime dep").next().unwrap());
@@ -182,7 +182,7 @@ mod tests {
         let dg = DepGraph::new(sr).unwrap();
         let bsh = dg.spec_hash(&dg.by_name("top build").next().unwrap());
 
-        let toplevel_manifest = BuildManifest::make(&dg, &dg.top_level, &bsh);
+        let toplevel_manifest = BuildManifest::make(&dg, &dg.top_levels[0], &bsh);
         assert_eq!(toplevel_manifest.hash, bsh);
 
         let runtime_dep_hash = dg.spec_hash(&dg.by_name("runtime dep").next().unwrap());
@@ -245,7 +245,7 @@ mod tests {
         let dg = DepGraph::new(sr).unwrap();
         let bsh = dg.spec_hash(&dg.by_name("top build").next().unwrap());
 
-        let toplevel_manifest = BuildManifest::make(&dg, &dg.top_level, &bsh);
+        let toplevel_manifest = BuildManifest::make(&dg, &dg.top_levels[0], &bsh);
         assert_eq!(toplevel_manifest.hash, bsh);
 
         let nested_dep_hash = dg.spec_hash(&dg.by_name("nested dep").next().unwrap());

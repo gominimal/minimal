@@ -24,7 +24,11 @@ pub struct BuildArgs {
 pub async fn cmd_build(args: BuildArgs) -> Result<()> {
     let dp = super::graph_from_package_name(&args.package, args.source);
 
-    let debug_bsr = if args.debug { Some(dp.top_level) } else { None };
+    let debug_bsr = if args.debug {
+        Some(dp.top_levels[0])
+    } else {
+        None
+    };
 
     let cache = super::load_cache(args.cache_dir).unwrap();
     let remote_storage = RemoteStorage::new().await.unwrap();

@@ -23,7 +23,7 @@ use serde::Deserialize;
 type OutputMap = nickel_lang_core::term::IndexMap<String, BuildOutput>;
 
 /// A reference to some other [BuildSpec] in a [DepGraph].
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, PartialOrd, Ord)]
 pub struct BuildSpecRef(pub(crate) generational_arena::Index);
 
 /// A description of pulling source code regardless of form.
@@ -195,7 +195,7 @@ impl SpecHashable for BuildSpec {
 #[allow(dead_code)]
 pub struct DepGraph {
     builds: Arena<BuildSpec>,
-    pub top_level: BuildSpecRef,
+    pub top_levels: Vec<BuildSpecRef>,
 
     hash_cache: Arc<RwLock<HashMap<BuildSpecRef, SpecHash>>>,
 }
@@ -208,8 +208,16 @@ impl DepGraph {
         };
 
         let (ncl_tree, mut program) = sr.finish()?;
-        let top_level = graph.read_buildspec(&ncl_tree, &mut program)?;
-        Ok(graph.finish(top_level))
+        let ncl_tree = eval_if_closure(&ncl_tree, &mut program)?;
+        let top_levels = if let Term::Array(a, _attrs) = ncl_tree.term.as_ref() {
+            a.iter()
+                .map(|bs| graph.read_buildspec(bs, &mut program))
+                .collect::<Result<Vec<_>, Error>>()?
+        } else {
+            vec![graph.read_buildspec(&ncl_tree, &mut program)?]
+        };
+
+        Ok(graph.finish(top_levels))
     }
 
     /// Fetches a build-spec by reference.
@@ -384,12 +392,12 @@ fn eval_if_closure(rt: &RichTerm, program: &'_ mut Program<CacheImpl>) -> Result
 }
 
 impl GraphBuilder {
-    fn finish(self, top_level: BuildSpecRef) -> DepGraph {
+    fn finish(self, top_levels: Vec<BuildSpecRef>) -> DepGraph {
         let Self { builds, .. } = self;
         let hash_cache = Arc::new(RwLock::new(HashMap::with_capacity(builds.len())));
         DepGraph {
             builds,
-            top_level,
+            top_levels,
             hash_cache,
         }
     }
@@ -1459,7 +1467,7 @@ mod tests {
 
         let dp = DepGraph::new(sr).unwrap();
         assert_eq!(
-            dp.transitive_specs_of(&dp.top_level),
+            dp.transitive_specs_of(&dp.top_levels[0]),
             vec![
                 BuildSpecRef(dp.builds.iter().find(|b| b.1.name == "shared").unwrap().0),
                 BuildSpecRef(
@@ -1511,5 +1519,29 @@ mod tests {
                 .map(|b| b.name)
                 .collect::<Vec<String>>()
         );
+    }
+
+    #[test]
+    fn packages_ensure_no_dupes() {
+        let sr = SpecReader::new_with_all_pkgs(
+            std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                .join("../../packages"),
+            &SpecReaderOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        let dp = DepGraph::new(sr).unwrap();
+
+        let mut names: Vec<_> = dp.iter().map(|(_bsr, bs)| bs.name.clone()).collect();
+        names.sort();
+
+        let mut dupes = names.clone();
+        dupes.dedup();
+        if dupes.len() < names.len() {
+            panic!("duplicate build-specs in packages/:\n{:?}", names);
+        }
     }
 }

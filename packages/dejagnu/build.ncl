@@ -3,7 +3,7 @@ let base = import "../base/build.ncl" in
 let tcl = import "../tcl/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
-  name = "expect",
+  name = "dejagnu",
   inputs = [
     { file = "build.sh" } | Local,
     {

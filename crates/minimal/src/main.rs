@@ -70,6 +70,30 @@ pub fn graph_from_package_name(package_name: &String, source: bool) -> DepGraph 
         .unwrap()
 }
 
+pub fn graph_from_all_packages() -> DepGraph {
+    let package_dir = Path::new("packages");
+
+    let sr = SpecReader::new_with_all_pkgs(
+        &package_dir,
+        &SpecReaderOptions {
+            minimal_lib_path: "crates/graph/minimal-ncl".into(),
+        },
+    );
+
+    sr.as_ref().err().into_iter().for_each(|e| {
+        e.report_to_stderr();
+        panic!("spec parsing failed");
+    });
+    let sr = sr.unwrap();
+
+    DepGraph::new(sr)
+        .map_err(|e| {
+            e.report_to_stderr();
+            Err::<DepGraph, ()>(())
+        })
+        .unwrap()
+}
+
 pub fn load_cache(
     cache_dir: Option<PathBuf>,
 ) -> Result<cache::Cache<cache::LocalDir>, std::io::Error> {
