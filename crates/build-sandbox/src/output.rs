@@ -177,7 +177,7 @@ impl OutputValidator {
         // Create standard FHS compatibility symlinks for merged /usr layout
         let symlinks = [
             ("bin", "usr/bin"),
-            ("sbin", "usr/sbin"), 
+            ("sbin", "usr/sbin"),
             ("lib", "usr/lib"),
             ("lib64", "usr/lib"), // x86_64 compatibility
         ];
@@ -191,9 +191,8 @@ impl OutputValidator {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::symlink;
-                    symlink(target, &link_path).map_err(|_| OutputError::MissingOutput {
-                        path: link_path,
-                    })?;
+                    symlink(target, &link_path)
+                        .map_err(|_| OutputError::MissingOutput { path: link_path })?;
                     info!("Created FHS symlink: {} -> {}", link_name, target);
                 }
             }

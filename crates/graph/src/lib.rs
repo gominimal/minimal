@@ -243,7 +243,7 @@ pub use spec_reader::{SpecError, SpecReader, SpecReaderOptions};
 mod spec_schema;
 
 pub mod dep_graph;
-pub use dep_graph::{BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph};
+pub use dep_graph::{BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, SourceInput};
 
 mod planner;
 pub use planner::ExecPlan;

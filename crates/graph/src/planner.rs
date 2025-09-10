@@ -512,7 +512,7 @@ mod tests {
         let sr = sr.unwrap();
 
         let dp = DepGraph::new(sr).unwrap();
-        let cycles = ExecPlan::new(&dp)
+        let mut cycles = ExecPlan::new(&dp)
             .find_cycles()
             .into_iter()
             .map(|c| {
@@ -521,10 +521,11 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+        cycles.sort();
 
         assert_eq!(
             cycles,
-            vec![vec!["build 2", "build 1"], vec!["build 1", "build 2"],],
+            vec![vec!["build 1", "build 2"], vec!["build 2", "build 1"]],
         );
     }
 

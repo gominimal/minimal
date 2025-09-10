@@ -1,12 +1,13 @@
 use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage, run::Run};
 use anyhow::{Context, Result};
+use graph::ExecPlan;
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
 pub struct BuildArgs {
     /// Package name to build
     #[arg(short, long)]
-    package: String,
+    package: Option<String>,
 
     /// Launch debug shell instead of building
     #[arg(short, long)]
@@ -22,10 +23,13 @@ pub struct BuildArgs {
 }
 
 pub async fn cmd_build(args: BuildArgs) -> Result<()> {
-    let dp = super::graph_from_package_name(&args.package, args.source);
+    let graph = match args.package {
+        Some(ref package) => super::graph_from_package_name(package, args.source),
+        None => super::graph_from_all_packages(),
+    };
 
     let debug_bsr = if args.debug {
-        Some(dp.top_levels[0])
+        Some(graph.top_levels[0])
     } else {
         None
     };
@@ -45,17 +49,17 @@ pub async fn cmd_build(args: BuildArgs) -> Result<()> {
         PrebuiltsLock::default()
     });
 
-    let mut run = Run::new(
-        dp,
-        cache,
-        args.source,
-        args.package.clone(),
-        remote_storage,
-        lockfile,
-    );
-    run.execute(debug_bsr)
+    let mut run = Run::new(&graph, cache, remote_storage, lockfile);
+    run.execute(ExecPlan::new(&graph), debug_bsr)
         .await
         .context("Failed to execute build")?;
+
+    if args.source {
+        for bsr in &graph.top_levels {
+            run.upload_prebuilt_archive(graph.get(&bsr).unwrap(), &graph.spec_hash(&bsr))
+                .await?;
+        }
+    }
 
     Ok(())
 }
