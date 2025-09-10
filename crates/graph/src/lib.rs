@@ -248,8 +248,8 @@ pub use dep_graph::{BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGra
 mod planner;
 pub use planner::ExecPlan;
 
-mod build_manifest;
-pub use build_manifest::BuildManifest;
+mod transitives;
+pub use transitives::Transitives;
 
 #[cfg(test)]
 mod tests {

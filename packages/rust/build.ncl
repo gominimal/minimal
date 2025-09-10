@@ -7,6 +7,7 @@ let openssl = import "../openssl/build.ncl" in
 let pkgconf = import "../pkgconf/build.ncl" in
 let python = import "../python/build.ncl" in
 let sqlite = import "../sqlite/build.ncl" in
+let libffi = import "../libffi/build.ncl" in
 let toolchain-gnullvm = import "../toolchain-gnullvm/build.ncl" in
 {
   name = "rust",
@@ -28,6 +29,7 @@ let toolchain-gnullvm = import "../toolchain-gnullvm/build.ncl" in
   ],
   runtime_deps = [
     sqlite,
+    libffi,
   ],
   cmd = "./build.sh",
   outputs = {

@@ -197,7 +197,12 @@ pub struct DepGraph {
     builds: Arena<BuildSpec>,
     pub top_levels: Vec<BuildSpecRef>,
 
-    hash_cache: Arc<RwLock<HashMap<BuildSpecRef, SpecHash>>>,
+    hash_cache: Arc<
+        RwLock<(
+            HashMap<BuildSpecRef, SpecHash>,
+            HashMap<SpecHash, BuildSpecRef>,
+        )>,
+    >,
 }
 
 impl DepGraph {
@@ -242,7 +247,7 @@ impl DepGraph {
     /// Returns the specification hash of the given build spec.
     pub fn spec_hash(&self, bsr: &BuildSpecRef) -> SpecHash {
         {
-            if let Some(hash) = self.hash_cache.read().unwrap().get(bsr) {
+            if let Some(hash) = self.hash_cache.read().unwrap().0.get(bsr) {
                 return hash.clone();
             }
         }
@@ -251,7 +256,11 @@ impl DepGraph {
         let mut seen = HashMap::with_capacity(32);
         let hash = self.spec_hash_impl(bsr, &mut seen);
 
-        self.hash_cache.write().unwrap().insert(*bsr, hash.clone());
+        {
+            let mut hashes = self.hash_cache.write().unwrap();
+            hashes.0.insert(*bsr, hash.clone());
+            hashes.1.insert(hash.clone(), *bsr);
+        }
         hash
     }
 
@@ -394,7 +403,10 @@ fn eval_if_closure(rt: &RichTerm, program: &'_ mut Program<CacheImpl>) -> Result
 impl GraphBuilder {
     fn finish(self, top_levels: Vec<BuildSpecRef>) -> DepGraph {
         let Self { builds, .. } = self;
-        let hash_cache = Arc::new(RwLock::new(HashMap::with_capacity(builds.len())));
+        let hash_cache = Arc::new(RwLock::new((
+            HashMap::with_capacity(builds.len()),
+            HashMap::with_capacity(builds.len()),
+        )));
         DepGraph {
             builds,
             top_levels,

@@ -3,8 +3,8 @@ use build_sandbox::{BuildConfig, config::BuildScript, run_build};
 use cache::{Cache, LocalDir};
 use graph::dep_graph::SourceFetch;
 use graph::{
-    BuildManifest, BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, ExecPlan,
-    SourceInput, SpecHash,
+    BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, ExecPlan, SourceInput,
+    SpecHash, Transitives,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -75,38 +75,93 @@ async fn materialize_source(
     }
 }
 
-/// yields 'dependencies' mappings for making the given input available to a sandbox build.
-fn materialize_build_input(
-    input_ref: &BuildSpecRef,
+/// yields 'dependencies' mappings for making the given input or runtime_dep available to a sandbox build.
+///
+/// If a build is missing but a cycle-breaker is present for itself or any of its dependencies, it will try to use that.
+fn all_paths_for_spec(
+    spec_ref: &BuildSpecRef,
     graph: &DepGraph,
     cache: &Cache<LocalDir>,
 ) -> Result<HashMap<PathBuf, PathBuf>> {
-    let input_hash = graph.spec_hash(input_ref);
-    let input_build = graph.get(input_ref).unwrap();
-
     let mut out_paths = HashMap::with_capacity(12);
-    debug!(
-        "  Input: Build({}) -- [{}]",
-        input_build.name,
-        input_hash.0.to_hex()
-    );
 
-    // Make the input build itself available in the sandbox
-    let cache_path = cache.read_dir(&input_hash).unwrap().path().to_path_buf();
-    out_paths.insert(cache_path, PathBuf::from("/"));
+    // Make the input build itself available in the sandbox.
+    let (spec_bsr, self_paths) = path_for_self_spec(spec_ref, &graph.spec_hash(spec_ref), graph.get(spec_ref).unwrap(), graph, cache)?;
+    out_paths.insert(self_paths.0, self_paths.1);
 
-    // Make all the transitive runtime_deps available in the sandbox
-    for (bsh, _attribution) in BuildManifest::make(graph, input_ref, &input_hash)
-        .transitive_runtime_deps
-        .into_iter()
-    {
-        debug!("   - Transitive runtime dep -- [{}]", bsh.0.to_hex());
-
-        let cache_path = cache.read_dir(&bsh).unwrap().path().to_path_buf();
-        out_paths.insert(cache_path, PathBuf::from("/"));
-    }
+    // Make all the transitive deps available in the sandbox.
+    path_transitive_deps_of(&graph.get(&spec_bsr).unwrap(), graph, cache, &mut out_paths)?;
 
     Ok(out_paths)
+}
+
+fn path_for_self_spec(
+    input_ref: &BuildSpecRef,
+    input_hash: &SpecHash,
+    input_build: &BuildSpec,
+    graph: &DepGraph,
+    cache: &Cache<LocalDir>,
+) -> Result<(BuildSpecRef, (PathBuf, PathBuf))> {
+    match cache.read_dir(&input_hash) {
+        Ok(cache_entry) => {
+            let cache_path = cache_entry.path().to_path_buf();
+            Ok((input_ref.clone(), (cache_path, PathBuf::from("/"))))
+        }
+        Err(cache::CacheErr::NotFound) => {
+            match input_build.replace_on_cycle {
+                None => panic!("missing build in cache for {} [{}]", input_build.name, input_hash.0.to_hex()),
+                Some(cycle_breaker) => {
+                    let breaker_hash = graph.spec_hash(&cycle_breaker);
+                    let breaker_build = graph.get(&cycle_breaker).unwrap();
+
+                    debug!("  --- subbing in cycle breaker {} [{}] ---", breaker_build.name, breaker_hash.0.to_hex());
+                    path_for_self_spec(
+                        &cycle_breaker,
+                        &breaker_hash,
+                        &breaker_build,
+                        graph,
+                        cache,
+                    )
+                }
+            }
+        },
+        Err(e) => {
+            panic!("unexpected cache error when resolving path for {} [{}]: {:?}", input_build.name, input_hash.0.to_hex(), e);
+        },
+    }
+}
+
+/// yields 'dependencies' mappings for the transitive dependencies of the given build spec.
+fn path_transitive_deps_of(
+    input_build: &BuildSpec,
+    graph: &DepGraph,
+    cache: &Cache<LocalDir>,
+    out_paths: &mut HashMap<PathBuf, PathBuf>,
+) -> Result<()> {
+    use BuildSpecInput::*;
+    for dep_bsr in input_build
+        .inputs
+        .iter()
+        .filter_map(|input| match input {
+            Build(dep_bsr) => Some(dep_bsr),
+            Source(_) | HostPath(_) | Local(_) | Prebuilt(_) => None,
+        })
+        .chain(input_build.runtime_deps.iter()) {
+            let (dep_bsr, dep_paths) = path_for_self_spec(dep_bsr, &graph.spec_hash(dep_bsr), &graph.get(dep_bsr).unwrap(), graph, cache)?;
+            if !out_paths.contains_key(&dep_paths.0) {
+                let dep_build = graph.get(&dep_bsr).unwrap();
+                debug!(
+                    "   - Transitive dep {} -- [{}]",
+                    dep_build.name,
+                    graph.spec_hash(&dep_bsr).0.to_hex()
+                );
+
+                out_paths.insert(dep_paths.0, dep_paths.1);
+                path_transitive_deps_of(&dep_build, graph, cache, out_paths)?;
+            }
+        };
+
+    Ok(())
 }
 
 fn is_pure_prebuilt(build: &BuildSpec) -> bool {
@@ -242,8 +297,15 @@ impl<'a> Run<'a> {
             use BuildSpecInput::*;
             match input {
                 Build(dep_ref) => {
-                    let input_paths = materialize_build_input(dep_ref, &self.graph, &self.cache)?;
-                    dependencies.extend(input_paths.into_iter());
+                    debug!(
+                        "  Input {}: Build({}) -- [{}]",
+                        i,
+                        self.graph.get(&dep_ref).unwrap().name,
+                        self.graph.spec_hash(&dep_ref).0.to_hex()
+                    );
+
+                    let input_paths = all_paths_for_spec(dep_ref, &self.graph, &self.cache)?;
+                    dependencies.extend(input_paths);
                 }
                 HostPath(path) => {
                     debug!("  Input {}: HostPath({})", i, path.display());
@@ -278,26 +340,9 @@ impl<'a> Run<'a> {
                 dep_hash.0.to_hex()
             );
 
-            let cache_path = self.cache.read_dir(&dep_hash).unwrap().path().to_path_buf();
-            dependencies.insert(cache_path, PathBuf::from("/"));
-
-            for (bsh, _attribution) in BuildManifest::make(&self.graph, bsr, &dep_hash)
-                .transitive_runtime_deps
-                .into_iter()
-            {
-                debug!("   - Transitive runtime dep -- [{}]", dep_hash.0.to_hex());
-
-                let cache_path = self.cache.read_dir(&bsh).unwrap().path().to_path_buf();
-                if dependencies
-                    .insert(cache_path, PathBuf::from("/"))
-                    .is_some()
-                {
-                    warn!(
-                        "Transitive dependency [{}] was already present - probably fine",
-                        dep_hash.0.to_hex(),
-                    );
-                }
-            }
+            let dep_paths =
+                all_paths_for_spec(bsr, &self.graph, &self.cache)?;
+            dependencies.extend(dep_paths);
         }
 
         debug!(
