@@ -1,0 +1,38 @@
+change-id = 142379
+
+[build]
+# When compiling from source, you almost always want a full stage 2 build,
+# which has all the latest optimizations from nightly.
+build-stage = 2
+test-stage = 2
+doc-stage = 2
+# When compiling from source, you usually want all tools.
+extended = true
+# Use libtest built from the source tree instead of the precompiled one from stage 0.
+compiletest-use-stage0-libtest = false
+
+docs = false
+
+[llvm]
+link-shared = true
+
+[rust]
+channel = "stable"
+download-rustc = false
+lld = false
+llvm-bitcode-linker = false
+
+# lto = "thin"
+# codegen-units = 1
+
+[dist]
+compression-profile = "balanced"
+
+[target.x86_64-unknown-linux-gnu]
+cc = "clang"
+cxx = "clang++"
+linker = "clang"
+llvm-config = "/usr/bin/llvm-config"
+
+[install]
+prefix = "/usr"
