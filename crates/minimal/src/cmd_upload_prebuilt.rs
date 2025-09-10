@@ -1,4 +1,5 @@
 use crate::remote_storage::RemoteStorage;
+use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
@@ -12,9 +13,7 @@ pub struct UploadPrebuiltArgs {
     cache_dir: Option<PathBuf>,
 }
 
-pub async fn cmd_upload_prebuilt(
-    args: UploadPrebuiltArgs,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn cmd_upload_prebuilt(args: UploadPrebuiltArgs) -> Result<()> {
     let package_name = &args.package;
 
     // Load the package spec to compute its hash
@@ -22,7 +21,7 @@ pub async fn cmd_upload_prebuilt(
     let spec_path = std::path::Path::new(&spec_file);
 
     if !spec_path.exists() {
-        return Err(format!("Package spec file not found: {}", spec_file).into());
+        bail!("Package spec file not found: {}", spec_file);
     }
 
     // Load the SOURCE dependency graph for this package to get the correct hash
@@ -33,7 +32,7 @@ pub async fn cmd_upload_prebuilt(
         .iter()
         .find(|(_, spec)| spec.name == *package_name)
         .map(|(bsr, _spec)| bsr)
-        .ok_or_else(|| format!("Package '{}' not found in dependency graph", package_name))?;
+        .with_context(|| format!("Package '{}' not found in dependency graph", package_name))?;
 
     let spec_hash = dp.spec_hash(&package_ref);
 
@@ -45,7 +44,7 @@ pub async fn cmd_upload_prebuilt(
         .join(package_name)
         .join("prebuilt");
     if !prebuilt_dir.exists() {
-        return Err(format!("Prebuilt directory not found: {}", prebuilt_dir.display()).into());
+        bail!("Prebuilt directory not found: {}", prebuilt_dir.display());
     }
 
     println!("Creating archive from: {}", prebuilt_dir.display());

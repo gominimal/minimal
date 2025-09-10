@@ -91,7 +91,7 @@ impl BuildExecutor {
     }
 
     fn execute_in_container(&self, config: &BuildConfig) -> Result<()> {
-        info!("Executing command in hakoniwa container");
+        info!("Executing command in container...");
 
         let rootfs = self.prepare_rootfs(config)?;
 

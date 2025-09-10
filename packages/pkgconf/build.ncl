@@ -14,6 +14,7 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
+    pkg_config = { glob = "usr/bin/pkg-config" } | OutputLib,
     usr_bin = { glob = "usr/bin/*" } | OutputLib,
     usr_include_pkgconf_libpkgconf = { glob = "usr/include/pkgconf/libpkgconf/*" } | OutputLib,
     usr_lib = { glob = "usr/lib/*" } | OutputLib,

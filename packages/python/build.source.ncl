@@ -1,10 +1,14 @@
 let { BuildSpec, HostPath, OutputLib, Local, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let expat = import "../expat/build.ncl" in
+let gdbm = import "../gdbm/build.ncl" in
 let libffi = import "../libffi/build.ncl" in
 let ncurses = import "../ncurses/build.ncl" in
+let openssl = import "../openssl/build.ncl" in
 let pkgconf = import "../pkgconf/build.ncl" in
+let sqlite = import "../sqlite/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
+# let util-linux = import "../util-linux/build.ncl" in
 {
   name = "python",
   inputs = [
@@ -15,10 +19,14 @@ let toolchain = import "../toolchain/build.ncl" in
     } | Source,
     base,
     expat,
+    gdbm,
     libffi,
     ncurses,
+    openssl,
     pkgconf,
+    sqlite,
     toolchain,
+    # util-linux,
   ],
   cmd = "./build.source.sh",
   outputs = {

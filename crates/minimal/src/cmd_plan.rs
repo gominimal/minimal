@@ -1,4 +1,4 @@
-use build_sandbox::Result;
+use anyhow::Result;
 use graph::ExecPlan;
 use std::path::PathBuf;
 

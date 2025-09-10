@@ -1,8 +1,12 @@
 let { BuildSpec, HostPath, OutputLib, Local, Prebuilt, .. } = import "minimal.ncl" in
+let zlib = import "../zlib/build.ncl" in
 {
   name = "binutils",
   inputs = [
     { package = "binutils" } | Prebuilt,
+  ],
+  runtime_deps = [
+    zlib,
   ],
   cmd = "",
   outputs = {

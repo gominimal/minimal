@@ -17,7 +17,7 @@ echo "rootsbindir=/usr/sbin" > configparms
             --enable-kernel=6.1
 
 make -j$(nproc)
-# make check
+make check
 make DESTDIR=$OUTPUT_DIR install
 
 sed '/RTLDLIST=/s@/usr@@g' -i $OUTPUT_DIR/usr/bin/ldd

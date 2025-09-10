@@ -1,3 +1,4 @@
+use anyhow::{Context, Result, bail};
 use build_sandbox::{BuildConfig, config::BuildScript, run_build};
 use cache::{Cache, LocalDir};
 use graph::dep_graph::SourceFetch;
@@ -45,7 +46,7 @@ impl Run {
     async fn sandbox_paths_from_buildspec(
         &self,
         build: &BuildSpec,
-    ) -> Result<(HashMap<PathBuf, PathBuf>, Vec<PathBuf>), Box<dyn std::error::Error>> {
+    ) -> Result<(HashMap<PathBuf, PathBuf>, Vec<PathBuf>)> {
         let mut dependencies = HashMap::new();
         let mut inputs = Vec::new();
 
@@ -100,11 +101,11 @@ impl Run {
                     match &source.from {
                         SourceFetch::URL(url_str) => {
                             let url = Url::parse(url_str)
-                                .map_err(|e| format!("Failed to parse URL '{}': {}", url_str, e))?;
+                                .with_context(|| format!("Failed to parse URL '{}'", url_str))?;
 
                             match url.scheme() {
                                 "gs" => {
-                                    let bucket_id = url.host_str().ok_or_else(|| {
+                                    let bucket_id = url.host_str().with_context(|| {
                                         format!(
                                             "Invalid gs:// URL: missing bucket name in '{}'",
                                             url_str
@@ -137,11 +138,12 @@ impl Run {
                                     let computed_hex = hex::encode(computed_hash);
 
                                     if computed_hex != source.sha256 {
-                                        return Err(format!(
+                                        bail!(
                                             "SHA256 mismatch for {}: expected {}, got {}",
-                                            url_str, source.sha256, computed_hex
-                                        )
-                                        .into());
+                                            url_str,
+                                            source.sha256,
+                                            computed_hex
+                                        );
                                     }
 
                                     debug!(
@@ -162,8 +164,8 @@ impl Run {
                     let package_hash =
                         if let Some(locked_hash) = self.lockfile.get_hash(package_name) {
                             debug!("  Using locked hash for {}: {}", package_name, locked_hash);
-                            SpecHash(blake3::Hash::from_hex(locked_hash).map_err(|e| {
-                                format!("Invalid hex hash in lockfile for {}: {}", package_name, e)
+                            SpecHash(blake3::Hash::from_hex(locked_hash).with_context(|| {
+                                format!("Invalid hex hash in lockfile for {}", package_name)
                             })?)
                         } else {
                             debug!(
@@ -192,11 +194,8 @@ impl Run {
                         .remote_storage
                         .download(bucket_id.to_string(), &file_path)
                         .await
-                        .map_err(|e| {
-                            format!(
-                                "Failed to download prebuilt archive for {}: {}",
-                                package_name, e
-                            )
+                        .with_context(|| {
+                            format!("Failed to download prebuilt archive for {}", package_name)
                         })?;
 
                     std::fs::write(&temp_archive_path, content)?;
@@ -257,10 +256,7 @@ impl Run {
         Ok((dependencies, inputs))
     }
 
-    pub async fn execute(
-        &mut self,
-        debug: Option<BuildSpecRef>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn execute(&mut self, debug: Option<BuildSpecRef>) -> Result<()> {
         // Execute builds in dependency order - each build runs in isolation
         // and can only access outputs from previously completed builds
         let mut lockfile_updates = Vec::new(); // Track what needs lockfile updates
@@ -271,7 +267,7 @@ impl Run {
                 let build = self.graph.get(bsr).unwrap();
 
                 if self.cache.read_dir(&bsh).is_ok() {
-                    println!(
+                    eprintln!(
                         "Skipping already-cached build {} [{}]",
                         build.name,
                         bsh.0.to_hex()
@@ -279,7 +275,7 @@ impl Run {
                     continue;
                 }
 
-                println!("Executing build: {} [{}]", build.name, bsh.0.to_hex());
+                eprintln!("Executing build: {} [{}]", build.name, bsh.0.to_hex());
                 let (dependencies, inputs) = self.sandbox_paths_from_buildspec(build).await?;
 
                 // Check if this is a pure prebuilt package (only has Prebuilt inputs + system dependencies)
@@ -293,7 +289,7 @@ impl Run {
 
                 if has_prebuilt && !has_local_or_source {
                     // Pure prebuilt package - just copy the prebuilt files directly
-                    println!(
+                    eprintln!(
                         "Pure prebuilt package: {}, copying files directly",
                         build.name
                     );
@@ -317,6 +313,13 @@ impl Run {
                             }
                         }
                     }
+                    cache_handle.finalize().unwrap();
+                } else if build.cmd.trim().is_empty() {
+                    eprintln!(
+                        "No-op package with empty cmd: {}, creating cache entry",
+                        build.name
+                    );
+                    let cache_handle = self.cache.write_dir(&bsh).unwrap();
                     cache_handle.finalize().unwrap();
                 } else {
                     // Regular build with build script
@@ -354,7 +357,7 @@ impl Run {
                     out_dir.finalize().unwrap();
                 }
 
-                println!("Completed isolated build: {}", build.name);
+                eprintln!("Completed isolated build: {}", build.name);
 
                 // If this is a source build of the requested package, handle upload
                 if self.is_source_build && build.name == self.package_name {
@@ -364,19 +367,15 @@ impl Run {
             }
         }
 
-        // Handle uploads and lockfile updates after the main build loop
         for (package_name, bsh) in lockfile_updates {
-            println!("Processing upload for {}", package_name);
+            eprintln!("Processing upload for {}", package_name);
             self.upload_prebuilt_archive(&bsh).await?;
         }
 
         Ok(())
     }
 
-    async fn upload_prebuilt_archive(
-        &mut self,
-        bsh: &SpecHash,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn upload_prebuilt_archive(&mut self, bsh: &SpecHash) -> Result<()> {
         eprintln!("Auto-uploading prebuilt archive for {}", self.package_name);
 
         let package_hash = self.compute_package_hash(&self.package_name)?;
@@ -416,10 +415,7 @@ impl Run {
         Ok(())
     }
 
-    fn compute_package_hash(
-        &self,
-        package_name: &str,
-    ) -> Result<SpecHash, Box<dyn std::error::Error>> {
+    fn compute_package_hash(&self, package_name: &str) -> Result<SpecHash> {
         // For prebuilt packages, we need to compute the hash based on the SOURCE build spec,
         // not the current build spec (which would cause circular reference).
 
@@ -431,12 +427,11 @@ impl Run {
         let source_spec_path = package_dir.join("build.source.ncl");
 
         if !source_spec_path.exists() {
-            return Err(format!(
+            bail!(
                 "Source build spec not found for package '{}': {}",
                 package_name,
                 source_spec_path.display()
-            )
-            .into());
+            );
         }
 
         let sr = SpecReader::new_with_path(
@@ -445,26 +440,27 @@ impl Run {
                 minimal_lib_path: "crates/graph/minimal-ncl".into(),
             },
         )
-        .map_err(|e| format!("Failed to load source spec for {}: {:?}", package_name, e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to load source spec for {}: {:?}", package_name, e))?;
 
         let source_graph = graph::DepGraph::new(sr).map_err(|e| {
-            format!(
+            anyhow::anyhow!(
                 "Failed to build source dependency graph for {}: {:?}",
-                package_name, e
+                package_name,
+                e
             )
         })?;
 
         // The top-level build spec should be for this package
         let source_spec = source_graph
             .get(&source_graph.top_level)
-            .ok_or_else(|| format!("Source spec not found for package '{}'", package_name))?;
+            .with_context(|| format!("Source spec not found for package '{}'", package_name))?;
 
         if source_spec.name != package_name {
-            return Err(format!(
+            bail!(
                 "Source spec name mismatch: expected '{}', got '{}'",
-                package_name, source_spec.name
-            )
-            .into());
+                package_name,
+                source_spec.name
+            );
         }
 
         Ok(source_graph.spec_hash(&source_graph.top_level))
@@ -474,7 +470,7 @@ impl Run {
         &self,
         archive_path: &PathBuf,
         extract_dir: &PathBuf,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<()> {
         let file = std::fs::File::open(archive_path)?;
         let decoder = zstd::stream::Decoder::new(file)?;
         let mut archive = tar::Archive::new(decoder);

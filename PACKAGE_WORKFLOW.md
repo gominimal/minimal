@@ -1,16 +1,18 @@
 # Package Creation Workflow for Claude
 
-This guide provides step-by-step instructions for Claude (AI assistants) to add new packages to the minpkgs system using Linux From Scratch (LFS) as a reference source.
+This guide provides step-by-step instructions for Claude (AI assistants) to add new packages to the minpkgs system using Linux From Scratch (LFS) and Beyond Linux From Scratch (BLFS) as reference sources.
 
 ## Overview
 
 The workflow involves:
-1. Finding package information from LFS
+1. Finding package information from LFS or BLFS
 2. Uploading source archives to Google Cloud Storage
 3. Creating package specifications and build scripts
 4. Iteratively resolving dependencies through build failures
 
-## Step 1: Research Package in Linux From Scratch
+## Step 1: Research Package in Linux From Scratch or Beyond Linux From Scratch
+
+### For Core System Packages (LFS)
 
 1. **Find the package list**: Visit https://www.linuxfromscratch.org/lfs/view/systemd/chapter03/packages.html
 2. **Locate your package**: Find the package name, version, and download URL
@@ -20,16 +22,49 @@ Example for "patch":
 - Download URL: `https://ftp.gnu.org/gnu/patch/patch-2.8.tar.xz`
 - Build instructions in Chapter 8.24
 
+### For Additional Packages (BLFS)
+
+1. **Browse BLFS index**: Visit https://www.linuxfromscratch.org/blfs/view/systemd/index.html
+2. **Navigate by category**: Browse sections like:
+   - General Libraries (e.g., libffi, gmp, mpfr)
+   - System Utilities (e.g., which, tree)
+   - Programming (e.g., Python modules, development tools)
+   - Multimedia Libraries (e.g., SDL, audio/video codecs)
+   - Networking (e.g., curl, wget)
+   - Text Web Browsers, Desktop environments, etc.
+3. **Find package page**: Each package has its own page with download URLs and build instructions
+4. **Note dependencies**: BLFS packages often have more complex dependency chains
+
+Example for "libffi" (BLFS General Libraries):
+- BLFS page: https://www.linuxfromscratch.org/blfs/view/systemd/general/libffi.html
+- Download URL: `https://github.com/libffi/libffi/releases/download/v3.5.2/libffi-3.5.2.tar.gz`
+- Build instructions with configure options specific to libffi
+
+### Choosing Between LFS and BLFS
+
+- **LFS packages**: Core system components needed for a minimal Linux system (toolchain, basic utilities)
+- **BLFS packages**: Additional functionality beyond basic system (libraries, applications, development tools)
+- **Check LFS first**: If a package isn't in LFS Chapter 3, check BLFS
+- **Version consistency**: Use versions that match the LFS/BLFS book you're following
+
 ## Step 2: Upload Source Archive
 
-1. **Download the source**: Use the URL from LFS package list
+1. **Download the source**: Use the URL from LFS or BLFS package page
 ```bash
+# LFS example
 wget https://ftp.gnu.org/gnu/patch/patch-2.8.tar.xz
+
+# BLFS example  
+wget https://github.com/libffi/libffi/releases/download/v3.5.2/libffi-3.5.2.tar.gz
 ```
 
 2. **Upload to Google Cloud Storage**:
 ```bash
+# LFS example
 gcloud storage cp patch-2.8.tar.xz gs://minimal-staging-archives/
+
+# BLFS example
+gcloud storage cp libffi-3.5.2.tar.gz gs://minimal-staging-archives/
 ```
 
 ## Step 3: Create Package Directory Structure
@@ -45,17 +80,8 @@ Create `packages/<package-name>/build.ncl` with this template:
 
 ```nickel
 let {BuildSpec, HostPath, OutputLib, Local, Source, ..} = import "minimal.ncl" in
-let bash = import "../bash/build.ncl" in
-let binutils = import "../binutils/build.ncl" in
-let coreutils = import "../coreutils/build.ncl" in
-let gcc = import "../gcc/build.ncl" in
-let glibc = import "../glibc/build.ncl" in
-let linux_headers = import "../linux_headers/build.ncl" in
-let tar = import "../tar/build.ncl" in
-# Add archive utility based on file extension:
-# let gzip = import "../gzip/build.ncl" in      # for .tar.gz
-# let xz = import "../xz/build.ncl" in          # for .tar.xz
-# let bzip2 = import "../bzip2/build.ncl" in    # for .tar.bz2
+let base = import "../base/build.ncl" in
+let toolchain = import "../toolchain/build.ncl" in
 {
     name = "package-name",
     inputs = [
@@ -64,14 +90,8 @@ let tar = import "../tar/build.ncl" in
             url = "gs://minimal-staging-archives/package-version.tar.ext",
             sha256 = "placeholder_sha256_will_be_updated_from_build_failure"
         } | Source,
-        bash,
-        binutils, 
-        coreutils,
-        gcc,
-        glibc,
-        linux_headers,
-        tar,
-        # Add archive utility here
+        base,
+        toolchain,
     ],
     cmd = "./build.sh",
     outputs = {
@@ -85,10 +105,34 @@ let tar = import "../tar/build.ncl" in
 } | BuildSpec
 ```
 
+### Understanding Metapackages
+
+The minpkgs system uses two key metapackages that simplify dependency management:
+
+#### `base` metapackage
+Contains common build and system utilities:
+- bash, coreutils, sed, grep, gawk, make
+- tar, xz, bzip2, gzip (archive utilities)
+- diffutils, findutils, file, perl
+
+#### `toolchain` metapackage  
+Contains core compilation tools:
+- gcc (C/C++ compiler)
+- binutils (assembler, linker, etc.)
+- glibc (C library)
+- linux_headers (kernel headers)
+- Includes `base` as a dependency
+
+**Key Benefits:**
+- **Simplified dependencies**: Just import `base` and `toolchain` instead of 10+ individual packages
+- **Consistent environment**: All packages get the same standard build environment
+- **Reduced maintenance**: Changes to core tools propagate automatically
+
 ## Step 5: Create build.sh Script
 
-Create `packages/<package-name>/build.sh` based on LFS instructions:
+Create `packages/<package-name>/build.sh` based on LFS or BLFS instructions:
 
+### LFS Pattern (Simple autotools)
 ```bash
 #!/bin/sh
 set -e
@@ -103,10 +147,29 @@ make
 make DESTDIR="$OUTPUT_DIR" install
 ```
 
+### BLFS Pattern (More complex configuration)
+```bash
+#!/bin/sh
+set -e
+
+# Extract archive
+tar xfo libffi-3.5.2.tar.gz
+cd libffi-3.5.2
+
+# BLFS often has more configure options
+./configure --prefix=/usr          \
+            --disable-static       \
+            --with-gcc-arch=native \
+            --disable-exec-static-tramp
+make
+make DESTDIR="$OUTPUT_DIR" install
+```
+
 **Important notes:**
 - Always use `DESTDIR="$OUTPUT_DIR"` for installation
 - Use `make -j$(nproc)` for parallel builds if the package supports it
-- Copy configuration flags from LFS documentation
+- Copy configuration flags exactly from LFS/BLFS documentation
+- BLFS packages often have more complex configure options and dependencies
 
 ## Step 5a: Make Build Script Executable
 
@@ -128,25 +191,23 @@ Copy the correct SHA256 from the error message and update `build.ncl`.
 
 ## Step 7: Iterative Dependency Resolution
 
-Re-run the build command. When it fails due to missing dependencies:
+Re-run the build command. Most packages will build successfully with just `base` and `toolchain` metapackages, but some may need additional dependencies.
+
+When a build fails due to missing dependencies:
 
 1. **Identify the missing tool/library** from error messages
-2. **Add the corresponding package** to the inputs in `build.ncl`
+2. **Add the specific package** to the inputs in `build.ncl`
 3. **Re-run the build**
 
-### Common Dependencies to Add
+### Common Additional Dependencies
 
-Based on build failures, you'll typically need to add:
+Most basic build tools are included in `base` and `toolchain`, but you may need to add:
 
-- `make = import "../make/build.ncl" in` for build systems
-- `sed = import "../sed/build.ncl" in` for text processing
-- `grep = import "../grep/build.ncl" in` for pattern matching  
-- `diffutils = import "../diffutils/build.ncl" in` for diff, cmp commands
-- `gawk = import "../gawk/build.ncl" in` for AWK processing
 - `m4 = import "../m4/build.ncl" in` for macro processing
 - `autoconf = import "../autoconf/build.ncl" in` for autotools
-- `automake = import "../automake/build.ncl" in` for autotools
-- `perl = import "../perl/build.ncl" in` for Perl scripts
+- `automake = import "../automake/build.ncl" in` for autotools  
+- `pkgconf = import "../pkgconf/build.ncl" in` for pkg-config
+- Other library dependencies specific to the package
 
 ### Adding Dependencies
 
@@ -154,16 +215,26 @@ When you identify a missing dependency:
 
 1. Add the import at the top:
 ```nickel
-let make = import "../make/build.ncl" in
+let m4 = import "../m4/build.ncl" in
 ```
 
 2. Add it to the inputs array:
 ```nickel
 inputs = [
-    # ... existing inputs ...
-    make,
+    {file = "build.sh"} | Local,
+    {url = "...", sha256 = "..."} | Source,
+    base,
+    toolchain,
+    m4,  # Additional dependency
 ],
 ```
+
+### When NOT to Add Individual Dependencies
+
+**Do NOT add these individually** - they're already included in the metapackages:
+- bash, coreutils, sed, grep, gawk, make (in `base`)
+- tar, xz, bzip2, gzip (in `base`) 
+- gcc, binutils, glibc, linux_headers (in `toolchain`)
 
 ## Step 8: Define Outputs
 
@@ -208,31 +279,49 @@ outputs = {
 
 ## Examples
 
-### Simple Package (patch)
+### Simple LFS Package (patch)
 - Basic configure/make/install pattern
-- Minimal dependencies
+- Uses `base` and `toolchain` metapackages
 - Single binary output
+- Found in LFS Chapter 8
 
-### Complex Package (ncurses) 
+### Complex LFS Package (ncurses) 
 - Multiple configure flags
+- Uses `base` and `toolchain` metapackages
 - Many library outputs
 - Parallel make with `-j$(nproc)`
+- Found in LFS Chapter 8
+
+### BLFS Library Package (libffi, libunistring)
+- Complex configure options for optimization
+- Uses `base` and `toolchain` metapackages
+- Library outputs with development headers
+- Most build successfully with just the metapackages
+- Found in BLFS General Libraries section
+
+### BLFS Utility Package (which)
+- Simple utility but sourced from BLFS
+- Uses `base` and `toolchain` metapackages
+- Minimal build requirements
+- Found in BLFS System Utilities section
 
 ## Debugging Tips
 
 1. **Use debug mode**: `cargo run -- build --package <name> --debug` launches a shell in the build environment
 2. **Check build logs**: Temporary directories are preserved in `/tmp/build-sandbox-*`
-3. **Examine LFS instructions carefully**: Some packages have special installation steps
+3. **Examine LFS/BLFS instructions carefully**: Some packages have special installation steps
 4. **Look at existing packages**: Check similar packages in the codebase for patterns
+5. **BLFS dependency chains**: BLFS packages may have complex dependency requirements not obvious from the main instructions
 
 ## Common Pitfalls
 
 1. **Forgetting DESTDIR**: Always use `make DESTDIR="$OUTPUT_DIR" install`
-2. **Missing archive utilities**: Add gzip/xz/bzip2 based on archive type
+2. **Adding individual dependencies unnecessarily**: Use `base` and `toolchain` metapackages instead of individual tools
 3. **Incomplete outputs**: Make sure all important files are listed in outputs
-4. **Wrong configure flags**: Copy flags exactly from LFS documentation
-5. **Missing make dependency**: Most packages need the `make` package
-6. **Executable permissions**: Run `chmod +x` on build.sh before testing
+4. **Wrong configure flags**: Copy flags exactly from LFS/BLFS documentation
+5. **Executable permissions**: Run `chmod +x` on build.sh before testing
+6. **BLFS version mismatches**: Ensure BLFS package versions are compatible with your LFS base system
+7. **Missing library dependencies**: BLFS packages may require other BLFS library packages
 
 ## Troubleshooting Output Pattern Errors
 

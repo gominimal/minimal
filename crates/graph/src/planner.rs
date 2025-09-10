@@ -74,7 +74,7 @@ impl<'a> ExecPlan<'a> {
     ///
     /// Takes into account overrides.
     fn is_built(&self, dependency: BuildSpecRef, used_by: Option<BuildSpecRef>) -> bool {
-        return self.built.contains_key(&dependency)
+        self.built.contains_key(&dependency)
             || used_by
                 .map(|used_by| {
                     if let Some(overrides) =
@@ -85,7 +85,7 @@ impl<'a> ExecPlan<'a> {
                         false
                     }
                 })
-                .unwrap_or(false);
+                .unwrap_or(false)
     }
 
     fn find_cycles(&mut self) -> Vec<Vec<BuildSpecRef>> {
@@ -95,7 +95,7 @@ impl<'a> ExecPlan<'a> {
         let mut path: Vec<BuildSpecRef> = Vec::with_capacity(self.reachable.len() + 256);
 
         for cursor in self.reachable.iter() {
-            if self.is_built(cursor.clone(), None) {
+            if self.is_built(*cursor, None) {
                 continue;
             }
 
@@ -208,7 +208,7 @@ impl<'a> Iterator for ExecPlan<'a> {
         // Check every reachable build, and add them to this phase if all their dependencies are met.
         let mut met: Vec<BuildSpecRef> = Vec::new();
         'candidate_loop: for candidate in self.reachable.iter().chain(self.cycle_breakers.keys()) {
-            if self.is_built(candidate.clone(), None) {
+            if self.is_built(*candidate, None) {
                 continue;
             }
 
@@ -221,7 +221,7 @@ impl<'a> Iterator for ExecPlan<'a> {
                 use BuildSpecInput::*;
                 match input {
                     Build(bsr) => {
-                        if !self.is_built(bsr.clone(), Some(candidate.clone())) {
+                        if !self.is_built(*bsr, Some(*candidate)) {
                             continue 'candidate_loop;
                         }
                     }
@@ -229,7 +229,7 @@ impl<'a> Iterator for ExecPlan<'a> {
                 }
             }
             for bsr in bs.runtime_deps.iter() {
-                if !self.is_built(bsr.clone(), Some(candidate.clone())) {
+                if !self.is_built(*bsr, Some(*candidate)) {
                     continue 'candidate_loop;
                 }
             }
@@ -256,7 +256,7 @@ impl<'a> Iterator for ExecPlan<'a> {
                         // A cycle was for a build-spec which 1) declared a cycle breaker, and 2) hasnt been used yet.
                         at_least_one_cycle_breaker = true;
                         // Bring the cycle-breaker into scope along with all its transitive dependencies
-                        self.cycle_breakers.insert(replace_on_cycle.clone(), ());
+                        self.cycle_breakers.insert(replace_on_cycle, ());
                         self.dep_graph
                             .transitive_specs_of(&replace_on_cycle)
                             .into_iter()
@@ -267,17 +267,12 @@ impl<'a> Iterator for ExecPlan<'a> {
                             .collect::<Vec<_>>()
                             .into_iter()
                             .for_each(|bsr| {
-                                self.cycle_breakers.insert(bsr.clone(), ());
+                                self.cycle_breakers.insert(bsr, ());
                             });
                     }
 
                     // Make sure the satisfaction of the cycle-breaker counts for resolving the previous dependent in the cycle chain.
-                    let used_by = path
-                        .iter()
-                        .rev()
-                        .nth(1)
-                        .unwrap_or_else(|| cycling_build)
-                        .to_owned();
+                    let used_by = path.iter().rev().nth(1).unwrap_or(cycling_build).to_owned();
                     match self
                         .met_dependency_overrides
                         .get_mut(&(used_by, *cycling_build))

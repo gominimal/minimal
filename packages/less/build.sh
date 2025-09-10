@@ -1,7 +1,7 @@
 #!/bin/sh
-set -e
+set -ex
 
-tar xfo less-679.tar.gz
+tar xf less-679.tar.gz
 cd less-679
 
 ./configure --prefix=/usr --sysconfdir=/etc

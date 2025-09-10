@@ -1,5 +1,5 @@
 use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage, run::Run};
-use build_sandbox::Result;
+use anyhow::{Context, Result};
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
@@ -49,7 +49,9 @@ pub async fn cmd_build(args: BuildArgs) -> Result<()> {
         remote_storage,
         lockfile,
     );
-    run.execute(debug_bsr).await.unwrap();
+    run.execute(debug_bsr)
+        .await
+        .context("Failed to execute build")?;
 
     Ok(())
 }

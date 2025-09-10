@@ -1,7 +1,8 @@
 let { BuildSpec, HostPath, OutputLib, Local, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let ncurses = import "../ncurses/build.ncl" in
-let toolchain = import "../toolchain/build.ncl" in
+let toolchain-gnullvm = import "../toolchain-gnullvm/build.ncl" in
+let gmp = import "../gmp/build.source.ncl" in
 {
   name = "less",
   inputs = [
@@ -12,7 +13,8 @@ let toolchain = import "../toolchain/build.ncl" in
     } | Source,
     base,
     ncurses,
-    toolchain,
+    toolchain-gnullvm,
+    # gmp,
   ],
   cmd = "./build.sh",
   outputs = {

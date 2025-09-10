@@ -16,6 +16,7 @@ let xz = import "../xz/build.ncl" in
 {
   name = "base",
   inputs = [
+    { file = "build.sh" } | Local,
     coreutils,
   ],
   runtime_deps = [
@@ -34,6 +35,8 @@ let xz = import "../xz/build.ncl" in
     tar,
     xz,
   ],
-  cmd = "true",
-  outputs = {},
+  cmd = "build.sh",
+  outputs = {
+    resolvconf = { glob = "etc/resolv.conf" } | OutputLib,
+  },
 } | BuildSpec
