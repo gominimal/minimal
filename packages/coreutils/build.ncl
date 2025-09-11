@@ -2,6 +2,7 @@ let { BuildSpec, OutputLib, Local, Prebuilt, .. } = import "minimal.ncl" in
 let acl = import "../acl/build.ncl" in
 let glibc = import "../glibc/build.ncl" in
 let libcap = import "../libcap/build.ncl" in
+let libgmp = import "../gmp/build.ncl" in
 {
   name = "coreutils",
   inputs = [
@@ -11,6 +12,7 @@ let libcap = import "../libcap/build.ncl" in
     acl,
     glibc,
     libcap,
+    libgmp,
   ],
   cmd = "",
   outputs = {

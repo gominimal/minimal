@@ -148,16 +148,7 @@ fn path_transitive_deps_of(
     cache: &Cache<LocalDir>,
     out_paths: &mut HashSet<PathBuf>,
 ) -> Result<()> {
-    use BuildSpecInput::*;
-    for dep_bsr in input_build
-        .inputs
-        .iter()
-        .filter_map(|input| match input {
-            Build(dep_bsr) => Some(dep_bsr),
-            Source(_) | HostPath(_) | Local(_) | Prebuilt(_) => None,
-        })
-        .chain(input_build.runtime_deps.iter())
-    {
+    for dep_bsr in input_build.runtime_deps.iter() {
         let (dep_bsr, dep_paths) = path_for_self_spec(
             dep_bsr,
             &graph.spec_hash(dep_bsr),
