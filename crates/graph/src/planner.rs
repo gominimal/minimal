@@ -266,10 +266,8 @@ impl<'a> Iterator for ExecPlan<'a> {
                             .unwrap_or(path.last().unwrap())
                             .to_owned(),
                     ),
-                    // // try seeing if theres a replace_on_cycle as the first element
-                    // (path.first().unwrap(), path.last().unwrap().clone()),
-
-                    // TODO: probably remove the first+last element iter thing if this keeps working
+                    // try seeing if theres a replace_on_cycle as the first element
+                    (path.first().unwrap(), path.last().unwrap().clone()),
                 ] {
                     if let Some(replace_on_cycle) =
                         self.dep_graph.get(head).unwrap().replace_on_cycle

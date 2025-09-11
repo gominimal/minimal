@@ -1,5 +1,6 @@
 let { BuildSpec, OutputLib, Local, Prebuilt, .. } = import "minimal.ncl" in
 let glibc = import "../glibc/build.ncl" in
+let ncurses = import "../ncurses/build.ncl" in
 let readline = import "../readline/build.ncl" in
 {
   name = "bash",
@@ -8,6 +9,7 @@ let readline = import "../readline/build.ncl" in
   ],
   runtime_deps = [
     glibc,
+    ncurses,
     readline,
   ],
   cmd = "",
