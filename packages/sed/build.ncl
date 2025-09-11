@@ -38,7 +38,6 @@ let tar = import "../tar/build.ncl" in
   ],
   runtime_deps = [
     acl,
-    attr,
   ],
 
   cmd = "./build.sh",
@@ -53,10 +52,11 @@ let tar = import "../tar/build.ncl" in
       inputs = [
         { package = "sed" } | Prebuilt,
       ],
-      runtime_deps = [
-        acl,
-        attr,
-      ],
+      # TODO: runtime_deps in a cycle breaker are borked?
+      # runtime_deps = [
+      #   acl,
+      #   attr,
+      # ],
       cmd = "",
       outputs = {
         sed_bin = { path = "usr/bin/sed" } | OutputBin,

@@ -85,7 +85,16 @@ impl<'a> ExecPlan<'a> {
         let mut path: Vec<BuildSpecRef> = Vec::with_capacity(self.reachable.len() + 256);
         let mut seen: HashMap<BuildSpecRef, ()> = HashMap::with_capacity(self.reachable.len());
 
-        for cursor in self.reachable.iter() {
+        for cursor in self
+            .reachable
+            .iter()
+            .chain(self.reachable.iter().filter_map(|bsr| {
+                match self.dep_graph.get(bsr).unwrap().replace_on_cycle {
+                    None => None,
+                    Some(ref bsr) => Some(bsr),
+                }
+            }))
+        {
             if self.is_built(*cursor, None) {
                 continue;
             }
@@ -292,6 +301,7 @@ impl<'a> Iterator for ExecPlan<'a> {
                         }
 
                         // Make sure the satisfaction of the cycle-breaker counts for resolving the previous dependent in the cycle chain.
+                        // Also allow the cycle breaker to use any of the satisfactions.
                         match self.met_dependency_overrides.get_mut(&(*used_by, **head)) {
                             Some(v) => {
                                 if !v.contains(&replace_on_cycle) {
@@ -308,6 +318,28 @@ impl<'a> Iterator for ExecPlan<'a> {
             }
 
             if !at_least_one_cycle_breaker {
+                // println!(
+                //     "requested cycle breakers: {}",
+                //     self.cycle_breakers
+                //         .keys()
+                //         .map(|bsr| self.dep_graph.get(&bsr).unwrap().name.clone())
+                //         .collect::<Vec<_>>()
+                //         .join(",")
+                // );
+                // for ((bsr, dep_bsr), breakers) in &self.met_dependency_overrides {
+                //     let b = self.dep_graph.get(bsr).unwrap();
+                //     let dep = self.dep_graph.get(dep_bsr).unwrap();
+                //     let conditionals = breakers
+                //         .iter()
+                //         .map(|b| self.dep_graph.get(b).unwrap().name.clone())
+                //         .collect::<Vec<_>>()
+                //         .join(",");
+                //     println!(
+                //         "{} was allowed to satisfy {} using {}",
+                //         b.name, dep.name, conditionals
+                //     );
+                // }
+
                 panic!(
                     "cycle(s) detected! {:?}",
                     cycles
