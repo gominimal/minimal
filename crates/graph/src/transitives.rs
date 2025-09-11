@@ -21,7 +21,7 @@ pub struct Transitives {
 
 impl Transitives {
     /// Constructs the set of transitive dependencies for the given build.
-    pub fn new(g: &DepGraph, bsr: &BuildSpecRef) -> Self {
+    pub fn new(g: &DepGraph, bsr: &BuildSpecRef, include_inputs: bool) -> Self {
         let build = g.get(bsr).unwrap();
 
         let mut out = Transitives {
@@ -42,13 +42,14 @@ impl Transitives {
         build
             .inputs
             .iter()
-            .filter_map(|input| match input {
-                Build(bsr) => Some(bsr),
-                Source(_) | HostPath(_) | Local(_) | Prebuilt(_) => None,
+            .filter_map(|input| match (input, include_inputs) {
+                (Build(bsr), true) => Some(bsr),
+                (Build(_), false) => None,
+                (Source(_) | HostPath(_) | Local(_) | Prebuilt(_), _) => None,
             })
             .chain(build.runtime_deps.iter())
             .for_each(|bsr| {
-                for (hash, source) in Transitives::new(g, bsr)
+                for (hash, source) in Transitives::new(g, bsr, false)
                     .transitive_runtime_deps
                     .keys()
                     .map(|runtime_dep| (*runtime_dep, DepInfo::Inherited { from: *bsr }))
@@ -113,7 +114,7 @@ mod tests {
 
         let dg = DepGraph::new(sr).unwrap();
 
-        let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0]);
+        let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], true);
         assert_eq!(
             toplevel_manifest.build,
             dg.by_name("top build").next().unwrap()
@@ -172,7 +173,7 @@ mod tests {
 
         let dg = DepGraph::new(sr).unwrap();
 
-        let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0]);
+        let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], true);
         assert_eq!(
             toplevel_manifest.build,
             dg.by_name("top build").next().unwrap()
@@ -234,7 +235,7 @@ mod tests {
 
         let dg = DepGraph::new(sr).unwrap();
 
-        let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0]);
+        let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], true);
         assert_eq!(
             toplevel_manifest.build,
             dg.by_name("top build").next().unwrap()
