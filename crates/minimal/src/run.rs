@@ -3,13 +3,12 @@ use build_sandbox::{BuildConfig, config::BuildScript, run_build};
 use cache::{Cache, LocalDir};
 use graph::dep_graph::SourceFetch;
 use graph::{
-    BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, ExecPlan, SourceInput,
-    SpecHash, Transitives,
+    BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, ExecPlan, SourceInput, SpecHash,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tracing::{debug, warn};
+use tracing::debug;
 use url::Url;
 
 use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage};
@@ -86,7 +85,13 @@ fn all_paths_for_spec(
     let mut out_paths = HashMap::with_capacity(12);
 
     // Make the input build itself available in the sandbox.
-    let (spec_bsr, self_paths) = path_for_self_spec(spec_ref, &graph.spec_hash(spec_ref), graph.get(spec_ref).unwrap(), graph, cache)?;
+    let (spec_bsr, self_paths) = path_for_self_spec(
+        spec_ref,
+        &graph.spec_hash(spec_ref),
+        graph.get(spec_ref).unwrap(),
+        graph,
+        cache,
+    )?;
     out_paths.insert(self_paths.0, self_paths.1);
 
     // Make all the transitive deps available in the sandbox.
@@ -107,27 +112,32 @@ fn path_for_self_spec(
             let cache_path = cache_entry.path().to_path_buf();
             Ok((input_ref.clone(), (cache_path, PathBuf::from("/"))))
         }
-        Err(cache::CacheErr::NotFound) => {
-            match input_build.replace_on_cycle {
-                None => panic!("missing build in cache for {} [{}]", input_build.name, input_hash.0.to_hex()),
-                Some(cycle_breaker) => {
-                    let breaker_hash = graph.spec_hash(&cycle_breaker);
-                    let breaker_build = graph.get(&cycle_breaker).unwrap();
+        Err(cache::CacheErr::NotFound) => match input_build.replace_on_cycle {
+            None => panic!(
+                "missing build in cache for {} [{}]",
+                input_build.name,
+                input_hash.0.to_hex()
+            ),
+            Some(cycle_breaker) => {
+                let breaker_hash = graph.spec_hash(&cycle_breaker);
+                let breaker_build = graph.get(&cycle_breaker).unwrap();
 
-                    debug!("  --- subbing in cycle breaker {} [{}] ---", breaker_build.name, breaker_hash.0.to_hex());
-                    path_for_self_spec(
-                        &cycle_breaker,
-                        &breaker_hash,
-                        &breaker_build,
-                        graph,
-                        cache,
-                    )
-                }
+                debug!(
+                    "  --- subbing in cycle breaker {} [{}] ---",
+                    breaker_build.name,
+                    breaker_hash.0.to_hex()
+                );
+                path_for_self_spec(&cycle_breaker, &breaker_hash, &breaker_build, graph, cache)
             }
         },
         Err(e) => {
-            panic!("unexpected cache error when resolving path for {} [{}]: {:?}", input_build.name, input_hash.0.to_hex(), e);
-        },
+            panic!(
+                "unexpected cache error when resolving path for {} [{}]: {:?}",
+                input_build.name,
+                input_hash.0.to_hex(),
+                e
+            );
+        }
     }
 }
 
@@ -146,20 +156,27 @@ fn path_transitive_deps_of(
             Build(dep_bsr) => Some(dep_bsr),
             Source(_) | HostPath(_) | Local(_) | Prebuilt(_) => None,
         })
-        .chain(input_build.runtime_deps.iter()) {
-            let (dep_bsr, dep_paths) = path_for_self_spec(dep_bsr, &graph.spec_hash(dep_bsr), &graph.get(dep_bsr).unwrap(), graph, cache)?;
-            if !out_paths.contains_key(&dep_paths.0) {
-                let dep_build = graph.get(&dep_bsr).unwrap();
-                debug!(
-                    "   - Transitive dep {} -- [{}]",
-                    dep_build.name,
-                    graph.spec_hash(&dep_bsr).0.to_hex()
-                );
+        .chain(input_build.runtime_deps.iter())
+    {
+        let (dep_bsr, dep_paths) = path_for_self_spec(
+            dep_bsr,
+            &graph.spec_hash(dep_bsr),
+            &graph.get(dep_bsr).unwrap(),
+            graph,
+            cache,
+        )?;
+        if !out_paths.contains_key(&dep_paths.0) {
+            let dep_build = graph.get(&dep_bsr).unwrap();
+            debug!(
+                "   - Transitive dep {} -- [{}]",
+                dep_build.name,
+                graph.spec_hash(&dep_bsr).0.to_hex()
+            );
 
-                out_paths.insert(dep_paths.0, dep_paths.1);
-                path_transitive_deps_of(&dep_build, graph, cache, out_paths)?;
-            }
-        };
+            out_paths.insert(dep_paths.0, dep_paths.1);
+            path_transitive_deps_of(&dep_build, graph, cache, out_paths)?;
+        }
+    }
 
     Ok(())
 }
@@ -340,8 +357,7 @@ impl<'a> Run<'a> {
                 dep_hash.0.to_hex()
             );
 
-            let dep_paths =
-                all_paths_for_spec(bsr, &self.graph, &self.cache)?;
+            let dep_paths = all_paths_for_spec(bsr, &self.graph, &self.cache)?;
             dependencies.extend(dep_paths);
         }
 

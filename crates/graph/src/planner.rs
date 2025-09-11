@@ -84,19 +84,23 @@ impl<'a> ExecPlan<'a> {
         let mut cycles: Vec<Vec<BuildSpecRef>> = Vec::with_capacity(32);
 
         let mut path: Vec<BuildSpecRef> = Vec::with_capacity(self.reachable.len() + 256);
+        let mut seen: HashMap<BuildSpecRef, ()> = HashMap::with_capacity(self.reachable.len());
 
         for cursor in self.reachable.iter() {
             if self.is_built(*cursor, None) {
                 continue;
             }
+            seen.clear();
 
             path.clear();
             path.push(*cursor);
-            if let Ok(()) = Self::dfs_iter(self.dep_graph, cursor, &mut path) {
-                cycles.push(path.clone());
+            if let Some(paths) = Self::dfs_iter(self.dep_graph, cursor, &mut path, &mut seen) {
+                cycles.extend(paths);
             }
         }
 
+        cycles.sort();
+        cycles.dedup();
         cycles
     }
 
@@ -104,7 +108,11 @@ impl<'a> ExecPlan<'a> {
         g: &DepGraph,
         cursor: &BuildSpecRef,
         path: &mut Vec<BuildSpecRef>,
-    ) -> Result<(), ()> {
+        seen: &mut HashMap<BuildSpecRef, ()>,
+    ) -> Option<Vec<Vec<BuildSpecRef>>> {
+        if seen.contains_key(cursor) {
+            return None;
+        }
         let bs = g.get(cursor).unwrap();
         // println!(
         //     "dfs_iter(): {}, {:?}",
@@ -114,32 +122,43 @@ impl<'a> ExecPlan<'a> {
         //         .collect::<Vec<_>>()
         // );
 
+        let mut out: Option<Vec<Vec<BuildSpecRef>>> = None;
+
         // Look at a node which is a dependency of cursor.
-        let mut process = |bsr| -> Result<(), ()> {
-            let found_cycle = path.contains(bsr);
+        let mut process = |bsr,
+                           seen: &mut HashMap<BuildSpecRef, ()>,
+                           out: &mut Option<Vec<Vec<BuildSpecRef>>>| {
             // println!("-process: {}", g.get(bsr).unwrap().name.clone());
 
-            let mut recurse = |bsr: &BuildSpecRef| -> Result<(), ()> {
+            // We've seen this build-spec before, therefore theres a cycle in our path.
+            if path.contains(bsr) {
+                // Trim off path so its just representative of the cycle (and not the path to get to the cycle)
+                let mut out_path = path.clone();
+                let cycle_start_idx = out_path.iter().position(|x| x == bsr).unwrap();
+                out_path.drain(..cycle_start_idx);
+                match out {
+                    None => {
+                        *out = Some(vec![out_path]);
+                    }
+                    Some(l) => {
+                        l.push(out_path);
+                    }
+                };
+            } else {
                 let bsr = *bsr;
                 path.push(bsr);
-                match Self::dfs_iter(g, &bsr, path) {
-                    Err(()) => {
-                        path.pop();
-                        Err(())
+                let paths = Self::dfs_iter(g, &bsr, path, seen);
+                path.pop();
+                if let Some(new_paths) = paths {
+                    match out {
+                        None => {
+                            *out = Some(new_paths);
+                        }
+                        Some(out) => {
+                            out.extend(new_paths);
+                        }
                     }
-                    Ok(()) => Ok(()),
                 }
-            };
-
-            // We've seen this build-spec before, therefore theres a cycle in our path.
-            if found_cycle {
-                // Trim off path so its just representative of the cycle (and not the path to get to the cycle)
-                let cycle_start_idx = path.iter().position(|x| x == bsr).unwrap();
-                path.drain(..cycle_start_idx);
-
-                Ok(())
-            } else {
-                recurse(bsr)
             }
         };
 
@@ -148,20 +167,17 @@ impl<'a> ExecPlan<'a> {
             use BuildSpecInput::*;
             match input {
                 Build(bsr) => {
-                    if let Ok(ok) = process(bsr) {
-                        return Ok(ok);
-                    }
+                    process(bsr, seen, &mut out);
                 }
                 Source(_) | HostPath(_) | Local(_) | Prebuilt(_) => {}
             }
         }
         for bsr in bs.runtime_deps.iter() {
-            if let Ok(ok) = process(bsr) {
-                return Ok(ok);
-            }
+            process(bsr, seen, &mut out);
         }
 
-        Err(()) // no cycles found from this node
+        seen.insert(*cursor, ());
+        out
     }
 }
 
@@ -241,44 +257,54 @@ impl<'a> Iterator for ExecPlan<'a> {
             let mut at_least_one_cycle_breaker = false;
 
             for path in &cycles {
-                let cycling_build = path.last().unwrap();
+                for (head, used_by) in &[
+                    // try seeing if theres a replace_on_cycle as the last element
+                    (
+                        path.last().unwrap(),
+                        path.iter()
+                            .rev()
+                            .nth(1)
+                            .unwrap_or(path.last().unwrap())
+                            .to_owned(),
+                    ),
+                    // // try seeing if theres a replace_on_cycle as the first element
+                    // (path.first().unwrap(), path.last().unwrap().clone()),
 
-                if let Some(replace_on_cycle) =
-                    self.dep_graph.get(cycling_build).unwrap().replace_on_cycle
-                {
-                    if !self.cycle_breakers.contains_key(&replace_on_cycle) {
-                        // A cycle was for a build-spec which 1) declared a cycle breaker, and 2) hasnt been used yet.
-                        at_least_one_cycle_breaker = true;
-                        // Bring the cycle-breaker into scope along with all its transitive dependencies
-                        self.cycle_breakers.insert(replace_on_cycle, ());
-                        self.dep_graph
-                            .transitive_specs_of(&replace_on_cycle)
-                            .into_iter()
-                            .filter(|bsr| {
-                                !self.reachable.contains(bsr)
-                                    && !self.cycle_breakers.contains_key(bsr)
-                            })
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .for_each(|bsr| {
-                                self.cycle_breakers.insert(bsr, ());
-                            });
-                    }
-
-                    // Make sure the satisfaction of the cycle-breaker counts for resolving the previous dependent in the cycle chain.
-                    let used_by = path.iter().rev().nth(1).unwrap_or(cycling_build).to_owned();
-                    match self
-                        .met_dependency_overrides
-                        .get_mut(&(used_by, *cycling_build))
+                    // TODO: probably remove the first+last element iter thing if this keeps working
+                ] {
+                    if let Some(replace_on_cycle) =
+                        self.dep_graph.get(head).unwrap().replace_on_cycle
                     {
-                        Some(v) => {
-                            if !v.contains(&replace_on_cycle) {
-                                v.push(replace_on_cycle);
-                            }
+                        if !self.cycle_breakers.contains_key(&replace_on_cycle) {
+                            // A cycle was for a build-spec which 1) declared a cycle breaker, and 2) hasnt been used yet.
+                            at_least_one_cycle_breaker = true;
+                            // Bring the cycle-breaker into scope along with all its transitive dependencies
+                            self.cycle_breakers.insert(replace_on_cycle, ());
+                            self.dep_graph
+                                .transitive_specs_of(&replace_on_cycle)
+                                .into_iter()
+                                .filter(|bsr| {
+                                    !self.reachable.contains(bsr)
+                                        && !self.cycle_breakers.contains_key(bsr)
+                                })
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .for_each(|bsr| {
+                                    self.cycle_breakers.insert(bsr, ());
+                                });
                         }
-                        None => {
-                            self.met_dependency_overrides
-                                .insert((used_by, *cycling_build), vec![replace_on_cycle]);
+
+                        // Make sure the satisfaction of the cycle-breaker counts for resolving the previous dependent in the cycle chain.
+                        match self.met_dependency_overrides.get_mut(&(*used_by, **head)) {
+                            Some(v) => {
+                                if !v.contains(&replace_on_cycle) {
+                                    v.push(replace_on_cycle);
+                                }
+                            }
+                            None => {
+                                self.met_dependency_overrides
+                                    .insert((*used_by, **head), vec![replace_on_cycle]);
+                            }
                         }
                     }
                 }
