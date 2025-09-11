@@ -168,7 +168,7 @@ impl<'a> ExecPlan<'a> {
                 Build(bsr) => {
                     process(bsr, seen, &mut out);
                 }
-                Source(_) | HostPath(_) | Local(_) | Prebuilt(_) => {}
+                Source(_) | HostPath(_) | Local(_) | Prebuilt(_, _) => {}
             }
         }
         for bsr in bs.runtime_deps.iter() {
@@ -236,7 +236,7 @@ impl<'a> Iterator for ExecPlan<'a> {
                             continue 'candidate_loop;
                         }
                     }
-                    Source(_) | HostPath(_) | Local(_) | Prebuilt(_) => {}
+                    Source(_) | HostPath(_) | Local(_) | Prebuilt(_, _) => {}
                 }
             }
             for bsr in bs.runtime_deps.iter() {

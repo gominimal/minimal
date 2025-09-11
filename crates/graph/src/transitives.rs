@@ -45,7 +45,7 @@ impl Transitives {
             .filter_map(|input| match (input, include_inputs) {
                 (Build(bsr), true) => Some(bsr),
                 (Build(_), false) => None,
-                (Source(_) | HostPath(_) | Local(_) | Prebuilt(_), _) => None,
+                (Source(_) | HostPath(_) | Local(_) | Prebuilt(_, _), _) => None,
             })
             .chain(build.runtime_deps.iter())
             .for_each(|bsr| {

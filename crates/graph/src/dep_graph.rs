@@ -47,7 +47,7 @@ pub enum BuildSpecInput {
     Source(SourceInput),
     HostPath(PathBuf),
     Local((PathBuf, blake3::Hash)),
-    Prebuilt(String), // Package name
+    Prebuilt(String, Option<String>), // Package name, sha256
 }
 
 impl SpecHashable for BuildSpecInput {
@@ -81,9 +81,13 @@ impl SpecHashable for BuildSpecInput {
                     .unwrap();
                 h.write_all(p.1.as_bytes()).unwrap();
             }
-            Prebuilt(package) => {
+            Prebuilt(package, sha256) => {
                 h.write_all(b"prebuilt").unwrap();
                 h.write_all(package.as_bytes()).unwrap();
+                if let Some(hash) = sha256 {
+                    h.write_all(b"sha256").unwrap();
+                    h.write_all(hash.as_bytes()).unwrap();
+                }
             }
         }
 
@@ -325,7 +329,7 @@ impl DepGraph {
             .iter()
             .filter_map(|input| match input {
                 Build(bsr) => Some(bsr),
-                Source(_) | HostPath(_) | Local(_) | Prebuilt(_) => None,
+                Source(_) | HostPath(_) | Local(_) | Prebuilt(_, _) => None,
             })
             .chain(build_spec.runtime_deps.iter())
             .for_each(|bsr| {
@@ -813,8 +817,9 @@ impl GraphBuilder {
         &mut self,
         rt: &RichTerm,
         program: &mut Program<CacheImpl>,
-    ) -> Result<String, Error> {
+    ) -> Result<(String, Option<String>), Error> {
         let mut package: Option<String> = None;
+        let mut sha256: Option<String> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                 r.fields
@@ -829,6 +834,15 @@ impl GraphBuilder {
                                     )?)
                                     .unwrap(),
                                 );
+                                Ok(())
+                            }
+                            "sha256" => {
+                                if let Some(field) = field.value.as_ref() {
+                                    sha256 = Some(
+                                        String::deserialize(eval_if_closure(field, program)?)
+                                            .unwrap(),
+                                    );
+                                }
                                 Ok(())
                             }
                             _ => Ok(()), // TODO: Should we error if we see an unknown field?
@@ -849,7 +863,7 @@ impl GraphBuilder {
             }
         };
 
-        Ok(package)
+        Ok((package, sha256))
     }
 
     /// Recursively reads a buildspec input, inserting it into the graph.
@@ -874,9 +888,10 @@ impl GraphBuilder {
                 let (full_path, file_hash) = self.read_input_local(&rt, program)?;
                 Ok(BuildSpecInput::Local((full_path, file_hash)))
             }
-            ObjTy::Prebuilt => Ok(BuildSpecInput::Prebuilt(
-                self.read_input_prebuilt(&rt, program)?,
-            )),
+            ObjTy::Prebuilt => {
+                let pb = self.read_input_prebuilt(&rt, program)?;
+                Ok(BuildSpecInput::Prebuilt(pb.0, pb.1))
+            }
             ObjTy::OutputLib | ObjTy::OutputBin | ObjTy::OutputData => {
                 Err(Error::UnexpectedObject {
                     files: program.files(),

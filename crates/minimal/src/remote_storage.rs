@@ -1,15 +1,83 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use bytes::Bytes;
 use google_cloud_storage::client::Storage;
+use sha2::{Digest, Sha256};
+
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
 
 pub struct RemoteStorage {
     client: Storage,
+    cache_dir: PathBuf,
 }
 
 impl RemoteStorage {
     pub async fn new() -> Result<Self> {
+        let cache_dir = {
+            let dir = dirs::cache_dir().unwrap().join("minimal-fetches");
+            match fs::create_dir_all(&dir) {
+                Ok(_) => {}
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::AlreadyExists {
+                        panic!("failed to create build fetch-cache dir: {}", e);
+                    }
+                }
+            };
+            dir
+        };
+
         let client = Storage::builder().build().await?;
-        Ok(Self { client })
+        Ok(Self { client, cache_dir })
+    }
+
+    pub async fn download_with_verification_and_caching(
+        &self,
+        bucket_id: String,
+        file: &str,
+        sha256: &str,
+    ) -> Result<Bytes> {
+        if sha256.contains("/") {
+            bail!("SHA256 had a slash in it");
+        }
+
+        let download_path = self.cache_dir.join(sha256);
+
+        if fs::exists(&download_path)? {
+            let file_contents = fs::read(&download_path)?;
+            // Verify SHA256 hash
+            let mut hasher = Sha256::new();
+            hasher.update(&file_contents);
+            let computed_hash = hasher.finalize();
+            let computed_hex = hex::encode(computed_hash);
+
+            if computed_hex == sha256 {
+                return Ok(file_contents.into());
+            }
+        }
+
+        let data = self.download(bucket_id.clone(), file).await?;
+        {
+            let mut f = fs::File::create(download_path)?;
+            f.write(&data).unwrap();
+            f.sync_data()?;
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(&data);
+        let computed_hash = hasher.finalize();
+        let computed_hex = hex::encode(computed_hash);
+
+        if computed_hex != sha256 {
+            bail!(
+                "SHA256 mismatch for {}//{}: expected {}, got {}",
+                bucket_id,
+                file,
+                sha256,
+                computed_hex
+            );
+        }
+        Ok(data)
     }
 
     pub async fn download(&self, bucket_id: String, file: &str) -> Result<Bytes> {

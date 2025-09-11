@@ -5,7 +5,6 @@ use graph::dep_graph::SourceFetch;
 use graph::{
     BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, ExecPlan, SourceInput, SpecHash,
 };
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use tracing::debug;
@@ -42,25 +41,14 @@ async fn materialize_source(
                     let temp_path = temp_base.join(local_filename);
 
                     let content = remote_storage
-                        .download(bucket_id.to_string(), file_name)
+                        .download_with_verification_and_caching(
+                            bucket_id.to_string(),
+                            file_name,
+                            &source.sha256,
+                        )
                         .await?;
 
                     std::fs::write(&temp_path, content)?;
-
-                    // Verify SHA256 hash
-                    let mut hasher = Sha256::new();
-                    hasher.update(&std::fs::read(&temp_path)?);
-                    let computed_hash = hasher.finalize();
-                    let computed_hex = hex::encode(computed_hash);
-
-                    if computed_hex != source.sha256 {
-                        bail!(
-                            "SHA256 mismatch for {}: expected {}, got {}",
-                            url.as_str(),
-                            source.sha256,
-                            computed_hex
-                        );
-                    }
 
                     debug!(
                         "  Downloaded and verified source from gs://{}/{}",
@@ -176,7 +164,7 @@ fn is_pure_prebuilt(build: &BuildSpec) -> bool {
     let has_prebuilt = build
         .inputs
         .iter()
-        .any(|input| matches!(input, BuildSpecInput::Prebuilt(_)));
+        .any(|input| matches!(input, BuildSpecInput::Prebuilt(_, _)));
     let has_local_or_source = build
         .inputs
         .iter()
@@ -201,7 +189,7 @@ async fn materialize_prebuilt(
 
     // Find the prebuilt input and copy its contents
     for input in build.inputs.iter() {
-        if let BuildSpecInput::Prebuilt(package_name) = input {
+        if let BuildSpecInput::Prebuilt(package_name, sha256) = input {
             // First check if we have a locked hash for this package
             let package_hash = if let Some(locked_hash) = lockfile.get_hash(package_name) {
                 debug!("  Using locked hash for {}: {}", package_name, locked_hash);
@@ -230,12 +218,25 @@ async fn materialize_prebuilt(
             let temp_archive_path = temp_base.join(format!("{}.tar.zst", package_name));
 
             // Download the prebuilt archive
-            let content = remote_storage
-                .download(bucket_id.to_string(), &file_path)
-                .await
-                .with_context(|| {
-                    format!("Failed to download prebuilt archive for {}", package_name)
-                })?;
+            let content = if let Some(sha256) = sha256 {
+                remote_storage
+                    .download_with_verification_and_caching(
+                        bucket_id.to_string(),
+                        &file_path,
+                        sha256,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("Failed to download prebuilt archive for {}", package_name)
+                    })?
+            } else {
+                remote_storage
+                    .download(bucket_id.to_string(), &file_path)
+                    .await
+                    .with_context(|| {
+                        format!("Failed to download prebuilt archive for {}", package_name)
+                    })?
+            };
 
             std::fs::write(&temp_archive_path, content)?;
 
@@ -329,7 +330,7 @@ impl<'a> Run<'a> {
                             .await?,
                     );
                 }
-                Prebuilt(package_name) => {
+                Prebuilt(package_name, _sha256) => {
                     debug!("  Input {}: Prebuilt({})", i, package_name);
                     bail!("prebuilt input cannot exist in a non-prebuilt build spec");
                 }

@@ -63,5 +63,7 @@
         ty | [| 'Builder, 'Path, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Prebuilt |] = 'Prebuilt,
         package
           | String,
+        sha256
+          | String | optional,
     },
 }
