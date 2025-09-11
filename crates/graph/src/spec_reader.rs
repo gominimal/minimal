@@ -157,6 +157,7 @@ impl SpecReader {
         use nickel_lang_core::traverse::{Traverse as _, TraverseOrder};
 
         let mut id: u64 = 0;
+        let buildspec_id_ident = LocIdent::new("__magic_buildspec_id");
         let mut traversal = |rt: RichTerm| -> Result<RichTerm, CacheError<()>> {
             if let Term::Annotated(annotation, inner) = rt.as_ref() {
                 let is_buildspec = annotation.contracts.iter().any(|lt| {
@@ -174,31 +175,25 @@ impl SpecReader {
                 if is_buildspec {
                     let new_inner = match inner.term.as_ref().clone() {
                         Term::RecRecord(mut record_data, includes, dyn_fields, deps) => {
-                            if record_data
-                                .fields
-                                .get(&LocIdent::new("__magic_buildspec_id"))
-                                .is_none()
-                            {
-                                record_data.fields.insert(
-                                    LocIdent::new("__magic_buildspec_id"),
-                                    RichTerm::from(Term::ForeignId(id)).into(),
-                                );
-                                id += 1;
+                            if record_data.fields.get(&buildspec_id_ident).is_some() {
+                                return Ok(rt);
                             }
+                            record_data.fields.insert(
+                                LocIdent::new("__magic_buildspec_id"),
+                                RichTerm::from(Term::ForeignId(id)).into(),
+                            );
+                            id += 1;
                             Term::RecRecord(record_data, includes, dyn_fields, deps).into()
                         }
                         Term::Record(mut record_data) => {
-                            if record_data
-                                .fields
-                                .get(&LocIdent::new("__magic_buildspec_id"))
-                                .is_none()
-                            {
-                                record_data.fields.insert(
-                                    LocIdent::new("__magic_buildspec_id"),
-                                    RichTerm::from(Term::ForeignId(id)).into(),
-                                );
-                                id += 1;
+                            if record_data.fields.get(&buildspec_id_ident).is_some() {
+                                return Ok(rt);
                             }
+                            record_data.fields.insert(
+                                LocIdent::new("__magic_buildspec_id"),
+                                RichTerm::from(Term::ForeignId(id)).into(),
+                            );
+                            id += 1;
                             Term::Record(record_data).into()
                         }
                         _ => unreachable!(),
