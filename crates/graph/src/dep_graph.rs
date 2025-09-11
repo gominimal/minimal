@@ -197,6 +197,7 @@ pub struct DepGraph {
     builds: Arena<BuildSpec>,
     pub top_levels: Vec<BuildSpecRef>,
 
+    #[allow(clippy::type_complexity)]
     hash_cache: Arc<
         RwLock<(
             HashMap<BuildSpecRef, SpecHash>,

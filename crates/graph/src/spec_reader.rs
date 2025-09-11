@@ -116,7 +116,7 @@ impl SpecReader {
             Ok(())
         }
         visit_dirs(&mut src, pkg_dir.as_ref())?;
-        src.push_str("]");
+        src.push(']');
 
         let mut program = Program::new_from_source(
             io::Cursor::new(src),

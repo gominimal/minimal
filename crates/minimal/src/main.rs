@@ -74,7 +74,7 @@ pub fn graph_from_all_packages() -> DepGraph {
     let package_dir = Path::new("packages");
 
     let sr = SpecReader::new_with_all_pkgs(
-        &package_dir,
+        package_dir,
         &SpecReaderOptions {
             minimal_lib_path: "crates/graph/minimal-ncl".into(),
         },

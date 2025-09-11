@@ -25,7 +25,7 @@ impl Transitives {
         let build = g.get(bsr).unwrap();
 
         let mut out = Transitives {
-            build: bsr.clone(),
+            build: *bsr,
             transitive_runtime_deps: HashMap::with_capacity(
                 2 * (build.inputs.len() + build.runtime_deps.len()),
             ),
@@ -33,7 +33,7 @@ impl Transitives {
 
         for bsr in build.runtime_deps.iter() {
             out.transitive_runtime_deps
-                .insert(bsr.clone(), vec![DepInfo::Ours]);
+                .insert(*bsr, vec![DepInfo::Ours]);
         }
 
         // Collect all transitive runtime_deps by recursing into the [BuildManifest] of
@@ -48,16 +48,10 @@ impl Transitives {
             })
             .chain(build.runtime_deps.iter())
             .for_each(|bsr| {
-                for (hash, source) in
-                    Transitives::new(g, bsr)
-                        .transitive_runtime_deps
-                        .keys()
-                        .map(|runtime_dep| {
-                            (
-                                runtime_dep.clone(),
-                                DepInfo::Inherited { from: bsr.clone() },
-                            )
-                        })
+                for (hash, source) in Transitives::new(g, bsr)
+                    .transitive_runtime_deps
+                    .keys()
+                    .map(|runtime_dep| (*runtime_dep, DepInfo::Inherited { from: *bsr }))
                 {
                     match out.transitive_runtime_deps.get_mut(&hash) {
                         Some(source_list) => source_list.push(source),

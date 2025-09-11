@@ -37,17 +37,16 @@ impl<'a> ExecPlan<'a> {
         ExecPlan::with_toplevels(dep_graph, &dep_graph.top_levels)
     }
 
-    pub fn with_toplevels(dep_graph: &'a DepGraph, toplevels: &Vec<BuildSpecRef>) -> Self {
+    pub fn with_toplevels(dep_graph: &'a DepGraph, toplevels: &[BuildSpecRef]) -> Self {
         let built = HashMap::with_capacity(dep_graph.len());
         let mut reachable: Vec<_> = toplevels
             .iter()
-            .map(|toplevel| dep_graph.transitive_specs_of(&toplevel))
-            .flatten()
+            .flat_map(|toplevel| dep_graph.transitive_specs_of(toplevel))
             .collect();
         reachable.sort();
         reachable.dedup();
 
-        let mut toplevels = toplevels.clone();
+        let mut toplevels = toplevels.to_owned();
         toplevels.sort();
         toplevels.dedup();
 

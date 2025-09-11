@@ -56,7 +56,7 @@ pub async fn cmd_build(args: BuildArgs) -> Result<()> {
 
     if args.source {
         for bsr in &graph.top_levels {
-            run.upload_prebuilt_archive(graph.get(&bsr).unwrap(), &graph.spec_hash(&bsr))
+            run.upload_prebuilt_archive(graph.get(bsr).unwrap(), &graph.spec_hash(bsr))
                 .await?;
         }
     }

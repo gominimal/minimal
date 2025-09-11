@@ -21,7 +21,7 @@ async fn materialize_source(
 ) -> Result<PathBuf> {
     match &source.from {
         SourceFetch::URL(url) => {
-            let url = Url::parse(&url).with_context(|| format!("Failed to parse URL '{}'", url))?;
+            let url = Url::parse(url).with_context(|| format!("Failed to parse URL '{}'", url))?;
 
             match url.scheme() {
                 "gs" => {
@@ -95,7 +95,7 @@ fn all_paths_for_spec(
     out_paths.insert(self_paths.0);
 
     // Make all the transitive deps available in the sandbox.
-    path_transitive_deps_of(&graph.get(&spec_bsr).unwrap(), graph, cache, &mut out_paths)?;
+    path_transitive_deps_of(graph.get(&spec_bsr).unwrap(), graph, cache, &mut out_paths)?;
 
     Ok(out_paths)
 }
@@ -107,10 +107,10 @@ fn path_for_self_spec(
     graph: &DepGraph,
     cache: &Cache<LocalDir>,
 ) -> Result<(BuildSpecRef, (PathBuf, PathBuf))> {
-    match cache.read_dir(&input_hash) {
+    match cache.read_dir(input_hash) {
         Ok(cache_entry) => {
             let cache_path = cache_entry.path().to_path_buf();
-            Ok((input_ref.clone(), (cache_path, PathBuf::from("/"))))
+            Ok((*input_ref, (cache_path, PathBuf::from("/"))))
         }
         Err(cache::CacheErr::NotFound) => match input_build.replace_on_cycle {
             None => panic!(
@@ -127,7 +127,7 @@ fn path_for_self_spec(
                     breaker_build.name,
                     breaker_hash.0.to_hex()
                 );
-                path_for_self_spec(&cycle_breaker, &breaker_hash, &breaker_build, graph, cache)
+                path_for_self_spec(&cycle_breaker, &breaker_hash, breaker_build, graph, cache)
             }
         },
         Err(e) => {
@@ -161,7 +161,7 @@ fn path_transitive_deps_of(
         let (dep_bsr, dep_paths) = path_for_self_spec(
             dep_bsr,
             &graph.spec_hash(dep_bsr),
-            &graph.get(dep_bsr).unwrap(),
+            graph.get(dep_bsr).unwrap(),
             graph,
             cache,
         )?;
@@ -174,7 +174,7 @@ fn path_transitive_deps_of(
             );
 
             out_paths.insert(dep_paths.0);
-            path_transitive_deps_of(&dep_build, graph, cache, out_paths)?;
+            path_transitive_deps_of(dep_build, graph, cache, out_paths)?;
         }
     }
 
@@ -317,11 +317,11 @@ impl<'a> Run<'a> {
                     debug!(
                         "  Input {}: Build({}) -- [{}]",
                         i,
-                        self.graph.get(&dep_ref).unwrap().name,
-                        self.graph.spec_hash(&dep_ref).0.to_hex()
+                        self.graph.get(dep_ref).unwrap().name,
+                        self.graph.spec_hash(dep_ref).0.to_hex()
                     );
 
-                    let input_paths = all_paths_for_spec(dep_ref, &self.graph, &self.cache)?;
+                    let input_paths = all_paths_for_spec(dep_ref, self.graph, &self.cache)?;
                     dependencies.extend(input_paths);
                 }
                 HostPath(_) => {
@@ -355,7 +355,7 @@ impl<'a> Run<'a> {
                 dep_hash.0.to_hex()
             );
 
-            let dep_paths = all_paths_for_spec(bsr, &self.graph, &self.cache)?;
+            let dep_paths = all_paths_for_spec(bsr, self.graph, &self.cache)?;
             dependencies.extend(dep_paths);
         }
 
