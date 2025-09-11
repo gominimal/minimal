@@ -166,14 +166,8 @@ impl BuildExecutor {
         let rootfs = self.temp_dir_path.join("rootfs");
         fs::create_dir_all(&rootfs)?;
 
-        for (cache_path, mount_point) in &config.dependencies {
-            if mount_point == Path::new("/") {
-                self.copy_dir_contents(cache_path, &rootfs)?;
-            } else {
-                let dest = rootfs.join(mount_point.strip_prefix("/").unwrap_or(mount_point));
-                fs::create_dir_all(&dest)?;
-                self.copy_dir_contents(cache_path, &dest)?;
-            }
+        for cache_path in &config.dependencies {
+            self.copy_dir_contents(cache_path, &rootfs)?;
         }
 
         Ok(rootfs)

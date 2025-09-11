@@ -1,4 +1,4 @@
-let { BuildSpec, HostPath, OutputLib, Local, Prebuilt, .. } = import "minimal.ncl" in
+let { BuildSpec, OutputLib, Local, Prebuilt, .. } = import "minimal.ncl" in
 let zlib = import "../zlib/build.ncl" in
 {
   name = "binutils",

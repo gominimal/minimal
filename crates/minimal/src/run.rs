@@ -6,7 +6,7 @@ use graph::{
     BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, ExecPlan, SourceInput, SpecHash,
 };
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use tracing::debug;
 use url::Url;
@@ -81,8 +81,8 @@ fn all_paths_for_spec(
     spec_ref: &BuildSpecRef,
     graph: &DepGraph,
     cache: &Cache<LocalDir>,
-) -> Result<HashMap<PathBuf, PathBuf>> {
-    let mut out_paths = HashMap::with_capacity(12);
+) -> Result<HashSet<PathBuf>> {
+    let mut out_paths = HashSet::with_capacity(12);
 
     // Make the input build itself available in the sandbox.
     let (spec_bsr, self_paths) = path_for_self_spec(
@@ -92,7 +92,7 @@ fn all_paths_for_spec(
         graph,
         cache,
     )?;
-    out_paths.insert(self_paths.0, self_paths.1);
+    out_paths.insert(self_paths.0);
 
     // Make all the transitive deps available in the sandbox.
     path_transitive_deps_of(&graph.get(&spec_bsr).unwrap(), graph, cache, &mut out_paths)?;
@@ -146,7 +146,7 @@ fn path_transitive_deps_of(
     input_build: &BuildSpec,
     graph: &DepGraph,
     cache: &Cache<LocalDir>,
-    out_paths: &mut HashMap<PathBuf, PathBuf>,
+    out_paths: &mut HashSet<PathBuf>,
 ) -> Result<()> {
     use BuildSpecInput::*;
     for dep_bsr in input_build
@@ -165,7 +165,7 @@ fn path_transitive_deps_of(
             graph,
             cache,
         )?;
-        if !out_paths.contains_key(&dep_paths.0) {
+        if !out_paths.contains(&dep_paths.0) {
             let dep_build = graph.get(&dep_bsr).unwrap();
             debug!(
                 "   - Transitive dep {} -- [{}]",
@@ -173,7 +173,7 @@ fn path_transitive_deps_of(
                 graph.spec_hash(&dep_bsr).0.to_hex()
             );
 
-            out_paths.insert(dep_paths.0, dep_paths.1);
+            out_paths.insert(dep_paths.0);
             path_transitive_deps_of(&dep_build, graph, cache, out_paths)?;
         }
     }
@@ -305,8 +305,8 @@ impl<'a> Run<'a> {
     async fn sandbox_paths_from_buildspec(
         &self,
         build: &BuildSpec,
-    ) -> Result<(HashMap<PathBuf, PathBuf>, Vec<PathBuf>)> {
-        let mut dependencies = HashMap::new();
+    ) -> Result<(HashSet<PathBuf>, Vec<PathBuf>)> {
+        let mut dependencies = HashSet::new();
         let mut inputs = Vec::new();
 
         debug!("Build {} has {} inputs", build.name, build.inputs.len());
@@ -324,10 +324,8 @@ impl<'a> Run<'a> {
                     let input_paths = all_paths_for_spec(dep_ref, &self.graph, &self.cache)?;
                     dependencies.extend(input_paths);
                 }
-                HostPath(path) => {
-                    debug!("  Input {}: HostPath({})", i, path.display());
-                    let host_path = PathBuf::from(path);
-                    dependencies.insert(host_path.clone(), host_path);
+                HostPath(_) => {
+                    todo!();
                 }
                 Local((path, _hash)) => {
                     debug!("  Input {}: Local file from {}", i, path.display());

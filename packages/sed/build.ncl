@@ -27,18 +27,19 @@ let toolchain = import "../toolchain/build.ncl" in
     usr_share = { glob = "usr/share/**/*" } | OutputLib,
   },
 
-  replace_on_cycle = {
-    name = "sed (prebuilt)",
-    inputs = [
-      { package = "sed" } | Prebuilt,
-    ],
-    runtime_deps = [
-      acl,
-      attr,
-    ],
-    cmd = "",
-    outputs = {
-      sed_bin = { path = "usr/bin/sed" } | OutputBin,
-    },
-  } | BuildSpec,
+  replace_on_cycle =
+    {
+      name = "sed (prebuilt)",
+      inputs = [
+        { package = "sed" } | Prebuilt,
+      ],
+      runtime_deps = [
+        acl,
+        attr,
+      ],
+      cmd = "",
+      outputs = {
+        sed_bin = { path = "usr/bin/sed" } | OutputBin,
+      },
+    } | BuildSpec,
 } | BuildSpec

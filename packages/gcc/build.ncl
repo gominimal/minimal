@@ -1,4 +1,4 @@
-let { BuildSpec, HostPath, OutputLib, Local, Prebuilt, .. } = import "minimal.ncl" in
+let { BuildSpec, OutputLib, Local, Prebuilt, .. } = import "minimal.ncl" in
 let gmp = import "../gmp/build.ncl" in
 let mpc = import "../mpc/build.ncl" in
 let mpfr = import "../mpfr/build.ncl" in

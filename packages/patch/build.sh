@@ -1,5 +1,7 @@
 #!/bin/sh
-set -e
+set -ex
+
+echo "hello"
 
 tar -xf patch-2.8.tar.xz
 cd patch-2.8

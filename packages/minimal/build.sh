@@ -9,3 +9,6 @@ export LD=gcc
 export RUSTFLAGS="-C linker=gcc"
 
 cargo build --release
+
+mkdir -p $OUTPUT_DIR/usr/bin
+cp target/release/minimal $OUTPUT_DIR/usr/bin

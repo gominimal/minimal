@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::error::{ConfigError, Result};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BuildConfig {
-    pub dependencies: HashMap<PathBuf, PathBuf>,
+    pub dependencies: HashSet<PathBuf>,
     pub inputs: Vec<PathBuf>,
     pub build_script: BuildScript,
     pub outputs: Vec<String>,
@@ -29,7 +29,7 @@ impl BuildConfig {
             .into());
         }
 
-        for dep in self.dependencies.keys() {
+        for dep in &self.dependencies {
             if !dep.exists() {
                 return Err(ConfigError::InvalidDependency { path: dep.clone() }.into());
             }

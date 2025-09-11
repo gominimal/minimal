@@ -1,4 +1,4 @@
-let { BuildSpec, HostPath, OutputLib, OutputBin, Local, Source, Prebuilt, .. } = import "minimal.ncl" in
+let { BuildSpec, OutputLib, OutputBin, Local, Source, Prebuilt, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
@@ -21,14 +21,15 @@ let toolchain = import "../toolchain/build.ncl" in
     locale_files = { glob = "usr/share/locale/*/LC_MESSAGES/*.mo" } | OutputLib,
   },
 
-  replace_on_cycle = {
-    name = "make (prebuilt)",
-    inputs = [
-      { package = "make" } | Prebuilt,
-    ],
-    cmd = "",
-    outputs = {
-      make = { path = "usr/bin/make" } | OutputBin,
-    },
-  } | BuildSpec,
+  replace_on_cycle =
+    {
+      name = "make (prebuilt)",
+      inputs = [
+        { package = "make" } | Prebuilt,
+      ],
+      cmd = "",
+      outputs = {
+        make = { path = "usr/bin/make" } | OutputBin,
+      },
+    } | BuildSpec,
 } | BuildSpec
