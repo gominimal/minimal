@@ -33,3 +33,6 @@ serde_json = { version = "1.0" }
 build-sandbox = { path = "crates/build-sandbox" }
 graph = { version = "0.0.1", path = "crates/graph" }
 cache = { version = "0.0.1", path = "crates/cache" }
+
+[patch.crates-io]
+nickel-lang-core = { git = "https://github.com/gominimal/nickel" }

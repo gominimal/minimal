@@ -206,8 +206,10 @@ impl SpecReader {
         };
 
         self.p
-            .custom_transform(|_cache, rt| rt.traverse(&mut traversal, TraverseOrder::TopDown))
-            .map_err(|_| SpecError::AnnotationFailed)
+            .custom_transform(0, |_cache, rt| {
+                rt.traverse(&mut traversal, TraverseOrder::TopDown)
+            })
+            .map_err(|_e| SpecError::AnnotationFailed)
     }
 
     pub fn finish(self) -> Result<(RichTerm, Program<CacheImpl>), SpecError> {
