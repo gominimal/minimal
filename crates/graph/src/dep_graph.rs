@@ -10,7 +10,7 @@ use nickel_lang_core::term::{RichTerm, Term};
 use nickel_lang_core::{eval::cache::CacheImpl, program::Program};
 
 use generational_arena::Arena;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -51,7 +51,7 @@ pub enum BuildSpecInput {
 }
 
 impl SpecHashable for BuildSpecInput {
-    fn spec_hash(&self, g: &DepGraph, seen: &mut HashMap<BuildSpecRef, ()>) -> SpecHash {
+    fn spec_hash(&self, g: &DepGraph, seen: &mut BTreeSet<BuildSpecRef>) -> SpecHash {
         let mut h = blake3::Hasher::new();
 
         use BuildSpecInput::*;
@@ -150,7 +150,7 @@ pub struct BuildSpec {
 }
 
 impl SpecHashable for BuildSpec {
-    fn spec_hash(&self, g: &DepGraph, seen: &mut HashMap<BuildSpecRef, ()>) -> SpecHash {
+    fn spec_hash(&self, g: &DepGraph, seen: &mut BTreeSet<BuildSpecRef>) -> SpecHash {
         let mut h = blake3::Hasher::new();
 
         h.write_all(b"build spec").unwrap();
@@ -195,7 +195,7 @@ impl SpecHashable for BuildSpec {
 }
 
 /// The dependency graph.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[allow(dead_code)]
 pub struct DepGraph {
     builds: Arena<BuildSpec>,
@@ -208,6 +208,8 @@ pub struct DepGraph {
             HashMap<SpecHash, BuildSpecRef>,
         )>,
     >,
+
+    hash_subset_cache: RwLock<HashMap<(BuildSpecRef, u64), SpecHash>>,
 }
 
 impl DepGraph {
@@ -257,8 +259,7 @@ impl DepGraph {
             }
         }
 
-        // TODO: use smol/starts-on-stack type for hashmap?
-        let mut seen = HashMap::with_capacity(32);
+        let mut seen = BTreeSet::new();
         let hash = self.spec_hash_impl(bsr, &mut seen);
 
         {
@@ -269,16 +270,35 @@ impl DepGraph {
         hash
     }
 
-    fn spec_hash_impl(&self, bsr: &BuildSpecRef, seen: &mut HashMap<BuildSpecRef, ()>) -> SpecHash {
-        if seen.contains_key(bsr) {
+    fn spec_hash_impl(&self, bsr: &BuildSpecRef, seen: &mut BTreeSet<BuildSpecRef>) -> SpecHash {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        if seen.contains(bsr) {
             return SpecHash::cycle();
+        }
+        let seen_hash = {
+            let mut s = DefaultHasher::new();
+            seen.hash(&mut s);
+            s.finish()
+        };
+        if let Some(stored_spec_hash) = self
+            .hash_subset_cache
+            .read()
+            .unwrap()
+            .get(&(*bsr, seen_hash))
+        {
+            return stored_spec_hash.clone();
         }
 
         let build = self.get(bsr).unwrap();
 
-        seen.insert(*bsr, ());
+        seen.insert(*bsr);
         let hash = build.spec_hash(self, seen);
         seen.remove(bsr);
+
+        self.hash_subset_cache
+            .write()
+            .unwrap()
+            .insert((*bsr, seen_hash), hash.clone());
         hash
     }
 
@@ -412,10 +432,12 @@ impl GraphBuilder {
             HashMap::with_capacity(builds.len()),
             HashMap::with_capacity(builds.len()),
         )));
+        let hash_subset_cache = RwLock::new(HashMap::with_capacity(4096));
         DepGraph {
             builds,
             top_levels,
             hash_cache,
+            hash_subset_cache,
         }
     }
 
@@ -1337,7 +1359,7 @@ mod tests {
             .find(|b| b.1.name == "top build")
             .unwrap()
             .1
-            .spec_hash(&dp, &mut HashMap::new());
+            .spec_hash(&dp, &mut BTreeSet::new());
 
         {
             let (mut input1, mut input2) = dp
@@ -1359,7 +1381,7 @@ mod tests {
                 .find(|b| b.1.name == "top build")
                 .unwrap()
                 .1
-                .spec_hash(&dp, &mut HashMap::new()),
+                .spec_hash(&dp, &mut BTreeSet::new()),
         );
     }
 
