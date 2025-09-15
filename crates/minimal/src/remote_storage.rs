@@ -7,6 +7,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
+#[derive(Debug, Clone)]
 pub struct RemoteStorage {
     client: Storage,
     cache_dir: PathBuf,
