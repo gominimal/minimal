@@ -482,7 +482,10 @@ impl<'a> Run<'a> {
     }
 }
 
-pub(crate) fn create_prebuilt_archive(prebuilt_dir: &PathBuf, archive_path: &PathBuf) -> std::io::Result<()> {
+pub(crate) fn create_prebuilt_archive(
+    prebuilt_dir: &PathBuf,
+    archive_path: &PathBuf,
+) -> std::io::Result<()> {
     let file = std::fs::File::create(archive_path)?;
     let encoder = zstd::stream::Encoder::new(file, 3)?; // Compression level 3
     let mut tar_builder = tar::Builder::new(encoder);

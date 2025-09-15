@@ -31,14 +31,27 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs) -> Result<()> {
         PrebuiltsLock::default()
     });
 
-    let mut run = Run::new(&graph, cache.clone(), remote_storage.clone(), lockfile.clone());
+    let mut run = Run::new(
+        &graph,
+        cache.clone(),
+        remote_storage.clone(),
+        lockfile.clone(),
+    );
     run.execute(ExecPlan::new(&graph), None)
         .await
         .context("Failed to execute build")?;
 
     // Work out the name of the prebuilt by looking at replace_by_cycle and then the first input
     let prebuilt_name = {
-        let replace_spec = graph.get(&graph.get(&graph.top_levels[0]).unwrap().replace_on_cycle.unwrap()).unwrap();
+        let replace_spec = graph
+            .get(
+                &graph
+                    .get(&graph.top_levels[0])
+                    .unwrap()
+                    .replace_on_cycle
+                    .unwrap(),
+            )
+            .unwrap();
         if let BuildSpecInput::Prebuilt(name, _) = &replace_spec.inputs[0] {
             name.clone()
         } else {
@@ -68,8 +81,7 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs) -> Result<()> {
     );
 
     // Update the prebuilts lockfile
-    lockfile
-        .update_hash(prebuilt_name.clone(), package_hash.0.to_hex().to_string());
+    lockfile.update_hash(prebuilt_name.clone(), package_hash.0.to_hex().to_string());
     let lockfile_path = std::path::Path::new("prebuilts.lock");
     lockfile.save(lockfile_path)?;
     eprintln!("Updated prebuilts.lock with new hash for {}", prebuilt_name);
