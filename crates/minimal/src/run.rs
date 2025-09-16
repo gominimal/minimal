@@ -8,10 +8,13 @@ use graph::{
 };
 use std::collections::HashSet;
 use std::path::PathBuf;
+use tempfile::Builder;
 use tracing::debug;
 use url::Url;
 
 use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage};
+
+static BUCKET_ID: &str = "minimal-staging-archives";
 
 /// yields a directory that the files in an [InputSource] are available.
 async fn materialize_source(
@@ -213,10 +216,14 @@ async fn materialize_prebuilt(
                 package_hash.0.to_hex()
             );
 
-            let temp_base = std::env::temp_dir()
-                .join(format!("minpkgs-prebuilt-{}", build.name.replace('/', "-")));
+            let temp_base = Builder::new()
+                .prefix(&format!(
+                    "minpkgs-prebuilt-{}",
+                    build.name.replace('/', "-")
+                ))
+                .tempdir()?;
             std::fs::create_dir_all(&temp_base)?;
-            let temp_archive_path = temp_base.join(format!("{}.tar.zst", package_name));
+            let temp_archive_path = temp_base.path().join(format!("{}.tar.zst", package_name));
 
             // Download the prebuilt archive
             let content = if let Some(sha256) = sha256 {
@@ -242,7 +249,7 @@ async fn materialize_prebuilt(
             std::fs::write(&temp_archive_path, content)?;
 
             // Extract the archive
-            let extract_dir = temp_base.join("extracted");
+            let extract_dir = temp_base.path().join("extracted");
             std::fs::create_dir_all(&extract_dir)?;
 
             extract_prebuilt_archive(&temp_archive_path, &extract_dir)?;
@@ -494,29 +501,31 @@ impl<'a> Run<'a> {
         build: &BuildSpec,
         bsh: &SpecHash,
     ) -> Result<()> {
-        eprintln!("Auto-uploading prebuilt archive for {}", build.name);
-
         let package_hash = compute_source_package_hash(&build.name)?;
         let cache_handle = self.cache.read_dir(bsh).unwrap();
         let cache_dir = cache_handle.path();
         let archive_name = format!("{}.tar.zst", package_hash.0.to_hex());
         let temp_archive_path = std::env::temp_dir().join(&archive_name);
 
-        create_prebuilt_archive(&cache_dir.to_path_buf(), &temp_archive_path)?;
-
-        let bucket_id = "minimal-staging-archives";
         let gcs_path = format!("prebuilts/{}/{}", build.name, archive_name);
+
+        if self.remote_storage.exists(BUCKET_ID, &gcs_path).await? {
+            eprintln!("Archive already uploaded, skipping...");
+            return Ok(());
+        }
+
+        create_prebuilt_archive(&cache_dir.to_path_buf(), &temp_archive_path)?;
 
         let archive_data = std::fs::read(&temp_archive_path)?;
         self.remote_storage
-            .upload(bucket_id.to_string(), &gcs_path, &archive_data)
+            .upload(BUCKET_ID, &gcs_path, &archive_data)
             .await?;
 
         std::fs::remove_file(&temp_archive_path)?;
 
         eprintln!(
             "Automatically uploaded prebuilt to gs://{}/{}",
-            bucket_id, gcs_path
+            BUCKET_ID, gcs_path
         );
 
         self.lockfile

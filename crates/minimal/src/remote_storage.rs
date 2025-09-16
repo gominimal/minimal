@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use bytes::Bytes;
-use google_cloud_storage::client::Storage;
+use google_cloud_gax::error::rpc::Code;
+use google_cloud_storage::client::{Storage, StorageControl};
 use sha2::{Digest, Sha256};
 
 use std::fs;
@@ -11,6 +12,7 @@ use std::path::PathBuf;
 pub struct RemoteStorage {
     client: Storage,
     cache_dir: PathBuf,
+    control_client: StorageControl,
 }
 
 impl RemoteStorage {
@@ -29,7 +31,12 @@ impl RemoteStorage {
         };
 
         let client = Storage::builder().build().await?;
-        Ok(Self { client, cache_dir })
+        let control_client = StorageControl::builder().build().await?;
+        Ok(Self {
+            client,
+            cache_dir,
+            control_client,
+        })
     }
 
     pub async fn download_with_verification_and_caching(
@@ -95,7 +102,7 @@ impl RemoteStorage {
         Ok(Bytes::from(contents))
     }
 
-    pub async fn upload(&self, bucket_id: String, file_path: &str, data: &[u8]) -> Result<()> {
+    pub async fn upload(&self, bucket_id: &str, file_path: &str, data: &[u8]) -> Result<()> {
         eprintln!("Uploading {} to bucket {}", file_path, bucket_id);
 
         let bytes_data = bytes::Bytes::copy_from_slice(data);
@@ -117,5 +124,26 @@ impl RemoteStorage {
         );
 
         Ok(())
+    }
+
+    pub async fn exists(&self, bucket_id: &str, file_path: &str) -> Result<bool> {
+        match self
+            .control_client
+            .get_object()
+            .set_bucket(format!("projects/_/buckets/{bucket_id}"))
+            .set_object(file_path)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                if let Some(status) = e.status()
+                    && status.code == Code::NotFound
+                {
+                    return Ok(false);
+                }
+                Err(e.into())
+            }
+        }
     }
 }

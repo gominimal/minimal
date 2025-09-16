@@ -21,7 +21,6 @@ let toolchain = import "../toolchain/build.ncl" in
   cmd = "./build.source.sh",
   outputs = {
     etc = { glob = "etc/**/*" } | OutputLib,
-    lib64 = { glob = "lib64/**/*" } | OutputLib,
     usr = { glob = "usr/**/*" } | OutputLib,
     var = { glob = "var/**/*" } | OutputLib,
   },

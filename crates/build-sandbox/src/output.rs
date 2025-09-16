@@ -24,7 +24,7 @@ impl OutputValidator {
         })?;
 
         // Create standard FHS compatibility symlinks in staging directory BEFORE validation
-        Self::create_fhs_symlinks(staging_dir)?;
+        // Self::create_fhs_symlinks(staging_dir)?;
 
         let mut found_files = Vec::new();
         for output_pattern in &config.outputs {
@@ -69,9 +69,6 @@ impl OutputValidator {
         }
 
         Self::warn_about_leftover_files(staging_dir, &found_files)?;
-
-        // Create standard FHS compatibility symlinks in final output directory too
-        Self::create_fhs_symlinks(final_output_dir)?;
 
         Ok(collected_outputs)
     }
@@ -171,33 +168,5 @@ impl OutputValidator {
         } else {
             Ok(vec![])
         }
-    }
-
-    fn create_fhs_symlinks(final_output_dir: &Path) -> Result<()> {
-        // Create standard FHS compatibility symlinks for merged /usr layout
-        let symlinks = [
-            ("bin", "usr/bin"),
-            ("sbin", "usr/sbin"),
-            ("lib", "usr/lib"),
-            ("lib64", "usr/lib"), // x86_64 compatibility
-        ];
-
-        for (link_name, target) in &symlinks {
-            let target_path = final_output_dir.join(target);
-            let link_path = final_output_dir.join(link_name);
-
-            // Only create symlink if target directory exists and link doesn't already exist
-            if target_path.exists() && target_path.is_dir() && !link_path.exists() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::symlink;
-                    symlink(target, &link_path)
-                        .map_err(|_| OutputError::MissingOutput { path: link_path })?;
-                    info!("Created FHS symlink: {} -> {}", link_name, target);
-                }
-            }
-        }
-
-        Ok(())
     }
 }

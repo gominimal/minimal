@@ -22,7 +22,8 @@ rayon.workspace = true
 tokio.workspace = true
 futures.workspace = true
 
-google-cloud-storage = "0.25.0"
+google-cloud-gax = "1.0.0"
+google-cloud-storage = "1.0.0"
 anyhow = "1.0.99"
 bytes = "1.10.1"
 url = "2.5"
@@ -30,4 +31,4 @@ sha2 = "0.10.9"
 hex = "0.4"
 zstd = "0.13"
 tar = "0.4"
-toml = "0.8"
+toml = "0.9"

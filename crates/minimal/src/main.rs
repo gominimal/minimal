@@ -12,8 +12,6 @@ mod cmd_build;
 use cmd_build::{BuildArgs, cmd_build};
 mod cmd_plan;
 use cmd_plan::{PlanArgs, cmd_plan};
-mod cmd_upload_prebuilt;
-use cmd_upload_prebuilt::{UploadPrebuiltArgs, cmd_upload_prebuilt};
 mod cmd_nw_update;
 use cmd_nw_update::{NWUpdateArgs, cmd_new_world_update};
 
@@ -23,7 +21,6 @@ use cmd_nw_update::{NWUpdateArgs, cmd_new_world_update};
 enum Cli {
     Build(BuildArgs),
     Plan(PlanArgs),
-    UploadPrebuilt(UploadPrebuiltArgs),
     NewWorldUpdate(NWUpdateArgs),
 }
 
@@ -124,7 +121,6 @@ async fn main() -> Result<()> {
     match Cli::parse() {
         Cli::Build(args) => cmd_build(args).await,
         Cli::Plan(args) => cmd_plan(args),
-        Cli::UploadPrebuilt(args) => cmd_upload_prebuilt(args).await,
         Cli::NewWorldUpdate(args) => cmd_new_world_update(args).await,
     }
 }

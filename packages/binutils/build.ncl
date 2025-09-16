@@ -3,7 +3,7 @@ let zlib = import "../zlib/build.ncl" in
 {
   name = "binutils",
   inputs = [
-    { package = "binutils", sha256 = "d063e1a41e7353394aaa55329d3a537c7000e07110710f56e0260792cf75fb54" } | Prebuilt,
+    { package = "binutils", sha256 = "0c2d510d101dc38a2374bdf0b97c2dcb98447c2aeb5a505c7dad9958cbcf0864" } | Prebuilt,
   ],
   runtime_deps = [
     zlib,

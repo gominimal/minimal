@@ -82,7 +82,7 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs) -> Result<()> {
     let gcs_path = format!("prebuilts/{}/{}", prebuilt_name, archive_name);
     let archive_data = std::fs::read(&temp_archive_path)?;
     remote_storage
-        .upload(bucket_id.to_string(), &gcs_path, &archive_data)
+        .upload(bucket_id, &gcs_path, &archive_data)
         .await?;
     std::fs::remove_file(&temp_archive_path)?;
     eprintln!(

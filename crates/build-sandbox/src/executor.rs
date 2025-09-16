@@ -114,6 +114,8 @@ impl BuildExecutor {
             .devfsmount("/dev")
             .bindmount_rw(&temp_dir_str, "/tmp")
             .bindmount_rw(&output_dir_str, "/tmp/output")
+            .symlink("/usr/bin", "/bin")
+            .symlink("/usr/lib", "/lib64")
             .command(program);
 
         if !config.debug_shell {
