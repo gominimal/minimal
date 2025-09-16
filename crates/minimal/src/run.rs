@@ -447,6 +447,8 @@ impl<'a> Run<'a> {
         // Execute builds in dependency order - each build runs in isolation
         // and can only access outputs from previously completed builds
 
+        let tokio_runtime = tokio::runtime::Handle::current();
+
         for phase in plan {
             use std::sync::{Arc, Mutex};
             let self2 = Arc::new(&*self);
@@ -454,6 +456,7 @@ impl<'a> Run<'a> {
 
             rayon::scope(|s| {
                 for (bsr, full_build) in phase.unwrap().builds.iter() {
+                    let tokio_runtime = tokio_runtime.clone();
                     let debug_shell = matches!(debug, Some(debug_bsr) if *bsr == debug_bsr);
                     let bsr = bsr.to_owned();
                     let full_build = full_build.to_owned();
@@ -461,6 +464,8 @@ impl<'a> Run<'a> {
                     let err_bsr = build_which_errored.clone();
 
                     s.spawn(move |_| {
+                        let _rt = tokio_runtime.enter();
+
                         let res = futures::executor::block_on(self2.do_build(
                             &bsr,
                             full_build,
