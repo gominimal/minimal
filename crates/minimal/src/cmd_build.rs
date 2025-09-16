@@ -1,6 +1,6 @@
 use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage, run::Run};
 use anyhow::{Context, Result};
-use graph::ExecPlan;
+use graph::planner2::ExecPlan;
 use std::path::PathBuf;
 
 #[derive(clap::Args)]

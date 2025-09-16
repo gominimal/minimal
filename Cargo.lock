@@ -2209,7 +2209,7 @@ dependencies = [
 [[package]]
 name = "nickel-lang-core"
 version = "0.14.0"
-source = "git+https://github.com/gominimal/nickel#6aac63bf8ef23a80f87195218ac8e6c7bea4075d"
+source = "git+https://github.com/gominimal/nickel#dd1a66ddf2b74a66b79c68d8e320f3f50597053c"
 dependencies = [
  "ansi_term",
  "bumpalo",
@@ -2256,7 +2256,7 @@ dependencies = [
 [[package]]
 name = "nickel-lang-vector"
 version = "0.1.0"
-source = "git+https://github.com/gominimal/nickel#6aac63bf8ef23a80f87195218ac8e6c7bea4075d"
+source = "git+https://github.com/gominimal/nickel#dd1a66ddf2b74a66b79c68d8e320f3f50597053c"
 dependencies = [
  "imbl-sized-chunks",
  "serde",

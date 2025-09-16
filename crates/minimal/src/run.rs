@@ -3,8 +3,9 @@ use build_sandbox::{BuildConfig, config::BuildScript, run_build};
 use cache::{Cache, LocalDir};
 use graph::dep_graph::SourceFetch;
 use graph::{
-    BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, ExecPlan, SourceInput, SpecHash,
+    BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, SourceInput, SpecHash,
 };
+use graph::planner2::ExecPlan;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use tracing::debug;
@@ -365,7 +366,7 @@ impl<'a> Run<'a> {
         // let mut lockfile_updates = Vec::new(); // Track what needs lockfile updates
 
         for phase in plan {
-            for bsr in phase.iter() {
+            for (bsr, full_build) in phase.unwrap().builds.iter() {
                 let bsh = self.graph.spec_hash(bsr);
                 let build = self.graph.get(bsr).unwrap();
 
@@ -375,6 +376,9 @@ impl<'a> Run<'a> {
                         build.name,
                         bsh.0.to_hex()
                     );
+                    if *full_build {
+                        eprintln!("NOTE: Will not skip build once Tom finishes plumbing planner2");
+                    }
                     continue;
                 }
                 if is_pure_prebuilt(build) {

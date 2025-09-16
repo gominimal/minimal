@@ -248,6 +248,7 @@ pub use dep_graph::{BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGra
 
 mod planner;
 pub use planner::ExecPlan;
+pub mod planner2;
 
 mod transitives;
 pub use transitives::Transitives;

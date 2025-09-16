@@ -1,5 +1,5 @@
 use anyhow::Result;
-use graph::ExecPlan;
+use graph::planner2::ExecPlan;
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
@@ -23,13 +23,19 @@ pub fn cmd_plan(args: PlanArgs) -> Result<()> {
     println!("✓ = Already built, ⚙️ = To be built");
     for (i, phase) in ExecPlan::new(&graph).enumerate() {
         println!("Phase {}", i + 1);
-        for bsr in phase.iter() {
+        for (bsr, do_full_build) in phase.unwrap().builds.iter() {
             let build = graph.get(bsr).unwrap();
             let bsh = graph.spec_hash(bsr);
             let is_cached = cache.read_dir(&bsh).is_ok();
             let cached_emoji = if is_cached { "✓" } else { "⚙️" };
 
-            println!(" - {} {} [{}]", cached_emoji, build.name, bsh.0.to_hex());
+            println!(
+                " - {} {} [{}] full_build={}",
+                cached_emoji,
+                build.name,
+                bsh.0.to_hex(),
+                do_full_build
+            );
         }
     }
 
