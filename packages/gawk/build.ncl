@@ -1,15 +1,38 @@
-let { BuildSpec, OutputLib, Local, Prebuilt, .. } = import "minimal.ncl" in
+let { BuildSpec, OutputLib, OutputBin, Local, Prebuilt, Source, .. } = import "minimal.ncl" in
+let base = import "../base/build.ncl" in
+let toolchain = import "../toolchain/build.ncl" in
 {
   name = "gawk",
   inputs = [
-    { package = "gawk" } | Prebuilt,
+    { file = "build.sh" } | Local,
+    {
+      url = "gs://minimal-staging-archives/gawk-5.3.2.tar.xz",
+      sha256 = "f8c3486509de705192138b00ef2c00bbbdd0e84c30d5c07d23fc73a9dc4cc9cc"
+    } | Source,
+    base,
+    toolchain,
   ],
-  cmd = "",
+  cmd = "./build.sh",
   outputs = {
-    usr_bin = { glob = "usr/bin/**/*" } | OutputLib,
+    usr_bin = { path = "usr/bin/**/*" } | OutputBin,
     usr_include = { glob = "usr/include/**/*" } | OutputLib,
     usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
     usr_libexec = { glob = "usr/libexec/**/*" } | OutputLib,
     usr_share = { glob = "usr/share/**/*" } | OutputLib,
   },
+
+  replace_on_cycle = {
+    name = "gawk (prebuilt)",
+    inputs = [
+      { package = "gawk" } | Prebuilt,
+    ],
+    cmd = "",
+    outputs = {
+      usr_bin = { path = "usr/bin/**/*" } | OutputBin,
+      usr_include = { glob = "usr/include/**/*" } | OutputLib,
+      usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
+      usr_libexec = { glob = "usr/libexec/**/*" } | OutputLib,
+      usr_share = { glob = "usr/share/**/*" } | OutputLib,
+    },
+  } | BuildSpec,
 } | BuildSpec

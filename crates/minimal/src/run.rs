@@ -2,10 +2,10 @@ use anyhow::{Context, Result, bail};
 use build_sandbox::{BuildConfig, config::BuildScript, run_build};
 use cache::{Cache, LocalDir};
 use graph::dep_graph::SourceFetch;
+use graph::planner2::ExecPlan;
 use graph::{
     BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, SourceInput, SpecHash,
 };
-use graph::planner2::ExecPlan;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use tracing::debug;
