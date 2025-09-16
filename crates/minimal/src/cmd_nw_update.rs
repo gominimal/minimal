@@ -13,9 +13,18 @@ pub struct NWUpdateArgs {
     /// Path to a directory to cache build outputs in
     #[arg(long)]
     cache_dir: Option<PathBuf>,
+
+    /// Number of parallel builds
+    #[arg(short, long, default_value_t = 4)]
+    num_parallel_builds: usize,
 }
 
 pub async fn cmd_new_world_update(args: NWUpdateArgs) -> Result<()> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(args.num_parallel_builds)
+        .build_global()
+        .unwrap();
+
     let graph = super::graph_from_package_name(&args.package, false);
     let cache = super::load_cache(args.cache_dir).unwrap();
     let remote_storage = RemoteStorage::new().await.unwrap();

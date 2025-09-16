@@ -20,9 +20,18 @@ pub struct BuildArgs {
     /// Path to a directory to cache build outputs in
     #[arg(long)]
     cache_dir: Option<PathBuf>,
+
+    /// Number of parallel builds
+    #[arg(short, long, default_value_t = 4)]
+    num_parallel_builds: usize,
 }
 
 pub async fn cmd_build(args: BuildArgs) -> Result<()> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(args.num_parallel_builds)
+        .build_global()
+        .unwrap();
+
     let graph = match args.package {
         Some(ref package) => super::graph_from_package_name(package, args.source),
         None => super::graph_from_all_packages(),

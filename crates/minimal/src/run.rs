@@ -360,87 +360,125 @@ impl<'a> Run<'a> {
         Ok((dependencies, inputs))
     }
 
+    /// runs a single isolated build, does not take self so it can be spawned in a thread.
+    async fn do_build(
+        &self,
+        build: &BuildSpecRef,
+        full_build: bool,
+        debug_shell: bool,
+    ) -> Result<()> {
+        let bsh = self.graph.spec_hash(build);
+        let build = self.graph.get(build).unwrap();
+
+        if self.cache.read_dir(&bsh).is_ok() {
+            eprintln!(
+                "Skipping already-cached build {} [{}]",
+                build.name,
+                bsh.0.to_hex()
+            );
+            if full_build {
+                eprintln!("NOTE: Will not skip build once Tom finishes plumbing planner2");
+            }
+            return Ok(());
+        }
+        if is_pure_prebuilt(build) {
+            materialize_prebuilt(
+                build,
+                &bsh,
+                &self.cache,
+                &self.lockfile,
+                &self.remote_storage,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        eprintln!("Executing build: {} [{}]", build.name, bsh.0.to_hex());
+        let (dependencies, inputs) = self.sandbox_paths_from_buildspec(build).await?;
+
+        if build.cmd.trim().is_empty() {
+            eprintln!(
+                "No-op package with empty cmd: {}, creating cache entry",
+                build.name
+            );
+            let cache_handle = self.cache.write_dir(&bsh).unwrap();
+            cache_handle.finalize().unwrap();
+        } else {
+            // Regular build with build script
+            let cmd_parts: Vec<String> =
+                shlex::split(&build.cmd).unwrap_or_else(|| vec![build.cmd.clone()]);
+            let (executable, args) = if !cmd_parts.is_empty() {
+                let exe = cmd_parts[0].clone();
+                let args = cmd_parts[1..].to_vec();
+                (exe, args)
+            } else {
+                (build.cmd.clone(), vec![])
+            };
+
+            let config = BuildConfig {
+                dependencies,
+                inputs,
+                build_script: BuildScript {
+                    executable: executable.into(),
+                    args,
+                },
+                outputs: build
+                    .outputs
+                    .values()
+                    .map(|output| match output {
+                        BuildOutput::Library { glob } => glob.clone(),
+                        BuildOutput::Data { glob } => glob.clone(),
+                        BuildOutput::Binary { path } => path.clone(),
+                    })
+                    .collect(),
+                debug_shell,
+            };
+
+            let out_dir = self.cache.write_dir(&bsh).unwrap();
+            run_build(&config, out_dir.path(), true)?;
+            out_dir.finalize().unwrap();
+        }
+
+        eprintln!("Completed isolated build: {}", build.name);
+        Ok(())
+    }
+
     pub async fn execute(&mut self, plan: ExecPlan<'a>, debug: Option<BuildSpecRef>) -> Result<()> {
         // Execute builds in dependency order - each build runs in isolation
         // and can only access outputs from previously completed builds
-        // let mut lockfile_updates = Vec::new(); // Track what needs lockfile updates
 
         for phase in plan {
-            for (bsr, full_build) in phase.unwrap().builds.iter() {
-                let bsh = self.graph.spec_hash(bsr);
-                let build = self.graph.get(bsr).unwrap();
+            use std::sync::{Arc, Mutex};
+            let self2 = Arc::new(&*self);
+            let build_which_errored = Arc::new(Mutex::new(None));
 
-                if self.cache.read_dir(&bsh).is_ok() {
-                    eprintln!(
-                        "Skipping already-cached build {} [{}]",
-                        build.name,
-                        bsh.0.to_hex()
-                    );
-                    if *full_build {
-                        eprintln!("NOTE: Will not skip build once Tom finishes plumbing planner2");
-                    }
-                    continue;
+            rayon::scope(|s| {
+                for (bsr, full_build) in phase.unwrap().builds.iter() {
+                    let debug_shell = matches!(debug, Some(debug_bsr) if *bsr == debug_bsr);
+                    let bsr = bsr.to_owned();
+                    let full_build = full_build.to_owned();
+                    let self2 = self2.clone();
+                    let err_bsr = build_which_errored.clone();
+
+                    s.spawn(move |_| {
+                        let res = futures::executor::block_on(self2.do_build(
+                            &bsr,
+                            full_build,
+                            debug_shell,
+                        ));
+                        if let Err(e) = res {
+                            *err_bsr.lock().unwrap() = Some((bsr, e));
+                        }
+                    });
                 }
-                if is_pure_prebuilt(build) {
-                    materialize_prebuilt(
-                        build,
-                        &bsh,
-                        &self.cache,
-                        &self.lockfile,
-                        &self.remote_storage,
-                    )
-                    .await?;
-                    continue;
-                }
+            });
 
-                eprintln!("Executing build: {} [{}]", build.name, bsh.0.to_hex());
-                let (dependencies, inputs) = self.sandbox_paths_from_buildspec(build).await?;
-
-                if build.cmd.trim().is_empty() {
-                    eprintln!(
-                        "No-op package with empty cmd: {}, creating cache entry",
-                        build.name
-                    );
-                    let cache_handle = self.cache.write_dir(&bsh).unwrap();
-                    cache_handle.finalize().unwrap();
-                } else {
-                    // Regular build with build script
-                    let cmd_parts: Vec<String> =
-                        shlex::split(&build.cmd).unwrap_or_else(|| vec![build.cmd.clone()]);
-                    let (executable, args) = if !cmd_parts.is_empty() {
-                        let exe = cmd_parts[0].clone();
-                        let args = cmd_parts[1..].to_vec();
-                        (exe, args)
-                    } else {
-                        (build.cmd.clone(), vec![])
-                    };
-
-                    let config = BuildConfig {
-                        dependencies,
-                        inputs,
-                        build_script: BuildScript {
-                            executable: executable.into(),
-                            args,
-                        },
-                        outputs: build
-                            .outputs
-                            .values()
-                            .map(|output| match output {
-                                BuildOutput::Library { glob } => glob.clone(),
-                                BuildOutput::Data { glob } => glob.clone(),
-                                BuildOutput::Binary { path } => path.clone(),
-                            })
-                            .collect(),
-                        debug_shell: matches!(debug, Some(debug_bsr) if bsr == &debug_bsr),
-                    };
-
-                    let out_dir = self.cache.write_dir(&bsh).unwrap();
-                    run_build(&config, out_dir.path(), true)?;
-                    out_dir.finalize().unwrap();
-                }
-
-                eprintln!("Completed isolated build: {}", build.name);
-            }
+            Arc::into_inner(build_which_errored)
+                .unwrap()
+                .into_inner()
+                .unwrap()
+                .map(|(_bsr, e)| Err(e))
+                .unwrap_or(Ok(()))?;
         }
 
         Ok(())
