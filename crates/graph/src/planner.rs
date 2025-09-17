@@ -85,16 +85,11 @@ impl<'a> ExecPlan<'a> {
         let mut path: Vec<BuildSpecRef> = Vec::with_capacity(self.reachable.len() + 256);
         let mut seen: HashMap<BuildSpecRef, ()> = HashMap::with_capacity(self.reachable.len());
 
-        for cursor in self
-            .reachable
-            .iter()
-            .chain(self.reachable.iter().filter_map(|bsr| {
-                match self.dep_graph.get(bsr).unwrap().replace_on_cycle {
-                    None => None,
-                    Some(ref bsr) => Some(bsr),
-                }
-            }))
-        {
+        for cursor in self.reachable.iter().chain(
+            self.reachable
+                .iter()
+                .filter_map(|bsr| self.dep_graph.get(bsr).unwrap().replace_on_cycle.as_ref()),
+        ) {
             if self.is_built(*cursor, None) {
                 continue;
             }
@@ -276,7 +271,7 @@ impl<'a> Iterator for ExecPlan<'a> {
                             .to_owned(),
                     ),
                     // try seeing if theres a replace_on_cycle as the first element
-                    (path.first().unwrap(), path.last().unwrap().clone()),
+                    (path.first().unwrap(), *path.last().unwrap()),
                 ] {
                     if let Some(replace_on_cycle) =
                         self.dep_graph.get(head).unwrap().replace_on_cycle

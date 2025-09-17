@@ -67,7 +67,7 @@ impl RemoteStorage {
         let data = self.download(bucket_id.clone(), file).await?;
         {
             let mut f = fs::File::create(download_path)?;
-            f.write(&data).unwrap();
+            f.write_all(&data).unwrap();
             f.sync_data()?;
         }
 

@@ -76,7 +76,7 @@ impl<'a> SpecHasher<'a> {
 
         // allocate a spot in the specs array, remember our index
         let idx = SpecIndex(self.specs.len());
-        self.specs.push((bsr.clone(), None));
+        self.specs.push((*bsr, None));
         self.spec_idx.insert(*bsr, idx);
 
         // recurse in a well-defined order to capture referenced specs.
@@ -165,13 +165,7 @@ fn build_attrs_hash(spec: &BuildSpec, h: &mut Hasher) {
     h.write_all(b"-inputs").unwrap();
     spec.inputs
         .iter()
-        .filter_map(|i| {
-            if i.as_build().is_some() {
-                None
-            } else {
-                Some(i)
-            }
-        })
+        .filter(|i| i.as_build().is_none())
         .for_each(|i| build_input_hash(i, h));
 
     h.write_all(b"-outputs").unwrap();

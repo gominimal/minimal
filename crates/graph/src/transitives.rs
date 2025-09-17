@@ -250,10 +250,7 @@ mod tests {
         assert_eq!(
             deps,
             vec![
-                (
-                    dg.by_name("top dep").next().unwrap().clone(),
-                    vec![DepInfo::Ours],
-                ),
+                (dg.by_name("top dep").next().unwrap(), vec![DepInfo::Ours],),
                 (
                     dg.by_name("nested dep").next().unwrap(),
                     vec![DepInfo::Inherited {

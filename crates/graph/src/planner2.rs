@@ -28,7 +28,6 @@ impl BuildState {
     }
 }
 
-///
 #[derive(Debug, Default, Clone, PartialEq)]
 struct BuildInfo {
     state: BuildState,
