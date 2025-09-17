@@ -1,8 +1,8 @@
 let { BuildSpec, OutputLib, Local, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
+let glibc = import "../glibc/build.source.ncl" in
 let ncurses = import "../ncurses/build.ncl" in
-let toolchain-gnullvm = import "../toolchain-gnullvm/build.ncl" in
-let gmp = import "../gmp/build.source.ncl" in
+let toolchain = import "../toolchain/build.ncl" in
 {
   name = "less",
   inputs = [
@@ -12,9 +12,11 @@ let gmp = import "../gmp/build.source.ncl" in
       sha256 = "9b68820c34fa8a0af6b0e01b74f0298bcdd40a0489c61649b47058908a153d78"
     } | Source,
     base,
+    toolchain,
+  ],
+  runtime_deps = [
+    glibc,
     ncurses,
-    toolchain-gnullvm,
-    # gmp,
   ],
   cmd = "./build.sh",
   outputs = {

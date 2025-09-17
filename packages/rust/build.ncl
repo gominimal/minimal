@@ -21,15 +21,15 @@ let toolchain-gnullvm = import "../toolchain-gnullvm/build.ncl" in
     base,
     cmake,
     curl,
-    llvm,
-    openssl,
     pkgconf,
     python,
     toolchain-gnullvm,
   ],
   runtime_deps = [
-    sqlite,
     libffi,
+    llvm,
+    openssl,
+    sqlite,
   ],
   cmd = "./build.sh",
   outputs = {

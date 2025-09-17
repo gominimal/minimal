@@ -1,10 +1,11 @@
-let { BuildSpec, OutputLib, Local, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, OutputLib, Local, Prebuilt, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let cmake = import "../cmake/build.ncl" in
 let libffi = import "../libffi/build.ncl" in
 let ninja = import "../ninja/build.ncl" in
 let python = import "../python/build.ncl" in
-let toolchain-gnullvm = import "../toolchain-gnullvm/build.ncl" in
+# let toolchain-gnullvm = import "../toolchain-gnullvm/build.ncl" in
+let toolchain = import "../toolchain/build.ncl" in
 {
   name = "llvm",
   inputs = [
@@ -34,10 +35,21 @@ let toolchain-gnullvm = import "../toolchain-gnullvm/build.ncl" in
     libffi,
     ninja,
     python,
-    toolchain-gnullvm,
+    # toolchain-gnullvm,
+    toolchain,
   ],
   cmd = "./build.sh",
   outputs = {
     usr = { glob = "usr/**/*" } | OutputLib,
   },
+
+  replace_on_cycle =
+    {
+      name = "llvm (prebuilt)",
+      inputs = [
+        { package = "llvm" } | Prebuilt,
+      ],
+      cmd = "",
+      outputs = {},
+    } | BuildSpec,
 } | BuildSpec

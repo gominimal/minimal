@@ -14,6 +14,8 @@ mod cmd_plan;
 use cmd_plan::{PlanArgs, cmd_plan};
 mod cmd_nw_update;
 use cmd_nw_update::{NWUpdateArgs, cmd_new_world_update};
+mod cmd_oci_image;
+use cmd_oci_image::{OciImageArgs, cmd_oci_image};
 
 #[derive(Parser)]
 #[command(name = "minimal")]
@@ -22,6 +24,7 @@ enum Cli {
     Build(BuildArgs),
     Plan(PlanArgs),
     NewWorldUpdate(NWUpdateArgs),
+    OciImage(OciImageArgs),
 }
 
 pub fn graph_from_package_name(package_name: &String, source: bool) -> DepGraph {
@@ -147,5 +150,6 @@ async fn main() -> Result<()> {
         Cli::Build(args) => cmd_build(args).await,
         Cli::Plan(args) => cmd_plan(args),
         Cli::NewWorldUpdate(args) => cmd_new_world_update(args).await,
+        Cli::OciImage(args) => cmd_oci_image(args).await,
     }
 }

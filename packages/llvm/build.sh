@@ -22,8 +22,8 @@ sed 's/utility/tool/' -i utils/FileCheck/CMakeLists.txt
 mkdir -v build
 cd build
 
-export CC=clang 
-export CXX=clang++ 
+# export CC=clang 
+# export CXX=clang++ 
 
 cmake \
 	-D CLANG_CONFIG_FILE_SYSTEM_DIR=/etc/clang \
