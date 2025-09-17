@@ -321,6 +321,25 @@ impl<FS: FileSystem> Cache<FS> {
     }
 }
 
+/// An adapter that lets you use a [Cache] as a [graph::BinProvider].
+#[derive(Debug, Clone)]
+pub struct CacheBinProvider<'a> {
+    graph: &'a graph::DepGraph,
+    cache: Cache<LocalDir>,
+}
+
+impl<'a> CacheBinProvider<'a> {
+    pub fn new(graph: &'a graph::DepGraph, cache: Cache<LocalDir>) -> Self {
+        Self { graph, cache }
+    }
+}
+
+impl<'a> graph::BinProvider for CacheBinProvider<'a> {
+    fn exists(&self, bsr: &graph::BuildSpecRef) -> bool {
+        self.cache.read_dir(&self.graph.spec_hash(bsr)).is_ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

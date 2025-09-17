@@ -5,7 +5,7 @@
 //! becomes a separate layer,.
 
 use anyhow::Result;
-use cache::{Cache, LocalDir};
+use cache::{Cache, CacheBinProvider, LocalDir};
 use docker_credential::{CredentialRetrievalError, DockerCredential, get_credential};
 use flate2::{Compression, write::GzEncoder};
 use graph::{BuildSpecRef, DepGraph, ExecPlan, SpecHash, Transitives};
@@ -153,7 +153,12 @@ async fn ensure_package_built(
         PrebuiltsLock::default()
     });
     let mut runner = Run::new(graph, cache.clone(), remote_storage, lockfile);
-    runner.execute(ExecPlan::new(graph), None).await?;
+    runner
+        .execute(
+            ExecPlan::new_with_bin_provider(graph, CacheBinProvider::new(graph, cache.clone())),
+            None,
+        )
+        .await?;
 
     Ok(())
 }

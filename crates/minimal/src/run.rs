@@ -9,7 +9,7 @@ use graph::{
 use std::collections::HashSet;
 use std::path::PathBuf;
 use tempfile::Builder;
-use tracing::debug;
+use tracing::{debug, warn};
 use url::Url;
 
 use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage};
@@ -389,22 +389,18 @@ impl<'a> Run<'a> {
     async fn do_build(
         &self,
         build: &BuildSpecRef,
-        full_build: bool,
+        _full_build: bool,
         debug_shell: bool,
     ) -> Result<Option<PendingDir>> {
         let bsh = self.graph.spec_hash(build);
         let build = self.graph.get(build).unwrap();
 
         if self.cache.read_dir(&bsh).is_ok() {
-            eprintln!(
-                "Skipping already-cached build {} [{}]",
+            warn!(
+                "Not skipping already-cached build {} [{}], new behavior",
                 build.name,
                 bsh.0.to_hex()
             );
-            if full_build {
-                eprintln!("NOTE: Will not skip build once Tom finishes plumbing planner2");
-            }
-            return Ok(None);
         }
         if is_pure_prebuilt(build) {
             return Ok(Some(

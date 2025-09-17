@@ -1,5 +1,6 @@
 use anyhow::Result;
-use graph::ExecPlan;
+use cache::{Cache, CacheBinProvider, LocalDir};
+use graph::{BinProvider, DepGraph, ExecPlan};
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
@@ -11,6 +12,10 @@ pub struct PlanArgs {
     /// Path to a directory to cache build outputs in
     #[arg(long)]
     cache_dir: Option<PathBuf>,
+
+    /// Whether to ignore the local cache
+    #[arg(long, default_value_t = false)]
+    no_cache: bool,
 }
 
 pub fn cmd_plan(args: PlanArgs) -> Result<()> {
@@ -24,9 +29,23 @@ pub fn cmd_plan(args: PlanArgs) -> Result<()> {
     };
 
     let cache = super::load_cache(args.cache_dir).unwrap();
+    if args.no_cache {
+        print_plan(&graph, &cache, ExecPlan::new(&graph));
+    } else {
+        let adapter = CacheBinProvider::new(&graph, cache.clone());
+        print_plan(
+            &graph,
+            &cache,
+            ExecPlan::new_with_bin_provider(&graph, adapter),
+        );
+    }
 
+    Ok(())
+}
+
+fn print_plan<BP: BinProvider>(graph: &DepGraph, cache: &Cache<LocalDir>, plan: ExecPlan<BP>) {
     println!("✓ = Already built, ⚙️ = To be built");
-    for (i, phase) in ExecPlan::new(&graph).enumerate() {
+    for (i, phase) in plan.enumerate() {
         println!("Phase {}", i + 1);
         for (bsr, do_full_build) in phase.unwrap().builds.iter() {
             let build = graph.get(bsr).unwrap();
@@ -43,6 +62,4 @@ pub fn cmd_plan(args: PlanArgs) -> Result<()> {
             );
         }
     }
-
-    Ok(())
 }

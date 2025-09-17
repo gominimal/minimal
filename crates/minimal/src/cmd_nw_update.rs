@@ -1,7 +1,6 @@
-use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage, run::Run};
-use anyhow::{Context, Result};
+use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage};
+use anyhow::Result;
 use graph::BuildSpecInput;
-use graph::ExecPlan;
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
@@ -14,23 +13,33 @@ pub struct NWUpdateArgs {
     #[arg(long)]
     cache_dir: Option<PathBuf>,
 
+    /// Whether to ignore the local cache
+    #[arg(long, default_value_t = false)]
+    no_cache: bool,
+
     /// Number of parallel builds
     #[arg(short, long, default_value_t = 4)]
     num_parallel_builds: usize,
 }
 
 pub async fn cmd_new_world_update(args: NWUpdateArgs) -> Result<()> {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(args.num_parallel_builds)
-        .build_global()
-        .unwrap();
-
     let graph = match args.packages.len() {
         1 => super::graph_from_package_name(&args.packages[0], false),
         _ => super::graph_from_package_names(&args.packages),
     };
 
     let cache = super::load_cache(args.cache_dir).unwrap();
+
+    crate::cmd_build::cmd_build_impl(
+        &graph,
+        args.no_cache,
+        false,
+        cache.clone(),
+        None,
+        args.num_parallel_builds,
+    )
+    .await?;
+
     let remote_storage = RemoteStorage::new().await.unwrap();
 
     // Load the lockfile
@@ -44,16 +53,6 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs) -> Result<()> {
         eprintln!("Using empty lockfile...");
         PrebuiltsLock::default()
     });
-
-    let mut run = Run::new(
-        &graph,
-        cache.clone(),
-        remote_storage.clone(),
-        lockfile.clone(),
-    );
-    run.execute(ExecPlan::new(&graph), None)
-        .await
-        .context("Failed to execute build")?;
 
     for bsr in &graph.top_levels {
         // Work out the name of the prebuilt by looking at replace_by_cycle and then the first input
