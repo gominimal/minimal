@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use build_sandbox::{BuildConfig, config::BuildScript, run_build};
-use cache::{Cache, LocalDir};
+use cache::{Cache, LocalDir, PendingDir};
 use graph::dep_graph::SourceFetch;
 use graph::planner2::ExecPlan;
 use graph::{
@@ -183,7 +183,7 @@ async fn materialize_prebuilt(
     cache: &Cache<LocalDir>,
     lockfile: &PrebuiltsLock,
     remote_storage: &RemoteStorage,
-) -> Result<()> {
+) -> Result<PendingDir> {
     eprintln!(
         "Pure prebuilt package: {}, copying files directly",
         build.name
@@ -275,8 +275,7 @@ async fn materialize_prebuilt(
             }
         }
     }
-    cache_handle.finalize().unwrap();
-    Ok(())
+    Ok(cache_handle)
 }
 
 /// A run executes builds according to some plan.
@@ -373,7 +372,7 @@ impl<'a> Run<'a> {
         build: &BuildSpecRef,
         full_build: bool,
         debug_shell: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<PendingDir>> {
         let bsh = self.graph.spec_hash(build);
         let build = self.graph.get(build).unwrap();
 
@@ -386,18 +385,19 @@ impl<'a> Run<'a> {
             if full_build {
                 eprintln!("NOTE: Will not skip build once Tom finishes plumbing planner2");
             }
-            return Ok(());
+            return Ok(None);
         }
         if is_pure_prebuilt(build) {
-            materialize_prebuilt(
-                build,
-                &bsh,
-                &self.cache,
-                &self.lockfile,
-                &self.remote_storage,
-            )
-            .await?;
-            return Ok(());
+            return Ok(Some(
+                materialize_prebuilt(
+                    build,
+                    &bsh,
+                    &self.cache,
+                    &self.lockfile,
+                    &self.remote_storage,
+                )
+                .await?,
+            ));
         }
 
         eprintln!("Executing build: {} [{}]", build.name, bsh.0.to_hex());
@@ -409,7 +409,7 @@ impl<'a> Run<'a> {
                 build.name
             );
             let cache_handle = self.cache.write_dir(&bsh).unwrap();
-            cache_handle.finalize().unwrap();
+            Ok(Some(cache_handle))
         } else {
             // Regular build with build script
             let cmd_parts: Vec<String> =
@@ -443,11 +443,9 @@ impl<'a> Run<'a> {
 
             let out_dir = self.cache.write_dir(&bsh).unwrap();
             run_build(&config, out_dir.path(), true)?;
-            out_dir.finalize().unwrap();
+            eprintln!("Completed isolated build: {}", build.name);
+            Ok(Some(out_dir))
         }
-
-        eprintln!("Completed isolated build: {}", build.name);
-        Ok(())
     }
 
     pub async fn execute(&mut self, plan: ExecPlan<'a>, debug: Option<BuildSpecRef>) -> Result<()> {
@@ -460,6 +458,9 @@ impl<'a> Run<'a> {
             use std::sync::{Arc, Mutex};
             let self2 = Arc::new(&*self);
             let build_which_errored = Arc::new(Mutex::new(None));
+            let cache_handles = Arc::new(Mutex::new(Vec::with_capacity(
+                phase.as_ref().unwrap().builds.len(),
+            )));
 
             rayon::scope(|s| {
                 for (bsr, full_build) in phase.unwrap().builds.iter() {
@@ -469,28 +470,44 @@ impl<'a> Run<'a> {
                     let full_build = full_build.to_owned();
                     let self2 = self2.clone();
                     let err_bsr = build_which_errored.clone();
+                    let cache_handles = cache_handles.clone();
 
                     s.spawn(move |_| {
                         let _rt = tokio_runtime.enter();
 
-                        let res = futures::executor::block_on(self2.do_build(
+                        let cache_handle = futures::executor::block_on(self2.do_build(
                             &bsr,
                             full_build,
                             debug_shell,
                         ));
-                        if let Err(e) = res {
-                            *err_bsr.lock().unwrap() = Some((bsr, e));
+
+                        match cache_handle {
+                            Err(e) => {
+                                *err_bsr.lock().unwrap() = Some((bsr, e));
+                            }
+                            Ok(None) => {}
+                            Ok(Some(cache_handle)) => {
+                                cache_handles.lock().unwrap().push(cache_handle);
+                            }
                         }
                     });
                 }
             });
 
-            Arc::into_inner(build_which_errored)
+            let err = Arc::into_inner(build_which_errored)
+                .unwrap()
+                .into_inner()
+                .unwrap();
+
+            // Commit all the builds to the build cache
+            Arc::into_inner(cache_handles)
                 .unwrap()
                 .into_inner()
                 .unwrap()
-                .map(|(_bsr, e)| Err(e))
-                .unwrap_or(Ok(()))?;
+                .into_iter()
+                .for_each(|ch| ch.finalize().unwrap());
+
+            err.map(|(_bsr, e)| Err(e)).unwrap_or(Ok(()))?;
         }
 
         Ok(())
