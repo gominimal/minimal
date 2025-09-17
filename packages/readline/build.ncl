@@ -1,17 +1,42 @@
-let { BuildSpec, OutputLib, Local, Prebuilt, .. } = import "minimal.ncl" in
+let { BuildSpec, OutputBin, OutputData, OutputLib, Local, Prebuilt, Source, .. } = import "minimal.ncl" in
+let base = import "../base/build.ncl" in
 let ncurses = import "../ncurses/build.ncl" in
+let toolchain = import "../toolchain/build.ncl" in
 {
   name = "readline",
   inputs = [
-    { package = "readline" } | Prebuilt,
+    { file = "build.sh" } | Local,
+    {
+      url = "gs://minimal-staging-archives/readline-8.3.tar.gz",
+      sha256 = "fe5383204467828cd495ee8d1d3c037a7eba1389c22bc6a041f627976f9061cc"
+    } | Source,
+    base,
+    toolchain,
   ],
   runtime_deps = [
     ncurses,
   ],
-  cmd = "",
+  cmd = "./build.sh",
   outputs = {
-    usr_bin = { glob = "usr/bin/**/*" } | OutputLib,
-    usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
-    usr_include = { glob = "usr/include/**/*" } | OutputLib,
+    libreadline = { glob = "usr/lib/libreadline.so*" } | OutputLib,
+    libhistory = { glob = "usr/lib/libhistory.so*" } | OutputLib,
+
+    pkgconfig = { data = "usr/lib/pkgconfig/*.pc" } | OutputData,
+    headers = { data = "usr/include/readline/*.h" } | OutputData,
   },
+
+  replace_on_cycle = {
+    name = "readline (prebuilt)",
+    inputs = [
+      { package = "readline" } | Prebuilt,
+    ],
+    runtime_deps = [
+      ncurses,
+    ],
+    cmd = "",
+    outputs = {
+      usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
+      usr_include = { data = "usr/include/**/*" } | OutputData,
+    },
+  } | BuildSpec,
 } | BuildSpec

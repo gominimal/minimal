@@ -442,7 +442,8 @@ impl<'a> Run<'a> {
             };
 
             let out_dir = self.cache.write_dir(&bsh).unwrap();
-            run_build(&config, out_dir.path(), true)?;
+            run_build(&config, out_dir.path(), true)
+                .map_err(|e| anyhow::anyhow!("Failed to build {}: {:?}", build.name, e))?;
             eprintln!("Completed isolated build: {}", build.name);
             Ok(Some(out_dir))
         }
