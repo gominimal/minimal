@@ -1,0 +1,35 @@
+let { BuildSpec, OutputLib, OutputData, Local, Source, .. } = import "minimal.ncl" in
+let base = import "../base/build.ncl" in
+let m4 = import "../m4/build.ncl" in
+let toolchain = import "../toolchain/build.ncl" in
+
+let bzip2 = import "../bzip2/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
+let libz = import "../zlib/build.ncl" in
+let xz = import "../xz/build.ncl" in
+let zstd = import "../zstd/build.ncl" in
+{
+  name = "elfutils",
+  inputs = [
+    { file = "build.sh" } | Local,
+    {
+      url = "gs://minimal-staging-archives/elfutils-0.192.tar.bz2",
+      sha256 = "616099beae24aba11f9b63d86ca6cc8d566d968b802391334c91df54eab416b4"
+    } | Source,
+    base,
+    m4,
+    toolchain,
+  ],
+  runtime_deps = [
+    bzip2,
+    glibc,
+    libz,
+    xz,
+    zstd,
+  ],
+  cmd = "./build.sh",
+  outputs = {
+    libs = { glob = "usr/lib/*" } | OutputLib,
+    include = { data = "usr/include/*" } | OutputData,
+  },
+} | BuildSpec
