@@ -23,6 +23,7 @@ tempfile = { version = "3.0" }
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow = "1.0.99"
 clap = { version = "4.4", features = ["derive"] }
 dirs = "6"
 
@@ -33,6 +34,10 @@ serde_json = { version = "1.0" }
 rayon = "1.11"
 tokio = { version = "1.47.1", features = ["full"] }
 futures = "0.3"
+
+google-cloud-gax = "1.0.0"
+google-cloud-storage = "1.0.0"
+reqwest = "0.12" # keep in sync with google-cloud-gax
 
 # our crates
 build-sandbox = { path = "crates/build-sandbox" }

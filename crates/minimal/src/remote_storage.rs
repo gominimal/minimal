@@ -39,6 +39,56 @@ impl RemoteStorage {
         })
     }
 
+    pub async fn download_https_with_verification_and_caching(
+        &self,
+        url: &str,
+        sha256: &str,
+    ) -> Result<Bytes> {
+        if sha256.contains("/") {
+            bail!("SHA256 had a slash in it");
+        }
+        let cached_path = self.cache_dir.join(sha256);
+
+        if fs::exists(&cached_path)? {
+            let file_contents = fs::read(&cached_path)?;
+            // Verify SHA256 hash
+            let mut hasher = Sha256::new();
+            hasher.update(&file_contents);
+            let computed_hash = hasher.finalize();
+            let computed_hex = hex::encode(computed_hash);
+
+            if computed_hex == sha256 {
+                return Ok(file_contents.into());
+            }
+        }
+
+        {
+            let mut f = fs::File::create(&cached_path)?;
+            let mut res = reqwest::get(url).await?;
+
+            while let Some(chunk) = res.chunk().await? {
+                f.write(&chunk).unwrap();
+            }
+            f.sync_all()?;
+        }
+
+        let data = fs::read(&cached_path)?;
+        let mut hasher = Sha256::new();
+        hasher.update(&data);
+        let computed_hash = hasher.finalize();
+        let computed_hex = hex::encode(computed_hash);
+
+        if computed_hex != sha256 {
+            bail!(
+                "SHA256 mismatch for {}: expected {}, got {}",
+                url,
+                sha256,
+                computed_hex
+            );
+        }
+        Ok(data.into())
+    }
+
     pub async fn download_with_verification_and_caching(
         &self,
         bucket_id: String,

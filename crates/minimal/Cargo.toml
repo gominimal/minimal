@@ -22,9 +22,12 @@ rayon.workspace = true
 tokio.workspace = true
 futures.workspace = true
 
-google-cloud-gax = "1.0.0"
-google-cloud-storage = "1.0.0"
-anyhow = "1.0.99"
+google-cloud-gax.workspace = true
+google-cloud-storage.workspace = true
+reqwest.workspace = true
+
+anyhow.workspace = true
+
 bytes = "1.10.1"
 url = "2.5"
 sha2 = "0.10.9"

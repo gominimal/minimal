@@ -27,6 +27,26 @@ async fn materialize_source(
             let url = Url::parse(url).with_context(|| format!("Failed to parse URL '{}'", url))?;
 
             match url.scheme() {
+                "https" => {
+                    let bytes = remote_storage.download_https_with_verification_and_caching(url.as_str(), &source.sha256).await?;
+
+                    let file_name = url.path().trim_start_matches('/');
+
+                    let temp_base = std::env::temp_dir()
+                        .join(format!("minpkgs-sources-{}", build_name.replace('/', "-")));
+                    std::fs::create_dir_all(&temp_base)?;
+
+                    let local_filename = file_name.rsplit('/').next().unwrap_or(file_name);
+                    let temp_path = temp_base.join(local_filename);
+                    std::fs::write(&temp_path, bytes)?;
+
+                    debug!(
+                        "  Downloaded and verified source from {}",
+                        url
+                    );
+                    Ok(temp_path)
+                },
+
                 "gs" => {
                     let bucket_id = url.host_str().with_context(|| {
                         format!(
