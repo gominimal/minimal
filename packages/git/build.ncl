@@ -32,6 +32,6 @@ let zlib = import "../zlib/build.ncl" in
     git_core = { glob = "usr/libexec/git-core/*" } | OutputLib,
     git_core_mergetools = { glob = "usr/libexec/git-core/mergetools/*" } | OutputLib,
 
-    locale = { glob = "usr/share/locale/**/*" } | OutputLib,
+    locale = { data = "usr/share/locale/**/*" } | OutputData,
   },
 } | BuildSpec
