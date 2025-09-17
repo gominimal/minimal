@@ -4,9 +4,9 @@ use std::path::PathBuf;
 
 #[derive(clap::Args)]
 pub struct PlanArgs {
-    /// Package name to build
-    #[arg(short, long)]
-    package: Option<String>,
+    /// Package names to build
+    #[arg(short, long, alias="package", value_delimiter=',', num_args=0..)]
+    packages: Option<Vec<String>>,
 
     /// Path to a directory to cache build outputs in
     #[arg(long)]
@@ -14,10 +14,15 @@ pub struct PlanArgs {
 }
 
 pub fn cmd_plan(args: PlanArgs) -> Result<()> {
-    let graph = match args.package {
-        Some(ref package) => super::graph_from_package_name(package, false),
+    let graph = match args.packages {
+        Some(ref packages) => match packages.len() {
+            0 => super::graph_from_all_packages(),
+            1 => super::graph_from_package_name(&packages[0], false),
+            _ => super::graph_from_package_names(packages),
+        },
         None => super::graph_from_all_packages(),
     };
+
     let cache = super::load_cache(args.cache_dir).unwrap();
 
     println!("✓ = Already built, ⚙️ = To be built");

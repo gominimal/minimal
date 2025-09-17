@@ -5,9 +5,9 @@ use std::path::PathBuf;
 
 #[derive(clap::Args)]
 pub struct BuildArgs {
-    /// Package name to build
-    #[arg(short, long)]
-    package: Option<String>,
+    /// Package names to build
+    #[arg(short, long, alias="package", value_delimiter=',', num_args=0..)]
+    packages: Option<Vec<String>>,
 
     /// Launch debug shell instead of building
     #[arg(short, long)]
@@ -32,8 +32,12 @@ pub async fn cmd_build(args: BuildArgs) -> Result<()> {
         .build_global()
         .unwrap();
 
-    let graph = match args.package {
-        Some(ref package) => super::graph_from_package_name(package, args.source),
+    let graph = match args.packages {
+        Some(ref packages) => match packages.len() {
+            0 => super::graph_from_all_packages(),
+            1 => super::graph_from_package_name(&packages[0], args.source),
+            _ => super::graph_from_package_names(packages),
+        },
         None => super::graph_from_all_packages(),
     };
 

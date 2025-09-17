@@ -135,6 +135,40 @@ impl SpecReader {
         Ok(out)
     }
 
+    /// Processes the build-spec universe with a top level using the named packages, given options and a path to a packages directory.
+    pub fn new_with_pkgs<P: AsRef<Path>>(
+        packages: &[String],
+        pkg_dir: P,
+        opts: &SpecReaderOptions,
+    ) -> Result<Self, SpecError> {
+        let mut src = String::with_capacity(2048);
+        src.push_str("[\n");
+        for name in packages {
+            src.push_str(&format!(
+                "  import \"{}/{}/build.ncl\",\n",
+                pkg_dir.as_ref().to_str().unwrap(),
+                name.as_str()
+            ));
+        }
+        src.push(']');
+
+        let mut program = Program::new_from_source(
+            io::Cursor::new(src),
+            "toplevel",
+            std::io::stderr(),
+            NullReporter {},
+        )?;
+        program.add_import_paths([&opts.minimal_lib_path].iter());
+
+        program
+            .typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk)
+            .map_err(|e| SpecError::Nickel(program.files(), e))?;
+
+        let mut out = Self { p: program };
+        out.annotate()?;
+        Ok(out)
+    }
+
     /// Processes the resulting build-spec universe, given options and a path to source representing the top level.
     pub fn new_with_path<P: Into<OsString>>(
         src: P,
