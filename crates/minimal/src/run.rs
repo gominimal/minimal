@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use build_sandbox::{BuildConfig, config::BuildScript, run_build};
 use cache::{Cache, LocalDir, PendingDir};
 use graph::dep_graph::SourceFetch;
-use graph::planner2::ExecPlan;
+use graph::planner2::{BinProvider, ExecPlan};
 use graph::{
     BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, SourceInput, SpecHash,
 };
@@ -28,7 +28,9 @@ async fn materialize_source(
 
             match url.scheme() {
                 "https" => {
-                    let bytes = remote_storage.download_https_with_verification_and_caching(url.as_str(), &source.sha256).await?;
+                    let bytes = remote_storage
+                        .download_https_with_verification_and_caching(url.as_str(), &source.sha256)
+                        .await?;
 
                     let file_name = url.path().trim_start_matches('/');
 
@@ -40,12 +42,9 @@ async fn materialize_source(
                     let temp_path = temp_base.join(local_filename);
                     std::fs::write(&temp_path, bytes)?;
 
-                    debug!(
-                        "  Downloaded and verified source from {}",
-                        url
-                    );
+                    debug!("  Downloaded and verified source from {}", url);
                     Ok(temp_path)
-                },
+                }
 
                 "gs" => {
                     let bucket_id = url.host_str().with_context(|| {
@@ -469,7 +468,11 @@ impl<'a> Run<'a> {
         }
     }
 
-    pub async fn execute(&mut self, plan: ExecPlan<'a>, debug: Option<BuildSpecRef>) -> Result<()> {
+    pub async fn execute<BP: BinProvider>(
+        &mut self,
+        plan: ExecPlan<'a, BP>,
+        debug: Option<BuildSpecRef>,
+    ) -> Result<()> {
         // Execute builds in dependency order - each build runs in isolation
         // and can only access outputs from previously completed builds
 

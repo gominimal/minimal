@@ -410,7 +410,12 @@ impl GraphBuilder {
                                     .value
                                     .as_ref()
                                     .map(|rt| eval_if_closure(rt, program))
-                                    .unwrap()?;
+                                    .ok_or_else(|| Error::MissingField {
+                                        files: program.files(),
+                                        obj: ObjTy::Builder,
+                                        pos: rt.pos,
+                                        field: "inputs",
+                                    })??;
                                 if let Term::Array(a, _attrs) = inputs_rt.as_ref() {
                                     inputs = Some(
                                         a.iter()
@@ -450,7 +455,12 @@ impl GraphBuilder {
                                     .value
                                     .as_ref()
                                     .map(|rt| eval_if_closure(rt, program))
-                                    .unwrap()?;
+                                    .ok_or_else(|| Error::MissingField {
+                                        files: program.files(),
+                                        obj: ObjTy::Builder,
+                                        pos: rt.pos,
+                                        field: "outputs",
+                                    })??;
 
                                 if let Term::Record(r) = outputs_rt.as_ref() {
                                     outputs = Some(

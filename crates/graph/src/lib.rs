@@ -53,12 +53,17 @@ impl Error {
                 pos,
             } => {
                 let mut files = files.clone();
-                let diagnostic = Diagnostic::error()
-                    .with_message(format!(
-                        "unexpected record: found {:?} when looking for {:?}",
-                        got, want
-                    ))
-                    .with_label(primary(&pos.into_opt().unwrap()).with_message("at this record"));
+                let diagnostic = Diagnostic::error().with_message(format!(
+                    "unexpected record: found {:?} when looking for {:?}",
+                    got, want
+                ));
+                let diagnostic = if let Some(pos) = pos.into_opt() {
+                    diagnostic
+                        .with_label(primary(&pos))
+                        .with_message("at this record")
+                } else {
+                    diagnostic
+                };
 
                 report(
                     &mut files,
@@ -69,9 +74,13 @@ impl Error {
             }
             MissingID(files, pos) => {
                 let mut files = files.clone();
-                let diagnostic = Diagnostic::error()
-                    .with_message("record was not declared a build spec")
-                    .with_label(primary(&pos.into_opt().unwrap()));
+                let diagnostic =
+                    Diagnostic::error().with_message("record was not declared a build spec");
+                let diagnostic = if let Some(pos) = pos.into_opt() {
+                    diagnostic.with_label(primary(&pos))
+                } else {
+                    diagnostic
+                };
 
                 report(
                     &mut files,
@@ -82,10 +91,13 @@ impl Error {
             }
             MissingTy(files, pos) => {
                 let mut files = files.clone();
-                let diagnostic = Diagnostic::error()
-                    .with_message("record was not given a type")
-                    .with_label(primary(&pos.into_opt().unwrap()))
-                    .with_note("Perhaps you meant to apply ('|' operator) a type such as BuildSpec, OutputLib, Source, etc etc");
+                let diagnostic = Diagnostic::error().with_message("record was not given a type");
+                let diagnostic = if let Some(pos) = pos.into_opt() {
+                    diagnostic.with_label(primary(&pos))
+                } else {
+                    diagnostic
+                };
+                let diagnostic = diagnostic.with_note("Perhaps you meant to apply ('|' operator) a type such as BuildSpec, OutputLib, Source, etc etc");
 
                 report(
                     &mut files,
@@ -101,12 +113,15 @@ impl Error {
                 field,
             } => {
                 let mut files = files.clone();
-                let diagnostic = Diagnostic::error()
-                    .with_message(format!(
-                        "missing field {} for record of type {:?}",
-                        field, obj
-                    ))
-                    .with_label(primary(&pos.into_opt().unwrap()));
+                let diagnostic = Diagnostic::error().with_message(format!(
+                    "missing field {} for record of type {:?}",
+                    field, obj
+                ));
+                let diagnostic = if let Some(pos) = pos.into_opt() {
+                    diagnostic.with_label(primary(&pos))
+                } else {
+                    diagnostic
+                };
 
                 report(
                     &mut files,

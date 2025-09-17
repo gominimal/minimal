@@ -89,7 +89,7 @@ impl BuildInfo {
     }
 }
 
-pub trait BinProvider {
+pub trait BinProvider: std::fmt::Debug {
     fn exists(&self, bsr: &BuildSpecRef) -> bool;
 }
 
@@ -103,7 +103,8 @@ impl BinProvider for () {
 ///
 /// Users should iterate this plan to get the ordering that build specs must be built.
 /// When multiple build specs are yielded in one iteration, these builds may be executed in parallel.
-pub struct ExecPlan<'a, BP: BinProvider = ()> {
+#[derive(Debug)]
+pub struct ExecPlan<'a, BP: BinProvider> {
     graph: &'a DepGraph,
     bin_provider: BP,
 
@@ -149,10 +150,6 @@ fn make_reachable<BP: BinProvider>(
             for runtime_dep_bsr in &build.runtime_deps {
                 make_reachable(runtime_dep_bsr, graph, bin_provider, builds)?;
             }
-        } else if let Some(cycle_breaker) = build.replace_on_cycle {
-            // We found a cycle, lets bring its cycle_breaker in preemptively.
-            make_reachable(&cycle_breaker, graph, bin_provider, builds)?;
-            builds.get_mut(&cycle_breaker).unwrap().cycle_breaker_of = Some(*bsr);
         }
         Ok(())
     } else {
@@ -177,10 +174,6 @@ fn make_reachable<BP: BinProvider>(
             {
                 make_reachable(bsr, graph, bin_provider, builds)?;
             }
-        } else if let Some(cycle_breaker) = build.replace_on_cycle {
-            // We found a cycle, lets bring its cycle_breaker in preemptively.
-            make_reachable(&cycle_breaker, graph, bin_provider, builds)?;
-            builds.get_mut(&cycle_breaker).unwrap().cycle_breaker_of = Some(*bsr);
         }
         Ok(())
     }
@@ -188,12 +181,20 @@ fn make_reachable<BP: BinProvider>(
 
 impl<'a> ExecPlan<'a, ()> {
     pub fn new(dep_graph: &'a DepGraph) -> Self {
-        ExecPlan::with_toplevels(dep_graph, &dep_graph.top_levels)
+        ExecPlan::with_toplevels((), dep_graph, &dep_graph.top_levels)
+    }
+}
+
+impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
+    pub fn new_with_bin_provider(dep_graph: &'a DepGraph, bin_provider: BP) -> ExecPlan<'a, BP> {
+        ExecPlan::with_toplevels(bin_provider, dep_graph, &dep_graph.top_levels)
     }
 
-    pub fn with_toplevels(graph: &'a DepGraph, toplevels: &[BuildSpecRef]) -> Self {
-        let mut bin_provider = ();
-
+    pub fn with_toplevels(
+        mut bin_provider: BP,
+        graph: &'a DepGraph,
+        toplevels: &[BuildSpecRef],
+    ) -> ExecPlan<'a, BP> {
         let mut toplevels = toplevels.to_owned();
         toplevels.sort();
         toplevels.dedup();
@@ -210,9 +211,7 @@ impl<'a> ExecPlan<'a, ()> {
             builds,
         }
     }
-}
 
-impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
     /// Returns true if the given dependency should be considered built in an earlier phase.
     fn is_built(&self, dependency: &BuildSpecRef, cycle_breakers_allowed: bool) -> bool {
         if self.bin_provider.exists(dependency) {
@@ -244,9 +243,48 @@ impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
 
     /// Returns true when the build plan is complete.
     pub fn finished(&self) -> bool {
+        // fast path: If the top level itself isnt satisfied, then we are definitely not done.
+        let tops_sat = self.toplevels.iter().all(|bsr| {
+            matches!(
+                self.builds.get(bsr).unwrap().state,
+                BuildState::FullyBuilt | BuildState::Fetched
+            )
+        });
+        if !tops_sat {
+            return false;
+        }
+
+        // If all the top levels are satisfied, we could still have some work to do if a transitive
+        // dep isn't satisfied.
+        fn check_runtime_deps_recursive(
+            bsr: &BuildSpecRef,
+            graph: &DepGraph,
+            builds: &IndexMap<BuildSpecRef, BuildInfo>,
+            seen: &mut HashMap<BuildSpecRef, ()>,
+        ) -> bool {
+            let self_satisfied = matches!(
+                builds.get(bsr).unwrap().state,
+                BuildState::FullyBuilt | BuildState::Fetched
+            );
+
+            // If we've already recursed, return early
+            if seen.contains_key(bsr) {
+                return self_satisfied;
+            }
+            seen.insert(*bsr, ());
+
+            let build = graph.get(bsr).unwrap();
+            build
+                .runtime_deps
+                .iter()
+                .all(|bsr| check_runtime_deps_recursive(bsr, graph, builds, seen))
+                && self_satisfied
+        }
+
+        let mut seen: HashMap<BuildSpecRef, ()> = HashMap::with_capacity(5 * self.toplevels.len());
         self.toplevels
             .iter()
-            .all(|bsr| self.builds.get(bsr).unwrap().state == BuildState::FullyBuilt)
+            .all(|bsr| check_runtime_deps_recursive(bsr, self.graph, &self.builds, &mut seen))
     }
 
     fn find_cycles(&mut self) -> Vec<Vec<BuildSpecRef>> {
@@ -524,8 +562,13 @@ mod tests {
         });
         let sr = sr.unwrap();
 
-        let dp = DepGraph::new(sr).unwrap();
-        let planner: ExecPlan = ExecPlan::new(&dp);
+        let dp = DepGraph::new(sr)
+            .map_err(|e| {
+                e.report_to_stderr();
+                Err::<DepGraph, ()>(())
+            })
+            .unwrap();
+        let planner: ExecPlan<()> = ExecPlan::new(&dp);
 
         assert_eq!(
             planner
@@ -585,8 +628,13 @@ mod tests {
         });
         let sr = sr.unwrap();
 
-        let dp = DepGraph::new(sr).unwrap();
-        let planner: ExecPlan = ExecPlan::new(&dp);
+        let dp = DepGraph::new(sr)
+            .map_err(|e| {
+                e.report_to_stderr();
+                Err::<DepGraph, ()>(())
+            })
+            .unwrap();
+        let planner: ExecPlan<()> = ExecPlan::new(&dp);
 
         // true = all builds without cycle-breakers
         assert_eq!(
@@ -636,7 +684,12 @@ mod tests {
         });
         let sr = sr.unwrap();
 
-        let dp = DepGraph::new(sr).unwrap();
+        let dp = DepGraph::new(sr)
+            .map_err(|e| {
+                e.report_to_stderr();
+                Err::<DepGraph, ()>(())
+            })
+            .unwrap();
         let mut cycles = ExecPlan::new(&dp)
             .find_cycles()
             .into_iter()
@@ -695,7 +748,12 @@ mod tests {
         });
         let sr = sr.unwrap();
 
-        let dp = DepGraph::new(sr).unwrap();
+        let dp = DepGraph::new(sr)
+            .map_err(|e| {
+                e.report_to_stderr();
+                Err::<DepGraph, ()>(())
+            })
+            .unwrap();
         let plan: Vec<BuildPhase> = ExecPlan::new(&dp).collect::<Result<_, _>>().unwrap();
 
         assert_eq!(
@@ -720,6 +778,158 @@ mod tests {
                     ]
                 },
             ],
+        );
+    }
+
+    #[derive(Debug)]
+    struct BinProviderFake(HashMap<BuildSpecRef, ()>);
+
+    impl BinProvider for BinProviderFake {
+        fn exists(&self, bsr: &BuildSpecRef) -> bool {
+            self.0.contains_key(bsr)
+        }
+    }
+
+    impl From<HashMap<BuildSpecRef, ()>> for BinProviderFake {
+        fn from(hm: HashMap<BuildSpecRef, ()>) -> Self {
+            BinProviderFake(hm)
+        }
+    }
+
+    #[test]
+    fn bin_provider_elludes_present() {
+        let sr = SpecReader::new(
+            indoc! {
+                "
+                let {BuildSpec, ..} = import \"minimal.ncl\" in
+
+                let rec nested_dep = {
+                    name = \"nested dep\",
+                    inputs = [],
+                    cmd = \"\",
+                } | BuildSpec,
+                dep = {
+                    name = \"dep\",
+                    inputs = [nested_dep],
+                    cmd = \"\",
+                } | BuildSpec,
+                top = {
+                    name = \"top\",
+                    inputs = [dep],
+                    cmd = \"\",
+                } | BuildSpec,
+                in
+                top
+                "
+            }
+            .to_string(),
+            &SpecReaderOptions::for_test(),
+        );
+        // So we can see the actual error when parsing fails
+        sr.as_ref().err().into_iter().for_each(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+        let sr = sr.unwrap();
+
+        let dp = DepGraph::new(sr)
+            .map_err(|e| {
+                e.report_to_stderr();
+                Err::<DepGraph, ()>(())
+            })
+            .unwrap();
+
+        let bin_provider: BinProviderFake =
+            HashMap::from([(dp.by_name("nested dep").next().unwrap(), ())]).into();
+
+        let planner: ExecPlan<BinProviderFake> = ExecPlan::new_with_bin_provider(&dp, bin_provider);
+
+        // BinProvider declares "nested dep" exists, so it shouldn't be part of the build plan
+        // true = all builds without cycle-breakers
+        assert_eq!(
+            planner.collect::<Result<Vec<_>, _>>().unwrap(),
+            vec![
+                BuildPhase {
+                    builds: vec![(dp.by_name("dep").next().unwrap(), true)]
+                },
+                BuildPhase {
+                    builds: vec![(dp.by_name("top").next().unwrap(), true)]
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn bin_provider_not_ellude_runtime_dep() {
+        let sr = SpecReader::new(
+            indoc! {
+                "
+                let {BuildSpec, ..} = import \"minimal.ncl\" in
+
+                let rec nested_deeper_dep = {
+                    name = \"nested deeper dep\",
+                    inputs = [],
+                    cmd = \"\",
+                } | BuildSpec,
+                nested_dep = {
+                    name = \"nested dep\",
+                    inputs = [],
+                    runtime_deps = [nested_deeper_dep],
+                    cmd = \"\",
+                } | BuildSpec,
+                dep = {
+                    name = \"dep\",
+                    inputs = [],
+                    runtime_deps = [nested_dep],
+                    cmd = \"\",
+                } | BuildSpec,
+                top = {
+                    name = \"top\",
+                    inputs = [],
+                    runtime_deps = [dep],
+                    cmd = \"\",
+                } | BuildSpec,
+                in
+                top
+                "
+            }
+            .to_string(),
+            &SpecReaderOptions::for_test(),
+        );
+        // So we can see the actual error when parsing fails
+        sr.as_ref().err().into_iter().for_each(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+        let sr = sr.unwrap();
+
+        let dp = DepGraph::new(sr)
+            .map_err(|e| {
+                e.report_to_stderr();
+                Err::<DepGraph, ()>(())
+            })
+            .unwrap();
+
+        let bin_provider: BinProviderFake = HashMap::from([
+            (dp.by_name("top").next().unwrap(), ()),
+            (dp.by_name("nested dep").next().unwrap(), ()),
+        ])
+        .into();
+
+        let planner: ExecPlan<BinProviderFake> = ExecPlan::new_with_bin_provider(&dp, bin_provider);
+
+        // BinProvider declares "top" exists, but its runtime dep "dep" is missing so should be built,
+        // as well as the transitive runtime dep "nested deeper dep". Theres no interdependency between
+        // those two so they should be built in the same cycle.
+        // true = all builds without cycle-breakers
+        assert_eq!(
+            planner.collect::<Result<Vec<_>, _>>().unwrap(),
+            vec![BuildPhase {
+                builds: vec![
+                    (dp.by_name("dep").next().unwrap(), true),
+                    (dp.by_name("nested deeper dep").next().unwrap(), true),
+                ]
+            },],
         );
     }
 }
