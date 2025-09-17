@@ -8,7 +8,7 @@ use anyhow::Result;
 use cache::{Cache, LocalDir};
 use docker_credential::{CredentialRetrievalError, DockerCredential, get_credential};
 use flate2::{Compression, write::GzEncoder};
-use graph::{BuildSpecRef, DepGraph, SpecHash, Transitives};
+use graph::{BuildSpecRef, DepGraph, ExecPlan, SpecHash, Transitives};
 use oci_client::{Client, Reference, client::ClientConfig};
 use oci_spec::image::{
     Descriptor, DescriptorBuilder, ImageConfiguration, ImageConfigurationBuilder, ImageManifest,
@@ -153,9 +153,7 @@ async fn ensure_package_built(
         PrebuiltsLock::default()
     });
     let mut runner = Run::new(graph, cache.clone(), remote_storage, lockfile);
-    runner
-        .execute(graph::planner2::ExecPlan::new(graph), None)
-        .await?;
+    runner.execute(ExecPlan::new(graph), None).await?;
 
     Ok(())
 }

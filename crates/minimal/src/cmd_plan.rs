@@ -1,5 +1,5 @@
 use anyhow::Result;
-use graph::planner2::ExecPlan;
+use graph::ExecPlan;
 use std::path::PathBuf;
 
 #[derive(clap::Args)]

@@ -1,7 +1,7 @@
 use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage, run::Run};
 use anyhow::{Context, Result};
 use graph::BuildSpecInput;
-use graph::planner2::ExecPlan;
+use graph::ExecPlan;
 use std::path::PathBuf;
 
 #[derive(clap::Args)]

@@ -253,8 +253,7 @@ pub mod dep_graph;
 pub use dep_graph::{BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, SourceInput};
 
 mod planner;
-pub use planner::ExecPlan;
-pub mod planner2;
+pub use planner::{BinProvider, ExecPlan};
 
 mod transitives;
 pub use transitives::Transitives;
