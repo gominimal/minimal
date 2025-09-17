@@ -1,6 +1,6 @@
 let { BuildSpec, OutputLib, Local, Prebuilt, .. } = import "minimal.ncl" in
 {
-  name = "glibc",
+  name = "glibc (prebuilt)",
   inputs = [
     { package = "glibc" } | Prebuilt,
   ],
