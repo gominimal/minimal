@@ -47,7 +47,7 @@ let tar = import "../tar/build.ncl" in
   replace_on_cycle = {
     name = "acl (prebuilt)",
     inputs = [
-      { package = "acl" } | Prebuilt,
+      { package = "acl", sha256 = "42491a1408cedbb0716b278c3cd88bb788b00de547fc2d6cb583ed94f9495edb" } | Prebuilt,
     ],
     cmd = "",
     outputs = {

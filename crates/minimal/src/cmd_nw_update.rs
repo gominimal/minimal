@@ -57,7 +57,7 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs) -> Result<()> {
 
     for bsr in &graph.top_levels {
         // Work out the name of the prebuilt by looking at replace_by_cycle and then the first input
-        let prebuilt_name = {
+        let (prebuilt_name, prebuilt_sha256) = {
             let replace_spec = graph
                 .get(
                     &graph
@@ -67,8 +67,8 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs) -> Result<()> {
                         .expect("expected a cycle breaker on each named package"),
                 )
                 .unwrap();
-            if let BuildSpecInput::Prebuilt(name, _) = &replace_spec.inputs[0] {
-                name.clone()
+            if let BuildSpecInput::Prebuilt(name, sha256) = &replace_spec.inputs[0] {
+                (name.clone(), sha256.clone())
             } else {
                 unreachable!("first input was not a prebuilt")
             }
@@ -81,6 +81,17 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs) -> Result<()> {
         let archive_name = format!("{}.tar.zst", package_hash.0.to_hex());
         let temp_archive_path = std::env::temp_dir().join(&archive_name);
         crate::run::create_prebuilt_archive(&cache_dir.to_path_buf(), &temp_archive_path)?;
+
+        // Compute sha256 hash
+        let hash_hex = {
+            use sha2::{Digest, Sha256};
+            let file_contents = std::fs::read(&temp_archive_path)?;
+            let mut hasher = Sha256::new();
+            hasher.update(&file_contents);
+            let computed_hash = hasher.finalize();
+            hex::encode(computed_hash)
+        };
+        eprintln!("sha256({}) = {}", prebuilt_name, hash_hex);
 
         // Upload
         let bucket_id = "minimal-staging-archives";
@@ -98,6 +109,34 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs) -> Result<()> {
         // Update the prebuilts lockfile
         lockfile.update_hash(prebuilt_name.clone(), package_hash.0.to_hex().to_string());
         eprintln!("Updated prebuilts.lock with new hash for {}", prebuilt_name);
+
+        if let Some(old_hash_hex) = prebuilt_sha256 {
+            eprintln!(
+                "updating hardcoded sha256 value: {} => {}",
+                old_hash_hex, hash_hex
+            );
+            use std::process::Command;
+
+            let status = Command::new("find")
+                .args([
+                    "packages/",
+                    "-type",
+                    "f",
+                    "-exec",
+                    "sed",
+                    "-i",
+                    &format!("s/{}/{}/g", old_hash_hex, hash_hex),
+                    "{}",
+                    "+",
+                ])
+                .status()?;
+            if !status.success() {
+                eprintln!(
+                    "find/replace for hardcoded hash failed with exit code: {:?}",
+                    status.code()
+                );
+            }
+        }
     }
     let lockfile_path = std::path::Path::new("prebuilts.lock");
     lockfile.save(lockfile_path)?;

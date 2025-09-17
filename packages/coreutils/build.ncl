@@ -69,7 +69,7 @@ let toolchain = import "../toolchain/build.ncl" in
   replace_on_cycle = {
     name = "coreutils (prebuilt)",
     inputs = [
-      { package = "coreutils" } | Prebuilt,
+      { package = "coreutils", sha256 = "60f33aa50e1e9817d65822a4614cc277b21fa264f25b6e87cd08ec9a1ae8d5cb" } | Prebuilt,
     ],
     runtime_deps = [
       acl,
