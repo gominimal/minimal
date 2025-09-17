@@ -13,6 +13,7 @@ debug = true
 [workspace.dependencies]
 indoc = "^2.0"
 generational-arena = "^0.2"
+smallvec = "1.14"
 blake3 = "1"
 fxhash = "0.2"
 nickel-lang-core = "0.14"

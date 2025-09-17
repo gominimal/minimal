@@ -16,3 +16,4 @@ serde_json.workspace = true
 blake3.workspace = true
 fxhash.workspace = true
 generational-arena.workspace = true
+smallvec.workspace = true

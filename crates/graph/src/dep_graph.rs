@@ -10,13 +10,12 @@ use nickel_lang_core::term::{RichTerm, Term};
 use nickel_lang_core::{eval::cache::CacheImpl, program::Program};
 
 use generational_arena::Arena;
-use std::collections::{BTreeSet, HashMap};
-use std::io::Write;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crate::spec_schema::*;
-use crate::{Error, SpecError, SpecHash, SpecHashable, SpecReader};
+use crate::{Error, SpecError, SpecHash, SpecHasher, SpecReader};
 use serde::Deserialize;
 
 /// A map with ordered iteration semantics - we need this for stable spec hashes.
@@ -50,54 +49,9 @@ pub enum BuildSpecInput {
     Prebuilt(String, Option<String>), // Package name, sha256
 }
 
-impl SpecHashable for BuildSpecInput {
-    fn spec_hash(&self, g: &DepGraph, seen: &mut BTreeSet<BuildSpecRef>) -> SpecHash {
-        let mut h = blake3::Hasher::new();
-
-        use BuildSpecInput::*;
-        match self {
-            Build(bsr) => {
-                h.write_all(b"input").unwrap();
-                h.write_all(g.spec_hash_impl(bsr, seen).as_bytes()).unwrap();
-            }
-            Source(s) => {
-                h.write_all(b"source").unwrap();
-                match &s.from {
-                    SourceFetch::URL(url) => {
-                        h.write_all(b"url").unwrap();
-                        h.write_all(url.as_bytes()).unwrap()
-                    }
-                };
-                h.write_all(s.sha256.as_bytes()).unwrap()
-            }
-            HostPath(p) => {
-                h.write_all(b"host path").unwrap();
-                h.write_all(p.as_path().to_string_lossy().as_bytes())
-                    .unwrap();
-            }
-            Local(p) => {
-                h.write_all(b"local").unwrap();
-                h.write_all(p.0.as_path().to_string_lossy().as_bytes())
-                    .unwrap();
-                h.write_all(p.1.as_bytes()).unwrap();
-            }
-            Prebuilt(package, sha256) => {
-                h.write_all(b"prebuilt").unwrap();
-                h.write_all(package.as_bytes()).unwrap();
-                if let Some(hash) = sha256 {
-                    h.write_all(b"sha256").unwrap();
-                    h.write_all(hash.as_bytes()).unwrap();
-                }
-            }
-        }
-
-        SpecHash(h.finalize())
-    }
-}
-
 #[allow(dead_code)]
 impl BuildSpecInput {
-    fn as_build(&self) -> Option<&BuildSpecRef> {
+    pub(crate) fn as_build(&self) -> Option<&BuildSpecRef> {
         match self {
             BuildSpecInput::Build(bsr) => Some(bsr),
             _ => None,
@@ -114,27 +68,6 @@ pub enum BuildOutput {
     Binary { path: String },
 }
 
-impl BuildOutput {
-    #[allow(dead_code)]
-    fn partial_spec_hash(&self, h: &mut blake3::Hasher) {
-        use BuildOutput::*;
-        match self {
-            Library { glob } => {
-                h.write_all(b"library").unwrap();
-                h.write_all(glob.as_bytes()).unwrap();
-            }
-            Data { glob } => {
-                h.write_all(b"data").unwrap();
-                h.write_all(glob.as_bytes()).unwrap();
-            }
-            Binary { path } => {
-                h.write_all(b"binary").unwrap();
-                h.write_all(path.as_bytes()).unwrap();
-            }
-        }
-    }
-}
-
 /// Some task or build in the dependency graph.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -147,51 +80,6 @@ pub struct BuildSpec {
     pub outputs: OutputMap,
 
     pub replace_on_cycle: Option<BuildSpecRef>,
-}
-
-impl SpecHashable for BuildSpec {
-    fn spec_hash(&self, g: &DepGraph, seen: &mut BTreeSet<BuildSpecRef>) -> SpecHash {
-        let mut h = blake3::Hasher::new();
-
-        h.write_all(b"build spec").unwrap();
-        h.write_all(self.name.as_bytes()).unwrap();
-        h.write_all(self.cmd.as_bytes()).unwrap();
-
-        // We don't want the spec hash to change if the order of the inputs or runtime_deps change,
-        // so lets sort the hashes before they are updated to our spec hash.
-        // TODO: Consider performance implications of linear sort
-        h.write_all(b"-inputs").unwrap();
-        let mut input_hashes: Vec<SpecHash> =
-            self.inputs.iter().map(|i| i.spec_hash(g, seen)).collect();
-        input_hashes.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-        for hash in input_hashes.drain(..) {
-            h.write_all(hash.as_bytes()).unwrap();
-        }
-        h.write_all(b"-runtime_deps").unwrap();
-        let mut runtime_dep_hashes: Vec<SpecHash> = self
-            .runtime_deps
-            .iter()
-            .map(|bsr| g.spec_hash_impl(bsr, seen))
-            .collect();
-        runtime_dep_hashes.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-        for hash in runtime_dep_hashes.drain(..) {
-            h.write_all(hash.as_bytes()).unwrap();
-        }
-
-        h.write_all(b"-outputs").unwrap();
-        for (name, output) in self.outputs.iter() {
-            h.write_all(name.as_bytes()).unwrap();
-            output.partial_spec_hash(&mut h);
-        }
-
-        if let Some(replace_on_cycle) = self.replace_on_cycle {
-            h.write_all(b"replace on cycle").unwrap();
-            h.write_all(g.spec_hash_impl(&replace_on_cycle, seen).as_bytes())
-                .unwrap();
-        }
-
-        SpecHash(h.finalize())
-    }
 }
 
 /// The dependency graph.
@@ -208,8 +96,6 @@ pub struct DepGraph {
             HashMap<SpecHash, BuildSpecRef>,
         )>,
     >,
-
-    hash_subset_cache: RwLock<HashMap<(BuildSpecRef, u64), SpecHash>>,
 }
 
 impl DepGraph {
@@ -259,46 +145,13 @@ impl DepGraph {
             }
         }
 
-        let mut seen = BTreeSet::new();
-        let hash = self.spec_hash_impl(bsr, &mut seen);
+        let hash = SpecHasher::hash(self, bsr);
 
         {
             let mut hashes = self.hash_cache.write().unwrap();
             hashes.0.insert(*bsr, hash.clone());
             hashes.1.insert(hash.clone(), *bsr);
         }
-        hash
-    }
-
-    fn spec_hash_impl(&self, bsr: &BuildSpecRef, seen: &mut BTreeSet<BuildSpecRef>) -> SpecHash {
-        use std::hash::{DefaultHasher, Hash, Hasher};
-        if seen.contains(bsr) {
-            return SpecHash::cycle();
-        }
-        let seen_hash = {
-            let mut s = DefaultHasher::new();
-            seen.hash(&mut s);
-            s.finish()
-        };
-        if let Some(stored_spec_hash) = self
-            .hash_subset_cache
-            .read()
-            .unwrap()
-            .get(&(*bsr, seen_hash))
-        {
-            return stored_spec_hash.clone();
-        }
-
-        let build = self.get(bsr).unwrap();
-
-        seen.insert(*bsr);
-        let hash = build.spec_hash(self, seen);
-        seen.remove(bsr);
-
-        self.hash_subset_cache
-            .write()
-            .unwrap()
-            .insert((*bsr, seen_hash), hash.clone());
         hash
     }
 
@@ -432,12 +285,10 @@ impl GraphBuilder {
             HashMap::with_capacity(builds.len()),
             HashMap::with_capacity(builds.len()),
         )));
-        let hash_subset_cache = RwLock::new(HashMap::with_capacity(4096));
         DepGraph {
             builds,
             top_levels,
             hash_cache,
-            hash_subset_cache,
         }
     }
 
@@ -1311,77 +1162,6 @@ mod tests {
                 .into_iter()
                 .map(|b| b.name)
                 .collect::<Vec<String>>()
-        );
-    }
-
-    #[test]
-    fn spec_hash_smoketest() {
-        let sr = SpecReader::new(
-            indoc! {
-                "
-                let {BuildSpec, Source, ..} = import \"minimal.ncl\" in
-
-                let shared = {
-                    name = \"shared\",
-                    inputs = [
-                        {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
-                    ],
-                    cmd = \"\",
-                } | BuildSpec
-                in
-
-                {
-                    name = \"top build\",
-                    inputs = [
-                        shared,
-                        {
-                            name = \"second build\",
-                            inputs = [],
-                            cmd = \"\",
-                        } | BuildSpec,
-                    ],
-                    cmd = \"\",
-                } | BuildSpec"
-            }
-            .to_string(),
-            &SpecReaderOptions::for_test(),
-        )
-        .unwrap_or_else(|e| {
-            e.report_to_stderr();
-            panic!("spec parsing failed");
-        });
-
-        let mut dp = DepGraph::new(sr).unwrap();
-
-        let top_hash = dp
-            .builds
-            .iter()
-            .find(|b| b.1.name == "top build")
-            .unwrap()
-            .1
-            .spec_hash(&dp, &mut BTreeSet::new());
-
-        {
-            let (mut input1, mut input2) = dp
-                .builds
-                .iter_mut()
-                .find(|b| b.1.name == "top build")
-                .unwrap()
-                .1
-                .inputs
-                .split_at_mut(1);
-            std::mem::swap(&mut input1, &mut input2);
-        }
-
-        // check the spec hash is the same even if the input order changes
-        assert_eq!(
-            top_hash,
-            dp.builds
-                .iter()
-                .find(|b| b.1.name == "top build")
-                .unwrap()
-                .1
-                .spec_hash(&dp, &mut BTreeSet::new()),
         );
     }
 

@@ -2,8 +2,6 @@ use crate::spec_schema::ObjTy;
 use nickel_lang_core::files::Files;
 use nickel_lang_core::position::TermPos;
 
-use std::collections::BTreeSet;
-
 use serde::{de, de::Visitor, Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
@@ -127,16 +125,7 @@ impl From<SpecError> for Error {
     }
 }
 
-/// A hash describing the object (specification hash), as well as everything it is dependent on.
-///
-/// This hash should change if any semantics change, but stay the same for anything immaterial (i.e, should
-/// not change with comments, line numbers, locations in different files etc).
-#[allow(dead_code)]
-trait SpecHashable {
-    fn spec_hash(&self, _graph: &DepGraph, _seen: &mut BTreeSet<BuildSpecRef>) -> SpecHash;
-}
-
-/// A hash describing the object (specificatino hash), including everything it is dependent on.
+/// A hash describing the object (specification hash), including everything it is dependent on.
 ///
 /// This hash should change if any semantics change, but stay the same for anything immaterial (i.e, should
 /// not change with comments, line numbers, locations in different files etc).
@@ -160,9 +149,8 @@ impl SpecHash {
         self.0.as_bytes()
     }
 
-    /// symbolic hash to represent a cycle when computing a SpecHash.
-    fn cycle() -> Self {
-        Self(blake3::Hash::from_bytes([1u8; 32]))
+    pub fn from_hex(hex: impl AsRef<[u8]>) -> Result<Self, blake3::HexError> {
+        Ok(SpecHash(blake3::Hash::from_hex(hex)?))
     }
 }
 
@@ -237,6 +225,9 @@ impl<'de> Deserialize<'de> for SpecHash {
         deserializer.deserialize_bytes(HashVisitor)
     }
 }
+
+mod spec_hasher;
+pub use spec_hasher::SpecHasher;
 
 mod spec_reader;
 pub use spec_reader::{SpecError, SpecReader, SpecReaderOptions};
