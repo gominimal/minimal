@@ -177,7 +177,7 @@ impl Error {
     fn report_to_stderr(&self) {
         match self {
             Error::Graph(e) => e.report_to_stderr(),
-            Error::Other(e) => eprintln!("{}", e),
+            Error::Other(e) => eprintln!("{:?}", e),
         }
     }
 }
@@ -203,7 +203,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Build(args) => cmd_build(args, &cli.global_args).await,
-        Command::Plan(args) => cmd_plan(args, &cli.global_args).map_err(Error::from),
+        Command::Plan(args) => cmd_plan(args, &cli.global_args),
         Command::NewWorldUpdate(args) => cmd_new_world_update(args, &cli.global_args).await,
         Command::OciImage(args) => cmd_oci_image(args, &cli.global_args).await,
     };
