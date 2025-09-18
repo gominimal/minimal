@@ -47,8 +47,8 @@ pub enum ExecutionError {
         source: std::io::Error,
     },
 
-    #[error("Failed to copy {source} to {destination}: {error}")]
-    CopyFailed {
+    #[error("Failed to link {source} to {destination}: {error}")]
+    HardLinkFailed {
         source: String,
         destination: String,
         #[source]

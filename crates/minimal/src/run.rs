@@ -195,7 +195,7 @@ fn is_pure_prebuilt(build: &BuildSpec) -> bool {
     has_prebuilt && !has_local_or_source
 }
 
-#[tracing::instrument]
+#[tracing::instrument(skip_all)]
 async fn materialize_prebuilt(
     build: &BuildSpec,
     build_hash: &SpecHash,

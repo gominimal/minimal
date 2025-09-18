@@ -1,6 +1,6 @@
-use fs_extra::dir::{self as fs_dir};
 use hakoniwa::Container;
 use std::fs;
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 use tracing::{error, info};
@@ -27,12 +27,12 @@ impl BuildExecutor {
     #[tracing::instrument(skip(config))]
     pub fn execute(&self, config: &BuildConfig) -> Result<i32> {
         info!(
-            "Copying {} inputs to build environment",
+            "Linking {} inputs to build environment",
             config.inputs.len()
         );
         for input in &config.inputs {
-            info!("  Copying input: {}", input.display());
-            self.copy_to_tmpdir(input)?;
+            info!("  Linking input: {}", input.display());
+            self.hardlink_to_tmpdir(input)?;
         }
 
         self.execute_in_container(config)?;
@@ -48,7 +48,7 @@ impl BuildExecutor {
         self.path.join("output").to_path_buf()
     }
 
-    fn copy_to_tmpdir(&self, input: &Path) -> Result<()> {
+    fn hardlink_to_tmpdir(&self, input: &Path) -> Result<()> {
         let dest_path = if let Some(file_name) = input.file_name() {
             self.path.join(file_name)
         } else {
@@ -56,23 +56,13 @@ impl BuildExecutor {
         };
 
         if input.is_file() {
-            fs::copy(input, &dest_path).map_err(|e| ExecutionError::CopyFailed {
+            fs::hard_link(input, &dest_path).map_err(|e| ExecutionError::HardLinkFailed {
                 source: input.display().to_string(),
                 destination: dest_path.display().to_string(),
                 error: e,
             })?;
         } else if input.is_dir() {
-            let mut options = fs_dir::CopyOptions::new();
-            options.overwrite = true;
-            options.copy_inside = true;
-
-            fs_dir::copy(input, &dest_path, &options).map_err(|e| {
-                ExecutionError::FileOperation {
-                    operation: "copy directory".to_string(),
-                    path: input.display().to_string(),
-                    source: std::io::Error::other(e.to_string()),
-                }
-            })?;
+            hardlink_dir_contents(input, &dest_path)?;
         }
 
         Ok(())
@@ -167,24 +157,63 @@ impl BuildExecutor {
         fs::create_dir_all(&rootfs)?;
 
         for cache_path in &config.dependencies {
-            self.copy_dir_contents(cache_path, &rootfs)?;
+            hardlink_dir_contents(cache_path, &rootfs)?;
         }
 
         Ok(rootfs)
     }
+}
 
-    fn copy_dir_contents(&self, src: &Path, dst: &Path) -> Result<()> {
-        let mut options = fs_dir::CopyOptions::new();
-        options.overwrite = true;
-        options.copy_inside = true;
-        options.content_only = true;
-
-        fs_dir::copy(src, dst, &options).map_err(|e| ExecutionError::FileOperation {
-            operation: "copy directory contents".to_string(),
+fn hardlink_dir_contents(src: &Path, dst: &Path) -> Result<()> {
+    for entry in fs::read_dir(src).map_err(|e| ExecutionError::FileOperation {
+        operation: "read directory".to_string(),
+        path: src.display().to_string(),
+        source: e,
+    })? {
+        let entry = entry.map_err(|e| ExecutionError::FileOperation {
+            operation: "read directory entry".to_string(),
             path: src.display().to_string(),
-            source: std::io::Error::other(e.to_string()),
+            source: e,
         })?;
 
-        Ok(())
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let dst_path = dst.join(&file_name);
+
+        let metadata = entry
+            .metadata()
+            .map_err(|e| ExecutionError::FileOperation {
+                operation: "get metadata".to_string(),
+                path: path.display().to_string(),
+                source: e,
+            })?;
+
+        if metadata.is_dir() {
+            fs::create_dir_all(&dst_path).map_err(|e| ExecutionError::FileOperation {
+                operation: "create directory".to_string(),
+                path: dst_path.display().to_string(),
+                source: e,
+            })?;
+            hardlink_dir_contents(&path, &dst_path)?;
+        } else if metadata.is_file() {
+            fs::hard_link(&path, &dst_path).map_err(|e| ExecutionError::HardLinkFailed {
+                source: path.display().to_string(),
+                destination: dst_path.display().to_string(),
+                error: e,
+            })?;
+        } else if metadata.is_symlink() {
+            let target = fs::read_link(&path).map_err(|e| ExecutionError::FileOperation {
+                operation: "read symlink".to_string(),
+                path: path.display().to_string(),
+                source: e,
+            })?;
+            symlink(&target, &dst_path).map_err(|e| ExecutionError::FileOperation {
+                operation: "create symlink".to_string(),
+                path: dst_path.display().to_string(),
+                source: e,
+            })?;
+        }
     }
+
+    Ok(())
 }
