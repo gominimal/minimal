@@ -13,8 +13,11 @@ type Edges = SmallVec<[Edge; 12]>;
 struct SpecIndex(usize);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct SubsetInfo(Vec<String>, bool);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Edge {
-    BuildInput(SpecIndex),
+    BuildInput(SpecIndex, Option<SubsetInfo>),
     RuntimeDep(SpecIndex),
     ReplaceOnCycle(SpecIndex),
 }
@@ -49,9 +52,17 @@ impl<'a> SpecHasher<'a> {
             for edge in edges.unwrap().into_iter() {
                 use Edge::*;
                 match edge {
-                    BuildInput(input_idx) => {
+                    BuildInput(input_idx, subset_info) => {
                         h.write_all(b"i").unwrap();
                         h.write_all(&input_idx.0.to_le_bytes()).unwrap();
+                        if let Some(SubsetInfo(outputs, strict)) = subset_info {
+                            h.write_all(b"ss").unwrap();
+                            for output in &outputs {
+                                h.write_all(output.as_bytes()).unwrap();
+                                h.write_all(b",").unwrap();
+                            }
+                            h.write_all(if strict { b"s" } else { b"l" }).unwrap();
+                        }
                     }
                     RuntimeDep(dep_idx) => {
                         h.write_all(b"r").unwrap();
@@ -81,8 +92,14 @@ impl<'a> SpecHasher<'a> {
 
         // recurse in a well-defined order to capture referenced specs.
         let mut edges = Edges::new();
-        for i in build.inputs.iter().filter_map(|i| i.as_build()) {
-            edges.push(Edge::BuildInput(self.process(i)));
+        for (bsr, subset_info) in build.inputs.iter().filter_map(|i| match i {
+            BuildSpecInput::Build(bsr) => Some((bsr, None)),
+            BuildSpecInput::Subset(si) => {
+                Some((&si.from, Some(SubsetInfo(si.outputs.clone(), si.strict))))
+            }
+            _ => None,
+        }) {
+            edges.push(Edge::BuildInput(self.process(bsr), subset_info));
         }
         for d in build.runtime_deps.iter() {
             edges.push(Edge::RuntimeDep(self.process(d)));
@@ -121,7 +138,7 @@ fn build_output_hash(output: &BuildOutput, h: &mut Hasher) {
 fn build_input_hash(input: &BuildSpecInput, h: &mut Hasher) {
     use BuildSpecInput::*;
     match input {
-        Build(_bsr) => {
+        Build(_) | Subset(_) => {
             unreachable!();
         }
         Source(s) => {

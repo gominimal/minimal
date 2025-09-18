@@ -250,7 +250,9 @@ pub use spec_reader::{SpecError, SpecReader, SpecReaderOptions};
 mod spec_schema;
 
 pub mod dep_graph;
-pub use dep_graph::{BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, SourceInput};
+pub use dep_graph::{
+    BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, SourceInput, SubsetInput,
+};
 
 mod planner;
 pub use planner::{BinProvider, ExecPlan};

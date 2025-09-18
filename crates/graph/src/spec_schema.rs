@@ -14,4 +14,5 @@ pub enum ObjTy {
     Source,
     Local,
     Prebuilt,
+    Subset,
 }

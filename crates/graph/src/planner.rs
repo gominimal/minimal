@@ -1,4 +1,4 @@
-use crate::{BuildSpecInput, BuildSpecRef, DepGraph};
+use crate::{BuildSpecInput, BuildSpecRef, DepGraph, SubsetInput};
 use nickel_lang_core::term::IndexMap;
 use std::collections::HashMap;
 
@@ -386,7 +386,7 @@ impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
         for input in bs.inputs.iter() {
             use BuildSpecInput::*;
             match input {
-                Build(bsr) => {
+                Build(bsr) | Subset(SubsetInput { from: bsr, .. }) => {
                     process(bsr, seen, &mut out);
                 }
                 Source(_) | HostPath(_) | Local(_) | Prebuilt(_, _) => {}

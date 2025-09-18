@@ -343,6 +343,7 @@ impl<'a> Run<'a> {
                     let input_paths = all_paths_for_spec(dep_ref, self.graph, &self.cache)?;
                     dependencies.extend(input_paths);
                 }
+                Subset(s) => todo!("subsets: {:?}", s),
                 HostPath(_) => {
                     todo!();
                 }

@@ -1,4 +1,4 @@
-use crate::{BuildSpecInput, BuildSpecRef, DepGraph};
+use crate::{BuildSpecInput, BuildSpecRef, DepGraph, SubsetInput};
 use std::collections::HashMap;
 
 /// Information about why a transitive dependency exists.
@@ -43,8 +43,8 @@ impl Transitives {
             .inputs
             .iter()
             .filter_map(|input| match (input, include_inputs) {
-                (Build(bsr), true) => Some(bsr),
-                (Build(_), false) => None,
+                (Build(bsr) | Subset(SubsetInput { from: bsr, .. }), true) => Some(bsr),
+                (Build(_) | Subset(_), false) => None,
                 (Source(_) | HostPath(_) | Local(_) | Prebuilt(_, _), _) => None,
             })
             .chain(build.runtime_deps.iter())

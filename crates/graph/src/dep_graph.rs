@@ -38,6 +38,14 @@ pub struct SourceInput {
     pub sha256: String,
 }
 
+/// A dependency on some of the outputs of a build-spec.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubsetInput {
+    pub from: BuildSpecRef,
+    pub outputs: Vec<String>,
+    pub strict: bool,
+}
+
 /// An input to a build spec.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -47,6 +55,7 @@ pub enum BuildSpecInput {
     HostPath(PathBuf),
     Local((PathBuf, blake3::Hash)),
     Prebuilt(String, Option<String>), // Package name, sha256
+    Subset(SubsetInput),
 }
 
 #[allow(dead_code)]
@@ -202,6 +211,7 @@ impl DepGraph {
             .iter()
             .filter_map(|input| match input {
                 Build(bsr) => Some(bsr),
+                Subset(si) => Some(&si.from),
                 Source(_) | HostPath(_) | Local(_) | Prebuilt(_, _) => None,
             })
             .chain(build_spec.runtime_deps.iter())
@@ -749,6 +759,97 @@ impl GraphBuilder {
         Ok((package, sha256))
     }
 
+    fn read_subset(
+        &mut self,
+        rt: &RichTerm,
+        program: &mut Program<CacheImpl>,
+    ) -> Result<SubsetInput, Error> {
+        let mut from: Option<BuildSpecRef> = None;
+        let mut outputs: Option<Vec<String>> = None;
+        let mut strict: bool = false;
+        match rt.term.as_ref() {
+            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
+                r.fields
+                    .iter()
+                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                        match ident_and_loc.label() {
+                            "from" => {
+                                from = Some(
+                                    self.read_buildspec(field.value.as_ref().unwrap(), program)?,
+                                );
+                                Ok(())
+                            }
+                            "outputs" => {
+                                let outputs_rt =
+                                    field.value.as_ref().map(|rt| eval_if_closure(rt, program));
+                                match outputs_rt {
+                                    None => {}
+                                    Some(outputs_rt) => match outputs_rt?.term.as_ref() {
+                                        Term::Array(a, _attrs) => {
+                                            outputs = Some(
+                                                a.iter()
+                                                    .map(|input| {
+                                                        Ok(String::deserialize(eval_if_closure(
+                                                            input, program,
+                                                        )?)
+                                                        .unwrap())
+                                                    })
+                                                    .collect::<Result<Vec<_>, Error>>()?,
+                                            );
+                                        }
+                                        _ => todo!(
+                                            "handle outputs value being non-array {:?}",
+                                            field.value
+                                        ),
+                                    },
+                                }
+                                Ok(())
+                            }
+                            "strict" => {
+                                if let Some(field) = field.value.as_ref() {
+                                    strict = bool::deserialize(eval_if_closure(field, program)?)
+                                        .unwrap();
+                                }
+                                Ok(())
+                            }
+                            _ => Ok(()), // TODO: Should we error if we see an unknown field?
+                        }
+                    })?;
+            }
+            _ => {}
+        }
+        let from = match from {
+            Some(from) => from,
+            None => {
+                return Err(Error::MissingField {
+                    files: program.files(),
+                    obj: ObjTy::Subset,
+                    pos: rt.pos,
+                    field: "from",
+                })
+            }
+        };
+        let mut outputs = match outputs {
+            Some(outputs) => outputs,
+            None => {
+                return Err(Error::MissingField {
+                    files: program.files(),
+                    obj: ObjTy::Subset,
+                    pos: rt.pos,
+                    field: "outputs",
+                })
+            }
+        };
+        outputs.sort();
+        outputs.dedup();
+
+        Ok(SubsetInput {
+            from,
+            strict,
+            outputs,
+        })
+    }
+
     /// Recursively reads a buildspec input, inserting it into the graph.
     fn read_input(
         &mut self,
@@ -761,6 +862,7 @@ impl GraphBuilder {
         let ty = read_ty(&rt, program)?;
         match ty {
             ObjTy::Builder => Ok(BuildSpecInput::Build(self.read_buildspec(&rt, program)?)),
+            ObjTy::Subset => Ok(BuildSpecInput::Subset(self.read_subset(&rt, program)?)),
             ObjTy::Source => Ok(BuildSpecInput::Source(
                 self.read_input_source(&rt, program)?,
             )),
@@ -1035,6 +1137,49 @@ mod tests {
         assert!(matches!(
             dp.builds.iter().next().unwrap().1.inputs[0].clone(),
             BuildSpecInput::Local((p, _)) if p.ends_with("testdata/local_input.txt"),
+        ));
+    }
+    #[test]
+    fn subset_input() {
+        let sr = SpecReader::new(
+            indoc! {
+                "
+                let {BuildSpec, Subset, ..} = import \"minimal.ncl\" in
+                let other_spec = {
+                    name = \"other\",
+                    inputs = [],
+                    cmd = \"\",
+                } | BuildSpec in
+                {
+                    name = \"top\",
+                    inputs = [
+                        {from = other_spec, outputs = [\"uwu\", \"abc\"]} | Subset,
+                    ],
+                    cmd = \"\",
+                } | BuildSpec"
+            }
+            .to_string(),
+            &SpecReaderOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        let dp = DepGraph::new(sr)
+            .map_err(|e| {
+                e.report_to_stderr();
+                Err::<DepGraph, ()>(())
+            })
+            .unwrap();
+        // We expect that buildspec to have one Subset input
+        assert!(matches!(
+            dp.get(&dp.by_name("top").next().unwrap()).unwrap().inputs[0].clone(),
+            BuildSpecInput::Subset(SubsetInput {
+                from,
+                strict: false,
+                outputs,
+            }) if from == dp.by_name("other").next().unwrap() && outputs == vec!["abc", "uwu"],
         ));
     }
 
