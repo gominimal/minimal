@@ -1,7 +1,6 @@
 use anyhow::{Result, bail};
 use bytes::Bytes;
-use google_cloud_gax::error::rpc::Code;
-use google_cloud_storage::client::{Storage, StorageControl};
+use google_cloud_storage::client::Storage;
 use sha2::{Digest, Sha256};
 
 use std::fs;
@@ -12,7 +11,6 @@ use std::path::PathBuf;
 pub struct RemoteStorage {
     client: Storage,
     cache_dir: PathBuf,
-    control_client: StorageControl,
 }
 
 impl RemoteStorage {
@@ -31,12 +29,7 @@ impl RemoteStorage {
         };
 
         let client = Storage::builder().build().await?;
-        let control_client = StorageControl::builder().build().await?;
-        Ok(Self {
-            client,
-            cache_dir,
-            control_client,
-        })
+        Ok(Self { client, cache_dir })
     }
 
     pub async fn download_https_with_verification_and_caching(
@@ -67,7 +60,7 @@ impl RemoteStorage {
             let mut res = reqwest::get(url).await?;
 
             while let Some(chunk) = res.chunk().await? {
-                f.write(&chunk).unwrap();
+                f.write_all(&chunk).unwrap();
             }
             f.sync_all()?;
         }
@@ -174,26 +167,5 @@ impl RemoteStorage {
         );
 
         Ok(())
-    }
-
-    pub async fn exists(&self, bucket_id: &str, file_path: &str) -> Result<bool> {
-        match self
-            .control_client
-            .get_object()
-            .set_bucket(format!("projects/_/buckets/{bucket_id}"))
-            .set_object(file_path)
-            .send()
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                if let Some(status) = e.status()
-                    && status.code == Code::NotFound
-                {
-                    return Ok(false);
-                }
-                Err(e.into())
-            }
-        }
     }
 }

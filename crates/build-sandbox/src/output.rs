@@ -23,9 +23,6 @@ impl OutputValidator {
             path: final_output_dir.to_path_buf(),
         })?;
 
-        // Create standard FHS compatibility symlinks in staging directory BEFORE validation
-        // Self::create_fhs_symlinks(staging_dir)?;
-
         let mut found_files = Vec::new();
         for output_pattern in &config.outputs {
             let resolved_outputs = Self::resolve_output_pattern(output_pattern, staging_dir)?;

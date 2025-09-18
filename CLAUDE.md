@@ -23,9 +23,6 @@ cargo run -- build --package libffi --cache-dir /path/to/cache
 ```bash
 # Show execution plan for a package
 cargo run -- plan --package libffi
-
-# Plan source build
-cargo run -- plan --package libffi --source
 ```
 
 ### Managing Prebuilts
@@ -82,11 +79,6 @@ Package Spec (build.ncl) → SpecReader → DepGraph → ExecPlan → Build Reso
 7. **Output Management**: Collects enumerated outputs, stores in cache with computed hashes
 
 ### Key Architectural Decisions
-
-**Dual Build System**:
-- **Source builds**: Build everything from source code (`--source` flag)
-- **Prebuilt builds**: Use prebuilt binaries from remote storage with lockfile integrity (default)
-- **Hybrid support**: Mix source and prebuilt inputs within single build
 
 **Cache System**:
 - **Content-addressed**: Uses Blake3 hash of complete build specification
@@ -231,9 +223,6 @@ ls ~/.cache/minimal-builds/
 
 # View execution plan
 cargo run -- plan --package <name>
-
-# Force source build to avoid cache
-cargo run -- build --package <name> --source
 ```
 
 ### Cache Management

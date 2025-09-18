@@ -3,6 +3,8 @@ use anyhow::Result;
 use graph::BuildSpecInput;
 use std::path::PathBuf;
 
+static BUCKET_ID: &str = "minimal-staging-archives";
+
 #[derive(clap::Args)]
 pub struct NWUpdateArgs {
     /// Package names to build & update
@@ -24,7 +26,7 @@ pub struct NWUpdateArgs {
 
 pub async fn cmd_new_world_update(args: NWUpdateArgs) -> Result<()> {
     let graph = match args.packages.len() {
-        1 => super::graph_from_package_name(&args.packages[0], false),
+        1 => super::graph_from_package_name(&args.packages[0]),
         _ => super::graph_from_package_names(&args.packages),
     };
 
@@ -33,7 +35,6 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs) -> Result<()> {
     crate::cmd_build::cmd_build_impl(
         &graph,
         args.no_cache,
-        false,
         cache.clone(),
         None,
         args.num_parallel_builds,
@@ -95,14 +96,13 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs) -> Result<()> {
         eprintln!("sha256({}) = {}", prebuilt_name, hash_hex);
 
         // Upload
-        let bucket_id = "minimal-staging-archives";
         let gcs_path = format!("prebuilts/{}/{}", prebuilt_name, archive_name);
         remote_storage
-            .upload(bucket_id, &gcs_path, &archive_data)
+            .upload(BUCKET_ID, &gcs_path, &archive_data)
             .await?;
         eprintln!(
             "Automatically uploaded prebuilt to gs://{}/{}",
-            bucket_id, gcs_path
+            BUCKET_ID, gcs_path
         );
 
         // Update the prebuilts lockfile

@@ -42,7 +42,7 @@ pub struct OciImageArgs {
 }
 
 pub async fn cmd_oci_image(args: OciImageArgs) -> Result<()> {
-    let graph = crate::graph_from_package_name(&args.package, false);
+    let graph = crate::graph_from_package_name(&args.package);
     let cache = load_cache(args.cache_dir)?;
 
     let package_ref = graph

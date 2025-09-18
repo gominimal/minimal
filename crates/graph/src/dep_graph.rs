@@ -230,9 +230,9 @@ impl DepGraph {
                 Subset(si) => Some(&si.from),
                 Source(_) | HostPath(_) | Local(_) | Prebuilt(_, _) => None,
             })
-            .chain(build_spec.runtime_deps.iter().filter_map(|dep| match dep {
-                RuntimeDep::Build(bsr) => Some(bsr),
-                RuntimeDep::Subset(si) => Some(&si.from),
+            .chain(build_spec.runtime_deps.iter().map(|dep| match dep {
+                RuntimeDep::Build(bsr) => bsr,
+                RuntimeDep::Subset(si) => &si.from,
             }))
             .for_each(|bsr| {
                 if !seen.contains_key(bsr) {

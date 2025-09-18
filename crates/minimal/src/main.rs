@@ -27,20 +27,10 @@ enum Cli {
     OciImage(OciImageArgs),
 }
 
-pub fn graph_from_package_name(package_name: &String, source: bool) -> DepGraph {
+pub fn graph_from_package_name(package_name: &String) -> DepGraph {
     let package_dir = Path::new("packages").join(package_name);
 
-    let build_ncl_path = if source {
-        let source_path = package_dir.join("build.source.ncl");
-        if !source_path.exists() {
-            eprintln!(
-                "Error: build.source.ncl not found in package directory: {}",
-                package_dir.display()
-            );
-            std::process::exit(1);
-        }
-        source_path
-    } else {
+    let build_ncl_path = {
         let normal_path = package_dir.join("build.ncl");
         if !normal_path.exists() {
             eprintln!(

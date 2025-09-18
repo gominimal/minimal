@@ -14,10 +14,6 @@ pub struct BuildArgs {
     #[arg(short, long)]
     debug: bool,
 
-    /// Build from source instead of using prebuilt binaries
-    #[arg(short, long)]
-    source: bool,
-
     /// Path to a directory to cache build outputs in
     #[arg(long)]
     cache_dir: Option<PathBuf>,
@@ -35,7 +31,7 @@ pub async fn cmd_build(args: BuildArgs) -> Result<()> {
     let graph = match args.packages {
         Some(ref packages) => match packages.len() {
             0 => super::graph_from_all_packages(),
-            1 => super::graph_from_package_name(&packages[0], args.source),
+            1 => super::graph_from_package_name(&packages[0]),
             _ => super::graph_from_package_names(packages),
         },
         None => super::graph_from_all_packages(),
@@ -52,7 +48,6 @@ pub async fn cmd_build(args: BuildArgs) -> Result<()> {
     cmd_build_impl(
         &graph,
         args.no_cache,
-        args.source,
         cache,
         debug_bsr,
         args.num_parallel_builds,
@@ -63,7 +58,6 @@ pub async fn cmd_build(args: BuildArgs) -> Result<()> {
 pub async fn cmd_build_impl(
     graph: &DepGraph,
     ignore_cache: bool,
-    source_build: bool,
     cache: Cache<LocalDir>,
     debug_bsr: Option<BuildSpecRef>,
     num_parallel_builds: usize,
@@ -87,22 +81,15 @@ pub async fn cmd_build_impl(
         PrebuiltsLock::default()
     });
 
-    let mut run = Run::new(&graph, cache.clone(), remote_storage, lockfile);
+    let mut run = Run::new(graph, cache.clone(), remote_storage, lockfile);
     if ignore_cache {
-        run.execute(ExecPlan::new(&graph), debug_bsr).await
+        run.execute(ExecPlan::new(graph), debug_bsr).await
     } else {
-        let adapter = CacheBinProvider::new(&graph, cache.clone());
-        run.execute(ExecPlan::new_with_bin_provider(&graph, adapter), debug_bsr)
+        let adapter = CacheBinProvider::new(graph, cache.clone());
+        run.execute(ExecPlan::new_with_bin_provider(graph, adapter), debug_bsr)
             .await
     }
     .context("Failed to execute build")?;
-
-    if source_build {
-        for bsr in &graph.top_levels {
-            run.upload_prebuilt_archive(graph.get(bsr).unwrap(), &graph.spec_hash(bsr))
-                .await?;
-        }
-    }
 
     Ok(())
 }

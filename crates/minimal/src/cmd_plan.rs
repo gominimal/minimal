@@ -22,7 +22,7 @@ pub fn cmd_plan(args: PlanArgs) -> Result<()> {
     let graph = match args.packages {
         Some(ref packages) => match packages.len() {
             0 => super::graph_from_all_packages(),
-            1 => super::graph_from_package_name(&packages[0], false),
+            1 => super::graph_from_package_name(&packages[0]),
             _ => super::graph_from_package_names(packages),
         },
         None => super::graph_from_all_packages(),
