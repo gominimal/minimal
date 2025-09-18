@@ -16,7 +16,9 @@ generational-arena = "^0.2"
 smallvec = "1.14"
 blake3 = "1"
 fxhash = "0.2"
+
 nickel-lang-core = "0.14"
+codespan-reporting = { version = "0.12", features = ["serialization"] } # Keep in sync with nickel-lang-core
 
 path-absolutize = "^3.1"
 tempfile = { version = "3.0" }

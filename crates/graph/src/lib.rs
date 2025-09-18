@@ -32,8 +32,8 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn report_to_stderr(&self) {
-        use nickel_lang_core::error::{report::report, Diagnostic, Label};
+    pub fn report_to(&self, writer: &mut dyn codespan_reporting::term::termcolor::WriteColor) {
+        use nickel_lang_core::error::{report::report_with, Diagnostic, Label};
         use nickel_lang_core::files::FileId;
         use nickel_lang_core::position::RawSpan;
         use Error::*;
@@ -70,11 +70,11 @@ impl Error {
                     diagnostic
                 };
 
-                report(
+                report_with(
+                    writer,
                     &mut files,
                     diagnostic,
                     nickel_lang_core::error::report::ErrorFormat::Text,
-                    nickel_lang_core::error::report::ColorOpt::Auto,
                 );
             }
             MissingID(files, pos) => {
@@ -87,11 +87,11 @@ impl Error {
                     diagnostic
                 };
 
-                report(
+                report_with(
+                    writer,
                     &mut files,
                     diagnostic,
                     nickel_lang_core::error::report::ErrorFormat::Text,
-                    nickel_lang_core::error::report::ColorOpt::Auto,
                 );
             }
             MissingTy(files, pos) => {
@@ -104,11 +104,11 @@ impl Error {
                 };
                 let diagnostic = diagnostic.with_note("Perhaps you meant to apply ('|' operator) a type such as BuildSpec, OutputLib, Source, etc etc");
 
-                report(
+                report_with(
+                    writer,
                     &mut files,
                     diagnostic,
                     nickel_lang_core::error::report::ErrorFormat::Text,
-                    nickel_lang_core::error::report::ColorOpt::Auto,
                 );
             }
             Error::MissingField {
@@ -128,11 +128,11 @@ impl Error {
                     diagnostic
                 };
 
-                report(
+                report_with(
+                    writer,
                     &mut files,
                     diagnostic,
                     nickel_lang_core::error::report::ErrorFormat::Text,
-                    nickel_lang_core::error::report::ColorOpt::Auto,
                 );
             }
             Error::NoSuchOutput { files, pos, output } => {
@@ -145,14 +145,19 @@ impl Error {
                     diagnostic
                 };
 
-                report(
+                report_with(
+                    writer,
                     &mut files,
                     diagnostic,
                     nickel_lang_core::error::report::ErrorFormat::Text,
-                    nickel_lang_core::error::report::ColorOpt::Auto,
                 );
             }
         }
+    }
+
+    pub fn report_to_stderr(&self) {
+        use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
+        self.report_to(&mut StandardStream::stderr(ColorChoice::Auto).lock());
     }
 }
 
