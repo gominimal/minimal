@@ -3,7 +3,7 @@ use hakoniwa::Container;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
-use tracing::info;
+use tracing::{error, info};
 
 use crate::config::BuildConfig;
 use crate::error::{ExecutionError, Result};
@@ -146,9 +146,44 @@ impl BuildExecutor {
             message: format!("Container execution failed: {}", e),
         })?;
 
+        fs::write(Path::new(&temp_dir_str).join("stdout"), &output.stdout).map_err(|e| {
+            ExecutionError::SandboxFailed {
+                message: format!("Failed to write stdout: {}", e),
+            }
+        })?;
+        fs::write(Path::new(&temp_dir_str).join("stderr"), &output.stderr).map_err(|e| {
+            ExecutionError::SandboxFailed {
+                message: format!("Failed to write stderr: {}", e),
+            }
+        })?;
+
         if !output.status.success() {
             let exit_code = output.status.code;
-            return Err(ExecutionError::BuildFailed { code: exit_code }.into());
+
+            // Read the last few lines of stderr for immediate context
+            let stderr_snippet = fs::read_to_string(Path::new(&temp_dir_str).join("stderr"))
+                .unwrap_or_default()
+                .lines()
+                .rev()
+                .take(5)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            error!(
+                exit_code = exit_code,
+                temp_dir = %temp_dir_str,
+                stderr_snippet = %stderr_snippet,
+                "Build command failed"
+            );
+
+            return Err(ExecutionError::BuildFailed {
+                code: exit_code,
+                temp_dir: self.temp_dir_path.clone(),
+            }
+            .into());
         }
 
         Ok(())

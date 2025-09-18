@@ -1,7 +1,7 @@
 use glob::glob;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::BuildConfig;
 use crate::error::{OutputError, Result};
@@ -19,8 +19,12 @@ impl OutputValidator {
 
         info!("Validating {} output patterns", config.outputs.len());
         // Create final output directory if it doesn't exist
-        fs::create_dir_all(final_output_dir).map_err(|_| OutputError::MissingOutput {
-            path: final_output_dir.to_path_buf(),
+        fs::create_dir_all(final_output_dir).map_err(|e| OutputError::FileOperation {
+            message: format!(
+                "Failed to create output directory {}: {}",
+                final_output_dir.display(),
+                e
+            ),
         })?;
 
         let mut found_files = Vec::new();
@@ -28,8 +32,19 @@ impl OutputValidator {
             let resolved_outputs = Self::resolve_output_pattern(output_pattern, staging_dir)?;
 
             if resolved_outputs.is_empty() {
+                let files_found = Self::collect_staging_dir_files(staging_dir)?;
+
+                error!(
+                    pattern = %output_pattern,
+                    staging_dir = %staging_dir.display(),
+                    files_found = ?files_found,
+                    "Output pattern matched no files"
+                );
+
                 return Err(OutputError::MissingOutput {
                     path: PathBuf::from(output_pattern),
+                    staging_dir: staging_dir.to_path_buf(),
+                    files_found,
                 }
                 .into());
             }
@@ -42,19 +57,31 @@ impl OutputValidator {
             let relative_path =
                 output_file
                     .strip_prefix(staging_dir)
-                    .map_err(|_| OutputError::MissingOutput {
-                        path: output_file.clone(),
+                    .map_err(|_| OutputError::FileOperation {
+                        message: format!(
+                            "Failed to strip prefix from output file {}",
+                            output_file.display()
+                        ),
                     })?;
             let dest_path = final_output_dir.join(relative_path);
 
             if let Some(parent) = dest_path.parent() {
-                fs::create_dir_all(parent).map_err(|_| OutputError::MissingOutput {
-                    path: dest_path.clone(),
+                fs::create_dir_all(parent).map_err(|e| OutputError::FileOperation {
+                    message: format!(
+                        "Failed to create parent directory {}: {}",
+                        parent.display(),
+                        e
+                    ),
                 })?;
             }
 
-            fs::copy(output_file, &dest_path).map_err(|_| OutputError::MissingOutput {
-                path: dest_path.clone(),
+            fs::copy(output_file, &dest_path).map_err(|e| OutputError::FileOperation {
+                message: format!(
+                    "Failed to copy {} to {}: {}",
+                    output_file.display(),
+                    dest_path.display(),
+                    e
+                ),
             })?;
 
             info!(
@@ -91,6 +118,29 @@ impl OutputValidator {
         }
 
         Ok(())
+    }
+
+    fn collect_staging_dir_files(staging_dir: &Path) -> Result<Vec<String>> {
+        let mut files = Vec::new();
+        if let Ok(entries) = fs::read_dir(staging_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let relative_path = path
+                    .strip_prefix(staging_dir)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string();
+
+                if path.is_file() {
+                    files.push(format!("file: {}", relative_path));
+                } else if path.is_dir() {
+                    files.push(format!("dir: {}", relative_path));
+                }
+            }
+        }
+        // Limit to first 20 entries to avoid overwhelming output
+        files.truncate(20);
+        Ok(files)
     }
 
     fn collect_all_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {

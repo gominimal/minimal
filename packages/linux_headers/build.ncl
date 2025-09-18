@@ -1,6 +1,8 @@
 let { BuildSpec, OutputLib, Local, Source, Prebuilt, .. } = import "minimal.ncl" in
 let bash = import "../bash/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
+let findutils = import "../findutils/build.ncl" in
+let grep = import "../grep/build.ncl" in
 let make = import "../make/build.ncl" in
 let sed = import "../sed/build.ncl" in
 let tar = import "../tar/build.ncl" in
@@ -20,6 +22,8 @@ let linux_headers = import "../linux_headers/build.ncl" in
     } | Source,
     bash,
     coreutils,
+    findutils,
+    grep,
     make,
     sed,
     tar,

@@ -29,8 +29,10 @@ pub enum ConfigError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {
-    #[error("Build command failed with exit code {code}")]
-    BuildFailed { code: i32 },
+    #[error(
+        "Build command failed with exit code {code}\n  Temp directory: {temp_dir}\n  Check stderr: cat {temp_dir}/stderr"
+    )]
+    BuildFailed { code: i32, temp_dir: PathBuf },
 
     #[error("Container execution failed: {message}")]
     SandboxFailed { message: String },
@@ -56,11 +58,20 @@ pub enum ExecutionError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum OutputError {
-    #[error("Missing output file: {path}")]
-    MissingOutput { path: PathBuf },
+    #[error(
+        "Missing output file: {path}\n  Staging directory: {staging_dir}\n  Debug with: ls -la {staging_dir}\n  Files found: {files_found:?}"
+    )]
+    MissingOutput {
+        path: PathBuf,
+        staging_dir: PathBuf,
+        files_found: Vec<String>,
+    },
 
     #[error("Glob pattern error: {pattern}")]
     GlobPattern { pattern: String },
+
+    #[error("File operation failed: {message}")]
+    FileOperation { message: String },
 }
 
 pub type Result<T> = std::result::Result<T, BuildSandboxError>;

@@ -6,6 +6,7 @@ use crate::error::{ConfigError, Result};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BuildConfig {
+    pub name: String,
     pub dependencies: HashSet<PathBuf>,
     pub inputs: Vec<PathBuf>,
     pub build_script: BuildScript,

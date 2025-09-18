@@ -132,7 +132,7 @@ pub fn load_cache(
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::registry()
-        .with(fmt::layer())
+        .with(fmt::layer().with_target(false).with_thread_ids(true))
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")))
         .init();
 
