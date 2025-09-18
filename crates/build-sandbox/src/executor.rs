@@ -142,16 +142,12 @@ impl BuildExecutor {
 
         cmd.current_dir("/tmp");
 
-        let mut child = cmd.spawn().map_err(|e| ExecutionError::SandboxFailed {
+        let output = cmd.output().map_err(|e| ExecutionError::SandboxFailed {
             message: format!("Container execution failed: {}", e),
         })?;
 
-        let status = child.wait().map_err(|e| ExecutionError::SandboxFailed {
-            message: format!("Failed to wait for container process: {}", e),
-        })?;
-
-        if !status.success() {
-            let exit_code = status.code;
+        if !output.status.success() {
+            let exit_code = output.status.code;
             return Err(ExecutionError::BuildFailed { code: exit_code }.into());
         }
 

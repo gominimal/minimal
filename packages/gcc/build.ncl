@@ -1,4 +1,25 @@
-let { BuildSpec, OutputLib, Local, Prebuilt, .. } = import "minimal.ncl" in
+let { BuildSpec, OutputLib, Local, Source, Prebuilt, .. } = import "minimal.ncl" in
+# base
+let bash = import "../bash/build.ncl" in
+let bzip2 = import "../bzip2/build.ncl" in
+let coreutils = import "../coreutils/build.ncl" in
+let diffutils = import "../diffutils/build.ncl" in
+let file = import "../file/build.ncl" in
+let findutils = import "../findutils/build.ncl" in
+let gawk = import "../gawk/build.ncl" in
+let grep = import "../grep/build.ncl" in
+let gzip = import "../gzip/build.ncl" in
+let make = import "../make/build.ncl" in
+let perl = import "../perl/build.ncl" in
+let sed = import "../sed/build.ncl" in
+let tar = import "../tar/build.ncl" in
+let xz = import "../xz/build.ncl" in
+# toolchain
+let binutils = import "../binutils/build.ncl" in
+let gcc = import "../gcc/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
+let linux_headers = import "../linux_headers/build.ncl" in
+# other
 let gmp = import "../gmp/build.ncl" in
 let mpc = import "../mpc/build.ncl" in
 let mpfr = import "../mpfr/build.ncl" in
@@ -7,7 +28,37 @@ let zstd = import "../zstd/build.ncl" in
 {
   name = "gcc",
   inputs = [
-    { package = "gcc", sha256 = "1d1a1d7467b6c078a19c2b542461c5b715fcdcd7d808840fa58444aec0a1ef48" } | Prebuilt,
+    { file = "build.sh" } | Local,
+    {
+      url = "gs://minimal-staging-archives/gcc-15.2.0.tar.xz",
+      sha256 = "438fd996826b0c82485a29da03a72d71d6e3541a83ec702df4271f6fe025d24e"
+    } | Source,
+    # base
+    bash,
+    bzip2,
+    coreutils,
+    diffutils,
+    file,
+    findutils,
+    gawk,
+    grep,
+    gzip,
+    make,
+    perl,
+    sed,
+    tar,
+    xz,
+    # toolchain
+    binutils,
+    gcc,
+    glibc,
+    linux_headers,
+    # other
+    gmp,
+    mpc,
+    mpfr,
+    zlib,
+    zstd,
   ],
   runtime_deps = [
     gmp,
@@ -16,8 +67,26 @@ let zstd = import "../zstd/build.ncl" in
     zlib,
     zstd,
   ],
-  cmd = "",
+  cmd = "./build.sh",
   outputs = {
     usr = { glob = "usr/**/*" } | OutputLib,
   },
+  replace_on_cycle =
+    {
+      name = "gcc (prebuilt)",
+      inputs = [
+        { package = "gcc" } | Prebuilt,
+      ],
+      runtime_deps = [
+        gmp,
+        mpc,
+        mpfr,
+        zlib,
+        zstd,
+      ],
+      cmd = "",
+      outputs = {
+        usr = { glob = "usr/**/*" } | OutputLib,
+      },
+    } | BuildSpec,
 } | BuildSpec

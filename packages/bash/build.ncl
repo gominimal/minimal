@@ -10,7 +10,11 @@ let gzip = import "../gzip/build.ncl" in
 let make = import "../make/build.ncl" in
 let sed = import "../sed/build.ncl" in
 let tar = import "../tar/build.ncl" in
-let toolchain = import "../toolchain/build.ncl" in
+# toolchain
+let binutils = import "../binutils/build.ncl" in
+let gcc = import "../gcc/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
+let linux_headers = import "../linux_headers/build.ncl" in
 {
   name = "bash",
   inputs = [
@@ -27,7 +31,11 @@ let toolchain = import "../toolchain/build.ncl" in
     make,
     sed,
     tar,
-    toolchain,
+    # toolchain
+    binutils,
+    gcc,
+    glibc,
+    linux_headers,
   ],
   runtime_deps = [
     glibc,
@@ -43,17 +51,18 @@ let toolchain = import "../toolchain/build.ncl" in
     usr_include = { glob = "usr/include/**/*" } | OutputLib,
   },
 
-  replace_on_cycle = {
-    name = "bash (prebuilt)",
-    inputs = [
-      { package = "bash" } | Prebuilt,
-    ],
-    runtime_deps = [
-      glibc,
-      ncurses,
-      readline,
-    ],
-    cmd = "",
-    outputs = {},
-  } | BuildSpec,
+  replace_on_cycle =
+    {
+      name = "bash (prebuilt)",
+      inputs = [
+        { package = "bash" } | Prebuilt,
+      ],
+      runtime_deps = [
+        glibc,
+        ncurses,
+        readline,
+      ],
+      cmd = "",
+      outputs = {},
+    } | BuildSpec,
 } | BuildSpec
