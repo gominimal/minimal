@@ -4,10 +4,10 @@ let toolchain = import "../toolchain/build.ncl" in
 {
   name = "gdbm",
   inputs = [
-    {file = "build.sh"} | Local,
+    { file = "build.sh" } | Local,
     {
-        url = "gs://minimal-staging-archives/gdbm-1.26.tar.gz",
-        sha256 = "6a24504a14de4a744103dcb936be976df6fbe88ccff26065e54c1c47946f4a5e"
+      url = "gs://minimal-staging-archives/gdbm-1.26.tar.gz",
+      sha256 = "6a24504a14de4a744103dcb936be976df6fbe88ccff26065e54c1c47946f4a5e"
     } | Source,
     base,
     toolchain,
@@ -16,22 +16,8 @@ let toolchain = import "../toolchain/build.ncl" in
   outputs = {
     bin = { path = "usr/bin/*" } | OutputBin,
     lib = { glob = "usr/lib/*" } | OutputLib,
-    include = { data = "usr/include/**/*" } | OutputData,
+    usr_include = { data = "usr/include/**/*" } | OutputData,
     man = { data = "usr/share/man/**/*" } | OutputData,
     info = { data = "usr/share/info/*" } | OutputData,
   },
-
-  replace_on_cycle = {
-    name = "gdbm (prebuilt)",
-    inputs = [
-      { package = "gdbm" } | Prebuilt,
-    ],
-    runtime_deps = [],
-    cmd = "",
-    outputs = {
-      bin = { path = "usr/bin/*" } | OutputBin,
-      lib = { glob = "usr/lib/*" } | OutputLib,
-      include = { data = "usr/include/**/*" } | OutputData,
-    },
-  } | BuildSpec,
 } | BuildSpec

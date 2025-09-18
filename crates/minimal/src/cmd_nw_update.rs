@@ -78,15 +78,17 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs) -> Result<()> {
         let cache_handle = cache.read_dir(&package_hash).unwrap();
         let cache_dir = cache_handle.path();
         let archive_name = format!("{}.tar.zst", package_hash.0.to_hex());
-        let temp_archive_path = std::env::temp_dir().join(&archive_name);
-        crate::run::create_prebuilt_archive(&cache_dir.to_path_buf(), &temp_archive_path)?;
+
+        let encoder = zstd::stream::Encoder::new(Vec::new(), 3)?;
+        let mut tar_builder = tar::Builder::new(encoder);
+        tar_builder.append_dir_all(".", cache_dir)?;
+        let archive_data = tar_builder.into_inner()?.finish()?;
 
         // Compute sha256 hash
         let hash_hex = {
             use sha2::{Digest, Sha256};
-            let file_contents = std::fs::read(&temp_archive_path)?;
             let mut hasher = Sha256::new();
-            hasher.update(&file_contents);
+            hasher.update(&archive_data);
             let computed_hash = hasher.finalize();
             hex::encode(computed_hash)
         };
@@ -95,11 +97,9 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs) -> Result<()> {
         // Upload
         let bucket_id = "minimal-staging-archives";
         let gcs_path = format!("prebuilts/{}/{}", prebuilt_name, archive_name);
-        let archive_data = std::fs::read(&temp_archive_path)?;
         remote_storage
             .upload(bucket_id, &gcs_path, &archive_data)
             .await?;
-        std::fs::remove_file(&temp_archive_path)?;
         eprintln!(
             "Automatically uploaded prebuilt to gs://{}/{}",
             bucket_id, gcs_path

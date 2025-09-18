@@ -8,7 +8,7 @@ use graph::{
 };
 use std::collections::HashSet;
 use std::path::PathBuf;
-use tempfile::Builder;
+use tempfile::{Builder, tempdir};
 use tracing::{debug, warn};
 use url::Url;
 
@@ -56,6 +56,7 @@ async fn materialize_source(
 
                     let file_name = url.path().trim_start_matches('/');
 
+                    // TODO
                     let temp_base = std::env::temp_dir()
                         .join(format!("minpkgs-sources-{}", build_name.replace('/', "-")));
                     std::fs::create_dir_all(&temp_base)?;
@@ -542,7 +543,7 @@ impl<'a> Run<'a> {
         let cache_handle = self.cache.read_dir(bsh).unwrap();
         let cache_dir = cache_handle.path();
         let archive_name = format!("{}.tar.zst", package_hash.0.to_hex());
-        let temp_archive_path = std::env::temp_dir().join(&archive_name);
+        let temp_archive_path = tempdir()?.path().join(&archive_name);
 
         let gcs_path = format!("prebuilts/{}/{}", build.name, archive_name);
 
@@ -551,9 +552,11 @@ impl<'a> Run<'a> {
             return Ok(());
         }
 
-        create_prebuilt_archive(&cache_dir.to_path_buf(), &temp_archive_path)?;
+        let encoder = zstd::stream::Encoder::new(Vec::new(), 3)?;
+        let mut tar_builder = tar::Builder::new(encoder);
+        tar_builder.append_dir_all(".", cache_dir)?;
+        let archive_data = tar_builder.into_inner()?.finish()?;
 
-        let archive_data = std::fs::read(&temp_archive_path)?;
         self.remote_storage
             .upload(BUCKET_ID, &gcs_path, &archive_data)
             .await?;
@@ -573,23 +576,6 @@ impl<'a> Run<'a> {
 
         Ok(())
     }
-}
-
-pub(crate) fn create_prebuilt_archive(
-    prebuilt_dir: &PathBuf,
-    archive_path: &PathBuf,
-) -> std::io::Result<()> {
-    let file = std::fs::File::create(archive_path)?;
-    let encoder = zstd::stream::Encoder::new(file, 3)?; // Compression level 3
-    let mut tar_builder = tar::Builder::new(encoder);
-
-    // Add all files from the prebuilt directory to the archive
-    tar_builder.append_dir_all(".", prebuilt_dir)?;
-
-    let encoder = tar_builder.into_inner()?;
-    encoder.finish()?;
-
-    Ok(())
 }
 
 fn extract_prebuilt_archive(archive_path: &PathBuf, extract_dir: &PathBuf) -> Result<()> {

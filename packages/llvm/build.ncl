@@ -4,8 +4,7 @@ let cmake = import "../cmake/build.ncl" in
 let libffi = import "../libffi/build.ncl" in
 let ninja = import "../ninja/build.ncl" in
 let python = import "../python/build.ncl" in
-# let toolchain-gnullvm = import "../toolchain-gnullvm/build.ncl" in
-let toolchain = import "../toolchain/build.ncl" in
+let toolchain-gnullvm = import "../toolchain-gnullvm/build.ncl" in
 {
   name = "llvm",
   inputs = [
@@ -35,8 +34,7 @@ let toolchain = import "../toolchain/build.ncl" in
     libffi,
     ninja,
     python,
-    # toolchain-gnullvm,
-    toolchain,
+    toolchain-gnullvm,
   ],
   cmd = "./build.sh",
   outputs = {

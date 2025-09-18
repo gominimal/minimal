@@ -2,13 +2,11 @@ use fs_extra::dir::{self as fs_dir};
 use hakoniwa::Container;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use tempfile::tempdir;
 use tracing::info;
 
 use crate::config::BuildConfig;
 use crate::error::{ExecutionError, Result};
-
-static BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct BuildExecutor {
     pub temp_dir_path: PathBuf,
@@ -17,11 +15,7 @@ pub struct BuildExecutor {
 
 impl BuildExecutor {
     pub fn new() -> Result<Self> {
-        let build_id = BUILD_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let unique_id = format!("{}-{}", std::process::id(), build_id);
-        let temp_dir_path = std::env::temp_dir().join(format!("build-sandbox-{}", unique_id));
-        fs::create_dir_all(&temp_dir_path).map_err(|_| ExecutionError::TempDirCreation)?;
-
+        let temp_dir_path = tempdir()?.path().to_path_buf();
         let output_staging_path = temp_dir_path.join("output");
         fs::create_dir_all(&output_staging_path).map_err(|_| ExecutionError::TempDirCreation)?;
 
