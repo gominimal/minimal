@@ -2,6 +2,8 @@ use crate::{
     Error, GlobalArgs, PackagesArg, lockfile::PrebuiltsLock, remote_storage::RemoteStorage,
 };
 use graph::BuildSpecInput;
+use std::path::Path;
+use tracing::{info, warn};
 
 static BUCKET_ID: &str = "minimal-staging-archives";
 
@@ -19,24 +21,13 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs, globals: &GlobalArgs) -> R
         &graph,
         globals.no_cache,
         cache.clone(),
-        None,
         globals.num_parallel_builds,
     )
     .await?;
 
     let remote_storage = RemoteStorage::new().await.unwrap();
 
-    // Load the lockfile
-    let lockfile_path = std::path::Path::new("prebuilts.lock");
-    let mut lockfile = PrebuiltsLock::load(lockfile_path).unwrap_or_else(|e| {
-        eprintln!(
-            "Warning: Failed to load lockfile {}: {}",
-            lockfile_path.display(),
-            e
-        );
-        eprintln!("Using empty lockfile...");
-        PrebuiltsLock::default()
-    });
+    let mut lockfile = PrebuiltsLock::load(Path::new("prebuilts.lock")).unwrap();
 
     for bsr in &graph.top_levels {
         // Work out the name of the prebuilt by looking at replace_by_cycle and then the first input
@@ -82,24 +73,24 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs, globals: &GlobalArgs) -> R
             let computed_hash = hasher.finalize();
             hex::encode(computed_hash)
         };
-        eprintln!("sha256({}) = {}", prebuilt_name, hash_hex);
+        info!("sha256({}) = {}", prebuilt_name, hash_hex);
 
         // Upload
         let gcs_path = format!("prebuilts/{}/{}", prebuilt_name, archive_name);
         remote_storage
             .upload(BUCKET_ID, &gcs_path, &archive_data)
             .await?;
-        eprintln!(
+        info!(
             "Automatically uploaded prebuilt to gs://{}/{}",
             BUCKET_ID, gcs_path
         );
 
         // Update the prebuilts lockfile
         lockfile.update_hash(prebuilt_name.clone(), package_hash.0.to_hex().to_string());
-        eprintln!("Updated prebuilts.lock with new hash for {}", prebuilt_name);
+        info!("Updated prebuilts.lock with new hash for {}", prebuilt_name);
 
         if let Some(old_hash_hex) = prebuilt_sha256 {
-            eprintln!(
+            info!(
                 "updating hardcoded sha256 value: {} => {}",
                 old_hash_hex, hash_hex
             );
@@ -120,7 +111,7 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs, globals: &GlobalArgs) -> R
                 .status()
                 .map_err(anyhow::Error::from)?;
             if !status.success() {
-                eprintln!(
+                warn!(
                     "find/replace for hardcoded hash failed with exit code: {:?}",
                     status.code()
                 );

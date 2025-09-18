@@ -27,16 +27,16 @@ pub fn cmd_plan(args: PlanArgs, globals: &GlobalArgs) -> Result<(), Error> {
 }
 
 fn print_plan<BP: BinProvider>(graph: &DepGraph, cache: &Cache<LocalDir>, plan: ExecPlan<BP>) {
-    println!("✓ = Already built, ⚙️ = To be built");
+    eprintln!("✓ = Already built, ⚙️ = To be built");
     for (i, phase) in plan.enumerate() {
-        println!("Phase {}", i + 1);
+        eprintln!("Phase {}", i + 1);
         for (bsr, do_full_build) in phase.unwrap().builds.iter() {
             let build = graph.get(bsr).unwrap();
             let bsh = graph.spec_hash(bsr);
             let is_cached = cache.read_dir(&bsh).is_ok();
             let cached_emoji = if is_cached { "✓" } else { "⚙️" };
 
-            println!(
+            eprintln!(
                 " - {} {} [{}] full_build={}",
                 cached_emoji,
                 build.name,

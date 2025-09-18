@@ -11,8 +11,6 @@ pub struct BuildConfig {
     pub inputs: Vec<PathBuf>,
     pub build_script: BuildScript,
     pub outputs: Vec<String>,
-    #[serde(default)]
-    pub debug_shell: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

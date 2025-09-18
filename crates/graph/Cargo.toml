@@ -18,3 +18,4 @@ blake3.workspace = true
 fxhash.workspace = true
 generational-arena.workspace = true
 smallvec.workspace = true
+tracing.workspace = true

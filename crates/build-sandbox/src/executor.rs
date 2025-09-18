@@ -8,26 +8,24 @@ use tracing::{error, info};
 use crate::config::BuildConfig;
 use crate::error::{ExecutionError, Result};
 
+#[derive(Debug)]
 pub struct BuildExecutor {
-    pub temp_dir_path: PathBuf,
-    pub output_staging_path: PathBuf,
+    path: PathBuf,
 }
 
 impl BuildExecutor {
+    #[tracing::instrument]
     pub fn new() -> Result<Self> {
-        let temp_dir_path = tempdir()?.path().to_path_buf();
-        let output_staging_path = temp_dir_path.join("output");
-        fs::create_dir_all(&output_staging_path).map_err(|_| ExecutionError::TempDirCreation)?;
-
-        info!("Created build environment at {}", temp_dir_path.display());
-
-        Ok(BuildExecutor {
-            temp_dir_path,
-            output_staging_path,
-        })
+        let executor = BuildExecutor {
+            path: tempdir()?.path().to_path_buf(),
+        };
+        fs::create_dir_all(executor.output_staging_dir())
+            .map_err(|_| ExecutionError::TempDirCreation)?;
+        Ok(executor)
     }
 
-    pub fn execute(&self, config: &BuildConfig, _verbose: bool) -> Result<BuildResult> {
+    #[tracing::instrument(skip(config))]
+    pub fn execute(&self, config: &BuildConfig) -> Result<i32> {
         info!(
             "Copying {} inputs to build environment",
             config.inputs.len()
@@ -37,26 +35,22 @@ impl BuildExecutor {
             self.copy_to_tmpdir(input)?;
         }
 
-        if config.debug_shell {
-            self.create_debug_helper()?;
-        }
-
         self.execute_in_container(config)?;
 
-        Ok(BuildResult { exit_code: 0 })
+        Ok(0)
     }
 
     pub fn temp_output_dir(&self) -> &Path {
-        &self.temp_dir_path
+        &self.path
     }
 
-    pub fn output_staging_dir(&self) -> &Path {
-        &self.output_staging_path
+    pub fn output_staging_dir(&self) -> PathBuf {
+        self.path.join("output").to_path_buf()
     }
 
     fn copy_to_tmpdir(&self, input: &Path) -> Result<()> {
         let dest_path = if let Some(file_name) = input.file_name() {
-            self.temp_dir_path.join(file_name)
+            self.path.join(file_name)
         } else {
             return Ok(());
         };
@@ -84,38 +78,24 @@ impl BuildExecutor {
         Ok(())
     }
 
+    #[tracing::instrument(skip(config))]
     fn execute_in_container(&self, config: &BuildConfig) -> Result<()> {
-        info!("Executing command in container...");
-
         let rootfs = self.prepare_rootfs(config)?;
-
-        let program = if config.debug_shell {
-            "/bin/bash"
-        } else {
-            &config.build_script.executable.to_string_lossy()
-        };
-
-        info!("Using program: {}", program);
-
-        let temp_dir_str = self.temp_dir_path.to_string_lossy().into_owned();
-        let output_dir_str = self.output_staging_path.to_string_lossy().into_owned();
-
+        let program = &config.build_script.executable.to_string_lossy();
         let mut cmd = Container::new()
             .rootfs(&rootfs)
             .map_err(|e| ExecutionError::SandboxFailed {
                 message: format!("Failed to set rootfs: {}", e),
             })?
             .devfsmount("/dev")
-            .bindmount_rw(&temp_dir_str, "/tmp")
-            .bindmount_rw(&output_dir_str, "/tmp/output")
+            .bindmount_rw(self.path.to_str().unwrap(), "/tmp")
+            .bindmount_rw(self.output_staging_dir().to_str().unwrap(), "/tmp/output")
             .symlink("/usr/bin", "/bin")
             .symlink("/usr/lib", "/lib64")
             .command(program);
 
-        if !config.debug_shell {
-            for arg in &config.build_script.args {
-                cmd.arg(arg);
-            }
+        for arg in &config.build_script.args {
+            cmd.arg(arg);
         }
 
         cmd.env("HOME", "/tmp")
@@ -126,19 +106,11 @@ impl BuildExecutor {
             .env("LC_ALL", "en_US.utf8")
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
 
-        if config.debug_shell {
-            cmd.env("SHELL", "/bin/bash").env("TERM", "xterm");
-            if let Ok(user) = std::env::var("USER") {
-                cmd.env("USER", &user);
-            }
-            info!("Starting interactive debug shell...");
-        } else {
-            info!(
-                "Executing: {} {}",
-                config.build_script.executable.display(),
-                config.build_script.args.join(" ")
-            );
-        }
+        info!(
+            "Executing: {} {}",
+            config.build_script.executable.display(),
+            config.build_script.args.join(" ")
+        );
 
         cmd.current_dir("/tmp");
 
@@ -146,12 +118,12 @@ impl BuildExecutor {
             message: format!("Container execution failed: {}", e),
         })?;
 
-        fs::write(Path::new(&temp_dir_str).join("stdout"), &output.stdout).map_err(|e| {
+        fs::write(self.path.join("stdout"), &output.stdout).map_err(|e| {
             ExecutionError::SandboxFailed {
                 message: format!("Failed to write stdout: {}", e),
             }
         })?;
-        fs::write(Path::new(&temp_dir_str).join("stderr"), &output.stderr).map_err(|e| {
+        fs::write(self.path.join("stderr"), &output.stderr).map_err(|e| {
             ExecutionError::SandboxFailed {
                 message: format!("Failed to write stderr: {}", e),
             }
@@ -161,7 +133,7 @@ impl BuildExecutor {
             let exit_code = output.status.code;
 
             // Read the last few lines of stderr for immediate context
-            let stderr_snippet = fs::read_to_string(Path::new(&temp_dir_str).join("stderr"))
+            let stderr_snippet = fs::read_to_string(self.path.join("stderr"))
                 .unwrap_or_default()
                 .lines()
                 .rev()
@@ -174,14 +146,14 @@ impl BuildExecutor {
 
             error!(
                 exit_code = exit_code,
-                temp_dir = %temp_dir_str,
+                temp_dir = self.path.to_str().unwrap(),
                 stderr_snippet = %stderr_snippet,
                 "Build command failed"
             );
 
             return Err(ExecutionError::BuildFailed {
                 code: exit_code,
-                temp_dir: self.temp_dir_path.clone(),
+                temp_dir: self.path.clone(),
             }
             .into());
         }
@@ -189,8 +161,9 @@ impl BuildExecutor {
         Ok(())
     }
 
+    #[tracing::instrument(skip(config))]
     fn prepare_rootfs(&self, config: &BuildConfig) -> Result<PathBuf> {
-        let rootfs = self.temp_dir_path.join("rootfs");
+        let rootfs = self.path.join("rootfs");
         fs::create_dir_all(&rootfs)?;
 
         for cache_path in &config.dependencies {
@@ -214,25 +187,4 @@ impl BuildExecutor {
 
         Ok(())
     }
-
-    fn create_debug_helper(&self) -> Result<()> {
-        let bashrc = r#"echo "=== Build Sandbox Debug Shell ==="
-echo "TMPDIR=$TMPDIR"
-echo "OUTPUT_DIR=$OUTPUT_DIR" 
-echo "Type 'exit' to leave"
-echo "=================================="
-"#;
-        let bashrc_path = self.temp_dir_path.join(".bashrc");
-        fs::write(&bashrc_path, bashrc).map_err(|e| ExecutionError::FileOperation {
-            operation: "write .bashrc".to_string(),
-            path: bashrc_path.display().to_string(),
-            source: e,
-        })?;
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
-pub struct BuildResult {
-    pub exit_code: i32,
 }

@@ -14,6 +14,7 @@ pub struct RemoteStorage {
 }
 
 impl RemoteStorage {
+    #[tracing::instrument]
     pub async fn new() -> Result<Self> {
         let cache_dir = {
             let dir = dirs::cache_dir().unwrap().join("minimal-fetches");
@@ -32,6 +33,7 @@ impl RemoteStorage {
         Ok(Self { client, cache_dir })
     }
 
+    #[tracing::instrument]
     pub async fn download_https_with_verification_and_caching(
         &self,
         url: &str,
@@ -82,6 +84,7 @@ impl RemoteStorage {
         Ok(data.into())
     }
 
+    #[tracing::instrument]
     pub async fn download_with_verification_and_caching(
         &self,
         bucket_id: String,
@@ -131,8 +134,8 @@ impl RemoteStorage {
         Ok(data)
     }
 
+    #[tracing::instrument]
     pub async fn download(&self, bucket_id: String, file: &str) -> Result<Bytes> {
-        eprintln!("Fetching {} from bucket {}", file, bucket_id);
         let mut reader = self
             .client
             .read_object(format!("projects/_/buckets/{bucket_id}"), file)
@@ -145,9 +148,8 @@ impl RemoteStorage {
         Ok(Bytes::from(contents))
     }
 
+    #[tracing::instrument]
     pub async fn upload(&self, bucket_id: &str, file_path: &str, data: &[u8]) -> Result<()> {
-        eprintln!("Uploading {} to bucket {}", file_path, bucket_id);
-
         let bytes_data = bytes::Bytes::copy_from_slice(data);
         let _response = self
             .client
@@ -158,13 +160,6 @@ impl RemoteStorage {
             )
             .send_buffered()
             .await?;
-
-        println!(
-            "Successfully uploaded {} bytes to gs://{}/{}",
-            data.len(),
-            bucket_id,
-            file_path
-        );
 
         Ok(())
     }

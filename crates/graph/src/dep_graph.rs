@@ -163,6 +163,7 @@ impl DepGraph {
     }
 
     /// Returns the specification hash of the given build spec.
+    #[tracing::instrument]
     pub fn spec_hash(&self, bsr: &BuildSpecRef) -> SpecHash {
         {
             if let Some(hash) = self.hash_cache.read().unwrap().0.get(bsr) {

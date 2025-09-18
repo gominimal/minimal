@@ -10,6 +10,7 @@ pub struct PrebuiltsLock {
 
 impl PrebuiltsLock {
     /// Load lockfile from disk, or create empty one if it doesn't exist
+    #[tracing::instrument]
     pub fn load(path: &Path) -> Result<Self> {
         if path.exists() {
             let contents = std::fs::read_to_string(path)?;
@@ -22,6 +23,7 @@ impl PrebuiltsLock {
     }
 
     /// Save lockfile to disk
+    #[tracing::instrument]
     pub fn save(&self, path: &Path) -> Result<()> {
         let contents = toml::to_string_pretty(self)?;
         std::fs::write(path, contents)?;
@@ -29,18 +31,14 @@ impl PrebuiltsLock {
     }
 
     /// Get the locked hash for a package, if it exists
+    #[tracing::instrument]
     pub fn get_hash(&self, package: &str) -> Option<&str> {
         self.prebuilts.get(package).map(|s| s.as_str())
     }
 
     /// Update the locked hash for a package
+    #[tracing::instrument]
     pub fn update_hash(&mut self, package: String, hash: String) {
         self.prebuilts.insert(package, hash);
-    }
-
-    /// Check if a package has a locked hash
-    #[allow(dead_code)]
-    pub fn has_package(&self, package: &str) -> bool {
-        self.prebuilts.contains_key(package)
     }
 }

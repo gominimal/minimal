@@ -1,7 +1,11 @@
+#![allow(clippy::result_large_err)]
+
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use graph::{DepGraph, Error as GraphError, SpecReader, SpecReaderOptions};
 use std::path::{Path, PathBuf};
+use tracing::error;
+use tracing_indicatif::IndicatifLayer;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 mod lockfile;
@@ -41,7 +45,7 @@ enum Command {
 }
 
 /// Shared arguments and builders across all subcommands
-#[derive(Args)]
+#[derive(Debug, Args)]
 pub struct GlobalArgs {
     /// Override the directory where binary artifacts are cached
     #[arg(long)]
@@ -92,7 +96,7 @@ impl GlobalArgs {
         let build_ncl_path = {
             let normal_path = package_dir.join("build.ncl");
             if !normal_path.exists() {
-                eprintln!(
+                error!(
                     "Error: build.ncl not found in package directory: {}",
                     package_dir.display()
                 );
@@ -111,6 +115,7 @@ impl GlobalArgs {
         DepGraph::new(sr)
     }
 
+    #[tracing::instrument]
     pub fn graph_from_package_names(&self, names: &[String]) -> Result<DepGraph, GraphError> {
         let packages_dir = match &self.packages_dir {
             Some(dir) => dir,
@@ -128,6 +133,7 @@ impl GlobalArgs {
         DepGraph::new(sr)
     }
 
+    #[tracing::instrument]
     pub fn graph_from_all_packages(&self) -> Result<DepGraph, GraphError> {
         let packages_dir = match &self.packages_dir {
             Some(dir) => dir,
@@ -146,7 +152,7 @@ impl GlobalArgs {
 }
 
 /// Argument parser for `[--packages <package 1>[,<package N>]]`.
-#[derive(Args)]
+#[derive(Debug, Args)]
 pub struct PackagesArg {
     /// Package names to build, comma-separated
     #[arg(short, long, alias="package", value_delimiter=',', num_args=0..)]
@@ -168,6 +174,7 @@ impl PackagesArg {
 }
 
 /// Error variants for CLI subcommand results.
+#[allow(clippy::large_enum_variant)]
 pub enum Error {
     Graph(GraphError),
     Other(anyhow::Error),
@@ -195,9 +202,12 @@ impl From<anyhow::Error> for Error {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let indicatif_layer = IndicatifLayer::new().with_max_progress_bars(99, None);
     tracing_subscriber::registry()
-        .with(fmt::layer().with_target(false).with_thread_ids(true))
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")))
+        // .with(fmt::layer().with_target(false).with_thread_ids(true))
+        .with(fmt::layer().with_writer(indicatif_layer.get_stderr_writer()))
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(indicatif_layer)
         .init();
 
     let cli = Cli::parse();

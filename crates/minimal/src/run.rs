@@ -9,7 +9,7 @@ use graph::{
 use std::collections::HashSet;
 use std::path::PathBuf;
 use tempfile::Builder;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage};
@@ -195,6 +195,7 @@ fn is_pure_prebuilt(build: &BuildSpec) -> bool {
     has_prebuilt && !has_local_or_source
 }
 
+#[tracing::instrument]
 async fn materialize_prebuilt(
     build: &BuildSpec,
     build_hash: &SpecHash,
@@ -202,10 +203,6 @@ async fn materialize_prebuilt(
     lockfile: &PrebuiltsLock,
     remote_storage: &RemoteStorage,
 ) -> Result<PendingDir> {
-    eprintln!(
-        "Pure prebuilt package: {}, copying files directly",
-        build.name
-    );
     let cache_handle = cache.write_dir(build_hash).unwrap();
     let output_dir = cache_handle.path();
 
@@ -292,6 +289,7 @@ async fn materialize_prebuilt(
 }
 
 /// A run executes builds according to some plan.
+#[derive(Debug)]
 pub struct Run<'a> {
     graph: &'a DepGraph,
     cache: Cache<LocalDir>,
@@ -314,6 +312,7 @@ impl<'a> Run<'a> {
         }
     }
 
+    #[tracing::instrument]
     async fn sandbox_paths_from_buildspec(
         &self,
         build: &BuildSpec,
@@ -372,20 +371,15 @@ impl<'a> Run<'a> {
             dependencies.extend(dep_paths);
         }
 
-        debug!(
-            "Dependencies for isolated build {}: {:?}",
-            build.name, dependencies
-        );
-
         Ok((dependencies, inputs))
     }
 
     /// runs a single isolated build, does not take self so it can be spawned in a thread.
+    #[tracing::instrument(skip_all)]
     async fn do_build(
         &self,
         build: &BuildSpecRef,
         _full_build: bool,
-        debug_shell: bool,
     ) -> Result<Option<PendingDir>> {
         let bsh = self.graph.spec_hash(build);
         let build = self.graph.get(build).unwrap();
@@ -410,11 +404,10 @@ impl<'a> Run<'a> {
             ));
         }
 
-        eprintln!("Executing build: {} [{}]", build.name, bsh.0.to_hex());
         let (dependencies, inputs) = self.sandbox_paths_from_buildspec(build).await?;
 
         if build.cmd.trim().is_empty() {
-            eprintln!(
+            info!(
                 "No-op package with empty cmd: {}, creating cache entry",
                 build.name
             );
@@ -449,22 +442,16 @@ impl<'a> Run<'a> {
                         BuildOutput::Binary { path } => path.clone(),
                     })
                     .collect(),
-                debug_shell,
             };
 
             let out_dir = self.cache.write_dir(&bsh).unwrap();
-            run_build(&config, out_dir.path(), true)
+            run_build(&config, out_dir.path())
                 .map_err(|e| anyhow::anyhow!("Failed to build {}: {}", build.name, e))?;
-            eprintln!("Completed isolated build: {}", build.name);
             Ok(Some(out_dir))
         }
     }
 
-    pub async fn execute<BP: BinProvider>(
-        &mut self,
-        plan: ExecPlan<'a, BP>,
-        debug: Option<BuildSpecRef>,
-    ) -> Result<()> {
+    pub async fn execute<BP: BinProvider>(&mut self, plan: ExecPlan<'a, BP>) -> Result<()> {
         // Execute builds in dependency order - each build runs in isolation
         // and can only access outputs from previously completed builds
 
@@ -481,7 +468,6 @@ impl<'a> Run<'a> {
             rayon::scope(|s| {
                 for (bsr, full_build) in phase.unwrap().builds.iter() {
                     let tokio_runtime = tokio_runtime.clone();
-                    let debug_shell = matches!(debug, Some(debug_bsr) if *bsr == debug_bsr);
                     let bsr = bsr.to_owned();
                     let full_build = full_build.to_owned();
                     let self2 = self2.clone();
@@ -491,11 +477,8 @@ impl<'a> Run<'a> {
                     s.spawn(move |_| {
                         let _rt = tokio_runtime.enter();
 
-                        let cache_handle = futures::executor::block_on(self2.do_build(
-                            &bsr,
-                            full_build,
-                            debug_shell,
-                        ));
+                        let cache_handle =
+                            futures::executor::block_on(self2.do_build(&bsr, full_build));
 
                         match cache_handle {
                             Err(e) => {

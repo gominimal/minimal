@@ -1,7 +1,7 @@
 use glob::glob;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 use crate::config::BuildConfig;
 use crate::error::{OutputError, Result};
@@ -9,15 +9,14 @@ use crate::error::{OutputError, Result};
 pub struct OutputValidator;
 
 impl OutputValidator {
+    #[tracing::instrument(skip(config))]
     pub fn validate_and_collect(
         config: &BuildConfig,
         staging_dir: &Path,
         final_output_dir: &Path,
-        _verbose: bool,
     ) -> Result<Vec<PathBuf>> {
         let mut collected_outputs = Vec::new();
 
-        info!("Validating {} output patterns", config.outputs.len());
         // Create final output directory if it doesn't exist
         fs::create_dir_all(final_output_dir).map_err(|e| OutputError::FileOperation {
             message: format!(
@@ -84,11 +83,6 @@ impl OutputValidator {
                 ),
             })?;
 
-            info!(
-                "Copied {} to {}",
-                output_file.display(),
-                dest_path.display()
-            );
             collected_outputs.push(dest_path);
         }
 

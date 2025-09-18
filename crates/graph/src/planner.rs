@@ -193,12 +193,14 @@ fn make_reachable<BP: BinProvider>(
 }
 
 impl<'a> ExecPlan<'a, ()> {
+    #[tracing::instrument]
     pub fn new(dep_graph: &'a DepGraph) -> Self {
         ExecPlan::with_toplevels((), dep_graph, &dep_graph.top_levels)
     }
 }
 
 impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
+    #[tracing::instrument]
     pub fn new_with_bin_provider(dep_graph: &'a DepGraph, bin_provider: BP) -> ExecPlan<'a, BP> {
         ExecPlan::with_toplevels(bin_provider, dep_graph, &dep_graph.top_levels)
     }
