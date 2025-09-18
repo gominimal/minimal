@@ -1,43 +1,26 @@
-use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage};
-use anyhow::Result;
+use crate::{
+    Error, GlobalArgs, PackagesArg, lockfile::PrebuiltsLock, remote_storage::RemoteStorage,
+};
 use graph::BuildSpecInput;
-use std::path::PathBuf;
 
 static BUCKET_ID: &str = "minimal-staging-archives";
 
 #[derive(clap::Args)]
 pub struct NWUpdateArgs {
-    /// Package names to build & update
-    #[arg(short, long, alias="package", value_delimiter=',', num_args=0..)]
-    packages: Vec<String>,
-
-    /// Path to a directory to cache build outputs in
-    #[arg(long)]
-    cache_dir: Option<PathBuf>,
-
-    /// Whether to ignore the local cache
-    #[arg(long, default_value_t = false)]
-    no_cache: bool,
-
-    /// Number of parallel builds
-    #[arg(short, long, default_value_t = 4)]
-    num_parallel_builds: usize,
+    #[command(flatten)]
+    packages: PackagesArg,
 }
 
-pub async fn cmd_new_world_update(args: NWUpdateArgs) -> Result<()> {
-    let graph = match args.packages.len() {
-        1 => super::graph_from_package_name(&args.packages[0]),
-        _ => super::graph_from_package_names(&args.packages),
-    };
-
-    let cache = super::load_cache(args.cache_dir).unwrap();
+pub async fn cmd_new_world_update(args: NWUpdateArgs, globals: &GlobalArgs) -> Result<(), Error> {
+    let graph = args.packages.graph(globals)?;
+    let cache = globals.cache().map_err(anyhow::Error::from)?;
 
     crate::cmd_build::cmd_build_impl(
         &graph,
-        args.no_cache,
+        globals.no_cache,
         cache.clone(),
         None,
-        args.num_parallel_builds,
+        globals.num_parallel_builds,
     )
     .await?;
 
@@ -80,10 +63,16 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs) -> Result<()> {
         let cache_dir = cache_handle.path();
         let archive_name = format!("{}.tar.zst", package_hash.0.to_hex());
 
-        let encoder = zstd::stream::Encoder::new(Vec::new(), 3)?;
+        let encoder = zstd::stream::Encoder::new(Vec::new(), 3).map_err(anyhow::Error::from)?;
         let mut tar_builder = tar::Builder::new(encoder);
-        tar_builder.append_dir_all(".", cache_dir)?;
-        let archive_data = tar_builder.into_inner()?.finish()?;
+        tar_builder
+            .append_dir_all(".", cache_dir)
+            .map_err(anyhow::Error::from)?;
+        let archive_data = tar_builder
+            .into_inner()
+            .map_err(anyhow::Error::from)?
+            .finish()
+            .map_err(anyhow::Error::from)?;
 
         // Compute sha256 hash
         let hash_hex = {
@@ -128,7 +117,8 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs) -> Result<()> {
                     "{}",
                     "+",
                 ])
-                .status()?;
+                .status()
+                .map_err(anyhow::Error::from)?;
             if !status.success() {
                 eprintln!(
                     "find/replace for hardcoded hash failed with exit code: {:?}",

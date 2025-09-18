@@ -4,7 +4,6 @@
 //! from minimal packages. It generates multi-layer images where each runtime dependency
 //! becomes a separate layer,.
 
-use anyhow::Result;
 use cache::{Cache, CacheBinProvider, LocalDir};
 use docker_credential::{CredentialRetrievalError, DockerCredential, get_credential};
 use flate2::{Compression, write::GzEncoder};
@@ -20,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use tracing::{debug, info};
 
-use crate::{load_cache, lockfile::PrebuiltsLock, remote_storage::RemoteStorage, run::Run};
+use crate::{Error, GlobalArgs, lockfile::PrebuiltsLock, remote_storage::RemoteStorage, run::Run};
 
 #[derive(clap::Args)]
 pub struct OciImageArgs {
@@ -35,15 +34,11 @@ pub struct OciImageArgs {
     /// Image tag (defaults to package spec hash)
     #[arg(short, long)]
     tag: Option<String>,
-
-    /// Path to a directory to cache build outputs in
-    #[arg(long)]
-    cache_dir: Option<PathBuf>,
 }
 
-pub async fn cmd_oci_image(args: OciImageArgs) -> Result<()> {
-    let graph = crate::graph_from_package_name(&args.package);
-    let cache = load_cache(args.cache_dir)?;
+pub async fn cmd_oci_image(args: OciImageArgs, globals: &GlobalArgs) -> Result<(), Error> {
+    let graph = globals.graph_from_package_name(&args.package)?;
+    let cache = globals.cache().map_err(anyhow::Error::from)?;
 
     let package_ref = graph
         .top_levels
@@ -94,7 +89,7 @@ pub async fn cmd_oci_image(args: OciImageArgs) -> Result<()> {
     }
 
     let config = create_image_config(layer_diff_ids)?;
-    let config_bytes = serde_json::to_vec(&config)?;
+    let config_bytes = serde_json::to_vec(&config).map_err(anyhow::Error::from)?;
     let config_digest_hex = format!("{:x}", sha2::Sha256::digest(&config_bytes));
     let config_digest = format!("sha256:{}", config_digest_hex);
     let config_descriptor = create_config_descriptor(config_bytes.len() as u64, &config_digest)?;
@@ -103,7 +98,8 @@ pub async fn cmd_oci_image(args: OciImageArgs) -> Result<()> {
         .schema_version(SCHEMA_VERSION)
         .config(config_descriptor)
         .layers(layers)
-        .build()?;
+        .build()
+        .map_err(anyhow::Error::from)?;
 
     let tag = args
         .tag
@@ -131,7 +127,7 @@ async fn ensure_package_built(
     graph: &DepGraph,
     package_ref: BuildSpecRef,
     cache: &Cache<LocalDir>,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     let package_hash = graph.spec_hash(&package_ref);
 
     if cache.read_dir(&package_hash).is_ok() {
@@ -163,7 +159,7 @@ async fn ensure_package_built(
     Ok(())
 }
 
-async fn create_base_layer() -> Result<(Descriptor, String, Vec<u8>, String)> {
+async fn create_base_layer() -> anyhow::Result<(Descriptor, String, Vec<u8>, String)> {
     let enc = GzEncoder::new(Vec::new(), Compression::default());
     let mut tar = tar::Builder::new(enc);
 
@@ -212,7 +208,7 @@ async fn create_layer_from_cache(
     cache: &Cache<LocalDir>,
     spec_hash: &SpecHash,
     package_name: &str,
-) -> Result<(Descriptor, String, Vec<u8>, String)> {
+) -> anyhow::Result<(Descriptor, String, Vec<u8>, String)> {
     let cache_entry = cache
         .read_dir(spec_hash)
         .map_err(|_| anyhow::anyhow!("Package {} not found in cache", package_name))?;
@@ -264,7 +260,7 @@ fn add_dir_to_tar<W: Write>(
     tar: &mut tar::Builder<W>,
     src_dir: &Path,
     tar_prefix: &str,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(src_dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -285,7 +281,7 @@ fn add_dir_to_tar<W: Write>(
     Ok(())
 }
 
-fn create_image_config(layer_diff_ids: Vec<String>) -> Result<ImageConfiguration> {
+fn create_image_config(layer_diff_ids: Vec<String>) -> anyhow::Result<ImageConfiguration> {
     let rootfs = RootFsBuilder::default()
         .typ("layers")
         .diff_ids(layer_diff_ids)
@@ -300,7 +296,7 @@ fn create_image_config(layer_diff_ids: Vec<String>) -> Result<ImageConfiguration
     Ok(config)
 }
 
-fn create_config_descriptor(size: u64, digest: &str) -> Result<Descriptor> {
+fn create_config_descriptor(size: u64, digest: &str) -> anyhow::Result<Descriptor> {
     let digest_hex = digest.strip_prefix("sha256:").unwrap_or(digest);
 
     let descriptor = DescriptorBuilder::default()
@@ -374,7 +370,7 @@ async fn push_to_registry(
     manifest: ImageManifest,
     config_bytes: Vec<u8>,
     layer_data: Vec<(Vec<u8>, String)>,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     let reference_string = format!("{}/{}:{}", registry, package_name, tag);
     let reference = Reference::try_from(reference_string.as_str())?;
 

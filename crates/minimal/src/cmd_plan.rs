@@ -1,35 +1,18 @@
-use anyhow::Result;
+use crate::{Error, GlobalArgs, PackagesArg};
 use cache::{Cache, CacheBinProvider, LocalDir};
 use graph::{BinProvider, DepGraph, ExecPlan};
-use std::path::PathBuf;
 
 #[derive(clap::Args)]
 pub struct PlanArgs {
-    /// Package names to build
-    #[arg(short, long, alias="package", value_delimiter=',', num_args=0..)]
-    packages: Option<Vec<String>>,
-
-    /// Path to a directory to cache build outputs in
-    #[arg(long)]
-    cache_dir: Option<PathBuf>,
-
-    /// Whether to ignore the local cache
-    #[arg(long, default_value_t = false)]
-    no_cache: bool,
+    #[command(flatten)]
+    packages: PackagesArg,
 }
 
-pub fn cmd_plan(args: PlanArgs) -> Result<()> {
-    let graph = match args.packages {
-        Some(ref packages) => match packages.len() {
-            0 => super::graph_from_all_packages(),
-            1 => super::graph_from_package_name(&packages[0]),
-            _ => super::graph_from_package_names(packages),
-        },
-        None => super::graph_from_all_packages(),
-    };
+pub fn cmd_plan(args: PlanArgs, globals: &GlobalArgs) -> Result<(), Error> {
+    let graph = args.packages.graph(globals)?;
+    let cache = globals.cache().map_err(anyhow::Error::from)?;
 
-    let cache = super::load_cache(args.cache_dir).unwrap();
-    if args.no_cache {
+    if globals.no_cache {
         print_plan(&graph, &cache, ExecPlan::new(&graph));
     } else {
         let adapter = CacheBinProvider::new(&graph, cache.clone());

@@ -1,41 +1,22 @@
-use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage, run::Run};
-use anyhow::{Context, Result};
+use crate::{Error, lockfile::PrebuiltsLock, remote_storage::RemoteStorage, run::Run};
+use crate::{GlobalArgs, PackagesArg};
+use anyhow::Context;
 use cache::{Cache, CacheBinProvider, LocalDir};
 use graph::{BuildSpecRef, DepGraph, ExecPlan};
-use std::path::PathBuf;
 
 #[derive(clap::Args)]
 pub struct BuildArgs {
-    /// Package names to build
-    #[arg(short, long, alias="package", value_delimiter=',', num_args=0..)]
-    packages: Option<Vec<String>>,
+    #[command(flatten)]
+    packages: PackagesArg,
 
     /// Launch debug shell instead of building
     #[arg(short, long)]
     debug: bool,
-
-    /// Path to a directory to cache build outputs in
-    #[arg(long)]
-    cache_dir: Option<PathBuf>,
-
-    /// Whether to ignore the local cache
-    #[arg(long, default_value_t = false)]
-    no_cache: bool,
-
-    /// Number of parallel builds
-    #[arg(short, long, default_value_t = 4)]
-    num_parallel_builds: usize,
 }
 
-pub async fn cmd_build(args: BuildArgs) -> Result<()> {
-    let graph = match args.packages {
-        Some(ref packages) => match packages.len() {
-            0 => super::graph_from_all_packages(),
-            1 => super::graph_from_package_name(&packages[0]),
-            _ => super::graph_from_package_names(packages),
-        },
-        None => super::graph_from_all_packages(),
-    };
+pub async fn cmd_build(args: BuildArgs, globals: &GlobalArgs) -> Result<(), Error> {
+    let graph = args.packages.graph(globals)?;
+    let cache = globals.cache().map_err(anyhow::Error::from)?;
 
     let debug_bsr = if args.debug {
         Some(graph.top_levels[0])
@@ -43,16 +24,16 @@ pub async fn cmd_build(args: BuildArgs) -> Result<()> {
         None
     };
 
-    let cache = super::load_cache(args.cache_dir).unwrap();
-
     cmd_build_impl(
         &graph,
-        args.no_cache,
+        globals.no_cache,
         cache,
         debug_bsr,
-        args.num_parallel_builds,
+        globals.num_parallel_builds,
     )
-    .await
+    .await?;
+
+    Ok(())
 }
 
 pub async fn cmd_build_impl(
@@ -61,7 +42,7 @@ pub async fn cmd_build_impl(
     cache: Cache<LocalDir>,
     debug_bsr: Option<BuildSpecRef>,
     num_parallel_builds: usize,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_parallel_builds)
         .build_global()
