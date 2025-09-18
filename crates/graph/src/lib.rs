@@ -24,6 +24,11 @@ pub enum Error {
     },
     MissingID(Files, TermPos),
     MissingTy(Files, TermPos),
+    NoSuchOutput {
+        files: Files,
+        pos: TermPos,
+        output: String,
+    },
 }
 
 impl Error {
@@ -117,6 +122,23 @@ impl Error {
                     "missing field {} for record of type {:?}",
                     field, obj
                 ));
+                let diagnostic = if let Some(pos) = pos.into_opt() {
+                    diagnostic.with_label(primary(&pos))
+                } else {
+                    diagnostic
+                };
+
+                report(
+                    &mut files,
+                    diagnostic,
+                    nickel_lang_core::error::report::ErrorFormat::Text,
+                    nickel_lang_core::error::report::ColorOpt::Auto,
+                );
+            }
+            Error::NoSuchOutput { files, pos, output } => {
+                let mut files = files.clone();
+                let diagnostic = Diagnostic::error()
+                    .with_message(format!("no such output '{}' on parent build spec", output));
                 let diagnostic = if let Some(pos) = pos.into_opt() {
                     diagnostic.with_label(primary(&pos))
                 } else {
@@ -251,7 +273,8 @@ mod spec_schema;
 
 pub mod dep_graph;
 pub use dep_graph::{
-    BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, SourceInput, SubsetInput,
+    BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, RuntimeDep, SourceInput,
+    SubsetInput,
 };
 
 mod planner;

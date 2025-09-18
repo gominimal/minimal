@@ -77,6 +77,22 @@ pub enum BuildOutput {
     Binary { path: String },
 }
 
+/// An entry in a build spec runtime_deps array.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RuntimeDep {
+    Build(BuildSpecRef),
+    Subset(SubsetInput),
+}
+
+impl RuntimeDep {
+    pub fn bsr(&self) -> &BuildSpecRef {
+        match self {
+            RuntimeDep::Build(bsr) => bsr,
+            RuntimeDep::Subset(SubsetInput { from, .. }) => from,
+        }
+    }
+}
+
 /// Some task or build in the dependency graph.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -85,7 +101,7 @@ pub struct BuildSpec {
     pub cmd: String,
 
     pub inputs: Vec<BuildSpecInput>,
-    pub runtime_deps: Vec<BuildSpecRef>,
+    pub runtime_deps: Vec<RuntimeDep>,
     pub outputs: OutputMap,
 
     pub replace_on_cycle: Option<BuildSpecRef>,
@@ -214,7 +230,10 @@ impl DepGraph {
                 Subset(si) => Some(&si.from),
                 Source(_) | HostPath(_) | Local(_) | Prebuilt(_, _) => None,
             })
-            .chain(build_spec.runtime_deps.iter())
+            .chain(build_spec.runtime_deps.iter().filter_map(|dep| match dep {
+                RuntimeDep::Build(bsr) => Some(bsr),
+                RuntimeDep::Subset(si) => Some(&si.from),
+            }))
             .for_each(|bsr| {
                 if !seen.contains_key(bsr) {
                     seen.insert(*bsr, ());
@@ -406,7 +425,7 @@ impl GraphBuilder {
 
         // Handle more complicated attributes.
         let mut inputs: Option<Vec<BuildSpecInput>> = None;
-        let mut runtime_deps: Option<Vec<BuildSpecRef>> = None;
+        let mut runtime_deps: Option<Vec<RuntimeDep>> = None;
         let mut outputs: Option<OutputMap> = None;
         let mut replace_on_cycle: Option<BuildSpecRef> = None;
         match rt.term.as_ref() {
@@ -447,7 +466,7 @@ impl GraphBuilder {
                                             runtime_deps = Some(
                                                 a.iter()
                                                     .map(|input| {
-                                                        self.read_buildspec(input, program)
+                                                        self.read_runtime_dep(input, program)
                                                     })
                                                     .collect::<Result<Vec<_>, Error>>()?,
                                             );
@@ -536,6 +555,108 @@ impl GraphBuilder {
         bs.replace_on_cycle = replace_on_cycle;
 
         Ok(bsr)
+    }
+
+    fn read_subset(
+        &mut self,
+        rt: &RichTerm,
+        program: &mut Program<CacheImpl>,
+    ) -> Result<SubsetInput, Error> {
+        let mut from: Option<BuildSpecRef> = None;
+        let mut outputs: Option<Vec<String>> = None;
+        let mut strict: bool = false;
+        match rt.term.as_ref() {
+            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
+                r.fields
+                    .iter()
+                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                        match ident_and_loc.label() {
+                            "from" => {
+                                from = Some(
+                                    self.read_buildspec(field.value.as_ref().unwrap(), program)?,
+                                );
+                                Ok(())
+                            }
+                            "outputs" => {
+                                let outputs_rt =
+                                    field.value.as_ref().map(|rt| eval_if_closure(rt, program));
+                                match outputs_rt {
+                                    None => {}
+                                    Some(outputs_rt) => match outputs_rt?.term.as_ref() {
+                                        Term::Array(a, _attrs) => {
+                                            outputs = Some(
+                                                a.iter()
+                                                    .map(|input| {
+                                                        Ok(String::deserialize(eval_if_closure(
+                                                            input, program,
+                                                        )?)
+                                                        .unwrap())
+                                                    })
+                                                    .collect::<Result<Vec<_>, Error>>()?,
+                                            );
+                                        }
+                                        _ => todo!(
+                                            "handle outputs value being non-array {:?}",
+                                            field.value
+                                        ),
+                                    },
+                                }
+                                Ok(())
+                            }
+                            "strict" => {
+                                if let Some(field) = field.value.as_ref() {
+                                    strict = bool::deserialize(eval_if_closure(field, program)?)
+                                        .unwrap();
+                                }
+                                Ok(())
+                            }
+                            _ => Ok(()), // TODO: Should we error if we see an unknown field?
+                        }
+                    })?;
+            }
+            _ => {}
+        }
+        let from = match from {
+            Some(from) => from,
+            None => {
+                return Err(Error::MissingField {
+                    files: program.files(),
+                    obj: ObjTy::Subset,
+                    pos: rt.pos,
+                    field: "from",
+                })
+            }
+        };
+        let mut outputs = match outputs {
+            Some(outputs) => outputs,
+            None => {
+                return Err(Error::MissingField {
+                    files: program.files(),
+                    obj: ObjTy::Subset,
+                    pos: rt.pos,
+                    field: "outputs",
+                })
+            }
+        };
+        outputs.sort();
+        outputs.dedup();
+
+        for output in &outputs {
+            let build = self.builds.get(from.0).unwrap();
+            if !build.outputs.contains_key(output) {
+                return Err(Error::NoSuchOutput {
+                    files: program.files(),
+                    pos: rt.pos,
+                    output: output.clone(),
+                });
+            }
+        }
+
+        Ok(SubsetInput {
+            from,
+            strict,
+            outputs,
+        })
     }
 
     fn read_input_source(
@@ -759,95 +880,32 @@ impl GraphBuilder {
         Ok((package, sha256))
     }
 
-    fn read_subset(
+    /// Reads an entry in runtime_deps, which can either be a build spec or a subset.
+    fn read_runtime_dep(
         &mut self,
         rt: &RichTerm,
         program: &mut Program<CacheImpl>,
-    ) -> Result<SubsetInput, Error> {
-        let mut from: Option<BuildSpecRef> = None;
-        let mut outputs: Option<Vec<String>> = None;
-        let mut strict: bool = false;
-        match rt.term.as_ref() {
-            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                r.fields
-                    .iter()
-                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
-                        match ident_and_loc.label() {
-                            "from" => {
-                                from = Some(
-                                    self.read_buildspec(field.value.as_ref().unwrap(), program)?,
-                                );
-                                Ok(())
-                            }
-                            "outputs" => {
-                                let outputs_rt =
-                                    field.value.as_ref().map(|rt| eval_if_closure(rt, program));
-                                match outputs_rt {
-                                    None => {}
-                                    Some(outputs_rt) => match outputs_rt?.term.as_ref() {
-                                        Term::Array(a, _attrs) => {
-                                            outputs = Some(
-                                                a.iter()
-                                                    .map(|input| {
-                                                        Ok(String::deserialize(eval_if_closure(
-                                                            input, program,
-                                                        )?)
-                                                        .unwrap())
-                                                    })
-                                                    .collect::<Result<Vec<_>, Error>>()?,
-                                            );
-                                        }
-                                        _ => todo!(
-                                            "handle outputs value being non-array {:?}",
-                                            field.value
-                                        ),
-                                    },
-                                }
-                                Ok(())
-                            }
-                            "strict" => {
-                                if let Some(field) = field.value.as_ref() {
-                                    strict = bool::deserialize(eval_if_closure(field, program)?)
-                                        .unwrap();
-                                }
-                                Ok(())
-                            }
-                            _ => Ok(()), // TODO: Should we error if we see an unknown field?
-                        }
-                    })?;
-            }
-            _ => {}
-        }
-        let from = match from {
-            Some(from) => from,
-            None => {
-                return Err(Error::MissingField {
-                    files: program.files(),
-                    obj: ObjTy::Subset,
-                    pos: rt.pos,
-                    field: "from",
-                })
-            }
-        };
-        let mut outputs = match outputs {
-            Some(outputs) => outputs,
-            None => {
-                return Err(Error::MissingField {
-                    files: program.files(),
-                    obj: ObjTy::Subset,
-                    pos: rt.pos,
-                    field: "outputs",
-                })
-            }
-        };
-        outputs.sort();
-        outputs.dedup();
+    ) -> Result<RuntimeDep, Error> {
+        let rt = eval_if_closure(rt, program)?;
 
-        Ok(SubsetInput {
-            from,
-            strict,
-            outputs,
-        })
+        // The type hint ty identifies which input variant this term represents
+        let ty = read_ty(&rt, program)?;
+        match ty {
+            ObjTy::Builder => Ok(RuntimeDep::Build(self.read_buildspec(&rt, program)?)),
+            ObjTy::Subset => Ok(RuntimeDep::Subset(self.read_subset(&rt, program)?)),
+            ObjTy::OutputLib
+            | ObjTy::OutputBin
+            | ObjTy::OutputData
+            | ObjTy::Source
+            | ObjTy::Path
+            | ObjTy::Local
+            | ObjTy::Prebuilt => Err(Error::UnexpectedObject {
+                files: program.files(),
+                got: ty,
+                want: ObjTy::Builder,
+                pos: rt.pos,
+            }),
+        }
     }
 
     /// Recursively reads a buildspec input, inserting it into the graph.
@@ -1144,11 +1202,15 @@ mod tests {
         let sr = SpecReader::new(
             indoc! {
                 "
-                let {BuildSpec, Subset, ..} = import \"minimal.ncl\" in
+                let {BuildSpec, OutputData, Subset, ..} = import \"minimal.ncl\" in
                 let other_spec = {
                     name = \"other\",
                     inputs = [],
                     cmd = \"\",
+                    outputs = {
+                        abc = {data=\"\"} | OutputData,
+                        uwu = {data=\"\"} | OutputData,
+                    },
                 } | BuildSpec in
                 {
                     name = \"top\",
@@ -1364,16 +1426,22 @@ mod tests {
         let sr = SpecReader::new(
             indoc! {
                 "
-                let {BuildSpec, ..} = import \"minimal.ncl\" in
+                let {BuildSpec, OutputData, Subset, subsetOf, ..} = import \"minimal.ncl\" in
                 let our_runtime_dep = {
                     name = \"runtime dep\",
                     inputs = [],
                     cmd = \"\",
+                    outputs = {
+                        some_data = { data = \"usr/*\"} | OutputData,
+                    }
                 } | BuildSpec in
                 {
                     name = \"top build\",
                     inputs = [our_runtime_dep],
-                    runtime_deps = [our_runtime_dep],
+                    runtime_deps = [
+                        our_runtime_dep,
+                        subsetOf our_runtime_dep [\"some_data\"],
+                    ],
                     cmd = \"\",
                 } | BuildSpec"
             }
@@ -1384,8 +1452,13 @@ mod tests {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
+        let dp = DepGraph::new(sr)
+            .map_err(|e| {
+                e.report_to_stderr();
+                Err::<DepGraph, ()>(())
+            })
+            .unwrap();
 
-        let dp = DepGraph::new(sr).unwrap();
         // We expect two buildspecs - deeper first
         assert_eq!(
             vec!["top build".to_string(), "runtime dep".to_string()],
@@ -1403,14 +1476,23 @@ mod tests {
                 .collect::<Vec<BuildSpec>>()[0]
                 .inputs[0]
                 .as_build()
-                .unwrap()
-                .clone(),
+                .unwrap(),
             dp.builds
                 .iter()
                 .map(|b| b.1.clone())
                 .collect::<Vec<BuildSpec>>()[0]
                 .runtime_deps[0]
+                .bsr()
         );
+        // Lets check the subset
+        assert!(matches!(
+            dp.get(&dp.by_name("top build").next().unwrap()).unwrap().runtime_deps[1].clone(),
+            RuntimeDep::Subset(SubsetInput {
+                from,
+                strict: false,
+                outputs,
+            }) if from == dp.by_name("runtime dep").next().unwrap() && outputs == vec!["some_data"],
+        ));
     }
 
     #[test]

@@ -160,8 +160,8 @@ fn make_reachable<BP: BinProvider>(
         // We have access to a build of this build-spec, so all we need
         // is the runtime deps.
         if !seen_before {
-            for runtime_dep_bsr in &build.runtime_deps {
-                make_reachable(runtime_dep_bsr, graph, bin_provider, builds)?;
+            for runtime_dep in &build.runtime_deps {
+                make_reachable(runtime_dep.bsr(), graph, bin_provider, builds)?;
             }
         }
         Ok(())
@@ -183,7 +183,7 @@ fn make_reachable<BP: BinProvider>(
                     BuildSpecInput::Build(bsr) => Some(bsr),
                     _ => None,
                 })
-                .chain(build.runtime_deps.iter())
+                .chain(build.runtime_deps.iter().map(|dep| dep.bsr()))
             {
                 make_reachable(bsr, graph, bin_provider, builds)?;
             }
@@ -290,6 +290,7 @@ impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
             build
                 .runtime_deps
                 .iter()
+                .map(|dep| dep.bsr())
                 .all(|bsr| check_runtime_deps_recursive(bsr, graph, builds, seen))
                 && self_satisfied
         }
@@ -392,8 +393,8 @@ impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
                 Source(_) | HostPath(_) | Local(_) | Prebuilt(_, _) => {}
             }
         }
-        for bsr in bs.runtime_deps.iter() {
-            process(bsr, seen, &mut out);
+        for dep in bs.runtime_deps.iter() {
+            process(dep.bsr(), seen, &mut out);
         }
 
         seen.insert(*cursor, ());
@@ -452,7 +453,7 @@ impl<'a, BP: BinProvider> Iterator for ExecPlan<'a, BP> {
                     BuildSpecInput::Build(bsr) => Some(bsr),
                     _ => None,
                 })
-                .chain(build.runtime_deps.iter())
+                .chain(build.runtime_deps.iter().map(|dep| dep.bsr()))
                 .fold((true, true), |acc, dep_bsr| {
                     (
                         acc.0 & self.is_built(dep_bsr, false),

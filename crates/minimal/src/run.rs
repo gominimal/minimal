@@ -160,11 +160,11 @@ fn path_transitive_deps_of(
     cache: &Cache<LocalDir>,
     out_paths: &mut HashSet<PathBuf>,
 ) -> Result<()> {
-    for dep_bsr in input_build.runtime_deps.iter() {
+    for dep in input_build.runtime_deps.iter() {
         let (dep_bsr, dep_paths) = path_for_self_spec(
-            dep_bsr,
-            &graph.spec_hash(dep_bsr),
-            graph.get(dep_bsr).unwrap(),
+            dep.bsr(),
+            &graph.spec_hash(dep.bsr()),
+            graph.get(dep.bsr()).unwrap(),
             graph,
             cache,
         )?;
@@ -364,9 +364,9 @@ impl<'a> Run<'a> {
                 }
             }
         }
-        for (i, bsr) in build.runtime_deps.iter().enumerate() {
-            let dep_hash = self.graph.spec_hash(bsr);
-            let dep_build = self.graph.get(bsr).unwrap();
+        for (i, dep) in build.runtime_deps.iter().enumerate() {
+            let dep_hash = self.graph.spec_hash(dep.bsr());
+            let dep_build = self.graph.get(dep.bsr()).unwrap();
 
             debug!(
                 "  Runtime dep {}: Build({}) -- [{}]",
@@ -375,7 +375,7 @@ impl<'a> Run<'a> {
                 dep_hash.0.to_hex()
             );
 
-            let dep_paths = all_paths_for_spec(bsr, self.graph, &self.cache)?;
+            let dep_paths = all_paths_for_spec(dep.bsr(), self.graph, &self.cache)?;
             dependencies.extend(dep_paths);
         }
 

@@ -31,9 +31,9 @@ impl Transitives {
             ),
         };
 
-        for bsr in build.runtime_deps.iter() {
+        for dep in build.runtime_deps.iter() {
             out.transitive_runtime_deps
-                .insert(*bsr, vec![DepInfo::Ours]);
+                .insert(*dep.bsr(), vec![DepInfo::Ours]);
         }
 
         // Collect all transitive runtime_deps by recursing into the [BuildManifest] of
@@ -47,7 +47,7 @@ impl Transitives {
                 (Build(_) | Subset(_), false) => None,
                 (Source(_) | HostPath(_) | Local(_) | Prebuilt(_, _), _) => None,
             })
-            .chain(build.runtime_deps.iter())
+            .chain(build.runtime_deps.iter().map(|dep| dep.bsr()))
             .for_each(|bsr| {
                 for (hash, source) in Transitives::new(g, bsr, false)
                     .transitive_runtime_deps

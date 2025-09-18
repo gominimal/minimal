@@ -1,6 +1,6 @@
 use crate::{
     dep_graph::SourceFetch, BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph,
-    SpecHash,
+    RuntimeDep, SpecHash,
 };
 use blake3::Hasher;
 use smallvec::SmallVec;
@@ -18,7 +18,7 @@ struct SubsetInfo(Vec<String>, bool);
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Edge {
     BuildInput(SpecIndex, Option<SubsetInfo>),
-    RuntimeDep(SpecIndex),
+    RuntimeDep(SpecIndex, Option<SubsetInfo>),
     ReplaceOnCycle(SpecIndex),
 }
 
@@ -64,9 +64,17 @@ impl<'a> SpecHasher<'a> {
                             h.write_all(if strict { b"s" } else { b"l" }).unwrap();
                         }
                     }
-                    RuntimeDep(dep_idx) => {
+                    RuntimeDep(dep_idx, subset_info) => {
                         h.write_all(b"r").unwrap();
                         h.write_all(&dep_idx.0.to_le_bytes()).unwrap();
+                        if let Some(SubsetInfo(outputs, strict)) = subset_info {
+                            h.write_all(b"ss").unwrap();
+                            for output in &outputs {
+                                h.write_all(output.as_bytes()).unwrap();
+                                h.write_all(b",").unwrap();
+                            }
+                            h.write_all(if strict { b"s" } else { b"l" }).unwrap();
+                        }
                     }
                     ReplaceOnCycle(r_idx) => {
                         h.write_all(b"c").unwrap();
@@ -102,7 +110,13 @@ impl<'a> SpecHasher<'a> {
             edges.push(Edge::BuildInput(self.process(bsr), subset_info));
         }
         for d in build.runtime_deps.iter() {
-            edges.push(Edge::RuntimeDep(self.process(d)));
+            match d {
+                RuntimeDep::Build(bsr) => edges.push(Edge::RuntimeDep(self.process(bsr), None)),
+                RuntimeDep::Subset(si) => edges.push(Edge::RuntimeDep(
+                    self.process(&si.from),
+                    Some(SubsetInfo(si.outputs.clone(), si.strict)),
+                )),
+            }
         }
         if let Some(replace_on_cycle) = build.replace_on_cycle.as_ref() {
             edges.push(Edge::ReplaceOnCycle(self.process(replace_on_cycle)));

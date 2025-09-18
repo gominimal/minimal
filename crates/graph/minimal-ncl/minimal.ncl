@@ -76,4 +76,8 @@
         strict
           | Bool | optional = false,
     },
+
+    subsetOf | BuildSpec -> Array String -> Subset | doc "Constructs a subset of the outputs of a build, for use as an input or runtime_dep." = 
+      fun spec outputs =>
+        {from = spec, include outputs}  | Subset,
 }
