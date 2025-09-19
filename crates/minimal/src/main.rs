@@ -6,6 +6,9 @@ use graph::{DepGraph, Error as GraphError, SpecReader, SpecReaderOptions};
 use std::path::{Path, PathBuf};
 use tracing::error;
 use tracing_indicatif::IndicatifLayer;
+use tracing_indicatif::TickSettings;
+use tracing_indicatif::filter::IndicatifFilter;
+use tracing_indicatif::filter::hide_indicatif_span_fields;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 mod lockfile;
@@ -215,12 +218,20 @@ impl From<anyhow::Error> for Error {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let indicatif_layer = IndicatifLayer::new().with_max_progress_bars(99, None);
+    let indicatif_layer = IndicatifLayer::new()
+        .with_max_progress_bars(99, None)
+        .with_span_field_formatter(hide_indicatif_span_fields(fmt::format::DefaultFields::new()))
+        .with_tick_settings(TickSettings {
+            term_draw_hz: 4,
+            default_tick_interval: None,
+            footer_tick_interval: None,
+            ..Default::default()
+        });
     tracing_subscriber::registry()
         // .with(fmt::layer().with_target(false).with_thread_ids(true))
         .with(fmt::layer().with_writer(indicatif_layer.get_stderr_writer()))
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(indicatif_layer)
+        .with(indicatif_layer.with_filter(IndicatifFilter::new(false)))
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             EnvFilter::new("debug").add_directive("topiary=off".parse().unwrap())
         }))

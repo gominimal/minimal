@@ -24,7 +24,7 @@ impl BuildExecutor {
         Ok(executor)
     }
 
-    #[tracing::instrument(skip(config))]
+    #[tracing::instrument(skip(config), fields(indicatif.pb_show))]
     pub fn execute(&self, config: &BuildConfig) -> Result<i32> {
         info!(
             "Linking {} inputs to build environment",

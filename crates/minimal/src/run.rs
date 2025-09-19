@@ -375,7 +375,7 @@ impl<'a> Run<'a> {
     }
 
     /// runs a single isolated build, does not take self so it can be spawned in a thread.
-    #[tracing::instrument(skip_all)]
+    #[tracing::instrument(skip_all, fields(indicatif.pb_hide))]
     async fn do_build(
         &self,
         build: &BuildSpecRef,
