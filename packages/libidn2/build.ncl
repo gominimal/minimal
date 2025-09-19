@@ -1,4 +1,4 @@
-let {BuildSpec, OutputLib, Local, Source, ..} = import "minimal.ncl" in
+let {BuildSpec, OutputLib, Local, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 let libunistring = import "../libunistring/build.ncl" in
@@ -8,7 +8,7 @@ let libunistring = import "../libunistring/build.ncl" in
         {file = "build.sh"} | Local,
         {
             url = "gs://minimal-staging-archives/libidn2-2.3.8.tar.gz",
-            sha256 = "f557911bf6171621e1f72ff35f5b1825bb35b52ed45325dcdee931e5d3c0787a"
+            sha256 = "f557911bf6171621e1f72ff35f5b1825bb35b52ed45325dcdee931e5d3c0787a",
         } | Source,
         base,
         toolchain,

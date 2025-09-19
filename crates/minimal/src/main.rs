@@ -14,6 +14,8 @@ mod run;
 
 mod cmd_build;
 use cmd_build::{BuildArgs, cmd_build};
+mod cmd_check;
+use cmd_check::{CheckArgs, cmd_check};
 mod cmd_plan;
 use cmd_plan::{PlanArgs, cmd_plan};
 mod cmd_nw_update;
@@ -42,6 +44,8 @@ enum Command {
     NewWorldUpdate(NWUpdateArgs),
     /// Materializes an OCI container image for executing the specified package
     OciImage(OciImageArgs),
+    /// Validates and formats nickel build-spec files
+    Check(CheckArgs),
 }
 
 /// Shared arguments and builders across all subcommands
@@ -86,12 +90,16 @@ impl GlobalArgs {
         cache::Cache::at_dir(dir)
     }
 
-    pub fn graph_from_package_name(&self, package_name: &String) -> Result<DepGraph, GraphError> {
-        let package_dir = match &self.packages_dir {
-            Some(dir) => dir,
-            None => Path::new("packages"),
+    pub fn packages_dir(&self) -> PathBuf {
+        match &self.packages_dir {
+            Some(dir) => dir.to_path_buf(),
+            None => Path::new("packages").to_path_buf(),
         }
-        .join(package_name);
+    }
+
+    /// Returns a [DepGraph] with the given package and its transitive dependencies loaded.
+    pub fn graph_from_package_name(&self, package_name: &String) -> Result<DepGraph, GraphError> {
+        let package_dir = self.packages_dir().join(package_name);
 
         let build_ncl_path = {
             let normal_path = package_dir.join("build.ncl");
@@ -117,10 +125,7 @@ impl GlobalArgs {
 
     #[tracing::instrument]
     pub fn graph_from_package_names(&self, names: &[String]) -> Result<DepGraph, GraphError> {
-        let packages_dir = match &self.packages_dir {
-            Some(dir) => dir,
-            None => Path::new("packages"),
-        };
+        let packages_dir = self.packages_dir();
 
         let sr = SpecReader::new_with_pkgs(
             names,
@@ -133,12 +138,8 @@ impl GlobalArgs {
         DepGraph::new(sr)
     }
 
-    #[tracing::instrument]
     pub fn graph_from_all_packages(&self) -> Result<DepGraph, GraphError> {
-        let packages_dir = match &self.packages_dir {
-            Some(dir) => dir,
-            None => Path::new("packages"),
-        };
+        let packages_dir = self.packages_dir();
 
         let sr = SpecReader::new_with_all_pkgs(
             packages_dir,
@@ -169,6 +170,18 @@ impl PackagesArg {
                 _ => globals.graph_from_package_names(packages),
             },
             None => globals.graph_from_all_packages(),
+        }
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        match &self.packages {
+            Some(packages) => {
+                let mut names = packages.clone();
+                names.sort();
+                names.dedup();
+                names
+            }
+            None => vec![],
         }
     }
 }
@@ -208,11 +221,15 @@ async fn main() -> Result<()> {
         .with(fmt::layer().with_writer(indicatif_layer.get_stderr_writer()))
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(indicatif_layer)
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new("debug").add_directive("topiary=off".parse().unwrap())
+        }))
         .init();
 
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Build(args) => cmd_build(args, &cli.global_args).await,
+        Command::Check(args) => cmd_check(args, &cli.global_args),
         Command::Plan(args) => cmd_plan(args, &cli.global_args),
         Command::NewWorldUpdate(args) => cmd_new_world_update(args, &cli.global_args).await,
         Command::OciImage(args) => cmd_oci_image(args, &cli.global_args).await,

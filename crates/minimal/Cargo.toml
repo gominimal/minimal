@@ -8,6 +8,9 @@ edition = "2024"
 graph = { workspace = true }
 cache = { workspace = true }
 
+nickel-lang-core.workspace = true
+codespan-reporting.workspace = true
+
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
