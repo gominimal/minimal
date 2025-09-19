@@ -9,6 +9,7 @@
           | Array BuildSpec | optional,
 
         cmd | String,
+        build_args | {_: String} | optional,
 
         # Do NOT set this yourself
         __magic_buildspec_id | optional,

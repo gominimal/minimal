@@ -6,7 +6,7 @@
 use nickel_lang_core::eval::Closure;
 use nickel_lang_core::files::FileId;
 use nickel_lang_core::identifier::LocIdent;
-use nickel_lang_core::term::{RichTerm, Term};
+use nickel_lang_core::term::{IndexMap, RichTerm, Term};
 use nickel_lang_core::{eval::cache::CacheImpl, program::Program};
 
 use generational_arena::Arena;
@@ -19,7 +19,7 @@ use crate::{Error, SpecError, SpecHash, SpecHasher, SpecReader};
 use serde::Deserialize;
 
 /// A map with ordered iteration semantics - we need this for stable spec hashes.
-type OutputMap = nickel_lang_core::term::IndexMap<String, BuildOutput>;
+type OutputMap = IndexMap<String, BuildOutput>;
 
 /// A reference to some other [BuildSpec] in a [DepGraph].
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, PartialOrd, Ord)]
@@ -99,6 +99,7 @@ impl RuntimeDep {
 pub struct BuildSpec {
     pub name: String,
     pub cmd: String,
+    pub build_args: Option<IndexMap<String, String>>,
 
     pub inputs: Vec<BuildSpecInput>,
     pub runtime_deps: Vec<RuntimeDep>,
@@ -344,6 +345,7 @@ impl GraphBuilder {
         let mut name: Option<String> = None;
         let mut cmd: Option<String> = None;
         let mut ty: Option<ObjTy> = None;
+        let mut build_args: Option<IndexMap<String, String>> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                 r.fields
@@ -378,6 +380,33 @@ impl GraphBuilder {
                                     )?)
                                     .unwrap(),
                                 );
+                                Ok(())
+                            }
+                            "build_args" => {
+                                if let Some(build_args_rt) = field.value.as_ref() {
+                                    let build_args_rt =
+                                        eval_if_closure(build_args_rt, program)?;
+
+                                    match build_args_rt.term.as_ref() {
+                                        Term::Record(r) | Term::RecRecord(r, _, _, _) => {
+                                            build_args = Some(r.fields.iter().map(
+                                                |(ident_and_loc, field)| -> Result<(String, String), Error> {
+                                                    Ok((
+                                                        ident_and_loc.label().to_string(),
+                                                        String::deserialize(eval_if_closure(
+                                                            field.value.as_ref().unwrap(),
+                                                            program,
+                                                        )?)
+                                                        .unwrap(),
+                                                    ))
+                                                },
+                                            ).collect::<Result<IndexMap<_, _>, Error>>()?
+                                            );
+                                        }
+                                        _ => todo!("unexpected term for build_args"),
+                                    };
+                                }
+
                                 Ok(())
                             }
                             _ => Ok(()), // TODO: Should we error if we see an unknown field?
@@ -416,6 +445,7 @@ impl GraphBuilder {
         let bsr = BuildSpecRef(self.builds.insert(BuildSpec {
             name,
             cmd,
+            build_args,
             inputs: Vec::new(),
             runtime_deps: Vec::new(),
             outputs: OutputMap::new(),
@@ -1119,7 +1149,10 @@ mod tests {
                     outputs = {
                         something = { glob = \"/usr/lib/something.*.so\" } | OutputLib,
                     },
-        			cmd = \"\",
+        			cmd = \"./build.sh\",
+                    build_args = {
+                        fish = \"swiggity swooty\",
+                    },
         		} | BuildSpec"
             }
             .to_string(),
@@ -1144,6 +1177,21 @@ mod tests {
             dp.builds.iter().next().unwrap().1.inputs[0],
             BuildSpecInput::HostPath(_)
         ));
+
+        assert_eq!(dp.builds.iter().next().unwrap().1.cmd, "./build.sh",);
+        assert_eq!(
+            dp.builds
+                .iter()
+                .next()
+                .unwrap()
+                .1
+                .build_args
+                .clone()
+                .unwrap()
+                .get("fish")
+                .to_owned(),
+            Some("swiggity swooty".to_string()).as_ref(),
+        );
     }
 
     #[test]

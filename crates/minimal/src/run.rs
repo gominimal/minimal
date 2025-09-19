@@ -432,6 +432,7 @@ impl<'a> Run<'a> {
                 build_script: BuildScript {
                     executable: executable.into(),
                     args,
+                    build_args: build.build_args.clone(),
                 },
                 outputs: build
                     .outputs

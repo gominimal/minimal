@@ -95,6 +95,22 @@ impl BuildExecutor {
             .env("LANG", "en_US.utf8")
             .env("LC_ALL", "en_US.utf8")
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+        if let Some(build_args) = &config.build_script.build_args {
+            cmd.envs(build_args.iter().map(|(k, v)| {
+                (
+                    "MINIMAL_ARG_".to_owned()
+                        + &k.as_str()
+                            .trim()
+                            .replace("=", "")
+                            .replace(":", "")
+                            .replace("/", "")
+                            .replace("\"", "")
+                            .replace("'", "")
+                            .to_uppercase(),
+                    v,
+                )
+            }));
+        }
 
         info!(
             "Executing: {} {}",

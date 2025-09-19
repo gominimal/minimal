@@ -129,7 +129,6 @@ impl<'a> SpecHasher<'a> {
     }
 }
 
-#[allow(dead_code)]
 fn build_output_hash(output: &BuildOutput, h: &mut Hasher) {
     use BuildOutput::*;
     match output {
@@ -148,7 +147,6 @@ fn build_output_hash(output: &BuildOutput, h: &mut Hasher) {
     }
 }
 
-#[allow(dead_code)]
 fn build_input_hash(input: &BuildSpecInput, h: &mut Hasher) {
     use BuildSpecInput::*;
     match input {
@@ -187,11 +185,21 @@ fn build_input_hash(input: &BuildSpecInput, h: &mut Hasher) {
     }
 }
 
-#[allow(dead_code)]
 fn build_attrs_hash(spec: &BuildSpec, h: &mut Hasher) {
     h.write_all(b"build spec").unwrap();
     h.write_all(spec.name.as_bytes()).unwrap();
     h.write_all(spec.cmd.as_bytes()).unwrap();
+    if let Some(build_args) = &spec.build_args {
+        if !build_args.is_empty() {
+            h.write_all(b"-build args").unwrap();
+            for (name, value) in build_args.iter() {
+                h.write_all(b"k").unwrap();
+                h.write_all(name.as_bytes()).unwrap();
+                h.write_all(b"v").unwrap();
+                h.write_all(value.as_bytes()).unwrap();
+            }
+        }
+    }
 
     h.write_all(b"-inputs").unwrap();
     spec.inputs

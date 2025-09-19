@@ -7,12 +7,13 @@ let python = import "../python/build.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 let zlib = import "../zlib/build.ncl" in
+let version = "2.51.0" in
 {
   name = "git",
   inputs = [
     { file = "build.sh" } | Local,
     {
-      url = "gs://minimal-staging-archives/git-2.51.0.tar.xz",
+      url = "gs://minimal-staging-archives/git-%{version}.tar.xz",
       sha256 = "60a7c2251cc2e588d5cd87bae567260617c6de0c22dca9cdbfc4c7d2b8990b62",
     } | Source,
     base,
@@ -26,7 +27,12 @@ let zlib = import "../zlib/build.ncl" in
     pcre2,
     zlib,
   ],
+
   cmd = "./build.sh",
+  build_args = {
+    include version,
+  },
+
   outputs = {
     bins = { path = "usr/bin/*" } | OutputBin,
     git_core = { glob = "usr/libexec/git-core/*" } | OutputLib,

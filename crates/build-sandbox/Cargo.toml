@@ -10,3 +10,5 @@ hakoniwa = "1.2"
 tempfile = { workspace = true }
 thiserror = "2.0"
 tracing = "0.1"
+
+nickel-lang-core.workspace = true

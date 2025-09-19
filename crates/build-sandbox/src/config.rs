@@ -1,3 +1,4 @@
+use nickel_lang_core::term::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -17,6 +18,8 @@ pub struct BuildConfig {
 pub struct BuildScript {
     pub executable: PathBuf,
     pub args: Vec<String>,
+
+    pub build_args: Option<IndexMap<String, String>>,
 }
 
 impl BuildConfig {
