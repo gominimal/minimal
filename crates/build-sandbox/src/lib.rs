@@ -13,7 +13,7 @@ pub struct BuildResult {
     pub outputs: Vec<std::path::PathBuf>,
 }
 
-#[tracing::instrument(skip_all, fields(name = config.name))]
+#[tracing::instrument(skip_all, fields(name = config.name, indicatif.pb_show))]
 pub fn run_build(config: &BuildConfig, output_dir: &std::path::Path) -> Result<BuildResult> {
     let executor = BuildExecutor::new()?;
     let exit_code = executor.execute(config)?;

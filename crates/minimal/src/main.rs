@@ -222,8 +222,8 @@ async fn main() -> Result<()> {
         .with_max_progress_bars(99, None)
         .with_span_field_formatter(hide_indicatif_span_fields(fmt::format::DefaultFields::new()))
         .with_tick_settings(TickSettings {
-            term_draw_hz: 4,
-            default_tick_interval: None,
+            term_draw_hz: 10,
+            default_tick_interval: Some(std::time::Duration::from_millis(500)),
             footer_tick_interval: None,
             ..Default::default()
         });

@@ -24,7 +24,7 @@ impl BuildExecutor {
         Ok(executor)
     }
 
-    #[tracing::instrument(skip(config), fields(indicatif.pb_show))]
+    #[tracing::instrument(skip(config), fields(indicatif.pb_hide))]
     pub fn execute(&self, config: &BuildConfig) -> Result<i32> {
         info!(
             "Linking {} inputs to build environment",
@@ -68,7 +68,7 @@ impl BuildExecutor {
         Ok(())
     }
 
-    #[tracing::instrument(skip(config))]
+    #[tracing::instrument(skip(config), fields(indicatif.pb_show))]
     fn execute_in_container(&self, config: &BuildConfig) -> Result<()> {
         let rootfs = self.prepare_rootfs(config)?;
         let program = &config.build_script.executable.to_string_lossy();
@@ -151,7 +151,7 @@ impl BuildExecutor {
         Ok(())
     }
 
-    #[tracing::instrument(skip(config))]
+    #[tracing::instrument(skip(config), fields(indicatif.pb_show))]
     fn prepare_rootfs(&self, config: &BuildConfig) -> Result<PathBuf> {
         let rootfs = self.path.join("rootfs");
         fs::create_dir_all(&rootfs)?;
