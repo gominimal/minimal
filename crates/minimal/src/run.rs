@@ -26,22 +26,25 @@ async fn materialize_source(
 
             match url.scheme() {
                 "https" => {
-                    let bytes = remote_storage
-                        .download_https_with_verification_and_caching(url.as_str(), &source.sha256)
-                        .await?;
+                    let cached_path = {
+                        let span = tracing::info_span!(
+                            "https_download",
+                            "indicatif.pb_show" = tracing::field::Empty,
+                            "build" = build_name,
+                            "url" = url.as_str()
+                        );
+                        let _enter = span.enter();
 
-                    let file_name = url.path().trim_start_matches('/');
-
-                    let temp_base = std::env::temp_dir()
-                        .join(format!("minpkgs-sources-{}", build_name.replace('/', "-")));
-                    std::fs::create_dir_all(&temp_base)?;
-
-                    let local_filename = file_name.rsplit('/').next().unwrap_or(file_name);
-                    let temp_path = temp_base.join(local_filename);
-                    std::fs::write(&temp_path, bytes)?;
+                        remote_storage
+                            .download_https_with_verification_and_caching(
+                                url.as_str(),
+                                &source.sha256,
+                            )
+                            .await?
+                    };
 
                     debug!("  Downloaded and verified source from {}", url);
-                    Ok(temp_path)
+                    Ok(cached_path)
                 }
 
                 "gs" => {
@@ -54,29 +57,29 @@ async fn materialize_source(
 
                     let file_name = url.path().trim_start_matches('/');
 
-                    // TODO
-                    let temp_base = std::env::temp_dir()
-                        .join(format!("minpkgs-sources-{}", build_name.replace('/', "-")));
-                    std::fs::create_dir_all(&temp_base)?;
+                    let cached_path = {
+                        let span = tracing::info_span!(
+                            "gcs_download",
+                            "indicatif.pb_show" = tracing::field::Empty,
+                            "build" = build_name,
+                            "url" = url.as_str()
+                        );
+                        let _enter = span.enter();
 
-                    let local_filename = file_name.rsplit('/').next().unwrap_or(file_name);
-                    let temp_path = temp_base.join(local_filename);
-
-                    let content = remote_storage
-                        .download_with_verification_and_caching(
-                            bucket_id.to_string(),
-                            file_name,
-                            &source.sha256,
-                        )
-                        .await?;
-
-                    std::fs::write(&temp_path, content)?;
+                        remote_storage
+                            .download_with_verification_and_caching(
+                                bucket_id.to_string(),
+                                file_name,
+                                &source.sha256,
+                            )
+                            .await?
+                    };
 
                     debug!(
                         "  Downloaded and verified source from gs://{}/{}",
                         bucket_id, file_name
                     );
-                    Ok(temp_path)
+                    Ok(cached_path)
                 }
                 _ => todo!(),
             }
@@ -226,17 +229,8 @@ async fn materialize_prebuilt(
                 package_hash.0.to_hex()
             );
 
-            let temp_base = Builder::new()
-                .prefix(&format!(
-                    "minpkgs-prebuilt-{}",
-                    build.name.replace('/', "-")
-                ))
-                .tempdir()?;
-            std::fs::create_dir_all(&temp_base)?;
-            let temp_archive_path = temp_base.path().join(format!("{}.tar.zst", package_name));
-
             // Download the prebuilt archive
-            let content = if let Some(sha256) = sha256 {
+            let archive_path = if let Some(sha256) = sha256 {
                 remote_storage
                     .download_with_verification_and_caching(
                         bucket_id.to_string(),
@@ -248,41 +242,31 @@ async fn materialize_prebuilt(
                         format!("Failed to download prebuilt archive for {}", package_name)
                     })?
             } else {
+                let (mut f, archive_path) = Builder::new()
+                    .prefix("minpkgs-prebuilt")
+                    .suffix(".tar.zst")
+                    .tempfile()?
+                    .keep()?;
+
                 remote_storage
-                    .download(bucket_id.to_string(), &file_path)
+                    .download(bucket_id.to_string(), &file_path, &mut f)
                     .await
                     .with_context(|| {
                         format!("Failed to download prebuilt archive for {}", package_name)
-                    })?
+                    })?;
+
+                f.sync_all()?;
+                drop(f);
+                archive_path
             };
 
-            std::fs::write(&temp_archive_path, content)?;
-
-            // Extract the archive
-            let extract_dir = temp_base.path().join("extracted");
-            std::fs::create_dir_all(&extract_dir)?;
-
-            extract_prebuilt_archive(&temp_archive_path, &extract_dir)?;
+            extract_prebuilt_archive(&archive_path, &output_dir.to_path_buf())?;
 
             debug!(
                 "  Downloaded and extracted prebuilt archive for {} to {}",
                 package_name,
-                extract_dir.display()
+                archive_path.display()
             );
-
-            // Copy all contents from the prebuilt extraction directory
-            for entry in std::fs::read_dir(extract_dir)? {
-                let entry = entry?;
-                let src = entry.path();
-                let filename = src.file_name().unwrap();
-                let dst = output_dir.join(filename);
-
-                if src.is_dir() {
-                    copy_dir_recursive(&src, &dst)?;
-                } else {
-                    std::fs::copy(&src, &dst)?;
-                }
-            }
         }
     }
     Ok(cache_handle)
@@ -519,21 +503,5 @@ fn extract_prebuilt_archive(archive_path: &PathBuf, extract_dir: &PathBuf) -> Re
     let decoder = zstd::stream::Decoder::new(file)?;
     let mut archive = tar::Archive::new(decoder);
     archive.unpack(extract_dir)?;
-    Ok(())
-}
-
-fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-
-        if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
-            std::fs::copy(&src_path, &dst_path)?;
-        }
-    }
     Ok(())
 }
