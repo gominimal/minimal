@@ -41,6 +41,8 @@ google-cloud-gax = "1.0.0"
 google-cloud-storage = "1.0.0"
 reqwest = "0.12" # keep in sync with google-cloud-gax
 
+regex = "1" # keep in sync with nickel-lang-core
+
 # our crates
 build-sandbox = { path = "crates/build-sandbox" }
 graph = { version = "0.0.1", path = "crates/graph" }

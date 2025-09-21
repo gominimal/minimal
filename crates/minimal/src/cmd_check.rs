@@ -1,5 +1,9 @@
 use crate::{Error, GlobalArgs, PackagesArg};
 use graph::DepGraph;
+use std::cmp::Ordering;
+
+use regex::Regex;
+use std::sync::LazyLock;
 
 #[derive(clap::Args)]
 pub struct CheckArgs {
@@ -94,7 +98,7 @@ pub fn cmd_check(args: CheckArgs, globals: &GlobalArgs) -> Result<(), Error> {
             }
             stdout.set_color(ColorSpec::new().set_fg(None)).unwrap();
 
-            if let Some(err) = check.err {
+            for err in check.err {
                 writeln!(&mut stdout, "\t{}", err).unwrap();
             }
         }
@@ -115,7 +119,7 @@ enum CheckVerdict {
 struct CheckResult {
     check: &'static str,
     verdict: CheckVerdict,
-    err: Option<String>,
+    err: Vec<String>,
 }
 
 fn check_package_parses(
@@ -127,13 +131,13 @@ fn check_package_parses(
     let mut result = CheckResult {
         verdict: CheckVerdict::Skip,
         check: "parse",
-        err: None,
+        err: vec![],
     };
 
     result.verdict = match globals.graph_from_package_name(pkg) {
         Ok(_) => CheckVerdict::Pass,
         Err(e) => {
-            result.err = Some(format!("{:?}", e));
+            result.err.push(format!("{:?}", e));
             CheckVerdict::Fail
         }
     };
@@ -150,7 +154,7 @@ fn check_package_spec_name_matches_dir(
     let mut result = CheckResult {
         verdict: CheckVerdict::Skip,
         check: "spec name matches dir",
-        err: None,
+        err: vec![],
     };
 
     result.verdict = match globals.graph_from_package_name(pkg) {
@@ -176,13 +180,14 @@ fn check_package_name(
     let mut result = CheckResult {
         verdict: CheckVerdict::Skip,
         check: "spec name valid",
-        err: None,
+        err: vec![],
     };
 
     result.verdict = if pkg.chars().all(|x| {
         (x.is_ascii_alphanumeric() && (!x.is_alphabetic() || x.is_ascii_lowercase()))
             || x == '_'
             || x == '-'
+            || x == '.'
     }) {
         if all_graph
             .as_ref()
@@ -190,13 +195,17 @@ fn check_package_name(
             .unwrap_or(1)
             != 1
         {
-            result.err = Some("Multiple build-specs exist with the same name".to_string());
+            result
+                .err
+                .push("Multiple build-specs exist with the same name".to_string());
             CheckVerdict::Fail
         } else {
             CheckVerdict::Pass
         }
     } else {
-        result.err = Some("Only lowercase a-z,0-9,-, and _ allowed".to_string());
+        result
+            .err
+            .push("Only lowercase a-z,0-9,-,., and _ allowed".to_string());
         CheckVerdict::Fail
     };
 
@@ -212,7 +221,7 @@ fn cycle_breaker_naming(
     let mut result = CheckResult {
         verdict: CheckVerdict::Skip,
         check: "cycle breaker naming",
-        err: None,
+        err: vec![],
     };
 
     result.verdict = match globals.graph_from_package_name(pkg) {
@@ -221,7 +230,7 @@ fn cycle_breaker_naming(
             if let Some(replace_on_cycle) = build.replace_on_cycle {
                 let cycle_breaker = graph.get(&replace_on_cycle).unwrap();
                 if cycle_breaker.name != format!("{} (prebuilt)", pkg) {
-                    result.err = Some(format!(
+                    result.err.push(format!(
                         "cycle breaker should be named '{} (prebuilt)' instead if '{}'",
                         pkg, cycle_breaker.name
                     ));
@@ -239,6 +248,110 @@ fn cycle_breaker_naming(
     Ok(result)
 }
 
+static MINIMAL_IMPORT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"let\s*\{\s*([^}]+)\s*\}\s*=\s*import\s+"minimal\.ncl"\s+in"#)
+        .expect("Invalid regex pattern")
+});
+
+fn check_minimal_import_line(
+    pkg: &String,
+    _all_graph: &Option<DepGraph>,
+    fix: bool,
+    globals: &GlobalArgs,
+) -> Result<CheckResult, Error> {
+    let mut result = CheckResult {
+        verdict: CheckVerdict::Skip,
+        check: "import line",
+        err: vec![],
+    };
+
+    let base = globals.packages_dir().join(pkg);
+    for e in std::fs::read_dir(base).map_err(anyhow::Error::from)? {
+        let e = e.map_err(anyhow::Error::from)?;
+        if e.file_type().unwrap().is_dir() {
+            continue;
+        }
+        let name = e.file_name();
+        if !name.to_str().unwrap().ends_with(".ncl") {
+            continue;
+        }
+
+        let file_contents =
+            String::from_utf8(std::fs::read(e.path()).map_err(anyhow::Error::from)?)
+                .map_err(anyhow::Error::from)?;
+
+        if let Some(captures) = (&*MINIMAL_IMPORT_REGEX).captures(&file_contents) {
+            let overall = captures.get(0).unwrap();
+            let identifiers_str = captures.get(1).unwrap().as_str();
+
+            // Split by comma and clean up whitespace, filter out ".."
+            let identifiers: Vec<&str> = identifiers_str
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty() && *s != "..")
+                .collect();
+
+            // Filter identifiers which arent used, if not in fix mode then report
+            let rest = &file_contents[overall.end()..];
+            let used_identifiers = identifiers
+                .iter()
+                .filter_map(|ident| {
+                    if !rest.contains(ident) {
+                        if !fix {
+                            result.err.push(format!(
+                                "{}: {} imported but not used",
+                                name.to_str().unwrap(),
+                                ident
+                            ));
+                        }
+                        None
+                    } else {
+                        Some(*ident)
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let mut sorted_identifiers = used_identifiers.clone();
+            sorted_identifiers.sort_by(|a, b| {
+                let a_is_lower = a.chars().next().unwrap_or('\0').is_ascii_lowercase();
+                let b_is_lower = b.chars().next().unwrap_or('\0').is_ascii_lowercase();
+
+                match (a_is_lower, b_is_lower) {
+                    // Both lowercase or both uppercase - use normal string comparison
+                    (true, true) | (false, false) => a.cmp(b),
+                    // a is lowercase, b is uppercase - a comes first
+                    (true, false) => Ordering::Less,
+                    // a is uppercase, b is lowercase - b comes first
+                    (false, true) => Ordering::Greater,
+                }
+            });
+
+            if sorted_identifiers != used_identifiers {
+                if fix {
+                    let fixed = format!(
+                        "let {{ {}, .. }} = import \"minimal.ncl\" in",
+                        sorted_identifiers.join(", ")
+                    );
+                    let mut new_file_contents = file_contents.clone();
+                    new_file_contents.replace_range(overall.start()..overall.end(), &fixed);
+                    std::fs::write(e.path(), new_file_contents).map_err(anyhow::Error::from)?;
+                    result.verdict = CheckVerdict::Fixed;
+                } else {
+                    result.err.push(format!(
+                        "{}: identifiers not in canonical order",
+                        name.to_str().unwrap()
+                    ));
+                }
+            }
+        }
+    }
+
+    if !result.err.is_empty() {
+        result.verdict = CheckVerdict::Fail;
+    }
+    Ok(result)
+}
+
 fn check_package_fmt(
     pkg: &String,
     _all_graph: &Option<DepGraph>,
@@ -248,7 +361,7 @@ fn check_package_fmt(
     let mut result = CheckResult {
         verdict: CheckVerdict::Skip,
         check: "fmt",
-        err: None,
+        err: vec![],
     };
 
     let base = globals.packages_dir().join(pkg);
@@ -267,7 +380,7 @@ fn check_package_fmt(
 
         match nickel_lang_core::format::format(&data[..], &mut out) {
             Err(e) => {
-                result.err = Some(format!(
+                result.err.push(format!(
                     "formatting {} failed: {:?}",
                     name.to_str().unwrap(),
                     e
@@ -303,6 +416,7 @@ fn check_package(
         check_package_spec_name_matches_dir(pkg, all_graph, fix, globals)?,
         check_package_name(pkg, all_graph, fix, globals)?,
         cycle_breaker_naming(pkg, all_graph, fix, globals)?,
+        check_minimal_import_line(pkg, all_graph, fix, globals)?,
         check_package_fmt(pkg, all_graph, fix, globals)?,
     ])
 }

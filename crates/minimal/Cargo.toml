@@ -10,6 +10,7 @@ cache = { workspace = true }
 
 nickel-lang-core.workspace = true
 codespan-reporting.workspace = true
+regex.workspace = true
 
 tracing.workspace = true
 tracing-subscriber.workspace = true

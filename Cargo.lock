@@ -2356,6 +2356,7 @@ dependencies = [
  "oci-client",
  "oci-spec",
  "rayon",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
