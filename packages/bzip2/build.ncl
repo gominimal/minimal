@@ -1,4 +1,4 @@
-let { BuildSpec, OutputBin, OutputData, OutputLib, Local, Prebuilt, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
@@ -31,12 +31,13 @@ let toolchain = import "../toolchain/build.ncl" in
     headers = { data = "usr/include/bzlib.h" } | OutputData,
   },
 
-  replace_on_cycle = {
-    name = "bzip2 (prebuilt)",
-    inputs = [
-      { package = "bzip2" } | Prebuilt,
-    ],
-    cmd = "",
-    outputs = {},
-  } | BuildSpec,
+  replace_on_cycle =
+    {
+      name = "bzip2 (prebuilt)",
+      inputs = [
+        { package = "bzip2" } | Prebuilt,
+      ],
+      cmd = "",
+      outputs = {},
+    } | BuildSpec,
 } | BuildSpec

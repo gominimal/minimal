@@ -1,4 +1,4 @@
-let { BuildSpec, OutputBin, OutputLib, Local, Prebuilt, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
@@ -18,14 +18,15 @@ let toolchain = import "../toolchain/build.ncl" in
     usr_share = { glob = "usr/share/**/*" } | OutputLib,
   },
 
-  replace_on_cycle = {
-    name = "m4 (prebuilt)",
-    inputs = [
-      { package = "m4" } | Prebuilt,
-    ],
-    cmd = "",
-    outputs = {
-      usr = { glob = "usr/**/*" } | OutputLib,
-    },
-  } | BuildSpec,
+  replace_on_cycle =
+    {
+      name = "m4 (prebuilt)",
+      inputs = [
+        { package = "m4" } | Prebuilt,
+      ],
+      cmd = "",
+      outputs = {
+        usr = { glob = "usr/**/*" } | OutputLib,
+      },
+    } | BuildSpec,
 } | BuildSpec

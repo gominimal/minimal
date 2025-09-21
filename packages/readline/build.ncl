@@ -1,4 +1,4 @@
-let { BuildSpec, OutputBin, OutputData, OutputLib, Local, Prebuilt, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputData, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let ncurses = import "../ncurses/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
@@ -25,18 +25,19 @@ let toolchain = import "../toolchain/build.ncl" in
     headers = { data = "usr/include/readline/*.h" } | OutputData,
   },
 
-  replace_on_cycle = {
-    name = "readline (prebuilt)",
-    inputs = [
-      { package = "readline" } | Prebuilt,
-    ],
-    runtime_deps = [
-      ncurses,
-    ],
-    cmd = "",
-    outputs = {
-      usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
-      usr_include = { data = "usr/include/**/*" } | OutputData,
-    },
-  } | BuildSpec,
+  replace_on_cycle =
+    {
+      name = "readline (prebuilt)",
+      inputs = [
+        { package = "readline" } | Prebuilt,
+      ],
+      runtime_deps = [
+        ncurses,
+      ],
+      cmd = "",
+      outputs = {
+        usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
+        usr_include = { data = "usr/include/**/*" } | OutputData,
+      },
+    } | BuildSpec,
 } | BuildSpec

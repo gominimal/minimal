@@ -1,4 +1,4 @@
-let { BuildSpec, HostPath, OutputLib, OutputData, Local, Prebuilt, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputData, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
 let bash = import "../bash/build.ncl" in
 let make = import "../make/build.ncl" in
 let sed = import "../sed/build.ncl" in
@@ -28,17 +28,18 @@ let toolchain = import "../toolchain/build.ncl" in
     pkgconfig = { data = "usr/lib/pkgconfig/zlib.pc" } | OutputData,
   },
 
-  replace_on_cycle = {
-    name = "zlib (prebuilt)",
-    inputs = [
-      { package = "zlib" } | Prebuilt,
-    ],
-    cmd = "",
-    outputs = {
-      libz = { glob = "usr/lib/libz.so*" } | OutputLib,
-      zconf_h = { data = "usr/include/zconf.h" } | OutputData,
-      zlib_h = { data = "usr/include/zlib.h" } | OutputData,
-      pkgconfig = { data = "usr/lib/pkgconfig/zlib.pc" } | OutputData,
-    },
-  } | BuildSpec,
+  replace_on_cycle =
+    {
+      name = "zlib (prebuilt)",
+      inputs = [
+        { package = "zlib" } | Prebuilt,
+      ],
+      cmd = "",
+      outputs = {
+        libz = { glob = "usr/lib/libz.so*" } | OutputLib,
+        zconf_h = { data = "usr/include/zconf.h" } | OutputData,
+        zlib_h = { data = "usr/include/zlib.h" } | OutputData,
+        pkgconfig = { data = "usr/lib/pkgconfig/zlib.pc" } | OutputData,
+      },
+    } | BuildSpec,
 } | BuildSpec

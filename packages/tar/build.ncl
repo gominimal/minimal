@@ -1,4 +1,4 @@
-let { BuildSpec, HostPath, OutputBin, OutputLib, Local, Prebuilt, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 let acl = import "../acl/build.ncl" in
@@ -28,19 +28,20 @@ let xz = import "../xz/build.ncl" in
     locale_files = { glob = "usr/share/locale/**/*" } | OutputLib,
   },
 
-  replace_on_cycle = {
-    name = "tar (prebuilt)",
-    inputs = [
-      { package = "tar" } | Prebuilt,
-    ],
-    runtime_deps = [
-      acl,
-      gzip,
-      xz,
-    ],
-    cmd = "",
-    outputs = {
-      tar = { path = "usr/bin/tar" } | OutputBin,
-    },
-  } | BuildSpec,
+  replace_on_cycle =
+    {
+      name = "tar (prebuilt)",
+      inputs = [
+        { package = "tar" } | Prebuilt,
+      ],
+      runtime_deps = [
+        acl,
+        gzip,
+        xz,
+      ],
+      cmd = "",
+      outputs = {
+        tar = { path = "usr/bin/tar" } | OutputBin,
+      },
+    } | BuildSpec,
 } | BuildSpec

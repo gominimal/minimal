@@ -1,4 +1,4 @@
-let { BuildSpec, OutputBin, OutputData, Local, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputData, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let bison = import "../bison/build.ncl" in
 let flex = import "../flex/build.ncl" in
@@ -28,6 +28,6 @@ let libcap = import "../libcap/build.ncl" in
   outputs = {
     sbins = { path = "usr/sbin/*" } | OutputBin,
 
-    include = { data = "usr/include/iproute2/*" } | OutputData,
+    includes = { data = "usr/include/iproute2/*" } | OutputData,
   },
 } | BuildSpec

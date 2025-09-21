@@ -260,7 +260,7 @@ fn check_minimal_import_line(
     globals: &GlobalArgs,
 ) -> Result<CheckResult, Error> {
     let mut result = CheckResult {
-        verdict: CheckVerdict::Skip,
+        verdict: CheckVerdict::Pass,
         check: "import line",
         err: vec![],
     };
@@ -326,22 +326,21 @@ fn check_minimal_import_line(
                 }
             });
 
-            if sorted_identifiers != used_identifiers {
-                if fix {
-                    let fixed = format!(
-                        "let {{ {}, .. }} = import \"minimal.ncl\" in",
-                        sorted_identifiers.join(", ")
-                    );
-                    let mut new_file_contents = file_contents.clone();
-                    new_file_contents.replace_range(overall.start()..overall.end(), &fixed);
-                    std::fs::write(e.path(), new_file_contents).map_err(anyhow::Error::from)?;
-                    result.verdict = CheckVerdict::Fixed;
-                } else {
-                    result.err.push(format!(
-                        "{}: identifiers not in canonical order",
-                        name.to_str().unwrap()
-                    ));
-                }
+            if !fix && sorted_identifiers != used_identifiers {
+                result.err.push(format!(
+                    "{}: identifiers not in canonical order",
+                    name.to_str().unwrap()
+                ));
+            }
+            if fix && (sorted_identifiers != used_identifiers || identifiers != used_identifiers) {
+                let fixed = format!(
+                    "let {{ {}, .. }} = import \"minimal.ncl\" in",
+                    sorted_identifiers.join(", ")
+                );
+                let mut new_file_contents = file_contents.clone();
+                new_file_contents.replace_range(overall.start()..overall.end(), &fixed);
+                std::fs::write(e.path(), new_file_contents).map_err(anyhow::Error::from)?;
+                result.verdict = CheckVerdict::Fixed;
             }
         }
     }

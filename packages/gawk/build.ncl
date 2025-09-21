@@ -1,4 +1,4 @@
-let { BuildSpec, OutputLib, OutputBin, Local, Prebuilt, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
@@ -21,18 +21,19 @@ let toolchain = import "../toolchain/build.ncl" in
     usr_share = { glob = "usr/share/**/*" } | OutputLib,
   },
 
-  replace_on_cycle = {
-    name = "gawk (prebuilt)",
-    inputs = [
-      { package = "gawk" } | Prebuilt,
-    ],
-    cmd = "",
-    outputs = {
-      usr_bin = { path = "usr/bin/**/*" } | OutputBin,
-      usr_include = { glob = "usr/include/**/*" } | OutputLib,
-      usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
-      usr_libexec = { glob = "usr/libexec/**/*" } | OutputLib,
-      usr_share = { glob = "usr/share/**/*" } | OutputLib,
-    },
-  } | BuildSpec,
+  replace_on_cycle =
+    {
+      name = "gawk (prebuilt)",
+      inputs = [
+        { package = "gawk" } | Prebuilt,
+      ],
+      cmd = "",
+      outputs = {
+        usr_bin = { path = "usr/bin/**/*" } | OutputBin,
+        usr_include = { glob = "usr/include/**/*" } | OutputLib,
+        usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
+        usr_libexec = { glob = "usr/libexec/**/*" } | OutputLib,
+        usr_share = { glob = "usr/share/**/*" } | OutputLib,
+      },
+    } | BuildSpec,
 } | BuildSpec

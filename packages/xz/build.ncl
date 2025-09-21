@@ -1,4 +1,4 @@
-let { BuildSpec, OutputLib, Local, Prebuilt, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
@@ -44,16 +44,17 @@ let toolchain = import "../toolchain/build.ncl" in
     lzma_headers = { glob = "usr/include/lzma/*.h" } | OutputLib,
   },
 
-  replace_on_cycle = {
-    name = "xz (prebuilt)",
-    inputs = [
-      { package = "xz" } | Prebuilt,
-    ],
-    cmd = "",
-    outputs = {
-      usr_bin = { glob = "usr/bin/**/*" } | OutputLib,
-      usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
-      usr_include = { glob = "usr/include/**/*" } | OutputLib,
-    },
-  } | BuildSpec,
+  replace_on_cycle =
+    {
+      name = "xz (prebuilt)",
+      inputs = [
+        { package = "xz" } | Prebuilt,
+      ],
+      cmd = "",
+      outputs = {
+        usr_bin = { glob = "usr/bin/**/*" } | OutputLib,
+        usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
+        usr_include = { glob = "usr/include/**/*" } | OutputLib,
+      },
+    } | BuildSpec,
 } | BuildSpec

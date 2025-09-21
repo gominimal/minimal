@@ -1,4 +1,4 @@
-let { BuildSpec, OutputLib, Local, Prebuilt, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputLib, .. } = import "minimal.ncl" in
 let bash = import "../bash/build.ncl" in
 let bzip2 = import "../bzip2/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in

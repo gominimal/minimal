@@ -1,4 +1,4 @@
-let { BuildSpec, OutputBin, OutputLib, Local, Prebuilt, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
 
 let base = import "../base/build.ncl" in
 let flex = import "../flex/build.ncl" in
@@ -30,14 +30,15 @@ let toolchain = import "../toolchain/build.ncl" in
     bison_aclocal = { glob = "usr/share/aclocal/bison*.m4" } | OutputLib,
   },
 
-  replace_on_cycle = {
-    name = "bison (prebuilt)",
-    inputs = [
-      { package = "bison" } | Prebuilt,
-    ],
-    cmd = "",
-    outputs = {
-      usr = { glob = "usr/**/*" } | OutputLib,
-    },
-  } | BuildSpec,
+  replace_on_cycle =
+    {
+      name = "bison (prebuilt)",
+      inputs = [
+        { package = "bison" } | Prebuilt,
+      ],
+      cmd = "",
+      outputs = {
+        usr = { glob = "usr/**/*" } | OutputLib,
+      },
+    } | BuildSpec,
 } | BuildSpec

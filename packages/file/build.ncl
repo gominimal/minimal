@@ -1,4 +1,4 @@
-let { BuildSpec, OutputBin, OutputLib, Local, Prebuilt, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
@@ -20,17 +20,18 @@ let toolchain = import "../toolchain/build.ncl" in
     magic_data = { glob = "usr/share/misc/magic*" } | OutputLib,
   },
 
-  replace_on_cycle = {
-    name = "file (prebuilt)",
-    inputs = [
-      { package = "file" } | Prebuilt,
-    ],
-    cmd = "",
-    outputs = {
-      usr_bin = { path = "usr/bin/**/*" } | OutputBin,
-      usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
-      usr_include = { glob = "usr/include/**/*" } | OutputLib,
-      usr_share = { glob = "usr/share/**/*" } | OutputLib,
-    }
-  } | BuildSpec,
+  replace_on_cycle =
+    {
+      name = "file (prebuilt)",
+      inputs = [
+        { package = "file" } | Prebuilt,
+      ],
+      cmd = "",
+      outputs = {
+        usr_bin = { path = "usr/bin/**/*" } | OutputBin,
+        usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
+        usr_include = { glob = "usr/include/**/*" } | OutputLib,
+        usr_share = { glob = "usr/share/**/*" } | OutputLib,
+      }
+    } | BuildSpec,
 } | BuildSpec

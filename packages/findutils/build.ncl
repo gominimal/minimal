@@ -1,4 +1,4 @@
-let { BuildSpec, OutputLib, Local, Prebuilt, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
 let bash = import "../gcc/build.ncl" in
 let binutils = import "../binutils/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
@@ -42,14 +42,15 @@ let tar = import "../tar/build.ncl" in
     usr_share = { glob = "usr/share/**/*" } | OutputLib,
   },
 
-  replace_on_cycle = {
-    name = "findutils (prebuilt)",
-    inputs = [
-      { package = "findutils" } | Prebuilt,
-    ],
-    cmd = "",
-    outputs = {
-      usr = { glob = "usr/**/*" } | OutputLib,
-    },
-  } | BuildSpec,
+  replace_on_cycle =
+    {
+      name = "findutils (prebuilt)",
+      inputs = [
+        { package = "findutils" } | Prebuilt,
+      ],
+      cmd = "",
+      outputs = {
+        usr = { glob = "usr/**/*" } | OutputLib,
+      },
+    } | BuildSpec,
 } | BuildSpec

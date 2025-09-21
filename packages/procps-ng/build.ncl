@@ -1,4 +1,4 @@
-let { BuildSpec, OutputBin, OutputData, OutputLib, Local, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let pkgconf = import "../pkgconf/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
@@ -24,7 +24,7 @@ let ncurses = import "../ncurses/build.ncl" in
     sbins = { path = "usr/sbin/*" } | OutputBin,
     libs = { glob = "usr/lib/*" } | OutputLib,
 
-    include = { data = "usr/include/libproc2/*" } | OutputData,
+    includes = { data = "usr/include/libproc2/*" } | OutputData,
     pkgconfig = { data = "usr/lib/pkgconfig/*" } | OutputData,
   },
 } | BuildSpec

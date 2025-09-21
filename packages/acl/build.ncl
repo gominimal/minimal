@@ -1,4 +1,4 @@
-let { BuildSpec, OutputLib, Local, Prebuilt, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
 let attr = import "../attr/build.ncl" in
 let bash = import "../gcc/build.ncl" in
 let binutils = import "../binutils/build.ncl" in
@@ -44,14 +44,15 @@ let tar = import "../tar/build.ncl" in
     usr_share = { glob = "usr/share/**/*" } | OutputLib,
   },
 
-  replace_on_cycle = {
-    name = "acl (prebuilt)",
-    inputs = [
-      { package = "acl", sha256 = "42491a1408cedbb0716b278c3cd88bb788b00de547fc2d6cb583ed94f9495edb" } | Prebuilt,
-    ],
-    cmd = "",
-    outputs = {
-      usr = { glob = "usr/**/*" } | OutputLib,
-    },
-  } | BuildSpec,
+  replace_on_cycle =
+    {
+      name = "acl (prebuilt)",
+      inputs = [
+        { package = "acl", sha256 = "42491a1408cedbb0716b278c3cd88bb788b00de547fc2d6cb583ed94f9495edb" } | Prebuilt,
+      ],
+      cmd = "",
+      outputs = {
+        usr = { glob = "usr/**/*" } | OutputLib,
+      },
+    } | BuildSpec,
 } | BuildSpec

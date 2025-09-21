@@ -1,4 +1,4 @@
-let { BuildSpec, OutputData, OutputLib, OutputBin, Local, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputData, Source, .. } = import "minimal.ncl" in
 let cmake = import "../cmake/build.ncl" in
 let meson = import "../meson/build.ncl" in
 let ninja = import "../ninja/build.ncl" in

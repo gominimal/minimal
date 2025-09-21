@@ -1,4 +1,4 @@
-let { BuildSpec, OutputBin, OutputData, OutputLib, Local, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
@@ -17,7 +17,7 @@ let toolchain = import "../toolchain/build.ncl" in
     bins = { path = "usr/bin/*" } | OutputBin,
     sbins = { path = "usr/sbin/*" } | OutputBin,
     libs = { glob = "usr/lib/*" } | OutputLib,
-    include = { data = "usr/include/**/*" } | OutputData,
+    includes = { data = "usr/include/**/*" } | OutputData,
 
     completions = { data = "usr/share/bash-completion/**/*" } | OutputData,
     pkgconfig = { data = "usr/lib/pkgconfig/**/*" } | OutputData,

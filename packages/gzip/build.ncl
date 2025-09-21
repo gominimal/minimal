@@ -1,4 +1,4 @@
-let { BuildSpec, OutputBin, OutputData, Local, Prebuilt, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputData, Prebuilt, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
@@ -19,14 +19,15 @@ let toolchain = import "../toolchain/build.ncl" in
     man = { data = "usr/share/man/man1/*.1" } | OutputData,
   },
 
-  replace_on_cycle = {
-    name = "gzip (prebuilt)",
-    inputs = [
-      { package = "gzip" } | Prebuilt,
-    ],
-    cmd = "",
-    outputs = {
-      binaries = { path = "usr/bin/*" } | OutputBin,
-    },
-  } | BuildSpec,
+  replace_on_cycle =
+    {
+      name = "gzip (prebuilt)",
+      inputs = [
+        { package = "gzip" } | Prebuilt,
+      ],
+      cmd = "",
+      outputs = {
+        binaries = { path = "usr/bin/*" } | OutputBin,
+      },
+    } | BuildSpec,
 } | BuildSpec

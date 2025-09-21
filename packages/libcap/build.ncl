@@ -1,4 +1,4 @@
-let { BuildSpec, HostPath, OutputLib, OutputBin, OutputData, Local, Prebuilt, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
 let bash = import "../bash/build.ncl" in
 let diffutils = import "../diffutils/build.ncl" in
 let grep = import "../grep/build.ncl" in
@@ -35,14 +35,15 @@ let toolchain = import "../toolchain/build.ncl" in
     pkgconfig = { data = "usr/lib/pkgconfig/*" } | OutputData,
   },
 
-  replace_on_cycle = {
-    name = "libcap (prebuilt)",
-    inputs = [
-      { package = "libcap" } | Prebuilt,
-    ],
-    cmd = "",
-    outputs = {
-      usr = { glob = "usr/**/*" } | OutputLib,
-    },
-  } | BuildSpec,
+  replace_on_cycle =
+    {
+      name = "libcap (prebuilt)",
+      inputs = [
+        { package = "libcap" } | Prebuilt,
+      ],
+      cmd = "",
+      outputs = {
+        usr = { glob = "usr/**/*" } | OutputLib,
+      },
+    } | BuildSpec,
 } | BuildSpec
