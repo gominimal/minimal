@@ -3,7 +3,7 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config::BuildConfig;
 use crate::error::{ExecutionError, Result};
@@ -56,7 +56,22 @@ impl BuildExecutor {
         };
 
         if input.is_file() {
-            fs::hard_link(input, &dest_path).map_err(|e| ExecutionError::HardLinkFailed {
+            match fs::hard_link(input, &dest_path) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        warn!(
+                            "Not linking {} => {}, already exists",
+                            input.display(),
+                            dest_path.display()
+                        );
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
+                }
+            }
+            .map_err(|e| ExecutionError::HardLinkFailed {
                 source: input.display().to_string(),
                 destination: dest_path.display().to_string(),
                 error: e,
@@ -212,7 +227,22 @@ fn hardlink_dir_contents(src: &Path, dst: &Path) -> Result<()> {
             })?;
             hardlink_dir_contents(&path, &dst_path)?;
         } else if metadata.is_file() {
-            fs::hard_link(&path, &dst_path).map_err(|e| ExecutionError::HardLinkFailed {
+            match fs::hard_link(&path, &dst_path) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        warn!(
+                            "Not linking {} => {}, already exists",
+                            path.display(),
+                            dst_path.display()
+                        );
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
+                }
+            }
+            .map_err(|e| ExecutionError::HardLinkFailed {
                 source: path.display().to_string(),
                 destination: dst_path.display().to_string(),
                 error: e,
