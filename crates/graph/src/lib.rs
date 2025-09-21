@@ -194,6 +194,10 @@ impl SpecHash {
     pub fn from_hex(hex: impl AsRef<[u8]>) -> Result<Self, blake3::HexError> {
         Ok(SpecHash(blake3::Hash::from_hex(hex)?))
     }
+
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        SpecHash(blake3::Hash::from_bytes(bytes))
+    }
 }
 
 impl PartialEq<blake3::Hash> for SpecHash {

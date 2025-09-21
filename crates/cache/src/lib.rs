@@ -8,6 +8,9 @@ pub use fs::FSError;
 pub use fs::FileSystem;
 pub use fs::LocalDir;
 
+#[allow(dead_code)]
+mod remote_index;
+
 /// A directory tree in the cache you can read or write.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
