@@ -1474,15 +1474,15 @@ mod tests {
         let sr = SpecReader::new(
             indoc! {
                 "
-                let {BuildSpec, OutputData, Subset, subsetOf, ..} = import \"minimal.ncl\" in
-                let our_runtime_dep = {
+                let {BuildSpec, OutputData, Subset, build, subsetOf, ..} = import \"minimal.ncl\" in
+                let our_runtime_dep = build {
                     name = \"runtime dep\",
                     inputs = [],
                     cmd = \"\",
                     outputs = {
                         some_data = { data = \"usr/*\"} | OutputData,
                     }
-                } | BuildSpec in
+                } in
                 {
                     name = \"top build\",
                     inputs = [our_runtime_dep],

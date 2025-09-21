@@ -19,6 +19,8 @@
         outputs
           | {_ : Output} | optional = {},
     },
+    build | Dyn -> BuildSpec | doc "Constructs a minimal build spec." =
+      fun spec => spec | BuildSpec,
 
     Output | doc "An artifact produced by the execution of a build spec" = std.contract.any_of [OutputLib, OutputBin, OutputData],
 

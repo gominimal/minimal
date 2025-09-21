@@ -66,9 +66,57 @@ impl SpecReaderOptions {
     }
 }
 
+macro_rules! annotate_record {
+    ($record:expr, $buildspec_id_ident:expr, $id:expr, $rt:expr, ($inner:expr, $files:expr, $minimal_lib_path:expr),) => {
+        // Skip annotation for any part of the minimal library.
+        if $inner
+            .pos
+            .src_id()
+            .map(|file_id| {
+                let file_path = $files.name(file_id);
+                file_path
+                    .to_str()
+                    .map(|s| s.starts_with($minimal_lib_path))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+        {
+            return Ok($rt);
+        } else {
+            match $record {
+                Term::RecRecord(mut record_data, includes, dyn_fields, deps) => {
+                    if record_data.fields.get(&$buildspec_id_ident).is_some() {
+                        return Ok($rt);
+                    }
+                    record_data.fields.insert(
+                        LocIdent::new("__magic_buildspec_id"),
+                        RichTerm::from(Term::ForeignId($id)).into(),
+                    );
+                    $id += 1;
+                    Term::RecRecord(record_data, includes, dyn_fields, deps).into()
+                }
+                Term::Record(mut record_data) => {
+                    if record_data.fields.get(&$buildspec_id_ident).is_some() {
+                        return Ok($rt);
+                    }
+                    record_data.fields.insert(
+                        LocIdent::new("__magic_buildspec_id"),
+                        RichTerm::from(Term::ForeignId($id)).into(),
+                    );
+                    $id += 1;
+                    Term::Record(record_data).into()
+                }
+                _ => unreachable!("record type was {:?}", $record),
+            }
+        }
+    };
+}
+
 /// Evaluates a universe of nickel files which describe minimal build specifications.
 pub struct SpecReader {
     p: Program<CacheImpl>,
+    minimal_lib_path: PathBuf,
+    last_id: u64,
 }
 
 impl SpecReader {
@@ -86,7 +134,11 @@ impl SpecReader {
             .typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk)
             .map_err(|e| SpecError::Nickel(program.files(), e))?;
 
-        let mut out = Self { p: program };
+        let mut out = Self {
+            p: program,
+            last_id: 0,
+            minimal_lib_path: opts.minimal_lib_path.canonicalize()?,
+        };
         out.annotate()?;
         Ok(out)
     }
@@ -130,7 +182,11 @@ impl SpecReader {
             .typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk)
             .map_err(|e| SpecError::Nickel(program.files(), e))?;
 
-        let mut out = Self { p: program };
+        let mut out = Self {
+            p: program,
+            last_id: 0,
+            minimal_lib_path: opts.minimal_lib_path.canonicalize()?,
+        };
         out.annotate()?;
         Ok(out)
     }
@@ -164,7 +220,11 @@ impl SpecReader {
             .typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk)
             .map_err(|e| SpecError::Nickel(program.files(), e))?;
 
-        let mut out = Self { p: program };
+        let mut out = Self {
+            p: program,
+            last_id: 0,
+            minimal_lib_path: opts.minimal_lib_path.canonicalize()?,
+        };
         out.annotate()?;
         Ok(out)
     }
@@ -181,7 +241,11 @@ impl SpecReader {
             .typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk)
             .map_err(|e| SpecError::Nickel(program.files(), e))?;
 
-        let mut out = Self { p: program };
+        let mut out = Self {
+            p: program,
+            last_id: 0,
+            minimal_lib_path: opts.minimal_lib_path.canonicalize()?,
+        };
         out.annotate()?;
         Ok(out)
     }
@@ -190,9 +254,13 @@ impl SpecReader {
     fn annotate(&mut self) -> Result<(), SpecError> {
         use nickel_lang_core::traverse::{Traverse as _, TraverseOrder};
 
-        let mut id: u64 = 0;
+        let files = self.p.files();
+        let minimal_lib_path = self.minimal_lib_path.to_str().unwrap();
+
+        let mut id: u64 = self.last_id;
         let buildspec_id_ident = LocIdent::new("__magic_buildspec_id");
         let mut traversal = |rt: RichTerm| -> Result<RichTerm, CacheError<()>> {
+            // Explicit declaration: { ... } | BuildSpec
             if let Term::Annotated(annotation, inner) = rt.as_ref() {
                 let is_buildspec = annotation.contracts.iter().any(|lt| {
                     if let TypeF::Contract(c) = &lt.typ.typ {
@@ -207,43 +275,54 @@ impl SpecReader {
                 });
 
                 if is_buildspec {
-                    let new_inner = match inner.term.as_ref().clone() {
-                        Term::RecRecord(mut record_data, includes, dyn_fields, deps) => {
-                            if record_data.fields.get(&buildspec_id_ident).is_some() {
-                                return Ok(rt);
-                            }
-                            record_data.fields.insert(
-                                LocIdent::new("__magic_buildspec_id"),
-                                RichTerm::from(Term::ForeignId(id)).into(),
-                            );
-                            id += 1;
-                            Term::RecRecord(record_data, includes, dyn_fields, deps).into()
-                        }
-                        Term::Record(mut record_data) => {
-                            if record_data.fields.get(&buildspec_id_ident).is_some() {
-                                return Ok(rt);
-                            }
-                            record_data.fields.insert(
-                                LocIdent::new("__magic_buildspec_id"),
-                                RichTerm::from(Term::ForeignId(id)).into(),
-                            );
-                            id += 1;
-                            Term::Record(record_data).into()
-                        }
-                        _ => unreachable!(),
-                    };
-                    return Ok(Term::Annotated(annotation.clone(), new_inner).into());
+                    return Ok(Term::Annotated(
+                        annotation.clone(),
+                        annotate_record!(
+                            inner.term.as_ref().clone(),
+                            buildspec_id_ident,
+                            id,
+                            rt,
+                            (inner, files, minimal_lib_path),
+                        ),
+                    )
+                    .into());
+                }
+            }
+
+            // Function-based declaration: build { ... }
+            if let Term::App(func, arg) = rt.as_ref() {
+                let is_build_decl = if let Term::Var(v) = func.as_ref() {
+                    v.label() == "build"
+                } else {
+                    false
+                };
+
+                if is_build_decl {
+                    return Ok(Term::App(
+                        func.clone(),
+                        annotate_record!(
+                            arg.term.as_ref().clone(),
+                            buildspec_id_ident,
+                            id,
+                            rt,
+                            (arg, files, minimal_lib_path),
+                        ),
+                    )
+                    .into());
                 }
             }
 
             Ok(rt)
         };
 
-        self.p
+        let result = self
+            .p
             .custom_transform(0, |_cache, rt| {
                 rt.traverse(&mut traversal, TraverseOrder::TopDown)
             })
-            .map_err(|_e| SpecError::AnnotationFailed)
+            .map_err(|_e| SpecError::AnnotationFailed);
+        self.last_id = id;
+        result
     }
 
     pub fn finish(self) -> Result<(RichTerm, Program<CacheImpl>), SpecError> {
@@ -267,11 +346,11 @@ mod tests {
     }
 
     #[test]
-    fn simple() {
-        let err = SpecReader::new(
+    fn smoketest() {
+        let sr = SpecReader::new(
             indoc! {
                 "
-                let {BuildSpec} = import \"minimal.ncl\" in
+                let {BuildSpec, ..} = import \"minimal.ncl\" in
                 {
 	        		toplevel = {
 	        			name = \"smol ol buildspec\"
@@ -280,12 +359,44 @@ mod tests {
             }
             .to_string(),
             &SpecReaderOptions::for_test(),
-        )
-        .err();
+        );
 
         // So we can see the actual error when the test fails
-        err.iter().for_each(|e| e.report_to_stderr());
+        sr.as_ref().err().iter().for_each(|e| {
+            e.report_to_stderr();
+            panic!();
+        });
 
-        assert!(err.is_none(), "got err = {:?}, want None", err);
+        let sr = sr.unwrap();
+        assert_eq!(sr.last_id, 1); // single increment for one build spec
+    }
+
+    #[test]
+    fn anotates_build_fn() {
+        let sr = SpecReader::new(
+            indoc! {
+                "
+                let {build, ..} = import \"minimal.ncl\" in
+                {
+                    toplevel = build {
+                        name = \"smol ol buildspec\",
+                        inputs = [
+                            build { name = \"swiggity swooty\" },
+                        ],
+                    }
+                }"
+            }
+            .to_string(),
+            &SpecReaderOptions::for_test(),
+        );
+
+        // So we can see the actual error when the test fails
+        sr.as_ref().err().iter().for_each(|e| {
+            e.report_to_stderr();
+            panic!();
+        });
+
+        let sr = sr.unwrap();
+        assert_eq!(sr.last_id, 2); // two build specs
     }
 }
