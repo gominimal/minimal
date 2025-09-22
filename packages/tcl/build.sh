@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-tar xfo tcl8.6.16-src.tar.gz
+tar xf tcl8.6.16-src.tar.gz
 cd tcl8.6.16
 
 SRCDIR=$(pwd)
@@ -30,5 +30,9 @@ sed -e "s|$SRCDIR/unix/pkgs/itcl4.3.2|/usr/lib/itcl4.3.2|" \
 unset SRCDIR
 
 # make test
+
 make DESTDIR=$OUTPUT_DIR install
 make DESTDIR=$OUTPUT_DIR install-private-headers
+
+# Conflicts with a Perl man page
+mv $OUTPUT_DIR/usr/share/man/man3/{Thread,Tcl_Thread}.3

@@ -199,7 +199,7 @@ impl RemoteStorage {
         Ok(())
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(skip(data))]
     pub async fn upload(&self, bucket_id: &str, file_path: &str, data: &[u8]) -> Result<()> {
         let bytes_data = bytes::Bytes::copy_from_slice(data);
         let _response = self
