@@ -16,10 +16,7 @@ pub struct CheckArgs {
 }
 
 pub fn cmd_check(args: CheckArgs, globals: &GlobalArgs) -> Result<(), Error> {
-    let all_graph = match globals.graph_from_all_packages() {
-        Ok(g) => Some(g),
-        Err(_) => None,
-    };
+    let all_graph = globals.graph_from_all_packages().ok();
     let packages_dir = globals.packages_dir();
 
     let packages_dirs = std::fs::read_dir(packages_dir)
@@ -43,14 +40,10 @@ pub fn cmd_check(args: CheckArgs, globals: &GlobalArgs) -> Result<(), Error> {
         .filter_map(|pkg| {
             let want_pkgs = args.packages.names();
             let pkg = pkg.to_str().unwrap().to_string();
-            if want_pkgs.len() == 0 {
+            if want_pkgs.is_empty() || want_pkgs.contains(&pkg) {
                 Some(pkg)
             } else {
-                if want_pkgs.contains(&pkg) {
-                    Some(pkg)
-                } else {
-                    None
-                }
+                None
             }
         })
         .map(|pkg| {
@@ -280,7 +273,7 @@ fn check_minimal_import_line(
             String::from_utf8(std::fs::read(e.path()).map_err(anyhow::Error::from)?)
                 .map_err(anyhow::Error::from)?;
 
-        if let Some(captures) = (&*MINIMAL_IMPORT_REGEX).captures(&file_contents) {
+        if let Some(captures) = &MINIMAL_IMPORT_REGEX.captures(&file_contents) {
             let overall = captures.get(0).unwrap();
             let identifiers_str = captures.get(1).unwrap().as_str();
 
