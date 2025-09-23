@@ -1,8 +1,12 @@
 use crate::{Error, GlobalArgs, PackagesArg};
 use graph::DepGraph;
-use std::cmp::Ordering;
 
+use codespan_reporting::term::termcolor::{
+    Color, ColorChoice, ColorSpec, StandardStream, WriteColor,
+};
 use regex::Regex;
+use std::cmp::Ordering;
+use std::io::Write;
 use std::sync::LazyLock;
 
 #[derive(clap::Args)]
@@ -51,10 +55,7 @@ pub fn cmd_check(args: CheckArgs, globals: &GlobalArgs) -> Result<(), Error> {
             (pkg, result)
         });
 
-    use codespan_reporting::term::termcolor::{
-        Color, ColorChoice, ColorSpec, StandardStream, WriteColor,
-    };
-    use std::io::Write;
+    let mut had_error = false;
     let mut stdout = StandardStream::stdout(ColorChoice::Always);
     for (pkg, result) in iter {
         let result = result?;
@@ -65,6 +66,7 @@ pub fn cmd_check(args: CheckArgs, globals: &GlobalArgs) -> Result<(), Error> {
             write!(&mut stdout, "{}...", check.check).unwrap();
             match check.verdict {
                 CheckVerdict::Fail => {
+                    had_error = true;
                     stdout
                         .set_color(ColorSpec::new().set_fg(Some(Color::Red)))
                         .unwrap();
@@ -97,7 +99,10 @@ pub fn cmd_check(args: CheckArgs, globals: &GlobalArgs) -> Result<(), Error> {
         }
     }
 
-    Ok(())
+    match had_error {
+        true => Err(anyhow::anyhow!("One or more checkers reported a failure").into()),
+        false => Ok(()),
+    }
 }
 
 #[derive(Debug, Clone)]
