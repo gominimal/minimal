@@ -4,25 +4,34 @@ use nickel_lang_core::position::TermPos;
 
 use common::SpecHash;
 
-/// An error during processing.
+/// An error during construction or processing of the dependency graph.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Error {
+    /// An error occurred during nickel processing or evaluation.
     SpecError(SpecError),
+    /// An object was used in a context where it is not valid.
     UnexpectedObject {
         files: Files,
         got: ObjTy,
         want: ObjTy,
         pos: TermPos,
     },
+    /// An object was missing a field that was required.
     MissingField {
         files: Files,
         obj: ObjTy,
         pos: TermPos,
         field: &'static str,
     },
+    /// An object which was expected to be a build-spec was missing annotation
+    /// with a unique ID (see [SpecReader]).
     MissingID(Files, TermPos),
+    /// An object which was expected to have a type hint but it was not found.
+    ///
+    /// A field named `ty` is set from application of a type from the minimal-ncl library.
     MissingTy(Files, TermPos),
+    /// The output of a build-spec was referenced, but no such output exists.
     NoSuchOutput {
         files: Files,
         pos: TermPos,
@@ -31,6 +40,7 @@ pub enum Error {
 }
 
 impl Error {
+    /// Writes a human-friendly error to the given terminal.
     pub fn report_to(&self, writer: &mut dyn codespan_reporting::term::termcolor::WriteColor) {
         use nickel_lang_core::error::{report::report_with, Diagnostic, Label};
         use nickel_lang_core::files::FileId;
@@ -154,6 +164,7 @@ impl Error {
         }
     }
 
+    /// Writes a human-friendly representation of the error to standard out.
     pub fn report_to_stderr(&self) {
         use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
         self.report_to(&mut StandardStream::stderr(ColorChoice::Auto).lock());

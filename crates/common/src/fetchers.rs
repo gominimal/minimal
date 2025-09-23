@@ -1,3 +1,5 @@
+//! Abstractions over reading data from the network.
+
 use bytes::{Bytes, BytesMut};
 use futures::future::FutureExt;
 use google_cloud_storage::client::Storage;
@@ -32,6 +34,7 @@ impl From<UpstreamReqwestUrl> for ReqwestUrl {
     }
 }
 
+/// The response to an RPC for some resource.
 pub trait FetchResponse: std::fmt::Debug + Sized {
     type Error: std::fmt::Debug;
 
@@ -116,7 +119,7 @@ impl FetchBackend for Client {
     }
 }
 
-/// Newtype to wire GCS buckets as a [FetchBackend].
+/// Newtype to wire GCS buckets as a [FetchUrl].
 #[derive(Clone, Debug)]
 pub struct GcsUrl {
     pub bucket: String,
@@ -177,6 +180,7 @@ impl FetchResponse for Result<google_cloud_storage::read_object::ReadObjectRespo
     }
 }
 
+/// Wiring to allow GCS buckets to be used as a [FetchBackend].
 impl FetchBackend for Storage {
     type Url = GcsUrl;
     type Error = GcsError;

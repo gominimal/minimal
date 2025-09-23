@@ -7,6 +7,7 @@ use common::fetchers::*;
 use google_cloud_storage::{client::Storage, Error as GcsError};
 use reqwest::{Client, Error as ReqwestError};
 
+/// An error from operations with the remote cache.
 #[derive(Debug)]
 pub enum Error<BE: std::fmt::Debug> {
     Backend(BE),
@@ -21,6 +22,8 @@ impl<BE: std::fmt::Debug> From<BE> for Error<BE> {
     }
 }
 
+/// A source of compiled build artifacts accessible over the network. Artifacts
+/// can be fetched by [SpecHash].
 #[derive(Debug)]
 pub struct RemoteCache<B: FetchBackend> {
     backend: B,
@@ -46,6 +49,7 @@ impl RemoteCache<Client> {
 }
 
 impl RemoteCache<Storage> {
+    /// Instantiates a new remote cache using the given GCS client + bucket.
     pub async fn new_with_gcs_bucket(
         storage: Storage,
         bucket_id: &str,
@@ -58,6 +62,10 @@ impl RemoteCache<Storage> {
         Self::new(storage, url).await
     }
 
+    /// Uploads the given artifact to the GCS bucket, staging it for inclusion
+    /// in the index.
+    ///
+    /// Call [RemoteCache::finish_uploads] when all your uploads are done to finish the index.
     pub async fn upload(
         &mut self,
         spec_hash: &SpecHash,
@@ -108,6 +116,8 @@ impl RemoteCache<Storage> {
         Ok(())
     }
 
+    /// Pushes a new index to the GCS bucket, complete with all the previous entries
+    /// as well as any new entries which were added using [RemoteCache::upload].
     pub async fn finish_uploads(self) -> Result<(), Error<GcsError>> {
         let Self {
             mut index,
@@ -139,6 +149,7 @@ where
     Error<<B as FetchBackend>::Error>:
         From<<<B as FetchBackend>::Response as FetchResponse>::Error>,
 {
+    /// Creates a new remote cache based on the given backend and URL.
     pub async fn new(backend: B, url: B::Url) -> Result<Self, Error<B::Error>> {
         let index_req = backend.get(url.join(INDEX_FILENAME).unwrap())?;
 

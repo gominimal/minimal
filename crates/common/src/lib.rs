@@ -1,9 +1,12 @@
+//! Common types and utilities used across the minimal codebase.
+
 pub mod fetchers;
 
 mod spec_hash;
 pub use spec_hash::SpecHash;
 use std::io::Write;
 
+/// Implements [Write], mirroring all writes to two underlying writers.
 #[derive(Debug)]
 pub struct Tee<W1: Write, W2: Write> {
     writer1: W1,
@@ -11,6 +14,7 @@ pub struct Tee<W1: Write, W2: Write> {
 }
 
 impl<W1: Write, W2: Write> Tee<W1, W2> {
+    /// Creates a new tee, where all writes are mirrorred to both given writers.
     pub fn new(writer1: W1, writer2: W2) -> Self {
         Tee { writer1, writer2 }
     }

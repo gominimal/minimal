@@ -13,6 +13,7 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Errors that can occur while processing a nickel universe through a [SpecReader].
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum SpecError {

@@ -21,14 +21,17 @@ impl Ord for SpecHash {
 }
 
 impl SpecHash {
+    /// Returns the bytes representation of a spec hash.
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }
 
+    /// Decodes a spec hash from a lowercase-hex representation.
     pub fn from_hex(hex: impl AsRef<[u8]>) -> Result<Self, blake3::HexError> {
         Ok(SpecHash(blake3::Hash::from_hex(hex)?))
     }
 
+    /// Decodes a spec hash from a bytes representation.
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         SpecHash(blake3::Hash::from_bytes(bytes))
     }

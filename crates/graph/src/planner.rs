@@ -2,12 +2,18 @@ use crate::{BuildSpecInput, BuildSpecRef, DepGraph, SubsetInput};
 use nickel_lang_core::term::IndexMap;
 use std::collections::HashMap;
 
+/// The status of a build spec / dependency at some moment during planning.
 #[derive(Debug, Default, Clone, Ord, PartialOrd, PartialEq, Eq)]
 enum BuildState {
+    /// The dep has not been built - not available.
     #[default]
     NotBuilt,
+    /// The dep has been built using cycle breakers - its available for use but should be
+    /// rebuilt.
     BuiltUsingBreakers,
+    /// The dep has been built without cycle breakers.
     FullyBuilt,
+    /// The dep was just fetched.
     Fetched,
 }
 
@@ -28,6 +34,7 @@ impl BuildState {
     }
 }
 
+/// The internal state of a build spec / dependency at some moment during planning.
 #[derive(Debug, Default, Clone, PartialEq)]
 struct BuildInfo {
     state: BuildState,
@@ -193,6 +200,7 @@ fn make_reachable<BP: BinProvider>(
 }
 
 impl<'a> ExecPlan<'a, ()> {
+    /// Initializes a new execution plan to materialize the top levels of the given dependency graph.
     #[tracing::instrument]
     pub fn new(dep_graph: &'a DepGraph) -> Self {
         ExecPlan::with_toplevels((), dep_graph, &dep_graph.top_levels)
@@ -200,11 +208,14 @@ impl<'a> ExecPlan<'a, ()> {
 }
 
 impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
+    /// Initializes a new execution plan to materialize the top levels of the given dependency graph,
+    /// leveraging the provided bin provider to know which dependencies are already available.
     #[tracing::instrument]
     pub fn new_with_bin_provider(dep_graph: &'a DepGraph, bin_provider: BP) -> ExecPlan<'a, BP> {
         ExecPlan::with_toplevels(bin_provider, dep_graph, &dep_graph.top_levels)
     }
 
+    /// Initializes a new execution plan to materialize the specified deps within the given dependency graph.
     pub fn with_toplevels(
         mut bin_provider: BP,
         graph: &'a DepGraph,
@@ -404,6 +415,7 @@ impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
     }
 }
 
+/// Errors that can occur when planning an execution.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlanErr {
     Cycles(Vec<Vec<BuildSpecRef>>),

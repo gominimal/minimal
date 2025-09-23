@@ -65,6 +65,29 @@ impl Transitives {
 
         out
     }
+
+    /// Returns the unique transitive dependencies required to materialize the given toplevels.
+    pub fn for_toplevels(
+        graph: &DepGraph,
+        top_levels: Vec<BuildSpecRef>,
+        include_inputs: bool,
+    ) -> Vec<BuildSpecRef> {
+        let mut out: Vec<_> = top_levels
+            .iter()
+            .map(|base| Transitives::new(&graph, base, include_inputs))
+            .flat_map(|t| {
+                t.transitive_runtime_deps
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .chain(top_levels.iter().copied())
+            .collect();
+
+        out.sort();
+        out.dedup();
+        out
+    }
 }
 
 #[cfg(test)]

@@ -13,19 +13,8 @@ pub async fn cmd_upload_cache(args: UploadArgs, globals: &GlobalArgs) -> Result<
     let graph = args.packages.graph(globals)?;
     let cache = globals.cache().map_err(anyhow::Error::from)?;
 
-    let mut upload_bsrs: Vec<_> = graph
-        .top_levels
-        .iter()
-        .map(|base| Transitives::new(&graph, base, false))
-        .flat_map(|t| {
-            t.transitive_runtime_deps
-                .keys().copied()
-                .collect::<Vec<_>>()
-        })
-        .chain(graph.top_levels.iter().copied())
-        .collect();
-    upload_bsrs.sort();
-    upload_bsrs.dedup();
+    let upload_bsrs: Vec<_> =
+        Transitives::for_toplevels(&graph, graph.top_levels.iter().copied().collect(), false);
 
     let mut remote_cache = RemoteCache::new_with_gcs_bucket(
         Storage::builder()

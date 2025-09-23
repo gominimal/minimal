@@ -1,3 +1,5 @@
+//! Implementations of caches storing artifacts keyed by [SpedHash].
+
 use common::SpecHash;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -220,6 +222,7 @@ impl<FS: FileSystem> Clone for Cache<FS> {
 }
 
 impl Cache<LocalDir> {
+    /// Constructs a local cache that uses the given directory for storage.
     pub fn at_dir<P: AsRef<Path>>(p: P) -> Result<Self, std::io::Error> {
         let inner = CacheInner {
             fs: LocalDir::with_base(p)?,
@@ -241,6 +244,9 @@ impl Cache<LocalDir> {
         })
     }
 
+    /// Allocates a directory for writing into the cache as the given spec_hash when finalized.
+    ///
+    /// Call `finalize` on the [PendingDir] once it is populated to have it show up in the cache.
     pub fn write_dir(&self, hash: &SpecHash) -> Result<PendingDir, CacheErr> {
         let mut inner = self.inner();
         inner.ensure_hash_dir_exists(hash.as_bytes()[0])?;
@@ -265,6 +271,8 @@ impl<FS: FileSystem> Cache<FS> {
         let guard = self.inner.lock().unwrap();
         f(&*guard)
     }
+
+    /// Invalidates (deletes) a directory cache entry with the given spec hash.
     pub fn invalidate_dir(&self, hash: &SpecHash) -> Result<(), CacheErr> {
         let hash_hex = hash.0.to_hex();
         // Entries on disk are at <root>/<first byte as hex>/<remaining bytes as hex>
@@ -275,6 +283,7 @@ impl<FS: FileSystem> Cache<FS> {
         self.inner().fs.remove_dir(subpath).map_err(CacheErr::from)
     }
 
+    /// Reads a file cached as the given spec hash.
     pub fn read_file(&self, hash: &SpecHash) -> Result<FileCacheEntry<FS>, CacheErr> {
         let hash_hex = hash.0.to_hex();
         // Entries on disk are at <root>/<first byte as hex>/<remaining bytes as hex>
@@ -297,6 +306,7 @@ impl<FS: FileSystem> Cache<FS> {
         })
     }
 
+    /// Reads a directory cached as the given spec hash.
     pub fn read_dir(&self, hash: &SpecHash) -> Result<DirCacheEntry<FS>, CacheErr> {
         Ok(DirCacheEntry {
             c: self.clone(),
@@ -305,6 +315,7 @@ impl<FS: FileSystem> Cache<FS> {
         })
     }
 
+    /// Returns a handle for writing a file into the cache as a given spec hash.
     pub fn write_file(&self, hash: &SpecHash) -> Result<FileCacheEntry<FS>, CacheErr> {
         let file = {
             let mut inner = self.inner();

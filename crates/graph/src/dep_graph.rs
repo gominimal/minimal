@@ -47,6 +47,8 @@ pub struct SubsetInput {
 }
 
 /// An input to a build spec.
+///
+/// Each entry in a build-spec's `inputs` array corresponds to one [BuildSpecInput].
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum BuildSpecInput {
@@ -60,6 +62,7 @@ pub enum BuildSpecInput {
 
 #[allow(dead_code)]
 impl BuildSpecInput {
+    /// Returns the underlying build-spec reference if this value was the Build variant.
     pub(crate) fn as_build(&self) -> Option<&BuildSpecRef> {
         match self {
             BuildSpecInput::Build(bsr) => Some(bsr),
@@ -72,19 +75,27 @@ impl BuildSpecInput {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum BuildOutput {
+    /// This output describes shared libraries matched with the given glob.
     Library { glob: String },
+    /// This output describes data files matched with the given glob.
     Data { glob: String },
+    /// This output describes binaries matched with the given glob.
     Binary { path: String },
 }
 
-/// An entry in a build spec runtime_deps array.
+/// A runtime dependency declared on a build-spec.
+///
+/// Each entry in a build-spec's `runtime_deps` array corresponds to one [RuntimeDep].
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeDep {
+    /// A direct runtime dependency on the build-spec described by the contained reference.
     Build(BuildSpecRef),
+    /// A direct runtime dependency on a subset of the outputs of some other build-spec.
     Subset(SubsetInput),
 }
 
 impl RuntimeDep {
+    /// Returns the build spec that the runtime dependency ultimately depends on.
     pub fn bsr(&self) -> &BuildSpecRef {
         match self {
             RuntimeDep::Build(bsr) => bsr,
@@ -97,14 +108,22 @@ impl RuntimeDep {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct BuildSpec {
+    /// The human-readable name declared on the build spec.
     pub name: String,
+    /// The build command declared on the build spec.
     pub cmd: String,
+    /// Any arguments to the build command, ultimately passed as environment variables.
     pub build_args: Option<IndexMap<String, String>>,
 
+    /// The dependencies needed to execute the build spec.
     pub inputs: Vec<BuildSpecInput>,
+    /// The dependencies needed to run outputs of this build spec, as well as possibly needed
+    /// during the build.
     pub runtime_deps: Vec<RuntimeDep>,
+    /// The named outputs (and match patterns) produced by executing this build spec.
     pub outputs: OutputMap,
 
+    /// An alternative build spec to use to break cycles in resolving dependencies on this build spec.
     pub replace_on_cycle: Option<BuildSpecRef>,
 }
 
@@ -112,9 +131,14 @@ pub struct BuildSpec {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct DepGraph {
+    /// All the build-specs known to this dependency graph.
     builds: Arena<BuildSpec>,
+    /// The top level build-specs (i.e. non-transitive) that were read when
+    /// constructing this dependency graph.
     pub top_levels: Vec<BuildSpecRef>,
 
+    /// The cache of build specs to their [SpecHash]. There is also a
+    /// reverse cache of [SpecHash]'s to the build spec they correspond to.
     #[allow(clippy::type_complexity)]
     hash_cache: Arc<
         RwLock<(
@@ -125,6 +149,7 @@ pub struct DepGraph {
 }
 
 impl DepGraph {
+    /// Constructs a new dependency graph from the given parsed/annotated nickel universe.
     pub fn new(sr: SpecReader) -> Result<Self, Error> {
         let mut graph = GraphBuilder {
             builds: Arena::with_capacity(4096),
