@@ -11,7 +11,21 @@ indoc.workspace = true
 
 [dependencies]
 blake3.workspace = true
+hex.workspace = true
+sha2.workspace = true
 path-absolutize.workspace = true
 tempfile.workspace = true
 
+bytes.workspace = true
+reqwest.workspace = true
+google-cloud-storage.workspace = true
+url.workspace = true
+
+tar.workspace = true
+zstd.workspace = true
+
+futures.workspace = true
+tokio.workspace = true
+
+common = { workspace = true }
 graph = { workspace = true }

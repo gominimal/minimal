@@ -1,4 +1,4 @@
-use graph::SpecHash;
+use common::SpecHash;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -8,6 +8,9 @@ pub use fs::FSError;
 pub use fs::FileSystem;
 pub use fs::LocalDir;
 
+#[allow(dead_code)]
+mod remote;
+pub use remote::RemoteCache;
 #[allow(dead_code)]
 mod remote_index;
 

@@ -25,6 +25,8 @@ mod cmd_nw_update;
 use cmd_nw_update::{NWUpdateArgs, cmd_new_world_update};
 mod cmd_oci_image;
 use cmd_oci_image::{OciImageArgs, cmd_oci_image};
+mod cmd_upload_cache;
+use cmd_upload_cache::{UploadArgs, cmd_upload_cache};
 
 #[derive(Parser)]
 #[command(name = "minimal", version = env!("GIT_HASH"))]
@@ -49,6 +51,8 @@ enum Command {
     OciImage(OciImageArgs),
     /// Validates and formats nickel build-spec files
     Check(CheckArgs),
+    /// Uploads the specified packages and their transitive needs to the cache.
+    UploadCache(UploadArgs),
 }
 
 /// Shared arguments and builders across all subcommands
@@ -242,6 +246,7 @@ async fn main() -> Result<()> {
         Command::Build(args) => cmd_build(args, &cli.global_args).await,
         Command::Check(args) => cmd_check(args, &cli.global_args),
         Command::Plan(args) => cmd_plan(args, &cli.global_args),
+        Command::UploadCache(args) => cmd_upload_cache(args, &cli.global_args).await,
         Command::NewWorldUpdate(args) => cmd_new_world_update(args, &cli.global_args).await,
         Command::OciImage(args) => cmd_oci_image(args, &cli.global_args).await,
     };

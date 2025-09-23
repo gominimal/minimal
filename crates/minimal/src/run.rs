@@ -1,11 +1,10 @@
 use anyhow::{Context, Result, bail};
 use build_sandbox::{BuildConfig, config::BuildScript, run_build};
 use cache::{Cache, LocalDir, PendingDir};
+use common::SpecHash;
 use graph::dep_graph::SourceFetch;
 use graph::{BinProvider, ExecPlan};
-use graph::{
-    BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, SourceInput, SpecHash,
-};
+use graph::{BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, SourceInput};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use tempfile::Builder;
@@ -14,7 +13,7 @@ use url::Url;
 
 use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage};
 
-/// yields a directory that the files in an [InputSource] are available.
+/// yields a directory that the files in an [SourceInput] are available.
 async fn materialize_source(
     build_name: &str,
     source: &SourceInput,

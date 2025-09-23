@@ -5,9 +5,10 @@
 //! becomes a separate layer,.
 
 use cache::{Cache, CacheBinProvider, LocalDir};
+use common::SpecHash;
 use docker_credential::{CredentialRetrievalError, DockerCredential, get_credential};
 use flate2::{Compression, write::GzEncoder};
-use graph::{BuildSpecRef, DepGraph, ExecPlan, SpecHash, Transitives};
+use graph::{BuildSpecRef, DepGraph, ExecPlan, Transitives};
 use oci_client::{Client, Reference, client::ClientConfig};
 use oci_spec::image::{
     Descriptor, DescriptorBuilder, ImageConfiguration, ImageConfigurationBuilder, ImageManifest,

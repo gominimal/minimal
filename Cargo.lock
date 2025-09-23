@@ -364,10 +364,21 @@ name = "cache"
 version = "0.0.1"
 dependencies = [
  "blake3",
+ "bytes",
+ "common",
+ "futures",
+ "google-cloud-storage",
  "graph",
+ "hex",
  "indoc",
  "path-absolutize",
+ "reqwest",
+ "sha2",
+ "tar",
  "tempfile",
+ "tokio",
+ "url",
+ "zstd",
 ]
 
 [[package]]
@@ -503,6 +514,26 @@ name = "colorchoice"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
+
+[[package]]
+name = "common"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "bytes",
+ "futures",
+ "fxhash",
+ "google-cloud-gax",
+ "google-cloud-storage",
+ "indoc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tempfile",
+ "tracing",
+ "url",
+]
 
 [[package]]
 name = "comrak"
@@ -1505,6 +1536,7 @@ version = "0.0.1"
 dependencies = [
  "blake3",
  "codespan-reporting",
+ "common",
  "fxhash",
  "generational-arena",
  "indoc",
@@ -2343,6 +2375,7 @@ dependencies = [
  "cache",
  "clap",
  "codespan-reporting",
+ "common",
  "dirs",
  "docker_credential",
  "flate2",

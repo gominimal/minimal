@@ -1,6 +1,6 @@
 [package]
 edition = "2021"
-name = "graph"
+name = "common"
 version = "0.0.1"
 license = "MIT OR Apache-2.0"
 
@@ -10,14 +10,19 @@ rust-version = "1.85"
 indoc.workspace = true
 
 [dependencies]
-nickel-lang-core.workspace = true
-codespan-reporting.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 blake3.workspace = true
 fxhash.workspace = true
-generational-arena.workspace = true
 smallvec.workspace = true
 tracing.workspace = true
 
-common.workspace = true
+tempfile.workspace = true
+
+bytes.workspace = true
+reqwest.workspace = true
+futures.workspace = true
+url.workspace = true
+
+google-cloud-gax.workspace = true
+google-cloud-storage.workspace = true
