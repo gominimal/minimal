@@ -11,8 +11,7 @@ pub async fn cmd_upload_cache(args: UploadArgs, globals: &GlobalArgs) -> Result<
     let graph = args.packages.graph(globals)?;
     let cache = globals.cache().map_err(anyhow::Error::from)?;
 
-    let upload_bsrs: Vec<_> =
-        Transitives::for_toplevels(&graph, graph.top_levels.iter().copied().collect(), false);
+    let upload_bsrs: Vec<_> = Transitives::for_toplevels(&graph, graph.top_levels.to_vec(), false);
 
     let mut remote_cache = globals.remote_cache().await.unwrap();
 

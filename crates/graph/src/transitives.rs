@@ -74,7 +74,7 @@ impl Transitives {
     ) -> Vec<BuildSpecRef> {
         let mut out: Vec<_> = top_levels
             .iter()
-            .map(|base| Transitives::new(&graph, base, include_inputs))
+            .map(|base| Transitives::new(graph, base, include_inputs))
             .flat_map(|t| {
                 t.transitive_runtime_deps
                     .keys()

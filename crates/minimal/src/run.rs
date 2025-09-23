@@ -519,7 +519,6 @@ impl<'a> Run<'a> {
                     let self2 = self2.clone();
                     let err_bsr = build_which_errored.clone();
                     let cache_handles = cache_handles.clone();
-                    let remote_cache = remote_cache.clone();
 
                     s.spawn(move |_| {
                         let _rt = tokio_runtime.enter();

@@ -64,7 +64,7 @@ pub async fn cmd_build_impl(
         }
         // Only local cache
         (false, true) => {
-            let local_adapter = CacheBinProvider::new(&graph, cache.clone());
+            let local_adapter = CacheBinProvider::new(graph, cache.clone());
             run.execute(ExecPlan::new_with_bin_provider(graph, local_adapter), None)
                 .await
         }
@@ -77,7 +77,7 @@ pub async fn cmd_build_impl(
     // can materialize that locally now.
     if !globals.no_fetch {
         let needs_materialize: Vec<_> =
-            Transitives::for_toplevels(&graph, graph.top_levels.iter().copied().collect(), false)
+            Transitives::for_toplevels(graph, graph.top_levels.to_vec(), false)
                 .into_iter()
                 .filter_map(|bsr| {
                     // Filter runtime_deps that are in the local cache
