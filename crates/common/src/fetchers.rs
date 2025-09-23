@@ -14,7 +14,7 @@ impl TryFrom<String> for ReqwestUrl {
     type Error = url::ParseError;
 
     fn try_from(s: String) -> Result<Self, url::ParseError> {
-        UpstreamReqwestUrl::parse(&s).map(|url| ReqwestUrl(url))
+        UpstreamReqwestUrl::parse(&s).map(ReqwestUrl)
     }
 }
 
@@ -22,7 +22,7 @@ impl core::str::FromStr for ReqwestUrl {
     type Err = url::ParseError;
 
     fn from_str(s: &str) -> Result<Self, url::ParseError> {
-        UpstreamReqwestUrl::parse(s).map(|url| ReqwestUrl(url))
+        UpstreamReqwestUrl::parse(s).map(ReqwestUrl)
     }
 }
 
@@ -76,7 +76,7 @@ impl FetchUrl for ReqwestUrl {
     type JoinError = url::ParseError;
 
     fn join(&self, input: &str) -> Result<Self, Self::JoinError> {
-        UpstreamReqwestUrl::join(&self.0, input).map(|url| ReqwestUrl(url))
+        UpstreamReqwestUrl::join(&self.0, input).map(ReqwestUrl)
     }
 }
 
@@ -132,7 +132,7 @@ impl FetchUrl for GcsUrl {
             out.object = input.into();
             Ok(out)
         } else {
-            out.object.push_str("/");
+            out.object.push('/');
             out.object.push_str(input);
             Ok(out)
         }
@@ -192,6 +192,6 @@ impl FetchBackend for Storage {
         &self,
         req: Self::Request,
     ) -> impl futures::Future<Output = Result<Self::Response, Self::Error>> {
-        req.send().map(|v| Ok(v))
+        req.send().map(Ok)
     }
 }

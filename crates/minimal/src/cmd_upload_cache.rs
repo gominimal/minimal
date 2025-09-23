@@ -19,11 +19,10 @@ pub async fn cmd_upload_cache(args: UploadArgs, globals: &GlobalArgs) -> Result<
         .map(|base| Transitives::new(&graph, base, false))
         .flat_map(|t| {
             t.transitive_runtime_deps
-                .keys()
-                .map(|bsr| bsr.clone())
+                .keys().copied()
                 .collect::<Vec<_>>()
         })
-        .chain(graph.top_levels.iter().map(|bsr| bsr.clone()))
+        .chain(graph.top_levels.iter().copied())
         .collect();
     upload_bsrs.sort();
     upload_bsrs.dedup();

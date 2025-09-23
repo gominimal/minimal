@@ -163,7 +163,7 @@ impl RemoteIndex {
 
     /// Returns true if the given spec hash is in the remote index.
     pub fn exists(&self, spec_hash: &SpecHash) -> bool {
-        self.idx.get(spec_hash).is_some()
+        self.idx.contains_key(spec_hash)
     }
 
     /// Returns the SHA256 of the build represented by the given spec hash, if present.

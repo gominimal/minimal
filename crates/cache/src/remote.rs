@@ -9,7 +9,7 @@ use reqwest::{Client, Error as ReqwestError};
 
 #[derive(Debug)]
 pub enum Error<BE: std::fmt::Debug> {
-    BackendError(BE),
+    Backend(BE),
     IO(std::io::Error),
     Cache(crate::CacheErr),
     NotFound,
@@ -17,7 +17,7 @@ pub enum Error<BE: std::fmt::Debug> {
 
 impl<BE: std::fmt::Debug> From<BE> for Error<BE> {
     fn from(backend_err: BE) -> Self {
-        Self::BackendError(backend_err)
+        Self::Backend(backend_err)
     }
 }
 
@@ -30,7 +30,7 @@ pub struct RemoteCache<B: FetchBackend> {
     uploaded: Vec<(SpecHash, [u8; 32])>,
 }
 
-const INDEX_FILENAME: &'static str = "index.shisha";
+const INDEX_FILENAME: &str = "index.shisha";
 
 impl RemoteCache<Client> {
     pub async fn new_over_https<URL: Into<ReqwestUrl>>(

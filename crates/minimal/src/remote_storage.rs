@@ -194,7 +194,7 @@ impl RemoteStorage {
             .send()
             .await?;
         while let Some(chunk) = reader.next().await.transpose()? {
-            into.write(&chunk)?;
+            into.write_all(&chunk)?;
         }
 
         Ok(())
