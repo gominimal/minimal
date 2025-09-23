@@ -1,5 +1,5 @@
 use crate::{Error, GlobalArgs, PackagesArg};
-use cache::{Cache, CacheBinProvider, LocalDir};
+use cache::{Cache, CacheBinProvider, LocalDir, RemoteBinProvider};
 use graph::{BinProvider, DepGraph, ExecPlan};
 
 #[derive(clap::Args)]
@@ -8,20 +8,45 @@ pub struct PlanArgs {
     packages: PackagesArg,
 }
 
-pub fn cmd_plan(args: PlanArgs, globals: &GlobalArgs) -> Result<(), Error> {
+pub async fn cmd_plan(args: PlanArgs, globals: &GlobalArgs) -> Result<(), Error> {
     let graph = args.packages.graph(globals)?;
     let cache = globals.cache().map_err(anyhow::Error::from)?;
 
-    if globals.no_cache {
-        print_plan(&graph, &cache, ExecPlan::new(&graph));
-    } else {
-        let adapter = CacheBinProvider::new(&graph, cache.clone());
-        print_plan(
-            &graph,
-            &cache,
-            ExecPlan::new_with_bin_provider(&graph, adapter),
-        );
-    }
+    match (globals.no_cache, globals.no_fetch) {
+        // no local or remote cache
+        (true, true) => print_plan(&graph, &cache, ExecPlan::new(&graph)),
+        // both local and remote cache
+        (false, false) => {
+            let local_adapter = CacheBinProvider::new(&graph, cache.clone());
+            let remote_cache = globals.remote_cache().await.unwrap();
+            let remote_adapter = RemoteBinProvider::new(&graph, &remote_cache);
+            print_plan(
+                &graph,
+                &cache,
+                ExecPlan::new_with_bin_provider(&graph, (local_adapter, remote_adapter)),
+            )
+        }
+
+        // Only remote cache
+        (true, false) => {
+            let remote_cache = globals.remote_cache().await.unwrap();
+            let remote_adapter = RemoteBinProvider::new(&graph, &remote_cache);
+            print_plan(
+                &graph,
+                &cache,
+                ExecPlan::new_with_bin_provider(&graph, remote_adapter),
+            )
+        }
+        // Only local cache
+        (false, true) => {
+            let local_adapter = CacheBinProvider::new(&graph, cache.clone());
+            print_plan(
+                &graph,
+                &cache,
+                ExecPlan::new_with_bin_provider(&graph, local_adapter),
+            )
+        }
+    };
 
     Ok(())
 }

@@ -1,4 +1,4 @@
-//! Implementations of caches storing artifacts keyed by [SpedHash].
+//! Implementations of caches storing artifacts keyed by [SpecHash].
 
 use common::SpecHash;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ pub use fs::LocalDir;
 
 #[allow(dead_code)]
 mod remote;
-pub use remote::RemoteCache;
+pub use remote::{Error as RemoteError, RemoteCache};
 #[allow(dead_code)]
 mod remote_index;
 
@@ -63,7 +63,7 @@ impl<FS: FileSystem<Subtree = ST>, ST: FileSystem> FileSystem for DirCacheEntry<
     }
 }
 
-// A writeable directory that will end up in the cache when finalized.
+/// A writeable directory that will end up in the cache when finalized.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct PendingDir {
@@ -354,6 +354,25 @@ impl<'a> CacheBinProvider<'a> {
 impl<'a> graph::BinProvider for CacheBinProvider<'a> {
     fn exists(&self, bsr: &graph::BuildSpecRef) -> bool {
         self.cache.read_dir(&self.graph.spec_hash(bsr)).is_ok()
+    }
+}
+
+/// An adapter that lets you use a [RemoteCache] as a [graph::BinProvider].
+#[derive(Debug, Clone)]
+pub struct RemoteBinProvider<'a, B: common::fetchers::FetchBackend> {
+    graph: &'a graph::DepGraph,
+    remote: &'a RemoteCache<B>,
+}
+
+impl<'a, B: common::fetchers::FetchBackend> RemoteBinProvider<'a, B> {
+    pub fn new(graph: &'a graph::DepGraph, remote: &'a RemoteCache<B>) -> Self {
+        Self { graph, remote }
+    }
+}
+
+impl<'a, B: common::fetchers::FetchBackend> graph::BinProvider for RemoteBinProvider<'a, B> {
+    fn exists(&self, bsr: &graph::BuildSpecRef) -> bool {
+        self.remote.exists(&self.graph.spec_hash(bsr))
     }
 }
 

@@ -151,10 +151,10 @@ async fn ensure_package_built(
     });
     let mut runner = Run::new(graph, cache.clone(), remote_storage, lockfile);
     runner
-        .execute(ExecPlan::new_with_bin_provider(
-            graph,
-            CacheBinProvider::new(graph, cache.clone()),
-        ))
+        .execute(
+            ExecPlan::new_with_bin_provider(graph, CacheBinProvider::new(graph, cache.clone())),
+            None,
+        )
         .await?;
 
     Ok(())

@@ -1,6 +1,4 @@
 use crate::{Error, GlobalArgs, PackagesArg};
-use cache::RemoteCache;
-use google_cloud_storage::client::Storage;
 use graph::Transitives;
 
 #[derive(clap::Args)]
@@ -16,15 +14,7 @@ pub async fn cmd_upload_cache(args: UploadArgs, globals: &GlobalArgs) -> Result<
     let upload_bsrs: Vec<_> =
         Transitives::for_toplevels(&graph, graph.top_levels.iter().copied().collect(), false);
 
-    let mut remote_cache = RemoteCache::new_with_gcs_bucket(
-        Storage::builder()
-            .build()
-            .await
-            .map_err(anyhow::Error::from)?,
-        "minimal-staging-cache",
-    )
-    .await
-    .unwrap();
+    let mut remote_cache = globals.remote_cache().await.unwrap();
 
     for bsr in &upload_bsrs {
         let build = graph.get(bsr).unwrap();

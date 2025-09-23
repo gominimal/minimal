@@ -1,7 +1,9 @@
 #![allow(clippy::result_large_err)]
 
 use anyhow::Result;
+use cache::{Cache, LocalDir, RemoteCache, RemoteError};
 use clap::{Args, Parser, Subcommand};
+use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
 use graph::{DepGraph, Error as GraphError, SpecReader, SpecReaderOptions};
 use std::path::{Path, PathBuf};
 use tracing::error;
@@ -70,6 +72,10 @@ pub struct GlobalArgs {
     #[arg(long, default_value_t = false)]
     no_cache: bool,
 
+    /// Do not fetch completed builds from the internet
+    #[arg(long, default_value_t = false)]
+    no_fetch: bool,
+
     /// Configure the number of parallel builds
     #[arg(short, long, default_value_t = 4)]
     num_parallel_builds: usize,
@@ -77,7 +83,7 @@ pub struct GlobalArgs {
 
 impl GlobalArgs {
     /// Builds and returns an instance of the local cache.
-    pub fn cache(&self) -> Result<cache::Cache<cache::LocalDir>, std::io::Error> {
+    pub fn cache(&self) -> Result<Cache<LocalDir>, std::io::Error> {
         let dir = match &self.cache_dir {
             None => {
                 let dir = dirs::cache_dir().unwrap().join("minimal-builds");
@@ -94,7 +100,16 @@ impl GlobalArgs {
             Some(cache_dir) => cache_dir.to_path_buf(),
         };
 
-        cache::Cache::at_dir(dir)
+        Cache::at_dir(dir)
+    }
+
+    /// Builds and returns a remote cache with default configurations.
+    pub async fn remote_cache(&self) -> Result<RemoteCache<GcsStorage>, RemoteError<GcsError>> {
+        RemoteCache::new_with_gcs_bucket(
+            GcsStorage::builder().build().await.unwrap(),
+            "minimal-staging-cache",
+        )
+        .await
     }
 
     pub fn packages_dir(&self) -> PathBuf {
@@ -245,7 +260,7 @@ async fn main() -> Result<()> {
     let result = match cli.command {
         Command::Build(args) => cmd_build(args, &cli.global_args).await,
         Command::Check(args) => cmd_check(args, &cli.global_args),
-        Command::Plan(args) => cmd_plan(args, &cli.global_args),
+        Command::Plan(args) => cmd_plan(args, &cli.global_args).await,
         Command::UploadCache(args) => cmd_upload_cache(args, &cli.global_args).await,
         Command::NewWorldUpdate(args) => cmd_new_world_update(args, &cli.global_args).await,
         Command::OciImage(args) => cmd_oci_image(args, &cli.global_args).await,

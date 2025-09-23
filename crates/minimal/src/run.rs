@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use build_sandbox::{BuildConfig, config::BuildScript, run_build};
-use cache::{Cache, LocalDir, PendingDir};
+use cache::{Cache, LocalDir, PendingDir, RemoteCache};
 use common::SpecHash;
+use google_cloud_storage::client::Storage as GcsStorage;
 use graph::dep_graph::SourceFetch;
 use graph::{BinProvider, ExecPlan};
 use graph::{BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, SourceInput};
@@ -89,10 +90,11 @@ async fn materialize_source(
 /// yields 'dependencies' mappings for making the given input or runtime_dep available to a sandbox build.
 ///
 /// If a build is missing but a cycle-breaker is present for itself or any of its dependencies, it will try to use that.
-fn all_paths_for_spec(
+async fn all_paths_for_spec(
     spec_ref: &BuildSpecRef,
     graph: &DepGraph,
     cache: &Cache<LocalDir>,
+    remote_cache: Option<&RemoteCache<GcsStorage>>,
 ) -> Result<HashSet<PathBuf>> {
     let mut out_paths = HashSet::with_capacity(12);
 
@@ -103,46 +105,86 @@ fn all_paths_for_spec(
         graph.get(spec_ref).unwrap(),
         graph,
         cache,
-    )?;
+        remote_cache,
+    )
+    .await?;
     out_paths.insert(self_paths.0);
 
     // Make all the transitive deps available in the sandbox.
-    path_transitive_deps_of(graph.get(&spec_bsr).unwrap(), graph, cache, &mut out_paths)?;
+    path_transitive_deps_of(
+        graph.get(&spec_bsr).unwrap(),
+        graph,
+        cache,
+        &mut out_paths,
+        remote_cache,
+    )
+    .await?;
 
     Ok(out_paths)
 }
 
-fn path_for_self_spec(
+async fn path_for_self_spec(
     input_ref: &BuildSpecRef,
     input_hash: &SpecHash,
     input_build: &BuildSpec,
     graph: &DepGraph,
     cache: &Cache<LocalDir>,
+    remote_cache: Option<&RemoteCache<GcsStorage>>,
 ) -> Result<(BuildSpecRef, (PathBuf, PathBuf))> {
-    match cache.read_dir(input_hash) {
-        Ok(cache_entry) => {
+    match (
+        cache.read_dir(input_hash),
+        remote_cache.as_ref().map(|c| c.exists(input_hash)),
+    ) {
+        (Ok(cache_entry), _) => {
             let cache_path = cache_entry.path().to_path_buf();
             Ok((*input_ref, (cache_path, PathBuf::from("/"))))
         }
-        Err(cache::CacheErr::NotFound) => match input_build.replace_on_cycle {
-            None => panic!(
-                "missing build in cache for {} [{}]",
-                input_build.name,
-                input_hash.0.to_hex()
-            ),
-            Some(cycle_breaker) => {
-                let breaker_hash = graph.spec_hash(&cycle_breaker);
-                let breaker_build = graph.get(&cycle_breaker).unwrap();
+        // In the remote cache but not the local cache.
+        (_, Some(true)) => {
+            let span = tracing::info_span!(
+                "download_cached",
+                "indicatif.pb_show" = tracing::field::Empty,
+                "build" = input_build.name,
+            );
+            let _enter = span.enter();
 
-                debug!(
-                    "  --- subbing in cycle breaker {} [{}] ---",
-                    breaker_build.name,
-                    breaker_hash.0.to_hex()
-                );
-                path_for_self_spec(&cycle_breaker, &breaker_hash, breaker_build, graph, cache)
+            remote_cache
+                .as_ref()
+                .unwrap()
+                .materialize(input_hash, cache)
+                .await?;
+            let cache_path = cache.read_dir(input_hash).unwrap().path().to_path_buf();
+            Ok((*input_ref, (cache_path, PathBuf::from("/"))))
+        }
+        (Err(cache::CacheErr::NotFound), None | Some(false)) => {
+            match input_build.replace_on_cycle {
+                None => panic!(
+                    "missing build in cache for {} [{}]",
+                    input_build.name,
+                    input_hash.0.to_hex()
+                ),
+                Some(cycle_breaker) => {
+                    let breaker_hash = graph.spec_hash(&cycle_breaker);
+                    let breaker_build = graph.get(&cycle_breaker).unwrap();
+
+                    debug!(
+                        "  --- subbing in cycle breaker {} [{}] ---",
+                        breaker_build.name,
+                        breaker_hash.0.to_hex()
+                    );
+                    Box::pin(path_for_self_spec(
+                        &cycle_breaker,
+                        &breaker_hash,
+                        breaker_build,
+                        graph,
+                        cache,
+                        remote_cache,
+                    ))
+                    .await
+                }
             }
-        },
-        Err(e) => {
+        }
+        (Err(e), _) => {
             panic!(
                 "unexpected cache error when resolving path for {} [{}]: {:?}",
                 input_build.name,
@@ -154,11 +196,12 @@ fn path_for_self_spec(
 }
 
 /// yields 'dependencies' mappings for the transitive dependencies of the given build spec.
-fn path_transitive_deps_of(
+async fn path_transitive_deps_of(
     input_build: &BuildSpec,
     graph: &DepGraph,
     cache: &Cache<LocalDir>,
     out_paths: &mut HashSet<PathBuf>,
+    remote_cache: Option<&RemoteCache<GcsStorage>>,
 ) -> Result<()> {
     for dep in input_build.runtime_deps.iter() {
         let (dep_bsr, dep_paths) = path_for_self_spec(
@@ -167,7 +210,9 @@ fn path_transitive_deps_of(
             graph.get(dep.bsr()).unwrap(),
             graph,
             cache,
-        )?;
+            remote_cache,
+        )
+        .await?;
         if !out_paths.contains(&dep_paths.0) {
             let dep_build = graph.get(&dep_bsr).unwrap();
             debug!(
@@ -177,7 +222,14 @@ fn path_transitive_deps_of(
             );
 
             out_paths.insert(dep_paths.0);
-            path_transitive_deps_of(dep_build, graph, cache, out_paths)?;
+            Box::pin(path_transitive_deps_of(
+                dep_build,
+                graph,
+                cache,
+                out_paths,
+                remote_cache,
+            ))
+            .await?;
         }
     }
 
@@ -299,6 +351,7 @@ impl<'a> Run<'a> {
     async fn sandbox_paths_from_buildspec(
         &self,
         build: &BuildSpec,
+        remote_cache: Option<&RemoteCache<GcsStorage>>,
     ) -> Result<(HashSet<PathBuf>, Vec<PathBuf>)> {
         let mut dependencies = HashSet::new();
         let mut inputs = Vec::new();
@@ -315,7 +368,8 @@ impl<'a> Run<'a> {
                         self.graph.spec_hash(dep_ref).0.to_hex()
                     );
 
-                    let input_paths = all_paths_for_spec(dep_ref, self.graph, &self.cache)?;
+                    let input_paths =
+                        all_paths_for_spec(dep_ref, self.graph, &self.cache, remote_cache).await?;
                     dependencies.extend(input_paths);
                 }
                 Subset(s) => todo!("subsets: {:?}", s),
@@ -350,7 +404,8 @@ impl<'a> Run<'a> {
                 dep_hash.0.to_hex()
             );
 
-            let dep_paths = all_paths_for_spec(dep.bsr(), self.graph, &self.cache)?;
+            let dep_paths =
+                all_paths_for_spec(dep.bsr(), self.graph, &self.cache, remote_cache).await?;
             dependencies.extend(dep_paths);
         }
 
@@ -363,6 +418,7 @@ impl<'a> Run<'a> {
         &self,
         build: &BuildSpecRef,
         _full_build: bool,
+        remote_cache: Option<&RemoteCache<GcsStorage>>,
     ) -> Result<Option<PendingDir>> {
         let bsh = self.graph.spec_hash(build);
         let build = self.graph.get(build).unwrap();
@@ -387,7 +443,9 @@ impl<'a> Run<'a> {
             ));
         }
 
-        let (dependencies, inputs) = self.sandbox_paths_from_buildspec(build).await?;
+        let (dependencies, inputs) = self
+            .sandbox_paths_from_buildspec(build, remote_cache)
+            .await?;
 
         if build.cmd.trim().is_empty() {
             info!(
@@ -435,7 +493,11 @@ impl<'a> Run<'a> {
         }
     }
 
-    pub async fn execute<BP: BinProvider>(&mut self, plan: ExecPlan<'a, BP>) -> Result<()> {
+    pub async fn execute<BP: BinProvider>(
+        &mut self,
+        plan: ExecPlan<'a, BP>,
+        remote_cache: Option<&RemoteCache<GcsStorage>>,
+    ) -> Result<()> {
         // Execute builds in dependency order - each build runs in isolation
         // and can only access outputs from previously completed builds
 
@@ -457,12 +519,16 @@ impl<'a> Run<'a> {
                     let self2 = self2.clone();
                     let err_bsr = build_which_errored.clone();
                     let cache_handles = cache_handles.clone();
+                    let remote_cache = remote_cache.clone();
 
                     s.spawn(move |_| {
                         let _rt = tokio_runtime.enter();
 
-                        let cache_handle =
-                            futures::executor::block_on(self2.do_build(&bsr, full_build));
+                        let cache_handle = futures::executor::block_on(self2.do_build(
+                            &bsr,
+                            full_build,
+                            remote_cache,
+                        ));
 
                         match cache_handle {
                             Err(e) => {

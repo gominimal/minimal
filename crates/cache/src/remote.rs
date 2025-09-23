@@ -16,6 +16,14 @@ pub enum Error<BE: std::fmt::Debug> {
     NotFound,
 }
 
+impl<BE: std::fmt::Debug> std::fmt::Display for Error<BE> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl<BE: std::fmt::Debug> std::error::Error for Error<BE> {}
+
 impl<BE: std::fmt::Debug> From<BE> for Error<BE> {
     fn from(backend_err: BE) -> Self {
         Self::Backend(backend_err)
@@ -144,13 +152,12 @@ impl RemoteCache<Storage> {
     }
 }
 
-impl<B: FetchBackend> RemoteCache<B>
-where
-    Error<<B as FetchBackend>::Error>:
-        From<<<B as FetchBackend>::Response as FetchResponse>::Error>,
-{
+impl<B: FetchBackend> RemoteCache<B> {
     /// Creates a new remote cache based on the given backend and URL.
-    pub async fn new(backend: B, url: B::Url) -> Result<Self, Error<B::Error>> {
+    pub async fn new(
+        backend: B,
+        url: B::Url,
+    ) -> Result<Self, Error<<B::Response as FetchResponse>::Error>> {
         let index_req = backend.get(url.join(INDEX_FILENAME).unwrap())?;
 
         // TODO: Gotta be a better way to stream it into [RemoteIndex].
@@ -183,7 +190,7 @@ where
         &self,
         spec_hash: &SpecHash,
         cache: &Cache<LocalDir>,
-    ) -> Result<(), Error<B::Error>> {
+    ) -> Result<(), Error<<B::Response as FetchResponse>::Error>> {
         let sha256: [u8; 32] = self.index.sha256(spec_hash).ok_or(Error::NotFound)?;
 
         let req = self.backend.get(

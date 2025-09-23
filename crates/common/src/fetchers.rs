@@ -42,7 +42,7 @@ pub trait FetchResponse: std::fmt::Debug + Sized {
     fn is_success(&self) -> bool;
     fn status_code(&self) -> usize;
 
-    fn bytes(self) -> impl std::future::Future<Output = Result<Bytes, Self::Error>> + Send;
+    fn bytes(self) -> impl Future<Output = Result<Bytes, Self::Error>> + Send;
 
     fn chunk(&mut self) -> impl Future<Output = Result<Option<Bytes>, Self::Error>>;
 }
@@ -86,35 +86,40 @@ impl FetchUrl for ReqwestUrl {
 /// An implementation that is able to make async network requests.
 pub trait FetchBackend: std::fmt::Debug {
     type Url: FetchUrl;
-    type Error: std::fmt::Debug;
 
     type Request: std::fmt::Debug;
     type Response: FetchResponse;
 
-    fn get(&self, url: Self::Url) -> Result<Self::Request, Self::Error>;
+    fn get(
+        &self,
+        url: Self::Url,
+    ) -> Result<Self::Request, <Self::Response as FetchResponse>::Error>;
 
     fn execute(
         &self,
         req: Self::Request,
-    ) -> impl Future<Output = Result<Self::Response, Self::Error>>;
+    ) -> impl Future<Output = Result<Self::Response, <Self::Response as FetchResponse>::Error>>;
 }
 
 /// Wiring to allow reqwest to be used as a [FetchBackend].
 impl FetchBackend for Client {
     type Url = ReqwestUrl;
-    type Error = ReqwestError;
 
     type Request = Request;
     type Response = Response;
 
-    fn get(&self, url: Self::Url) -> Result<Self::Request, Self::Error> {
+    fn get(
+        &self,
+        url: Self::Url,
+    ) -> Result<Self::Request, <Self::Response as FetchResponse>::Error> {
         self.get(url.0).build()
     }
 
     fn execute(
         &self,
         req: Self::Request,
-    ) -> impl Future<Output = Result<Self::Response, Self::Error>> {
+    ) -> impl Future<Output = Result<Self::Response, <Self::Response as FetchResponse>::Error>>
+    {
         self.execute(req)
     }
 }
@@ -183,19 +188,22 @@ impl FetchResponse for Result<google_cloud_storage::read_object::ReadObjectRespo
 /// Wiring to allow GCS buckets to be used as a [FetchBackend].
 impl FetchBackend for Storage {
     type Url = GcsUrl;
-    type Error = GcsError;
 
     type Request = google_cloud_storage::builder::storage::ReadObject;
     type Response = Result<google_cloud_storage::read_object::ReadObjectResponse, GcsError>;
 
-    fn get(&self, url: Self::Url) -> Result<Self::Request, Self::Error> {
+    fn get(
+        &self,
+        url: Self::Url,
+    ) -> Result<Self::Request, <Self::Response as FetchResponse>::Error> {
         Ok(self.read_object(url.bucket, url.object))
     }
 
     fn execute(
         &self,
         req: Self::Request,
-    ) -> impl futures::Future<Output = Result<Self::Response, Self::Error>> {
+    ) -> impl futures::Future<Output = Result<Self::Response, <Self::Response as FetchResponse>::Error>>
+    {
         req.send().map(Ok)
     }
 }
