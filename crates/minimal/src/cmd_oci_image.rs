@@ -143,7 +143,7 @@ pub async fn cmd_oci_image(args: OciImageArgs, globals: &GlobalArgs) -> Result<(
 }
 
 async fn create_base_layer() -> anyhow::Result<(Descriptor, String, std::fs::File, String)> {
-    let enc = GzEncoder::new(tempfile::tempfile()?, Compression::default());
+    let enc = GzEncoder::new(tempfile::tempfile()?, Compression::best());
     let mut tar = tar::Builder::new(enc);
 
     let mut header = tar::Header::new_gnu();
@@ -203,7 +203,7 @@ async fn create_layer_from_cache(
     let cache_dir = cache_entry.path();
 
     // Create tar.gz backed by temporary file
-    let enc = GzEncoder::new(tempfile::tempfile()?, Compression::default());
+    let enc = GzEncoder::new(tempfile::tempfile()?, Compression::best());
     let mut tar = tar::Builder::new(enc);
     add_dir_to_tar(&mut tar, cache_dir, ".")?;
     tar.finish()?;
