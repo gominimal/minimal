@@ -2,8 +2,8 @@
 
 use bytes::{Bytes, BytesMut};
 use futures::future::FutureExt;
-use google_cloud_storage::client::Storage;
 use google_cloud_storage::Error as GcsError;
+use google_cloud_storage::client::Storage;
 use reqwest::{Client, Error as ReqwestError, Request, Response, Url as UpstreamReqwestUrl};
 
 use std::future::Future;

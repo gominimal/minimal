@@ -449,7 +449,7 @@ impl GraphBuilder {
                     got: ty,
                     want: ObjTy::Builder,
                     pos: rt.pos,
-                })
+                });
             }
         }
         let name = match name {
@@ -460,7 +460,7 @@ impl GraphBuilder {
                     obj: ObjTy::Builder,
                     pos: rt.pos,
                     field: "name",
-                })
+                });
             }
         };
         let cmd = cmd.unwrap_or_default();
@@ -583,7 +583,7 @@ impl GraphBuilder {
                     obj: ObjTy::Builder,
                     pos: rt.pos,
                     field: "inputs",
-                })
+                });
             }
         };
         let outputs = match outputs {
@@ -598,7 +598,7 @@ impl GraphBuilder {
                     obj: ObjTy::Builder,
                     pos: rt.pos,
                     field: "outputs",
-                })
+                });
             }
         };
         let runtime_deps = runtime_deps.unwrap_or_default();
@@ -679,7 +679,7 @@ impl GraphBuilder {
                     obj: ObjTy::Subset,
                     pos: rt.pos,
                     field: "from",
-                })
+                });
             }
         };
         let mut outputs = match outputs {
@@ -690,7 +690,7 @@ impl GraphBuilder {
                     obj: ObjTy::Subset,
                     pos: rt.pos,
                     field: "outputs",
-                })
+                });
             }
         };
         outputs.sort();
@@ -761,7 +761,7 @@ impl GraphBuilder {
                     obj: ObjTy::Source,
                     pos: rt.pos,
                     field: "url",
-                })
+                });
             }
         };
         let sha256 = match sha256 {
@@ -772,7 +772,7 @@ impl GraphBuilder {
                     obj: ObjTy::Source,
                     pos: rt.pos,
                     field: "sha256",
-                })
+                });
             }
         };
 
@@ -818,7 +818,7 @@ impl GraphBuilder {
                     obj: ObjTy::Path,
                     pos: rt.pos,
                     field: "path",
-                })
+                });
             }
         };
 
@@ -862,7 +862,7 @@ impl GraphBuilder {
                     obj: ObjTy::Local,
                     pos: rt.pos,
                     field: "file",
-                })
+                });
             }
         };
 
@@ -928,7 +928,7 @@ impl GraphBuilder {
                     obj: ObjTy::Prebuilt,
                     pos: rt.pos,
                     field: "package",
-                })
+                });
             }
         };
 
@@ -1037,7 +1037,7 @@ impl GraphBuilder {
                     obj: ObjTy::OutputLib,
                     pos: rt.pos,
                     field: "glob",
-                })
+                });
             }
         };
 
@@ -1080,7 +1080,7 @@ impl GraphBuilder {
                     obj: ObjTy::OutputData,
                     pos: rt.pos,
                     field: "data",
-                })
+                });
             }
         };
 
@@ -1123,7 +1123,7 @@ impl GraphBuilder {
                     obj: ObjTy::OutputBin,
                     pos: rt.pos,
                     field: "path",
-                })
+                });
             }
         };
 

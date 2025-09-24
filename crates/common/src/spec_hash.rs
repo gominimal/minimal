@@ -1,4 +1,4 @@
-use serde::{de, de::Visitor, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de, de::Visitor};
 use std::fmt;
 
 /// A hash describing the object (specification hash), including everything it is dependent on.

@@ -1,6 +1,6 @@
 use crate::{
-    dep_graph::SourceFetch, BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph,
-    RuntimeDep, SpecHash,
+    BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, RuntimeDep, SpecHash,
+    dep_graph::SourceFetch,
 };
 use blake3::Hasher;
 use smallvec::SmallVec;

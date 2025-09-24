@@ -1,5 +1,5 @@
 use common::SpecHash;
-use futures::{io::AsyncReadExt, StreamExt};
+use futures::{StreamExt, io::AsyncReadExt};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 

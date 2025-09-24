@@ -42,10 +42,10 @@ pub enum Error {
 impl Error {
     /// Writes a human-friendly error to the given terminal.
     pub fn report_to(&self, writer: &mut dyn codespan_reporting::term::termcolor::WriteColor) {
-        use nickel_lang_core::error::{report::report_with, Diagnostic, Label};
+        use Error::*;
+        use nickel_lang_core::error::{Diagnostic, Label, report::report_with};
         use nickel_lang_core::files::FileId;
         use nickel_lang_core::position::RawSpan;
-        use Error::*;
 
         /// Create a primary label from a span.
         fn primary(span: &RawSpan) -> Label<FileId> {

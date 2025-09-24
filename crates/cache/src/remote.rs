@@ -1,10 +1,10 @@
-use crate::{remote_index::RemoteIndex, Cache, LocalDir};
+use crate::{Cache, LocalDir, remote_index::RemoteIndex};
 use common::{SpecHash, Tee};
 use sha2::{Digest, Sha256};
 use std::io::{Seek, Write};
 
 use common::fetchers::*;
-use google_cloud_storage::{client::Storage, Error as GcsError};
+use google_cloud_storage::{Error as GcsError, client::Storage};
 use reqwest::{Client, Error as ReqwestError};
 
 /// An error from operations with the remote cache.

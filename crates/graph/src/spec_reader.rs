@@ -24,8 +24,8 @@ pub enum SpecError {
 
 impl SpecError {
     pub fn report_to_stderr(&self) {
-        use nickel_lang_core::error::report::report;
         use SpecError::*;
+        use nickel_lang_core::error::report::report;
 
         match self {
             IO(e) => eprintln!("IO Error: {}", e),
