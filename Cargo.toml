@@ -8,6 +8,8 @@ members = [
 ]
 resolver = "3"
 
+package.publish = false
+
 [profile.release]
 debug = true
 

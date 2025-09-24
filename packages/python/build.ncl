@@ -8,7 +8,7 @@ let openssl = import "../openssl/build.ncl" in
 let pkgconf = import "../pkgconf/build.ncl" in
 let sqlite = import "../sqlite/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
-# let util-linux = import "../util-linux/build.ncl" in
+let util-linux = import "../util-linux/build.ncl" in
 {
   name = "python",
   inputs = [
@@ -24,7 +24,7 @@ let toolchain = import "../toolchain/build.ncl" in
     pkgconf,
     sqlite,
     toolchain,
-    # util-linux,
+    util-linux,
   ],
   runtime_deps = [
     expat,
