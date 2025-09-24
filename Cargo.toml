@@ -8,6 +8,7 @@ members = [
 ]
 resolver = "3"
 
+package.edition = "2024"
 package.publish = false
 
 [profile.release]
