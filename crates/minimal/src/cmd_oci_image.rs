@@ -4,11 +4,11 @@
 //! from minimal packages. It generates multi-layer images where each runtime dependency
 //! becomes a separate layer,.
 
-use cache::{Cache, CacheBinProvider, LocalDir};
+use cache::{Cache, LocalDir};
 use common::SpecHash;
 use docker_credential::{CredentialRetrievalError, DockerCredential, get_credential};
 use flate2::{Compression, write::GzEncoder};
-use graph::{BuildSpecRef, DepGraph, ExecPlan, Transitives};
+use graph::{BuildSpecRef, Transitives};
 use oci_client::{Client, Reference, client::ClientConfig};
 use oci_spec::image::{
     Descriptor, DescriptorBuilder, ImageConfiguration, ImageConfigurationBuilder, ImageManifest,
@@ -20,47 +20,44 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use tracing::{debug, info};
 
-use crate::{Error, GlobalArgs, lockfile::PrebuiltsLock, remote_storage::RemoteStorage, run::Run};
+use crate::{Error, GlobalArgs, PackagesArg};
 
 #[derive(clap::Args)]
 pub struct OciImageArgs {
-    /// Package name to create OCI image for
-    #[arg(short, long)]
-    package: String,
+    /// Package names to materialize to the OCI image
+    #[command(flatten)]
+    packages: PackagesArg,
 
     /// Registry URL (e.g., ghcr.io/user/repo)
     #[arg(short, long)]
     registry: String,
 
-    /// Image tag (defaults to package spec hash)
+    /// Image name
     #[arg(short, long)]
-    tag: Option<String>,
+    name: String,
+
+    /// Image tag
+    #[arg(short, long)]
+    tag: String,
 }
 
 pub async fn cmd_oci_image(args: OciImageArgs, globals: &GlobalArgs) -> Result<(), Error> {
-    let graph = globals.graph_from_package_name(&args.package)?;
+    let graph = args.packages.graph(globals)?;
     let cache = globals.cache().map_err(anyhow::Error::from)?;
 
-    let package_ref = graph
-        .top_levels
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("No package found for name: {}", args.package))?;
+    // Make sure the packages are built
+    crate::cmd_build::cmd_build_impl(&graph, globals, cache.clone(), globals.num_parallel_builds)
+        .await?;
 
-    ensure_package_built(&graph, *package_ref, &cache).await?;
-
-    let transitives = Transitives::new(&graph, package_ref, false);
-    let mut all_deps: Vec<BuildSpecRef> = transitives
-        .transitive_runtime_deps
-        .keys()
-        .cloned()
-        .collect();
+    let mut all_deps: Vec<BuildSpecRef> =
+        Transitives::for_toplevels(&graph, graph.top_levels.to_vec(), false)
+            .into_iter()
+            .collect();
     all_deps.sort_by_key(|bsr| graph.get(bsr).unwrap().name.clone());
 
-    all_deps.push(*package_ref);
-
-    info!("Creating OCI image for package: {}", args.package);
+    info!("Creating OCI image for packages: {}", args.packages);
     info!(
-        "Will create {} layers: base layer + {} dependencies + main package",
+        "Will create {} layers: base layer + {} packages",
         all_deps.len() + 1,
         all_deps.len() - 1
     );
@@ -102,14 +99,10 @@ pub async fn cmd_oci_image(args: OciImageArgs, globals: &GlobalArgs) -> Result<(
         .build()
         .map_err(anyhow::Error::from)?;
 
-    let tag = args
-        .tag
-        .unwrap_or_else(|| graph.spec_hash(package_ref).0.to_hex()[..12].to_string());
-
     push_to_registry(
         &args.registry,
-        &args.package,
-        &tag,
+        &args.name,
+        &args.tag,
         manifest,
         config_bytes,
         layer_data,
@@ -118,44 +111,8 @@ pub async fn cmd_oci_image(args: OciImageArgs, globals: &GlobalArgs) -> Result<(
 
     info!(
         "Successfully pushed OCI image to {}/{}:{}",
-        args.registry, args.package, tag
+        args.registry, args.name, args.tag
     );
-
-    Ok(())
-}
-
-async fn ensure_package_built(
-    graph: &DepGraph,
-    package_ref: BuildSpecRef,
-    cache: &Cache<LocalDir>,
-) -> anyhow::Result<()> {
-    let package_hash = graph.spec_hash(&package_ref);
-
-    if cache.read_dir(&package_hash).is_ok() {
-        debug!("Package already built and cached");
-        return Ok(());
-    }
-
-    info!("Package not in cache, building...");
-
-    let remote_storage = RemoteStorage::new().await?;
-    let lockfile_path = std::path::Path::new("prebuilts.lock");
-    let lockfile = PrebuiltsLock::load(lockfile_path).unwrap_or_else(|e| {
-        debug!(
-            "Warning: Failed to load lockfile {}: {}",
-            lockfile_path.display(),
-            e
-        );
-        debug!("Using empty lockfile...");
-        PrebuiltsLock::default()
-    });
-    let mut runner = Run::new(graph, cache.clone(), remote_storage, lockfile);
-    runner
-        .execute(
-            ExecPlan::new_with_bin_provider(graph, CacheBinProvider::new(graph, cache.clone())),
-            None,
-        )
-        .await?;
 
     Ok(())
 }
@@ -366,13 +323,13 @@ fn build_auth(reference: &Reference) -> oci_client::secrets::RegistryAuth {
 
 async fn push_to_registry(
     registry: &str,
-    package_name: &str,
+    name: &str,
     tag: &str,
     manifest: ImageManifest,
     config_bytes: Vec<u8>,
     layer_data: Vec<(Vec<u8>, String)>,
 ) -> anyhow::Result<()> {
-    let reference_string = format!("{}/{}:{}", registry, package_name, tag);
+    let reference_string = format!("{}/{}:{}", registry, name, tag);
     let reference = Reference::try_from(reference_string.as_str())?;
 
     let client = Client::new(ClientConfig {

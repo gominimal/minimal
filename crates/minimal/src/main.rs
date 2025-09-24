@@ -182,6 +182,16 @@ pub struct PackagesArg {
     packages: Option<Vec<String>>,
 }
 
+impl std::fmt::Display for PackagesArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(packages) = &self.packages {
+            write!(f, "{}", packages.join(","))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl PackagesArg {
     /// Returns a [DepGraph] containing the named packages, or all packages if none were specified.
     pub fn graph(&self, globals: &GlobalArgs) -> Result<DepGraph, graph::Error> {
