@@ -15,7 +15,7 @@ use oci_spec::image::{
     ImageManifestBuilder, MediaType, RootFsBuilder, SCHEMA_VERSION, Sha256Digest,
 };
 use sha2::Digest;
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use tracing::{debug, info};
@@ -67,23 +67,48 @@ pub async fn cmd_oci_image(args: OciImageArgs, globals: &GlobalArgs) -> Result<(
     let mut layer_data = Vec::new();
 
     // Create base layer with /lib64 symlink
-    let (base_layer_descriptor, base_diff_id, base_layer_bytes, base_layer_digest) =
+    let (base_layer_descriptor, base_diff_id, base_layer_file, base_layer_digest) =
         create_base_layer().await?;
     layers.push(base_layer_descriptor);
     layer_diff_ids.push(base_diff_id);
-    layer_data.push((base_layer_bytes, base_layer_digest));
+    layer_data.push((base_layer_file, base_layer_digest));
 
-    for dep_ref in &all_deps {
-        let dep_spec = graph.get(dep_ref).unwrap();
-        let dep_hash = graph.spec_hash(dep_ref);
+    let tokio_runtime = tokio::runtime::Handle::current();
+    let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(all_deps.len())));
+    rayon::scope(|s| {
+        for dep_ref in &all_deps {
+            let tokio_runtime = tokio_runtime.clone();
+            let results = results.clone();
+            let cache = cache.clone();
 
-        info!("Creating layer for: {}", dep_spec.name);
+            let dep_spec = graph.get(dep_ref).unwrap();
+            let dep_hash = graph.spec_hash(dep_ref);
 
-        let (layer_descriptor, diff_id, layer_bytes, layer_digest) =
-            create_layer_from_cache(&cache, &dep_hash, &dep_spec.name).await?;
+            info!("Creating layer for: {}", dep_spec.name);
+
+            s.spawn(move |_| {
+                let _rt = tokio_runtime.enter();
+                let result = futures::executor::block_on(create_layer_from_cache(
+                    &cache,
+                    &dep_hash,
+                    &dep_spec.name,
+                ));
+                results.lock().unwrap().push(result);
+            });
+        }
+    });
+
+    let results = std::sync::Arc::into_inner(results)
+        .unwrap()
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>();
+
+    for (layer_descriptor, diff_id, layer_file, layer_digest) in results? {
         layers.push(layer_descriptor);
         layer_diff_ids.push(diff_id);
-        layer_data.push((layer_bytes, layer_digest));
+        layer_data.push((layer_file, layer_digest));
     }
 
     let config = create_image_config(layer_diff_ids)?;
@@ -117,8 +142,8 @@ pub async fn cmd_oci_image(args: OciImageArgs, globals: &GlobalArgs) -> Result<(
     Ok(())
 }
 
-async fn create_base_layer() -> anyhow::Result<(Descriptor, String, Vec<u8>, String)> {
-    let enc = GzEncoder::new(Vec::new(), Compression::default());
+async fn create_base_layer() -> anyhow::Result<(Descriptor, String, std::fs::File, String)> {
+    let enc = GzEncoder::new(tempfile::tempfile()?, Compression::default());
     let mut tar = tar::Builder::new(enc);
 
     let mut header = tar::Header::new_gnu();
@@ -130,13 +155,21 @@ async fn create_base_layer() -> anyhow::Result<(Descriptor, String, Vec<u8>, Str
     tar.append(&header, std::io::empty())?;
 
     tar.finish()?;
-    let compressed_bytes = tar.into_inner()?.finish()?;
+    let mut tar_file = tar.into_inner()?.finish()?;
 
-    let compressed_digest_hex = format!("{:x}", sha2::Sha256::digest(&compressed_bytes));
+    // Calculate digests
+    let (sha256, compressed_len) = {
+        let mut hasher = sha2::Sha256::new();
+        tar_file.seek(std::io::SeekFrom::Start(0))?;
+        let len = std::io::copy(&mut tar_file, &mut hasher)?;
+        (hasher.finalize(), len)
+    };
+    let compressed_digest_hex = format!("{:x}", sha256);
     let compressed_digest = format!("sha256:{}", compressed_digest_hex);
 
     let uncompressed_digest = {
-        let dec = flate2::read::GzDecoder::new(&compressed_bytes[..]);
+        tar_file.seek(std::io::SeekFrom::Start(0))?;
+        let dec = flate2::read::GzDecoder::new(&tar_file);
         let mut hasher = sha2::Sha256::new();
         let mut reader = std::io::BufReader::new(dec);
         std::io::copy(&mut reader, &mut hasher)?;
@@ -145,49 +178,50 @@ async fn create_base_layer() -> anyhow::Result<(Descriptor, String, Vec<u8>, Str
 
     let descriptor = DescriptorBuilder::default()
         .media_type(MediaType::ImageLayerGzip)
-        .size(compressed_bytes.len() as u64)
+        .size(compressed_len)
         .digest(Sha256Digest::from_str(&compressed_digest_hex)?)
         .build()?;
 
     info!(
-        "Created base layer with /lib64 symlink: {} bytes",
-        compressed_bytes.len()
+        "Created base layer with /lib64 symlink: {}",
+        size::Size::from_bytes(compressed_len)
     );
 
-    Ok((
-        descriptor,
-        uncompressed_digest,
-        compressed_bytes,
-        compressed_digest,
-    ))
+    tar_file.seek(std::io::SeekFrom::Start(0))?;
+    Ok((descriptor, uncompressed_digest, tar_file, compressed_digest))
 }
 
 async fn create_layer_from_cache(
     cache: &Cache<LocalDir>,
     spec_hash: &SpecHash,
     package_name: &str,
-) -> anyhow::Result<(Descriptor, String, Vec<u8>, String)> {
+) -> anyhow::Result<(Descriptor, String, std::fs::File, String)> {
     let cache_entry = cache
         .read_dir(spec_hash)
         .map_err(|_| anyhow::anyhow!("Package {} not found in cache", package_name))?;
 
     let cache_dir = cache_entry.path();
 
-    // Create tar.gz in memory
-    let enc = GzEncoder::new(Vec::new(), Compression::default());
+    // Create tar.gz backed by temporary file
+    let enc = GzEncoder::new(tempfile::tempfile()?, Compression::default());
     let mut tar = tar::Builder::new(enc);
-
     add_dir_to_tar(&mut tar, cache_dir, ".")?;
-
     tar.finish()?;
-    let compressed_bytes = tar.into_inner()?.finish()?;
+    let mut tar_file = tar.into_inner()?.finish()?;
 
     // Calculate digests
-    let compressed_digest_hex = format!("{:x}", sha2::Sha256::digest(&compressed_bytes));
+    let (sha256, compressed_len) = {
+        let mut hasher = sha2::Sha256::new();
+        tar_file.seek(std::io::SeekFrom::Start(0))?;
+        let len = std::io::copy(&mut tar_file, &mut hasher)?;
+        (hasher.finalize(), len)
+    };
+    let compressed_digest_hex = format!("{:x}", sha256);
     let compressed_digest = format!("sha256:{}", compressed_digest_hex);
 
     let uncompressed_digest = {
-        let dec = flate2::read::GzDecoder::new(&compressed_bytes[..]);
+        tar_file.seek(std::io::SeekFrom::Start(0))?;
+        let dec = flate2::read::GzDecoder::new(&tar_file);
         let mut hasher = sha2::Sha256::new();
         let mut reader = std::io::BufReader::new(dec);
         std::io::copy(&mut reader, &mut hasher)?;
@@ -196,22 +230,18 @@ async fn create_layer_from_cache(
 
     let descriptor = DescriptorBuilder::default()
         .media_type(MediaType::ImageLayerGzip)
-        .size(compressed_bytes.len() as u64)
+        .size(compressed_len)
         .digest(Sha256Digest::from_str(&compressed_digest_hex)?)
         .build()?;
 
     info!(
-        "Created layer for {}: {} bytes",
+        "Created layer for {}: {}",
         package_name,
-        compressed_bytes.len()
+        size::Size::from_bytes(compressed_len)
     );
 
-    Ok((
-        descriptor,
-        uncompressed_digest,
-        compressed_bytes,
-        compressed_digest,
-    ))
+    tar_file.seek(std::io::SeekFrom::Start(0))?;
+    Ok((descriptor, uncompressed_digest, tar_file, compressed_digest))
 }
 
 fn add_dir_to_tar<W: Write>(
@@ -327,7 +357,7 @@ async fn push_to_registry(
     tag: &str,
     manifest: ImageManifest,
     config_bytes: Vec<u8>,
-    layer_data: Vec<(Vec<u8>, String)>,
+    layer_data: Vec<(std::fs::File, String)>,
 ) -> anyhow::Result<()> {
     let reference_string = format!("{}/{}:{}", registry, name, tag);
     let reference = Reference::try_from(reference_string.as_str())?;
@@ -349,9 +379,14 @@ async fn push_to_registry(
         .push_blob(&reference, &config_bytes, &config_digest)
         .await?;
 
-    for (i, (layer_bytes, digest)) in layer_data.iter().enumerate() {
-        info!("Pushing layer {} of {}...", i + 1, layer_data.len());
-        client.push_blob(&reference, layer_bytes, digest).await?;
+    let num_layers = layer_data.len();
+    for (i, (mut layer_file, digest)) in layer_data.into_iter().enumerate() {
+        layer_file.seek(std::io::SeekFrom::Start(0))?;
+        let mut layer_bytes: Vec<u8> = Vec::with_capacity(1024 * 1024);
+        std::io::copy(&mut layer_file, &mut layer_bytes)?;
+
+        info!("Pushing layer {} of {}...", i + 1, num_layers);
+        client.push_blob(&reference, &layer_bytes, &digest).await?;
     }
 
     info!("Pushing manifest...");

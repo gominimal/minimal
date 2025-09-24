@@ -52,6 +52,8 @@ url = "2.5" # keep in sync with reqwest
 
 regex = "1" # keep in sync with nickel-lang-core
 
+size = "0.5"
+
 # our crates
 build-sandbox = { path = "crates/build-sandbox" }
 graph = { version = "0.0.1", path = "crates/graph" }
