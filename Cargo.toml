@@ -17,7 +17,7 @@ generational-arena = "^0.2"
 smallvec = "1.14"
 blake3 = "1"
 sha2 = "0.10.9"
-fxhash = "0.2"
+rustc-hash = "2.1.1"
 hex = "0.4"
 
 nickel-lang-core = { version = "0.14", default-features = false, features = [

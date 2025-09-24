@@ -10,10 +10,10 @@ rust-version = "1.85"
 indoc.workspace = true
 
 [dependencies]
+rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 blake3.workspace = true
-fxhash.workspace = true
 smallvec.workspace = true
 tracing.workspace = true
 
