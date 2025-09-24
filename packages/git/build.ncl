@@ -1,7 +1,9 @@
 let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
 let curl = import "../curl/build.ncl" in
 let gettext = import "../gettext/build.ncl" in
+let expat = import "../expat/build.ncl" in
 let make = import "../make/build.ncl" in
+let openssl = import "../openssl/build.ncl" in
 let pcre2 = import "../pcre2/build.ncl" in
 let python = import "../python/build.ncl" in
 let base = import "../base/build.ncl" in
@@ -24,6 +26,8 @@ let version = "2.51.0" in
   ],
   runtime_deps = [
     curl,
+    expat,
+    openssl,
     pcre2,
     zlib,
   ],
