@@ -1,10 +1,10 @@
 [package]
 name = "graph"
 version = "0.0.1"
-edition = { workspace = true }
+edition.workspace = true
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-publish = { workspace = true }
+publish.workspace = true
 
 [dev-dependencies]
 indoc.workspace = true

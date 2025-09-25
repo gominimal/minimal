@@ -22,28 +22,57 @@ ignore = true
 
 [bans]
 skip = [
+    # nickel-lang-core -> pretty
+    # https://github.com/Marwes/pretty.rs/blob/bd138e503ee3f679b26c838c9f148fbdaf6d2b7c/Cargo.toml#L17
     { name = "arrayvec", version = "0.5.2" },
+    # oci-client -> jwt
+    # https://github.com/mikkyang/rust-jwt/pull/101
     { name = "base64", version = "0.13.1" },
+    # docker_credential
+    # https://github.com/keirlawson/docker_credential/pull/21
     { name = "base64", version = "0.21.7" },
+    # hyper-tls -> native-tls -> security-framework
+    # https://github.com/sfackler/rust-native-tls/pull/338
     { name = "core-foundation", version = "0.9.4" },
+    # # oci-spec -> derive_builder
+    # https://github.com/colin-kiegel/rust-derive-builder/pull/349
     { name = "darling_core", version = "0.20.11" },
     { name = "darling_macro", version = "0.20.11" },
     { name = "darling_macro", version = "0.20.11" },
     { name = "darling", version = "0.20.11" },
+    # google-cloud-auth -> rustls -> ring 
+    # https://github.com/briansmith/ring/issues/2341
     { name = "getrandom", version = "0.2.16" },
+    # nickel-lang-core -> malachite -> malachite-base
+    # https://github.com/mhogrefe/malachite/pull/80
     { name = "hashbrown", version = "0.15.5" },
+    # nickel-lang-core -> ouroboros -> ouroboros_macro
+    # https://github.com/someguynamedjosh/ouroboros/pull/127
     { name = "heck", version = "0.4.1" },
+    # nickel-lang-core -> malachite -> malachite-base
+    # https://github.com/tweag/nickel/pull/2367
     { name = "itertools", version = "0.11.0" },
-    { name = "linux-raw-sys", version = "0.4.15" },
-    { name = "rustix", version = "0.38.44" },
+    # reqwest -> hyper-tls -> native-tls -> security-framework
+    # https://github.com/sfackler/rust-native-tls/pull/338
     { name = "security-framework", version = "2.11.1" },
+    # nickel-lang-core -> toml
+    # https://github.com/tweag/nickel/pull/2368
     { name = "serde_spanned", version = "0.6.9" },
+    # hakoniwa -> caps -> thiserror
+    # https://github.com/lucab/caps-rs/pull/88
     { name = "thiserror-impl", version = "1.0.69" },
     { name = "thiserror", version = "1.0.69" },
+    # nickel-lang-core
+    # https://github.com/tweag/nickel/pull/2368
     { name = "toml_datetime", version = "0.6.11" },
     { name = "toml", version = "0.8.23" },
+    # nickel-lang-core -> pretty
+    # https://github.com/Marwes/pretty.rs/pull/90
     { name = "unicode-width", version = "0.1.14" },
+    # tracing-indicatif -> indicatif -> vt100
+    # https://github.com/console-rs/indicatif/pull/723
     { name = "vte", version = "0.11.1" },
+    # tokio -> mio
     { name = "wasi", version = "=0.11.1+wasi-snapshot-preview1" },
 
 ]
@@ -57,4 +86,4 @@ skip-tree = [
 ]
 
 [sources.allow-org]
-github = ["gominimal"]
+github = ["gominimal", "souk4711"]
