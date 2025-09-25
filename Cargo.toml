@@ -12,7 +12,9 @@ package.edition = "2024"
 package.publish = false
 
 [profile.release]
-debug = true
+strip = true
+lto = true
+codegen-units = 1
 
 [workspace.dependencies]
 indoc = "^2.0"
