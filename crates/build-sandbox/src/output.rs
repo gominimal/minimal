@@ -1,4 +1,3 @@
-use glob::glob;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{error, warn};
@@ -156,48 +155,61 @@ impl OutputValidator {
     }
 
     fn resolve_output_pattern(pattern: &str, search_dir: &Path) -> Result<Vec<PathBuf>> {
-        let search_pattern = if Path::new(pattern).is_absolute() {
-            pattern.to_string()
-        } else {
-            search_dir.join(pattern).to_string_lossy().to_string()
-        };
-
         if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
-            Self::resolve_glob_pattern(&search_pattern)
+            Self::resolve_glob_pattern(pattern, search_dir)
         } else {
+            let search_pattern = if Path::new(pattern).is_absolute() {
+                pattern.to_string()
+            } else {
+                search_dir.join(pattern).to_string_lossy().to_string()
+            };
+
             Self::resolve_literal_pattern(&search_pattern)
         }
     }
 
-    fn resolve_glob_pattern(pattern: &str) -> Result<Vec<PathBuf>> {
+    fn resolve_glob_pattern<P: AsRef<Path>>(pattern: &str, root_dir: P) -> Result<Vec<PathBuf>> {
         let mut results = Vec::new();
 
-        match glob(pattern) {
-            Ok(paths) => {
-                for entry in paths {
-                    match entry {
-                        Ok(path) => {
-                            if path.is_file() {
-                                results.push(path);
-                            }
-                        }
-                        Err(_) => {
-                            return Err(OutputError::GlobPattern {
-                                pattern: pattern.to_string(),
-                            }
-                            .into());
-                        }
-                    }
+        let matcher = globset::GlobBuilder::new(pattern)
+            .literal_separator(true)
+            .empty_alternates(true)
+            .build()
+            .map_err(|_| OutputError::GlobPattern {
+                pattern: pattern.to_string(),
+            })?
+            .compile_matcher();
+
+        // Walk the filesystem starting from root_dir
+        fn walk_dir(
+            dir: &Path,
+            root_dir: &Path,
+            matcher: &globset::GlobMatcher,
+            results: &mut Vec<PathBuf>,
+        ) -> Result<()> {
+            let entries = fs::read_dir(dir).map_err(|_| OutputError::GlobPattern {
+                pattern: dir.to_string_lossy().to_string(),
+            })?;
+
+            for entry in entries {
+                let entry = entry.map_err(|_| OutputError::GlobPattern {
+                    pattern: dir.to_string_lossy().to_string(),
+                })?;
+
+                let path = entry.path();
+                let subset = path.strip_prefix(root_dir).unwrap();
+                if path.is_file() && matcher.is_match(&subset) {
+                    results.push(path);
+                } else if path.is_dir() {
+                    // Recursively walk subdirectories
+                    walk_dir(&path, root_dir, matcher, results)?;
                 }
             }
-            Err(_) => {
-                return Err(OutputError::GlobPattern {
-                    pattern: pattern.to_string(),
-                }
-                .into());
-            }
+
+            Ok(())
         }
 
+        walk_dir(root_dir.as_ref(), root_dir.as_ref(), &matcher, &mut results)?;
         Ok(results)
     }
 
