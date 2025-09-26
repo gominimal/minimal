@@ -1,4 +1,5 @@
-let Tys = [| 'Builder, 'Path, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Prebuilt, 'Subset |] in
+let Tys = [| 'Builder, 'Path, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Prebuilt, 'Subset |]
+in
 {
     BuildSpec | doc "A minimal build spec, defining inputs to the build as well as outputs which carry build artifacts downstream" = {
         ty | Tys = 'Builder,
@@ -23,7 +24,18 @@ let Tys = [| 'Builder, 'Path, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Loc
     build | Dyn -> BuildSpec | doc "Constructs a minimal build spec." =
       fun spec => spec | BuildSpec,
 
-    Output | doc "An artifact produced by the execution of a build spec" = std.contract.any_of [OutputLib, OutputBin, OutputData],
+    Output | doc "An artifact produced by the execution of a build spec" = fun Contract =>
+      std.contract.custom (fun label value =>
+        match {
+            'OutputLib => std.contract.check OutputLib label value,
+            'OutputBin => std.contract.check OutputBin label value,
+            'OutputData => std.contract.check OutputData label value,
+            _ => 'Error {
+              message = "Expected Output type",
+            },
+        }
+        value.ty
+      ),
 
     OutputLib | doc "An output of a build spec which represents a shared library." = {
         ty | Tys = 'OutputLib,
