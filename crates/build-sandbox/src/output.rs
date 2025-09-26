@@ -198,7 +198,7 @@ impl OutputValidator {
 
                 let path = entry.path();
                 let subset = path.strip_prefix(root_dir).unwrap();
-                if path.is_file() && matcher.is_match(&subset) {
+                if path.is_file() && matcher.is_match(subset) {
                     results.push(path);
                 } else if path.is_dir() {
                     // Recursively walk subdirectories
