@@ -182,11 +182,11 @@ impl FetchResponse for Result<google_cloud_storage::read_object::ReadObjectRespo
             Ok(_) => 200,
             Err(e) => {
                 if let Some(sc) = e.http_status_code() {
-                   sc as usize
+                    sc as usize
                 } else {
                     panic!("non-status error: {:?}", e);
                 }
-            },
+            }
         }
     }
 }

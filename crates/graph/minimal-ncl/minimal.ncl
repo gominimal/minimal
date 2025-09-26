@@ -8,7 +8,7 @@ in
         inputs
           | Array Input,
         runtime_deps
-          | Array BuildSpec | optional,
+          | Array RuntimeDep | optional,
 
         cmd | String,
         build_args | {_: String} | optional,
@@ -53,13 +53,39 @@ in
           | String,
     },
 
+    RuntimeDep | doc "Possible values for a runtime dependency entry." = fun Contract =>
+        std.contract.custom (fun label value =>
+            match {
+                {ty = 'Builder, ..} => std.contract.check BuildSpec label value,
+                {ty = 'Subset, ..} => std.contract.check Subset label value,
+                _ => 'Error {
+                    message = "Expected Input type",
+                },
+            }
+            value
+        ),
+
+    Input | doc "Possible inputs to a build spec." = fun Contract =>
+        std.contract.custom (fun label value =>
+            match {
+                {ty = 'Builder, ..} => std.contract.check BuildSpec label value,
+                {ty = 'Path, ..} => std.contract.check HostPath label value,
+                {ty = 'Source, ..} => std.contract.check Source label value,
+                {ty = 'Local, ..}  => std.contract.check Local label value,
+                {ty = 'Prebuilt, ..} => std.contract.check Prebuilt label value,
+                {ty = 'Subset, ..} => std.contract.check Subset label value,
+                _ => 'Error {
+                    message = "Expected Input type",
+                },
+            }
+            value
+        ),
+
     HostPath | doc "An input which represents a path on the building machine" = {
         ty | Tys = 'Path,
         path
-          | String,
+            | String,
     },
-
-    Input = std.contract.any_of [BuildSpec, HostPath, Source, Local, Prebuilt, Subset],
 
     Source | doc "An input to a build spec which represents source code from some location." = {
         ty | Tys = 'Source,
