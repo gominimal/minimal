@@ -14,9 +14,9 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    binaries = { path = "usr/bin/*" } | OutputBin,
-    info = { data = "usr/share/info/*.info" } | OutputData,
-    man = { data = "usr/share/man/man1/*.1" } | OutputData,
+    binaries = { glob = "usr/bin/*" } | OutputBin,
+    info = { glob = "usr/share/info/*.info" } | OutputData,
+    man = { glob = "usr/share/man/man1/*.1" } | OutputData,
   },
 
   replace_on_cycle =
@@ -27,7 +27,7 @@ let toolchain = import "../toolchain/build.ncl" in
       ],
       cmd = "",
       outputs = {
-        binaries = { path = "usr/bin/*" } | OutputBin,
+        binaries = { glob = "usr/bin/*" } | OutputBin,
       },
     } | BuildSpec,
 } | BuildSpec

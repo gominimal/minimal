@@ -140,9 +140,9 @@ fn build_output_hash(output: &BuildOutput, h: &mut Hasher) {
             h.write_all(b"data").unwrap();
             h.write_all(glob.as_bytes()).unwrap();
         }
-        Binary { path } => {
+        Binary { glob } => {
             h.write_all(b"bin").unwrap();
-            h.write_all(path.as_bytes()).unwrap();
+            h.write_all(glob.as_bytes()).unwrap();
         }
     }
 }
@@ -235,8 +235,8 @@ mod tests {
                     ],
                     outputs = {
                         something = { glob = \"/usr/lib/something.*.so\" } | OutputLib,
-                        uwu_tool = { path = \"/bin/uwu\" } | OutputBin,
-                        some_data = { data = \"/data/locale/*\"  } | OutputData,
+                        uwu_tool = { glob = \"/bin/uwu\" } | OutputBin,
+                        some_data = { glob = \"/data/locale/*\"  } | OutputData,
                     },
                     cmd = \"something\",
                 } | BuildSpec"

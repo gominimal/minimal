@@ -22,12 +22,12 @@ let zlib = import "../zlib/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    lspci = { path = "usr/bin/lspci" } | OutputBin,
-    sbins = { path = "usr/sbin/*" } | OutputBin,
+    lspci = { glob = "usr/bin/lspci" } | OutputBin,
+    sbins = { glob = "usr/sbin/*" } | OutputBin,
 
     libs = { glob = "usr/lib/*" } | OutputLib,
 
-    includes = { data = "usr/include/**/*" } | OutputData,
-    pkgconfig = { data = "usr/lib/pkgconfig/*" } | OutputData,
+    includes = { glob = "usr/include/**/*" } | OutputData,
+    pkgconfig = { glob = "usr/lib/pkgconfig/*" } | OutputData,
   },
 } | BuildSpec

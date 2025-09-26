@@ -25,17 +25,17 @@ in
       fun spec => spec | BuildSpec,
 
     Output | doc "An artifact produced by the execution of a build spec" = fun Contract =>
-      std.contract.custom (fun label value =>
-        match {
-            'OutputLib => std.contract.check OutputLib label value,
-            'OutputBin => std.contract.check OutputBin label value,
-            'OutputData => std.contract.check OutputData label value,
-            _ => 'Error {
-              message = "Expected Output type",
-            },
-        }
-        value.ty
-      ),
+        std.contract.custom (fun label value =>
+            match {
+                {ty = 'OutputLib, ..} => std.contract.check OutputLib label value,
+                {ty = 'OutputBin, ..}  => std.contract.check OutputBin label value,
+                {ty = 'OutputData, ..} => std.contract.check OutputData label value,
+                _ => 'Error {
+                    message = "Expected Output type",
+                },
+            }
+            value
+        ),
 
     OutputLib | doc "An output of a build spec which represents a shared library." = {
         ty | Tys = 'OutputLib,
@@ -44,12 +44,12 @@ in
     },
     OutputBin | doc "An output of a build spec which represents a shared library." = {
         ty | Tys = 'OutputBin,
-        path
+        glob
           | String,
     },
     OutputData | doc "An output of a build spec which represents data files that are used during execution." = {
         ty | Tys = 'OutputData,
-        data
+        glob
           | String,
     },
 

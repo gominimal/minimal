@@ -14,21 +14,21 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    bunzip2 = { path = "usr/bin/bunzip2" } | OutputBin,
-    bzcat = { path = "usr/bin/bzcat" } | OutputBin,
-    bzcmp = { path = "usr/bin/bzcmp" } | OutputBin,
-    bzdiff = { path = "usr/bin/bzdiff" } | OutputBin,
-    bzegrep = { path = "usr/bin/bzegrep" } | OutputBin,
-    bzfgrep = { path = "usr/bin/bzfgrep" } | OutputBin,
-    bzgrep = { path = "usr/bin/bzgrep" } | OutputBin,
-    bzip2 = { path = "usr/bin/bzip2" } | OutputBin,
-    bzip2recover = { path = "usr/bin/bzip2recover" } | OutputBin,
-    bzless = { path = "usr/bin/bzless" } | OutputBin,
-    bzmore = { path = "usr/bin/bzmore" } | OutputBin,
+    bunzip2 = { glob = "usr/bin/bunzip2" } | OutputBin,
+    bzcat = { glob = "usr/bin/bzcat" } | OutputBin,
+    bzcmp = { glob = "usr/bin/bzcmp" } | OutputBin,
+    bzdiff = { glob = "usr/bin/bzdiff" } | OutputBin,
+    bzegrep = { glob = "usr/bin/bzegrep" } | OutputBin,
+    bzfgrep = { glob = "usr/bin/bzfgrep" } | OutputBin,
+    bzgrep = { glob = "usr/bin/bzgrep" } | OutputBin,
+    bzip2 = { glob = "usr/bin/bzip2" } | OutputBin,
+    bzip2recover = { glob = "usr/bin/bzip2recover" } | OutputBin,
+    bzless = { glob = "usr/bin/bzless" } | OutputBin,
+    bzmore = { glob = "usr/bin/bzmore" } | OutputBin,
 
     libbz2 = { glob = "usr/lib/libbz2.so*" } | OutputLib,
 
-    headers = { data = "usr/include/bzlib.h" } | OutputData,
+    headers = { glob = "usr/include/bzlib.h" } | OutputData,
   },
 
   replace_on_cycle =

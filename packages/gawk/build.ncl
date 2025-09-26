@@ -14,7 +14,7 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    usr_bin = { path = "usr/bin/**/*" } | OutputBin,
+    usr_bin = { glob = "usr/bin/**/*" } | OutputBin,
     usr_include = { glob = "usr/include/**/*" } | OutputLib,
     usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
     usr_libexec = { glob = "usr/libexec/**/*" } | OutputLib,
@@ -29,7 +29,7 @@ let toolchain = import "../toolchain/build.ncl" in
       ],
       cmd = "",
       outputs = {
-        usr_bin = { path = "usr/bin/**/*" } | OutputBin,
+        usr_bin = { glob = "usr/bin/**/*" } | OutputBin,
         usr_include = { glob = "usr/include/**/*" } | OutputLib,
         usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
         usr_libexec = { glob = "usr/libexec/**/*" } | OutputLib,

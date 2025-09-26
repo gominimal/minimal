@@ -19,8 +19,8 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    bison_bin = { path = "usr/bin/bison" } | OutputBin,
-    yacc_bin = { path = "usr/bin/yacc" } | OutputBin,
+    bison_bin = { glob = "usr/bin/bison" } | OutputBin,
+    yacc_bin = { glob = "usr/bin/yacc" } | OutputBin,
     liby = { glob = "usr/lib/liby.a" } | OutputLib,
     bison_share = { glob = "usr/share/bison/**/*" } | OutputLib,
     bison_man = { glob = "usr/share/man/man1/bison.1" } | OutputLib,

@@ -22,7 +22,7 @@ let xz = import "../xz/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    tar = { path = "usr/bin/tar" } | OutputBin,
+    tar = { glob = "usr/bin/tar" } | OutputBin,
     rmt = { glob = "usr/libexec/rmt" } | OutputLib,
     info = { glob = "usr/share/info/tar.info*" } | OutputLib,
     locale_files = { glob = "usr/share/locale/**/*" } | OutputLib,
@@ -41,7 +41,7 @@ let xz = import "../xz/build.ncl" in
       ],
       cmd = "",
       outputs = {
-        tar = { path = "usr/bin/tar" } | OutputBin,
+        tar = { glob = "usr/bin/tar" } | OutputBin,
       },
     } | BuildSpec,
 } | BuildSpec

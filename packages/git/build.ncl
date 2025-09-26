@@ -38,10 +38,10 @@ let version = "2.51.0" in
   },
 
   outputs = {
-    bins = { path = "usr/bin/*" } | OutputBin,
+    bins = { glob = "usr/bin/*" } | OutputBin,
     git_core = { glob = "usr/libexec/git-core/*" } | OutputLib,
     git_core_mergetools = { glob = "usr/libexec/git-core/mergetools/*" } | OutputLib,
 
-    locale = { data = "usr/share/locale/**/*" } | OutputData,
+    locale = { glob = "usr/share/locale/**/*" } | OutputData,
   },
 } | BuildSpec

@@ -26,8 +26,8 @@ let libcap = import "../libcap/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    sbins = { path = "usr/sbin/*" } | OutputBin,
+    sbins = { glob = "usr/sbin/*" } | OutputBin,
 
-    includes = { data = "usr/include/iproute2/*" } | OutputData,
+    includes = { glob = "usr/include/iproute2/*" } | OutputData,
   },
 } | BuildSpec

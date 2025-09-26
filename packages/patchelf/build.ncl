@@ -20,7 +20,7 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    patchelf = { path = "usr/bin/patchelf" } | OutputBin,
-    man = { data = "usr/share/man/**/*" } | OutputData,
+    patchelf = { glob = "usr/bin/patchelf" } | OutputBin,
+    man = { glob = "usr/share/man/**/*" } | OutputData,
   },
 } | BuildSpec

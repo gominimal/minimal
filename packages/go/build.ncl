@@ -34,9 +34,9 @@ let version = "1.25.1" in
   },
 
   outputs = {
-    go_bin = { path = "usr/bin/go" } | OutputBin,
-    gofmt_bin = { path = "usr/bin/gofmt" } | OutputBin,
+    go_bin = { glob = "usr/bin/go" } | OutputBin,
+    gofmt_bin = { glob = "usr/bin/gofmt" } | OutputBin,
 
-    goroot = { data = "usr/go/**/*" } | OutputData,
+    goroot = { glob = "usr/go/**/*" } | OutputData,
   },
 } | BuildSpec

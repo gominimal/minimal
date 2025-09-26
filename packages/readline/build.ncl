@@ -21,8 +21,8 @@ let toolchain = import "../toolchain/build.ncl" in
     libreadline = { glob = "usr/lib/libreadline.so*" } | OutputLib,
     libhistory = { glob = "usr/lib/libhistory.so*" } | OutputLib,
 
-    pkgconfig = { data = "usr/lib/pkgconfig/*.pc" } | OutputData,
-    headers = { data = "usr/include/readline/*.h" } | OutputData,
+    pkgconfig = { glob = "usr/lib/pkgconfig/*.pc" } | OutputData,
+    headers = { glob = "usr/include/readline/*.h" } | OutputData,
   },
 
   replace_on_cycle =
@@ -37,7 +37,7 @@ let toolchain = import "../toolchain/build.ncl" in
       cmd = "",
       outputs = {
         usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
-        usr_include = { data = "usr/include/**/*" } | OutputData,
+        usr_include = { glob = "usr/include/**/*" } | OutputData,
       },
     } | BuildSpec,
 } | BuildSpec

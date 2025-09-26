@@ -481,7 +481,7 @@ impl<'a> Run<'a> {
                     .map(|output| match output {
                         BuildOutput::Library { glob } => glob.clone(),
                         BuildOutput::Data { glob } => glob.clone(),
-                        BuildOutput::Binary { path } => path.clone(),
+                        BuildOutput::Binary { glob } => glob.clone(),
                     })
                     .collect(),
             };

@@ -60,13 +60,13 @@ let zlib = import "../zlib/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    etc = { data = "etc/*" } | OutputData,
+    etc = { glob = "etc/*" } | OutputData,
     usr_bin = { glob = "usr/bin/*" } | OutputLib,
     usr_lib = { glob = "usr/lib/*" } | OutputLib,
     usr_lib_ldscripts = { glob = "usr/lib/ldscripts/*" } | OutputLib,
     usr_lib_gprofng = { glob = "usr/lib/gprofng/*" } | OutputLib,
     usr_lib_bfdplugins = { glob = "usr/lib/bfd-plugins/*" } | OutputLib,
-    usr_include = { data = "usr/include/*" } | OutputData,
+    usr_include = { glob = "usr/include/*" } | OutputData,
   },
 
   replace_on_cycle =

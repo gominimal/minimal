@@ -80,7 +80,7 @@ pub enum BuildOutput {
     /// This output describes data files matched with the given glob.
     Data { glob: String },
     /// This output describes binaries matched with the given glob.
-    Binary { path: String },
+    Binary { glob: String },
 }
 
 /// A runtime dependency declared on a build-spec.
@@ -1049,15 +1049,15 @@ impl GraphBuilder {
         rt: &RichTerm,
         program: &mut Program<CacheImpl>,
     ) -> Result<BuildOutput, Error> {
-        let mut data: Option<String> = None;
+        let mut glob: Option<String> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                 r.fields
                     .iter()
                     .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
                         match ident_and_loc.label() {
-                            "data" => {
-                                data = Some(
+                            "glob" => {
+                                glob = Some(
                                     String::deserialize(eval_if_closure(
                                         field.value.as_ref().unwrap(),
                                         program,
@@ -1072,19 +1072,19 @@ impl GraphBuilder {
             }
             _ => {}
         }
-        let data = match data {
-            Some(data) => data,
+        let glob = match glob {
+            Some(glob) => glob,
             None => {
                 return Err(Error::MissingField {
                     files: program.files(),
                     obj: ObjTy::OutputData,
                     pos: rt.pos,
-                    field: "data",
+                    field: "glob",
                 });
             }
         };
 
-        Ok(BuildOutput::Data { glob: data })
+        Ok(BuildOutput::Data { glob })
     }
 
     fn read_output_bin(
@@ -1092,15 +1092,15 @@ impl GraphBuilder {
         rt: &RichTerm,
         program: &mut Program<CacheImpl>,
     ) -> Result<BuildOutput, Error> {
-        let mut path: Option<String> = None;
+        let mut glob: Option<String> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                 r.fields
                     .iter()
                     .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
                         match ident_and_loc.label() {
-                            "path" => {
-                                path = Some(
+                            "glob" => {
+                                glob = Some(
                                     String::deserialize(eval_if_closure(
                                         field.value.as_ref().unwrap(),
                                         program,
@@ -1115,19 +1115,19 @@ impl GraphBuilder {
             }
             _ => {}
         }
-        let path = match path {
-            Some(path) => path,
+        let glob = match glob {
+            Some(glob) => glob,
             None => {
                 return Err(Error::MissingField {
                     files: program.files(),
                     obj: ObjTy::OutputBin,
                     pos: rt.pos,
-                    field: "path",
+                    field: "glob",
                 });
             }
         };
 
-        Ok(BuildOutput::Binary { path })
+        Ok(BuildOutput::Binary { glob })
     }
 
     /// Recursively reads a buildspec output value, inserting it into the graph.
@@ -1281,8 +1281,8 @@ mod tests {
                     inputs = [],
                     cmd = \"\",
                     outputs = {
-                        abc = {data=\"\"} | OutputData,
-                        uwu = {data=\"\"} | OutputData,
+                        abc = {glob=\"\"} | OutputData,
+                        uwu = {glob=\"\"} | OutputData,
                     },
                 } | BuildSpec in
                 {
@@ -1331,8 +1331,8 @@ mod tests {
                     ],
                     outputs = {
                         something = { glob = \"/usr/lib/something.*.so\" } | OutputLib,
-                        uwu_tool = { path = \"/bin/uwu\" } | OutputBin,
-                        some_data = { data = \"/data/locale/*\"  } | OutputData,
+                        uwu_tool = { glob = \"/bin/uwu\" } | OutputBin,
+                        some_data = { glob = \"/data/locale/*\"  } | OutputData,
                     },
                     cmd = \"\",
                 } | BuildSpec"
@@ -1356,7 +1356,7 @@ mod tests {
         assert_eq!(
             dp.builds.iter().next().unwrap().1.outputs["uwu_tool"],
             BuildOutput::Binary {
-                path: "/bin/uwu".to_string()
+                glob: "/bin/uwu".to_string()
             },
         );
         // We expect that buildspec to have one Data output
@@ -1505,7 +1505,7 @@ mod tests {
                     inputs = [],
                     cmd = \"\",
                     outputs = {
-                        some_data = { data = \"usr/*\"} | OutputData,
+                        some_data = { glob = \"usr/*\"} | OutputData,
                     }
                 } in
                 {

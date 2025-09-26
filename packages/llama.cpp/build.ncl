@@ -26,7 +26,7 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    bins = { path = "usr/bin/*" } | OutputBin,
+    bins = { glob = "usr/bin/*" } | OutputBin,
 
     libs = { glob = "usr/lib/*" } | OutputLib,
   },

@@ -14,10 +14,10 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    bin = { path = "usr/bin/*" } | OutputBin,
+    bin = { glob = "usr/bin/*" } | OutputBin,
     lib = { glob = "usr/lib/*" } | OutputLib,
-    usr_include = { data = "usr/include/**/*" } | OutputData,
-    man = { data = "usr/share/man/**/*" } | OutputData,
-    info = { data = "usr/share/info/*" } | OutputData,
+    usr_include = { glob = "usr/include/**/*" } | OutputData,
+    man = { glob = "usr/share/man/**/*" } | OutputData,
+    info = { glob = "usr/share/info/*" } | OutputData,
   },
 } | BuildSpec

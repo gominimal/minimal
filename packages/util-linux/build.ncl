@@ -14,12 +14,12 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    bins = { path = "usr/bin/*" } | OutputBin,
-    sbins = { path = "usr/sbin/*" } | OutputBin,
+    bins = { glob = "usr/bin/*" } | OutputBin,
+    sbins = { glob = "usr/sbin/*" } | OutputBin,
     libs = { glob = "usr/lib/*" } | OutputLib,
-    includes = { data = "usr/include/**/*" } | OutputData,
+    includes = { glob = "usr/include/**/*" } | OutputData,
 
-    completions = { data = "usr/share/bash-completion/**/*" } | OutputData,
-    pkgconfig = { data = "usr/lib/pkgconfig/**/*" } | OutputData,
+    completions = { glob = "usr/share/bash-completion/**/*" } | OutputData,
+    pkgconfig = { glob = "usr/lib/pkgconfig/**/*" } | OutputData,
   },
 } | BuildSpec

@@ -56,10 +56,10 @@ let pcre2 = import "../pcre2/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    grep_bin = { path = "usr/bin/grep" } | OutputBin,
-    egrep_bin = { path = "usr/bin/egrep" } | OutputBin,
-    fgrep_bin = { path = "usr/bin/fgrep" } | OutputBin,
-    locales = { data = "usr/share/locale/**/*" } | OutputData,
+    grep_bin = { glob = "usr/bin/grep" } | OutputBin,
+    egrep_bin = { glob = "usr/bin/egrep" } | OutputBin,
+    fgrep_bin = { glob = "usr/bin/fgrep" } | OutputBin,
+    locales = { glob = "usr/share/locale/**/*" } | OutputData,
   },
   replace_on_cycle =
     {
@@ -72,9 +72,9 @@ let pcre2 = import "../pcre2/build.ncl" in
       ],
       cmd = "",
       outputs = {
-        grep_bin = { path = "usr/bin/grep" } | OutputBin,
-        egrep_bin = { path = "usr/bin/egrep" } | OutputBin,
-        fgrep_bin = { path = "usr/bin/fgrep" } | OutputBin,
+        grep_bin = { glob = "usr/bin/grep" } | OutputBin,
+        egrep_bin = { glob = "usr/bin/egrep" } | OutputBin,
+        fgrep_bin = { glob = "usr/bin/fgrep" } | OutputBin,
       },
     } | BuildSpec,
 } | BuildSpec

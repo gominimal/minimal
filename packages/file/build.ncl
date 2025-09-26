@@ -14,7 +14,7 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    file_bin = { path = "usr/bin/file" } | OutputBin,
+    file_bin = { glob = "usr/bin/file" } | OutputBin,
     libmagic = { glob = "usr/lib/libmagic.so*" } | OutputLib,
     headers = { glob = "usr/include/magic.h" } | OutputLib,
     magic_data = { glob = "usr/share/misc/magic*" } | OutputLib,
@@ -28,7 +28,7 @@ let toolchain = import "../toolchain/build.ncl" in
       ],
       cmd = "",
       outputs = {
-        usr_bin = { path = "usr/bin/**/*" } | OutputBin,
+        usr_bin = { glob = "usr/bin/**/*" } | OutputBin,
         usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
         usr_include = { glob = "usr/include/**/*" } | OutputLib,
         usr_share = { glob = "usr/share/**/*" } | OutputLib,

@@ -25,8 +25,8 @@ let zlib = import "../zlib/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    bin = { path = "usr/bin/nano" } | OutputBin,
-    languages = { data = "usr/share/nano/*" } | OutputData,
-    man = { data = "usr/share/man/**/*" } | OutputData,
+    bin = { glob = "usr/bin/nano" } | OutputBin,
+    languages = { glob = "usr/share/nano/*" } | OutputData,
+    man = { glob = "usr/share/man/**/*" } | OutputData,
   },
 } | BuildSpec

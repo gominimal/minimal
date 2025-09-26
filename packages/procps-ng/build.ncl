@@ -20,11 +20,11 @@ let ncurses = import "../ncurses/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    bins = { path = "usr/bin/*" } | OutputBin,
-    sbins = { path = "usr/sbin/*" } | OutputBin,
+    bins = { glob = "usr/bin/*" } | OutputBin,
+    sbins = { glob = "usr/sbin/*" } | OutputBin,
     libs = { glob = "usr/lib/*" } | OutputLib,
 
-    includes = { data = "usr/include/libproc2/*" } | OutputData,
-    pkgconfig = { data = "usr/lib/pkgconfig/*" } | OutputData,
+    includes = { glob = "usr/include/libproc2/*" } | OutputData,
+    pkgconfig = { glob = "usr/lib/pkgconfig/*" } | OutputData,
   },
 } | BuildSpec

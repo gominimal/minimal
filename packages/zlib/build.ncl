@@ -23,9 +23,9 @@ let toolchain = import "../toolchain/build.ncl" in
   cmd = "./build.sh",
   outputs = {
     libz = { glob = "usr/lib/libz.so*" } | OutputLib,
-    zconf_h = { data = "usr/include/zconf.h" } | OutputData,
-    zlib_h = { data = "usr/include/zlib.h" } | OutputData,
-    pkgconfig = { data = "usr/lib/pkgconfig/zlib.pc" } | OutputData,
+    zconf_h = { glob = "usr/include/zconf.h" } | OutputData,
+    zlib_h = { glob = "usr/include/zlib.h" } | OutputData,
+    pkgconfig = { glob = "usr/lib/pkgconfig/zlib.pc" } | OutputData,
   },
 
   replace_on_cycle =
@@ -37,9 +37,9 @@ let toolchain = import "../toolchain/build.ncl" in
       cmd = "",
       outputs = {
         libz = { glob = "usr/lib/libz.so*" } | OutputLib,
-        zconf_h = { data = "usr/include/zconf.h" } | OutputData,
-        zlib_h = { data = "usr/include/zlib.h" } | OutputData,
-        pkgconfig = { data = "usr/lib/pkgconfig/zlib.pc" } | OutputData,
+        zconf_h = { glob = "usr/include/zconf.h" } | OutputData,
+        zlib_h = { glob = "usr/include/zlib.h" } | OutputData,
+        pkgconfig = { glob = "usr/lib/pkgconfig/zlib.pc" } | OutputData,
       },
     } | BuildSpec,
 } | BuildSpec

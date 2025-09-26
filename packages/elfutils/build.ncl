@@ -30,6 +30,6 @@ let zstd = import "../zstd/build.ncl" in
   cmd = "./build.sh",
   outputs = {
     libs = { glob = "usr/lib/*" } | OutputLib,
-    includes = { data = "usr/include/*" } | OutputData,
+    includes = { glob = "usr/include/*" } | OutputData,
   },
 } | BuildSpec

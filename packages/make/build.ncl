@@ -50,7 +50,7 @@ let linux_headers = import "../linux_headers/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    make_bin = { path = "usr/bin/make" } | OutputBin,
+    make_bin = { glob = "usr/bin/make" } | OutputBin,
     headers = { glob = "usr/include/*.h" } | OutputLib,
     info_pages = { glob = "usr/share/info/*.info*" } | OutputLib,
     man_pages = { glob = "usr/share/man/man1/*.1" } | OutputLib,
@@ -65,7 +65,7 @@ let linux_headers = import "../linux_headers/build.ncl" in
       ],
       cmd = "",
       outputs = {
-        make = { path = "usr/bin/make" } | OutputBin,
+        make = { glob = "usr/bin/make" } | OutputBin,
       },
     } | BuildSpec,
 } | BuildSpec

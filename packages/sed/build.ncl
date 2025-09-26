@@ -42,7 +42,7 @@ let tar = import "../tar/build.ncl" in
 
   cmd = "./build.sh",
   outputs = {
-    usr_bin = { path = "usr/bin/**/*" } | OutputBin,
+    usr_bin = { glob = "usr/bin/**/*" } | OutputBin,
     usr_share = { glob = "usr/share/**/*" } | OutputLib,
   },
 
@@ -59,7 +59,7 @@ let tar = import "../tar/build.ncl" in
       # ],
       cmd = "",
       outputs = {
-        sed_bin = { path = "usr/bin/sed" } | OutputBin,
+        sed_bin = { glob = "usr/bin/sed" } | OutputBin,
       },
     } | BuildSpec,
 } | BuildSpec

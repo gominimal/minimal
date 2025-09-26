@@ -21,9 +21,9 @@ let toolchain = import "../toolchain/build.ncl" in
 
   outputs = {
     libs = { glob = "usr/lib/**/*" } | OutputLib,
-    bins = { path = "usr/bin/*" } | OutputBin,
-    sbins = { path = "usr/sbin/*" } | OutputBin,
+    bins = { glob = "usr/bin/*" } | OutputBin,
+    sbins = { glob = "usr/sbin/*" } | OutputBin,
 
-    includes = { data = "usr/include/**/*" } | OutputData,
+    includes = { glob = "usr/include/**/*" } | OutputData,
   },
 } | BuildSpec

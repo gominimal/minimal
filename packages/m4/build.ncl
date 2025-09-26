@@ -14,7 +14,7 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    usr_bin = { path = "usr/bin/**/*" } | OutputBin,
+    usr_bin = { glob = "usr/bin/**/*" } | OutputBin,
     usr_share = { glob = "usr/share/**/*" } | OutputLib,
   },
 

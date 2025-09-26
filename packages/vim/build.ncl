@@ -22,9 +22,9 @@ let ncurses = import "../ncurses/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    vim = { path = "usr/bin/vim" } | OutputBin,
-    vimdiff = { path = "usr/bin/vimdiff" } | OutputBin,
+    vim = { glob = "usr/bin/vim" } | OutputBin,
+    vimdiff = { glob = "usr/bin/vimdiff" } | OutputBin,
 
-    data = { data = "usr/share/**/*" } | OutputData,
+    data = { glob = "usr/share/**/*" } | OutputData,
   },
 } | BuildSpec
