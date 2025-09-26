@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 "build-sandbox".workspace = true
+spongebob = { path = "../spongebob" }
 graph.workspace = true
 cache.workspace = true
 common.workspace = true

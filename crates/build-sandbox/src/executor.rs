@@ -24,8 +24,12 @@ impl BuildExecutor {
         Ok(executor)
     }
 
-    #[tracing::instrument(skip(config), fields(indicatif.pb_hide))]
-    pub fn execute(&self, config: &BuildConfig) -> Result<i32> {
+    #[tracing::instrument(skip(config, spongebob_client), fields(indicatif.pb_hide))]
+    pub async fn execute(
+        &self,
+        config: &BuildConfig,
+        spongebob_client: &mut spongebob::SpongeBob,
+    ) -> Result<i32> {
         info!(
             "Linking {} inputs to build environment",
             config.inputs.len()
@@ -35,7 +39,7 @@ impl BuildExecutor {
             self.hardlink_to_tmpdir(input)?;
         }
 
-        self.execute_in_container(config)?;
+        self.execute_in_container(config, spongebob_client).await?;
 
         Ok(0)
     }
@@ -83,8 +87,12 @@ impl BuildExecutor {
         Ok(())
     }
 
-    #[tracing::instrument(skip(config), fields(indicatif.pb_show))]
-    fn execute_in_container(&self, config: &BuildConfig) -> Result<()> {
+    #[tracing::instrument(skip(config, spongebob_client), fields(indicatif.pb_show))]
+    async fn execute_in_container(
+        &self,
+        config: &BuildConfig,
+        spongebob_client: &mut spongebob::SpongeBob,
+    ) -> Result<()> {
         let rootfs = self.prepare_rootfs(config)?;
         let program = &config.build_script.executable.to_string_lossy();
         let mut cmd = Container::new()
@@ -150,6 +158,9 @@ impl BuildExecutor {
             }
         })?;
 
+        self.upload_logs(config, &output.stdout, &output.stderr, spongebob_client)
+            .await;
+
         if !output.status.success() {
             let exit_code = output.status.code;
 
@@ -192,6 +203,33 @@ impl BuildExecutor {
         }
 
         Ok(rootfs)
+    }
+
+    async fn upload_logs(
+        &self,
+        config: &BuildConfig,
+        stdout: &[u8],
+        stderr: &[u8],
+        client: &mut spongebob::SpongeBob,
+    ) {
+        let result = client
+            .upload_build_logs(&config.name, stdout.to_vec(), stderr.to_vec())
+            .await;
+
+        match result {
+            Ok(()) => {
+                info!(
+                    "Successfully uploaded build logs to SpongeBob for {}",
+                    config.name
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to upload logs to SpongeBob for {}: {}",
+                    config.name, e
+                );
+            }
+        }
     }
 }
 

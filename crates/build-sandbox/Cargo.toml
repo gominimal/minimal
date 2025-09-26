@@ -11,5 +11,7 @@ hakoniwa.workspace = true
 globset.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tokio.workspace = true
+spongebob = { path = "../spongebob" }
 
 nickel-lang-core.workspace = true

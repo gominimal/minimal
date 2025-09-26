@@ -14,9 +14,13 @@ pub struct BuildResult {
 }
 
 #[tracing::instrument(skip_all, fields(name = config.name, indicatif.pb_show))]
-pub fn run_build(config: &BuildConfig, output_dir: &std::path::Path) -> Result<BuildResult> {
+pub async fn run_build(
+    config: &BuildConfig,
+    output_dir: &std::path::Path,
+    spongebob_client: &mut spongebob::SpongeBob,
+) -> Result<BuildResult> {
     let executor = BuildExecutor::new()?;
-    let exit_code = executor.execute(config)?;
+    let exit_code = executor.execute(config, spongebob_client).await?;
 
     let outputs =
         OutputValidator::validate_and_collect(config, &executor.output_staging_dir(), output_dir)?;

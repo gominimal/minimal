@@ -1,0 +1,15 @@
+[package]
+name = "spongebob"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+tonic.workspace = true
+prost.workspace = true
+tonic-prost.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true

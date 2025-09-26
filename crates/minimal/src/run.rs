@@ -487,7 +487,12 @@ impl<'a> Run<'a> {
             };
 
             let out_dir = self.cache.write_dir(&bsh).unwrap();
-            run_build(&config, out_dir.path())
+
+            // Create a new SpongeBob client for this build to avoid shared mutable state in parallel execution
+            let mut spongebob_client = spongebob::SpongeBob::new().await.unwrap();
+
+            run_build(&config, out_dir.path(), &mut spongebob_client)
+                .await
                 .map_err(|e| anyhow::anyhow!("Failed to build {}: {}", build.name, e))?;
             Ok(Some(out_dir))
         }
