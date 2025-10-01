@@ -1,9 +1,8 @@
-use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::transport::{Channel, ClientTlsConfig};
 use uuid::Uuid;
 
 use crate::api::{
-    CreateFileRequest, CreateInvokationRequest, File, Invokation,
+    CreateFileRequest, CreateInvocationRequest, File, Invocation,
     sponge_bob_service_client::SpongeBobServiceClient,
 };
 
@@ -11,7 +10,7 @@ pub mod api {
     tonic::include_proto!("spongebob.v1");
 }
 
-const ENDPOINT: &str = "https://spongebob-289724348228.us-west1.run.app";
+const ENDPOINT: &str = "https://spongebob.minimal.farm";
 
 #[derive(thiserror::Error, Debug)]
 pub enum SpongeBobError {
@@ -50,28 +49,39 @@ impl SpongeBob {
         Ok(SpongeBob { service })
     }
 
-    pub async fn create_invokation(&mut self, name: &str) -> Result<String> {
-        let invokation_id = Self::generate_invokation_id(name);
-        let request = CreateInvokationRequest {
-            invokation_id: invokation_id.clone(),
-            invokation: Some(Invokation {
+    pub async fn create_invocation(&mut self, name: &str) -> Result<String> {
+        let invocation_id = Self::generate_invocation_id(name);
+        self.create_invocation_with_id(name, &invocation_id).await
+    }
+
+    pub async fn create_invocation_with_url(&mut self, name: &str) -> Result<(String, String)> {
+        let invocation_id = Self::generate_invocation_id(name);
+        let resource_name = self.create_invocation_with_id(name, &invocation_id).await?;
+        let url = self.generate_invocation_url(&invocation_id);
+        Ok((resource_name, url))
+    }
+
+    async fn create_invocation_with_id(&mut self, name: &str, invocation_id: &str) -> Result<String> {
+        let request = CreateInvocationRequest {
+            invocation_id: invocation_id.to_string(),
+            invocation: Some(Invocation {
                 name: name.to_string(),
             }),
         };
 
-        let response = self.service.create_invokation(request).await?;
+        let response = self.service.create_invocation(request).await?;
         Ok(response.into_inner().name)
     }
 
     pub async fn create_file(
         &mut self,
-        parent_invokation_resource: &str,
+        parent_invocation_resource: &str,
         file_name: &str,
         contents: Vec<u8>,
     ) -> Result<()> {
         let file_id = Uuid::new_v4().to_string();
         let request = CreateFileRequest {
-            parent: parent_invokation_resource.to_string(),
+            parent: parent_invocation_resource.to_string(),
             file_id,
             file: Some(File {
                 name: file_name.to_string(),
@@ -88,27 +98,34 @@ impl SpongeBob {
         build_name: &str,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
-    ) -> Result<()> {
-        // Create invokation for this build
-        let invokation_resource = self.create_invokation(build_name).await?;
+    ) -> Result<String> {
+        // Generate invocation ID first
+        let invocation_id = Self::generate_invocation_id(build_name);
+
+        // Create invocation for this build
+        let invocation_resource = self.create_invocation_with_id(build_name, &invocation_id).await?;
 
         // Upload stdout
-        self.create_file(&invokation_resource, "stdout", stdout)
+        self.create_file(&invocation_resource, "stdout", stdout)
             .await?;
 
         // Upload stderr
-        self.create_file(&invokation_resource, "stderr", stderr)
+        self.create_file(&invocation_resource, "stderr", stderr)
             .await?;
 
-        Ok(())
+        // Generate and return the viewable URL
+        let spongebob_url = self.generate_invocation_url(&invocation_id);
+
+        Ok(spongebob_url)
     }
 
-    fn generate_invokation_id(name: &str) -> String {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+    fn generate_invocation_id(_name: &str) -> String {
+        // Just use a UUID for the invocation ID to ensure URL safety
+        Uuid::new_v4().to_string()
+    }
 
-        format!("{}-{}-{}", name, timestamp, Uuid::new_v4())
+    /// Generate the web URL for viewing an invocation
+    fn generate_invocation_url(&self, invocation_id: &str) -> String {
+        format!("{}/invocation/{}", ENDPOINT, invocation_id)
     }
 }

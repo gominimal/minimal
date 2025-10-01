@@ -4,6 +4,7 @@ use anyhow::Context;
 use cache::{Cache, CacheBinProvider, LocalDir, RemoteBinProvider};
 use graph::{DepGraph, ExecPlan, Transitives};
 use std::path::Path;
+use tracing::info;
 
 #[derive(Debug, clap::Args)]
 pub struct BuildArgs {
@@ -26,16 +27,34 @@ pub async fn cmd_build_impl(
     cache: Cache<LocalDir>,
     num_parallel_builds: usize,
 ) -> anyhow::Result<()> {
+    // Create SpongeBob invocation for this build command
+    let mut spongebob_client = spongebob::SpongeBob::new()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob client: {}", e))?;
+
+    let command_info = format!("build --packages {}",
+        graph.top_levels.iter()
+            .map(|bsr| graph.get(bsr).unwrap().name.as_str())
+            .collect::<Vec<_>>()
+            .join(","));
+
+    let (spongebob_resource, spongebob_url) = create_build_command_invocation(&mut spongebob_client, &command_info).await?;
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_parallel_builds)
         .build_global()
         .unwrap();
 
+    let output_base = globals.path_config().sandbox_base_dir().to_path_buf();
+    std::fs::create_dir_all(&output_base).ok();
+
     let mut run = Run::new(
         graph,
         cache.clone(),
-        RemoteStorage::new().await.unwrap(),
+        RemoteStorage::new(globals.path_config().download_cache_dir().to_path_buf())
+            .await
+            .unwrap(),
         PrebuiltsLock::load(Path::new("prebuilts.lock")).unwrap(),
+        output_base,
     );
 
     match (globals.no_cache, globals.no_fetch) {
@@ -116,5 +135,87 @@ pub async fn cmd_build_impl(
         }
     }
 
+    // Log build results to SpongeBob
+    log_build_results_to_spongebob(&mut spongebob_client, &spongebob_resource, graph, true).await?;
+
+    // Display build summary
+    display_build_summary(graph, &cache, globals, &run, &spongebob_url);
+
     Ok(())
+}
+
+/// Create a SpongeBob invocation for the entire build command
+async fn create_build_command_invocation(
+    spongebob_client: &mut spongebob::SpongeBob,
+    command_info: &str,
+) -> anyhow::Result<(String, String)> {
+    let (resource_name, url) = spongebob_client
+        .create_invocation_with_url(command_info)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob invocation: {}", e))?;
+
+    Ok((resource_name, url))
+}
+
+/// Log build command results to SpongeBob
+async fn log_build_results_to_spongebob(
+    spongebob_client: &mut spongebob::SpongeBob,
+    spongebob_resource: &str,
+    graph: &DepGraph,
+    success: bool,
+) -> anyhow::Result<()> {
+    let packages_list = graph.top_levels.iter()
+        .map(|bsr| graph.get(bsr).unwrap().name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let _build_summary = if success {
+        format!("Build completed successfully for packages: {}", packages_list)
+    } else {
+        format!("Build failed for packages: {}", packages_list)
+    };
+
+    let build_log = format!(
+        "Build Command Summary\n\
+         Packages: {}\n\
+         Status: {}\n\
+         Total packages: {}\n",
+        packages_list,
+        if success { "SUCCESS" } else { "FAILED" },
+        graph.top_levels.len()
+    );
+
+    // Upload build summary as stdout
+    spongebob_client
+        .create_file(spongebob_resource, "build-summary.txt", build_log.into_bytes())
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to upload build summary to SpongeBob: {}", e))?;
+
+    Ok(())
+}
+
+/// Display a summary of what was built and where outputs can be found
+fn display_build_summary(graph: &DepGraph, cache: &Cache<LocalDir>, globals: &GlobalArgs, _run: &Run, command_spongebob_url: &str) {
+    let path_config = globals.path_config();
+
+    info!("Build completed successfully!");
+
+    // Show target packages and their cache locations
+    if !graph.top_levels.is_empty() {
+        info!("Target packages:");
+        for bsr in &graph.top_levels {
+            let build = graph.get(bsr).unwrap();
+            let spec_hash = graph.spec_hash(bsr);
+            let hash_hex = spec_hash.0.to_hex();
+            let cache_path = path_config.format_cache_path(&hash_hex);
+
+            // Check if the package exists in cache
+            if cache.read_dir(&spec_hash).is_ok() {
+                info!("  {} -> {}", build.name, cache_path);
+            } else {
+                info!("  {} -> (not in cache)", build.name);
+            }
+        }
+    }
+    info!("{}", command_spongebob_url);
 }

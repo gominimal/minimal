@@ -11,19 +11,27 @@ pub use output::OutputValidator;
 pub struct BuildResult {
     pub exit_code: i32,
     pub outputs: Vec<std::path::PathBuf>,
+    pub spongebob_url: Option<String>,
 }
 
+/// Run a build in a sandboxed environment
+///
+/// # Parameters
+/// * `config` - Build configuration including inputs, outputs, and build script
+/// * `cache_dest_dir` - Final destination in cache where successful build outputs are stored
+/// * `sandbox_base_dir` - Base directory for creating temporary build sandboxes
 #[tracing::instrument(skip_all, fields(name = config.name, indicatif.pb_show))]
 pub async fn run_build(
     config: &BuildConfig,
-    output_dir: &std::path::Path,
+    cache_dest_dir: &std::path::Path,
     spongebob_client: &mut spongebob::SpongeBob,
+    sandbox_base_dir: std::path::PathBuf,
 ) -> Result<BuildResult> {
-    let executor = BuildExecutor::new()?;
-    let exit_code = executor.execute(config, spongebob_client).await?;
+    let executor = BuildExecutor::new(sandbox_base_dir, config.name.clone())?;
+    let (exit_code, spongebob_url) = executor.execute(config, spongebob_client).await?;
 
     let outputs =
-        OutputValidator::validate_and_collect(config, &executor.output_staging_dir(), output_dir)?;
+        OutputValidator::validate_and_collect(config, &executor.output_staging_dir(), cache_dest_dir)?;
 
-    Ok(BuildResult { exit_code, outputs })
+    Ok(BuildResult { exit_code, outputs, spongebob_url })
 }

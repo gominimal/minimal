@@ -1,0 +1,145 @@
+use std::path::{Path, PathBuf};
+
+/// Centralized configuration for all paths used by the minimal package manager.
+/// This provides a single source of truth for directory organization.
+#[derive(Debug, Clone)]
+pub struct PathConfig {
+    /// Root directory for all minimal-related data
+    /// Default: ~/.cache/minimal/
+    root_dir: PathBuf,
+
+    /// Directory for content-addressed build cache
+    /// Default: ~/.cache/minimal/builds/
+    cache_dir: PathBuf,
+
+    /// Directory for downloaded sources and prebuilts
+    /// Default: ~/.cache/minimal/downloads/
+    download_cache_dir: PathBuf,
+
+    /// Base directory for build sandboxes
+    /// Default: ~/.cache/minimal/sandboxes/
+    sandbox_base_dir: PathBuf,
+
+    /// Directory containing package definitions
+    /// Default: ./packages/
+    packages_dir: PathBuf,
+}
+
+impl PathConfig {
+    /// Create a new PathConfig with default values
+    pub fn new() -> Self {
+        let root_dir = Self::default_root_dir();
+
+        Self {
+            cache_dir: root_dir.join("builds"),
+            download_cache_dir: root_dir.join("downloads"),
+            sandbox_base_dir: root_dir.join("sandboxes"),
+            root_dir,
+            packages_dir: PathBuf::from("packages"),
+        }
+    }
+
+    /// Create a PathConfig with custom cache directory
+    pub fn with_cache_dir(mut self, cache_dir: PathBuf) -> Self {
+        self.cache_dir = cache_dir;
+        self
+    }
+
+    /// Create a PathConfig with custom download cache directory
+    pub fn with_download_cache_dir(mut self, download_cache_dir: PathBuf) -> Self {
+        self.download_cache_dir = download_cache_dir;
+        self
+    }
+
+    /// Create a PathConfig with custom sandbox base directory
+    pub fn with_sandbox_base_dir(mut self, sandbox_base_dir: PathBuf) -> Self {
+        self.sandbox_base_dir = sandbox_base_dir;
+        self
+    }
+
+    /// Create a PathConfig with custom packages directory
+    pub fn with_packages_dir(mut self, packages_dir: PathBuf) -> Self {
+        self.packages_dir = packages_dir;
+        self
+    }
+
+    /// Get the default root directory following XDG Base Directory specification
+    fn default_root_dir() -> PathBuf {
+        dirs::cache_dir()
+            .unwrap_or_else(|| PathBuf::from("~/.cache"))
+            .join("minimal")
+    }
+
+    /// Get the root directory
+    pub fn root_dir(&self) -> &Path {
+        &self.root_dir
+    }
+
+    /// Get the cache directory for builds
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+
+    /// Get the download cache directory
+    pub fn download_cache_dir(&self) -> &Path {
+        &self.download_cache_dir
+    }
+
+    /// Get the sandbox base directory
+    pub fn sandbox_base_dir(&self) -> &Path {
+        &self.sandbox_base_dir
+    }
+
+    /// Get the packages directory
+    pub fn packages_dir(&self) -> &Path {
+        &self.packages_dir
+    }
+
+    /// Create all necessary directories
+    pub fn ensure_directories(&self) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.cache_dir)?;
+        std::fs::create_dir_all(&self.download_cache_dir)?;
+        std::fs::create_dir_all(&self.sandbox_base_dir)?;
+        // Note: packages_dir is expected to exist already
+        Ok(())
+    }
+
+    /// Display all configured paths for debugging
+    pub fn display_paths(&self) {
+        println!("Minimal Path Configuration:");
+        println!("  Root directory:          {}", self.root_dir.display());
+        println!("  Build cache:             {}", self.cache_dir.display());
+        println!(
+            "  Download cache:          {}",
+            self.download_cache_dir.display()
+        );
+        println!(
+            "  Sandbox base:            {}",
+            self.sandbox_base_dir.display()
+        );
+        println!("  Packages directory:      {}", self.packages_dir.display());
+    }
+
+    /// Get the cache path for a specific spec hash
+    /// Cache entries are stored as: <cache_dir>/<first_byte_hex>/<remaining_bytes_hex>/
+    pub fn cache_path_for_hash(&self, hash_hex: &str) -> PathBuf {
+        if hash_hex.len() < 2 {
+            return self.cache_dir.join(hash_hex);
+        }
+        self.cache_dir
+            .join(&hash_hex[0..2])
+            .join(&hash_hex[2..])
+    }
+
+    /// Format a cache path nicely for display
+    pub fn format_cache_path(&self, hash_hex: &str) -> String {
+        let full_path = self.cache_path_for_hash(hash_hex);
+        format!("{}", full_path.display())
+    }
+}
+
+impl Default for PathConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}

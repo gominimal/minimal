@@ -5,7 +5,7 @@ use cache::{Cache, LocalDir, RemoteCache, RemoteError};
 use clap::{Args, Parser, Subcommand};
 use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
 use graph::{DepGraph, Error as GraphError, SpecReader, SpecReaderOptions};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::error;
 use tracing_indicatif::IndicatifLayer;
 use tracing_indicatif::TickSettings;
@@ -14,8 +14,11 @@ use tracing_indicatif::filter::hide_indicatif_span_fields;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 mod lockfile;
+mod paths;
 mod remote_storage;
 mod run;
+
+use paths::PathConfig;
 
 mod cmd_build;
 use cmd_build::{BuildArgs, cmd_build};
@@ -79,28 +82,55 @@ pub struct GlobalArgs {
     /// Configure the number of parallel builds
     #[arg(short, long, default_value_t = 4)]
     num_parallel_builds: usize,
+
+    /// Override the output base directory for build workspaces (default: ~/.cache/minimal/sandboxes)
+    #[arg(long)]
+    output_base: Option<PathBuf>,
+
+    /// Override the download cache directory (default: ~/.cache/minimal/downloads)
+    #[arg(long)]
+    download_cache_dir: Option<PathBuf>,
 }
 
 impl GlobalArgs {
+    /// Create the PathConfig based on command line arguments
+    pub fn path_config(&self) -> PathConfig {
+        let mut config = PathConfig::new();
+
+        if let Some(cache_dir) = &self.cache_dir {
+            config = config.with_cache_dir(cache_dir.clone());
+        }
+
+        if let Some(download_cache_dir) = &self.download_cache_dir {
+            config = config.with_download_cache_dir(download_cache_dir.clone());
+        }
+
+        if let Some(output_base) = &self.output_base {
+            config = config.with_sandbox_base_dir(output_base.clone());
+        }
+
+        if let Some(packages_dir) = &self.packages_dir {
+            config = config.with_packages_dir(packages_dir.clone());
+        }
+
+        config
+    }
+
     /// Builds and returns an instance of the local cache.
     pub fn cache(&self) -> Result<Cache<LocalDir>, std::io::Error> {
-        let dir = match &self.cache_dir {
-            None => {
-                let dir = dirs::cache_dir().unwrap().join("minimal-builds");
-                match std::fs::create_dir_all(&dir) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        if e.kind() != std::io::ErrorKind::AlreadyExists {
-                            panic!("failed to create build cache dir: {}", e);
-                        }
-                    }
-                };
-                dir
+        let path_config = self.path_config();
+        let cache_dir = path_config.cache_dir().to_path_buf();
+
+        match std::fs::create_dir_all(&cache_dir) {
+            Ok(_) => {}
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
+                    panic!("failed to create build cache dir: {}", e);
+                }
             }
-            Some(cache_dir) => cache_dir.to_path_buf(),
         };
 
-        Cache::at_dir(dir)
+        Cache::at_dir(cache_dir)
     }
 
     /// Builds and returns a remote cache with default configurations.
@@ -113,10 +143,7 @@ impl GlobalArgs {
     }
 
     pub fn packages_dir(&self) -> PathBuf {
-        match &self.packages_dir {
-            Some(dir) => dir.to_path_buf(),
-            None => Path::new("packages").to_path_buf(),
-        }
+        self.path_config().packages_dir().to_path_buf()
     }
 
     /// Returns a [DepGraph] with the given package and its transitive dependencies loaded.

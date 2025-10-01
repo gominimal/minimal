@@ -15,23 +15,19 @@ pub struct RemoteStorage {
 
 impl RemoteStorage {
     #[tracing::instrument]
-    pub async fn new() -> Result<Self> {
+    pub async fn new(cache_dir: PathBuf) -> Result<Self> {
         // TODO: This is temporary, remove this after october
         if fs::exists(dirs::cache_dir().unwrap().join("minimal-fetches"))? {
             fs::remove_dir_all(dirs::cache_dir().unwrap().join("minimal-fetches"))?;
         }
 
-        let cache_dir = {
-            let dir = dirs::cache_dir().unwrap().join("minimal-dl");
-            match fs::create_dir_all(&dir) {
-                Ok(_) => {}
-                Err(e) => {
-                    if e.kind() != std::io::ErrorKind::AlreadyExists {
-                        panic!("failed to create build fetch-cache dir: {}", e);
-                    }
+        match fs::create_dir_all(&cache_dir) {
+            Ok(_) => {}
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
+                    panic!("failed to create build fetch-cache dir: {}", e);
                 }
-            };
-            dir
+            }
         };
 
         let client = Storage::builder().build().await?;

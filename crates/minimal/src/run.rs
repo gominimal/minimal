@@ -9,7 +9,7 @@ use graph::{BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, Sour
 use std::collections::HashSet;
 use std::path::PathBuf;
 use tempfile::Builder;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use url::Url;
 
 use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage};
@@ -330,6 +330,8 @@ pub struct Run<'a> {
     cache: Cache<LocalDir>,
     remote_storage: RemoteStorage,
     lockfile: PrebuiltsLock,
+    output_base: PathBuf,
+    latest_spongebob_url: Option<String>,
 }
 
 impl<'a> Run<'a> {
@@ -338,12 +340,15 @@ impl<'a> Run<'a> {
         cache: Cache<LocalDir>,
         remote_storage: RemoteStorage,
         lockfile: PrebuiltsLock,
+        output_base: PathBuf,
     ) -> Self {
         Self {
             graph,
             cache,
             remote_storage,
             lockfile,
+            output_base,
+            latest_spongebob_url: None,
         }
     }
 
@@ -419,28 +424,34 @@ impl<'a> Run<'a> {
         build: &BuildSpecRef,
         _full_build: bool,
         remote_cache: Option<&RemoteCache<GcsStorage>>,
-    ) -> Result<Option<PendingDir>> {
+    ) -> Result<(Option<PendingDir>, Option<String>)> {
         let bsh = self.graph.spec_hash(build);
         let build = self.graph.get(build).unwrap();
 
-        if self.cache.read_dir(&bsh).is_ok() {
-            warn!(
-                "Not skipping already-cached build {} [{}], new behavior",
+        // Check if already in cache
+        if let Ok(_cache_entry) = self.cache.read_dir(&bsh) {
+            let path_config = crate::paths::PathConfig::new(); // TODO: pass this in properly
+            let cache_path = path_config.format_cache_path(&bsh.0.to_hex());
+            info!(
+                "Package {} already built and cached at: {}",
                 build.name,
-                bsh.0.to_hex()
+                cache_path
             );
+            // Return None to indicate this was a cache hit, not a new build
+            return Ok((None, None));
         }
         if is_pure_prebuilt(build) {
-            return Ok(Some(
-                materialize_prebuilt(
-                    build,
-                    &bsh,
-                    &self.cache,
-                    &self.lockfile,
-                    &self.remote_storage,
-                )
-                .await?,
-            ));
+            info!("Materializing prebuilt package: {}", build.name);
+            let result = materialize_prebuilt(
+                build,
+                &bsh,
+                &self.cache,
+                &self.lockfile,
+                &self.remote_storage,
+            )
+            .await?;
+            info!("Successfully materialized prebuilt package: {}", build.name);
+            return Ok((Some(result), None));
         }
 
         let (dependencies, inputs) = self
@@ -453,7 +464,7 @@ impl<'a> Run<'a> {
                 build.name
             );
             let cache_handle = self.cache.write_dir(&bsh).unwrap();
-            Ok(Some(cache_handle))
+            Ok((Some(cache_handle), None))
         } else {
             // Regular build with build script
             let cmd_parts: Vec<String> =
@@ -491,10 +502,16 @@ impl<'a> Run<'a> {
             // Create a new SpongeBob client for this build to avoid shared mutable state in parallel execution
             let mut spongebob_client = spongebob::SpongeBob::new().await.unwrap();
 
-            run_build(&config, out_dir.path(), &mut spongebob_client)
+            info!("Building package: {}", build.name);
+            let build_result = run_build(&config, out_dir.path(), &mut spongebob_client, self.output_base.clone())
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to build {}: {}", build.name, e))?;
-            Ok(Some(out_dir))
+
+            // Extract SpongeBob URL from BuildResult
+            let spongebob_url = build_result.spongebob_url;
+
+            info!("Successfully built package: {}", build.name);
+            Ok((Some(out_dir), spongebob_url))
         }
     }
 
@@ -515,6 +532,7 @@ impl<'a> Run<'a> {
             let cache_handles = Arc::new(Mutex::new(Vec::with_capacity(
                 phase.as_ref().unwrap().builds.len(),
             )));
+            let spongebob_urls = Arc::new(Mutex::new(Vec::<String>::new()));
 
             rayon::scope(|s| {
                 for (bsr, full_build) in phase.unwrap().builds.iter() {
@@ -524,23 +542,31 @@ impl<'a> Run<'a> {
                     let self2 = self2.clone();
                     let err_bsr = build_which_errored.clone();
                     let cache_handles = cache_handles.clone();
+                    let spongebob_urls = spongebob_urls.clone();
 
                     s.spawn(move |_| {
                         let _rt = tokio_runtime.enter();
 
-                        let cache_handle = futures::executor::block_on(self2.do_build(
+                        let result = futures::executor::block_on(self2.do_build(
                             &bsr,
                             full_build,
                             remote_cache,
                         ));
 
-                        match cache_handle {
+                        match result {
                             Err(e) => {
                                 *err_bsr.lock().unwrap() = Some((bsr, e));
                             }
-                            Ok(None) => {}
-                            Ok(Some(cache_handle)) => {
+                            Ok((None, spongebob_url)) => {
+                                if let Some(url) = spongebob_url {
+                                    spongebob_urls.lock().unwrap().push(url);
+                                }
+                            }
+                            Ok((Some(cache_handle), spongebob_url)) => {
                                 cache_handles.lock().unwrap().push(cache_handle);
+                                if let Some(url) = spongebob_url {
+                                    spongebob_urls.lock().unwrap().push(url);
+                                }
                             }
                         }
                     });
@@ -560,10 +586,22 @@ impl<'a> Run<'a> {
                 .into_iter()
                 .for_each(|ch| ch.finalize().unwrap());
 
+            // Store the latest SpongeBob URL (if any) for display at the end
+            let urls = Arc::into_inner(spongebob_urls).unwrap().into_inner().unwrap();
+            if let Some(latest_url) = urls.last() {
+                self.latest_spongebob_url = Some(latest_url.clone());
+            }
+
             err.map(|(_bsr, e)| Err(e)).unwrap_or(Ok(()))?;
         }
 
         Ok(())
+    }
+
+    /// Get the latest SpongeBob URL from the most recent build session
+    #[allow(dead_code)]
+    pub fn latest_spongebob_url(&self) -> Option<&String> {
+        self.latest_spongebob_url.as_ref()
     }
 }
 

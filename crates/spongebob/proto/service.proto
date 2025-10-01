@@ -3,17 +3,17 @@ syntax = "proto3";
 package spongebob.v1;
 
 service SpongeBobService {
-  rpc CreateInvokation(CreateInvokationRequest) returns (Invokation) {}
+  rpc CreateInvocation(CreateInvocationRequest) returns (Invocation) {}
   rpc CreateFile(CreateFileRequest) returns (File) {}
 }
 
-message Invokation {
+message Invocation {
   string name = 1;
 }
 
-message CreateInvokationRequest {
-  string invokation_id = 1;
-  Invokation invokation = 2;
+message CreateInvocationRequest {
+  string invocation_id = 1;
+  Invocation invocation = 2;
 }
 
 message File {

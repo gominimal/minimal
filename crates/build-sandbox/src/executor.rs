@@ -2,7 +2,7 @@ use hakoniwa::Container;
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use tempfile::tempdir;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 
 use crate::config::BuildConfig;
@@ -10,26 +10,55 @@ use crate::error::{ExecutionError, Result};
 
 #[derive(Debug)]
 pub struct BuildExecutor {
-    path: PathBuf,
+    build_workspace_dir: PathBuf,
 }
 
 impl BuildExecutor {
+    /// Create a new build executor with a unique sandbox workspace
+    ///
+    /// # Parameters
+    /// * `sandbox_base_dir` - Base directory where temporary build sandboxes are created
+    /// * `package_name` - Name of the package being built (used in directory naming for debugging)
     #[tracing::instrument]
-    pub fn new() -> Result<Self> {
+    pub fn new(sandbox_base_dir: PathBuf, package_name: String) -> Result<Self> {
+        // Create a unique directory name using timestamp and process ID
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| ExecutionError::FileOperation {
+                operation: "get timestamp".to_string(),
+                path: String::new(),
+                source: std::io::Error::other(e),
+            })?
+            .as_secs();
+        let pid = std::process::id();
+
+        // Include package name if provided for better debugging
+        let dir_name = format!("{}-{}-{}", package_name, timestamp, pid);
+
+        let build_workspace_dir = sandbox_base_dir.join(dir_name);
+
+        // Create the build directory
+        fs::create_dir_all(&build_workspace_dir).map_err(|e| ExecutionError::FileOperation {
+            operation: "create build directory".to_string(),
+            path: build_workspace_dir.display().to_string(),
+            source: e,
+        })?;
+
         let executor = BuildExecutor {
-            path: tempdir()?.path().to_path_buf(),
+            build_workspace_dir,
         };
+
         fs::create_dir_all(executor.output_staging_dir())
             .map_err(|_| ExecutionError::TempDirCreation)?;
         Ok(executor)
     }
 
-    #[tracing::instrument(skip(config, spongebob_client), fields(indicatif.pb_hide))]
+    #[tracing::instrument(skip(config, spongebob_client), fields(indicatif.pb_hide, package = %config.name))]
     pub async fn execute(
         &self,
         config: &BuildConfig,
         spongebob_client: &mut spongebob::SpongeBob,
-    ) -> Result<i32> {
+    ) -> Result<(i32, Option<String>)> {
         info!(
             "Linking {} inputs to build environment",
             config.inputs.len()
@@ -39,22 +68,22 @@ impl BuildExecutor {
             self.hardlink_to_tmpdir(input)?;
         }
 
-        self.execute_in_container(config, spongebob_client).await?;
+        let spongebob_url = self.execute_in_container(config, spongebob_client).await?;
 
-        Ok(0)
+        Ok((0, spongebob_url))
     }
 
-    pub fn temp_output_dir(&self) -> &Path {
-        &self.path
+    pub fn build_workspace_dir(&self) -> &Path {
+        &self.build_workspace_dir
     }
 
     pub fn output_staging_dir(&self) -> PathBuf {
-        self.path.join("output").to_path_buf()
+        self.build_workspace_dir.join("output").to_path_buf()
     }
 
     fn hardlink_to_tmpdir(&self, input: &Path) -> Result<()> {
         let dest_path = if let Some(file_name) = input.file_name() {
-            self.path.join(file_name)
+            self.build_workspace_dir.join(file_name)
         } else {
             return Ok(());
         };
@@ -92,8 +121,9 @@ impl BuildExecutor {
         &self,
         config: &BuildConfig,
         spongebob_client: &mut spongebob::SpongeBob,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let rootfs = self.prepare_rootfs(config)?;
+        let sandbox_mount_point = "/build";
         let program = &config.build_script.executable.to_string_lossy();
         let mut cmd = Container::new()
             .rootfs(&rootfs)
@@ -101,8 +131,14 @@ impl BuildExecutor {
                 message: format!("Failed to set rootfs: {}", e),
             })?
             .devfsmount("/dev")
-            .bindmount_rw(self.path.to_str().unwrap(), "/tmp")
-            .bindmount_rw(self.output_staging_dir().to_str().unwrap(), "/tmp/output")
+            .bindmount_rw(
+                self.build_workspace_dir.to_str().unwrap(),
+                sandbox_mount_point,
+            )
+            .bindmount_rw(
+                self.output_staging_dir().to_str().unwrap(),
+                format!("{}/output", sandbox_mount_point).as_str(),
+            )
             .symlink("/usr/bin", "/bin")
             .symlink("/usr/lib", "/lib64")
             .command(program);
@@ -111,10 +147,10 @@ impl BuildExecutor {
             cmd.arg(arg);
         }
 
-        cmd.env("HOME", "/tmp")
-            .env("PWD", "/tmp")
-            .env("TMPDIR", "/tmp")
-            .env("OUTPUT_DIR", "/tmp/output")
+        cmd.env("HOME", sandbox_mount_point)
+            .env("PWD", sandbox_mount_point)
+            .env("TMPDIR", sandbox_mount_point)
+            .env("OUTPUT_DIR", &format!("{}/output", sandbox_mount_point))
             .env("LANG", "en_US.utf8")
             .env("LC_ALL", "en_US.utf8")
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
@@ -141,31 +177,31 @@ impl BuildExecutor {
             config.build_script.args.join(" ")
         );
 
-        cmd.current_dir("/tmp");
+        cmd.current_dir(sandbox_mount_point);
 
         let output = cmd.output().map_err(|e| ExecutionError::SandboxFailed {
             message: format!("Container execution failed: {}", e),
         })?;
 
-        fs::write(self.path.join("stdout"), &output.stdout).map_err(|e| {
+        fs::write(self.build_workspace_dir.join("stdout"), &output.stdout).map_err(|e| {
             ExecutionError::SandboxFailed {
                 message: format!("Failed to write stdout: {}", e),
             }
         })?;
-        fs::write(self.path.join("stderr"), &output.stderr).map_err(|e| {
+        fs::write(self.build_workspace_dir.join("stderr"), &output.stderr).map_err(|e| {
             ExecutionError::SandboxFailed {
                 message: format!("Failed to write stderr: {}", e),
             }
         })?;
 
-        self.upload_logs(config, &output.stdout, &output.stderr, spongebob_client)
+        let spongebob_url = self.upload_logs(config, &output.stdout, &output.stderr, spongebob_client)
             .await;
 
         if !output.status.success() {
             let exit_code = output.status.code;
 
             // Read the last few lines of stderr for immediate context
-            let stderr_snippet = fs::read_to_string(self.path.join("stderr"))
+            let stderr_snippet = fs::read_to_string(self.build_workspace_dir.join("stderr"))
                 .unwrap_or_default()
                 .lines()
                 .rev()
@@ -178,24 +214,24 @@ impl BuildExecutor {
 
             error!(
                 exit_code = exit_code,
-                temp_dir = self.path.to_str().unwrap(),
+                temp_dir = self.build_workspace_dir.to_str().unwrap(),
                 stderr_snippet = %stderr_snippet,
                 "Build command failed"
             );
 
             return Err(ExecutionError::BuildFailed {
                 code: exit_code,
-                temp_dir: self.path.clone(),
+                temp_dir: self.build_workspace_dir.clone(),
             }
             .into());
         }
 
-        Ok(())
+        Ok(spongebob_url)
     }
 
     #[tracing::instrument(skip(config), fields(indicatif.pb_show))]
     fn prepare_rootfs(&self, config: &BuildConfig) -> Result<PathBuf> {
-        let rootfs = self.path.join("rootfs");
+        let rootfs = self.build_workspace_dir.join("rootfs");
         fs::create_dir_all(&rootfs)?;
 
         for cache_path in &config.dependencies {
@@ -211,23 +247,25 @@ impl BuildExecutor {
         stdout: &[u8],
         stderr: &[u8],
         client: &mut spongebob::SpongeBob,
-    ) {
+    ) -> Option<String> {
         let result = client
             .upload_build_logs(&config.name, stdout.to_vec(), stderr.to_vec())
             .await;
 
         match result {
-            Ok(()) => {
+            Ok(spongebob_url) => {
                 info!(
                     "Successfully uploaded build logs to SpongeBob for {}",
                     config.name
                 );
+                Some(spongebob_url)
             }
             Err(e) => {
                 warn!(
                     "Failed to upload logs to SpongeBob for {}: {}",
                     config.name, e
                 );
+                None
             }
         }
     }

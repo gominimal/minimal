@@ -6,7 +6,6 @@ publish.workspace = true
 
 [dependencies]
 serde.workspace = true
-tempfile.workspace = true
 hakoniwa.workspace = true
 globset.workspace = true
 thiserror.workspace = true

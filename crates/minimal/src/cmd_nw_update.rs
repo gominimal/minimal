@@ -20,7 +20,10 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs, globals: &GlobalArgs) -> R
     crate::cmd_build::cmd_build_impl(&graph, globals, cache.clone(), globals.num_parallel_builds)
         .await?;
 
-    let remote_storage = RemoteStorage::new().await.unwrap();
+    let remote_storage =
+        RemoteStorage::new(globals.path_config().download_cache_dir().to_path_buf())
+            .await
+            .unwrap();
 
     let mut lockfile = PrebuiltsLock::load(Path::new("prebuilts.lock")).unwrap();
 
