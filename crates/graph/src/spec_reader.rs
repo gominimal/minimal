@@ -2,7 +2,7 @@
 
 #![allow(clippy::result_large_err)]
 
-use nickel_lang_core::cache::CacheError;
+use nickel_lang_core::cache::TermCacheError;
 use nickel_lang_core::error::Error as NclError;
 use nickel_lang_core::files::Files;
 use nickel_lang_core::identifier::LocIdent;
@@ -260,7 +260,7 @@ impl SpecReader {
 
         let mut id: u64 = self.last_id;
         let buildspec_id_ident = LocIdent::new("__magic_buildspec_id");
-        let mut traversal = |rt: RichTerm| -> Result<RichTerm, CacheError<()>> {
+        let mut traversal = |rt: RichTerm| -> Result<RichTerm, TermCacheError<()>> {
             // Explicit declaration: { ... } | BuildSpec
             if let Term::Annotated(annotation, inner) = rt.as_ref() {
                 let is_buildspec = annotation.contracts.iter().any(|lt| {

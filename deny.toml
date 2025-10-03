@@ -79,4 +79,4 @@ skip-tree = [
 ]
 
 [sources.allow-org]
-github = ["souk4711", "tweag"]
+github = ["souk4711"]

@@ -35,7 +35,7 @@ google-cloud-storage = "1.0.0"
 hakoniwa = { git = "https://github.com/souk4711/hakoniwa", branch = "main" }
 hex = "0.4"
 indoc = "^2.0"
-nickel-lang-core = { git = "https://github.com/tweag/nickel", branch = "master", default-features = false, features = [
+nickel-lang-core = { version = "0.15.0", default-features = false, features = [
     "format",
 ] }
 oci-client = { version = "0.15.0", features = [
@@ -70,7 +70,7 @@ tracing = "0.1"
 tracing-indicatif = "0.3.13"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2.5" # keep in sync with reqwest
-uuid = { version = "1.0", features = ["v4"] }
+uuid = { version = "1.18", features = ["v4"] }
 zstd = "0.13"
 
 globset = "0.4"
