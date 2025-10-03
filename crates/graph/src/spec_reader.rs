@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 pub enum SpecError {
     IO(io::Error),
     Nickel(Files, NclError),
-    AnnotationFailed,
+    AnnotationFailed(String),
 }
 
 impl SpecError {
@@ -29,7 +29,7 @@ impl SpecError {
 
         match self {
             IO(e) => eprintln!("IO Error: {}", e),
-            AnnotationFailed => eprintln!("Annotation failed"),
+            AnnotationFailed(msg) => eprintln!("Annotation failed: {}", msg),
             Nickel(files, e) => {
                 let mut files = files.clone();
                 report(
@@ -134,6 +134,9 @@ impl SpecReader {
         program
             .typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk)
             .map_err(|e| SpecError::Nickel(program.files(), e))?;
+        program
+            .compile()
+            .map_err(|e| SpecError::Nickel(program.files(), e))?;
 
         let mut out = Self {
             p: program,
@@ -182,6 +185,9 @@ impl SpecReader {
         program
             .typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk)
             .map_err(|e| SpecError::Nickel(program.files(), e))?;
+        program
+            .compile()
+            .map_err(|e| SpecError::Nickel(program.files(), e))?;
 
         let mut out = Self {
             p: program,
@@ -220,6 +226,9 @@ impl SpecReader {
         program
             .typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk)
             .map_err(|e| SpecError::Nickel(program.files(), e))?;
+        program
+            .compile()
+            .map_err(|e| SpecError::Nickel(program.files(), e))?;
 
         let mut out = Self {
             p: program,
@@ -240,6 +249,9 @@ impl SpecReader {
 
         program
             .typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk)
+            .map_err(|e| SpecError::Nickel(program.files(), e))?;
+        program
+            .compile()
             .map_err(|e| SpecError::Nickel(program.files(), e))?;
 
         let mut out = Self {
@@ -321,7 +333,7 @@ impl SpecReader {
             .custom_transform(0, |_cache, rt| {
                 rt.traverse(&mut traversal, TraverseOrder::TopDown)
             })
-            .map_err(|_e| SpecError::AnnotationFailed);
+            .map_err(|e| SpecError::AnnotationFailed(format!("{:?}", e)));
         self.last_id = id;
         result
     }
