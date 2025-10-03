@@ -61,7 +61,11 @@ impl SpongeBob {
         Ok((resource_name, url))
     }
 
-    async fn create_invocation_with_id(&mut self, name: &str, invocation_id: &str) -> Result<String> {
+    async fn create_invocation_with_id(
+        &mut self,
+        name: &str,
+        invocation_id: &str,
+    ) -> Result<String> {
         let request = CreateInvocationRequest {
             invocation_id: invocation_id.to_string(),
             invocation: Some(Invocation {
@@ -103,7 +107,9 @@ impl SpongeBob {
         let invocation_id = Self::generate_invocation_id(build_name);
 
         // Create invocation for this build
-        let invocation_resource = self.create_invocation_with_id(build_name, &invocation_id).await?;
+        let invocation_resource = self
+            .create_invocation_with_id(build_name, &invocation_id)
+            .await?;
 
         // Upload stdout
         self.create_file(&invocation_resource, "stdout", stdout)

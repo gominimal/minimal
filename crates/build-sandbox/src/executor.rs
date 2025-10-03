@@ -194,7 +194,8 @@ impl BuildExecutor {
             }
         })?;
 
-        let spongebob_url = self.upload_logs(config, &output.stdout, &output.stderr, spongebob_client)
+        let spongebob_url = self
+            .upload_logs(config, &output.stdout, &output.stderr, spongebob_client)
             .await;
 
         if !output.status.success() {

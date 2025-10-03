@@ -30,8 +30,15 @@ pub async fn run_build(
     let executor = BuildExecutor::new(sandbox_base_dir, config.name.clone())?;
     let (exit_code, spongebob_url) = executor.execute(config, spongebob_client).await?;
 
-    let outputs =
-        OutputValidator::validate_and_collect(config, &executor.output_staging_dir(), cache_dest_dir)?;
+    let outputs = OutputValidator::validate_and_collect(
+        config,
+        &executor.output_staging_dir(),
+        cache_dest_dir,
+    )?;
 
-    Ok(BuildResult { exit_code, outputs, spongebob_url })
+    Ok(BuildResult {
+        exit_code,
+        outputs,
+        spongebob_url,
+    })
 }

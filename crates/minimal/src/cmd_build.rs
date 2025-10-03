@@ -32,13 +32,18 @@ pub async fn cmd_build_impl(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob client: {}", e))?;
 
-    let command_info = format!("build --packages {}",
-        graph.top_levels.iter()
+    let command_info = format!(
+        "build --packages {}",
+        graph
+            .top_levels
+            .iter()
             .map(|bsr| graph.get(bsr).unwrap().name.as_str())
             .collect::<Vec<_>>()
-            .join(","));
+            .join(",")
+    );
 
-    let (spongebob_resource, spongebob_url) = create_build_command_invocation(&mut spongebob_client, &command_info).await?;
+    let (spongebob_resource, spongebob_url) =
+        create_build_command_invocation(&mut spongebob_client, &command_info).await?;
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_parallel_builds)
         .build_global()
@@ -164,13 +169,18 @@ async fn log_build_results_to_spongebob(
     graph: &DepGraph,
     success: bool,
 ) -> anyhow::Result<()> {
-    let packages_list = graph.top_levels.iter()
+    let packages_list = graph
+        .top_levels
+        .iter()
         .map(|bsr| graph.get(bsr).unwrap().name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
 
     let _build_summary = if success {
-        format!("Build completed successfully for packages: {}", packages_list)
+        format!(
+            "Build completed successfully for packages: {}",
+            packages_list
+        )
     } else {
         format!("Build failed for packages: {}", packages_list)
     };
@@ -187,7 +197,11 @@ async fn log_build_results_to_spongebob(
 
     // Upload build summary as stdout
     spongebob_client
-        .create_file(spongebob_resource, "build-summary.txt", build_log.into_bytes())
+        .create_file(
+            spongebob_resource,
+            "build-summary.txt",
+            build_log.into_bytes(),
+        )
         .await
         .map_err(|e| anyhow::anyhow!("Failed to upload build summary to SpongeBob: {}", e))?;
 
@@ -195,9 +209,13 @@ async fn log_build_results_to_spongebob(
 }
 
 /// Display a summary of what was built and where outputs can be found
-fn display_build_summary(graph: &DepGraph, cache: &Cache<LocalDir>, globals: &GlobalArgs, _run: &Run, command_spongebob_url: &str) {
-    let path_config = globals.path_config();
-
+fn display_build_summary(
+    graph: &DepGraph,
+    cache: &Cache<LocalDir>,
+    _globals: &GlobalArgs,
+    _run: &Run,
+    command_spongebob_url: &str,
+) {
     info!("Build completed successfully!");
 
     // Show target packages and their cache locations
@@ -206,12 +224,10 @@ fn display_build_summary(graph: &DepGraph, cache: &Cache<LocalDir>, globals: &Gl
         for bsr in &graph.top_levels {
             let build = graph.get(bsr).unwrap();
             let spec_hash = graph.spec_hash(bsr);
-            let hash_hex = spec_hash.0.to_hex();
-            let cache_path = path_config.format_cache_path(&hash_hex);
 
             // Check if the package exists in cache
-            if cache.read_dir(&spec_hash).is_ok() {
-                info!("  {} -> {}", build.name, cache_path);
+            if let Ok(e) = cache.read_dir(&spec_hash) {
+                info!("  {} -> {}", build.name, e.path().display());
             } else {
                 info!("  {} -> (not in cache)", build.name);
             }

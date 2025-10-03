@@ -8,7 +8,7 @@ pub struct PathConfig {
     /// Default: ~/.cache/minimal/
     root_dir: PathBuf,
 
-    /// Directory for content-addressed build cache
+    /// Directory for input-addressed build cache
     /// Default: ~/.cache/minimal/builds/
     cache_dir: PathBuf,
 
@@ -118,23 +118,6 @@ impl PathConfig {
             self.sandbox_base_dir.display()
         );
         println!("  Packages directory:      {}", self.packages_dir.display());
-    }
-
-    /// Get the cache path for a specific spec hash
-    /// Cache entries are stored as: <cache_dir>/<first_byte_hex>/<remaining_bytes_hex>/
-    pub fn cache_path_for_hash(&self, hash_hex: &str) -> PathBuf {
-        if hash_hex.len() < 2 {
-            return self.cache_dir.join(hash_hex);
-        }
-        self.cache_dir
-            .join(&hash_hex[0..2])
-            .join(&hash_hex[2..])
-    }
-
-    /// Format a cache path nicely for display
-    pub fn format_cache_path(&self, hash_hex: &str) -> String {
-        let full_path = self.cache_path_for_hash(hash_hex);
-        format!("{}", full_path.display())
     }
 }
 

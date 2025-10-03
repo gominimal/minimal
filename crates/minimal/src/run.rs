@@ -418,6 +418,9 @@ impl<'a> Run<'a> {
     }
 
     /// runs a single isolated build, does not take self so it can be spawned in a thread.
+    ///
+    /// Upon success, returns both the pending cache entry representing the build outputs,
+    /// and the spongebob URL of the build.
     #[tracing::instrument(skip_all, fields(indicatif.pb_hide))]
     async fn do_build(
         &self,
@@ -429,13 +432,11 @@ impl<'a> Run<'a> {
         let build = self.graph.get(build).unwrap();
 
         // Check if already in cache
-        if let Ok(_cache_entry) = self.cache.read_dir(&bsh) {
-            let path_config = crate::paths::PathConfig::new(); // TODO: pass this in properly
-            let cache_path = path_config.format_cache_path(&bsh.0.to_hex());
+        if let Ok(e) = self.cache.read_dir(&bsh) {
             info!(
                 "Package {} already built and cached at: {}",
                 build.name,
-                cache_path
+                e.path().display(),
             );
             // Return None to indicate this was a cache hit, not a new build
             return Ok((None, None));
@@ -503,9 +504,14 @@ impl<'a> Run<'a> {
             let mut spongebob_client = spongebob::SpongeBob::new().await.unwrap();
 
             info!("Building package: {}", build.name);
-            let build_result = run_build(&config, out_dir.path(), &mut spongebob_client, self.output_base.clone())
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to build {}: {}", build.name, e))?;
+            let build_result = run_build(
+                &config,
+                out_dir.path(),
+                &mut spongebob_client,
+                self.output_base.clone(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to build {}: {}", build.name, e))?;
 
             // Extract SpongeBob URL from BuildResult
             let spongebob_url = build_result.spongebob_url;
@@ -557,13 +563,10 @@ impl<'a> Run<'a> {
                             Err(e) => {
                                 *err_bsr.lock().unwrap() = Some((bsr, e));
                             }
-                            Ok((None, spongebob_url)) => {
-                                if let Some(url) = spongebob_url {
-                                    spongebob_urls.lock().unwrap().push(url);
+                            Ok((cache_handle, spongebob_url)) => {
+                                if let Some(cache_handle) = cache_handle {
+                                    cache_handles.lock().unwrap().push(cache_handle);
                                 }
-                            }
-                            Ok((Some(cache_handle), spongebob_url)) => {
-                                cache_handles.lock().unwrap().push(cache_handle);
                                 if let Some(url) = spongebob_url {
                                     spongebob_urls.lock().unwrap().push(url);
                                 }
@@ -587,7 +590,10 @@ impl<'a> Run<'a> {
                 .for_each(|ch| ch.finalize().unwrap());
 
             // Store the latest SpongeBob URL (if any) for display at the end
-            let urls = Arc::into_inner(spongebob_urls).unwrap().into_inner().unwrap();
+            let urls = Arc::into_inner(spongebob_urls)
+                .unwrap()
+                .into_inner()
+                .unwrap();
             if let Some(latest_url) = urls.last() {
                 self.latest_spongebob_url = Some(latest_url.clone());
             }

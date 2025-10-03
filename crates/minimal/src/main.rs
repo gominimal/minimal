@@ -66,6 +66,12 @@ pub struct GlobalArgs {
     /// Override the directory where binary artifacts are cached
     #[arg(long)]
     cache_dir: Option<PathBuf>,
+    /// Override the direct where builds are performed (default: ~/.cache/minimal/sandboxes)
+    #[arg(long)]
+    builds_dir: Option<PathBuf>,
+    /// Override the download cache directory (default: ~/.cache/minimal/downloads)
+    #[arg(long)]
+    download_cache_dir: Option<PathBuf>,
 
     /// Override the packages/ directory where build-specs are loaded
     #[arg(long)]
@@ -82,14 +88,6 @@ pub struct GlobalArgs {
     /// Configure the number of parallel builds
     #[arg(short, long, default_value_t = 4)]
     num_parallel_builds: usize,
-
-    /// Override the output base directory for build workspaces (default: ~/.cache/minimal/sandboxes)
-    #[arg(long)]
-    output_base: Option<PathBuf>,
-
-    /// Override the download cache directory (default: ~/.cache/minimal/downloads)
-    #[arg(long)]
-    download_cache_dir: Option<PathBuf>,
 }
 
 impl GlobalArgs {
@@ -105,8 +103,8 @@ impl GlobalArgs {
             config = config.with_download_cache_dir(download_cache_dir.clone());
         }
 
-        if let Some(output_base) = &self.output_base {
-            config = config.with_sandbox_base_dir(output_base.clone());
+        if let Some(builds_dir) = &self.builds_dir {
+            config = config.with_sandbox_base_dir(builds_dir.clone());
         }
 
         if let Some(packages_dir) = &self.packages_dir {
