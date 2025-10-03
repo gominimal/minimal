@@ -35,6 +35,14 @@ impl Transitives {
             out.transitive_runtime_deps
                 .insert(*dep.bsr(), vec![DepInfo::Ours]);
         }
+        if include_inputs {
+            for dep in build.inputs.iter() {
+                if let Build(bsr) | Subset(SubsetInput { from: bsr, .. }) = dep {
+                    out.transitive_runtime_deps
+                        .insert(*bsr, vec![DepInfo::Ours]);
+                }
+            }
+        }
 
         // Collect all transitive runtime_deps by recursing into the [BuildManifest] of
         // all inputs, as well as all runtime_deps.
@@ -49,15 +57,15 @@ impl Transitives {
             })
             .chain(build.runtime_deps.iter().map(|dep| dep.bsr()))
             .for_each(|bsr| {
-                for (hash, source) in Transitives::new(g, bsr, false)
+                for (dep_bsr, source) in Transitives::new(g, bsr, false)
                     .transitive_runtime_deps
                     .keys()
                     .map(|runtime_dep| (*runtime_dep, DepInfo::Inherited { from: *bsr }))
                 {
-                    match out.transitive_runtime_deps.get_mut(&hash) {
+                    match out.transitive_runtime_deps.get_mut(&dep_bsr) {
                         Some(source_list) => source_list.push(source),
                         None => {
-                            out.transitive_runtime_deps.insert(hash, vec![source]);
+                            out.transitive_runtime_deps.insert(dep_bsr, vec![source]);
                         }
                     }
                 }
@@ -137,7 +145,7 @@ mod tests {
 
         let dg = DepGraph::new(sr).unwrap();
 
-        let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], true);
+        let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], false);
         assert_eq!(
             toplevel_manifest.build,
             dg.by_name("top build").next().unwrap()
@@ -202,17 +210,25 @@ mod tests {
             dg.by_name("top build").next().unwrap()
         );
 
+        let mut deps = toplevel_manifest
+            .transitive_runtime_deps
+            .into_iter()
+            .collect::<Vec<_>>();
+        deps.sort_by(|(a, _), (b, _)| a.cmp(b));
         assert_eq!(
-            toplevel_manifest
-                .transitive_runtime_deps
-                .into_iter()
-                .collect::<Vec<_>>(),
-            vec![(
-                dg.by_name("runtime dep").next().unwrap(),
-                vec![DepInfo::Inherited {
-                    from: dg.by_name("nested input").next().unwrap()
-                }]
-            )],
+            deps,
+            vec![
+                (
+                    dg.by_name("nested input").next().unwrap(),
+                    vec![DepInfo::Ours]
+                ),
+                (
+                    dg.by_name("runtime dep").next().unwrap(),
+                    vec![DepInfo::Inherited {
+                        from: dg.by_name("nested input").next().unwrap()
+                    }]
+                )
+            ],
         );
     }
 

@@ -1,4 +1,4 @@
-use crate::{BuildSpecInput, BuildSpecRef, DepGraph, SubsetInput};
+use crate::{BuildSpecInput, BuildSpecRef, DepGraph, SubsetInput, Transitives};
 use nickel_lang_core::term::IndexMap;
 use std::collections::HashMap;
 
@@ -13,7 +13,7 @@ enum BuildState {
     BuiltUsingBreakers,
     /// The dep has been built without cycle breakers.
     FullyBuilt,
-    /// The dep was just fetched.
+    /// The dep is available without building, i.e. available in a cache.
     Fetched,
 }
 
@@ -456,24 +456,19 @@ impl<'a, BP: BinProvider> Iterator for ExecPlan<'a, BP> {
         }) {
             // This build-spec is either not built at all, or built using cycle breakers.
             let cycle_breakers_allowed = info.state != BuildState::BuiltUsingBreakers;
-            let build = self.graph.get(candidate).unwrap();
 
-            // no need to recurse as if the top-level inputs/runtime-deps are resolved, that implies
-            // their dependents are resolved.
-            let (can_build_full, can_build_breakers) = build
-                .inputs
-                .iter()
-                .filter_map(|i| match i {
-                    BuildSpecInput::Build(bsr) => Some(bsr),
-                    _ => None,
-                })
-                .chain(build.runtime_deps.iter().map(|dep| dep.bsr()))
-                .fold((true, true), |acc, dep_bsr| {
-                    (
-                        acc.0 & self.is_built(dep_bsr, false),
-                        acc.1 & self.is_built(dep_bsr, true),
-                    )
-                });
+            // Something is ready to be built if all its inputs are built, and all its transitive
+            // runtime deps (and the transitive runtime deps of its inputs) are built.
+            let (can_build_full, can_build_breakers) =
+                Transitives::new(self.graph, candidate, true)
+                    .transitive_runtime_deps
+                    .keys()
+                    .fold((true, true), |acc, dep_bsr| {
+                        (
+                            acc.0 & self.is_built(dep_bsr, false),
+                            acc.1 & self.is_built(dep_bsr, true),
+                        )
+                    });
 
             // Prefer a full build if all the deps have been fully built. If deps are satisfied
             // by cycle breakers, we can do a cycle-breaker build.
@@ -947,17 +942,22 @@ mod tests {
         let planner: ExecPlan<BinProviderFake> = ExecPlan::new_with_bin_provider(&dp, bin_provider);
 
         // BinProvider declares "top" exists, but its runtime dep "dep" is missing so should be built,
-        // as well as the transitive runtime dep "nested deeper dep". Theres no interdependency between
-        // those two so they should be built in the same cycle.
+        // as well as the transitive runtime dep "nested deeper dep".
+        //
+        // Theres no interdependency between those two so they could be built in the same cycle, but the
+        // current implementation wont consider dep satisfied till its runtime deps are.
+        //
         // true = all builds without cycle-breakers
         assert_eq!(
             planner.collect::<Result<Vec<_>, _>>().unwrap(),
-            vec![BuildPhase {
-                builds: vec![
-                    (dp.by_name("dep").next().unwrap(), true),
-                    (dp.by_name("nested deeper dep").next().unwrap(), true),
-                ]
-            },],
+            vec![
+                BuildPhase {
+                    builds: vec![(dp.by_name("nested deeper dep").next().unwrap(), true),]
+                },
+                BuildPhase {
+                    builds: vec![(dp.by_name("dep").next().unwrap(), true),]
+                },
+            ],
         );
     }
 }
