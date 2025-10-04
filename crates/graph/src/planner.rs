@@ -187,7 +187,8 @@ fn make_reachable<BP: BinProvider>(
                 .inputs
                 .iter()
                 .filter_map(|i| match i {
-                    BuildSpecInput::Build(bsr) => Some(bsr),
+                    BuildSpecInput::Build(bsr)
+                    | BuildSpecInput::Subset(SubsetInput { from: bsr, .. }) => Some(bsr),
                     _ => None,
                 })
                 .chain(build.runtime_deps.iter().map(|dep| dep.bsr()))
