@@ -1,6 +1,6 @@
 ## Building `minimal`
 
-For now, the minimal tool only runs on Linux.
+For now, the minimal tool only runs on amd64 Linux. 8 cores and at least 8 Gb of ram recommended, but it should still run on a wet piece of spaghetti (slowly).
 
 ### Dependencies
 1. Install a fairly recent version of rust: https://rust-lang.org/tools/install/
