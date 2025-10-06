@@ -6,6 +6,7 @@
 use nickel_lang_core::eval::Closure;
 use nickel_lang_core::files::FileId;
 use nickel_lang_core::identifier::LocIdent;
+use nickel_lang_core::position::{RawSpan, TermPos};
 use nickel_lang_core::term::{IndexMap, RichTerm, Term};
 use nickel_lang_core::{eval::cache::CacheImpl, program::Program};
 
@@ -44,6 +45,13 @@ pub struct SubsetInput {
     pub from: BuildSpecRef,
     pub outputs: Vec<String>,
     pub strict: bool,
+}
+
+/// A description of where a build was declared.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeclPos {
+    file: String,
+    span: RawSpan,
 }
 
 /// An input to a build spec.
@@ -125,6 +133,10 @@ pub struct BuildSpec {
 
     /// An alternative build spec to use to break cycles in resolving dependencies on this build spec.
     pub replace_on_cycle: Option<BuildSpecRef>,
+
+    /// Where in the source the build was declared.
+    /// TODO: Work out why this is seldom set.
+    pub pos: Option<DeclPos>,
 }
 
 /// The dependency graph.
@@ -354,9 +366,14 @@ impl GraphBuilder {
         rt: &RichTerm,
         program: &mut Program<CacheImpl>,
     ) -> Result<BuildSpecRef, Error> {
+        let mut pos = rt.pos;
         let rt = eval_if_closure(rt, program)?;
+        if pos == TermPos::None && rt.pos != TermPos::None {
+            pos = rt.pos;
+        }
         let magic_id =
             read_buildspec_id(&rt).ok_or_else(|| Error::MissingID(program.files(), rt.pos))?;
+
         // If we have seen this build-spec object before, bail-out with a reference to the existing
         // object, that way we can handle circular references of build specs.
         //
@@ -475,6 +492,17 @@ impl GraphBuilder {
             runtime_deps: Vec::new(),
             outputs: OutputMap::new(),
             replace_on_cycle: None,
+            pos: pos.into_opt().map(|rs| {
+                DeclPos {
+                    file: program
+                        .files()
+                        .name(rs.src_id)
+                        .to_str()
+                        .unwrap()
+                        .to_string(),
+                    span: rs,
+                }
+            }),
         }));
         self.spec_id_lookup.insert(magic_id, bsr);
 
