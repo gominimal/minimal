@@ -189,6 +189,7 @@ impl<B: FetchBackend> RemoteCache<B> {
     pub async fn materialize(
         &self,
         spec_hash: &SpecHash,
+        spec_name: &str,
         cache: &Cache<LocalDir>,
     ) -> Result<(), Error<<B::Response as FetchResponse>::Error>> {
         let sha256: [u8; 32] = self.index.sha256(spec_hash).ok_or(Error::NotFound)?;
@@ -214,7 +215,13 @@ impl<B: FetchBackend> RemoteCache<B> {
             tar::Archive::new(zstd::stream::Decoder::new(tar_file).map_err(Error::IO)?);
         let cache_hnd = cache.write_dir(spec_hash).map_err(Error::Cache)?;
         archive.unpack(cache_hnd.path()).map_err(Error::IO)?;
-        cache_hnd.finalize().map_err(Error::Cache)?;
+        cache_hnd
+            .finalize(crate::EntryMeta {
+                spec_name: spec_name.to_string(),
+                fetched: true,
+                ..Default::default()
+            })
+            .map_err(Error::Cache)?;
 
         Ok(())
     }

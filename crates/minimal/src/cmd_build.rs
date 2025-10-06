@@ -112,7 +112,7 @@ pub async fn cmd_build_impl(
     // There could still be stuff thats fetchable but not in the local cache. We
     // can materialize that locally now.
     if !globals.no_fetch {
-        let needs_materialize: Vec<_> =
+        let mut needs_materialize: Vec<_> =
             Transitives::for_toplevels(graph, graph.top_levels.to_vec(), false)
                 .into_iter()
                 .filter_map(|bsr| {
@@ -123,6 +123,8 @@ pub async fn cmd_build_impl(
                         .unwrap_or(Some(bsr))
                 })
                 .collect();
+        needs_materialize.sort();
+        needs_materialize.dedup();
 
         if !needs_materialize.is_empty() {
             let remote_cache = globals.remote_cache().await.unwrap();
@@ -135,16 +137,19 @@ pub async fn cmd_build_impl(
 
                     s.spawn(move |_| {
                         let _rt = tokio_runtime.enter();
+                        let name = &graph.get(&bsr).unwrap().name;
                         let span = tracing::info_span!(
                             "download_cached",
                             "indicatif.pb_show" = tracing::field::Empty,
-                            "build" = graph.get(&bsr).unwrap().name,
+                            "build" = name,
                         );
                         let _enter = span.enter();
 
-                        futures::executor::block_on(
-                            remote_cache.materialize(&graph.spec_hash(&bsr), cache),
-                        )
+                        futures::executor::block_on(remote_cache.materialize(
+                            &graph.spec_hash(&bsr),
+                            name,
+                            cache,
+                        ))
                         .unwrap();
                     });
                 }

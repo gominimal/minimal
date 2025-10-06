@@ -151,7 +151,7 @@ async fn path_for_self_spec(
             remote_cache
                 .as_ref()
                 .unwrap()
-                .materialize(input_hash, cache)
+                .materialize(input_hash, &input_build.name, cache)
                 .await?;
             let cache_path = cache.read_dir(input_hash).unwrap().path().to_path_buf();
             Ok((*input_ref, (cache_path, PathBuf::from("/"))))
@@ -564,7 +564,10 @@ impl<'a> Run<'a> {
                             }
                             Ok((cache_handle, spongebob_url)) => {
                                 if let Some(cache_handle) = cache_handle {
-                                    cache_handles.lock().unwrap().push(cache_handle);
+                                    cache_handles.lock().unwrap().push((
+                                        cache_handle,
+                                        self2.graph.get(&bsr).unwrap().name.clone(),
+                                    ));
                                 }
                                 if let Some(url) = spongebob_url {
                                     spongebob_urls.lock().unwrap().push(url);
@@ -586,7 +589,15 @@ impl<'a> Run<'a> {
                 .into_inner()
                 .unwrap()
                 .into_iter()
-                .for_each(|ch| ch.finalize().unwrap());
+                .for_each(|(cache_hnd, name)| {
+                    cache_hnd
+                        .finalize(cache::EntryMeta {
+                            spec_name: name,
+                            fetched: false,
+                            ..Default::default()
+                        })
+                        .unwrap()
+                });
 
             // Store the latest SpongeBob URL (if any) for display at the end
             let urls = Arc::into_inner(spongebob_urls)

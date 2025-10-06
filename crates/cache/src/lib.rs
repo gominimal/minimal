@@ -3,6 +3,7 @@
 use common::SpecHash;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[allow(dead_code)]
 mod fs;
@@ -15,6 +16,26 @@ mod remote;
 pub use remote::{Error as RemoteError, RemoteCache};
 #[allow(dead_code)]
 mod remote_index;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EntryMeta {
+    pub spec_name: String,
+    pub fetched: bool,
+    pub epoch_millis: u128,
+}
+
+impl Default for EntryMeta {
+    fn default() -> Self {
+        EntryMeta {
+            spec_name: "".to_string(),
+            fetched: false,
+            epoch_millis: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        }
+    }
+}
 
 /// A directory tree in the cache you can read or write.
 #[derive(Debug, Clone)]
@@ -79,7 +100,7 @@ impl PendingDir {
         self.tempdir.path()
     }
 
-    pub fn finalize(self) -> Result<(), CacheErr> {
+    pub fn finalize(self, meta: EntryMeta) -> Result<(), CacheErr> {
         let hash_hex = self.hash.0.to_hex();
         // Entries on disk are at <root>/<first byte as hex>/<remaining bytes as hex>
         let subpath: PathBuf = [&hash_hex.as_str()[0..2], &hash_hex.as_str()[2..]]
@@ -89,9 +110,13 @@ impl PendingDir {
         let inner = self.c.inner();
         inner.fs.mkdir(&subpath)?;
 
-        let st = inner.fs.subtree(subpath)?;
+        let st = inner.fs.subtree(&subpath)?;
         std::fs::remove_dir_all(st.path())?;
         std::fs::rename(self.tempdir.keep(), st.path())?;
+        drop(st);
+
+        let f = inner.fs.open_write(format!("meta/{}.json", hash_hex))?;
+        serde_json::to_writer(f, &meta).map_err(std::io::Error::from)?;
         Ok(())
     }
 }
@@ -228,16 +253,18 @@ impl Cache<LocalDir> {
             fs: LocalDir::with_base(p)?,
         };
 
-        match inner.fs.mkdir("temp") {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                if let std::io::ErrorKind::AlreadyExists = e.kind() {
-                    Ok(())
-                } else {
-                    Err(e)
+        for dir in &["temp", "meta"] {
+            match inner.fs.mkdir(dir) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    if let std::io::ErrorKind::AlreadyExists = e.kind() {
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
                 }
-            }
-        }?;
+            }?;
+        }
 
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -410,7 +437,12 @@ mod tests {
             .unwrap()
             .write_all("uwu".as_bytes())
             .unwrap();
-        w.finalize().unwrap();
+        w.finalize(EntryMeta {
+            spec_name: "".to_string(),
+            fetched: false,
+            ..Default::default()
+        })
+        .unwrap();
 
         let r = cache
             .read_dir(&test_key)
@@ -433,7 +465,12 @@ mod tests {
             .unwrap()
             .write_all("uwu".as_bytes())
             .unwrap();
-        w.finalize().unwrap();
+        w.finalize(EntryMeta {
+            spec_name: "".to_string(),
+            fetched: false,
+            ..Default::default()
+        })
+        .unwrap();
 
         // Write again and change the data in the file, but don't call finalize
         let w = cache.write_dir(&test_key).unwrap();
@@ -464,7 +501,12 @@ mod tests {
             .unwrap()
             .write_all("bad data".as_bytes())
             .unwrap();
-        w.finalize().unwrap();
+        w.finalize(EntryMeta {
+            spec_name: "".to_string(),
+            fetched: false,
+            ..Default::default()
+        })
+        .unwrap();
 
         // Write again and change the data in the file
         let w = cache.write_dir(&test_key).unwrap();
@@ -472,7 +514,12 @@ mod tests {
             .unwrap()
             .write_all("good data".as_bytes())
             .unwrap();
-        w.finalize().unwrap();
+        w.finalize(EntryMeta {
+            spec_name: "".to_string(),
+            fetched: false,
+            ..Default::default()
+        })
+        .unwrap();
 
         let r = cache
             .read_dir(&test_key)
