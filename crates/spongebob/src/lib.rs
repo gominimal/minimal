@@ -29,6 +29,39 @@ pub struct SpongeBob {
     service: SpongeBobServiceClient<Channel>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SpongeBobInvocation {
+    service: SpongeBobServiceClient<Channel>,
+    resource_name: String,
+    url: String,
+}
+
+impl SpongeBobInvocation {
+    #[tracing::instrument(skip(self, contents))]
+    pub async fn upload_file(&mut self, file_name: &str, contents: Vec<u8>) -> Result<()> {
+        let file_id = Uuid::new_v4().to_string();
+        let request = CreateFileRequest {
+            parent: self.resource_name.clone(),
+            file_id,
+            file: Some(File {
+                name: file_name.to_string(),
+                contents,
+            }),
+        };
+
+        self.service.create_file(request).await?;
+        Ok(())
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn resource_name(&self) -> &str {
+        &self.resource_name
+    }
+}
+
 impl SpongeBob {
     pub async fn new() -> Result<Self> {
         let tls_config = ClientTlsConfig::new().with_native_roots();
@@ -49,18 +82,20 @@ impl SpongeBob {
         Ok(SpongeBob { service })
     }
 
-    pub async fn create_invocation(&mut self, name: &str) -> Result<String> {
-        let invocation_id = Self::generate_invocation_id(name);
-        self.create_invocation_with_id(name, &invocation_id).await
-    }
-
-    pub async fn create_invocation_with_url(&mut self, name: &str) -> Result<(String, String)> {
+    #[tracing::instrument]
+    pub async fn create_invocation(&mut self, name: &str) -> Result<SpongeBobInvocation> {
         let invocation_id = Self::generate_invocation_id(name);
         let resource_name = self.create_invocation_with_id(name, &invocation_id).await?;
         let url = self.generate_invocation_url(&invocation_id);
-        Ok((resource_name, url))
+
+        Ok(SpongeBobInvocation {
+            service: self.service.clone(),
+            resource_name,
+            url,
+        })
     }
 
+    #[tracing::instrument]
     async fn create_invocation_with_id(
         &mut self,
         name: &str,
@@ -77,53 +112,7 @@ impl SpongeBob {
         Ok(response.into_inner().name)
     }
 
-    pub async fn create_file(
-        &mut self,
-        parent_invocation_resource: &str,
-        file_name: &str,
-        contents: Vec<u8>,
-    ) -> Result<()> {
-        let file_id = Uuid::new_v4().to_string();
-        let request = CreateFileRequest {
-            parent: parent_invocation_resource.to_string(),
-            file_id,
-            file: Some(File {
-                name: file_name.to_string(),
-                contents,
-            }),
-        };
 
-        self.service.create_file(request).await?;
-        Ok(())
-    }
-
-    pub async fn upload_build_logs(
-        &mut self,
-        build_name: &str,
-        stdout: Vec<u8>,
-        stderr: Vec<u8>,
-    ) -> Result<String> {
-        // Generate invocation ID first
-        let invocation_id = Self::generate_invocation_id(build_name);
-
-        // Create invocation for this build
-        let invocation_resource = self
-            .create_invocation_with_id(build_name, &invocation_id)
-            .await?;
-
-        // Upload stdout
-        self.create_file(&invocation_resource, "stdout", stdout)
-            .await?;
-
-        // Upload stderr
-        self.create_file(&invocation_resource, "stderr", stderr)
-            .await?;
-
-        // Generate and return the viewable URL
-        let spongebob_url = self.generate_invocation_url(&invocation_id);
-
-        Ok(spongebob_url)
-    }
 
     fn generate_invocation_id(_name: &str) -> String {
         // Just use a UUID for the invocation ID to ensure URL safety

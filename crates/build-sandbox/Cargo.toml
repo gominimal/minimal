@@ -5,12 +5,11 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-serde.workspace = true
-hakoniwa.workspace = true
 globset.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
-tokio.workspace = true
-spongebob = { path = "../spongebob" }
-
+hakoniwa.workspace = true
 nickel-lang-core.workspace = true
+serde.workspace = true
+spongebob = { path = "../spongebob" }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

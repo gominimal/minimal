@@ -30,9 +30,14 @@ pub enum ConfigError {
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {
     #[error(
-        "Build command failed with exit code {code}\n  Temp directory: {temp_dir}\n  Check stderr: cat {temp_dir}/stderr"
+        "Build command failed with exit code {code}\n  Temp directory: {temp_dir}\n  Check stderr: cat {temp_dir}/stderr{}",
+        spongebob_url.as_ref().map(|url| format!("\n  View logs: {}", url)).unwrap_or_default()
     )]
-    BuildFailed { code: i32, temp_dir: PathBuf },
+    BuildFailed {
+        code: i32,
+        temp_dir: PathBuf,
+        spongebob_url: Option<String>,
+    },
 
     #[error("Container execution failed: {message}")]
     SandboxFailed { message: String },

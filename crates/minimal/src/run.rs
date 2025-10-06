@@ -352,7 +352,6 @@ impl<'a> Run<'a> {
         }
     }
 
-    #[tracing::instrument]
     async fn sandbox_paths_from_buildspec(
         &self,
         build: &BuildSpec,
@@ -427,6 +426,7 @@ impl<'a> Run<'a> {
         build: &BuildSpecRef,
         _full_build: bool,
         remote_cache: Option<&RemoteCache<GcsStorage>>,
+        spongebob_invocation: &mut spongebob::SpongeBobInvocation,
     ) -> Result<(Option<PendingDir>, Option<String>)> {
         let bsh = self.graph.spec_hash(build);
         let build = self.graph.get(build).unwrap();
@@ -500,14 +500,11 @@ impl<'a> Run<'a> {
 
             let out_dir = self.cache.write_dir(&bsh).unwrap();
 
-            // Create a new SpongeBob client for this build to avoid shared mutable state in parallel execution
-            let mut spongebob_client = spongebob::SpongeBob::new().await.unwrap();
-
             info!("Building package: {}", build.name);
             let build_result = run_build(
                 &config,
                 out_dir.path(),
-                &mut spongebob_client,
+                spongebob_invocation,
                 self.output_base.clone(),
             )
             .await
@@ -525,6 +522,7 @@ impl<'a> Run<'a> {
         &mut self,
         plan: ExecPlan<'a, BP>,
         remote_cache: Option<&RemoteCache<GcsStorage>>,
+        spongebob_invocation: &mut spongebob::SpongeBobInvocation,
     ) -> Result<()> {
         // Execute builds in dependency order - each build runs in isolation
         // and can only access outputs from previously completed builds
@@ -549,14 +547,15 @@ impl<'a> Run<'a> {
                     let err_bsr = build_which_errored.clone();
                     let cache_handles = cache_handles.clone();
                     let spongebob_urls = spongebob_urls.clone();
+                    let mut invocation_clone = spongebob_invocation.clone();
 
                     s.spawn(move |_| {
                         let _rt = tokio_runtime.enter();
-
                         let result = futures::executor::block_on(self2.do_build(
                             &bsr,
                             full_build,
                             remote_cache,
+                            &mut invocation_clone,
                         ));
 
                         match result {

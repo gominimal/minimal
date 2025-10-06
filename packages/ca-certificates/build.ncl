@@ -1,14 +1,16 @@
 let { BuildSpec, Local, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
+let openssl = import "../openssl/build.ncl" in
 {
   name = "ca-certificates",
   inputs = [
     { file = "build.sh" } | Local,
     {
       url = "gs://minimal-staging-archives/ssl-certs-complete.tar.gz",
-      sha256 = "5e4ce79f2e24206f0aeedce802d8a654da2db7c70a76f841cfd1699d00e5f2c1"
+      sha256 = "4b080b63089e05eede8f2f653c6b8329d2a8332285b393bb7844dc8c8d9d062d"
     } | Source,
     base,
+    openssl,
   ],
   cmd = "./build.sh",
   outputs = {

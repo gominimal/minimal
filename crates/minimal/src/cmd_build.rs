@@ -42,8 +42,11 @@ pub async fn cmd_build_impl(
             .join(",")
     );
 
-    let (spongebob_resource, spongebob_url) =
-        create_build_command_invocation(&mut spongebob_client, &command_info).await?;
+    let mut spongebob_invocation = spongebob_client
+        .create_invocation(&command_info)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob invocation: {}", e))?;
+    let spongebob_url = spongebob_invocation.url().to_string();
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_parallel_builds)
         .build_global()
@@ -64,7 +67,7 @@ pub async fn cmd_build_impl(
 
     match (globals.no_cache, globals.no_fetch) {
         // No local or remote cache
-        (true, true) => run.execute(ExecPlan::new(graph), None).await,
+        (true, true) => run.execute(ExecPlan::new(graph), None, &mut spongebob_invocation).await,
         // Both caches
         (false, false) => {
             let local_adapter = CacheBinProvider::new(graph, cache.clone());
@@ -73,6 +76,7 @@ pub async fn cmd_build_impl(
             run.execute(
                 ExecPlan::new_with_bin_provider(graph, (local_adapter, remote_adapter)),
                 Some(&remote_cache),
+                &mut spongebob_invocation,
             )
             .await
         }
@@ -83,13 +87,14 @@ pub async fn cmd_build_impl(
             run.execute(
                 ExecPlan::new_with_bin_provider(graph, remote_adapter),
                 Some(&remote_cache),
+                &mut spongebob_invocation,
             )
             .await
         }
         // Only local cache
         (false, true) => {
             let local_adapter = CacheBinProvider::new(graph, cache.clone());
-            run.execute(ExecPlan::new_with_bin_provider(graph, local_adapter), None)
+            run.execute(ExecPlan::new_with_bin_provider(graph, local_adapter), None, &mut spongebob_invocation)
                 .await
         }
     }
@@ -141,7 +146,7 @@ pub async fn cmd_build_impl(
     }
 
     // Log build results to SpongeBob
-    log_build_results_to_spongebob(&mut spongebob_client, &spongebob_resource, graph, true).await?;
+    log_build_results_to_spongebob(&mut spongebob_invocation, graph, true).await?;
 
     // Display build summary
     display_build_summary(graph, &cache, globals, &run, &spongebob_url);
@@ -149,23 +154,9 @@ pub async fn cmd_build_impl(
     Ok(())
 }
 
-/// Create a SpongeBob invocation for the entire build command
-async fn create_build_command_invocation(
-    spongebob_client: &mut spongebob::SpongeBob,
-    command_info: &str,
-) -> anyhow::Result<(String, String)> {
-    let (resource_name, url) = spongebob_client
-        .create_invocation_with_url(command_info)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob invocation: {}", e))?;
-
-    Ok((resource_name, url))
-}
-
 /// Log build command results to SpongeBob
 async fn log_build_results_to_spongebob(
-    spongebob_client: &mut spongebob::SpongeBob,
-    spongebob_resource: &str,
+    spongebob_invocation: &mut spongebob::SpongeBobInvocation,
     graph: &DepGraph,
     success: bool,
 ) -> anyhow::Result<()> {
@@ -195,13 +186,10 @@ async fn log_build_results_to_spongebob(
         graph.top_levels.len()
     );
 
-    // Upload build summary as stdout
-    spongebob_client
-        .create_file(
-            spongebob_resource,
-            "build-summary.txt",
-            build_log.into_bytes(),
-        )
+    // Upload build summary
+    info!("Uploading build summary to SpongeBob invocation");
+    spongebob_invocation
+        .upload_file("build-summary.txt", build_log.into_bytes())
         .await
         .map_err(|e| anyhow::anyhow!("Failed to upload build summary to SpongeBob: {}", e))?;
 

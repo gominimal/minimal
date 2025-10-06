@@ -24,11 +24,11 @@ pub struct BuildResult {
 pub async fn run_build(
     config: &BuildConfig,
     cache_dest_dir: &std::path::Path,
-    spongebob_client: &mut spongebob::SpongeBob,
+    spongebob_invocation: &mut spongebob::SpongeBobInvocation,
     sandbox_base_dir: std::path::PathBuf,
 ) -> Result<BuildResult> {
     let executor = BuildExecutor::new(sandbox_base_dir, config.name.clone())?;
-    let (exit_code, spongebob_url) = executor.execute(config, spongebob_client).await?;
+    let (exit_code, spongebob_url) = executor.execute(config, spongebob_invocation).await?;
 
     let outputs = OutputValidator::validate_and_collect(
         config,
