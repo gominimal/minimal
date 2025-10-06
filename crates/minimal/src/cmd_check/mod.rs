@@ -313,6 +313,7 @@ fn check_package(
         naming::package_spec_name_matches_dir(pkg, all_graph, fix, globals)?,
         naming::package_name(pkg, all_graph, fix, globals)?,
         naming::cycle_breaker_naming(pkg, all_graph, fix, globals)?,
+        naming::output_naming(pkg, all_graph, fix, globals)?,
         outputs::output_types_valid(pkg, all_graph, fix, globals)?,
         check_minimal_import_line(pkg, all_graph, fix, globals)?,
         check_package_fmt(pkg, all_graph, fix, globals)?,
