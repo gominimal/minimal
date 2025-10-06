@@ -41,7 +41,7 @@ nickel-lang-core = { version = "0.15.0", default-features = false, features = [
 oci-client = { version = "0.15.0", features = [
     "rustls-tls",
 ], default-features = false }
-oci-spec = "0.8.2"
+oci-spec = "0.8.3"
 path-absolutize = "^3.1"
 rayon = "1.11"
 regex = "1" # keep in sync with nickel-lang-core
