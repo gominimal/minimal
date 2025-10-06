@@ -68,7 +68,9 @@ impl BuildExecutor {
             self.hardlink_to_tmpdir(input)?;
         }
 
-        let spongebob_url = self.execute_in_container(config, spongebob_invocation).await?;
+        let spongebob_url = self
+            .execute_in_container(config, spongebob_invocation)
+            .await?;
 
         Ok((0, spongebob_url))
     }

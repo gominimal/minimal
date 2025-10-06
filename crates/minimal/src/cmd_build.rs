@@ -67,7 +67,10 @@ pub async fn cmd_build_impl(
 
     match (globals.no_cache, globals.no_fetch) {
         // No local or remote cache
-        (true, true) => run.execute(ExecPlan::new(graph), None, &mut spongebob_invocation).await,
+        (true, true) => {
+            run.execute(ExecPlan::new(graph), None, &mut spongebob_invocation)
+                .await
+        }
         // Both caches
         (false, false) => {
             let local_adapter = CacheBinProvider::new(graph, cache.clone());
@@ -94,8 +97,12 @@ pub async fn cmd_build_impl(
         // Only local cache
         (false, true) => {
             let local_adapter = CacheBinProvider::new(graph, cache.clone());
-            run.execute(ExecPlan::new_with_bin_provider(graph, local_adapter), None, &mut spongebob_invocation)
-                .await
+            run.execute(
+                ExecPlan::new_with_bin_provider(graph, local_adapter),
+                None,
+                &mut spongebob_invocation,
+            )
+            .await
         }
     }
     .context("Failed to execute build")?;

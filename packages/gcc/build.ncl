@@ -75,7 +75,7 @@ let zstd = import "../zstd/build.ncl" in
     {
       name = "gcc (prebuilt)",
       inputs = [
-        { package = "gcc" } | Prebuilt,
+        { package = "gcc", sha256 = "69d6a1da34c99566214174776a09216dffb4b52f67971eb000de3e1f8aae7a86" } | Prebuilt,
       ],
       runtime_deps = [
         gmp,

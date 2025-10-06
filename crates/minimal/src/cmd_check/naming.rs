@@ -164,5 +164,8 @@ pub(crate) fn output_naming(
         }
     }
 
+    if !result.err.is_empty() {
+        result.verdict = CheckVerdict::Fail;
+    }
     Ok(result)
 }

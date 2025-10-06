@@ -112,8 +112,6 @@ impl SpongeBob {
         Ok(response.into_inner().name)
     }
 
-
-
     fn generate_invocation_id(_name: &str) -> String {
         // Just use a UUID for the invocation ID to ensure URL safety
         Uuid::new_v4().to_string()

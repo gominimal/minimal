@@ -1,4 +1,4 @@
-let { BuildSpec, Local, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
 let attr = import "../attr/build.ncl" in
 let bash = import "../gcc/build.ncl" in
 let binutils = import "../binutils/build.ncl" in
@@ -38,10 +38,15 @@ let tar = import "../tar/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    usr_bin = { glob = "usr/bin/**/*" } | OutputLib,
-    usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
-    usr_include = { glob = "usr/include/**/*" } | OutputLib,
-    usr_share = { glob = "usr/share/**/*" } | OutputLib,
+    bins = { glob = "usr/bin/*" } | OutputBin,
+    libs = { glob = "usr/lib/libacl.so*" } | OutputLib,
+
+    ltconfigs = { glob = "usr/lib/libacl.la" } | OutputData,
+    pkgconfigs = { glob = "usr/lib/pkgconfig/**" } | OutputData,
+
+    mans = { glob = "usr/share/man/**" } | OutputData,
+    includes = { glob = "usr/include/**" } | OutputData,
+    locales = { glob = "usr/share/locale/**" } | OutputData,
   },
 
   replace_on_cycle =
