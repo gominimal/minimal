@@ -1,14 +1,7 @@
-use tonic::transport::{Channel, ClientTlsConfig};
+use minimal_spongebob_community_neoeinstein_prost::spongebob::v1::{CreateFileRequest, CreateInvocationRequest, File, Invocation};
+use minimal_spongebob_community_neoeinstein_tonic::spongebob::v1::tonic::sponge_bob_service_client::SpongeBobServiceClient;
+use tonic::transport::Channel;
 use uuid::Uuid;
-
-use crate::api::{
-    CreateFileRequest, CreateInvocationRequest, File, Invocation,
-    sponge_bob_service_client::SpongeBobServiceClient,
-};
-
-pub mod api {
-    tonic::include_proto!("spongebob.v1");
-}
 
 const ENDPOINT: &str = "https://spongebob.minimal.farm";
 
@@ -18,8 +11,6 @@ pub enum SpongeBobError {
     Connection(#[from] tonic::transport::Error),
     #[error("SpongeBob service error: {0}")]
     Service(#[from] tonic::Status),
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, SpongeBobError>;
@@ -45,7 +36,7 @@ impl SpongeBobInvocation {
             file_id,
             file: Some(File {
                 name: file_name.to_string(),
-                contents,
+                contents: contents.into(),
             }),
         };
 
@@ -64,20 +55,7 @@ impl SpongeBobInvocation {
 
 impl SpongeBob {
     pub async fn new() -> Result<Self> {
-        let tls_config = ClientTlsConfig::new().with_native_roots();
-        let channel = Channel::from_static(ENDPOINT)
-            .tls_config(tls_config)
-            .unwrap()
-            .connect()
-            .await?;
-        let service = SpongeBobServiceClient::new(channel);
-
-        Ok(SpongeBob { service })
-    }
-
-    pub async fn with_endpoint(endpoint: &'static str) -> Result<Self> {
-        let channel = Channel::from_static(endpoint).connect().await?;
-        let service = SpongeBobServiceClient::new(channel);
+        let service = SpongeBobServiceClient::connect(ENDPOINT).await?;
 
         Ok(SpongeBob { service })
     }

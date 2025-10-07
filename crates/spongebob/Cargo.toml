@@ -5,10 +5,10 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-prost.workspace = true
+minimal_spongebob_community_neoeinstein-prost = { version = "0.4.0-20251007185801-98893cf03142.1", registry = "buf" }
+minimal_spongebob_community_neoeinstein-tonic = { version = "0.4.1-20251007185801-98893cf03142.1", registry = "buf" }
 thiserror.workspace = true
-tonic-prost.workspace = true
-tonic.workspace = true
+tonic = "0.12.3"
 tracing.workspace = true
 uuid.workspace = true
 
