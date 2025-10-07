@@ -1,4 +1,4 @@
-let { BuildSpec, Local, OutputLib, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputData, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let readline = import "../readline/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
@@ -11,14 +11,14 @@ let toolchain = import "../toolchain/build.ncl" in
     } | Source,
     { file = "build.sh" } | Local,
     base,
-    readline,
     toolchain,
+  ],
+  runtime_deps = [
+    readline,
   ],
   cmd = "./build.sh",
   outputs = {
-    bc_bin = { glob = "usr/bin/bc" } | OutputLib,
-    dc_bin = { glob = "usr/bin/dc" } | OutputLib,
-    bc_man = { glob = "usr/share/man/man1/bc.1" } | OutputLib,
-    dc_man = { glob = "usr/share/man/man1/dc.1" } | OutputLib,
+    bins = { glob = "usr/bin/*" } | OutputBin,
+    mans = { glob = "usr/share/man/**" } | OutputData,
   },
 } | BuildSpec

@@ -1,4 +1,4 @@
-let { BuildSpec, Local, OutputData, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
 # base
 let bash = import "../bash/build.ncl" in
 let bzip2 = import "../bzip2/build.ncl" in
@@ -19,7 +19,7 @@ let binutils = import "../binutils/build.ncl" in
 let gcc = import "../gcc/build.ncl" in
 let glibc = import "../glibc/build.ncl" in
 let linux_headers = import "../linux_headers/build.ncl" in
-# other 
+# other
 let dejagnu = import "../dejagnu/build.ncl" in
 let expect = import "../expect/build.ncl" in
 let zlib = import "../zlib/build.ncl" in
@@ -60,13 +60,19 @@ let zlib = import "../zlib/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    etc = { glob = "etc/*" } | OutputData,
-    usr_bin = { glob = "usr/bin/*" } | OutputLib,
-    usr_lib = { glob = "usr/lib/*" } | OutputLib,
-    usr_lib_ldscripts = { glob = "usr/lib/ldscripts/*" } | OutputLib,
-    usr_lib_gprofng = { glob = "usr/lib/gprofng/*" } | OutputLib,
-    usr_lib_bfdplugins = { glob = "usr/lib/bfd-plugins/*" } | OutputLib,
-    usr_include = { glob = "usr/include/*" } | OutputData,
+    bins = { glob = "usr/bin/*" } | OutputBin,
+    libs = { glob = "usr/lib/*.{a,so*}" } | OutputLib,
+
+    ltconfigs = { glob = "usr/lib/*.la" } | OutputData,
+    ldscripts = { glob = "usr/lib/ldscripts/*" } | OutputData,
+
+    gprofng_libs = { glob = "usr/lib/gprofng/*.so*" } | OutputLib,
+    gprofng_ltconfigs = { glob = "usr/lib/gprofng/*.la" } | OutputData,
+
+    bfdplugins = { glob = "usr/lib/bfd-plugins/**" } | OutputLib,
+
+    etcs = { glob = "etc/*" } | OutputData,
+    includes = { glob = "usr/include/**" } | OutputData,
   },
 
   replace_on_cycle =

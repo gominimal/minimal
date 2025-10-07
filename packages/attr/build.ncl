@@ -35,7 +35,7 @@ let tar = import "../tar/build.ncl" in
   cmd = "./build.sh",
   outputs = {
     bins = { glob = "usr/bin/*" } | OutputBin,
-    libs = { glob = "usr/lib/libattr.so*" } | OutputLib,
+    libs = { glob = "usr/lib/*.{a,so*}" } | OutputLib,
 
     ltconfigs = { glob = "usr/lib/libattr.la" } | OutputData,
     pkgconfigs = { glob = "usr/lib/pkgconfig/**" } | OutputData,

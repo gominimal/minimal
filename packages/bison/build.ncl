@@ -1,4 +1,4 @@
-let { BuildSpec, Local, OutputBin, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
 
 let base = import "../base/build.ncl" in
 let flex = import "../flex/build.ncl" in
@@ -19,15 +19,15 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    bison_bin = { glob = "usr/bin/bison" } | OutputBin,
-    yacc_bin = { glob = "usr/bin/yacc" } | OutputBin,
+    bison = { glob = "usr/bin/bison" } | OutputBin,
+    yacc = { glob = "usr/bin/yacc" } | OutputBin,
+
     liby = { glob = "usr/lib/liby.a" } | OutputLib,
-    bison_share = { glob = "usr/share/bison/**/*" } | OutputLib,
-    bison_man = { glob = "usr/share/man/man1/bison.1" } | OutputLib,
-    yacc_man = { glob = "usr/share/man/man1/yacc.1" } | OutputLib,
-    bison_info = { glob = "usr/share/info/bison.info*" } | OutputLib,
-    bison_locale = { glob = "usr/share/locale/**/*" } | OutputLib,
-    bison_aclocal = { glob = "usr/share/aclocal/bison*.m4" } | OutputLib,
+
+    bison_share = { glob = "usr/share/bison/**/*" } | OutputData,
+    mans = { glob = "usr/share/man/**" } | OutputData,
+    locales = { glob = "usr/share/locale/**" } | OutputData,
+    aclocals = { glob = "usr/share/aclocal/*" } | OutputData,
   },
 
   replace_on_cycle =

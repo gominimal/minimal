@@ -159,7 +159,9 @@ pub async fn cmd_build_impl(
         log_build_results_to_spongebob(invocation, graph, true).await?;
     }
 
-    let spongebob_url = spongebob_invocation.as_ref().map(|inv| inv.url().to_string());
+    let spongebob_url = spongebob_invocation
+        .as_ref()
+        .map(|inv| inv.url().to_string());
 
     // Display build summary
     display_build_summary(graph, &cache, globals, &run, spongebob_url.as_deref());

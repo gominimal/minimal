@@ -39,7 +39,7 @@ let tar = import "../tar/build.ncl" in
   cmd = "./build.sh",
   outputs = {
     bins = { glob = "usr/bin/*" } | OutputBin,
-    libs = { glob = "usr/lib/libacl.so*" } | OutputLib,
+    libs = { glob = "usr/lib/*.{a,so*}" } | OutputLib,
 
     ltconfigs = { glob = "usr/lib/libacl.la" } | OutputData,
     pkgconfigs = { glob = "usr/lib/pkgconfig/**" } | OutputData,

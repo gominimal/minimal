@@ -86,14 +86,14 @@ pub async fn cmd_unsafe_patched_build(
         .unwrap();
 
     info!("Building package: {}", build.name);
-    let command_info = format!("unsafe-patched-command {}", build.name);
+    let command_info = format!("unsafe-patched-build {}", build.name);
     let mut spongebob_invocation = Some(
         spongebob::SpongeBob::new()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob client: {}", e))?
             .create_invocation(&command_info)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob invocation: {}", e))?
+            .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob invocation: {}", e))?,
     );
     run_build(
         &config,

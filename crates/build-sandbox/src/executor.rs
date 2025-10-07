@@ -199,14 +199,20 @@ impl BuildExecutor {
         })?;
 
         if let Some(invocation) = spongebob_invocation {
-            if let Err(e) = invocation.upload_file("stdout", output.stdout.to_vec()).await {
+            if let Err(e) = invocation
+                .upload_file("stdout", output.stdout.to_vec())
+                .await
+            {
                 warn!(
                     "Failed to upload stdout to SpongeBob for {}: {}",
                     config.name, e
                 );
             }
 
-            if let Err(e) = invocation.upload_file("stderr", output.stderr.to_vec()).await {
+            if let Err(e) = invocation
+                .upload_file("stderr", output.stderr.to_vec())
+                .await
+            {
                 warn!(
                     "Failed to upload stderr to SpongeBob for {}: {}",
                     config.name, e
@@ -239,7 +245,9 @@ impl BuildExecutor {
             return Err(ExecutionError::BuildFailed {
                 code: exit_code,
                 temp_dir: self.build_workspace_dir.clone(),
-                spongebob_url: spongebob_invocation.as_ref().map(|inv| inv.url().to_string()),
+                spongebob_url: spongebob_invocation
+                    .as_ref()
+                    .map(|inv| inv.url().to_string()),
             }
             .into());
         }

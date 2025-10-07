@@ -1,4 +1,4 @@
-let { BuildSpec, Local, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
 let glibc = import "../glibc/build.ncl" in
 let ncurses = import "../ncurses/build.ncl" in
 let readline = import "../readline/build.ncl" in
@@ -44,11 +44,14 @@ let linux_headers = import "../linux_headers/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    bash = { glob = "usr/bin/bash" } | OutputLib,
-    usr_bin = { glob = "usr/bin/**/*" } | OutputLib,
-    usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
-    usr_share = { glob = "usr/share/**/*" } | OutputLib,
-    usr_include = { glob = "usr/include/**/*" } | OutputLib,
+    bash = { glob = "usr/bin/bash" } | OutputBin,
+    sh = { glob = "usr/bin/sh" } | OutputBin,
+
+    # libs = { glob = "usr/lib/bash/*" } | OutputLib,
+
+    mans = { glob = "usr/share/man/**" } | OutputData,
+    includes = { glob = "usr/include/**" } | OutputData,
+    locales = { glob = "usr/share/locale/**" } | OutputData,
   },
 
   replace_on_cycle =

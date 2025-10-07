@@ -56,6 +56,10 @@ pub(crate) fn output_types_valid(
                 (Err(e), BuildOutput::Binary { .. } | BuildOutput::Library { .. }) => {
                     if matches!(output, BuildOutput::Binary { .. }) && data.starts_with(b"#!") {
                         // Special case for binaries - its valid for it to be a #! executable.
+                    } else if matches!(output, BuildOutput::Library { .. })
+                        && object::read::archive::ArchiveFile::parse(&*data).is_ok()
+                    {
+                        // Special case for libraries - its valid for it to be a .a archive object.
                     } else {
                         result.verdict = CheckVerdict::Fail;
                         result.err.push(format!(
