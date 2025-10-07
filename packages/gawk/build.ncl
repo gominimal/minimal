@@ -1,4 +1,4 @@
-let { BuildSpec, Local, OutputBin, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
@@ -14,11 +14,15 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    usr_bin = { glob = "usr/bin/**/*" } | OutputBin,
-    usr_include = { glob = "usr/include/**/*" } | OutputLib,
-    usr_lib = { glob = "usr/lib/**/*" } | OutputLib,
-    usr_libexec = { glob = "usr/libexec/**/*" } | OutputLib,
-    usr_share = { glob = "usr/share/**/*" } | OutputLib,
+    bins = { glob = "usr/bin/*" } | OutputBin,
+    libs = { glob = "usr/lib/gawk/*.so" } | OutputLib,
+    libexec = { glob = "usr/libexec/awk/*" } | OutputLib,
+
+    includes = { glob = "usr/include/**" } | OutputData,
+
+    awk_data = { glob = "usr/share/awk/*" } | OutputData,
+    mans = { glob = "usr/share/man/**" } | OutputData,
+    locales = { glob = "usr/share/locale/**" } | OutputData,
   },
 
   replace_on_cycle =

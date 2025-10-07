@@ -1,4 +1,4 @@
-let { BuildSpec, Local, OutputLib, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputData, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let tcl = import "../tcl/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
@@ -15,8 +15,10 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    usr_bin = { glob = "usr/bin/*" } | OutputLib,
-    usr_include = { glob = "usr/include/*" } | OutputLib,
-    usr_share_dejagnu = { glob = "usr/share/dejagnu/**/*" } | OutputLib,
+    dejagnu = { glob = "usr/bin/dejagnu" } | OutputBin,
+    runtest = { glob = "usr/bin/runtest" } | OutputBin,
+
+    includes = { glob = "usr/include/**" } | OutputData,
+    usr_share_dejagnu = { glob = "usr/share/dejagnu/**/*" } | OutputData,
   },
 } | BuildSpec

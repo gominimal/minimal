@@ -59,7 +59,8 @@ let pcre2 = import "../pcre2/build.ncl" in
     grep_bin = { glob = "usr/bin/grep" } | OutputBin,
     egrep_bin = { glob = "usr/bin/egrep" } | OutputBin,
     fgrep_bin = { glob = "usr/bin/fgrep" } | OutputBin,
-    locales = { glob = "usr/share/locale/**/*" } | OutputData,
+
+    locales = { glob = "usr/share/locale/**" } | OutputData,
   },
   replace_on_cycle =
     {

@@ -1,4 +1,4 @@
-let { BuildSpec, Local, OutputBin, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
@@ -14,10 +14,12 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    file_bin = { glob = "usr/bin/file" } | OutputBin,
+    file = { glob = "usr/bin/file" } | OutputBin,
+
     libmagic = { glob = "usr/lib/libmagic.so*" } | OutputLib,
-    headers = { glob = "usr/include/magic.h" } | OutputLib,
-    magic_data = { glob = "usr/share/misc/magic*" } | OutputLib,
+    data = { glob = "usr/share/misc/magic*" } | OutputData,
+
+    includes = { glob = "usr/include/**" } | OutputData,
   },
 
   replace_on_cycle =

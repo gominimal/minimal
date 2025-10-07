@@ -25,7 +25,7 @@ pub async fn cmd_upload_cache(args: UploadArgs, globals: &GlobalArgs) -> Result<
             remote_cache.upload(&bsh, &cache).await.unwrap();
         } else {
             eprintln!(
-                "Skipping unbuild package {} [{}]",
+                "Skipping unbuilt package {} [{}]",
                 build.name,
                 bsh.0.to_hex()
             );

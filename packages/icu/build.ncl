@@ -20,10 +20,11 @@ let toolchain = import "../toolchain/build.ncl" in
   cmd = "./build.sh",
 
   outputs = {
-    libs = { glob = "usr/lib/**/*" } | OutputLib,
     bins = { glob = "usr/bin/*" } | OutputBin,
     sbins = { glob = "usr/sbin/*" } | OutputBin,
+    libs = { glob = "usr/lib/*.{a,so*}" } | OutputLib,
 
-    includes = { glob = "usr/include/**/*" } | OutputData,
+    pkgconfigs = { glob = "usr/lib/pkgconfig/**" } | OutputData,
+    includes = { glob = "usr/include/**" } | OutputData,
   },
 } | BuildSpec

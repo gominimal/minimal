@@ -1,4 +1,4 @@
-let { BuildSpec, Local, OutputLib, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let patch = import "../patch/build.ncl" in
 let python = import "../python/build.ncl" in
@@ -26,9 +26,9 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    libexpect5 = { glob = "usr/lib/libexpect5.45.4.so" } | OutputLib,
-    usr_bin = { glob = "usr/bin/*" } | OutputLib,
-    usr_lib_expect = { glob = "usr/lib/expect5.45.4/*" } | OutputLib,
-    usr_include = { glob = "usr/include/*" } | OutputLib,
+    bins = { glob = "usr/bin/*" } | OutputBin,
+    libs = { glob = "usr/lib/**/*.{a,so*}" } | OutputLib,
+
+    includes = { glob = "usr/include/**" } | OutputData,
   },
 } | BuildSpec

@@ -1,4 +1,4 @@
-let { BuildSpec, Local, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputData, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
 # base
 let bash = import "../bash/build.ncl" in
 let bzip2 = import "../bzip2/build.ncl" in
@@ -54,7 +54,13 @@ let m4 = import "../m4/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    usr = { glob = "usr/**/*" } | OutputLib,
+    libs = { glob = "usr/lib/*.{a,so*}" } | OutputLib,
+
+    ltconfigs = { glob = "usr/lib/*.la" } | OutputData,
+    pkgconfigs = { glob = "usr/lib/pkgconfig/**" } | OutputData,
+
+    infos = { glob = "usr/share/info/*.info" } | OutputData,
+    includes = { glob = "usr/include/**" } | OutputData,
   },
   replace_on_cycle =
     {

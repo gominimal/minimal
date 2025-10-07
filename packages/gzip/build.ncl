@@ -14,9 +14,10 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    binaries = { glob = "usr/bin/*" } | OutputBin,
-    info = { glob = "usr/share/info/*.info" } | OutputData,
-    man = { glob = "usr/share/man/man1/*.1" } | OutputData,
+    bins = { glob = "usr/bin/*" } | OutputBin,
+
+    infos = { glob = "usr/share/info/*.info" } | OutputData,
+    mans = { glob = "usr/share/man/**" } | OutputData,
   },
 
   replace_on_cycle =

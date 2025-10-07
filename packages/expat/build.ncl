@@ -1,4 +1,4 @@
-let { BuildSpec, Local, OutputLib, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
@@ -14,9 +14,11 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    xmlwf = { glob = "usr/bin/xmlwf" } | OutputLib,
-    library = { glob = "usr/lib/libexpat.so*" } | OutputLib,
-    headers = { glob = "usr/include/expat*.h" } | OutputLib,
-    pkgconfig = { glob = "usr/lib/pkgconfig/expat.pc" } | OutputLib,
+    xmlwf = { glob = "usr/bin/xmlwf" } | OutputBin,
+
+    libexpat = { glob = "usr/lib/libexpat.so*" } | OutputLib,
+
+    includes = { glob = "usr/include/expat*.h" } | OutputData,
+    pkgconfig = { glob = "usr/lib/pkgconfig/expat.pc" } | OutputData,
   },
 } | BuildSpec
