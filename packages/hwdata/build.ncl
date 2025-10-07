@@ -16,6 +16,6 @@ let toolchain = import "../toolchain/build.ncl" in
   outputs = {
     hwdata = { glob = "usr/share/hwdata/*" } | OutputData,
 
-    pkgconfigs = { glob = "usr/lib/pkgconfig/**" } | OutputData,
+    pkgconfigs = { glob = "usr/share/pkgconfig/*" } | OutputData,
   },
 } | BuildSpec
