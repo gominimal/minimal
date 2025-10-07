@@ -1,4 +1,4 @@
-let { BuildSpec, Local, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputLib, OutputData, Prebuilt, Source, .. } = import "minimal.ncl" in
 # base
 let bash = import "../bash/build.ncl" in
 let bzip2 = import "../bzip2/build.ncl" in
@@ -69,8 +69,31 @@ let zstd = import "../zstd/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    usr = { glob = "usr/**/*" } | OutputLib,
+    bins = { glob = "usr/bin/*" } | OutputBin,
+
+    libs = { glob = "usr/lib/**/*.{a,o,so*}" } | OutputLib,
+    libatomic = { glob = "usr/lib/libatomic.so*" } | OutputLib,
+    libgcc = { glob = "usr/lib/libgcc_s.so*" } | OutputLib,
+    libgomp = { glob = "usr/lib/libgomp.so*" } | OutputLib,
+    libstdcpp = { glob = "usr/lib/libstdc++*.so*" } | OutputLib,
+
+    libs_data = { glob = "usr/lib/**" } | OutputData,
+    share_data = { glob = "usr/share/gcc-*/**" } | OutputData,
+    ltconfigs = { glob = "usr/lib/**/*.la" } | OutputData,
+
+    # Wildcards are target/version
+    libexec_bins = { glob = "usr/libexec/gcc/*/*/{cc1,cc1plus,collect2,lto1,lto-wrapper}" } | OutputBin,
+    libexec_libs = { glob = "usr/libexec/gcc/*/*/g++-mapper-server" } | OutputLib,
+    plugins = { glob = "usr/libexec/gcc/*/*/plugin/*" } | OutputBin,
+    install_tools = { glob = "usr/libexec/gcc/*/*/install-tools/*" } | OutputBin,
+
+    liblto_plugin = { glob = "usr/libexec/gcc/*/*/liblto_plugin.so" } | OutputLib,
+    lto_plugin_ltconfig = { glob = "usr/libexec/gcc/*/*/liblto_plugin.la" } | OutputData,
+
+    mans = { glob = "usr/share/man/**" } | OutputData,
+    includes = { glob = "usr/include/**" } | OutputData,
   },
+
   replace_on_cycle =
     {
       name = "gcc (prebuilt)",
