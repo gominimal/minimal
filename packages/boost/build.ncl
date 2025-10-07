@@ -26,7 +26,7 @@ let toolchain = import "../toolchain/build.ncl" in
   outputs = {
     libs = { glob = "usr/lib/*" } | OutputLib,
 
-    includes = { glob = "usr/include/**/*" } | OutputData,
+    includes = { glob = "usr/include/boost/**" } | OutputData,
     cmake_data = { glob = "usr/lib/cmake/**/*" } | OutputData,
   },
 } | BuildSpec

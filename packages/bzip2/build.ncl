@@ -26,7 +26,7 @@ let toolchain = import "../toolchain/build.ncl" in
     bzless = { glob = "usr/bin/bzless" } | OutputBin,
     bzmore = { glob = "usr/bin/bzmore" } | OutputBin,
 
-    libbz2 = { glob = "usr/lib/libbz2.so*" } | OutputLib,
+    libs = { glob = "usr/lib/*" } | OutputLib,
 
     headers = { glob = "usr/include/bzlib.h" } | OutputData,
   },

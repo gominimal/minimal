@@ -1,4 +1,4 @@
-let { BuildSpec, Local, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let m4 = import "../m4/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
@@ -29,7 +29,9 @@ let zstd = import "../zstd/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    libs = { glob = "usr/lib/*" } | OutputLib,
-    includes = { glob = "usr/include/*" } | OutputData,
+    bins = { glob = "usr/bin/*" } | OutputBin,
+    libs = { glob = "usr/lib/*.{a,so*}" } | OutputLib,
+
+    includes = { glob = "usr/include/**" } | OutputData,
   },
 } | BuildSpec

@@ -1,4 +1,4 @@
-let { BuildSpec, Local, OutputLib, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputData, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let openssl = import "../openssl/build.ncl" in
 {
@@ -14,6 +14,6 @@ let openssl = import "../openssl/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    certs = { glob = "etc/ssl/certs/*" } | OutputLib,
+    certs = { glob = "etc/ssl/certs/*" } | OutputData,
   },
 } | BuildSpec

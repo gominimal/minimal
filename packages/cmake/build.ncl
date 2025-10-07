@@ -1,4 +1,4 @@
-let { BuildSpec, Local, OutputLib, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let openssl = import "../openssl/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
@@ -18,6 +18,13 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    usr = { glob = "usr/**/*" } | OutputLib,
+    cmake = { glob = "usr/bin/cmake" } | OutputBin,
+    cpack = { glob = "usr/bin/cpack" } | OutputBin,
+    ctest = { glob = "usr/bin/ctest" } | OutputBin,
+
+    cmake_data = { glob = "usr/share/cmake-*/**" } | OutputData,
+
+    aclocals = { glob = "usr/share/aclocal/*" } | OutputData,
+    completions = { glob = "usr/share/bash-completion/**/*" } | OutputData,
   },
 } | BuildSpec
