@@ -3,8 +3,12 @@ name: ci
 on:
   push:
     branches: [ "main" ]
+    paths-ignore:
+      - 'packages/**'
   pull_request:
     branches: [ "main" ]
+    paths-ignore:
+      - 'packages/**'
 
 env:
   CARGO_TERM_COLOR: always
