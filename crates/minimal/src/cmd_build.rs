@@ -42,11 +42,6 @@ pub async fn cmd_build_impl(
             .join(",")
     );
 
-    let mut spongebob_invocation = spongebob_client
-        .create_invocation(&command_info)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob invocation: {}", e))?;
-    let spongebob_url = spongebob_invocation.url().to_string();
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_parallel_builds)
         .build_global()
@@ -64,6 +59,8 @@ pub async fn cmd_build_impl(
         PrebuiltsLock::load(Path::new("prebuilts.lock")).unwrap(),
         output_base,
     );
+
+    let mut spongebob_invocation = spongebob_client.create_invocation(&command_info).await.ok();
 
     match (globals.no_cache, globals.no_fetch) {
         // No local or remote cache
@@ -158,10 +155,14 @@ pub async fn cmd_build_impl(
     }
 
     // Log build results to SpongeBob
-    log_build_results_to_spongebob(&mut spongebob_invocation, graph, true).await?;
+    if let Some(ref mut invocation) = spongebob_invocation {
+        log_build_results_to_spongebob(invocation, graph, true).await?;
+    }
+
+    let spongebob_url = spongebob_invocation.as_ref().map(|inv| inv.url().to_string());
 
     // Display build summary
-    display_build_summary(graph, &cache, globals, &run, &spongebob_url);
+    display_build_summary(graph, &cache, globals, &run, spongebob_url.as_deref());
 
     Ok(())
 }
@@ -214,7 +215,7 @@ fn display_build_summary(
     cache: &Cache<LocalDir>,
     _globals: &GlobalArgs,
     _run: &Run,
-    command_spongebob_url: &str,
+    command_spongebob_url: Option<&str>,
 ) {
     info!("Build completed successfully!");
 
@@ -233,5 +234,7 @@ fn display_build_summary(
             }
         }
     }
-    info!("{}", command_spongebob_url);
+    if let Some(url) = command_spongebob_url {
+        info!("{}", url);
+    };
 }

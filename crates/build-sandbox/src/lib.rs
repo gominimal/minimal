@@ -24,7 +24,7 @@ pub struct BuildResult {
 pub async fn run_build(
     config: &BuildConfig,
     cache_dest_dir: &std::path::Path,
-    spongebob_invocation: &mut spongebob::SpongeBobInvocation,
+    spongebob_invocation: &mut Option<spongebob::SpongeBobInvocation>,
     sandbox_base_dir: std::path::PathBuf,
 ) -> Result<BuildResult> {
     let executor = BuildExecutor::new(sandbox_base_dir, config.name.clone())?;

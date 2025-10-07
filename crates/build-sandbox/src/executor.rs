@@ -57,7 +57,7 @@ impl BuildExecutor {
     pub async fn execute(
         &self,
         config: &BuildConfig,
-        spongebob_invocation: &mut spongebob::SpongeBobInvocation,
+        spongebob_invocation: &mut Option<spongebob::SpongeBobInvocation>,
     ) -> Result<(i32, Option<String>)> {
         info!(
             "Linking {} inputs to build environment",
@@ -68,9 +68,12 @@ impl BuildExecutor {
             self.hardlink_to_tmpdir(input)?;
         }
 
-        let spongebob_url = self
-            .execute_in_container(config, spongebob_invocation)
+        self.execute_in_container(config, spongebob_invocation)
             .await?;
+
+        let spongebob_url = spongebob_invocation
+            .as_ref()
+            .map(|inv| inv.url().to_string());
 
         Ok((0, spongebob_url))
     }
@@ -122,8 +125,8 @@ impl BuildExecutor {
     async fn execute_in_container(
         &self,
         config: &BuildConfig,
-        spongebob_invocation: &mut spongebob::SpongeBobInvocation,
-    ) -> Result<Option<String>> {
+        spongebob_invocation: &mut Option<spongebob::SpongeBobInvocation>,
+    ) -> Result<()> {
         let rootfs = self.prepare_rootfs(config)?;
         let sandbox_mount_point = "/build";
         let program = &config.build_script.executable.to_string_lossy();
@@ -195,9 +198,21 @@ impl BuildExecutor {
             }
         })?;
 
-        let spongebob_url = self
-            .upload_logs(config, &output.stdout, &output.stderr, spongebob_invocation)
-            .await;
+        if let Some(invocation) = spongebob_invocation {
+            if let Err(e) = invocation.upload_file("stdout", output.stdout.to_vec()).await {
+                warn!(
+                    "Failed to upload stdout to SpongeBob for {}: {}",
+                    config.name, e
+                );
+            }
+
+            if let Err(e) = invocation.upload_file("stderr", output.stderr.to_vec()).await {
+                warn!(
+                    "Failed to upload stderr to SpongeBob for {}: {}",
+                    config.name, e
+                );
+            }
+        }
 
         if !output.status.success() {
             let exit_code = output.status.code;
@@ -224,12 +239,12 @@ impl BuildExecutor {
             return Err(ExecutionError::BuildFailed {
                 code: exit_code,
                 temp_dir: self.build_workspace_dir.clone(),
-                spongebob_url,
+                spongebob_url: spongebob_invocation.as_ref().map(|inv| inv.url().to_string()),
             }
             .into());
         }
 
-        Ok(spongebob_url)
+        Ok(())
     }
 
     #[tracing::instrument(skip(config), fields(indicatif.pb_show))]
@@ -242,30 +257,6 @@ impl BuildExecutor {
         }
 
         Ok(rootfs)
-    }
-
-    async fn upload_logs(
-        &self,
-        config: &BuildConfig,
-        stdout: &[u8],
-        stderr: &[u8],
-        invocation: &mut spongebob::SpongeBobInvocation,
-    ) -> Option<String> {
-        if let Err(e) = invocation.upload_file("stdout", stdout.to_vec()).await {
-            warn!(
-                "Failed to upload stdout to SpongeBob for {}: {}",
-                config.name, e
-            );
-        }
-
-        if let Err(e) = invocation.upload_file("stderr", stderr.to_vec()).await {
-            warn!(
-                "Failed to upload stderr to SpongeBob for {}: {}",
-                config.name, e
-            );
-        }
-
-        Some(invocation.url().to_string())
     }
 }
 

@@ -426,7 +426,7 @@ impl<'a> Run<'a> {
         build: &BuildSpecRef,
         _full_build: bool,
         remote_cache: Option<&RemoteCache<GcsStorage>>,
-        spongebob_invocation: &mut spongebob::SpongeBobInvocation,
+        spongebob_invocation: &mut Option<spongebob::SpongeBobInvocation>,
     ) -> Result<(Option<PendingDir>, Option<String>)> {
         let bsh = self.graph.spec_hash(build);
         let build = self.graph.get(build).unwrap();
@@ -522,7 +522,7 @@ impl<'a> Run<'a> {
         &mut self,
         plan: ExecPlan<'a, BP>,
         remote_cache: Option<&RemoteCache<GcsStorage>>,
-        spongebob_invocation: &mut spongebob::SpongeBobInvocation,
+        spongebob_invocation: &mut Option<spongebob::SpongeBobInvocation>,
     ) -> Result<()> {
         // Execute builds in dependency order - each build runs in isolation
         // and can only access outputs from previously completed builds
