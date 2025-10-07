@@ -4,7 +4,7 @@ For now, the minimal tool only runs on amd64 Linux. 8 cores and at least 8 Gb of
 
 ### Dependencies
 1. Install a fairly recent version of rust: https://rust-lang.org/tools/install/
-2. Install deps (openssl, pkg-config, git, protoc-compiler): `sudo apt-get install openssl pkg-config libssl-dev git protobuf-compiler`
+2. Install deps (openssl, pkg-config, build-essential, git, protoc-compiler): `sudo apt-get install build-essential openssl pkg-config libssl-dev git protobuf-compiler `
 
 ### Building the binary
 Either: `cargo build` for debug (faster build) and `cargo build --release` (slower build, faster execution)
