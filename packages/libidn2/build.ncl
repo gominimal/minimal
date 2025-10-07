@@ -1,4 +1,4 @@
-let { BuildSpec, Local, OutputLib, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 let libunistring = import "../libunistring/build.ncl" in
@@ -16,10 +16,13 @@ let libunistring = import "../libunistring/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    bins = { glob = "usr/bin/idn2" } | OutputLib,
-    libs = { glob = "usr/lib/libidn2*" } | OutputLib,
-    includes = { glob = "usr/include/*" } | OutputLib,
-    pkgconfig = { glob = "usr/lib/pkgconfig/libidn2.pc" } | OutputLib,
-    man = { glob = "usr/share/man/man*/*" } | OutputLib,
+    idn2 = { glob = "usr/bin/idn2" } | OutputBin,
+    libs = { glob = "usr/lib/*.{a,so*}" } | OutputLib,
+
+    pkgconfigs = { glob = "usr/lib/pkgconfig/*" } | OutputData,
+
+    mans = { glob = "usr/share/man/**" } | OutputData,
+    includes = { glob = "usr/include/**" } | OutputData,
+    locales = { glob = "usr/share/locale/**" } | OutputData,
   },
 } | BuildSpec

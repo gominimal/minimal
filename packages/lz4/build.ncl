@@ -1,4 +1,4 @@
-let { BuildSpec, Local, OutputLib, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
@@ -14,11 +14,16 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    lz4_bin = { glob = "usr/bin/lz4" } | OutputLib,
-    lz4c_bin = { glob = "usr/bin/lz4c" } | OutputLib,
-    lz4cat_bin = { glob = "usr/bin/lz4cat" } | OutputLib,
-    unlz4_bin = { glob = "usr/bin/unlz4" } | OutputLib,
+    lz4 = { glob = "usr/bin/lz4" } | OutputBin,
+    lz4c = { glob = "usr/bin/lz4c" } | OutputBin,
+    lz4cat = { glob = "usr/bin/lz4cat" } | OutputBin,
+    unlz4 = { glob = "usr/bin/unlz4" } | OutputBin,
+
     liblz4 = { glob = "usr/lib/liblz4.so*" } | OutputLib,
-    headers = { glob = "usr/include/*.h" } | OutputLib,
+
+    pkgconfigs = { glob = "usr/lib/pkgconfig/**" } | OutputData,
+
+    mans = { glob = "usr/share/man/**" } | OutputData,
+    includes = { glob = "usr/include/**" } | OutputData,
   },
 } | BuildSpec

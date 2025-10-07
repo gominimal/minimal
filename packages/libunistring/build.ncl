@@ -1,4 +1,4 @@
-let { BuildSpec, Local, OutputLib, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
@@ -14,9 +14,7 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    libs = { glob = "usr/lib/libunistring*" } | OutputLib,
-    includes = { glob = "usr/include/*.h" } | OutputLib,
-    includes_unistring = { glob = "usr/include/unistring/*.h" } | OutputLib,
-    doc = { glob = "usr/share/doc/libunistring-1.3/*" } | OutputLib,
+    libs = { glob = "usr/lib/*.{a,so*}" } | OutputLib,
+    includes = { glob = "usr/include/**" } | OutputData,
   },
 } | BuildSpec

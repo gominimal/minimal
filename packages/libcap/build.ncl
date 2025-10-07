@@ -28,11 +28,13 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   cmd = "./build.sh",
   outputs = {
-    sbin = { glob = "usr/sbin/*" } | OutputBin,
-    lib = { glob = "usr/lib/*" } | OutputLib,
-    usr_include = { glob = "usr/include/**/*" } | OutputData,
-    man = { glob = "usr/share/man/**/*" } | OutputData,
-    pkgconfig = { glob = "usr/lib/pkgconfig/*" } | OutputData,
+    sbins = { glob = "usr/sbin/*" } | OutputBin,
+    libs = { glob = "usr/lib/*.so*" } | OutputLib,
+
+    pkgconfigs = { glob = "usr/lib/pkgconfig/**" } | OutputData,
+
+    mans = { glob = "usr/share/man/**" } | OutputData,
+    includes = { glob = "usr/include/**" } | OutputData,
   },
 
   replace_on_cycle =
