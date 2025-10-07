@@ -60,7 +60,13 @@ pub async fn cmd_build_impl(
         output_base,
     );
 
-    let mut spongebob_invocation = spongebob_client.create_invocation(&command_info).await.ok();
+    let mut spongebob_invocation = match spongebob_client.create_invocation(&command_info).await {
+        Ok(inv) => Some(inv),
+        Err(e) => {
+            tracing::warn!("Failed to create SpongeBob invocation: {}", e);
+            None
+        }
+    };
 
     match (globals.no_cache, globals.no_fetch) {
         // No local or remote cache
