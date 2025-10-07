@@ -32,6 +32,8 @@ mod cmd_oci_image;
 use cmd_oci_image::{OciImageArgs, cmd_oci_image};
 mod cmd_upload_cache;
 use cmd_upload_cache::{UploadArgs, cmd_upload_cache};
+mod cmd_unsafe_patched_build;
+use cmd_unsafe_patched_build::{UnsafePatchedBuildArgs, cmd_unsafe_patched_build};
 
 #[derive(Parser)]
 #[command(name = "minimal", version = env!("GIT_HASH"))]
@@ -58,6 +60,8 @@ enum Command {
     Check(CheckArgs),
     /// Uploads the specified packages and their transitive needs to the cache.
     UploadCache(UploadArgs),
+    /// Unsafely executes the build for a package, using potentially stale dependencies.
+    UnsafePatchedBuild(UnsafePatchedBuildArgs),
 }
 
 /// Shared arguments and builders across all subcommands
@@ -299,6 +303,7 @@ async fn main() -> Result<()> {
         Command::UploadCache(args) => cmd_upload_cache(args, &cli.global_args).await,
         Command::NewWorldUpdate(args) => cmd_new_world_update(args, &cli.global_args).await,
         Command::OciImage(args) => cmd_oci_image(args, &cli.global_args).await,
+        Command::UnsafePatchedBuild(args) => cmd_unsafe_patched_build(args, &cli.global_args).await,
     };
 
     if let Err(e) = result {

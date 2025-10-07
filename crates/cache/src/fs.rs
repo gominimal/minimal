@@ -115,8 +115,14 @@ impl FileSystem for LocalDir {
         std::fs::File::create(p)
     }
 
-    fn read_dir<P: AsRef<Path>>(&self, _path: P) -> Result<Vec<Self::DirEntry>, FSError> {
-        todo!();
+    fn read_dir<P: AsRef<Path>>(&self, path: P) -> Result<Vec<Self::DirEntry>, FSError> {
+        let p = Path::new(&self.base).join(path);
+        let p = p.absolutize()?;
+        if !p.starts_with(&self.base) {
+            return Err(std::io::Error::other("outside local dir"));
+        }
+
+        std::fs::read_dir(p).map(|r| r.collect::<Result<Vec<_>, _>>())?
     }
 
     fn mkdir<P: AsRef<Path>>(&self, path: P) -> Result<(), FSError> {

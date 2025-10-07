@@ -15,7 +15,7 @@ use url::Url;
 use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage};
 
 /// yields a directory that the files in an [SourceInput] are available.
-async fn materialize_source(
+pub(crate) async fn materialize_source(
     build_name: &str,
     source: &SourceInput,
     remote_storage: &RemoteStorage,
