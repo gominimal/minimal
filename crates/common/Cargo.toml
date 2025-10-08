@@ -17,7 +17,10 @@ blake3.workspace = true
 smallvec.workspace = true
 tracing.workspace = true
 
+sha2.workspace = true
+tar.workspace = true
 tempfile.workspace = true
+zstd.workspace = true
 
 bytes.workspace = true
 reqwest.workspace = true

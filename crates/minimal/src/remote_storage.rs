@@ -3,7 +3,7 @@ use common::Tee;
 use google_cloud_storage::client::Storage;
 use sha2::{Digest, Sha256};
 
-use std::fs;
+use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
 use std::path::PathBuf;
 
@@ -191,15 +191,14 @@ impl RemoteStorage {
         Ok(())
     }
 
-    #[tracing::instrument(skip(data))]
-    pub async fn upload(&self, bucket_id: &str, file_path: &str, data: &[u8]) -> Result<()> {
-        let bytes_data = bytes::Bytes::copy_from_slice(data);
+    #[tracing::instrument(skip(file))]
+    pub async fn upload(&self, bucket_id: &str, file_path: &str, file: File) -> Result<()> {
         let _response = self
             .client
             .write_object(
                 format!("projects/_/buckets/{bucket_id}"),
                 file_path,
-                bytes_data,
+                tokio::fs::File::from_std(file),
             )
             .send_buffered()
             .await?;

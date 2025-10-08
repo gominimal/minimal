@@ -527,10 +527,13 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
+ "sha2",
  "smallvec",
+ "tar",
  "tempfile",
  "tracing",
  "url",
+ "zstd",
 ]
 
 [[package]]
