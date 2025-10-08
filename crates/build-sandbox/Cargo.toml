@@ -6,10 +6,12 @@ publish.workspace = true
 
 [dependencies]
 globset.workspace = true
-hakoniwa.workspace = true
 nickel-lang-core.workspace = true
 serde.workspace = true
 spongebob = { path = "../spongebob" }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+hakoniwa.workspace = true

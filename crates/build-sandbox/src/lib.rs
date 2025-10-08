@@ -1,5 +1,9 @@
 pub mod config;
 pub mod error;
+#[cfg(target_os = "linux")]
+pub mod executor;
+#[cfg(not(target_os = "linux"))]
+#[path = "executor_stub.rs"]
 pub mod executor;
 pub mod output;
 
