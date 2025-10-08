@@ -67,13 +67,13 @@ enum Command {
 /// Shared arguments and builders across all subcommands
 #[derive(Debug, Args)]
 pub struct GlobalArgs {
-    /// Override the directory where binary artifacts are cached
+    /// Override the directory where binary artifacts are cached (default: ~/.cache/minimal/builds)
     #[arg(long)]
     cache_dir: Option<PathBuf>,
-    /// Override the direct where builds are performed (default: ~/.cache/minimal/sandboxes)
+    /// Override the directory where builds are performed (default: ~/.cache/minimal/sandboxes)
     #[arg(long)]
     builds_dir: Option<PathBuf>,
-    /// Override the download cache directory (default: ~/.cache/minimal/downloads)
+    /// Override the directory where downloads are cached (default: ~/.cache/minimal/downloads)
     #[arg(long)]
     download_cache_dir: Option<PathBuf>,
 
@@ -153,13 +153,10 @@ impl GlobalArgs {
         .await
     }
 
-    pub fn packages_dir(&self) -> PathBuf {
-        self.path_config().packages_dir().to_path_buf()
-    }
-
     /// Returns a [DepGraph] with the given package and its transitive dependencies loaded.
     pub fn graph_from_package_name(&self, package_name: &String) -> Result<DepGraph, GraphError> {
-        let package_dir = self.packages_dir().join(package_name);
+        let path_config = self.path_config();
+        let package_dir = path_config.packages_dir().join(package_name);
 
         let build_ncl_path = {
             let normal_path = package_dir.join("build.ncl");
@@ -176,7 +173,7 @@ impl GlobalArgs {
         let sr = SpecReader::new_with_path(
             &build_ncl_path,
             &SpecReaderOptions {
-                minimal_lib_path: "crates/graph/minimal-ncl".into(),
+                minimal_lib_path: path_config.minimal_stdlib_dir().to_path_buf(),
             },
         )?;
 
@@ -185,13 +182,14 @@ impl GlobalArgs {
 
     #[tracing::instrument]
     pub fn graph_from_package_names(&self, names: &[String]) -> Result<DepGraph, GraphError> {
-        let packages_dir = self.packages_dir();
+        let path_config = self.path_config();
+        let packages_dir = path_config.packages_dir();
 
         let sr = SpecReader::new_with_pkgs(
             names,
             packages_dir,
             &SpecReaderOptions {
-                minimal_lib_path: "crates/graph/minimal-ncl".into(),
+                minimal_lib_path: path_config.minimal_stdlib_dir().to_path_buf(),
             },
         )?;
 
@@ -199,12 +197,13 @@ impl GlobalArgs {
     }
 
     pub fn graph_from_all_packages(&self) -> Result<DepGraph, GraphError> {
-        let packages_dir = self.packages_dir();
+        let path_config = self.path_config();
+        let packages_dir = path_config.packages_dir();
 
         let sr = SpecReader::new_with_all_pkgs(
             packages_dir,
             &SpecReaderOptions {
-                minimal_lib_path: "crates/graph/minimal-ncl".into(),
+                minimal_lib_path: path_config.minimal_stdlib_dir().to_path_buf(),
             },
         )?;
 
