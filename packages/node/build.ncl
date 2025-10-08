@@ -9,6 +9,8 @@ let icu = import "../icu/build.ncl" in
 let libuv = import "../libuv/build.ncl" in
 let sqlite = import "../sqlite/build.ncl" in
 let zlib = import "../zlib/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
+let gcc = import "../gcc/build.ncl" in
 
 let version = "24.9.0" in
 {
@@ -31,6 +33,8 @@ let version = "24.9.0" in
     libuv,
     zlib,
     sqlite,
+    glibc,
+    gcc, # TODO: Use a subset thats just libstdc, libm, libgcc_s
   ],
 
   cmd = "./build.sh",
