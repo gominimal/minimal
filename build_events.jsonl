@@ -1,0 +1,8 @@
+{"type":"build_started","invocation_id":"demo-invocation-123","command_line":["minimal","build","//example:target"],"timestamp_millis":1759951982261,"working_directory":"/Users/bweeks/Code/minimal/minpkgs"}
+{"type":"target_started","label":"//example:target","target_kind":"binary","timestamp_millis":1759951982363}
+{"type":"action_started","action_id":"action-compile-1","label":"//example:target","mnemonic":"RustcCompile","timestamp_millis":1759951982466}
+{"type":"action_completed","action_id":"action-compile-1","success":true,"timestamp_millis":1759951982667,"exit_code":0,"stdout":"Compiling example v0.1.0","stderr":null}
+{"type":"action_started","action_id":"action-link-1","label":"//example:target","mnemonic":"RustcLink","timestamp_millis":1759951982769}
+{"type":"action_completed","action_id":"action-link-1","success":true,"timestamp_millis":1759951982922,"exit_code":0,"stdout":"Finished release [optimized] target(s)","stderr":null}
+{"type":"target_completed","label":"//example:target","success":true,"timestamp_millis":1759951983024,"error_message":null,"outputs":["target/release/example"]}
+{"type":"build_finished","invocation_id":"demo-invocation-123","success":true,"timestamp_millis":1759951983126,"error_message":null}

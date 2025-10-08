@@ -1,6 +1,9 @@
 use crate::{Error, lockfile::PrebuiltsLock, remote_storage::RemoteStorage, run::Run};
 use crate::{GlobalArgs, PackagesArg};
 use anyhow::Context;
+use build_events::events::{BuildEvent, BuildFinished, BuildStarted, current_millis};
+use build_events::{BuildEventBus, BuildEventDispatcher};
+use build_events_proto::SpongeBobSubscriberV2;
 use cache::{Cache, CacheBinProvider, LocalDir, RemoteBinProvider};
 use graph::{DepGraph, ExecPlan, Transitives};
 use std::path::Path;
@@ -32,15 +35,7 @@ pub async fn cmd_build_impl(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob client: {}", e))?;
 
-    let command_info = format!(
-        "build --packages {}",
-        graph
-            .top_levels
-            .iter()
-            .map(|bsr| graph.get(bsr).unwrap().name.as_str())
-            .collect::<Vec<_>>()
-            .join(",")
-    );
+    let mut spongebob_invocation = Some(spongebob_client.create_invocation());
 
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_parallel_builds)
@@ -60,15 +55,43 @@ pub async fn cmd_build_impl(
         output_base,
     );
 
-    let mut spongebob_invocation = match spongebob_client.create_invocation(&command_info).await {
-        Ok(inv) => Some(inv),
-        Err(e) => {
-            tracing::warn!("Failed to create SpongeBob invocation: {}", e);
-            None
-        }
-    };
+    // Setup build events system
+    let event_bus = BuildEventBus::new(10000);
 
-    match (globals.no_cache, globals.no_fetch) {
+    // Create dispatcher with SpongeBobSubscriberV2 if we have an invocation
+    if let Some(ref invocation) = spongebob_invocation {
+        let mut dispatcher = BuildEventDispatcher::new(event_bus.subscribe());
+        let subscriber = SpongeBobSubscriberV2::from_invocation(invocation.clone());
+        dispatcher.add_subscriber(Box::new(subscriber));
+
+        // Spawn dispatcher in background
+        tokio::spawn(async move {
+            dispatcher.run().await;
+        });
+    }
+
+    // Get invocation_id for events
+    let invocation_id = spongebob_invocation
+        .as_ref()
+        .map(|inv| inv.invocation_id().to_string())
+        .unwrap_or_else(|| "local".to_string());
+
+    // Get command line for BuildStarted event
+    let command_line = std::env::args().collect::<Vec<_>>();
+    let working_directory = std::env::current_dir()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    // Emit BuildStarted event
+    event_bus.emit(BuildEvent::BuildStarted(BuildStarted {
+        invocation_id: invocation_id.clone(),
+        command_line,
+        timestamp_millis: current_millis(),
+        working_directory,
+    }));
+
+    let build_success = match (globals.no_cache, globals.no_fetch) {
         // No local or remote cache
         (true, true) => {
             run.execute(ExecPlan::new(graph), None, &mut spongebob_invocation)
@@ -107,8 +130,22 @@ pub async fn cmd_build_impl(
             )
             .await
         }
-    }
-    .context("Failed to execute build")?;
+    };
+
+    // Determine if build was successful
+    let build_succeeded = build_success.is_ok();
+    let error_message = build_success.as_ref().err().map(|e| e.to_string());
+
+    // Emit BuildFinished event
+    event_bus.emit(BuildEvent::BuildFinished(BuildFinished {
+        invocation_id: invocation_id.clone(),
+        success: build_succeeded,
+        timestamp_millis: current_millis(),
+        error_message,
+    }));
+
+    // Propagate error if build failed
+    build_success.context("Failed to execute build")?;
 
     // If we got this far, everything we need is either fetchable or built.
     //
@@ -162,7 +199,7 @@ pub async fn cmd_build_impl(
 
     // Log build results to SpongeBob
     if let Some(ref mut invocation) = spongebob_invocation {
-        log_build_results_to_spongebob(invocation, graph, true).await?;
+        log_build_results_to_spongebob(invocation, graph, build_succeeded).await?;
     }
 
     let spongebob_url = spongebob_invocation

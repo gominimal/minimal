@@ -1,5 +1,10 @@
-use minimal_spongebob_community_neoeinstein_prost::spongebob::v1::{CreateFileRequest, CreateInvocationRequest, File, Invocation};
-use minimal_spongebob_community_neoeinstein_tonic::spongebob::v1::tonic::sponge_bob_service_client::SpongeBobServiceClient;
+use minimal_spongebob_community_neoeinstein_prost::spongebob::v1::{
+    BuildEvent, CreateFileRequest, File, PublishBuildEventRequest,
+};
+use minimal_spongebob_community_neoeinstein_tonic::spongebob::v1::tonic::{
+    build_event_service_client::BuildEventServiceClient,
+    result_storage_service_client::ResultStorageServiceClient,
+};
 use tonic::transport::Channel;
 use uuid::Uuid;
 
@@ -17,22 +22,43 @@ pub type Result<T> = std::result::Result<T, SpongeBobError>;
 
 #[derive(Debug)]
 pub struct SpongeBob {
-    service: SpongeBobServiceClient<Channel>,
+    build_event_service: BuildEventServiceClient<Channel>,
+    result_storage_service: ResultStorageServiceClient<Channel>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SpongeBobInvocation {
-    service: SpongeBobServiceClient<Channel>,
-    resource_name: String,
+    build_event_service: BuildEventServiceClient<Channel>,
+    result_storage_service: ResultStorageServiceClient<Channel>,
+    invocation_id: String,
     url: String,
 }
 
 impl SpongeBobInvocation {
+    /// Create a new invocation (no RPC needed - invocation created on first BuildStarted event)
+    pub fn new(
+        build_event_service: BuildEventServiceClient<Channel>,
+        result_storage_service: ResultStorageServiceClient<Channel>,
+        invocation_id: String,
+    ) -> Self {
+        let url = format!(
+            "{}/invocations/{}",
+            "https://dash.minimal.dev", invocation_id
+        );
+        Self {
+            build_event_service,
+            result_storage_service,
+            invocation_id,
+            url,
+        }
+    }
+
     #[tracing::instrument(skip(self, contents))]
     pub async fn upload_file(&mut self, file_name: &str, contents: Vec<u8>) -> Result<()> {
         let file_id = Uuid::new_v4().to_string();
+        let parent = format!("invocations/{}", self.invocation_id);
         let request = CreateFileRequest {
-            parent: self.resource_name.clone(),
+            parent,
             file_id,
             file: Some(File {
                 name: file_name.to_string(),
@@ -40,7 +66,22 @@ impl SpongeBobInvocation {
             }),
         };
 
-        self.service.create_file(request).await?;
+        self.result_storage_service.create_file(request).await?;
+        Ok(())
+    }
+
+    /// Publish a build event to Spongebob
+    /// Invocation is auto-created on first BuildStarted event
+    #[tracing::instrument(skip(self, event))]
+    pub async fn publish_build_event(&mut self, event: BuildEvent) -> Result<()> {
+        let request = PublishBuildEventRequest {
+            event: Some(event),
+            request_id: String::new(), // Optional idempotency key
+        };
+
+        self.build_event_service
+            .publish_build_event(request)
+            .await?;
         Ok(())
     }
 
@@ -48,55 +89,33 @@ impl SpongeBobInvocation {
         &self.url
     }
 
-    pub fn resource_name(&self) -> &str {
-        &self.resource_name
+    pub fn invocation_id(&self) -> &str {
+        &self.invocation_id
+    }
+
+    pub fn resource_name(&self) -> String {
+        format!("invocations/{}", self.invocation_id)
     }
 }
 
 impl SpongeBob {
     pub async fn new() -> Result<Self> {
-        let service = SpongeBobServiceClient::connect(ENDPOINT).await?;
+        let build_event_service = BuildEventServiceClient::connect(ENDPOINT).await?;
+        let result_storage_service = ResultStorageServiceClient::connect(ENDPOINT).await?;
 
-        Ok(SpongeBob { service })
-    }
-
-    #[tracing::instrument]
-    pub async fn create_invocation(&mut self, name: &str) -> Result<SpongeBobInvocation> {
-        let invocation_id = Self::generate_invocation_id(name);
-        let resource_name = self.create_invocation_with_id(name, &invocation_id).await?;
-        let url = self.generate_invocation_url(&invocation_id);
-
-        Ok(SpongeBobInvocation {
-            service: self.service.clone(),
-            resource_name,
-            url,
+        Ok(SpongeBob {
+            build_event_service,
+            result_storage_service,
         })
     }
 
-    #[tracing::instrument]
-    async fn create_invocation_with_id(
-        &mut self,
-        name: &str,
-        invocation_id: &str,
-    ) -> Result<String> {
-        let request = CreateInvocationRequest {
-            invocation_id: invocation_id.to_string(),
-            invocation: Some(Invocation {
-                name: name.to_string(),
-            }),
-        };
-
-        let response = self.service.create_invocation(request).await?;
-        Ok(response.into_inner().name)
-    }
-
-    fn generate_invocation_id(_name: &str) -> String {
-        // Just use a UUID for the invocation ID to ensure URL safety
-        Uuid::new_v4().to_string()
-    }
-
-    /// Generate the web URL for viewing an invocation
-    fn generate_invocation_url(&self, invocation_id: &str) -> String {
-        format!("{}/invocation/{}", ENDPOINT, invocation_id)
+    /// Create a new invocation handle (no RPC - invocation created on first BuildStarted event)
+    pub fn create_invocation(&mut self) -> SpongeBobInvocation {
+        let invocation_id = Uuid::new_v4().to_string();
+        SpongeBobInvocation::new(
+            self.build_event_service.clone(),
+            self.result_storage_service.clone(),
+            invocation_id,
+        )
     }
 }

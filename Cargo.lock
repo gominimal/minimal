@@ -182,20 +182,45 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edca88bc138befd0323b20752846e6587272d3b03b0343c8ea28a6f819e6e71f"
 dependencies = [
  "async-trait",
- "axum-core",
+ "axum-core 0.4.5",
  "bytes",
  "futures-util",
  "http",
  "http-body",
  "http-body-util",
  "itoa",
- "matchit",
+ "matchit 0.7.3",
  "memchr",
  "mime",
  "percent-encoding",
  "pin-project-lite",
  "rustversion",
  "serde",
+ "sync_wrapper",
+ "tower 0.5.2",
+ "tower-layer",
+ "tower-service",
+]
+
+[[package]]
+name = "axum"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a18ed336352031311f4e0b4dd2ff392d4fbb370777c9d18d7fc9d7359f73871"
+dependencies = [
+ "axum-core 0.5.5",
+ "bytes",
+ "futures-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "itoa",
+ "matchit 0.8.4",
+ "memchr",
+ "mime",
+ "percent-encoding",
+ "pin-project-lite",
+ "serde_core",
  "sync_wrapper",
  "tower 0.5.2",
  "tower-layer",
@@ -217,6 +242,24 @@ dependencies = [
  "mime",
  "pin-project-lite",
  "rustversion",
+ "sync_wrapper",
+ "tower-layer",
+ "tower-service",
+]
+
+[[package]]
+name = "axum-core"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59446ce19cd142f8833f856eb31f3eb097812d1479ab224f54d72428ca21ea22"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "http",
+ "http-body",
+ "http-body-util",
+ "mime",
+ "pin-project-lite",
  "sync_wrapper",
  "tower-layer",
  "tower-service",
@@ -363,6 +406,40 @@ checksum = "234113d19d0d7d613b40e86fb654acf958910802bcceab913a4f9e7cda03b1a4"
 dependencies = [
  "memchr",
  "serde",
+]
+
+[[package]]
+name = "build-events"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "build-events-proto"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "build-events",
+ "minimal_spongebob_community_neoeinstein-prost",
+ "prost 0.14.1",
+ "spongebob",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tokio",
+ "tokio-stream",
+ "tonic 0.14.2",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -832,7 +909,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -906,7 +983,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1425,12 +1502,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hashbrown"
-version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5419bdc4f6a9207fbeba6d11b604d481addf78ecd10c11ad51e76c2f6482748d"
-
-[[package]]
 name = "hashlink"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1780,7 +1851,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b0f83760fb341a774ed326568e19f5a863af4a952def8c39f9ab92fd95b88e5"
 dependencies = [
  "equivalent",
- "hashbrown 0.16.0",
+ "hashbrown 0.15.5",
  "serde",
  "serde_core",
 ]
@@ -2112,6 +2183,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
+name = "matchit"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
+
+[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2155,6 +2232,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "build-events",
+ "build-events-proto",
  "build-sandbox",
  "bytes",
  "cache",
@@ -2197,9 +2276,9 @@ dependencies = [
 
 [[package]]
 name = "minimal_spongebob_community_neoeinstein-prost"
-version = "0.4.0-20251007185801-98893cf03142.1"
+version = "0.4.0-20251008233118-4a2c40ff6cb8.1"
 source = "sparse+https://buf.build/gen/cargo/"
-checksum = "0abe641c48e94dee645ebec4acf117dcbe3d77648e43f0d91c16ea41754a031d"
+checksum = "3b7f67266fb3637565abb8b4513f7ac5b6b1db85ef32b52378490b32a5f1cf6d"
 dependencies = [
  "prost 0.13.5",
  "prost-types 0.13.5",
@@ -2207,9 +2286,9 @@ dependencies = [
 
 [[package]]
 name = "minimal_spongebob_community_neoeinstein-tonic"
-version = "0.4.1-20251007185801-98893cf03142.1"
+version = "0.4.1-20251008233118-4a2c40ff6cb8.1"
 source = "sparse+https://buf.build/gen/cargo/"
-checksum = "c166b27b766a89f4dd619b7215d6613cc80af29e6a3f274b568624a298b60da4"
+checksum = "243b90d6da5fd10bfd4ce7da52788eece61c44d8d5847ca2d0346d435b7ea8af"
 dependencies = [
  "minimal_spongebob_community_neoeinstein-prost",
  "tonic 0.12.3",
@@ -2789,7 +2868,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac6c3320f9abac597dcbc668774ef006702672474aad53c6d596b62e487b40b1"
 dependencies = [
  "heck 0.5.0",
- "itertools 0.14.0",
+ "itertools 0.11.0",
  "log",
  "multimap",
  "once_cell",
@@ -2824,7 +2903,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9120690fafc389a67ba3803df527d0ec9cbbc9cc45e4cc20b332996dfb672425"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "syn",
@@ -3179,7 +3258,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3589,7 +3668,6 @@ dependencies = [
  "minimal_spongebob_community_neoeinstein-tonic",
  "thiserror 2.0.17",
  "tonic 0.12.3",
- "tonic-prost-build",
  "tracing",
  "uuid",
 ]
@@ -3736,7 +3814,7 @@ dependencies = [
  "getrandom 0.3.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3745,7 +3823,7 @@ version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2111ef44dae28680ae9752bb89409e7310ca33a8c621ebe7b106cf5c928b3ac0"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3922,6 +4000,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -3997,7 +4076,7 @@ checksum = "877c5b330756d856ffcc4553ab34a5684481ade925ecc54bcd1bf02b1d0d4d52"
 dependencies = [
  "async-stream",
  "async-trait",
- "axum",
+ "axum 0.7.9",
  "base64 0.22.1",
  "bytes",
  "h2",
@@ -4010,8 +4089,11 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "prost 0.13.5",
+ "rustls-native-certs",
+ "rustls-pemfile",
  "socket2 0.5.10",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower 0.4.13",
  "tower-layer",
@@ -4025,8 +4107,11 @@ version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eb7613188ce9f7df5bfe185db26c5814347d110db17920415cf2fbcad85e7203"
 dependencies = [
+ "async-trait",
+ "axum 0.8.6",
  "base64 0.22.1",
  "bytes",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
@@ -4036,6 +4121,7 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "rustls-native-certs",
+ "socket2 0.6.0",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -4673,7 +4759,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

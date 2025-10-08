@@ -1,0 +1,91 @@
+syntax = "proto3";
+
+package build_events.v1;
+
+// BuildEvent is the top-level event wrapper that contains one of the specific event types
+message BuildEvent {
+  oneof event {
+    BuildStarted build_started = 1;
+    BuildFinished build_finished = 2;
+    TargetStarted target_started = 3;
+    TargetCompleted target_completed = 4;
+    ActionStarted action_started = 5;
+    ActionCompleted action_completed = 6;
+  }
+}
+
+// BuildStarted is emitted when a build invocation starts
+message BuildStarted {
+  string invocation_id = 1;
+  repeated string command_line = 2;
+  int64 timestamp_millis = 3;
+  string working_directory = 4;
+}
+
+// BuildFinished is emitted when a build invocation completes
+message BuildFinished {
+  string invocation_id = 1;
+  bool success = 2;
+  int64 timestamp_millis = 3;
+  optional string error_message = 4;
+}
+
+// TargetStarted is emitted when a build target starts building
+message TargetStarted {
+  string target_id = 1;
+  string label = 2;
+  TargetKind target_kind = 3;
+  int64 timestamp_millis = 4;
+}
+
+// TargetCompleted is emitted when a build target completes
+message TargetCompleted {
+  string target_id = 1;
+  string label = 2;
+  bool success = 3;
+  int64 timestamp_millis = 4;
+  optional string error_message = 5;
+  repeated string outputs = 6;
+  bool cache_hit = 7;
+}
+
+// ActionStarted is emitted when a build action starts executing
+message ActionStarted {
+  string action_id = 1;
+  string action_name = 2;
+  string target_id = 3;
+  int64 timestamp_millis = 4;
+}
+
+// ActionCompleted is emitted when a build action completes
+message ActionCompleted {
+  string action_id = 1;
+  bool success = 2;
+  int64 timestamp_millis = 3;
+  int32 exit_code = 4;
+  optional string stdout = 5;
+  optional string stderr = 6;
+}
+
+// TargetKind represents the type of build target
+enum TargetKind {
+  TARGET_KIND_UNSPECIFIED = 0;
+  TARGET_KIND_BINARY = 1;
+  TARGET_KIND_LIBRARY = 2;
+  TARGET_KIND_TEST = 3;
+}
+
+// BuildEventService provides a streaming interface for build events
+service BuildEventService {
+  // Subscribe to build events for a specific invocation or all invocations
+  rpc StreamEvents(StreamEventsRequest) returns (stream BuildEvent);
+}
+
+// StreamEventsRequest configures the event stream subscription
+message StreamEventsRequest {
+  // Optional filter to only receive events for a specific invocation
+  optional string invocation_id = 1;
+
+  // Optional: start streaming from this timestamp (milliseconds since epoch)
+  optional int64 start_timestamp_millis = 2;
+}
