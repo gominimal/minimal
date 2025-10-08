@@ -82,7 +82,7 @@ impl RemoteCache<Storage> {
 
         let (tar_file, sha256) = common::compress_dir(cache_dir.path()).map_err(Error::IO)?;
         let indexed_sha = self.index.sha256(spec_hash);
-        if indexed_sha == Some(sha256.into()) {
+        if indexed_sha == Some(sha256) {
             return Ok(()); // Cached one is up to date.
         }
 
@@ -98,7 +98,7 @@ impl RemoteCache<Storage> {
             .send_buffered()
             .await?;
 
-        self.uploaded.push((spec_hash.clone(), sha256.into()));
+        self.uploaded.push((spec_hash.clone(), sha256));
         Ok(())
     }
 
