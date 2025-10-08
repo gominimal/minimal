@@ -90,8 +90,17 @@ pub struct GlobalArgs {
     no_fetch: bool,
 
     /// Configure the number of parallel builds
-    #[arg(short, long, default_value_t = 4)]
+    #[arg(short, long, default_value_t = default_parallelism())]
     num_parallel_builds: usize,
+}
+
+fn default_parallelism() -> usize {
+    let rough_threadcount = std::thread::available_parallelism().unwrap().get();
+    match rough_threadcount {
+        1..=3 => 1,
+        4 => 3,
+        _ => rough_threadcount - 2,
+    }
 }
 
 impl GlobalArgs {
