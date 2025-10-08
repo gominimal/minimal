@@ -46,8 +46,14 @@ pub async fn cmd_oci_image(args: OciImageArgs, globals: &GlobalArgs) -> Result<(
     let cache = globals.cache().map_err(anyhow::Error::from)?;
 
     // Make sure the packages are built
-    crate::cmd_build::cmd_build_impl(&graph, globals, cache.clone(), globals.num_parallel_builds)
-        .await?;
+    crate::cmd_build::cmd_build_impl(
+        &graph,
+        globals,
+        cache.clone(),
+        globals.num_parallel_builds,
+        true,
+    )
+    .await?;
 
     let mut all_deps: Vec<BuildSpecRef> =
         Transitives::for_toplevels(&graph, graph.top_levels.to_vec(), false)

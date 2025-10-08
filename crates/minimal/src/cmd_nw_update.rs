@@ -17,8 +17,14 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs, globals: &GlobalArgs) -> R
     let graph = args.packages.graph(globals)?;
     let cache = globals.cache().map_err(anyhow::Error::from)?;
 
-    crate::cmd_build::cmd_build_impl(&graph, globals, cache.clone(), globals.num_parallel_builds)
-        .await?;
+    crate::cmd_build::cmd_build_impl(
+        &graph,
+        globals,
+        cache.clone(),
+        globals.num_parallel_builds,
+        true,
+    )
+    .await?;
 
     let remote_storage =
         RemoteStorage::new(globals.path_config().download_cache_dir().to_path_buf())

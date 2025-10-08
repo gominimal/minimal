@@ -1,6 +1,7 @@
 #![allow(clippy::result_large_err)]
 
 use anyhow::Result;
+use anyhow::bail;
 use cache::{Cache, LocalDir, RemoteCache, RemoteError};
 use clap::{Args, Parser, Subcommand};
 use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
@@ -32,8 +33,10 @@ mod cmd_oci_image;
 use cmd_oci_image::{OciImageArgs, cmd_oci_image};
 mod cmd_upload_cache;
 use cmd_upload_cache::{UploadArgs, cmd_upload_cache};
-mod cmd_unsafe_patched_build;
-use cmd_unsafe_patched_build::{UnsafePatchedBuildArgs, cmd_unsafe_patched_build};
+mod cmd_patched_build;
+use cmd_patched_build::{PatchedBuildArgs, cmd_patched_build};
+mod cmd_run;
+use cmd_run::{RunArgs, cmd_run};
 
 #[derive(Parser)]
 #[command(name = "minimal", version = env!("GIT_HASH"))]
@@ -60,8 +63,12 @@ enum Command {
     Check(CheckArgs),
     /// Uploads the specified packages and their transitive needs to the cache.
     UploadCache(UploadArgs),
-    /// Unsafely executes the build for a package, using potentially stale dependencies.
-    UnsafePatchedBuild(UnsafePatchedBuildArgs),
+    /// Executes the build for a package, using stale dependencies.
+    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
+    PatchedBuild(PatchedBuildArgs),
+    /// Runs a command using the given packages, in the current working directory.
+    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
+    Run(RunArgs),
 }
 
 /// Shared arguments and builders across all subcommands
@@ -101,6 +108,22 @@ fn default_parallelism() -> usize {
         4 => 3,
         _ => rough_threadcount - 2,
     }
+}
+
+pub(crate) fn enforce_science_mode() -> Result<()> {
+    if std::env::var("MINIMAL_SCIENCE_MODE").unwrap_or("".to_string()) != "yeppers" {
+        eprintln!("You are using a command that is experimental or very unsafe!!");
+        eprintln!(
+            "No guarantees are given about the consistency of your minimal install following the execution of such commands, nor the stability of any such commands."
+        );
+        eprintln!(
+            "If you are sure you want to continue, set the environment variable MINIMAL_SCIENCE_MODE=yeppers before continuing."
+        );
+        eprintln!();
+
+        bail!("Aborting execution of unsafe command outside of science mode");
+    }
+    Ok(())
 }
 
 impl GlobalArgs {
@@ -311,7 +334,8 @@ async fn main() -> Result<()> {
         Command::UploadCache(args) => cmd_upload_cache(args, &cli.global_args).await,
         Command::NewWorldUpdate(args) => cmd_new_world_update(args, &cli.global_args).await,
         Command::OciImage(args) => cmd_oci_image(args, &cli.global_args).await,
-        Command::UnsafePatchedBuild(args) => cmd_unsafe_patched_build(args, &cli.global_args).await,
+        Command::PatchedBuild(args) => cmd_patched_build(args, &cli.global_args).await,
+        Command::Run(args) => cmd_run(args, &cli.global_args).await,
     };
 
     if let Err(e) = result {

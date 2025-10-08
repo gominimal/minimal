@@ -7,14 +7,13 @@ use std::collections::HashSet;
 use tracing::info;
 
 #[derive(Debug, clap::Args)]
-pub struct UnsafePatchedBuildArgs {
+pub struct PatchedBuildArgs {
     package: String,
 }
 
-pub async fn cmd_unsafe_patched_build(
-    args: UnsafePatchedBuildArgs,
-    globals: &GlobalArgs,
-) -> Result<(), Error> {
+pub async fn cmd_patched_build(args: PatchedBuildArgs, globals: &GlobalArgs) -> Result<(), Error> {
+    crate::enforce_science_mode()?;
+
     let graph = globals.graph_from_package_name(&args.package)?;
     let cache = globals.cache().map_err(anyhow::Error::from)?;
     let remote_storage =

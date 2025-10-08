@@ -343,6 +343,7 @@ dependencies = [
 name = "build-sandbox"
 version = "0.1.0"
 dependencies = [
+ "common",
  "globset",
  "hakoniwa",
  "nickel-lang-core",
@@ -531,6 +532,7 @@ dependencies = [
  "smallvec",
  "tar",
  "tempfile",
+ "thiserror 2.0.17",
  "tracing",
  "url",
  "zstd",
@@ -2147,6 +2149,7 @@ dependencies = [
  "google-cloud-gax",
  "google-cloud-storage",
  "graph",
+ "hakoniwa",
  "hex",
  "nickel-lang-core",
  "object",
