@@ -1,6 +1,7 @@
 let { BuildSpec, Local, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
 {
   name = "libxcrypt",
   inputs = [
@@ -12,6 +13,10 @@ let toolchain = import "../toolchain/build.ncl" in
     base,
     toolchain,
   ],
+  runtime_deps = [
+    glibc,
+  ],
+
   cmd = "./build.sh",
   outputs = {
     libs = { glob = "usr/lib/*.so*" } | OutputLib,

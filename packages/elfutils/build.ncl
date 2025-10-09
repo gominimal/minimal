@@ -8,6 +8,7 @@ let glibc = import "../glibc/build.ncl" in
 let libz = import "../zlib/build.ncl" in
 let xz = import "../xz/build.ncl" in
 let zstd = import "../zstd/build.ncl" in
+let gcc = import "../gcc/build.ncl" in
 {
   name = "elfutils",
   inputs = [
@@ -26,6 +27,7 @@ let zstd = import "../zstd/build.ncl" in
     libz,
     xz,
     zstd,
+    gcc, # TODO: Use subsets for libgcc_s and libstdc++
   ],
   cmd = "./build.sh",
   outputs = {
