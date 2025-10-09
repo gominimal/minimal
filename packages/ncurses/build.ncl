@@ -2,6 +2,7 @@ let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Prebuilt, Source, .. }
 let attr = import "../attr/build.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
+let gcc = import "../gcc/build.ncl" in
 {
   name = "ncurses",
   inputs = [
@@ -15,7 +16,9 @@ let toolchain = import "../toolchain/build.ncl" in
   ],
   runtime_deps = [
     attr,
+    gcc, # TODO: Use a subset for this
   ],
+
   cmd = "./build.sh",
   outputs = {
     bin = { glob = "usr/bin/*" } | OutputBin,

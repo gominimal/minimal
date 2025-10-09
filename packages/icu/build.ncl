@@ -2,6 +2,7 @@ let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, .. } = import 
 let base = import "../base/build.ncl" in
 let gcc = import "../gcc/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
 {
   name = "icu",
   inputs = [
@@ -14,6 +15,7 @@ let toolchain = import "../toolchain/build.ncl" in
     toolchain,
   ],
   runtime_deps = [
+    glibc,
     gcc, # TODO: We really need to use a subset for this
   ],
 
