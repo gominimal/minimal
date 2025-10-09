@@ -1,6 +1,7 @@
 let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
 {
   name = "bzip2",
   inputs = [
@@ -12,6 +13,10 @@ let toolchain = import "../toolchain/build.ncl" in
     base,
     toolchain,
   ],
+  runtime_deps = [
+    glibc,
+  ],
+
   cmd = "./build.sh",
   outputs = {
     bunzip2 = { glob = "usr/bin/bunzip2" } | OutputBin,

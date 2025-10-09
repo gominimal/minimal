@@ -4,6 +4,7 @@ let base = import "../base/build.ncl" in
 let flex = import "../flex/build.ncl" in
 let m4 = import "../m4/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
 {
   name = "bison",
   inputs = [
@@ -17,6 +18,10 @@ let toolchain = import "../toolchain/build.ncl" in
     m4,
     toolchain,
   ],
+  runtime_deps = [
+    glibc,
+  ],
+
   cmd = "./build.sh",
   outputs = {
     bison = { glob = "usr/bin/bison" } | OutputBin,
