@@ -144,6 +144,7 @@ fn make_reachable<BP: BinProvider>(
     graph: &DepGraph,
     bin_provider: &mut BP,
     builds: &mut IndexMap<BuildSpecRef, BuildInfo>,
+    path: &mut Vec<BuildSpecRef>,
 ) -> Result<(), ()> {
     let mut upsert = |bsr: &BuildSpecRef, info: BuildInfo| -> bool {
         if let Some(stored_info) = builds.get_mut(bsr) {
@@ -168,7 +169,10 @@ fn make_reachable<BP: BinProvider>(
         // is the runtime deps.
         if !seen_before {
             for runtime_dep in &build.runtime_deps {
-                make_reachable(runtime_dep.bsr(), graph, bin_provider, builds)?;
+                path.push(*bsr);
+                let result = make_reachable(runtime_dep.bsr(), graph, bin_provider, builds, path);
+                path.pop();
+                result?;
             }
         }
         Ok(())
@@ -180,6 +184,18 @@ fn make_reachable<BP: BinProvider>(
                 ..BuildInfo::default_not_built()
             },
         );
+        if path.contains(bsr) {
+            // We've found a cycle! eagerly bring in cycle breaker if there is one.
+            if let Some(cycle_breaker) = build.replace_on_cycle {
+                if !builds.contains_key(&cycle_breaker) {
+                    path.push(*bsr);
+                    let result = make_reachable(&cycle_breaker, graph, bin_provider, builds, path);
+                    path.pop();
+                    result?;
+                }
+            }
+        }
+
         // We need to build this build-spec. Bring in not only its runtime deps,
         // but its inputs as well (so we can do da build).
         if !seen_before {
@@ -193,7 +209,10 @@ fn make_reachable<BP: BinProvider>(
                 })
                 .chain(build.runtime_deps.iter().map(|dep| dep.bsr()))
             {
-                make_reachable(bsr, graph, bin_provider, builds)?;
+                path.push(*bsr);
+                let result = make_reachable(bsr, graph, bin_provider, builds, path);
+                path.pop();
+                result?;
             }
         }
         Ok(())
@@ -227,8 +246,10 @@ impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
         toplevels.dedup();
 
         let mut builds: IndexMap<_, _> = IndexMap::with_capacity(4096);
+        let mut path = Vec::with_capacity(64);
         for bsr in toplevels.iter() {
-            make_reachable(bsr, graph, &mut bin_provider, &mut builds).unwrap();
+            path.clear();
+            make_reachable(bsr, graph, &mut bin_provider, &mut builds, &mut path).unwrap();
         }
 
         Self {
@@ -506,12 +527,14 @@ impl<'a, BP: BinProvider> Iterator for ExecPlan<'a, BP> {
                 for cycle in &[first, last] {
                     if let Some(cycle_breaker) = self.graph.get(cycle).unwrap().replace_on_cycle {
                         if !self.builds.contains_key(&cycle_breaker) {
+                            let mut path = Vec::new();
                             // We found a new cycle breaker we haven't brought into the fray yet.
                             make_reachable(
                                 &cycle_breaker,
                                 self.graph,
                                 &mut self.bin_provider,
                                 &mut self.builds,
+                                &mut path,
                             )
                             .unwrap();
                             self.builds
