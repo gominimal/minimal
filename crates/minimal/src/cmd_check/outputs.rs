@@ -170,7 +170,11 @@ pub(crate) fn missing_runtime_deps(
         .map(|dep| Ok::<_, CacheErr>((*dep, cache.read_dir(&all_graph.spec_hash(dep))?)))
         .collect::<Result<Vec<_>, _>>();
     let deps: Vec<(BuildSpecRef, DirCacheEntry<LocalDir>)> = match transitives {
-        Ok(t) => t,
+        Ok(mut t) => {
+            // We need to consider imports from libraries in the current package as well
+            t.push((bsr.clone(), cache.read_dir(&spec_hash).unwrap()));
+            t
+        }
         Err(_) => {
             return Ok(result); // skip, we need the cached build of all runtime_deps
         }
