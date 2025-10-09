@@ -49,13 +49,13 @@ let zlib = import "../zlib/build.ncl" in
     # toolchain
     binutils,
     gcc,
-    glibc,
     linux_headers,
     # other
     dejagnu,
     expect,
   ],
   runtime_deps = [
+    glibc,
     zlib,
   ],
   cmd = "./build.sh",
