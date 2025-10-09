@@ -41,7 +41,7 @@ impl From<events::BuildStarted> for proto::BuildStarted {
     fn from(event: events::BuildStarted) -> Self {
         proto::BuildStarted {
             invocation_id: event.invocation_id,
-            command_line: event.command_line,
+            command: event.command,
             timestamp_millis: event.timestamp_millis,
             working_directory: event.working_directory,
         }
@@ -157,7 +157,7 @@ impl TryFrom<proto::BuildStarted> for events::BuildStarted {
     fn try_from(event: proto::BuildStarted) -> Result<Self, Self::Error> {
         Ok(events::BuildStarted {
             invocation_id: event.invocation_id,
-            command_line: event.command_line,
+            command: event.command,
             timestamp_millis: event.timestamp_millis,
             working_directory: event.working_directory,
         })
@@ -272,7 +272,7 @@ mod tests {
     fn test_build_started_round_trip() {
         let rust_event = events::BuildStarted {
             invocation_id: "test-123".to_string(),
-            command_line: vec!["cargo".to_string(), "build".to_string()],
+            command: "build".to_string(),
             timestamp_millis: 1234567890,
             working_directory: "/tmp".to_string(),
         };
@@ -287,7 +287,7 @@ mod tests {
     fn test_build_event_round_trip() {
         let rust_event = events::BuildEvent::BuildStarted(events::BuildStarted {
             invocation_id: "test-456".to_string(),
-            command_line: vec!["cargo".to_string(), "test".to_string()],
+            command: "test".to_string(),
             timestamp_millis: 9876543210,
             working_directory: "/home/user".to_string(),
         });

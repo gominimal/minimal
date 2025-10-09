@@ -192,7 +192,7 @@ mod tests {
             sender
                 .send(BuildEvent::BuildStarted(BuildStarted {
                     invocation_id: format!("test-{}", i),
-                    command_line: vec![],
+                    command: "build".to_string(),
                     timestamp_millis: current_millis(),
                     working_directory: "/tmp".to_string(),
                 }))
@@ -236,7 +236,7 @@ mod tests {
             sender
                 .send(BuildEvent::BuildStarted(BuildStarted {
                     invocation_id: format!("test-{}", i),
-                    command_line: vec![],
+                    command: "build".to_string(),
                     timestamp_millis: current_millis(),
                     working_directory: "/tmp".to_string(),
                 }))
@@ -290,7 +290,7 @@ mod tests {
         sender
             .send(BuildEvent::BuildStarted(BuildStarted {
                 invocation_id: "test".to_string(),
-                command_line: vec![],
+                command: "build".to_string(),
                 timestamp_millis: current_millis(),
                 working_directory: "/tmp".to_string(),
             }))

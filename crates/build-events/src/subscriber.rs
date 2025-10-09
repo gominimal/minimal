@@ -112,7 +112,7 @@ mod tests {
 
         let event = BuildEvent::BuildStarted(BuildStarted {
             invocation_id: "test-123".to_string(),
-            command_line: vec![],
+            command: "build".to_string(),
             timestamp_millis: current_millis(),
             working_directory: "/tmp".to_string(),
         });

@@ -17,9 +17,9 @@ message BuildEvent {
 // BuildStarted is emitted when a build invocation starts
 message BuildStarted {
   string invocation_id = 1;
-  repeated string command_line = 2;
   int64 timestamp_millis = 3;
   string working_directory = 4;
+  string command = 5;  // Command string for display
 }
 
 // BuildFinished is emitted when a build invocation completes

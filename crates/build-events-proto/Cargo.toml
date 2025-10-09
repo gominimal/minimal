@@ -21,7 +21,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 spongebob = { path = "../spongebob", optional = true }
 
 # Need proto types for conversion when spongebob-subscriber feature is enabled
-minimal_spongebob_community_neoeinstein-prost = { version = "=0.4.0-20251008233118-4a2c40ff6cb8.1", registry = "buf", optional = true }
+minimal_spongebob_community_neoeinstein-prost = { version = "=0.4.0-20251009015156-8bcd87750609.1", registry = "buf", optional = true }
 
 [features]
 default = []

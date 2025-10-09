@@ -49,7 +49,7 @@ async fn test_full_event_flow() {
     // Emit all event types
     bus.emit(BuildEvent::BuildStarted(BuildStarted {
         invocation_id: "test-integration".to_string(),
-        command_line: vec!["cargo".to_string(), "test".to_string()],
+        command: "build".to_string(),
         timestamp_millis: current_millis(),
         working_directory: "/tmp".to_string(),
     }));
@@ -128,7 +128,7 @@ async fn test_multiple_subscribers() {
     for i in 0..3 {
         bus.emit(BuildEvent::BuildStarted(BuildStarted {
             invocation_id: format!("test-{}", i),
-            command_line: vec![],
+            command: "build".to_string(),
             timestamp_millis: current_millis(),
             working_directory: "/tmp".to_string(),
         }));
@@ -159,7 +159,7 @@ async fn test_late_subscriber_misses_early_events() {
     // Emit event before subscription
     bus.emit(BuildEvent::BuildStarted(BuildStarted {
         invocation_id: "early".to_string(),
-        command_line: vec![],
+        command: "build".to_string(),
         timestamp_millis: current_millis(),
         working_directory: "/tmp".to_string(),
     }));
@@ -178,7 +178,7 @@ async fn test_late_subscriber_misses_early_events() {
     // Emit event after subscription
     bus.emit(BuildEvent::BuildStarted(BuildStarted {
         invocation_id: "late".to_string(),
-        command_line: vec![],
+        command: "build".to_string(),
         timestamp_millis: current_millis(),
         working_directory: "/tmp".to_string(),
     }));
@@ -209,7 +209,7 @@ async fn test_bus_cloning() {
     // Emit from original bus
     bus.emit(BuildEvent::BuildStarted(BuildStarted {
         invocation_id: "original".to_string(),
-        command_line: vec![],
+        command: "build".to_string(),
         timestamp_millis: current_millis(),
         working_directory: "/tmp".to_string(),
     }));
@@ -217,7 +217,7 @@ async fn test_bus_cloning() {
     // Emit from cloned bus
     bus_clone.emit(BuildEvent::BuildStarted(BuildStarted {
         invocation_id: "clone".to_string(),
-        command_line: vec![],
+        command: "build".to_string(),
         timestamp_millis: current_millis(),
         working_directory: "/tmp".to_string(),
     }));

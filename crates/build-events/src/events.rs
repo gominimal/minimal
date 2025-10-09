@@ -29,8 +29,8 @@ pub enum BuildEvent {
 pub struct BuildStarted {
     /// Unique identifier for this build invocation
     pub invocation_id: String,
-    /// Command line arguments used to start the build
-    pub command_line: Vec<String>,
+    /// Command string for display
+    pub command: String,
     /// Unix timestamp in milliseconds
     pub timestamp_millis: i64,
     /// Working directory where build was started
@@ -156,7 +156,7 @@ mod tests {
     fn test_event_serialization() {
         let event = BuildEvent::BuildStarted(BuildStarted {
             invocation_id: "test-123".to_string(),
-            command_line: vec!["cargo".to_string(), "build".to_string()],
+            command: "build".to_string(),
             timestamp_millis: 1234567890,
             working_directory: "/tmp".to_string(),
         });

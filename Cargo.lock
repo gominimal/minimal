@@ -2276,9 +2276,9 @@ dependencies = [
 
 [[package]]
 name = "minimal_spongebob_community_neoeinstein-prost"
-version = "0.4.0-20251008233118-4a2c40ff6cb8.1"
+version = "0.4.0-20251009015156-8bcd87750609.1"
 source = "sparse+https://buf.build/gen/cargo/"
-checksum = "3b7f67266fb3637565abb8b4513f7ac5b6b1db85ef32b52378490b32a5f1cf6d"
+checksum = "699b4089a62d6370864b932906ff4ba10eec4485cf9ea0ef3d868dd8352b5e4f"
 dependencies = [
  "prost 0.13.5",
  "prost-types 0.13.5",
@@ -2286,9 +2286,9 @@ dependencies = [
 
 [[package]]
 name = "minimal_spongebob_community_neoeinstein-tonic"
-version = "0.4.1-20251008233118-4a2c40ff6cb8.1"
+version = "0.4.1-20251009015156-8bcd87750609.1"
 source = "sparse+https://buf.build/gen/cargo/"
-checksum = "243b90d6da5fd10bfd4ce7da52788eece61c44d8d5847ca2d0346d435b7ea8af"
+checksum = "fa73a8386302f7d6aba6c519bbaacb9087e711d79d9496ec191b2c22bb2627b4"
 dependencies = [
  "minimal_spongebob_community_neoeinstein-prost",
  "tonic 0.12.3",
@@ -2868,7 +2868,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac6c3320f9abac597dcbc668774ef006702672474aad53c6d596b62e487b40b1"
 dependencies = [
  "heck 0.5.0",
- "itertools 0.11.0",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "once_cell",
@@ -2890,7 +2890,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.11.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn",
@@ -2903,7 +2903,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9120690fafc389a67ba3803df527d0ec9cbbc9cc45e4cc20b332996dfb672425"
 dependencies = [
  "anyhow",
- "itertools 0.11.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn",

@@ -77,11 +77,7 @@ async fn simulate_build(bus: &BuildEventBus) {
     println!("1. Emitting BuildStarted event");
     bus.emit(BuildEvent::BuildStarted(BuildStarted {
         invocation_id: "demo-invocation-123".to_string(),
-        command_line: vec![
-            "minimal".to_string(),
-            "build".to_string(),
-            "//example:target".to_string(),
-        ],
+        command: "build //example:target".to_string(),
         timestamp_millis: current_millis(),
         working_directory: std::env::current_dir()
             .unwrap()

@@ -54,7 +54,6 @@
 //!     // Emit events from build
 //!     event_bus.emit(BuildEvent::BuildStarted(BuildStarted {
 //!         invocation_id: "build-123".to_string(),
-//!         command_line: std::env::args().collect(),
 //!         timestamp_millis: current_millis(),
 //!         working_directory: std::env::current_dir()
 //!             .unwrap()

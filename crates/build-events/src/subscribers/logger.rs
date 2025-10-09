@@ -49,7 +49,7 @@ impl BuildEventSubscriber for LoggerSubscriber {
                 info!(
                     event = "build_started",
                     invocation_id = %e.invocation_id,
-                    command_line = ?e.command_line,
+                    command = %e.command,
                     timestamp_millis = e.timestamp_millis,
                     working_directory = %e.working_directory,
                     "Build started"
@@ -129,7 +129,7 @@ mod tests {
 
         let event = BuildEvent::BuildStarted(BuildStarted {
             invocation_id: "test-123".to_string(),
-            command_line: vec!["cargo".to_string(), "build".to_string()],
+            command: "build".to_string(),
             timestamp_millis: current_millis(),
             working_directory: "/tmp".to_string(),
         });
@@ -145,7 +145,7 @@ mod tests {
         let events = vec![
             BuildEvent::BuildStarted(BuildStarted {
                 invocation_id: "test".to_string(),
-                command_line: vec![],
+                command: "build".to_string(),
                 timestamp_millis: current_millis(),
                 working_directory: "/tmp".to_string(),
             }),

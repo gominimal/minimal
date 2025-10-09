@@ -76,8 +76,14 @@ pub async fn cmd_build_impl(
         .map(|inv| inv.invocation_id().to_string())
         .unwrap_or_else(|| "local".to_string());
 
-    // Get command line for BuildStarted event
-    let command_line = std::env::args().collect::<Vec<_>>();
+    // Get command for BuildStarted event (skip binary path at index 0)
+    let args: Vec<String> = std::env::args().collect();
+    let command = if args.len() > 1 {
+        args[1..].join(" ")
+    } else {
+        args.first().cloned().unwrap_or_default()
+    };
+
     let working_directory = std::env::current_dir()
         .unwrap_or_default()
         .to_string_lossy()
@@ -86,7 +92,7 @@ pub async fn cmd_build_impl(
     // Emit BuildStarted event
     event_bus.emit(BuildEvent::BuildStarted(BuildStarted {
         invocation_id: invocation_id.clone(),
-        command_line,
+        command,
         timestamp_millis: current_millis(),
         working_directory,
     }));

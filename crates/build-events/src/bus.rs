@@ -24,7 +24,7 @@ use tokio::sync::broadcast;
 ///
 ///     bus.emit(BuildEvent::BuildStarted(BuildStarted {
 ///         invocation_id: "test-123".to_string(),
-///         command_line: vec!["cargo".to_string(), "build".to_string()],
+///         command: "build".to_string(),
 ///         timestamp_millis: current_millis(),
 ///         working_directory: "/tmp".to_string(),
 ///     }));
@@ -79,7 +79,7 @@ impl BuildEventBus {
     /// let bus = BuildEventBus::new(1000);
     /// bus.emit(BuildEvent::BuildStarted(BuildStarted {
     ///     invocation_id: "test-123".to_string(),
-    ///     command_line: vec!["cargo".to_string(), "build".to_string()],
+    ///     command: "build".to_string(),
     ///     timestamp_millis: current_millis(),
     ///     working_directory: "/tmp".to_string(),
     /// }));
@@ -138,7 +138,7 @@ mod tests {
 
         let event = BuildEvent::BuildStarted(BuildStarted {
             invocation_id: "test-123".to_string(),
-            command_line: vec!["cargo".to_string(), "build".to_string()],
+            command: "build".to_string(),
             timestamp_millis: current_millis(),
             working_directory: "/tmp".to_string(),
         });
@@ -157,7 +157,7 @@ mod tests {
 
         let event = BuildEvent::BuildStarted(BuildStarted {
             invocation_id: "test-456".to_string(),
-            command_line: vec!["cargo".to_string(), "test".to_string()],
+            command: "build".to_string(),
             timestamp_millis: current_millis(),
             working_directory: "/tmp".to_string(),
         });
@@ -178,7 +178,7 @@ mod tests {
 
         let event = BuildEvent::BuildStarted(BuildStarted {
             invocation_id: "test-789".to_string(),
-            command_line: vec!["cargo".to_string(), "run".to_string()],
+            command: "build".to_string(),
             timestamp_millis: current_millis(),
             working_directory: "/tmp".to_string(),
         });
@@ -208,7 +208,7 @@ mod tests {
 
         let event1 = BuildEvent::BuildStarted(BuildStarted {
             invocation_id: "early".to_string(),
-            command_line: vec![],
+            command: "build".to_string(),
             timestamp_millis: current_millis(),
             working_directory: "/tmp".to_string(),
         });
@@ -221,7 +221,7 @@ mod tests {
 
         let event2 = BuildEvent::BuildStarted(BuildStarted {
             invocation_id: "late".to_string(),
-            command_line: vec![],
+            command: "build".to_string(),
             timestamp_millis: current_millis(),
             working_directory: "/tmp".to_string(),
         });

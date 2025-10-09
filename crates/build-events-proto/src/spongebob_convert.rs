@@ -57,7 +57,7 @@ pub fn to_proto_build_event(event: &BuildEvent, invocation_id: &str) -> pb::Buil
 fn to_proto_build_started(e: &BuildStarted) -> pb::BuildStarted {
     pb::BuildStarted {
         invocation_id: e.invocation_id.clone(),
-        command_line: e.command_line.clone(),
+        command: e.command.clone(),
         timestamp_millis: e.timestamp_millis,
         working_directory: e.working_directory.clone(),
     }
@@ -130,7 +130,7 @@ mod tests {
     fn test_build_started_conversion() {
         let rust_event = BuildEvent::BuildStarted(BuildStarted {
             invocation_id: "test-123".to_string(),
-            command_line: vec!["cargo".to_string(), "build".to_string()],
+            command: "build".to_string(),
             timestamp_millis: current_millis(),
             working_directory: "/tmp".to_string(),
         });
@@ -141,7 +141,7 @@ mod tests {
         match proto_event.event.unwrap() {
             pb::build_event::Event::BuildStarted(e) => {
                 assert_eq!(e.invocation_id, "test-123");
-                assert_eq!(e.command_line.len(), 2);
+                assert_eq!(e.command, "build");
             }
             _ => panic!("Wrong event type"),
         }
