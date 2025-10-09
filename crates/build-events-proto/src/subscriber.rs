@@ -89,8 +89,19 @@ impl GrpcStreamSubscriber {
 #[async_trait]
 impl BuildEventSubscriber for GrpcStreamSubscriber {
     async fn on_event(&self, event: &BuildEvent) -> Result<(), SubscriberError> {
-        // Convert Rust event to proto
-        let proto_event: proto::BuildEvent = event.clone().into();
+        // Extract invocation_id from the event (all variants have it)
+        let invocation_id = match event {
+            BuildEvent::BuildStarted(e) => &e.invocation_id,
+            BuildEvent::BuildFinished(e) => &e.invocation_id,
+            BuildEvent::TargetStarted(_) => "", // Targets don't have invocation_id in inner fields
+            BuildEvent::TargetCompleted(_) => "",
+            BuildEvent::ActionStarted(_) => "",
+            BuildEvent::ActionCompleted(_) => "",
+        };
+
+        // Convert Rust event to proto using ergonomic extension trait
+        use crate::convert::ToProto;
+        let proto_event = event.to_proto(invocation_id);
 
         // Broadcast to all subscribers
         // If there are no subscribers, this is a no-op

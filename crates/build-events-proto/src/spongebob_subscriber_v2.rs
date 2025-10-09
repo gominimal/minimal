@@ -8,7 +8,7 @@ use build_events::{BuildEvent, BuildEventSubscriber, SubscriberError};
 use tracing::warn;
 
 #[cfg(feature = "spongebob-subscriber")]
-use crate::spongebob_convert::to_proto_build_event;
+use crate::convert::ToProto;
 
 /// Subscriber that publishes build events to Spongebob service
 ///
@@ -72,7 +72,7 @@ impl BuildEventSubscriber for SpongeBobSubscriberV2 {
         let mut invocation = self.invocation.lock().await;
 
         // Convert Rust event to proto (need invocation_id from the invocation)
-        let proto_event = to_proto_build_event(event, invocation.invocation_id());
+        let proto_event = event.to_proto(invocation.invocation_id());
 
         // Publish event
         match invocation.publish_build_event(proto_event).await {

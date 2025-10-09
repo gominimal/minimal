@@ -6,7 +6,6 @@
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
-use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 use crate::proto;
@@ -102,13 +101,14 @@ impl BuildEventServiceImpl {
 
 #[tonic::async_trait]
 impl BuildEventService for BuildEventServiceImpl {
-    type StreamEventsStream =
-        std::pin::Pin<Box<dyn Stream<Item = Result<proto::BuildEvent, Status>> + Send + 'static>>;
+    type StreamBuildEventsStream = std::pin::Pin<
+        Box<dyn Stream<Item = Result<proto::BuildEvent, tonic::Status>> + Send + 'static>,
+    >;
 
-    async fn stream_events(
+    async fn stream_build_events(
         &self,
-        request: Request<proto::StreamEventsRequest>,
-    ) -> Result<Response<Self::StreamEventsStream>, Status> {
+        request: tonic::Request<proto::StreamBuildEventsRequest>,
+    ) -> Result<tonic::Response<Self::StreamBuildEventsStream>, tonic::Status> {
         let req = request.into_inner();
 
         info!(
@@ -172,12 +172,32 @@ impl BuildEventService for BuildEventServiceImpl {
                 Err(e) => {
                     warn!("Broadcast stream error: {}", e);
                     // Convert to gRPC status
-                    Some(Err(Status::internal(format!("Stream error: {}", e))))
+                    Some(Err(tonic::Status::internal(format!("Stream error: {}", e))))
                 }
             }
         });
 
-        Ok(Response::new(Box::pin(filtered_stream)))
+        Ok(tonic::Response::new(Box::pin(filtered_stream)))
+    }
+
+    async fn publish_build_event(
+        &self,
+        request: tonic::Request<proto::PublishBuildEventRequest>,
+    ) -> Result<tonic::Response<proto::PublishBuildEventResponse>, tonic::Status> {
+        let req = request.into_inner();
+
+        // Extract the event from the request
+        let event = req
+            .event
+            .ok_or_else(|| tonic::Status::invalid_argument("Missing event in request"))?;
+
+        // Publish to broadcast channel
+        self.publish(event);
+
+        // Return success response with empty name (will be set by server)
+        Ok(tonic::Response::new(proto::PublishBuildEventResponse {
+            name: String::new(),
+        }))
     }
 }
 
@@ -194,7 +214,10 @@ mod tests {
     #[test]
     fn test_publish_no_subscribers() {
         let service = BuildEventServiceImpl::new(100);
-        let event = proto::BuildEvent { event: None };
+        let event = proto::BuildEvent {
+            invocation_id: String::new(),
+            event: None,
+        };
         // Should not panic
         service.publish(event);
     }

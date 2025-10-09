@@ -40,7 +40,12 @@ indoc = "^2.0"
 nickel-lang-core = { version = "0.15.0", default-features = false, features = [
     "format",
 ] }
-object = {version = "0.37", default-features = false, features = ["archive", "elf", "std", "read_core"]}
+object = { version = "0.37", default-features = false, features = [
+    "archive",
+    "elf",
+    "std",
+    "read_core",
+] }
 oci-client = { version = "0.15.0", features = [
     "rustls-tls",
 ], default-features = false }

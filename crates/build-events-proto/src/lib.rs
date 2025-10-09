@@ -113,9 +113,15 @@
 //! assert_eq!(rust_event, converted_back);
 //! ```
 
-// Include generated protobuf code
+// Use BSR-generated protobuf code from canonical spongebob.v1 package
 pub mod proto {
-    tonic::include_proto!("build_events.v1");
+    // Re-export message types from prost
+    pub use minimal_spongebob_community_neoeinstein_prost::spongebob::v1::*;
+
+    // Re-export service types from tonic
+    pub use minimal_spongebob_community_neoeinstein_tonic::spongebob::v1::tonic::{
+        build_event_service_client, build_event_service_server,
+    };
 }
 
 pub mod convert;
@@ -123,12 +129,10 @@ pub mod service;
 pub mod subscriber;
 
 #[cfg(feature = "spongebob-subscriber")]
-pub mod spongebob_convert;
-#[cfg(feature = "spongebob-subscriber")]
 pub mod spongebob_subscriber_v2;
 
 // Re-export main types for convenience
-pub use convert::ConversionError;
+pub use convert::{ConversionError, ToProto, to_proto_build_event};
 pub use service::BuildEventServiceImpl;
 pub use subscriber::GrpcStreamSubscriber;
 
