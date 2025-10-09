@@ -68,6 +68,19 @@ skip = [
     # tokio -> mio
     { name = "wasi", version = "=0.11.1+wasi-snapshot-preview1" },
 
+
+    { name = "tower", version = "0.4.13" },
+    { name = "tonic", version = "0.12.3" },
+    { name = "socket2", version = "0.5.10" },
+    { name = "rand_core", version = "0.6.4" },
+    { name = "rand_chacha", version = "0.3.1" },
+    { name = "rand", version = "0.8.5" },
+    { name = "prost-types", version = "0.13.5" },
+    { name = "prost-derive", version = "0.13.5" },
+    { name = "prost", version = "0.13.5" },
+    { name = "indexmap", version = "1.9.3" },
+
+
 ]
 
 skip-tree = [

@@ -250,10 +250,17 @@ async fn log_build_results_to_spongebob(
         graph.top_levels.len()
     );
 
-    // Upload build summary
+    // Use a semantic target ID for the build command summary
+    let build_command_target_id = "build-summary".to_string();
+
+    // Upload build summary to the synthetic target
     info!("Uploading build summary to SpongeBob invocation");
     spongebob_invocation
-        .upload_file("build-summary.txt", build_log.into_bytes())
+        .upload_file(
+            &build_command_target_id,
+            "build-summary.txt",
+            build_log.into_bytes(),
+        )
         .await
         .map_err(|e| anyhow::anyhow!("Failed to upload build summary to SpongeBob: {}", e))?;
 

@@ -500,12 +500,16 @@ impl<'a> Run<'a> {
 
             let out_dir = self.cache.write_dir(&bsh).unwrap();
 
+            // Use package name as target ID for semantic meaning
+            let target_id = build.name.clone();
+
             info!("Building package: {}", build.name);
             let build_result = run_build(
                 &config,
                 out_dir.path(),
                 spongebob_invocation,
                 self.output_base.clone(),
+                &target_id,
             )
             .await
             .map_err(|e| anyhow::anyhow!("Failed to build {}: {}", build.name, e))?;

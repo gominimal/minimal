@@ -53,10 +53,16 @@ impl SpongeBobInvocation {
         }
     }
 
+    /// Upload a file to a specific target within this invocation
     #[tracing::instrument(skip(self, contents))]
-    pub async fn upload_file(&mut self, file_name: &str, contents: Vec<u8>) -> Result<()> {
+    pub async fn upload_file(
+        &mut self,
+        target_id: &str,
+        file_name: &str,
+        contents: Vec<u8>,
+    ) -> Result<()> {
         let file_id = Uuid::new_v4().to_string();
-        let parent = format!("invocations/{}", self.invocation_id);
+        let parent = format!("invocations/{}/targets/{}", self.invocation_id, target_id);
         let request = CreateFileRequest {
             parent,
             file_id,

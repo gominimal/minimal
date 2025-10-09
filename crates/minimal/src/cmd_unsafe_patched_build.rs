@@ -91,11 +91,16 @@ pub async fn cmd_unsafe_patched_build(
         .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob client: {}", e))?;
 
     let mut spongebob_invocation = Some(spongebob_client.create_invocation());
+
+    // Use package name as target ID for semantic meaning
+    let target_id = build.name.clone();
+
     run_build(
         &config,
         out_dir.path(),
         &mut spongebob_invocation,
         output_base.clone(),
+        &target_id,
     )
     .await
     .map_err(|e| anyhow::anyhow!("Failed to build {}: {}", build.name, e))?;

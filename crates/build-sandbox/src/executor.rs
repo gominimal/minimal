@@ -1,4 +1,7 @@
 use hakoniwa::Container;
+use minimal_spongebob_community_neoeinstein_prost::spongebob::v1::{
+    build_event, BuildEvent, TargetCompleted, TargetKind, TargetStarted,
+};
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
@@ -58,6 +61,7 @@ impl BuildExecutor {
         &self,
         config: &BuildConfig,
         spongebob_invocation: &mut Option<spongebob::SpongeBobInvocation>,
+        target_id: &str,
     ) -> Result<(i32, Option<String>)> {
         info!(
             "Linking {} inputs to build environment",
@@ -68,8 +72,52 @@ impl BuildExecutor {
             self.hardlink_to_tmpdir(input)?;
         }
 
-        self.execute_in_container(config, spongebob_invocation)
-            .await?;
+        // Emit TargetStarted event
+        if let Some(invocation) = spongebob_invocation {
+            let target_started = BuildEvent {
+                invocation_id: invocation.invocation_id().to_string(),
+                event: Some(build_event::Event::TargetStarted(TargetStarted {
+                    target_id: target_id.to_string(),
+                    label: config.name.clone(),
+                    target_kind: TargetKind::Binary as i32,
+                    timestamp_millis: current_millis(),
+                })),
+            };
+            if let Err(e) = invocation.publish_build_event(target_started).await {
+                warn!("Failed to publish TargetStarted event: {}", e);
+            }
+        }
+
+        let execute_result = self
+            .execute_in_container(config, spongebob_invocation, target_id)
+            .await;
+
+        // Emit TargetCompleted event
+        if let Some(invocation) = spongebob_invocation {
+            let (success, error_message) = match &execute_result {
+                Ok(_) => (true, None),
+                Err(e) => (false, Some(e.to_string())),
+            };
+
+            let target_completed = BuildEvent {
+                invocation_id: invocation.invocation_id().to_string(),
+                event: Some(build_event::Event::TargetCompleted(TargetCompleted {
+                    target_id: target_id.to_string(),
+                    label: config.name.clone(),
+                    success,
+                    timestamp_millis: current_millis(),
+                    error_message,
+                    outputs: vec![],      // Outputs are collected later
+                    cache_hit: false,     // Cache hit detection happens earlier
+                })),
+            };
+            if let Err(e) = invocation.publish_build_event(target_completed).await {
+                warn!("Failed to publish TargetCompleted event: {}", e);
+            }
+        }
+
+        // Return the original result
+        execute_result?;
 
         let spongebob_url = spongebob_invocation
             .as_ref()
@@ -126,6 +174,7 @@ impl BuildExecutor {
         &self,
         config: &BuildConfig,
         spongebob_invocation: &mut Option<spongebob::SpongeBobInvocation>,
+        target_id: &str,
     ) -> Result<()> {
         let rootfs = self.prepare_rootfs(config)?;
         let sandbox_mount_point = "/build";
@@ -200,7 +249,7 @@ impl BuildExecutor {
 
         if let Some(invocation) = spongebob_invocation {
             if let Err(e) = invocation
-                .upload_file("stdout", output.stdout.to_vec())
+                .upload_file(target_id, "stdout", output.stdout.to_vec())
                 .await
             {
                 warn!(
@@ -210,7 +259,7 @@ impl BuildExecutor {
             }
 
             if let Err(e) = invocation
-                .upload_file("stderr", output.stderr.to_vec())
+                .upload_file(target_id, "stderr", output.stderr.to_vec())
                 .await
             {
                 warn!(
@@ -335,4 +384,12 @@ fn hardlink_dir_contents(src: &Path, dst: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Helper function to get current timestamp in milliseconds
+fn current_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("System time before UNIX epoch")
+        .as_millis() as i64
 }

@@ -17,6 +17,7 @@ impl BuildExecutor {
         &self,
         _: &BuildConfig,
         _: &mut Option<spongebob::SpongeBobInvocation>,
+        _: &str,
     ) -> Result<(i32, Option<String>)> {
         todo!()
     }
@@ -37,6 +38,7 @@ impl BuildExecutor {
         &self,
         _: &BuildConfig,
         _: &mut Option<spongebob::SpongeBobInvocation>,
+        _: &str,
     ) -> Result<()> {
         todo!()
     }
