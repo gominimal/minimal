@@ -315,6 +315,7 @@ fn check_package(
         naming::cycle_breaker_naming(pkg, all_graph, fix, globals)?,
         naming::output_naming(pkg, all_graph, fix, globals)?,
         outputs::output_types_valid(pkg, all_graph, fix, globals)?,
+        outputs::missing_runtime_deps(pkg, all_graph, fix, globals)?,
         check_minimal_import_line(pkg, all_graph, fix, globals)?,
         check_package_fmt(pkg, all_graph, fix, globals)?,
     ])
