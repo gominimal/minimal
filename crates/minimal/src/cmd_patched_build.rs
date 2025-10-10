@@ -89,21 +89,10 @@ pub async fn cmd_patched_build(args: PatchedBuildArgs, globals: &GlobalArgs) -> 
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob client: {}", e))?;
 
-    let mut spongebob_invocation = Some(spongebob_client.create_invocation());
 
     // Use package name as target ID for semantic meaning
     let target_id = build.name.clone();
-    let command_info = format!("unsafe-patched-build {}", build.name);
-    let mut spongebob_client = spongebob::SpongeBob::new()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob client: {}", e))?;
-    let mut spongebob_invocation = match spongebob_client.create_invocation(&command_info).await {
-        Ok(inv) => Some(inv),
-        Err(e) => {
-            tracing::warn!("Failed to create SpongeBob invocation: {}", e);
-            None
-        }
-    };
+    let mut spongebob_invocation = Some(spongebob_client.create_invocation());
 
     run_build(
         &config,

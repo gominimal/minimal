@@ -404,6 +404,7 @@ dependencies = [
  "common",
  "globset",
  "hakoniwa",
+ "minimal_spongebob_community_neoeinstein-prost",
  "nickel-lang-core",
  "serde",
  "spongebob",
