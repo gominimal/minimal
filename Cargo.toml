@@ -71,3 +71,10 @@ build-sandbox = { path = "crates/build-sandbox" }
 graph = { version = "0.0.1", path = "crates/graph" }
 cache = { version = "0.0.1", path = "crates/cache" }
 common = { version = "0.0.1", path = "crates/common" }
+
+[patch.crates-io]
+malachite = { git = "https://github.com/brandonweeks/malachite.git", branch = "v0.6.0" }
+malachite-base = { git = "https://github.com/brandonweeks/malachite.git", branch = "v0.6.0" }
+malachite-float = { git = "https://github.com/brandonweeks/malachite.git", branch = "v0.6.0" }
+malachite-nz = { git = "https://github.com/brandonweeks/malachite.git", branch = "v0.6.0" }
+malachite-q = { git = "https://github.com/brandonweeks/malachite.git", branch = "v0.6.0" }

@@ -52,6 +52,9 @@ skip = [
     # google-cloud-auth -> rustls -> ring 
     # https://github.com/briansmith/ring/issues/2341
     { name = "getrandom", version = "0.2.16" },
+    # nickel-lang-core -> saphyr-parser -> hashlink
+    # https://github.com/djc/hashlink/pull/38
+    { name = "hashbrown", version = "0.15.5" },
     # nickel-lang-core -> ouroboros -> ouroboros_macro
     # https://github.com/someguynamedjosh/ouroboros/pull/127
     { name = "heck", version = "0.4.1" },
