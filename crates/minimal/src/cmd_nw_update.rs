@@ -22,7 +22,6 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs, globals: &GlobalArgs) -> R
         globals,
         cache.clone(),
         globals.num_parallel_builds,
-        true,
     )
     .await?;
 

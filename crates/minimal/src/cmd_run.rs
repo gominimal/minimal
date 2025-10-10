@@ -28,7 +28,6 @@ pub async fn cmd_run(args: RunArgs, globals: &GlobalArgs) -> Result<(), Error> {
         globals,
         cache.clone(),
         globals.num_parallel_builds,
-        true,
     )
     .await?;
 

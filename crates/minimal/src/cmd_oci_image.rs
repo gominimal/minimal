@@ -51,7 +51,6 @@ pub async fn cmd_oci_image(args: OciImageArgs, globals: &GlobalArgs) -> Result<(
         globals,
         cache.clone(),
         globals.num_parallel_builds,
-        true,
     )
     .await?;
 
