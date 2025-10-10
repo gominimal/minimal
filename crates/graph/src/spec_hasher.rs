@@ -3,6 +3,7 @@ use crate::{
     dep_graph::SourceFetch,
 };
 use blake3::Hasher;
+use common::{Target, target};
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::io::Write;
@@ -211,6 +212,11 @@ fn build_attrs_hash(spec: &BuildSpec, h: &mut Hasher) {
     for (name, output) in spec.outputs.iter() {
         h.write_all(name.as_bytes()).unwrap();
         build_output_hash(output, h);
+    }
+
+    if spec.target != Target::new(target::Arch::Amd64, target::OS::Linux) {
+        h.write_all(b"-target").unwrap();
+        spec.target.hash_to(h);
     }
 }
 

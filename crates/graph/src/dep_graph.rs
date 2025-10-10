@@ -3,6 +3,10 @@
 #![allow(clippy::result_large_err)]
 #![allow(clippy::single_match)]
 
+use common::{
+    Target,
+    target::{Arch, OS},
+};
 use nickel_lang_core::eval::Closure;
 use nickel_lang_core::files::FileId;
 use nickel_lang_core::identifier::LocIdent;
@@ -118,6 +122,9 @@ impl RuntimeDep {
 pub struct BuildSpec {
     /// The human-readable name declared on the build spec.
     pub name: String,
+    /// The system this build-spec is meant to run on. Defaults to amd64 Linux.
+    pub target: Target,
+
     /// The build command declared on the build spec.
     pub cmd: String,
     /// Any arguments to the build command, ultimately passed as environment variables.
@@ -387,6 +394,7 @@ impl GraphBuilder {
         let mut name: Option<String> = None;
         let mut cmd: Option<String> = None;
         let mut ty: Option<ObjTy> = None;
+        let mut target: Option<Target> = None;
         let mut build_args: Option<IndexMap<String, String>> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
@@ -423,6 +431,25 @@ impl GraphBuilder {
                                     .unwrap(),
                                 );
                                 Ok(())
+                            }
+                            "target" => {
+                                if let Some(target_rt) = field.value.as_ref() {
+                                    let target_str =
+                                        String::deserialize(eval_if_closure(
+                                            target_rt,
+                                            program,
+                                        )?)
+                                        .unwrap();
+                                    match Target::all().iter().find(|t| t.as_ref() == target_str) {
+                                        None => Err(Error::InvalidTarget { files: program.files(), got: target_str, pos: rt.pos }),
+                                        Some(t) => {
+                                            target = Some(t.clone());
+                                            Ok(())
+                                        }
+                                    }
+                                } else {
+                                    Ok(())
+                                }
                             }
                             "build_args" => {
                                 if let Some(build_args_rt) = field.value.as_ref() {
@@ -488,6 +515,7 @@ impl GraphBuilder {
             name,
             cmd,
             build_args,
+            target: target.unwrap_or(Target::new(Arch::Amd64, OS::Linux)),
             inputs: Vec::new(),
             runtime_deps: Vec::new(),
             outputs: OutputMap::new(),
@@ -1711,5 +1739,41 @@ mod tests {
         if dupes.len() < names.len() {
             panic!("duplicate build-specs in packages/:\n{:?}", names);
         }
+    }
+
+    #[test]
+    fn parse_target() {
+        let sr = SpecReader::new(
+            indoc! {
+                "
+                let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
+                {
+        			name = \"buildspec\",
+                    inputs = [],
+        			cmd = \"./build.sh\",
+                    target = \"arm64/macos\",
+        		} | BuildSpec"
+            }
+            .to_string(),
+            &SpecReaderOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        let dp = DepGraph::new(sr)
+            .map_err(|e| {
+                e.report_to_stderr();
+                Err::<DepGraph, ()>(())
+            })
+            .unwrap();
+        // We expect a single buildspec with a known name
+        assert_eq!(
+            dp.get(&dp.by_name("buildspec").next().unwrap())
+                .unwrap()
+                .target,
+            Target::new(Arch::Arm64, OS::MacOS),
+        );
     }
 }

@@ -1,6 +1,8 @@
 //! Common types and utilities used across the minimal codebase.
 
 pub mod fetchers;
+pub mod target;
+pub use target::Target;
 
 mod spec_hash;
 use sha2::{Digest, Sha256};
