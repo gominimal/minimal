@@ -20,6 +20,10 @@ pub struct CheckArgs {
 
     #[command(flatten)]
     packages: PackagesArg,
+
+    /// Checker names to skip, comma-separated
+    #[arg(short, long, alias="skip", value_delimiter=',', num_args=0..)]
+    skip_checkers: Option<Vec<String>>,
 }
 
 pub fn cmd_check(args: CheckArgs, globals: &GlobalArgs) -> Result<(), Error> {
@@ -54,7 +58,13 @@ pub fn cmd_check(args: CheckArgs, globals: &GlobalArgs) -> Result<(), Error> {
             }
         })
         .map(|pkg| {
-            let result = check_package(&pkg, &all_graph, args.fix, globals);
+            let result = check_package(
+                &pkg,
+                &all_graph,
+                args.fix,
+                args.skip_checkers.clone().unwrap_or_default(),
+                globals,
+            );
             (pkg, result)
         });
 
@@ -306,17 +316,41 @@ fn check_package(
     pkg: &String,
     all_graph: &Option<DepGraph>,
     fix: bool,
+    skip_checkers: Vec<String>,
     globals: &GlobalArgs,
 ) -> Result<Vec<CheckResult>, Error> {
-    Ok(vec![
-        check_package_parses(pkg, all_graph, fix, globals)?,
-        naming::package_spec_name_matches_dir(pkg, all_graph, fix, globals)?,
-        naming::package_name(pkg, all_graph, fix, globals)?,
-        naming::cycle_breaker_naming(pkg, all_graph, fix, globals)?,
-        naming::output_naming(pkg, all_graph, fix, globals)?,
-        outputs::output_types_valid(pkg, all_graph, fix, globals)?,
-        outputs::missing_runtime_deps(pkg, all_graph, fix, globals)?,
-        check_minimal_import_line(pkg, all_graph, fix, globals)?,
-        check_package_fmt(pkg, all_graph, fix, globals)?,
-    ])
+    let mut out = Vec::new();
+
+    // TODO: This is garbage
+    if !skip_checkers.contains(&"parse".to_string()) {
+        out.push(check_package_parses(pkg, all_graph, fix, globals)?);
+    }
+    if !skip_checkers.contains(&"spec name valid".to_string()) {
+        out.push(naming::package_name(pkg, all_graph, fix, globals)?);
+    }
+    if !skip_checkers.contains(&"spec name matches dir".to_string()) {
+        out.push(naming::package_spec_name_matches_dir(
+            pkg, all_graph, fix, globals,
+        )?);
+    }
+    if !skip_checkers.contains(&"cycle breaker naming".to_string()) {
+        out.push(naming::cycle_breaker_naming(pkg, all_graph, fix, globals)?);
+    }
+    if !skip_checkers.contains(&"output naming".to_string()) {
+        out.push(naming::output_naming(pkg, all_graph, fix, globals)?);
+    }
+    if !skip_checkers.contains(&"output types valid".to_string()) {
+        out.push(outputs::output_types_valid(pkg, all_graph, fix, globals)?);
+    }
+    if !skip_checkers.contains(&"missing runtime_deps".to_string()) {
+        out.push(outputs::missing_runtime_deps(pkg, all_graph, fix, globals)?);
+    }
+    if !skip_checkers.contains(&"import line".to_string()) {
+        out.push(check_minimal_import_line(pkg, all_graph, fix, globals)?);
+    }
+    if !skip_checkers.contains(&"fmt".to_string()) {
+        out.push(check_package_fmt(pkg, all_graph, fix, globals)?);
+    }
+
+    Ok(out)
 }
