@@ -61,11 +61,10 @@ impl SpongeBobInvocation {
         file_name: &str,
         contents: Vec<u8>,
     ) -> Result<()> {
-        let file_id = Uuid::new_v4().to_string();
         let parent = format!("invocations/{}/targets/{}", self.invocation_id, target_id);
         let request = CreateFileRequest {
             parent,
-            file_id,
+            file_id: file_name.to_string(),
             file: Some(File {
                 name: file_name.to_string(),
                 contents: contents.into(),
