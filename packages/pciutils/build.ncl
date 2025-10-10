@@ -2,6 +2,7 @@ let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, .. } = import 
 let base = import "../base/build.ncl" in
 let sed = import "../sed/build.ncl" in
 let gcc = import "../gcc/build.ncl" in
+let make = import "../make/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 let zlib = import "../zlib/build.ncl" in
 {
@@ -14,6 +15,7 @@ let zlib = import "../zlib/build.ncl" in
     } | Source,
     base,
     sed,
+    make,
     toolchain,
   ],
   runtime_deps = [

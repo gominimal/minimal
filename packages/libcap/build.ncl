@@ -8,6 +8,7 @@ let tar = import "../tar/build.ncl" in
 let linux_headers = import "../linux_headers/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
 {
   name = "libcap",
   inputs = [
@@ -26,6 +27,10 @@ let toolchain = import "../toolchain/build.ncl" in
     coreutils,
     toolchain,
   ],
+  runtime_deps = [
+    glibc,
+  ],
+
   cmd = "./build.sh",
   outputs = {
     sbins = { glob = "usr/sbin/*" } | OutputBin,

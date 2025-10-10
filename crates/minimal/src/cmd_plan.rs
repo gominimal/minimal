@@ -46,16 +46,19 @@ pub async fn cmd_plan(args: PlanArgs, globals: &GlobalArgs) -> Result<(), Error>
                 ExecPlan::new_with_bin_provider(&graph, local_adapter),
             )
         }
-    };
-
-    Ok(())
+    }
+    .map_err(|e| Error::PlanErr(graph, e))
 }
 
-fn print_plan<BP: BinProvider>(graph: &DepGraph, cache: &Cache<LocalDir>, plan: ExecPlan<BP>) {
+fn print_plan<BP: BinProvider>(
+    graph: &DepGraph,
+    cache: &Cache<LocalDir>,
+    plan: ExecPlan<BP>,
+) -> Result<(), graph::PlanErr> {
     eprintln!("✓ = Already built, ⚙️ = To be built");
     for (i, phase) in plan.enumerate() {
         eprintln!("Phase {}", i + 1);
-        for (bsr, do_full_build) in phase.unwrap().builds.iter() {
+        for (bsr, do_full_build) in phase?.builds.iter() {
             let build = graph.get(bsr).unwrap();
             let bsh = graph.spec_hash(bsr);
             let is_cached = cache.read_dir(&bsh).is_ok();
@@ -70,4 +73,6 @@ fn print_plan<BP: BinProvider>(graph: &DepGraph, cache: &Cache<LocalDir>, plan: 
             );
         }
     }
+
+    Ok(())
 }

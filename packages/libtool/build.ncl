@@ -1,7 +1,9 @@
 let { BuildSpec, Local, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let m4 = import "../m4/build.ncl" in
+let make = import "../make/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
 {
   name = "libtool",
   inputs = [
@@ -12,8 +14,13 @@ let toolchain = import "../toolchain/build.ncl" in
     } | Source,
     base,
     m4,
+    make,
     toolchain,
   ],
+  runtime_deps = [
+    glibc,
+  ],
+
   cmd = "./build.sh",
   outputs = {
     bin = { glob = "usr/bin/*" } | OutputLib,

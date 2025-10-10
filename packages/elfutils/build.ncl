@@ -1,6 +1,7 @@
 let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let m4 = import "../m4/build.ncl" in
+let make = import "../make/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 
 let bzip2 = import "../bzip2/build.ncl" in
@@ -8,6 +9,7 @@ let glibc = import "../glibc/build.ncl" in
 let libz = import "../zlib/build.ncl" in
 let xz = import "../xz/build.ncl" in
 let zstd = import "../zstd/build.ncl" in
+let gcc = import "../gcc/build.ncl" in
 {
   name = "elfutils",
   inputs = [
@@ -18,6 +20,7 @@ let zstd = import "../zstd/build.ncl" in
     } | Source,
     base,
     m4,
+    make,
     toolchain,
   ],
   runtime_deps = [
@@ -26,6 +29,7 @@ let zstd = import "../zstd/build.ncl" in
     libz,
     xz,
     zstd,
+    gcc, # TODO: Use subsets for libgcc_s and libstdc++
   ],
   cmd = "./build.sh",
   outputs = {

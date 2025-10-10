@@ -17,8 +17,13 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs, globals: &GlobalArgs) -> R
     let graph = args.packages.graph(globals)?;
     let cache = globals.cache().map_err(anyhow::Error::from)?;
 
-    crate::cmd_build::cmd_build_impl(&graph, globals, cache.clone(), globals.num_parallel_builds)
-        .await?;
+    crate::cmd_build::cmd_build_impl(
+        &graph,
+        globals,
+        cache.clone(),
+        globals.num_parallel_builds,
+    )
+    .await?;
 
     let remote_storage =
         RemoteStorage::new(globals.path_config().download_cache_dir().to_path_buf())
@@ -52,31 +57,14 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs, globals: &GlobalArgs) -> R
         let cache_dir = cache_handle.path();
         let archive_name = format!("{}.tar.zst", package_hash.0.to_hex());
 
-        let encoder = zstd::stream::Encoder::new(Vec::new(), 3).map_err(anyhow::Error::from)?;
-        let mut tar_builder = tar::Builder::new(encoder);
-        tar_builder
-            .append_dir_all(".", cache_dir)
-            .map_err(anyhow::Error::from)?;
-        let archive_data = tar_builder
-            .into_inner()
-            .map_err(anyhow::Error::from)?
-            .finish()
-            .map_err(anyhow::Error::from)?;
-
-        // Compute sha256 hash
-        let hash_hex = {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(&archive_data);
-            let computed_hash = hasher.finalize();
-            hex::encode(computed_hash)
-        };
+        let (tar_file, sha256) = common::compress_dir(cache_dir).map_err(anyhow::Error::from)?;
+        let hash_hex = hex::encode(sha256);
         info!("sha256({}) = {}", prebuilt_name, hash_hex);
 
         // Upload
         let gcs_path = format!("prebuilts/{}/{}", prebuilt_name, archive_name);
         remote_storage
-            .upload(BUCKET_ID, &gcs_path, &archive_data)
+            .upload(BUCKET_ID, &gcs_path, tar_file)
             .await?;
         info!(
             "Automatically uploaded prebuilt to gs://{}/{}",

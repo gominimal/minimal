@@ -3,6 +3,9 @@ let acl = import "../acl/build.ncl" in
 let base = import "../base/build.ncl" in
 let ncurses = import "../ncurses/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
+let make = import "../make/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
+let gcc = import "../gcc/build.ncl" in
 {
   name = "gettext",
   inputs = [
@@ -11,11 +14,17 @@ let toolchain = import "../toolchain/build.ncl" in
       url = "gs://minimal-staging-archives/gettext-0.26.tar.xz",
       sha256 = "d1fb86e260cfe7da6031f94d2e44c0da55903dbae0a2fa0fae78c91ae1b56f00"
     } | Source,
-    acl,
     base,
-    ncurses,
+    make,
     toolchain,
   ],
+  runtime_deps = [
+    acl,
+    ncurses,
+    glibc,
+    gcc, # TODO: Use a subset for this
+  ],
+
   cmd = "./build.sh",
   outputs = {
     bin = { glob = "usr/bin/*" } | OutputLib,

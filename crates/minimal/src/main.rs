@@ -1,9 +1,11 @@
 #![allow(clippy::result_large_err)]
 
 use anyhow::Result;
+use anyhow::bail;
 use cache::{Cache, LocalDir, RemoteCache, RemoteError};
 use clap::{Args, Parser, Subcommand};
 use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
+use graph::PlanErr;
 use graph::{DepGraph, Error as GraphError, SpecReader, SpecReaderOptions};
 use std::path::PathBuf;
 use tracing::error;
@@ -32,8 +34,10 @@ mod cmd_oci_image;
 use cmd_oci_image::{OciImageArgs, cmd_oci_image};
 mod cmd_upload_cache;
 use cmd_upload_cache::{UploadArgs, cmd_upload_cache};
-mod cmd_unsafe_patched_build;
-use cmd_unsafe_patched_build::{UnsafePatchedBuildArgs, cmd_unsafe_patched_build};
+mod cmd_patched_build;
+use cmd_patched_build::{PatchedBuildArgs, cmd_patched_build};
+mod cmd_run;
+use cmd_run::{RunArgs, cmd_run};
 
 #[derive(Parser)]
 #[command(name = "minimal", version = env!("GIT_HASH"))]
@@ -60,20 +64,24 @@ enum Command {
     Check(CheckArgs),
     /// Uploads the specified packages and their transitive needs to the cache.
     UploadCache(UploadArgs),
-    /// Unsafely executes the build for a package, using potentially stale dependencies.
-    UnsafePatchedBuild(UnsafePatchedBuildArgs),
+    /// Executes the build for a package, using stale dependencies.
+    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
+    PatchedBuild(PatchedBuildArgs),
+    /// Runs a command using the given packages, in the current working directory.
+    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
+    Run(RunArgs),
 }
 
 /// Shared arguments and builders across all subcommands
 #[derive(Debug, Args)]
 pub struct GlobalArgs {
-    /// Override the directory where binary artifacts are cached
+    /// Override the directory where binary artifacts are cached (default: ~/.cache/minimal/builds)
     #[arg(long)]
     cache_dir: Option<PathBuf>,
-    /// Override the direct where builds are performed (default: ~/.cache/minimal/sandboxes)
+    /// Override the directory where builds are performed (default: ~/.cache/minimal/sandboxes)
     #[arg(long)]
     builds_dir: Option<PathBuf>,
-    /// Override the download cache directory (default: ~/.cache/minimal/downloads)
+    /// Override the directory where downloads are cached (default: ~/.cache/minimal/downloads)
     #[arg(long)]
     download_cache_dir: Option<PathBuf>,
 
@@ -101,6 +109,22 @@ fn default_parallelism() -> usize {
         4 => 3,
         _ => rough_threadcount - 2,
     }
+}
+
+pub(crate) fn enforce_science_mode() -> Result<()> {
+    if std::env::var("MINIMAL_SCIENCE_MODE").unwrap_or("".to_string()) != "yeppers" {
+        eprintln!("You are using a command that is experimental or very unsafe!!");
+        eprintln!(
+            "No guarantees are given about the consistency of your minimal install following the execution of such commands, nor the stability of any such commands."
+        );
+        eprintln!(
+            "If you are sure you want to continue, set the environment variable MINIMAL_SCIENCE_MODE=yeppers before continuing."
+        );
+        eprintln!();
+
+        bail!("Aborting execution of unsafe command outside of science mode");
+    }
+    Ok(())
 }
 
 impl GlobalArgs {
@@ -153,13 +177,10 @@ impl GlobalArgs {
         .await
     }
 
-    pub fn packages_dir(&self) -> PathBuf {
-        self.path_config().packages_dir().to_path_buf()
-    }
-
     /// Returns a [DepGraph] with the given package and its transitive dependencies loaded.
     pub fn graph_from_package_name(&self, package_name: &String) -> Result<DepGraph, GraphError> {
-        let package_dir = self.packages_dir().join(package_name);
+        let path_config = self.path_config();
+        let package_dir = path_config.packages_dir().join(package_name);
 
         let build_ncl_path = {
             let normal_path = package_dir.join("build.ncl");
@@ -176,7 +197,7 @@ impl GlobalArgs {
         let sr = SpecReader::new_with_path(
             &build_ncl_path,
             &SpecReaderOptions {
-                minimal_lib_path: "crates/graph/minimal-ncl".into(),
+                minimal_lib_path: path_config.minimal_stdlib_dir().to_path_buf(),
             },
         )?;
 
@@ -185,13 +206,14 @@ impl GlobalArgs {
 
     #[tracing::instrument]
     pub fn graph_from_package_names(&self, names: &[String]) -> Result<DepGraph, GraphError> {
-        let packages_dir = self.packages_dir();
+        let path_config = self.path_config();
+        let packages_dir = path_config.packages_dir();
 
         let sr = SpecReader::new_with_pkgs(
             names,
             packages_dir,
             &SpecReaderOptions {
-                minimal_lib_path: "crates/graph/minimal-ncl".into(),
+                minimal_lib_path: path_config.minimal_stdlib_dir().to_path_buf(),
             },
         )?;
 
@@ -199,12 +221,13 @@ impl GlobalArgs {
     }
 
     pub fn graph_from_all_packages(&self) -> Result<DepGraph, GraphError> {
-        let packages_dir = self.packages_dir();
+        let path_config = self.path_config();
+        let packages_dir = path_config.packages_dir();
 
         let sr = SpecReader::new_with_all_pkgs(
             packages_dir,
             &SpecReaderOptions {
-                minimal_lib_path: "crates/graph/minimal-ncl".into(),
+                minimal_lib_path: path_config.minimal_stdlib_dir().to_path_buf(),
             },
         )?;
 
@@ -261,6 +284,7 @@ impl PackagesArg {
 pub enum Error {
     Graph(GraphError),
     Other(anyhow::Error),
+    PlanErr(DepGraph, PlanErr),
 }
 
 impl Error {
@@ -268,6 +292,23 @@ impl Error {
         match self {
             Error::Graph(e) => e.report_to_stderr(),
             Error::Other(e) => eprintln!("{:?}", e),
+            Error::PlanErr(graph, err) => match err {
+                PlanErr::Cycles(cycles) => {
+                    eprintln!(
+                        "Planning failed: unable to progress with unresolvable dependency cycles"
+                    );
+                    eprintln!("Cycles:");
+                    for c in cycles {
+                        eprintln!(
+                            "\t{}",
+                            c.iter()
+                                .map(|bsr| graph.get(bsr).unwrap().name.clone())
+                                .collect::<Vec<_>>()
+                                .join(" -> "),
+                        )
+                    }
+                }
+            },
         }
     }
 }
@@ -312,7 +353,8 @@ async fn main() -> Result<()> {
         Command::UploadCache(args) => cmd_upload_cache(args, &cli.global_args).await,
         Command::NewWorldUpdate(args) => cmd_new_world_update(args, &cli.global_args).await,
         Command::OciImage(args) => cmd_oci_image(args, &cli.global_args).await,
-        Command::UnsafePatchedBuild(args) => cmd_unsafe_patched_build(args, &cli.global_args).await,
+        Command::PatchedBuild(args) => cmd_patched_build(args, &cli.global_args).await,
+        Command::Run(args) => cmd_run(args, &cli.global_args).await,
     };
 
     if let Err(e) = result {

@@ -3,7 +3,6 @@ use minimal_spongebob_community_neoeinstein_prost::spongebob::v1::{
     build_event, BuildEvent, TargetCompleted, TargetKind, TargetStarted,
 };
 use std::fs;
-use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
@@ -318,72 +317,21 @@ impl BuildExecutor {
 }
 
 fn hardlink_dir_contents(src: &Path, dst: &Path) -> Result<()> {
-    for entry in fs::read_dir(src).map_err(|e| ExecutionError::FileOperation {
-        operation: "read directory".to_string(),
-        path: src.display().to_string(),
-        source: e,
-    })? {
-        let entry = entry.map_err(|e| ExecutionError::FileOperation {
-            operation: "read directory entry".to_string(),
-            path: src.display().to_string(),
+    use common::HardlinkError;
+    common::hardlink_dir_contents(src, dst).map_err(|e| match e {
+        HardlinkError::IO(op, path, e) => ExecutionError::FileOperation {
+            operation: op.to_string(),
+            path: path.display().to_string(),
             source: e,
-        })?;
-
-        let path = entry.path();
-        let file_name = entry.file_name();
-        let dst_path = dst.join(&file_name);
-
-        let metadata = entry
-            .metadata()
-            .map_err(|e| ExecutionError::FileOperation {
-                operation: "get metadata".to_string(),
-                path: path.display().to_string(),
-                source: e,
-            })?;
-
-        if metadata.is_dir() {
-            fs::create_dir_all(&dst_path).map_err(|e| ExecutionError::FileOperation {
-                operation: "create directory".to_string(),
-                path: dst_path.display().to_string(),
-                source: e,
-            })?;
-            hardlink_dir_contents(&path, &dst_path)?;
-        } else if metadata.is_file() {
-            match fs::hard_link(&path, &dst_path) {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::AlreadyExists {
-                        warn!(
-                            "Not linking {} => {}, already exists",
-                            path.display(),
-                            dst_path.display()
-                        );
-                        Ok(())
-                    } else {
-                        Err(e)
-                    }
-                }
-            }
-            .map_err(|e| ExecutionError::HardLinkFailed {
-                source: path.display().to_string(),
-                destination: dst_path.display().to_string(),
-                error: e,
-            })?;
-        } else if metadata.is_symlink() {
-            let target = fs::read_link(&path).map_err(|e| ExecutionError::FileOperation {
-                operation: "read symlink".to_string(),
-                path: path.display().to_string(),
-                source: e,
-            })?;
-            symlink(&target, &dst_path).map_err(|e| ExecutionError::FileOperation {
-                operation: "create symlink".to_string(),
-                path: dst_path.display().to_string(),
-                source: e,
-            })?;
         }
-    }
-
-    Ok(())
+        .into(),
+        HardlinkError::HardlinkFailed(src, dst, e) => ExecutionError::HardLinkFailed {
+            source: src.display().to_string(),
+            destination: dst.display().to_string(),
+            error: e,
+        }
+        .into(),
+    })
 }
 
 /// Helper function to get current timestamp in milliseconds

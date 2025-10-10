@@ -1,6 +1,5 @@
 use crate::{Cache, LocalDir, remote_index::RemoteIndex};
-use common::{SpecHash, Tee};
-use sha2::{Digest, Sha256};
+use common::SpecHash;
 use std::io::{Seek, Write};
 
 use common::fetchers::*;
@@ -81,30 +80,9 @@ impl RemoteCache<Storage> {
     ) -> Result<(), Error<GcsError>> {
         let cache_dir = cache.read_dir(spec_hash).map_err(Error::Cache)?;
 
-        // Compress to archive while computing hash
-        let mut tar_file = tempfile::tempfile().map_err(Error::IO)?;
-        let mut hasher = Sha256::new();
-        {
-            let mut w = Tee::new(&mut tar_file, &mut hasher);
-            let encoder = zstd::stream::Encoder::new(&mut w, 3).map_err(Error::IO)?;
-            let mut tar_builder = tar::Builder::new(encoder);
-            tar_builder
-                .append_dir_all(".", cache_dir.path())
-                .map_err(Error::IO)?;
-            tar_builder
-                .into_inner()
-                .map_err(Error::IO)?
-                .finish()
-                .map_err(Error::IO)?;
-        }
-        tar_file
-            .seek(std::io::SeekFrom::Start(0))
-            .map_err(Error::IO)?;
-
-        let sha256 = hasher.finalize();
-
+        let (tar_file, sha256) = common::compress_dir(cache_dir.path()).map_err(Error::IO)?;
         let indexed_sha = self.index.sha256(spec_hash);
-        if indexed_sha == Some(sha256.into()) {
+        if indexed_sha == Some(sha256) {
             return Ok(()); // Cached one is up to date.
         }
 
@@ -120,7 +98,7 @@ impl RemoteCache<Storage> {
             .send_buffered()
             .await?;
 
-        self.uploaded.push((spec_hash.clone(), sha256.into()));
+        self.uploaded.push((spec_hash.clone(), sha256));
         Ok(())
     }
 

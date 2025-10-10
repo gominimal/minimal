@@ -1,6 +1,7 @@
 let { BuildSpec, Local, OutputBin, OutputData, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let tcl = import "../tcl/build.ncl" in
+let make = import "../make/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
   name = "dejagnu",
@@ -11,6 +12,7 @@ let toolchain = import "../toolchain/build.ncl" in
       sha256 = "87daefacd7958b4a69f88c6856dbd1634261963c414079d0c371f589cd66a2e3"
     } | Source,
     base,
+    make,
     toolchain,
   ],
   cmd = "./build.sh",

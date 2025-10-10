@@ -1,5 +1,6 @@
 let { BuildSpec, Local, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
+let make = import "../make/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
   name = "pkgconf",
@@ -10,6 +11,7 @@ let toolchain = import "../toolchain/build.ncl" in
       sha256 = "cd05c9589b9f86ecf044c10a2269822bc9eb001eced2582cfffd658b0a50c243"
     } | Source,
     base,
+    make,
     toolchain,
   ],
   cmd = "./build.sh",

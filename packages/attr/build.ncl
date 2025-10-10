@@ -32,6 +32,10 @@ let tar = import "../tar/build.ncl" in
     sed,
     tar,
   ],
+  runtime_deps = [
+    glibc,
+  ],
+
   cmd = "./build.sh",
   outputs = {
     bins = { glob = "usr/bin/*" } | OutputBin,

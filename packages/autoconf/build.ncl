@@ -1,6 +1,8 @@
 let { BuildSpec, Local, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let m4 = import "../m4/build.ncl" in
+let make = import "../make/build.ncl" in
+let perl = import "../perl/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
   name = "autoconf",
@@ -12,6 +14,8 @@ let toolchain = import "../toolchain/build.ncl" in
     } | Source,
     base,
     m4,
+    make,
+    perl,
     toolchain,
   ],
   cmd = "./build.sh",

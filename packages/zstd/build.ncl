@@ -1,6 +1,7 @@
 let { BuildSpec, Local, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let lz4 = import "../lz4/build.ncl" in
+let make = import "../make/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 let zlib = import "../zlib/build.ncl" in
 {
@@ -12,6 +13,7 @@ let zlib = import "../zlib/build.ncl" in
       sha256 = "8c29e06cf42aacc1eafc4077ae2ec6c6fcb96a626157e0593d5e82a34fd403c1"
     } | Source,
     base,
+    make,
     lz4,
     toolchain,
     zlib,

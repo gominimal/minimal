@@ -8,12 +8,12 @@ let file = import "../file/build.ncl" in
 let ncurses = import "../ncurses/build.ncl" in
 let zlib = import "../zlib/build.ncl" in
 {
-  name = "nano",
+  name = "strace",
   inputs = [
     { file = "build.sh" } | Local,
     {
-      url = "gs://minimal-staging-archives/nano-8.6.tar.xz",
-      sha256 = "f7abfbf0eed5f573ab51bd77a458f32d82f9859c55e9689f819d96fe1437a619"
+      url = "gs://minimal-staging-archives/strace-6.17.tar.xz",
+      sha256 = "0a7c7bedc7efc076f3242a0310af2ae63c292a36dd4236f079e88a93e98cb9c0"
     } | Source,
     base,
     make,
@@ -21,14 +21,12 @@ let zlib = import "../zlib/build.ncl" in
   ],
   runtime_deps = [
     glibc,
-    file,
-    ncurses,
-    zlib,
   ],
+
   cmd = "./build.sh",
   outputs = {
-    bin = { glob = "usr/bin/nano" } | OutputBin,
-    languages = { glob = "usr/share/nano/*" } | OutputData,
-    man = { glob = "usr/share/man/**/*" } | OutputData,
+    strace = { glob = "usr/bin/strace" } | OutputBin,
+
+    mans = { glob = "usr/share/man/**" } | OutputData,
   },
 } | BuildSpec

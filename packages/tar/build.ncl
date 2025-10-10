@@ -1,7 +1,9 @@
 let { BuildSpec, Local, OutputBin, OutputLib, Prebuilt, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
+let make = import "../make/build.ncl" in
 let acl = import "../acl/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
 let gzip = import "../gzip/build.ncl" in
 let xz = import "../xz/build.ncl" in
 {
@@ -13,10 +15,12 @@ let xz = import "../xz/build.ncl" in
       sha256 = "4d62ff37342ec7aed748535323930c7cf94acf71c3591882b26a7ea50f3edc16"
     } | Source,
     base,
+    make,
     toolchain,
   ],
   runtime_deps = [
     acl,
+    glibc,
     gzip,
     xz,
   ],
@@ -36,6 +40,7 @@ let xz = import "../xz/build.ncl" in
       ],
       runtime_deps = [
         acl,
+        glibc,
         gzip,
         xz,
       ],

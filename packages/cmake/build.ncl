@@ -1,6 +1,7 @@
 let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let openssl = import "../openssl/build.ncl" in
+let make = import "../make/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
   name = "cmake",
@@ -11,6 +12,7 @@ let toolchain = import "../toolchain/build.ncl" in
     } | Source,
     { file = "build.sh" } | Local,
     base,
+    make,
     toolchain,
   ],
   runtime_deps = [

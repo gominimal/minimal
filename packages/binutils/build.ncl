@@ -49,14 +49,15 @@ let zlib = import "../zlib/build.ncl" in
     # toolchain
     binutils,
     gcc,
-    glibc,
     linux_headers,
     # other
     dejagnu,
     expect,
   ],
   runtime_deps = [
+    glibc,
     zlib,
+    gcc, # TODO: Subsets for just libstdc++.so.6 & libgcc_s.so.1
   ],
   cmd = "./build.sh",
   outputs = {

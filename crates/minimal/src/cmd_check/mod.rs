@@ -24,7 +24,7 @@ pub struct CheckArgs {
 
 pub fn cmd_check(args: CheckArgs, globals: &GlobalArgs) -> Result<(), Error> {
     let all_graph = globals.graph_from_all_packages().ok();
-    let packages_dir = globals.packages_dir();
+    let packages_dir = globals.path_config().packages_dir().to_path_buf();
 
     let packages_dirs = std::fs::read_dir(packages_dir)
         .map_err(anyhow::Error::from)?
@@ -163,7 +163,7 @@ fn check_minimal_import_line(
         err: vec![],
     };
 
-    let base = globals.packages_dir().join(pkg);
+    let base = globals.path_config().packages_dir().join(pkg);
     for e in std::fs::read_dir(base).map_err(anyhow::Error::from)? {
         let e = e.map_err(anyhow::Error::from)?;
         if e.file_type().unwrap().is_dir() {
@@ -261,7 +261,7 @@ fn check_package_fmt(
         err: vec![],
     };
 
-    let base = globals.packages_dir().join(pkg);
+    let base = globals.path_config().packages_dir().join(pkg);
     for e in std::fs::read_dir(base).map_err(anyhow::Error::from)? {
         let e = e.map_err(anyhow::Error::from)?;
         if e.file_type().unwrap().is_dir() {
@@ -315,6 +315,7 @@ fn check_package(
         naming::cycle_breaker_naming(pkg, all_graph, fix, globals)?,
         naming::output_naming(pkg, all_graph, fix, globals)?,
         outputs::output_types_valid(pkg, all_graph, fix, globals)?,
+        outputs::missing_runtime_deps(pkg, all_graph, fix, globals)?,
         check_minimal_import_line(pkg, all_graph, fix, globals)?,
         check_package_fmt(pkg, all_graph, fix, globals)?,
     ])

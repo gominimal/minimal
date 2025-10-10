@@ -3,6 +3,7 @@ let base = import "../base/build.ncl" in
 let patch = import "../patch/build.ncl" in
 let python = import "../python/build.ncl" in
 let tcl = import "../tcl/build.ncl" in
+let make = import "../make/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
   name = "expect",
@@ -17,6 +18,7 @@ let toolchain = import "../toolchain/build.ncl" in
       sha256 = "ab5fc0af9e2e0f80d7623c1a3a3dbeb1da3d8c9134276792199df401f9eb2cec"
     } | Source,
     base,
+    make,
     patch,
     python,
     toolchain,

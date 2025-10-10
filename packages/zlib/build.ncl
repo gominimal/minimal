@@ -5,6 +5,7 @@ let sed = import "../sed/build.ncl" in
 let tar = import "../tar/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
 {
   name = "zlib",
   inputs = [
@@ -20,6 +21,10 @@ let toolchain = import "../toolchain/build.ncl" in
     coreutils,
     toolchain,
   ],
+  runtime_deps = [
+    glibc,
+  ],
+
   cmd = "./build.sh",
   outputs = {
     libz = { glob = "usr/lib/libz.so*" } | OutputLib,

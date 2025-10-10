@@ -1,9 +1,11 @@
 let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
+let make = import "../make/build.ncl" in
 let ca-certificates = import "../ca-certificates/build.ncl" in
 let libpsl = import "../libpsl/build.ncl" in
 let openssl = import "../openssl/build.ncl" in
 let pkgconf = import "../pkgconf/build.ncl" in
+let perl = import "../perl/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
   name = "curl",
@@ -14,14 +16,17 @@ let toolchain = import "../toolchain/build.ncl" in
       sha256 = "6cd0a8a5b126ddfda61c94dc2c3fc53481ba7a35461cf7c5ab66aa9d6775b609"
     } | Source,
     base,
-    openssl,
+    make,
+    perl,
     pkgconf,
     toolchain,
   ],
   runtime_deps = [
     ca-certificates,
     libpsl,
+    openssl,
   ],
+
   cmd = "./build.sh",
   outputs = {
     bins = { glob = "usr/bin/*" } | OutputBin,

@@ -7,14 +7,13 @@ use std::collections::HashSet;
 use tracing::info;
 
 #[derive(Debug, clap::Args)]
-pub struct UnsafePatchedBuildArgs {
+pub struct PatchedBuildArgs {
     package: String,
 }
 
-pub async fn cmd_unsafe_patched_build(
-    args: UnsafePatchedBuildArgs,
-    globals: &GlobalArgs,
-) -> Result<(), Error> {
+pub async fn cmd_patched_build(args: PatchedBuildArgs, globals: &GlobalArgs) -> Result<(), Error> {
+    crate::enforce_science_mode()?;
+
     let graph = globals.graph_from_package_name(&args.package)?;
     let cache = globals.cache().map_err(anyhow::Error::from)?;
     let remote_storage =
@@ -94,6 +93,17 @@ pub async fn cmd_unsafe_patched_build(
 
     // Use package name as target ID for semantic meaning
     let target_id = build.name.clone();
+    let command_info = format!("unsafe-patched-build {}", build.name);
+    let mut spongebob_client = spongebob::SpongeBob::new()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob client: {}", e))?;
+    let mut spongebob_invocation = match spongebob_client.create_invocation(&command_info).await {
+        Ok(inv) => Some(inv),
+        Err(e) => {
+            tracing::warn!("Failed to create SpongeBob invocation: {}", e);
+            None
+        }
+    };
 
     run_build(
         &config,

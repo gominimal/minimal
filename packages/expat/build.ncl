@@ -1,5 +1,6 @@
 let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
+let make = import "../make/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
   name = "expat",
@@ -10,6 +11,7 @@ let toolchain = import "../toolchain/build.ncl" in
       sha256 = "354552544b8f99012e5062f7d570ec77f14b412a3ff5c7d8d0dae62c0d217c30"
     } | Source,
     base,
+    make,
     toolchain,
   ],
   cmd = "./build.sh",

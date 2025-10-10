@@ -35,6 +35,7 @@ let tar = import "../tar/build.ncl" in
   ],
   runtime_deps = [
     attr,
+    glibc,
   ],
   cmd = "./build.sh",
   outputs = {

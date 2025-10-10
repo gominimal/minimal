@@ -1,0 +1,5 @@
+[formatting]
+align_comments = false
+column_width = 120
+indent_string = "    "
+reorder_arrays = true
