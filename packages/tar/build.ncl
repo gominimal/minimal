@@ -34,11 +34,6 @@ let xz = import "../xz/build.ncl" in
       inputs = [
         { package = "tar" } | Prebuilt,
       ],
-      runtime_deps = [
-        acl,
-        gzip,
-        xz,
-      ],
       cmd = "",
       outputs = {
         tar = { glob = "usr/bin/tar" } | OutputBin,

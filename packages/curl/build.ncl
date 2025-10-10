@@ -14,14 +14,15 @@ let toolchain = import "../toolchain/build.ncl" in
       sha256 = "6cd0a8a5b126ddfda61c94dc2c3fc53481ba7a35461cf7c5ab66aa9d6775b609"
     } | Source,
     base,
-    openssl,
     pkgconf,
     toolchain,
   ],
   runtime_deps = [
     ca-certificates,
     libpsl,
+    openssl,
   ],
+
   cmd = "./build.sh",
   outputs = {
     bins = { glob = "usr/bin/*" } | OutputBin,

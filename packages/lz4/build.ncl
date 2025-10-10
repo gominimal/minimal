@@ -1,6 +1,13 @@
 let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
-let base = import "../base/build.ncl" in
+let bash = import "../bash/build.ncl" in
+let tar = import "../tar/build.ncl" in
+let make = import "../make/build.ncl" in
+let sed = import "../sed/build.ncl" in
+let grep = import "../grep/build.ncl" in
+let coreutils = import "../coreutils/build.ncl" in
+let diffutils = import "../diffutils/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
+
 let glibc = import "../glibc/build.ncl" in
 {
   name = "lz4",
@@ -10,7 +17,13 @@ let glibc = import "../glibc/build.ncl" in
       url = "gs://minimal-staging-archives/lz4-1.10.0.tar.gz",
       sha256 = "537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b"
     } | Source,
-    base,
+    bash,
+    tar,
+    make,
+    sed,
+    grep,
+    coreutils,
+    diffutils,
     toolchain,
   ],
   runtime_deps = [

@@ -8,8 +8,6 @@ let findutils = import "../findutils/build.ncl" in
 let gawk = import "../gawk/build.ncl" in
 let grep = import "../grep/build.ncl" in
 let gzip = import "../gzip/build.ncl" in
-let make = import "../make/build.ncl" in
-let perl = import "../perl/build.ncl" in
 let sed = import "../sed/build.ncl" in
 let tar = import "../tar/build.ncl" in
 let xz = import "../xz/build.ncl" in
@@ -17,7 +15,6 @@ let xz = import "../xz/build.ncl" in
   name = "base",
   inputs = [
     { file = "build.sh" } | Local,
-    coreutils,
   ],
   runtime_deps = [
     bash,
@@ -29,8 +26,6 @@ let xz = import "../xz/build.ncl" in
     gawk,
     grep,
     gzip,
-    make,
-    perl,
     sed,
     tar,
     xz,

@@ -7,6 +7,7 @@ let m4 = import "../m4/build.ncl" in
 let automake = import "../automake/build.ncl" in
 let autoconf = import "../autoconf/build.ncl" in
 let libtool = import "../libtool/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
 
 let version = "1.51.0" in
 {
@@ -25,6 +26,9 @@ let version = "1.51.0" in
     automake,
     autoconf,
     libtool,
+  ],
+  runtime_deps = [
+    glibc,
   ],
 
   cmd = "./build.sh",

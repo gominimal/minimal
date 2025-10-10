@@ -45,11 +45,14 @@ let zlib = import "../zlib/build.ncl" in
     # toolchain
     binutils,
     gcc,
-    glibc,
     linux_headers,
     # other
     zlib,
   ],
+  runtime_deps = [
+    glibc,
+  ],
+
   cmd = "./build.sh",
   outputs = {
     usr_bin = { glob = "usr/bin/**/*" } | OutputLib,
