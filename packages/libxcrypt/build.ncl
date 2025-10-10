@@ -1,6 +1,8 @@
 let { BuildSpec, Local, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
+let make = import "../make/build.ncl" in
+let perl = import "../perl/build.ncl" in
 let glibc = import "../glibc/build.ncl" in
 {
   name = "libxcrypt",
@@ -11,6 +13,8 @@ let glibc = import "../glibc/build.ncl" in
       sha256 = "80304b9c306ea799327f01d9a7549bdb28317789182631f1b54f4511b4206dd6"
     } | Source,
     base,
+    perl,
+    make,
     toolchain,
   ],
   runtime_deps = [

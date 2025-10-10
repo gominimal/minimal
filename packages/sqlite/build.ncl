@@ -1,5 +1,6 @@
 let { BuildSpec, Local, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
+let make = import "../make/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 {
   name = "sqlite",
@@ -10,6 +11,7 @@ let toolchain = import "../toolchain/build.ncl" in
       sha256 = "a3db587a1b92ee5ddac2f66b3edb41b26f9c867275782d46c3a088977d6a5b18"
     } | Source,
     base,
+    make,
     toolchain,
   ],
   cmd = "./build.sh",

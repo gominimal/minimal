@@ -3,6 +3,7 @@ let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Prebuilt, Source, .. }
 let base = import "../base/build.ncl" in
 let flex = import "../flex/build.ncl" in
 let m4 = import "../m4/build.ncl" in
+let make = import "../make/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 let glibc = import "../glibc/build.ncl" in
 {
@@ -14,6 +15,7 @@ let glibc = import "../glibc/build.ncl" in
     } | Source,
     { file = "build.sh" } | Local,
     base,
+    make,
     flex,
     m4,
     toolchain,

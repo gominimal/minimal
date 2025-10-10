@@ -1,5 +1,6 @@
 let { BuildSpec, Local, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
+let make = import "../make/build.ncl" in
 let expat = import "../expat/build.ncl" in
 let gdbm = import "../gdbm/build.ncl" in
 let libffi = import "../libffi/build.ncl" in
@@ -18,6 +19,7 @@ let util-linux = import "../util-linux/build.ncl" in
       sha256 = "5462f9099dfd30e238def83c71d91897d8caa5ff6ebc7a50f14d4802cdaaa79a"
     } | Source,
     base,
+    make,
     gdbm,
     libffi,
     ncurses,

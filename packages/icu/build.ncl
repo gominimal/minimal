@@ -2,6 +2,7 @@ let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, .. } = import 
 let base = import "../base/build.ncl" in
 let gcc = import "../gcc/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
+let make = import "../make/build.ncl" in
 let glibc = import "../glibc/build.ncl" in
 {
   name = "icu",
@@ -12,6 +13,7 @@ let glibc = import "../glibc/build.ncl" in
       sha256 = "588e431f77327c39031ffbb8843c0e3bc122c211374485fa87dc5f3faff24061",
     } | Source,
     base,
+    make,
     toolchain,
   ],
   runtime_deps = [

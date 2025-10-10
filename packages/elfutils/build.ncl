@@ -1,6 +1,7 @@
 let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let m4 = import "../m4/build.ncl" in
+let make = import "../make/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 
 let bzip2 = import "../bzip2/build.ncl" in
@@ -19,6 +20,7 @@ let gcc = import "../gcc/build.ncl" in
     } | Source,
     base,
     m4,
+    make,
     toolchain,
   ],
   runtime_deps = [

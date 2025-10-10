@@ -1,6 +1,7 @@
 let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let pkgconf = import "../pkgconf/build.ncl" in
+let make = import "../make/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 let ncurses = import "../ncurses/build.ncl" in
 {
@@ -13,6 +14,7 @@ let ncurses = import "../ncurses/build.ncl" in
     } | Source,
     base,
     pkgconf,
+    make,
     toolchain,
   ],
   runtime_deps = [
