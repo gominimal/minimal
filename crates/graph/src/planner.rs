@@ -508,49 +508,51 @@ impl<'a, BP: BinProvider> Iterator for ExecPlan<'a, BP> {
         }
 
         if met.is_empty() {
-            let cycles = self.find_cycles().into_iter().collect::<Vec<_>>();
-            // println!(
-            //     "cycle(s) detected! {:?}",
-            //     cycles
-            //         .iter()
-            //         .map(|c| {
-            //             c.into_iter()
-            //                 .map(|bsr| self.graph.get(&bsr).unwrap().name.clone())
-            //                 .collect::<Vec<_>>()
-            //         })
-            //         .collect::<Vec<_>>()
-            // );
+            // Filter chains where both ends are already built
+            let cycles = self
+                .find_cycles()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .filter(|bsrs| {
+                    let (first, last) = (bsrs.first().unwrap(), bsrs.last().unwrap());
 
-            let mut added_cycle_breaker = false;
-            for path in &cycles {
-                let (first, last) = (path.first().unwrap(), path.last().unwrap());
-                for cycle in &[first, last] {
-                    if let Some(cycle_breaker) = self.graph.get(cycle).unwrap().replace_on_cycle {
-                        if !self.builds.contains_key(&cycle_breaker) {
-                            let mut path = Vec::new();
-                            // We found a new cycle breaker we haven't brought into the fray yet.
-                            make_reachable(
-                                &cycle_breaker,
-                                self.graph,
-                                &mut self.bin_provider,
-                                &mut self.builds,
-                                &mut path,
-                            )
-                            .unwrap();
-                            self.builds
-                                .get_mut(&cycle_breaker)
-                                .unwrap()
-                                .cycle_breaker_of = Some(**cycle);
-                            added_cycle_breaker = true;
-                        }
-                    }
-                }
-            }
-            if !added_cycle_breaker {
-                return Some(Err(PlanErr::Cycles(cycles)));
-            } else {
-                return self.next();
-            }
+                    ![first, last]
+                        .into_iter()
+                        .all(|bsr| self.is_built(bsr, true))
+                })
+                .collect::<Vec<_>>();
+
+            // let mut added_cycle_breaker = false;
+            // for path in &cycles {
+            //     let (first, last) = (path.first().unwrap(), path.last().unwrap());
+            //     for cycle in &[first, last] {
+            //         if let Some(cycle_breaker) = self.graph.get(cycle).unwrap().replace_on_cycle {
+            //             if !self.builds.contains_key(&cycle_breaker) {
+            //                 let mut path = Vec::new();
+            //                 // We found a new cycle breaker we haven't brought into the fray yet.
+            //                 make_reachable(
+            //                     &cycle_breaker,
+            //                     self.graph,
+            //                     &mut self.bin_provider,
+            //                     &mut self.builds,
+            //                     &mut path,
+            //                 )
+            //                 .unwrap();
+            //                 self.builds
+            //                     .get_mut(&cycle_breaker)
+            //                     .unwrap()
+            //                     .cycle_breaker_of = Some(**cycle);
+            //                 added_cycle_breaker = true;
+            //             }
+            //         }
+            //     }
+            // }
+            // if !added_cycle_breaker {
+            return Some(Err(PlanErr::Cycles(cycles)));
+            // } else {
+            //     return self.next();
+            // }
         }
 
         let out = BuildPhase { builds: met };

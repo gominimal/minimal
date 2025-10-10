@@ -192,7 +192,7 @@ pub use dep_graph::{
 };
 
 mod planner;
-pub use planner::{BinProvider, ExecPlan};
+pub use planner::{BinProvider, ExecPlan, PlanErr};
 
 mod transitives;
 pub use transitives::Transitives;

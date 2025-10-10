@@ -5,6 +5,7 @@ use anyhow::bail;
 use cache::{Cache, LocalDir, RemoteCache, RemoteError};
 use clap::{Args, Parser, Subcommand};
 use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
+use graph::PlanErr;
 use graph::{DepGraph, Error as GraphError, SpecReader, SpecReaderOptions};
 use std::path::PathBuf;
 use tracing::error;
@@ -283,6 +284,7 @@ impl PackagesArg {
 pub enum Error {
     Graph(GraphError),
     Other(anyhow::Error),
+    PlanErr(DepGraph, PlanErr),
 }
 
 impl Error {
@@ -290,6 +292,23 @@ impl Error {
         match self {
             Error::Graph(e) => e.report_to_stderr(),
             Error::Other(e) => eprintln!("{:?}", e),
+            Error::PlanErr(graph, err) => match err {
+                PlanErr::Cycles(cycles) => {
+                    eprintln!(
+                        "Planning failed: unable to progress with unresolvable dependency cycles"
+                    );
+                    eprintln!("Cycles:");
+                    for c in cycles {
+                        eprintln!(
+                            "\t{}",
+                            c.into_iter()
+                                .map(|bsr| graph.get(bsr).unwrap().name.clone())
+                                .collect::<Vec<_>>()
+                                .join(" -> "),
+                        )
+                    }
+                }
+            },
         }
     }
 }
