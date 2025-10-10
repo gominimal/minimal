@@ -1,6 +1,7 @@
 let { BuildSpec, Local, OutputBin, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let curl = import "../curl/build.ncl" in
+let make = import "../make/build.ncl" in
 let cmake = import "../cmake/build.ncl" in
 let git = import "../git/build.ncl" in
 let hwdata = import "../hwdata/build.ncl" in
@@ -16,6 +17,7 @@ let toolchain = import "../toolchain/build.ncl" in
     } | Source,
     base,
     git,
+    make,
     cmake,
     toolchain,
   ],
