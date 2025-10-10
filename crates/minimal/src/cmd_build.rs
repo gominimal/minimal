@@ -16,7 +16,7 @@ pub async fn cmd_build(args: BuildArgs, globals: &GlobalArgs) -> Result<(), Erro
     let graph = args.packages.graph(globals)?;
     let cache = globals.cache().map_err(anyhow::Error::from)?;
 
-    cmd_build_impl(&graph, globals, cache, globals.num_parallel_builds, false).await?;
+    cmd_build_impl(&graph, globals, cache, globals.num_parallel_builds).await?;
 
     Ok(())
 }
@@ -26,7 +26,6 @@ pub async fn cmd_build_impl(
     globals: &GlobalArgs,
     cache: Cache<LocalDir>,
     num_parallel_builds: usize,
-    quiet: bool,
 ) -> anyhow::Result<()> {
     // Create SpongeBob invocation for this build command
     let mut spongebob_client = spongebob::SpongeBob::new()
@@ -64,9 +63,7 @@ pub async fn cmd_build_impl(
     let mut spongebob_invocation = match spongebob_client.create_invocation(&command_info).await {
         Ok(inv) => Some(inv),
         Err(e) => {
-            if !quiet {
-                tracing::warn!("Failed to create SpongeBob invocation: {}", e);
-            }
+            tracing::debug!("Failed to create SpongeBob invocation: {}", e);
             None
         }
     };
@@ -165,7 +162,7 @@ pub async fn cmd_build_impl(
 
     // Log build results to SpongeBob
     if let Some(ref mut invocation) = spongebob_invocation {
-        log_build_results_to_spongebob(invocation, graph, true, quiet).await?;
+        log_build_results_to_spongebob(invocation, graph, true).await?;
     }
 
     let spongebob_url = spongebob_invocation
@@ -173,9 +170,7 @@ pub async fn cmd_build_impl(
         .map(|inv| inv.url().to_string());
 
     // Display build summary
-    if !quiet {
-        display_build_summary(graph, &cache, globals, &run, spongebob_url.as_deref());
-    }
+    display_build_summary(graph, &cache, globals, &run, spongebob_url.as_deref());
 
     Ok(())
 }
@@ -185,7 +180,6 @@ async fn log_build_results_to_spongebob(
     spongebob_invocation: &mut spongebob::SpongeBobInvocation,
     graph: &DepGraph,
     success: bool,
-    quiet: bool,
 ) -> anyhow::Result<()> {
     let packages_list = graph
         .top_levels
@@ -214,9 +208,7 @@ async fn log_build_results_to_spongebob(
     );
 
     // Upload build summary
-    if !quiet {
-        info!("Uploading build summary to SpongeBob invocation");
-    }
+    info!("Uploading build summary to SpongeBob invocation");
     spongebob_invocation
         .upload_file("build-summary.txt", build_log.into_bytes())
         .await

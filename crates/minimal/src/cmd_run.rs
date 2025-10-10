@@ -23,14 +23,8 @@ pub async fn cmd_run(args: RunArgs, globals: &GlobalArgs) -> Result<(), Error> {
     };
     let cache = globals.cache().map_err(anyhow::Error::from)?;
     // Make sure the packages are built
-    crate::cmd_build::cmd_build_impl(
-        &graph,
-        globals,
-        cache.clone(),
-        globals.num_parallel_builds,
-        true,
-    )
-    .await?;
+    crate::cmd_build::cmd_build_impl(&graph, globals, cache.clone(), globals.num_parallel_builds)
+        .await?;
 
     // Start setting up the run container
     let base = tempfile::tempdir().map_err(anyhow::Error::from)?;
