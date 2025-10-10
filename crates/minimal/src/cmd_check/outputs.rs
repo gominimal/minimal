@@ -172,7 +172,7 @@ pub(crate) fn missing_runtime_deps(
     let deps: Vec<(BuildSpecRef, DirCacheEntry<LocalDir>)> = match transitives {
         Ok(mut t) => {
             // We need to consider imports from libraries in the current package as well
-            t.push((bsr.clone(), cache.read_dir(&spec_hash).unwrap()));
+            t.push((bsr, cache.read_dir(&spec_hash).unwrap()));
             t
         }
         Err(_) => {

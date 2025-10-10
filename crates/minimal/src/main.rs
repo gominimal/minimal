@@ -301,7 +301,7 @@ impl Error {
                     for c in cycles {
                         eprintln!(
                             "\t{}",
-                            c.into_iter()
+                            c.iter()
                                 .map(|bsr| graph.get(bsr).unwrap().name.clone())
                                 .collect::<Vec<_>>()
                                 .join(" -> "),
