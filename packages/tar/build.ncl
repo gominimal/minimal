@@ -2,6 +2,7 @@ let { BuildSpec, Local, OutputBin, OutputLib, Prebuilt, Source, .. } = import "m
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 let acl = import "../acl/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
 let gzip = import "../gzip/build.ncl" in
 let xz = import "../xz/build.ncl" in
 {
@@ -17,6 +18,7 @@ let xz = import "../xz/build.ncl" in
   ],
   runtime_deps = [
     acl,
+    glibc,
     gzip,
     xz,
   ],
@@ -33,6 +35,12 @@ let xz = import "../xz/build.ncl" in
       name = "tar (prebuilt)",
       inputs = [
         { package = "tar" } | Prebuilt,
+      ],
+      runtime_deps = [
+        acl,
+        glibc,
+        gzip,
+        xz,
       ],
       cmd = "",
       outputs = {
