@@ -10,6 +10,10 @@ let pkgconf = import "../pkgconf/build.ncl" in
 let sqlite = import "../sqlite/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 let util-linux = import "../util-linux/build.ncl" in
+
+let glibc = import "../glibc/build.ncl" in
+let zlib = import "../zlib/build.ncl" in
+let xz = import "../xz/build.ncl" in
 {
   name = "python",
   inputs = [
@@ -21,7 +25,6 @@ let util-linux = import "../util-linux/build.ncl" in
     base,
     make,
     gdbm,
-    libffi,
     ncurses,
     pkgconf,
     sqlite,
@@ -29,9 +32,15 @@ let util-linux = import "../util-linux/build.ncl" in
     util-linux,
   ],
   runtime_deps = [
+    libffi,
     expat,
     openssl,
+    glibc,
+    util-linux, # TODO: Use subsets to get just libuuid
+    zlib,
+    xz,
   ],
+
   cmd = "./build.sh",
   outputs = {
     usr_bin = { glob = "usr/bin/**/*" } | OutputLib,
