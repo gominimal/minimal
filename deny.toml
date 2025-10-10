@@ -2,6 +2,7 @@
 ignore = ["RUSTSEC-2024-0014"]
 
 [licenses]
+unused-allowed-license = "deny"
 allow = [
     "Apache-2.0 WITH LLVM-exception",
     "Apache-2.0",
@@ -10,11 +11,19 @@ allow = [
     "CDLA-Permissive-2.0",
     "ISC",
     "LGPL-3.0 WITH LGPL-3.0-linking-exception",
-    "LGPL-3.0-only",
     "MIT",
     "MPL-2.0",
     "Unicode-3.0",
     "Zlib",
+]
+
+exceptions = [
+    # Dummy comment for formatting
+    { allow = ["LGPL-3.0-only"], crate = "malachite" },
+    { allow = ["LGPL-3.0-only"], crate = "malachite-base" },
+    { allow = ["LGPL-3.0-only"], crate = "malachite-float" },
+    { allow = ["LGPL-3.0-only"], crate = "malachite-nz" },
+    { allow = ["LGPL-3.0-only"], crate = "malachite-q" },
 ]
 
 [licenses.private]
@@ -36,10 +45,10 @@ skip = [
     { name = "core-foundation", version = "0.9.4" },
     # # oci-spec -> derive_builder
     # https://github.com/colin-kiegel/rust-derive-builder/pull/349
+    { name = "darling", version = "0.20.11" },
     { name = "darling_core", version = "0.20.11" },
     { name = "darling_macro", version = "0.20.11" },
     { name = "darling_macro", version = "0.20.11" },
-    { name = "darling", version = "0.20.11" },
     # google-cloud-auth -> rustls -> ring 
     # https://github.com/briansmith/ring/issues/2341
     { name = "getrandom", version = "0.2.16" },
@@ -57,8 +66,8 @@ skip = [
     { name = "security-framework", version = "2.11.1" },
     # hakoniwa -> caps -> thiserror
     # https://github.com/lucab/caps-rs/pull/88
-    { name = "thiserror-impl", version = "1.0.69" },
     { name = "thiserror", version = "1.0.69" },
+    { name = "thiserror-impl", version = "1.0.69" },
     # nickel-lang-core -> pretty
     # https://github.com/Marwes/pretty.rs/pull/90
     { name = "unicode-width", version = "0.1.14" },

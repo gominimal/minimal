@@ -37,3 +37,8 @@ jobs:
       run: cargo fmt -- --check
     - name: Run Clippy
       run: cargo clippy --all-targets -- -D warnings
+
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: EmbarkStudios/cargo-deny-action@v2
