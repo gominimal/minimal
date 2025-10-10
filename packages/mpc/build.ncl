@@ -19,6 +19,9 @@ let binutils = import "../binutils/build.ncl" in
 let gcc = import "../gcc/build.ncl" in
 let glibc = import "../glibc/build.ncl" in
 let linux_headers = import "../linux_headers/build.ncl" in
+# other
+let gmp = import "../gmp/build.ncl" in
+let mpfr = import "../mpfr/build.ncl" in
 {
   name = "mpc",
   inputs = [
@@ -48,6 +51,12 @@ let linux_headers = import "../linux_headers/build.ncl" in
     glibc,
     linux_headers,
   ],
+  runtime_deps = [
+    glibc,
+    gmp,
+    mpfr,
+  ],
+
   cmd = "./build.sh",
   outputs = {
     usr = { glob = "usr/**/*" } | OutputLib,

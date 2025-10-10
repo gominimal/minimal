@@ -47,11 +47,14 @@ let m4 = import "../m4/build.ncl" in
     # toolchain
     binutils,
     gcc,
-    glibc,
     linux_headers,
     # other
     m4
   ],
+  runtime_deps = [
+    glibc,
+  ],
+
   cmd = "./build.sh",
   outputs = {
     libs = { glob = "usr/lib/*.{a,so*}" } | OutputLib,

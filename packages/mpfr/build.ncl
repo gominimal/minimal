@@ -21,6 +21,7 @@ let glibc = import "../glibc/build.ncl" in
 let linux_headers = import "../linux_headers/build.ncl" in
 # other
 let m4 = import "../m4/build.ncl" in
+let gmp = import "../gmp/build.ncl" in
 {
   name = "mpfr",
   inputs = [
@@ -52,6 +53,11 @@ let m4 = import "../m4/build.ncl" in
     # other
     m4,
   ],
+  runtime_deps = [
+    glibc,
+    gmp,
+  ],
+
   cmd = "./build.sh",
   outputs = {
     usr = { glob = "usr/**/*" } | OutputLib,
