@@ -236,19 +236,6 @@ async fn path_transitive_deps_of(
     Ok(())
 }
 
-fn is_pure_prebuilt(build: &BuildSpec) -> bool {
-    let has_prebuilt = build
-        .inputs
-        .iter()
-        .any(|input| matches!(input, BuildSpecInput::Prebuilt(_, _)));
-    let has_local_or_source = build
-        .inputs
-        .iter()
-        .any(|input| matches!(input, BuildSpecInput::Local(_) | BuildSpecInput::Source(_)));
-
-    has_prebuilt && !has_local_or_source
-}
-
 #[tracing::instrument(skip_all, fields(name = build.name, indicatif.pb_show))]
 async fn materialize_prebuilt(
     build: &BuildSpec,
@@ -441,7 +428,7 @@ impl<'a> Run<'a> {
             // Return None to indicate this was a cache hit, not a new build
             return Ok((None, None));
         }
-        if is_pure_prebuilt(build) {
+        if build.is_pure_prebuilt() {
             info!("Materializing prebuilt package: {}", build.name);
             let result = materialize_prebuilt(
                 build,

@@ -146,6 +146,27 @@ pub struct BuildSpec {
     pub pos: Option<DeclPos>,
 }
 
+impl BuildSpec {
+    /// Returns true if the build-spec represents a fetch of files but no actual computation.
+    pub fn is_pure_prebuilt(&self) -> bool {
+        let has_prebuilt = self
+            .inputs
+            .iter()
+            .any(|input| matches!(input, BuildSpecInput::Prebuilt(_, _)));
+        let has_local_or_source = self
+            .inputs
+            .iter()
+            .any(|input| matches!(input, BuildSpecInput::Local(_) | BuildSpecInput::Source(_)));
+
+        has_prebuilt && !has_local_or_source
+    }
+
+    /// Returns true if the build-spec represents a rollup of runtime_deps but no substance or computation of its own.
+    pub fn is_pure_collection(&self) -> bool {
+        self.inputs.is_empty() && self.cmd.is_empty()
+    }
+}
+
 /// The dependency graph.
 #[derive(Debug)]
 #[allow(dead_code)]
