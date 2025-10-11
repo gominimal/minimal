@@ -12,6 +12,7 @@ let version = "1.8.1" in
     {
       url = "gs://minimal-staging-archives/jq-%{version}.tar.gz",
       sha256 = "2be64e7129cecb11d5906290eba10af694fb9e3e7f9fc208a311dc33ca837eb0",
+      extract = true,
     } | Source,
     base,
     make,

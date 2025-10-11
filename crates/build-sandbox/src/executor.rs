@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 
-use crate::config::BuildConfig;
+use crate::config::{BuildConfig, Input};
 use crate::error::{ExecutionError, Result};
 
 #[derive(Debug)]
@@ -63,8 +63,19 @@ impl BuildExecutor {
             config.inputs.len()
         );
         for input in &config.inputs {
-            info!("  Linking input: {}", input.display());
-            self.hardlink_to_tmpdir(input)?;
+            match input {
+                Input::File(p) => {
+                    info!("  Linking input: {}", p.display());
+                    self.hardlink_to_tmpdir(p)?;
+                }
+                Input::Dir(p) => {
+                    info!("  Linking input dir: {}", p.display());
+                    for entry in fs::read_dir(p)? {
+                        let entry = entry?;
+                        self.hardlink_to_tmpdir(&entry.path())?;
+                    }
+                }
+            }
         }
 
         self.execute_in_container(config, spongebob_invocation)
@@ -114,6 +125,14 @@ impl BuildExecutor {
                 error: e,
             })?;
         } else if input.is_dir() {
+            match fs::create_dir(&dest_path) {
+                Ok(_) => {}
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(e.into());
+                    }
+                }
+            };
             hardlink_dir_contents(input, &dest_path)?;
         }
 

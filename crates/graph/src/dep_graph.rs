@@ -41,6 +41,7 @@ pub enum SourceFetch {
 pub struct SourceInput {
     pub from: SourceFetch,
     pub sha256: String,
+    pub extract: bool,
 }
 
 /// A dependency on some of the outputs of a build-spec.
@@ -798,6 +799,7 @@ impl GraphBuilder {
     ) -> Result<SourceInput, Error> {
         let mut url: Option<String> = None;
         let mut sha256: Option<String> = None;
+        let mut extract: Option<bool> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                 r.fields
@@ -822,6 +824,15 @@ impl GraphBuilder {
                                     )?)
                                     .unwrap(),
                                 );
+                                Ok(())
+                            }
+                            "extract" => {
+                                if let Some(ext_rt) = field.value.as_ref() {
+                                    extract = Some(
+                                        bool::deserialize(eval_if_closure(ext_rt, program)?)
+                                            .unwrap(),
+                                    );
+                                }
                                 Ok(())
                             }
                             _ => Ok(()), // TODO: Should we error if we see an unknown field?
@@ -856,6 +867,7 @@ impl GraphBuilder {
         Ok(SourceInput {
             from: SourceFetch::URL(url),
             sha256,
+            extract: extract.unwrap_or(false),
         })
     }
 
@@ -1305,7 +1317,7 @@ mod tests {
                 {
                     name = \"single buildspec\",
                     inputs = [
-                        {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
+                        {url = \"http://uwu.com\", sha256 = \"abcdef\", extract = true} | Source,
                     ],
                     cmd = \"\",
                 } | BuildSpec"
@@ -1325,6 +1337,7 @@ mod tests {
             BuildSpecInput::Source(SourceInput {
                 from: SourceFetch::URL(url),
                 sha256: sha,
+                extract: true,
             }) if url == "http://uwu.com" && sha == "abcdef",
         ));
     }

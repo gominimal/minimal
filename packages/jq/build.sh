@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-tar xfo "jq-${MINIMAL_ARG_VERSION}.tar.gz"
+ls -lah
 cd "jq-${MINIMAL_ARG_VERSION}"
 
 ./configure --prefix=/usr                   \

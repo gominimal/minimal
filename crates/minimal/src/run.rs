@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use build_sandbox::{BuildConfig, config::BuildScript, run_build};
+use build_sandbox::{BuildConfig, Input as SandboxInput, config::BuildScript, run_build};
 use cache::{Cache, LocalDir, PendingDir, RemoteCache};
 use common::SpecHash;
 use google_cloud_storage::client::Storage as GcsStorage;
@@ -8,23 +8,31 @@ use graph::{BinProvider, ExecPlan};
 use graph::{BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, SourceInput};
 use std::collections::HashSet;
 use std::path::PathBuf;
-use tempfile::Builder;
+use tempfile::{Builder, TempDir, tempfile};
 use tracing::{debug, info};
 use url::Url;
 
 use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage};
+
+/// A materialized source, either a file or directory tree.
+#[derive(Debug)]
+pub enum Materialized {
+    File(PathBuf),
+    TempDir(tempfile::TempDir),
+}
 
 /// yields a directory that the files in an [SourceInput] are available.
 pub(crate) async fn materialize_source(
     build_name: &str,
     source: &SourceInput,
     remote_storage: &RemoteStorage,
-) -> Result<PathBuf> {
+    cache: &Cache<LocalDir>,
+) -> Result<Materialized> {
     match &source.from {
         SourceFetch::URL(url) => {
             let url = Url::parse(url).with_context(|| format!("Failed to parse URL '{}'", url))?;
 
-            match url.scheme() {
+            let cached_path = match url.scheme() {
                 "https" => {
                     let cached_path = {
                         let span = tracing::info_span!(
@@ -44,7 +52,7 @@ pub(crate) async fn materialize_source(
                     };
 
                     debug!("  Downloaded and verified source from {}", url);
-                    Ok(cached_path)
+                    cached_path
                 }
 
                 "gs" => {
@@ -79,9 +87,46 @@ pub(crate) async fn materialize_source(
                         "  Downloaded and verified source from gs://{}/{}",
                         bucket_id, file_name
                     );
-                    Ok(cached_path)
+                    cached_path
                 }
                 _ => todo!(),
+            };
+
+            if source.extract {
+                let file_name = url
+                    .path_segments()
+                    .map(|mut s| s.next_back().unwrap())
+                    .unwrap();
+                let tempdir = cache.temp_dir()?;
+                let span = tracing::info_span!(
+                    "extract",
+                    "indicatif.pb_show" = tracing::field::Empty,
+                    "build" = build_name,
+                    "file" = file_name,
+                );
+                let _enter = span.enter();
+
+                if url.path().ends_with(".tar.gz") {
+                    let f = std::fs::File::open(cached_path)?;
+                    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(f));
+                    archive.unpack(tempdir.path())?;
+
+                    Ok(Materialized::TempDir(tempdir))
+                } else if url.path().ends_with(".tar.xz") {
+                    let mut decomp_buf = tempfile()?;
+                    let f = std::fs::File::open(cached_path)?;
+                    lzma_rs::xz_decompress(&mut std::io::BufReader::new(f), &mut decomp_buf)?;
+                    std::io::Seek::rewind(&mut decomp_buf)?;
+
+                    let mut archive = tar::Archive::new(decomp_buf);
+                    archive.unpack(tempdir.path())?;
+
+                    Ok(Materialized::TempDir(tempdir))
+                } else {
+                    bail!("cannot extract archive {}: unhandled extension", file_name)
+                }
+            } else {
+                Ok(Materialized::File(cached_path))
             }
         }
     }
@@ -343,9 +388,10 @@ impl<'a> Run<'a> {
         &self,
         build: &BuildSpec,
         remote_cache: Option<&RemoteCache<GcsStorage>>,
-    ) -> Result<(HashSet<PathBuf>, Vec<PathBuf>)> {
+    ) -> Result<(HashSet<PathBuf>, Vec<SandboxInput>, Vec<TempDir>)> {
         let mut dependencies = HashSet::new();
         let mut inputs = Vec::new();
+        let mut tempdirs = Vec::new();
 
         debug!("Build {} has {} inputs", build.name, build.inputs.len());
         for (i, input) in build.inputs.iter().enumerate() {
@@ -369,14 +415,24 @@ impl<'a> Run<'a> {
                 }
                 Local((path, _hash)) => {
                     debug!("  Input {}: Local file from {}", i, path.display());
-                    inputs.push(path.to_path_buf());
+                    inputs.push(SandboxInput::File(path.to_path_buf()));
                 }
                 Source(source) => {
                     debug!("  Input {}: Source({:?})", i, source.from);
-                    inputs.push(
-                        materialize_source(build.name.as_str(), source, &self.remote_storage)
-                            .await?,
-                    );
+                    match materialize_source(
+                        build.name.as_str(),
+                        source,
+                        &self.remote_storage,
+                        &self.cache,
+                    )
+                    .await?
+                    {
+                        Materialized::File(path) => inputs.push(SandboxInput::File(path)),
+                        Materialized::TempDir(td) => {
+                            inputs.push(SandboxInput::Dir(td.path().to_path_buf()));
+                            tempdirs.push(td);
+                        }
+                    };
                 }
                 Prebuilt(package_name, _sha256) => {
                     debug!("  Input {}: Prebuilt({})", i, package_name);
@@ -400,7 +456,7 @@ impl<'a> Run<'a> {
             dependencies.extend(dep_paths);
         }
 
-        Ok((dependencies, inputs))
+        Ok((dependencies, inputs, tempdirs))
     }
 
     /// runs a single isolated build, does not take self so it can be spawned in a thread.
@@ -442,7 +498,7 @@ impl<'a> Run<'a> {
             return Ok((Some(result), None));
         }
 
-        let (dependencies, inputs) = self
+        let (dependencies, inputs, temp_dirs) = self
             .sandbox_paths_from_buildspec(build, remote_cache)
             .await?;
 
@@ -501,6 +557,9 @@ impl<'a> Run<'a> {
             let spongebob_url = build_result.spongebob_url;
 
             info!("Successfully built package: {}", build.name);
+            for tempdir in temp_dirs.into_iter() {
+                drop(tempdir);
+            }
             Ok((Some(out_dir), spongebob_url))
         }
     }

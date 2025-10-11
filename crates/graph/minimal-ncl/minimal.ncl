@@ -95,6 +95,8 @@ in
           | String,
         sha256
           | String,
+        extract
+          | Bool | optional,
     },
 
     Local = {

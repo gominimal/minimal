@@ -7,7 +7,7 @@ pub mod executor;
 pub mod executor;
 pub mod output;
 
-pub use config::BuildConfig;
+pub use config::{BuildConfig, Input};
 pub use error::{BuildSandboxError as Error, Result};
 pub use executor::BuildExecutor;
 pub use output::OutputValidator;

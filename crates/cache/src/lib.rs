@@ -273,14 +273,20 @@ impl Cache<LocalDir> {
         })
     }
 
+    /// Allocates a temporary directory in the same filesystem as the rest of the cache.
+    pub fn temp_dir(&self) -> Result<tempfile::TempDir, std::io::Error> {
+        let inner = self.inner();
+        tempfile::tempdir_in(inner.fs.path().join("temp"))
+    }
+
     /// Allocates a directory for writing into the cache as the given spec_hash when finalized.
     ///
     /// Call `finalize` on the [PendingDir] once it is populated to have it show up in the cache.
     pub fn write_dir(&self, hash: &SpecHash) -> Result<PendingDir, CacheErr> {
+        let tempdir = self.temp_dir()?;
+
         let mut inner = self.inner();
         inner.ensure_hash_dir_exists(hash.as_bytes()[0])?;
-
-        let tempdir = tempfile::tempdir_in(inner.fs.path().join("temp"))?;
 
         Ok(PendingDir {
             c: self.clone(),

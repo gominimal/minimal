@@ -1,7 +1,6 @@
 #!/bin/sh
 set -e
 
-tar xfo attr-2.5.2.tar.gz
 cd attr-2.5.2
 
 ./configure  --prefix=/usr      \

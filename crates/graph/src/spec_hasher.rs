@@ -162,7 +162,10 @@ fn build_input_hash(input: &BuildSpecInput, h: &mut Hasher) {
                     h.write_all(url.as_bytes()).unwrap()
                 }
             };
-            h.write_all(s.sha256.as_bytes()).unwrap()
+            h.write_all(s.sha256.as_bytes()).unwrap();
+            if s.extract {
+                h.write_all(b"ext").unwrap();
+            }
         }
         HostPath(p) => {
             h.write_all(b"host path").unwrap();

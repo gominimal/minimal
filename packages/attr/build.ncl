@@ -10,14 +10,14 @@ let grep = import "../grep/build.ncl" in
 let make = import "../make/build.ncl" in
 let linux_headers = import "../linux_headers/build.ncl" in
 let sed = import "../sed/build.ncl" in
-let tar = import "../tar/build.ncl" in
 {
   name = "attr",
   inputs = [
     { file = "build.sh" } | Local,
     {
       url = "gs://minimal-staging-archives/attr-2.5.2.tar.gz",
-      sha256 = "39bf67452fa41d0948c2197601053f48b3d78a029389734332a6309a680c6c87"
+      sha256 = "39bf67452fa41d0948c2197601053f48b3d78a029389734332a6309a680c6c87",
+      extract = true,
     } | Source,
     bash,
     binutils,
@@ -30,7 +30,6 @@ let tar = import "../tar/build.ncl" in
     make,
     linux_headers,
     sed,
-    tar,
   ],
   runtime_deps = [
     glibc,

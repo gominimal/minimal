@@ -6,10 +6,16 @@ use std::path::PathBuf;
 use crate::error::{ConfigError, Result};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub enum Input {
+    File(PathBuf),
+    Dir(PathBuf),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BuildConfig {
     pub name: String,
     pub dependencies: HashSet<PathBuf>,
-    pub inputs: Vec<PathBuf>,
+    pub inputs: Vec<Input>,
     pub build_script: BuildScript,
     pub outputs: Vec<String>,
 }
@@ -38,11 +44,12 @@ impl BuildConfig {
         }
 
         for input in &self.inputs {
-            if !input.exists() {
-                return Err(ConfigError::InvalidInput {
-                    path: input.clone(),
+            match input {
+                Input::File(p) | Input::Dir(p) => {
+                    if !p.exists() {
+                        return Err(ConfigError::InvalidInput { path: p.clone() }.into());
+                    }
                 }
-                .into());
             }
         }
 
