@@ -4,6 +4,7 @@ let gcc = import "../gcc/build.ncl" in
 let glibc = import "../glibc/build.ncl" in
 let python = import "../python/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
+let xz = import "../xz/build.ncl" in
 {
   name = "boost",
   inputs = [
@@ -19,6 +20,7 @@ let toolchain = import "../toolchain/build.ncl" in
   runtime_deps = [
     gcc, # TODO: We really need to use a subset for this
     glibc,
+    xz,
   ],
 
   cmd = "./build.sh",

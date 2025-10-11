@@ -10,6 +10,7 @@ let toolchain = import "../toolchain/build.ncl" in
 
 let glibc = import "../glibc/build.ncl" in
 let lz4 = import "../lz4/build.ncl" in
+let xz = import "../xz/build.ncl" in
 {
   name = "file",
   inputs = [
@@ -30,6 +31,7 @@ let lz4 = import "../lz4/build.ncl" in
   runtime_deps = [
     glibc,
     lz4,
+    xz,
   ],
 
   cmd = "./build.sh",

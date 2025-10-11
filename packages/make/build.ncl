@@ -45,9 +45,12 @@ let linux_headers = import "../linux_headers/build.ncl" in
     # toolchain
     binutils,
     gcc,
-    glibc,
     linux_headers,
   ],
+  runtime_deps = [
+    glibc,
+  ],
+
   cmd = "./build.sh",
   outputs = {
     make_bin = { glob = "usr/bin/make" } | OutputBin,

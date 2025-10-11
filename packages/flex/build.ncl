@@ -3,6 +3,7 @@ let base = import "../base/build.ncl" in
 let m4 = import "../m4/build.ncl" in
 let make = import "../make/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
 {
   name = "flex",
   inputs = [
@@ -16,6 +17,10 @@ let toolchain = import "../toolchain/build.ncl" in
     make,
     toolchain,
   ],
+  runtime_deps = [
+    glibc,
+  ],
+
   cmd = "./build.sh",
   outputs = {
     flex = { glob = "usr/bin/flex" } | OutputBin,

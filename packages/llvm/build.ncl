@@ -5,6 +5,10 @@ let libffi = import "../libffi/build.ncl" in
 let ninja = import "../ninja/build.ncl" in
 let python = import "../python/build.ncl" in
 let toolchain-gnullvm = import "../toolchain-gnullvm/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
+let gcc = import "../gcc/build.ncl" in
+let zlib = import "../zlib/build.ncl" in
+
 {
   name = "llvm",
   inputs = [
@@ -31,11 +35,17 @@ let toolchain-gnullvm = import "../toolchain-gnullvm/build.ncl" in
     } | Source,
     base,
     cmake,
-    libffi,
     ninja,
     python,
     toolchain-gnullvm,
   ],
+  runtime_deps = [
+    glibc,
+    libffi,
+    gcc, # TODO: Only need libgcc_s.so.1, libstdc++.so.6
+    zlib,
+  ],
+
   cmd = "./build.sh",
   outputs = {
     usr = { glob = "usr/**/*" } | OutputLib,
