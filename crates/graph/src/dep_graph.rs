@@ -42,6 +42,7 @@ pub struct SourceInput {
     pub from: SourceFetch,
     pub sha256: String,
     pub extract: bool,
+    pub strip_prefix: Option<String>,
 }
 
 /// A dependency on some of the outputs of a build-spec.
@@ -800,6 +801,7 @@ impl GraphBuilder {
         let mut url: Option<String> = None;
         let mut sha256: Option<String> = None;
         let mut extract: Option<bool> = None;
+        let mut strip_prefix: Option<String> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                 r.fields
@@ -830,6 +832,15 @@ impl GraphBuilder {
                                 if let Some(ext_rt) = field.value.as_ref() {
                                     extract = Some(
                                         bool::deserialize(eval_if_closure(ext_rt, program)?)
+                                            .unwrap(),
+                                    );
+                                }
+                                Ok(())
+                            }
+                            "strip_prefix" => {
+                                if let Some(st_rt) = field.value.as_ref() {
+                                    strip_prefix = Some(
+                                        String::deserialize(eval_if_closure(st_rt, program)?)
                                             .unwrap(),
                                     );
                                 }
@@ -868,6 +879,7 @@ impl GraphBuilder {
             from: SourceFetch::URL(url),
             sha256,
             extract: extract.unwrap_or(false),
+            strip_prefix,
         })
     }
 
@@ -1338,6 +1350,7 @@ mod tests {
                 from: SourceFetch::URL(url),
                 sha256: sha,
                 extract: true,
+                strip_prefix: None,
             }) if url == "http://uwu.com" && sha == "abcdef",
         ));
     }

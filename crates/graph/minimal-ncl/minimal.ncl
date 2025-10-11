@@ -97,6 +97,8 @@ in
           | String,
         extract
           | Bool | optional,
+        strip_prefix
+          | String | optional,
     },
 
     Local = {

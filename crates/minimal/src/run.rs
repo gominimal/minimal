@@ -98,6 +98,7 @@ pub(crate) async fn materialize_source(
                     .map(|mut s| s.next_back().unwrap())
                     .unwrap();
                 let tempdir = cache.temp_dir()?;
+                let tempdir_path = tempdir.path();
                 let span = tracing::info_span!(
                     "extract",
                     "indicatif.pb_show" = tracing::field::Empty,
@@ -109,7 +110,16 @@ pub(crate) async fn materialize_source(
                 if url.path().ends_with(".tar.gz") {
                     let f = std::fs::File::open(cached_path)?;
                     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(f));
-                    archive.unpack(tempdir.path())?;
+
+                    if let Some(strip_prefix) = &source.strip_prefix {
+                        for entry in archive.entries()? {
+                            let mut entry = entry?;
+                            let path = entry.path()?.strip_prefix(strip_prefix)?.to_owned();
+                            entry.unpack(tempdir_path.join(path))?;
+                        }
+                    } else {
+                        archive.unpack(tempdir_path)?;
+                    }
 
                     Ok(Materialized::TempDir(tempdir))
                 } else if url.path().ends_with(".tar.xz") {
@@ -117,9 +127,17 @@ pub(crate) async fn materialize_source(
                     let f = std::fs::File::open(cached_path)?;
                     lzma_rs::xz_decompress(&mut std::io::BufReader::new(f), &mut decomp_buf)?;
                     std::io::Seek::rewind(&mut decomp_buf)?;
-
                     let mut archive = tar::Archive::new(decomp_buf);
-                    archive.unpack(tempdir.path())?;
+
+                    if let Some(strip_prefix) = &source.strip_prefix {
+                        for entry in archive.entries()? {
+                            let mut entry = entry?;
+                            let path = entry.path()?.strip_prefix(strip_prefix)?.to_owned();
+                            entry.unpack(tempdir_path.join(path))?;
+                        }
+                    } else {
+                        archive.unpack(tempdir_path)?;
+                    }
 
                     Ok(Materialized::TempDir(tempdir))
                 } else {

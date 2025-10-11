@@ -166,6 +166,10 @@ fn build_input_hash(input: &BuildSpecInput, h: &mut Hasher) {
             if s.extract {
                 h.write_all(b"ext").unwrap();
             }
+            if let Some(prefix) = &s.strip_prefix {
+                h.write_all(b"strip_prefix").unwrap();
+                h.write_all(prefix.as_bytes()).unwrap();
+            }
         }
         HostPath(p) => {
             h.write_all(b"host path").unwrap();

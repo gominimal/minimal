@@ -18,6 +18,7 @@ let sed = import "../sed/build.ncl" in
       url = "gs://minimal-staging-archives/acl-2.3.2.tar.xz",
       sha256 = "97203a72cae99ab89a067fe2210c1cbf052bc492b479eca7d226d9830883b0bd",
       extract = true,
+      strip_prefix = "acl-2.3.2",
     } | Source,
     bash,
     binutils,
