@@ -9,6 +9,10 @@ pub struct RunArgs {
     #[command(flatten)]
     packages: PackagesArg,
 
+    /// Any additional directories to bind-mount read-write.
+    #[arg(long, required = false)]
+    rw_dir: Vec<String>,
+
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
 }
@@ -40,20 +44,26 @@ pub async fn cmd_run(args: RunArgs, globals: &GlobalArgs) -> Result<(), Error> {
     let cwd = std::env::current_dir().unwrap();
     std::fs::create_dir_all(base.path().join(cwd.clone())).map_err(anyhow::Error::from)?;
 
-    let command = if args.args[0].starts_with("/") || args.args[0].starts_with("./") {
-        args.args[0].clone()
-    } else {
-        format!("/bin/{}", args.args[0])
-    };
-    let mut cmd = Container::new()
+    let mut container = Container::new();
+    container
         .rootfs(base.path())
         .map_err(anyhow::Error::from)?
         .devfsmount("/dev")
         .tmpfsmount("/tmp")
         .bindmount_rw(cwd.clone().to_str().unwrap(), cwd.clone().to_str().unwrap())
         .symlink("/usr/bin", "/bin")
-        .symlink("/usr/lib", "/lib64")
-        .command(&command);
+        .symlink("/usr/lib", "/lib64");
+    for rw_mount in args.rw_dir {
+        std::fs::create_dir_all(base.path().join(rw_mount.clone())).map_err(anyhow::Error::from)?;
+        container.bindmount_rw(&rw_mount, &rw_mount);
+    }
+
+    let command = if args.args[0].starts_with("/") || args.args[0].starts_with("./") {
+        args.args[0].clone()
+    } else {
+        format!("/bin/{}", args.args[0])
+    };
+    let mut cmd = container.command(&command);
 
     cmd.args(args.args.iter().skip(1));
     cmd.current_dir(&cwd);
