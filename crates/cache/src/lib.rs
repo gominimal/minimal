@@ -490,16 +490,16 @@ mod tests {
         let key2 = SpecHash(blake3::hash("key2".as_bytes()));
 
         let w = cache.write_dir(&key1).unwrap();
+        let m = EntryMeta {
+            spec_name: "spec".to_string(),
+            fetched: false,
+            ..Default::default()
+        };
         w.open_write("file_name")
             .unwrap()
             .write_all("old data".as_bytes())
             .unwrap();
-        w.finalize(EntryMeta {
-            spec_name: "spec".to_string(),
-            fetched: false,
-            ..Default::default()
-        })
-        .unwrap();
+        w.finalize(m.clone()).unwrap();
 
         // Write again and change the data in the file
         let w = cache.write_dir(&key2).unwrap();
@@ -510,6 +510,7 @@ mod tests {
         w.finalize(EntryMeta {
             spec_name: "spec".to_string(),
             fetched: true,
+            epoch_millis: m.epoch_millis + 1000,
             ..Default::default()
         })
         .unwrap();
