@@ -65,7 +65,7 @@
 //! ```no_run
 //! use build_events_proto::proto::{
 //!     build_event_service_client::BuildEventServiceClient,
-//!     StreamEventsRequest,
+//!     StreamBuildEventsRequest,
 //! };
 //! use tokio_stream::StreamExt;
 //!
@@ -73,12 +73,12 @@
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let mut client = BuildEventServiceClient::connect("http://[::1]:50051").await?;
 //!
-//!     let request = StreamEventsRequest {
+//!     let request = StreamBuildEventsRequest {
 //!         invocation_id: None,
 //!         start_timestamp_millis: None,
 //!     };
 //!
-//!     let mut stream = client.stream_events(request).await?.into_inner();
+//!     let mut stream = client.stream_build_events(request).await?.into_inner();
 //!
 //!     while let Some(event) = stream.next().await {
 //!         let event = event?;
@@ -96,7 +96,7 @@
 //! ```
 //! use build_events::events::{BuildStarted, current_millis};
 //! use build_events::BuildEvent;
-//! use build_events_proto::proto;
+//! use build_events_proto::{proto, convert::ToProto};
 //!
 //! // Rust -> Proto
 //! let rust_event = BuildEvent::BuildStarted(BuildStarted {
@@ -106,11 +106,7 @@
 //!     working_directory: "/tmp".to_string(),
 //! });
 //!
-//! let proto_event: proto::BuildEvent = rust_event.clone().into();
-//!
-//! // Proto -> Rust
-//! let converted_back: BuildEvent = proto_event.try_into().unwrap();
-//! assert_eq!(rust_event, converted_back);
+//! let proto_event: proto::BuildEvent = rust_event.to_proto("test-123");
 //! ```
 
 // Use BSR-generated protobuf code from canonical spongebob.v1 package

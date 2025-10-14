@@ -70,7 +70,10 @@ impl BuildEventServiceImpl {
     /// use build_events_proto::{BuildEventServiceImpl, proto};
     ///
     /// let service = BuildEventServiceImpl::new(1000);
-    /// let event = proto::BuildEvent { event: None };
+    /// let event = proto::BuildEvent {
+    ///     invocation_id: String::new(),
+    ///     event: None
+    /// };
     /// service.publish(event);
     /// ```
     pub fn publish(&self, event: proto::BuildEvent) {

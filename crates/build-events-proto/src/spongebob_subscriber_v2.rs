@@ -24,7 +24,7 @@ use crate::convert::ToProto;
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///     // Create a spongebob client and invocation
 ///     let mut spongebob = spongebob::SpongeBob::new().await?;
-///     let invocation = spongebob.create_invocation("my-build").await?;
+///     let invocation = spongebob.create_invocation();
 ///
 ///     // Create subscriber from the invocation
 ///     let subscriber = SpongeBobSubscriberV2::from_invocation(invocation);
@@ -52,7 +52,7 @@ impl SpongeBobSubscriberV2 {
     /// # use build_events_proto::SpongeBobSubscriberV2;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let mut spongebob = spongebob::SpongeBob::new().await?;
-    /// let invocation = spongebob.create_invocation("my-build").await?;
+    /// let invocation = spongebob.create_invocation();
     /// let subscriber = SpongeBobSubscriberV2::from_invocation(invocation);
     /// # Ok(())
     /// # }
