@@ -1,6 +1,7 @@
 [registries.buf]
 index = "sparse+https://buf.build/gen/cargo/"
 credential-provider = "cargo:token"
+token = "Bearer a54105a33eb0bc75fd05666e96f6a63ec8bb54fa7b964665e230d24824268687"
 
 [build]
 rustflags = ["-C", "prefer-dynamic"]
