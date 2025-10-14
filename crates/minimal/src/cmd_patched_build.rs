@@ -2,7 +2,7 @@ use crate::GlobalArgs;
 use crate::run::Materialized;
 use crate::{Error, remote_storage::RemoteStorage};
 use build_sandbox::{BuildConfig, Input as SandboxInput, config::BuildScript, run_build};
-use cache::EntryMeta;
+use cache::{EntryMeta, MetaInner};
 use graph::{BuildOutput, BuildSpecInput, Transitives};
 use std::collections::HashSet;
 use tracing::info;
@@ -124,7 +124,7 @@ pub async fn cmd_patched_build(args: PatchedBuildArgs, globals: &GlobalArgs) -> 
 
     out_dir
         .finalize(EntryMeta {
-            spec_name: build.name.clone(),
+            inner: MetaInner::Spec(build.name.clone()),
             ..Default::default()
         })
         .unwrap();

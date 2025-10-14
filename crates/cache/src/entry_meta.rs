@@ -1,16 +1,33 @@
 //! Metadata for cache entries.
 
-use common::SpecHash;
+use common::{SpecHash, SubsetSpec};
 use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::warn;
 
 use crate::CacheErr;
 use crate::fs::{DirEntry, FileSystem};
 
+/// Metadata specific to the object being cached.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum MetaInner {
+    Spec(String),       // name
+    Subset(SubsetSpec), // (build-spec, output-names), both sorted
+}
+
+impl MetaInner {
+    pub fn spec_name(&self) -> Option<&String> {
+        match self {
+            MetaInner::Spec(sn) => Some(sn),
+            _ => None,
+        }
+    }
+}
+
 /// Metadata associated with a cache entry.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct EntryMeta {
-    pub spec_name: String,
+    pub inner: MetaInner,
     pub fetched: bool,
     pub epoch_millis: u128,
 }
@@ -18,7 +35,7 @@ pub struct EntryMeta {
 impl Default for EntryMeta {
     fn default() -> Self {
         EntryMeta {
-            spec_name: "".to_string(),
+            inner: MetaInner::Spec("".to_string()),
             fetched: false,
             epoch_millis: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -82,21 +99,36 @@ impl EntryMeta {
 
             for e in fs.read_dir(dir.path()?)? {
                 let f = fs.open_read(e.path()?)?;
-                let entry: EntryMeta = Self::read_from(f)?;
-                if entry.spec_name == name {
-                    let p = e.path()?;
-                    let hash_hex = leading_hex.to_owned()
-                        + p.file_name()
-                            .and_then(|n| n.to_str())
-                            .and_then(|s| s.strip_suffix(".json"))
-                            .ok_or_else(|| {
-                                CacheErr::IO(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    "invalid metadata filename",
-                                ))
-                            })?;
+                let entry = match Self::read_from(f) {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        warn!(
+                            "Skipping cache metadata entry that failed to parse: {:?}",
+                            e
+                        );
+                        continue;
+                    }
+                };
 
-                    candidates.push((hash_hex, entry.epoch_millis));
+                match entry.inner {
+                    MetaInner::Subset(_) => {}
+                    MetaInner::Spec(spec_name) => {
+                        if spec_name == name {
+                            let p = e.path()?;
+                            let hash_hex = leading_hex.to_owned()
+                                + p.file_name()
+                                    .and_then(|n| n.to_str())
+                                    .and_then(|s| s.strip_suffix(".json"))
+                                    .ok_or_else(|| {
+                                        CacheErr::IO(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            "invalid metadata filename",
+                                        ))
+                                    })?;
+
+                            candidates.push((hash_hex, entry.epoch_millis));
+                        }
+                    }
                 }
             }
         }

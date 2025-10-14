@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use build_sandbox::{BuildConfig, Input as SandboxInput, config::BuildScript, run_build};
-use cache::{Cache, LocalDir, PendingDir, RemoteCache};
+use cache::{Cache, LocalDir, MetaInner, PendingDir, RemoteCache};
 use common::SpecHash;
 use google_cloud_storage::client::Storage as GcsStorage;
 use graph::dep_graph::SourceFetch;
@@ -634,7 +634,7 @@ impl<'a> Run<'a> {
                 .for_each(|(cache_hnd, name)| {
                     cache_hnd
                         .finalize(cache::EntryMeta {
-                            spec_name: name,
+                            inner: MetaInner::Spec(name),
                             fetched: false,
                             ..Default::default()
                         })

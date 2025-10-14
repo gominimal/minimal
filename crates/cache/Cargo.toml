@@ -10,6 +10,7 @@ publish.workspace = true
 indoc.workspace = true
 
 [dependencies]
+tracing.workspace = true
 blake3.workspace = true
 hex.workspace = true
 sha2.workspace = true
