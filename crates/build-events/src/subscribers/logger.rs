@@ -107,6 +107,13 @@ impl BuildEventSubscriber for LoggerSubscriber {
                     "Action completed"
                 );
             }
+            BuildEvent::BuildMetadata(e) => {
+                info!(
+                    event = "build_metadata",
+                    metadata = ?e.metadata,
+                    "Build metadata"
+                );
+            }
         }
 
         Ok(())

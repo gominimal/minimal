@@ -1,12 +1,14 @@
 use crate::{Error, lockfile::PrebuiltsLock, remote_storage::RemoteStorage, run::Run};
 use crate::{GlobalArgs, PackagesArg};
 use anyhow::Context;
-use build_events::events::{BuildEvent, BuildFinished, BuildStarted, current_millis};
+use build_events::events::{BuildEvent, BuildFinished, BuildMetadata, BuildStarted, current_millis};
 use build_events::{BuildEventBus, BuildEventDispatcher};
 use build_events_proto::SpongeBobSubscriberV2;
 use cache::{Cache, CacheBinProvider, LocalDir, RemoteBinProvider};
 use graph::{DepGraph, ExecPlan, Transitives};
+use std::collections::HashMap;
 use std::path::Path;
+use std::process::Command;
 use tracing::info;
 
 #[derive(Debug, clap::Args)]
@@ -96,6 +98,50 @@ pub async fn cmd_build_impl(
         timestamp_millis: current_millis(),
         working_directory,
     }));
+
+    // Collect and emit git metadata
+    let mut metadata = HashMap::new();
+
+    // Get git user
+    if let Ok(output) = Command::new("git").args(["config", "user.name"]).output() {
+        if output.status.success() {
+            if let Ok(user) = String::from_utf8(output.stdout) {
+                metadata.insert("user".to_string(), user.trim().to_string());
+            }
+        }
+    }
+
+    // Get git branch
+    if let Ok(output) = Command::new("git").args(["rev-parse", "--abbrev-ref", "HEAD"]).output() {
+        if output.status.success() {
+            if let Ok(branch) = String::from_utf8(output.stdout) {
+                metadata.insert("branch".to_string(), branch.trim().to_string());
+            }
+        }
+    }
+
+    // Get git commit SHA
+    if let Ok(output) = Command::new("git").args(["rev-parse", "HEAD"]).output() {
+        if output.status.success() {
+            if let Ok(commit) = String::from_utf8(output.stdout) {
+                metadata.insert("commit".to_string(), commit.trim().to_string());
+            }
+        }
+    }
+
+    // Get git remote URL
+    if let Ok(output) = Command::new("git").args(["config", "remote.origin.url"]).output() {
+        if output.status.success() {
+            if let Ok(repo_url) = String::from_utf8(output.stdout) {
+                metadata.insert("repo_url".to_string(), repo_url.trim().to_string());
+            }
+        }
+    }
+
+    // Emit BuildMetadata event if we collected any metadata
+    if !metadata.is_empty() {
+        event_bus.emit(BuildEvent::BuildMetadata(BuildMetadata { metadata }));
+    }
 
     let build_success = match (globals.no_cache, globals.no_fetch) {
         // No local or remote cache

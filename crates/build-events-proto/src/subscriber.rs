@@ -97,6 +97,7 @@ impl BuildEventSubscriber for GrpcStreamSubscriber {
             BuildEvent::TargetCompleted(_) => "",
             BuildEvent::ActionStarted(_) => "",
             BuildEvent::ActionCompleted(_) => "",
+            BuildEvent::BuildMetadata(_) => "", // Metadata doesn't have invocation_id in inner fields
         };
 
         // Convert Rust event to proto using ergonomic extension trait

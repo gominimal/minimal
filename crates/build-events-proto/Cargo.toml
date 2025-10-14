@@ -19,8 +19,8 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 spongebob = { path = "../spongebob", optional = true }
 
 # BSR proto dependencies for canonical spongebob.v1 types
-minimal_spongebob_community_neoeinstein-prost = { version = "=0.4.0-20251009015156-8bcd87750609.1", registry = "buf" }
-minimal_spongebob_community_neoeinstein-tonic = { version = "=0.4.1-20251009015156-8bcd87750609.1", registry = "buf" }
+minimal_spongebob_community_neoeinstein-prost = { version = "=0.4.0-20251010205210-42ae8fd1517e.1", registry = "buf" }
+minimal_spongebob_community_neoeinstein-tonic = { version = "=0.4.1-20251010205210-42ae8fd1517e.1", registry = "buf" }
 
 [features]
 default = []

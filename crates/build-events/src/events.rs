@@ -5,6 +5,7 @@
 //! for easy serialization to JSON, protobuf, or other formats.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Main build event enum that wraps all possible event types
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -22,6 +23,8 @@ pub enum BuildEvent {
     ActionStarted(ActionStarted),
     /// Action completed executing
     ActionCompleted(ActionCompleted),
+    /// Build metadata (user, branch, commit, etc.)
+    BuildMetadata(BuildMetadata),
 }
 
 /// Event emitted when a build starts
@@ -110,6 +113,14 @@ pub struct ActionCompleted {
     pub stdout: Option<String>,
     /// Optional stderr from the action
     pub stderr: Option<String>,
+}
+
+/// Event containing arbitrary key-value metadata about the build environment
+/// Standard keys: "user", "branch", "commit", "repo_url"
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct BuildMetadata {
+    /// Metadata key-value pairs
+    pub metadata: HashMap<String, String>,
 }
 
 /// Type of build target

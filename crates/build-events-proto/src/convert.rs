@@ -52,6 +52,9 @@ pub fn to_proto_build_event(event: &events::BuildEvent, invocation_id: &str) -> 
         events::BuildEvent::ActionCompleted(e) => {
             proto::build_event::Event::ActionCompleted(to_proto_action_completed(e))
         }
+        events::BuildEvent::BuildMetadata(e) => {
+            proto::build_event::Event::BuildMetadata(to_proto_build_metadata(e))
+        }
     };
 
     proto::BuildEvent {
@@ -119,6 +122,12 @@ pub fn to_proto_action_completed(event: &events::ActionCompleted) -> proto::Acti
     }
 }
 
+pub fn to_proto_build_metadata(event: &events::BuildMetadata) -> proto::BuildMetadata {
+    proto::BuildMetadata {
+        metadata: event.metadata.clone(),
+    }
+}
+
 pub fn to_proto_target_kind(kind: &events::TargetKind) -> proto::TargetKind {
     match kind {
         events::TargetKind::Binary => proto::TargetKind::Binary,
@@ -154,6 +163,9 @@ pub fn from_proto_build_event(
         )),
         proto::build_event::Event::ActionCompleted(e) => Ok(events::BuildEvent::ActionCompleted(
             from_proto_action_completed(e)?,
+        )),
+        proto::build_event::Event::BuildMetadata(e) => Ok(events::BuildEvent::BuildMetadata(
+            from_proto_build_metadata(e)?,
         )),
     }
 }
@@ -229,6 +241,14 @@ pub fn from_proto_action_completed(
         exit_code: event.exit_code,
         stdout: event.stdout,
         stderr: event.stderr,
+    })
+}
+
+pub fn from_proto_build_metadata(
+    event: proto::BuildMetadata,
+) -> Result<events::BuildMetadata, ConversionError> {
+    Ok(events::BuildMetadata {
+        metadata: event.metadata,
     })
 }
 

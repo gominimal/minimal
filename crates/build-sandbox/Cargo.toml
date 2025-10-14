@@ -19,4 +19,4 @@ common.workspace = true
 hakoniwa.workspace = true
 
 # TODO, get this out of the build-sandbox crate
-minimal_spongebob_community_neoeinstein-prost = { version = "=0.4.0-20251009015156-8bcd87750609.1", registry = "buf" }
+minimal_spongebob_community_neoeinstein-prost = { version = "=0.4.0-20251010205210-42ae8fd1517e.1", registry = "buf" }

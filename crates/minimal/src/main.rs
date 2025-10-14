@@ -36,7 +36,9 @@ mod cmd_upload_cache;
 use cmd_upload_cache::{UploadArgs, cmd_upload_cache};
 mod cmd_patched_build;
 use cmd_patched_build::{PatchedBuildArgs, cmd_patched_build};
+#[cfg(target_os = "linux")]
 mod cmd_run;
+#[cfg(target_os = "linux")]
 use cmd_run::{RunArgs, cmd_run};
 
 #[derive(Parser)]
@@ -68,6 +70,7 @@ enum Command {
     #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
     PatchedBuild(PatchedBuildArgs),
     /// Runs a command using the given packages, in the current working directory.
+    #[cfg(target_os = "linux")]
     #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
     Run(RunArgs),
 }
@@ -354,6 +357,7 @@ async fn main() -> Result<()> {
         Command::NewWorldUpdate(args) => cmd_new_world_update(args, &cli.global_args).await,
         Command::OciImage(args) => cmd_oci_image(args, &cli.global_args).await,
         Command::PatchedBuild(args) => cmd_patched_build(args, &cli.global_args).await,
+        #[cfg(target_os = "linux")]
         Command::Run(args) => cmd_run(args, &cli.global_args).await,
     };
 

@@ -57,4 +57,5 @@ size.workspace = true
 object.workspace = true
 globset.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
 hakoniwa.workspace = true
