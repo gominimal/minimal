@@ -1,10 +1,7 @@
 use minimal_spongebob_community_neoeinstein_prost::spongebob::v1::{
-    BuildEvent, CreateFileRequest, File, PublishBuildEventRequest,
+    build_event, BuildEvent, FileCreated, PublishBuildEventRequest,
 };
-use minimal_spongebob_community_neoeinstein_tonic::spongebob::v1::tonic::{
-    build_event_service_client::BuildEventServiceClient,
-    result_storage_service_client::ResultStorageServiceClient,
-};
+use minimal_spongebob_community_neoeinstein_tonic::spongebob::v1::tonic::build_event_service_client::BuildEventServiceClient;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
@@ -23,13 +20,11 @@ pub type Result<T> = std::result::Result<T, SpongeBobError>;
 #[derive(Debug)]
 pub struct SpongeBob {
     build_event_service: BuildEventServiceClient<Channel>,
-    result_storage_service: ResultStorageServiceClient<Channel>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SpongeBobInvocation {
     build_event_service: BuildEventServiceClient<Channel>,
-    result_storage_service: ResultStorageServiceClient<Channel>,
     invocation_id: String,
     url: String,
 }
@@ -38,7 +33,6 @@ impl SpongeBobInvocation {
     /// Create a new invocation (no RPC needed - invocation created on first BuildStarted event)
     pub fn new(
         build_event_service: BuildEventServiceClient<Channel>,
-        result_storage_service: ResultStorageServiceClient<Channel>,
         invocation_id: String,
     ) -> Self {
         let url = format!(
@@ -47,31 +41,37 @@ impl SpongeBobInvocation {
         );
         Self {
             build_event_service,
-            result_storage_service,
             invocation_id,
             url,
         }
     }
 
-    /// Upload a file to a specific target within this invocation
+    /// Publish a FileCreated event to upload a file for a specific target
     #[tracing::instrument(skip(self, contents))]
-    pub async fn upload_file(
+    pub async fn publish_file_created_event(
         &mut self,
         target_id: &str,
         file_name: &str,
         contents: Vec<u8>,
     ) -> Result<()> {
-        let parent = format!("invocations/{}/targets/{}", self.invocation_id, target_id);
-        let request = CreateFileRequest {
-            parent,
-            file_id: file_name.to_string(),
-            file: Some(File {
-                name: file_name.to_string(),
-                contents: contents.into(),
-            }),
+        let timestamp_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let file_created = FileCreated {
+            target_id: target_id.to_string(),
+            name: file_name.to_string(),
+            contents: contents.into(),
+            timestamp_millis,
         };
 
-        self.result_storage_service.create_file(request).await?;
+        let event = BuildEvent {
+            invocation_id: self.invocation_id.clone(),
+            event: Some(build_event::Event::FileCreated(file_created)),
+        };
+
+        self.publish_build_event(event).await?;
         Ok(())
     }
 
@@ -106,11 +106,9 @@ impl SpongeBobInvocation {
 impl SpongeBob {
     pub async fn new() -> Result<Self> {
         let build_event_service = BuildEventServiceClient::connect(ENDPOINT).await?;
-        let result_storage_service = ResultStorageServiceClient::connect(ENDPOINT).await?;
 
         Ok(SpongeBob {
             build_event_service,
-            result_storage_service,
         })
     }
 
@@ -119,7 +117,6 @@ impl SpongeBob {
         let invocation_id = Uuid::new_v4().to_string();
         SpongeBobInvocation::new(
             self.build_event_service.clone(),
-            self.result_storage_service.clone(),
             invocation_id,
         )
     }

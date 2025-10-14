@@ -1456,12 +1456,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hashbrown"
-version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5419bdc4f6a9207fbeba6d11b604d481addf78ecd10c11ad51e76c2f6482748d"
-
-[[package]]
 name = "hashlink"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1811,7 +1805,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b0f83760fb341a774ed326568e19f5a863af4a952def8c39f9ab92fd95b88e5"
 dependencies = [
  "equivalent",
- "hashbrown 0.16.0",
+ "hashbrown 0.15.5",
  "serde",
  "serde_core",
 ]
@@ -2229,9 +2223,9 @@ dependencies = [
 
 [[package]]
 name = "minimal_spongebob_community_neoeinstein-prost"
-version = "0.4.0-20251010205210-42ae8fd1517e.1"
+version = "0.4.0-20251014210131-30c82017bd87.1"
 source = "sparse+https://buf.build/gen/cargo/"
-checksum = "0d72206cc3cb5acbb8cfe6653c1ea5322c26f7a53cad76f8970a31f20a823bdf"
+checksum = "ce549111413cc1c9772e4ea3b4a62dd25bf9e8d6eb0d918e0d519b58293e274e"
 dependencies = [
  "prost 0.13.5",
  "prost-types 0.13.5",
@@ -2239,9 +2233,9 @@ dependencies = [
 
 [[package]]
 name = "minimal_spongebob_community_neoeinstein-tonic"
-version = "0.4.1-20251010205210-42ae8fd1517e.1"
+version = "0.4.1-20251014210131-30c82017bd87.1"
 source = "sparse+https://buf.build/gen/cargo/"
-checksum = "46f7ecbf0ff7510877a847108be91c9541ca392fddd5336875c3c09a9ea302fb"
+checksum = "36055716be965f6b27e2874c13529e8e6edc4b46c239165a3e91cd81878af22a"
 dependencies = [
  "minimal_spongebob_community_neoeinstein-prost",
  "tonic 0.12.3",
@@ -2821,7 +2815,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "syn",
@@ -2834,7 +2828,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9120690fafc389a67ba3803df527d0ec9cbbc9cc45e4cc20b332996dfb672425"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "syn",

@@ -114,6 +114,16 @@ impl BuildEventSubscriber for LoggerSubscriber {
                     "Build metadata"
                 );
             }
+            Some(build_event::Event::FileCreated(e)) => {
+                info!(
+                    event = "file_created",
+                    target_id = %e.target_id,
+                    name = %e.name,
+                    size = e.contents.len(),
+                    timestamp_millis = e.timestamp_millis,
+                    "File created"
+                );
+            }
             None => {
                 info!("Received event with no inner event type");
             }

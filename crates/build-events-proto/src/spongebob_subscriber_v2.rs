@@ -109,7 +109,7 @@ impl BuildEventSubscriber for SpongeBobSubscriberV2 {
             // Then upload files if paths are available
             if let Some(stdout_path) = stdout_path {
                 if let Ok(contents) = std::fs::read(stdout_path) {
-                    if let Err(e) = invocation.upload_file(target_id, "stdout", contents).await {
+                    if let Err(e) = invocation.publish_file_created_event(target_id, "stdout", contents).await {
                         warn!("Failed to upload stdout for target {}: {}", target_id, e);
                     }
                 } else {
@@ -119,7 +119,7 @@ impl BuildEventSubscriber for SpongeBobSubscriberV2 {
 
             if let Some(stderr_path) = stderr_path {
                 if let Ok(contents) = std::fs::read(stderr_path) {
-                    if let Err(e) = invocation.upload_file(target_id, "stderr", contents).await {
+                    if let Err(e) = invocation.publish_file_created_event(target_id, "stderr", contents).await {
                         warn!("Failed to upload stderr for target {}: {}", target_id, e);
                     }
                 } else {

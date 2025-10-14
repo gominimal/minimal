@@ -163,6 +163,7 @@ impl BuildEventService for BuildEventServiceImpl {
                                 e.timestamp_millis
                             }
                             Some(proto::build_event::Event::BuildMetadata(_)) => 0, // Metadata events have no timestamp
+                            Some(proto::build_event::Event::FileCreated(e)) => e.timestamp_millis,
                             None => return None,
                         };
 

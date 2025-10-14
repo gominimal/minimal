@@ -155,6 +155,17 @@ fn event_to_json(event: &BuildEvent) -> serde_json::Value {
                 }
             })
         }
+        Some(build_event::Event::FileCreated(e)) => {
+            serde_json::json!({
+                "type": "file_created",
+                "file_created": {
+                    "target_id": e.target_id,
+                    "name": e.name,
+                    "size": e.contents.len(),
+                    "timestamp_millis": e.timestamp_millis,
+                }
+            })
+        }
         None => {
             serde_json::json!({
                 "type": "unknown",
