@@ -388,7 +388,7 @@ mod tests {
         .unwrap();
 
         let meta = EntryMeta::read(&cache.inner().fs, &test_key).unwrap();
-        assert_eq!(meta.fetched, false);
+        assert!(!meta.fetched);
         assert_eq!(meta.spec_name, "some spec huh");
 
         let r = cache
