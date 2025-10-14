@@ -34,10 +34,14 @@ pub struct PathConfig {
 }
 
 impl PathConfig {
-    /// Create a new PathConfig with default values
+    /// Creates a default PathConfig.
     pub fn new() -> Self {
         let root_dir = Self::default_root_dir();
+        Self::new_with_base(root_dir)
+    }
 
+    /// Create a new PathConfig rooted at a given directory.
+    pub fn new_with_base(root_dir: PathBuf) -> Self {
         Self {
             cache_dir: root_dir.join("builds"),
             download_cache_dir: root_dir.join("downloads"),
