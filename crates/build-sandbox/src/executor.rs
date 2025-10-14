@@ -1,7 +1,6 @@
 use build_events::events::{
     build_event, BuildEvent, BuildMetadata, TargetCompleted, TargetKind, TargetStarted,
 };
-use build_events::BuildEventBus;
 use hakoniwa::Container;
 use std::collections::HashMap;
 use std::fs;
@@ -57,14 +56,8 @@ impl BuildExecutor {
         Ok(executor)
     }
 
-    #[tracing::instrument(skip(config, event_bus), fields(indicatif.pb_hide, package = %config.name))]
-    pub async fn execute(
-        &self,
-        config: &BuildConfig,
-        event_bus: &BuildEventBus,
-        invocation_id: &str,
-        target_id: &str,
-    ) -> Result<i32> {
+    #[tracing::instrument(skip(config), fields(indicatif.pb_hide, package = %config.name))]
+    pub async fn execute(&self, config: &BuildConfig, target_id: &str) -> Result<i32> {
         info!(
             "Linking {} inputs to build environment",
             config.inputs.len()
@@ -85,9 +78,9 @@ impl BuildExecutor {
             }
         }
 
-        // Emit TargetStarted event
-        event_bus.emit(BuildEvent {
-            invocation_id: invocation_id.to_string(),
+        // Emit TargetStarted event using global event bus
+        build_events::event_bus().emit(BuildEvent {
+            invocation_id: build_events::invocation_id().to_string(),
             event: Some(build_event::Event::TargetStarted(TargetStarted {
                 target_id: target_id.to_string(),
                 label: config.name.clone(),
@@ -98,14 +91,14 @@ impl BuildExecutor {
 
         let execute_result = self.execute_in_container(config, target_id).await;
 
-        // Emit TargetCompleted event
+        // Emit TargetCompleted event using global event bus
         let (success, error_message) = match &execute_result {
             Ok(_) => (true, None),
             Err(e) => (false, Some(e.to_string())),
         };
 
-        event_bus.emit(BuildEvent {
-            invocation_id: invocation_id.to_string(),
+        build_events::event_bus().emit(BuildEvent {
+            invocation_id: build_events::invocation_id().to_string(),
             event: Some(build_event::Event::TargetCompleted(TargetCompleted {
                 target_id: target_id.to_string(),
                 label: config.name.clone(),
@@ -134,8 +127,8 @@ impl BuildExecutor {
                 .to_string(),
         );
 
-        event_bus.emit(BuildEvent {
-            invocation_id: invocation_id.to_string(),
+        build_events::event_bus().emit(BuildEvent {
+            invocation_id: build_events::invocation_id().to_string(),
             event: Some(build_event::Event::BuildMetadata(BuildMetadata {
                 metadata: file_metadata,
             })),

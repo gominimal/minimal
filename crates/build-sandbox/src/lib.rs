@@ -22,23 +22,17 @@ pub struct BuildResult {
 /// # Parameters
 /// * `config` - Build configuration including inputs, outputs, and build script
 /// * `cache_dest_dir` - Final destination in cache where successful build outputs are stored
-/// * `event_bus` - Event bus for emitting build events
-/// * `invocation_id` - Invocation ID for this build session
 /// * `sandbox_base_dir` - Base directory for creating temporary build sandboxes
 /// * `target_id` - Unique identifier for the target being built
 #[tracing::instrument(skip_all, fields(name = config.name, indicatif.pb_show))]
 pub async fn run_build(
     config: &BuildConfig,
     cache_dest_dir: &std::path::Path,
-    event_bus: &build_events::BuildEventBus,
-    invocation_id: &str,
     sandbox_base_dir: std::path::PathBuf,
     target_id: &str,
 ) -> Result<BuildResult> {
     let executor = BuildExecutor::new(sandbox_base_dir, config.name.clone())?;
-    let exit_code = executor
-        .execute(config, event_bus, invocation_id, target_id)
-        .await?;
+    let exit_code = executor.execute(config, target_id).await?;
 
     let outputs = OutputValidator::validate_and_collect(
         config,

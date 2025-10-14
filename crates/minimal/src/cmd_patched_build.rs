@@ -101,40 +101,13 @@ pub async fn cmd_patched_build(args: PatchedBuildArgs, globals: &GlobalArgs) -> 
         .unwrap();
 
     info!("Building package: {}", build.name);
-    let mut spongebob_client = spongebob::SpongeBob::new()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob client: {}", e))?;
-
-    let spongebob_invocation = spongebob_client.create_invocation();
-    let invocation_id = spongebob_invocation.invocation_id().to_string();
-
-    // Setup event bus and subscriber
-    use build_events::{BuildEventBus, BuildEventDispatcher};
-    use build_events_proto::SpongeBobSubscriberV2;
-
-    let event_bus = BuildEventBus::new(10000);
-    let mut dispatcher = BuildEventDispatcher::new(event_bus.subscribe());
-    let subscriber = SpongeBobSubscriberV2::from_invocation(spongebob_invocation.clone());
-    dispatcher.add_subscriber(Box::new(subscriber));
-
-    // Spawn dispatcher in background
-    tokio::spawn(async move {
-        dispatcher.run().await;
-    });
 
     // Use package name as target ID for semantic meaning
     let target_id = build.name.clone();
 
-    run_build(
-        &config,
-        out_dir.path(),
-        &event_bus,
-        &invocation_id,
-        output_base.clone(),
-        &target_id,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("Failed to build {}: {}", build.name, e))?;
+    run_build(&config, out_dir.path(), output_base.clone(), &target_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to build {}: {}", build.name, e))?;
 
     out_dir
         .finalize(EntryMeta {

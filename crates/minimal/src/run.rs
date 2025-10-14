@@ -462,8 +462,6 @@ impl<'a> Run<'a> {
         build: &BuildSpecRef,
         _full_build: bool,
         remote_cache: Option<&RemoteCache<GcsStorage>>,
-        event_bus: &build_events::BuildEventBus,
-        invocation_id: &str,
     ) -> Result<Option<PendingDir>> {
         let bsh = self.graph.spec_hash(build);
         let build = self.graph.get(build).unwrap();
@@ -544,8 +542,6 @@ impl<'a> Run<'a> {
             let _build_result = run_build(
                 &config,
                 out_dir.path(),
-                event_bus,
-                invocation_id,
                 self.output_base.clone(),
                 &target_id,
             )
@@ -564,8 +560,6 @@ impl<'a> Run<'a> {
         &mut self,
         plan: ExecPlan<'a, BP>,
         remote_cache: Option<&RemoteCache<GcsStorage>>,
-        event_bus: &build_events::BuildEventBus,
-        invocation_id: &str,
     ) -> Result<()> {
         // Execute builds in dependency order - each build runs in isolation
         // and can only access outputs from previously completed builds
@@ -591,13 +585,8 @@ impl<'a> Run<'a> {
 
                     s.spawn(move |_| {
                         let _rt = tokio_runtime.enter();
-                        let result = futures::executor::block_on(self2.do_build(
-                            &bsr,
-                            full_build,
-                            remote_cache,
-                            event_bus,
-                            invocation_id,
-                        ));
+                        let result =
+                            futures::executor::block_on(self2.do_build(&bsr, full_build, remote_cache));
 
                         match result {
                             Err(e) => {

@@ -131,3 +131,40 @@ pub use bus::BuildEventBus;
 pub use dispatcher::BuildEventDispatcher;
 pub use events::BuildEvent;
 pub use subscriber::{BuildEventSubscriber, SubscriberError};
+
+// Global event bus infrastructure
+use std::sync::OnceLock;
+
+static GLOBAL_EVENT_BUS: OnceLock<BuildEventBus> = OnceLock::new();
+static INVOCATION_ID: OnceLock<String> = OnceLock::new();
+
+/// Initialize the global event bus and invocation ID
+///
+/// This should be called once at application startup before any events are emitted.
+/// Panics if called more than once.
+pub fn initialize_global_event_bus(invocation_id: String) {
+    GLOBAL_EVENT_BUS
+        .set(BuildEventBus::new(10000))
+        .expect("Global event bus already initialized");
+    INVOCATION_ID
+        .set(invocation_id)
+        .expect("Invocation ID already initialized");
+}
+
+/// Get a reference to the global event bus
+///
+/// Panics if the global event bus has not been initialized via `initialize_global_event_bus`.
+pub fn event_bus() -> &'static BuildEventBus {
+    GLOBAL_EVENT_BUS
+        .get()
+        .expect("Global event bus not initialized. Call initialize_global_event_bus() first.")
+}
+
+/// Get the invocation ID for this build session
+///
+/// Panics if the invocation ID has not been initialized via `initialize_global_event_bus`.
+pub fn invocation_id() -> &'static str {
+    INVOCATION_ID
+        .get()
+        .expect("Invocation ID not initialized. Call initialize_global_event_bus() first.")
+}

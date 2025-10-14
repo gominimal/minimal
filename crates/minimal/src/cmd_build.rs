@@ -4,8 +4,6 @@ use anyhow::Context;
 use build_events::events::{
     build_event, BuildEvent, BuildFinished, BuildMetadata, BuildStarted, current_millis,
 };
-use build_events::{BuildEventBus, BuildEventDispatcher};
-use build_events_proto::SpongeBobSubscriberV2;
 use cache::{Cache, CacheBinProvider, LocalDir, RemoteBinProvider};
 use graph::{DepGraph, ExecPlan, Transitives};
 use std::collections::HashMap;
@@ -35,13 +33,6 @@ pub async fn cmd_build_impl(
     cache: Cache<LocalDir>,
     num_parallel_builds: usize,
 ) -> anyhow::Result<()> {
-    // Create SpongeBob invocation for this build command
-    let mut spongebob_client = spongebob::SpongeBob::new()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob client: {}", e))?;
-
-    let spongebob_invocation = Some(spongebob_client.create_invocation());
-
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_parallel_builds)
         .build_global()
@@ -60,27 +51,6 @@ pub async fn cmd_build_impl(
         output_base,
     );
 
-    // Setup build events system
-    let event_bus = BuildEventBus::new(10000);
-
-    // Create dispatcher with SpongeBobSubscriberV2 if we have an invocation
-    if let Some(ref invocation) = spongebob_invocation {
-        let mut dispatcher = BuildEventDispatcher::new(event_bus.subscribe());
-        let subscriber = SpongeBobSubscriberV2::from_invocation(invocation.clone());
-        dispatcher.add_subscriber(Box::new(subscriber));
-
-        // Spawn dispatcher in background
-        tokio::spawn(async move {
-            dispatcher.run().await;
-        });
-    }
-
-    // Get invocation_id for events
-    let invocation_id = spongebob_invocation
-        .as_ref()
-        .map(|inv| inv.invocation_id().to_string())
-        .unwrap_or_else(|| "local".to_string());
-
     // Get command for BuildStarted event (skip binary path at index 0)
     let args: Vec<String> = std::env::args().collect();
     let command = if args.len() > 1 {
@@ -94,11 +64,11 @@ pub async fn cmd_build_impl(
         .to_string_lossy()
         .to_string();
 
-    // Emit BuildStarted event
-    event_bus.emit(BuildEvent {
-        invocation_id: invocation_id.clone(),
+    // Emit BuildStarted event using global event bus
+    build_events::event_bus().emit(BuildEvent {
+        invocation_id: build_events::invocation_id().to_string(),
         event: Some(build_event::Event::BuildStarted(BuildStarted {
-            invocation_id: invocation_id.clone(),
+            invocation_id: build_events::invocation_id().to_string(),
             command,
             timestamp_millis: current_millis(),
             working_directory,
@@ -140,20 +110,17 @@ pub async fn cmd_build_impl(
                 metadata.insert("repo_url".to_string(), repo_url.trim().to_string());
             }
 
-    // Emit BuildMetadata event if we collected any metadata
+    // Emit BuildMetadata event if we collected any metadata (using global event bus)
     if !metadata.is_empty() {
-        event_bus.emit(BuildEvent {
-            invocation_id: invocation_id.clone(),
+        build_events::event_bus().emit(BuildEvent {
+            invocation_id: build_events::invocation_id().to_string(),
             event: Some(build_event::Event::BuildMetadata(BuildMetadata { metadata })),
         });
     }
 
     let build_success = match (globals.no_cache, globals.no_fetch) {
         // No local or remote cache
-        (true, true) => {
-            run.execute(ExecPlan::new(graph), None, &event_bus, &invocation_id)
-                .await
-        }
+        (true, true) => run.execute(ExecPlan::new(graph), None).await,
         // Both caches
         (false, false) => {
             let local_adapter = CacheBinProvider::new(graph, cache.clone());
@@ -162,8 +129,6 @@ pub async fn cmd_build_impl(
             run.execute(
                 ExecPlan::new_with_bin_provider(graph, (local_adapter, remote_adapter)),
                 Some(&remote_cache),
-                &event_bus,
-                &invocation_id,
             )
             .await
         }
@@ -174,21 +139,14 @@ pub async fn cmd_build_impl(
             run.execute(
                 ExecPlan::new_with_bin_provider(graph, remote_adapter),
                 Some(&remote_cache),
-                &event_bus,
-                &invocation_id,
             )
             .await
         }
         // Only local cache
         (false, true) => {
             let local_adapter = CacheBinProvider::new(graph, cache.clone());
-            run.execute(
-                ExecPlan::new_with_bin_provider(graph, local_adapter),
-                None,
-                &event_bus,
-                &invocation_id,
-            )
-            .await
+            run.execute(ExecPlan::new_with_bin_provider(graph, local_adapter), None)
+                .await
         }
     };
 
@@ -196,11 +154,11 @@ pub async fn cmd_build_impl(
     let build_succeeded = build_success.is_ok();
     let error_message = build_success.as_ref().err().map(|e| e.to_string());
 
-    // Emit BuildFinished event
-    event_bus.emit(BuildEvent {
-        invocation_id: invocation_id.clone(),
+    // Emit BuildFinished event using global event bus
+    build_events::event_bus().emit(BuildEvent {
+        invocation_id: build_events::invocation_id().to_string(),
         event: Some(build_event::Event::BuildFinished(BuildFinished {
-            invocation_id: invocation_id.clone(),
+            invocation_id: build_events::invocation_id().to_string(),
             success: build_succeeded,
             timestamp_millis: current_millis(),
             error_message,
@@ -261,10 +219,11 @@ pub async fn cmd_build_impl(
     }
 
     // Display build summary with spongebob URL
-    let spongebob_url = spongebob_invocation
-        .as_ref()
-        .map(|inv| inv.url().to_string());
-    display_build_summary(graph, &cache, globals, &run, spongebob_url.as_deref());
+    let spongebob_url = format!(
+        "https://dash.minimal.dev/invocations/{}",
+        build_events::invocation_id()
+    );
+    display_build_summary(graph, &cache, globals, &run, Some(&spongebob_url));
 
     Ok(())
 }
