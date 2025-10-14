@@ -346,6 +346,7 @@ name = "build-events"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "minimal_spongebob_community_neoeinstein-prost",
  "serde",
  "serde_json",
  "tempfile",
@@ -377,10 +378,10 @@ dependencies = [
 name = "build-sandbox"
 version = "0.1.0"
 dependencies = [
+ "build-events",
  "common",
  "globset",
  "hakoniwa",
- "minimal_spongebob_community_neoeinstein-prost",
  "nickel-lang-core",
  "serde",
  "spongebob",

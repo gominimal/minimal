@@ -1,7 +1,7 @@
-use hakoniwa::Container;
-use minimal_spongebob_community_neoeinstein_prost::spongebob::v1::{
-    BuildEvent, TargetCompleted, TargetKind, TargetStarted, build_event,
+use build_events::events::{
+    build_event, BuildEvent, TargetCompleted, TargetKind, TargetStarted,
 };
+use hakoniwa::Container;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};

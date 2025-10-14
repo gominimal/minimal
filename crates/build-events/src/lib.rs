@@ -27,7 +27,7 @@
 //! ```no_run
 //! use build_events::{
 //!     BuildEventBus, BuildEventDispatcher, BuildEvent,
-//!     events::{BuildStarted, current_millis},
+//!     events::{build_event, BuildStarted, current_millis},
 //!     subscribers::{LoggerSubscriber, JsonFileWriter},
 //! };
 //!
@@ -52,15 +52,18 @@
 //!     });
 //!
 //!     // Emit events from build
-//!     event_bus.emit(BuildEvent::BuildStarted(BuildStarted {
+//!     event_bus.emit(BuildEvent {
 //!         invocation_id: "build-123".to_string(),
-//!         command: "cargo build".to_string(),
-//!         timestamp_millis: current_millis(),
-//!         working_directory: std::env::current_dir()
-//!             .unwrap()
-//!             .to_string_lossy()
-//!             .to_string(),
-//!     }));
+//!         event: Some(build_event::Event::BuildStarted(BuildStarted {
+//!             invocation_id: "build-123".to_string(),
+//!             command: "cargo build".to_string(),
+//!             timestamp_millis: current_millis(),
+//!             working_directory: std::env::current_dir()
+//!                 .unwrap()
+//!                 .to_string_lossy()
+//!                 .to_string(),
+//!         })),
+//!     });
 //!
 //!     // ... perform build ...
 //!

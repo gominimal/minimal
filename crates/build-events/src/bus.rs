@@ -22,17 +22,19 @@ use tokio::sync::broadcast;
 ///     let bus = BuildEventBus::new(1000);
 ///     let mut receiver = bus.subscribe();
 ///
-///     bus.emit(BuildEvent::BuildStarted(BuildStarted {
+///     bus.emit(BuildEvent {
 ///         invocation_id: "test-123".to_string(),
-///         command: "build".to_string(),
-///         timestamp_millis: current_millis(),
-///         working_directory: "/tmp".to_string(),
-///     }));
+///         event: Some(build_event::Event::BuildStarted(BuildStarted {
+///             invocation_id: "test-123".to_string(),
+///             command: "build".to_string(),
+///             timestamp_millis: current_millis(),
+///             working_directory: "/tmp".to_string(),
+///         })),
+///     });
 ///
 ///     let event = receiver.recv().await.unwrap();
-///     match event {
-///         BuildEvent::BuildStarted(_) => println!("Build started!"),
-///         _ => {}
+///     if let Some(build_event::Event::BuildStarted(_)) = event.event {
+///         println!("Build started!");
 ///     }
 /// }
 /// ```
@@ -77,12 +79,15 @@ impl BuildEventBus {
     /// use build_events::{BuildEventBus, BuildEvent, events::*};
     ///
     /// let bus = BuildEventBus::new(1000);
-    /// bus.emit(BuildEvent::BuildStarted(BuildStarted {
+    /// bus.emit(BuildEvent {
     ///     invocation_id: "test-123".to_string(),
-    ///     command: "build".to_string(),
-    ///     timestamp_millis: current_millis(),
-    ///     working_directory: "/tmp".to_string(),
-    /// }));
+    ///     event: Some(build_event::Event::BuildStarted(BuildStarted {
+    ///         invocation_id: "test-123".to_string(),
+    ///         command: "build".to_string(),
+    ///         timestamp_millis: current_millis(),
+    ///         working_directory: "/tmp".to_string(),
+    ///     })),
+    /// });
     /// ```
     pub fn emit(&self, event: BuildEvent) {
         // Use try_send to avoid blocking. If the channel is full, the event
@@ -133,15 +138,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_bus_emit_and_receive() {
+        use crate::events::build_event;
+
         let bus = BuildEventBus::new(100);
         let mut receiver = bus.subscribe();
 
-        let event = BuildEvent::BuildStarted(BuildStarted {
+        let event = BuildEvent {
             invocation_id: "test-123".to_string(),
-            command: "build".to_string(),
-            timestamp_millis: current_millis(),
-            working_directory: "/tmp".to_string(),
-        });
+            event: Some(build_event::Event::BuildStarted(BuildStarted {
+                invocation_id: "test-123".to_string(),
+                command: "build".to_string(),
+                timestamp_millis: current_millis(),
+                working_directory: "/tmp".to_string(),
+            })),
+        };
 
         bus.emit(event.clone());
 
@@ -151,16 +161,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_bus_multiple_subscribers() {
+        use crate::events::build_event;
+
         let bus = BuildEventBus::new(100);
         let mut receiver1 = bus.subscribe();
         let mut receiver2 = bus.subscribe();
 
-        let event = BuildEvent::BuildStarted(BuildStarted {
+        let event = BuildEvent {
             invocation_id: "test-456".to_string(),
-            command: "build".to_string(),
-            timestamp_millis: current_millis(),
-            working_directory: "/tmp".to_string(),
-        });
+            event: Some(build_event::Event::BuildStarted(BuildStarted {
+                invocation_id: "test-456".to_string(),
+                command: "build".to_string(),
+                timestamp_millis: current_millis(),
+                working_directory: "/tmp".to_string(),
+            })),
+        };
 
         bus.emit(event.clone());
 
@@ -172,16 +187,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_bus_clone() {
+        use crate::events::build_event;
+
         let bus = BuildEventBus::new(100);
         let bus_clone = bus.clone();
         let mut receiver = bus.subscribe();
 
-        let event = BuildEvent::BuildStarted(BuildStarted {
+        let event = BuildEvent {
             invocation_id: "test-789".to_string(),
-            command: "build".to_string(),
-            timestamp_millis: current_millis(),
-            working_directory: "/tmp".to_string(),
-        });
+            event: Some(build_event::Event::BuildStarted(BuildStarted {
+                invocation_id: "test-789".to_string(),
+                command: "build".to_string(),
+                timestamp_millis: current_millis(),
+                working_directory: "/tmp".to_string(),
+            })),
+        };
 
         // Emit from the cloned bus
         bus_clone.emit(event.clone());
@@ -204,14 +224,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_late_subscription() {
+        use crate::events::build_event;
+
         let bus = BuildEventBus::new(100);
 
-        let event1 = BuildEvent::BuildStarted(BuildStarted {
+        let event1 = BuildEvent {
             invocation_id: "early".to_string(),
-            command: "build".to_string(),
-            timestamp_millis: current_millis(),
-            working_directory: "/tmp".to_string(),
-        });
+            event: Some(build_event::Event::BuildStarted(BuildStarted {
+                invocation_id: "early".to_string(),
+                command: "build".to_string(),
+                timestamp_millis: current_millis(),
+                working_directory: "/tmp".to_string(),
+            })),
+        };
 
         // Emit before subscription
         bus.emit(event1.clone());
@@ -219,12 +244,15 @@ mod tests {
         // Subscribe after event was emitted
         let mut receiver = bus.subscribe();
 
-        let event2 = BuildEvent::BuildStarted(BuildStarted {
+        let event2 = BuildEvent {
             invocation_id: "late".to_string(),
-            command: "build".to_string(),
-            timestamp_millis: current_millis(),
-            working_directory: "/tmp".to_string(),
-        });
+            event: Some(build_event::Event::BuildStarted(BuildStarted {
+                invocation_id: "late".to_string(),
+                command: "build".to_string(),
+                timestamp_millis: current_millis(),
+                working_directory: "/tmp".to_string(),
+            })),
+        };
 
         bus.emit(event2.clone());
 

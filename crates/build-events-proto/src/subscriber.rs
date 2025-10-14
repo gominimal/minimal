@@ -89,21 +89,6 @@ impl GrpcStreamSubscriber {
 #[async_trait]
 impl BuildEventSubscriber for GrpcStreamSubscriber {
     async fn on_event(&self, event: &BuildEvent) -> Result<(), SubscriberError> {
-        // Extract invocation_id from the event (all variants have it)
-        let invocation_id = match event {
-            BuildEvent::BuildStarted(e) => &e.invocation_id,
-            BuildEvent::BuildFinished(e) => &e.invocation_id,
-            BuildEvent::TargetStarted(_) => "", // Targets don't have invocation_id in inner fields
-            BuildEvent::TargetCompleted(_) => "",
-            BuildEvent::ActionStarted(_) => "",
-            BuildEvent::ActionCompleted(_) => "",
-            BuildEvent::BuildMetadata(_) => "", // Metadata doesn't have invocation_id in inner fields
-        };
-
-        // Convert Rust event to proto using ergonomic extension trait
-        use crate::convert::ToProto;
-        let proto_event = event.to_proto(invocation_id);
-
         // Broadcast to all subscribers
         // If there are no subscribers, this is a no-op
         if self.sender.receiver_count() == 0 {
@@ -111,7 +96,7 @@ impl BuildEventSubscriber for GrpcStreamSubscriber {
         }
 
         // Send to broadcast channel (will drop if no receivers)
-        if let Err(e) = self.sender.send(proto_event) {
+        if let Err(e) = self.sender.send(event.clone()) {
             // If channel has no receivers, this is expected
             warn!("GrpcStreamSubscriber: no active receivers ({})", e);
         }
@@ -137,15 +122,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscriber_stream() {
+        use build_events::events::build_event;
+
         let subscriber = GrpcStreamSubscriber::new(10);
         let mut stream = subscriber.subscribe_stream();
 
-        let event = BuildEvent::BuildStarted(BuildStarted {
+        let event = BuildEvent {
             invocation_id: "test-123".to_string(),
-            command: "test".to_string(),
-            timestamp_millis: current_millis(),
-            working_directory: "/tmp".to_string(),
-        });
+            event: Some(build_event::Event::BuildStarted(BuildStarted {
+                invocation_id: "test-123".to_string(),
+                command: "test".to_string(),
+                timestamp_millis: current_millis(),
+                working_directory: "/tmp".to_string(),
+            })),
+        };
 
         // Send event
         subscriber.on_event(&event).await.unwrap();

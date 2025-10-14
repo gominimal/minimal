@@ -2,7 +2,7 @@ use crate::{Error, lockfile::PrebuiltsLock, remote_storage::RemoteStorage, run::
 use crate::{GlobalArgs, PackagesArg};
 use anyhow::Context;
 use build_events::events::{
-    BuildEvent, BuildFinished, BuildMetadata, BuildStarted, current_millis,
+    build_event, BuildEvent, BuildFinished, BuildMetadata, BuildStarted, current_millis,
 };
 use build_events::{BuildEventBus, BuildEventDispatcher};
 use build_events_proto::SpongeBobSubscriberV2;
@@ -95,61 +95,57 @@ pub async fn cmd_build_impl(
         .to_string();
 
     // Emit BuildStarted event
-    event_bus.emit(BuildEvent::BuildStarted(BuildStarted {
+    event_bus.emit(BuildEvent {
         invocation_id: invocation_id.clone(),
-        command,
-        timestamp_millis: current_millis(),
-        working_directory,
-    }));
+        event: Some(build_event::Event::BuildStarted(BuildStarted {
+            invocation_id: invocation_id.clone(),
+            command,
+            timestamp_millis: current_millis(),
+            working_directory,
+        })),
+    });
 
     // Collect and emit git metadata
     let mut metadata = HashMap::new();
 
     // Get git user
-    if let Ok(output) = Command::new("git").args(["config", "user.name"]).output() {
-        if output.status.success() {
-            if let Ok(user) = String::from_utf8(output.stdout) {
+    if let Ok(output) = Command::new("git").args(["config", "user.name"]).output()
+        && output.status.success()
+            && let Ok(user) = String::from_utf8(output.stdout) {
                 metadata.insert("user".to_string(), user.trim().to_string());
             }
-        }
-    }
 
     // Get git branch
     if let Ok(output) = Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output()
-    {
-        if output.status.success() {
-            if let Ok(branch) = String::from_utf8(output.stdout) {
+        && output.status.success()
+            && let Ok(branch) = String::from_utf8(output.stdout) {
                 metadata.insert("branch".to_string(), branch.trim().to_string());
             }
-        }
-    }
 
     // Get git commit SHA
-    if let Ok(output) = Command::new("git").args(["rev-parse", "HEAD"]).output() {
-        if output.status.success() {
-            if let Ok(commit) = String::from_utf8(output.stdout) {
+    if let Ok(output) = Command::new("git").args(["rev-parse", "HEAD"]).output()
+        && output.status.success()
+            && let Ok(commit) = String::from_utf8(output.stdout) {
                 metadata.insert("commit".to_string(), commit.trim().to_string());
             }
-        }
-    }
 
     // Get git remote URL
     if let Ok(output) = Command::new("git")
         .args(["config", "remote.origin.url"])
         .output()
-    {
-        if output.status.success() {
-            if let Ok(repo_url) = String::from_utf8(output.stdout) {
+        && output.status.success()
+            && let Ok(repo_url) = String::from_utf8(output.stdout) {
                 metadata.insert("repo_url".to_string(), repo_url.trim().to_string());
             }
-        }
-    }
 
     // Emit BuildMetadata event if we collected any metadata
     if !metadata.is_empty() {
-        event_bus.emit(BuildEvent::BuildMetadata(BuildMetadata { metadata }));
+        event_bus.emit(BuildEvent {
+            invocation_id: invocation_id.clone(),
+            event: Some(build_event::Event::BuildMetadata(BuildMetadata { metadata })),
+        });
     }
 
     let build_success = match (globals.no_cache, globals.no_fetch) {
@@ -198,12 +194,15 @@ pub async fn cmd_build_impl(
     let error_message = build_success.as_ref().err().map(|e| e.to_string());
 
     // Emit BuildFinished event
-    event_bus.emit(BuildEvent::BuildFinished(BuildFinished {
+    event_bus.emit(BuildEvent {
         invocation_id: invocation_id.clone(),
-        success: build_succeeded,
-        timestamp_millis: current_millis(),
-        error_message,
-    }));
+        event: Some(build_event::Event::BuildFinished(BuildFinished {
+            invocation_id: invocation_id.clone(),
+            success: build_succeeded,
+            timestamp_millis: current_millis(),
+            error_message,
+        })),
+    });
 
     // Propagate error if build failed
     build_success.context("Failed to execute build")?;

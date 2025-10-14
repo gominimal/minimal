@@ -89,24 +89,24 @@
 //! }
 //! ```
 //!
-//! # Type Conversions
+//! # Type Usage
 //!
-//! Convert between Rust and protobuf types:
+//! Since build-events now uses proto types directly, no conversion is needed:
 //!
 //! ```
-//! use build_events::events::{BuildStarted, current_millis};
-//! use build_events::BuildEvent;
-//! use build_events_proto::{proto, convert::ToProto};
+//! use build_events::events::{build_event, BuildEvent, BuildStarted, current_millis};
+//! use build_events_proto::proto;
 //!
-//! // Rust -> Proto
-//! let rust_event = BuildEvent::BuildStarted(BuildStarted {
+//! // Create proto event (build-events types ARE proto types)
+//! let event = BuildEvent {
 //!     invocation_id: "test-123".to_string(),
-//!     command: "build".to_string(),
-//!     timestamp_millis: current_millis(),
-//!     working_directory: "/tmp".to_string(),
-//! });
-//!
-//! let proto_event: proto::BuildEvent = rust_event.to_proto("test-123");
+//!     event: Some(build_event::Event::BuildStarted(BuildStarted {
+//!         invocation_id: "test-123".to_string(),
+//!         command: "build".to_string(),
+//!         timestamp_millis: current_millis(),
+//!         working_directory: "/tmp".to_string(),
+//!     })),
+//! };
 //! ```
 
 // Use BSR-generated protobuf code from canonical spongebob.v1 package
@@ -120,7 +120,6 @@ pub mod proto {
     };
 }
 
-pub mod convert;
 pub mod service;
 pub mod subscriber;
 
@@ -128,7 +127,6 @@ pub mod subscriber;
 pub mod spongebob_subscriber_v2;
 
 // Re-export main types for convenience
-pub use convert::{ConversionError, ToProto, to_proto_build_event};
 pub use service::BuildEventServiceImpl;
 pub use subscriber::GrpcStreamSubscriber;
 

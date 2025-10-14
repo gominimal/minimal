@@ -85,7 +85,7 @@ pub trait BuildEventSubscriber: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{BuildStarted, current_millis};
+    use crate::events::{build_event, BuildStarted, current_millis};
 
     struct TestSubscriber {
         name: String,
@@ -110,12 +110,15 @@ mod tests {
 
         assert_eq!(subscriber.name(), "test");
 
-        let event = BuildEvent::BuildStarted(BuildStarted {
+        let event = BuildEvent {
             invocation_id: "test-123".to_string(),
-            command: "build".to_string(),
-            timestamp_millis: current_millis(),
-            working_directory: "/tmp".to_string(),
-        });
+            event: Some(build_event::Event::BuildStarted(BuildStarted {
+                invocation_id: "test-123".to_string(),
+                command: "build".to_string(),
+                timestamp_millis: current_millis(),
+                working_directory: "/tmp".to_string(),
+            })),
+        };
 
         let result = subscriber.on_event(&event).await;
         assert!(result.is_ok());

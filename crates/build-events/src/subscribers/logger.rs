@@ -2,7 +2,7 @@
 //!
 //! Logs build events using the tracing crate with structured fields.
 
-use crate::events::BuildEvent;
+use crate::events::{build_event, BuildEvent};
 use crate::subscriber::{BuildEventSubscriber, SubscriberError};
 use async_trait::async_trait;
 use tracing::info;
@@ -44,8 +44,8 @@ impl Default for LoggerSubscriber {
 #[async_trait]
 impl BuildEventSubscriber for LoggerSubscriber {
     async fn on_event(&self, event: &BuildEvent) -> Result<(), SubscriberError> {
-        match event {
-            BuildEvent::BuildStarted(e) => {
+        match &event.event {
+            Some(build_event::Event::BuildStarted(e)) => {
                 info!(
                     event = "build_started",
                     invocation_id = %e.invocation_id,
@@ -55,7 +55,7 @@ impl BuildEventSubscriber for LoggerSubscriber {
                     "Build started"
                 );
             }
-            BuildEvent::BuildFinished(e) => {
+            Some(build_event::Event::BuildFinished(e)) => {
                 info!(
                     event = "build_finished",
                     invocation_id = %e.invocation_id,
@@ -65,7 +65,7 @@ impl BuildEventSubscriber for LoggerSubscriber {
                     "Build finished"
                 );
             }
-            BuildEvent::TargetStarted(e) => {
+            Some(build_event::Event::TargetStarted(e)) => {
                 info!(
                     event = "target_started",
                     label = %e.label,
@@ -74,7 +74,7 @@ impl BuildEventSubscriber for LoggerSubscriber {
                     "Target started"
                 );
             }
-            BuildEvent::TargetCompleted(e) => {
+            Some(build_event::Event::TargetCompleted(e)) => {
                 info!(
                     event = "target_completed",
                     label = %e.label,
@@ -85,7 +85,7 @@ impl BuildEventSubscriber for LoggerSubscriber {
                     "Target completed"
                 );
             }
-            BuildEvent::ActionStarted(e) => {
+            Some(build_event::Event::ActionStarted(e)) => {
                 info!(
                     event = "action_started",
                     action_id = %e.action_id,
@@ -95,7 +95,7 @@ impl BuildEventSubscriber for LoggerSubscriber {
                     "Action started"
                 );
             }
-            BuildEvent::ActionCompleted(e) => {
+            Some(build_event::Event::ActionCompleted(e)) => {
                 info!(
                     event = "action_completed",
                     action_id = %e.action_id,
@@ -107,12 +107,15 @@ impl BuildEventSubscriber for LoggerSubscriber {
                     "Action completed"
                 );
             }
-            BuildEvent::BuildMetadata(e) => {
+            Some(build_event::Event::BuildMetadata(e)) => {
                 info!(
                     event = "build_metadata",
                     metadata = ?e.metadata,
                     "Build metadata"
                 );
+            }
+            None => {
+                info!("Received event with no inner event type");
             }
         }
 
@@ -134,12 +137,15 @@ mod tests {
         let subscriber = LoggerSubscriber::new();
         assert_eq!(subscriber.name(), "LoggerSubscriber");
 
-        let event = BuildEvent::BuildStarted(BuildStarted {
+        let event = BuildEvent {
             invocation_id: "test-123".to_string(),
-            command: "build".to_string(),
-            timestamp_millis: current_millis(),
-            working_directory: "/tmp".to_string(),
-        });
+            event: Some(build_event::Event::BuildStarted(BuildStarted {
+                invocation_id: "test-123".to_string(),
+                command: "build".to_string(),
+                timestamp_millis: current_millis(),
+                working_directory: "/tmp".to_string(),
+            })),
+        };
 
         let result = subscriber.on_event(&event).await;
         assert!(result.is_ok());
@@ -150,18 +156,24 @@ mod tests {
         let subscriber = LoggerSubscriber::new();
 
         let events = vec![
-            BuildEvent::BuildStarted(BuildStarted {
+            BuildEvent {
                 invocation_id: "test".to_string(),
-                command: "build".to_string(),
-                timestamp_millis: current_millis(),
-                working_directory: "/tmp".to_string(),
-            }),
-            BuildEvent::TargetStarted(TargetStarted {
-                target_id: "target-1".to_string(),
-                label: "//foo:bar".to_string(),
-                target_kind: TargetKind::Binary,
-                timestamp_millis: current_millis(),
-            }),
+                event: Some(build_event::Event::BuildStarted(BuildStarted {
+                    invocation_id: "test".to_string(),
+                    command: "build".to_string(),
+                    timestamp_millis: current_millis(),
+                    working_directory: "/tmp".to_string(),
+                })),
+            },
+            BuildEvent {
+                invocation_id: "test".to_string(),
+                event: Some(build_event::Event::TargetStarted(TargetStarted {
+                    target_id: "target-1".to_string(),
+                    label: "//foo:bar".to_string(),
+                    target_kind: TargetKind::Binary as i32,
+                    timestamp_millis: current_millis(),
+                })),
+            },
         ];
 
         for event in events {

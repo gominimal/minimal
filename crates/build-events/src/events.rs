@@ -1,139 +1,14 @@
 //! Build event type definitions
 //!
-//! This module defines the core event types emitted during a build.
-//! Events are strongly-typed Rust enums and structs with serde support
-//! for easy serialization to JSON, protobuf, or other formats.
+//! This module re-exports protobuf event types from the canonical spongebob.v1 schema
+//! as the single source of truth for build events. Proto types are used directly
+//! throughout the build-events system for consistency and to eliminate duplication.
 
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-
-/// Main build event enum that wraps all possible event types
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum BuildEvent {
-    /// Build process started
-    BuildStarted(BuildStarted),
-    /// Build process finished
-    BuildFinished(BuildFinished),
-    /// Target started building
-    TargetStarted(TargetStarted),
-    /// Target completed building
-    TargetCompleted(TargetCompleted),
-    /// Action started executing
-    ActionStarted(ActionStarted),
-    /// Action completed executing
-    ActionCompleted(ActionCompleted),
-    /// Build metadata (user, branch, commit, etc.)
-    BuildMetadata(BuildMetadata),
-}
-
-/// Event emitted when a build starts
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct BuildStarted {
-    /// Unique identifier for this build invocation
-    pub invocation_id: String,
-    /// Command string for display
-    pub command: String,
-    /// Unix timestamp in milliseconds
-    pub timestamp_millis: i64,
-    /// Working directory where build was started
-    pub working_directory: String,
-}
-
-/// Event emitted when a build finishes
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct BuildFinished {
-    /// Unique identifier for this build invocation
-    pub invocation_id: String,
-    /// Whether the build succeeded
-    pub success: bool,
-    /// Unix timestamp in milliseconds
-    pub timestamp_millis: i64,
-    /// Optional error message if build failed
-    pub error_message: Option<String>,
-}
-
-/// Event emitted when a target starts building
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct TargetStarted {
-    /// Unique identifier for this target
-    pub target_id: String,
-    /// Target label (e.g., "//foo:bar")
-    pub label: String,
-    /// Type of target being built
-    pub target_kind: TargetKind,
-    /// Unix timestamp in milliseconds
-    pub timestamp_millis: i64,
-}
-
-/// Event emitted when a target completes
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct TargetCompleted {
-    /// Unique identifier for this target (must match TargetStarted.target_id)
-    pub target_id: String,
-    /// Target label (e.g., "//foo:bar")
-    pub label: String,
-    /// Whether the target built successfully
-    pub success: bool,
-    /// Unix timestamp in milliseconds
-    pub timestamp_millis: i64,
-    /// Optional error message if target failed
-    pub error_message: Option<String>,
-    /// Paths to generated output files
-    pub outputs: Vec<String>,
-    /// Whether this target was served from cache
-    pub cache_hit: bool,
-}
-
-/// Event emitted when an action starts executing
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ActionStarted {
-    /// Unique identifier for this action
-    pub action_id: String,
-    /// Human-readable name for the action (e.g., "CppCompile", "Link")
-    pub action_name: String,
-    /// Target this action belongs to (if any)
-    pub target_id: String,
-    /// Unix timestamp in milliseconds
-    pub timestamp_millis: i64,
-}
-
-/// Event emitted when an action completes
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ActionCompleted {
-    /// Unique identifier for this action
-    pub action_id: String,
-    /// Whether the action succeeded
-    pub success: bool,
-    /// Unix timestamp in milliseconds
-    pub timestamp_millis: i64,
-    /// Exit code of the action
-    pub exit_code: i32,
-    /// Optional stdout from the action
-    pub stdout: Option<String>,
-    /// Optional stderr from the action
-    pub stderr: Option<String>,
-}
-
-/// Event containing arbitrary key-value metadata about the build environment
-/// Standard keys: "user", "branch", "commit", "repo_url"
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct BuildMetadata {
-    /// Metadata key-value pairs
-    pub metadata: HashMap<String, String>,
-}
-
-/// Type of build target
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum TargetKind {
-    /// Binary executable target
-    Binary,
-    /// Library target
-    Library,
-    /// Test target
-    Test,
-}
+// Re-export proto types as the canonical event types
+pub use minimal_spongebob_community_neoeinstein_prost::spongebob::v1::{
+    build_event, ActionCompleted, ActionStarted, BuildEvent, BuildFinished, BuildMetadata,
+    BuildStarted, TargetCompleted, TargetKind, TargetStarted,
+};
 
 /// Helper function to get current timestamp in milliseconds
 ///
@@ -164,23 +39,30 @@ mod tests {
     }
 
     #[test]
-    fn test_event_serialization() {
-        let event = BuildEvent::BuildStarted(BuildStarted {
+    fn test_event_construction() {
+        let event = BuildEvent {
             invocation_id: "test-123".to_string(),
-            command: "build".to_string(),
-            timestamp_millis: 1234567890,
-            working_directory: "/tmp".to_string(),
-        });
+            event: Some(build_event::Event::BuildStarted(BuildStarted {
+                invocation_id: "test-123".to_string(),
+                command: "build".to_string(),
+                timestamp_millis: 1234567890,
+                working_directory: "/tmp".to_string(),
+            })),
+        };
 
-        let json = serde_json::to_string(&event).unwrap();
-        let deserialized: BuildEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(event, deserialized);
+        assert_eq!(event.invocation_id, "test-123");
+        assert!(matches!(
+            event.event,
+            Some(build_event::Event::BuildStarted(_))
+        ));
     }
 
     #[test]
-    fn test_target_kind_serialization() {
-        let kind = TargetKind::Binary;
-        let json = serde_json::to_string(&kind).unwrap();
-        assert_eq!(json, "\"binary\"");
+    fn test_target_kind_values() {
+        // Verify proto enum values
+        assert_eq!(TargetKind::Unspecified as i32, 0);
+        assert_eq!(TargetKind::Binary as i32, 1);
+        assert_eq!(TargetKind::Library as i32, 2);
+        assert_eq!(TargetKind::Test as i32, 3);
     }
 }

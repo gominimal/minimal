@@ -148,7 +148,7 @@ impl BuildEventDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{BuildStarted, current_millis};
+    use crate::events::{build_event, BuildStarted, current_millis};
     use crate::subscriber::SubscriberError;
     use async_trait::async_trait;
     use std::sync::Arc;
@@ -190,12 +190,15 @@ mod tests {
         // Send some events
         for i in 0..5 {
             sender
-                .send(BuildEvent::BuildStarted(BuildStarted {
+                .send(BuildEvent {
                     invocation_id: format!("test-{}", i),
-                    command: "build".to_string(),
-                    timestamp_millis: current_millis(),
-                    working_directory: "/tmp".to_string(),
-                }))
+                    event: Some(build_event::Event::BuildStarted(BuildStarted {
+                        invocation_id: format!("test-{}", i),
+                        command: "build".to_string(),
+                        timestamp_millis: current_millis(),
+                        working_directory: "/tmp".to_string(),
+                    })),
+                })
                 .unwrap();
         }
 
@@ -234,12 +237,15 @@ mod tests {
         // Send events
         for i in 0..3 {
             sender
-                .send(BuildEvent::BuildStarted(BuildStarted {
+                .send(BuildEvent {
                     invocation_id: format!("test-{}", i),
-                    command: "build".to_string(),
-                    timestamp_millis: current_millis(),
-                    working_directory: "/tmp".to_string(),
-                }))
+                    event: Some(build_event::Event::BuildStarted(BuildStarted {
+                        invocation_id: format!("test-{}", i),
+                        command: "build".to_string(),
+                        timestamp_millis: current_millis(),
+                        working_directory: "/tmp".to_string(),
+                    })),
+                })
                 .unwrap();
         }
 
@@ -288,12 +294,15 @@ mod tests {
 
         // Send event
         sender
-            .send(BuildEvent::BuildStarted(BuildStarted {
+            .send(BuildEvent {
                 invocation_id: "test".to_string(),
-                command: "build".to_string(),
-                timestamp_millis: current_millis(),
-                working_directory: "/tmp".to_string(),
-            }))
+                event: Some(build_event::Event::BuildStarted(BuildStarted {
+                    invocation_id: "test".to_string(),
+                    command: "build".to_string(),
+                    timestamp_millis: current_millis(),
+                    working_directory: "/tmp".to_string(),
+                })),
+            })
             .unwrap();
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;

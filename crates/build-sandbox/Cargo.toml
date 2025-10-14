@@ -15,8 +15,8 @@ tracing.workspace = true
 
 common.workspace = true
 
+# Use build-events which now provides proto types
+build-events.workspace = true
+
 [target.'cfg(target_os = "linux")'.dependencies]
 hakoniwa.workspace = true
-
-# TODO, get this out of the build-sandbox crate
-minimal_spongebob_community_neoeinstein-prost = { version = "=0.4.0-20251010205210-42ae8fd1517e.1", registry = "buf" }
