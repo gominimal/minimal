@@ -511,7 +511,6 @@ mod tests {
             spec_name: "spec".to_string(),
             fetched: true,
             epoch_millis: m.epoch_millis + 1000,
-            ..Default::default()
         })
         .unwrap();
 
