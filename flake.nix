@@ -18,11 +18,12 @@
         buildInputs = with pkgs; [
           cargo
           clippy
-	  protobuf
+	        protobuf
           rust-analyzer
           rustc
           rustfmt
           openssl
+          taplo
         ];
       };
     };
