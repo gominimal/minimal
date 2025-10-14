@@ -346,6 +346,8 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    cli.global_args.path_config().ensure_directories()?;
+
     let result = match cli.command {
         Command::Build(args) => cmd_build(args, &cli.global_args).await,
         Command::Check(args) => cmd_check(args, &cli.global_args),

@@ -31,7 +31,8 @@ pub async fn cmd_run(args: RunArgs, globals: &GlobalArgs) -> Result<(), Error> {
         .await?;
 
     // Start setting up the run container
-    let base = tempfile::tempdir().map_err(anyhow::Error::from)?;
+    let base =
+        tempfile::tempdir_in(globals.path_config().run_base_dir()).map_err(anyhow::Error::from)?;
     for dep in Transitives::for_toplevels(&graph, graph.top_levels.clone(), false).into_iter() {
         common::hardlink_dir_contents(
             cache.read_dir(&graph.spec_hash(&dep)).unwrap().path(),
