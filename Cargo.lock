@@ -384,7 +384,6 @@ dependencies = [
  "hakoniwa",
  "nickel-lang-core",
  "serde",
- "spongebob",
  "thiserror 2.0.17",
  "tokio",
  "tracing",

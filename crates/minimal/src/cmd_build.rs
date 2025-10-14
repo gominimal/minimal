@@ -40,7 +40,7 @@ pub async fn cmd_build_impl(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob client: {}", e))?;
 
-    let mut spongebob_invocation = Some(spongebob_client.create_invocation());
+    let spongebob_invocation = Some(spongebob_client.create_invocation());
 
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_parallel_builds)
@@ -151,7 +151,7 @@ pub async fn cmd_build_impl(
     let build_success = match (globals.no_cache, globals.no_fetch) {
         // No local or remote cache
         (true, true) => {
-            run.execute(ExecPlan::new(graph), None, &mut spongebob_invocation)
+            run.execute(ExecPlan::new(graph), None, &event_bus, &invocation_id)
                 .await
         }
         // Both caches
@@ -162,7 +162,8 @@ pub async fn cmd_build_impl(
             run.execute(
                 ExecPlan::new_with_bin_provider(graph, (local_adapter, remote_adapter)),
                 Some(&remote_cache),
-                &mut spongebob_invocation,
+                &event_bus,
+                &invocation_id,
             )
             .await
         }
@@ -173,7 +174,8 @@ pub async fn cmd_build_impl(
             run.execute(
                 ExecPlan::new_with_bin_provider(graph, remote_adapter),
                 Some(&remote_cache),
-                &mut spongebob_invocation,
+                &event_bus,
+                &invocation_id,
             )
             .await
         }
@@ -183,7 +185,8 @@ pub async fn cmd_build_impl(
             run.execute(
                 ExecPlan::new_with_bin_provider(graph, local_adapter),
                 None,
-                &mut spongebob_invocation,
+                &event_bus,
+                &invocation_id,
             )
             .await
         }
@@ -257,11 +260,10 @@ pub async fn cmd_build_impl(
         }
     }
 
+    // Display build summary with spongebob URL
     let spongebob_url = spongebob_invocation
         .as_ref()
         .map(|inv| inv.url().to_string());
-
-    // Display build summary
     display_build_summary(graph, &cache, globals, &run, spongebob_url.as_deref());
 
     Ok(())

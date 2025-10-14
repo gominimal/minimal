@@ -359,7 +359,6 @@ pub struct Run<'a> {
     remote_storage: RemoteStorage,
     lockfile: PrebuiltsLock,
     output_base: PathBuf,
-    latest_spongebob_url: Option<String>,
 }
 
 impl<'a> Run<'a> {
@@ -376,7 +375,6 @@ impl<'a> Run<'a> {
             remote_storage,
             lockfile,
             output_base,
-            latest_spongebob_url: None,
         }
     }
 
@@ -457,16 +455,16 @@ impl<'a> Run<'a> {
 
     /// runs a single isolated build, does not take self so it can be spawned in a thread.
     ///
-    /// Upon success, returns both the pending cache entry representing the build outputs,
-    /// and the spongebob URL of the build.
+    /// Upon success, returns the pending cache entry representing the build outputs.
     #[tracing::instrument(skip_all, fields(indicatif.pb_hide))]
     async fn do_build(
         &self,
         build: &BuildSpecRef,
         _full_build: bool,
         remote_cache: Option<&RemoteCache<GcsStorage>>,
-        spongebob_invocation: &mut Option<spongebob::SpongeBobInvocation>,
-    ) -> Result<(Option<PendingDir>, Option<String>)> {
+        event_bus: &build_events::BuildEventBus,
+        invocation_id: &str,
+    ) -> Result<Option<PendingDir>> {
         let bsh = self.graph.spec_hash(build);
         let build = self.graph.get(build).unwrap();
 
@@ -478,7 +476,7 @@ impl<'a> Run<'a> {
                 e.path().display(),
             );
             // Return None to indicate this was a cache hit, not a new build
-            return Ok((None, None));
+            return Ok(None);
         }
         if build.is_pure_prebuilt() {
             info!("Materializing prebuilt package: {}", build.name);
@@ -491,7 +489,7 @@ impl<'a> Run<'a> {
             )
             .await?;
             info!("Successfully materialized prebuilt package: {}", build.name);
-            return Ok((Some(result), None));
+            return Ok(Some(result));
         }
 
         let (dependencies, inputs, temp_dirs) = self
@@ -504,7 +502,7 @@ impl<'a> Run<'a> {
                 build.name
             );
             let cache_handle = self.cache.write_dir(&bsh).unwrap();
-            Ok((Some(cache_handle), None))
+            Ok(Some(cache_handle))
         } else {
             // Regular build with build script
             let cmd_parts: Vec<String> =
@@ -543,24 +541,22 @@ impl<'a> Run<'a> {
             let target_id = build.name.clone();
 
             info!("Building package: {}", build.name);
-            let build_result = run_build(
+            let _build_result = run_build(
                 &config,
                 out_dir.path(),
-                spongebob_invocation,
+                event_bus,
+                invocation_id,
                 self.output_base.clone(),
                 &target_id,
             )
             .await
             .map_err(|e| anyhow::anyhow!("Failed to build {}: {}", build.name, e))?;
 
-            // Extract SpongeBob URL from BuildResult
-            let spongebob_url = build_result.spongebob_url;
-
             info!("Successfully built package: {}", build.name);
             for tempdir in temp_dirs.into_iter() {
                 drop(tempdir);
             }
-            Ok((Some(out_dir), spongebob_url))
+            Ok(Some(out_dir))
         }
     }
 
@@ -568,7 +564,8 @@ impl<'a> Run<'a> {
         &mut self,
         plan: ExecPlan<'a, BP>,
         remote_cache: Option<&RemoteCache<GcsStorage>>,
-        spongebob_invocation: &mut Option<spongebob::SpongeBobInvocation>,
+        event_bus: &build_events::BuildEventBus,
+        invocation_id: &str,
     ) -> Result<()> {
         // Execute builds in dependency order - each build runs in isolation
         // and can only access outputs from previously completed builds
@@ -582,7 +579,6 @@ impl<'a> Run<'a> {
             let cache_handles = Arc::new(Mutex::new(Vec::with_capacity(
                 phase.as_ref().unwrap().builds.len(),
             )));
-            let spongebob_urls = Arc::new(Mutex::new(Vec::<String>::new()));
 
             rayon::scope(|s| {
                 for (bsr, full_build) in phase.unwrap().builds.iter() {
@@ -592,8 +588,6 @@ impl<'a> Run<'a> {
                     let self2 = self2.clone();
                     let err_bsr = build_which_errored.clone();
                     let cache_handles = cache_handles.clone();
-                    let spongebob_urls = spongebob_urls.clone();
-                    let mut invocation_clone = spongebob_invocation.clone();
 
                     s.spawn(move |_| {
                         let _rt = tokio_runtime.enter();
@@ -601,22 +595,20 @@ impl<'a> Run<'a> {
                             &bsr,
                             full_build,
                             remote_cache,
-                            &mut invocation_clone,
+                            event_bus,
+                            invocation_id,
                         ));
 
                         match result {
                             Err(e) => {
                                 *err_bsr.lock().unwrap() = Some((bsr, e));
                             }
-                            Ok((cache_handle, spongebob_url)) => {
+                            Ok(cache_handle) => {
                                 if let Some(cache_handle) = cache_handle {
                                     cache_handles.lock().unwrap().push((
                                         cache_handle,
                                         self2.graph.get(&bsr).unwrap().name.clone(),
                                     ));
-                                }
-                                if let Some(url) = spongebob_url {
-                                    spongebob_urls.lock().unwrap().push(url);
                                 }
                             }
                         }
@@ -645,25 +637,10 @@ impl<'a> Run<'a> {
                         .unwrap()
                 });
 
-            // Store the latest SpongeBob URL (if any) for display at the end
-            let urls = Arc::into_inner(spongebob_urls)
-                .unwrap()
-                .into_inner()
-                .unwrap();
-            if let Some(latest_url) = urls.last() {
-                self.latest_spongebob_url = Some(latest_url.clone());
-            }
-
             err.map(|(_bsr, e)| Err(e)).unwrap_or(Ok(()))?;
         }
 
         Ok(())
-    }
-
-    /// Get the latest SpongeBob URL from the most recent build session
-    #[allow(dead_code)]
-    pub fn latest_spongebob_url(&self) -> Option<&String> {
-        self.latest_spongebob_url.as_ref()
     }
 }
 
