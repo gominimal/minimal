@@ -249,66 +249,12 @@ pub async fn cmd_build_impl(
         }
     }
 
-    // Log build results to SpongeBob
-    if let Some(ref mut invocation) = spongebob_invocation {
-        log_build_results_to_spongebob(invocation, graph, build_succeeded).await?;
-    }
-
     let spongebob_url = spongebob_invocation
         .as_ref()
         .map(|inv| inv.url().to_string());
 
     // Display build summary
     display_build_summary(graph, &cache, globals, &run, spongebob_url.as_deref());
-
-    Ok(())
-}
-
-/// Log build command results to SpongeBob
-async fn log_build_results_to_spongebob(
-    spongebob_invocation: &mut spongebob::SpongeBobInvocation,
-    graph: &DepGraph,
-    success: bool,
-) -> anyhow::Result<()> {
-    let packages_list = graph
-        .top_levels
-        .iter()
-        .map(|bsr| graph.get(bsr).unwrap().name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let _build_summary = if success {
-        format!(
-            "Build completed successfully for packages: {}",
-            packages_list
-        )
-    } else {
-        format!("Build failed for packages: {}", packages_list)
-    };
-
-    let build_log = format!(
-        "Build Command Summary\n\
-         Packages: {}\n\
-         Status: {}\n\
-         Total packages: {}\n",
-        packages_list,
-        if success { "SUCCESS" } else { "FAILED" },
-        graph.top_levels.len()
-    );
-
-    // Use a semantic target ID for the build command summary
-    let build_command_target_id = "build-summary".to_string();
-
-    // Upload build summary to the synthetic target
-    info!("Uploading build summary to SpongeBob invocation");
-    spongebob_invocation
-        .upload_file(
-            &build_command_target_id,
-            "build-summary.txt",
-            build_log.into_bytes(),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to upload build summary to SpongeBob: {}", e))?;
 
     Ok(())
 }
