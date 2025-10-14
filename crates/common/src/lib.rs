@@ -8,10 +8,12 @@ pub mod archive;
 
 mod spec_hash;
 pub use spec_hash::SpecHash;
+mod subsets;
 use std::{
     io::Write,
     path::{Path, PathBuf},
 };
+pub use subsets::SubsetSpec;
 use tracing::warn;
 
 /// Implements [Write], mirroring all writes to two underlying writers.

@@ -198,9 +198,10 @@ impl<B: FetchBackend> RemoteCache<B> {
         )
         .map_err(Error::ArchiveError)?;
 
+        use crate::{EntryMeta, MetaInner};
         cache_hnd
-            .finalize(crate::EntryMeta {
-                spec_name: spec_name.to_string(),
+            .finalize(EntryMeta {
+                inner: MetaInner::Spec(spec_name.to_string()),
                 fetched: true,
                 ..Default::default()
             })

@@ -15,7 +15,7 @@ mod remote;
 pub use remote::{Error as RemoteError, RemoteCache};
 
 pub(crate) mod entry_meta;
-pub use entry_meta::EntryMeta;
+pub use entry_meta::{EntryMeta, MetaInner};
 
 #[allow(dead_code)]
 mod remote_index;
@@ -364,6 +364,8 @@ impl<'a, B: common::fetchers::FetchBackend> graph::BinProvider for RemoteBinProv
 
 #[cfg(test)]
 mod tests {
+    use crate::entry_meta::MetaInner;
+
     use super::*;
     use tempfile::TempDir;
 
@@ -381,7 +383,7 @@ mod tests {
             .write_all("uwu".as_bytes())
             .unwrap();
         w.finalize(EntryMeta {
-            spec_name: "some spec huh".to_string(),
+            inner: MetaInner::Spec("some spec huh".to_string()),
             fetched: false,
             ..Default::default()
         })
@@ -389,7 +391,7 @@ mod tests {
 
         let meta = EntryMeta::read(&cache.inner().fs, &test_key).unwrap();
         assert!(!meta.fetched);
-        assert_eq!(meta.spec_name, "some spec huh");
+        assert_eq!(meta.inner.spec_name(), Some(&"some spec huh".to_string()));
 
         let r = cache
             .read_dir(&test_key)
@@ -413,7 +415,7 @@ mod tests {
             .write_all("uwu".as_bytes())
             .unwrap();
         w.finalize(EntryMeta {
-            spec_name: "old name".to_string(),
+            inner: MetaInner::Spec("old name".to_string()),
             fetched: false,
             ..Default::default()
         })
@@ -434,7 +436,7 @@ mod tests {
             .unwrap();
         assert_eq!("uwu", std::io::read_to_string(r).unwrap());
         let meta = EntryMeta::read(&cache.inner().fs, &test_key).unwrap();
-        assert_eq!(meta.spec_name, "old name");
+        assert_eq!(meta.inner.spec_name(), Some(&"old name".to_string()));
     }
 
     #[test]
@@ -451,7 +453,7 @@ mod tests {
             .write_all("bad data".as_bytes())
             .unwrap();
         w.finalize(EntryMeta {
-            spec_name: "old".to_string(),
+            inner: MetaInner::Spec("old".to_string()),
             fetched: false,
             ..Default::default()
         })
@@ -464,7 +466,7 @@ mod tests {
             .write_all("good data".as_bytes())
             .unwrap();
         w.finalize(EntryMeta {
-            spec_name: "new".to_string(),
+            inner: MetaInner::Spec("new".to_string()),
             fetched: false,
             ..Default::default()
         })
@@ -477,7 +479,7 @@ mod tests {
             .unwrap();
         assert_eq!("good data", std::io::read_to_string(r).unwrap());
         let meta = EntryMeta::read(&cache.inner().fs, &test_key).unwrap();
-        assert_eq!(meta.spec_name, "new");
+        assert_eq!(meta.inner.spec_name(), Some(&"new".to_string()));
     }
 
     #[test]
@@ -491,7 +493,7 @@ mod tests {
 
         let w = cache.write_dir(&key1).unwrap();
         let m = EntryMeta {
-            spec_name: "spec".to_string(),
+            inner: MetaInner::Spec("spec".to_string()),
             fetched: false,
             ..Default::default()
         };
@@ -508,7 +510,7 @@ mod tests {
             .write_all("new data".as_bytes())
             .unwrap();
         w.finalize(EntryMeta {
-            spec_name: "spec".to_string(),
+            inner: MetaInner::Spec("spec".to_string()),
             fetched: true,
             epoch_millis: m.epoch_millis + 1000,
         })
