@@ -4,6 +4,7 @@ let meson = import "../meson/build.ncl" in
 let ninja = import "../ninja/build.ncl" in
 let base = import "../base/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
 {
   name = "patchelf",
   inputs = [
@@ -18,6 +19,10 @@ let toolchain = import "../toolchain/build.ncl" in
     ninja,
     toolchain,
   ],
+  runtime_deps = [
+    glibc,
+  ],
+
   cmd = "./build.sh",
   outputs = {
     patchelf = { glob = "usr/bin/patchelf" } | OutputBin,

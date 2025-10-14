@@ -1,7 +1,6 @@
 #!/bin/sh
 set -e
 
-tar xfo bash-5.3.tar.gz
 cd bash-5.3
 
 ./configure --prefix=/usr \

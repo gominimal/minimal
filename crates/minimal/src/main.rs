@@ -78,14 +78,20 @@ enum Command {
 /// Shared arguments and builders across all subcommands
 #[derive(Debug, Args)]
 pub struct GlobalArgs {
-    /// Override the directory where binary artifacts are cached (default: ~/.cache/minimal/builds)
+    /// Override the base directory used for operations (default: ~/.cache/minimal)
     #[arg(long)]
+    minimal_dir: Option<PathBuf>,
+    /// Override the directory where binary artifacts are cached (default: ~/.cache/minimal/builds)
+    #[arg(long, hide = true)]
     cache_dir: Option<PathBuf>,
     /// Override the directory where builds are performed (default: ~/.cache/minimal/sandboxes)
-    #[arg(long)]
+    #[arg(long, hide = true)]
     builds_dir: Option<PathBuf>,
+    /// Override the directory where run sandboxes are created (default: ~/.cache/minimal/runs)
+    #[arg(long, hide = true)]
+    runs_dir: Option<PathBuf>,
     /// Override the directory where downloads are cached (default: ~/.cache/minimal/downloads)
-    #[arg(long)]
+    #[arg(long, hide = true)]
     download_cache_dir: Option<PathBuf>,
 
     /// Override the packages/ directory where build-specs are loaded
@@ -133,18 +139,23 @@ pub(crate) fn enforce_science_mode() -> Result<()> {
 impl GlobalArgs {
     /// Create the PathConfig based on command line arguments
     pub fn path_config(&self) -> PathConfig {
-        let mut config = PathConfig::new();
+        let mut config = if let Some(base_dir) = &self.minimal_dir {
+            PathConfig::new_with_base(base_dir.clone())
+        } else {
+            PathConfig::new()
+        };
 
         if let Some(cache_dir) = &self.cache_dir {
             config = config.with_cache_dir(cache_dir.clone());
         }
-
         if let Some(download_cache_dir) = &self.download_cache_dir {
             config = config.with_download_cache_dir(download_cache_dir.clone());
         }
-
         if let Some(builds_dir) = &self.builds_dir {
             config = config.with_sandbox_base_dir(builds_dir.clone());
+        }
+        if let Some(runs_dir) = &self.runs_dir {
+            config = config.with_run_base_dir(runs_dir.clone());
         }
 
         if let Some(packages_dir) = &self.packages_dir {
@@ -349,6 +360,8 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    cli.global_args.path_config().ensure_directories()?;
+
     let result = match cli.command {
         Command::Build(args) => cmd_build(args, &cli.global_args).await,
         Command::Check(args) => cmd_check(args, &cli.global_args),

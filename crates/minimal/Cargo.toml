@@ -43,7 +43,6 @@ anyhow.workspace = true
 
 sha2.workspace = true
 hex.workspace = true
-zstd.workspace = true
 tar.workspace = true
 toml.workspace = true
 oci-spec.workspace = true

@@ -47,13 +47,14 @@ let pcre2 = import "../pcre2/build.ncl" in
     # toolchain
     binutils,
     gcc,
-    glibc,
     linux_headers,
     # other
   ],
   runtime_deps = [
     pcre2,
+    glibc,
   ],
+
   cmd = "./build.sh",
   outputs = {
     grep_bin = { glob = "usr/bin/grep" } | OutputBin,

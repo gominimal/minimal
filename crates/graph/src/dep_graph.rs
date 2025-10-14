@@ -3,6 +3,10 @@
 #![allow(clippy::result_large_err)]
 #![allow(clippy::single_match)]
 
+use common::{
+    Target,
+    target::{Arch, OS},
+};
 use nickel_lang_core::eval::Closure;
 use nickel_lang_core::files::FileId;
 use nickel_lang_core::identifier::LocIdent;
@@ -37,6 +41,8 @@ pub enum SourceFetch {
 pub struct SourceInput {
     pub from: SourceFetch,
     pub sha256: String,
+    pub extract: bool,
+    pub strip_prefix: Option<String>,
 }
 
 /// A dependency on some of the outputs of a build-spec.
@@ -118,6 +124,9 @@ impl RuntimeDep {
 pub struct BuildSpec {
     /// The human-readable name declared on the build spec.
     pub name: String,
+    /// The system this build-spec is meant to run on. Defaults to amd64 Linux.
+    pub target: Target,
+
     /// The build command declared on the build spec.
     pub cmd: String,
     /// Any arguments to the build command, ultimately passed as environment variables.
@@ -137,6 +146,27 @@ pub struct BuildSpec {
     /// Where in the source the build was declared.
     /// TODO: Work out why this is seldom set.
     pub pos: Option<DeclPos>,
+}
+
+impl BuildSpec {
+    /// Returns true if the build-spec represents a fetch of files but no actual computation.
+    pub fn is_pure_prebuilt(&self) -> bool {
+        let has_prebuilt = self
+            .inputs
+            .iter()
+            .any(|input| matches!(input, BuildSpecInput::Prebuilt(_, _)));
+        let has_local_or_source = self
+            .inputs
+            .iter()
+            .any(|input| matches!(input, BuildSpecInput::Local(_) | BuildSpecInput::Source(_)));
+
+        has_prebuilt && !has_local_or_source
+    }
+
+    /// Returns true if the build-spec represents a rollup of runtime_deps but no substance or computation of its own.
+    pub fn is_pure_collection(&self) -> bool {
+        self.inputs.is_empty() && self.cmd.is_empty()
+    }
 }
 
 /// The dependency graph.
@@ -387,6 +417,7 @@ impl GraphBuilder {
         let mut name: Option<String> = None;
         let mut cmd: Option<String> = None;
         let mut ty: Option<ObjTy> = None;
+        let mut target: Option<Target> = None;
         let mut build_args: Option<IndexMap<String, String>> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
@@ -423,6 +454,25 @@ impl GraphBuilder {
                                     .unwrap(),
                                 );
                                 Ok(())
+                            }
+                            "target" => {
+                                if let Some(target_rt) = field.value.as_ref() {
+                                    let target_str =
+                                        String::deserialize(eval_if_closure(
+                                            target_rt,
+                                            program,
+                                        )?)
+                                        .unwrap();
+                                    match Target::all().iter().find(|t| t.as_ref() == target_str) {
+                                        None => Err(Error::InvalidTarget { files: program.files(), got: target_str, pos: rt.pos }),
+                                        Some(t) => {
+                                            target = Some(t.clone());
+                                            Ok(())
+                                        }
+                                    }
+                                } else {
+                                    Ok(())
+                                }
                             }
                             "build_args" => {
                                 if let Some(build_args_rt) = field.value.as_ref() {
@@ -488,6 +538,7 @@ impl GraphBuilder {
             name,
             cmd,
             build_args,
+            target: target.unwrap_or(Target::new(Arch::Amd64, OS::Linux)),
             inputs: Vec::new(),
             runtime_deps: Vec::new(),
             outputs: OutputMap::new(),
@@ -749,6 +800,8 @@ impl GraphBuilder {
     ) -> Result<SourceInput, Error> {
         let mut url: Option<String> = None;
         let mut sha256: Option<String> = None;
+        let mut extract: Option<bool> = None;
+        let mut strip_prefix: Option<String> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                 r.fields
@@ -773,6 +826,24 @@ impl GraphBuilder {
                                     )?)
                                     .unwrap(),
                                 );
+                                Ok(())
+                            }
+                            "extract" => {
+                                if let Some(ext_rt) = field.value.as_ref() {
+                                    extract = Some(
+                                        bool::deserialize(eval_if_closure(ext_rt, program)?)
+                                            .unwrap(),
+                                    );
+                                }
+                                Ok(())
+                            }
+                            "strip_prefix" => {
+                                if let Some(st_rt) = field.value.as_ref() {
+                                    strip_prefix = Some(
+                                        String::deserialize(eval_if_closure(st_rt, program)?)
+                                            .unwrap(),
+                                    );
+                                }
                                 Ok(())
                             }
                             _ => Ok(()), // TODO: Should we error if we see an unknown field?
@@ -807,6 +878,8 @@ impl GraphBuilder {
         Ok(SourceInput {
             from: SourceFetch::URL(url),
             sha256,
+            extract: extract.unwrap_or(false),
+            strip_prefix,
         })
     }
 
@@ -1256,7 +1329,7 @@ mod tests {
                 {
                     name = \"single buildspec\",
                     inputs = [
-                        {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
+                        {url = \"http://uwu.com\", sha256 = \"abcdef\", extract = true} | Source,
                     ],
                     cmd = \"\",
                 } | BuildSpec"
@@ -1276,6 +1349,8 @@ mod tests {
             BuildSpecInput::Source(SourceInput {
                 from: SourceFetch::URL(url),
                 sha256: sha,
+                extract: true,
+                strip_prefix: None,
             }) if url == "http://uwu.com" && sha == "abcdef",
         ));
     }
@@ -1711,5 +1786,41 @@ mod tests {
         if dupes.len() < names.len() {
             panic!("duplicate build-specs in packages/:\n{:?}", names);
         }
+    }
+
+    #[test]
+    fn parse_target() {
+        let sr = SpecReader::new(
+            indoc! {
+                "
+                let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
+                {
+        			name = \"buildspec\",
+                    inputs = [],
+        			cmd = \"./build.sh\",
+                    target = \"arm64/macos\",
+        		} | BuildSpec"
+            }
+            .to_string(),
+            &SpecReaderOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        let dp = DepGraph::new(sr)
+            .map_err(|e| {
+                e.report_to_stderr();
+                Err::<DepGraph, ()>(())
+            })
+            .unwrap();
+        // We expect a single buildspec with a known name
+        assert_eq!(
+            dp.get(&dp.by_name("buildspec").next().unwrap())
+                .unwrap()
+                .target,
+            Target::new(Arch::Arm64, OS::MacOS),
+        );
     }
 }

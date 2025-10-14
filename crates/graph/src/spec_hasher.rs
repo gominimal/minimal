@@ -3,6 +3,7 @@ use crate::{
     dep_graph::SourceFetch,
 };
 use blake3::Hasher;
+use common::{Target, target};
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::io::Write;
@@ -161,7 +162,14 @@ fn build_input_hash(input: &BuildSpecInput, h: &mut Hasher) {
                     h.write_all(url.as_bytes()).unwrap()
                 }
             };
-            h.write_all(s.sha256.as_bytes()).unwrap()
+            h.write_all(s.sha256.as_bytes()).unwrap();
+            if s.extract {
+                h.write_all(b"ext").unwrap();
+            }
+            if let Some(prefix) = &s.strip_prefix {
+                h.write_all(b"strip_prefix").unwrap();
+                h.write_all(prefix.as_bytes()).unwrap();
+            }
         }
         HostPath(p) => {
             h.write_all(b"host path").unwrap();
@@ -211,6 +219,11 @@ fn build_attrs_hash(spec: &BuildSpec, h: &mut Hasher) {
     for (name, output) in spec.outputs.iter() {
         h.write_all(name.as_bytes()).unwrap();
         build_output_hash(output, h);
+    }
+
+    if spec.target != Target::new(target::Arch::Amd64, target::OS::Linux) {
+        h.write_all(b"-target").unwrap();
+        spec.target.hash_to(h);
     }
 }
 

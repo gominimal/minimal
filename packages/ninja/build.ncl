@@ -2,6 +2,8 @@ let { BuildSpec, Local, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let python = import "../python/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
+let gcc = import "../gcc/build.ncl" in
 {
   name = "ninja",
   inputs = [
@@ -14,6 +16,11 @@ let toolchain = import "../toolchain/build.ncl" in
     python,
     toolchain,
   ],
+  runtime_deps = [
+    glibc,
+    gcc, # TODO: just need libstdc++.so.6
+  ],
+
   cmd = "./build.sh",
   outputs = {
     ninja = { glob = "usr/bin/ninja" } | OutputLib,

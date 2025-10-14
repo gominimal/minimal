@@ -7,6 +7,7 @@ let openssl = import "../openssl/build.ncl" in
 let pkgconf = import "../pkgconf/build.ncl" in
 let perl = import "../perl/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
+let zlib = import "../zlib/build.ncl" in
 {
   name = "curl",
   inputs = [
@@ -25,6 +26,7 @@ let toolchain = import "../toolchain/build.ncl" in
     ca-certificates,
     libpsl,
     openssl,
+    zlib,
   ],
 
   cmd = "./build.sh",

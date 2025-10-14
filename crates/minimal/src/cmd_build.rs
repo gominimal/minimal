@@ -1,7 +1,9 @@
 use crate::{Error, lockfile::PrebuiltsLock, remote_storage::RemoteStorage, run::Run};
 use crate::{GlobalArgs, PackagesArg};
 use anyhow::Context;
-use build_events::events::{BuildEvent, BuildFinished, BuildMetadata, BuildStarted, current_millis};
+use build_events::events::{
+    BuildEvent, BuildFinished, BuildMetadata, BuildStarted, current_millis,
+};
 use build_events::{BuildEventBus, BuildEventDispatcher};
 use build_events_proto::SpongeBobSubscriberV2;
 use cache::{Cache, CacheBinProvider, LocalDir, RemoteBinProvider};
@@ -21,6 +23,7 @@ pub async fn cmd_build(args: BuildArgs, globals: &GlobalArgs) -> Result<(), Erro
     let graph = args.packages.graph(globals)?;
     let cache = globals.cache().map_err(anyhow::Error::from)?;
 
+    cmd_build_impl(&graph, globals, cache.clone(), globals.num_parallel_builds).await?;
     cmd_build_impl(&graph, globals, cache, globals.num_parallel_builds).await?;
 
     Ok(())
@@ -112,7 +115,10 @@ pub async fn cmd_build_impl(
     }
 
     // Get git branch
-    if let Ok(output) = Command::new("git").args(["rev-parse", "--abbrev-ref", "HEAD"]).output() {
+    if let Ok(output) = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+    {
         if output.status.success() {
             if let Ok(branch) = String::from_utf8(output.stdout) {
                 metadata.insert("branch".to_string(), branch.trim().to_string());
@@ -130,7 +136,10 @@ pub async fn cmd_build_impl(
     }
 
     // Get git remote URL
-    if let Ok(output) = Command::new("git").args(["config", "remote.origin.url"]).output() {
+    if let Ok(output) = Command::new("git")
+        .args(["config", "remote.origin.url"])
+        .output()
+    {
         if output.status.success() {
             if let Ok(repo_url) = String::from_utf8(output.stdout) {
                 metadata.insert("repo_url".to_string(), repo_url.trim().to_string());

@@ -4,7 +4,7 @@ let bison = import "../bison/build.ncl" in
 let flex = import "../flex/build.ncl" in
 let m4 = import "../m4/build.ncl" in
 let pkgconf = import "../pkgconf/build.ncl" in
-let make = import "../make/build.ncl" in 
+let make = import "../make/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
 let libcap = import "../libcap/build.ncl" in
 {

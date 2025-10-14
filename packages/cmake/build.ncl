@@ -1,8 +1,10 @@
-let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputBin, OutputData, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let openssl = import "../openssl/build.ncl" in
 let make = import "../make/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
+let gcc = import "../gcc/build.ncl" in
 {
   name = "cmake",
   inputs = [
@@ -16,8 +18,11 @@ let toolchain = import "../toolchain/build.ncl" in
     toolchain,
   ],
   runtime_deps = [
+    glibc,
+    gcc, # TODO: Only need libstdc++.so.6 and libgcc_s.so1.
     openssl,
   ],
+
   cmd = "./build.sh",
   outputs = {
     cmake = { glob = "usr/bin/cmake" } | OutputBin,

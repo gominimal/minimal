@@ -20,6 +20,10 @@ pub struct PathConfig {
     /// Default: ~/.cache/minimal/sandboxes/
     sandbox_base_dir: PathBuf,
 
+    /// Base directory for runtime sandboxes
+    /// Default: ~/.cache/minimal/runs
+    run_base_dir: PathBuf,
+
     /// Directory containing package definitions
     /// Default: ./packages/
     packages_dir: PathBuf,
@@ -30,14 +34,19 @@ pub struct PathConfig {
 }
 
 impl PathConfig {
-    /// Create a new PathConfig with default values
+    /// Creates a default PathConfig.
     pub fn new() -> Self {
         let root_dir = Self::default_root_dir();
+        Self::new_with_base(root_dir)
+    }
 
+    /// Create a new PathConfig rooted at a given directory.
+    pub fn new_with_base(root_dir: PathBuf) -> Self {
         Self {
             cache_dir: root_dir.join("builds"),
             download_cache_dir: root_dir.join("downloads"),
             sandbox_base_dir: root_dir.join("sandboxes"),
+            run_base_dir: root_dir.join("runs"),
             root_dir,
             packages_dir: PathBuf::from("packages"),
             stdlib_dir: PathBuf::from("crates/graph/minimal-ncl"),
@@ -59,6 +68,12 @@ impl PathConfig {
     /// Create a PathConfig with custom sandbox base directory
     pub fn with_sandbox_base_dir(mut self, sandbox_base_dir: PathBuf) -> Self {
         self.sandbox_base_dir = sandbox_base_dir;
+        self
+    }
+
+    /// Create a PathConfig with custom run sandbox base directory
+    pub fn with_run_base_dir(mut self, run_base_dir: PathBuf) -> Self {
+        self.run_base_dir = run_base_dir;
         self
     }
 
@@ -101,6 +116,11 @@ impl PathConfig {
         &self.sandbox_base_dir
     }
 
+    /// Get the runtime sandbox base directory
+    pub fn run_base_dir(&self) -> &Path {
+        &self.run_base_dir
+    }
+
     /// Get the packages directory
     pub fn packages_dir(&self) -> &Path {
         &self.packages_dir
@@ -116,6 +136,7 @@ impl PathConfig {
         std::fs::create_dir_all(&self.cache_dir)?;
         std::fs::create_dir_all(&self.download_cache_dir)?;
         std::fs::create_dir_all(&self.sandbox_base_dir)?;
+        std::fs::create_dir_all(&self.run_base_dir)?;
         // Note: packages_dir is expected to exist already
         Ok(())
     }

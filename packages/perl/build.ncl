@@ -46,11 +46,10 @@ let zlib = import "../zlib/build.ncl" in
     binutils,
     gcc,
     linux_headers,
-    # other
-    zlib,
   ],
   runtime_deps = [
     glibc,
+    zlib,
   ],
 
   cmd = "./build.sh",

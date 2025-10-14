@@ -495,13 +495,27 @@ impl<'a, BP: BinProvider> Iterator for ExecPlan<'a, BP> {
             // Prefer a full build if all the deps have been fully built. If deps are satisfied
             // by cycle breakers, we can do a cycle-breaker build.
             match (can_build_full, can_build_breakers, cycle_breakers_allowed) {
+                // All deps are fully satisfied, so we can fully build candidate
                 (true, _, _) => {
                     built_this_phase.insert(*candidate, false);
                     met.push((*candidate, true));
                 }
+                // All deps are satisfied by fully-builts or cycle-breakers
                 (false, true, true) => {
-                    built_this_phase.insert(*candidate, true);
-                    met.push((*candidate, false));
+                    let consider_built_with_breakers = {
+                        // true = mark candidate as built with breakers, false = fully built
+                        //
+                        // We typically return true here as it WAS built with breakers,
+                        // but we do consider a spec fully-built in the following two cases:
+                        // - Prebuilts - stuff thats just a fetch, so wont change with a rebuild
+                        // - Collections - stuff thats just a rollup of runtime deps, so wont change with a rebuild
+
+                        let build = self.graph.get(candidate).unwrap();
+                        !(build.is_pure_prebuilt() || build.is_pure_collection())
+                    };
+
+                    built_this_phase.insert(*candidate, consider_built_with_breakers);
+                    met.push((*candidate, !consider_built_with_breakers));
                 }
                 _ => {}
             }

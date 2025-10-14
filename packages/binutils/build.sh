@@ -1,13 +1,12 @@
 #!/bin/sh
 set -e
 
-tar -xf binutils-2.45.tar.xz
 cd binutils-2.45
 
 mkdir -v build
 cd build
 
-# TODO 
+# TODO
 # --enable-nls
 
 ../configure  --prefix=/usr        \

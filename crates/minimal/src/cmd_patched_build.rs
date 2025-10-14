@@ -1,6 +1,7 @@
 use crate::GlobalArgs;
+use crate::run::Materialized;
 use crate::{Error, remote_storage::RemoteStorage};
-use build_sandbox::{BuildConfig, config::BuildScript, run_build};
+use build_sandbox::{BuildConfig, Input as SandboxInput, config::BuildScript, run_build};
 use cache::EntryMeta;
 use graph::{BuildOutput, BuildSpecInput, Transitives};
 use std::collections::HashSet;
@@ -13,6 +14,7 @@ pub struct PatchedBuildArgs {
 
 pub async fn cmd_patched_build(args: PatchedBuildArgs, globals: &GlobalArgs) -> Result<(), Error> {
     crate::enforce_science_mode()?;
+    let mut temp_dirs = Vec::new();
 
     let graph = globals.graph_from_package_name(&args.package)?;
     let cache = globals.cache().map_err(anyhow::Error::from)?;
@@ -38,11 +40,25 @@ pub async fn cmd_patched_build(args: PatchedBuildArgs, globals: &GlobalArgs) -> 
     let build = graph.get(&graph.top_levels[0]).unwrap();
     for input in build.inputs.iter() {
         match input {
-            BuildSpecInput::Local((path, _hash)) => inputs.push(path.to_path_buf()),
-            BuildSpecInput::Source(source) => inputs.push(
-                crate::run::materialize_source(build.name.as_str(), source, &remote_storage)
-                    .await?,
-            ),
+            BuildSpecInput::Local((path, _hash)) => {
+                inputs.push(SandboxInput::File(path.to_path_buf()))
+            }
+            BuildSpecInput::Source(source) => {
+                match crate::run::materialize_source(
+                    build.name.as_str(),
+                    source,
+                    &remote_storage,
+                    &cache,
+                )
+                .await?
+                {
+                    Materialized::File(path) => inputs.push(SandboxInput::File(path)),
+                    Materialized::TempDir(td) => {
+                        inputs.push(SandboxInput::Dir(td.path().to_path_buf()));
+                        temp_dirs.push(td);
+                    }
+                }
+            }
             BuildSpecInput::Build(_) => {} // Handled by Transitives above
             _ => todo!("input: {:?}", input),
         }
@@ -89,7 +105,6 @@ pub async fn cmd_patched_build(args: PatchedBuildArgs, globals: &GlobalArgs) -> 
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob client: {}", e))?;
 
-
     // Use package name as target ID for semantic meaning
     let target_id = build.name.clone();
     let mut spongebob_invocation = Some(spongebob_client.create_invocation());
@@ -111,5 +126,8 @@ pub async fn cmd_patched_build(args: PatchedBuildArgs, globals: &GlobalArgs) -> 
         })
         .unwrap();
 
+    for tempdir in temp_dirs.into_iter() {
+        drop(tempdir);
+    }
     Ok(())
 }

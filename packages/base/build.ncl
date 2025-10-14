@@ -1,4 +1,4 @@
-let { BuildSpec, Local, OutputLib, .. } = import "minimal.ncl" in
+let { BuildSpec, Local, OutputData, .. } = import "minimal.ncl" in
 let bash = import "../bash/build.ncl" in
 let bzip2 = import "../bzip2/build.ncl" in
 let coreutils = import "../coreutils/build.ncl" in
@@ -32,6 +32,7 @@ let xz = import "../xz/build.ncl" in
   ],
   cmd = "build.sh",
   outputs = {
-    resolvconf = { glob = "etc/resolv.conf" } | OutputLib,
+    hosts = { glob = "etc/hosts" } | OutputData,
+    resolvconf = { glob = "etc/resolv.conf" } | OutputData,
   },
 } | BuildSpec

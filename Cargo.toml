@@ -35,6 +35,7 @@ google-cloud-storage = "1.1.0"
 hakoniwa = { git = "https://github.com/souk4711/hakoniwa", branch = "main" }
 hex = "0.4"
 indoc = "^2.0"
+lzma-rs = "0.3"
 nickel-lang-core = { version = "0.15.0", default-features = false, features = ["format"] }
 object = { version = "0.37", default-features = false, features = ["archive", "elf", "read_core", "std"] }
 oci-client = { version = "0.15.0", features = ["rustls-tls"], default-features = false }
@@ -75,10 +76,3 @@ build-sandbox = { path = "crates/build-sandbox" }
 graph = { version = "0.0.1", path = "crates/graph" }
 cache = { version = "0.0.1", path = "crates/cache" }
 common = { version = "0.0.1", path = "crates/common" }
-
-[patch.crates-io]
-malachite = { git = "https://github.com/brandonweeks/malachite.git", branch = "v0.6.0" }
-malachite-base = { git = "https://github.com/brandonweeks/malachite.git", branch = "v0.6.0" }
-malachite-float = { git = "https://github.com/brandonweeks/malachite.git", branch = "v0.6.0" }
-malachite-nz = { git = "https://github.com/brandonweeks/malachite.git", branch = "v0.6.0" }
-malachite-q = { git = "https://github.com/brandonweeks/malachite.git", branch = "v0.6.0" }

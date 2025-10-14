@@ -1,5 +1,5 @@
 use crate::{Cache, LocalDir, remote_index::RemoteIndex};
-use common::SpecHash;
+use common::{SpecHash, archive};
 use std::io::{Seek, Write};
 
 use common::fetchers::*;
@@ -13,6 +13,7 @@ pub enum Error<BE: std::fmt::Debug> {
     IO(std::io::Error),
     Cache(crate::CacheErr),
     NotFound,
+    ArchiveError(archive::ArchiveError),
 }
 
 impl<BE: std::fmt::Debug> std::fmt::Display for Error<BE> {
@@ -80,7 +81,7 @@ impl RemoteCache<Storage> {
     ) -> Result<(), Error<GcsError>> {
         let cache_dir = cache.read_dir(spec_hash).map_err(Error::Cache)?;
 
-        let (tar_file, sha256) = common::compress_dir(cache_dir.path()).map_err(Error::IO)?;
+        let (tar_file, sha256) = archive::compress_dir(cache_dir.path()).map_err(Error::IO)?;
         let indexed_sha = self.index.sha256(spec_hash);
         if indexed_sha == Some(sha256) {
             return Ok(()); // Cached one is up to date.
@@ -188,11 +189,15 @@ impl<B: FetchBackend> RemoteCache<B> {
             .seek(std::io::SeekFrom::Start(0))
             .map_err(Error::IO)?;
 
-        // Unzip archive into the cache
-        let mut archive =
-            tar::Archive::new(zstd::stream::Decoder::new(tar_file).map_err(Error::IO)?);
         let cache_hnd = cache.write_dir(spec_hash).map_err(Error::Cache)?;
-        archive.unpack(cache_hnd.path()).map_err(Error::IO)?;
+        archive::extract_compressed_tar(
+            tar_file,
+            archive::Compression::Zstd,
+            cache_hnd.path(),
+            None,
+        )
+        .map_err(Error::ArchiveError)?;
+
         cache_hnd
             .finalize(crate::EntryMeta {
                 spec_name: spec_name.to_string(),

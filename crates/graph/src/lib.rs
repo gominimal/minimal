@@ -37,6 +37,12 @@ pub enum Error {
         pos: TermPos,
         output: String,
     },
+    /// A target string was expected, but the given string was invalid.
+    InvalidTarget {
+        files: Files,
+        pos: TermPos,
+        got: String,
+    },
 }
 
 impl Error {
@@ -148,6 +154,23 @@ impl Error {
                 let mut files = files.clone();
                 let diagnostic = Diagnostic::error()
                     .with_message(format!("no such output '{}' on parent build spec", output));
+                let diagnostic = if let Some(pos) = pos.into_opt() {
+                    diagnostic.with_label(primary(&pos))
+                } else {
+                    diagnostic
+                };
+
+                report_with(
+                    writer,
+                    &mut files,
+                    diagnostic,
+                    nickel_lang_core::error::report::ErrorFormat::Text,
+                );
+            }
+            Error::InvalidTarget { files, pos, got } => {
+                let mut files = files.clone();
+                let diagnostic =
+                    Diagnostic::error().with_message(format!("'{}' is not a valid target", got));
                 let diagnostic = if let Some(pos) = pos.into_opt() {
                     diagnostic.with_label(primary(&pos))
                 } else {

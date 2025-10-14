@@ -10,7 +10,6 @@ allow = [
     "BSD-3-Clause",
     "CDLA-Permissive-2.0",
     "ISC",
-    "LGPL-3.0 WITH LGPL-3.0-linking-exception",
     "MIT",
     "MPL-2.0",
     "Unicode-3.0",
@@ -19,6 +18,7 @@ allow = [
 
 exceptions = [
     # Dummy comment for formatting
+    { allow = ["LGPL-3.0-only WITH LGPL-3.0-linking-exception"], crate = "hakoniwa" },
     { allow = ["LGPL-3.0-only"], crate = "malachite" },
     { allow = ["LGPL-3.0-only"], crate = "malachite-base" },
     { allow = ["LGPL-3.0-only"], crate = "malachite-float" },
@@ -74,8 +74,6 @@ skip = [
     # tracing-indicatif -> indicatif -> vt100
     # https://github.com/console-rs/indicatif/pull/723
     { name = "vte", version = "0.11.1" },
-    # tokio -> mio
-    { name = "wasi", version = "=0.11.1+wasi-snapshot-preview1" },
 
 
     { name = "tower", version = "0.4.13" },

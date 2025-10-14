@@ -3,6 +3,7 @@ let base = import "../base/build.ncl" in
 let sed = import "../sed/build.ncl" in
 let make = import "../make/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
 {
   name = "inetutils",
   inputs = [
@@ -16,6 +17,10 @@ let toolchain = import "../toolchain/build.ncl" in
     sed,
     toolchain,
   ],
+  runtime_deps = [
+    glibc,
+  ],
+
   cmd = "./build.sh",
   outputs = {
     bins = { glob = "usr/bin/*" } | OutputBin,

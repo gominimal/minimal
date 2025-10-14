@@ -16,6 +16,8 @@ in
         # Do NOT set this yourself
         __magic_buildspec_id | optional,
 
+        target | String | optional,
+
         replace_on_cycle | BuildSpec | optional,
 
         outputs
@@ -93,6 +95,10 @@ in
           | String,
         sha256
           | String,
+        extract
+          | Bool | optional,
+        strip_prefix
+          | String | optional,
     },
 
     Local = {

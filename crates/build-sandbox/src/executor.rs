@@ -1,13 +1,13 @@
 use hakoniwa::Container;
 use minimal_spongebob_community_neoeinstein_prost::spongebob::v1::{
-    build_event, BuildEvent, TargetCompleted, TargetKind, TargetStarted,
+    BuildEvent, TargetCompleted, TargetKind, TargetStarted, build_event,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 
-use crate::config::BuildConfig;
+use crate::config::{BuildConfig, Input};
 use crate::error::{ExecutionError, Result};
 
 #[derive(Debug)]
@@ -67,8 +67,19 @@ impl BuildExecutor {
             config.inputs.len()
         );
         for input in &config.inputs {
-            info!("  Linking input: {}", input.display());
-            self.hardlink_to_tmpdir(input)?;
+            match input {
+                Input::File(p) => {
+                    info!("  Linking input: {}", p.display());
+                    self.hardlink_to_tmpdir(p)?;
+                }
+                Input::Dir(p) => {
+                    info!("  Linking input dir: {}", p.display());
+                    for entry in fs::read_dir(p)? {
+                        let entry = entry?;
+                        self.hardlink_to_tmpdir(&entry.path())?;
+                    }
+                }
+            }
         }
 
         // Emit TargetStarted event
@@ -106,8 +117,8 @@ impl BuildExecutor {
                     success,
                     timestamp_millis: current_millis(),
                     error_message,
-                    outputs: vec![],      // Outputs are collected later
-                    cache_hit: false,     // Cache hit detection happens earlier
+                    outputs: vec![],  // Outputs are collected later
+                    cache_hit: false, // Cache hit detection happens earlier
                 })),
             };
             if let Err(e) = invocation.publish_build_event(target_completed).await {
@@ -162,6 +173,14 @@ impl BuildExecutor {
                 error: e,
             })?;
         } else if input.is_dir() {
+            match fs::create_dir(&dest_path) {
+                Ok(_) => {}
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(e.into());
+                    }
+                }
+            };
             hardlink_dir_contents(input, &dest_path)?;
         }
 

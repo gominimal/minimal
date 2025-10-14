@@ -9,6 +9,10 @@ pub struct RunArgs {
     #[command(flatten)]
     packages: PackagesArg,
 
+    /// Any additional directories to bind-mount read-write.
+    #[arg(long, required = false)]
+    rw_dir: Vec<String>,
+
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
 }
@@ -23,16 +27,12 @@ pub async fn cmd_run(args: RunArgs, globals: &GlobalArgs) -> Result<(), Error> {
     };
     let cache = globals.cache().map_err(anyhow::Error::from)?;
     // Make sure the packages are built
-    crate::cmd_build::cmd_build_impl(
-        &graph,
-        globals,
-        cache.clone(),
-        globals.num_parallel_builds,
-    )
-    .await?;
+    crate::cmd_build::cmd_build_impl(&graph, globals, cache.clone(), globals.num_parallel_builds)
+        .await?;
 
     // Start setting up the run container
-    let base = tempfile::tempdir().map_err(anyhow::Error::from)?;
+    let base =
+        tempfile::tempdir_in(globals.path_config().run_base_dir()).map_err(anyhow::Error::from)?;
     for dep in Transitives::for_toplevels(&graph, graph.top_levels.clone(), false).into_iter() {
         common::hardlink_dir_contents(
             cache.read_dir(&graph.spec_hash(&dep)).unwrap().path(),
@@ -45,20 +45,26 @@ pub async fn cmd_run(args: RunArgs, globals: &GlobalArgs) -> Result<(), Error> {
     let cwd = std::env::current_dir().unwrap();
     std::fs::create_dir_all(base.path().join(cwd.clone())).map_err(anyhow::Error::from)?;
 
-    let command = if args.args[0].starts_with("/") || args.args[0].starts_with("./") {
-        args.args[0].clone()
-    } else {
-        format!("/bin/{}", args.args[0])
-    };
-    let mut cmd = Container::new()
+    let mut container = Container::new();
+    container
         .rootfs(base.path())
         .map_err(anyhow::Error::from)?
         .devfsmount("/dev")
         .tmpfsmount("/tmp")
         .bindmount_rw(cwd.clone().to_str().unwrap(), cwd.clone().to_str().unwrap())
         .symlink("/usr/bin", "/bin")
-        .symlink("/usr/lib", "/lib64")
-        .command(&command);
+        .symlink("/usr/lib", "/lib64");
+    for rw_mount in args.rw_dir {
+        std::fs::create_dir_all(base.path().join(rw_mount.clone())).map_err(anyhow::Error::from)?;
+        container.bindmount_rw(&rw_mount, &rw_mount);
+    }
+
+    let command = if args.args[0].starts_with("/") || args.args[0].starts_with("./") {
+        args.args[0].clone()
+    } else {
+        format!("/bin/{}", args.args[0])
+    };
+    let mut cmd = container.command(&command);
 
     cmd.args(args.args.iter().skip(1));
     cmd.current_dir(&cwd);
