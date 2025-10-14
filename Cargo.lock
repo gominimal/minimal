@@ -2223,9 +2223,9 @@ dependencies = [
 
 [[package]]
 name = "minimal_spongebob_community_neoeinstein-prost"
-version = "0.4.0-20251014210131-30c82017bd87.1"
+version = "0.4.0-20251014214004-4ceda9b7e17f.1"
 source = "sparse+https://buf.build/gen/cargo/"
-checksum = "ce549111413cc1c9772e4ea3b4a62dd25bf9e8d6eb0d918e0d519b58293e274e"
+checksum = "54c207aab4a172c7ffbe80866557cd86a2d2dc1b8672cff5a5165955dd578694"
 dependencies = [
  "prost 0.13.5",
  "prost-types 0.13.5",
@@ -2233,9 +2233,9 @@ dependencies = [
 
 [[package]]
 name = "minimal_spongebob_community_neoeinstein-tonic"
-version = "0.4.1-20251014210131-30c82017bd87.1"
+version = "0.4.1-20251014214004-4ceda9b7e17f.1"
 source = "sparse+https://buf.build/gen/cargo/"
-checksum = "36055716be965f6b27e2874c13529e8e6edc4b46c239165a3e91cd81878af22a"
+checksum = "088a8ec4ad0d378cb9d24da98613b0f25c48ffd89fa28f7428a7be2ecce89946"
 dependencies = [
  "minimal_spongebob_community_neoeinstein-prost",
  "tonic 0.12.3",
@@ -2815,7 +2815,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.11.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn",
@@ -2828,7 +2828,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9120690fafc389a67ba3803df527d0ec9cbbc9cc45e4cc20b332996dfb672425"
 dependencies = [
  "anyhow",
- "itertools 0.11.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn",
@@ -3566,9 +3566,10 @@ dependencies = [
  "minimal_spongebob_community_neoeinstein-prost",
  "minimal_spongebob_community_neoeinstein-tonic",
  "thiserror 2.0.17",
+ "tokio",
+ "tokio-stream",
  "tonic 0.12.3",
  "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -4380,8 +4381,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f87b8aa10b915a06587d0dec516c282ff295b475d94abf425d62b57710070a2"
 dependencies = [
  "getrandom 0.3.4",
- "js-sys",
- "wasm-bindgen",
 ]
 
 [[package]]

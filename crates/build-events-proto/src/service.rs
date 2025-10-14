@@ -131,22 +131,10 @@ impl BuildEventService for BuildEventServiceImpl {
         let filtered_stream = stream.filter_map(move |result| {
             match result {
                 Ok(event) => {
-                    // Apply invocation_id filter if specified
-                    if let Some(ref filter_id) = invocation_filter {
-                        // Check if event has matching invocation_id
-                        let matches = match &event.event {
-                            Some(proto::build_event::Event::BuildStarted(e)) => {
-                                &e.invocation_id == filter_id
-                            }
-                            Some(proto::build_event::Event::BuildFinished(e)) => {
-                                &e.invocation_id == filter_id
-                            }
-                            _ => true, // Other events pass through
-                        };
-
-                        if !matches {
-                            return None;
-                        }
+                    // Note: invocation_id filtering is no longer supported at event level
+                    // since events are implicitly associated with invocations via the stream
+                    if invocation_filter.is_some() {
+                        // Ignore filter for now - would need to track at stream level
                     }
 
                     // Apply timestamp filter if specified
@@ -203,6 +191,20 @@ impl BuildEventService for BuildEventServiceImpl {
         Ok(tonic::Response::new(proto::PublishBuildEventResponse {
             name: String::new(),
         }))
+    }
+
+    type PublishBuildEventStreamStream = std::pin::Pin<
+        Box<dyn Stream<Item = Result<proto::PublishBuildEventStreamResponse, tonic::Status>> + Send + 'static>,
+    >;
+
+    async fn publish_build_event_stream(
+        &self,
+        _request: tonic::Request<tonic::Streaming<proto::PublishBuildEventStreamRequest>>,
+    ) -> Result<tonic::Response<Self::PublishBuildEventStreamStream>, tonic::Status> {
+        // Not implemented in this service - this is a client-side method
+        Err(tonic::Status::unimplemented(
+            "Bidirectional streaming not implemented in this build events service"
+        ))
     }
 }
 

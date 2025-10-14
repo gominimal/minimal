@@ -80,7 +80,6 @@ impl BuildExecutor {
 
         // Emit TargetStarted event using global event bus
         build_events::event_bus().emit(BuildEvent {
-            invocation_id: build_events::invocation_id().to_string(),
             event: Some(build_event::Event::TargetStarted(TargetStarted {
                 target_id: target_id.to_string(),
                 label: config.name.clone(),
@@ -98,7 +97,6 @@ impl BuildExecutor {
         };
 
         build_events::event_bus().emit(BuildEvent {
-            invocation_id: build_events::invocation_id().to_string(),
             event: Some(build_event::Event::TargetCompleted(TargetCompleted {
                 target_id: target_id.to_string(),
                 label: config.name.clone(),
@@ -128,7 +126,6 @@ impl BuildExecutor {
         );
 
         build_events::event_bus().emit(BuildEvent {
-            invocation_id: build_events::invocation_id().to_string(),
             event: Some(build_event::Event::BuildMetadata(BuildMetadata {
                 metadata: file_metadata,
             })),

@@ -48,7 +48,6 @@ impl BuildEventSubscriber for LoggerSubscriber {
             Some(build_event::Event::BuildStarted(e)) => {
                 info!(
                     event = "build_started",
-                    invocation_id = %e.invocation_id,
                     command = %e.command,
                     timestamp_millis = e.timestamp_millis,
                     working_directory = %e.working_directory,
@@ -58,7 +57,6 @@ impl BuildEventSubscriber for LoggerSubscriber {
             Some(build_event::Event::BuildFinished(e)) => {
                 info!(
                     event = "build_finished",
-                    invocation_id = %e.invocation_id,
                     success = e.success,
                     timestamp_millis = e.timestamp_millis,
                     error_message = ?e.error_message,

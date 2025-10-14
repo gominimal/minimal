@@ -41,16 +41,13 @@ mod tests {
     #[test]
     fn test_event_construction() {
         let event = BuildEvent {
-            invocation_id: "test-123".to_string(),
             event: Some(build_event::Event::BuildStarted(BuildStarted {
-                invocation_id: "test-123".to_string(),
                 command: "build".to_string(),
                 timestamp_millis: 1234567890,
                 working_directory: "/tmp".to_string(),
             })),
         };
 
-        assert_eq!(event.invocation_id, "test-123");
         assert!(matches!(
             event.event,
             Some(build_event::Event::BuildStarted(_))

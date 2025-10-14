@@ -66,9 +66,7 @@ pub async fn cmd_build_impl(
 
     // Emit BuildStarted event using global event bus
     build_events::event_bus().emit(BuildEvent {
-        invocation_id: build_events::invocation_id().to_string(),
         event: Some(build_event::Event::BuildStarted(BuildStarted {
-            invocation_id: build_events::invocation_id().to_string(),
             command,
             timestamp_millis: current_millis(),
             working_directory,
@@ -113,7 +111,6 @@ pub async fn cmd_build_impl(
     // Emit BuildMetadata event if we collected any metadata (using global event bus)
     if !metadata.is_empty() {
         build_events::event_bus().emit(BuildEvent {
-            invocation_id: build_events::invocation_id().to_string(),
             event: Some(build_event::Event::BuildMetadata(BuildMetadata { metadata })),
         });
     }
@@ -156,9 +153,7 @@ pub async fn cmd_build_impl(
 
     // Emit BuildFinished event using global event bus
     build_events::event_bus().emit(BuildEvent {
-        invocation_id: build_events::invocation_id().to_string(),
         event: Some(build_event::Event::BuildFinished(BuildFinished {
-            invocation_id: build_events::invocation_id().to_string(),
             success: build_succeeded,
             timestamp_millis: current_millis(),
             error_message,

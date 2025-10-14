@@ -363,21 +363,20 @@ async fn main() -> Result<()> {
     cli.global_args.path_config().ensure_directories()?;
 
     // Initialize global event bus and SpongeBob integration
-    let mut spongebob_client = spongebob::SpongeBob::new()
+    let spongebob = spongebob::SpongeBob::new()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob client: {}", e))?;
-    let spongebob_invocation = spongebob_client.create_invocation();
-    let invocation_id = spongebob_invocation.invocation_id().to_string();
+    let invocation_id = spongebob.invocation_id().to_string();
 
     // Initialize the global event bus
     build_events::initialize_global_event_bus(invocation_id);
 
     // Setup SpongeBob subscriber
-    use build_events::{BuildEventDispatcher};
+    use build_events::BuildEventDispatcher;
     use build_events_proto::SpongeBobSubscriberV2;
 
     let mut dispatcher = BuildEventDispatcher::new(build_events::event_bus().subscribe());
-    let subscriber = SpongeBobSubscriberV2::from_invocation(spongebob_invocation);
+    let subscriber = SpongeBobSubscriberV2::from_client(spongebob);
     dispatcher.add_subscriber(Box::new(subscriber));
 
     // Spawn dispatcher in background

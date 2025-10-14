@@ -10,7 +10,7 @@ use tracing::warn;
 /// Subscriber that publishes build events to Spongebob service
 ///
 /// This subscriber uses the workspace `spongebob` crate to connect to the
-/// Spongebob service and publish build events.
+/// Spongebob service and publish build events via bidirectional streaming.
 ///
 /// # Example
 /// ```no_run
@@ -19,12 +19,11 @@ use tracing::warn;
 ///
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     // Create a spongebob client and invocation
-///     let mut spongebob = spongebob::SpongeBob::new().await?;
-///     let invocation = spongebob.create_invocation();
+///     // Create a spongebob client (opens stream and gets server-assigned ID)
+///     let spongebob = spongebob::SpongeBob::new().await?;
 ///
-///     // Create subscriber from the invocation
-///     let subscriber = SpongeBobSubscriberV2::from_invocation(invocation);
+///     // Create subscriber from the client
+///     let subscriber = SpongeBobSubscriberV2::from_client(spongebob);
 ///
 ///     // Use with BuildEventDispatcher
 ///     // dispatcher.add_subscriber(Box::new(subscriber));
@@ -33,32 +32,31 @@ use tracing::warn;
 /// ```
 #[cfg(feature = "spongebob-subscriber")]
 pub struct SpongeBobSubscriberV2 {
-    invocation: std::sync::Arc<tokio::sync::Mutex<spongebob::SpongeBobInvocation>>,
+    spongebob: std::sync::Arc<spongebob::SpongeBob>,
     /// Cache of file paths from BuildMetadata events, keyed by "{target_id}/stdout_path" etc.
     file_paths: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>>,
 }
 
 #[cfg(feature = "spongebob-subscriber")]
 impl SpongeBobSubscriberV2 {
-    /// Create subscriber from an existing SpongeBobInvocation
+    /// Create subscriber from an existing SpongeBob client
     ///
     /// # Arguments
-    /// * `invocation` - An existing SpongeBobInvocation to publish events to
+    /// * `client` - An existing SpongeBob client with active streaming connection
     ///
     /// # Example
     /// ```no_run
     /// # #[cfg(feature = "spongebob-subscriber")]
     /// # use build_events_proto::SpongeBobSubscriberV2;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut spongebob = spongebob::SpongeBob::new().await?;
-    /// let invocation = spongebob.create_invocation();
-    /// let subscriber = SpongeBobSubscriberV2::from_invocation(invocation);
+    /// let spongebob = spongebob::SpongeBob::new().await?;
+    /// let subscriber = SpongeBobSubscriberV2::from_client(spongebob);
     /// # Ok(())
     /// # }
     /// ```
-    pub fn from_invocation(invocation: spongebob::SpongeBobInvocation) -> Self {
+    pub fn from_client(client: spongebob::SpongeBob) -> Self {
         Self {
-            invocation: std::sync::Arc::new(tokio::sync::Mutex::new(invocation)),
+            spongebob: std::sync::Arc::new(client),
             file_paths: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -93,12 +91,12 @@ impl BuildEventSubscriber for SpongeBobSubscriberV2 {
             let stdout_key = format!("{}/stdout_path", target_id);
             let stderr_key = format!("{}/stderr_path", target_id);
 
-            let stdout_path = file_paths.get(&stdout_key);
-            let stderr_path = file_paths.get(&stderr_key);
+            let stdout_path = file_paths.get(&stdout_key).cloned();
+            let stderr_path = file_paths.get(&stderr_key).cloned();
+            drop(file_paths);
 
             // First publish the TargetCompleted event
-            let mut invocation = self.invocation.lock().await;
-            if let Err(e) = invocation.publish_build_event(event.clone()).await {
+            if let Err(e) = self.spongebob.publish_build_event(event.clone()).await {
                 warn!("Failed to publish TargetCompleted event to Spongebob: {}", e);
                 return Err(SubscriberError::Custom(format!(
                     "Failed to publish TargetCompleted event: {}",
@@ -108,8 +106,8 @@ impl BuildEventSubscriber for SpongeBobSubscriberV2 {
 
             // Then upload files if paths are available
             if let Some(stdout_path) = stdout_path {
-                if let Ok(contents) = std::fs::read(stdout_path) {
-                    if let Err(e) = invocation.publish_file_created_event(target_id, "stdout", contents).await {
+                if let Ok(contents) = std::fs::read(&stdout_path) {
+                    if let Err(e) = self.spongebob.publish_file_created_event(target_id, "stdout", contents).await {
                         warn!("Failed to upload stdout for target {}: {}", target_id, e);
                     }
                 } else {
@@ -118,8 +116,8 @@ impl BuildEventSubscriber for SpongeBobSubscriberV2 {
             }
 
             if let Some(stderr_path) = stderr_path {
-                if let Ok(contents) = std::fs::read(stderr_path) {
-                    if let Err(e) = invocation.publish_file_created_event(target_id, "stderr", contents).await {
+                if let Ok(contents) = std::fs::read(&stderr_path) {
+                    if let Err(e) = self.spongebob.publish_file_created_event(target_id, "stderr", contents).await {
                         warn!("Failed to upload stderr for target {}: {}", target_id, e);
                     }
                 } else {
@@ -127,13 +125,11 @@ impl BuildEventSubscriber for SpongeBobSubscriberV2 {
                 }
             }
 
-            drop(invocation);
             return Ok(());
         }
 
         // For all other events, just publish them
-        let mut invocation = self.invocation.lock().await;
-        match invocation.publish_build_event(event.clone()).await {
+        match self.spongebob.publish_build_event(event.clone()).await {
             Ok(()) => {
                 tracing::debug!("Successfully published build event to Spongebob");
                 Ok(())

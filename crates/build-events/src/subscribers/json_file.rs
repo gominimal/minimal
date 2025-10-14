@@ -74,7 +74,6 @@ fn event_to_json(event: &BuildEvent) -> serde_json::Value {
             serde_json::json!({
                 "type": "build_started",
                 "build_started": {
-                    "invocation_id": e.invocation_id,
                     "command": e.command,
                     "timestamp_millis": e.timestamp_millis,
                     "working_directory": e.working_directory,
@@ -85,7 +84,6 @@ fn event_to_json(event: &BuildEvent) -> serde_json::Value {
             serde_json::json!({
                 "type": "build_finished",
                 "build_finished": {
-                    "invocation_id": e.invocation_id,
                     "success": e.success,
                     "timestamp_millis": e.timestamp_millis,
                     "error_message": e.error_message,
@@ -173,10 +171,7 @@ fn event_to_json(event: &BuildEvent) -> serde_json::Value {
         }
     };
 
-    serde_json::json!({
-        "invocation_id": event.invocation_id,
-        "event": event_type_json,
-    })
+    event_type_json
 }
 
 #[async_trait]

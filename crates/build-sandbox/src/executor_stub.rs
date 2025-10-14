@@ -16,9 +16,8 @@ impl BuildExecutor {
     pub async fn execute(
         &self,
         _: &BuildConfig,
-        _: &mut Option<spongebob::SpongeBobInvocation>,
         _: &str,
-    ) -> Result<(i32, Option<String>)> {
+    ) -> Result<i32> {
         todo!()
     }
 
@@ -37,7 +36,6 @@ impl BuildExecutor {
     async fn execute_in_container(
         &self,
         _: &BuildConfig,
-        _: &mut Option<spongebob::SpongeBobInvocation>,
         _: &str,
     ) -> Result<()> {
         todo!()
