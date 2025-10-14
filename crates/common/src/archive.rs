@@ -149,3 +149,181 @@ fn extract_tar_impl<R: Read>(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compression_from_extension() {
+        assert!(matches!(
+            Compression::from_extension("file.tar.gz"),
+            Some(Compression::Gzip)
+        ));
+        assert!(matches!(
+            Compression::from_extension("file.tar.xz"),
+            Some(Compression::Xz)
+        ));
+        assert!(matches!(
+            Compression::from_extension("file.tar.zst"),
+            Some(Compression::Zstd)
+        ));
+        assert!(matches!(
+            Compression::from_extension("file.tar"),
+            Some(Compression::None)
+        ));
+        assert!(Compression::from_extension("file.zip").is_none());
+        assert!(Compression::from_extension("file.txt").is_none());
+    }
+
+    #[test]
+    fn extract_uncompressed_tar() -> Result<(), ArchiveError> {
+        let extract_dir = tempfile::tempdir().unwrap();
+
+        // Create a simple tar archive in memory
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+
+            // Add a file
+            let content = b"Hello, World!";
+            let mut header = tar::Header::new_gnu();
+            header.set_path("test.txt").unwrap();
+            header.set_size(content.len() as u64);
+            header.set_cksum();
+            builder.append(&header, &content[..]).unwrap();
+
+            builder.finish().unwrap();
+        }
+
+        // Extract the tar
+        extract_compressed_tar(&tar_data[..], Compression::None, extract_dir.path(), None)?;
+
+        // Verify the extracted file
+        let extracted_path = extract_dir.path().join("test.txt");
+        assert!(extracted_path.exists());
+        let contents = std::fs::read_to_string(extracted_path).unwrap();
+        assert_eq!(contents, "Hello, World!");
+
+        Ok(())
+    }
+
+    #[test]
+    fn extract_with_prefix() -> Result<(), ArchiveError> {
+        let extract_dir = tempfile::tempdir().unwrap();
+
+        // Create a tar archive with a prefix directory
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+
+            // Add directory entries
+            let mut dir_header = tar::Header::new_gnu();
+            dir_header.set_path("prefix/").unwrap();
+            dir_header.set_size(0);
+            dir_header.set_mode(0o755);
+            dir_header.set_entry_type(tar::EntryType::Directory);
+            dir_header.set_cksum();
+            builder.append(&dir_header, &[][..]).unwrap();
+
+            let mut subdir_header = tar::Header::new_gnu();
+            subdir_header.set_path("prefix/subdir/").unwrap();
+            subdir_header.set_size(0);
+            subdir_header.set_mode(0o755);
+            subdir_header.set_entry_type(tar::EntryType::Directory);
+            subdir_header.set_cksum();
+            builder.append(&subdir_header, &[][..]).unwrap();
+
+            // Add file
+            let content = b"Test content";
+            let mut header = tar::Header::new_gnu();
+            header.set_path("prefix/subdir/file.txt").unwrap();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, &content[..]).unwrap();
+
+            builder.finish().unwrap();
+        }
+
+        // Extract with prefix stripping
+        extract_compressed_tar(
+            &tar_data[..],
+            Compression::None,
+            extract_dir.path(),
+            Some(&"prefix".to_string()),
+        )?;
+
+        // Verify the file was extracted without the prefix
+        let extracted_path = extract_dir.path().join("subdir/file.txt");
+        assert!(extracted_path.exists());
+        let contents = std::fs::read_to_string(extracted_path).unwrap();
+        assert_eq!(contents, "Test content");
+
+        // Verify the prefix directory doesn't exist
+        assert!(!extract_dir.path().join("prefix").exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn extract_gzip_tar() -> Result<(), ArchiveError> {
+        let extract_dir = tempfile::tempdir().unwrap();
+
+        // Create a gzipped tar archive
+        let mut compressed_data = Vec::new();
+        {
+            let encoder =
+                flate2::write::GzEncoder::new(&mut compressed_data, flate2::Compression::default());
+            let mut builder = tar::Builder::new(encoder);
+
+            let content = b"Compressed content";
+            let mut header = tar::Header::new_gnu();
+            header.set_path("compressed.txt").unwrap();
+            header.set_size(content.len() as u64);
+            header.set_cksum();
+            builder.append(&header, &content[..]).unwrap();
+
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+
+        // Extract the gzipped tar
+        extract_compressed_tar(
+            &compressed_data[..],
+            Compression::Gzip,
+            extract_dir.path(),
+            None,
+        )?;
+
+        // Verify extraction
+        let extracted_path = extract_dir.path().join("compressed.txt");
+        assert!(extracted_path.exists());
+        let contents = std::fs::read_to_string(extracted_path).unwrap();
+        assert_eq!(contents, "Compressed content");
+
+        Ok(())
+    }
+
+    #[test]
+    fn compress_dir() -> std::io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        // Create some test files
+        std::fs::write(temp_dir.path().join("file1.txt"), b"Content 1")?;
+        std::fs::create_dir(temp_dir.path().join("subdir"))?;
+        std::fs::write(temp_dir.path().join("subdir/file2.txt"), b"Content 2")?;
+
+        // Compress the directory
+        let (mut compressed_file, hash) = super::compress_dir(temp_dir.path())?;
+
+        // Verify we got a hash
+        assert_eq!(hash.len(), 32);
+
+        // Verify we can read the compressed data
+        let mut buffer = Vec::new();
+        compressed_file.read_to_end(&mut buffer)?;
+        assert!(!buffer.is_empty());
+
+        Ok(())
+    }
+}
