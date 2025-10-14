@@ -41,13 +41,11 @@ anyhow.workspace = true
 
 sha2.workspace = true
 hex.workspace = true
-zstd.workspace = true
 tar.workspace = true
 toml.workspace = true
 oci-spec.workspace = true
 oci-client.workspace = true
 flate2.workspace = true
-lzma-rs.workspace = true
 serde_json.workspace = true
 docker_credential.workspace = true
 

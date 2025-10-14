@@ -392,11 +392,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "tar",
  "tempfile",
  "tokio",
  "url",
- "zstd",
 ]
 
 [[package]]
@@ -520,10 +518,12 @@ version = "0.0.1"
 dependencies = [
  "blake3",
  "bytes",
+ "flate2",
  "futures",
  "google-cloud-gax",
  "google-cloud-storage",
  "indoc",
+ "lzma-rs",
  "reqwest",
  "rustc-hash",
  "serde",
@@ -2172,7 +2172,6 @@ dependencies = [
  "graph",
  "hakoniwa",
  "hex",
- "lzma-rs",
  "nickel-lang-core",
  "object",
  "oci-client",
@@ -2194,7 +2193,6 @@ dependencies = [
  "tracing-indicatif",
  "tracing-subscriber",
  "url",
- "zstd",
 ]
 
 [[package]]

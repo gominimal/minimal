@@ -52,7 +52,8 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs, globals: &GlobalArgs) -> R
         let cache_dir = cache_handle.path();
         let archive_name = format!("{}.tar.zst", package_hash.0.to_hex());
 
-        let (tar_file, sha256) = common::compress_dir(cache_dir).map_err(anyhow::Error::from)?;
+        let (tar_file, sha256) =
+            common::archive::compress_dir(cache_dir).map_err(anyhow::Error::from)?;
         let hash_hex = hex::encode(sha256);
         info!("sha256({}) = {}", prebuilt_name, hash_hex);
 

@@ -7,8 +7,8 @@ use graph::dep_graph::SourceFetch;
 use graph::{BinProvider, ExecPlan};
 use graph::{BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, SourceInput};
 use std::collections::HashSet;
-use std::path::PathBuf;
-use tempfile::{Builder, TempDir, tempfile};
+use std::path::{Path, PathBuf};
+use tempfile::{Builder, TempDir};
 use tracing::{debug, info};
 use url::Url;
 
@@ -107,41 +107,19 @@ pub(crate) async fn materialize_source(
                 );
                 let _enter = span.enter();
 
-                if url.path().ends_with(".tar.gz") {
-                    let f = std::fs::File::open(cached_path)?;
-                    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(f));
-
-                    if let Some(strip_prefix) = &source.strip_prefix {
-                        for entry in archive.entries()? {
-                            let mut entry = entry?;
-                            let path = entry.path()?.strip_prefix(strip_prefix)?.to_owned();
-                            entry.unpack(tempdir_path.join(path))?;
-                        }
-                    } else {
-                        archive.unpack(tempdir_path)?;
+                use common::archive;
+                match archive::Compression::from_extension(file_name) {
+                    Some(compression) => {
+                        let f = std::fs::File::open(cached_path)?;
+                        archive::extract_compressed_tar(
+                            f,
+                            compression,
+                            tempdir_path,
+                            source.strip_prefix.as_ref(),
+                        )?;
+                        Ok(Materialized::TempDir(tempdir))
                     }
-
-                    Ok(Materialized::TempDir(tempdir))
-                } else if url.path().ends_with(".tar.xz") {
-                    let mut decomp_buf = tempfile()?;
-                    let f = std::fs::File::open(cached_path)?;
-                    lzma_rs::xz_decompress(&mut std::io::BufReader::new(f), &mut decomp_buf)?;
-                    std::io::Seek::rewind(&mut decomp_buf)?;
-                    let mut archive = tar::Archive::new(decomp_buf);
-
-                    if let Some(strip_prefix) = &source.strip_prefix {
-                        for entry in archive.entries()? {
-                            let mut entry = entry?;
-                            let path = entry.path()?.strip_prefix(strip_prefix)?.to_owned();
-                            entry.unpack(tempdir_path.join(path))?;
-                        }
-                    } else {
-                        archive.unpack(tempdir_path)?;
-                    }
-
-                    Ok(Materialized::TempDir(tempdir))
-                } else {
-                    bail!("cannot extract archive {}: unhandled extension", file_name)
+                    None => bail!("cannot extract archive {}: unhandled extension", file_name),
                 }
             } else {
                 Ok(Materialized::File(cached_path))
@@ -361,7 +339,7 @@ async fn materialize_prebuilt(
                 archive_path
             };
 
-            extract_prebuilt_archive(&archive_path, &output_dir.to_path_buf())?;
+            extract_prebuilt_archive(&archive_path, output_dir)?;
 
             debug!(
                 "  Downloaded and extracted prebuilt archive for {} to {}",
@@ -685,10 +663,10 @@ impl<'a> Run<'a> {
     }
 }
 
-fn extract_prebuilt_archive(archive_path: &PathBuf, extract_dir: &PathBuf) -> Result<()> {
+fn extract_prebuilt_archive(archive_path: &PathBuf, extract_dir: &Path) -> Result<()> {
     let file = std::fs::File::open(archive_path)?;
-    let decoder = zstd::stream::Decoder::new(file)?;
-    let mut archive = tar::Archive::new(decoder);
-    archive.unpack(extract_dir)?;
+    use common::archive;
+    archive::extract_compressed_tar(file, archive::Compression::Zstd, extract_dir, None)?;
+
     Ok(())
 }

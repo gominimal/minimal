@@ -20,6 +20,8 @@ tracing.workspace = true
 
 sha2.workspace = true
 tar.workspace = true
+flate2.workspace = true
+lzma-rs.workspace = true
 tempfile.workspace = true
 zstd.workspace = true
 

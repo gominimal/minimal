@@ -4,12 +4,12 @@ pub mod fetchers;
 pub mod target;
 pub use target::Target;
 
+pub mod archive;
+
 mod spec_hash;
-use sha2::{Digest, Sha256};
 pub use spec_hash::SpecHash;
 use std::{
-    fs::File,
-    io::{self, Seek, Write},
+    io::Write,
     path::{Path, PathBuf},
 };
 use tracing::warn;
@@ -40,22 +40,6 @@ impl<W1: Write, W2: Write> Write for Tee<W1, W2> {
         self.writer2.flush()?;
         Ok(())
     }
-}
-
-/// Compresses files in the given directory into a .tar.zst, returning the compressed file + its sha256.
-pub fn compress_dir<P: AsRef<Path>>(dir: P) -> Result<(File, [u8; 32]), io::Error> {
-    let mut tar_file = tempfile::tempfile()?;
-    let mut hasher = Sha256::new();
-    {
-        let mut w = Tee::new(&mut tar_file, &mut hasher);
-        let encoder = zstd::stream::Encoder::new(&mut w, 3)?;
-        let mut tar_builder = tar::Builder::new(encoder);
-        tar_builder.append_dir_all(".", dir)?;
-        tar_builder.into_inner()?.finish()?;
-    }
-    tar_file.seek(std::io::SeekFrom::Start(0))?;
-
-    Ok((tar_file, hasher.finalize().into()))
 }
 
 /// The error produced by calls to [hardlink_dir_contents].
