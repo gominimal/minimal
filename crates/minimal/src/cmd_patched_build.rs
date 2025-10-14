@@ -33,7 +33,7 @@ pub async fn cmd_patched_build(args: PatchedBuildArgs, globals: &GlobalArgs) -> 
         .collect();
     for bsr in build_deps.iter() {
         let build = graph.get(bsr).unwrap();
-        let cache_dir = cache.unsafe_get_by_name(&build.name).unwrap();
+        let cache_dir = cache.unsafe_get_build_by_name(&build.name).unwrap();
         dependencies.insert(cache_dir.path().to_path_buf());
     }
 
