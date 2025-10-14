@@ -90,7 +90,7 @@ impl RemoteStorage {
         let mut hasher = Sha256::new();
         {
             let mut f = fs::File::create(&cached_path)?;
-            let mut res = reqwest::get(url).await?;
+            let mut res = reqwest::get(url).await?.error_for_status()?;
 
             let mut w = Tee::new(&mut f, &mut hasher);
             while let Some(chunk) = res.chunk().await? {
