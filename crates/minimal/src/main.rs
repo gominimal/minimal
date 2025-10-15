@@ -1,8 +1,6 @@
 #![allow(clippy::result_large_err)]
 
-use anyhow::Result;
-use anyhow::anyhow;
-use anyhow::bail;
+use anyhow::{Result, bail};
 use cache::{Cache, LocalDir, RemoteCache, RemoteError};
 use clap::{Args, Parser, Subcommand};
 use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
@@ -339,7 +337,7 @@ impl From<common::GlobError> for Error {
     fn from(e: common::GlobError) -> Self {
         match e {
             common::GlobError::IO(e) => Self::Other(e.into()),
-            common::GlobError::Glob(e) => Self::Other(anyhow!("glob error: {:?}", e.kind())),
+            common::GlobError::Glob(e) => Self::Other(e.into()),
         }
     }
 }

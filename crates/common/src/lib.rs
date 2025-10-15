@@ -9,11 +9,13 @@ pub mod archive;
 mod spec_hash;
 pub use spec_hash::SpecHash;
 mod subsets;
+pub use subsets::SubsetSpec;
+
 use std::{
+    fmt,
     io::Write,
     path::{Path, PathBuf},
 };
-pub use subsets::SubsetSpec;
 use tracing::warn;
 
 /// Implements [Write], mirroring all writes to two underlying writers.
@@ -45,12 +47,36 @@ impl<W1: Write, W2: Write> Write for Tee<W1, W2> {
 }
 
 /// The error produced by calls to [hardlink_dir_contents].
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum HardlinkError {
-    #[error("IO error: {0}")]
     IO(&'static str, PathBuf, std::io::Error),
-    #[error("Hardlink error: {0}")]
     HardlinkFailed(PathBuf, PathBuf, std::io::Error),
+}
+
+impl fmt::Display for HardlinkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HardlinkError::IO(ctx, path, e) => {
+                write!(f, "{} I/O error at path {}: {}", ctx, path.display(), e)
+            }
+            HardlinkError::HardlinkFailed(from, to, e) => write!(
+                f,
+                "failed to hardlink {} to {}: {}",
+                from.display(),
+                to.display(),
+                e
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HardlinkError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            HardlinkError::IO(_, _, e) => Some(e),
+            HardlinkError::HardlinkFailed(_, _, e) => Some(e),
+        }
+    }
 }
 
 /// Creates a hardlink farm in dst representing files in src, recursively.
@@ -105,12 +131,30 @@ pub fn hardlink_dir_contents(src: &Path, dst: &Path) -> Result<(), HardlinkError
     Ok(())
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum GlobError {
-    #[error("IO error: {0}")]
     IO(std::io::Error),
-    #[error("Glob error: {0}")]
     Glob(globset::Error),
+}
+
+impl fmt::Display for GlobError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GlobError::IO(e) => {
+                write!(f, "I/O error: {}", e)
+            }
+            GlobError::Glob(e) => write!(f, "glob error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for GlobError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            GlobError::IO(e) => Some(e),
+            GlobError::Glob(e) => Some(e),
+        }
+    }
 }
 
 impl From<globset::Error> for GlobError {
