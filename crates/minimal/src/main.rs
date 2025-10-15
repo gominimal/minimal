@@ -1,6 +1,7 @@
 #![allow(clippy::result_large_err)]
 
 use anyhow::Result;
+use anyhow::anyhow;
 use anyhow::bail;
 use cache::{Cache, LocalDir, RemoteCache, RemoteError};
 use clap::{Args, Parser, Subcommand};
@@ -335,6 +336,14 @@ impl From<GraphError> for Error {
 impl From<anyhow::Error> for Error {
     fn from(e: anyhow::Error) -> Self {
         Self::Other(e)
+    }
+}
+impl From<common::GlobError> for Error {
+    fn from(e: common::GlobError) -> Self {
+        match e {
+            common::GlobError::IO(e) => Self::Other(e.into()),
+            common::GlobError::Glob(e) => Self::Other(anyhow!("glob error: {:?}", e.kind())),
+        }
     }
 }
 

@@ -4,7 +4,7 @@ use cache::{Cache, LocalDir, MetaInner, PendingDir, RemoteCache};
 use common::SpecHash;
 use google_cloud_storage::client::Storage as GcsStorage;
 use graph::dep_graph::SourceFetch;
-use graph::{BinProvider, ExecPlan};
+use graph::{BinProvider, ExecPlan, RuntimeDep, SubsetInput};
 use graph::{BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, SourceInput};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -192,7 +192,7 @@ async fn path_for_self_spec(
             remote_cache
                 .as_ref()
                 .unwrap()
-                .materialize(input_hash, &input_build.name, cache)
+                .materialize(input_hash, MetaInner::Spec(input_build.name.clone()), cache)
                 .await?;
             let cache_path = cache.read_dir(input_hash).unwrap().path().to_path_buf();
             Ok((*input_ref, (cache_path, PathBuf::from("/"))))
@@ -236,6 +236,124 @@ async fn path_for_self_spec(
     }
 }
 
+/// Yields the cached directory containing the subset of build artifacts described by the given [SubsetInput].
+///
+/// If the subset is not already materialized in the cache, it will be created.
+pub async fn materialize_subset(
+    subset: &SubsetInput,
+    graph: &DepGraph,
+    cache: &Cache<LocalDir>,
+    remote_cache: Option<&RemoteCache<GcsStorage>>,
+) -> Result<(BuildSpecRef, (PathBuf, PathBuf))> {
+    let build = graph.get(&subset.from).unwrap();
+    let subset_spec = subset.as_spec(graph);
+    let subset_hash = graph.subset_hash(subset);
+
+    match (
+        cache.read_dir(&subset_hash),
+        remote_cache.as_ref().map(|c| c.exists(&subset_hash)),
+    ) {
+        // We have the subset already in the local cache.
+        (Ok(cache_entry), _) => {
+            let cache_path = cache_entry.path().to_path_buf();
+            Ok((subset.from, (cache_path, PathBuf::from("/"))))
+        }
+        // In the remote cache but not the local cache.
+        (_, Some(true)) => {
+            let name = format!("{} (subset)", build.name);
+            let span = tracing::info_span!(
+                "download_cached",
+                "indicatif.pb_show" = tracing::field::Empty,
+                "build" = name,
+            );
+            let _enter = span.enter();
+
+            remote_cache
+                .as_ref()
+                .unwrap()
+                .materialize(&subset_hash, MetaInner::Subset(subset_spec), cache)
+                .await?;
+            let cache_path = cache.read_dir(&subset_hash).unwrap().path().to_path_buf();
+            Ok((subset.from, (cache_path, PathBuf::from("/"))))
+        }
+        (Err(cache::CacheErr::NotFound), None | Some(false)) => {
+            // Subset is neither downloadable nor in the local cache.
+            // Either:
+            //  - We can build it: we have built the thing which this is a subset of
+            //  - We can't (build we are a subset of isnt built) but theres a cycle-breaker.
+            let dep_hash = graph.spec_hash(&subset.from);
+            if let Ok(cache_dir) = cache.read_dir(&dep_hash) {
+                let out = cache.write_dir(&subset_hash).unwrap();
+                // Lets build it from the upstream
+                let mut files: Vec<_> = subset
+                    .outputs
+                    .iter()
+                    .map(|output_name| {
+                        common::match_files_for_glob(
+                            cache_dir.path(),
+                            build.outputs.get(output_name).unwrap().glob(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                files.sort();
+                files.dedup();
+
+                for file in files.into_iter() {
+                    let trimmed = file.strip_prefix(cache_dir.path()).unwrap();
+                    if let Some(parent) = trimmed.parent() {
+                        std::fs::create_dir_all(out.path().join(parent))?;
+                    }
+                    std::fs::copy(&file, out.path().join(trimmed))?;
+                }
+                out.finalize(cache::EntryMeta {
+                    inner: MetaInner::Subset(subset_spec),
+                    fetched: false,
+                    ..Default::default()
+                })
+                .unwrap();
+                let cache_path = cache.read_dir(&subset_hash).unwrap().path().to_path_buf();
+                return Ok((subset.from, (cache_path, PathBuf::from("/"))));
+            };
+
+            match build.replace_on_cycle {
+                None => panic!(
+                    "missing build in cache for subset of {} [{}]",
+                    build.name,
+                    subset_hash.0.to_hex(),
+                ),
+                Some(cycle_breaker) => {
+                    let breaker_hash = graph.spec_hash(&cycle_breaker);
+                    let breaker_build = graph.get(&cycle_breaker).unwrap();
+
+                    debug!(
+                        "  --- subbing in cycle breaker {} to resolve subset [{}] ---",
+                        breaker_build.name,
+                        breaker_hash.0.to_hex()
+                    );
+                    Box::pin(materialize_subset(
+                        &subset.override_build(cycle_breaker),
+                        graph,
+                        cache,
+                        remote_cache,
+                    ))
+                    .await
+                }
+            }
+        }
+        (Err(e), _) => {
+            panic!(
+                "unexpected cache error when resolving path for {} [{}]: {:?}",
+                build.name,
+                subset_hash.0.to_hex(),
+                e
+            );
+        }
+    }
+}
+
 /// yields 'dependencies' mappings for the transitive dependencies of the given build spec.
 async fn path_transitive_deps_of(
     input_build: &BuildSpec,
@@ -245,15 +363,23 @@ async fn path_transitive_deps_of(
     remote_cache: Option<&RemoteCache<GcsStorage>>,
 ) -> Result<()> {
     for dep in input_build.runtime_deps.iter() {
-        let (dep_bsr, dep_paths) = path_for_self_spec(
-            dep.bsr(),
-            &graph.spec_hash(dep.bsr()),
-            graph.get(dep.bsr()).unwrap(),
-            graph,
-            cache,
-            remote_cache,
-        )
-        .await?;
+        let (dep_bsr, dep_paths) = match dep {
+            RuntimeDep::Build(bsr) => {
+                path_for_self_spec(
+                    bsr,
+                    &graph.spec_hash(dep.bsr()),
+                    graph.get(dep.bsr()).unwrap(),
+                    graph,
+                    cache,
+                    remote_cache,
+                )
+                .await?
+            }
+            RuntimeDep::Subset(subset) => {
+                materialize_subset(subset, graph, cache, remote_cache).await?
+            }
+        };
+
         if !out_paths.contains(&dep_paths.0) {
             let dep_build = graph.get(&dep_bsr).unwrap();
             debug!(
@@ -403,7 +529,11 @@ impl<'a> Run<'a> {
                         all_paths_for_spec(dep_ref, self.graph, &self.cache, remote_cache).await?;
                     dependencies.extend(input_paths);
                 }
-                Subset(s) => todo!("subsets: {:?}", s),
+                Subset(s) => {
+                    let (_based_on_bsr, paths) =
+                        materialize_subset(s, self.graph, &self.cache, remote_cache).await?;
+                    dependencies.insert(paths.0);
+                }
                 HostPath(_) => {
                     todo!();
                 }

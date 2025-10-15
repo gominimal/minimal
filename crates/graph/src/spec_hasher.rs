@@ -3,7 +3,7 @@ use crate::{
     dep_graph::SourceFetch,
 };
 use blake3::Hasher;
-use common::{Target, target};
+use common::{SubsetSpec, Target, target};
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::io::Write;
@@ -14,7 +14,7 @@ type Edges = SmallVec<[Edge; 12]>;
 struct SpecIndex(usize);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SubsetInfo(Vec<String>, bool);
+struct SubsetInfo(Vec<String>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Edge {
@@ -56,25 +56,25 @@ impl<'a> SpecHasher<'a> {
                     BuildInput(input_idx, subset_info) => {
                         h.write_all(b"i").unwrap();
                         h.write_all(&input_idx.0.to_le_bytes()).unwrap();
-                        if let Some(SubsetInfo(outputs, strict)) = subset_info {
+                        if let Some(SubsetInfo(outputs)) = subset_info {
                             h.write_all(b"ss").unwrap();
                             for output in &outputs {
                                 h.write_all(output.as_bytes()).unwrap();
                                 h.write_all(b",").unwrap();
                             }
-                            h.write_all(if strict { b"s" } else { b"l" }).unwrap();
+                            h.write_all(b"l").unwrap(); // TODO: Remove the next time we break spec-hash values
                         }
                     }
                     RuntimeDep(dep_idx, subset_info) => {
                         h.write_all(b"r").unwrap();
                         h.write_all(&dep_idx.0.to_le_bytes()).unwrap();
-                        if let Some(SubsetInfo(outputs, strict)) = subset_info {
+                        if let Some(SubsetInfo(outputs)) = subset_info {
                             h.write_all(b"ss").unwrap();
                             for output in &outputs {
                                 h.write_all(output.as_bytes()).unwrap();
                                 h.write_all(b",").unwrap();
                             }
-                            h.write_all(if strict { b"s" } else { b"l" }).unwrap();
+                            h.write_all(b"l").unwrap(); // TODO: Remove the next time we break spec-hash values
                         }
                     }
                     ReplaceOnCycle(r_idx) => {
@@ -103,9 +103,7 @@ impl<'a> SpecHasher<'a> {
         let mut edges = Edges::new();
         for (bsr, subset_info) in build.inputs.iter().filter_map(|i| match i {
             BuildSpecInput::Build(bsr) => Some((bsr, None)),
-            BuildSpecInput::Subset(si) => {
-                Some((&si.from, Some(SubsetInfo(si.outputs.clone(), si.strict))))
-            }
+            BuildSpecInput::Subset(si) => Some((&si.from, Some(SubsetInfo(si.outputs.clone())))),
             _ => None,
         }) {
             edges.push(Edge::BuildInput(self.process(bsr), subset_info));
@@ -115,7 +113,7 @@ impl<'a> SpecHasher<'a> {
                 RuntimeDep::Build(bsr) => edges.push(Edge::RuntimeDep(self.process(bsr), None)),
                 RuntimeDep::Subset(si) => edges.push(Edge::RuntimeDep(
                     self.process(&si.from),
-                    Some(SubsetInfo(si.outputs.clone(), si.strict)),
+                    Some(SubsetInfo(si.outputs.clone())),
                 )),
             }
         }
@@ -224,6 +222,47 @@ fn build_attrs_hash(spec: &BuildSpec, h: &mut Hasher) {
     if spec.target != Target::new(target::Arch::Amd64, target::OS::Linux) {
         h.write_all(b"-target").unwrap();
         spec.target.hash_to(h);
+    }
+}
+
+/// Computes the [SpecHash] for a subset.
+pub struct SubsetHasher;
+
+impl SubsetHasher {
+    /// Computs the [SpecHash] of a subset of outputs from the given [BuildSpecRef].
+    pub fn hash_single<'a, S: Into<String>>(
+        graph: &'a DepGraph,
+        bsr: &'a BuildSpecRef,
+        outputs: Vec<S>,
+    ) -> SpecHash {
+        let build = graph.get(bsr).unwrap();
+        let outputs: Vec<_> = outputs.into_iter().map(|s| s.into()).collect();
+        for output in outputs.iter() {
+            if build.outputs.get(output).is_none() {
+                panic!(
+                    "consistency check: cannot form subset over non-existent output {}",
+                    output
+                );
+            }
+        }
+
+        let subset_spec = SubsetSpec::new_single(&graph.spec_hash(bsr), outputs);
+        Self::hash(&subset_spec)
+    }
+
+    /// Computs the [SpecHash] of the given [SubsetSpec].
+    pub fn hash(subset_spec: &SubsetSpec) -> SpecHash {
+        let mut h = Hasher::new();
+        h.write_all(b"subset").unwrap();
+        for (spec, sorted_outputs) in subset_spec.iter_components() {
+            h.write_all(spec.as_bytes()).unwrap();
+            for output in sorted_outputs {
+                h.write_all(b"-output").unwrap();
+                h.write_all(output.as_bytes()).unwrap();
+            }
+        }
+
+        SpecHash(h.finalize())
     }
 }
 
@@ -355,6 +394,45 @@ mod tests {
         assert_eq!(
             SpecHasher::hash(&dp, &dp.top_levels[0]),
             SpecHash::from_hex("e9bc6fb92d25f8c86d83a132d7bc5121a4571a7117554cf59169d2010a695e86")
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn subset_hash() {
+        let sr = SpecReader::new(
+            indoc! {
+                "
+                let {BuildSpec, HostPath, Source, Prebuilt, OutputLib, OutputBin, OutputData, ..} = import \"minimal.ncl\" in
+                {
+                    name = \"single buildspec\",
+                    inputs = [
+                        {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
+                        {package = \"uwu\"} | Prebuilt,
+                        {path = \"/\"} | HostPath,
+                    ],
+                    outputs = {
+                        something = { glob = \"/usr/lib/something.*.so\" } | OutputLib,
+                        uwu_tool = { glob = \"/bin/uwu\" } | OutputBin,
+                        some_data = { glob = \"/data/locale/*\"  } | OutputData,
+                    },
+                    cmd = \"something\",
+                } | BuildSpec"
+            }
+            .to_string(),
+            &SpecReaderOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        let dp = DepGraph::new(sr).unwrap();
+
+        // println!("{}", SpecHasher::hash(&dp, &dp.top_levels[0]).0.to_hex());
+        assert_eq!(
+            SubsetHasher::hash_single(&dp, &dp.top_levels[0], vec!["uwu_tool", "something"]),
+            SpecHash::from_hex("23d6c828d07f1572f7d8ec315c0a0fb92b00079d290692358cefad45b4b51cc5")
                 .unwrap(),
         );
     }

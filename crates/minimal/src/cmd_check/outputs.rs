@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 use super::{CheckResult, CheckVerdict};
@@ -49,7 +49,7 @@ pub(crate) fn output_types_valid(
             | BuildOutput::Library { glob }
             | BuildOutput::Data { glob } => glob,
         };
-        for path in match_paths_for_glob(&cached_build, glob)?.into_iter() {
+        for path in common::match_files_for_glob(cached_build.path(), glob)?.into_iter() {
             let data = std::fs::read(&path).map_err(anyhow::Error::from)?;
             match (object::File::parse(&*data), output) {
                 (Ok(_), BuildOutput::Binary { .. } | BuildOutput::Library { .. }) => {}
@@ -84,49 +84,6 @@ pub(crate) fn output_types_valid(
     }
 
     Ok(result)
-}
-
-fn match_paths_for_glob(
-    cached_build: &DirCacheEntry<LocalDir>,
-    glob: &str,
-) -> Result<Vec<PathBuf>, Error> {
-    let mut results = Vec::new();
-
-    let matcher = globset::GlobBuilder::new(glob)
-        .literal_separator(true)
-        .empty_alternates(true)
-        .build()
-        .map_err(anyhow::Error::from)?
-        .compile_matcher();
-
-    // Walk the filesystem starting from root_dir
-    fn walk_dir(
-        dir: &Path,
-        root_dir: &Path,
-        matcher: &globset::GlobMatcher,
-        results: &mut Vec<PathBuf>,
-    ) -> Result<(), Error> {
-        let entries = std::fs::read_dir(dir).map_err(anyhow::Error::from)?;
-
-        for entry in entries {
-            let entry = entry.map_err(anyhow::Error::from)?;
-
-            let path = entry.path();
-            let subset = path.strip_prefix(root_dir).unwrap();
-            if path.is_file() && matcher.is_match(subset) {
-                results.push(path);
-            } else if path.is_dir() {
-                // Recursively walk subdirectories
-                walk_dir(&path, root_dir, matcher, results)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    let root_dir = cached_build.path();
-    walk_dir(root_dir, root_dir, &matcher, &mut results)?;
-    Ok(results)
 }
 
 pub(crate) fn missing_runtime_deps(
@@ -191,7 +148,7 @@ pub(crate) fn missing_runtime_deps(
             | BuildOutput::Library { glob }
             | BuildOutput::Data { glob } => glob,
         };
-        for path in match_paths_for_glob(&cached_build, glob)?.into_iter() {
+        for path in common::match_files_for_glob(cached_build.path(), glob)?.into_iter() {
             let data = std::fs::read(&path).map_err(anyhow::Error::from)?;
             if let (Ok(elf), BuildOutput::Binary { .. } | BuildOutput::Library { .. }) =
                 (object::File::parse(&*data), output)
@@ -319,7 +276,10 @@ fn find_lib_in_deps(
     for (i, (_bsr, dep_files)) in deps.iter().enumerate() {
         let base = dep_files.path();
 
-        if let Some(candidate) = (match_paths_for_glob(dep_files, &glob)?).into_iter().next() {
+        if let Some(candidate) = (common::match_files_for_glob(dep_files.path(), &glob)?)
+            .into_iter()
+            .next()
+        {
             return Ok(Some((
                 i,
                 candidate.strip_prefix(base).unwrap().to_path_buf(),

@@ -1,4 +1,4 @@
-use crate::{Cache, LocalDir, remote_index::RemoteIndex};
+use crate::{Cache, EntryMeta, LocalDir, MetaInner, remote_index::RemoteIndex};
 use common::{SpecHash, archive};
 use std::io::{Seek, Write};
 
@@ -168,7 +168,7 @@ impl<B: FetchBackend> RemoteCache<B> {
     pub async fn materialize(
         &self,
         spec_hash: &SpecHash,
-        spec_name: &str,
+        inner: MetaInner,
         cache: &Cache<LocalDir>,
     ) -> Result<(), Error<<B::Response as FetchResponse>::Error>> {
         let sha256: [u8; 32] = self.index.sha256(spec_hash).ok_or(Error::NotFound)?;
@@ -198,10 +198,9 @@ impl<B: FetchBackend> RemoteCache<B> {
         )
         .map_err(Error::ArchiveError)?;
 
-        use crate::{EntryMeta, MetaInner};
         cache_hnd
             .finalize(EntryMeta {
-                inner: MetaInner::Spec(spec_name.to_string()),
+                inner,
                 fetched: true,
                 ..Default::default()
             })
