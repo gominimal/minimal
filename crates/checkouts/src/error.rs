@@ -28,6 +28,9 @@ pub enum Error {
 
     /// A generic error with a custom message.
     Other(String),
+
+    /// Failed to read the statefile.
+    StatefileInvalid(serde_json::Error),
 }
 
 impl Error {

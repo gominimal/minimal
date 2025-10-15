@@ -136,7 +136,7 @@ impl Repo {
             .map(|(p, c)| (p.clone(), c.rev.clone()))
     }
 
-    pub fn checkout_to(&mut self, path: PathBuf, git_ref: GitRef) -> Result<(), Error> {
+    pub fn checkout_to(&mut self, path: PathBuf, git_ref: GitRef) -> Result<Checkout, Error> {
         self.run_git_bare(&[
             "worktree",
             "add",
@@ -147,14 +147,12 @@ impl Repo {
         ])?;
         let output = self.run_git_checkout(&path, &["rev-parse", "HEAD"])?;
 
-        self.checkouts.insert(
-            path,
-            Checkout {
-                version: git_ref,
-                rev: String::from_utf8_lossy(&output.stdout).trim().to_string(),
-            },
-        );
-        Ok(())
+        let checkout = Checkout {
+            version: git_ref,
+            rev: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        };
+        self.checkouts.insert(path, checkout.clone());
+        Ok(checkout)
     }
 
     /// Returns a list of all tags in the repository.

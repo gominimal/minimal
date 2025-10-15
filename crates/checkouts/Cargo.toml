@@ -8,10 +8,12 @@ publish.workspace = true
 
 [dev-dependencies]
 indoc.workspace = true
-tempfile.workspace = true
 
 [dependencies]
+tempfile.workspace = true
 tracing.workspace = true
 hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+rand = "0.9"

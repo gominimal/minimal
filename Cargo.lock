@@ -420,6 +420,7 @@ version = "0.0.1"
 dependencies = [
  "hex",
  "indoc",
+ "rand",
  "serde",
  "serde_json",
  "tempfile",
