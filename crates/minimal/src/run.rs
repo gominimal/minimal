@@ -705,10 +705,12 @@ impl<'a> Run<'a> {
             )));
 
             rayon::scope(|s| {
-                for (bsr, full_build) in phase.unwrap().builds.iter() {
+                for build in phase.unwrap().builds.iter() {
+                    // TODO: Wire the build based on deps, rather than probing whats available
+
                     let tokio_runtime = tokio_runtime.clone();
-                    let bsr = bsr.to_owned();
-                    let full_build = full_build.to_owned();
+                    let bsr = build.spec.to_owned();
+                    let full_build = build.full_build();
                     let self2 = self2.clone();
                     let err_bsr = build_which_errored.clone();
                     let cache_handles = cache_handles.clone();

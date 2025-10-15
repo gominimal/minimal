@@ -58,18 +58,29 @@ fn print_plan<BP: BinProvider>(
     eprintln!("✓ = Already built, ⚙️ = To be built");
     for (i, phase) in plan.enumerate() {
         eprintln!("Phase {}", i + 1);
-        for (bsr, do_full_build) in phase?.builds.iter() {
-            let build = graph.get(bsr).unwrap();
-            let bsh = graph.spec_hash(bsr);
+        for build in phase?.builds.iter() {
+            let b = graph.get(&build.spec).unwrap();
+            let bsh = graph.spec_hash(&build.spec);
             let is_cached = cache.read_dir(&bsh).is_ok();
             let cached_emoji = if is_cached { "✓" } else { "⚙️" };
+            let num_cycle_breakers = build
+                .with_deps
+                .iter()
+                .filter_map(|d| d.cycle_breaker().to_owned())
+                .count();
 
             eprintln!(
-                " - {} {} [{}] full_build={}",
+                " - {} {} [{}] full_build={} deps={} {}",
                 cached_emoji,
-                build.name,
+                b.name,
                 bsh.0.to_hex(),
-                do_full_build
+                build.full_build(),
+                build.with_deps.len(),
+                if num_cycle_breakers > 0 {
+                    format!("({} cycle-breakers)", num_cycle_breakers)
+                } else {
+                    "".to_string()
+                }
             );
         }
     }
