@@ -1,8 +1,7 @@
 use build_events::events::{
-    build_event, BuildEvent, BuildMetadata, TargetCompleted, TargetKind, TargetStarted,
+    build_event, BuildEvent, FileCreated, TargetCompleted, TargetKind, TargetStarted,
 };
 use hakoniwa::Container;
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -108,28 +107,28 @@ impl BuildExecutor {
             })),
         });
 
-        // Emit BuildMetadata with file paths so subscriber can upload them
-        let mut file_metadata = HashMap::new();
-        file_metadata.insert(
-            format!("{}/stdout_path", target_id),
-            self.build_workspace_dir
-                .join("stdout")
-                .to_string_lossy()
-                .to_string(),
-        );
-        file_metadata.insert(
-            format!("{}/stderr_path", target_id),
-            self.build_workspace_dir
-                .join("stderr")
-                .to_string_lossy()
-                .to_string(),
-        );
+        // Emit FileCreated events for stdout and stderr
+        if let Ok(stdout_contents) = fs::read(self.build_workspace_dir.join("stdout")) {
+            build_events::event_bus().emit(BuildEvent {
+                event: Some(build_event::Event::FileCreated(FileCreated {
+                    target_id: target_id.to_string(),
+                    name: "stdout".to_string(),
+                    contents: stdout_contents.into(),
+                    timestamp_millis: current_millis(),
+                })),
+            });
+        }
 
-        build_events::event_bus().emit(BuildEvent {
-            event: Some(build_event::Event::BuildMetadata(BuildMetadata {
-                metadata: file_metadata,
-            })),
-        });
+        if let Ok(stderr_contents) = fs::read(self.build_workspace_dir.join("stderr")) {
+            build_events::event_bus().emit(BuildEvent {
+                event: Some(build_event::Event::FileCreated(FileCreated {
+                    target_id: target_id.to_string(),
+                    name: "stderr".to_string(),
+                    contents: stderr_contents.into(),
+                    timestamp_millis: current_millis(),
+                })),
+            });
+        }
 
         // Return the original result
         execute_result?;

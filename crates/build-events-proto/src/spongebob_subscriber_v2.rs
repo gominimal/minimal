@@ -28,8 +28,6 @@ use tracing::warn;
 /// ```
 pub struct SpongeBobSubscriberV2 {
     spongebob: std::sync::Arc<crate::client::SpongeBob>,
-    /// Cache of file paths from BuildMetadata events, keyed by "{target_id}/stdout_path" etc.
-    file_paths: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>>,
 }
 
 impl SpongeBobSubscriberV2 {
@@ -50,9 +48,6 @@ impl SpongeBobSubscriberV2 {
     pub fn from_client(client: crate::client::SpongeBob) -> Self {
         Self {
             spongebob: std::sync::Arc::new(client),
-            file_paths: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
         }
     }
 }
@@ -60,67 +55,7 @@ impl SpongeBobSubscriberV2 {
 #[async_trait]
 impl BuildEventSubscriber for SpongeBobSubscriberV2 {
     async fn on_event(&self, event: &BuildEvent) -> Result<(), SubscriberError> {
-        use build_events::events::build_event::Event;
-
-        // Handle BuildMetadata events to cache file paths
-        if let Some(Event::BuildMetadata(metadata)) = &event.event {
-            let mut file_paths = self.file_paths.lock().await;
-            for (key, value) in &metadata.metadata {
-                if key.ends_with("_path") {
-                    file_paths.insert(key.clone(), value.clone());
-                }
-            }
-            // Don't publish BuildMetadata with file paths to avoid clutter
-            return Ok(());
-        }
-
-        // Handle TargetCompleted events with file uploads
-        if let Some(Event::TargetCompleted(target_completed)) = &event.event {
-            let target_id = &target_completed.target_id;
-
-            // Get file paths from cache
-            let file_paths = self.file_paths.lock().await;
-            let stdout_key = format!("{}/stdout_path", target_id);
-            let stderr_key = format!("{}/stderr_path", target_id);
-
-            let stdout_path = file_paths.get(&stdout_key).cloned();
-            let stderr_path = file_paths.get(&stderr_key).cloned();
-            drop(file_paths);
-
-            // First publish the TargetCompleted event
-            if let Err(e) = self.spongebob.publish_build_event(event.clone()).await {
-                warn!("Failed to publish TargetCompleted event to Spongebob: {}", e);
-                return Err(SubscriberError::Custom(format!(
-                    "Failed to publish TargetCompleted event: {}",
-                    e
-                )));
-            }
-
-            // Then upload files if paths are available
-            if let Some(stdout_path) = stdout_path {
-                if let Ok(contents) = std::fs::read(&stdout_path) {
-                    if let Err(e) = self.spongebob.publish_file_created_event(target_id, "stdout", contents).await {
-                        warn!("Failed to upload stdout for target {}: {}", target_id, e);
-                    }
-                } else {
-                    warn!("Failed to read stdout file: {}", stdout_path);
-                }
-            }
-
-            if let Some(stderr_path) = stderr_path {
-                if let Ok(contents) = std::fs::read(&stderr_path) {
-                    if let Err(e) = self.spongebob.publish_file_created_event(target_id, "stderr", contents).await {
-                        warn!("Failed to upload stderr for target {}: {}", target_id, e);
-                    }
-                } else {
-                    warn!("Failed to read stderr file: {}", stderr_path);
-                }
-            }
-
-            return Ok(());
-        }
-
-        // For all other events, just publish them
+        // Publish all events to SpongeBob
         match self.spongebob.publish_build_event(event.clone()).await {
             Ok(()) => {
                 tracing::debug!("Successfully published build event to Spongebob");

@@ -7,7 +7,7 @@
 // Re-export proto types as the canonical event types
 pub use minimal_spongebob_community_neoeinstein_prost::spongebob::v1::{
     build_event, ActionCompleted, ActionStarted, BuildEvent, BuildFinished, BuildMetadata,
-    BuildStarted, TargetCompleted, TargetKind, TargetStarted,
+    BuildStarted, FileCreated, TargetCompleted, TargetKind, TargetStarted,
 };
 
 /// Helper function to get current timestamp in milliseconds
