@@ -4,7 +4,7 @@
 #![allow(clippy::single_match)]
 
 use common::{
-    Target,
+    SubsetSpec, Target,
     target::{Arch, OS},
 };
 use nickel_lang_core::eval::Closure;
@@ -19,8 +19,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use crate::spec_schema::*;
 use crate::{Error, SpecError, SpecHash, SpecHasher, SpecReader};
+use crate::{spec_hasher::SubsetHasher, spec_schema::*};
 use serde::Deserialize;
 
 /// A map with ordered iteration semantics - we need this for stable spec hashes.
@@ -50,7 +50,20 @@ pub struct SourceInput {
 pub struct SubsetInput {
     pub from: BuildSpecRef,
     pub outputs: Vec<String>,
-    pub strict: bool,
+}
+
+impl SubsetInput {
+    /// Constructs a new [SubsetInput], except using the given build instead.
+    pub fn override_build(&self, bsr: BuildSpecRef) -> Self {
+        Self {
+            from: bsr,
+            ..self.clone()
+        }
+    }
+
+    pub fn as_spec(&self, graph: &DepGraph) -> SubsetSpec {
+        SubsetSpec::new_single(&graph.spec_hash(&self.from), self.outputs.clone())
+    }
 }
 
 /// A description of where a build was declared.
@@ -95,6 +108,16 @@ pub enum BuildOutput {
     Data { glob: String },
     /// This output describes binaries matched with the given glob.
     Binary { glob: String },
+}
+
+impl BuildOutput {
+    pub fn glob(&self) -> &String {
+        match self {
+            BuildOutput::Binary { glob } => glob,
+            BuildOutput::Data { glob } => glob,
+            BuildOutput::Library { glob } => glob,
+        }
+    }
 }
 
 /// A runtime dependency declared on a build-spec.
@@ -246,6 +269,11 @@ impl DepGraph {
             hashes.1.insert(hash.clone(), *bsr);
         }
         hash
+    }
+
+    /// Returns the specification hash of a subset.
+    pub fn subset_hash(&self, subset: &SubsetInput) -> SpecHash {
+        SubsetHasher::hash_single(self, &subset.from, subset.outputs.clone())
     }
 
     /// Returns an iterator over all build-spec references.
@@ -698,7 +726,6 @@ impl GraphBuilder {
     ) -> Result<SubsetInput, Error> {
         let mut from: Option<BuildSpecRef> = None;
         let mut outputs: Option<Vec<String>> = None;
-        let mut strict: bool = false;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                 r.fields
@@ -734,13 +761,6 @@ impl GraphBuilder {
                                             field.value
                                         ),
                                     },
-                                }
-                                Ok(())
-                            }
-                            "strict" => {
-                                if let Some(field) = field.value.as_ref() {
-                                    strict = bool::deserialize(eval_if_closure(field, program)?)
-                                        .unwrap();
                                 }
                                 Ok(())
                             }
@@ -786,11 +806,7 @@ impl GraphBuilder {
             }
         }
 
-        Ok(SubsetInput {
-            from,
-            strict,
-            outputs,
-        })
+        Ok(SubsetInput { from, outputs })
     }
 
     fn read_input_source(
@@ -1415,7 +1431,6 @@ mod tests {
             dp.get(&dp.by_name("top").next().unwrap()).unwrap().inputs[0].clone(),
             BuildSpecInput::Subset(SubsetInput {
                 from,
-                strict: false,
                 outputs,
             }) if from == dp.by_name("other").next().unwrap() && outputs == vec!["abc", "uwu"],
         ));
@@ -1665,7 +1680,6 @@ mod tests {
             dp.get(&dp.by_name("top build").next().unwrap()).unwrap().runtime_deps[1].clone(),
             RuntimeDep::Subset(SubsetInput {
                 from,
-                strict: false,
                 outputs,
             }) if from == dp.by_name("runtime dep").next().unwrap() && outputs == vec!["some_data"],
         ));

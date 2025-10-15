@@ -1,4 +1,4 @@
-let { BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
+let { subsetOf, BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, .. } = import "minimal.ncl" in
 let base = import "../base/build.ncl" in
 let gcc = import "../gcc/build.ncl" in
 let toolchain = import "../toolchain/build.ncl" in
@@ -18,7 +18,7 @@ let glibc = import "../glibc/build.ncl" in
   ],
   runtime_deps = [
     glibc,
-    gcc, # TODO: We really need to use a subset for this
+    subsetOf gcc ["libgcc", "libstdcpp"],
   ],
 
   cmd = "./build.sh",

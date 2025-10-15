@@ -104,3 +104,62 @@ pub fn hardlink_dir_contents(src: &Path, dst: &Path) -> Result<(), HardlinkError
 
     Ok(())
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum GlobError {
+    #[error("IO error: {0}")]
+    IO(std::io::Error),
+    #[error("Glob error: {0}")]
+    Glob(globset::Error),
+}
+
+impl From<globset::Error> for GlobError {
+    fn from(e: globset::Error) -> Self {
+        GlobError::Glob(e)
+    }
+}
+
+impl From<std::io::Error> for GlobError {
+    fn from(e: std::io::Error) -> Self {
+        GlobError::IO(e)
+    }
+}
+
+/// Enumerates files which match the given glob within the given directory.
+pub fn match_files_for_glob(dir: &Path, glob: &str) -> Result<Vec<PathBuf>, GlobError> {
+    let mut results = Vec::new();
+
+    let matcher = globset::GlobBuilder::new(glob)
+        .literal_separator(true)
+        .empty_alternates(true)
+        .build()?
+        .compile_matcher();
+
+    // Walk the filesystem starting from root_dir
+    fn walk_dir(
+        dir: &Path,
+        root_dir: &Path,
+        matcher: &globset::GlobMatcher,
+        results: &mut Vec<PathBuf>,
+    ) -> Result<(), GlobError> {
+        let entries = std::fs::read_dir(dir)?;
+
+        for entry in entries {
+            let entry = entry?;
+
+            let path = entry.path();
+            let subset = path.strip_prefix(root_dir).unwrap();
+            if path.is_file() && matcher.is_match(subset) {
+                results.push(path);
+            } else if path.is_dir() {
+                // Recursively walk subdirectories
+                walk_dir(&path, root_dir, matcher, results)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    walk_dir(dir, dir, &matcher, &mut results)?;
+    Ok(results)
+}

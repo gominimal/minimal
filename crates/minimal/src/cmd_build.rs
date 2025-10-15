@@ -150,7 +150,7 @@ pub async fn cmd_build_impl(
 
                         futures::executor::block_on(remote_cache.materialize(
                             &graph.spec_hash(&bsr),
-                            name,
+                            cache::MetaInner::Spec(name.clone()),
                             cache,
                         ))
                         .unwrap();

@@ -121,8 +121,6 @@ in
           | BuildSpec,
         outputs
           | Array String,
-        strict
-          | Bool | optional = false,
     },
 
     subsetOf | BuildSpec -> Array String -> Subset | doc "Constructs a subset of the outputs of a build, for use as an input or runtime_dep." =

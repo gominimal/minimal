@@ -52,6 +52,5 @@ docker_credential.workspace = true
 size.workspace = true
 
 object.workspace = true
-globset.workspace = true
 
 hakoniwa.workspace = true
