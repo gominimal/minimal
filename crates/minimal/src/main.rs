@@ -363,7 +363,7 @@ async fn main() -> Result<()> {
     cli.global_args.path_config().ensure_directories()?;
 
     // Initialize global event bus and SpongeBob integration
-    let spongebob = spongebob::SpongeBob::new()
+    let spongebob = build_events_proto::SpongeBob::new()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob client: {}", e))?;
     let invocation_id = spongebob.invocation_id().to_string();

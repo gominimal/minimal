@@ -364,7 +364,6 @@ dependencies = [
  "build-events",
  "minimal_spongebob_community_neoeinstein-prost",
  "minimal_spongebob_community_neoeinstein-tonic",
- "spongebob",
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
@@ -2210,7 +2209,6 @@ dependencies = [
  "sha2",
  "shlex",
  "size",
- "spongebob",
  "tar",
  "tempfile",
  "tokio",
@@ -3560,19 +3558,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "spongebob"
-version = "0.1.0"
-dependencies = [
- "minimal_spongebob_community_neoeinstein-prost",
- "minimal_spongebob_community_neoeinstein-tonic",
- "thiserror 2.0.17",
- "tokio",
- "tokio-stream",
- "tonic 0.12.3",
- "tracing",
-]
-
-[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3897,7 +3882,6 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
- "tokio-util",
 ]
 
 [[package]]

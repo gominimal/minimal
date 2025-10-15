@@ -1,89 +1,49 @@
 //! Build Events Protobuf Layer
 //!
-//! This crate provides protobuf definitions and gRPC streaming support for
-//! the `build-events` crate. It enables remote observability of builds via
-//! gRPC streaming.
+//! This crate provides protobuf definitions and SpongeBob client integration for
+//! the `build-events` crate. It enables remote observability of builds by sending
+//! events to the SpongeBob service via gRPC streaming.
 //!
 //! # Overview
 //!
 //! This crate extends the pure Rust `build-events` crate with:
-//! - **Protobuf message definitions** for all build event types
-//! - **Type conversions** between Rust and protobuf types
-//! - **GrpcStreamSubscriber** for converting events to proto and streaming
-//! - **BuildEventService** gRPC service implementation
+//! - **Protobuf message definitions** for all build event types (via BSR)
+//! - **SpongeBob gRPC client** for streaming build events to spongebob.minimal.farm
+//! - **SpongeBobSubscriberV2** for forwarding events to SpongeBob service
 //!
 //! # Architecture
 //!
 //! ```text
-//! Build Events (Rust) → Conversion → Proto Events → gRPC Stream → Clients
+//! Build Events → BuildEventDispatcher → SpongeBobSubscriberV2 → SpongeBob client → spongebob.minimal.farm
 //! ```
 //!
-//! # Example: gRPC Streaming
+//! # Example: Sending Events to SpongeBob
 //!
-//! ## Server Side
-//!
-//! ```no_run
+//! ```ignore
 //! use build_events::{BuildEventBus, BuildEventDispatcher};
-//! use build_events_proto::{
-//!     GrpcStreamSubscriber,
-//!     BuildEventServiceImpl,
-//!     proto::build_event_service_server::BuildEventServiceServer,
-//! };
-//! use tonic::transport::Server;
+//! use build_events_proto::{SpongeBob, SpongeBobSubscriberV2};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Create event bus
+//!     // Create SpongeBob client (opens bidirectional stream)
+//!     let spongebob = SpongeBob::new().await?;
+//!     let invocation_id = spongebob.invocation_id().to_string();
+//!
+//!     // Initialize event bus
 //!     let event_bus = BuildEventBus::new(10000);
 //!
-//!     // Create gRPC service
-//!     let service = BuildEventServiceImpl::new(1000);
-//!     let sender = service.sender();
-//!
-//!     // Setup dispatcher with a subscriber that feeds the gRPC service
+//!     // Setup dispatcher with SpongeBob subscriber
 //!     let mut dispatcher = BuildEventDispatcher::new(event_bus.subscribe());
-//!     let subscriber = GrpcStreamSubscriber::new(100);
+//!     let subscriber = SpongeBobSubscriberV2::from_client(spongebob);
 //!     dispatcher.add_subscriber(Box::new(subscriber));
 //!
-//!     // Start dispatcher
+//!     // Start dispatcher in background
 //!     tokio::spawn(async move {
 //!         dispatcher.run().await;
 //!     });
 //!
-//!     // Start gRPC server
-//!     Server::builder()
-//!         .add_service(BuildEventServiceServer::new(service))
-//!         .serve("[::1]:50051".parse()?)
-//!         .await?;
-//!
-//!     Ok(())
-//! }
-//! ```
-//!
-//! ## Client Side
-//!
-//! ```no_run
-//! use build_events_proto::proto::{
-//!     build_event_service_client::BuildEventServiceClient,
-//!     StreamBuildEventsRequest,
-//! };
-//! use tokio_stream::StreamExt;
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let mut client = BuildEventServiceClient::connect("http://[::1]:50051").await?;
-//!
-//!     let request = StreamBuildEventsRequest {
-//!         invocation_id: None,
-//!         start_timestamp_millis: None,
-//!     };
-//!
-//!     let mut stream = client.stream_build_events(request).await?.into_inner();
-//!
-//!     while let Some(event) = stream.next().await {
-//!         let event = event?;
-//!         println!("Received event: {:?}", event);
-//!     }
+//!     // Events emitted to event_bus are now forwarded to SpongeBob
+//!     // ... perform builds ...
 //!
 //!     Ok(())
 //! }
@@ -91,17 +51,14 @@
 //!
 //! # Type Usage
 //!
-//! Since build-events now uses proto types directly, no conversion is needed:
+//! Since build-events uses proto types directly from BSR, no conversion is needed:
 //!
 //! ```
 //! use build_events::events::{build_event, BuildEvent, BuildStarted, current_millis};
-//! use build_events_proto::proto;
 //!
 //! // Create proto event (build-events types ARE proto types)
 //! let event = BuildEvent {
-//!     invocation_id: "test-123".to_string(),
 //!     event: Some(build_event::Event::BuildStarted(BuildStarted {
-//!         invocation_id: "test-123".to_string(),
 //!         command: "build".to_string(),
 //!         timestamp_millis: current_millis(),
 //!         working_directory: "/tmp".to_string(),
@@ -120,15 +77,9 @@ pub mod proto {
     };
 }
 
-pub mod service;
-pub mod subscriber;
-
-#[cfg(feature = "spongebob-subscriber")]
+pub mod client;
 pub mod spongebob_subscriber_v2;
 
 // Re-export main types for convenience
-pub use service::BuildEventServiceImpl;
-pub use subscriber::GrpcStreamSubscriber;
-
-#[cfg(feature = "spongebob-subscriber")]
+pub use client::{SpongeBob, SpongeBobError, Result};
 pub use spongebob_subscriber_v2::SpongeBobSubscriberV2;

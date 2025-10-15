@@ -8,23 +8,16 @@ publish.workspace = true
 
 [dependencies]
 build-events.workspace = true
-tonic = "0.12.3"
-tokio.workspace = true
+tonic = { version = "0.12.3", features = ["tls", "tls-native-roots"] }
+tokio = { workspace = true, features = ["sync"] }
+tokio-stream = "0.1"
 thiserror.workspace = true
 tracing.workspace = true
 async-trait = "0.1"
-tokio-stream = { version = "0.1", features = ["sync"] }
-
-# Use workspace spongebob crate instead of direct BSR imports
-spongebob = { path = "../spongebob", optional = true }
 
 # BSR proto dependencies for canonical spongebob.v1 types
 minimal_spongebob_community_neoeinstein-prost = { version = "=0.4.0-20251014214004-4ceda9b7e17f.1", registry = "buf" }
 minimal_spongebob_community_neoeinstein-tonic = { version = "=0.4.1-20251014214004-4ceda9b7e17f.1", registry = "buf" }
-
-[features]
-default = []
-spongebob-subscriber = ["spongebob"]
 
 [dev-dependencies]
 tempfile.workspace = true

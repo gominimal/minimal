@@ -6,9 +6,8 @@ publish.workspace = true
 
 [dependencies]
 "build-sandbox".workspace = true
-spongebob = { path = "../spongebob" }
 build-events.workspace = true
-build-events-proto = { path = "../build-events-proto", features = ["spongebob-subscriber"] }
+build-events-proto = { path = "../build-events-proto" }
 graph.workspace = true
 cache.workspace = true
 common.workspace = true

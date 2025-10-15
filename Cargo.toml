@@ -7,7 +7,6 @@ members = [
     "crates/common",
     "crates/graph",
     "crates/minimal",
-    "crates/spongebob",
 ]
 resolver = "3"
 

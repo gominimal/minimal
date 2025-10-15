@@ -21,7 +21,6 @@ pub async fn cmd_build(args: BuildArgs, globals: &GlobalArgs) -> Result<(), Erro
     let graph = args.packages.graph(globals)?;
     let cache = globals.cache().map_err(anyhow::Error::from)?;
 
-    cmd_build_impl(&graph, globals, cache.clone(), globals.num_parallel_builds).await?;
     cmd_build_impl(&graph, globals, cache, globals.num_parallel_builds).await?;
 
     Ok(())
@@ -215,7 +214,7 @@ pub async fn cmd_build_impl(
 
     // Display build summary with spongebob URL
     let spongebob_url = format!(
-        "https://dash.minimal.dev/invocations/{}",
+        "https://dash.minimal.farm/invocations/{}",
         build_events::invocation_id()
     );
     display_build_summary(graph, &cache, globals, &run, Some(&spongebob_url));

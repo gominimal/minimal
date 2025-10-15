@@ -1,26 +1,22 @@
-//! Subscriber that sends build events to Spongebob service using the workspace spongebob crate
+//! Subscriber that sends build events to Spongebob service
 
-#[cfg(feature = "spongebob-subscriber")]
 use async_trait::async_trait;
-#[cfg(feature = "spongebob-subscriber")]
 use build_events::{BuildEvent, BuildEventSubscriber, SubscriberError};
-#[cfg(feature = "spongebob-subscriber")]
 use tracing::warn;
 
 /// Subscriber that publishes build events to Spongebob service
 ///
-/// This subscriber uses the workspace `spongebob` crate to connect to the
+/// This subscriber uses the `SpongeBob` client to connect to the
 /// Spongebob service and publish build events via bidirectional streaming.
 ///
 /// # Example
-/// ```no_run
-/// # #[cfg(feature = "spongebob-subscriber")]
-/// use build_events_proto::SpongeBobSubscriberV2;
+/// ```ignore
+/// use build_events_proto::{SpongeBob, SpongeBobSubscriberV2};
 ///
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///     // Create a spongebob client (opens stream and gets server-assigned ID)
-///     let spongebob = spongebob::SpongeBob::new().await?;
+///     let spongebob = SpongeBob::new().await?;
 ///
 ///     // Create subscriber from the client
 ///     let subscriber = SpongeBobSubscriberV2::from_client(spongebob);
@@ -30,14 +26,12 @@ use tracing::warn;
 ///     Ok(())
 /// }
 /// ```
-#[cfg(feature = "spongebob-subscriber")]
 pub struct SpongeBobSubscriberV2 {
-    spongebob: std::sync::Arc<spongebob::SpongeBob>,
+    spongebob: std::sync::Arc<crate::client::SpongeBob>,
     /// Cache of file paths from BuildMetadata events, keyed by "{target_id}/stdout_path" etc.
     file_paths: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>>,
 }
 
-#[cfg(feature = "spongebob-subscriber")]
 impl SpongeBobSubscriberV2 {
     /// Create subscriber from an existing SpongeBob client
     ///
@@ -45,16 +39,15 @@ impl SpongeBobSubscriberV2 {
     /// * `client` - An existing SpongeBob client with active streaming connection
     ///
     /// # Example
-    /// ```no_run
-    /// # #[cfg(feature = "spongebob-subscriber")]
-    /// # use build_events_proto::SpongeBobSubscriberV2;
+    /// ```ignore
+    /// # use build_events_proto::{SpongeBob, SpongeBobSubscriberV2};
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let spongebob = spongebob::SpongeBob::new().await?;
+    /// let spongebob = SpongeBob::new().await?;
     /// let subscriber = SpongeBobSubscriberV2::from_client(spongebob);
     /// # Ok(())
     /// # }
     /// ```
-    pub fn from_client(client: spongebob::SpongeBob) -> Self {
+    pub fn from_client(client: crate::client::SpongeBob) -> Self {
         Self {
             spongebob: std::sync::Arc::new(client),
             file_paths: std::sync::Arc::new(tokio::sync::Mutex::new(
@@ -64,7 +57,6 @@ impl SpongeBobSubscriberV2 {
     }
 }
 
-#[cfg(feature = "spongebob-subscriber")]
 #[async_trait]
 impl BuildEventSubscriber for SpongeBobSubscriberV2 {
     async fn on_event(&self, event: &BuildEvent) -> Result<(), SubscriberError> {
@@ -154,7 +146,7 @@ impl BuildEventSubscriber for SpongeBobSubscriberV2 {
     }
 }
 
-#[cfg(all(test, feature = "spongebob-subscriber"))]
+#[cfg(test)]
 mod tests {
     #[test]
     fn test_subscriber_creation() {
