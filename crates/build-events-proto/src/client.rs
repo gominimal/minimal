@@ -1,16 +1,14 @@
 //! SpongeBob gRPC client for streaming build events
 
 use crate::proto::{
-    build_event, BuildEvent, BuildStarted, OrderedBuildEvent, PublishBuildEventStreamRequest,
-    build_event_service_client::BuildEventServiceClient,
+    build_event, BuildEvent, BuildStarted, build_event_service_client::BuildEventServiceClient,
 };
 use async_trait::async_trait;
 use build_events::{BuildEventSubscriber, SubscriberError};
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
+use uuid::Uuid;
 
 const ENDPOINT: &str = "https://spongebob.minimal.farm";
 
@@ -26,25 +24,22 @@ pub enum SpongeBobError {
 
 pub type Result<T> = std::result::Result<T, SpongeBobError>;
 
-/// SpongeBob client with server-assigned invocation ID
+/// SpongeBob client with client-generated invocation ID
 ///
-/// Creates a bidirectional stream on initialization and receives
-/// a server-assigned invocation ID. All events are published through
-/// this stream with monotonically increasing sequence numbers.
-///
-/// The client spawns a background task to continuously read from the
-/// response stream, allowing non-blocking event publishing.
+/// Creates a client streaming connection with a client-generated
+/// invocation ID. All events are published through this stream.
+/// The server sends an Empty response when the stream closes.
 #[derive(Debug, Clone)]
 pub struct SpongeBob {
-    request_tx: Arc<Mutex<mpsc::Sender<PublishBuildEventStreamRequest>>>,
-    sequence_number: Arc<AtomicI64>,
+    request_tx: mpsc::Sender<BuildEvent>,
+    invocation_id: Arc<String>,
 }
 
 impl SpongeBob {
     /// Create a new SpongeBob client and open streaming connection
     ///
-    /// This immediately connects to the server and opens a bidirectional
-    /// stream. The server assigns an invocation ID which is logged.
+    /// This immediately connects to the server and opens a client
+    /// streaming connection. The client generates an invocation ID which is logged.
     ///
     /// # Example
     /// ```ignore
@@ -56,129 +51,86 @@ impl SpongeBob {
     /// ```
     #[tracing::instrument]
     pub async fn new() -> Result<Self> {
+        // Generate invocation ID on client side
+        let invocation_id = Uuid::new_v4().to_string();
+
         // Connect to service
         let mut client = BuildEventServiceClient::connect(ENDPOINT).await?;
 
-        // Create channel for bidirectional streaming
+        // Create channel for client streaming
         let (request_tx, request_rx) = mpsc::channel(100);
 
-        // Send initial BuildStarted event to initiate handshake
-        // Server will respond with assigned invocation ID
+        // Send initial BuildStarted event with client-generated invocation ID
         let timestamp_millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
 
         request_tx
-            .send(PublishBuildEventStreamRequest {
-                ordered_event: Some(OrderedBuildEvent {
-                    sequence_number: 1,
-                    stream_id: None, // Server will assign
-                    event: Some(BuildEvent {
-                        event: Some(build_event::Event::BuildStarted(BuildStarted {
-                            command: std::env::args().collect::<Vec<_>>().join(" "),
-                            timestamp_millis,
-                            working_directory: std::env::current_dir()
-                                .ok()
-                                .and_then(|p| p.to_str().map(|s| s.to_string()))
-                                .unwrap_or_default(),
-                        })),
-                    }),
-                }),
+            .send(BuildEvent {
+                event: Some(build_event::Event::BuildStarted(BuildStarted {
+                    invocation_id: invocation_id.clone(),
+                    command: std::env::args().collect::<Vec<_>>().join(" "),
+                    timestamp_millis,
+                    working_directory: std::env::current_dir()
+                        .ok()
+                        .and_then(|p| p.to_str().map(|s| s.to_string()))
+                        .unwrap_or_default(),
+                })),
             })
             .await
             .map_err(|e| SpongeBobError::Stream(format!("Failed to queue initial event: {}", e)))?;
 
-        // Wrap receiver in a stream (initial BuildStarted is already queued)
-        let request_stream = ReceiverStream::new(request_rx);
-
-        // Open bidirectional stream - this will immediately have data to send
-        let response = client.publish_build_event_stream(request_stream).await?;
-        let mut response_stream = response.into_inner();
-
-        // Read first response to get invocation ID
-        let first_response = response_stream
-            .message()
-            .await?
-            .ok_or_else(|| SpongeBobError::Stream("Server closed stream before sending invocation ID".to_string()))?;
-
-        let invocation_id = first_response
-            .stream_id
-            .ok_or_else(|| SpongeBobError::Stream("Server did not provide stream ID".to_string()))?
-            .invocation_id;
-
         // Log invocation URL at start
         tracing::info!("https://dash.minimal.farm/invocations/{}", invocation_id);
 
-        // Spawn background task to drain responses
+        // Spawn task to handle stream and wait for response
         let invocation_id_for_task = invocation_id.clone();
         tokio::spawn(async move {
-            loop {
-                match response_stream.message().await {
-                    Ok(Some(response)) => {
-                        tracing::debug!(
-                            sequence_number = response.sequence_number,
-                            "Received acknowledgment from server"
-                        );
-                    }
-                    Ok(None) => {
-                        // Stream closed by server - log final URL
-                        tracing::info!("https://dash.minimal.farm/invocations/{}", invocation_id_for_task);
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::warn!("Error reading from response stream: {}", e);
-                        tracing::info!("https://dash.minimal.farm/invocations/{}", invocation_id_for_task);
-                        break;
-                    }
+            let request_stream = ReceiverStream::new(request_rx);
+            match client.publish_build_event_stream(request_stream).await {
+                Ok(_response) => {
+                    tracing::info!("Stream closed successfully");
+                    tracing::info!("https://dash.minimal.farm/invocations/{}", invocation_id_for_task);
+                }
+                Err(e) => {
+                    tracing::error!("Stream error: {}", e);
+                    tracing::info!("https://dash.minimal.farm/invocations/{}", invocation_id_for_task);
                 }
             }
         });
 
         Ok(Self {
-            request_tx: Arc::new(Mutex::new(request_tx)),
-            sequence_number: Arc::new(AtomicI64::new(2)), // Start at 2 (we used 1 for BuildStarted)
+            request_tx,
+            invocation_id: Arc::new(invocation_id),
         })
     }
 
     /// Publish a build event to Spongebob via the streaming connection
     ///
-    /// This method is non-blocking - it sends the event to the stream without
-    /// waiting for acknowledgment. Acknowledgments are processed asynchronously
-    /// by a background task spawned in `new()`.
+    /// This method is non-blocking - it sends the event to the channel.
+    /// The background task handles sending to the server.
     #[tracing::instrument(skip(self, event))]
     pub async fn publish_build_event(&self, event: BuildEvent) -> Result<()> {
-        let seq = self.sequence_number.fetch_add(1, Ordering::SeqCst);
-
-        // Send event with sequence number
-        let request = PublishBuildEventStreamRequest {
-            ordered_event: Some(OrderedBuildEvent {
-                sequence_number: seq,
-                stream_id: None, // Only needed on first message
-                event: Some(event),
-            }),
-        };
-
-        let request_tx = self.request_tx.lock().await;
-        request_tx
-            .send(request)
+        self.request_tx
+            .send(event)
             .await
             .map_err(|e| SpongeBobError::Stream(format!("Failed to send event: {}", e)))?;
 
-        tracing::debug!(sequence_number = seq, "Event sent to stream");
+        tracing::debug!("Event queued for sending");
 
         Ok(())
     }
 
-    /// Close the stream (drops the connection)
+    /// Close the stream and wait for final response
     ///
-    /// If BuildFinished was not sent, the server will mark the invocation
-    /// as terminated. The background task reading responses will detect
-    /// the closed stream and terminate gracefully.
+    /// Drops the request sender which closes the stream. The server will
+    /// process all events and send a final response. The background task
+    /// will log the final status.
     pub async fn close(self) -> Result<()> {
-        // Drop the request sender which will close the stream
-        // The background task will detect the closed stream and terminate
+        // Drop the request sender which closes the stream
         drop(self.request_tx);
+        // Background task will receive the final response and log it
         Ok(())
     }
 }

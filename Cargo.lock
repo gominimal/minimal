@@ -371,6 +371,7 @@ dependencies = [
  "tonic 0.12.3",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -2221,9 +2222,9 @@ dependencies = [
 
 [[package]]
 name = "minimal_spongebob_community_neoeinstein-prost"
-version = "0.4.0-20251014214004-4ceda9b7e17f.1"
+version = "0.4.0-20251015195841-61cd123d44d0.1"
 source = "sparse+https://buf.build/gen/cargo/"
-checksum = "54c207aab4a172c7ffbe80866557cd86a2d2dc1b8672cff5a5165955dd578694"
+checksum = "f6ea00e7e69ce45575508fdc1a97a1e901304062f012d8068367cf0e1d7fbfb7"
 dependencies = [
  "prost 0.13.5",
  "prost-types 0.13.5",
@@ -2231,9 +2232,9 @@ dependencies = [
 
 [[package]]
 name = "minimal_spongebob_community_neoeinstein-tonic"
-version = "0.4.1-20251014214004-4ceda9b7e17f.1"
+version = "0.4.1-20251015195841-61cd123d44d0.1"
 source = "sparse+https://buf.build/gen/cargo/"
-checksum = "088a8ec4ad0d378cb9d24da98613b0f25c48ffd89fa28f7428a7be2ecce89946"
+checksum = "91c1f93a6c1bcd3e9019972149d8a64308460516ea7535a44bcde834047574f1"
 dependencies = [
  "minimal_spongebob_community_neoeinstein-prost",
  "tonic 0.12.3",
@@ -4365,6 +4366,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f87b8aa10b915a06587d0dec516c282ff295b475d94abf425d62b57710070a2"
 dependencies = [
  "getrandom 0.3.4",
+ "js-sys",
+ "wasm-bindgen",
 ]
 
 [[package]]

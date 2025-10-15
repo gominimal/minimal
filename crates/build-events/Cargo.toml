@@ -15,7 +15,7 @@ tokio.workspace = true
 tracing.workspace = true
 
 # Proto types as single source of truth
-minimal_spongebob_community_neoeinstein-prost = { version = "=0.4.0-20251014214004-4ceda9b7e17f.1", registry = "buf" }
+minimal_spongebob_community_neoeinstein-prost = { version = "=0.4.0-20251015195841-61cd123d44d0.1", registry = "buf" }
 
 [dev-dependencies]
 serde_json.workspace = true
