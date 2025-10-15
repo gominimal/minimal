@@ -13,6 +13,10 @@ pub struct RunArgs {
     #[arg(long, required = false)]
     rw_dir: Vec<String>,
 
+    /// Environment variables to set
+    #[arg(long, required = false)]
+    env: Vec<String>,
+
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
 }
@@ -75,6 +79,24 @@ pub async fn cmd_run(args: RunArgs, globals: &GlobalArgs) -> Result<(), Error> {
         )
         .env("LANG", "en_US.utf8")
         .env("LC_ALL", "en_US.utf8");
+    if let Ok(term) = std::env::var("TERM") {
+        cmd.env("TERM", term.as_str());
+    }
+    if let Ok(ct) = std::env::var("COLORTERM") {
+        cmd.env("COLORTERM", ct.as_str());
+    }
+    if let Ok(lsc) = std::env::var("LS_COLORS") {
+        cmd.env("LS_COLORS", lsc.as_str());
+    }
+    for env in args.env {
+        let mut spl = env.split("=");
+        let (var, val) = (
+            spl.next().unwrap(),
+            spl.next()
+                .expect("expected '=' between --env var and value"),
+        );
+        cmd.env(var, val);
+    }
 
     cmd.spawn()
         .map_err(anyhow::Error::from)?
