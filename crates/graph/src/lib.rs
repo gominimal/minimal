@@ -214,7 +214,7 @@ pub use dep_graph::{
     SubsetInput,
 };
 
-mod planner;
+pub mod planner;
 pub use planner::{BinProvider, ExecPlan, PlanErr};
 
 mod transitives;

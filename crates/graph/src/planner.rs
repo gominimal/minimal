@@ -1,6 +1,6 @@
-use crate::{BuildSpecInput, BuildSpecRef, DepGraph, SubsetInput, Transitives};
+use crate::{BuildSpecInput, BuildSpecRef, DepGraph, SubsetInput, Transitives, transitives};
 use nickel_lang_core::term::IndexMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The status of a build spec / dependency at some moment during planning.
 #[derive(Debug, Default, Clone, Ord, PartialOrd, PartialEq, Eq)]
@@ -93,6 +93,64 @@ impl BuildInfo {
             state: BuildState::NotBuilt,
             ..Default::default()
         }
+    }
+}
+
+/// Describes a specific dependency that should be wired into a build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Dep {
+    /// Use the cached build artifacts corresponding to the given bsr.
+    Cached(BuildSpecRef, Option<HashSet<String>>),
+    /// Use the previously-built artifacts specified as a dependency.
+    Built {
+        bsr: BuildSpecRef,
+        /// If the dependency is a cycle-breaker substitution.
+        cycle_breaker_for: Option<BuildSpecRef>,
+        /// If the build is impure: that is it was built with cycle-breakers.
+        built_with_breakers: bool,
+        /// Specific outputs to use instead of the whole build
+        outputs: Option<HashSet<String>>,
+    },
+}
+
+impl Dep {
+    /// Returns false if this dependency is a cycle breaker, meaning the build its part of will eventually
+    /// need to be rebuilt.
+    pub fn fully_built(&self) -> bool {
+        use Dep::*;
+        match self {
+            Cached(..) => true,
+            Built {
+                cycle_breaker_for, ..
+            } => !cycle_breaker_for.is_some(),
+        }
+    }
+
+    fn bsr(&self) -> &BuildSpecRef {
+        use Dep::*;
+        match self {
+            Cached(bsr, _) => bsr,
+            Built { bsr, .. } => bsr,
+        }
+    }
+
+    pub fn cycle_breaker(&self) -> &Option<BuildSpecRef> {
+        use Dep::*;
+        match self {
+            Cached(..) => &None,
+            Built {
+                cycle_breaker_for, ..
+            } => cycle_breaker_for,
+        }
+    }
+
+    fn with_outputs(mut self, new_outputs: Option<HashSet<String>>) -> Self {
+        match &mut self {
+            Dep::Built { outputs, .. } | Dep::Cached(_, outputs) => {
+                *outputs = new_outputs;
+            }
+        }
+        self
     }
 }
 
@@ -262,29 +320,55 @@ impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
 
     /// Returns true if the given dependency should be considered built in an earlier phase.
     fn is_built(&self, dependency: &BuildSpecRef, cycle_breakers_allowed: bool) -> bool {
+        self.dep_candidate(dependency, cycle_breakers_allowed)
+            .is_some()
+    }
+
+    /// Returns something that can be used to satisfy the requested dependency, if possible.
+    ///
+    /// While [Dep] can encode subsets, it is never set here.
+    fn dep_candidate(
+        &self,
+        dependency: &BuildSpecRef,
+        cycle_breakers_allowed: bool,
+    ) -> Option<Dep> {
         if self.bin_provider.exists(dependency) {
-            return true;
+            return Some(Dep::Cached(*dependency, None));
         }
 
         match self.builds.get(dependency) {
             None => {
                 // queried dependency was not in .builds, this can happen for cycle breakers
                 // which have not been added in to be reachable. Obviously not built in that case
-                false
+                None
             }
             Some(info) => {
                 if info.state.is_built() {
-                    return true;
+                    return Some(Dep::Built {
+                        bsr: *dependency,
+                        cycle_breaker_for: None,
+                        built_with_breakers: info.state == BuildState::BuiltUsingBreakers,
+                        outputs: None,
+                    });
                 }
 
                 if cycle_breakers_allowed {
-                    info.cycle_breaker
-                        .as_ref()
-                        .map(|bsr| self.is_built(bsr, cycle_breakers_allowed))
-                        .unwrap_or(false)
-                } else {
-                    false
+                    if let Some(cycle_breaker) = info.cycle_breaker.as_ref() {
+                        if self.is_built(cycle_breaker, cycle_breakers_allowed) {
+                            return Some(Dep::Built {
+                                bsr: *cycle_breaker,
+                                cycle_breaker_for: Some(*dependency),
+                                built_with_breakers: self
+                                    .builds
+                                    .get(cycle_breaker)
+                                    .map(|i| i.state == BuildState::BuiltUsingBreakers)
+                                    .unwrap_or(false),
+                                outputs: None,
+                            });
+                        }
+                    }
                 }
+                None
             }
         }
     }
@@ -443,12 +527,38 @@ pub enum PlanErr {
     Cycles(Vec<Vec<BuildSpecRef>>),
 }
 
+/// Describes a build which should be performed using a given set of dependencies as part of a build plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Build {
+    pub spec: BuildSpecRef,
+    pub with_deps: Vec<Dep>,
+}
+
+impl Build {
+    fn new(bsr: BuildSpecRef, deps: Vec<(Option<Dep>, transitives::Dep)>) -> Self {
+        let mut deps = deps
+            .into_iter()
+            .map(|(dep, info)| dep.unwrap().with_outputs(info.outputs))
+            .collect::<Vec<_>>();
+        deps.sort_by(|a, b| a.bsr().cmp(b.bsr()));
+
+        Self {
+            spec: bsr,
+            with_deps: deps,
+        }
+    }
+
+    /// Returns false if any cycle breakers were used as a dependency.
+    pub fn full_build(&self) -> bool {
+        self.with_deps.iter().all(|d| d.fully_built())
+    }
+}
+
 /// The set of build-specs which can be built in parallel with all deps satisfied by
 /// the planners' associated [BinProvider], or built in a preceeding phase.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BuildPhase {
-    // (bsr, full_build)
-    pub builds: Vec<(BuildSpecRef, bool)>,
+    pub builds: Vec<Build>,
 }
 
 impl<'a, BP: BinProvider> Iterator for ExecPlan<'a, BP> {
@@ -466,7 +576,7 @@ impl<'a, BP: BinProvider> Iterator for ExecPlan<'a, BP> {
         // (bsr, used_breakers)
         let mut built_this_phase: HashMap<BuildSpecRef, bool> = HashMap::new();
         // (bsr, full_build)
-        let mut met: Vec<(BuildSpecRef, bool)> = Vec::new();
+        let mut met: Vec<Build> = Vec::new();
 
         // Iterate all reachable builds which have not been fully built.
         for (candidate, info) in self.builds.iter().filter_map(|(candidate, info)| {
@@ -481,14 +591,25 @@ impl<'a, BP: BinProvider> Iterator for ExecPlan<'a, BP> {
 
             // Something is ready to be built if all its inputs are built, and all its transitive
             // runtime deps (and the transitive runtime deps of its inputs) are built.
-            let (can_build_full, can_build_breakers) =
+            let deps: Vec<(Option<Dep>, transitives::Dep)> =
                 Transitives::new(self.graph, candidate, true)
                     .transitive_runtime_deps
-                    .keys()
-                    .fold((true, true), |acc, dep_bsr| {
+                    .into_iter()
+                    .map(|(bsr, info)| (self.dep_candidate(&bsr, true), info))
+                    .collect();
+
+            // Determine if all deps are satisfied somehow (can_build_breakers=true), as well
+            // as determine if all deps are satisfied without cycle-breakers (can_build_full=true).
+            let (can_build_full, can_build_breakers) =
+                deps.iter()
+                    .fold((true, true), |acc, (built_candidate, _info)| {
                         (
-                            acc.0 & self.is_built(dep_bsr, false),
-                            acc.1 & self.is_built(dep_bsr, true),
+                            acc.0
+                                & built_candidate
+                                    .as_ref()
+                                    .map(|d| d.fully_built())
+                                    .unwrap_or(false),
+                            acc.1 & built_candidate.is_some(),
                         )
                     });
 
@@ -498,7 +619,7 @@ impl<'a, BP: BinProvider> Iterator for ExecPlan<'a, BP> {
                 // All deps are fully satisfied, so we can fully build candidate
                 (true, _, _) => {
                     built_this_phase.insert(*candidate, false);
-                    met.push((*candidate, true));
+                    met.push(Build::new(*candidate, deps));
                 }
                 // All deps are satisfied by fully-builts or cycle-breakers
                 (false, true, true) => {
@@ -515,7 +636,7 @@ impl<'a, BP: BinProvider> Iterator for ExecPlan<'a, BP> {
                     };
 
                     built_this_phase.insert(*candidate, consider_built_with_breakers);
-                    met.push((*candidate, !consider_built_with_breakers));
+                    met.push(Build::new(*candidate, deps));
                 }
                 _ => {}
             }
@@ -704,13 +825,32 @@ mod tests {
             planner.collect::<Result<Vec<_>, _>>().unwrap(),
             vec![
                 BuildPhase {
-                    builds: vec![(dp.by_name("nested dep").next().unwrap(), true)]
+                    builds: vec![Build {
+                        spec: dp.by_name("nested dep").next().unwrap(),
+                        with_deps: vec![],
+                    },],
                 },
                 BuildPhase {
-                    builds: vec![(dp.by_name("dep").next().unwrap(), true)]
+                    builds: vec![Build {
+                        spec: dp.by_name("dep").next().unwrap(),
+                        with_deps: vec![Dep::Built {
+                            bsr: dp.by_name("nested dep").next().unwrap(),
+                            cycle_breaker_for: None,
+                            built_with_breakers: false,
+                            outputs: None
+                        },],
+                    },],
                 },
                 BuildPhase {
-                    builds: vec![(dp.by_name("top").next().unwrap(), true)]
+                    builds: vec![Build {
+                        spec: dp.by_name("top").next().unwrap(),
+                        with_deps: vec![Dep::Built {
+                            bsr: dp.by_name("dep").next().unwrap(),
+                            cycle_breaker_for: None,
+                            built_with_breakers: false,
+                            outputs: None
+                        },],
+                    },],
                 },
             ],
         );
@@ -823,21 +963,64 @@ mod tests {
             plan,
             vec![
                 BuildPhase {
-                    builds: vec![(dp.by_name("breaker dep").next().unwrap(), true)]
+                    builds: vec![Build {
+                        spec: dp.by_name("breaker dep").next().unwrap(),
+                        with_deps: vec![],
+                    },],
                 },
                 BuildPhase {
-                    builds: vec![(dp.by_name("breaker").next().unwrap(), true)]
+                    builds: vec![Build {
+                        spec: dp.by_name("breaker").next().unwrap(),
+                        with_deps: vec![Dep::Built {
+                            bsr: dp.by_name("breaker dep").next().unwrap(),
+                            cycle_breaker_for: None,
+                            built_with_breakers: false,
+                            outputs: None
+                        },],
+                    },],
                 },
                 BuildPhase {
                     builds: vec![
-                        (dp.by_name("top").next().unwrap(), false),
-                        (dp.by_name("self ref").next().unwrap(), false),
+                        Build {
+                            spec: dp.by_name("top").next().unwrap(),
+                            with_deps: vec![Dep::Built {
+                                bsr: dp.by_name("breaker").next().unwrap(),
+                                cycle_breaker_for: Some(dp.by_name("self ref").next().unwrap()),
+                                built_with_breakers: false,
+                                outputs: None
+                            },],
+                        },
+                        Build {
+                            spec: dp.by_name("self ref").next().unwrap(),
+                            with_deps: vec![Dep::Built {
+                                bsr: dp.by_name("breaker").next().unwrap(),
+                                cycle_breaker_for: Some(dp.by_name("self ref").next().unwrap()),
+                                built_with_breakers: false,
+                                outputs: None
+                            },],
+                        },
                     ]
                 },
                 BuildPhase {
                     builds: vec![
-                        (dp.by_name("top").next().unwrap(), true),
-                        (dp.by_name("self ref").next().unwrap(), true),
+                        Build {
+                            spec: dp.by_name("top").next().unwrap(),
+                            with_deps: vec![Dep::Built {
+                                bsr: dp.by_name("self ref").next().unwrap(),
+                                cycle_breaker_for: None,
+                                built_with_breakers: true,
+                                outputs: None
+                            },],
+                        },
+                        Build {
+                            spec: dp.by_name("self ref").next().unwrap(),
+                            with_deps: vec![Dep::Built {
+                                bsr: dp.by_name("self ref").next().unwrap(),
+                                cycle_breaker_for: None,
+                                built_with_breakers: true,
+                                outputs: None
+                            },],
+                        },
                     ]
                 },
             ],
@@ -913,10 +1096,24 @@ mod tests {
             planner.collect::<Result<Vec<_>, _>>().unwrap(),
             vec![
                 BuildPhase {
-                    builds: vec![(dp.by_name("dep").next().unwrap(), true)]
+                    builds: vec![Build {
+                        spec: dp.by_name("dep").next().unwrap(),
+                        with_deps: vec![Dep::Cached(
+                            dp.by_name("nested dep").next().unwrap(),
+                            None
+                        ),],
+                    },],
                 },
                 BuildPhase {
-                    builds: vec![(dp.by_name("top").next().unwrap(), true)]
+                    builds: vec![Build {
+                        spec: dp.by_name("top").next().unwrap(),
+                        with_deps: vec![Dep::Built {
+                            bsr: dp.by_name("dep").next().unwrap(),
+                            cycle_breaker_for: None,
+                            built_with_breakers: false,
+                            outputs: None
+                        },],
+                    },],
                 },
             ],
         );
@@ -992,10 +1189,24 @@ mod tests {
             planner.collect::<Result<Vec<_>, _>>().unwrap(),
             vec![
                 BuildPhase {
-                    builds: vec![(dp.by_name("nested deeper dep").next().unwrap(), true),]
+                    builds: vec![Build {
+                        spec: dp.by_name("nested deeper dep").next().unwrap(),
+                        with_deps: vec![],
+                    },],
                 },
                 BuildPhase {
-                    builds: vec![(dp.by_name("dep").next().unwrap(), true),]
+                    builds: vec![Build {
+                        spec: dp.by_name("dep").next().unwrap(),
+                        with_deps: vec![
+                            Dep::Cached(dp.by_name("nested dep").next().unwrap(), None),
+                            Dep::Built {
+                                bsr: dp.by_name("nested deeper dep").next().unwrap(),
+                                cycle_breaker_for: None,
+                                built_with_breakers: false,
+                                outputs: None
+                            },
+                        ],
+                    },],
                 },
             ],
         );
