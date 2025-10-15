@@ -2,6 +2,7 @@
 members = [
     "crates/build-sandbox",
     "crates/cache",
+    "crates/checkouts",
     "crates/common",
     "crates/graph",
     "crates/minimal",
@@ -71,4 +72,5 @@ globset = "0.4"
 build-sandbox = { path = "crates/build-sandbox" }
 graph = { version = "0.0.1", path = "crates/graph" }
 cache = { version = "0.0.1", path = "crates/cache" }
+checkouts = { version = "0.0.1", path = "crates/checkouts" }
 common = { version = "0.0.1", path = "crates/common" }

@@ -1,0 +1,17 @@
+[package]
+name = "checkouts"
+version = "0.0.1"
+edition.workspace = true
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish.workspace = true
+
+[dev-dependencies]
+indoc.workspace = true
+tempfile.workspace = true
+
+[dependencies]
+tracing.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
