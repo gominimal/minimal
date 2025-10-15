@@ -1,9 +1,25 @@
-use crate::{BuildSpecInput, BuildSpecRef, DepGraph, SubsetInput};
-use std::collections::HashMap;
+use crate::{BuildSpecInput, BuildSpecRef, DepGraph, RuntimeDep, SubsetInput};
+use std::collections::{HashMap, HashSet};
+
+/// Information about a dependency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dep {
+    pub needed_by: Vec<Attribution>,
+    pub outputs: Option<HashSet<String>>,
+}
+
+impl From<Vec<Attribution>> for Dep {
+    fn from(needed_by: Vec<Attribution>) -> Self {
+        Self {
+            needed_by,
+            outputs: None,
+        }
+    }
+}
 
 /// Information about why a transitive dependency exists.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DepInfo {
+#[derive(Debug, Clone, PartialEq, PartialOrd, Ord, Eq)]
+pub enum Attribution {
     /// The dependency is declared on the build spec.
     Ours,
     /// The dependency is transitively required by a input spec.
@@ -16,10 +32,48 @@ pub struct Transitives {
     pub build: BuildSpecRef,
 
     /// The transitive runtime dependencies any use of this build needs, along with attribution.
-    pub transitive_runtime_deps: HashMap<BuildSpecRef, Vec<DepInfo>>,
+    pub transitive_runtime_deps: HashMap<BuildSpecRef, Dep>,
 }
 
 impl Transitives {
+    fn upsert<I: Iterator<Item = Attribution>, O: IntoIterator<Item = String>>(
+        transitive_runtime_deps: &mut HashMap<BuildSpecRef, Dep>,
+        bsr: &BuildSpecRef,
+        needed_by: I,
+        outputs: Option<O>,
+    ) {
+        match transitive_runtime_deps.get_mut(bsr) {
+            Some(existing) => {
+                // union attributions
+                existing.needed_by.extend(needed_by);
+                existing.needed_by.sort();
+                existing.needed_by.dedup();
+
+                // union outputs
+                match (&mut existing.outputs, outputs) {
+                    (None, _) | (_, None) => {
+                        // One of the outputs wasnt a subset, so we turn into the full build.
+                        existing.outputs = None;
+                    }
+                    (Some(stored), Some(new)) => {
+                        // Both stored & incoming are subsets, union the outputs they are requesting
+                        stored.extend(new);
+                    }
+                }
+            }
+            None => {
+                // New entry
+                transitive_runtime_deps.insert(
+                    *bsr,
+                    Dep {
+                        needed_by: needed_by.collect(),
+                        outputs: outputs.map(|v| v.into_iter().collect()),
+                    },
+                );
+            }
+        }
+    }
+
     /// Constructs the set of transitive dependencies for the given build.
     pub fn new(g: &DepGraph, bsr: &BuildSpecRef, include_inputs: bool) -> Self {
         let build = g.get(bsr).unwrap();
@@ -32,14 +86,46 @@ impl Transitives {
         };
 
         for dep in build.runtime_deps.iter() {
-            out.transitive_runtime_deps
-                .insert(*dep.bsr(), vec![DepInfo::Ours]);
+            match dep {
+                RuntimeDep::Build(bsr) => {
+                    Self::upsert(
+                        &mut out.transitive_runtime_deps,
+                        bsr,
+                        [Attribution::Ours].into_iter(),
+                        None::<Vec<String>>,
+                    );
+                }
+                RuntimeDep::Subset(SubsetInput { from: bsr, outputs }) => {
+                    Self::upsert(
+                        &mut out.transitive_runtime_deps,
+                        bsr,
+                        [Attribution::Ours].into_iter(),
+                        Some(outputs.clone()),
+                    );
+                }
+            }
         }
         if include_inputs {
             for dep in build.inputs.iter() {
-                if let Build(bsr) | Subset(SubsetInput { from: bsr, .. }) = dep {
-                    out.transitive_runtime_deps
-                        .insert(*bsr, vec![DepInfo::Ours]);
+                use BuildSpecInput::*;
+                match dep {
+                    Build(bsr) => {
+                        Self::upsert(
+                            &mut out.transitive_runtime_deps,
+                            bsr,
+                            [Attribution::Ours].into_iter(),
+                            None::<Vec<String>>,
+                        );
+                    }
+                    Subset(SubsetInput { from: bsr, outputs }) => {
+                        Self::upsert(
+                            &mut out.transitive_runtime_deps,
+                            bsr,
+                            [Attribution::Ours].into_iter(),
+                            Some(outputs.clone()),
+                        );
+                    }
+                    Source(_) | Prebuilt(_, _) | Local(_) | HostPath(_) => {}
                 }
             }
         }
@@ -51,23 +137,33 @@ impl Transitives {
             .inputs
             .iter()
             .filter_map(|input| match (input, include_inputs) {
-                (Build(bsr) | Subset(SubsetInput { from: bsr, .. }), true) => Some(bsr),
+                (Build(bsr), true) => Some((bsr, None)),
+                (Subset(SubsetInput { from: bsr, outputs }), true) => Some((bsr, Some(outputs))),
                 (Build(_) | Subset(_), false) => None,
                 (Source(_) | HostPath(_) | Local(_) | Prebuilt(_, _), _) => None,
             })
-            .chain(build.runtime_deps.iter().map(|dep| dep.bsr()))
-            .for_each(|bsr| {
-                for (dep_bsr, source) in Transitives::new(g, bsr, false)
+            .chain(build.runtime_deps.iter().map(|dep| match dep {
+                RuntimeDep::Build(bsr) => (bsr, None),
+                RuntimeDep::Subset(SubsetInput { from: bsr, outputs }) => (bsr, Some(outputs)),
+            }))
+            .for_each(|(bsr, _)| {
+                for (dep_bsr, info) in Transitives::new(g, bsr, false)
                     .transitive_runtime_deps
-                    .keys()
-                    .map(|runtime_dep| (*runtime_dep, DepInfo::Inherited { from: *bsr }))
+                    .into_iter()
+                    .map(|(dep_bsr, mut info)| {
+                        (dep_bsr, {
+                            info.needed_by.clear();
+                            info.needed_by.push(Attribution::Inherited { from: *bsr });
+                            info
+                        })
+                    })
                 {
-                    match out.transitive_runtime_deps.get_mut(&dep_bsr) {
-                        Some(source_list) => source_list.push(source),
-                        None => {
-                            out.transitive_runtime_deps.insert(dep_bsr, vec![source]);
-                        }
-                    }
+                    Self::upsert(
+                        &mut out.transitive_runtime_deps,
+                        &dep_bsr,
+                        info.needed_by.into_iter(),
+                        info.outputs,
+                    );
                 }
             });
 
@@ -158,7 +254,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(
                 dg.by_name("runtime dep").next().unwrap(),
-                vec![DepInfo::Ours]
+                Dep {
+                    needed_by: vec![Attribution::Ours],
+                    outputs: None,
+                }
             )],
         );
     }
@@ -220,13 +319,19 @@ mod tests {
             vec![
                 (
                     dg.by_name("nested input").next().unwrap(),
-                    vec![DepInfo::Ours]
+                    Dep {
+                        needed_by: vec![Attribution::Ours],
+                        outputs: None,
+                    }
                 ),
                 (
                     dg.by_name("runtime dep").next().unwrap(),
-                    vec![DepInfo::Inherited {
-                        from: dg.by_name("nested input").next().unwrap()
-                    }]
+                    Dep {
+                        needed_by: vec![Attribution::Inherited {
+                            from: dg.by_name("nested input").next().unwrap()
+                        }],
+                        outputs: None,
+                    }
                 )
             ],
         );
@@ -289,13 +394,194 @@ mod tests {
         assert_eq!(
             deps,
             vec![
-                (dg.by_name("top dep").next().unwrap(), vec![DepInfo::Ours],),
+                (
+                    dg.by_name("top dep").next().unwrap(),
+                    Dep {
+                        needed_by: vec![Attribution::Ours],
+                        outputs: None,
+                    }
+                ),
                 (
                     dg.by_name("nested dep").next().unwrap(),
-                    vec![DepInfo::Inherited {
-                        from: dg.by_name("top dep").next().unwrap()
-                    }]
+                    Dep {
+                        needed_by: vec![Attribution::Inherited {
+                            from: dg.by_name("top dep").next().unwrap()
+                        }],
+                        outputs: None,
+                    }
                 )
+            ],
+        );
+    }
+
+    #[test]
+    fn subsets_combined() {
+        let sr = SpecReader::new(
+            indoc! {
+                "
+                let {subsetOf, BuildSpec, Source, OutputData, ..} = import \"minimal.ncl\" in
+
+                let runtime_dep = {
+                    name = \"runtime dep\",
+                    inputs = [
+                        {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
+                    ],
+                    cmd = \"\",
+                    outputs = {
+                      a = {glob = \"a\"} | OutputData,
+                      b = {glob = \"b\"} | OutputData,
+                    }
+                } | BuildSpec
+                in
+                let collection = {
+                  name = \"collection\",
+                  inputs = [],
+                  cmd = \"\",
+                  runtime_deps = [subsetOf runtime_dep [\"a\"]],
+                } | BuildSpec
+                in
+
+                {
+                    name = \"top build\",
+                    inputs = [
+                        {
+                            name = \"input\",
+                            inputs = [],
+                            cmd = \"\",
+                        } | BuildSpec,
+                    ],
+                    runtime_deps = [
+                        collection,
+                        subsetOf runtime_dep [\"b\"],
+                    ],
+                    cmd = \"\",
+                } | BuildSpec"
+            }
+            .to_string(),
+            &SpecReaderOptions::for_test(),
+        );
+        // So we can see the actual error when parsing fails
+        sr.as_ref().err().into_iter().for_each(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+        let sr = sr.unwrap();
+
+        let dg = DepGraph::new(sr).unwrap();
+
+        let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], false);
+        assert_eq!(
+            toplevel_manifest.build,
+            dg.by_name("top build").next().unwrap()
+        );
+
+        let mut result = toplevel_manifest
+            .transitive_runtime_deps
+            .into_iter()
+            .collect::<Vec<_>>();
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            result,
+            vec![
+                (
+                    dg.by_name("collection").next().unwrap(),
+                    Dep {
+                        needed_by: vec![Attribution::Ours],
+                        outputs: None,
+                    }
+                ),
+                (
+                    dg.by_name("runtime dep").next().unwrap(),
+                    Dep {
+                        needed_by: vec![
+                            Attribution::Ours,
+                            Attribution::Inherited {
+                                from: dg.by_name("collection").next().unwrap()
+                            }
+                        ],
+                        outputs: Some(["a", "b"].into_iter().map(|s| s.to_string()).collect()),
+                    }
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn subset_promoted() {
+        let sr = SpecReader::new(
+            indoc! {
+                "
+                let {subsetOf, BuildSpec, Source, OutputData, ..} = import \"minimal.ncl\" in
+
+                let runtime_dep = {
+                    name = \"runtime dep\",
+                    inputs = [
+                        {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
+                    ],
+                    cmd = \"\",
+                    outputs = {
+                      a = {glob = \"a\"} | OutputData,
+                      b = {glob = \"a\"} | OutputData,
+                    }
+                } | BuildSpec
+                in
+
+                {
+                    name = \"top build\",
+                    inputs = [
+                        {
+                            name = \"input\",
+                            inputs = [],
+                            cmd = \"\",
+                        } | BuildSpec,
+                        runtime_dep,
+                    ],
+                    runtime_deps = [
+                        subsetOf runtime_dep [\"a\"],
+                    ],
+                    cmd = \"\",
+                } | BuildSpec"
+            }
+            .to_string(),
+            &SpecReaderOptions::for_test(),
+        );
+        // So we can see the actual error when parsing fails
+        sr.as_ref().err().into_iter().for_each(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+        let sr = sr.unwrap();
+
+        let dg = DepGraph::new(sr).unwrap();
+
+        let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], true);
+        assert_eq!(
+            toplevel_manifest.build,
+            dg.by_name("top build").next().unwrap()
+        );
+
+        let mut result = toplevel_manifest
+            .transitive_runtime_deps
+            .into_iter()
+            .collect::<Vec<_>>();
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            result,
+            vec![
+                (
+                    dg.by_name("input").next().unwrap(),
+                    Dep {
+                        needed_by: vec![Attribution::Ours],
+                        outputs: None,
+                    }
+                ),
+                (
+                    dg.by_name("runtime dep").next().unwrap(),
+                    Dep {
+                        needed_by: vec![Attribution::Ours],
+                        outputs: None,
+                    }
+                ),
             ],
         );
     }
