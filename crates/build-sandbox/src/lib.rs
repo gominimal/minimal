@@ -40,8 +40,5 @@ pub async fn run_build(
         cache_dest_dir,
     )?;
 
-    Ok(BuildResult {
-        exit_code,
-        outputs,
-    })
+    Ok(BuildResult { exit_code, outputs })
 }

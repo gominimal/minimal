@@ -2,7 +2,7 @@
 //!
 //! Writes build events to a file in JSON-lines format (one JSON object per line).
 
-use crate::events::{build_event, BuildEvent, TargetKind};
+use crate::events::{BuildEvent, TargetKind, build_event};
 use crate::subscriber::{BuildEventSubscriber, SubscriberError};
 use async_trait::async_trait;
 use std::io::Write;
@@ -69,11 +69,12 @@ impl std::fmt::Debug for JsonFileWriter {
 
 /// Convert proto BuildEvent to JSON value (custom serialization since proto types don't have serde)
 fn event_to_json(event: &BuildEvent) -> serde_json::Value {
-    let event_type_json = match &event.event {
+    match &event.event {
         Some(build_event::Event::BuildStarted(e)) => {
             serde_json::json!({
                 "type": "build_started",
                 "build_started": {
+                    "invocation_id": e.invocation_id,
                     "command": e.command,
                     "timestamp_millis": e.timestamp_millis,
                     "working_directory": e.working_directory,
@@ -169,9 +170,7 @@ fn event_to_json(event: &BuildEvent) -> serde_json::Value {
                 "type": "unknown",
             })
         }
-    };
-
-    event_type_json
+    }
 }
 
 #[async_trait]
@@ -216,7 +215,6 @@ mod tests {
         assert_eq!(writer.path(), file_path.as_path());
 
         let event = BuildEvent {
-            invocation_id: "test-123".to_string(),
             event: Some(build_event::Event::BuildStarted(BuildStarted {
                 invocation_id: "test-123".to_string(),
                 command: "build".to_string(),
@@ -240,8 +238,8 @@ mod tests {
         assert_eq!(lines.len(), 1);
 
         let parsed: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
-        assert_eq!(parsed["invocation_id"], "test-123");
-        assert_eq!(parsed["event"]["type"], "build_started");
+        assert_eq!(parsed["build_started"]["invocation_id"], "test-123");
+        assert_eq!(parsed["type"], "build_started");
     }
 
     #[tokio::test]
@@ -253,7 +251,6 @@ mod tests {
 
         let events = vec![
             BuildEvent {
-                invocation_id: "test-1".to_string(),
                 event: Some(build_event::Event::BuildStarted(BuildStarted {
                     invocation_id: "test-1".to_string(),
                     command: "build".to_string(),
@@ -262,7 +259,6 @@ mod tests {
                 })),
             },
             BuildEvent {
-                invocation_id: "test-1".to_string(),
                 event: Some(build_event::Event::TargetStarted(TargetStarted {
                     target_id: "target-1".to_string(),
                     label: "//foo:bar".to_string(),
@@ -287,10 +283,10 @@ mod tests {
         assert_eq!(lines.len(), 2);
 
         let parsed0: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
-        assert_eq!(parsed0["event"]["type"], "build_started");
+        assert_eq!(parsed0["type"], "build_started");
 
         let parsed1: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
-        assert_eq!(parsed1["event"]["type"], "target_started");
+        assert_eq!(parsed1["type"], "target_started");
     }
 
     #[tokio::test]
@@ -305,7 +301,6 @@ mod tests {
         let writer = JsonFileWriter::new(&file_path).unwrap();
 
         let event = BuildEvent {
-            invocation_id: "new".to_string(),
             event: Some(build_event::Event::BuildStarted(BuildStarted {
                 invocation_id: "new".to_string(),
                 command: "build".to_string(),

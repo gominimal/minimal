@@ -23,7 +23,6 @@ use tokio::sync::broadcast;
 ///     let mut receiver = bus.subscribe();
 ///
 ///     bus.emit(BuildEvent {
-///         invocation_id: "test-123".to_string(),
 ///         event: Some(build_event::Event::BuildStarted(BuildStarted {
 ///             invocation_id: "test-123".to_string(),
 ///             command: "build".to_string(),
@@ -80,7 +79,6 @@ impl BuildEventBus {
     ///
     /// let bus = BuildEventBus::new(1000);
     /// bus.emit(BuildEvent {
-    ///     invocation_id: "test-123".to_string(),
     ///     event: Some(build_event::Event::BuildStarted(BuildStarted {
     ///         invocation_id: "test-123".to_string(),
     ///         command: "build".to_string(),
@@ -144,7 +142,6 @@ mod tests {
         let mut receiver = bus.subscribe();
 
         let event = BuildEvent {
-            invocation_id: "test-123".to_string(),
             event: Some(build_event::Event::BuildStarted(BuildStarted {
                 invocation_id: "test-123".to_string(),
                 command: "build".to_string(),
@@ -168,7 +165,6 @@ mod tests {
         let mut receiver2 = bus.subscribe();
 
         let event = BuildEvent {
-            invocation_id: "test-456".to_string(),
             event: Some(build_event::Event::BuildStarted(BuildStarted {
                 invocation_id: "test-456".to_string(),
                 command: "build".to_string(),
@@ -194,7 +190,6 @@ mod tests {
         let mut receiver = bus.subscribe();
 
         let event = BuildEvent {
-            invocation_id: "test-789".to_string(),
             event: Some(build_event::Event::BuildStarted(BuildStarted {
                 invocation_id: "test-789".to_string(),
                 command: "build".to_string(),
@@ -229,7 +224,6 @@ mod tests {
         let bus = BuildEventBus::new(100);
 
         let event1 = BuildEvent {
-            invocation_id: "early".to_string(),
             event: Some(build_event::Event::BuildStarted(BuildStarted {
                 invocation_id: "early".to_string(),
                 command: "build".to_string(),
@@ -245,7 +239,6 @@ mod tests {
         let mut receiver = bus.subscribe();
 
         let event2 = BuildEvent {
-            invocation_id: "late".to_string(),
             event: Some(build_event::Event::BuildStarted(BuildStarted {
                 invocation_id: "late".to_string(),
                 command: "build".to_string(),

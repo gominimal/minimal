@@ -13,6 +13,7 @@ use tracing_indicatif::TickSettings;
 use tracing_indicatif::filter::IndicatifFilter;
 use tracing_indicatif::filter::hide_indicatif_span_fields;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use uuid::Uuid;
 
 mod lockfile;
 mod paths;
@@ -369,15 +370,20 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     cli.global_args.path_config().ensure_directories()?;
 
-    // Initialize global event bus and SpongeBob integration
-    let spongebob = build_events_proto::SpongeBob::new()
+    // Generate invocation ID for this build
+    let invocation_id = Uuid::new_v4().to_string();
+
+    // Initialize global invocation ID and event bus
+    build_events::initialize_invocation_id(invocation_id.clone());
+    build_events::initialize_global_event_bus();
+
+    // Initialize SpongeBob integration
+    let spongebob = build_events_proto::SpongeBob::new(invocation_id)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob client: {}", e))?;
 
-    // Initialize the global event bus
-    build_events::initialize_global_event_bus();
-
-    let mut dispatcher = build_events::BuildEventDispatcher::new(build_events::event_bus().subscribe());
+    let mut dispatcher =
+        build_events::BuildEventDispatcher::new(build_events::event_bus().subscribe());
     dispatcher.add_subscriber(Box::new(spongebob));
 
     // Spawn dispatcher in background

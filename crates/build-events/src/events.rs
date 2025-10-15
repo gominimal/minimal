@@ -6,8 +6,8 @@
 
 // Re-export proto types as the canonical event types
 pub use minimal_spongebob_community_neoeinstein_prost::spongebob::v1::{
-    build_event, ActionCompleted, ActionStarted, BuildEvent, BuildFinished, BuildMetadata,
-    BuildStarted, FileCreated, TargetCompleted, TargetKind, TargetStarted,
+    ActionCompleted, ActionStarted, BuildEvent, BuildFinished, BuildMetadata, BuildStarted,
+    FileCreated, TargetCompleted, TargetKind, TargetStarted, build_event,
 };
 
 /// Helper function to get current timestamp in milliseconds
@@ -42,6 +42,7 @@ mod tests {
     fn test_event_construction() {
         let event = BuildEvent {
             event: Some(build_event::Event::BuildStarted(BuildStarted {
+                invocation_id: "test-invocation-id".to_string(),
                 command: "build".to_string(),
                 timestamp_millis: 1234567890,
                 working_directory: "/tmp".to_string(),

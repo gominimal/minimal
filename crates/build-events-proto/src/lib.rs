@@ -22,11 +22,15 @@
 //! ```ignore
 //! use build_events::{BuildEventBus, BuildEventDispatcher};
 //! use build_events_proto::SpongeBob;
+//! use uuid::Uuid;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Generate invocation ID
+//!     let invocation_id = Uuid::new_v4().to_string();
+//!
 //!     // Create SpongeBob client (opens bidirectional stream)
-//!     let spongebob = SpongeBob::new().await?;
+//!     let spongebob = SpongeBob::new(invocation_id).await?;
 //!
 //!     // Initialize event bus
 //!     let event_bus = BuildEventBus::new(10000);
@@ -57,6 +61,7 @@
 //! // Create proto event (build-events types ARE proto types)
 //! let event = BuildEvent {
 //!     event: Some(build_event::Event::BuildStarted(BuildStarted {
+//!         invocation_id: "invocation-123".to_string(),
 //!         command: "build".to_string(),
 //!         timestamp_millis: current_millis(),
 //!         working_directory: "/tmp".to_string(),
@@ -78,4 +83,4 @@ pub mod proto {
 pub mod client;
 
 // Re-export main types for convenience
-pub use client::{SpongeBob, SpongeBobError, Result};
+pub use client::{Result, SpongeBob, SpongeBobError};

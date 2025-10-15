@@ -1,5 +1,5 @@
 use build_events::events::{
-    build_event, BuildEvent, FileCreated, TargetCompleted, TargetKind, TargetStarted,
+    BuildEvent, FileCreated, TargetCompleted, TargetKind, TargetStarted, build_event,
 };
 use hakoniwa::Container;
 use std::fs;
@@ -102,7 +102,7 @@ impl BuildExecutor {
                 success,
                 timestamp_millis: current_millis(),
                 error_message,
-                outputs: vec![], // Outputs are collected later
+                outputs: vec![],  // Outputs are collected later
                 cache_hit: false, // Cache hit detection happens earlier
             })),
         });

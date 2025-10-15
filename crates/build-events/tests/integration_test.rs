@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use build_events::{
     BuildEvent, BuildEventBus, BuildEventDispatcher, BuildEventSubscriber, SubscriberError,
     events::{
-        build_event, ActionCompleted, ActionStarted, BuildFinished, BuildStarted, TargetCompleted,
-        TargetKind, TargetStarted, current_millis,
+        ActionCompleted, ActionStarted, BuildFinished, BuildStarted, TargetCompleted, TargetKind,
+        TargetStarted, build_event, current_millis,
     },
     subscribers::{JsonFileWriter, LoggerSubscriber},
 };
@@ -48,7 +48,6 @@ async fn test_full_event_flow() {
 
     // Emit all event types
     bus.emit(BuildEvent {
-        invocation_id: "test-integration".to_string(),
         event: Some(build_event::Event::BuildStarted(BuildStarted {
             invocation_id: "test-integration".to_string(),
             command: "build".to_string(),
@@ -58,7 +57,6 @@ async fn test_full_event_flow() {
     });
 
     bus.emit(BuildEvent {
-        invocation_id: "test-integration".to_string(),
         event: Some(build_event::Event::TargetStarted(TargetStarted {
             target_id: "target-1".to_string(),
             label: "//foo:bar".to_string(),
@@ -68,7 +66,6 @@ async fn test_full_event_flow() {
     });
 
     bus.emit(BuildEvent {
-        invocation_id: "test-integration".to_string(),
         event: Some(build_event::Event::ActionStarted(ActionStarted {
             action_id: "action-1".to_string(),
             action_name: "CppCompile".to_string(),
@@ -78,7 +75,6 @@ async fn test_full_event_flow() {
     });
 
     bus.emit(BuildEvent {
-        invocation_id: "test-integration".to_string(),
         event: Some(build_event::Event::ActionCompleted(ActionCompleted {
             action_id: "action-1".to_string(),
             success: true,
@@ -90,7 +86,6 @@ async fn test_full_event_flow() {
     });
 
     bus.emit(BuildEvent {
-        invocation_id: "test-integration".to_string(),
         event: Some(build_event::Event::TargetCompleted(TargetCompleted {
             target_id: "target-1".to_string(),
             label: "//foo:bar".to_string(),
@@ -103,9 +98,7 @@ async fn test_full_event_flow() {
     });
 
     bus.emit(BuildEvent {
-        invocation_id: "test-integration".to_string(),
         event: Some(build_event::Event::BuildFinished(BuildFinished {
-            invocation_id: "test-integration".to_string(),
             success: true,
             timestamp_millis: current_millis(),
             error_message: None,
@@ -145,7 +138,6 @@ async fn test_multiple_subscribers() {
     // Emit a few events
     for i in 0..3 {
         bus.emit(BuildEvent {
-            invocation_id: format!("test-{}", i),
             event: Some(build_event::Event::BuildStarted(BuildStarted {
                 invocation_id: format!("test-{}", i),
                 command: "build".to_string(),
@@ -179,7 +171,6 @@ async fn test_late_subscriber_misses_early_events() {
 
     // Emit event before subscription
     bus.emit(BuildEvent {
-        invocation_id: "early".to_string(),
         event: Some(build_event::Event::BuildStarted(BuildStarted {
             invocation_id: "early".to_string(),
             command: "build".to_string(),
@@ -201,7 +192,6 @@ async fn test_late_subscriber_misses_early_events() {
 
     // Emit event after subscription
     bus.emit(BuildEvent {
-        invocation_id: "late".to_string(),
         event: Some(build_event::Event::BuildStarted(BuildStarted {
             invocation_id: "late".to_string(),
             command: "build".to_string(),
@@ -235,7 +225,6 @@ async fn test_bus_cloning() {
 
     // Emit from original bus
     bus.emit(BuildEvent {
-        invocation_id: "original".to_string(),
         event: Some(build_event::Event::BuildStarted(BuildStarted {
             invocation_id: "original".to_string(),
             command: "build".to_string(),
@@ -246,7 +235,6 @@ async fn test_bus_cloning() {
 
     // Emit from cloned bus
     bus_clone.emit(BuildEvent {
-        invocation_id: "clone".to_string(),
         event: Some(build_event::Event::BuildStarted(BuildStarted {
             invocation_id: "clone".to_string(),
             command: "build".to_string(),

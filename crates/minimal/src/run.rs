@@ -717,8 +717,11 @@ impl<'a> Run<'a> {
 
                     s.spawn(move |_| {
                         let _rt = tokio_runtime.enter();
-                        let result =
-                            futures::executor::block_on(self2.do_build(&bsr, full_build, remote_cache));
+                        let result = futures::executor::block_on(self2.do_build(
+                            &bsr,
+                            full_build,
+                            remote_cache,
+                        ));
 
                         match result {
                             Err(e) => {

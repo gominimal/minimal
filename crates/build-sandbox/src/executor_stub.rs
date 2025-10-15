@@ -13,11 +13,7 @@ impl BuildExecutor {
         todo!()
     }
 
-    pub async fn execute(
-        &self,
-        _: &BuildConfig,
-        _: &str,
-    ) -> Result<i32> {
+    pub async fn execute(&self, _: &BuildConfig, _: &str) -> Result<i32> {
         todo!()
     }
 
@@ -33,11 +29,7 @@ impl BuildExecutor {
         todo!()
     }
 
-    async fn execute_in_container(
-        &self,
-        _: &BuildConfig,
-        _: &str,
-    ) -> Result<()> {
+    async fn execute_in_container(&self, _: &BuildConfig, _: &str) -> Result<()> {
         todo!()
     }
 

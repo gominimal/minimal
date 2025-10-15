@@ -148,7 +148,7 @@ impl BuildEventDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{build_event, BuildStarted, current_millis};
+    use crate::events::{BuildStarted, build_event, current_millis};
     use crate::subscriber::SubscriberError;
     use async_trait::async_trait;
     use std::sync::Arc;
@@ -191,7 +191,6 @@ mod tests {
         for i in 0..5 {
             sender
                 .send(BuildEvent {
-                    invocation_id: format!("test-{}", i),
                     event: Some(build_event::Event::BuildStarted(BuildStarted {
                         invocation_id: format!("test-{}", i),
                         command: "build".to_string(),
@@ -238,7 +237,6 @@ mod tests {
         for i in 0..3 {
             sender
                 .send(BuildEvent {
-                    invocation_id: format!("test-{}", i),
                     event: Some(build_event::Event::BuildStarted(BuildStarted {
                         invocation_id: format!("test-{}", i),
                         command: "build".to_string(),
@@ -295,7 +293,6 @@ mod tests {
         // Send event
         sender
             .send(BuildEvent {
-                invocation_id: "test".to_string(),
                 event: Some(build_event::Event::BuildStarted(BuildStarted {
                     invocation_id: "test".to_string(),
                     command: "build".to_string(),

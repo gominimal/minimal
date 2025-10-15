@@ -2,7 +2,7 @@
 //!
 //! Logs build events using the tracing crate with structured fields.
 
-use crate::events::{build_event, BuildEvent};
+use crate::events::{BuildEvent, build_event};
 use crate::subscriber::{BuildEventSubscriber, SubscriberError};
 use async_trait::async_trait;
 use tracing::info;
@@ -146,7 +146,6 @@ mod tests {
         assert_eq!(subscriber.name(), "LoggerSubscriber");
 
         let event = BuildEvent {
-            invocation_id: "test-123".to_string(),
             event: Some(build_event::Event::BuildStarted(BuildStarted {
                 invocation_id: "test-123".to_string(),
                 command: "build".to_string(),
@@ -165,7 +164,6 @@ mod tests {
 
         let events = vec![
             BuildEvent {
-                invocation_id: "test".to_string(),
                 event: Some(build_event::Event::BuildStarted(BuildStarted {
                     invocation_id: "test".to_string(),
                     command: "build".to_string(),
@@ -174,7 +172,6 @@ mod tests {
                 })),
             },
             BuildEvent {
-                invocation_id: "test".to_string(),
                 event: Some(build_event::Event::TargetStarted(TargetStarted {
                     target_id: "target-1".to_string(),
                     label: "//foo:bar".to_string(),
