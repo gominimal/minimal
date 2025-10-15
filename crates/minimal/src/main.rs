@@ -377,13 +377,8 @@ async fn main() -> Result<()> {
     // Initialize the global event bus
     build_events::initialize_global_event_bus();
 
-    // Setup SpongeBob subscriber
-    use build_events::BuildEventDispatcher;
-    use build_events_proto::SpongeBobSubscriberV2;
-
-    let mut dispatcher = BuildEventDispatcher::new(build_events::event_bus().subscribe());
-    let subscriber = SpongeBobSubscriberV2::from_client(spongebob);
-    dispatcher.add_subscriber(Box::new(subscriber));
+    let mut dispatcher = build_events::BuildEventDispatcher::new(build_events::event_bus().subscribe());
+    dispatcher.add_subscriber(Box::new(spongebob));
 
     // Spawn dispatcher in background
     tokio::spawn(async move {

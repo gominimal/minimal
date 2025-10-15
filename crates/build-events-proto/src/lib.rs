@@ -9,33 +9,31 @@
 //! This crate extends the pure Rust `build-events` crate with:
 //! - **Protobuf message definitions** for all build event types (via BSR)
 //! - **SpongeBob gRPC client** for streaming build events to spongebob.minimal.farm
-//! - **SpongeBobSubscriberV2** for forwarding events to SpongeBob service
+//! - **BuildEventSubscriber implementation** on SpongeBob for direct integration
 //!
 //! # Architecture
 //!
 //! ```text
-//! Build Events → BuildEventDispatcher → SpongeBobSubscriberV2 → SpongeBob client → spongebob.minimal.farm
+//! Build Events → BuildEventDispatcher → SpongeBob client → spongebob.minimal.farm
 //! ```
 //!
 //! # Example: Sending Events to SpongeBob
 //!
 //! ```ignore
 //! use build_events::{BuildEventBus, BuildEventDispatcher};
-//! use build_events_proto::{SpongeBob, SpongeBobSubscriberV2};
+//! use build_events_proto::SpongeBob;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Create SpongeBob client (opens bidirectional stream)
 //!     let spongebob = SpongeBob::new().await?;
-//!     let invocation_id = spongebob.invocation_id().to_string();
 //!
 //!     // Initialize event bus
 //!     let event_bus = BuildEventBus::new(10000);
 //!
-//!     // Setup dispatcher with SpongeBob subscriber
+//!     // Setup dispatcher with SpongeBob as subscriber
 //!     let mut dispatcher = BuildEventDispatcher::new(event_bus.subscribe());
-//!     let subscriber = SpongeBobSubscriberV2::from_client(spongebob);
-//!     dispatcher.add_subscriber(Box::new(subscriber));
+//!     dispatcher.add_subscriber(Box::new(spongebob));
 //!
 //!     // Start dispatcher in background
 //!     tokio::spawn(async move {
@@ -78,8 +76,6 @@ pub mod proto {
 }
 
 pub mod client;
-pub mod spongebob_subscriber_v2;
 
 // Re-export main types for convenience
 pub use client::{SpongeBob, SpongeBobError, Result};
-pub use spongebob_subscriber_v2::SpongeBobSubscriberV2;

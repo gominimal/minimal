@@ -4,6 +4,8 @@ use crate::proto::{
     build_event, BuildEvent, BuildStarted, OrderedBuildEvent, PublishBuildEventStreamRequest,
     build_event_service_client::BuildEventServiceClient,
 };
+use async_trait::async_trait;
+use build_events::{BuildEventSubscriber, SubscriberError};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -177,6 +179,37 @@ impl SpongeBob {
         // Drop the request sender which will close the stream
         // The background task will detect the closed stream and terminate
         drop(self.request_tx);
+        Ok(())
+    }
+}
+
+/// Implement BuildEventSubscriber trait to allow SpongeBob client to be used
+/// directly as a subscriber in the build events dispatcher.
+#[async_trait]
+impl BuildEventSubscriber for SpongeBob {
+    async fn on_event(&self, event: &BuildEvent) -> std::result::Result<(), SubscriberError> {
+        // Publish all events to SpongeBob
+        match self.publish_build_event(event.clone()).await {
+            Ok(()) => {
+                tracing::debug!("Successfully published build event to Spongebob");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!("Failed to publish build event to Spongebob: {}", e);
+                Err(SubscriberError::Custom(format!(
+                    "Failed to publish event: {}",
+                    e
+                )))
+            }
+        }
+    }
+
+    fn name(&self) -> &str {
+        "SpongeBob"
+    }
+
+    async fn on_close(&self) -> std::result::Result<(), SubscriberError> {
+        // No cleanup needed - connection will be closed when dropped
         Ok(())
     }
 }
