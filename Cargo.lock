@@ -574,7 +574,6 @@ dependencies = [
  "smallvec",
  "tar",
  "tempfile",
- "thiserror 2.0.17",
  "tracing",
  "url",
  "zstd",

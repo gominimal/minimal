@@ -87,7 +87,7 @@ pub enum Compression {
 impl Compression {
     /// Detect compression format from file extension, if recognized.
     pub fn from_extension(path: &str) -> Option<Self> {
-        if path.ends_with(".tar.gz") {
+        if path.ends_with(".tar.gz") || path.ends_with(".tgz") {
             Some(Compression::Gzip)
         } else if path.ends_with(".tar.xz") {
             Some(Compression::Xz)
