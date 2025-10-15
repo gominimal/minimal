@@ -373,10 +373,9 @@ async fn main() -> Result<()> {
     let spongebob = build_events_proto::SpongeBob::new()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob client: {}", e))?;
-    let invocation_id = spongebob.invocation_id().to_string();
 
     // Initialize the global event bus
-    build_events::initialize_global_event_bus(invocation_id);
+    build_events::initialize_global_event_bus();
 
     // Setup SpongeBob subscriber
     use build_events::BuildEventDispatcher;

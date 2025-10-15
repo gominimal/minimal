@@ -1,7 +1,7 @@
 //! SpongeBob gRPC client for streaming build events
 
 use crate::proto::{
-    build_event, BuildEvent, BuildStarted, FileCreated, OrderedBuildEvent, PublishBuildEventStreamRequest,
+    build_event, BuildEvent, BuildStarted, OrderedBuildEvent, PublishBuildEventStreamRequest,
     build_event_service_client::BuildEventServiceClient,
 };
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -35,8 +35,6 @@ pub type Result<T> = std::result::Result<T, SpongeBobError>;
 #[derive(Debug, Clone)]
 pub struct SpongeBob {
     request_tx: Arc<Mutex<mpsc::Sender<PublishBuildEventStreamRequest>>>,
-    invocation_id: String,
-    url: String,
     sequence_number: Arc<AtomicI64>,
 }
 
@@ -44,14 +42,13 @@ impl SpongeBob {
     /// Create a new SpongeBob client and open streaming connection
     ///
     /// This immediately connects to the server and opens a bidirectional
-    /// stream. The server assigns an invocation ID which is returned in
-    /// the first response.
+    /// stream. The server assigns an invocation ID which is logged.
     ///
     /// # Example
     /// ```ignore
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let spongebob = build_events_proto::SpongeBob::new().await?;
-    /// println!("Invocation URL: {}", spongebob.url());
+    /// // Invocation URL is automatically logged
     /// # Ok(())
     /// # }
     /// ```
@@ -97,89 +94,49 @@ impl SpongeBob {
         let response = client.publish_build_event_stream(request_stream).await?;
         let mut response_stream = response.into_inner();
 
-        // Create oneshot channel for first response
-        let (first_response_tx, first_response_rx) = tokio::sync::oneshot::channel();
-
-        // Spawn background task to continuously read responses
-        // This task reads responses and sends the first one to the oneshot channel
-        tokio::spawn(async move {
-            let mut first_response_tx = Some(first_response_tx);
-
-            loop {
-                match response_stream.message().await {
-                    Ok(Some(response)) => {
-                        // Send first response to oneshot channel
-                        if let Some(tx) = first_response_tx.take() {
-                            let _ = tx.send(response);
-                        } else {
-                            // Log acknowledgment for debugging
-                            tracing::debug!(
-                                sequence_number = response.sequence_number,
-                                "Received acknowledgment from server"
-                            );
-                        }
-                    }
-                    Ok(None) => {
-                        // Stream closed by server
-                        tracing::info!("Response stream closed by server");
-                        break;
-                    }
-                    Err(e) => {
-                        // Log error but don't crash - allow graceful degradation
-                        tracing::warn!("Error reading from response stream: {}", e);
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Wait for first response from background task
-        let first_response = first_response_rx
-            .await
-            .map_err(|_| SpongeBobError::Stream("Background task died before first response".to_string()))?;
+        // Read first response to get invocation ID
+        let first_response = response_stream
+            .message()
+            .await?
+            .ok_or_else(|| SpongeBobError::Stream("Server closed stream before sending invocation ID".to_string()))?;
 
         let invocation_id = first_response
             .stream_id
             .ok_or_else(|| SpongeBobError::Stream("Server did not provide stream ID".to_string()))?
             .invocation_id;
 
-        let url = format!("https://dash.minimal.farm/invocations/{}", invocation_id);
+        // Log invocation URL at start
+        tracing::info!("https://dash.minimal.farm/invocations/{}", invocation_id);
 
-        tracing::info!(invocation_id = %invocation_id, "Received server-assigned invocation ID");
+        // Spawn background task to drain responses
+        let invocation_id_for_task = invocation_id.clone();
+        tokio::spawn(async move {
+            loop {
+                match response_stream.message().await {
+                    Ok(Some(response)) => {
+                        tracing::debug!(
+                            sequence_number = response.sequence_number,
+                            "Received acknowledgment from server"
+                        );
+                    }
+                    Ok(None) => {
+                        // Stream closed by server - log final URL
+                        tracing::info!("https://dash.minimal.farm/invocations/{}", invocation_id_for_task);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Error reading from response stream: {}", e);
+                        tracing::info!("https://dash.minimal.farm/invocations/{}", invocation_id_for_task);
+                        break;
+                    }
+                }
+            }
+        });
 
         Ok(Self {
             request_tx: Arc::new(Mutex::new(request_tx)),
-            invocation_id,
-            url,
             sequence_number: Arc::new(AtomicI64::new(2)), // Start at 2 (we used 1 for BuildStarted)
         })
-    }
-
-    /// Publish a FileCreated event to upload a file for a specific target
-    #[tracing::instrument(skip(self, contents))]
-    pub async fn publish_file_created_event(
-        &self,
-        target_id: &str,
-        file_name: &str,
-        contents: Vec<u8>,
-    ) -> Result<()> {
-        let timestamp_millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-
-        let file_created = FileCreated {
-            target_id: target_id.to_string(),
-            name: file_name.to_string(),
-            contents: contents.into(),
-            timestamp_millis,
-        };
-
-        let event = BuildEvent {
-            event: Some(build_event::Event::FileCreated(file_created)),
-        };
-
-        self.publish_build_event(event).await
     }
 
     /// Publish a build event to Spongebob via the streaming connection
@@ -221,20 +178,5 @@ impl SpongeBob {
         // The background task will detect the closed stream and terminate
         drop(self.request_tx);
         Ok(())
-    }
-
-    /// Get the server-assigned invocation ID
-    pub fn invocation_id(&self) -> &str {
-        &self.invocation_id
-    }
-
-    /// Get the dashboard URL for this invocation
-    pub fn url(&self) -> &str {
-        &self.url
-    }
-
-    /// Get the resource name for this invocation
-    pub fn resource_name(&self) -> String {
-        format!("invocations/{}", self.invocation_id)
     }
 }

@@ -212,12 +212,8 @@ pub async fn cmd_build_impl(
         }
     }
 
-    // Display build summary with spongebob URL
-    let spongebob_url = format!(
-        "https://dash.minimal.farm/invocations/{}",
-        build_events::invocation_id()
-    );
-    display_build_summary(graph, &cache, globals, &run, Some(&spongebob_url));
+    // Display build summary
+    display_build_summary(graph, &cache, globals, &run);
 
     Ok(())
 }
@@ -228,7 +224,6 @@ fn display_build_summary(
     cache: &Cache<LocalDir>,
     _globals: &GlobalArgs,
     _run: &Run,
-    command_spongebob_url: Option<&str>,
 ) {
     info!("Build completed successfully!");
 
@@ -247,7 +242,4 @@ fn display_build_summary(
             }
         }
     }
-    if let Some(url) = command_spongebob_url {
-        info!("{}", url);
-    };
 }
