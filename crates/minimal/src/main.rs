@@ -386,8 +386,8 @@ async fn main() -> Result<()> {
         build_events::BuildEventDispatcher::new(build_events::event_bus().subscribe());
     dispatcher.add_subscriber(Box::new(spongebob));
 
-    // Spawn dispatcher in background
-    tokio::spawn(async move {
+    // Spawn dispatcher in background and store the join handle
+    let dispatcher_handle = tokio::spawn(async move {
         dispatcher.run().await;
     });
 
@@ -402,6 +402,14 @@ async fn main() -> Result<()> {
         #[cfg(target_os = "linux")]
         Command::Run(args) => cmd_run(args, &cli.global_args).await,
     };
+
+    // Close the event bus to signal the dispatcher to shut down gracefully
+    build_events::event_bus().close();
+
+    // Wait for dispatcher to complete (which will wait for SpongeBob to log the final URL)
+    if let Err(e) = dispatcher_handle.await {
+        tracing::warn!("Dispatcher task failed: {}", e);
+    }
 
     if let Err(e) = result {
         e.report_to_stderr();

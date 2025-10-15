@@ -4,7 +4,7 @@
 //! broadcast channel to distribute events to multiple subscribers.
 
 use crate::events::BuildEvent;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 /// Central event bus for distributing build events to subscribers
@@ -39,7 +39,7 @@ use tokio::sync::broadcast;
 /// ```
 #[derive(Clone, Debug)]
 pub struct BuildEventBus {
-    sender: Arc<broadcast::Sender<BuildEvent>>,
+    sender: Arc<Mutex<Option<broadcast::Sender<BuildEvent>>>>,
 }
 
 impl BuildEventBus {
@@ -60,7 +60,7 @@ impl BuildEventBus {
     pub fn new(capacity: usize) -> Self {
         let (sender, _) = broadcast::channel(capacity);
         Self {
-            sender: Arc::new(sender),
+            sender: Arc::new(Mutex::new(Some(sender))),
         }
     }
 
@@ -88,10 +88,14 @@ impl BuildEventBus {
     /// });
     /// ```
     pub fn emit(&self, event: BuildEvent) {
-        // Use try_send to avoid blocking. If the channel is full, the event
-        // will be dropped. This is acceptable because we prioritize not
-        // blocking the build process over guaranteed delivery.
-        let _ = self.sender.send(event);
+        // Lock and send. If the sender is closed, drop the event.
+        // This is acceptable because we prioritize not blocking the build
+        // process over guaranteed delivery.
+        if let Ok(sender_lock) = self.sender.lock() {
+            if let Some(sender) = sender_lock.as_ref() {
+                let _ = sender.send(event);
+            }
+        }
     }
 
     /// Subscribe to build events
@@ -110,7 +114,11 @@ impl BuildEventBus {
     /// // Both receivers will get events emitted from now on
     /// ```
     pub fn subscribe(&self) -> broadcast::Receiver<BuildEvent> {
-        self.sender.subscribe()
+        let sender_lock = self.sender.lock().expect("Mutex poisoned");
+        sender_lock
+            .as_ref()
+            .expect("Cannot subscribe to closed event bus")
+            .subscribe()
     }
 
     /// Get the current number of active subscribers
@@ -125,7 +133,41 @@ impl BuildEventBus {
     /// assert_eq!(bus.receiver_count(), 1);
     /// ```
     pub fn receiver_count(&self) -> usize {
-        self.sender.receiver_count()
+        if let Ok(sender_lock) = self.sender.lock() {
+            sender_lock
+                .as_ref()
+                .map(|s| s.receiver_count())
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    /// Close the event bus, signaling all receivers to shut down
+    ///
+    /// This drops the sender, which causes all receivers to receive
+    /// `RecvError::Closed`, allowing them to shut down gracefully.
+    ///
+    /// # Example
+    /// ```
+    /// use build_events::BuildEventBus;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let bus = BuildEventBus::new(1000);
+    ///     let mut receiver = bus.subscribe();
+    ///
+    ///     // Close the bus
+    ///     bus.close();
+    ///
+    ///     // Receiver will get Closed error
+    ///     assert!(receiver.recv().await.is_err());
+    /// }
+    /// ```
+    pub fn close(&self) {
+        if let Ok(mut sender_lock) = self.sender.lock() {
+            sender_lock.take(); // Drop the sender, closing the channel
+        }
     }
 }
 

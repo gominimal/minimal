@@ -3,6 +3,7 @@
 use crate::proto::{BuildEvent, build_event_service_client::BuildEventServiceClient};
 use async_trait::async_trait;
 use build_events::{BuildEventSubscriber, SubscriberError};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -25,9 +26,19 @@ pub type Result<T> = std::result::Result<T, SpongeBobError>;
 /// Creates a client streaming connection for publishing build events.
 /// All events are published through this stream.
 /// The server sends an Empty response when the stream closes.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SpongeBob {
-    request_tx: mpsc::Sender<BuildEvent>,
+    request_tx: Arc<tokio::sync::Mutex<Option<mpsc::Sender<BuildEvent>>>>,
+    stream_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+}
+
+impl Clone for SpongeBob {
+    fn clone(&self) -> Self {
+        Self {
+            request_tx: self.request_tx.clone(),
+            stream_handle: self.stream_handle.clone(),
+        }
+    }
 }
 
 impl SpongeBob {
@@ -58,7 +69,7 @@ impl SpongeBob {
 
         // Spawn task to handle stream and wait for response
         let invocation_id_for_task = invocation_id.clone();
-        tokio::spawn(async move {
+        let stream_handle = tokio::spawn(async move {
             let request_stream = ReceiverStream::new(request_rx);
             match client.publish_build_event_stream(request_stream).await {
                 Ok(_response) => {
@@ -78,7 +89,10 @@ impl SpongeBob {
             }
         });
 
-        Ok(Self { request_tx })
+        Ok(Self {
+            request_tx: Arc::new(tokio::sync::Mutex::new(Some(request_tx))),
+            stream_handle: Arc::new(tokio::sync::Mutex::new(Some(stream_handle))),
+        })
     }
 
     /// Publish a build event to Spongebob via the streaming connection
@@ -87,14 +101,17 @@ impl SpongeBob {
     /// The background task handles sending to the server.
     #[tracing::instrument(skip(self, event))]
     pub async fn publish_build_event(&self, event: BuildEvent) -> Result<()> {
-        self.request_tx
-            .send(event)
-            .await
-            .map_err(|e| SpongeBobError::Stream(format!("Failed to send event: {}", e)))?;
+        let tx_lock = self.request_tx.lock().await;
+        if let Some(tx) = tx_lock.as_ref() {
+            tx.send(event)
+                .await
+                .map_err(|e| SpongeBobError::Stream(format!("Failed to send event: {}", e)))?;
 
-        tracing::debug!("Event queued for sending");
-
-        Ok(())
+            tracing::debug!("Event queued for sending");
+            Ok(())
+        } else {
+            Err(SpongeBobError::Stream("Stream already closed".to_string()))
+        }
     }
 
     /// Close the stream and wait for final response
@@ -136,7 +153,22 @@ impl BuildEventSubscriber for SpongeBob {
     }
 
     async fn on_close(&self) -> std::result::Result<(), SubscriberError> {
-        // No cleanup needed - connection will be closed when dropped
+        tracing::debug!("Closing SpongeBob client and waiting for stream to complete");
+
+        // Drop the request sender to close the stream
+        {
+            let mut tx_lock = self.request_tx.lock().await;
+            tx_lock.take(); // This drops the sender, closing the channel
+        }
+
+        // Wait for the stream handler task to complete and log the final URL
+        let mut handle_lock = self.stream_handle.lock().await;
+        if let Some(handle) = handle_lock.take() {
+            if let Err(e) = handle.await {
+                tracing::warn!("Stream handler task failed: {}", e);
+            }
+        }
+
         Ok(())
     }
 }
