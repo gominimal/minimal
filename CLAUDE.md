@@ -93,10 +93,17 @@ Package Spec (build.ncl) → SpecReader → DepGraph → ExecPlan → Build Reso
 
 **Sandbox Isolation Strategy**:
 - **Linux**: User namespaces + mount namespaces for filesystem isolation
-- **macOS**: `sandbox-exec` with dynamically generated policies  
+- **macOS**: `sandbox-exec` with dynamically generated policies
 - **Dependency mounting**: Build dependencies mounted read-only at specific paths
 - **Input copying**: Source files and local inputs copied to TMPDIR
 - **Output staging**: Builds write to `OUTPUT_DIR`, enumerated outputs copied to cache
+
+**SpongeBob Integration**:
+- **Build events**: Executor emits TargetStarted and TargetCompleted events for observability
+- **Target identifiers**: Package names (e.g., "tar", "glibc") used as target IDs
+- **File uploads**: stdout/stderr uploaded to SpongeBob after build execution
+- **Event flow**: TargetStarted → Build executes → Files uploaded → TargetCompleted
+- **Error handling**: Events published even on build failure for complete observability
 
 ### Package Ecosystem
 
@@ -174,6 +181,14 @@ gcc,
 - `Sandbox` trait with platform-specific implementations
 - Linux uses direct syscalls via `nix` crate (no external dependencies)
 - Error handling includes platform-specific sandbox violations
+
+**Build Observability (SpongeBob Integration)**:
+- **build-sandbox executor** emits build events automatically when a SpongeBobInvocation is provided
+- **TargetStarted event**: Published before build execution begins, creates target in database
+- **TargetCompleted event**: Published after build finishes (success or failure)
+- **File uploads**: stdout/stderr automatically uploaded to SpongeBob for each target
+- **Target naming**: Uses package name as semantic target identifier (e.g., "tar" not a random UUID)
+- **Requirement**: Targets must exist (via TargetStarted) before file uploads succeed
 
 ## Working with Package Specs
 

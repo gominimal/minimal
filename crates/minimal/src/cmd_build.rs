@@ -1,9 +1,14 @@
 use crate::{Context, PackagesArg};
 use crate::{Error, lockfile::PrebuiltsLock, remote_storage::RemoteStorage, run::Run};
 use anyhow::Context as _;
+use build_events::events::{
+    BuildEvent, BuildFinished, BuildMetadata, BuildStarted, build_event, current_millis,
+};
 use cache::{Cache, CacheBinProvider, LocalDir, RemoteBinProvider};
 use graph::{DepGraph, ExecPlan, Transitives};
+use std::collections::HashMap;
 use std::path::Path;
+use std::process::Command;
 use tracing::info;
 
 #[derive(Debug, clap::Args)]
@@ -27,21 +32,6 @@ pub async fn cmd_build_impl(
     cache: Cache<LocalDir>,
     num_parallel_builds: usize,
 ) -> anyhow::Result<()> {
-    // Create SpongeBob invocation for this build command
-    let mut spongebob_client = spongebob::SpongeBob::new()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob client: {}", e))?;
-
-    let command_info = format!(
-        "build --packages {}",
-        graph
-            .top_levels
-            .iter()
-            .map(|bsr| graph.get(bsr).unwrap().name.as_str())
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_parallel_builds)
         .build_global()
@@ -60,20 +50,80 @@ pub async fn cmd_build_impl(
         output_base,
     );
 
-    let mut spongebob_invocation = match spongebob_client.create_invocation(&command_info).await {
-        Ok(inv) => Some(inv),
-        Err(e) => {
-            tracing::debug!("Failed to create SpongeBob invocation: {}", e);
-            None
-        }
+    // Get command for BuildStarted event (skip binary path at index 0)
+    let args: Vec<String> = std::env::args().collect();
+    let command = if args.len() > 1 {
+        args[1..].join(" ")
+    } else {
+        args.first().cloned().unwrap_or_default()
     };
 
-    match (ctx.no_cache, ctx.no_fetch) {
+    let working_directory = std::env::current_dir()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    // Emit BuildStarted event using global event bus
+    build_events::event_bus().emit(BuildEvent {
+        event: Some(build_event::Event::BuildStarted(BuildStarted {
+            invocation_id: build_events::invocation_id().to_string(),
+            command,
+            timestamp_millis: current_millis(),
+            working_directory,
+        })),
+    });
+
+    // Collect and emit git metadata
+    let mut metadata = HashMap::new();
+
+    // Get git user
+    if let Ok(output) = Command::new("git").args(["config", "user.name"]).output()
+        && output.status.success()
+        && let Ok(user) = String::from_utf8(output.stdout)
+    {
+        metadata.insert("user".to_string(), user.trim().to_string());
+    }
+
+    // Get git branch
+    if let Ok(output) = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        && output.status.success()
+        && let Ok(branch) = String::from_utf8(output.stdout)
+    {
+        metadata.insert("branch".to_string(), branch.trim().to_string());
+    }
+
+    // Get git commit SHA
+    if let Ok(output) = Command::new("git").args(["rev-parse", "HEAD"]).output()
+        && output.status.success()
+        && let Ok(commit) = String::from_utf8(output.stdout)
+    {
+        metadata.insert("commit".to_string(), commit.trim().to_string());
+    }
+
+    // Get git remote URL
+    if let Ok(output) = Command::new("git")
+        .args(["config", "remote.origin.url"])
+        .output()
+        && output.status.success()
+        && let Ok(repo_url) = String::from_utf8(output.stdout)
+    {
+        metadata.insert("repo_url".to_string(), repo_url.trim().to_string());
+    }
+
+    // Emit BuildMetadata event if we collected any metadata (using global event bus)
+    if !metadata.is_empty() {
+        build_events::event_bus().emit(BuildEvent {
+            event: Some(build_event::Event::BuildMetadata(BuildMetadata {
+                metadata,
+            })),
+        });
+    }
+
+    let build_success = match (ctx.no_cache, ctx.no_fetch) {
         // No local or remote cache
-        (true, true) => {
-            run.execute(ExecPlan::new(graph), None, &mut spongebob_invocation)
-                .await
-        }
+        (true, true) => run.execute(ExecPlan::new(graph), None).await,
         // Both caches
         (false, false) => {
             let local_adapter = CacheBinProvider::new(graph, cache.clone());
@@ -82,7 +132,6 @@ pub async fn cmd_build_impl(
             run.execute(
                 ExecPlan::new_with_bin_provider(graph, (local_adapter, remote_adapter)),
                 Some(&remote_cache),
-                &mut spongebob_invocation,
             )
             .await
         }
@@ -93,22 +142,32 @@ pub async fn cmd_build_impl(
             run.execute(
                 ExecPlan::new_with_bin_provider(graph, remote_adapter),
                 Some(&remote_cache),
-                &mut spongebob_invocation,
             )
             .await
         }
         // Only local cache
         (false, true) => {
             let local_adapter = CacheBinProvider::new(graph, cache.clone());
-            run.execute(
-                ExecPlan::new_with_bin_provider(graph, local_adapter),
-                None,
-                &mut spongebob_invocation,
-            )
-            .await
+            run.execute(ExecPlan::new_with_bin_provider(graph, local_adapter), None)
+                .await
         }
-    }
-    .context("Failed to execute build")?;
+    };
+
+    // Determine if build was successful
+    let build_succeeded = build_success.is_ok();
+    let error_message = build_success.as_ref().err().map(|e| e.to_string());
+
+    // Emit BuildFinished event using global event bus
+    build_events::event_bus().emit(BuildEvent {
+        event: Some(build_event::Event::BuildFinished(BuildFinished {
+            success: build_succeeded,
+            timestamp_millis: current_millis(),
+            error_message,
+        })),
+    });
+
+    // Propagate error if build failed
+    build_success.context("Failed to execute build")?;
 
     // If we got this far, everything we need is either fetchable or built.
     //
@@ -160,59 +219,8 @@ pub async fn cmd_build_impl(
         }
     }
 
-    // Log build results to SpongeBob
-    if let Some(ref mut invocation) = spongebob_invocation {
-        log_build_results_to_spongebob(invocation, graph, true).await?;
-    }
-
-    let spongebob_url = spongebob_invocation
-        .as_ref()
-        .map(|inv| inv.url().to_string());
-
     // Display build summary
-    display_build_summary(graph, &cache, ctx, &run, spongebob_url.as_deref());
-
-    Ok(())
-}
-
-/// Log build command results to SpongeBob
-async fn log_build_results_to_spongebob(
-    spongebob_invocation: &mut spongebob::SpongeBobInvocation,
-    graph: &DepGraph,
-    success: bool,
-) -> anyhow::Result<()> {
-    let packages_list = graph
-        .top_levels
-        .iter()
-        .map(|bsr| graph.get(bsr).unwrap().name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let _build_summary = if success {
-        format!(
-            "Build completed successfully for packages: {}",
-            packages_list
-        )
-    } else {
-        format!("Build failed for packages: {}", packages_list)
-    };
-
-    let build_log = format!(
-        "Build Command Summary\n\
-         Packages: {}\n\
-         Status: {}\n\
-         Total packages: {}\n",
-        packages_list,
-        if success { "SUCCESS" } else { "FAILED" },
-        graph.top_levels.len()
-    );
-
-    // Upload build summary
-    info!("Uploading build summary to SpongeBob invocation");
-    spongebob_invocation
-        .upload_file("build-summary.txt", build_log.into_bytes())
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to upload build summary to SpongeBob: {}", e))?;
+    display_build_summary(graph, &cache, ctx, &run);
 
     Ok(())
 }
@@ -223,7 +231,6 @@ fn display_build_summary(
     cache: &Cache<LocalDir>,
     _ctx: &mut Context,
     _run: &Run,
-    command_spongebob_url: Option<&str>,
 ) {
     info!("Build completed successfully!");
 
@@ -242,7 +249,4 @@ fn display_build_summary(
             }
         }
     }
-    if let Some(url) = command_spongebob_url {
-        info!("{}", url);
-    };
 }

@@ -8,12 +8,14 @@ publish.workspace = true
 globset.workspace = true
 nickel-lang-core.workspace = true
 serde.workspace = true
-spongebob = { path = "../spongebob" }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 common.workspace = true
+
+# Use build-events which now provides proto types
+build-events.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 hakoniwa.workspace = true

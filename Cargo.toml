@@ -1,12 +1,13 @@
 [workspace]
 members = [
+    "crates/build-events",
+    "crates/build-events-proto",
     "crates/build-sandbox",
     "crates/cache",
     "crates/checkouts",
     "crates/common",
     "crates/graph",
     "crates/minimal",
-    "crates/spongebob",
 ]
 resolver = "3"
 
@@ -69,6 +70,8 @@ zstd = "0.13"
 globset = "0.4"
 
 # our crates
+build-events = { version = "0.0.1", path = "crates/build-events" }
+build-events-proto = { version = "0.0.1", path = "crates/build-events-proto" }
 build-sandbox = { path = "crates/build-sandbox" }
 graph = { version = "0.0.1", path = "crates/graph" }
 cache = { version = "0.0.1", path = "crates/cache" }

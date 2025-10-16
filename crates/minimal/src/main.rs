@@ -10,6 +10,7 @@ use tracing::error;
 use tracing_indicatif::{IndicatifLayer, TickSettings};
 use tracing_indicatif::{filter::IndicatifFilter, filter::hide_indicatif_span_fields};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use uuid::Uuid;
 
 mod lockfile;
 mod paths;
@@ -32,7 +33,9 @@ mod cmd_upload_cache;
 use cmd_upload_cache::{UploadArgs, cmd_upload_cache};
 mod cmd_patched_build;
 use cmd_patched_build::{PatchedBuildArgs, cmd_patched_build};
+#[cfg(target_os = "linux")]
 mod cmd_run;
+#[cfg(target_os = "linux")]
 use cmd_run::{RunArgs, cmd_run};
 
 #[derive(Parser)]
@@ -66,6 +69,7 @@ enum Command {
     #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
     PatchedBuild(PatchedBuildArgs),
     /// Runs a command using the given packages, in the current working directory.
+    #[cfg(target_os = "linux")]
     #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
     Run(RunArgs),
 }
@@ -104,6 +108,10 @@ pub struct GlobalArgs {
     /// Configure the number of parallel builds
     #[arg(short, long, default_value_t = default_parallelism())]
     num_parallel_builds: usize,
+
+    /// Write build events to a protobuf text format file
+    #[arg(long)]
+    build_events_file: Option<PathBuf>,
 }
 
 fn default_parallelism() -> usize {
@@ -412,7 +420,47 @@ async fn main() -> Result<()> {
         }))
         .init();
 
-    if let Err(e) = run_cli(Cli::parse()).await {
+    let cli = Cli::parse();
+
+    // Generate invocation ID for this build
+    let invocation_id = Uuid::new_v4().to_string();
+
+    // Initialize global invocation ID and event bus
+    build_events::initialize_invocation_id(invocation_id.clone());
+    build_events::initialize_global_event_bus();
+
+    // Initialize SpongeBob integration
+    let spongebob = build_events_proto::SpongeBob::new(invocation_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob client: {}", e))?;
+
+    let mut dispatcher =
+        build_events::BuildEventDispatcher::new(build_events::event_bus().subscribe());
+    dispatcher.add_subscriber(Box::new(spongebob));
+
+    // Add text file writer if requested
+    if let Some(events_file) = &cli.global_args.build_events_file {
+        let writer = build_events::subscribers::TextFileWriter::new(events_file)
+            .map_err(|e| anyhow::anyhow!("Failed to create events file writer: {}", e))?;
+        dispatcher.add_subscriber(Box::new(writer));
+    }
+
+    // Spawn dispatcher in background and store the join handle
+    let dispatcher_handle = tokio::spawn(async move {
+        dispatcher.run().await;
+    });
+
+    let result = run_cli(cli).await;
+
+    // Close the event bus to signal the dispatcher to shut down gracefully
+    build_events::event_bus().close();
+
+    // Wait for dispatcher to complete (which will wait for SpongeBob to log the final URL)
+    if let Err(e) = dispatcher_handle.await {
+        tracing::warn!("Dispatcher task failed: {}", e);
+    }
+
+    if let Err(e) = result {
         e.report_to_stderr();
         std::process::exit(1);
     };
@@ -434,6 +482,7 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         Command::NewWorldUpdate(args) => cmd_new_world_update(args, &mut ctx).await,
         Command::OciImage(args) => cmd_oci_image(args, &mut ctx).await,
         Command::PatchedBuild(args) => cmd_patched_build(args, &mut ctx).await,
+        #[cfg(target_os = "linux")]
         Command::Run(args) => cmd_run(args, &mut ctx).await,
 
         Command::Update => ctx

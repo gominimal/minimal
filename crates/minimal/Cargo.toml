@@ -6,7 +6,8 @@ publish.workspace = true
 
 [dependencies]
 "build-sandbox".workspace = true
-spongebob = { path = "../spongebob" }
+build-events.workspace = true
+build-events-proto = { path = "../build-events-proto" }
 graph.workspace = true
 cache.workspace = true
 common.workspace = true
@@ -31,6 +32,7 @@ serde.workspace = true
 rayon.workspace = true
 tokio.workspace = true
 futures.workspace = true
+uuid.workspace = true
 
 google-cloud-gax.workspace = true
 google-cloud-storage.workspace = true
@@ -54,4 +56,5 @@ size.workspace = true
 
 object.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
 hakoniwa.workspace = true

@@ -28,6 +28,7 @@ exceptions = [
 
 [licenses.private]
 ignore = true
+ignore-sources = ["https://buf.build/gen/cargo//"]
 
 [bans]
 skip = [
@@ -75,6 +76,17 @@ skip = [
     # https://github.com/console-rs/indicatif/pull/723
     { name = "vte", version = "0.11.1" },
 
+
+    { name = "indexmap", version = "1.9.3" },
+    { name = "prost", version = "0.13.5" },
+    { name = "prost-derive", version = "0.13.5" },
+    { name = "prost-types", version = "0.13.5" },
+    { name = "rand", version = "0.8.5" },
+    { name = "rand_chacha", version = "0.3.1" },
+    { name = "rand_core", version = "0.6.4" },
+    { name = "socket2", version = "0.5.10" },
+    { name = "tonic", version = "0.12.3" },
+    { name = "tower", version = "0.4.13" },
 ]
 
 skip-tree = [
@@ -84,6 +96,9 @@ skip-tree = [
     { name = "windows-sys", version = "=0.60.2" },
     { name = "windows-targets", version = "=0.52.6" },
 ]
+
+[sources]
+allow-registry = ["registry+https://github.com/rust-lang/crates.io-index", "sparse+https://buf.build/gen/cargo/"]
 
 [sources.allow-org]
 github = ["souk4711"]

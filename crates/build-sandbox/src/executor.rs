@@ -1,3 +1,6 @@
+use build_events::events::{
+    BuildEvent, FileCreated, TargetCompleted, TargetKind, TargetStarted, build_event,
+};
 use hakoniwa::Container;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -52,12 +55,8 @@ impl BuildExecutor {
         Ok(executor)
     }
 
-    #[tracing::instrument(skip(config, spongebob_invocation), fields(indicatif.pb_hide, package = %config.name))]
-    pub async fn execute(
-        &self,
-        config: &BuildConfig,
-        spongebob_invocation: &mut Option<spongebob::SpongeBobInvocation>,
-    ) -> Result<(i32, Option<String>)> {
+    #[tracing::instrument(skip(config), fields(indicatif.pb_hide, package = %config.name))]
+    pub async fn execute(&self, config: &BuildConfig, target_id: &str) -> Result<i32> {
         info!(
             "Linking {} inputs to build environment",
             config.inputs.len()
@@ -78,14 +77,63 @@ impl BuildExecutor {
             }
         }
 
-        self.execute_in_container(config, spongebob_invocation)
-            .await?;
+        // Emit TargetStarted event using global event bus
+        build_events::event_bus().emit(BuildEvent {
+            event: Some(build_event::Event::TargetStarted(TargetStarted {
+                target_id: target_id.to_string(),
+                label: config.name.clone(),
+                target_kind: TargetKind::Binary as i32,
+                timestamp_millis: current_millis(),
+            })),
+        });
 
-        let spongebob_url = spongebob_invocation
-            .as_ref()
-            .map(|inv| inv.url().to_string());
+        let execute_result = self.execute_in_container(config, target_id).await;
 
-        Ok((0, spongebob_url))
+        // Emit TargetCompleted event using global event bus
+        let (success, error_message) = match &execute_result {
+            Ok(_) => (true, None),
+            Err(e) => (false, Some(e.to_string())),
+        };
+
+        build_events::event_bus().emit(BuildEvent {
+            event: Some(build_event::Event::TargetCompleted(TargetCompleted {
+                target_id: target_id.to_string(),
+                label: config.name.clone(),
+                success,
+                timestamp_millis: current_millis(),
+                error_message,
+                outputs: vec![],  // Outputs are collected later
+                cache_hit: false, // Cache hit detection happens earlier
+            })),
+        });
+
+        // Emit FileCreated events for stdout and stderr
+        if let Ok(stdout_contents) = fs::read(self.build_workspace_dir.join("stdout")) {
+            build_events::event_bus().emit(BuildEvent {
+                event: Some(build_event::Event::FileCreated(FileCreated {
+                    target_id: target_id.to_string(),
+                    name: "stdout".to_string(),
+                    contents: stdout_contents.into(),
+                    timestamp_millis: current_millis(),
+                })),
+            });
+        }
+
+        if let Ok(stderr_contents) = fs::read(self.build_workspace_dir.join("stderr")) {
+            build_events::event_bus().emit(BuildEvent {
+                event: Some(build_event::Event::FileCreated(FileCreated {
+                    target_id: target_id.to_string(),
+                    name: "stderr".to_string(),
+                    contents: stderr_contents.into(),
+                    timestamp_millis: current_millis(),
+                })),
+            });
+        }
+
+        // Return the original result
+        execute_result?;
+
+        Ok(0)
     }
 
     pub fn build_workspace_dir(&self) -> &Path {
@@ -139,12 +187,8 @@ impl BuildExecutor {
         Ok(())
     }
 
-    #[tracing::instrument(skip(config, spongebob_invocation), fields(indicatif.pb_show))]
-    async fn execute_in_container(
-        &self,
-        config: &BuildConfig,
-        spongebob_invocation: &mut Option<spongebob::SpongeBobInvocation>,
-    ) -> Result<()> {
+    #[tracing::instrument(skip(config), fields(indicatif.pb_show))]
+    async fn execute_in_container(&self, config: &BuildConfig, target_id: &str) -> Result<()> {
         let rootfs = self.prepare_rootfs(config)?;
         let sandbox_mount_point = "/build";
         let program = &config.build_script.executable.to_string_lossy();
@@ -216,28 +260,6 @@ impl BuildExecutor {
             }
         })?;
 
-        if let Some(invocation) = spongebob_invocation {
-            if let Err(e) = invocation
-                .upload_file("stdout", output.stdout.to_vec())
-                .await
-            {
-                warn!(
-                    "Failed to upload stdout to SpongeBob for {}: {}",
-                    config.name, e
-                );
-            }
-
-            if let Err(e) = invocation
-                .upload_file("stderr", output.stderr.to_vec())
-                .await
-            {
-                warn!(
-                    "Failed to upload stderr to SpongeBob for {}: {}",
-                    config.name, e
-                );
-            }
-        }
-
         if !output.status.success() {
             let exit_code = output.status.code;
 
@@ -263,9 +285,7 @@ impl BuildExecutor {
             return Err(ExecutionError::BuildFailed {
                 code: exit_code,
                 temp_dir: self.build_workspace_dir.clone(),
-                spongebob_url: spongebob_invocation
-                    .as_ref()
-                    .map(|inv| inv.url().to_string()),
+                spongebob_url: None, // URL is now tracked at invocation level
             }
             .into());
         }
@@ -302,4 +322,12 @@ fn hardlink_dir_contents(src: &Path, dst: &Path) -> Result<()> {
         }
         .into(),
     })
+}
+
+/// Helper function to get current timestamp in milliseconds
+fn current_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("System time before UNIX epoch")
+        .as_millis() as i64
 }

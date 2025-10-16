@@ -1,0 +1,23 @@
+[package]
+name = "build-events-proto"
+version = "0.0.1"
+edition.workspace = true
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+build-events.workspace = true
+minimal_spongebob_community_neoeinstein-prost = { version = "=0.4.0-20251015195841-61cd123d44d0.1", registry = "buf" }
+minimal_spongebob_community_neoeinstein-tonic = { version = "=0.4.1-20251015195841-61cd123d44d0.1", registry = "buf" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tokio-stream = "0.1"
+tonic = { version = "0.12.3", features = ["tls", "tls-native-roots"] }
+tracing.workspace = true
+uuid = { version = "1.11", features = ["v4"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tracing-subscriber.workspace = true
