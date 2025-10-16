@@ -1,5 +1,5 @@
 use crate::Error;
-use crate::{GlobalArgs, PackagesArg};
+use crate::{Context, PackagesArg};
 use graph::Transitives;
 
 use hakoniwa::Container;
@@ -21,22 +21,20 @@ pub struct RunArgs {
     args: Vec<String>,
 }
 
-pub async fn cmd_run(args: RunArgs, globals: &GlobalArgs) -> Result<(), Error> {
+pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
     crate::enforce_science_mode()?;
 
     let graph = if args.packages.packages.is_none() {
-        globals.graph_from_package_name(&"base".to_string())?
+        ctx.graph_from_package_name(&"base".to_string())?
     } else {
-        args.packages.graph(globals)?
+        args.packages.graph(ctx)?
     };
-    let cache = globals.cache().map_err(anyhow::Error::from)?;
+    let cache = ctx.local_cache();
     // Make sure the packages are built
-    crate::cmd_build::cmd_build_impl(&graph, globals, cache.clone(), globals.num_parallel_builds)
-        .await?;
+    crate::cmd_build::cmd_build_impl(&graph, ctx, cache.clone(), ctx.num_parallel_builds).await?;
 
     // Start setting up the run container
-    let base =
-        tempfile::tempdir_in(globals.path_config().run_base_dir()).map_err(anyhow::Error::from)?;
+    let base = tempfile::tempdir_in(ctx.paths().run_base_dir()).map_err(anyhow::Error::from)?;
     for dep in Transitives::for_toplevels(&graph, graph.top_levels.clone(), false).into_iter() {
         common::hardlink_dir_contents(
             cache.read_dir(&graph.spec_hash(&dep)).unwrap().path(),

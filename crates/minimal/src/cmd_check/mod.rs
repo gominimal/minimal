@@ -1,4 +1,4 @@
-use crate::{Error, GlobalArgs, PackagesArg};
+use crate::{Context, Error, PackagesArg};
 use graph::DepGraph;
 
 use codespan_reporting::term::termcolor::{
@@ -26,9 +26,9 @@ pub struct CheckArgs {
     skip_checkers: Option<Vec<String>>,
 }
 
-pub fn cmd_check(args: CheckArgs, globals: &GlobalArgs) -> Result<(), Error> {
-    let all_graph = globals.graph_from_all_packages().ok();
-    let packages_dir = globals.path_config().packages_dir().to_path_buf();
+pub fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> {
+    let all_graph = ctx.graph_from_all_packages().ok();
+    let packages_dir = ctx.paths().packages_dir().to_path_buf();
 
     let packages_dirs = std::fs::read_dir(packages_dir)
         .map_err(anyhow::Error::from)?
@@ -63,7 +63,7 @@ pub fn cmd_check(args: CheckArgs, globals: &GlobalArgs) -> Result<(), Error> {
                 &all_graph,
                 args.fix,
                 args.skip_checkers.clone().unwrap_or_default(),
-                globals,
+                ctx,
             );
             (pkg, result)
         });
@@ -137,7 +137,7 @@ fn check_package_parses(
     pkg: &String,
     _all_graph: &Option<DepGraph>,
     _fix: bool,
-    globals: &GlobalArgs,
+    ctx: &mut Context,
 ) -> Result<CheckResult, Error> {
     let mut result = CheckResult {
         verdict: CheckVerdict::Skip,
@@ -145,7 +145,7 @@ fn check_package_parses(
         err: vec![],
     };
 
-    result.verdict = match globals.graph_from_package_name(pkg) {
+    result.verdict = match ctx.graph_from_package_name(pkg) {
         Ok(_) => CheckVerdict::Pass,
         Err(e) => {
             result.err.push(format!("{:?}", e));
@@ -165,7 +165,7 @@ fn check_minimal_import_line(
     pkg: &String,
     _all_graph: &Option<DepGraph>,
     fix: bool,
-    globals: &GlobalArgs,
+    ctx: &mut Context,
 ) -> Result<CheckResult, Error> {
     let mut result = CheckResult {
         verdict: CheckVerdict::Pass,
@@ -173,7 +173,7 @@ fn check_minimal_import_line(
         err: vec![],
     };
 
-    let base = globals.path_config().packages_dir().join(pkg);
+    let base = ctx.paths().packages_dir().join(pkg);
     for e in std::fs::read_dir(base).map_err(anyhow::Error::from)? {
         let e = e.map_err(anyhow::Error::from)?;
         if e.file_type().unwrap().is_dir() {
@@ -263,7 +263,7 @@ fn check_package_fmt(
     pkg: &String,
     _all_graph: &Option<DepGraph>,
     fix: bool,
-    globals: &GlobalArgs,
+    ctx: &mut Context,
 ) -> Result<CheckResult, Error> {
     let mut result = CheckResult {
         verdict: CheckVerdict::Skip,
@@ -271,7 +271,7 @@ fn check_package_fmt(
         err: vec![],
     };
 
-    let base = globals.path_config().packages_dir().join(pkg);
+    let base = ctx.paths().packages_dir().join(pkg);
     for e in std::fs::read_dir(base).map_err(anyhow::Error::from)? {
         let e = e.map_err(anyhow::Error::from)?;
         if e.file_type().unwrap().is_dir() {
@@ -317,39 +317,39 @@ fn check_package(
     all_graph: &Option<DepGraph>,
     fix: bool,
     skip_checkers: Vec<String>,
-    globals: &GlobalArgs,
+    ctx: &mut Context,
 ) -> Result<Vec<CheckResult>, Error> {
     let mut out = Vec::new();
 
     // TODO: This is garbage
     if !skip_checkers.contains(&"parse".to_string()) {
-        out.push(check_package_parses(pkg, all_graph, fix, globals)?);
+        out.push(check_package_parses(pkg, all_graph, fix, ctx)?);
     }
     if !skip_checkers.contains(&"spec name valid".to_string()) {
-        out.push(naming::package_name(pkg, all_graph, fix, globals)?);
+        out.push(naming::package_name(pkg, all_graph, fix, ctx)?);
     }
     if !skip_checkers.contains(&"spec name matches dir".to_string()) {
         out.push(naming::package_spec_name_matches_dir(
-            pkg, all_graph, fix, globals,
+            pkg, all_graph, fix, ctx,
         )?);
     }
     if !skip_checkers.contains(&"cycle breaker naming".to_string()) {
-        out.push(naming::cycle_breaker_naming(pkg, all_graph, fix, globals)?);
+        out.push(naming::cycle_breaker_naming(pkg, all_graph, fix, ctx)?);
     }
     if !skip_checkers.contains(&"output naming".to_string()) {
-        out.push(naming::output_naming(pkg, all_graph, fix, globals)?);
+        out.push(naming::output_naming(pkg, all_graph, fix, ctx)?);
     }
     if !skip_checkers.contains(&"output types valid".to_string()) {
-        out.push(outputs::output_types_valid(pkg, all_graph, fix, globals)?);
+        out.push(outputs::output_types_valid(pkg, all_graph, fix, ctx)?);
     }
     if !skip_checkers.contains(&"missing runtime_deps".to_string()) {
-        out.push(outputs::missing_runtime_deps(pkg, all_graph, fix, globals)?);
+        out.push(outputs::missing_runtime_deps(pkg, all_graph, fix, ctx)?);
     }
     if !skip_checkers.contains(&"import line".to_string()) {
-        out.push(check_minimal_import_line(pkg, all_graph, fix, globals)?);
+        out.push(check_minimal_import_line(pkg, all_graph, fix, ctx)?);
     }
     if !skip_checkers.contains(&"fmt".to_string()) {
-        out.push(check_package_fmt(pkg, all_graph, fix, globals)?);
+        out.push(check_package_fmt(pkg, all_graph, fix, ctx)?);
     }
 
     Ok(out)

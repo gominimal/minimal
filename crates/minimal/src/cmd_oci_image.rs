@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use tracing::{debug, info};
 
-use crate::{Error, GlobalArgs, PackagesArg};
+use crate::{Context, Error, PackagesArg};
 
 #[derive(clap::Args)]
 pub struct OciImageArgs {
@@ -41,13 +41,12 @@ pub struct OciImageArgs {
     tag: String,
 }
 
-pub async fn cmd_oci_image(args: OciImageArgs, globals: &GlobalArgs) -> Result<(), Error> {
-    let graph = args.packages.graph(globals)?;
-    let cache = globals.cache().map_err(anyhow::Error::from)?;
+pub async fn cmd_oci_image(args: OciImageArgs, ctx: &mut Context) -> Result<(), Error> {
+    let graph = args.packages.graph(ctx)?;
+    let cache = ctx.local_cache();
 
     // Make sure the packages are built
-    crate::cmd_build::cmd_build_impl(&graph, globals, cache.clone(), globals.num_parallel_builds)
-        .await?;
+    crate::cmd_build::cmd_build_impl(&graph, ctx, cache.clone(), ctx.num_parallel_builds).await?;
 
     let mut all_deps: Vec<BuildSpecRef> =
         Transitives::for_toplevels(&graph, graph.top_levels.to_vec(), false)

@@ -1,6 +1,6 @@
+use crate::{Context, PackagesArg};
 use crate::{Error, lockfile::PrebuiltsLock, remote_storage::RemoteStorage, run::Run};
-use crate::{GlobalArgs, PackagesArg};
-use anyhow::Context;
+use anyhow::Context as _;
 use cache::{Cache, CacheBinProvider, LocalDir, RemoteBinProvider};
 use graph::{DepGraph, ExecPlan, Transitives};
 use std::path::Path;
@@ -12,18 +12,18 @@ pub struct BuildArgs {
     packages: PackagesArg,
 }
 
-pub async fn cmd_build(args: BuildArgs, globals: &GlobalArgs) -> Result<(), Error> {
-    let graph = args.packages.graph(globals)?;
-    let cache = globals.cache().map_err(anyhow::Error::from)?;
+pub async fn cmd_build(args: BuildArgs, ctx: &mut Context) -> Result<(), Error> {
+    let graph = args.packages.graph(ctx)?;
+    let cache = ctx.local_cache();
 
-    cmd_build_impl(&graph, globals, cache, globals.num_parallel_builds).await?;
+    cmd_build_impl(&graph, ctx, cache, ctx.num_parallel_builds).await?;
 
     Ok(())
 }
 
 pub async fn cmd_build_impl(
     graph: &DepGraph,
-    globals: &GlobalArgs,
+    ctx: &mut Context,
     cache: Cache<LocalDir>,
     num_parallel_builds: usize,
 ) -> anyhow::Result<()> {
@@ -47,13 +47,13 @@ pub async fn cmd_build_impl(
         .build_global()
         .unwrap();
 
-    let output_base = globals.path_config().sandbox_base_dir().to_path_buf();
+    let output_base = ctx.paths().sandbox_base_dir().to_path_buf();
     std::fs::create_dir_all(&output_base).ok();
 
     let mut run = Run::new(
         graph,
         cache.clone(),
-        RemoteStorage::new(globals.path_config().download_cache_dir().to_path_buf())
+        RemoteStorage::new(ctx.paths().download_cache_dir().to_path_buf())
             .await
             .unwrap(),
         PrebuiltsLock::load(Path::new("prebuilts.lock")).unwrap(),
@@ -68,7 +68,7 @@ pub async fn cmd_build_impl(
         }
     };
 
-    match (globals.no_cache, globals.no_fetch) {
+    match (ctx.no_cache, ctx.no_fetch) {
         // No local or remote cache
         (true, true) => {
             run.execute(ExecPlan::new(graph), None, &mut spongebob_invocation)
@@ -77,7 +77,7 @@ pub async fn cmd_build_impl(
         // Both caches
         (false, false) => {
             let local_adapter = CacheBinProvider::new(graph, cache.clone());
-            let remote_cache = globals.remote_cache().await.unwrap();
+            let remote_cache = ctx.remote_cache().await.unwrap();
             let remote_adapter = RemoteBinProvider::new(graph, &remote_cache);
             run.execute(
                 ExecPlan::new_with_bin_provider(graph, (local_adapter, remote_adapter)),
@@ -88,7 +88,7 @@ pub async fn cmd_build_impl(
         }
         // Only remote cache
         (true, false) => {
-            let remote_cache = globals.remote_cache().await.unwrap();
+            let remote_cache = ctx.remote_cache().await.unwrap();
             let remote_adapter = RemoteBinProvider::new(graph, &remote_cache);
             run.execute(
                 ExecPlan::new_with_bin_provider(graph, remote_adapter),
@@ -114,7 +114,7 @@ pub async fn cmd_build_impl(
     //
     // There could still be stuff thats fetchable but not in the local cache. We
     // can materialize that locally now.
-    if !globals.no_fetch {
+    if !ctx.no_fetch {
         let mut needs_materialize: Vec<_> =
             Transitives::for_toplevels(graph, graph.top_levels.to_vec(), false)
                 .into_iter()
@@ -130,7 +130,7 @@ pub async fn cmd_build_impl(
         needs_materialize.dedup();
 
         if !needs_materialize.is_empty() {
-            let remote_cache = globals.remote_cache().await.unwrap();
+            let remote_cache = ctx.remote_cache().await.unwrap();
             let tokio_runtime = tokio::runtime::Handle::current();
             rayon::scope(|s| {
                 let remote_cache = &remote_cache;
@@ -170,7 +170,7 @@ pub async fn cmd_build_impl(
         .map(|inv| inv.url().to_string());
 
     // Display build summary
-    display_build_summary(graph, &cache, globals, &run, spongebob_url.as_deref());
+    display_build_summary(graph, &cache, ctx, &run, spongebob_url.as_deref());
 
     Ok(())
 }
@@ -221,7 +221,7 @@ async fn log_build_results_to_spongebob(
 fn display_build_summary(
     graph: &DepGraph,
     cache: &Cache<LocalDir>,
-    _globals: &GlobalArgs,
+    _ctx: &mut Context,
     _run: &Run,
     command_spongebob_url: Option<&str>,
 ) {
