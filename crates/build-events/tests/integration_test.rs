@@ -9,7 +9,7 @@ use build_events::{
         ActionCompleted, ActionStarted, BuildFinished, BuildStarted, TargetCompleted, TargetKind,
         TargetStarted, build_event, current_millis,
     },
-    subscribers::{JsonFileWriter, LoggerSubscriber},
+    subscribers::{LoggerSubscriber, TextFileWriter},
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -119,14 +119,14 @@ async fn test_full_event_flow() {
 #[tokio::test]
 async fn test_multiple_subscribers() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let json_path = temp_dir.path().join("events.jsonl");
+    let text_path = temp_dir.path().join("events.textproto");
 
     let bus = BuildEventBus::new(100);
     let count = Arc::new(AtomicUsize::new(0));
 
     let mut dispatcher = BuildEventDispatcher::new(bus.subscribe());
     dispatcher.add_subscriber(Box::new(LoggerSubscriber::new()));
-    dispatcher.add_subscriber(Box::new(JsonFileWriter::new(&json_path).unwrap()));
+    dispatcher.add_subscriber(Box::new(TextFileWriter::new(&text_path).unwrap()));
     dispatcher.add_subscriber(Box::new(CountingSubscriber {
         count: count.clone(),
     }));
@@ -154,15 +154,12 @@ async fn test_multiple_subscribers() {
     // Verify counter subscriber received events
     assert_eq!(count.load(Ordering::SeqCst), 3);
 
-    // Verify JSON file has events
-    let content = std::fs::read_to_string(&json_path).unwrap();
-    let lines: Vec<&str> = content.lines().collect();
-    assert_eq!(lines.len(), 3);
+    // Verify text format file has events
+    let content = std::fs::read_to_string(&text_path).unwrap();
 
-    // Verify each line is valid JSON (we can parse as serde_json::Value even though BuildEvent doesn't have serde)
-    for line in lines {
-        let _: serde_json::Value = serde_json::from_str(line).unwrap();
-    }
+    // Each event should have "build_started" in the output
+    let event_count = content.matches("build_started").count();
+    assert_eq!(event_count, 3);
 }
 
 #[tokio::test]

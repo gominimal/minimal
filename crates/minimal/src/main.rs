@@ -109,6 +109,10 @@ pub struct GlobalArgs {
     /// Configure the number of parallel builds
     #[arg(short, long, default_value_t = default_parallelism())]
     num_parallel_builds: usize,
+
+    /// Write build events to a protobuf text format file
+    #[arg(long)]
+    build_events_file: Option<PathBuf>,
 }
 
 fn default_parallelism() -> usize {
@@ -385,6 +389,13 @@ async fn main() -> Result<()> {
     let mut dispatcher =
         build_events::BuildEventDispatcher::new(build_events::event_bus().subscribe());
     dispatcher.add_subscriber(Box::new(spongebob));
+
+    // Add text file writer if requested
+    if let Some(events_file) = &cli.global_args.build_events_file {
+        let writer = build_events::subscribers::TextFileWriter::new(events_file)
+            .map_err(|e| anyhow::anyhow!("Failed to create events file writer: {}", e))?;
+        dispatcher.add_subscriber(Box::new(writer));
+    }
 
     // Spawn dispatcher in background and store the join handle
     let dispatcher_handle = tokio::spawn(async move {

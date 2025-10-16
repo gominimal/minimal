@@ -2,10 +2,10 @@
 //!
 //! This module provides ready-to-use subscriber implementations:
 //! - [`LoggerSubscriber`]: Logs events using tracing
-//! - [`JsonFileWriter`]: Writes events to a JSON-lines file
+//! - [`TextFileWriter`]: Writes events to a protobuf text format file
 
-mod json_file;
 mod logger;
+mod text_file;
 
-pub use json_file::JsonFileWriter;
 pub use logger::LoggerSubscriber;
+pub use text_file::TextFileWriter;

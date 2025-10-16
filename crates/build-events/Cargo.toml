@@ -8,16 +8,13 @@ publish.workspace = true
 
 [dependencies]
 async-trait = "0.1"
-serde_json.workspace = true
-serde.workspace = true
+minimal_spongebob_community_neoeinstein-prost = { version = "=0.4.0-20251015195841-61cd123d44d0.1", registry = "buf" }
+prost = "0.13"
+prost-reflect = { version = "0.15", features = ["text-format"] }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
-# Proto types as single source of truth
-minimal_spongebob_community_neoeinstein-prost = { version = "=0.4.0-20251015195841-61cd123d44d0.1", registry = "buf" }
-
 [dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true

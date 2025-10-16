@@ -11,14 +11,14 @@
 //! - **BuildEventBus** for publishing events using tokio broadcast channels
 //! - **BuildEventSubscriber** trait for consuming events
 //! - **BuildEventDispatcher** for managing multiple subscribers
-//! - **Built-in subscribers** for logging and JSON file output
+//! - **Built-in subscribers** for logging and protobuf text format file output
 //!
 //! # Architecture
 //!
 //! ```text
 //! Build Components → BuildEventBus → BuildEventDispatcher → Subscribers
 //!                                                            ├─ LoggerSubscriber
-//!                                                            ├─ JsonFileWriter
+//!                                                            ├─ TextFileWriter
 //!                                                            └─ Custom Subscribers
 //! ```
 //!
@@ -28,7 +28,7 @@
 //! use build_events::{
 //!     BuildEventBus, BuildEventDispatcher, BuildEvent,
 //!     events::{build_event, BuildStarted, current_millis},
-//!     subscribers::{LoggerSubscriber, JsonFileWriter},
+//!     subscribers::{LoggerSubscriber, TextFileWriter},
 //! };
 //!
 //! #[tokio::main]
@@ -43,7 +43,7 @@
 //!     let mut dispatcher = BuildEventDispatcher::new(event_bus.subscribe());
 //!     dispatcher.add_subscriber(Box::new(LoggerSubscriber::new()));
 //!     dispatcher.add_subscriber(Box::new(
-//!         JsonFileWriter::new("build_events.jsonl").unwrap()
+//!         TextFileWriter::new("build_events.textproto").unwrap()
 //!     ));
 //!
 //!     // Start event processing
