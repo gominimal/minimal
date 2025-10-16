@@ -82,7 +82,11 @@ pub enum BuildSpecInput {
     Build(BuildSpecRef),
     Source(SourceInput),
     HostPath(PathBuf),
-    Local((PathBuf, blake3::Hash)),
+    Local {
+        full_path: PathBuf,
+        filename: String,
+        file_hash: blake3::Hash,
+    },
     Prebuilt(String, Option<String>), // Package name, sha256
     Subset(SubsetInput),
 }
@@ -178,10 +182,12 @@ impl BuildSpec {
             .inputs
             .iter()
             .any(|input| matches!(input, BuildSpecInput::Prebuilt(_, _)));
-        let has_local_or_source = self
-            .inputs
-            .iter()
-            .any(|input| matches!(input, BuildSpecInput::Local(_) | BuildSpecInput::Source(_)));
+        let has_local_or_source = self.inputs.iter().any(|input| {
+            matches!(
+                input,
+                BuildSpecInput::Local { .. } | BuildSpecInput::Source(_)
+            )
+        });
 
         has_prebuilt && !has_local_or_source
     }
@@ -324,7 +330,7 @@ impl DepGraph {
             .filter_map(|input| match input {
                 Build(bsr) => Some(bsr),
                 Subset(si) => Some(&si.from),
-                Source(_) | HostPath(_) | Local(_) | Prebuilt(_, _) => None,
+                Source(_) | HostPath(_) | Local { .. } | Prebuilt(_, _) => None,
             })
             .chain(build_spec.runtime_deps.iter().map(|dep| match dep {
                 RuntimeDep::Build(bsr) => bsr,
@@ -946,7 +952,7 @@ impl GraphBuilder {
         &mut self,
         rt: &RichTerm,
         program: &mut Program<CacheImpl>,
-    ) -> Result<(PathBuf, blake3::Hash), Error> {
+    ) -> Result<(PathBuf, String, blake3::Hash), Error> {
         let mut file: Option<(String, FileId)> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
@@ -986,7 +992,7 @@ impl GraphBuilder {
         let full_path = Path::new(program.files().name(src_id))
             .parent()
             .unwrap()
-            .join(file);
+            .join(&file);
 
         let file_hash = blake3::hash(&std::fs::read(&full_path).unwrap_or_else(|err| {
             panic!(
@@ -996,7 +1002,7 @@ impl GraphBuilder {
             )
         }));
 
-        Ok((full_path, file_hash))
+        Ok((full_path, file, file_hash))
     }
 
     fn read_input_prebuilt(
@@ -1100,8 +1106,12 @@ impl GraphBuilder {
                 self.read_input_hostpath(&rt, program)?.into(),
             )),
             ObjTy::Local => {
-                let (full_path, file_hash) = self.read_input_local(&rt, program)?;
-                Ok(BuildSpecInput::Local((full_path, file_hash)))
+                let (full_path, filename, file_hash) = self.read_input_local(&rt, program)?;
+                Ok(BuildSpecInput::Local {
+                    full_path,
+                    filename,
+                    file_hash,
+                })
             }
             ObjTy::Prebuilt => {
                 let pb = self.read_input_prebuilt(&rt, program)?;
@@ -1386,7 +1396,7 @@ mod tests {
         // We expect that buildspec to have one Local input
         assert!(matches!(
             dp.builds.iter().next().unwrap().1.inputs[0].clone(),
-            BuildSpecInput::Local((p, _)) if p.ends_with("testdata/local_input.txt"),
+            BuildSpecInput::Local{ full_path, .. } if full_path.ends_with("testdata/local_input.txt"),
         ));
     }
     #[test]

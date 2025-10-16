@@ -38,8 +38,8 @@ pub async fn cmd_patched_build(args: PatchedBuildArgs, ctx: &mut Context) -> Res
     let build = graph.get(&graph.top_levels[0]).unwrap();
     for input in build.inputs.iter() {
         match input {
-            BuildSpecInput::Local((path, _hash)) => {
-                inputs.push(SandboxInput::File(path.to_path_buf()))
+            BuildSpecInput::Local { full_path, .. } => {
+                inputs.push(SandboxInput::File(full_path.to_path_buf()))
             }
             BuildSpecInput::Source(source) => {
                 match crate::run::materialize_source(

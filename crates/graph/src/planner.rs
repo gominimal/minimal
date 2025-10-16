@@ -509,7 +509,7 @@ impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
                 Build(bsr) | Subset(SubsetInput { from: bsr, .. }) => {
                     process(bsr, seen, &mut out);
                 }
-                Source(_) | HostPath(_) | Local(_) | Prebuilt(_, _) => {}
+                Source(_) | HostPath(_) | Local { .. } | Prebuilt(_, _) => {}
             }
         }
         for dep in bs.runtime_deps.iter() {

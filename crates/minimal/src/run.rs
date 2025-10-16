@@ -537,9 +537,9 @@ impl<'a> Run<'a> {
                 HostPath(_) => {
                     todo!();
                 }
-                Local((path, _hash)) => {
-                    debug!("  Input {}: Local file from {}", i, path.display());
-                    inputs.push(SandboxInput::File(path.to_path_buf()));
+                Local { full_path, .. } => {
+                    debug!("  Input {}: Local file from {}", i, full_path.display());
+                    inputs.push(SandboxInput::File(full_path.to_path_buf()));
                 }
                 Source(source) => {
                     debug!("  Input {}: Source({:?})", i, source.from);

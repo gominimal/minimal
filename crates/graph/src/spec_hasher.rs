@@ -174,11 +174,14 @@ fn build_input_hash(input: &BuildSpecInput, h: &mut Hasher) {
             h.write_all(p.as_path().to_string_lossy().as_bytes())
                 .unwrap();
         }
-        Local(p) => {
+        Local {
+            full_path: _,
+            filename,
+            file_hash,
+        } => {
             h.write_all(b"local").unwrap();
-            h.write_all(p.0.as_path().to_string_lossy().as_bytes())
-                .unwrap();
-            h.write_all(p.1.as_bytes()).unwrap();
+            h.write_all(filename.as_bytes()).unwrap();
+            h.write_all(file_hash.as_bytes()).unwrap();
         }
         Prebuilt(package, sha256) => {
             h.write_all(b"prebuilt").unwrap();
