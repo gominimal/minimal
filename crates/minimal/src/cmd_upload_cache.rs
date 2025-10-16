@@ -1,4 +1,4 @@
-use crate::{Error, GlobalArgs, PackagesArg};
+use crate::{Context, Error, PackagesArg};
 use graph::Transitives;
 
 #[derive(clap::Args)]
@@ -7,13 +7,13 @@ pub struct UploadArgs {
     packages: PackagesArg,
 }
 
-pub async fn cmd_upload_cache(args: UploadArgs, globals: &GlobalArgs) -> Result<(), Error> {
-    let graph = args.packages.graph(globals)?;
-    let cache = globals.cache().map_err(anyhow::Error::from)?;
+pub async fn cmd_upload_cache(args: UploadArgs, ctx: &mut Context) -> Result<(), Error> {
+    let graph = args.packages.graph(ctx)?;
+    let cache = ctx.local_cache();
 
     let upload_bsrs: Vec<_> = Transitives::for_toplevels(&graph, graph.top_levels.to_vec(), false);
 
-    let mut remote_cache = globals.remote_cache().await.unwrap();
+    let mut remote_cache = ctx.remote_cache().await.unwrap();
 
     for bsr in &upload_bsrs {
         let build = graph.get(bsr).unwrap();

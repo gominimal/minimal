@@ -1,6 +1,5 @@
-use crate::GlobalArgs;
 use crate::run::Materialized;
-use crate::{Error, remote_storage::RemoteStorage};
+use crate::{Context, Error, remote_storage::RemoteStorage};
 use build_sandbox::{BuildConfig, Input as SandboxInput, config::BuildScript, run_build};
 use cache::{EntryMeta, MetaInner};
 use graph::{BuildOutput, BuildSpecInput, Transitives};
@@ -12,16 +11,15 @@ pub struct PatchedBuildArgs {
     package: String,
 }
 
-pub async fn cmd_patched_build(args: PatchedBuildArgs, globals: &GlobalArgs) -> Result<(), Error> {
+pub async fn cmd_patched_build(args: PatchedBuildArgs, ctx: &mut Context) -> Result<(), Error> {
     crate::enforce_science_mode()?;
     let mut temp_dirs = Vec::new();
 
-    let graph = globals.graph_from_package_name(&args.package)?;
-    let cache = globals.cache().map_err(anyhow::Error::from)?;
-    let remote_storage =
-        RemoteStorage::new(globals.path_config().download_cache_dir().to_path_buf())
-            .await
-            .unwrap();
+    let graph = ctx.graph_from_package_name(&args.package)?;
+    let cache = ctx.local_cache();
+    let remote_storage = RemoteStorage::new(ctx.paths().download_cache_dir().to_path_buf())
+        .await
+        .unwrap();
 
     let mut inputs = Vec::new();
     let mut dependencies = HashSet::new();
@@ -94,7 +92,7 @@ pub async fn cmd_patched_build(args: PatchedBuildArgs, globals: &GlobalArgs) -> 
             .collect(),
     };
 
-    let output_base = globals.path_config().sandbox_base_dir().to_path_buf();
+    let output_base = ctx.paths().sandbox_base_dir().to_path_buf();
     std::fs::create_dir_all(&output_base).ok();
     let out_dir = cache
         .write_dir(&graph.spec_hash(&graph.top_levels[0]))

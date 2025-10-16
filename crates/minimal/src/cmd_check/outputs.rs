@@ -4,7 +4,7 @@ use std::{
 };
 
 use super::{CheckResult, CheckVerdict};
-use crate::{Error, GlobalArgs};
+use crate::{Context, Error};
 use cache::{CacheErr, DirCacheEntry, LocalDir};
 use graph::{BuildOutput, BuildSpecRef, DepGraph, Transitives};
 use object::{Object, ObjectSymbol};
@@ -13,7 +13,7 @@ pub(crate) fn output_types_valid(
     pkg: &String,
     all_graph: &Option<DepGraph>,
     _fix: bool,
-    globals: &GlobalArgs,
+    ctx: &mut Context,
 ) -> Result<CheckResult, Error> {
     let mut result = CheckResult {
         verdict: CheckVerdict::Skip,
@@ -34,7 +34,7 @@ pub(crate) fn output_types_valid(
         }
     };
     let build = all_graph.get(&bsr).unwrap();
-    let cache = globals.cache().map_err(anyhow::Error::from)?;
+    let cache = ctx.local_cache();
     let spec_hash = all_graph.spec_hash(&bsr);
     let cached_build = if let Ok(cached_build) = cache.read_dir(&spec_hash) {
         cached_build
@@ -90,7 +90,7 @@ pub(crate) fn missing_runtime_deps(
     pkg: &String,
     all_graph: &Option<DepGraph>,
     _fix: bool,
-    globals: &GlobalArgs,
+    ctx: &mut Context,
 ) -> Result<CheckResult, Error> {
     let mut result = CheckResult {
         verdict: CheckVerdict::Skip,
@@ -111,7 +111,7 @@ pub(crate) fn missing_runtime_deps(
         }
     };
     let build = all_graph.get(&bsr).unwrap();
-    let cache = globals.cache().map_err(anyhow::Error::from)?;
+    let cache = ctx.local_cache();
     let spec_hash = all_graph.spec_hash(&bsr);
     let cached_build = if let Ok(cached_build) = cache.read_dir(&spec_hash) {
         cached_build

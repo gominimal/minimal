@@ -1,4 +1,4 @@
-use crate::{Error, GlobalArgs, PackagesArg};
+use crate::{Context, Error, PackagesArg};
 use cache::{Cache, CacheBinProvider, LocalDir, RemoteBinProvider};
 use graph::{BinProvider, DepGraph, ExecPlan};
 
@@ -8,17 +8,17 @@ pub struct PlanArgs {
     packages: PackagesArg,
 }
 
-pub async fn cmd_plan(args: PlanArgs, globals: &GlobalArgs) -> Result<(), Error> {
-    let graph = args.packages.graph(globals)?;
-    let cache = globals.cache().map_err(anyhow::Error::from)?;
+pub async fn cmd_plan(args: PlanArgs, ctx: &mut Context) -> Result<(), Error> {
+    let graph = args.packages.graph(ctx)?;
+    let cache = ctx.local_cache();
 
-    match (globals.no_cache, globals.no_fetch) {
+    match (ctx.no_cache, ctx.no_fetch) {
         // no local or remote cache
         (true, true) => print_plan(&graph, &cache, ExecPlan::new(&graph)),
         // both local and remote cache
         (false, false) => {
             let local_adapter = CacheBinProvider::new(&graph, cache.clone());
-            let remote_cache = globals.remote_cache().await.unwrap();
+            let remote_cache = ctx.remote_cache().await.unwrap();
             let remote_adapter = RemoteBinProvider::new(&graph, &remote_cache);
             print_plan(
                 &graph,
@@ -29,7 +29,7 @@ pub async fn cmd_plan(args: PlanArgs, globals: &GlobalArgs) -> Result<(), Error>
 
         // Only remote cache
         (true, false) => {
-            let remote_cache = globals.remote_cache().await.unwrap();
+            let remote_cache = ctx.remote_cache().await.unwrap();
             let remote_adapter = RemoteBinProvider::new(&graph, &remote_cache);
             print_plan(
                 &graph,

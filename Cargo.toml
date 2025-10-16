@@ -4,6 +4,7 @@ members = [
     "crates/build-events-proto",
     "crates/build-sandbox",
     "crates/cache",
+    "crates/checkouts",
     "crates/common",
     "crates/graph",
     "crates/minimal",
@@ -74,4 +75,5 @@ build-events-proto = { version = "0.0.1", path = "crates/build-events-proto" }
 build-sandbox = { path = "crates/build-sandbox" }
 graph = { version = "0.0.1", path = "crates/graph" }
 cache = { version = "0.0.1", path = "crates/cache" }
+checkouts = { version = "0.0.1", path = "crates/checkouts" }
 common = { version = "0.0.1", path = "crates/common" }

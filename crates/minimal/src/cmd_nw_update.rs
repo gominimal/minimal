@@ -1,6 +1,4 @@
-use crate::{
-    Error, GlobalArgs, PackagesArg, lockfile::PrebuiltsLock, remote_storage::RemoteStorage,
-};
+use crate::{Context, Error, PackagesArg, lockfile::PrebuiltsLock, remote_storage::RemoteStorage};
 use graph::BuildSpecInput;
 use std::path::Path;
 use tracing::{info, warn};
@@ -13,17 +11,15 @@ pub struct NWUpdateArgs {
     packages: PackagesArg,
 }
 
-pub async fn cmd_new_world_update(args: NWUpdateArgs, globals: &GlobalArgs) -> Result<(), Error> {
-    let graph = args.packages.graph(globals)?;
-    let cache = globals.cache().map_err(anyhow::Error::from)?;
+pub async fn cmd_new_world_update(args: NWUpdateArgs, ctx: &mut Context) -> Result<(), Error> {
+    let graph = args.packages.graph(ctx)?;
+    let cache = ctx.local_cache();
 
-    crate::cmd_build::cmd_build_impl(&graph, globals, cache.clone(), globals.num_parallel_builds)
-        .await?;
+    crate::cmd_build::cmd_build_impl(&graph, ctx, cache.clone(), ctx.num_parallel_builds).await?;
 
-    let remote_storage =
-        RemoteStorage::new(globals.path_config().download_cache_dir().to_path_buf())
-            .await
-            .unwrap();
+    let remote_storage = RemoteStorage::new(ctx.paths().download_cache_dir().to_path_buf())
+        .await
+        .unwrap();
 
     let mut lockfile = PrebuiltsLock::load(Path::new("prebuilts.lock")).unwrap();
 

@@ -11,6 +11,7 @@ build-events-proto = { path = "../build-events-proto" }
 graph.workspace = true
 cache.workspace = true
 common.workspace = true
+checkouts.workspace = true
 
 nickel-lang-core.workspace = true
 codespan-reporting.workspace = true

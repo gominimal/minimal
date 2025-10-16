@@ -4,14 +4,11 @@ use anyhow::{Result, bail};
 use cache::{Cache, LocalDir, RemoteCache, RemoteError};
 use clap::{Args, Parser, Subcommand};
 use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
-use graph::PlanErr;
-use graph::{DepGraph, Error as GraphError, SpecReader, SpecReaderOptions};
+use graph::{DepGraph, Error as GraphError, PlanErr, SpecReader, SpecReaderOptions};
 use std::path::PathBuf;
 use tracing::error;
-use tracing_indicatif::IndicatifLayer;
-use tracing_indicatif::TickSettings;
-use tracing_indicatif::filter::IndicatifFilter;
-use tracing_indicatif::filter::hide_indicatif_span_fields;
+use tracing_indicatif::{IndicatifLayer, TickSettings};
+use tracing_indicatif::{filter::IndicatifFilter, filter::hide_indicatif_span_fields};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use uuid::Uuid;
 
@@ -66,6 +63,8 @@ enum Command {
     Check(CheckArgs),
     /// Uploads the specified packages and their transitive needs to the cache.
     UploadCache(UploadArgs),
+    /// Updates refreshes local checkouts of the minimal package & standard library.
+    Update,
     /// Executes the build for a package, using stale dependencies.
     #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
     PatchedBuild(PatchedBuildArgs),
@@ -140,50 +139,103 @@ pub(crate) fn enforce_science_mode() -> Result<()> {
     Ok(())
 }
 
-impl GlobalArgs {
-    /// Create the PathConfig based on command line arguments
-    pub fn path_config(&self) -> PathConfig {
-        let mut config = if let Some(base_dir) = &self.minimal_dir {
+/// Shared state describing the invocation of minimal functions.
+#[derive(Debug)]
+pub struct Context {
+    pub no_cache: bool,
+    pub no_fetch: bool,
+    pub num_parallel_builds: usize,
+
+    paths: PathConfig,
+    cache: Cache<LocalDir>,
+    vcs: checkouts::Manager,
+
+    // TODO: Move back into PathConfig
+    stdlib_path: PathBuf,
+}
+
+// Initialization of Context
+impl Context {
+    /// Consumes configuration arguments and sets up shared context for execution.
+    pub fn new(args: GlobalArgs) -> Result<Self, Error> {
+        let paths = Self::make_path_config(&args);
+        paths.ensure_directories().map_err(anyhow::Error::from)?;
+
+        // Setup VCS manager
+        let mut vcs = checkouts::Manager::new(paths.vcs_dir()).map_err(anyhow::Error::from)?;
+        let stdlib_path = vcs
+            .checkout_of(
+                "git@github.com:gominimal/std.git",
+                checkouts::GitRef::Branch("main".to_string()),
+            )
+            .map_err(anyhow::Error::from)?;
+
+        // Setup local cache
+        let cache_dir = paths.cache_dir().to_path_buf();
+        match std::fs::create_dir_all(&cache_dir) {
+            Ok(_) => {}
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(anyhow::Error::from(e).into());
+                }
+            }
+        };
+        let cache = Cache::at_dir(cache_dir).map_err(anyhow::Error::from)?;
+
+        Ok(Self {
+            no_cache: args.no_cache,
+            no_fetch: args.no_fetch,
+            num_parallel_builds: args.num_parallel_builds,
+
+            paths,
+            cache,
+            vcs,
+            stdlib_path,
+        })
+    }
+
+    fn make_path_config(args: &GlobalArgs) -> PathConfig {
+        let mut config = if let Some(base_dir) = &args.minimal_dir {
             PathConfig::new_with_base(base_dir.clone())
         } else {
             PathConfig::new()
         };
 
-        if let Some(cache_dir) = &self.cache_dir {
+        if let Some(cache_dir) = &args.cache_dir {
             config = config.with_cache_dir(cache_dir.clone());
         }
-        if let Some(download_cache_dir) = &self.download_cache_dir {
+        if let Some(download_cache_dir) = &args.download_cache_dir {
             config = config.with_download_cache_dir(download_cache_dir.clone());
         }
-        if let Some(builds_dir) = &self.builds_dir {
+        if let Some(builds_dir) = &args.builds_dir {
             config = config.with_sandbox_base_dir(builds_dir.clone());
         }
-        if let Some(runs_dir) = &self.runs_dir {
+        if let Some(runs_dir) = &args.runs_dir {
             config = config.with_run_base_dir(runs_dir.clone());
         }
 
-        if let Some(packages_dir) = &self.packages_dir {
+        if let Some(packages_dir) = &args.packages_dir {
             config = config.with_packages_dir(packages_dir.clone());
         }
 
         config
     }
+}
 
-    /// Builds and returns an instance of the local cache.
-    pub fn cache(&self) -> Result<Cache<LocalDir>, std::io::Error> {
-        let path_config = self.path_config();
-        let cache_dir = path_config.cache_dir().to_path_buf();
+// API surface of Context
+impl Context {
+    fn stdlib_dir(&self) -> PathBuf {
+        self.stdlib_path.clone()
+    }
 
-        match std::fs::create_dir_all(&cache_dir) {
-            Ok(_) => {}
-            Err(e) => {
-                if e.kind() != std::io::ErrorKind::AlreadyExists {
-                    panic!("failed to create build cache dir: {}", e);
-                }
-            }
-        };
-
-        Cache::at_dir(cache_dir)
+    pub fn vcs_manager(&mut self) -> &mut checkouts::Manager {
+        &mut self.vcs
+    }
+    pub fn local_cache(&self) -> Cache<LocalDir> {
+        self.cache.clone()
+    }
+    pub fn paths(&self) -> &PathConfig {
+        &self.paths
     }
 
     /// Builds and returns a remote cache with default configurations.
@@ -197,8 +249,7 @@ impl GlobalArgs {
 
     /// Returns a [DepGraph] with the given package and its transitive dependencies loaded.
     pub fn graph_from_package_name(&self, package_name: &String) -> Result<DepGraph, GraphError> {
-        let path_config = self.path_config();
-        let package_dir = path_config.packages_dir().join(package_name);
+        let package_dir = self.paths.packages_dir().join(package_name);
 
         let build_ncl_path = {
             let normal_path = package_dir.join("build.ncl");
@@ -215,7 +266,7 @@ impl GlobalArgs {
         let sr = SpecReader::new_with_path(
             &build_ncl_path,
             &SpecReaderOptions {
-                minimal_lib_path: path_config.minimal_stdlib_dir().to_path_buf(),
+                minimal_lib_path: self.stdlib_dir(),
             },
         )?;
 
@@ -224,14 +275,13 @@ impl GlobalArgs {
 
     #[tracing::instrument]
     pub fn graph_from_package_names(&self, names: &[String]) -> Result<DepGraph, GraphError> {
-        let path_config = self.path_config();
-        let packages_dir = path_config.packages_dir();
+        let packages_dir = self.paths.packages_dir();
 
         let sr = SpecReader::new_with_pkgs(
             names,
             packages_dir,
             &SpecReaderOptions {
-                minimal_lib_path: path_config.minimal_stdlib_dir().to_path_buf(),
+                minimal_lib_path: self.stdlib_dir(),
             },
         )?;
 
@@ -239,13 +289,12 @@ impl GlobalArgs {
     }
 
     pub fn graph_from_all_packages(&self) -> Result<DepGraph, GraphError> {
-        let path_config = self.path_config();
-        let packages_dir = path_config.packages_dir();
+        let packages_dir = self.paths.packages_dir();
 
         let sr = SpecReader::new_with_all_pkgs(
             packages_dir,
             &SpecReaderOptions {
-                minimal_lib_path: path_config.minimal_stdlib_dir().to_path_buf(),
+                minimal_lib_path: self.stdlib_dir(),
             },
         )?;
 
@@ -273,14 +322,14 @@ impl std::fmt::Display for PackagesArg {
 
 impl PackagesArg {
     /// Returns a [DepGraph] containing the named packages, or all packages if none were specified.
-    pub fn graph(&self, globals: &GlobalArgs) -> Result<DepGraph, graph::Error> {
+    pub fn graph(&self, ctx: &mut Context) -> Result<DepGraph, graph::Error> {
         match self.packages {
             Some(ref packages) => match packages.len() {
-                0 => globals.graph_from_all_packages(),
-                1 => globals.graph_from_package_name(&packages[0]),
-                _ => globals.graph_from_package_names(packages),
+                0 => ctx.graph_from_all_packages(),
+                1 => ctx.graph_from_package_name(&packages[0]),
+                _ => ctx.graph_from_package_names(packages),
             },
-            None => globals.graph_from_all_packages(),
+            None => ctx.graph_from_all_packages(),
         }
     }
 
@@ -372,7 +421,6 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    cli.global_args.path_config().ensure_directories()?;
 
     // Generate invocation ID for this build
     let invocation_id = Uuid::new_v4().to_string();
@@ -402,17 +450,7 @@ async fn main() -> Result<()> {
         dispatcher.run().await;
     });
 
-    let result = match cli.command {
-        Command::Build(args) => cmd_build(args, &cli.global_args).await,
-        Command::Check(args) => cmd_check(args, &cli.global_args),
-        Command::Plan(args) => cmd_plan(args, &cli.global_args).await,
-        Command::UploadCache(args) => cmd_upload_cache(args, &cli.global_args).await,
-        Command::NewWorldUpdate(args) => cmd_new_world_update(args, &cli.global_args).await,
-        Command::OciImage(args) => cmd_oci_image(args, &cli.global_args).await,
-        Command::PatchedBuild(args) => cmd_patched_build(args, &cli.global_args).await,
-        #[cfg(target_os = "linux")]
-        Command::Run(args) => cmd_run(args, &cli.global_args).await,
-    };
+    let result = run_cli(cli).await;
 
     // Close the event bus to signal the dispatcher to shut down gracefully
     build_events::event_bus().close();
@@ -425,6 +463,31 @@ async fn main() -> Result<()> {
     if let Err(e) = result {
         e.report_to_stderr();
         std::process::exit(1);
-    }
+    };
     Ok(())
+}
+
+async fn run_cli(cli: Cli) -> Result<(), Error> {
+    let Cli {
+        command,
+        global_args,
+    } = cli;
+    let mut ctx = Context::new(global_args)?;
+
+    match command {
+        Command::Build(args) => cmd_build(args, &mut ctx).await,
+        Command::Check(args) => cmd_check(args, &mut ctx),
+        Command::Plan(args) => cmd_plan(args, &mut ctx).await,
+        Command::UploadCache(args) => cmd_upload_cache(args, &mut ctx).await,
+        Command::NewWorldUpdate(args) => cmd_new_world_update(args, &mut ctx).await,
+        Command::OciImage(args) => cmd_oci_image(args, &mut ctx).await,
+        Command::PatchedBuild(args) => cmd_patched_build(args, &mut ctx).await,
+        #[cfg(target_os = "linux")]
+        Command::Run(args) => cmd_run(args, &mut ctx).await,
+
+        Command::Update => ctx
+            .vcs_manager()
+            .update()
+            .map_err(|e| Error::Other(anyhow::Error::from(e))),
+    }
 }

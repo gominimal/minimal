@@ -1,12 +1,12 @@
 use super::{CheckResult, CheckVerdict};
-use crate::{Error, GlobalArgs};
+use crate::{Context, Error};
 use graph::{BuildOutput, DepGraph};
 
 pub(crate) fn package_spec_name_matches_dir(
     pkg: &String,
     _all_graph: &Option<DepGraph>,
     _fix: bool,
-    globals: &GlobalArgs,
+    ctx: &mut Context,
 ) -> Result<CheckResult, Error> {
     let mut result = CheckResult {
         verdict: CheckVerdict::Skip,
@@ -14,7 +14,7 @@ pub(crate) fn package_spec_name_matches_dir(
         err: vec![],
     };
 
-    result.verdict = match globals.graph_from_package_name(pkg) {
+    result.verdict = match ctx.graph_from_package_name(pkg) {
         Ok(graph) => {
             if graph.get(&graph.top_levels[0]).unwrap().name == *pkg {
                 CheckVerdict::Pass
@@ -32,7 +32,7 @@ pub(crate) fn package_name(
     pkg: &String,
     all_graph: &Option<DepGraph>,
     _fix: bool,
-    _globals: &GlobalArgs,
+    _ctx: &mut Context,
 ) -> Result<CheckResult, Error> {
     let mut result = CheckResult {
         verdict: CheckVerdict::Skip,
@@ -73,7 +73,7 @@ pub(crate) fn cycle_breaker_naming(
     pkg: &String,
     all_graph: &Option<DepGraph>,
     _fix: bool,
-    _globals: &GlobalArgs,
+    _ctx: &mut Context,
 ) -> Result<CheckResult, Error> {
     let mut result = CheckResult {
         verdict: CheckVerdict::Skip,
@@ -116,7 +116,7 @@ pub(crate) fn output_naming(
     pkg: &String,
     all_graph: &Option<DepGraph>,
     _fix: bool,
-    _globals: &GlobalArgs,
+    _ctx: &mut Context,
 ) -> Result<CheckResult, Error> {
     let mut result = CheckResult {
         verdict: CheckVerdict::Skip,
