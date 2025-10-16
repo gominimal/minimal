@@ -2143,6 +2143,7 @@ dependencies = [
  "build-sandbox",
  "bytes",
  "cache",
+ "checkouts",
  "clap",
  "codespan-reporting",
  "common",

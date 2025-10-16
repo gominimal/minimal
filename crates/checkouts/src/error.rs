@@ -1,5 +1,7 @@
 //! Error types for the checkouts crate.
 
+use std::fmt;
+
 /// Errors that can occur when managing git repository checkouts.
 #[derive(Debug)]
 pub enum Error {
@@ -14,17 +16,8 @@ pub enum Error {
         stderr: String,
     },
 
-    /// The git binary was not found in PATH.
-    GitNotFound,
-
     /// The repository path is invalid (e.g., contains invalid UTF-8) or for a different remote.
     InvalidPath,
-
-    /// The repository is not in a clean state (has uncommitted changes).
-    DirtyWorkingDirectory,
-
-    /// The specified git reference (branch, tag, or commit) was not found.
-    RefNotFound(String),
 
     /// A generic error with a custom message.
     Other(String),
@@ -43,5 +36,29 @@ impl Error {
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Self::IO(e)
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::IO(e) => write!(f, "I/O error: {}", e),
+            Error::GitCommandFailed { command, stderr } => {
+                write!(f, "git command  {} failed: {}", command, stderr)
+            }
+            Error::InvalidPath => write!(f, "invalid path"),
+            Error::Other(e) => write!(f, "other: {}", e),
+            Error::StatefileInvalid(e) => write!(f, "statefile invalid: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::IO(e) => Some(e),
+            Error::StatefileInvalid(e) => Some(e),
+            _ => None,
+        }
     }
 }

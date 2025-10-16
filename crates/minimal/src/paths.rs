@@ -26,10 +26,6 @@ pub struct PathConfig {
     /// Directory containing VCS checkouts
     /// Default: ~/.cache/minimal/vcs/
     vcs_dir: PathBuf,
-
-    /// Directory containing the minimal standard library
-    /// Default: ./crates/graph/minimal-ncl
-    stdlib_dir: PathBuf,
 }
 
 impl PathConfig {
@@ -49,7 +45,6 @@ impl PathConfig {
             vcs_dir: root_dir.join("vcs"),
             root_dir,
             packages_dir: PathBuf::from("packages"),
-            stdlib_dir: PathBuf::from("crates/graph/minimal-ncl"),
         }
     }
 
@@ -86,12 +81,6 @@ impl PathConfig {
     /// Create a PathConfig with custom packages directory
     pub fn with_packages_dir(mut self, packages_dir: PathBuf) -> Self {
         self.packages_dir = packages_dir;
-        self
-    }
-
-    /// Create a PathConfig with the minimal-standard-library at the given directory
-    pub fn with_minimal_stdlib_dir(mut self, stdlib_dir: PathBuf) -> Self {
-        self.stdlib_dir = stdlib_dir;
         self
     }
 
@@ -137,11 +126,6 @@ impl PathConfig {
         &self.packages_dir
     }
 
-    /// Returns the path to the minimal standard library
-    pub fn minimal_stdlib_dir(&self) -> &Path {
-        &self.stdlib_dir
-    }
-
     /// Create all necessary directories
     pub fn ensure_directories(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.cache_dir)?;
@@ -167,7 +151,6 @@ impl PathConfig {
             self.sandbox_base_dir.display()
         );
         println!("  Packages directory:      {}", self.packages_dir.display());
-        println!("  minimal-ncl directory:    {}", self.stdlib_dir.display());
     }
 }
 

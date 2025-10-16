@@ -63,6 +63,8 @@ enum Command {
     Check(CheckArgs),
     /// Uploads the specified packages and their transitive needs to the cache.
     UploadCache(UploadArgs),
+    /// Updates refreshes local checkouts of the minimal package & standard library.
+    Update,
     /// Executes the build for a package, using stale dependencies.
     #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
     PatchedBuild(PatchedBuildArgs),
@@ -105,6 +107,11 @@ pub struct GlobalArgs {
     /// Configure the number of parallel builds
     #[arg(short, long, default_value_t = default_parallelism())]
     num_parallel_builds: usize,
+
+    #[arg(skip)]
+    vcs_manager: Option<checkouts::Manager>,
+    #[arg(skip)]
+    stdlib_path: Option<PathBuf>,
 }
 
 fn default_parallelism() -> usize {
@@ -133,6 +140,23 @@ pub(crate) fn enforce_science_mode() -> Result<()> {
 }
 
 impl GlobalArgs {
+    fn setup(&mut self) -> Result<(), anyhow::Error> {
+        let pc = self.path_config();
+        pc.ensure_directories()?;
+
+        let mut manager = checkouts::Manager::new(pc.vcs_dir())?;
+        self.stdlib_path = Some(manager.checkout_of(
+            "git@github.com:gominimal/std.git",
+            checkouts::GitRef::Branch("main".to_string()),
+        )?);
+        self.vcs_manager = Some(manager);
+        Ok(())
+    }
+
+    fn stdlib_dir(&self) -> PathBuf {
+        self.stdlib_path.as_ref().unwrap().clone()
+    }
+
     /// Create the PathConfig based on command line arguments
     pub fn path_config(&self) -> PathConfig {
         let mut config = if let Some(base_dir) = &self.minimal_dir {
@@ -207,7 +231,7 @@ impl GlobalArgs {
         let sr = SpecReader::new_with_path(
             &build_ncl_path,
             &SpecReaderOptions {
-                minimal_lib_path: path_config.minimal_stdlib_dir().to_path_buf(),
+                minimal_lib_path: self.stdlib_dir(),
             },
         )?;
 
@@ -223,7 +247,7 @@ impl GlobalArgs {
             names,
             packages_dir,
             &SpecReaderOptions {
-                minimal_lib_path: path_config.minimal_stdlib_dir().to_path_buf(),
+                minimal_lib_path: self.stdlib_dir(),
             },
         )?;
 
@@ -237,7 +261,7 @@ impl GlobalArgs {
         let sr = SpecReader::new_with_all_pkgs(
             packages_dir,
             &SpecReaderOptions {
-                minimal_lib_path: path_config.minimal_stdlib_dir().to_path_buf(),
+                minimal_lib_path: self.stdlib_dir(),
             },
         )?;
 
@@ -356,15 +380,15 @@ async fn main() -> Result<()> {
     tracing_subscriber::registry()
         // .with(fmt::layer().with_target(false).with_thread_ids(true))
         .with(fmt::layer().with_writer(indicatif_layer.get_stderr_writer()))
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("trace")))
         .with(indicatif_layer.with_filter(IndicatifFilter::new(false)))
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             EnvFilter::new("debug").add_directive("topiary=off".parse().unwrap())
         }))
         .init();
 
-    let cli = Cli::parse();
-    cli.global_args.path_config().ensure_directories()?;
+    let mut cli = Cli::parse();
+    cli.global_args.setup()?;
 
     let result = match cli.command {
         Command::Build(args) => cmd_build(args, &cli.global_args).await,
@@ -375,6 +399,12 @@ async fn main() -> Result<()> {
         Command::OciImage(args) => cmd_oci_image(args, &cli.global_args).await,
         Command::PatchedBuild(args) => cmd_patched_build(args, &cli.global_args).await,
         Command::Run(args) => cmd_run(args, &cli.global_args).await,
+
+        Command::Update => {
+            let manager = cli.global_args.vcs_manager.as_mut().unwrap();
+            manager.update()?;
+            Ok(())
+        }
     };
 
     if let Err(e) = result {

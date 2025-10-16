@@ -182,6 +182,21 @@ impl Manager {
         self.base_dir.join("git").join("db")
     }
 
+    /// Updates all repos to latest - does nothing for refs which arent symbolic (i.e. branches).
+    pub fn update(&mut self) -> Result<(), Error> {
+        let checkouts_dir = self.git_checkouts_dir();
+        for (_remote, id) in self.state.git_remotes.iter_mut() {
+            let repo = self.repos.get_mut(id).unwrap();
+            repo.fetch()?;
+            for (dir, checkout) in self.state.repos.get_mut(id).unwrap().checkouts.iter_mut() {
+                checkout.rev =
+                    repo.worktree_checkout(&checkouts_dir.join(dir), &checkout.version)?;
+            }
+        }
+        self.state.write_to(&self.base_dir)?;
+        Ok(())
+    }
+
     pub fn checkout_of(&mut self, remote: &str, at: GitRef) -> Result<PathBuf, Error> {
         let out = match self.state.git_remotes.get(remote) {
             // This remote is already managed
@@ -197,7 +212,7 @@ impl Manager {
                 let relative_dir = checkout_dir.strip_prefix(self.git_checkouts_dir()).unwrap();
                 let repo = self.repos.get_mut(id).unwrap();
                 repo.fetch()?;
-                let checkout = repo.checkout_to(checkout_dir.clone(), at.clone())?;
+                let checkout = repo.new_worktree(checkout_dir.clone(), at.clone())?;
 
                 self.state
                     .repos
@@ -221,7 +236,7 @@ impl Manager {
                 // Make checkout
                 let checkout_dir = tempdir_in(self.git_checkouts_dir()).unwrap().keep();
                 let relative_dir = checkout_dir.strip_prefix(self.git_checkouts_dir()).unwrap();
-                let checkout = repo.checkout_to(checkout_dir.clone(), at.clone())?;
+                let checkout = repo.new_worktree(checkout_dir.clone(), at.clone())?;
 
                 self.state
                     .git_remotes
@@ -278,7 +293,7 @@ mod tests {
         // Expect the README.md to exist from the checkout
         assert!(checkout.join("README.md").exists());
         // Expect runtime to be updated
-        assert!(manager.repos.get("spoon-knife").is_some());
+        assert!(manager.repos.contains_key("spoon-knife"));
         // Expect serialized state to be updated
         assert_eq!(
             manager.state.git_remotes.get(remote).unwrap(),
@@ -333,23 +348,20 @@ mod tests {
         repo.list_tags().unwrap();
 
         let checkout_dir = tempdir().unwrap();
-        repo.checkout_to(
+        repo.new_worktree(
             checkout_dir.path().to_path_buf(),
             GitRef::Branch("main".to_string()),
         )
         .unwrap();
 
         // Not fresh clone
-        let repo = Repo::new("https://github.com/octocat/Spoon-Knife", clone_dir.path()).unwrap();
+        let mut repo =
+            Repo::new("https://github.com/octocat/Spoon-Knife", clone_dir.path()).unwrap();
         repo.fetch().unwrap();
-
-        // Make sure the worktree was automatically initialized
         assert_eq!(
-            repo.checkouts[&checkout_dir.path().to_path_buf()],
-            Checkout {
-                rev: "d0dd1f61b33d64e29d8bc1372a94ef6a2fee76a9".to_string(),
-                version: GitRef::Branch("main".to_string()),
-            }
-        )
+            "d0dd1f61b33d64e29d8bc1372a94ef6a2fee76a9".to_string(),
+            repo.worktree_checkout(checkout_dir.path(), &GitRef::Branch("main".to_string()))
+                .unwrap()
+        );
     }
 }
