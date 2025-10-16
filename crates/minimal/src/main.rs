@@ -380,7 +380,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::registry()
         // .with(fmt::layer().with_target(false).with_thread_ids(true))
         .with(fmt::layer().with_writer(indicatif_layer.get_stderr_writer()))
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("trace")))
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(indicatif_layer.with_filter(IndicatifFilter::new(false)))
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             EnvFilter::new("debug").add_directive("topiary=off".parse().unwrap())
