@@ -1,4 +1,5 @@
 use crate::{Context, Error, PackagesArg};
+use anyhow::anyhow;
 use graph::DepGraph;
 
 use codespan_reporting::term::termcolor::{
@@ -29,6 +30,10 @@ pub struct CheckArgs {
 pub fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> {
     let all_graph = ctx.graph_from_all_packages().ok();
     let packages_dir = ctx.paths().packages_dir().unwrap().to_path_buf();
+
+    if args.fix && packages_dir.strip_prefix(ctx.paths().vcs_dir()).is_ok() {
+        return Err(anyhow!("--fix can only be used when --package-dir is specified").into());
+    }
 
     let packages_dirs = std::fs::read_dir(packages_dir)
         .map_err(anyhow::Error::from)?
