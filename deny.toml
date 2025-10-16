@@ -28,6 +28,7 @@ exceptions = [
 
 [licenses.private]
 ignore = true
+ignore-sources = ["https://buf.build/gen/cargo//"]
 
 [bans]
 skip = [
@@ -95,6 +96,9 @@ skip-tree = [
     { name = "windows-sys", version = "=0.60.2" },
     { name = "windows-targets", version = "=0.52.6" },
 ]
+
+[sources]
+allow-registry = ["registry+https://github.com/rust-lang/crates.io-index", "sparse+https://buf.build/gen/cargo/"]
 
 [sources.allow-org]
 github = ["souk4711"]
