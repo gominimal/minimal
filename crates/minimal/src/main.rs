@@ -193,7 +193,8 @@ impl Context {
                         "git@github.com:gominimal/pkgs.git",
                         checkouts::GitRef::Branch("main".to_string()),
                     )
-                    .map_err(anyhow::Error::from)?,
+                    .map_err(anyhow::Error::from)?
+                    .join("packages"),
             });
 
         Ok(Self {
