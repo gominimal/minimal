@@ -30,6 +30,12 @@ pub struct PathConfig {
     stdlib_dir: Option<PathBuf>,
 }
 
+impl Default for PathConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PathConfig {
     /// Creates a default PathConfig.
     pub fn new() -> Self {
@@ -133,11 +139,11 @@ impl PathConfig {
 
     /// Get the packages directory
     pub fn packages_dir(&self) -> Option<&Path> {
-        self.packages_dir.as_ref().map(|p| p.as_path())
+        self.packages_dir.as_deref()
     }
     /// Get the stdlib directory
     pub fn stdlib_dir(&self) -> Option<&Path> {
-        self.stdlib_dir.as_ref().map(|p| p.as_path())
+        self.stdlib_dir.as_deref()
     }
 
     /// Create all necessary directories
