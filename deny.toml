@@ -53,6 +53,9 @@ skip = [
     # google-cloud-auth -> rustls -> ring 
     # https://github.com/briansmith/ring/issues/2341
     { name = "getrandom", version = "0.2.16" },
+    # minimal_spongebob_community_neoeinstein-tonic -> tonic
+    # due to neoeinstein using an outdated tonic
+    { name = "hashbrown", version = "0.12.3" },
     # nickel-lang-core -> saphyr-parser -> hashlink
     # https://github.com/djc/hashlink/pull/38
     { name = "hashbrown", version = "0.15.5" },

@@ -16,7 +16,7 @@ tokio = { workspace = true, features = ["sync"] }
 tokio-stream = "0.1"
 tonic = { version = "0.12.3", features = ["tls", "tls-native-roots"] }
 tracing.workspace = true
-uuid = { version = "1.11", features = ["v4"] }
+uuid = { version = "1.18", features = ["v4"] }
 
 [dev-dependencies]
 tempfile.workspace = true
