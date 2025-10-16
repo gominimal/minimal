@@ -93,7 +93,10 @@ pub struct GlobalArgs {
     #[arg(long, hide = true)]
     download_cache_dir: Option<PathBuf>,
 
-    /// Override the packages/ directory where build-specs are loaded
+    /// Load the minimal stdlib from the given path instead
+    #[arg(long)]
+    stdlib_dir: Option<PathBuf>,
+    /// Load packages from the given path instead
     #[arg(long)]
     packages_dir: Option<PathBuf>,
 
@@ -149,9 +152,6 @@ pub struct Context {
     paths: PathConfig,
     cache: Cache<LocalDir>,
     vcs: checkouts::Manager,
-
-    // TODO: Move back into PathConfig
-    stdlib_path: PathBuf,
 }
 
 // Initialization of Context
@@ -163,12 +163,6 @@ impl Context {
 
         // Setup VCS manager
         let mut vcs = checkouts::Manager::new(paths.vcs_dir()).map_err(anyhow::Error::from)?;
-        let stdlib_path = vcs
-            .checkout_of(
-                "git@github.com:gominimal/std.git",
-                checkouts::GitRef::Branch("main".to_string()),
-            )
-            .map_err(anyhow::Error::from)?;
 
         // Setup local cache
         let cache_dir = paths.cache_dir().to_path_buf();
@@ -182,6 +176,26 @@ impl Context {
         };
         let cache = Cache::at_dir(cache_dir).map_err(anyhow::Error::from)?;
 
+        let paths = paths
+            .with_stdlib_dir(match args.stdlib_dir {
+                None => vcs
+                    .checkout_of(
+                        "git@github.com:gominimal/std.git",
+                        checkouts::GitRef::Branch("main".to_string()),
+                    )
+                    .map_err(anyhow::Error::from)?,
+                Some(dir) => dir,
+            })
+            .with_packages_dir(match args.packages_dir {
+                Some(dir) => dir,
+                None => vcs
+                    .checkout_of(
+                        "git@github.com:gominimal/pkgs.git",
+                        checkouts::GitRef::Branch("main".to_string()),
+                    )
+                    .map_err(anyhow::Error::from)?,
+            });
+
         Ok(Self {
             no_cache: args.no_cache,
             no_fetch: args.no_fetch,
@@ -190,7 +204,6 @@ impl Context {
             paths,
             cache,
             vcs,
-            stdlib_path,
         })
     }
 
@@ -214,20 +227,15 @@ impl Context {
             config = config.with_run_base_dir(runs_dir.clone());
         }
 
-        if let Some(packages_dir) = &args.packages_dir {
-            config = config.with_packages_dir(packages_dir.clone());
-        }
-
         config
     }
 }
 
 // API surface of Context
 impl Context {
-    fn stdlib_dir(&self) -> PathBuf {
-        self.stdlib_path.clone()
+    pub fn stdlib_dir(&self) -> PathBuf {
+        self.paths.stdlib_dir().unwrap().to_path_buf()
     }
-
     pub fn vcs_manager(&mut self) -> &mut checkouts::Manager {
         &mut self.vcs
     }
@@ -249,7 +257,7 @@ impl Context {
 
     /// Returns a [DepGraph] with the given package and its transitive dependencies loaded.
     pub fn graph_from_package_name(&self, package_name: &String) -> Result<DepGraph, GraphError> {
-        let package_dir = self.paths.packages_dir().join(package_name);
+        let package_dir = self.paths.packages_dir().unwrap().join(package_name);
 
         let build_ncl_path = {
             let normal_path = package_dir.join("build.ncl");
@@ -275,7 +283,7 @@ impl Context {
 
     #[tracing::instrument]
     pub fn graph_from_package_names(&self, names: &[String]) -> Result<DepGraph, GraphError> {
-        let packages_dir = self.paths.packages_dir();
+        let packages_dir = self.paths.packages_dir().unwrap();
 
         let sr = SpecReader::new_with_pkgs(
             names,
@@ -289,7 +297,7 @@ impl Context {
     }
 
     pub fn graph_from_all_packages(&self) -> Result<DepGraph, GraphError> {
-        let packages_dir = self.paths.packages_dir();
+        let packages_dir = self.paths.packages_dir().unwrap();
 
         let sr = SpecReader::new_with_all_pkgs(
             packages_dir,

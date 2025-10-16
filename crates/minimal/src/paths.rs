@@ -20,12 +20,14 @@ pub struct PathConfig {
     /// Base directory for runtime sandboxes
     /// Default: ~/.cache/minimal/runs
     run_base_dir: PathBuf,
-    /// Directory containing build-decls
-    /// Default: ./packages/
-    packages_dir: PathBuf,
     /// Directory containing VCS checkouts
     /// Default: ~/.cache/minimal/vcs/
     vcs_dir: PathBuf,
+
+    /// Directory containing build-decls
+    packages_dir: Option<PathBuf>,
+    /// Directory containing minimal standard library
+    stdlib_dir: Option<PathBuf>,
 }
 
 impl PathConfig {
@@ -37,14 +39,17 @@ impl PathConfig {
 
     /// Create a new PathConfig rooted at a given directory.
     pub fn new_with_base(root_dir: PathBuf) -> Self {
+        let stdlib_dir = None;
+        let packages_dir = None;
         Self {
             cache_dir: root_dir.join("builds"),
             download_cache_dir: root_dir.join("downloads"),
             sandbox_base_dir: root_dir.join("sandboxes"),
             run_base_dir: root_dir.join("runs"),
             vcs_dir: root_dir.join("vcs"),
+            packages_dir,
             root_dir,
-            packages_dir: PathBuf::from("packages"),
+            stdlib_dir,
         }
     }
 
@@ -80,7 +85,12 @@ impl PathConfig {
 
     /// Create a PathConfig with custom packages directory
     pub fn with_packages_dir(mut self, packages_dir: PathBuf) -> Self {
-        self.packages_dir = packages_dir;
+        self.packages_dir = Some(packages_dir);
+        self
+    }
+    /// Create a PathConfig with the given stdlib directory
+    pub fn with_stdlib_dir(mut self, stdlib_dir: PathBuf) -> Self {
+        self.stdlib_dir = Some(stdlib_dir);
         self
     }
 
@@ -122,8 +132,12 @@ impl PathConfig {
     }
 
     /// Get the packages directory
-    pub fn packages_dir(&self) -> &Path {
-        &self.packages_dir
+    pub fn packages_dir(&self) -> Option<&Path> {
+        self.packages_dir.as_ref().map(|p| p.as_path())
+    }
+    /// Get the stdlib directory
+    pub fn stdlib_dir(&self) -> Option<&Path> {
+        self.stdlib_dir.as_ref().map(|p| p.as_path())
     }
 
     /// Create all necessary directories
@@ -150,12 +164,19 @@ impl PathConfig {
             "  Sandbox base:            {}",
             self.sandbox_base_dir.display()
         );
-        println!("  Packages directory:      {}", self.packages_dir.display());
-    }
-}
-
-impl Default for PathConfig {
-    fn default() -> Self {
-        Self::new()
+        println!(
+            "  Minimal stdlib directory:      {}",
+            self.stdlib_dir
+                .as_ref()
+                .map(|d| d.display().to_string())
+                .unwrap_or("<unset>".to_string())
+        );
+        println!(
+            "  Packages directory:      {}",
+            self.packages_dir
+                .as_ref()
+                .map(|d| d.display().to_string())
+                .unwrap_or("<unset>".to_string())
+        );
     }
 }

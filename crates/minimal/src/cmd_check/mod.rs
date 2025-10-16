@@ -28,7 +28,7 @@ pub struct CheckArgs {
 
 pub fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> {
     let all_graph = ctx.graph_from_all_packages().ok();
-    let packages_dir = ctx.paths().packages_dir().to_path_buf();
+    let packages_dir = ctx.paths().packages_dir().unwrap().to_path_buf();
 
     let packages_dirs = std::fs::read_dir(packages_dir)
         .map_err(anyhow::Error::from)?
@@ -173,7 +173,7 @@ fn check_minimal_import_line(
         err: vec![],
     };
 
-    let base = ctx.paths().packages_dir().join(pkg);
+    let base = ctx.paths().packages_dir().unwrap().join(pkg);
     for e in std::fs::read_dir(base).map_err(anyhow::Error::from)? {
         let e = e.map_err(anyhow::Error::from)?;
         if e.file_type().unwrap().is_dir() {
@@ -271,7 +271,7 @@ fn check_package_fmt(
         err: vec![],
     };
 
-    let base = ctx.paths().packages_dir().join(pkg);
+    let base = ctx.paths().packages_dir().unwrap().join(pkg);
     for e in std::fs::read_dir(base).map_err(anyhow::Error::from)? {
         let e = e.map_err(anyhow::Error::from)?;
         if e.file_type().unwrap().is_dir() {
