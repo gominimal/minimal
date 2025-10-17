@@ -140,7 +140,11 @@ fn extract_tar_impl<R: Read>(
     if let Some(prefix) = strip_prefix {
         for entry in archive.entries()? {
             let mut entry = entry?;
-            let path = entry.path()?.strip_prefix(prefix)?.to_owned();
+            let p = entry.path()?;
+            if p.as_ref().as_os_str() == "pax_global_header" {
+                continue;
+            }
+            let path = p.strip_prefix(prefix)?.to_owned();
             entry.unpack(dest_dir.join(path))?;
         }
     } else {
