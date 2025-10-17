@@ -74,7 +74,12 @@ impl Repo {
     ///
     /// This updates the remote-tracking branches but does not modify any checkouts.
     pub fn fetch(&mut self) -> Result<(), Error> {
-        self.run_git_bare(&["fetch", "--quiet", "--set-upstream", "origin"])?;
+        self.run_git_bare(&[
+            "fetch",
+            "--quiet",
+            "origin",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ])?;
         Ok(())
     }
 
@@ -91,7 +96,10 @@ impl Repo {
         worktree_path: &Path,
         git_ref: &GitRef,
     ) -> Result<String, Error> {
-        self.run_git_checkout(worktree_path, &["checkout", git_ref.as_str()])?;
+        self.run_git_checkout(
+            worktree_path,
+            &["checkout", format!("origin/{}", git_ref.as_str()).as_str()],
+        )?;
         let output = self.run_git_checkout(worktree_path, &["rev-parse", "HEAD"])?;
         let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
         Ok(commit)

@@ -32,7 +32,7 @@ pub fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> {
     let packages_dir = ctx.paths().packages_dir().unwrap().to_path_buf();
 
     if args.fix && packages_dir.strip_prefix(ctx.paths().vcs_dir()).is_ok() {
-        return Err(anyhow!("--fix can only be used when --package-dir is specified").into());
+        return Err(anyhow!("--fix can only be used when --packages-dir is specified").into());
     }
 
     let packages_dirs = std::fs::read_dir(packages_dir)
