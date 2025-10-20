@@ -50,7 +50,7 @@ skip = [
     { name = "darling_core", version = "0.20.11" },
     { name = "darling_macro", version = "0.20.11" },
     { name = "darling_macro", version = "0.20.11" },
-    # google-cloud-auth -> rustls -> ring 
+    # google-cloud-auth -> rustls -> ring
     # https://github.com/briansmith/ring/issues/2341
     { name = "getrandom", version = "0.2.16" },
     # minimal_spongebob_community_neoeinstein-tonic -> tonic
@@ -68,10 +68,6 @@ skip = [
     # reqwest -> hyper-tls -> native-tls -> security-framework
     # https://github.com/sfackler/rust-native-tls/pull/338
     { name = "security-framework", version = "2.11.1" },
-    # hakoniwa -> caps -> thiserror
-    # https://github.com/lucab/caps-rs/pull/88
-    { name = "thiserror", version = "1.0.69" },
-    { name = "thiserror-impl", version = "1.0.69" },
     # nickel-lang-core -> pretty
     # https://github.com/Marwes/pretty.rs/pull/90
     { name = "unicode-width", version = "0.1.14" },
@@ -95,7 +91,6 @@ skip = [
 skip-tree = [
     { name = "windows-registry", version = "=0.5.3" },
     { name = "windows-sys", version = "=0.52.0" },
-    { name = "windows-sys", version = "=0.59.0" },
     { name = "windows-sys", version = "=0.60.2" },
     { name = "windows-targets", version = "=0.52.6" },
 ]
