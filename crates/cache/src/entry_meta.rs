@@ -29,6 +29,8 @@ impl MetaInner {
 pub struct EntryMeta {
     pub inner: MetaInner,
     pub fetched: bool,
+    #[serde(default)]
+    pub breaker_build: bool,
     pub epoch_millis: u128,
 }
 
@@ -37,6 +39,7 @@ impl Default for EntryMeta {
         EntryMeta {
             inner: MetaInner::Spec("".to_string()),
             fetched: false,
+            breaker_build: false,
             epoch_millis: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()

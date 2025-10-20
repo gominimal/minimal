@@ -700,7 +700,7 @@ impl<'a> Run<'a> {
             use std::sync::{Arc, Mutex};
             let self2 = Arc::new(&*self);
             let build_which_errored = Arc::new(Mutex::new(None));
-            let cache_handles = Arc::new(Mutex::new(Vec::with_capacity(
+            let outputs = Arc::new(Mutex::new(Vec::with_capacity(
                 phase.as_ref().unwrap().builds.len(),
             )));
 
@@ -713,7 +713,7 @@ impl<'a> Run<'a> {
                     let full_build = build.full_build();
                     let self2 = self2.clone();
                     let err_bsr = build_which_errored.clone();
-                    let cache_handles = cache_handles.clone();
+                    let outputs = outputs.clone();
 
                     s.spawn(move |_| {
                         let _rt = tokio_runtime.enter();
@@ -729,9 +729,16 @@ impl<'a> Run<'a> {
                             }
                             Ok(cache_handle) => {
                                 if let Some(cache_handle) = cache_handle {
-                                    cache_handles.lock().unwrap().push((
+                                    outputs.lock().unwrap().push((
                                         cache_handle,
-                                        self2.graph.get(&bsr).unwrap().name.clone(),
+                                        cache::EntryMeta {
+                                            inner: MetaInner::Spec(
+                                                self2.graph.get(&bsr).unwrap().name.clone(),
+                                            ),
+                                            fetched: false,
+                                            breaker_build: !full_build,
+                                            ..Default::default()
+                                        },
                                     ));
                                 }
                             }
@@ -746,20 +753,12 @@ impl<'a> Run<'a> {
                 .unwrap();
 
             // Commit all the builds to the build cache
-            Arc::into_inner(cache_handles)
+            Arc::into_inner(outputs)
                 .unwrap()
                 .into_inner()
                 .unwrap()
                 .into_iter()
-                .for_each(|(cache_hnd, name)| {
-                    cache_hnd
-                        .finalize(cache::EntryMeta {
-                            inner: MetaInner::Spec(name),
-                            fetched: false,
-                            ..Default::default()
-                        })
-                        .unwrap()
-                });
+                .for_each(|(cache_hnd, meta)| cache_hnd.finalize(meta).unwrap());
 
             err.map(|(_bsr, e)| Err(e)).unwrap_or(Ok(()))?;
         }

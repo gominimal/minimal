@@ -513,6 +513,7 @@ mod tests {
             inner: MetaInner::Spec("spec".to_string()),
             fetched: true,
             epoch_millis: m.epoch_millis + 1000,
+            ..Default::default()
         })
         .unwrap();
 
