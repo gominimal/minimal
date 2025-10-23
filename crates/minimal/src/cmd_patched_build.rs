@@ -110,9 +110,14 @@ pub async fn cmd_patched_build(args: PatchedBuildArgs, ctx: &mut Context) -> Res
     out_dir
         .finalize(EntryMeta {
             inner: MetaInner::Spec(build.name.clone()),
+            breaker_build: true,
             ..Default::default()
         })
         .unwrap();
+    println!(
+        "Written to cache with hash {}",
+        graph.spec_hash(&graph.top_levels[0]).0
+    );
 
     for tempdir in temp_dirs.into_iter() {
         drop(tempdir);
