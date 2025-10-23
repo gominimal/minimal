@@ -1,22 +1,52 @@
 //! Common types and utilities used across the minimal codebase.
 
-pub mod fetchers;
-pub mod target;
-pub use target::Target;
-
 pub mod archive;
+pub mod fetchers;
 
+pub mod repo_spec;
 mod spec_hash;
 pub use spec_hash::SpecHash;
 mod subsets;
 pub use subsets::SubsetSpec;
+pub mod target;
+pub use target::Target;
 
 use std::{
-    fmt,
+    env, fmt,
     io::Write,
     path::{Path, PathBuf},
 };
 use tracing::warn;
+
+/// Describes where a build-spec came from.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum SpecOrigin {
+    /// Filetree of nickel came from a path on the filesystem, not necessarily under VCS.
+    LocalDir { given: PathBuf, absolute: PathBuf },
+    /// Filetree came from a checkout of a VCS repo.
+    Repo(repo_spec::Repo),
+    /// Nickel was given inline and cannot be attributed to somewhere - usually for tests.
+    Inline,
+}
+
+impl SpecOrigin {
+    /// Constructs a [SpecOrigin] from the given directory on the system. Do not use this
+    /// if the directory represents a checked-out pristine repo, for that case,
+    /// use [SpecOrigin::Repo] instead.
+    pub fn from_dir<P: AsRef<Path>>(p: P) -> Self {
+        let p = p.as_ref();
+        match p.is_absolute() {
+            true => SpecOrigin::LocalDir {
+                given: p.to_path_buf(),
+                absolute: p.to_path_buf(),
+            },
+            false => SpecOrigin::LocalDir {
+                given: p.to_path_buf(),
+                absolute: env::current_dir().unwrap().join(p),
+            },
+        }
+    }
+}
 
 /// Implements [Write], mirroring all writes to two underlying writers.
 #[derive(Debug)]

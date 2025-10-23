@@ -2,6 +2,8 @@
 
 #![allow(clippy::result_large_err)]
 
+use common::SpecOrigin;
+
 use nickel_lang_core::cache::TermCacheError;
 use nickel_lang_core::error::Error as NclError;
 use nickel_lang_core::files::Files;
@@ -113,15 +115,16 @@ macro_rules! annotate_record {
     };
 }
 
-/// Evaluates a universe of nickel files which describe minimal build specifications.
+/// Evaluates a single repository of nickel files which describe minimal build specifications.
 pub struct SpecReader {
     p: Program<CacheImpl>,
+    from: SpecOrigin, // unset for SpecReader::new (which is meant for tests)
     minimal_lib_path: PathBuf,
     last_id: u64,
 }
 
 impl SpecReader {
-    /// Processes the resulting build-spec universe, given options and literal source representing the top level.
+    /// Processes the resulting collection of build-specs, given options and literal source representing the top level.
     pub fn new<S: Into<String>>(src: S, opts: &SpecReaderOptions) -> Result<Self, SpecError> {
         let mut program = Program::new_from_source(
             io::Cursor::new(src.into()),
@@ -140,6 +143,7 @@ impl SpecReader {
 
         let mut out = Self {
             p: program,
+            from: SpecOrigin::Inline,
             last_id: 0,
             minimal_lib_path: opts.minimal_lib_path.canonicalize()?,
         };
@@ -147,9 +151,10 @@ impl SpecReader {
         Ok(out)
     }
 
-    /// Processes the resulting build-spec universe, given options and a path to a packages directory.
+    /// Processes the resulting collection of build-specs, given options and a path to a packages directory.
     pub fn new_with_all_pkgs<P: AsRef<Path>>(
         pkg_dir: P,
+        from: SpecOrigin,
         opts: &SpecReaderOptions,
     ) -> Result<Self, SpecError> {
         let mut src = String::with_capacity(2048);
@@ -191,6 +196,7 @@ impl SpecReader {
 
         let mut out = Self {
             p: program,
+            from,
             last_id: 0,
             minimal_lib_path: opts.minimal_lib_path.canonicalize()?,
         };
@@ -198,10 +204,11 @@ impl SpecReader {
         Ok(out)
     }
 
-    /// Processes the build-spec universe with a top level using the named packages, given options and a path to a packages directory.
+    /// Processes a collection of build-specs, enumerating from the named build-specs and their transitive build-specs.
     pub fn new_with_pkgs<P: AsRef<Path>>(
         packages: &[String],
         pkg_dir: P,
+        from: SpecOrigin,
         opts: &SpecReaderOptions,
     ) -> Result<Self, SpecError> {
         let mut src = String::with_capacity(2048);
@@ -232,6 +239,7 @@ impl SpecReader {
 
         let mut out = Self {
             p: program,
+            from,
             last_id: 0,
             minimal_lib_path: opts.minimal_lib_path.canonicalize()?,
         };
@@ -239,9 +247,10 @@ impl SpecReader {
         Ok(out)
     }
 
-    /// Processes the resulting build-spec universe, given options and a path to source representing the top level.
+    /// Processes the collection of build-specs at the given path.
     pub fn new_with_path<P: Into<OsString>>(
         src: P,
+        from: SpecOrigin,
         opts: &SpecReaderOptions,
     ) -> Result<Self, SpecError> {
         let mut program = Program::new_from_file(src, std::io::stderr(), NullReporter {})?;
@@ -256,6 +265,7 @@ impl SpecReader {
 
         let mut out = Self {
             p: program,
+            from,
             last_id: 0,
             minimal_lib_path: opts.minimal_lib_path.canonicalize()?,
         };
@@ -338,13 +348,13 @@ impl SpecReader {
         result
     }
 
-    pub fn finish(self) -> Result<(RichTerm, Program<CacheImpl>), SpecError> {
-        let Self { mut p, .. } = self;
+    pub fn finish(self) -> Result<(RichTerm, Program<CacheImpl>, SpecOrigin), SpecError> {
+        let Self { mut p, from, .. } = self;
         let root_term = p
             .eval_record_spine()
             .map_err(|e| SpecError::Nickel(p.files(), e))?;
 
-        Ok((root_term, p))
+        Ok((root_term, p, from))
     }
 }
 

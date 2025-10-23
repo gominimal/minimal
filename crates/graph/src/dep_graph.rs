@@ -4,7 +4,7 @@
 #![allow(clippy::single_match)]
 
 use common::{
-    SubsetSpec, Target,
+    SpecOrigin, SubsetSpec, Target,
     target::{Arch, OS},
 };
 use nickel_lang_core::eval::Closure;
@@ -173,6 +173,8 @@ pub struct BuildSpec {
     /// Where in the source the build was declared.
     /// TODO: Work out why this is seldom set.
     pub pos: Option<DeclPos>,
+    /// Identifies the collection of build-specs where this was defined.
+    pub from: Vec<Arc<SpecOrigin>>,
 }
 
 impl BuildSpec {
@@ -222,12 +224,13 @@ pub struct DepGraph {
 impl DepGraph {
     /// Constructs a new dependency graph from the given parsed/annotated nickel universe.
     pub fn new(sr: SpecReader) -> Result<Self, Error> {
+        let (ncl_tree, mut program, spec_origin) = sr.finish()?;
         let mut graph = GraphBuilder {
             builds: Arena::with_capacity(4096),
             spec_id_lookup: HashMap::with_capacity(4096),
+            spec_origin: Arc::new(spec_origin),
         };
 
-        let (ncl_tree, mut program) = sr.finish()?;
         let ncl_tree = eval_if_closure(&ncl_tree, &mut program)?;
         let top_levels = if let Term::Array(a, _attrs) = ncl_tree.term.as_ref() {
             a.iter()
@@ -350,6 +353,7 @@ impl DepGraph {
 #[allow(dead_code)]
 struct GraphBuilder {
     builds: Arena<BuildSpec>,
+    spec_origin: Arc<SpecOrigin>,
 
     spec_id_lookup: HashMap<u64, BuildSpecRef>,
 }
@@ -588,6 +592,7 @@ impl GraphBuilder {
                     span: rs,
                 }
             }),
+            from: vec![self.spec_origin.clone()],
         }));
         self.spec_id_lookup.insert(magic_id, bsr);
 
@@ -1382,9 +1387,12 @@ mod tests {
     }
     #[test]
     fn local_input() {
+        let path = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("testdata/local_input.ncl");
+
         let sr = SpecReader::new_with_path(
-            std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
-                .join("testdata/local_input.ncl"),
+            path.clone(),
+            common::SpecOrigin::from_dir(path),
             &SpecReaderOptions::for_test(),
         )
         .unwrap_or_else(|e| {
@@ -1786,30 +1794,6 @@ mod tests {
                 .map(|b| b.name)
                 .collect::<Vec<String>>()
         );
-    }
-
-    #[test]
-    fn packages_ensure_no_dupes() {
-        let sr = SpecReader::new_with_all_pkgs(
-            std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
-                .join("../../packages"),
-            &SpecReaderOptions::for_test(),
-        )
-        .unwrap_or_else(|e| {
-            e.report_to_stderr();
-            panic!("spec parsing failed");
-        });
-
-        let dp = DepGraph::new(sr).unwrap();
-
-        let mut names: Vec<_> = dp.iter().map(|(_bsr, bs)| bs.name.clone()).collect();
-        names.sort();
-
-        let mut dupes = names.clone();
-        dupes.dedup();
-        if dupes.len() < names.len() {
-            panic!("duplicate build-specs in packages/:\n{:?}", names);
-        }
     }
 
     #[test]

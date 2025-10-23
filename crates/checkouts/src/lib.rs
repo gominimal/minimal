@@ -197,14 +197,16 @@ impl Manager {
         Ok(())
     }
 
-    pub fn checkout_of(&mut self, remote: &str, at: GitRef) -> Result<PathBuf, Error> {
+    /// Returns the path to a checkout described by the given parameters, as well as the
+    /// commit hash at the given ref.
+    pub fn checkout_of(&mut self, remote: &str, at: GitRef) -> Result<(PathBuf, String), Error> {
         let out = match self.state.git_remotes.get(remote) {
             // This remote is already managed
             Some(id) => {
                 // See if theres already a checkout of this ref
                 for (dir, checkout) in self.state.repos[id].checkouts.iter() {
                     if checkout.version == at {
-                        return Ok(self.git_checkouts_dir().join(dir));
+                        return Ok((self.git_checkouts_dir().join(dir), checkout.rev.clone()));
                     }
                 }
                 // There's not a checkout of this ref, lets create it.
@@ -213,6 +215,7 @@ impl Manager {
                 let repo = self.repos.get_mut(id).unwrap();
                 repo.fetch()?;
                 let checkout = repo.new_worktree(checkout_dir.clone(), at.clone())?;
+                let git_hash = checkout.rev.clone();
 
                 self.state
                     .repos
@@ -221,7 +224,7 @@ impl Manager {
                     .checkouts
                     .insert(relative_dir.to_str().unwrap().to_string(), checkout);
 
-                Ok(checkout_dir)
+                Ok((checkout_dir, git_hash))
             }
             // New remote, need to create
             None => {
@@ -237,6 +240,7 @@ impl Manager {
                 let checkout_dir = tempdir_in(self.git_checkouts_dir()).unwrap().keep();
                 let relative_dir = checkout_dir.strip_prefix(self.git_checkouts_dir()).unwrap();
                 let checkout = repo.new_worktree(checkout_dir.clone(), at.clone())?;
+                let git_hash = checkout.rev.clone();
 
                 self.state
                     .git_remotes
@@ -250,7 +254,7 @@ impl Manager {
                 );
                 self.repos.insert(id, repo);
 
-                Ok(checkout_dir)
+                Ok((checkout_dir, git_hash))
             }
         };
         self.state.write_to(&self.base_dir)?;
@@ -277,7 +281,7 @@ mod tests {
         let base_dir = tempdir().unwrap();
         let mut manager = Manager::new(base_dir.path()).unwrap();
 
-        let checkout = manager
+        let (checkout, hash) = manager
             .checkout_of(remote, GitRef::Branch("main".to_string()))
             .unwrap();
 
@@ -290,6 +294,7 @@ mod tests {
                 .join("spoon-knife")
                 .exists()
         );
+        assert_eq!(hash, "d0dd1f61b33d64e29d8bc1372a94ef6a2fee76a9".to_string());
         // Expect the README.md to exist from the checkout
         assert!(checkout.join("README.md").exists());
         // Expect runtime to be updated
@@ -321,16 +326,24 @@ mod tests {
         // Make sure state-file was written to disk
         assert!(base_dir.path().join("state.json").exists());
         // Make sure a fresh checkout request points to the same path.
-        let checkout2 = manager
+        let (checkout2, hash2) = manager
             .checkout_of(remote, GitRef::Branch("main".to_string()))
             .unwrap();
         assert_eq!(&checkout, &checkout2);
+        assert_eq!(
+            hash2,
+            "d0dd1f61b33d64e29d8bc1372a94ef6a2fee76a9".to_string()
+        );
         // Make sure even a freshly-initialized manager does the same
-        let checkout3 = Manager::new(base_dir.path())
+        let (checkout3, hash3) = Manager::new(base_dir.path())
             .unwrap()
             .checkout_of(remote, GitRef::Branch("main".to_string()))
             .unwrap();
         assert_eq!(&checkout, &checkout3);
+        assert_eq!(
+            hash3,
+            "d0dd1f61b33d64e29d8bc1372a94ef6a2fee76a9".to_string()
+        );
     }
 
     #[test]

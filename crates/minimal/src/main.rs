@@ -3,6 +3,8 @@
 use anyhow::{Result, bail};
 use cache::{Cache, LocalDir, RemoteCache, RemoteError};
 use clap::{Args, Parser, Subcommand};
+use common::SpecOrigin;
+use common::repo_spec::GitRef;
 use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
 use graph::{DepGraph, Error as GraphError, PlanErr, SpecReader, SpecReaderOptions};
 use std::path::PathBuf;
@@ -149,6 +151,7 @@ pub struct Context {
     pub no_fetch: bool,
     pub num_parallel_builds: usize,
 
+    spec_origin: SpecOrigin,
     paths: PathConfig,
     cache: Cache<LocalDir>,
     vcs: checkouts::Manager,
@@ -176,32 +179,45 @@ impl Context {
         };
         let cache = Cache::at_dir(cache_dir).map_err(anyhow::Error::from)?;
 
-        let paths = paths
-            .with_stdlib_dir(match args.stdlib_dir {
-                None => vcs
-                    .checkout_of(
-                        "git@github.com:gominimal/std.git",
-                        checkouts::GitRef::Branch("main".to_string()),
-                    )
-                    .map_err(anyhow::Error::from)?,
-                Some(dir) => dir,
-            })
-            .with_packages_dir(match args.packages_dir {
-                Some(dir) => dir,
-                None => vcs
+        let mut paths = paths.with_stdlib_dir(match args.stdlib_dir {
+            None => {
+                vcs.checkout_of(
+                    "git@github.com:gominimal/std.git",
+                    checkouts::GitRef::Branch("main".to_string()),
+                )
+                .map_err(anyhow::Error::from)?
+                .0
+            }
+            Some(dir) => dir,
+        });
+
+        let spec_origin = match args.packages_dir {
+            None => {
+                let (dir, git_hash) = vcs
                     .checkout_of(
                         "git@github.com:gominimal/pkgs.git",
                         checkouts::GitRef::Branch("main".to_string()),
                     )
-                    .map_err(anyhow::Error::from)?
-                    .join("packages"),
-            });
+                    .map_err(anyhow::Error::from)?;
+                paths = paths.with_packages_dir(dir.join("packages"));
+                SpecOrigin::Repo(common::repo_spec::Repo::Git {
+                    url: "git@github.com:gominimal/pkgs.git".to_string(),
+                    rev: git_hash,
+                    tracking: Some(GitRef::Branch("main".to_string())),
+                })
+            }
+            Some(dir) => {
+                paths = paths.with_packages_dir(dir.clone());
+                SpecOrigin::from_dir(dir)
+            }
+        };
 
         Ok(Self {
             no_cache: args.no_cache,
             no_fetch: args.no_fetch,
             num_parallel_builds: args.num_parallel_builds,
 
+            spec_origin,
             paths,
             cache,
             vcs,
@@ -274,6 +290,7 @@ impl Context {
 
         let sr = SpecReader::new_with_path(
             &build_ncl_path,
+            self.spec_origin.clone(),
             &SpecReaderOptions {
                 minimal_lib_path: self.stdlib_dir(),
             },
@@ -289,6 +306,7 @@ impl Context {
         let sr = SpecReader::new_with_pkgs(
             names,
             packages_dir,
+            self.spec_origin.clone(),
             &SpecReaderOptions {
                 minimal_lib_path: self.stdlib_dir(),
             },
@@ -302,6 +320,7 @@ impl Context {
 
         let sr = SpecReader::new_with_all_pkgs(
             packages_dir,
+            self.spec_origin.clone(),
             &SpecReaderOptions {
                 minimal_lib_path: self.stdlib_dir(),
             },
