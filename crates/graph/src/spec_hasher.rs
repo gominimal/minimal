@@ -14,7 +14,7 @@ type Edges = SmallVec<[Edge; 12]>;
 struct SpecIndex(usize);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SubsetInfo(Vec<String>);
+struct SubsetInfo(SmallVec<[String; 4]>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Edge {

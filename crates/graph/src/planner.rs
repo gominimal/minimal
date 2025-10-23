@@ -574,9 +574,9 @@ impl<'a, BP: BinProvider> Iterator for ExecPlan<'a, BP> {
         // }
 
         // (bsr, used_breakers)
-        let mut built_this_phase: HashMap<BuildSpecRef, bool> = HashMap::new();
+        let mut built_this_phase: HashMap<BuildSpecRef, bool> = HashMap::with_capacity(32);
         // (bsr, full_build)
-        let mut met: Vec<Build> = Vec::new();
+        let mut met: Vec<Build> = Vec::with_capacity(32);
 
         // Iterate all reachable builds which have not been fully built.
         for (candidate, info) in self.builds.iter().filter_map(|(candidate, info)| {

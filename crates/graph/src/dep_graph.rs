@@ -15,6 +15,7 @@ use nickel_lang_core::term::{IndexMap, RichTerm, Term};
 use nickel_lang_core::{eval::cache::CacheImpl, program::Program};
 
 use generational_arena::Arena;
+use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -49,7 +50,7 @@ pub struct SourceInput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubsetInput {
     pub from: BuildSpecRef,
-    pub outputs: Vec<String>,
+    pub outputs: SmallVec<[String; 4]>,
 }
 
 impl SubsetInput {
@@ -62,7 +63,7 @@ impl SubsetInput {
     }
 
     pub fn as_spec(&self, graph: &DepGraph) -> SubsetSpec {
-        SubsetSpec::new_single(&graph.spec_hash(&self.from), self.outputs.clone())
+        SubsetSpec::new_single(&graph.spec_hash(&self.from), self.outputs.to_vec())
     }
 }
 
@@ -160,10 +161,10 @@ pub struct BuildSpec {
     pub build_args: Option<IndexMap<String, String>>,
 
     /// The dependencies needed to execute the build spec.
-    pub inputs: Vec<BuildSpecInput>,
+    pub inputs: SmallVec<[BuildSpecInput; 10]>,
     /// The dependencies needed to run outputs of this build spec, as well as possibly needed
     /// during the build.
-    pub runtime_deps: Vec<RuntimeDep>,
+    pub runtime_deps: SmallVec<[RuntimeDep; 8]>,
     /// The named outputs (and match patterns) produced by executing this build spec.
     pub outputs: OutputMap,
 
@@ -174,7 +175,7 @@ pub struct BuildSpec {
     /// TODO: Work out why this is seldom set.
     pub pos: Option<DeclPos>,
     /// Identifies the collection of build-specs where this was defined.
-    pub from: Vec<Arc<SpecOrigin>>,
+    pub from: Arc<SpecOrigin>,
 }
 
 impl BuildSpec {
@@ -282,7 +283,7 @@ impl DepGraph {
 
     /// Returns the specification hash of a subset.
     pub fn subset_hash(&self, subset: &SubsetInput) -> SpecHash {
-        SubsetHasher::hash_single(self, &subset.from, subset.outputs.clone())
+        SubsetHasher::hash_single(self, &subset.from, subset.outputs.to_vec())
     }
 
     /// Returns an iterator over all build-spec references.
@@ -577,8 +578,8 @@ impl GraphBuilder {
             cmd,
             build_args,
             target: target.unwrap_or(Target::new(Arch::Amd64, OS::Linux)),
-            inputs: Vec::new(),
-            runtime_deps: Vec::new(),
+            inputs: SmallVec::new(),
+            runtime_deps: SmallVec::new(),
             outputs: OutputMap::new(),
             replace_on_cycle: None,
             pos: pos.into_opt().map(|rs| {
@@ -592,13 +593,13 @@ impl GraphBuilder {
                     span: rs,
                 }
             }),
-            from: vec![self.spec_origin.clone()],
+            from: self.spec_origin.clone(),
         }));
         self.spec_id_lookup.insert(magic_id, bsr);
 
         // Handle more complicated attributes.
-        let mut inputs: Option<Vec<BuildSpecInput>> = None;
-        let mut runtime_deps: Option<Vec<RuntimeDep>> = None;
+        let mut inputs: Option<SmallVec<[BuildSpecInput; 10]>> = None;
+        let mut runtime_deps: Option<SmallVec<[RuntimeDep; 8]>> = None;
         let mut outputs: Option<OutputMap> = None;
         let mut replace_on_cycle: Option<BuildSpecRef> = None;
         match rt.term.as_ref() {
@@ -622,7 +623,7 @@ impl GraphBuilder {
                                     inputs = Some(
                                         a.iter()
                                             .map(|input| self.read_input(input, program))
-                                            .collect::<Result<Vec<_>, Error>>()?,
+                                            .collect::<Result<SmallVec<_>, Error>>()?,
                                     );
                                 } else {
                                     todo!("handle inputs value being non-array {:?}", field.value);
@@ -641,7 +642,7 @@ impl GraphBuilder {
                                                     .map(|input| {
                                                         self.read_runtime_dep(input, program)
                                                     })
-                                                    .collect::<Result<Vec<_>, Error>>()?,
+                                                    .collect::<Result<SmallVec<_>, Error>>()?,
                                             );
                                         }
                                         _ => todo!(
@@ -736,7 +737,7 @@ impl GraphBuilder {
         program: &mut Program<CacheImpl>,
     ) -> Result<SubsetInput, Error> {
         let mut from: Option<BuildSpecRef> = None;
-        let mut outputs: Option<Vec<String>> = None;
+        let mut outputs: Option<SmallVec<[String; 4]>> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                 r.fields
@@ -764,7 +765,7 @@ impl GraphBuilder {
                                                         )?)
                                                         .unwrap())
                                                     })
-                                                    .collect::<Result<Vec<_>, Error>>()?,
+                                                    .collect::<Result<SmallVec<_>, Error>>()?,
                                             );
                                         }
                                         _ => todo!(
@@ -1450,7 +1451,7 @@ mod tests {
             BuildSpecInput::Subset(SubsetInput {
                 from,
                 outputs,
-            }) if from == dp.by_name("other").next().unwrap() && outputs == vec!["abc", "uwu"],
+            }) if from == dp.by_name("other").next().unwrap() && outputs.to_vec() == vec!["abc", "uwu"],
         ));
     }
 
@@ -1699,7 +1700,7 @@ mod tests {
             RuntimeDep::Subset(SubsetInput {
                 from,
                 outputs,
-            }) if from == dp.by_name("runtime dep").next().unwrap() && outputs == vec!["some_data"],
+            }) if from == dp.by_name("runtime dep").next().unwrap() && outputs.to_vec() == vec!["some_data"],
         ));
     }
 
