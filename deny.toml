@@ -70,12 +70,9 @@ skip = [
     # reqwest -> hyper-tls -> native-tls -> security-framework
     # https://github.com/sfackler/rust-native-tls/pull/338
     { name = "security-framework", version = "2.11.1" },
-    # nickel-lang-core -> pretty
-    # https://github.com/Marwes/pretty.rs/pull/90
-    { name = "unicode-width", version = "0.1.14" },
-    # tracing-indicatif -> indicatif -> vt100
-    # https://github.com/console-rs/indicatif/pull/723
-    { name = "vte", version = "0.11.1" },
+    # nickel-lang-core -> strip-ansi-escapes
+    # https://github.com/luser/strip-ansi-escapes/pull/23
+    { name = "vte", version = "0.14.1" },
 
 
     { name = "indexmap", version = "1.9.3" },
