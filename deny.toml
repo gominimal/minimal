@@ -41,6 +41,8 @@ skip = [
     # docker_credential
     # https://github.com/keirlawson/docker_credential/pull/21
     { name = "base64", version = "0.21.7" },
+    # nickel-lang-core -> codespan
+    { name = "codespan-reporting", version = "0.12.0" },
     # hyper-tls -> native-tls -> security-framework
     # https://github.com/sfackler/rust-native-tls/pull/338
     { name = "core-foundation", version = "0.9.4" },

@@ -24,14 +24,14 @@ anyhow = "1.0.100"
 blake3 = "1"
 bytes = "1.10.1" # keep in sync with reqwest
 clap = { version = "4.5", features = ["derive"] }
-codespan-reporting = { version = "0.12", features = ["serialization"] } # Keep in sync with nickel-lang-core
+codespan-reporting = { version = "0.13", features = ["serialization"] } # Keep in sync with nickel-lang-core
 dirs = "6"
 docker_credential = "1.3"
 flate2 = "1.1"
 futures = "0.3"
 generational-arena = "^0.2"
-google-cloud-gax = "1.1.0"
-google-cloud-storage = "1.1.0"
+google-cloud-gax = "1.2.0"
+google-cloud-storage = "1.2.0"
 hakoniwa = { git = "https://github.com/souk4711/hakoniwa", branch = "main" }
 hex = "0.4"
 indoc = "^2.0"
