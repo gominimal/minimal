@@ -8,7 +8,7 @@ publish.workspace = true
 
 [dependencies]
 async-trait = "0.1"
-minimal_spongebob_community_neoeinstein-prost = { version = "=0.4.0-20251015195841-61cd123d44d0.1", registry = "buf" }
+minimal_spongebob_community_neoeinstein-prost = { version = "=0.4.0-20251016192339-b653b5c17f28.1", registry = "buf" }
 prost = "0.13"
 prost-reflect = { version = "0.15", features = ["text-format"] }
 thiserror.workspace = true
