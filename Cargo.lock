@@ -816,6 +816,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "decode"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "codespan-reporting",
+ "common",
+ "generational-arena",
+ "indoc",
+ "nickel-lang-core",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "deranged"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1419,6 +1437,7 @@ dependencies = [
  "blake3",
  "codespan-reporting 0.13.1",
  "common",
+ "decode",
  "generational-arena",
  "indoc",
  "nickel-lang-core",
@@ -2222,6 +2241,7 @@ dependencies = [
  "clap",
  "codespan-reporting 0.13.1",
  "common",
+ "decode",
  "dirs",
  "docker_credential",
  "flate2",

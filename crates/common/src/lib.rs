@@ -19,13 +19,14 @@ use std::{
 use tracing::warn;
 
 /// Describes where a build-spec came from.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum SpecOrigin {
     /// Filetree of nickel came from a path on the filesystem, not necessarily under VCS.
     LocalDir { given: PathBuf, absolute: PathBuf },
     /// Filetree came from a checkout of a VCS repo.
     Repo(repo_spec::Repo),
     /// Nickel was given inline and cannot be attributed to somewhere - usually for tests.
+    #[default]
     Inline,
 }
 

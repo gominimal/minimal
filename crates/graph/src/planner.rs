@@ -705,12 +705,12 @@ impl<'a, BP: BinProvider> Iterator for ExecPlan<'a, BP> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SpecReader, SpecReaderOptions};
+    use decode::Layer;
     use indoc::indoc;
 
     #[test]
     fn inputs_and_runtime_deps_reachable_when_not_built() {
-        let sr = SpecReader::new(
+        let layer = Layer::new_for_test(
             indoc! {
                 "
                 let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
@@ -737,21 +737,15 @@ mod tests {
         		"
             }
             .to_string(),
-            &SpecReaderOptions::for_test(),
         );
         // So we can see the actual error when parsing fails
-        sr.as_ref().err().into_iter().for_each(|e| {
+        layer.as_ref().err().into_iter().for_each(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
-        let sr = sr.unwrap();
+        let layer = layer.unwrap();
 
-        let dp = DepGraph::new(sr)
-            .map_err(|e| {
-                e.report_to_stderr();
-                Err::<DepGraph, ()>(())
-            })
-            .unwrap();
+        let dp = DepGraph::new().ingest(layer);
         let planner: ExecPlan<()> = ExecPlan::new(&dp);
 
         assert_eq!(
@@ -778,7 +772,7 @@ mod tests {
 
     #[test]
     fn input_chain() {
-        let sr = SpecReader::new(
+        let layer = Layer::new_for_test(
             indoc! {
                 "
                 let {BuildSpec, ..} = import \"minimal.ncl\" in
@@ -803,21 +797,15 @@ mod tests {
                 "
             }
             .to_string(),
-            &SpecReaderOptions::for_test(),
         );
         // So we can see the actual error when parsing fails
-        sr.as_ref().err().into_iter().for_each(|e| {
+        layer.as_ref().err().into_iter().for_each(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
-        let sr = sr.unwrap();
+        let layer = layer.unwrap();
 
-        let dp = DepGraph::new(sr)
-            .map_err(|e| {
-                e.report_to_stderr();
-                Err::<DepGraph, ()>(())
-            })
-            .unwrap();
+        let dp = DepGraph::new().ingest(layer);
         let planner: ExecPlan<()> = ExecPlan::new(&dp);
 
         // true = all builds without cycle-breakers
@@ -858,7 +846,7 @@ mod tests {
 
     #[test]
     fn find_cycles_easy() {
-        let sr = SpecReader::new(
+        let layer = Layer::new_for_test(
             indoc! {
                 "
                 let {BuildSpec, ..} = import \"minimal.ncl\" in
@@ -878,21 +866,15 @@ mod tests {
                 "
             }
             .to_string(),
-            &SpecReaderOptions::for_test(),
         );
         // So we can see the actual error when parsing fails
-        sr.as_ref().err().into_iter().for_each(|e| {
+        layer.as_ref().err().into_iter().for_each(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
-        let sr = sr.unwrap();
+        let layer = layer.unwrap();
 
-        let dp = DepGraph::new(sr)
-            .map_err(|e| {
-                e.report_to_stderr();
-                Err::<DepGraph, ()>(())
-            })
-            .unwrap();
+        let dp = DepGraph::new().ingest(layer);
         let mut cycles = ExecPlan::new(&dp)
             .find_cycles()
             .into_iter()
@@ -912,7 +894,7 @@ mod tests {
 
     #[test]
     fn cycle_breaking_easy() {
-        let sr = SpecReader::new(
+        let layer = Layer::new_for_test(
             indoc! {
                 "
                 let {BuildSpec, ..} = import \"minimal.ncl\" in
@@ -942,21 +924,15 @@ mod tests {
                 "
             }
             .to_string(),
-            &SpecReaderOptions::for_test(),
         );
         // So we can see the actual error when parsing fails
-        sr.as_ref().err().into_iter().for_each(|e| {
+        layer.as_ref().err().into_iter().for_each(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
-        let sr = sr.unwrap();
+        let layer = layer.unwrap();
 
-        let dp = DepGraph::new(sr)
-            .map_err(|e| {
-                e.report_to_stderr();
-                Err::<DepGraph, ()>(())
-            })
-            .unwrap();
+        let dp = DepGraph::new().ingest(layer);
         let plan: Vec<BuildPhase> = ExecPlan::new(&dp).collect::<Result<_, _>>().unwrap();
 
         assert_eq!(
@@ -1044,7 +1020,7 @@ mod tests {
 
     #[test]
     fn bin_provider_elludes_present() {
-        let sr = SpecReader::new(
+        let layer = Layer::new_for_test(
             indoc! {
                 "
                 let {BuildSpec, ..} = import \"minimal.ncl\" in
@@ -1069,21 +1045,15 @@ mod tests {
                 "
             }
             .to_string(),
-            &SpecReaderOptions::for_test(),
         );
         // So we can see the actual error when parsing fails
-        sr.as_ref().err().into_iter().for_each(|e| {
+        layer.as_ref().err().into_iter().for_each(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
-        let sr = sr.unwrap();
+        let layer = layer.unwrap();
 
-        let dp = DepGraph::new(sr)
-            .map_err(|e| {
-                e.report_to_stderr();
-                Err::<DepGraph, ()>(())
-            })
-            .unwrap();
+        let dp = DepGraph::new().ingest(layer);
 
         let bin_provider: BinProviderFake =
             HashMap::from([(dp.by_name("nested dep").next().unwrap(), ())]).into();
@@ -1121,7 +1091,7 @@ mod tests {
 
     #[test]
     fn bin_provider_not_ellude_runtime_dep() {
-        let sr = SpecReader::new(
+        let layer = Layer::new_for_test(
             indoc! {
                 "
                 let {BuildSpec, ..} = import \"minimal.ncl\" in
@@ -1154,21 +1124,15 @@ mod tests {
                 "
             }
             .to_string(),
-            &SpecReaderOptions::for_test(),
         );
         // So we can see the actual error when parsing fails
-        sr.as_ref().err().into_iter().for_each(|e| {
+        layer.as_ref().err().into_iter().for_each(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
-        let sr = sr.unwrap();
+        let layer = layer.unwrap();
 
-        let dp = DepGraph::new(sr)
-            .map_err(|e| {
-                e.report_to_stderr();
-                Err::<DepGraph, ()>(())
-            })
-            .unwrap();
+        let dp = DepGraph::new().ingest(layer);
 
         let bin_provider: BinProviderFake = HashMap::from([
             (dp.by_name("top").next().unwrap(), ()),

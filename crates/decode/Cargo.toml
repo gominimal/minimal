@@ -1,5 +1,5 @@
 [package]
-name = "graph"
+name = "decode"
 version = "0.0.1"
 edition.workspace = true
 rust-version = "1.85"
@@ -10,6 +10,7 @@ publish.workspace = true
 indoc.workspace = true
 
 [dependencies]
+tempfile.workspace = true
 nickel-lang-core.workspace = true
 codespan-reporting.workspace = true
 serde.workspace = true
@@ -21,4 +22,3 @@ smallvec.workspace = true
 tracing.workspace = true
 
 common.workspace = true
-decode.workspace = true

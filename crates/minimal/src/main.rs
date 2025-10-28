@@ -3,12 +3,11 @@
 use anyhow::{Result, bail};
 use cache::{Cache, LocalDir, RemoteCache, RemoteError};
 use clap::{Args, Parser, Subcommand};
-use common::SpecOrigin;
-use common::repo_spec::GitRef;
+use common::{SpecOrigin, repo_spec::GitRef};
+use decode::{Layer, LoadOptions};
 use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
-use graph::{DepGraph, Error as GraphError, PlanErr, SpecReader, SpecReaderOptions};
+use graph::{DepGraph, Error as GraphError, PlanErr};
 use std::path::PathBuf;
-use tracing::error;
 use tracing_indicatif::{IndicatifLayer, TickSettings};
 use tracing_indicatif::{filter::IndicatifFilter, filter::hide_indicatif_span_fields};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -16,10 +15,9 @@ use uuid::Uuid;
 
 mod lockfile;
 mod paths;
+use paths::PathConfig;
 mod remote_storage;
 mod run;
-
-use paths::PathConfig;
 
 mod cmd_build;
 use cmd_build::{BuildArgs, cmd_build};
@@ -274,59 +272,46 @@ impl Context {
 
     /// Returns a [DepGraph] with the given package and its transitive dependencies loaded.
     pub fn graph_from_package_name(&self, package_name: &String) -> Result<DepGraph, GraphError> {
-        let package_dir = self.paths.packages_dir().unwrap().join(package_name);
-
-        let build_ncl_path = {
-            let normal_path = package_dir.join("build.ncl");
-            if !normal_path.exists() {
-                error!(
-                    "Error: build.ncl not found in package directory: {}",
-                    package_dir.display()
-                );
-                std::process::exit(1);
-            }
-            normal_path
-        };
-
-        let sr = SpecReader::new_with_path(
-            &build_ncl_path,
-            self.spec_origin.clone(),
-            &SpecReaderOptions {
+        let layer = Layer::new_with_pkgs(
+            &[package_name.clone()],
+            &self.paths.packages_dir().unwrap(),
+            &LoadOptions {
                 minimal_lib_path: self.stdlib_dir(),
+                from: self.spec_origin.clone(),
             },
         )?;
 
-        DepGraph::new(sr)
+        Ok(DepGraph::new().ingest(layer))
     }
 
     #[tracing::instrument]
     pub fn graph_from_package_names(&self, names: &[String]) -> Result<DepGraph, GraphError> {
         let packages_dir = self.paths.packages_dir().unwrap();
 
-        let sr = SpecReader::new_with_pkgs(
+        let layer = Layer::new_with_pkgs(
             names,
             packages_dir,
-            self.spec_origin.clone(),
-            &SpecReaderOptions {
+            &LoadOptions {
                 minimal_lib_path: self.stdlib_dir(),
+                from: self.spec_origin.clone(),
             },
         )?;
 
-        DepGraph::new(sr)
+        Ok(DepGraph::new().ingest(layer))
     }
 
     pub fn graph_from_all_packages(&self) -> Result<DepGraph, GraphError> {
         let packages_dir = self.paths.packages_dir().unwrap();
 
-        let sr = SpecReader::new_with_all_pkgs(
+        let layer = Layer::new_with_all_pkgs(
             packages_dir,
-            self.spec_origin.clone(),
-            &SpecReaderOptions {
+            &LoadOptions {
                 minimal_lib_path: self.stdlib_dir(),
+                from: self.spec_origin.clone(),
             },
         )?;
 
-        DepGraph::new(sr)
+        Ok(DepGraph::new().ingest(layer))
     }
 }
 

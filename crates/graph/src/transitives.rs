@@ -197,12 +197,12 @@ impl Transitives {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DepGraph, SpecReader, SpecReaderOptions};
+    use decode::Layer;
     use indoc::indoc;
 
     #[test]
     fn direct_runtime_deps() {
-        let sr = SpecReader::new(
+        let layer = Layer::new_for_test(
             indoc! {
                 "
                 let {BuildSpec, Source, ..} = import \"minimal.ncl\" in
@@ -230,16 +230,13 @@ mod tests {
                 } | BuildSpec"
             }
             .to_string(),
-            &SpecReaderOptions::for_test(),
-        );
-        // So we can see the actual error when parsing fails
-        sr.as_ref().err().into_iter().for_each(|e| {
+        )
+        .unwrap_or_else(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
-        let sr = sr.unwrap();
 
-        let dg = DepGraph::new(sr).unwrap();
+        let dg = DepGraph::new().ingest(layer);
 
         let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], false);
         assert_eq!(
@@ -264,7 +261,7 @@ mod tests {
 
     #[test]
     fn input_nested_runtime_deps() {
-        let sr = SpecReader::new(
+        let layer = Layer::new_for_test(
             indoc! {
                 "
                 let {BuildSpec, Source, ..} = import \"minimal.ncl\" in
@@ -292,16 +289,13 @@ mod tests {
                 } | BuildSpec"
             }
             .to_string(),
-            &SpecReaderOptions::for_test(),
-        );
-        // So we can see the actual error when parsing fails
-        sr.as_ref().err().into_iter().for_each(|e| {
+        )
+        .unwrap_or_else(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
-        let sr = sr.unwrap();
 
-        let dg = DepGraph::new(sr).unwrap();
+        let dg = DepGraph::new().ingest(layer);
 
         let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], true);
         assert_eq!(
@@ -339,7 +333,7 @@ mod tests {
 
     #[test]
     fn runtime_deps_nested_runtime_deps() {
-        let sr = SpecReader::new(
+        let layer = Layer::new_for_test(
             indoc! {
                 "
                 let {BuildSpec, Source, ..} = import \"minimal.ncl\" in
@@ -368,16 +362,13 @@ mod tests {
                 } | BuildSpec"
             }
             .to_string(),
-            &SpecReaderOptions::for_test(),
-        );
-        // So we can see the actual error when parsing fails
-        sr.as_ref().err().into_iter().for_each(|e| {
+        )
+        .unwrap_or_else(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
-        let sr = sr.unwrap();
 
-        let dg = DepGraph::new(sr).unwrap();
+        let dg = DepGraph::new().ingest(layer);
 
         let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], true);
         assert_eq!(
@@ -416,7 +407,7 @@ mod tests {
 
     #[test]
     fn subsets_combined() {
-        let sr = SpecReader::new(
+        let layer = Layer::new_for_test(
             indoc! {
                 "
                 let {subsetOf, BuildSpec, Source, OutputData, ..} = import \"minimal.ncl\" in
@@ -458,16 +449,13 @@ mod tests {
                 } | BuildSpec"
             }
             .to_string(),
-            &SpecReaderOptions::for_test(),
-        );
-        // So we can see the actual error when parsing fails
-        sr.as_ref().err().into_iter().for_each(|e| {
+        )
+        .unwrap_or_else(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
-        let sr = sr.unwrap();
 
-        let dg = DepGraph::new(sr).unwrap();
+        let dg = DepGraph::new().ingest(layer);
 
         let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], false);
         assert_eq!(
@@ -508,7 +496,7 @@ mod tests {
 
     #[test]
     fn subset_promoted() {
-        let sr = SpecReader::new(
+        let layer = Layer::new_for_test(
             indoc! {
                 "
                 let {subsetOf, BuildSpec, Source, OutputData, ..} = import \"minimal.ncl\" in
@@ -543,16 +531,13 @@ mod tests {
                 } | BuildSpec"
             }
             .to_string(),
-            &SpecReaderOptions::for_test(),
-        );
-        // So we can see the actual error when parsing fails
-        sr.as_ref().err().into_iter().for_each(|e| {
+        )
+        .unwrap_or_else(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
-        let sr = sr.unwrap();
 
-        let dg = DepGraph::new(sr).unwrap();
+        let dg = DepGraph::new().ingest(layer);
 
         let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], true);
         assert_eq!(

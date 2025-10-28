@@ -272,12 +272,12 @@ impl SubsetHasher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SpecReader, SpecReaderOptions};
+    use decode::Layer;
     use indoc::indoc;
 
     #[test]
     fn attrs_hash() {
-        let sr = SpecReader::new(
+        let layer = Layer::new_for_test(
             indoc! {
                 "
                 let {BuildSpec, HostPath, Source, Prebuilt, OutputLib, OutputBin, OutputData, ..} = import \"minimal.ncl\" in
@@ -297,14 +297,13 @@ mod tests {
                 } | BuildSpec"
             }
             .to_string(),
-            &SpecReaderOptions::for_test(),
         )
         .unwrap_or_else(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new(sr).unwrap();
+        let dp = DepGraph::new().ingest(layer);
 
         // println!("{}", SpecHasher::hash(&dp, &dp.top_levels[0]).0.to_hex());
         assert_eq!(
@@ -316,7 +315,7 @@ mod tests {
 
     #[test]
     fn spec_tree() {
-        let sr = SpecReader::new(
+        let layer = Layer::new_for_test(
             indoc! {
                 "
                 let {BuildSpec, Source, OutputLib, OutputBin, OutputData, ..} = import \"minimal.ncl\" in
@@ -341,14 +340,13 @@ mod tests {
                 } | BuildSpec"
             }
             .to_string(),
-            &SpecReaderOptions::for_test(),
         )
         .unwrap_or_else(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new(sr).unwrap();
+        let dp = DepGraph::new().ingest(layer);
 
         // println!("{}", SpecHasher::hash(&dp, &dp.top_levels[0]).0.to_hex());
         assert_eq!(
@@ -360,7 +358,7 @@ mod tests {
 
     #[test]
     fn cycle() {
-        let sr = SpecReader::new(
+        let layer = Layer::new_for_test(
             indoc! {
                 "
                 let {BuildSpec, Source, ..} = import \"minimal.ncl\" in
@@ -384,14 +382,13 @@ mod tests {
                 "
             }
             .to_string(),
-            &SpecReaderOptions::for_test(),
         )
         .unwrap_or_else(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new(sr).unwrap();
+        let dp = DepGraph::new().ingest(layer);
 
         // println!("{}", SpecHasher::hash(&dp, &dp.top_levels[0]).0.to_hex());
         assert_eq!(
@@ -403,7 +400,7 @@ mod tests {
 
     #[test]
     fn subset_hash() {
-        let sr = SpecReader::new(
+        let layer = Layer::new_for_test(
             indoc! {
                 "
                 let {BuildSpec, HostPath, Source, Prebuilt, OutputLib, OutputBin, OutputData, ..} = import \"minimal.ncl\" in
@@ -423,14 +420,13 @@ mod tests {
                 } | BuildSpec"
             }
             .to_string(),
-            &SpecReaderOptions::for_test(),
         )
         .unwrap_or_else(|e| {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new(sr).unwrap();
+        let dp = DepGraph::new().ingest(layer);
 
         // println!("{}", SpecHasher::hash(&dp, &dp.top_levels[0]).0.to_hex());
         assert_eq!(

@@ -1,0 +1,472 @@
+//! First phase of evaluating a layer of build specs - parsing and annotation.
+
+#![allow(clippy::result_large_err)]
+
+use crate::Error;
+use common::SpecOrigin;
+
+use nickel_lang_core::cache::TermCacheError;
+use nickel_lang_core::identifier::LocIdent;
+use nickel_lang_core::term::{RichTerm, Term};
+use nickel_lang_core::typ::TypeF;
+use nickel_lang_core::{error::NullReporter, eval::cache::CacheImpl, program::Program};
+use std::io;
+use std::path::{Path, PathBuf};
+
+/// Configuration for loading a layer (of Nickel files).
+///
+/// Use `LoadOptions::for_test()` in tests.
+pub struct LoadOptions {
+    /// Where on the filesystem the minimal base library (i.e. minimal.ncl) is located.
+    pub minimal_lib_path: PathBuf,
+    pub from: SpecOrigin,
+}
+
+impl LoadOptions {
+    pub fn for_test() -> Self {
+        Self {
+            from: SpecOrigin::Inline,
+            minimal_lib_path: std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                .join("minimal-ncl"),
+        }
+    }
+}
+
+macro_rules! annotate_record {
+    ($record:expr, $buildspec_id_ident:expr, $id:expr, $rt:expr, ($inner:expr, $files:expr, $minimal_lib_path:expr),) => {
+        // Skip annotation for any part of the minimal library.
+        if $inner
+            .pos
+            .src_id()
+            .map(|file_id| {
+                let file_path = $files.name(file_id);
+                file_path
+                    .to_str()
+                    .map(|s| s.starts_with($minimal_lib_path))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+        {
+            return Ok($rt);
+        } else {
+            match $record {
+                Term::RecRecord(mut record_data, includes, dyn_fields, deps) => {
+                    if record_data.fields.get(&$buildspec_id_ident).is_some() {
+                        return Ok($rt);
+                    }
+                    record_data.fields.insert(
+                        LocIdent::new("__magic_buildspec_id"),
+                        RichTerm::from(Term::ForeignId($id)).into(),
+                    );
+                    $id += 1;
+                    Term::RecRecord(record_data, includes, dyn_fields, deps).into()
+                }
+                Term::Record(mut record_data) => {
+                    if record_data.fields.get(&$buildspec_id_ident).is_some() {
+                        return Ok($rt);
+                    }
+                    record_data.fields.insert(
+                        LocIdent::new("__magic_buildspec_id"),
+                        RichTerm::from(Term::ForeignId($id)).into(),
+                    );
+                    $id += 1;
+                    Term::Record(record_data).into()
+                }
+                _ => unreachable!("record type was {:?}", $record),
+            }
+        }
+    };
+}
+
+fn build_decls_in_dir<P: AsRef<Path>>(
+    dir: P,
+    with_names: Option<&[String]>,
+) -> Result<Vec<PathBuf>, Error> {
+    let mut out = if let Some(names) = &with_names {
+        Vec::with_capacity(names.len())
+    } else {
+        Vec::with_capacity(128)
+    };
+
+    fn visit_dirs(
+        out: &mut Vec<PathBuf>,
+        with_names: &Option<&[String]>,
+        dir: &Path,
+    ) -> Result<(), Error> {
+        if dir.is_dir() {
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    match with_names {
+                        Some(names) => {
+                            if names.iter().any(|n| path.ends_with(n)) {
+                                visit_dirs(out, with_names, &path)?;
+                            }
+                        }
+                        None => {
+                            visit_dirs(out, with_names, &path)?;
+                        }
+                    };
+                } else if entry.file_name().to_string_lossy().ends_with("build.ncl") {
+                    out.push(path);
+                }
+            }
+        }
+        Ok(())
+    }
+    visit_dirs(&mut out, &with_names, dir.as_ref())?;
+
+    Ok(out)
+}
+
+/// Evaluates a single layer of nickel files which describe minimal build specifications.
+pub(crate) struct Loader {
+    p: Program<CacheImpl>,
+    from: SpecOrigin,
+    minimal_lib_path: PathBuf,
+    last_id: u64,
+}
+
+impl Loader {
+    /// Processes literal source representing a top-level collection of objects.
+    pub fn new<S: Into<String>>(src: S, opts: &LoadOptions) -> Result<Self, Error> {
+        let mut program = Program::new_from_source(
+            io::Cursor::new(src.into()),
+            "toplevel",
+            std::io::stderr(),
+            NullReporter {},
+        )?;
+        program.add_import_paths([&opts.minimal_lib_path].iter());
+
+        program
+            .typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk)
+            .map_err(|e| Error::Nickel(program.files(), e))?;
+        program
+            .compile()
+            .map_err(|e| Error::Nickel(program.files(), e))?;
+
+        let mut out = Self {
+            p: program,
+            from: opts.from.clone(),
+            last_id: 0,
+            minimal_lib_path: opts.minimal_lib_path.canonicalize()?,
+        };
+        out.annotate()?;
+        Ok(out)
+    }
+
+    /// Loads all build decls in the given directory following the standard directory layout.
+    pub fn new_with_all_pkgs<P: AsRef<Path>>(
+        pkg_dir: P,
+        opts: &LoadOptions,
+    ) -> Result<Self, Error> {
+        let mut src = String::with_capacity(2048);
+        src.push_str("[\n");
+        for pb in build_decls_in_dir(pkg_dir, None)?.into_iter() {
+            src.push_str("  import \"");
+            src.push_str(pb.to_str().unwrap());
+            src.push_str("\",\n");
+        }
+        src.push(']');
+
+        Self::new(src, opts)
+    }
+
+    /// Loads the specified build decls in the given directory following the standard directory layout.
+    pub fn new_with_pkgs<P: AsRef<Path>>(
+        packages: &[String],
+        pkg_dir: P,
+        opts: &LoadOptions,
+    ) -> Result<Self, Error> {
+        let mut src = String::with_capacity(2048);
+        src.push_str("[\n");
+        for pb in build_decls_in_dir(pkg_dir, Some(packages))?.into_iter() {
+            src.push_str("  import \"");
+            src.push_str(pb.to_str().unwrap());
+            src.push_str("\",\n");
+        }
+        src.push(']');
+
+        Self::new(src, opts)
+    }
+
+    /// Walks the AST to find unique build-spec declarations, annotating them with a unique ID.
+    fn annotate(&mut self) -> Result<(), Error> {
+        use nickel_lang_core::traverse::{Traverse as _, TraverseOrder};
+
+        let files = self.p.files();
+        let minimal_lib_path = self.minimal_lib_path.to_str().unwrap();
+
+        let mut id: u64 = self.last_id;
+        let buildspec_id_ident = LocIdent::new("__magic_buildspec_id");
+        let mut traversal = |rt: RichTerm| -> Result<RichTerm, TermCacheError<()>> {
+            // Explicit declaration: { ... } | BuildSpec
+            if let Term::Annotated(annotation, inner) = rt.as_ref() {
+                let is_buildspec = annotation.contracts.iter().any(|lt| {
+                    if let TypeF::Contract(c) = &lt.typ.typ {
+                        if let Term::Var(v) = c.as_ref() {
+                            v.label() == "BuildSpec"
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                });
+
+                if is_buildspec {
+                    return Ok(Term::Annotated(
+                        annotation.clone(),
+                        annotate_record!(
+                            inner.term.as_ref().clone(),
+                            buildspec_id_ident,
+                            id,
+                            rt,
+                            (inner, files, minimal_lib_path),
+                        ),
+                    )
+                    .into());
+                }
+            }
+
+            // Function-based declaration: build { ... }
+            if let Term::App(func, arg) = rt.as_ref() {
+                let is_build_decl = if let Term::Var(v) = func.as_ref() {
+                    v.label() == "build"
+                } else {
+                    false
+                };
+
+                if is_build_decl {
+                    return Ok(Term::App(
+                        func.clone(),
+                        annotate_record!(
+                            arg.term.as_ref().clone(),
+                            buildspec_id_ident,
+                            id,
+                            rt,
+                            (arg, files, minimal_lib_path),
+                        ),
+                    )
+                    .into());
+                }
+            }
+
+            Ok(rt)
+        };
+
+        let result = self
+            .p
+            .custom_transform(0, |_cache, rt| {
+                rt.traverse(&mut traversal, TraverseOrder::TopDown)
+            })
+            .map_err(|e| Error::Other(format!("annotation: {:?}", e)));
+        self.last_id = id;
+        result
+    }
+
+    /// Destroys the loader, returning the outputs of processing (the nickel tree, where it came from).
+    pub fn finish(self) -> Result<(RichTerm, Program<CacheImpl>, SpecOrigin), Error> {
+        let Self { mut p, from, .. } = self;
+        let root_term = p
+            .eval_record_spine()
+            .map_err(|e| Error::Nickel(p.files(), e))?;
+
+        Ok((root_term, p, from))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use indoc::indoc;
+
+    #[test]
+    fn build_decls_in_dir_simple() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create multiple package directories
+        for pkg_name in &["package-a", "package-b", "package-c"] {
+            let pkg_dir = temp_dir.path().join(pkg_name);
+            std::fs::create_dir(&pkg_dir).unwrap();
+            std::fs::write(pkg_dir.join("build.ncl"), "test content").unwrap();
+        }
+
+        let result = build_decls_in_dir(temp_dir.path(), None).unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert!(result.iter().any(|p| p.ends_with("package-a/build.ncl")));
+        assert!(result.iter().any(|p| p.ends_with("package-b/build.ncl")));
+        assert!(result.iter().any(|p| p.ends_with("package-c/build.ncl")));
+    }
+
+    #[test]
+    fn build_decls_in_dir_ignores_non_other_files() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let pkg_dir = temp_dir.path().join("test-package");
+        std::fs::create_dir(&pkg_dir).unwrap();
+
+        // Create build.ncl and other files
+        std::fs::write(pkg_dir.join("build.ncl"), "test content").unwrap();
+        std::fs::write(pkg_dir.join("build.sh"), "#!/bin/bash").unwrap();
+        std::fs::write(pkg_dir.join("readme.md"), "# README").unwrap();
+        std::fs::write(pkg_dir.join("other.ncl"), "other nickel file").unwrap();
+
+        let result = build_decls_in_dir(temp_dir.path(), None).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(result[0].ends_with("build.ncl"));
+    }
+
+    #[test]
+    fn build_decls_in_dir_filtered() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create multiple packages
+        for pkg_name in &["package-a", "package-b", "package-c"] {
+            let pkg_dir = temp_dir.path().join(pkg_name);
+            std::fs::create_dir(&pkg_dir).unwrap();
+            std::fs::write(pkg_dir.join("build.ncl"), "test content").unwrap();
+        }
+
+        let result = build_decls_in_dir(temp_dir.path(), Some(&["package-b".to_string()])).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(result[0].ends_with("package-b/build.ncl"));
+    }
+
+    #[test]
+    fn loader_empty() {
+        let _sr = Loader::new("{}".to_string(), &LoadOptions::for_test()).unwrap();
+    }
+
+    #[test]
+    fn loader_smoketest() {
+        let sr = Loader::new(
+            indoc! {
+                "
+                let {BuildSpec, ..} = import \"minimal.ncl\" in
+                {
+	        		toplevel = {
+	        			name = \"smol ol buildspec\"
+	        		} | BuildSpec
+        		}"
+            }
+            .to_string(),
+            &LoadOptions::for_test(),
+        );
+
+        // So we can see the actual error when the test fails
+        sr.as_ref().err().iter().for_each(|e| {
+            e.report_to_stderr();
+            panic!();
+        });
+
+        let sr = sr.unwrap();
+        assert_eq!(sr.last_id, 1); // single increment for one build spec
+    }
+
+    #[test]
+    fn loader_annotates_build_fn() {
+        let sr = Loader::new(
+            indoc! {
+                "
+                let {build, ..} = import \"minimal.ncl\" in
+                {
+                    toplevel = build {
+                        name = \"smol ol buildspec\",
+                        inputs = [
+                            build { name = \"swiggity swooty\" },
+                        ],
+                    }
+                }"
+            }
+            .to_string(),
+            &LoadOptions::for_test(),
+        );
+
+        // So we can see the actual error when the test fails
+        sr.as_ref().err().iter().for_each(|e| {
+            e.report_to_stderr();
+            panic!();
+        });
+
+        let sr = sr.unwrap();
+        assert_eq!(sr.last_id, 2); // two build specs
+    }
+
+    #[test]
+    fn loader_new_with_all_pkgs() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create multiple packages
+        for pkg_name in &["package-a", "package-b", "package-c"] {
+            let pkg_dir = temp_dir.path().join(pkg_name);
+            std::fs::create_dir(&pkg_dir).unwrap();
+            std::fs::write(
+                pkg_dir.join("build.ncl"),
+                indoc! {
+                "
+                let {BuildSpec, ..} = import \"minimal.ncl\" in
+                {
+	        		name = \"NAMEE\"
+	        	} | BuildSpec
+				"
+                }
+                .to_string()
+                .replace("NAMEE", pkg_name),
+            )
+            .unwrap();
+        }
+
+        let sr = Loader::new_with_all_pkgs(temp_dir.path(), &LoadOptions::for_test());
+        // So we can see the actual error when the test fails
+        sr.as_ref().err().iter().for_each(|e| {
+            e.report_to_stderr();
+            panic!();
+        });
+
+        let sr = sr.unwrap();
+        assert_eq!(sr.last_id, 3); // three build specs
+    }
+
+    #[test]
+    fn loader_new_with_pkgs() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create multiple packages
+        for pkg_name in &["package-a", "package-b", "package-c"] {
+            let pkg_dir = temp_dir.path().join(pkg_name);
+            std::fs::create_dir(&pkg_dir).unwrap();
+            std::fs::write(
+                pkg_dir.join("build.ncl"),
+                indoc! {
+                "
+                let {BuildSpec, ..} = import \"minimal.ncl\" in
+                {
+	        		name = \"NAMEE\"
+	        	} | BuildSpec
+				"
+                }
+                .to_string()
+                .replace("NAMEE", pkg_name),
+            )
+            .unwrap();
+        }
+
+        let sr = Loader::new_with_pkgs(
+            &["package-a".to_string(), "package-c".to_string()],
+            temp_dir.path(),
+            &LoadOptions::for_test(),
+        );
+        // So we can see the actual error when the test fails
+        sr.as_ref().err().iter().for_each(|e| {
+            e.report_to_stderr();
+            panic!();
+        });
+
+        let sr = sr.unwrap();
+        assert_eq!(sr.last_id, 2); // two build specs
+    }
+}
