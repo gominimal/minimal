@@ -270,10 +270,7 @@ impl BuildSpec {
                 .iter()
                 .map(|(k, v)| (k.clone(), BuildOutput::from_decoded(v)))
                 .collect(),
-            replace_on_cycle: match bd.replace_on_cycle.as_ref() {
-                Some(br) => Some(loader.load(br)),
-                None => None,
-            },
+            replace_on_cycle: bd.replace_on_cycle.as_ref().map(|br| loader.load(br)),
 
             from: loader.origin.clone(),
         }
@@ -321,15 +318,15 @@ impl Loader {
     }
 
     fn load_toplevels(&mut self) -> Vec<BuildSpecRef> {
-        let out = self
+        
+
+        self
             .from
             .top_levels
             .clone()
             .iter()
             .map(|idx| self.load_idx(idx))
-            .collect::<Vec<_>>();
-
-        out
+            .collect::<Vec<_>>()
     }
 }
 
