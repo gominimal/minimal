@@ -111,6 +111,7 @@ pub async fn cmd_patched_build(args: PatchedBuildArgs, ctx: &mut Context) -> Res
         .finalize(EntryMeta {
             inner: MetaInner::Spec(build.name.clone()),
             breaker_build: true,
+            origin: Some(build.from.as_ref().clone()),
             ..Default::default()
         })
         .unwrap();

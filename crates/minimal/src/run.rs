@@ -192,7 +192,12 @@ async fn path_for_self_spec(
             remote_cache
                 .as_ref()
                 .unwrap()
-                .materialize(input_hash, MetaInner::Spec(input_build.name.clone()), cache)
+                .materialize(
+                    input_hash,
+                    MetaInner::Spec(input_build.name.clone()),
+                    Some(input_build.from.as_ref().clone()),
+                    cache,
+                )
                 .await?;
             let cache_path = cache.read_dir(input_hash).unwrap().path().to_path_buf();
             Ok((*input_ref, (cache_path, PathBuf::from("/"))))
@@ -271,7 +276,12 @@ pub async fn materialize_subset(
             remote_cache
                 .as_ref()
                 .unwrap()
-                .materialize(&subset_hash, MetaInner::Subset(subset_spec), cache)
+                .materialize(
+                    &subset_hash,
+                    MetaInner::Subset(subset_spec),
+                    Some(graph.get(&subset.from).unwrap().from.as_ref().clone()),
+                    cache,
+                )
                 .await?;
             let cache_path = cache.read_dir(&subset_hash).unwrap().path().to_path_buf();
             Ok((subset.from, (cache_path, PathBuf::from("/"))))
@@ -311,6 +321,7 @@ pub async fn materialize_subset(
                 out.finalize(cache::EntryMeta {
                     inner: MetaInner::Subset(subset_spec),
                     fetched: false,
+                    origin: Some(graph.get(&subset.from).unwrap().from.as_ref().clone()),
                     ..Default::default()
                 })
                 .unwrap();
@@ -729,14 +740,14 @@ impl<'a> Run<'a> {
                             }
                             Ok(cache_handle) => {
                                 if let Some(cache_handle) = cache_handle {
+                                    let build = self2.graph.get(&bsr).unwrap();
                                     outputs.lock().unwrap().push((
                                         cache_handle,
                                         cache::EntryMeta {
-                                            inner: MetaInner::Spec(
-                                                self2.graph.get(&bsr).unwrap().name.clone(),
-                                            ),
+                                            inner: MetaInner::Spec(build.name.clone()),
                                             fetched: false,
                                             breaker_build: !full_build,
+                                            origin: Some(build.from.as_ref().clone()),
                                             ..Default::default()
                                         },
                                     ));

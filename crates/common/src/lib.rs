@@ -43,7 +43,7 @@ impl SpecOrigin {
             },
             false => SpecOrigin::LocalDir {
                 given: p.to_path_buf(),
-                absolute: env::current_dir().unwrap().join(p),
+                absolute: env::current_dir().unwrap().join(p).canonicalize().unwrap(),
             },
         }
     }

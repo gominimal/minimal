@@ -1,6 +1,6 @@
 //! Metadata for cache entries.
 
-use common::{SpecHash, SubsetSpec};
+use common::{SpecHash, SpecOrigin, SubsetSpec};
 use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
@@ -32,6 +32,7 @@ pub struct EntryMeta {
     #[serde(default)]
     pub breaker_build: bool,
     pub epoch_millis: u128,
+    pub origin: Option<SpecOrigin>,
 }
 
 impl Default for EntryMeta {
@@ -44,6 +45,7 @@ impl Default for EntryMeta {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis(),
+            origin: None,
         }
     }
 }
@@ -139,5 +141,27 @@ impl EntryMeta {
         // Sort by recency (most recent first)
         candidates.sort_by(|a, b| a.1.cmp(&b.1).reverse());
         Ok(candidates)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserialize_smoketest() {
+        // format as of 2025-10-28
+        assert_eq!(
+            serde_json::from_str::<EntryMeta>(
+                "{\"inner\":{\"Spec\":\"setuptools\"},\"fetched\":true,\"epoch_millis\":1760653637323}"
+            ).unwrap(),
+            EntryMeta {
+                fetched: true,
+                breaker_build: false,
+                epoch_millis: 1760653637323,
+                inner: MetaInner::Spec("setuptools".to_string()),
+                origin: None,
+            }
+        )
     }
 }

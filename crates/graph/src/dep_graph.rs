@@ -318,10 +318,7 @@ impl Loader {
     }
 
     fn load_toplevels(&mut self) -> Vec<BuildSpecRef> {
-        
-
-        self
-            .from
+        self.from
             .top_levels
             .clone()
             .iter()
