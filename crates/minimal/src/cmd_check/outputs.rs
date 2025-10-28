@@ -10,7 +10,7 @@ use graph::{BuildOutput, BuildSpecRef, DepGraph, Transitives};
 use object::{Object, ObjectSymbol};
 
 pub(crate) fn output_types_valid(
-    pkg: &String,
+    pkg: &str,
     all_graph: &Option<DepGraph>,
     _fix: bool,
     ctx: &mut Context,
@@ -87,7 +87,7 @@ pub(crate) fn output_types_valid(
 }
 
 pub(crate) fn missing_runtime_deps(
-    pkg: &String,
+    pkg: &str,
     all_graph: &Option<DepGraph>,
     _fix: bool,
     ctx: &mut Context,

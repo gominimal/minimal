@@ -25,7 +25,7 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
     crate::enforce_science_mode()?;
 
     let graph = if args.packages.packages.is_none() {
-        ctx.graph_from_package_name(&"base".to_string())?
+        ctx.graph_from_package_name("base")?
     } else {
         args.packages.graph(ctx)?
     };

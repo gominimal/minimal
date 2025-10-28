@@ -271,9 +271,9 @@ impl Context {
     }
 
     /// Returns a [DepGraph] with the given package and its transitive dependencies loaded.
-    pub fn graph_from_package_name(&self, package_name: &String) -> Result<DepGraph, GraphError> {
+    pub fn graph_from_package_name(&self, package_name: &str) -> Result<DepGraph, GraphError> {
         let layer = Layer::new_with_pkgs(
-            &[package_name.clone()],
+            &[package_name.to_owned()],
             self.paths.packages_dir().unwrap(),
             &LoadOptions {
                 minimal_lib_path: self.stdlib_dir(),

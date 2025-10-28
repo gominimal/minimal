@@ -3,7 +3,7 @@ use crate::{Context, Error};
 use graph::{BuildOutput, DepGraph};
 
 pub(crate) fn package_spec_name_matches_dir(
-    pkg: &String,
+    pkg: &str,
     _all_graph: &Option<DepGraph>,
     _fix: bool,
     ctx: &mut Context,
@@ -29,7 +29,7 @@ pub(crate) fn package_spec_name_matches_dir(
 }
 
 pub(crate) fn package_name(
-    pkg: &String,
+    pkg: &str,
     all_graph: &Option<DepGraph>,
     _fix: bool,
     _ctx: &mut Context,
@@ -70,7 +70,7 @@ pub(crate) fn package_name(
 }
 
 pub(crate) fn cycle_breaker_naming(
-    pkg: &String,
+    pkg: &str,
     all_graph: &Option<DepGraph>,
     _fix: bool,
     _ctx: &mut Context,
@@ -113,7 +113,7 @@ pub(crate) fn cycle_breaker_naming(
 }
 
 pub(crate) fn output_naming(
-    pkg: &String,
+    pkg: &str,
     all_graph: &Option<DepGraph>,
     _fix: bool,
     _ctx: &mut Context,

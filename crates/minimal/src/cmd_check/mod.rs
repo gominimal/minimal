@@ -139,7 +139,7 @@ struct CheckResult {
 }
 
 fn check_package_parses(
-    pkg: &String,
+    pkg: &str,
     _all_graph: &Option<DepGraph>,
     _fix: bool,
     ctx: &mut Context,
@@ -167,7 +167,7 @@ static MINIMAL_IMPORT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 fn check_minimal_import_line(
-    pkg: &String,
+    pkg: &str,
     _all_graph: &Option<DepGraph>,
     fix: bool,
     ctx: &mut Context,
@@ -265,7 +265,7 @@ fn check_minimal_import_line(
 }
 
 fn check_package_fmt(
-    pkg: &String,
+    pkg: &str,
     _all_graph: &Option<DepGraph>,
     fix: bool,
     ctx: &mut Context,
@@ -318,7 +318,7 @@ fn check_package_fmt(
 }
 
 fn check_package(
-    pkg: &String,
+    pkg: &str,
     all_graph: &Option<DepGraph>,
     fix: bool,
     skip_checkers: Vec<String>,
