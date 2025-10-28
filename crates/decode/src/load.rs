@@ -141,10 +141,10 @@ impl Loader {
 
         program
             .typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk)
-            .map_err(|e| Error::Nickel(program.files(), e))?;
+            .map_err(|e| Error::Nickel(Box::new((program.files(), e))))?;
         program
             .compile()
-            .map_err(|e| Error::Nickel(program.files(), e))?;
+            .map_err(|e| Error::Nickel(Box::new((program.files(), e))))?;
 
         let mut out = Self {
             p: program,
@@ -271,7 +271,7 @@ impl Loader {
         let Self { mut p, from, .. } = self;
         let root_term = p
             .eval_record_spine()
-            .map_err(|e| Error::Nickel(p.files(), e))?;
+            .map_err(|e| Error::Nickel(Box::new((p.files(), e))))?;
 
         Ok((root_term, p, from))
     }

@@ -12,7 +12,7 @@ pub enum Error {
     /// An I/O error occurred.
     IO(std::io::Error),
     /// An error parsing, typechecking, or evaluating Nickel.
-    Nickel(Files, NclError),
+    Nickel(Box<(Files, NclError)>),
     /// A generic error with a custom message.
     Other(String),
 
@@ -68,7 +68,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::IO(e) => write!(f, "I/O error: {}", e),
-            Error::Nickel(_files, e) => write!(f, "nickel: {:?}", e),
+            Error::Nickel(boxed) => write!(f, "nickel: {:?}", boxed.1),
             Error::Other(e) => write!(f, "other: {}", e),
             Error::MissingTy(_files, at) => write!(f, "missing ty: object defined at {:?}", at),
             Error::MissingField {
@@ -128,12 +128,12 @@ impl Error {
             IO(e) => write!(writer, "IO Error: {}", e).unwrap(),
             Other(msg) => write!(writer, "Error: {}", msg).unwrap(),
 
-            Nickel(files, e) => {
-                let mut files = files.clone();
+            Nickel(boxed) => {
+                let mut files = boxed.0.clone();
                 report_with(
                     writer,
                     &mut files,
-                    e.clone(),
+                    boxed.1.clone(),
                     nickel_lang_core::error::report::ErrorFormat::Text,
                 );
             }

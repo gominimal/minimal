@@ -820,7 +820,7 @@ name = "decode"
 version = "0.0.1"
 dependencies = [
  "blake3",
- "codespan-reporting",
+ "codespan-reporting 0.13.1",
  "common",
  "generational-arena",
  "indoc",

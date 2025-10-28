@@ -198,19 +198,19 @@ pub(crate) fn eval_if_closure(
 ) -> Result<RichTerm, Error> {
     if let Term::Closure(c) = rt.term.as_ref() {
         program.eval_closure(c.clone().into_closure()).map_err(|e| {
-            Error::Nickel(
+            Error::Nickel(Box::new((
                 program.files(),
                 nickel_lang_core::error::Error::EvalError(e),
-            )
+            )))
         })
     } else if !rt.term.is_eff_whnf() {
         program
             .eval_closure(Closure::atomic_closure(rt.clone()))
             .map_err(|e| {
-                Error::Nickel(
+                Error::Nickel(Box::new((
                     program.files(),
                     nickel_lang_core::error::Error::EvalError(e),
-                )
+                )))
             })
     } else {
         Ok(rt.clone())
