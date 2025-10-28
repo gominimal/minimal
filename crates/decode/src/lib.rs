@@ -61,6 +61,7 @@ impl Layer {
         })
     }
 
+    /// Simple builder of literal nickel for a test.
     pub fn new_for_test(s: String) -> Result<Self, Error> {
         let l = load::Loader::new(s, &load::LoadOptions::for_test())?;
         Self::from_loader(l)
@@ -152,6 +153,7 @@ trait DeclAccumulator {
     ) -> Result<(), Error>;
 }
 
+#[cfg(test)]
 impl DeclAccumulator for () {
     fn maybe_decode(
         &mut self,

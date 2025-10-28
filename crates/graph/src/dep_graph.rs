@@ -1,4 +1,4 @@
-//! The machinery for processing build specs into a dependency graph.
+//! The dependency graph.
 
 #![allow(clippy::result_large_err)]
 #![allow(clippy::single_match)]
@@ -78,11 +78,11 @@ impl SubsetInput {
         SubsetSpec::new_single(&graph.spec_hash(&self.from), self.outputs.to_vec())
     }
 
-    fn from_decoded(si: &builds::SubsetInput, loader: &Loader) -> Option<Self> {
-        Some(Self {
-            from: loader.load(&si.from)?,
+    fn from_decoded(si: &builds::SubsetInput, loader: &Loader) -> Self {
+        Self {
+            from: loader.load(&si.from),
             outputs: si.outputs.clone(),
-        })
+        }
     }
 }
 
@@ -114,12 +114,9 @@ impl BuildSpecInput {
         }
     }
 
-    fn from_decoded(i: &builds::BuildDeclInput, loader: &Loader) -> Option<Self> {
-        Some(match i {
-            builds::BuildDeclInput::Build(br) => Self::Build({
-                let res = loader.load(br);
-                res?
-            }),
+    fn from_decoded(i: &builds::BuildDeclInput, loader: &Loader) -> Self {
+        match i {
+            builds::BuildDeclInput::Build(br) => Self::Build(loader.load(br)),
             builds::BuildDeclInput::Source(s) => Self::Source(s.clone().into()),
             builds::BuildDeclInput::HostPath(p) => Self::HostPath(p.clone()),
             builds::BuildDeclInput::Local {
@@ -135,9 +132,9 @@ impl BuildSpecInput {
                 Self::Prebuilt(name.clone(), sha256.clone())
             }
             builds::BuildDeclInput::Subset(si) => {
-                Self::Subset(SubsetInput::from_decoded(si, loader)?)
+                Self::Subset(SubsetInput::from_decoded(si, loader))
             }
-        })
+        }
     }
 }
 
@@ -191,11 +188,11 @@ impl RuntimeDep {
         }
     }
 
-    fn from_decoded(d: &builds::RuntimeDep, loader: &Loader) -> Option<Self> {
-        Some(match d {
-            builds::RuntimeDep::Build(br) => Self::Build(loader.load(br)?),
-            builds::RuntimeDep::Subset(si) => Self::Subset(SubsetInput::from_decoded(si, loader)?),
-        })
+    fn from_decoded(d: &builds::RuntimeDep, loader: &Loader) -> Self {
+        match d {
+            builds::RuntimeDep::Build(br) => Self::Build(loader.load(br)),
+            builds::RuntimeDep::Subset(si) => Self::Subset(SubsetInput::from_decoded(si, loader)),
+        }
     }
 }
 
@@ -250,8 +247,8 @@ impl BuildSpec {
         self.inputs.is_empty() && self.cmd.is_empty()
     }
 
-    fn from_decoded(bd: &builds::BuildDecl, loader: &Loader) -> Option<Self> {
-        Some(Self {
+    fn from_decoded(bd: &builds::BuildDecl, loader: &Loader) -> Self {
+        Self {
             name: bd.name.clone(),
             target: bd.target.clone(),
             cmd: bd.cmd.clone(),
@@ -260,12 +257,12 @@ impl BuildSpec {
             inputs: bd
                 .inputs
                 .iter()
-                .map(|i| BuildSpecInput::from_decoded(i, loader).unwrap())
+                .map(|i| BuildSpecInput::from_decoded(i, loader))
                 .collect::<SmallVec<_>>(),
             runtime_deps: bd
                 .runtime_deps
                 .iter()
-                .map(|d| RuntimeDep::from_decoded(d, loader).unwrap())
+                .map(|d| RuntimeDep::from_decoded(d, loader))
                 .collect::<SmallVec<_>>(),
 
             outputs: bd
@@ -274,15 +271,16 @@ impl BuildSpec {
                 .map(|(k, v)| (k.clone(), BuildOutput::from_decoded(v)))
                 .collect(),
             replace_on_cycle: match bd.replace_on_cycle.as_ref() {
-                Some(br) => Some(loader.load(br)?),
+                Some(br) => Some(loader.load(br)),
                 None => None,
             },
 
             from: loader.origin.clone(),
-        })
+        }
     }
 }
 
+/// Manages loading a [Layer] into [DepGraph].
 struct Loader {
     from: Layer,
     origin: Arc<SpecOrigin>,
@@ -291,15 +289,17 @@ struct Loader {
 }
 
 impl Loader {
-    fn load(&self, br: &builds::BuildRef) -> Option<BuildSpecRef> {
+    /// upserts the specified build ref, returning the new or already-existing BSR.
+    fn load(&self, br: &builds::BuildRef) -> BuildSpecRef {
         let idx = self.from.resolve(br).unwrap();
         self.load_idx(idx)
     }
 
-    fn load_idx(&self, idx: &generational_arena::Index) -> Option<BuildSpecRef> {
+    /// upserts the specified layer idx, returning the new or already-existing BSR.
+    fn load_idx(&self, idx: &generational_arena::Index) -> BuildSpecRef {
         // Fast path: already loaded.
         if let Some(bsr) = self.resolved.borrow().get(idx) {
-            return Some(*bsr);
+            return *bsr;
         }
 
         let decl = self.from.get(*idx).unwrap();
@@ -314,23 +314,22 @@ impl Loader {
         self.resolved.borrow_mut().insert(*idx, bsr);
 
         // Decode the build-spec and write it back to the allocated position.
-        let build = BuildSpec::from_decoded(decl, self)?;
+        let build = BuildSpec::from_decoded(decl, self);
         *self.into_graph.borrow_mut().builds.get_mut(bsr.0).unwrap() = build;
 
-        Some(bsr)
+        bsr
     }
 
-    pub(crate) fn load_toplevels(&mut self) -> Option<Vec<BuildSpecRef>> {
+    fn load_toplevels(&mut self) -> Vec<BuildSpecRef> {
         let out = self
             .from
             .top_levels
             .clone()
             .iter()
             .map(|idx| self.load_idx(idx))
-            .collect::<Option<Vec<_>>>()
-            .unwrap();
+            .collect::<Vec<_>>();
 
-        Some(out)
+        out
     }
 }
 
@@ -382,7 +381,7 @@ impl DepGraph {
             into_graph: RefCell::new(self),
             resolved: RefCell::new(HashMap::with_capacity(1024)),
         };
-        let new_toplevels = loader.load_toplevels().unwrap();
+        let new_toplevels = loader.load_toplevels();
 
         let mut slf = loader.into_graph.into_inner();
         slf.top_levels.extend(new_toplevels);
