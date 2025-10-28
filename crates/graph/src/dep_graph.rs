@@ -117,7 +117,7 @@ impl BuildSpecInput {
     fn from_decoded(i: &builds::BuildDeclInput, loader: &Loader) -> Option<Self> {
         Some(match i {
             builds::BuildDeclInput::Build(br) => Self::Build({
-                let res = loader.load(&br);
+                let res = loader.load(br);
                 res?
             }),
             builds::BuildDeclInput::Source(s) => Self::Source(s.clone().into()),
@@ -129,7 +129,7 @@ impl BuildSpecInput {
             } => Self::Local {
                 full_path: full_path.clone(),
                 filename: filename.clone(),
-                file_hash: file_hash.clone(),
+                file_hash: *file_hash,
             },
             builds::BuildDeclInput::Prebuilt(name, sha256) => {
                 Self::Prebuilt(name.clone(), sha256.clone())
@@ -193,7 +193,7 @@ impl RuntimeDep {
 
     fn from_decoded(d: &builds::RuntimeDep, loader: &Loader) -> Option<Self> {
         Some(match d {
-            builds::RuntimeDep::Build(br) => Self::Build(loader.load(&br)?),
+            builds::RuntimeDep::Build(br) => Self::Build(loader.load(br)?),
             builds::RuntimeDep::Subset(si) => Self::Subset(SubsetInput::from_decoded(si, loader)?),
         })
     }
@@ -311,7 +311,7 @@ impl Loader {
                 .builds
                 .insert(BuildSpec::default()),
         );
-        self.resolved.borrow_mut().insert(*idx, bsr.clone());
+        self.resolved.borrow_mut().insert(*idx, bsr);
 
         // Decode the build-spec and write it back to the allocated position.
         let build = BuildSpec::from_decoded(decl, self)?;
@@ -353,6 +353,12 @@ pub struct DepGraph {
             HashMap<SpecHash, BuildSpecRef>,
         )>,
     >,
+}
+
+impl Default for DepGraph {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DepGraph {

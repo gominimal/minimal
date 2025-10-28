@@ -274,7 +274,7 @@ impl Context {
     pub fn graph_from_package_name(&self, package_name: &String) -> Result<DepGraph, GraphError> {
         let layer = Layer::new_with_pkgs(
             &[package_name.clone()],
-            &self.paths.packages_dir().unwrap(),
+            self.paths.packages_dir().unwrap(),
             &LoadOptions {
                 minimal_lib_path: self.stdlib_dir(),
                 from: self.spec_origin.clone(),

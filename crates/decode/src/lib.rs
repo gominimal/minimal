@@ -133,7 +133,7 @@ impl DeclAccumulator for Layer {
 
         // Allocate a ref
         let build_ref = self.builds.insert(BuildDecl::default());
-        self.read_ids.insert(*spec_id, build_ref.clone());
+        self.read_ids.insert(*spec_id, build_ref);
 
         let decl = BuildDecl::from_term(rt, program, self)?;
         *self.builds.get_mut(build_ref).unwrap() = decl;
