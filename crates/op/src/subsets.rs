@@ -134,7 +134,7 @@ mod tests {
             .unwrap();
 
         // Check that only a and c were present.
-        let out_dir = cache.read_dir(&dg.subset_hash(&sb.subset)).unwrap();
+        let out_dir = cache.read_dir(&dg.subset_hash(sb.subset)).unwrap();
         assert!(out_dir.path().join("a").exists());
         assert!(!out_dir.path().join("b").exists());
         assert!(out_dir.path().join("c").exists());
