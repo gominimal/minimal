@@ -1,6 +1,5 @@
 use crate::{Error, Options, Runnable};
-use cache::MetaInner;
-use common::SpecHash;
+use cache::PendingDir;
 use graph::SubsetInput;
 
 /// Constructs a subset, storing the resulting object in the cache.
@@ -9,12 +8,11 @@ pub struct SubsetBuild<'a> {
 }
 
 impl<'a> Runnable for SubsetBuild<'a> {
-    type Result = SpecHash;
+    type Result = PendingDir;
 
-    fn run(&mut self, opts: &Options) -> Result<Self::Result, Error> {
+    async fn run<'b>(&mut self, opts: &Options<'b>) -> Result<Self::Result, Error> {
         let build = opts.graph.get(&self.subset.from).unwrap();
         let build_hash = opts.graph.spec_hash(&self.subset.from);
-        let subset_spec = self.subset.as_spec(opts.graph);
         let subset_hash = opts.graph.subset_hash(self.subset);
 
         let build_dir = opts.cache.read_dir(&build_hash).unwrap();
@@ -50,22 +48,14 @@ impl<'a> Runnable for SubsetBuild<'a> {
             std::fs::copy(&file, out_base.join(trimmed))?;
         }
 
-        // Commit
-        out.finalize(cache::EntryMeta {
-            inner: MetaInner::Subset(subset_spec),
-            fetched: false,
-            origin: Some(build.from.as_ref().clone()),
-            ..Default::default()
-        })?;
-
-        Ok(subset_hash)
+        Ok(out)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cache::{Cache, EntryMeta};
+    use cache::{Cache, EntryMeta, MetaInner};
     use decode::Layer;
     use graph::DepGraph;
     use indoc::indoc;
@@ -122,16 +112,29 @@ mod tests {
                 outputs: smallvec!["a".to_string(), "c".to_string()],
             },
         };
-        let subset_hash = sb
-            .run(&Options {
-                cache: cache.clone(),
-                graph: &dg,
-                exec_base: "/not-exists".into(),
+        let run_opts = &Options {
+            cache: cache.clone(),
+            graph: &dg,
+            exec_base: "/not-exists".into(),
+        };
+        let pending_dir = futures::executor::block_on(sb.run(run_opts)).unwrap();
+        pending_dir
+            .finalize(cache::EntryMeta {
+                inner: MetaInner::Subset(sb.subset.as_spec(&dg)),
+                fetched: false,
+                origin: Some(
+                    dg.get(&dg.by_name("fake build").next().unwrap())
+                        .unwrap()
+                        .from
+                        .as_ref()
+                        .clone(),
+                ),
+                ..Default::default()
             })
             .unwrap();
 
         // Check that only a and c were present.
-        let out_dir = cache.read_dir(&subset_hash).unwrap();
+        let out_dir = cache.read_dir(&dg.subset_hash(&sb.subset)).unwrap();
         assert!(out_dir.path().join("a").exists());
         assert!(!out_dir.path().join("b").exists());
         assert!(out_dir.path().join("c").exists());

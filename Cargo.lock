@@ -2507,17 +2507,19 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 name = "op"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
+ "build-sandbox",
  "cache",
  "common",
  "decode",
+ "futures",
  "graph",
- "hex",
  "indoc",
- "serde",
- "serde_json",
+ "shlex",
  "smallvec",
  "tempfile",
  "tracing",
+ "url",
 ]
 
 [[package]]

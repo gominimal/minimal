@@ -206,3 +206,20 @@ impl RemoteStorage {
         Ok(())
     }
 }
+
+impl op::SourceFetcher for RemoteStorage {
+    async fn download_https(&self, url: &str, sha256: &str) -> Result<PathBuf, anyhow::Error> {
+        self.download_https_with_verification_and_caching(url, sha256)
+            .await
+    }
+
+    async fn download_gcs(
+        &self,
+        bucket_id: String,
+        file: &str,
+        sha256: &str,
+    ) -> Result<PathBuf, anyhow::Error> {
+        self.download_with_verification_and_caching(bucket_id, file, sha256)
+            .await
+    }
+}

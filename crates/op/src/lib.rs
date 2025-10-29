@@ -18,8 +18,23 @@ pub struct Options<'a> {
 /// Describes an operation which is configured and ready to be executed.
 pub trait Runnable {
     type Result: Sized + Send + Sync;
-    fn run(&mut self, opts: &Options) -> Result<Self::Result, Error>;
+    fn run(
+        &mut self,
+        opts: &Options,
+    ) -> impl std::future::Future<Output = Result<Self::Result, Error>> + Send;
+}
+
+/// A materialized source, either a file or directory tree.
+#[derive(Debug)]
+pub enum Materialized {
+    File(PathBuf),
+    TempDir(tempfile::TempDir),
 }
 
 mod subsets;
 pub use subsets::SubsetBuild;
+
+mod sources;
+pub use sources::{SourceFetcher, SourceLoad};
+mod specs;
+pub use specs::SpecBuild;

@@ -3,130 +3,42 @@ use build_sandbox::{BuildConfig, Input as SandboxInput, config::BuildScript, run
 use cache::{Cache, LocalDir, MetaInner, PendingDir, RemoteCache};
 use common::SpecHash;
 use google_cloud_storage::client::Storage as GcsStorage;
-use graph::dep_graph::SourceFetch;
 use graph::{BinProvider, ExecPlan, RuntimeDep, SubsetInput};
 use graph::{BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, SourceInput};
-use op::{Runnable, SubsetBuild};
+use op::{Materialized, Runnable, SourceLoad, SubsetBuild};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tempfile::{Builder, TempDir};
 use tracing::{debug, info};
-use url::Url;
 
 use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage};
-
-/// A materialized source, either a file or directory tree.
-#[derive(Debug)]
-pub enum Materialized {
-    File(PathBuf),
-    TempDir(tempfile::TempDir),
-}
 
 /// yields a directory that the files in an [SourceInput] are available.
 pub(crate) async fn materialize_source(
     build_name: &str,
     source: &SourceInput,
+    graph: &DepGraph,
     remote_storage: &RemoteStorage,
     cache: &Cache<LocalDir>,
 ) -> Result<Materialized> {
-    match &source.from {
-        SourceFetch::URL(url) => {
-            let url = Url::parse(url).with_context(|| format!("Failed to parse URL '{}'", url))?;
+    let span = tracing::info_span!(
+        "prepare_source",
+        "indicatif.pb_show" = tracing::field::Empty,
+        "build" = build_name,
+    );
+    let _enter = span.enter();
 
-            let cached_path = match url.scheme() {
-                "https" => {
-                    let cached_path = {
-                        let span = tracing::info_span!(
-                            "https_download",
-                            "indicatif.pb_show" = tracing::field::Empty,
-                            "build" = build_name,
-                            "url" = url.as_str()
-                        );
-                        let _enter = span.enter();
-
-                        remote_storage
-                            .download_https_with_verification_and_caching(
-                                url.as_str(),
-                                &source.sha256,
-                            )
-                            .await?
-                    };
-
-                    debug!("  Downloaded and verified source from {}", url);
-                    cached_path
-                }
-
-                "gs" => {
-                    let bucket_id = url.host_str().with_context(|| {
-                        format!(
-                            "Invalid gs:// URL: missing bucket name in '{}'",
-                            url.as_str()
-                        )
-                    })?;
-
-                    let file_name = url.path().trim_start_matches('/');
-
-                    let cached_path = {
-                        let span = tracing::info_span!(
-                            "gcs_download",
-                            "indicatif.pb_show" = tracing::field::Empty,
-                            "build" = build_name,
-                            "url" = url.as_str()
-                        );
-                        let _enter = span.enter();
-
-                        remote_storage
-                            .download_with_verification_and_caching(
-                                bucket_id.to_string(),
-                                file_name,
-                                &source.sha256,
-                            )
-                            .await?
-                    };
-
-                    debug!(
-                        "  Downloaded and verified source from gs://{}/{}",
-                        bucket_id, file_name
-                    );
-                    cached_path
-                }
-                _ => todo!(),
-            };
-
-            if source.extract {
-                let file_name = url
-                    .path_segments()
-                    .map(|mut s| s.next_back().unwrap())
-                    .unwrap();
-                let tempdir = cache.temp_dir()?;
-                let tempdir_path = tempdir.path();
-                let span = tracing::info_span!(
-                    "extract",
-                    "indicatif.pb_show" = tracing::field::Empty,
-                    "build" = build_name,
-                    "file" = file_name,
-                );
-                let _enter = span.enter();
-
-                use common::archive;
-                match archive::Compression::from_extension(file_name) {
-                    Some(compression) => {
-                        let f = std::fs::File::open(cached_path)?;
-                        archive::extract_compressed_tar(
-                            f,
-                            compression,
-                            tempdir_path,
-                            source.strip_prefix.as_ref(),
-                        )?;
-                        Ok(Materialized::TempDir(tempdir))
-                    }
-                    None => bail!("cannot extract archive {}: unhandled extension", file_name),
-                }
-            } else {
-                Ok(Materialized::File(cached_path))
-            }
-        }
+    SourceLoad {
+        remote_fetcher: remote_storage,
+        source,
     }
+    .run(&op::Options {
+        graph,
+        cache: cache.clone(),
+        exec_base: "/invalid".into(),
+    })
+    .await
+    .map_err(anyhow::Error::from)
 }
 
 /// yields 'dependencies' mappings for making the given input or runtime_dep available to a sandbox build.
@@ -295,13 +207,21 @@ pub async fn materialize_subset(
             let dep_hash = graph.spec_hash(&subset.from);
             if let Ok(cache_dir) = cache.read_dir(&dep_hash) {
                 drop(cache_dir);
-                SubsetBuild { subset }
+                let pending_dir = SubsetBuild { subset }
                     .run(&op::Options {
                         cache: cache.clone(),
                         graph,
                         exec_base: "/invalid".into(),
                     })
+                    .await
                     .unwrap();
+                pending_dir.finalize(cache::EntryMeta {
+                    inner: MetaInner::Subset(subset_spec),
+                    fetched: false,
+                    origin: Some(build.from.as_ref().clone()),
+                    ..Default::default()
+                })?;
+
                 let cache_path = cache.read_dir(&subset_hash).unwrap().path().to_path_buf();
                 return Ok((subset.from, (cache_path, PathBuf::from("/"))));
             };
@@ -534,6 +454,7 @@ impl<'a> Run<'a> {
                     match materialize_source(
                         build.name.as_str(),
                         source,
+                        self.graph,
                         &self.remote_storage,
                         &self.cache,
                     )

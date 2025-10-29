@@ -5,7 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-"build-sandbox".workspace = true
+build-sandbox.workspace = true
 build-events.workspace = true
 build-events-proto = { path = "../build-events-proto" }
 graph.workspace = true

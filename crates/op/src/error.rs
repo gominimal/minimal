@@ -11,15 +11,7 @@ pub enum Error {
     IO(std::io::Error),
     /// An error interacting with the Cache occurred.
     Cache(CacheErr),
-    /// A generic error with a custom message.
-    Other(String),
-}
-
-impl Error {
-    /// Creates a new error with a custom message.
-    pub fn other<S: Into<String>>(msg: S) -> Self {
-        Error::Other(msg.into())
-    }
+    Other(anyhow::Error),
 }
 
 impl From<std::io::Error> for Error {
@@ -31,6 +23,12 @@ impl From<std::io::Error> for Error {
 impl From<CacheErr> for Error {
     fn from(e: CacheErr) -> Self {
         Self::Cache(e)
+    }
+}
+
+impl From<anyhow::Error> for Error {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Other(e)
     }
 }
 

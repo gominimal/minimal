@@ -11,13 +11,15 @@ indoc.workspace = true
 smallvec.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+futures.workspace = true
+shlex.workspace = true
 tempfile.workspace = true
 tracing.workspace = true
-hex.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+url.workspace = true
 
-graph.workspace = true
+build-sandbox.workspace = true
 cache.workspace = true
 common.workspace = true
 decode.workspace = true
+graph.workspace = true
