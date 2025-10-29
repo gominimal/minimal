@@ -1,45 +1,16 @@
 use anyhow::{Context, Result, bail};
-use build_sandbox::{BuildConfig, Input as SandboxInput, config::BuildScript, run_build};
 use cache::{Cache, LocalDir, MetaInner, PendingDir, RemoteCache};
 use common::SpecHash;
 use google_cloud_storage::client::Storage as GcsStorage;
 use graph::{BinProvider, ExecPlan, RuntimeDep, SubsetInput};
-use graph::{BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, SourceInput};
-use op::{Materialized, Runnable, SourceLoad, SubsetBuild};
+use graph::{BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph};
+use op::{Runnable, SpecBuild, SubsetBuild};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use tempfile::{Builder, TempDir};
+use tempfile::Builder;
 use tracing::{debug, info};
 
 use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage};
-
-/// yields a directory that the files in an [SourceInput] are available.
-pub(crate) async fn materialize_source(
-    build_name: &str,
-    source: &SourceInput,
-    graph: &DepGraph,
-    remote_storage: &RemoteStorage,
-    cache: &Cache<LocalDir>,
-) -> Result<Materialized> {
-    let span = tracing::info_span!(
-        "prepare_source",
-        "indicatif.pb_show" = tracing::field::Empty,
-        "build" = build_name,
-    );
-    let _enter = span.enter();
-
-    SourceLoad {
-        remote_fetcher: remote_storage,
-        source,
-    }
-    .run(&op::Options {
-        graph,
-        cache: cache.clone(),
-        exec_base: "/invalid".into(),
-    })
-    .await
-    .map_err(anyhow::Error::from)
-}
 
 /// yields 'dependencies' mappings for making the given input or runtime_dep available to a sandbox build.
 ///
@@ -416,10 +387,8 @@ impl<'a> Run<'a> {
         &self,
         build: &BuildSpec,
         remote_cache: Option<&RemoteCache<GcsStorage>>,
-    ) -> Result<(HashSet<PathBuf>, Vec<SandboxInput>, Vec<TempDir>)> {
+    ) -> Result<HashSet<PathBuf>> {
         let mut dependencies = HashSet::new();
-        let mut inputs = Vec::new();
-        let mut tempdirs = Vec::new();
 
         debug!("Build {} has {} inputs", build.name, build.inputs.len());
         for (i, input) in build.inputs.iter().enumerate() {
@@ -447,25 +416,11 @@ impl<'a> Run<'a> {
                 }
                 Local { full_path, .. } => {
                     debug!("  Input {}: Local file from {}", i, full_path.display());
-                    inputs.push(SandboxInput::File(full_path.to_path_buf()));
+                    // Handled by [SpecBuild]
                 }
                 Source(source) => {
                     debug!("  Input {}: Source({:?})", i, source.from);
-                    match materialize_source(
-                        build.name.as_str(),
-                        source,
-                        self.graph,
-                        &self.remote_storage,
-                        &self.cache,
-                    )
-                    .await?
-                    {
-                        Materialized::File(path) => inputs.push(SandboxInput::File(path)),
-                        Materialized::TempDir(td) => {
-                            inputs.push(SandboxInput::Dir(td.path().to_path_buf()));
-                            tempdirs.push(td);
-                        }
-                    };
+                    // Handled by [SpecBuild]
                 }
                 Prebuilt(package_name, _sha256) => {
                     debug!("  Input {}: Prebuilt({})", i, package_name);
@@ -489,7 +444,7 @@ impl<'a> Run<'a> {
             dependencies.extend(dep_paths);
         }
 
-        Ok((dependencies, inputs, tempdirs))
+        Ok(dependencies)
     }
 
     /// runs a single isolated build, does not take self so it can be spawned in a thread.
@@ -498,12 +453,12 @@ impl<'a> Run<'a> {
     #[tracing::instrument(skip_all, fields(indicatif.pb_hide))]
     async fn do_build(
         &self,
-        build: &BuildSpecRef,
+        bsr: &BuildSpecRef,
         _full_build: bool,
         remote_cache: Option<&RemoteCache<GcsStorage>>,
     ) -> Result<Option<PendingDir>> {
-        let bsh = self.graph.spec_hash(build);
-        let build = self.graph.get(build).unwrap();
+        let bsh = self.graph.spec_hash(bsr);
+        let build = self.graph.get(bsr).unwrap();
 
         // Check if already in cache
         if let Ok(e) = self.cache.read_dir(&bsh) {
@@ -529,7 +484,7 @@ impl<'a> Run<'a> {
             return Ok(Some(result));
         }
 
-        let (dependencies, inputs, temp_dirs) = self
+        let dependencies = self
             .sandbox_paths_from_buildspec(build, remote_cache)
             .await?;
 
@@ -539,60 +494,24 @@ impl<'a> Run<'a> {
                 build.name
             );
             let cache_handle = self.cache.write_dir(&bsh).unwrap();
-            Ok(Some(cache_handle))
-        } else {
-            // Regular build with build script
-            let cmd_parts: Vec<String> =
-                shlex::split(&build.cmd).unwrap_or_else(|| vec![build.cmd.clone()]);
-            let (executable, args) = if !cmd_parts.is_empty() {
-                let exe = cmd_parts[0].clone();
-                let args = cmd_parts[1..].to_vec();
-                (exe, args)
-            } else {
-                (build.cmd.clone(), vec![])
-            };
-
-            let config = BuildConfig {
-                name: build.name.clone(),
-                dependencies,
-                inputs,
-                build_script: BuildScript {
-                    executable: executable.into(),
-                    args,
-                    build_args: build.build_args.clone(),
-                },
-                outputs: build
-                    .outputs
-                    .values()
-                    .map(|output| match output {
-                        BuildOutput::Library { glob } => glob.clone(),
-                        BuildOutput::Data { glob } => glob.clone(),
-                        BuildOutput::Binary { glob } => glob.clone(),
-                    })
-                    .collect(),
-            };
-
-            let out_dir = self.cache.write_dir(&bsh).unwrap();
-
-            // Use package name as target ID for semantic meaning
-            let target_id = build.name.clone();
-
-            info!("Building package: {}", build.name);
-            let _build_result = run_build(
-                &config,
-                out_dir.path(),
-                self.output_base.clone(),
-                &target_id,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to build {}: {}", build.name, e))?;
-
-            info!("Successfully built package: {}", build.name);
-            for tempdir in temp_dirs.into_iter() {
-                drop(tempdir);
-            }
-            Ok(Some(out_dir))
+            return Ok(Some(cache_handle));
         }
+
+        let out_dir = SpecBuild {
+            spec: bsr,
+            override_deps: Some(dependencies),
+            remote_fetcher: &self.remote_storage,
+        }
+        .run(&op::Options {
+            cache: self.cache.clone(),
+            graph: self.graph,
+            exec_base: self.output_base.clone(),
+        })
+        .await
+        .map_err(anyhow::Error::from)?;
+
+        info!("Successfully built package: {}", build.name);
+        Ok(Some(out_dir))
     }
 
     pub async fn execute<BP: BinProvider>(
