@@ -1,6 +1,7 @@
 //! Implementations of caches storing artifacts keyed by [SpecHash].
 
 use common::SpecHash;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -208,6 +209,24 @@ pub enum CacheErr {
 impl From<FSError> for CacheErr {
     fn from(fse: FSError) -> Self {
         CacheErr::IO(fse)
+    }
+}
+
+impl fmt::Display for CacheErr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CacheErr::IO(e) => write!(f, "i/o error: {}", e),
+            CacheErr::NotFound => write!(f, "not found"),
+        }
+    }
+}
+
+impl std::error::Error for CacheErr {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CacheErr::IO(e) => Some(e),
+            _ => None,
+        }
     }
 }
 

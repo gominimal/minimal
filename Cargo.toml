@@ -8,6 +8,7 @@ members = [
     "crates/common",
     "crates/decode",
     "crates/graph",
+    "crates/op",
     "crates/minimal",
 ]
 resolver = "3"
@@ -79,3 +80,4 @@ cache = { version = "0.0.1", path = "crates/cache" }
 checkouts = { version = "0.0.1", path = "crates/checkouts" }
 common = { version = "0.0.1", path = "crates/common" }
 decode = { version = "0.0.1", path = "crates/decode" }
+op = { version = "0.0.1", path = "crates/op" }

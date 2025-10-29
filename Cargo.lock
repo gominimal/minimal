@@ -2256,6 +2256,7 @@ dependencies = [
  "object",
  "oci-client",
  "oci-spec",
+ "op",
  "rayon",
  "regex",
  "reqwest",
@@ -2501,6 +2502,23 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "op"
+version = "0.0.1"
+dependencies = [
+ "cache",
+ "common",
+ "decode",
+ "graph",
+ "hex",
+ "indoc",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tempfile",
+ "tracing",
+]
 
 [[package]]
 name = "openssl"

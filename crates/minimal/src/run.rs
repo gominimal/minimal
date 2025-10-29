@@ -6,6 +6,7 @@ use google_cloud_storage::client::Storage as GcsStorage;
 use graph::dep_graph::SourceFetch;
 use graph::{BinProvider, ExecPlan, RuntimeDep, SubsetInput};
 use graph::{BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, SourceInput};
+use op::{Runnable, SubsetBuild};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tempfile::{Builder, TempDir};
@@ -293,38 +294,14 @@ pub async fn materialize_subset(
             //  - We can't (build we are a subset of isnt built) but theres a cycle-breaker.
             let dep_hash = graph.spec_hash(&subset.from);
             if let Ok(cache_dir) = cache.read_dir(&dep_hash) {
-                let out = cache.write_dir(&subset_hash).unwrap();
-                // Lets build it from the upstream
-                let mut files: Vec<_> = subset
-                    .outputs
-                    .iter()
-                    .map(|output_name| {
-                        common::match_files_for_glob(
-                            cache_dir.path(),
-                            build.outputs.get(output_name).unwrap().glob(),
-                        )
+                drop(cache_dir);
+                SubsetBuild { subset }
+                    .run(&op::Options {
+                        cache: cache.clone(),
+                        graph,
+                        exec_base: "/invalid".into(),
                     })
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                files.sort();
-                files.dedup();
-
-                for file in files.into_iter() {
-                    let trimmed = file.strip_prefix(cache_dir.path()).unwrap();
-                    if let Some(parent) = trimmed.parent() {
-                        std::fs::create_dir_all(out.path().join(parent))?;
-                    }
-                    std::fs::copy(&file, out.path().join(trimmed))?;
-                }
-                out.finalize(cache::EntryMeta {
-                    inner: MetaInner::Subset(subset_spec),
-                    fetched: false,
-                    origin: Some(graph.get(&subset.from).unwrap().from.as_ref().clone()),
-                    ..Default::default()
-                })
-                .unwrap();
+                    .unwrap();
                 let cache_path = cache.read_dir(&subset_hash).unwrap().path().to_path_buf();
                 return Ok((subset.from, (cache_path, PathBuf::from("/"))));
             };
