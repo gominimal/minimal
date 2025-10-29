@@ -1,8 +1,8 @@
 use std::{collections::HashSet, path::PathBuf};
 
-use crate::{Error, Materialized, Options, Runnable};
-use cache::PendingDir;
-use graph::{BuildSpec, BuildSpecInput, BuildSpecRef, Transitives};
+use crate::{Error, Materialized, Options, Runnable, SubsetBuild};
+use cache::{CacheErr, MetaInner, PendingDir};
+use graph::{BuildSpec, BuildSpecInput, BuildSpecRef, SubsetInput, Transitives};
 use tempfile::TempDir;
 use tracing::info;
 
@@ -50,7 +50,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                         }
                     }
                 }
-                BuildSpecInput::Build(_) => {} // Handled by Transitives above
+                BuildSpecInput::Build(_) => {} // Handled by Transitives
                 _ => todo!("input: {:?}", input),
             }
         }
@@ -59,7 +59,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
 
     async fn dependencies(
         &self,
-        _build: &BuildSpec,
+        build: &BuildSpec,
         opts: &Options<'a>,
     ) -> Result<HashSet<PathBuf>, Error> {
         if let Some(deps) = &self.override_deps {
@@ -68,14 +68,47 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
 
         let mut dependencies = HashSet::new();
         let transitives = Transitives::new(opts.graph, self.spec, true);
-        let build_deps: Vec<_> = transitives
-            .transitive_runtime_deps
-            .keys()
-            .to_owned()
-            .collect();
-        for bsr in build_deps.iter() {
-            let cache_dir = opts.cache.read_dir(&opts.graph.spec_hash(bsr)).unwrap();
-            dependencies.insert(cache_dir.path().to_path_buf());
+        let build_deps: Vec<_> = transitives.transitive_runtime_deps.into_iter().collect();
+        for (bsr, dep_info) in build_deps.into_iter() {
+            match dep_info.outputs {
+                // Regular build
+                None => {
+                    let cache_dir = opts.cache.read_dir(&opts.graph.spec_hash(&bsr)).unwrap();
+                    dependencies.insert(cache_dir.path().to_path_buf());
+                }
+                // Subset
+                Some(outputs) => {
+                    let subset = SubsetInput {
+                        from: bsr,
+                        outputs: outputs.into_iter().collect(),
+                    };
+                    let subset_hash = opts.graph.subset_hash(&subset);
+
+                    // If the subset exists use it, otherwise build it
+                    dependencies.insert(
+                        match opts.cache.read_dir(&subset_hash) {
+                            Ok(cache_dir) => cache_dir,
+                            Err(CacheErr::NotFound) => {
+                                let mut sb = SubsetBuild { subset: &subset };
+                                let pending_dir = sb.run(opts).await?;
+                                pending_dir.finalize(cache::EntryMeta {
+                                    inner: MetaInner::Subset(subset.as_spec(opts.graph)),
+                                    fetched: false,
+                                    origin: Some(build.from.as_ref().clone()),
+                                    ..Default::default()
+                                })?;
+
+                                opts.cache.read_dir(&subset_hash)?
+                            }
+                            Err(e) => {
+                                return Err(e.into());
+                            }
+                        }
+                        .path()
+                        .to_path_buf(),
+                    );
+                }
+            }
         }
         Ok(dependencies)
     }
