@@ -5,6 +5,8 @@ use std::fmt;
 use std::io::Read;
 use std::path::{Path, StripPrefixError};
 
+const ZSTD_LEVEL: i32 = 10;
+
 /// Errors which can occur when working with archives.
 #[derive(Debug)]
 pub enum ArchiveError {
@@ -64,7 +66,7 @@ pub fn compress_dir<P: AsRef<Path>>(dir: P) -> Result<(std::fs::File, [u8; 32]),
     let mut hasher = Sha256::new();
     {
         let mut w = super::Tee::new(&mut tar_file, &mut hasher);
-        let encoder = zstd::stream::Encoder::new(&mut w, 3)?;
+        let encoder = zstd::stream::Encoder::new(&mut w, ZSTD_LEVEL)?;
         let mut tar_builder = tar::Builder::new(encoder);
         tar_builder.append_dir_all(".", dir)?;
         tar_builder.into_inner()?.finish()?;

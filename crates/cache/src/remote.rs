@@ -70,18 +70,16 @@ impl RemoteCache<Storage> {
         Self::new(storage, url).await
     }
 
-    /// Uploads the given artifact to the GCS bucket, staging it for inclusion
+    /// Upserts the given artifact to the GCS bucket, staging it for inclusion
     /// in the index.
     ///
     /// Call [RemoteCache::finish_uploads] when all your uploads are done to finish the index.
     pub async fn upload(
         &mut self,
         spec_hash: &SpecHash,
-        cache: &Cache<LocalDir>,
+        artifact: (std::fs::File, [u8; 32]),
     ) -> Result<(), Error<GcsError>> {
-        let cache_dir = cache.read_dir(spec_hash).map_err(Error::Cache)?;
-
-        let (tar_file, sha256) = archive::compress_dir(cache_dir.path()).map_err(Error::IO)?;
+        let (tar_file, sha256) = artifact;
         let indexed_sha = self.index.sha256(spec_hash);
         if indexed_sha == Some(sha256) {
             return Ok(()); // Cached one is up to date.
