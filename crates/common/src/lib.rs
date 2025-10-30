@@ -154,8 +154,21 @@ pub fn hardlink_dir_contents(src: &Path, dst: &Path) -> Result<(), HardlinkError
 
             let target = fs::read_link(&path)
                 .map_err(|e| HardlinkError::IO("read symlink", path.to_path_buf(), e))?;
-            symlink(&target, &dst_path)
-                .map_err(|e| HardlinkError::IO("create symlink", dst_path, e))?;
+            match symlink(&target, &dst_path) {
+                Ok(v) => Ok(v),
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        warn!(
+                            "Not symlinking {} => {}, already exists",
+                            path.display(),
+                            dst_path.display()
+                        );
+                        Ok(())
+                    } else {
+                        Err(HardlinkError::IO("create symlink", dst_path, e))
+                    }
+                }
+            }?;
         }
     }
 
