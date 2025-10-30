@@ -53,19 +53,17 @@ pub async fn cmd_upload_cache(args: UploadArgs, ctx: &mut Context) -> Result<(),
                 .for_each_with(tx, |tx, data| tx.send(data).unwrap())
         });
 
-        s.spawn(move || {
-            for (bsr, (tar_file, sha256)) in rx {
-                let build = graph.get(&bsr).unwrap();
-                let bsh = graph.spec_hash(&bsr);
-                if block_on(remote_cache.upload(&bsh, (tar_file, sha256))).unwrap() {
-                    eprintln!("Uploaded {} [{}]", build.name, bsh.0.to_hex());
-                } else {
-                    eprintln!("{} [{}] is up to date", build.name, bsh.0.to_hex());
-                }
+        for (bsr, (tar_file, sha256)) in rx {
+            let build = graph.get(&bsr).unwrap();
+            let bsh = graph.spec_hash(&bsr);
+            if block_on(remote_cache.upload(&bsh, (tar_file, sha256))).unwrap() {
+                eprintln!("Uploaded {} [{}]", build.name, bsh.0.to_hex());
+            } else {
+                eprintln!("{} [{}] is up to date", build.name, bsh.0.to_hex());
             }
+        }
 
-            block_on(remote_cache.finish_uploads()).unwrap();
-        });
+        block_on(remote_cache.finish_uploads()).unwrap();
     });
 
     Ok(())
