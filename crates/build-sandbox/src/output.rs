@@ -55,6 +55,8 @@ impl OutputValidator {
 
             found_files.extend(resolved_outputs);
         }
+        found_files.sort();
+        found_files.dedup();
 
         // Copy enumerated output files to final destination
         for output_file in &found_files {
