@@ -436,6 +436,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-indicatif",
  "url",
 ]
 

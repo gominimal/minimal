@@ -6,6 +6,9 @@ use common::fetchers::*;
 use google_cloud_storage::{Error as GcsError, client::Storage};
 use reqwest::{Client, Error as ReqwestError};
 
+use tracing_indicatif::span_ext::IndicatifSpanExt;
+use tracing_indicatif::style::ProgressStyle;
+
 /// An error from operations with the remote cache.
 #[derive(Debug)]
 pub enum Error<BE: std::fmt::Debug> {
@@ -169,8 +172,19 @@ impl<B: FetchBackend> RemoteCache<B> {
         inner: MetaInner,
         origin: Option<SpecOrigin>,
         cache: &Cache<LocalDir>,
+        span_name: &str,
     ) -> Result<(), Error<<B::Response as FetchResponse>::Error>> {
         let sha256: [u8; 32] = self.index.sha256(spec_hash).ok_or(Error::NotFound)?;
+
+        let span = tracing::info_span!("materialize", "indicatif.pb_show" = tracing::field::Empty,);
+        span.pb_set_style(
+            &ProgressStyle::with_template(
+                "{prefix}Fetch: {msg:35!} [{wide_bar}]     {decimal_bytes:9!} / {decimal_total_bytes:9!}   ETA: {eta:5!}",
+            )
+            .unwrap()
+            .progress_chars("=> "),
+        );
+        span.pb_set_message(span_name);
 
         let req = self.backend.get(
             self.base
@@ -180,14 +194,20 @@ impl<B: FetchBackend> RemoteCache<B> {
 
         // Fetch the remote archive into a temporary file and seek to the beginning for decoding.
         let mut resp = self.backend.execute(req).await?;
+        span.pb_set_length(resp.content_length().unwrap());
+        let span_enter = span.enter();
+
         let mut tar_file = tempfile::tempfile().map_err(Error::IO)?;
         while let Some(chunk) = resp.chunk().await? {
+            span.pb_inc(chunk.len() as u64);
             tar_file.write_all(&chunk).map_err(Error::IO)?;
         }
         tar_file
             .seek(std::io::SeekFrom::Start(0))
             .map_err(Error::IO)?;
 
+        span.pb_set_style(&ProgressStyle::default_spinner());
+        span.pb_set_message(format!("Extract: {}", span_name).as_str());
         let cache_hnd = cache.write_dir(spec_hash).map_err(Error::Cache)?;
         archive::extract_compressed_tar(
             tar_file,
@@ -206,6 +226,8 @@ impl<B: FetchBackend> RemoteCache<B> {
             })
             .map_err(Error::Cache)?;
 
+        drop(span_enter);
+        drop(span);
         Ok(())
     }
 }

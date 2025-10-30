@@ -8,7 +8,7 @@ use decode::{Layer, LoadOptions};
 use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
 use graph::{DepGraph, Error as GraphError, PlanErr};
 use std::path::PathBuf;
-use tracing_indicatif::{IndicatifLayer, TickSettings};
+use tracing_indicatif::IndicatifLayer;
 use tracing_indicatif::{filter::IndicatifFilter, filter::hide_indicatif_span_fields};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use uuid::Uuid;
@@ -415,14 +415,9 @@ impl From<common::GlobError> for Error {
 #[tokio::main]
 async fn main() -> Result<()> {
     let indicatif_layer = IndicatifLayer::new()
-        .with_max_progress_bars(99, None)
-        .with_span_field_formatter(hide_indicatif_span_fields(fmt::format::DefaultFields::new()))
-        .with_tick_settings(TickSettings {
-            term_draw_hz: 10,
-            default_tick_interval: Some(std::time::Duration::from_millis(500)),
-            footer_tick_interval: None,
-            ..Default::default()
-        });
+        .with_max_progress_bars(32, None)
+        .with_span_field_formatter(hide_indicatif_span_fields(fmt::format::DefaultFields::new()));
+
     tracing_subscriber::registry()
         // .with(fmt::layer().with_target(false).with_thread_ids(true))
         .with(fmt::layer().with_writer(indicatif_layer.get_stderr_writer()))

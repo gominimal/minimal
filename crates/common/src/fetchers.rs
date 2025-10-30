@@ -41,6 +41,7 @@ pub trait FetchResponse: std::fmt::Debug + Sized {
     fn error_for_status(self) -> Result<Self, Self::Error>;
     fn is_success(&self) -> bool;
     fn status_code(&self) -> usize;
+    fn content_length(&self) -> Option<u64>;
 
     fn bytes(self) -> impl Future<Output = Result<Bytes, Self::Error>> + Send;
 
@@ -58,6 +59,9 @@ impl FetchResponse for Response {
     }
     fn error_for_status(self) -> Result<Self, Self::Error> {
         Response::error_for_status(self)
+    }
+    fn content_length(&self) -> Option<u64> {
+        self.content_length()
     }
 
     fn bytes(self) -> impl Future<Output = Result<Bytes, Self::Error>> {
@@ -187,6 +191,12 @@ impl FetchResponse for Result<google_cloud_storage::read_object::ReadObjectRespo
                     panic!("non-status error: {:?}", e);
                 }
             }
+        }
+    }
+    fn content_length(&self) -> Option<u64> {
+        match self {
+            Ok(s) => Some(s.object().size as u64),
+            Err(_) => None,
         }
     }
 }

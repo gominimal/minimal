@@ -201,18 +201,13 @@ pub async fn cmd_build_impl(
                         let _rt = tokio_runtime.enter();
                         let build = graph.get(&bsr).unwrap();
                         let (name, origin) = (&build.name, &build.from);
-                        let span = tracing::info_span!(
-                            "download_cached",
-                            "indicatif.pb_show" = tracing::field::Empty,
-                            "build" = name,
-                        );
-                        let _enter = span.enter();
 
                         futures::executor::block_on(remote_cache.materialize(
                             &graph.spec_hash(&bsr),
                             cache::MetaInner::Spec(name.clone()),
                             Some(origin.as_ref().clone()),
                             cache,
+                            name.as_str(),
                         ))
                         .unwrap();
                     });

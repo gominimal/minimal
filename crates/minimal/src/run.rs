@@ -66,13 +66,6 @@ async fn path_for_self_spec(
         }
         // In the remote cache but not the local cache.
         (_, Some(true)) => {
-            let span = tracing::info_span!(
-                "download_cached",
-                "indicatif.pb_show" = tracing::field::Empty,
-                "build" = input_build.name,
-            );
-            let _enter = span.enter();
-
             remote_cache
                 .as_ref()
                 .unwrap()
@@ -81,6 +74,7 @@ async fn path_for_self_spec(
                     MetaInner::Spec(input_build.name.clone()),
                     Some(input_build.from.as_ref().clone()),
                     cache,
+                    input_build.name.as_str(),
                 )
                 .await?;
             let cache_path = cache.read_dir(input_hash).unwrap().path().to_path_buf();
@@ -150,12 +144,6 @@ pub async fn materialize_subset(
         // In the remote cache but not the local cache.
         (_, Some(true)) => {
             let name = format!("{} (subset)", build.name);
-            let span = tracing::info_span!(
-                "download_cached",
-                "indicatif.pb_show" = tracing::field::Empty,
-                "build" = name,
-            );
-            let _enter = span.enter();
 
             remote_cache
                 .as_ref()
@@ -165,6 +153,7 @@ pub async fn materialize_subset(
                     MetaInner::Subset(subset_spec),
                     Some(graph.get(&subset.from).unwrap().from.as_ref().clone()),
                     cache,
+                    name.as_str(),
                 )
                 .await?;
             let cache_path = cache.read_dir(&subset_hash).unwrap().path().to_path_buf();
