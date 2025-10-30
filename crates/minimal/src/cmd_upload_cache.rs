@@ -1,9 +1,9 @@
-use std::sync::mpsc::channel;
-
 use crate::{Context, Error, PackagesArg};
 use common::archive;
 use futures::executor::block_on;
 use graph::Transitives;
+use std::sync::mpsc::channel;
+use tracing::info;
 
 #[derive(clap::Args)]
 pub struct UploadArgs {
@@ -42,7 +42,7 @@ pub async fn cmd_upload_cache(args: UploadArgs, ctx: &mut Context) -> Result<(),
                             archive::compress_dir(cache_dir.path(), Some(20)).unwrap(),
                         ))
                     } else {
-                        eprintln!(
+                        info!(
                             "Skipping unbuilt package {} [{}]",
                             build.name,
                             bsh.0.to_hex()
@@ -57,9 +57,9 @@ pub async fn cmd_upload_cache(args: UploadArgs, ctx: &mut Context) -> Result<(),
             let build = graph.get(&bsr).unwrap();
             let bsh = graph.spec_hash(&bsr);
             if block_on(remote_cache.upload(&bsh, (tar_file, sha256))).unwrap() {
-                eprintln!("Uploaded {} [{}]", build.name, bsh.0.to_hex());
+                info!("Uploaded {} [{}]", build.name, bsh.0.to_hex());
             } else {
-                eprintln!("{} [{}] is up to date", build.name, bsh.0.to_hex());
+                info!("{} [{}] is up to date", build.name, bsh.0.to_hex());
             }
         }
 
