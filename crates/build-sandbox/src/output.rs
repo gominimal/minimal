@@ -79,14 +79,40 @@ impl OutputValidator {
                 })?;
             }
 
-            fs::copy(output_file, &dest_path).map_err(|e| OutputError::FileOperation {
-                message: format!(
-                    "Failed to copy {} to {}: {}",
-                    output_file.display(),
-                    dest_path.display(),
-                    e
-                ),
-            })?;
+            if let Ok(link) = fs::read_link(output_file) {
+                let referenced_path = output_file.parent().unwrap().join(&link).canonicalize()?;
+                if referenced_path.starts_with(staging_dir) {
+                    // Symlink points to another output - safe to transcribe as a symlink.
+                    std::os::unix::fs::symlink(&link, &dest_path).map_err(|e| {
+                        OutputError::FileOperation {
+                            message: format!(
+                                "Failed to symlink {} to {}: {}",
+                                dest_path.display(),
+                                link.display(),
+                                e
+                            ),
+                        }
+                    })?;
+                } else {
+                    return Err(OutputError::FileOperation {
+                        message: format!(
+                            "unhandled: symlink target {} from {}",
+                            link.display(),
+                            dest_path.display()
+                        ),
+                    }
+                    .into());
+                }
+            } else {
+                fs::copy(output_file, &dest_path).map_err(|e| OutputError::FileOperation {
+                    message: format!(
+                        "Failed to copy {} to {}: {}",
+                        output_file.display(),
+                        dest_path.display(),
+                        e
+                    ),
+                })?;
+            }
 
             collected_outputs.push(dest_path);
         }
