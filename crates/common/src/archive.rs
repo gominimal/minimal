@@ -5,7 +5,7 @@ use std::fmt;
 use std::io::Read;
 use std::path::{Path, StripPrefixError};
 
-const ZSTD_LEVEL: i32 = 10;
+const ZSTD_LEVEL: i32 = 5;
 
 /// Errors which can occur when working with archives.
 #[derive(Debug)]
@@ -61,12 +61,15 @@ impl From<lzma_rs::error::Error> for ArchiveError {
 }
 
 /// Compresses files in the given directory into a .tar.zst, returning the compressed file + its sha256.
-pub fn compress_dir<P: AsRef<Path>>(dir: P) -> Result<(std::fs::File, [u8; 32]), std::io::Error> {
+pub fn compress_dir<P: AsRef<Path>>(
+    dir: P,
+    override_level: Option<i32>,
+) -> Result<(std::fs::File, [u8; 32]), std::io::Error> {
     let mut tar_file = tempfile::tempfile()?;
     let mut hasher = Sha256::new();
     {
         let mut w = super::Tee::new(&mut tar_file, &mut hasher);
-        let encoder = zstd::stream::Encoder::new(&mut w, ZSTD_LEVEL)?;
+        let encoder = zstd::stream::Encoder::new(&mut w, override_level.unwrap_or(ZSTD_LEVEL))?;
         let mut tar_builder = tar::Builder::new(encoder);
         tar_builder.append_dir_all(".", dir)?;
         tar_builder.into_inner()?.finish()?;
@@ -320,7 +323,7 @@ mod tests {
         std::fs::write(temp_dir.path().join("subdir/file2.txt"), b"Content 2")?;
 
         // Compress the directory
-        let (mut compressed_file, hash) = super::compress_dir(temp_dir.path())?;
+        let (mut compressed_file, hash) = super::compress_dir(temp_dir.path(), None)?;
 
         // Verify we got a hash
         assert_eq!(hash.len(), 32);

@@ -49,7 +49,7 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs, ctx: &mut Context) -> Resu
         let archive_name = format!("{}.tar.zst", package_hash.0.to_hex());
 
         let (tar_file, sha256) =
-            common::archive::compress_dir(cache_dir).map_err(anyhow::Error::from)?;
+            common::archive::compress_dir(cache_dir, Some(20)).map_err(anyhow::Error::from)?;
         let hash_hex = hex::encode(sha256);
         info!("sha256({}) = {}", prebuilt_name, hash_hex);
 

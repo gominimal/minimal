@@ -71,18 +71,18 @@ impl RemoteCache<Storage> {
     }
 
     /// Upserts the given artifact to the GCS bucket, staging it for inclusion
-    /// in the index.
+    /// in the index. Returns false if the given artifact is already in the index.
     ///
     /// Call [RemoteCache::finish_uploads] when all your uploads are done to finish the index.
     pub async fn upload(
         &mut self,
         spec_hash: &SpecHash,
         artifact: (std::fs::File, [u8; 32]),
-    ) -> Result<(), Error<GcsError>> {
+    ) -> Result<bool, Error<GcsError>> {
         let (tar_file, sha256) = artifact;
         let indexed_sha = self.index.sha256(spec_hash);
         if indexed_sha == Some(sha256) {
-            return Ok(()); // Cached one is up to date.
+            return Ok(false); // Cached one is up to date.
         }
 
         self.backend
@@ -98,7 +98,7 @@ impl RemoteCache<Storage> {
             .await?;
 
         self.uploaded.push((spec_hash.clone(), sha256));
-        Ok(())
+        Ok(true)
     }
 
     /// Pushes a new index to the GCS bucket, complete with all the previous entries
