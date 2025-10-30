@@ -1,6 +1,5 @@
 use crate::{Context, Error, PackagesArg};
 use common::archive;
-use futures::executor::block_on;
 use graph::Transitives;
 use std::sync::mpsc::channel;
 use tracing::info;
@@ -17,8 +16,8 @@ pub async fn cmd_upload_cache(args: UploadArgs, ctx: &mut Context) -> Result<(),
     let upload_bsrs: Vec<_> = Transitives::for_toplevels(&graph, graph.top_levels.to_vec(), false);
 
     let graph = &graph;
+    let handle = tokio::runtime::Handle::current();
     std::thread::scope(move |s| {
-        let mut remote_cache = block_on(ctx.remote_cache()).unwrap();
         let (tx, rx) = channel();
 
         use rayon::prelude::*;
@@ -39,7 +38,7 @@ pub async fn cmd_upload_cache(args: UploadArgs, ctx: &mut Context) -> Result<(),
 
                         Some((
                             *bsr,
-                            archive::compress_dir(cache_dir.path(), Some(20)).unwrap(),
+                            archive::compress_dir(cache_dir.path(), Some(16)).unwrap(),
                         ))
                     } else {
                         info!(
@@ -50,20 +49,27 @@ pub async fn cmd_upload_cache(args: UploadArgs, ctx: &mut Context) -> Result<(),
                         None
                     }
                 })
-                .for_each_with(tx, |tx, data| tx.send(data).unwrap())
+                .for_each_with(tx, |tx, data| tx.send(data).unwrap());
         });
 
-        for (bsr, (tar_file, sha256)) in rx {
-            let build = graph.get(&bsr).unwrap();
-            let bsh = graph.spec_hash(&bsr);
-            if block_on(remote_cache.upload(&bsh, (tar_file, sha256))).unwrap() {
-                info!("Uploaded {} [{}]", build.name, bsh.0.to_hex());
-            } else {
-                info!("{} [{}] is up to date", build.name, bsh.0.to_hex());
+        s.spawn(move || {
+            let mut remote_cache = handle.block_on(ctx.remote_cache()).unwrap();
+            for (bsr, (tar_file, sha256)) in rx {
+                let build = graph.get(&bsr).unwrap();
+                let bsh = graph.spec_hash(&bsr);
+                if handle
+                    .block_on(remote_cache.upload(&bsh, (tar_file, sha256)))
+                    .unwrap()
+                {
+                    info!("Uploaded {} [{}]", build.name, bsh.0.to_hex());
+                } else {
+                    info!("{} [{}] is up to date", build.name, bsh.0.to_hex());
+                }
             }
-        }
-
-        block_on(remote_cache.finish_uploads()).unwrap();
+            handle.block_on(remote_cache.finish_uploads()).unwrap();
+        })
+        .join()
+        .unwrap();
     });
 
     Ok(())
