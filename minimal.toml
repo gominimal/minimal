@@ -1,0 +1,3 @@
+[base]
+repo = "git@github.com:gominimal/std.git"
+branch = "main"

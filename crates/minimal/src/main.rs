@@ -3,7 +3,7 @@
 use anyhow::{Result, bail};
 use cache::{Cache, LocalDir, RemoteCache, RemoteError};
 use clap::{Args, Parser, Subcommand};
-use common::{SpecOrigin, repo_spec::GitRef};
+use common::{SpecOrigin, mfile, repo_spec::GitRef};
 use decode::{Layer, LoadOptions};
 use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
 use graph::{DepGraph, Error as GraphError, PlanErr};
@@ -148,6 +148,7 @@ pub struct Context {
     pub no_cache: bool,
     pub no_fetch: bool,
     pub num_parallel_builds: usize,
+    pub mfile: mfile::File,
 
     spec_origin: SpecOrigin,
     paths: PathConfig,
@@ -161,6 +162,15 @@ impl Context {
     pub fn new(args: GlobalArgs) -> Result<Self, Error> {
         let paths = Self::make_path_config(&args);
         paths.ensure_directories().map_err(anyhow::Error::from)?;
+
+        // Load the minimalfile.
+        let minimal_file = mfile::File::from_dir(std::env::current_dir().unwrap())?;
+        let base_repo = &minimal_file.base.repo;
+        let base_target = minimal_file
+            .base
+            .branch
+            .to_owned()
+            .unwrap_or_else(|| "main".to_string());
 
         // Setup VCS manager
         let mut vcs = checkouts::Manager::new(paths.vcs_dir()).map_err(anyhow::Error::from)?;
@@ -192,16 +202,13 @@ impl Context {
         let spec_origin = match args.packages_dir {
             None => {
                 let (dir, git_hash) = vcs
-                    .checkout_of(
-                        "git@github.com:gominimal/pkgs.git",
-                        checkouts::GitRef::Branch("main".to_string()),
-                    )
+                    .checkout_of(base_repo, checkouts::GitRef::Branch(base_target.clone()))
                     .map_err(anyhow::Error::from)?;
                 paths = paths.with_packages_dir(dir.join("packages"));
                 SpecOrigin::Repo(common::repo_spec::Repo::Git {
-                    url: "git@github.com:gominimal/pkgs.git".to_string(),
+                    url: base_repo.clone(),
                     rev: git_hash,
-                    tracking: Some(GitRef::Branch("main".to_string())),
+                    tracking: Some(GitRef::Branch(base_target)),
                 })
             }
             Some(dir) => {
@@ -214,6 +221,7 @@ impl Context {
             no_cache: args.no_cache,
             no_fetch: args.no_fetch,
             num_parallel_builds: args.num_parallel_builds,
+            mfile: minimal_file,
 
             spec_origin,
             paths,
@@ -362,6 +370,7 @@ impl PackagesArg {
 /// Error variants for CLI subcommand results.
 #[allow(clippy::large_enum_variant)]
 pub enum Error {
+    MFile(mfile::Error),
     Graph(GraphError),
     Other(anyhow::Error),
     PlanErr(DepGraph, PlanErr),
@@ -372,6 +381,7 @@ impl Error {
         match self {
             Error::Graph(e) => e.report_to_stderr(),
             Error::Other(e) => eprintln!("{:?}", e),
+            Error::MFile(e) => eprintln!("minimal file: {:?}", e),
             Error::PlanErr(graph, err) => match err {
                 PlanErr::Cycles(cycles) => {
                     eprintln!(
@@ -393,6 +403,11 @@ impl Error {
     }
 }
 
+impl From<mfile::Error> for Error {
+    fn from(e: mfile::Error) -> Self {
+        Self::MFile(e)
+    }
+}
 impl From<GraphError> for Error {
     fn from(e: GraphError) -> Self {
         Self::Graph(e)
