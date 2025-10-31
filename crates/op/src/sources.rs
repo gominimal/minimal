@@ -38,6 +38,13 @@ impl<'a, SF: SourceFetcher> Runnable for SourceLoad<'a, SF> {
     type Result = Materialized;
 
     async fn run<'b>(&mut self, opts: &Options<'b>) -> Result<Self::Result, Error> {
+        let span = tracing::info_span!(
+            "source_fetch",
+            "indicatif.pb_show" = tracing::field::Empty,
+            "from" = format!("{:?}", self.source.from),
+        );
+        let _enter = span.enter();
+
         use graph::dep_graph::SourceFetch;
         match &self.source.from {
             SourceFetch::URL(url) => {
