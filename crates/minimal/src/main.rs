@@ -148,9 +148,11 @@ pub struct Context {
     pub no_cache: bool,
     pub no_fetch: bool,
     pub num_parallel_builds: usize,
-    pub mfile: mfile::File,
 
-    spec_origin: SpecOrigin,
+    packages_dir_and_origin: Option<(PathBuf, SpecOrigin)>,
+
+    mfile: Option<mfile::File>,
+    packages_dir_override: Option<PathBuf>,
     paths: PathConfig,
     cache: Cache<LocalDir>,
     vcs: checkouts::Manager,
@@ -162,15 +164,6 @@ impl Context {
     pub fn new(args: GlobalArgs) -> Result<Self, Error> {
         let paths = Self::make_path_config(&args);
         paths.ensure_directories().map_err(anyhow::Error::from)?;
-
-        // Load the minimalfile.
-        let minimal_file = mfile::File::from_dir(std::env::current_dir().unwrap())?;
-        let base_repo = &minimal_file.base.repo;
-        let base_target = minimal_file
-            .base
-            .branch
-            .to_owned()
-            .unwrap_or_else(|| "main".to_string());
 
         // Setup VCS manager
         let mut vcs = checkouts::Manager::new(paths.vcs_dir()).map_err(anyhow::Error::from)?;
@@ -187,7 +180,7 @@ impl Context {
         };
         let cache = Cache::at_dir(cache_dir).map_err(anyhow::Error::from)?;
 
-        let mut paths = paths.with_stdlib_dir(match args.stdlib_dir {
+        let paths = paths.with_stdlib_dir(match args.stdlib_dir {
             None => {
                 vcs.checkout_of(
                     "git@github.com:gominimal/std.git",
@@ -199,31 +192,15 @@ impl Context {
             Some(dir) => dir,
         });
 
-        let spec_origin = match args.packages_dir {
-            None => {
-                let (dir, git_hash) = vcs
-                    .checkout_of(base_repo, checkouts::GitRef::Branch(base_target.clone()))
-                    .map_err(anyhow::Error::from)?;
-                paths = paths.with_packages_dir(dir.join("packages"));
-                SpecOrigin::Repo(common::repo_spec::Repo::Git {
-                    url: base_repo.clone(),
-                    rev: git_hash,
-                    tracking: Some(GitRef::Branch(base_target)),
-                })
-            }
-            Some(dir) => {
-                paths = paths.with_packages_dir(dir.clone());
-                SpecOrigin::from_dir(dir)
-            }
-        };
-
         Ok(Self {
             no_cache: args.no_cache,
             no_fetch: args.no_fetch,
             num_parallel_builds: args.num_parallel_builds,
-            mfile: minimal_file,
+            packages_dir_override: args.packages_dir,
 
-            spec_origin,
+            packages_dir_and_origin: None,
+            mfile: None,
+
             paths,
             cache,
             vcs,
@@ -269,6 +246,52 @@ impl Context {
         &self.paths
     }
 
+    /// Returns the path to the packages directory as well as info about where its from.
+    ///
+    /// This is computed either from the `--packagess-dir` argument or the minimal file.
+    /// The result is cached for future invocations.
+    fn packages_dir_and_origin(&mut self) -> Result<(PathBuf, SpecOrigin), Error> {
+        if let Some(dir) = &self.packages_dir_override {
+            return Ok((dir.clone(), SpecOrigin::from_dir(dir)));
+        }
+        if let Some(res) = &self.packages_dir_and_origin {
+            return Ok(res.clone());
+        }
+
+        let minimal_file = self.minimal_file()?.clone();
+        let base_target = minimal_file
+            .base
+            .branch
+            .to_owned()
+            .unwrap_or_else(|| "main".to_string());
+
+        let (dir, git_hash) = self
+            .vcs
+            .checkout_of(
+                &minimal_file.base.repo,
+                checkouts::GitRef::Branch(base_target.clone()),
+            )
+            .map_err(anyhow::Error::from)?;
+
+        self.packages_dir_and_origin = Some((
+            dir.join("packages"),
+            SpecOrigin::Repo(common::repo_spec::Repo::Git {
+                url: minimal_file.base.repo,
+                rev: git_hash,
+                tracking: Some(GitRef::Branch(base_target)),
+            }),
+        ));
+        Ok(self.packages_dir_and_origin.as_ref().unwrap().clone())
+    }
+
+    /// Returns the decoded minimal-file, reading it from disk if necessary.
+    pub fn minimal_file(&mut self) -> Result<&mfile::File, Error> {
+        if self.mfile.is_none() {
+            self.mfile = Some(mfile::File::from_dir(std::env::current_dir().unwrap())?);
+        }
+        Ok(self.mfile.as_ref().unwrap())
+    }
+
     /// Builds and returns a remote cache with default configurations.
     pub async fn remote_cache(&self) -> Result<RemoteCache<GcsStorage>, RemoteError<GcsError>> {
         RemoteCache::new_with_gcs_bucket(
@@ -279,45 +302,49 @@ impl Context {
     }
 
     /// Returns a [DepGraph] with the given package and its transitive dependencies loaded.
-    pub fn graph_from_package_name(&self, package_name: &str) -> Result<DepGraph, GraphError> {
+    pub fn graph_from_package_name(&mut self, package_name: &str) -> Result<DepGraph, Error> {
+        let (packages_dir, packages_origin) = self.packages_dir_and_origin()?;
         let layer = Layer::new_with_pkgs(
             &[package_name.to_owned()],
-            self.paths.packages_dir().unwrap(),
+            packages_dir,
             &LoadOptions {
                 minimal_lib_path: self.stdlib_dir(),
-                from: self.spec_origin.clone(),
+                from: packages_origin,
             },
-        )?;
+        )
+        .map_err(|e| Error::Graph(GraphError::Decode(e)))?;
 
         Ok(DepGraph::new().ingest(layer))
     }
 
     #[tracing::instrument]
-    pub fn graph_from_package_names(&self, names: &[String]) -> Result<DepGraph, GraphError> {
-        let packages_dir = self.paths.packages_dir().unwrap();
+    pub fn graph_from_package_names(&mut self, names: &[String]) -> Result<DepGraph, Error> {
+        let (packages_dir, packages_origin) = self.packages_dir_and_origin()?;
 
         let layer = Layer::new_with_pkgs(
             names,
             packages_dir,
             &LoadOptions {
                 minimal_lib_path: self.stdlib_dir(),
-                from: self.spec_origin.clone(),
+                from: packages_origin,
             },
-        )?;
+        )
+        .map_err(|e| Error::Graph(GraphError::Decode(e)))?;
 
         Ok(DepGraph::new().ingest(layer))
     }
 
-    pub fn graph_from_all_packages(&self) -> Result<DepGraph, GraphError> {
-        let packages_dir = self.paths.packages_dir().unwrap();
+    pub fn graph_from_all_packages(&mut self) -> Result<DepGraph, Error> {
+        let (packages_dir, packages_origin) = self.packages_dir_and_origin()?;
 
         let layer = Layer::new_with_all_pkgs(
             packages_dir,
             &LoadOptions {
                 minimal_lib_path: self.stdlib_dir(),
-                from: self.spec_origin.clone(),
+                from: packages_origin,
             },
-        )?;
+        )
+        .map_err(|e| Error::Graph(GraphError::Decode(e)))?;
 
         Ok(DepGraph::new().ingest(layer))
     }
@@ -343,7 +370,7 @@ impl std::fmt::Display for PackagesArg {
 
 impl PackagesArg {
     /// Returns a [DepGraph] containing the named packages, or all packages if none were specified.
-    pub fn graph(&self, ctx: &mut Context) -> Result<DepGraph, graph::Error> {
+    pub fn graph(&self, ctx: &mut Context) -> Result<DepGraph, Error> {
         match self.packages {
             Some(ref packages) => match packages.len() {
                 0 => ctx.graph_from_all_packages(),
@@ -369,6 +396,7 @@ impl PackagesArg {
 
 /// Error variants for CLI subcommand results.
 #[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
 pub enum Error {
     MFile(mfile::Error),
     Graph(GraphError),
