@@ -347,7 +347,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "minimal_spongebob_community_neoeinstein-prost",
- "prost 0.13.5",
+ "prost 0.14.1",
  "prost-reflect",
  "tempfile",
  "thiserror",
@@ -502,9 +502,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.5.50"
+version = "4.5.51"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c2cfd7bf8a6017ddaa4e32ffe7403d547790db06bd171c1c53926faab501623"
+checksum = "4c26d721170e0295f191a69bd9a1f93efcdb0aff38684b61ab5750468972e5f5"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -512,9 +512,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.5.50"
+version = "4.5.51"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a4c05b9e80c5ccd3a7ef080ad7b6ba7d6fc00a985b8b157197075677c82c7a0"
+checksum = "75835f0c7bf681bfd05abe44e965760fea999a5286c6eb2d59883634fd02011a"
 dependencies = [
  "anstream",
  "anstyle",
@@ -1471,8 +1471,8 @@ dependencies = [
 
 [[package]]
 name = "hakoniwa"
-version = "1.2.2"
-source = "git+https://github.com/souk4711/hakoniwa?branch=main#b54ccd17cf6e41a8690fc5df1ea501f89906d308"
+version = "1.2.3"
+source = "git+https://github.com/souk4711/hakoniwa?branch=main#5c8c26ca7b0f85ba9fac08b93072bd4dc72d7ca8"
 dependencies = [
  "bincode",
  "bitflags",
@@ -2344,9 +2344,9 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nickel-lang-core"
-version = "0.15.1"
+version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42176ad29373c1c273c9f21737a2e5e0561fe72389c298d7f9fd54ab1c23aeb3"
+checksum = "94cdfc3035139574c1c362e19d62c411da194ec5b541c9ebb4716393ce83af1f"
 dependencies = [
  "bumpalo",
  "codespan",
@@ -2912,13 +2912,13 @@ dependencies = [
 
 [[package]]
 name = "prost-reflect"
-version = "0.15.3"
+version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37587d5a8a1b3dc9863403d084fc2254b91ab75a702207098837950767e2260b"
+checksum = "89a3ac73ec9a9118131a4594c9d336631a07852220a1d0ae03ee36b04503a063"
 dependencies = [
  "logos",
- "prost 0.13.5",
- "prost-types 0.13.5",
+ "prost 0.14.1",
+ "prost-types 0.14.1",
 ]
 
 [[package]]
