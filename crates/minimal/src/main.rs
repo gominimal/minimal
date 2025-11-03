@@ -63,14 +63,13 @@ enum Command {
     Check(CheckArgs),
     /// Uploads the specified packages and their transitive needs to the cache.
     UploadCache(UploadArgs),
-    /// Updates refreshes local checkouts of the minimal package & standard library.
+    /// Updates refreshes local checkouts of the minimal packages & standard library.
     Update,
     /// Executes the build for a package, using stale dependencies.
     #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
     PatchedBuild(PatchedBuildArgs),
-    /// Runs a command using the given packages, in the current working directory.
+    /// Runs a task specified in `minimal.toml`.
     #[cfg(target_os = "linux")]
-    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
     Run(RunArgs),
 }
 
@@ -248,7 +247,7 @@ impl Context {
 
     /// Returns the path to the packages directory as well as info about where its from.
     ///
-    /// This is computed either from the `--packagess-dir` argument or the minimal file.
+    /// This is computed either from the `--packages-dir` argument or the minimal file.
     /// The result is cached for future invocations.
     fn packages_dir_and_origin(&mut self) -> Result<(PathBuf, SpecOrigin), Error> {
         if let Some(dir) = &self.packages_dir_override {
