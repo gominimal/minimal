@@ -1,3 +1,17 @@
 [base]
 repo = "git@github.com:gominimal/pkgs.git"
 branch = "main"
+
+[envs.dev]
+packages = ["base", "bash", "claude-code", "rust", "coreutils", "diffutils", "git"]
+
+[tasks.env-smoketest]
+env = "dev"
+inherit_cwd = true
+cmd = """
+bash -c "echo 'env:' && env && echo \\"pwd: $(pwd)\\""
+"""
+
+[tasks.claude]
+env = "dev"
+cmd = "claude"

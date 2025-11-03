@@ -52,12 +52,40 @@ pub struct Env {
     pub vars: HashMap<String, String>,
 }
 
+/// A task, defined in a `[tasks.<task_name>]` section of [File].
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct Task {
+    /// The name of the environment to use.
+    pub env: String,
+    /// The command invocation to use.
+    pub cmd: String,
+    /// Whether to use the current working directory of the invocation, instead
+    /// of the default which is the directory containing the minimal file.
+    #[serde(default)]
+    pub inherit_cwd: bool,
+}
+
+impl Task {
+    /// returns the program this task exec's, and the args to use.
+    pub fn cmd_and_args(&self) -> (String, Vec<String>) {
+        let mut cmd = shlex::Shlex::new(&self.cmd);
+        let mut exec = cmd.next().unwrap();
+        if !(exec.starts_with("/") || exec.starts_with("./")) {
+            exec = format!("/bin/{}", exec);
+        }
+
+        (exec, cmd.collect())
+    }
+}
+
 /// The loaded representation of the `minimal.toml` file.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct File {
     pub base: Base,
     #[serde(default)]
     pub envs: HashMap<String, Env>,
+    #[serde(default)]
+    pub tasks: HashMap<String, Task>,
 
     #[serde(skip)]
     from: Option<PathBuf>,
@@ -94,6 +122,14 @@ impl File {
             }
         }
     }
+
+    /// Returns the path to the directory where the minimal file is located.
+    pub fn dir_path(&self) -> Option<&Path> {
+        match &self.from {
+            None => None,
+            Some(fname) => fname.parent(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -112,6 +148,10 @@ mod tests {
 
             [envs.test]
             packages = ["base", "go"]
+
+            [tasks.test]
+            env = "test"
+            cmd = "go test ./..."
             "#
         })
         .unwrap();
@@ -128,6 +168,15 @@ mod tests {
                     Env {
                         packages: vec!["base".to_string(), "go".to_string()],
                         vars: HashMap::new(),
+                    }
+                )]
+                .into(),
+                tasks: [(
+                    "test".to_string(),
+                    Task {
+                        env: "test".to_string(),
+                        cmd: "go test ./...".to_string(),
+                        inherit_cwd: false,
                     }
                 )]
                 .into(),
@@ -154,12 +203,29 @@ mod tests {
         .unwrap();
 
         // test from `./`, also check if `from` is set
-        assert!(matches!(
-            File::from_dir(dir.path()),
-            Ok(File { from: Some(_), .. })
-        ));
+        let mfile = File::from_dir(dir.path());
+        assert!(matches!(mfile, Ok(File { from: Some(_), .. })));
+        assert_eq!(mfile.unwrap().dir_path().unwrap(), dir.path());
 
         std::fs::create_dir(dir.path().join("nested")).unwrap();
         assert!(File::from_dir(dir.path().join("nested")).is_ok()); // test from `./nested`
+    }
+
+    #[test]
+    fn task_cmd_and_args() {
+        let t: Task = toml::from_str(indoc! {
+            r#"
+            env = "test"
+            cmd = "go test ./..."
+            "#
+        })
+        .unwrap();
+        assert_eq!(
+            t.cmd_and_args(),
+            (
+                "/bin/go".to_string(),
+                vec!["test".to_string(), "./...".to_string()]
+            )
+        );
     }
 }
