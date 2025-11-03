@@ -68,7 +68,7 @@ pub struct Task {
 impl Task {
     /// returns the program this task exec's, and the args to use.
     pub fn cmd_and_args(&self) -> (String, Vec<String>) {
-        let mut cmd = shlex::Shlex::new(&self.cmd);
+        let mut cmd = shlex::Shlex::new(self.cmd.trim());
         let mut exec = cmd.next().unwrap();
         if !(exec.starts_with("/") || exec.starts_with("./")) {
             exec = format!("/bin/{}", exec);

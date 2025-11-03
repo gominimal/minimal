@@ -3,7 +3,12 @@ repo = "git@github.com:gominimal/pkgs.git"
 branch = "main"
 
 [envs.dev]
-packages = ["base", "bash", "claude-code", "rust", "coreutils", "diffutils", "git"]
+env_vars.CC = "gcc"
+packages = [
+    "bash", "claude-code",
+    "rust", "gcc", "binutils", "git",
+    "pkgconf", "openssl", "linux_headers", "zlib"
+]
 
 [tasks.env-smoketest]
 env = "dev"
@@ -15,3 +20,7 @@ bash -c "echo 'env:' && env && echo \\"pwd: $(pwd)\\""
 [tasks.claude]
 env = "dev"
 cmd = "claude"
+
+[tasks.test]
+env = "dev"
+cmd = "cargo --config target.x86_64-unknown-linux-gnu.linker=\\\"gcc\\\" test"
