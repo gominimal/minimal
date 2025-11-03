@@ -1,5 +1,6 @@
 //! Finding & reading the `minimal.toml` file.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::{env, fmt};
 
@@ -42,10 +43,21 @@ pub struct Base {
     pub branch: Option<String>,
 }
 
+/// An environment, defined in a `[envs.<env_name>]` section of [File].
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct Env {
+    #[serde(default)]
+    pub packages: Vec<String>,
+    #[serde(default, alias = "env_vars")]
+    pub vars: HashMap<String, String>,
+}
+
 /// The loaded representation of the `minimal.toml` file.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct File {
     pub base: Base,
+    #[serde(default)]
+    pub envs: HashMap<String, Env>,
 
     #[serde(skip)]
     from: Option<PathBuf>,
@@ -97,6 +109,9 @@ mod tests {
             [base]
             repo = "https://github.com/gominimal/pkgs"
             branch = "main"
+
+            [envs.test]
+            packages = ["base", "go"]
             "#
         })
         .unwrap();
@@ -108,6 +123,14 @@ mod tests {
                     repo: "https://github.com/gominimal/pkgs".to_string(),
                     branch: Some("main".to_string()),
                 },
+                envs: [(
+                    "test".to_string(),
+                    Env {
+                        packages: vec!["base".to_string(), "go".to_string()],
+                        vars: HashMap::new(),
+                    }
+                )]
+                .into(),
                 from: None,
             }
         )
