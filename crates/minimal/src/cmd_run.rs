@@ -1,33 +1,46 @@
+use crate::Context;
 use crate::Error;
-use crate::{Context, PackagesArg};
+use anyhow::anyhow;
 use graph::Transitives;
 
 use hakoniwa::Container;
 
 #[derive(Debug, clap::Args)]
 pub struct RunArgs {
-    #[command(flatten)]
-    packages: PackagesArg,
-
     /// Any additional directories to bind-mount read-write.
     #[arg(long, required = false)]
     rw_dir: Vec<String>,
 
-    /// Environment variables to set
-    #[arg(long, required = false)]
-    env: Vec<String>,
-
-    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-    args: Vec<String>,
+    task_name: String,
 }
 
 pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
-    crate::enforce_science_mode()?;
-
-    let graph = if args.packages.packages.is_none() {
-        ctx.graph_from_package_name("base")?
+    let mfile = ctx.minimal_file()?;
+    let task = match mfile.tasks.get(&args.task_name) {
+        Some(t) => t.clone(),
+        None => {
+            return Err(Error::Other(anyhow!(
+                "no such task named '{}'",
+                args.task_name
+            )));
+        }
+    };
+    let env = match mfile.envs.get(&task.env) {
+        Some(e) => e.clone(),
+        None => {
+            return Err(Error::Other(anyhow!("no such env named '{}'", task.env)));
+        }
+    };
+    let cwd = if task.inherit_cwd {
+        std::env::current_dir().unwrap()
     } else {
-        args.packages.graph(ctx)?
+        mfile.dir_path().unwrap().to_path_buf()
+    };
+
+    let graph = match env.packages.len() {
+        0 => ctx.graph_from_package_name("base")?,
+        1 => ctx.graph_from_package_name(&env.packages[0])?,
+        _ => ctx.graph_from_package_names(&env.packages)?,
     };
     let cache = ctx.local_cache();
     // Make sure the packages are built
@@ -44,7 +57,6 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
     }
 
     // Create the cwd in the rootfs, and bindmount the cwd to it
-    let cwd = std::env::current_dir().unwrap();
     std::fs::create_dir_all(base.path().join(cwd.clone())).map_err(anyhow::Error::from)?;
 
     let mut container = Container::new();
@@ -60,15 +72,18 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
         std::fs::create_dir_all(base.path().join(rw_mount.clone())).map_err(anyhow::Error::from)?;
         container.bindmount_rw(&rw_mount, &rw_mount);
     }
+    // TODO: Support bind-mounting files using the below setup
+    // container.mount(
+    //     "/home/xxx/.claude.json",
+    //     "/home/xxx/.claude.json",
+    //     "",
+    //     hakoniwa::MountOptions::BIND,
+    // );
 
-    let command = if args.args[0].starts_with("/") || args.args[0].starts_with("./") {
-        args.args[0].clone()
-    } else {
-        format!("/bin/{}", args.args[0])
-    };
+    let (command, args) = task.cmd_and_args();
     let mut cmd = container.command(&command);
+    cmd.args(args);
 
-    cmd.args(args.args.iter().skip(1));
     cmd.current_dir(&cwd);
     cmd.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .env(
@@ -76,7 +91,8 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
             std::env::var("HOME").unwrap_or("/".to_string()).as_str(),
         )
         .env("LANG", "en_US.utf8")
-        .env("LC_ALL", "en_US.utf8");
+        .env("LC_ALL", "en_US.utf8")
+        .env("PWD", cwd.to_str().unwrap());
     if let Ok(term) = std::env::var("TERM") {
         cmd.env("TERM", term.as_str());
     }
@@ -86,15 +102,9 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
     if let Ok(lsc) = std::env::var("LS_COLORS") {
         cmd.env("LS_COLORS", lsc.as_str());
     }
-    for env in args.env {
-        let mut spl = env.split("=");
-        let (var, val) = (
-            spl.next().unwrap(),
-            spl.next()
-                .expect("expected '=' between --env var and value"),
-        );
+    env.vars.iter().for_each(|(var, val)| {
         cmd.env(var, val);
-    }
+    });
 
     cmd.spawn()
         .map_err(anyhow::Error::from)?
