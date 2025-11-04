@@ -27,8 +27,8 @@ mod cmd_plan;
 use cmd_plan::{PlanArgs, cmd_plan};
 mod cmd_nw_update;
 use cmd_nw_update::{NWUpdateArgs, cmd_new_world_update};
-mod cmd_oci_image;
-use cmd_oci_image::{OciImageArgs, cmd_oci_image};
+mod cmd_materialize;
+use cmd_materialize::{MaterializeArgs, cmd_materialize};
 mod cmd_upload_cache;
 use cmd_upload_cache::{UploadArgs, cmd_upload_cache};
 mod cmd_patched_build;
@@ -51,26 +51,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Builds package(s), making them available in the minimal build cache
+    /// Builds package(s), making them available in the local cache.
     Build(BuildArgs),
-    /// Prints the build plan for the specified package(s)
-    Plan(PlanArgs),
-    /// Builds packages which have a prebuilt cycle-breaker, and uploads then + updates their build-specs
-    NewWorldUpdate(NWUpdateArgs),
-    /// Materializes an OCI container image for executing the specified package
-    OciImage(OciImageArgs),
-    /// Validates and formats nickel build-spec files
-    Check(CheckArgs),
-    /// Uploads the specified packages and their transitive needs to the cache.
-    UploadCache(UploadArgs),
-    /// Updates refreshes local checkouts of the minimal packages & standard library.
-    Update,
-    /// Executes the build for a package, using stale dependencies.
-    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
-    PatchedBuild(PatchedBuildArgs),
     /// Runs a task specified in `minimal.toml`.
     #[cfg(target_os = "linux")]
     Run(RunArgs),
+    /// Materializes an output specified in `minimal.toml`.
+    Materialize(MaterializeArgs),
+    /// Updates refreshes local checkouts of the minimal packages & standard library.
+    Update,
+
+    /// Prints the build plan for the specified package(s)
+    Plan(PlanArgs),
+    /// Builds packages which have a prebuilt cycle-breaker, and uploads then + updates their build-specs
+    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
+    NewWorldUpdate(NWUpdateArgs),
+    /// Validates and formats nickel build-spec files
+    Check(CheckArgs),
+    /// Uploads the specified packages and their transitive needs to the cache.
+    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
+    UploadCache(UploadArgs),
+    /// Executes the build for a package, using stale dependencies.
+    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
+    PatchedBuild(PatchedBuildArgs),
 }
 
 /// Shared arguments and builders across all subcommands
@@ -530,7 +533,7 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         Command::Plan(args) => cmd_plan(args, &mut ctx).await,
         Command::UploadCache(args) => cmd_upload_cache(args, &mut ctx).await,
         Command::NewWorldUpdate(args) => cmd_new_world_update(args, &mut ctx).await,
-        Command::OciImage(args) => cmd_oci_image(args, &mut ctx).await,
+        Command::Materialize(args) => cmd_materialize(args, &mut ctx).await,
         Command::PatchedBuild(args) => cmd_patched_build(args, &mut ctx).await,
         #[cfg(target_os = "linux")]
         Command::Run(args) => cmd_run(args, &mut ctx).await,

@@ -78,6 +78,22 @@ impl Task {
     }
 }
 
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum OutputKind {
+    #[default]
+    #[serde(alias = "oci-image")]
+    OciImage,
+}
+
+/// An output, defined in a `[outputs.<output_name>]` section of [File].
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct Output {
+    #[serde(alias = "type")]
+    pub ty: OutputKind,
+    #[serde(default)]
+    pub packages: Vec<String>,
+}
+
 /// The loaded representation of the `minimal.toml` file.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct File {
@@ -86,6 +102,8 @@ pub struct File {
     pub envs: HashMap<String, Env>,
     #[serde(default)]
     pub tasks: HashMap<String, Task>,
+    #[serde(default)]
+    pub outputs: HashMap<String, Output>,
 
     #[serde(skip)]
     from: Option<PathBuf>,
@@ -152,6 +170,10 @@ mod tests {
             [tasks.test]
             env = "test"
             cmd = "go test ./..."
+
+            [outputs.test]
+            type = "oci-image"
+            packages = ["bash", "go"]
             "#
         })
         .unwrap();
@@ -177,6 +199,14 @@ mod tests {
                         env: "test".to_string(),
                         cmd: "go test ./...".to_string(),
                         inherit_cwd: false,
+                    }
+                )]
+                .into(),
+                outputs: [(
+                    "test".to_string(),
+                    Output {
+                        ty: OutputKind::OciImage,
+                        packages: vec!["bash".to_string(), "go".to_string()],
                     }
                 )]
                 .into(),
