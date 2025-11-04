@@ -7,21 +7,18 @@ license = "MIT OR Apache-2.0"
 publish.workspace = true
 
 [dev-dependencies]
-indoc.workspace = true
 
 [dependencies]
 tracing.workspace = true
 tracing-indicatif.workspace = true
 blake3.workspace = true
 hex.workspace = true
-sha2.workspace = true
 path-absolutize.workspace = true
 tempfile.workspace = true
 
 bytes.workspace = true
 reqwest.workspace = true
 google-cloud-storage.workspace = true
-url.workspace = true
 
 futures.workspace = true
 tokio.workspace = true

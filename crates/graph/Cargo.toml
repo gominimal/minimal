@@ -12,10 +12,7 @@ indoc.workspace = true
 [dependencies]
 nickel-lang-core.workspace = true
 codespan-reporting.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 blake3.workspace = true
-rustc-hash.workspace = true
 generational-arena.workspace = true
 smallvec.workspace = true
 tracing.workspace = true
