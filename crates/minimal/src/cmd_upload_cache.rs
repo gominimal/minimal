@@ -13,7 +13,9 @@ pub struct UploadArgs {
 pub async fn cmd_upload_cache(args: UploadArgs, ctx: &mut Context) -> Result<(), Error> {
     let graph = args.packages.graph(ctx)?;
     let cache = ctx.local_cache();
-    let upload_bsrs: Vec<_> = Transitives::for_toplevels(&graph, graph.top_levels.to_vec(), false);
+    let upload_bsrs: Vec<_> = Transitives::for_toplevels(&graph, graph.top_levels.to_vec(), false)
+        .into_keys()
+        .collect();
 
     let graph = &graph;
     let handle = tokio::runtime::Handle::current();

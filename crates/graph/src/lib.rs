@@ -42,4 +42,5 @@ pub mod planner;
 pub use planner::{BinProvider, ExecPlan, PlanErr};
 
 mod transitives;
+pub use transitives::Dep as TransitivesDep;
 pub use transitives::Transitives;

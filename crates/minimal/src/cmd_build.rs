@@ -176,7 +176,7 @@ pub async fn cmd_build_impl(
     if !ctx.no_fetch {
         let mut needs_materialize: Vec<_> =
             Transitives::for_toplevels(graph, graph.top_levels.to_vec(), false)
-                .into_iter()
+                .into_keys()
                 .filter_map(|bsr| {
                     // Filter runtime_deps that are in the local cache
                     cache
