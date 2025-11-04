@@ -1,16 +1,16 @@
+use std::env::home_dir;
+use std::path::PathBuf;
+
 use crate::Context;
 use crate::Error;
 use anyhow::anyhow;
+use common::mfile::PatchSetting;
 use graph::Transitives;
 
 use hakoniwa::Container;
 
 #[derive(Debug, clap::Args)]
 pub struct RunArgs {
-    /// Any additional directories to bind-mount read-write.
-    #[arg(long, required = false)]
-    rw_dir: Vec<String>,
-
     task_name: String,
 }
 
@@ -68,17 +68,59 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
         .bindmount_rw(cwd.clone().to_str().unwrap(), cwd.clone().to_str().unwrap())
         .symlink("/usr/bin", "/bin")
         .symlink("/usr/lib", "/lib64");
-    for rw_mount in args.rw_dir {
-        std::fs::create_dir_all(base.path().join(rw_mount.clone())).map_err(anyhow::Error::from)?;
-        container.bindmount_rw(&rw_mount, &rw_mount);
+
+    for (dir, opts) in &env.patch.dir {
+        let dir = if let Some(stripped) = dir.strip_prefix("~/") {
+            home_dir().unwrap().join(stripped)
+        } else {
+            PathBuf::from(dir.clone())
+        };
+
+        // Create the dir if it doesnt exist
+        if let Err(e) = std::fs::create_dir(&dir)
+            && e.kind() != std::io::ErrorKind::AlreadyExists
+        {
+            return Err(anyhow::Error::from(e).into());
+        }
+        // Create the dir in the sandbox rootfs
+        std::fs::create_dir_all(base.path().join(&dir)).map_err(anyhow::Error::from)?;
+
+        match opts {
+            PatchSetting::ReadWrite => {
+                container.bindmount_rw(dir.to_str().unwrap(), dir.to_str().unwrap());
+            }
+            PatchSetting::ReadOnly => {
+                container.bindmount_ro(dir.to_str().unwrap(), dir.to_str().unwrap());
+            }
+        }
     }
-    // TODO: Support bind-mounting files using the below setup
-    // container.mount(
-    //     "/home/xxx/.claude.json",
-    //     "/home/xxx/.claude.json",
-    //     "",
-    //     hakoniwa::MountOptions::BIND,
-    // );
+    for (file, opts) in &env.patch.file {
+        let file = if let Some(stripped) = file.strip_prefix("~/") {
+            home_dir().unwrap().join(stripped)
+        } else {
+            PathBuf::from(file.clone())
+        };
+
+        // Create the dir if it doesnt exist
+        if !std::fs::exists(&file).map_err(anyhow::Error::from)? {
+            std::fs::write(&file, []).map_err(anyhow::Error::from)?;
+        }
+        // Create the dir in the sandbox rootfs
+        std::fs::create_dir_all(base.path().join(file.parent().unwrap()))
+            .map_err(anyhow::Error::from)?;
+
+        container.mount(
+            file.to_str().unwrap(),
+            file.to_str().unwrap(),
+            "",
+            match opts {
+                PatchSetting::ReadOnly => {
+                    hakoniwa::MountOptions::BIND | hakoniwa::MountOptions::RDONLY
+                }
+                PatchSetting::ReadWrite => hakoniwa::MountOptions::BIND,
+            },
+        );
+    }
 
     let (command, args) = task.cmd_and_args();
     let mut cmd = container.command(&command);
