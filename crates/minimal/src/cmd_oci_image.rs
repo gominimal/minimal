@@ -9,8 +9,8 @@ use common::SpecHash;
 use flate2::{Compression, write::GzEncoder};
 use graph::{BuildSpecRef, Transitives};
 use oci_spec::image::{
-    Descriptor, DescriptorBuilder, ImageConfigurationBuilder, ImageIndexBuilder, MediaType,
-    PlatformBuilder, RootFsBuilder, SCHEMA_VERSION, Sha256Digest,
+    Descriptor, DescriptorBuilder, ImageConfigurationBuilder, ImageIndexBuilder,
+    ImageManifestBuilder, MediaType, PlatformBuilder, RootFsBuilder, SCHEMA_VERSION, Sha256Digest,
 };
 use sha2::digest::OutputSizeUser;
 #[allow(deprecated)]
@@ -94,6 +94,11 @@ pub async fn cmd_oci_image(args: OciImageArgs, ctx: &mut Context) -> Result<(), 
             .into_iter(),
     );
 
+    // Required reading: https://github.com/opencontainers/image-spec/blob/main/spec.md
+    // index.json - entrypoint that points to a manifest descriptor
+    // blobs/sha256/<manifest-digest> - image manifest, points to a image config and also all the layers in order
+    // blobs/sha256/<image-config-digest> - image config, metadata about the image
+    // blobs/sha256/<layer-gzip-digest> - the tar.gz of a filesystem layer
     let w = std::fs::File::create(args.output).map_err(anyhow::Error::from)?;
     let mut tb = tar::Builder::new(w);
 
@@ -130,18 +135,58 @@ pub async fn cmd_oci_image(args: OciImageArgs, ctx: &mut Context) -> Result<(), 
     tb.append(&th, image_config_bytes.as_slice())
         .map_err(anyhow::Error::from)?;
 
+    // Image manifest - written out as blob object by hash
+    let image_manifest_bytes = serde_json::to_vec(
+        &ImageManifestBuilder::default()
+            .schema_version(SCHEMA_VERSION)
+            .config(
+                DescriptorBuilder::default()
+                    .media_type(MediaType::ImageConfig)
+                    .size(image_config_bytes.len() as u64)
+                    .digest(
+                        Sha256Digest::from_str(&format!(
+                            "{:x}",
+                            sha2::Sha256::digest(&image_config_bytes)
+                        ))
+                        .map_err(anyhow::Error::from)?,
+                    )
+                    .build()
+                    .map_err(anyhow::Error::from)?,
+            )
+            .layers(
+                layers
+                    .iter()
+                    .map(|l| l.descriptor.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .build()
+            .map_err(anyhow::Error::from)?,
+    )
+    .map_err(anyhow::Error::from)?;
+    let mut th = tar::Header::new_gnu();
+    th.set_mode(0o444);
+    th.set_path(format!(
+        "blobs/sha256/{:x}",
+        Sha256::digest(&image_manifest_bytes)
+    ))
+    .map_err(anyhow::Error::from)?;
+    th.set_size(image_manifest_bytes.len() as u64);
+    th.set_cksum();
+    tb.append(&th, image_manifest_bytes.as_slice())
+        .map_err(anyhow::Error::from)?;
+
     // Image index - index.json
     let image_index = ImageIndexBuilder::default()
         .schema_version(SCHEMA_VERSION)
         .media_type(MediaType::ImageIndex)
         .manifests(vec![
             DescriptorBuilder::default()
-                .media_type(MediaType::ImageConfig)
-                .size(image_config_bytes.len() as u64)
+                .media_type(MediaType::ImageManifest)
+                .size(image_manifest_bytes.len() as u64)
                 .digest(
                     Sha256Digest::from_str(&format!(
                         "{:x}",
-                        sha2::Sha256::digest(&image_config_bytes)
+                        sha2::Sha256::digest(&image_manifest_bytes)
                     ))
                     .map_err(anyhow::Error::from)?,
                 )
@@ -205,7 +250,7 @@ impl BuiltLayer {
 }
 
 async fn create_base_layer() -> anyhow::Result<BuiltLayer> {
-    let enc = GzEncoder::new(tempfile::tempfile()?, Compression::none()); // TODO: Back to reasonable setting
+    let enc = GzEncoder::new(tempfile::tempfile()?, Compression::best());
     let mut tar = tar::Builder::new(enc);
 
     let mut header = tar::Header::new_gnu();
