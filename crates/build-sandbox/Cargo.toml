@@ -9,7 +9,6 @@ globset.workspace = true
 nickel-lang-core.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
 tracing.workspace = true
 
 common.workspace = true
