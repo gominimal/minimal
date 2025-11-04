@@ -31,3 +31,7 @@ cmd = "cargo --config target.x86_64-unknown-linux-gnu.linker=\\\"gcc\\\" test --
 [tasks.shell]
 env = "dev"
 cmd = "bash -l"
+
+[outputs.bash-img]
+type = "oci-image"
+packages = ["bash", "coreutils", "diffutils", "findutils", "tar"]

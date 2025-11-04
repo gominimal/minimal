@@ -4,11 +4,12 @@
 //! from minimal packages. It generates multi-layer images where each runtime dependency
 //! becomes a separate layer,.
 
+use anyhow::anyhow;
 use cache::{Cache, LocalDir};
-use common::SpecHash;
+use common::{SpecHash, mfile};
 use flate2::{Compression, write::GzEncoder};
 use globset::{Glob, GlobSet};
-use graph::{BuildSpecRef, Transitives, TransitivesDep};
+use graph::{BuildSpecRef, DepGraph, Transitives, TransitivesDep};
 use oci_spec::image::{
     Descriptor, DescriptorBuilder, ImageConfigurationBuilder, ImageIndexBuilder,
     ImageManifestBuilder, MediaType, PlatformBuilder, RootFsBuilder, SCHEMA_VERSION, Sha256Digest,
@@ -22,33 +23,57 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use tracing::info;
 
-use crate::{Context, Error, PackagesArg};
+use crate::{Context, Error};
 
 #[derive(clap::Args)]
-pub struct OciImageArgs {
-    /// Package names to materialize to the OCI image
-    #[command(flatten)]
-    packages: PackagesArg,
-
-    /// The tarfile to write
+pub struct MaterializeArgs {
+    /// The output file to write
     #[arg(short, long)]
     output: PathBuf,
+
+    /// The name of the output in `minimal.toml` to materialize
+    output_name: String,
 }
 
-pub async fn cmd_oci_image(args: OciImageArgs, ctx: &mut Context) -> Result<(), Error> {
-    let graph = args.packages.graph(ctx)?;
+pub async fn cmd_materialize(args: MaterializeArgs, ctx: &mut Context) -> Result<(), Error> {
+    let mfile = ctx.minimal_file()?;
+    let output = match mfile.outputs.get(&args.output_name) {
+        Some(t) => t.clone(),
+        None => {
+            return Err(Error::Other(anyhow!(
+                "no such output named '{}'",
+                args.output_name
+            )));
+        }
+    };
+
+    let graph = match output.packages.len() {
+        0 => ctx.graph_from_package_name("base")?,
+        1 => ctx.graph_from_package_name(&output.packages[0])?,
+        _ => ctx.graph_from_package_names(&output.packages)?,
+    };
     let cache = ctx.local_cache();
 
     // Make sure the packages are built
     crate::cmd_build::cmd_build_impl(&graph, ctx, cache.clone(), ctx.num_parallel_builds).await?;
 
+    materialize_oci_image(output, args.output, graph, ctx, cache).await
+}
+
+pub async fn materialize_oci_image(
+    output: mfile::Output,
+    output_file: PathBuf,
+    graph: DepGraph,
+    _ctx: &mut Context,
+    cache: Cache<LocalDir>,
+) -> Result<(), Error> {
     let mut all_deps: Vec<(BuildSpecRef, TransitivesDep)> =
         Transitives::for_toplevels(&graph, graph.top_levels.to_vec(), false)
             .into_iter()
             .collect();
     all_deps.sort_by_key(|(bsr, _)| graph.get(bsr).unwrap().name.clone());
 
-    info!("Creating OCI image for packages: {}", args.packages);
+    info!("Creating OCI image for packages: {:?}", output.packages);
     info!(
         "Will create {} layers: base layer + {} packages",
         all_deps.len() + 1,
@@ -114,7 +139,7 @@ pub async fn cmd_oci_image(args: OciImageArgs, ctx: &mut Context) -> Result<(), 
     // blobs/sha256/<manifest-digest> - image manifest, points to a image config and also all the layers in order
     // blobs/sha256/<image-config-digest> - image config, metadata about the image
     // blobs/sha256/<layer-gzip-digest> - the tar.gz of a filesystem layer
-    let w = std::fs::File::create(args.output).map_err(anyhow::Error::from)?;
+    let w = std::fs::File::create(output_file).map_err(anyhow::Error::from)?;
     let mut tb = tar::Builder::new(w);
 
     // ImageConfig - written as blob object by hash
