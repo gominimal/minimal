@@ -5,9 +5,12 @@ branch = "main"
 [envs.dev]
 env_vars.CC = "gcc"
 packages = [
+    # Build needs
+    "rust", "gcc", "binutils",
+    "pkgconf", "openssl", "linux_headers", "zlib",
+    # Shell and claude-code needs
     "bash", "claude-code",
-    "rust", "gcc", "binutils", "git",
-    "pkgconf", "openssl", "linux_headers", "zlib"
+    "git", "skopeo", "coreutils",
 ]
 
 [tasks.env-smoketest]
@@ -23,4 +26,8 @@ cmd = "claude"
 
 [tasks.test]
 env = "dev"
-cmd = "cargo --config target.x86_64-unknown-linux-gnu.linker=\\\"gcc\\\" test"
+cmd = "cargo --config target.x86_64-unknown-linux-gnu.linker=\\\"gcc\\\" test --offline"
+
+[tasks.shell]
+env = "dev"
+cmd = "bash -l"
