@@ -43,6 +43,23 @@ pub struct Base {
     pub branch: Option<String>,
 }
 
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum PatchSetting {
+    #[default]
+    #[serde(alias = "ro", alias = "read-only")]
+    ReadOnly,
+    #[serde(alias = "rw", alias = "read-write")]
+    ReadWrite,
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct EnvPatches {
+    #[serde(default, alias = "dirs")]
+    pub dir: HashMap<String, PatchSetting>,
+    #[serde(default, alias = "files")]
+    pub file: HashMap<String, PatchSetting>,
+}
+
 /// An environment, defined in a `[envs.<env_name>]` section of [File].
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct Env {
@@ -50,6 +67,8 @@ pub struct Env {
     pub packages: Vec<String>,
     #[serde(default, alias = "env_vars")]
     pub vars: HashMap<String, String>,
+    #[serde(default, alias = "patches")]
+    pub patch: EnvPatches,
 }
 
 /// A task, defined in a `[tasks.<task_name>]` section of [File].
@@ -165,6 +184,7 @@ mod tests {
             branch = "main"
 
             [envs.test]
+            patch.dir."~/.claude" = "read-write"
             packages = ["base", "go"]
 
             [tasks.test]
@@ -190,6 +210,10 @@ mod tests {
                     Env {
                         packages: vec!["base".to_string(), "go".to_string()],
                         vars: HashMap::new(),
+                        patch: EnvPatches {
+                            dir: [("~/.claude".to_string(), PatchSetting::ReadWrite)].into(),
+                            file: HashMap::new()
+                        },
                     }
                 )]
                 .into(),

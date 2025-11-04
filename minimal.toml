@@ -3,6 +3,8 @@ repo = "git@github.com:gominimal/pkgs.git"
 branch = "main"
 
 [envs.dev]
+patch.dir."~/.claude" = "rw"
+patch.file."~/.claude.json" = "rw"
 env_vars.CC = "gcc"
 packages = [
     # Build needs
@@ -11,6 +13,8 @@ packages = [
     # Shell and claude-code needs
     "bash", "claude-code",
     "git", "skopeo", "coreutils",
+    # Network, for now
+    "base", "ca-certificates",
 ]
 
 [tasks.env-smoketest]
@@ -26,7 +30,7 @@ cmd = "claude"
 
 [tasks.test]
 env = "dev"
-cmd = "cargo --config target.x86_64-unknown-linux-gnu.linker=\\\"gcc\\\" test --offline"
+cmd = "cargo --config target.x86_64-unknown-linux-gnu.linker=\\\"gcc\\\" test"
 
 [tasks.shell]
 env = "dev"
