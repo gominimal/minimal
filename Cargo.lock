@@ -2169,6 +2169,7 @@ dependencies = [
  "dirs",
  "flate2",
  "futures",
+ "globset",
  "google-cloud-storage",
  "graph",
  "hakoniwa",

@@ -7,7 +7,8 @@
 use cache::{Cache, LocalDir};
 use common::SpecHash;
 use flate2::{Compression, write::GzEncoder};
-use graph::{BuildSpecRef, Transitives};
+use globset::{Glob, GlobSet};
+use graph::{BuildSpecRef, Transitives, TransitivesDep};
 use oci_spec::image::{
     Descriptor, DescriptorBuilder, ImageConfigurationBuilder, ImageIndexBuilder,
     ImageManifestBuilder, MediaType, PlatformBuilder, RootFsBuilder, SCHEMA_VERSION, Sha256Digest,
@@ -41,11 +42,11 @@ pub async fn cmd_oci_image(args: OciImageArgs, ctx: &mut Context) -> Result<(), 
     // Make sure the packages are built
     crate::cmd_build::cmd_build_impl(&graph, ctx, cache.clone(), ctx.num_parallel_builds).await?;
 
-    let mut all_deps: Vec<BuildSpecRef> =
+    let mut all_deps: Vec<(BuildSpecRef, TransitivesDep)> =
         Transitives::for_toplevels(&graph, graph.top_levels.to_vec(), false)
             .into_iter()
             .collect();
-    all_deps.sort_by_key(|bsr| graph.get(bsr).unwrap().name.clone());
+    all_deps.sort_by_key(|(bsr, _)| graph.get(bsr).unwrap().name.clone());
 
     info!("Creating OCI image for packages: {}", args.packages);
     info!(
@@ -63,15 +64,28 @@ pub async fn cmd_oci_image(args: OciImageArgs, ctx: &mut Context) -> Result<(), 
     let tokio_runtime = tokio::runtime::Handle::current();
     let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(all_deps.len())));
     rayon::scope(|s| {
-        for dep_ref in &all_deps {
+        for (bsr, dep) in &all_deps {
             let tokio_runtime = tokio_runtime.clone();
             let results = results.clone();
             let cache = cache.clone();
 
-            let dep_spec = graph.get(dep_ref).unwrap();
-            let dep_hash = graph.spec_hash(dep_ref);
+            let dep_spec = graph.get(bsr).unwrap();
+            let dep_hash = graph.spec_hash(bsr);
+            let match_globs = dep.outputs.as_ref().map(|set| {
+                GlobSet::new(set.iter().map(|output_name| {
+                    Glob::new(dep_spec.outputs.get(output_name).unwrap().glob()).unwrap()
+                }))
+                .unwrap()
+            });
 
-            info!("Creating layer for: {}", dep_spec.name);
+            info!(
+                "Creating layer for: {}",
+                if match_globs.is_some() {
+                    format!("{} (subset)", dep_spec.name)
+                } else {
+                    dep_spec.name.to_string()
+                }
+            );
 
             s.spawn(move |_| {
                 let _rt = tokio_runtime.enter();
@@ -79,6 +93,7 @@ pub async fn cmd_oci_image(args: OciImageArgs, ctx: &mut Context) -> Result<(), 
                     &cache,
                     &dep_hash,
                     &dep_spec.name,
+                    &match_globs,
                 ));
                 results.lock().unwrap().push(result);
             });
@@ -300,6 +315,7 @@ async fn create_layer_from_cache(
     cache: &Cache<LocalDir>,
     spec_hash: &SpecHash,
     package_name: &str,
+    match_globs: &Option<globset::GlobSet>,
 ) -> anyhow::Result<BuiltLayer> {
     let cache_entry = cache
         .read_dir(spec_hash)
@@ -310,7 +326,7 @@ async fn create_layer_from_cache(
     // Create tar.gz backed by temporary file
     let enc = GzEncoder::new(tempfile::tempfile()?, Compression::best());
     let mut tar = tar::Builder::new(enc);
-    add_dir_to_tar(&mut tar, cache_dir, ".")?;
+    add_dir_to_tar(&mut tar, cache_dir, ".", match_globs)?;
     tar.finish()?;
     let mut tar_file = tar.into_inner()?.finish()?;
 
@@ -339,7 +355,11 @@ async fn create_layer_from_cache(
 
     info!(
         "Created layer for {}: {}",
-        package_name,
+        if match_globs.is_some() {
+            format!("{} (subset)", package_name)
+        } else {
+            package_name.to_string()
+        },
         size::Size::from_bytes(compressed_len)
     );
 
@@ -356,6 +376,7 @@ fn add_dir_to_tar<W: Write>(
     tar: &mut tar::Builder<W>,
     src_dir: &Path,
     tar_prefix: &str,
+    match_globs: &Option<globset::GlobSet>,
 ) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(src_dir)? {
         let entry = entry?;
@@ -369,9 +390,17 @@ fn add_dir_to_tar<W: Write>(
 
         if path.is_dir() {
             tar.append_dir(&tar_path, &path)?;
-            add_dir_to_tar(tar, &path, &tar_path.to_string_lossy())?;
+            add_dir_to_tar(tar, &path, &tar_path.to_string_lossy(), match_globs)?;
         } else {
-            tar.append_path_with_name(&path, &tar_path)?;
+            // For files, only include them if there were no specified matchers,
+            // or something matched.
+            let matched = match_globs
+                .as_ref()
+                .map(|gs| gs.is_match(&tar_path))
+                .unwrap_or(true);
+            if matched {
+                tar.append_path_with_name(&path, &tar_path)?;
+            }
         }
     }
     Ok(())

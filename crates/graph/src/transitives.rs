@@ -170,26 +170,40 @@ impl Transitives {
         out
     }
 
-    /// Returns the unique transitive dependencies required to materialize the given toplevels.
+    /// Returns the transitive dependencies required to materialize the given toplevels.
     pub fn for_toplevels(
         graph: &DepGraph,
         top_levels: Vec<BuildSpecRef>,
         include_inputs: bool,
-    ) -> Vec<BuildSpecRef> {
-        let mut out: Vec<_> = top_levels
+    ) -> HashMap<BuildSpecRef, Dep> {
+        let mut out: HashMap<BuildSpecRef, Dep> = HashMap::with_capacity(512);
+        top_levels
             .iter()
-            .map(|base| Transitives::new(graph, base, include_inputs))
-            .flat_map(|t| {
-                t.transitive_runtime_deps
-                    .keys()
-                    .copied()
-                    .collect::<Vec<_>>()
+            .flat_map(|base| {
+                Transitives::new(graph, base, include_inputs)
+                    .transitive_runtime_deps
+                    .into_iter()
+                    .map(|(dep_bsr, mut info)| {
+                        (dep_bsr, {
+                            info.needed_by.clear();
+                            info.needed_by.push(Attribution::Inherited { from: *base });
+                            info
+                        })
+                    })
             })
-            .chain(top_levels.iter().copied())
-            .collect();
+            .chain(top_levels.iter().copied().map(|bsr| {
+                (
+                    bsr,
+                    Dep {
+                        needed_by: vec![Attribution::Ours],
+                        outputs: None,
+                    },
+                )
+            }))
+            .for_each(|(bsr, info)| {
+                Self::upsert(&mut out, &bsr, info.needed_by.into_iter(), info.outputs)
+            });
 
-        out.sort();
-        out.dedup();
         out
     }
 }
