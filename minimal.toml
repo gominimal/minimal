@@ -4,6 +4,7 @@ branch = "main"
 
 [envs.dev]
 patch.dir."~/.claude" = "rw"
+patch.dir."~/.cargo" = "rw"
 patch.file."~/.claude.json" = "rw"
 env_vars.CC = "gcc"
 packages = [
