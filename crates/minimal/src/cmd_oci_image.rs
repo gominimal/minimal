@@ -9,8 +9,8 @@ use common::SpecHash;
 use flate2::{Compression, write::GzEncoder};
 use graph::{BuildSpecRef, Transitives};
 use oci_spec::image::{
-    Descriptor, DescriptorBuilder, ImageConfigurationBuilder, ImageIndexBuilder,
-    ImageManifestBuilder, MediaType, PlatformBuilder, RootFsBuilder, SCHEMA_VERSION, Sha256Digest,
+    Descriptor, DescriptorBuilder, ImageConfigurationBuilder, ImageIndexBuilder, MediaType,
+    PlatformBuilder, RootFsBuilder, SCHEMA_VERSION, Sha256Digest,
 };
 use sha2::digest::OutputSizeUser;
 #[allow(deprecated)]
@@ -94,60 +94,67 @@ pub async fn cmd_oci_image(args: OciImageArgs, ctx: &mut Context) -> Result<(), 
             .into_iter(),
     );
 
-    let rootfs = RootFsBuilder::default()
-        .typ("layers")
-        .diff_ids(
-            layers
-                .iter()
-                .map(|l| l.uncompressed_digest())
-                .collect::<Vec<_>>(),
-        )
-        .build()
-        .map_err(anyhow::Error::from)?;
-    let image_config = ImageConfigurationBuilder::default()
-        .architecture("amd64")
-        .os("linux")
-        .rootfs(rootfs)
-        .build()
-        .map_err(anyhow::Error::from)?;
-    let image_config_bytes = serde_json::to_vec(&image_config).map_err(anyhow::Error::from)?;
-
-    let image_config_descriptor = DescriptorBuilder::default()
-        .media_type(MediaType::ImageConfig)
-        .size(image_config_bytes.len() as u64)
-        .digest(
-            Sha256Digest::from_str(&format!("{:x}", sha2::Sha256::digest(&image_config_bytes)))
-                .map_err(anyhow::Error::from)?,
-        )
-        .platform(
-            PlatformBuilder::default()
-                .os("linux")
-                .architecture("amd64")
-                .build()
-                .unwrap(),
-        )
-        .build()
-        .map_err(anyhow::Error::from)?;
-    let image_manifest = ImageManifestBuilder::default()
-        .schema_version(SCHEMA_VERSION)
-        .config(image_config_descriptor.clone())
-        .layers(
-            layers
-                .iter()
-                .map(|l| l.descriptor.clone())
-                .collect::<Vec<_>>(),
-        )
-        .build()
-        .map_err(anyhow::Error::from)?;
-
     let w = std::fs::File::create(args.output).map_err(anyhow::Error::from)?;
     let mut tb = tar::Builder::new(w);
+
+    // ImageConfig - written as blob object by hash
+    let image_config_bytes = serde_json::to_vec(
+        &ImageConfigurationBuilder::default()
+            .architecture("amd64")
+            .os("linux")
+            .rootfs(
+                RootFsBuilder::default()
+                    .typ("layers")
+                    .diff_ids(
+                        layers
+                            .iter()
+                            .map(|l| l.uncompressed_digest())
+                            .collect::<Vec<_>>(),
+                    )
+                    .build()
+                    .map_err(anyhow::Error::from)?,
+            )
+            .build()
+            .map_err(anyhow::Error::from)?,
+    )
+    .map_err(anyhow::Error::from)?;
+    let mut th = tar::Header::new_gnu();
+    th.set_mode(0o444);
+    th.set_path(format!(
+        "blobs/sha256/{:x}",
+        Sha256::digest(&image_config_bytes)
+    ))
+    .map_err(anyhow::Error::from)?;
+    th.set_size(image_config_bytes.len() as u64);
+    th.set_cksum();
+    tb.append(&th, image_config_bytes.as_slice())
+        .map_err(anyhow::Error::from)?;
 
     // Image index - index.json
     let image_index = ImageIndexBuilder::default()
         .schema_version(SCHEMA_VERSION)
         .media_type(MediaType::ImageIndex)
-        .manifests(vec![image_config_descriptor])
+        .manifests(vec![
+            DescriptorBuilder::default()
+                .media_type(MediaType::ImageConfig)
+                .size(image_config_bytes.len() as u64)
+                .digest(
+                    Sha256Digest::from_str(&format!(
+                        "{:x}",
+                        sha2::Sha256::digest(&image_config_bytes)
+                    ))
+                    .map_err(anyhow::Error::from)?,
+                )
+                .platform(
+                    PlatformBuilder::default()
+                        .os("linux")
+                        .architecture("amd64")
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .map_err(anyhow::Error::from)?,
+        ])
         .build()
         .map_err(anyhow::Error::from)?;
     let image_index_str = image_index.to_string().unwrap();
@@ -167,16 +174,6 @@ pub async fn cmd_oci_image(args: OciImageArgs, ctx: &mut Context) -> Result<(), 
     th.set_mode(0o644);
     th.set_cksum();
     tb.append(&th, layout_b).map_err(anyhow::Error::from)?;
-
-    // Manifest - manifest.json
-    let manifest_str = image_manifest.to_string().unwrap();
-    let manifest_b = manifest_str.as_bytes();
-    let mut th = tar::Header::new_gnu();
-    th.set_path("manifest.json").unwrap();
-    th.set_size(manifest_b.len() as u64);
-    th.set_mode(0o644);
-    th.set_cksum();
-    tb.append(&th, manifest_b).map_err(anyhow::Error::from)?;
 
     // Finally we write out each layer at "blobs/sha256/<sha256-hex>"
     for layer in layers {
