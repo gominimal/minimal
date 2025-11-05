@@ -15,7 +15,7 @@ packages = [
     "bash", "claude-code",
     "git", "skopeo", "coreutils",
     # Network, for now
-    "base", "ca-certificates",
+    "base", "ca-certificates", "resolver-quad8",
 ]
 
 [tasks.env-smoketest]
