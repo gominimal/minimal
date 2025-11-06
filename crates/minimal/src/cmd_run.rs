@@ -103,7 +103,8 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
 
         // Create the dir if it doesnt exist
         if !std::fs::exists(&file).map_err(anyhow::Error::from)? {
-            std::fs::write(&file, []).map_err(anyhow::Error::from)?;
+            std::fs::write(&file, if file.ends_with(".json") { "{}" } else { "" })
+                .map_err(anyhow::Error::from)?;
         }
         // Create the dir in the sandbox rootfs
         std::fs::create_dir_all(base.path().join(file.parent().unwrap()))
