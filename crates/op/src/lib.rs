@@ -38,3 +38,6 @@ mod sources;
 pub use sources::{SourceFetcher, SourceLoad};
 mod specs;
 pub use specs::SpecBuild;
+
+mod oci_image;
+pub use oci_image::OciImageCreate;

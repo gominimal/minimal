@@ -457,6 +457,15 @@ impl From<common::GlobError> for Error {
         }
     }
 }
+impl From<op::Error> for Error {
+    fn from(e: op::Error) -> Self {
+        match e {
+            op::Error::IO(e) => Self::Other(e.into()),
+            op::Error::Cache(e) => Self::Other(e.into()),
+            op::Error::Other(e) => Self::Other(e),
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
