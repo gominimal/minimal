@@ -32,6 +32,18 @@ impl From<anyhow::Error> for Error {
     }
 }
 
+impl From<oci_spec::OciSpecError> for Error {
+    fn from(e: oci_spec::OciSpecError) -> Self {
+        Self::Other(e.into())
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Other(e.into())
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
