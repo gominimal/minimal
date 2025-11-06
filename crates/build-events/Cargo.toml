@@ -14,7 +14,7 @@ prost-reflect = { version = "0.15", features = ["text-format"] }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tracing-subscriber.workspace = true
