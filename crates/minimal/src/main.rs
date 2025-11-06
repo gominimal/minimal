@@ -8,6 +8,7 @@ use decode::{Layer, LoadOptions};
 use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
 use graph::{DepGraph, Error as GraphError, PlanErr};
 use std::path::PathBuf;
+use tracing::warn;
 use tracing_indicatif::IndicatifLayer;
 use tracing_indicatif::{filter::IndicatifFilter, filter::hide_indicatif_span_fields};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -483,13 +484,16 @@ async fn main() -> Result<()> {
     build_events::initialize_global_event_bus();
 
     // Initialize SpongeBob integration
-    let spongebob = build_events_proto::SpongeBob::new(invocation_id)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create SpongeBob client: {}", e))?;
-
     let mut dispatcher =
         build_events::BuildEventDispatcher::new(build_events::event_bus().subscribe());
-    dispatcher.add_subscriber(Box::new(spongebob));
+    match build_events_proto::SpongeBob::new(invocation_id).await {
+        Ok(sb) => {
+            dispatcher.add_subscriber(Box::new(sb));
+        }
+        Err(e) => {
+            warn!("Failed to create SpongeBob client: {}", e);
+        }
+    };
 
     // Add text file writer if requested
     if let Some(events_file) = &cli.global_args.build_events_file {
