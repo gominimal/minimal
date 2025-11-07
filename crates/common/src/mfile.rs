@@ -111,6 +111,11 @@ pub struct Output {
     pub ty: OutputKind,
     #[serde(default)]
     pub packages: Vec<String>,
+
+    #[serde(default)]
+    pub entrypoint: Option<String>,
+    #[serde(default, alias = "env_vars")]
+    pub vars: HashMap<String, String>,
 }
 
 /// The loaded representation of the `minimal.toml` file.
@@ -231,6 +236,8 @@ mod tests {
                     Output {
                         ty: OutputKind::OciImage,
                         packages: vec!["bash".to_string(), "go".to_string()],
+                        entrypoint: None,
+                        vars: HashMap::new(),
                     }
                 )]
                 .into(),

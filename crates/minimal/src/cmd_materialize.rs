@@ -41,6 +41,8 @@ pub async fn cmd_materialize(args: MaterializeArgs, ctx: &mut Context) -> Result
     let mut op = op::OciImageCreate {
         packages: output.packages,
         output_file: args.output,
+        entrypoint: output.entrypoint,
+        vars: output.vars,
     };
     let opts = op::Options {
         cache,
