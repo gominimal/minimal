@@ -10,13 +10,14 @@ use flate2::{Compression, write::GzEncoder};
 use globset::{Glob, GlobSet};
 use graph::{BuildSpecRef, Transitives, TransitivesDep};
 use oci_spec::image::{
-    Descriptor, DescriptorBuilder, ImageConfigurationBuilder, ImageIndexBuilder,
+    ConfigBuilder, Descriptor, DescriptorBuilder, ImageConfigurationBuilder, ImageIndexBuilder,
     ImageManifestBuilder, MediaType, PlatformBuilder, RootFsBuilder, SCHEMA_VERSION, Sha256Digest,
 };
 use sha2::digest::OutputSizeUser;
 #[allow(deprecated)]
 use sha2::digest::generic_array::GenericArray;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -28,6 +29,9 @@ pub struct OciImageCreate {
     pub packages: Vec<String>,
     /// The output file path to write the OCI image tarball
     pub output_file: PathBuf,
+
+    pub entrypoint: Option<String>,
+    pub vars: HashMap<String, String>,
 }
 
 impl Runnable for OciImageCreate {
@@ -126,6 +130,21 @@ impl Runnable for OciImageCreate {
                         )
                         .build()?,
                 )
+                .config({
+                    let mut cb = ConfigBuilder::default();
+                    if let Some(entrypoint) = &self.entrypoint {
+                        cb = cb.entrypoint(shlex::split(entrypoint).unwrap());
+                    };
+                    if !self.vars.is_empty() {
+                        cb = cb.env(
+                            self.vars
+                                .iter()
+                                .map(|(k, v)| String::from_iter([k, "=", v]))
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                    cb.build().unwrap()
+                })
                 .build()?,
         )?;
         let mut th = tar::Header::new_gnu();
