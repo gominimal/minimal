@@ -15,6 +15,7 @@ pub struct RunArgs {
 }
 
 pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
+    let env_base_dir = ctx.paths().env_base_dir().to_path_buf();
     let mfile = ctx.minimal_file()?;
     let task = match mfile.tasks.get(&args.task_name) {
         Some(t) => t.clone(),
@@ -36,6 +37,12 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
     } else {
         mfile.dir_path().unwrap().to_path_buf()
     };
+    // Make sure the directories for storing durable state exist.
+    let state_base_dir = mfile.env_state_dir(&task.env, env_base_dir).unwrap();
+    std::fs::create_dir_all(state_base_dir.join("home")).map_err(anyhow::Error::from)?; // XDG_CONFIG_HOME ala ~/.config
+    std::fs::create_dir_all(state_base_dir.join("data")).map_err(anyhow::Error::from)?; // XDG_DATA_HOME ala ~/.local/share
+    std::fs::create_dir_all(state_base_dir.join("cache")).map_err(anyhow::Error::from)?; // XDG_CACHE_HOME  ala ~/.cache
+    std::fs::create_dir_all(state_base_dir.join("state")).map_err(anyhow::Error::from)?; // XDG_STATE_HOME  ala ~/.local/state
 
     let graph = match env.packages.len() {
         0 => ctx.graph_from_package_name("base")?,
@@ -56,8 +63,9 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
         .map_err(anyhow::Error::from)?;
     }
 
-    // Create the cwd in the rootfs, and bindmount the cwd to it
+    // Create the cwd & env in the rootfs
     std::fs::create_dir_all(base.path().join(cwd.clone())).map_err(anyhow::Error::from)?;
+    std::fs::create_dir_all(base.path().join("state")).map_err(anyhow::Error::from)?;
 
     let mut container = Container::new();
     container
@@ -66,6 +74,7 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
         .devfsmount("/dev")
         .tmpfsmount("/tmp")
         .bindmount_rw(cwd.clone().to_str().unwrap(), cwd.clone().to_str().unwrap())
+        .bindmount_rw(state_base_dir.to_str().unwrap(), "/state")
         .symlink("/usr/bin", "/bin")
         .symlink("/usr/lib", "/lib64");
 
@@ -135,6 +144,10 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
         )
         .env("LANG", "en_US.utf8")
         .env("LC_ALL", "en_US.utf8")
+        .env("XDG_CONFIG_HOME", "/state/home")
+        .env("XDG_DATA_HOME", "/state/data")
+        .env("XDG_CACHE_HOME", "/state/cache")
+        .env("XDG_STATE_HOME", "/state/state")
         .env("PWD", cwd.to_str().unwrap());
     if let Ok(term) = std::env::var("TERM") {
         cmd.env("TERM", term.as_str());

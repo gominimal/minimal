@@ -20,6 +20,9 @@ pub struct PathConfig {
     /// Base directory for runtime sandboxes
     /// Default: ~/.cache/minimal/runs
     run_base_dir: PathBuf,
+    /// Base directory for durable environment state
+    /// Default: ~/.cache/minimal/envs
+    env_base_dir: PathBuf,
     /// Directory containing VCS checkouts
     /// Default: ~/.cache/minimal/vcs/
     vcs_dir: PathBuf,
@@ -48,6 +51,7 @@ impl PathConfig {
             cache_dir: root_dir.join("builds"),
             download_cache_dir: root_dir.join("downloads"),
             sandbox_base_dir: root_dir.join("sandboxes"),
+            env_base_dir: root_dir.join("envs"),
             run_base_dir: root_dir.join("runs"),
             vcs_dir: root_dir.join("vcs"),
             root_dir,
@@ -70,6 +74,12 @@ impl PathConfig {
     /// Create a PathConfig with custom sandbox base directory
     pub fn with_sandbox_base_dir(mut self, sandbox_base_dir: PathBuf) -> Self {
         self.sandbox_base_dir = sandbox_base_dir;
+        self
+    }
+
+    /// Create a PathConfig with custom environment-state base directory
+    pub fn with_envs_base_dir(mut self, env_base_dir: PathBuf) -> Self {
+        self.env_base_dir = env_base_dir;
         self
     }
 
@@ -118,6 +128,11 @@ impl PathConfig {
         &self.sandbox_base_dir
     }
 
+    /// Get the environment-state base directory
+    pub fn env_base_dir(&self) -> &Path {
+        &self.env_base_dir
+    }
+
     /// Get the runtime sandbox base directory
     pub fn run_base_dir(&self) -> &Path {
         &self.run_base_dir
@@ -138,6 +153,7 @@ impl PathConfig {
         std::fs::create_dir_all(&self.cache_dir)?;
         std::fs::create_dir_all(&self.download_cache_dir)?;
         std::fs::create_dir_all(&self.sandbox_base_dir)?;
+        std::fs::create_dir_all(&self.env_base_dir)?;
         std::fs::create_dir_all(&self.run_base_dir)?;
         std::fs::create_dir_all(&self.vcs_dir)?;
         // Note: packages_dir is expected to exist already
