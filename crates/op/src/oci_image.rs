@@ -10,8 +10,9 @@ use flate2::{Compression, write::GzEncoder};
 use globset::{Glob, GlobSet};
 use graph::{BuildSpecRef, Transitives, TransitivesDep};
 use oci_spec::image::{
-    ConfigBuilder, Descriptor, DescriptorBuilder, ImageConfigurationBuilder, ImageIndexBuilder,
-    ImageManifestBuilder, MediaType, PlatformBuilder, RootFsBuilder, SCHEMA_VERSION, Sha256Digest,
+    ANNOTATION_REF_NAME, ConfigBuilder, Descriptor, DescriptorBuilder, ImageConfigurationBuilder,
+    ImageIndexBuilder, ImageManifestBuilder, MediaType, PlatformBuilder, RootFsBuilder,
+    SCHEMA_VERSION, Sha256Digest,
 };
 use sha2::digest::OutputSizeUser;
 #[allow(deprecated)]
@@ -30,6 +31,7 @@ pub struct OciImageCreate {
     /// The output file path to write the OCI image tarball
     pub output_file: PathBuf,
 
+    pub name: Option<String>,
     pub entrypoint: Option<String>,
     pub vars: HashMap<String, String>,
 }
@@ -208,6 +210,13 @@ impl Runnable for OciImageCreate {
                             .build()
                             .unwrap(),
                     )
+                    .annotations({
+                        let mut annotations = HashMap::new();
+                        if let Some(name) = &self.name {
+                            annotations.insert(ANNOTATION_REF_NAME.to_string(), name.clone());
+                        }
+                        annotations
+                    })
                     .build()?,
             ])
             .build()?;
