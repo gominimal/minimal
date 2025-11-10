@@ -1,4 +1,4 @@
 [registries.buf]
 index = "sparse+https://buf.build/gen/cargo/"
 credential-provider = "cargo:token"
-token = "Bearer a54105a33eb0bc75fd05666e96f6a63ec8bb54fa7b964665e230d24824268687"
+token = "Bearer c5ceab0fe4fbdddabe0aefb73a1351aa7f77149a9df3837af3f27e4f4171119f"
