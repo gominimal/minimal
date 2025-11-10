@@ -1,7 +1,7 @@
 //! Finding & reading the `minimal.toml` file.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::{env, fmt};
 
 const MFILE_NAME: &str = "minimal.toml";
@@ -171,6 +171,44 @@ impl File {
             None => None,
             Some(fname) => fname.parent(),
         }
+    }
+
+    /// Returns the path to where durable state for the given environment should be stored.
+    ///
+    /// None is returned if the location of the minimal file on disk is not known.
+    pub fn env_state_dir<P: AsRef<Path>>(
+        &self,
+        env_name: &str,
+        env_base_dir: P,
+    ) -> Option<PathBuf> {
+        self.dir_path().map(|mfile_dir| {
+            let hd = env::home_dir();
+
+            let (start_marker, components) = if let Some(home) = &hd
+                && mfile_dir.starts_with(home)
+            {
+                (
+                    '~',
+                    mfile_dir.strip_prefix(hd.unwrap()).unwrap().components(),
+                )
+            } else {
+                ('-', mfile_dir.components())
+            };
+
+            env_base_dir
+                .as_ref()
+                .join(format!(
+                    "{}{}",
+                    start_marker,
+                    components
+                        .filter(|c| matches!(c, Component::Normal(_)))
+                        .map(|c| c.as_os_str().to_str().unwrap())
+                        .map(|c| c.replace("-", "--"))
+                        .collect::<Vec<_>>()
+                        .join("-")
+                ))
+                .join(env_name)
+        })
     }
 }
 
