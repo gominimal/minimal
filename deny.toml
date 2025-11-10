@@ -35,12 +35,6 @@ skip = [
     # nickel-lang-core -> pretty
     # https://github.com/Marwes/pretty.rs/blob/bd138e503ee3f679b26c838c9f148fbdaf6d2b7c/Cargo.toml#L17
     { name = "arrayvec", version = "0.5.2" },
-    # oci-client -> jwt
-    # https://github.com/mikkyang/rust-jwt/pull/101
-    { name = "base64", version = "0.13.1" },
-    # docker_credential
-    # https://github.com/keirlawson/docker_credential/pull/21
-    { name = "base64", version = "0.21.7" },
     # nickel-lang-core -> codespan
     { name = "codespan-reporting", version = "0.12.0" },
     # hyper-tls -> native-tls -> security-framework
