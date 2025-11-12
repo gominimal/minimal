@@ -42,7 +42,16 @@ macro_rules! annotate_record {
                 let file_path = $files.name(file_id);
                 file_path
                     .to_str()
-                    .map(|s| s.starts_with($minimal_lib_path))
+                    .map(|s| {
+                        s.starts_with($minimal_lib_path)
+                            || if let Ok(md) = std::env::var("CARGO_MANIFEST_DIR") {
+                                (s.contains("minimal-ncl/")
+                                    && s.contains("crates")
+                                    && s.starts_with(&md))
+                            } else {
+                                false
+                            }
+                    })
                     .unwrap_or(false)
             })
             .unwrap_or(false)
