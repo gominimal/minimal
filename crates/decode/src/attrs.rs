@@ -10,6 +10,7 @@ use crate::{Error, eval_if_closure};
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum AttrValue {
     String(String),
+    Bool(bool),
     List(Vec<AttrValue>),
     Map(IndexMap<String, AttrValue>),
 }
@@ -29,6 +30,8 @@ impl AttrValue {
 
         match rt.term.as_ref() {
             Term::Str(s) => Ok(Self::String(s.to_string())),
+            Term::Bool(b) => Ok(Self::Bool(*b)),
+            Term::Enum(a) => Ok(Self::String(a.into_label())),
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                 let mut map = IndexMap::with_capacity(6);
                 r.fields
@@ -47,7 +50,10 @@ impl AttrValue {
                     .map(|e| AttrValue::from_term(e, program))
                     .collect::<Result<Vec<_>, Error>>()?,
             )),
-            _ => todo!("error for unexpected attribute value type"),
+            _ => todo!(
+                "error for unexpected attribute value type: {:?}",
+                rt.term.as_ref()
+            ),
         }
     }
 }
