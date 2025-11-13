@@ -10,6 +10,7 @@ use crate::{Error, eval_if_closure};
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum AttrValue {
     String(String),
+    List(Vec<AttrValue>),
     Map(IndexMap<String, AttrValue>),
 }
 
@@ -29,9 +30,93 @@ impl AttrValue {
         match rt.term.as_ref() {
             Term::Str(s) => Ok(Self::String(s.to_string())),
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                todo!("rec: {:?}", r);
+                let mut map = IndexMap::with_capacity(6);
+                r.fields
+                    .iter()
+                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                        map.insert(
+                            ident_and_loc.label().to_string(),
+                            AttrValue::from_term(field.value.as_ref().unwrap(), program)?,
+                        );
+                        Ok(())
+                    })?;
+                Ok(Self::Map(map))
             }
+            Term::Array(e, _attrs) => Ok(Self::List(
+                e.iter()
+                    .map(|e| AttrValue::from_term(e, program))
+                    .collect::<Result<Vec<_>, Error>>()?,
+            )),
             _ => todo!("error for unexpected attribute value type"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::load::*;
+
+    #[test]
+    fn parse_str() {
+        let (term, mut program, _origin) = Loader::new("\"a\"", &LoadOptions::for_test())
+            .unwrap_or_else(|e| {
+                e.report_to_stderr();
+                panic!("load failed");
+            })
+            .finish()
+            .unwrap_or_else(|e| {
+                e.report_to_stderr();
+                panic!("finish failed");
+            });
+
+        assert_eq!(
+            AttrValue::from_term(&term, &mut program).unwrap(),
+            AttrValue::String("a".to_string()),
+        );
+    }
+
+    #[test]
+    fn parse_record() {
+        let (term, mut program, _origin) = Loader::new("{key = \"a\"}", &LoadOptions::for_test())
+            .unwrap_or_else(|e| {
+                e.report_to_stderr();
+                panic!("load failed");
+            })
+            .finish()
+            .unwrap_or_else(|e| {
+                e.report_to_stderr();
+                panic!("finish failed");
+            });
+
+        assert_eq!(
+            AttrValue::from_term(&term, &mut program).unwrap(),
+            AttrValue::Map(IndexMap::from_iter([(
+                "key".to_string(),
+                AttrValue::String("a".to_string())
+            )])),
+        );
+    }
+
+    #[test]
+    fn parse_list() {
+        let (term, mut program, _origin) = Loader::new("[\"a\", \"b\"]", &LoadOptions::for_test())
+            .unwrap_or_else(|e| {
+                e.report_to_stderr();
+                panic!("load failed");
+            })
+            .finish()
+            .unwrap_or_else(|e| {
+                e.report_to_stderr();
+                panic!("finish failed");
+            });
+
+        assert_eq!(
+            AttrValue::from_term(&term, &mut program).unwrap(),
+            AttrValue::List(vec![
+                AttrValue::String("a".to_string()),
+                AttrValue::String("b".to_string()),
+            ]),
+        );
     }
 }
