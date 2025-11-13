@@ -18,9 +18,9 @@ pub use load::LoadOptions;
 mod error;
 pub use error::Error;
 
-use crate::builds::BuildDecl;
-
+pub mod attrs;
 pub mod builds;
+use builds::BuildDecl;
 
 /// A collection of nickel objects, defined together in a single codebase.
 #[derive(Debug)]

@@ -1,6 +1,24 @@
 let Tys = [| 'Builder, 'Path, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Prebuilt, 'Subset |]
 in
+let attrs_schema = import "attr_classes.ncl"
+in
 {
+    Attrs = std.contract.custom (fun label value =>
+        if std.is_record value then
+            value
+            |> std.record.fields
+            |> std.array.fold_right
+                (fun field_name rest =>
+                    if std.record.has_field field_name attrs_schema then
+                        rest
+                    else
+                        'Error { message = "no such attribute `%{field_name}`" }
+                )
+                ('Ok value)
+        else
+            'Error { message = "not a record" }
+    ),
+
     BuildSpec | doc "A minimal build spec, defining inputs to the build as well as outputs which carry build artifacts downstream" = {
         ty | Tys = 'Builder,
         name
@@ -9,6 +27,8 @@ in
           | Array Input,
         runtime_deps
           | Array RuntimeDep | optional,
+
+        attrs | Attrs | optional,
 
         cmd | String,
         build_args | {_: String} | optional,

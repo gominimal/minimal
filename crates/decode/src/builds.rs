@@ -1,6 +1,6 @@
 //! Build specification objects.
 
-use crate::{Error, ObjTy, eval_if_closure, read_ty};
+use crate::{Error, ObjTy, attrs::AttrValue, eval_if_closure, read_ty};
 use common::{
     Target,
     target::{Arch, OS},
@@ -678,10 +678,12 @@ impl RuntimeDep {
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 pub struct BuildDecl {
-    /// The human-readable name declared on the build spec.
+    /// The human-readable name declared on the build decl.
     pub name: String,
-    /// The system this build-spec is meant to run on. Defaults to amd64 Linux.
+    /// The system this build-decl is meant to run on. Defaults to amd64 Linux.
     pub target: Target,
+    /// Any attributes explicitly set on this build-decl.
+    pub attrs: Option<IndexMap<String, AttrValue>>,
 
     /// The build command declared on the build spec.
     pub cmd: String,
@@ -741,6 +743,7 @@ impl BuildDecl {
         let mut runtime_deps: Option<SmallVec<[RuntimeDep; 8]>> = None;
         let mut outputs: Option<OutputMap> = None;
         let mut replace_on_cycle: Option<BuildRef> = None;
+        let mut attrs: Option<IndexMap<String, AttrValue>> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                 r.fields
@@ -903,6 +906,31 @@ impl BuildDecl {
                                 }
                                 Ok(())
                             }
+                            "attrs" => {
+                                if let Some(attrs_rt) = field.value.as_ref() {
+                                    let attrs_rt =
+                                        eval_if_closure(attrs_rt, program)?;
+
+                                    match attrs_rt.term.as_ref() {
+                                        Term::Record(r) | Term::RecRecord(r, _, _, _) => {
+                                            attrs = Some(r.fields.iter().map(
+                                                |(ident_and_loc, field)| -> Result<(String, AttrValue), Error> {
+                                                    Ok((
+                                                        ident_and_loc.label().to_string(),
+                                                        AttrValue::from_term(
+                                                            field.value.as_ref().unwrap(),
+                                                            program,
+                                                        )?,
+                                                    ))
+                                                },
+                                            ).collect::<Result<IndexMap<_, _>, Error>>()?);
+                                        }
+                                        _ => todo!("unexpected term for attrs"),
+                                    };
+                                }
+
+                                Ok(())
+                            }
                             _ => Ok(()), // TODO: Should we error if we see an unknown field?
                         }
                     })?;
@@ -964,6 +992,7 @@ impl BuildDecl {
         Ok(Self {
             name,
             cmd,
+            attrs,
             build_args,
             target: target.unwrap_or(Target::new(Arch::Amd64, OS::Linux)),
             inputs,
@@ -1149,6 +1178,7 @@ mod tests {
                 name,
                 target,
                 cmd,
+                attrs: _,
                 build_args,
                 inputs: _,
                 runtime_deps: _,
@@ -1250,6 +1280,45 @@ mod tests {
             BuildOutput::Data {
                 glob: "/data/locale/*".to_string()
             },
+        );
+    }
+
+    #[test]
+    fn parse_attrs() {
+        let (term, mut program, _origin) = Loader::new(
+            indoc! {
+                "
+                let {Attrs, BuildSpec, ..} = import \"minimal.ncl\" in
+                {
+        			name = \"buildspec\",
+                    inputs = [],
+        			cmd = \"./build.sh\",
+                    attrs = {
+                      upstream_version = \"1.2.3\",
+                    } | Attrs,
+        		} | BuildSpec"
+            }
+            .to_string(),
+            &LoadOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("load failed");
+        })
+        .finish()
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("finish failed");
+        });
+
+        assert_eq!(
+            BuildDecl::from_term(&term, &mut program, &mut ())
+                .unwrap()
+                .attrs,
+            Some(IndexMap::from_iter([(
+                "upstream_version".to_string(),
+                AttrValue::String("1.2.3".to_string())
+            )])),
         );
     }
 }
