@@ -925,7 +925,7 @@ impl BuildDecl {
                                                 },
                                             ).collect::<Result<IndexMap<_, _>, Error>>()?);
                                         }
-                                        _ => todo!("unexpected term for attrs"),
+                                        _ => todo!("unexpected term for attrs: {:?}", attrs_rt.term.as_ref()),
                                     };
                                 }
 
