@@ -19,6 +19,7 @@ mod error;
 pub use error::Error;
 
 pub mod attrs;
+pub use attrs::AttrValue;
 pub mod builds;
 use builds::BuildDecl;
 
