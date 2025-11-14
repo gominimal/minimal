@@ -81,6 +81,42 @@ mod tests {
             AttrValue::String("a".to_string()),
         );
     }
+    #[test]
+    fn parse_bool() {
+        let (term, mut program, _origin) = Loader::new("true", &LoadOptions::for_test())
+            .unwrap_or_else(|e| {
+                e.report_to_stderr();
+                panic!("load failed");
+            })
+            .finish()
+            .unwrap_or_else(|e| {
+                e.report_to_stderr();
+                panic!("finish failed");
+            });
+
+        assert_eq!(
+            AttrValue::from_term(&term, &mut program).unwrap(),
+            AttrValue::Bool(true),
+        );
+    }
+    #[test]
+    fn parse_enum() {
+        let (term, mut program, _origin) = Loader::new("'Uwu", &LoadOptions::for_test())
+            .unwrap_or_else(|e| {
+                e.report_to_stderr();
+                panic!("load failed");
+            })
+            .finish()
+            .unwrap_or_else(|e| {
+                e.report_to_stderr();
+                panic!("finish failed");
+            });
+
+        assert_eq!(
+            AttrValue::from_term(&term, &mut program).unwrap(),
+            AttrValue::String("Uwu".to_string()),
+        );
+    }
 
     #[test]
     fn parse_record() {
