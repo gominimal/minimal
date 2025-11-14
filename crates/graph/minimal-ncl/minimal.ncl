@@ -5,19 +5,27 @@ in
 {
     Attrs = std.contract.custom (fun label value =>
         if std.is_record value then
-            value
-            |> std.record.fields
-            |> std.array.fold_right
-                (fun field_name rest =>
-                    if std.record.has_field field_name attrs_schema then
-                        rest
-                    else
-                        'Error { message = "no such attribute `%{field_name}`" }
-                )
-                ('Ok value)
+            let rec
+                results = (std.array.map
+                                (fun {field, value} =>
+                                    if std.record.has_field field attrs_schema then
+                                        std.contract.apply attrs_schema."%{field}".validate label value
+                                    else
+                                        'Error { message = "no such attribute `%{field}`" })
+                                (std.record.to_array value)),
+                errors = std.array.filter
+                            (fun x => match {
+                                'Error _ => true,
+                                any => false,
+                            } x) results,
+            in
+            if std.array.length errors == 0 then
+                'Ok value
+            else
+                std.array.first errors
         else
             'Error { message = "not a record" }
-    ),
+        ),
 
     BuildSpec | doc "A minimal build spec, defining inputs to the build as well as outputs which carry build artifacts downstream" = {
         ty | Tys = 'Builder,
@@ -64,7 +72,7 @@ in
         glob
           | String,
     },
-    OutputBin | doc "An output of a build spec which represents a shared library." = {
+    OutputBin | doc "An output of a build spec which represents a binary." = {
         ty | Tys = 'OutputBin,
         glob
           | String,
