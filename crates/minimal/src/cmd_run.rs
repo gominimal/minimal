@@ -26,7 +26,7 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
             )));
         }
     };
-    let env = match mfile.envs.get(&task.env) {
+    let mut env = match mfile.envs.get(&task.env) {
         Some(e) => e.clone(),
         None => {
             return Err(Error::Other(anyhow!("no such env named '{}'", task.env)));
@@ -61,6 +61,35 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
             base.path(),
         )
         .map_err(anyhow::Error::from)?;
+
+        // Check attributes on each dependency to see if theres any additional env wiring.
+        let attrs = &graph.get(&dep).unwrap().attrs;
+        if let Some(dirs) = attrs.get("env_dir_mappings") {
+            for mapping in dirs.as_list().unwrap() {
+                let mapping = mapping.as_map().unwrap();
+                env.patch.dir.insert(
+                    mapping.get("path").unwrap().as_string().unwrap().clone(),
+                    if *mapping.get("read_only").unwrap().as_bool().unwrap() {
+                        PatchSetting::ReadOnly
+                    } else {
+                        PatchSetting::ReadWrite
+                    },
+                );
+            }
+        }
+        if let Some(dirs) = attrs.get("env_file_mappings") {
+            for mapping in dirs.as_list().unwrap() {
+                let mapping = mapping.as_map().unwrap();
+                env.patch.file.insert(
+                    mapping.get("path").unwrap().as_string().unwrap().clone(),
+                    if *mapping.get("read_only").unwrap().as_bool().unwrap() {
+                        PatchSetting::ReadOnly
+                    } else {
+                        PatchSetting::ReadWrite
+                    },
+                );
+            }
+        }
     }
 
     // Create the cwd & env in the rootfs

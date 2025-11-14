@@ -20,6 +20,8 @@ use crate::{SpecHash, SpecHasher};
 /// A map with ordered iteration semantics - we need this for stable spec hashes.
 type OutputMap = IndexMap<String, BuildOutput>;
 
+pub use decode::AttrValue;
+
 /// A reference to some other [BuildSpec] in a [DepGraph].
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, PartialOrd, Ord)]
 pub struct BuildSpecRef(pub(crate) generational_arena::Index);
@@ -221,6 +223,9 @@ pub struct BuildSpec {
     /// An alternative build spec to use to break cycles in resolving dependencies on this build spec.
     pub replace_on_cycle: Option<BuildSpecRef>,
 
+    /// The attributes defined on the build-spec.
+    pub attrs: IndexMap<String, AttrValue>,
+
     /// Identifies the collection of build-specs where this was defined.
     pub from: Arc<SpecOrigin>,
 }
@@ -271,6 +276,8 @@ impl BuildSpec {
                 .map(|(k, v)| (k.clone(), BuildOutput::from_decoded(v)))
                 .collect(),
             replace_on_cycle: bd.replace_on_cycle.as_ref().map(|br| loader.load(br)),
+
+            attrs: bd.attrs.as_ref().cloned().unwrap_or(IndexMap::new()),
 
             from: loader.origin.clone(),
         }

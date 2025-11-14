@@ -56,6 +56,35 @@ impl AttrValue {
             ),
         }
     }
+
+    /// Returns the inner list, if this [AttrValue] is the list variant.
+    pub fn as_list(&self) -> Option<&Vec<AttrValue>> {
+        match self {
+            Self::List(l) => Some(l),
+            _ => None,
+        }
+    }
+    /// Returns the inner map, if this [AttrValue] is the map variant.
+    pub fn as_map(&self) -> Option<&IndexMap<String, AttrValue>> {
+        match self {
+            Self::Map(m) => Some(m),
+            _ => None,
+        }
+    }
+    /// Returns the inner string, if this [AttrValue] is the string variant.
+    pub fn as_string(&self) -> Option<&String> {
+        match self {
+            Self::String(s) => Some(s),
+            _ => None,
+        }
+    }
+    /// Returns the inner bool, if this [AttrValue] is the bool variant.
+    pub fn as_bool(&self) -> Option<&bool> {
+        match self {
+            Self::Bool(b) => Some(b),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
