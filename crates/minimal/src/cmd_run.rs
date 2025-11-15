@@ -53,7 +53,8 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
     // Make sure the packages are built
     crate::cmd_build::cmd_build_impl(&graph, ctx, cache.clone(), ctx.num_parallel_builds).await?;
 
-    // Start setting up the run container
+    // Iterate all transitive deps, patching them in and also
+    // checking any environment-wiring-relevant attributes for information
     let base = tempfile::tempdir_in(ctx.paths().run_base_dir()).map_err(anyhow::Error::from)?;
     for dep in Transitives::for_toplevels(&graph, graph.top_levels.clone(), false).into_keys() {
         common::hardlink_dir_contents(
@@ -89,6 +90,20 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
                     },
                 );
             }
+        }
+        if let Some(dir) = attrs.get("env_state_wiring") {
+            let mapping = dir.as_map().unwrap();
+            let env_var = mapping.get("env_var").unwrap().as_string().unwrap().clone();
+            let prefix = mapping.get("prefix").unwrap().as_string().unwrap().clone();
+            let dir = state_base_dir.join(&prefix);
+            std::fs::create_dir_all(&dir).map_err(anyhow::Error::from)?;
+            env.vars.entry(env_var).or_insert_with(|| {
+                PathBuf::from("/state")
+                    .join(dir.strip_prefix(&state_base_dir).unwrap())
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            });
         }
     }
 
