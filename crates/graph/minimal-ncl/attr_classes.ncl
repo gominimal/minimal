@@ -23,4 +23,13 @@
             class | [| 'Credential, 'State |],
         },
     },
+
+    env_state_wiring = {
+        name = "environment state directory & variable",
+        desc = "Indicates the need for a state directory in an environment, and the environment variable through which it is communicated.",
+        validate = {
+            env_var | String,
+            prefix | String,
+        },
+    },
 }
