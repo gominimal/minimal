@@ -1,6 +1,8 @@
 ## Building `minimal`
 
-For now, the minimal tool only runs on amd64 Linux. 8 cores and at least 8 Gb of ram recommended, but it should still run on a wet piece of spaghetti (slowly).
+For now, the minimal tool only runs on amd64 Linux.
+
+8 cores and at least 16 Gb of ram recommended, but it should (slowly) run on a wet piece of spaghetti.
 
 ### Dependencies
 1. Install a fairly recent version of rust: https://rust-lang.org/tools/install/
@@ -23,32 +25,32 @@ $> cargo run -- <minimal args>
 ### Minimal commands
 
 ```
+The Minimal CLI
+
 Usage: minimal [OPTIONS] <COMMAND>
 
 Commands:
-  build             Builds package(s), making them available in the minimal build cache
-  plan              Prints the build plan for the specified package(s)
-  new-world-update  Builds packages which have a prebuilt cycle-breaker, and uploads then + updates their build-specs
-  oci-image         Materializes an OCI container image for executing the specified package
-  check             Validates and formats nickel build-spec files
-  upload-cache      Uploads the specified packages and their transitive needs to the cache
-  help              Print this message or the help of the given subcommand(s)
+  build        Builds package(s), making them available in the local cache
+  run          Runs a task specified in `minimal.toml`
+  materialize  Materializes an output specified in `minimal.toml`
+  update       Refreshes local checkouts of upstream packages & the standard library
+  plan         Prints the build plan for the specified package(s)
+  check        Validates and formats nickel build-spec files
+  help         Print this message or the help of the given subcommand(s)
 
 Options:
-      --cache-dir <CACHE_DIR>
-          Override the directory where binary artifacts are cached
-      --builds-dir <BUILDS_DIR>
-          Override the direct where builds are performed (default: ~/.cache/minimal/sandboxes)
-      --download-cache-dir <DOWNLOAD_CACHE_DIR>
-          Override the download cache directory (default: ~/.cache/minimal/downloads)
+      --minimal-dir <MINIMAL_DIR>
+          Override the base directory used for operations (default: ~/.cache/minimal)
+      --stdlib-dir <STDLIB_DIR>
+          Load the minimal standard library from the given path instead
       --packages-dir <PACKAGES_DIR>
-          Override the packages/ directory where build-specs are loaded
+          Load packages from the given path instead of using `[base]` in `minimal.toml`
       --no-cache
-          Ignore cached builds (forcing a rebuild)
+          Ignore locally-available binary artifacts (results in rebuilds unless present in a remote cache)
       --no-fetch
-          Do not fetch completed builds from the internet
+          Do not fetch binary artifacts from the internet
   -n, --num-parallel-builds <NUM_PARALLEL_BUILDS>
-          Configure the number of parallel builds [default: 4]
+          Configure the number of parallel builds [default: 6]
   -h, --help
           Print help
   -V, --version
@@ -68,6 +70,6 @@ These args apply to planning as well.
 Other stuff thats less important:
 
  - `minimal new-world-update` - Updates the prebuilt cycle-breakers. Tom plans to rip this out when he replaces prebuilts.
- - `minimal oci-image` - Builds and uploads a container image containing the specified packages.
  - `minimal check` - Runs a bunch of formatting and correctness checks on our packaging.
  - `minimal upload-cache` - Ensures all the built artifacts cached locally are present in the remote cache (GCP bucket), uploading them if not.
+ - `minimal patched-build <package-name>` - Builds only the specified package, wiring dependencies into the build by package name instead of spec-hash.

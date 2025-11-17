@@ -41,7 +41,7 @@ use cmd_run::{RunArgs, cmd_run};
 
 #[derive(Parser)]
 #[command(name = "minimal", version = env!("GIT_HASH"))]
-#[command(about = "A minimal package manager")]
+#[command(about = "The Minimal CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -59,7 +59,7 @@ enum Command {
     Run(RunArgs),
     /// Materializes an output specified in `minimal.toml`.
     Materialize(MaterializeArgs),
-    /// Updates refreshes local checkouts of the minimal packages & standard library.
+    /// Refreshes local checkouts of upstream packages & the standard library.
     Update,
 
     /// Prints the build plan for the specified package(s)
@@ -96,18 +96,18 @@ pub struct GlobalArgs {
     #[arg(long, hide = true)]
     download_cache_dir: Option<PathBuf>,
 
-    /// Load the minimal stdlib from the given path instead
+    /// Load the minimal standard library from the given path instead
     #[arg(long)]
     stdlib_dir: Option<PathBuf>,
-    /// Load packages from the given path instead
+    /// Load packages from the given path instead of using `[base]` in `minimal.toml`
     #[arg(long)]
     packages_dir: Option<PathBuf>,
 
-    /// Ignore cached builds (forcing a rebuild)
+    /// Ignore locally-available binary artifacts (results in rebuilds unless present in a remote cache)
     #[arg(long, default_value_t = false)]
     no_cache: bool,
 
-    /// Do not fetch completed builds from the internet
+    /// Do not fetch binary artifacts from the internet
     #[arg(long, default_value_t = false)]
     no_fetch: bool,
 
@@ -117,6 +117,7 @@ pub struct GlobalArgs {
 
     /// Write build events to a protobuf text format file
     #[arg(long)]
+    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
     build_events_file: Option<PathBuf>,
 }
 
