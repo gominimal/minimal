@@ -745,7 +745,7 @@ mod tests {
         });
         let layer = layer.unwrap();
 
-        let dp = DepGraph::new().ingest(layer);
+        let dp = DepGraph::new().ingest(layer).unwrap();
         let planner: ExecPlan<()> = ExecPlan::new(&dp);
 
         assert_eq!(
@@ -805,7 +805,7 @@ mod tests {
         });
         let layer = layer.unwrap();
 
-        let dp = DepGraph::new().ingest(layer);
+        let dp = DepGraph::new().ingest(layer).unwrap();
         let planner: ExecPlan<()> = ExecPlan::new(&dp);
 
         // true = all builds without cycle-breakers
@@ -874,7 +874,7 @@ mod tests {
         });
         let layer = layer.unwrap();
 
-        let dp = DepGraph::new().ingest(layer);
+        let dp = DepGraph::new().ingest(layer).unwrap();
         let mut cycles = ExecPlan::new(&dp)
             .find_cycles()
             .into_iter()
@@ -932,7 +932,7 @@ mod tests {
         });
         let layer = layer.unwrap();
 
-        let dp = DepGraph::new().ingest(layer);
+        let dp = DepGraph::new().ingest(layer).unwrap();
         let plan: Vec<BuildPhase> = ExecPlan::new(&dp).collect::<Result<_, _>>().unwrap();
 
         assert_eq!(
@@ -1053,7 +1053,7 @@ mod tests {
         });
         let layer = layer.unwrap();
 
-        let dp = DepGraph::new().ingest(layer);
+        let dp = DepGraph::new().ingest(layer).unwrap();
 
         let bin_provider: BinProviderFake =
             HashMap::from([(dp.by_name("nested dep").next().unwrap(), ())]).into();
@@ -1132,7 +1132,7 @@ mod tests {
         });
         let layer = layer.unwrap();
 
-        let dp = DepGraph::new().ingest(layer);
+        let dp = DepGraph::new().ingest(layer).unwrap();
 
         let bin_provider: BinProviderFake = HashMap::from([
             (dp.by_name("top").next().unwrap(), ()),

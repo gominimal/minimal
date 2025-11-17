@@ -250,7 +250,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dg = DepGraph::new().ingest(layer);
+        let dg = DepGraph::new().ingest(layer).unwrap();
 
         let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], false);
         assert_eq!(
@@ -309,7 +309,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dg = DepGraph::new().ingest(layer);
+        let dg = DepGraph::new().ingest(layer).unwrap();
 
         let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], true);
         assert_eq!(
@@ -382,7 +382,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dg = DepGraph::new().ingest(layer);
+        let dg = DepGraph::new().ingest(layer).unwrap();
 
         let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], true);
         assert_eq!(
@@ -469,7 +469,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dg = DepGraph::new().ingest(layer);
+        let dg = DepGraph::new().ingest(layer).unwrap();
 
         let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], false);
         assert_eq!(
@@ -551,7 +551,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dg = DepGraph::new().ingest(layer);
+        let dg = DepGraph::new().ingest(layer).unwrap();
 
         let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], true);
         assert_eq!(

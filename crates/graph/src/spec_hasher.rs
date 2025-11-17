@@ -303,7 +303,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new().ingest(layer);
+        let dp = DepGraph::new().ingest(layer).unwrap();
 
         // println!("{}", SpecHasher::hash(&dp, &dp.top_levels[0]).0.to_hex());
         assert_eq!(
@@ -346,7 +346,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new().ingest(layer);
+        let dp = DepGraph::new().ingest(layer).unwrap();
 
         // println!("{}", SpecHasher::hash(&dp, &dp.top_levels[0]).0.to_hex());
         assert_eq!(
@@ -388,7 +388,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new().ingest(layer);
+        let dp = DepGraph::new().ingest(layer).unwrap();
 
         // println!("{}", SpecHasher::hash(&dp, &dp.top_levels[0]).0.to_hex());
         assert_eq!(
@@ -426,7 +426,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new().ingest(layer);
+        let dp = DepGraph::new().ingest(layer).unwrap();
 
         // println!("{}", SpecHasher::hash(&dp, &dp.top_levels[0]).0.to_hex());
         assert_eq!(

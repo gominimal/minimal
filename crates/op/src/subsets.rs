@@ -68,10 +68,11 @@ mod tests {
         let cache = Cache::at_dir(tmp_dir.path()).unwrap();
 
         // Make a fake upstream build.
-        let dg = DepGraph::new().ingest(
-            Layer::new_for_test(
-                indoc! {
-                    "
+        let dg = DepGraph::new()
+            .ingest(
+                Layer::new_for_test(
+                    indoc! {
+                        "
                 let {BuildSpec, Source, OutputData, ..} = import \"minimal.ncl\" in
                 {
                     name = \"fake build\",
@@ -83,11 +84,12 @@ mod tests {
                     c = {glob = \"c\"} | OutputData,
                     },
                 } | BuildSpec"
-                }
-                .to_string(),
+                    }
+                    .to_string(),
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        );
+            .unwrap();
         // Write some files into a cache entry to fake existence of a completed build of it.
         let build_hash = dg.spec_hash(&dg.by_name("fake build").next().unwrap());
         let build_files_dir = cache.write_dir(&build_hash).unwrap();

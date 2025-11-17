@@ -317,7 +317,7 @@ impl Context {
         )
         .map_err(|e| Error::Graph(GraphError::Decode(e)))?;
 
-        Ok(DepGraph::new().ingest(layer))
+        DepGraph::new().ingest(layer).map_err(Error::Graph)
     }
 
     #[tracing::instrument]
@@ -334,7 +334,7 @@ impl Context {
         )
         .map_err(|e| Error::Graph(GraphError::Decode(e)))?;
 
-        Ok(DepGraph::new().ingest(layer))
+        DepGraph::new().ingest(layer).map_err(Error::Graph)
     }
 
     pub fn graph_from_all_packages(&mut self) -> Result<DepGraph, Error> {
@@ -349,7 +349,7 @@ impl Context {
         )
         .map_err(|e| Error::Graph(GraphError::Decode(e)))?;
 
-        Ok(DepGraph::new().ingest(layer))
+        DepGraph::new().ingest(layer).map_err(Error::Graph)
     }
 }
 

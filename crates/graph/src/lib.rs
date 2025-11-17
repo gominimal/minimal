@@ -6,6 +6,12 @@ use common::SpecHash;
 pub enum Error {
     /// An error occurred during decoding.
     Decode(decode::Error),
+    /// A subset depended on an output that doesnt exist.
+    NoSuchOutput {
+        output: String,
+        from: (BuildSpecRef, String),
+        build: (BuildSpecRef, String),
+    },
 }
 
 impl Error {
@@ -13,6 +19,16 @@ impl Error {
     pub fn report_to(&self, writer: &mut dyn codespan_reporting::term::termcolor::WriteColor) {
         match self {
             Error::Decode(e) => e.report_to(writer),
+            Error::NoSuchOutput {
+                from,
+                output,
+                build: _,
+            } => write!(
+                writer,
+                "Error: subset referenced output '{}' on '{}' which does not exist",
+                output, from.1,
+            )
+            .unwrap(),
         }
     }
 
