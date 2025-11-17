@@ -4,6 +4,11 @@
         desc = "The software version as declared by the upstream.",
         validate = String,
     },
+    repology_project = {
+        name = "repology project name",
+        desc = "The name of this software as tracked by https://repology.org/.",
+        validate = String,
+    },
 
     env_dir_mappings = {
         name = "environment directory mappings",
