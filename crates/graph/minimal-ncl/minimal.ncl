@@ -1,7 +1,7 @@
 let Tys = [| 'Builder, 'Path, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Prebuilt, 'Subset |]
 in
-let attrs_schema = import "attr_classes.ncl"
-in
+let attrs_schema = import "attr_classes.ncl" in
+let needs_schema = import "need_classes.ncl" in
 {
     Attrs = std.contract.custom (fun label record_value =>
         if !(std.is_record record_value) then
@@ -18,7 +18,7 @@ in
                   'Error e => 'Error { message = "failed to validate %{field}", blame_location = e.blame_location }
                 }
               else
-                'Error { message = "no such attribute `%{field}`" }
+                'Error { message = "`%{field}` is not a valid attribute" }
             )
             []
           |> match {
@@ -26,6 +26,29 @@ in
             'Error e => 'Error e,
           }
       ),
+    Needs = std.contract.custom (fun label record_value =>
+        if !(std.is_record record_value) then
+        'Error { message = "not a record" }
+        else
+        record_value
+        |> std.record.to_array
+        |> std.array.try_fold_left
+            (fun acc { field, value } =>
+            if std.record.has_field field needs_schema then
+                std.contract.check needs_schema."%{field}".validate label value
+                |> match {
+                'Ok wrapped_value => 'Ok (acc @ [{ include field, value = wrapped_value }]),
+                'Error e => 'Error { message = "failed to validate %{field}", blame_location = e.blame_location }
+                }
+            else
+                'Error { message = "`%{field}` is not a valid need" }
+            )
+            []
+        |> match {
+            'Ok array => 'Ok (std.record.from_array array),
+            'Error e => 'Error e,
+        }
+    ),
 
     BuildSpec | doc "A minimal build spec, defining inputs to the build as well as outputs which carry build artifacts downstream" = {
         ty | Tys = 'Builder,
@@ -35,6 +58,7 @@ in
           | Array Input,
         runtime_deps
           | Array RuntimeDep | optional,
+        needs | Needs | optional,
 
         attrs | Attrs | optional,
 
