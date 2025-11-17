@@ -4,6 +4,7 @@ use crate::{
 };
 use blake3::Hasher;
 use common::{SubsetSpec, Target, target};
+use decode::AttrValue;
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::io::Write;
@@ -194,6 +195,8 @@ fn build_input_hash(input: &BuildSpecInput, h: &mut Hasher) {
     }
 }
 
+// NB: 'attrs' in this context means the fields of the build, not
+// literally attributes defined on the build (those are not part of the hash).
 fn build_attrs_hash(spec: &BuildSpec, h: &mut Hasher) {
     h.write_all(b"build spec").unwrap();
     h.write_all(spec.name.as_bytes()).unwrap();
@@ -225,6 +228,45 @@ fn build_attrs_hash(spec: &BuildSpec, h: &mut Hasher) {
     if spec.target != Target::new(target::Arch::Amd64, target::OS::Linux) {
         h.write_all(b"-target").unwrap();
         spec.target.hash_to(h);
+    }
+
+    if !spec.abstract_deps.is_empty() {
+        h.write_all(b"-needs").unwrap();
+        for (name, v) in spec.abstract_deps.iter() {
+            h.write_all(b"k").unwrap();
+            h.write_all(name.as_bytes()).unwrap();
+            h.write_all(b"v").unwrap();
+            build_attrvalue_hash(v, h);
+        }
+    }
+}
+
+fn build_attrvalue_hash(v: &AttrValue, h: &mut Hasher) {
+    match v {
+        AttrValue::Bool(b) => {
+            h.write_all(b"b").unwrap();
+            h.write_all(if *b { b"1" } else { b"0" }).unwrap();
+        }
+        AttrValue::String(s) => {
+            h.write_all(b"s").unwrap();
+            h.write_all(s.as_bytes()).unwrap();
+        }
+
+        AttrValue::List(v) => {
+            h.write_all(b"v").unwrap();
+            if !v.is_empty() {
+                v.iter().for_each(|av| build_attrvalue_hash(av, h));
+            }
+        }
+        AttrValue::Map(m) => {
+            h.write_all(b"m").unwrap();
+            if !m.is_empty() {
+                m.iter().for_each(|(k, av)| {
+                    h.write_all(k.as_bytes()).unwrap();
+                    build_attrvalue_hash(av, h);
+                });
+            }
+        }
     }
 }
 
@@ -311,6 +353,59 @@ mod tests {
             SpecHash::from_hex("48d0229ccc7973402752c4a62a5d09875c5db3c426d31655520710626340a4b8")
                 .unwrap(),
         );
+    }
+
+    #[test]
+    fn abstract_deps_hashed() {
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+                let {Needs, BuildSpec, ..} = import \"minimal.ncl\" in
+                {
+                    name = \"single buildspec\",
+                    inputs = [],
+                    cmd = \"something\",
+                    needs = {
+                        dns = {},
+                    } | Needs,
+                } | BuildSpec"
+            }
+            .to_string(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        let dp = DepGraph::new().ingest(layer).unwrap();
+
+        assert_eq!(
+            SpecHasher::hash(&dp, &dp.top_levels[0]),
+            SpecHash::from_hex("619459fa530bedc77f035ab942ef45e8e08a9f10407333a64a2e0367869fb197")
+                .unwrap(),
+        );
+
+        assert_ne!(SpecHasher::hash(&dp, &dp.top_levels[0]), {
+            // Identical except without setting needs
+            let layer = Layer::new_for_test(
+                indoc! {
+                    "
+                        let {Needs, BuildSpec, ..} = import \"minimal.ncl\" in
+                        {
+                            name = \"single buildspec\",
+                            inputs = [],
+                            cmd = \"something\",
+                        } | BuildSpec"
+                }
+                .to_string(),
+            )
+            .unwrap_or_else(|e| {
+                e.report_to_stderr();
+                panic!("spec parsing failed");
+            });
+            let dp = DepGraph::new().ingest(layer).unwrap();
+            SpecHasher::hash(&dp, &dp.top_levels[0])
+        });
     }
 
     #[test]

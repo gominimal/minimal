@@ -683,6 +683,8 @@ pub struct BuildDecl {
     /// The dependencies needed to run outputs of this build spec, as well as possibly needed
     /// during the build.
     pub runtime_deps: SmallVec<[RuntimeDep; 8]>,
+    /// Any needs explicitly set on this build-decl.
+    pub abstract_deps: Option<IndexMap<String, AttrValue>>,
     /// The named outputs (and match patterns) produced by executing this build spec.
     pub outputs: OutputMap,
 
@@ -729,6 +731,7 @@ impl BuildDecl {
         let mut build_args: Option<IndexMap<String, String>> = None;
         let mut inputs: Option<SmallVec<[BuildDeclInput; 10]>> = None;
         let mut runtime_deps: Option<SmallVec<[RuntimeDep; 8]>> = None;
+        let mut needs: Option<IndexMap<String, AttrValue>> = None;
         let mut outputs: Option<OutputMap> = None;
         let mut replace_on_cycle: Option<BuildRef> = None;
         let mut attrs: Option<IndexMap<String, AttrValue>> = None;
@@ -919,6 +922,31 @@ impl BuildDecl {
 
                                 Ok(())
                             }
+                            "needs" => {
+                                if let Some(needs_rt) = field.value.as_ref() {
+                                    let needs_rt =
+                                        eval_if_closure(needs_rt, program)?;
+
+                                    match needs_rt.term.as_ref() {
+                                        Term::Record(r) | Term::RecRecord(r, _, _, _) => {
+                                            needs = Some(r.fields.iter().map(
+                                                |(ident_and_loc, field)| -> Result<(String, AttrValue), Error> {
+                                                    Ok((
+                                                        ident_and_loc.label().to_string(),
+                                                        AttrValue::from_term(
+                                                            field.value.as_ref().unwrap(),
+                                                            program,
+                                                        )?,
+                                                    ))
+                                                },
+                                            ).collect::<Result<IndexMap<_, _>, Error>>()?);
+                                        }
+                                        _ => todo!("unexpected term for needs: {:?}", needs_rt.term.as_ref()),
+                                    };
+                                }
+
+                                Ok(())
+                            }
                             _ => Ok(()), // TODO: Should we error if we see an unknown field?
                         }
                     })?;
@@ -985,6 +1013,7 @@ impl BuildDecl {
             target: target.unwrap_or(Target::new(Arch::Amd64, OS::Linux)),
             inputs,
             runtime_deps,
+            abstract_deps: needs,
             outputs,
             replace_on_cycle,
         })
@@ -1170,6 +1199,7 @@ mod tests {
                 build_args,
                 inputs: _,
                 runtime_deps: _,
+                abstract_deps: _,
                 outputs,
                 replace_on_cycle
             } if name == "single buildspec" &&
@@ -1306,6 +1336,45 @@ mod tests {
             Some(IndexMap::from_iter([(
                 "upstream_version".to_string(),
                 AttrValue::String("1.2.3".to_string())
+            )])),
+        );
+    }
+
+    #[test]
+    fn parse_needs() {
+        let (term, mut program, _origin) = Loader::new(
+            indoc! {
+                "
+                let {Needs, BuildSpec, ..} = import \"minimal.ncl\" in
+                {
+        			name = \"buildspec\",
+                    inputs = [],
+        			cmd = \"./build.sh\",
+                    needs = {
+                      dns = {},
+                    } | Needs,
+        		} | BuildSpec"
+            }
+            .to_string(),
+            &LoadOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("load failed");
+        })
+        .finish()
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("finish failed");
+        });
+
+        assert_eq!(
+            BuildDecl::from_term(&term, &mut program, &mut ())
+                .unwrap()
+                .abstract_deps,
+            Some(IndexMap::from_iter([(
+                "dns".to_string(),
+                AttrValue::Map(Default::default())
             )])),
         );
     }

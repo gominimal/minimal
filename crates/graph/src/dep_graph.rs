@@ -217,6 +217,8 @@ pub struct BuildSpec {
     /// The dependencies needed to run outputs of this build spec, as well as possibly needed
     /// during the build.
     pub runtime_deps: SmallVec<[RuntimeDep; 8]>,
+    /// The 'needs' (abstract dependencies) defined on the build-spec.
+    pub abstract_deps: IndexMap<String, AttrValue>,
     /// The named outputs (and match patterns) produced by executing this build spec.
     pub outputs: OutputMap,
 
@@ -269,6 +271,11 @@ impl BuildSpec {
                 .iter()
                 .map(|d| RuntimeDep::from_decoded(d, loader))
                 .collect::<SmallVec<_>>(),
+            abstract_deps: bd
+                .abstract_deps
+                .as_ref()
+                .cloned()
+                .unwrap_or(IndexMap::new()),
 
             outputs: bd
                 .outputs
