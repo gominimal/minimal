@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use crate::spec_hasher::SubsetHasher;
-use crate::{SpecHash, SpecHasher};
+use crate::{Error, SpecHash, SpecHasher};
 
 /// A map with ordered iteration semantics - we need this for stable spec hashes.
 type OutputMap = IndexMap<String, BuildOutput>;
@@ -375,7 +375,7 @@ impl DepGraph {
     }
 
     /// Loads build declarations in from the given layer.
-    pub fn ingest(self, layer: Layer) -> Self {
+    pub fn ingest(self, layer: Layer) -> Result<Self, Error> {
         let mut loader = Loader {
             origin: Arc::new(layer.origin.clone()),
             from: layer,
@@ -386,7 +386,46 @@ impl DepGraph {
 
         let mut slf = loader.into_graph.into_inner();
         slf.top_levels.extend(new_toplevels);
-        slf
+
+        // Subsets reference outputs by name. Validate for these new
+        // build-specs that any subsets reference outputs that exist.
+        for (bsr, b) in slf
+            .builds
+            .iter()
+            .filter(|(_bsr, b)| b.from.as_ref() == &loader.from.origin)
+        {
+            for subset in b
+                .inputs
+                .iter()
+                .filter_map(|input| {
+                    if let BuildSpecInput::Subset(s) = input {
+                        Some(s)
+                    } else {
+                        None
+                    }
+                })
+                .chain(b.runtime_deps.iter().filter_map(|rd| {
+                    if let RuntimeDep::Subset(s) = rd {
+                        Some(s)
+                    } else {
+                        None
+                    }
+                }))
+            {
+                let build = slf.builds.get(subset.from.0).unwrap();
+                for output in &subset.outputs {
+                    if !build.outputs.contains_key(output) {
+                        return Err(Error::NoSuchOutput {
+                            from: (subset.from, build.name.clone()),
+                            build: (BuildSpecRef(bsr), b.name.clone()),
+                            output: output.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(slf)
     }
 
     /// Fetches a build-spec by reference.
@@ -532,7 +571,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new().ingest(layer);
+        let dp = DepGraph::new().ingest(layer).unwrap();
         assert!(
             dp.spec_hash(&dp.by_name("b1").next().unwrap())
                 != dp.spec_hash(&dp.by_name("b2").next().unwrap()),
@@ -575,7 +614,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new().ingest(layer);
+        let dp = DepGraph::new().ingest(layer).unwrap();
         assert_eq!(
             dp.transitive_specs_of(&dp.top_levels[0]),
             vec![
@@ -619,7 +658,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new().ingest(layer);
+        let dp = DepGraph::new().ingest(layer).unwrap();
         // We expect two buildspecs
         assert_eq!(
             vec!["build 1".to_string(), "build 2".to_string(),],

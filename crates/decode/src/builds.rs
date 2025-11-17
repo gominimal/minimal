@@ -308,18 +308,6 @@ impl SubsetInput {
         outputs.sort();
         outputs.dedup();
 
-        // TODO: Move this to loading into DepGraph
-        // for output in &outputs {
-        //     let build = self.builds.get(from.0).unwrap();
-        //     if !build.outputs.contains_key(output) {
-        //         return Err(Error::NoSuchOutput {
-        //             files: program.files(),
-        //             pos: rt.pos,
-        //             output: output.clone(),
-        //         });
-        //     }
-        // }
-
         Ok(SubsetInput { from, outputs })
     }
 }
