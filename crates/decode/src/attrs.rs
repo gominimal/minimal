@@ -190,4 +190,36 @@ mod tests {
             ]),
         );
     }
+
+    #[test]
+    fn unknown_attr_nickel_err() {
+        let res = Loader::new(
+            "let {Attrs, ..} = import \"minimal.ncl\" in {unknown_attr = \"a\"} | Attrs",
+            &LoadOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("load failed");
+        })
+        .finish();
+
+        assert!(res.is_err());
+        assert!(matches!(res, Err(Error::Nickel(_))));
+    }
+
+    #[test]
+    fn attr_wrong_schema_nickel_err() {
+        let res = Loader::new(
+            "let {Attrs, ..} = import \"minimal.ncl\" in {env_state_wiring = \"a\"} | Attrs",
+            &LoadOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("load failed");
+        })
+        .finish();
+
+        assert!(res.is_err());
+        assert!(matches!(res, Err(Error::Nickel(_))));
+    }
 }
