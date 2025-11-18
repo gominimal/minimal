@@ -26,7 +26,7 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
             )));
         }
     };
-    let mut env = match mfile.envs.get(&task.env) {
+    let env = match mfile.envs.get(&task.env) {
         Some(e) => e.clone(),
         None => {
             return Err(Error::Other(anyhow!("no such env named '{}'", task.env)));
@@ -53,63 +53,24 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
     // Make sure the packages are built
     crate::cmd_build::cmd_build_impl(&graph, ctx, cache.clone(), ctx.num_parallel_builds).await?;
 
-    // Iterate all transitive deps, patching them in and also
-    // checking any environment-wiring-relevant attributes for information
+    let transitive_deps = Transitives::for_toplevels(&graph, graph.top_levels.clone(), false);
     let base = tempfile::tempdir_in(ctx.paths().run_base_dir()).map_err(anyhow::Error::from)?;
-    for dep in Transitives::for_toplevels(&graph, graph.top_levels.clone(), false).into_keys() {
-        common::hardlink_dir_contents(
-            cache.read_dir(&graph.spec_hash(&dep)).unwrap().path(),
-            base.path(),
-        )
-        .map_err(anyhow::Error::from)?;
 
-        // Check attributes on each dependency to see if theres any additional env wiring.
-        let attrs = &graph.get(&dep).unwrap().attrs;
-        if let Some(dirs) = attrs.get("env_dir_mappings") {
-            for mapping in dirs.as_list().unwrap() {
-                let mapping = mapping.as_map().unwrap();
-                env.patch.dir.insert(
-                    mapping.get("path").unwrap().as_string().unwrap().clone(),
-                    if *mapping.get("read_only").unwrap().as_bool().unwrap() {
-                        PatchSetting::ReadOnly
-                    } else {
-                        PatchSetting::ReadWrite
-                    },
-                );
-            }
-        }
-        if let Some(dirs) = attrs.get("env_file_mappings") {
-            for mapping in dirs.as_list().unwrap() {
-                let mapping = mapping.as_map().unwrap();
-                env.patch.file.insert(
-                    mapping.get("path").unwrap().as_string().unwrap().clone(),
-                    if *mapping.get("read_only").unwrap().as_bool().unwrap() {
-                        PatchSetting::ReadOnly
-                    } else {
-                        PatchSetting::ReadWrite
-                    },
-                );
-            }
-        }
-        if let Some(dir) = attrs.get("env_state_wiring") {
-            let mapping = dir.as_map().unwrap();
-            let env_var = mapping.get("env_var").unwrap().as_string().unwrap().clone();
-            let prefix = mapping.get("prefix").unwrap().as_string().unwrap().clone();
-            let dir = state_base_dir.join(&prefix);
-            std::fs::create_dir_all(&dir).map_err(anyhow::Error::from)?;
-            env.vars.entry(env_var).or_insert_with(|| {
-                PathBuf::from("/state")
-                    .join(dir.strip_prefix(&state_base_dir).unwrap())
-                    .to_str()
-                    .unwrap()
-                    .to_string()
-            });
-        }
-    }
+    let mut op = op::EnvSetup {
+        state_base_dir: &state_base_dir,
+        top_levels: &graph.top_levels,
+        transitives: &transitive_deps,
+    };
+    let opts = op::Options {
+        cache,
+        graph: &graph,
+        exec_base: base.path().to_path_buf(),
+    };
+    use op::Runnable;
+    let (xtra_env_patches, xtra_env_vars) = op.run(&opts).await?;
 
-    // Create the cwd & env in the rootfs
+    // Create the cwd in the rootfs
     std::fs::create_dir_all(base.path().join(cwd.clone())).map_err(anyhow::Error::from)?;
-    std::fs::create_dir_all(base.path().join("state")).map_err(anyhow::Error::from)?;
 
     let mut container = Container::new();
     container
@@ -122,7 +83,7 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
         .symlink("/usr/bin", "/bin")
         .symlink("/usr/lib", "/lib64");
 
-    for (dir, opts) in &env.patch.dir {
+    for (dir, opts) in env.patch.dir.iter().chain(xtra_env_patches.dir.iter()) {
         let dir = if let Some(stripped) = dir.strip_prefix("~/") {
             home_dir().unwrap().join(stripped)
         } else {
@@ -147,7 +108,7 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
             }
         }
     }
-    for (file, opts) in &env.patch.file {
+    for (file, opts) in env.patch.file.iter().chain(xtra_env_patches.file.iter()) {
         let file = if let Some(stripped) = file.strip_prefix("~/") {
             home_dir().unwrap().join(stripped)
         } else {
@@ -202,9 +163,12 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
     if let Ok(lsc) = std::env::var("LS_COLORS") {
         cmd.env("LS_COLORS", lsc.as_str());
     }
-    env.vars.iter().for_each(|(var, val)| {
-        cmd.env(var, val);
-    });
+    env.vars
+        .iter()
+        .chain(xtra_env_vars.iter())
+        .for_each(|(var, val)| {
+            cmd.env(var, val);
+        });
 
     cmd.spawn()
         .map_err(anyhow::Error::from)?
