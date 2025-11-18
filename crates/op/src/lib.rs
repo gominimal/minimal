@@ -31,6 +31,9 @@ pub enum Materialized {
     TempDir(tempfile::TempDir),
 }
 
+mod envs;
+pub use envs::EnvSetup;
+
 mod subsets;
 pub use subsets::SubsetBuild;
 

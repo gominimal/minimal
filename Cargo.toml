@@ -47,6 +47,7 @@ reqwest = { version = "0.12", features = ["stream"] } # keep in sync with google
 rustc-hash = "2.1.1"
 serde = { version = "1.0", features = ["derive"] } # Keep within the same minor version as nickel-lang-core
 prost = "0.14.1"
+resolv-conf = "0.7"
 serde_json = { version = "1.0" }
 sha2 = "0.10.9"
 shlex = "1.3"
