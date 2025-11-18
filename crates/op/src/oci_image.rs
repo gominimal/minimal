@@ -5,7 +5,8 @@
 //! becomes a separate layer.
 
 use crate::{Error, Options, Runnable};
-use common::SpecHash;
+use common::mfile::StrOrList;
+use common::{SpecHash, mfile};
 use flate2::{Compression, write::GzEncoder};
 use globset::{Glob, GlobSet};
 use graph::{BuildSpecRef, Transitives, TransitivesDep};
@@ -32,7 +33,8 @@ pub struct OciImageCreate {
     pub output_file: PathBuf,
 
     pub name: Option<String>,
-    pub entrypoint: Option<String>,
+    pub entrypoint: Option<mfile::StrOrList>,
+    pub cmd: Option<mfile::StrOrList>,
     pub vars: HashMap<String, String>,
 }
 
@@ -135,7 +137,16 @@ impl Runnable for OciImageCreate {
                 .config({
                     let mut cb = ConfigBuilder::default();
                     if let Some(entrypoint) = &self.entrypoint {
-                        cb = cb.entrypoint(shlex::split(entrypoint).unwrap());
+                        cb = cb.entrypoint(match entrypoint {
+                            StrOrList::Single(s) => shlex::split(s).unwrap(),
+                            StrOrList::Multiple(v) => v.clone(),
+                        });
+                    };
+                    if let Some(cmd) = &self.cmd {
+                        cb = cb.cmd(match cmd {
+                            StrOrList::Single(s) => shlex::split(s).unwrap(),
+                            StrOrList::Multiple(v) => v.clone(),
+                        });
                     };
                     if !self.vars.is_empty() {
                         cb = cb.env(

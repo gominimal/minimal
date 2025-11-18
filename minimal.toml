@@ -38,4 +38,4 @@ cmd = "bash -l"
 type = "oci-image"
 packages = ["bash", "coreutils", "diffutils", "findutils", "tar"]
 env_vars.test = "ello"
-entrypoint = "/usr/bin/env"
+cmd = ["/usr/bin/bash", "-l"]

@@ -36,6 +36,14 @@ impl std::error::Error for Error {
     }
 }
 
+/// A value from serde that can either be a string, or an array of strings.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum StrOrList {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
 /// The `[base]` section of [File], describing the upstream to use.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct Base {
@@ -113,7 +121,9 @@ pub struct Output {
     pub packages: Vec<String>,
 
     #[serde(default)]
-    pub entrypoint: Option<String>,
+    pub entrypoint: Option<StrOrList>,
+    #[serde(default)]
+    pub cmd: Option<StrOrList>,
     #[serde(default, alias = "env_vars")]
     pub vars: HashMap<String, String>,
 }
@@ -237,6 +247,7 @@ mod tests {
             [outputs.test]
             type = "oci-image"
             packages = ["bash", "go"]
+            entrypoint = "/bin/sh"
             "#
         })
         .unwrap();
@@ -274,7 +285,8 @@ mod tests {
                     Output {
                         ty: OutputKind::OciImage,
                         packages: vec!["bash".to_string(), "go".to_string()],
-                        entrypoint: None,
+                        cmd: None,
+                        entrypoint: Some(StrOrList::Single("/bin/sh".to_string())),
                         vars: HashMap::new(),
                     }
                 )]

@@ -43,6 +43,7 @@ pub async fn cmd_materialize(args: MaterializeArgs, ctx: &mut Context) -> Result
         output_file: args.output,
         name: Some(args.output_name.clone()),
         entrypoint: output.entrypoint,
+        cmd: output.cmd,
         vars: output.vars,
     };
     let opts = op::Options {
