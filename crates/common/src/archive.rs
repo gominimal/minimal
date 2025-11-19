@@ -71,6 +71,7 @@ pub fn compress_dir<P: AsRef<Path>>(
         let mut w = super::Tee::new(&mut tar_file, &mut hasher);
         let encoder = zstd::stream::Encoder::new(&mut w, override_level.unwrap_or(ZSTD_LEVEL))?;
         let mut tar_builder = tar::Builder::new(encoder);
+        tar_builder.mode(tar::HeaderMode::Deterministic);
         tar_builder.follow_symlinks(false);
         tar_builder.append_dir_all(".", dir)?;
         tar_builder.into_inner()?.finish()?;
