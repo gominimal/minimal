@@ -14,7 +14,7 @@ pub use target::Target;
 
 use std::{
     env, fmt,
-    io::Write,
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 use tracing::warn;
@@ -251,4 +251,36 @@ pub fn match_files_for_glob(dir: &Path, glob: &str) -> Result<Vec<PathBuf>, Glob
 
     walk_dir(dir, dir, &matcher, &mut results)?;
     Ok(results)
+}
+
+pub fn synth_dns_config(p: &Path) -> Result<(), io::Error> {
+    let conf = if let Ok(c) = std::fs::read_to_string("/etc/resolv.conf") {
+        match resolv_conf::Config::parse(c) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                warn!(
+                    "Failed parsing /etc/resolv.conf, falling back to quad-8. Error: {}",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let conf = match conf {
+        Some(c) => c,
+        None => {
+            let mut config = resolv_conf::Config::new();
+            config
+                .nameservers
+                .push(resolv_conf::ScopedIp::V4(std::net::Ipv4Addr::new(
+                    8, 8, 8, 8,
+                )));
+            config
+        }
+    };
+
+    std::fs::create_dir_all(p.join("etc"))?;
+    std::fs::write(p.join("etc").join("resolv.conf"), format!("{}", conf))
 }

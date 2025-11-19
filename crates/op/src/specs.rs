@@ -61,13 +61,15 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         &self,
         build: &BuildSpec,
         opts: &Options<'a>,
-    ) -> Result<HashSet<PathBuf>, Error> {
+    ) -> Result<(HashSet<PathBuf>, bool), Error> {
         if let Some(deps) = &self.override_deps {
-            return Ok(deps.clone());
+            return Ok((deps.clone(), true));
         }
 
         let mut dependencies = HashSet::new();
         let transitives = Transitives::new(opts.graph, self.spec, true);
+
+        let mut needs_dns = false;
         let build_deps: Vec<_> = transitives.transitive_runtime_deps.into_iter().collect();
         for (bsr, dep_info) in build_deps.into_iter() {
             match dep_info.outputs {
@@ -109,8 +111,16 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                     );
                 }
             }
+
+            needs_dns |= opts
+                .graph
+                .get(&bsr)
+                .unwrap()
+                .abstract_deps
+                .get("dns")
+                .is_some();
         }
-        Ok(dependencies)
+        Ok((dependencies, needs_dns))
     }
 
     fn invocation(&self, build: &BuildSpec) -> Result<(String, Vec<String>), Error> {
@@ -133,9 +143,16 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
 
     async fn run<'b>(&mut self, opts: &Options<'b>) -> Result<Self::Result, Error> {
         let build = opts.graph.get(self.spec).unwrap();
-        let (inputs, temp_dirs) = self.inputs(build, opts).await?;
-        let dependencies = self.dependencies(build, opts).await?;
+        let (inputs, mut temp_dirs) = self.inputs(build, opts).await?;
+        let (mut dependencies, needs_dns) = self.dependencies(build, opts).await?;
         let (executable, args) = self.invocation(build)?;
+
+        let synth_files = TempDir::new()?;
+        if needs_dns {
+            common::synth_dns_config(synth_files.path()).map_err(anyhow::Error::from)?;
+        }
+        dependencies.insert(synth_files.path().to_path_buf());
+        temp_dirs.push(synth_files);
 
         let config = build_sandbox::BuildConfig {
             name: build.name.clone(),
