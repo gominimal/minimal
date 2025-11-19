@@ -15,6 +15,7 @@ anyhow.workspace = true
 flate2.workspace = true
 futures.workspace = true
 globset.workspace = true
+hakoniwa.workspace = true
 oci-spec.workspace = true
 rayon.workspace = true
 resolv-conf.workspace = true
