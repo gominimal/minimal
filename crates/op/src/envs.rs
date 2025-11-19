@@ -1,18 +1,19 @@
 use std::{
     collections::HashMap,
     env::home_dir,
+    net::Ipv4Addr,
     path::{Path, PathBuf},
 };
 
 use crate::{Error, Options, Runnable};
 use common::mfile::{EnvPatches, PatchSetting};
 use graph::{BuildSpecRef, TransitivesDep};
+use tracing::warn;
 
 /// Considers the transitive deps & toplevels which are going into the a runnable environment, and constructs
 /// scaffolding as necessary.
 ///
 /// Necessary dependencies are mapped into the given `opts.exec_base`, along with state wiring in `state_base_dir`.
-/// Any additional file/dir mounts, as well as additional environment variables, are returned as `Ok((patches, env_vars))`.
 pub struct EnvSetup<'a> {
     /// The `/state` dir that should live between invocations.
     ///
@@ -53,22 +54,11 @@ impl<'a> Runnable for EnvSetup<'a> {
         std::fs::create_dir_all(self.state_base_dir.join("cache")).map_err(anyhow::Error::from)?; // XDG_CACHE_HOME  ala ~/.cache
         std::fs::create_dir_all(self.state_base_dir.join("state")).map_err(anyhow::Error::from)?; // XDG_STATE_HOME  ala ~/.local/state
 
-        // Hardlink in the files which represent each dependency.
-        for dep in self.transitives.keys() {
-            common::hardlink_dir_contents(
-                opts.cache
-                    .read_dir(&opts.graph.spec_hash(dep))
-                    .unwrap()
-                    .path(),
-                &opts.exec_base,
-            )
-            .map_err(anyhow::Error::from)?;
-        }
-
         // Check attributes on each dependency to see if theres any additional env wiring.
+        let (mut needs_dns, mut _needs_internet) = (false, false);
         for dep in self.transitives.keys() {
-            let attrs = &opts.graph.get(dep).unwrap().attrs;
-            if let Some(dirs) = attrs.get("env_dir_mappings") {
+            let b = opts.graph.get(dep).unwrap();
+            if let Some(dirs) = b.attrs.get("env_dir_mappings") {
                 for mapping in dirs.as_list().unwrap() {
                     let mapping = mapping.as_map().unwrap();
                     patch.dir.insert(
@@ -81,7 +71,7 @@ impl<'a> Runnable for EnvSetup<'a> {
                     );
                 }
             }
-            if let Some(dirs) = attrs.get("env_file_mappings") {
+            if let Some(dirs) = b.attrs.get("env_file_mappings") {
                 for mapping in dirs.as_list().unwrap() {
                     let mapping = mapping.as_map().unwrap();
                     patch.file.insert(
@@ -94,7 +84,7 @@ impl<'a> Runnable for EnvSetup<'a> {
                     );
                 }
             }
-            if let Some(dir) = attrs.get("env_state_wiring") {
+            if let Some(dir) = b.attrs.get("env_state_wiring") {
                 let mapping = dir.as_map().unwrap();
                 let env_var = mapping.get("env_var").unwrap().as_string().unwrap().clone();
                 let prefix = mapping.get("prefix").unwrap().as_string().unwrap().clone();
@@ -108,6 +98,55 @@ impl<'a> Runnable for EnvSetup<'a> {
                         .to_string()
                 });
             }
+
+            needs_dns |= b.abstract_deps.get("dns").is_some();
+            _needs_internet |= b.abstract_deps.get("internet").is_some();
+        }
+
+        if needs_dns {
+            let conf = if let Ok(c) = std::fs::read_to_string("/etc/resolv.conf") {
+                match resolv_conf::Config::parse(c) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        warn!(
+                            "Failed parsing /etc/resolv.conf, falling back to quad-8. Error: {}",
+                            e
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let conf = match conf {
+                Some(c) => c,
+                None => {
+                    let mut config = resolv_conf::Config::new();
+                    config
+                        .nameservers
+                        .push(resolv_conf::ScopedIp::V4(Ipv4Addr::new(8, 8, 8, 8)));
+                    config
+                }
+            };
+
+            std::fs::create_dir_all(opts.exec_base.join("etc")).map_err(anyhow::Error::from)?;
+            std::fs::write(
+                opts.exec_base.join("etc").join("resolv.conf"),
+                format!("{}", conf),
+            )
+            .map_err(anyhow::Error::from)?;
+        }
+
+        // Hardlink in the files which represent each dependency.
+        for dep in self.transitives.keys() {
+            common::hardlink_dir_contents(
+                opts.cache
+                    .read_dir(&opts.graph.spec_hash(dep))
+                    .unwrap()
+                    .path(),
+                &opts.exec_base,
+            )
+            .map_err(anyhow::Error::from)?;
         }
 
         // Iterate all file/dir patches and make sure their bind mounts exist, also check
