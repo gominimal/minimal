@@ -1,14 +1,12 @@
 use std::{
     collections::HashMap,
     env::home_dir,
-    net::Ipv4Addr,
     path::{Path, PathBuf},
 };
 
 use crate::{Error, Options, Runnable};
 use common::mfile::{EnvPatches, PatchSetting};
 use graph::{BuildSpecRef, TransitivesDep};
-use tracing::warn;
 
 /// Considers the transitive deps & toplevels which are going into the a runnable environment, and constructs
 /// scaffolding as necessary.
@@ -104,37 +102,7 @@ impl<'a> Runnable for EnvSetup<'a> {
         }
 
         if needs_dns {
-            let conf = if let Ok(c) = std::fs::read_to_string("/etc/resolv.conf") {
-                match resolv_conf::Config::parse(c) {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        warn!(
-                            "Failed parsing /etc/resolv.conf, falling back to quad-8. Error: {}",
-                            e
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            let conf = match conf {
-                Some(c) => c,
-                None => {
-                    let mut config = resolv_conf::Config::new();
-                    config
-                        .nameservers
-                        .push(resolv_conf::ScopedIp::V4(Ipv4Addr::new(8, 8, 8, 8)));
-                    config
-                }
-            };
-
-            std::fs::create_dir_all(opts.exec_base.join("etc")).map_err(anyhow::Error::from)?;
-            std::fs::write(
-                opts.exec_base.join("etc").join("resolv.conf"),
-                format!("{}", conf),
-            )
-            .map_err(anyhow::Error::from)?;
+            common::synth_dns_config(&opts.exec_base).map_err(anyhow::Error::from)?;
         }
 
         // Hardlink in the files which represent each dependency.

@@ -31,3 +31,5 @@ reqwest.workspace = true
 futures.workspace = true
 url.workspace = true
 google-cloud-storage.workspace = true
+
+resolv-conf.workspace = true
