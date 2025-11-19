@@ -147,7 +147,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
         let (mut dependencies, needs_dns) = self.dependencies(build, opts).await?;
         let (executable, args) = self.invocation(build)?;
 
-        let synth_files = TempDir::new()?;
+        let synth_files = opts.cache.temp_dir()?;
         if needs_dns {
             common::synth_dns_config(synth_files.path()).map_err(anyhow::Error::from)?;
         }
