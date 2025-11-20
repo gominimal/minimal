@@ -22,6 +22,8 @@ pub mod attrs;
 pub use attrs::AttrValue;
 pub mod builds;
 use builds::BuildDecl;
+mod profiles;
+pub use profiles::Profile;
 
 /// A collection of nickel objects, defined together in a single codebase.
 #[derive(Debug)]
@@ -29,6 +31,8 @@ pub struct Layer {
     pub builds: Arena<BuildDecl>,
     pub origin: SpecOrigin,
     pub top_levels: Vec<generational_arena::Index>,
+
+    pub profiles: HashMap<String, Profile>,
 
     read_ids: HashMap<u64, generational_arena::Index>,
 }
@@ -91,15 +95,70 @@ impl Layer {
             top_levels: Vec::new(),
             builds: Arena::with_capacity(1024),
             read_ids: HashMap::with_capacity(1024),
+
+            profiles: HashMap::with_capacity(32),
         };
 
+        // The top-level of the nickel tree can either evaluate to:
+        //  - A build-spec to ingest
+        //  - An array of build-specs to ingest
+        //  - A Layer object, containing arrays of all the objects to ingest
+
         let ncl_tree = eval_if_closure(&ncl_tree, &mut program)?;
-        layer.top_levels = if let Term::Array(a, _attrs) = ncl_tree.term.as_ref() {
-            a.iter()
+        layer.top_levels = match ncl_tree.term.as_ref() {
+            Term::Array(a, _attrs) => a
+                .iter()
                 .map(|bs| layer.ingest_buildspec(bs, &mut program))
-                .collect::<Result<Vec<_>, Error>>()?
-        } else {
-            vec![layer.ingest_buildspec(&ncl_tree, &mut program)?]
+                .collect::<Result<Vec<_>, Error>>()?,
+            _ => {
+                let ty = read_ty(&ncl_tree, &mut program)?;
+                match ty {
+                    ObjTy::Builder => vec![layer.ingest_buildspec(&ncl_tree, &mut program)?],
+                    ObjTy::Layer => {
+                        let record = match ncl_tree.as_ref() {
+                            Term::RecRecord(record_data, _, _, _) => record_data,
+                            Term::Record(record_data) => record_data,
+                            _ => unreachable!(), // read_ty implicitly does the same check
+                        };
+
+                        if let Ok(Some(rt)) = record.get_value_with_ctrs(&LocIdent::new("profiles"))
+                        {
+                            if let Term::Array(a, _attrs) =
+                                eval_if_closure(&rt, &mut program)?.term.as_ref()
+                            {
+                                layer.profiles = HashMap::from_iter(
+                                    a.iter()
+                                        .map(|p| layer.ingest_profile(p, &mut program))
+                                        .collect::<Result<Vec<_>, Error>>()?
+                                        .into_iter()
+                                        .map(|p| (p.name.clone(), p)),
+                                );
+                            }
+                        };
+                        if let Ok(Some(rt)) = record.get_value_with_ctrs(&LocIdent::new("builds")) {
+                            if let Term::Array(a, _attrs) =
+                                eval_if_closure(&rt, &mut program)?.term.as_ref()
+                            {
+                                a.iter()
+                                    .map(|bs| layer.ingest_buildspec(bs, &mut program))
+                                    .collect::<Result<Vec<_>, Error>>()?
+                            } else {
+                                unreachable!(); // validation for Layer should ensure its an array
+                            }
+                        } else {
+                            vec![]
+                        }
+                    }
+                    _ => {
+                        return Err(Error::UnexpectedObject {
+                            files: program.files(),
+                            got: ty,
+                            want: ObjTy::Builder,
+                            pos: ncl_tree.pos,
+                        });
+                    }
+                }
+            }
         };
 
         Ok(layer)
@@ -119,6 +178,14 @@ impl Layer {
 
         // Thanks to [DeclAccumulator], all transitive builds would have been ingested
         Ok(self.read_ids[&id])
+    }
+
+    fn ingest_profile(
+        &mut self,
+        rt: &RichTerm,
+        program: &mut Program<CacheImpl>,
+    ) -> Result<Profile, Error> {
+        Profile::from_term(rt, program)
     }
 }
 
@@ -179,6 +246,8 @@ pub enum ObjTy {
     Local,
     Prebuilt,
     Subset,
+    Profile,
+    Layer,
 }
 
 pub(crate) fn read_ty(rt: &RichTerm, program: &mut Program<CacheImpl>) -> Result<ObjTy, Error> {
@@ -229,6 +298,7 @@ mod tests {
 
     use super::*;
     use indoc::indoc;
+    use nickel_lang_core::term::IndexMap;
 
     #[test]
     fn simple_buildspec() {
@@ -476,5 +546,57 @@ mod tests {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
+    }
+
+    #[test]
+    fn load_layer() {
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+                let {layer, profile, BuildSpec, ..} = import \"minimal.ncl\" in
+
+                layer {
+                  builds = [
+                    {
+                        name = \"build\",
+                        inputs = [],
+                        cmd = \"\",
+                    } | BuildSpec,
+                  ],
+
+                  profiles = [
+                    profile {
+                        name = \"uwu\",
+                        packages = [\"gcc\", \"rust\"],
+                        env_vars = {
+                            CC = \"gcc\",
+                        },
+                    }
+                  ],
+                }
+                "
+            }
+            .to_string(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        assert_eq!(
+            layer
+                .get(layer.by_name("build").next().unwrap())
+                .unwrap()
+                .name,
+            "build",
+        );
+        assert_eq!(
+            layer.profiles.get("uwu"),
+            Some(&Profile {
+                name: "uwu".to_string(),
+                packages: vec!["gcc".to_string(), "rust".to_string()],
+                env_vars: IndexMap::from_iter([("CC".to_string(), "gcc".to_string())])
+            }),
+        );
     }
 }

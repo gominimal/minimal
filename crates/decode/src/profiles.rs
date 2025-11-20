@@ -1,0 +1,196 @@
+use nickel_lang_core::{
+    eval::cache::CacheImpl,
+    program::Program,
+    term::{IndexMap, RichTerm, Term},
+};
+use serde::Deserialize;
+
+use crate::{Error, ObjTy, eval_if_closure};
+
+/// A profile, the initial configuration for an environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct Profile {
+    /// The human-readable name declared on the profile. Unique within a repo/layer.
+    pub name: String,
+    /// The names of build-specs/packages that should be present in any environment using this profile.
+    pub packages: Vec<String>,
+
+    /// The environment variables that should be applied to any environment using this profile.
+    pub env_vars: IndexMap<String, String>,
+}
+
+impl Profile {
+    pub(crate) fn from_term(
+        rt: &RichTerm,
+        program: &mut Program<CacheImpl>,
+    ) -> Result<Self, Error> {
+        let rt = eval_if_closure(rt, program)?;
+
+        let mut ty: Option<ObjTy> = None;
+        let mut name: Option<String> = None;
+        let mut packages: Option<Vec<String>> = None;
+        let mut env_vars: Option<IndexMap<String, String>> = None;
+        match rt.term.as_ref() {
+            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
+                r.fields
+                    .iter()
+                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                        match ident_and_loc.label() {
+                            "ty" => {
+                                ty = Some(
+                                    ObjTy::deserialize(eval_if_closure(
+                                        field.value.as_ref().unwrap(),
+                                        program,
+                                    )?)
+                                    .unwrap(),
+                                );
+                                Ok(())
+                            }
+                            "name" => {
+                                name = Some(
+                                    String::deserialize(eval_if_closure(
+                                        field.value.as_ref().unwrap(),
+                                        program,
+                                    )?)
+                                    .unwrap(),
+                                );
+                                Ok(())
+                            }
+
+                            "env_vars" => {
+                                if let Some(ev_rt) = field.value.as_ref() {
+                                    let ev_rt =
+                                        eval_if_closure(ev_rt, program)?;
+
+                                    match ev_rt.term.as_ref() {
+                                        Term::Record(r) | Term::RecRecord(r, _, _, _) => {
+                                            env_vars = Some(r.fields.iter().map(
+                                                |(ident_and_loc, field)| -> Result<(String, String), Error> {
+                                                    Ok((
+                                                        ident_and_loc.label().to_string(),
+                                                        String::deserialize(eval_if_closure(
+                                                            field.value.as_ref().unwrap(),
+                                                            program,
+                                                        )?).unwrap(),
+                                                    ))
+                                                },
+                                            ).collect::<Result<IndexMap<_, _>, Error>>()?);
+                                        }
+                                        _ => todo!("unexpected term for env_vars: {:?}", ev_rt.term.as_ref()),
+                                    };
+                                }
+
+                                Ok(())
+                            }
+                            "packages" => {
+                                if let Some(packages_rt) = field.value.as_ref() {
+                                    let packages_rt =
+                                        eval_if_closure(packages_rt, program)?;
+
+                                    match packages_rt.term.as_ref() {
+                                        Term::Array(a, _attrs) => {
+                                            packages = Some(
+                                                a.iter()
+                                                    .map(|input| {
+                                                        Ok(String::deserialize(eval_if_closure(
+                                                            input,
+                                                            program,
+                                                        )?).unwrap())
+                                                    })
+                                                    .collect::<Result<Vec<_>, Error>>()?,
+                                            );
+                                        }
+                                        _ => todo!(
+                                            "handle packages value being non-array {:?}",
+                                            field.value
+                                        ),
+                                    }
+                                }
+
+                                Ok(())
+                            }
+                            _ => Ok(()),
+                        }
+                    })?;
+            }
+            _ => {}
+        };
+
+        match ty {
+            Some(ObjTy::Profile) => {} // happy path
+            None => return Err(Error::MissingTy(program.files(), rt.pos)),
+            Some(ty) => {
+                return Err(Error::UnexpectedObject {
+                    files: program.files(),
+                    got: ty,
+                    want: ObjTy::Profile,
+                    pos: rt.pos,
+                });
+            }
+        };
+        let name = match name {
+            Some(name) => name,
+            None => {
+                return Err(Error::MissingField {
+                    files: program.files(),
+                    obj: ObjTy::Builder,
+                    pos: rt.pos,
+                    field: "name",
+                });
+            }
+        };
+        let packages = packages.unwrap_or_default();
+        let env_vars = env_vars.unwrap_or_default();
+
+        Ok(Self {
+            name,
+            packages,
+            env_vars,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::load::*;
+    use indoc::indoc;
+
+    #[test]
+    fn parse() {
+        let (term, mut program, _origin) = Loader::new(
+            indoc! {
+                "
+                let {profile, ..} = import \"minimal.ncl\" in
+                profile {
+                    name = \"uwu\",
+                    packages = [\"gcc\", \"rust\"],
+                }
+                "
+            }
+            .to_string(),
+            &LoadOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("load failed");
+        })
+        .finish()
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("finish failed");
+        });
+
+        let p = Profile::from_term(&term, &mut program).unwrap();
+
+        assert_eq!(
+            p,
+            Profile {
+                name: "uwu".to_string(),
+                packages: vec!["gcc".to_string(), "rust".to_string()],
+                env_vars: Default::default(),
+            }
+        )
+    }
+}
