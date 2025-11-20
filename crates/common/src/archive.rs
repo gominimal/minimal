@@ -2,8 +2,8 @@
 
 use sha2::{Digest, Sha256};
 use std::fmt;
-use std::io::Read;
-use std::path::{Path, StripPrefixError};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf, StripPrefixError};
 
 const ZSTD_LEVEL: i32 = 5;
 
@@ -73,13 +73,61 @@ pub fn compress_dir<P: AsRef<Path>>(
         let mut tar_builder = tar::Builder::new(encoder);
         tar_builder.mode(tar::HeaderMode::Deterministic);
         tar_builder.follow_symlinks(false);
-        tar_builder.append_dir_all(".", dir)?;
+        add_dir_to_tar(&mut tar_builder, dir.as_ref(), ".", &None)?;
         tar_builder.into_inner()?.finish()?;
     }
     use std::io::Seek;
     tar_file.seek(std::io::SeekFrom::Start(0))?;
 
     Ok((tar_file, hasher.finalize().into()))
+}
+
+/// Recursively adds the specified directory to the given tarball.
+///
+/// Arguments:
+///  * `tar_prefix` should be the "." or a prefix to prepend to all entries being written.
+///  * `match_globs` if set, only file paths which match the glob will be written.
+///
+/// Entries are written in deterministic order, regardless of the iteration order of
+/// the underlying filesystem.
+pub fn add_dir_to_tar<W: Write>(
+    tar: &mut tar::Builder<W>,
+    src_dir: &Path,
+    tar_prefix: &str,
+    match_globs: &Option<globset::GlobSet>,
+) -> std::io::Result<()> {
+    let mut entries: Vec<_> = std::fs::read_dir(src_dir)?
+        .map(|e| match e {
+            Ok(e) => Ok((e.file_name(), e)),
+            Err(e) => Err(e),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (name, entry) in entries.into_iter() {
+        let path = entry.path();
+        let tar_path = if tar_prefix == "." {
+            PathBuf::from(name)
+        } else {
+            PathBuf::from(tar_prefix).join(name)
+        };
+
+        if path.is_dir() {
+            tar.append_dir(&tar_path, &path)?;
+            add_dir_to_tar(tar, &path, &tar_path.to_string_lossy(), match_globs)?;
+        } else {
+            // For files, only include them if there were no specified matchers,
+            // or something matched.
+            let matched = match_globs
+                .as_ref()
+                .map(|gs| gs.is_match(&tar_path))
+                .unwrap_or(true);
+            if matched {
+                tar.append_path_with_name(&path, &tar_path)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Compression formats which can wrap a tarball.
