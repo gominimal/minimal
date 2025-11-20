@@ -1,55 +1,8 @@
-let Tys = [| 'Builder, 'Path, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Prebuilt, 'Subset |]
+let Tys = [| 'Builder, 'Path, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Prebuilt, 'Subset, 'Profile, 'Layer |]
 in
 let attrs_schema = import "attr_classes.ncl" in
 let needs_schema = import "need_classes.ncl" in
 {
-    Attrs = std.contract.custom (fun label record_value =>
-        if !(std.is_record record_value) then
-          'Error { message = "not a record" }
-        else
-          record_value
-          |> std.record.to_array
-          |> std.array.try_fold_left
-            (fun acc { field, value } =>
-              if std.record.has_field field attrs_schema then
-                std.contract.check attrs_schema."%{field}".validate label value
-                |> match {
-                  'Ok wrapped_value => 'Ok (acc @ [{ include field, value = wrapped_value }]),
-                  'Error e => 'Error { message = "failed to validate %{field}", blame_location = e.blame_location }
-                }
-              else
-                'Error { message = "`%{field}` is not a valid attribute" }
-            )
-            []
-          |> match {
-            'Ok array => 'Ok (std.record.from_array array),
-            'Error e => 'Error e,
-          }
-      ),
-    Needs = std.contract.custom (fun label record_value =>
-        if !(std.is_record record_value) then
-        'Error { message = "not a record" }
-        else
-        record_value
-        |> std.record.to_array
-        |> std.array.try_fold_left
-            (fun acc { field, value } =>
-            if std.record.has_field field needs_schema then
-                std.contract.check needs_schema."%{field}".validate label value
-                |> match {
-                'Ok wrapped_value => 'Ok (acc @ [{ include field, value = wrapped_value }]),
-                'Error e => 'Error { message = "failed to validate %{field}", blame_location = e.blame_location }
-                }
-            else
-                'Error { message = "`%{field}` is not a valid need" }
-            )
-            []
-        |> match {
-            'Ok array => 'Ok (std.record.from_array array),
-            'Error e => 'Error e,
-        }
-    ),
-
     BuildSpec | doc "A minimal build spec, defining inputs to the build as well as outputs which carry build artifacts downstream" = {
         ty | Tys = 'Builder,
         name
@@ -174,8 +127,79 @@ let needs_schema = import "need_classes.ncl" in
         outputs
           | Array String,
     },
-
     subsetOf | BuildSpec -> Array String -> Subset | doc "Constructs a subset of the outputs of a build, for use as an input or runtime_dep." =
       fun spec outputs =>
         {from = spec, include outputs}  | Subset,
+
+    Attrs | doc "A map of attributes applied to a build-spec, which are validated according to attr_classes.ncl."
+        = std.contract.custom (fun label record_value =>
+        if !(std.is_record record_value) then
+            'Error { message = "not a record" }
+        else
+            record_value
+            |> std.record.to_array
+            |> std.array.try_fold_left
+            (fun acc { field, value } =>
+                if std.record.has_field field attrs_schema then
+                std.contract.check attrs_schema."%{field}".validate label value
+                |> match {
+                    'Ok wrapped_value => 'Ok (acc @ [{ include field, value = wrapped_value }]),
+                    'Error e => 'Error { message = "failed to validate %{field}", blame_location = e.blame_location }
+                }
+                else
+                'Error { message = "`%{field}` is not a valid attribute" }
+            )
+            []
+            |> match {
+            'Ok array => 'Ok (std.record.from_array array),
+            'Error e => 'Error e,
+            }
+        ),
+    Needs | doc "Abstract dependencies needed by a build-spec, which are validated according to need_classes.ncl."
+        = std.contract.custom (fun label record_value =>
+        if !(std.is_record record_value) then
+        'Error { message = "not a record" }
+        else
+        record_value
+        |> std.record.to_array
+        |> std.array.try_fold_left
+            (fun acc { field, value } =>
+            if std.record.has_field field needs_schema then
+                std.contract.check needs_schema."%{field}".validate label value
+                |> match {
+                'Ok wrapped_value => 'Ok (acc @ [{ include field, value = wrapped_value }]),
+                'Error e => 'Error { message = "failed to validate %{field}", blame_location = e.blame_location }
+                }
+            else
+                'Error { message = "`%{field}` is not a valid need" }
+            )
+            []
+        |> match {
+            'Ok array => 'Ok (std.record.from_array array),
+            'Error e => 'Error e,
+        }
+    ),
+
+    Profile | doc "The initial configuration/wiring for an environment." = {
+        ty | Tys = 'Profile,
+        name
+          | String,
+
+        packages
+          | Array String | optional,
+        env_vars
+          | {_ : String} | optional,
+    },
+    profile | Dyn -> Profile | doc "Constructs a profile." =
+      fun spec => spec | Profile,
+
+    # Intended for internal use
+    Layer | doc "Implementation detail: the set of build-specs and profiles to be ingested." = {
+        ty | Tys = 'Layer,
+
+        builds | Array BuildSpec,
+        profiles | Array Profile,
+    },
+    layer | Dyn -> Layer | doc "Constructs a layer." =
+        fun spec => spec | Layer,
 }

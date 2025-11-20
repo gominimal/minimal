@@ -171,13 +171,36 @@ impl Loader {
         opts: &LoadOptions,
     ) -> Result<Self, Error> {
         let mut src = String::with_capacity(2048);
-        src.push_str("[\n");
-        for pb in build_decls_in_dir(pkg_dir, None)?.into_iter() {
-            src.push_str("  import \"");
+        src.push_str("let {layer, ..} = import \"minimal.ncl\" in\n");
+        src.push_str("layer {\n");
+        src.push_str("\tbuilds = [\n");
+        for pb in build_decls_in_dir(&pkg_dir, None)?.into_iter() {
+            src.push_str("\t\timport \"");
             src.push_str(pb.to_str().unwrap());
             src.push_str("\",\n");
         }
-        src.push(']');
+        src.push_str("\t],\n");
+
+        match std::fs::read_dir(pkg_dir.as_ref().join("profiles")) {
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(e.into());
+                }
+            }
+            Ok(d) => {
+                src.push_str("\tprofiles = [\n");
+                for e in d {
+                    let e = e?;
+                    if e.file_type()?.is_dir() {
+                        src.push_str("  import \"profiles/");
+                        src.push_str(e.file_name().to_str().unwrap());
+                        src.push_str("/profile.ncl\",\n");
+                    }
+                }
+                src.push_str("\t],\n");
+            }
+        }
+        src.push('}');
 
         Self::new(src, opts)
     }
@@ -189,13 +212,36 @@ impl Loader {
         opts: &LoadOptions,
     ) -> Result<Self, Error> {
         let mut src = String::with_capacity(2048);
-        src.push_str("[\n");
-        for pb in build_decls_in_dir(pkg_dir, Some(packages))?.into_iter() {
+        src.push_str("let {layer, ..} = import \"minimal.ncl\" in\n");
+        src.push_str("layer {\n");
+        src.push_str("\tbuilds = [\n");
+        for pb in build_decls_in_dir(&pkg_dir, Some(packages))?.into_iter() {
             src.push_str("  import \"");
             src.push_str(pb.to_str().unwrap());
             src.push_str("\",\n");
         }
-        src.push(']');
+        src.push_str("\t],\n");
+
+        match std::fs::read_dir(pkg_dir.as_ref().join("profiles")) {
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(e.into());
+                }
+            }
+            Ok(d) => {
+                src.push_str("\tprofiles = [\n");
+                for e in d {
+                    let e = e?;
+                    if e.file_type()?.is_dir() {
+                        src.push_str("  import \"profiles/");
+                        src.push_str(e.file_name().to_str().unwrap());
+                        src.push_str("/profile.ncl\",\n");
+                    }
+                }
+                src.push_str("\t],\n");
+            }
+        }
+        src.push('}');
 
         Self::new(src, opts)
     }

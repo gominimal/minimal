@@ -370,14 +370,16 @@ impl BuildDeclInput {
                 let pb = Self::from_term_prebuilt(&rt, program)?;
                 Ok(BuildDeclInput::Prebuilt(pb.0, pb.1))
             }
-            ObjTy::OutputLib | ObjTy::OutputBin | ObjTy::OutputData => {
-                Err(Error::UnexpectedObject {
-                    files: program.files(),
-                    got: ty,
-                    want: ObjTy::Builder,
-                    pos: rt.pos,
-                })
-            }
+            ObjTy::OutputLib
+            | ObjTy::OutputBin
+            | ObjTy::OutputData
+            | ObjTy::Profile
+            | ObjTy::Layer => Err(Error::UnexpectedObject {
+                files: program.files(),
+                got: ty,
+                want: ObjTy::Builder,
+                pos: rt.pos,
+            }),
         }
     }
 
@@ -646,13 +648,7 @@ impl RuntimeDep {
             ObjTy::Subset => Ok(RuntimeDep::Subset(SubsetInput::from_term(
                 &rt, program, acc,
             )?)),
-            ObjTy::OutputLib
-            | ObjTy::OutputBin
-            | ObjTy::OutputData
-            | ObjTy::Source
-            | ObjTy::Path
-            | ObjTy::Local
-            | ObjTy::Prebuilt => Err(Error::UnexpectedObject {
+            _ => Err(Error::UnexpectedObject {
                 files: program.files(),
                 got: ty,
                 want: ObjTy::Builder,
