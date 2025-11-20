@@ -29,10 +29,10 @@ pub struct CheckArgs {
 
 pub fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> {
     let all_graph = ctx.graph_from_all_packages().ok();
-    let packages_dir = ctx.packages_dir_and_origin()?.0;
+    let packages_dir = ctx.upstream_dir_and_origin()?.0.join("packages");
 
     if args.fix && packages_dir.strip_prefix(ctx.paths().vcs_dir()).is_ok() {
-        return Err(anyhow!("--fix can only be used when --packages-dir is specified").into());
+        return Err(anyhow!("--fix can only be used when --upstream-dir is specified").into());
     }
 
     let packages_dirs = std::fs::read_dir(packages_dir)
@@ -178,7 +178,7 @@ fn check_minimal_import_line(
         err: vec![],
     };
 
-    let base = ctx.packages_dir_and_origin()?.0.join(pkg);
+    let base = ctx.upstream_dir_and_origin()?.0.join("packages").join(pkg);
     for e in std::fs::read_dir(base).map_err(anyhow::Error::from)? {
         let e = e.map_err(anyhow::Error::from)?;
         if e.file_type().unwrap().is_dir() {
@@ -276,7 +276,7 @@ fn check_package_fmt(
         err: vec![],
     };
 
-    let base = ctx.packages_dir_and_origin()?.0.join(pkg);
+    let base = ctx.upstream_dir_and_origin()?.0.join("packages").join(pkg);
     for e in std::fs::read_dir(base).map_err(anyhow::Error::from)? {
         let e = e.map_err(anyhow::Error::from)?;
         if e.file_type().unwrap().is_dir() {

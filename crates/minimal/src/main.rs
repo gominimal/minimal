@@ -99,9 +99,9 @@ pub struct GlobalArgs {
     /// Load the minimal standard library from the given path instead
     #[arg(long)]
     stdlib_dir: Option<PathBuf>,
-    /// Load packages from the given path instead of using `[base]` in `minimal.toml`
+    /// Load the upstream from the given path instead of using `[base]` in `minimal.toml`
     #[arg(long)]
-    packages_dir: Option<PathBuf>,
+    upstream_dir: Option<PathBuf>,
 
     /// Ignore locally-available binary artifacts (results in rebuilds unless present in a remote cache)
     #[arg(long, default_value_t = false)]
@@ -153,10 +153,10 @@ pub struct Context {
     pub no_fetch: bool,
     pub num_parallel_builds: usize,
 
-    packages_dir_and_origin: Option<(PathBuf, SpecOrigin)>,
+    upstream_dir_and_origin: Option<(PathBuf, SpecOrigin)>,
 
     mfile: Option<mfile::File>,
-    packages_dir_override: Option<PathBuf>,
+    upstream_dir_override: Option<PathBuf>,
     paths: PathConfig,
     cache: Cache<LocalDir>,
     vcs: checkouts::Manager,
@@ -200,9 +200,9 @@ impl Context {
             no_cache: args.no_cache,
             no_fetch: args.no_fetch,
             num_parallel_builds: args.num_parallel_builds,
-            packages_dir_override: args.packages_dir,
+            upstream_dir_override: args.upstream_dir,
 
-            packages_dir_and_origin: None,
+            upstream_dir_and_origin: None,
             mfile: None,
 
             paths,
@@ -250,15 +250,15 @@ impl Context {
         &self.paths
     }
 
-    /// Returns the path to the packages directory as well as info about where its from.
+    /// Returns the path to the upstream directory as well as info about where its from.
     ///
-    /// This is computed either from the `--packages-dir` argument or the minimal file.
+    /// This is computed either from the `--upstream-dir` argument or the minimal file.
     /// The result is cached for future invocations.
-    fn packages_dir_and_origin(&mut self) -> Result<(PathBuf, SpecOrigin), Error> {
-        if let Some(dir) = &self.packages_dir_override {
+    fn upstream_dir_and_origin(&mut self) -> Result<(PathBuf, SpecOrigin), Error> {
+        if let Some(dir) = &self.upstream_dir_override {
             return Ok((dir.clone(), SpecOrigin::from_dir(dir)));
         }
-        if let Some(res) = &self.packages_dir_and_origin {
+        if let Some(res) = &self.upstream_dir_and_origin {
             return Ok(res.clone());
         }
 
@@ -277,15 +277,15 @@ impl Context {
             )
             .map_err(anyhow::Error::from)?;
 
-        self.packages_dir_and_origin = Some((
-            dir.join("packages"),
+        self.upstream_dir_and_origin = Some((
+            dir,
             SpecOrigin::Repo(common::repo_spec::Repo::Git {
                 url: minimal_file.base.repo,
                 rev: git_hash,
                 tracking: Some(GitRef::Branch(base_target)),
             }),
         ));
-        Ok(self.packages_dir_and_origin.as_ref().unwrap().clone())
+        Ok(self.upstream_dir_and_origin.as_ref().unwrap().clone())
     }
 
     /// Returns the decoded minimal-file, reading it from disk if necessary.
@@ -307,13 +307,13 @@ impl Context {
 
     /// Returns a [DepGraph] with the given package and its transitive dependencies loaded.
     pub fn graph_from_package_name(&mut self, package_name: &str) -> Result<DepGraph, Error> {
-        let (packages_dir, packages_origin) = self.packages_dir_and_origin()?;
+        let (upstream_dir, upstream_origin) = self.upstream_dir_and_origin()?;
         let layer = Layer::new_with_pkgs(
             &[package_name.to_owned()],
-            packages_dir,
+            upstream_dir,
             &LoadOptions {
                 minimal_lib_path: self.stdlib_dir(),
-                from: packages_origin,
+                from: upstream_origin,
             },
         )
         .map_err(|e| Error::Graph(GraphError::Decode(e)))?;
@@ -323,14 +323,14 @@ impl Context {
 
     #[tracing::instrument]
     pub fn graph_from_package_names(&mut self, names: &[String]) -> Result<DepGraph, Error> {
-        let (packages_dir, packages_origin) = self.packages_dir_and_origin()?;
+        let (upstream_dir, upstream_origin) = self.upstream_dir_and_origin()?;
 
         let layer = Layer::new_with_pkgs(
             names,
-            packages_dir,
+            upstream_dir,
             &LoadOptions {
                 minimal_lib_path: self.stdlib_dir(),
-                from: packages_origin,
+                from: upstream_origin,
             },
         )
         .map_err(|e| Error::Graph(GraphError::Decode(e)))?;
@@ -339,13 +339,13 @@ impl Context {
     }
 
     pub fn graph_from_all_packages(&mut self) -> Result<DepGraph, Error> {
-        let (packages_dir, packages_origin) = self.packages_dir_and_origin()?;
+        let (upstream_dir, upstream_origin) = self.upstream_dir_and_origin()?;
 
         let layer = Layer::new_with_all_pkgs(
-            packages_dir,
+            upstream_dir,
             &LoadOptions {
                 minimal_lib_path: self.stdlib_dir(),
-                from: packages_origin,
+                from: upstream_origin,
             },
         )
         .map_err(|e| Error::Graph(GraphError::Decode(e)))?;

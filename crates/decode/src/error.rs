@@ -49,6 +49,8 @@ pub enum Error {
         pos: TermPos,
         got: String,
     },
+    /// Some packages which were requested were not found.
+    PackagesNotFound { packages: Vec<String> },
 }
 
 impl Error {
@@ -92,6 +94,9 @@ impl fmt::Display for Error {
             Error::InvalidTarget { pos, got, .. } => {
                 write!(f, "invalid target string {}: defined at {:?}", got, pos)
             }
+            Error::PackagesNotFound { packages } => {
+                write!(f, "packages not found: {}", packages.join(","))
+            }
         }
     }
 }
@@ -125,8 +130,11 @@ impl Error {
         }
 
         match self {
-            IO(e) => write!(writer, "IO Error: {}", e).unwrap(),
-            Other(msg) => write!(writer, "Error: {}", msg).unwrap(),
+            IO(e) => writeln!(writer, "IO Error: {}", e).unwrap(),
+            Other(msg) => writeln!(writer, "Error: {}", msg).unwrap(),
+            PackagesNotFound { packages } => {
+                writeln!(writer, "Error: packages not found: {}", packages.join(",")).unwrap()
+            }
 
             Nickel(boxed) => {
                 let mut files = boxed.0.clone();
