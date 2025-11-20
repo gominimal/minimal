@@ -20,8 +20,8 @@ use sha2::digest::OutputSizeUser;
 use sha2::digest::generic_array::GenericArray;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::io::{Seek, Write};
-use std::path::{Path, PathBuf};
+use std::io::Seek;
+use std::path::PathBuf;
 use std::str::FromStr;
 use tracing::info;
 
@@ -340,7 +340,7 @@ async fn create_layer_from_cache(
     // Create tar.gz backed by temporary file
     let enc = GzEncoder::new(tempfile::tempfile()?, Compression::best());
     let mut tar = tar::Builder::new(enc);
-    add_dir_to_tar(&mut tar, cache_dir, ".", match_globs)?;
+    common::archive::add_dir_to_tar(&mut tar, cache_dir, ".", match_globs)?;
     tar.finish()?;
     let mut tar_file = tar.into_inner()?.finish()?;
 
@@ -384,38 +384,4 @@ async fn create_layer_from_cache(
         compressed_sha256: sha256,
         targz: tar_file,
     })
-}
-
-fn add_dir_to_tar<W: Write>(
-    tar: &mut tar::Builder<W>,
-    src_dir: &Path,
-    tar_prefix: &str,
-    match_globs: &Option<globset::GlobSet>,
-) -> anyhow::Result<()> {
-    for entry in std::fs::read_dir(src_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = entry.file_name();
-        let tar_path = if tar_prefix == "." {
-            PathBuf::from(name)
-        } else {
-            PathBuf::from(tar_prefix).join(name)
-        };
-
-        if path.is_dir() {
-            tar.append_dir(&tar_path, &path)?;
-            add_dir_to_tar(tar, &path, &tar_path.to_string_lossy(), match_globs)?;
-        } else {
-            // For files, only include them if there were no specified matchers,
-            // or something matched.
-            let matched = match_globs
-                .as_ref()
-                .map(|gs| gs.is_match(&tar_path))
-                .unwrap_or(true);
-            if matched {
-                tar.append_path_with_name(&path, &tar_path)?;
-            }
-        }
-    }
-    Ok(())
 }
