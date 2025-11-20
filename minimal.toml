@@ -19,7 +19,7 @@ packages = [
 env_vars.CC = "gcc"
 packages = [
     # Build needs
-    "gcc", "binutils",
+    "gcc", "binutils", "python",
     "pkgconf", "openssl", "linux_headers", "zlib",
     # Shell
     "bash",
@@ -66,3 +66,7 @@ cmd = "btop"
 [tasks.demo-shell]
 env = "demo"
 cmd = "bash -l"
+
+[tasks.python]
+env = "demo"
+cmd = "python3"
