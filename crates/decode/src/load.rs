@@ -126,6 +126,19 @@ fn build_decls_in_dir<P: AsRef<Path>>(
     }
     visit_dirs(&mut out, &with_names, dir.as_ref())?;
 
+    // Detect if any requested package was missing.
+    if let Some(names) = &with_names
+        && names.len() > out.len()
+    {
+        return Err(Error::PackagesNotFound {
+            packages: names
+                .iter()
+                .filter(|n| out.iter().any(|p| p.ends_with(format!("{}/build.ncl", n))))
+                .cloned()
+                .collect(),
+        });
+    }
+
     Ok(out)
 }
 
@@ -167,21 +180,21 @@ impl Loader {
 
     /// Loads all build decls in the given directory following the standard directory layout.
     pub fn new_with_all_pkgs<P: AsRef<Path>>(
-        pkg_dir: P,
+        layer_dir: P,
         opts: &LoadOptions,
     ) -> Result<Self, Error> {
         let mut src = String::with_capacity(2048);
         src.push_str("let {layer, ..} = import \"minimal.ncl\" in\n");
         src.push_str("layer {\n");
         src.push_str("\tbuilds = [\n");
-        for pb in build_decls_in_dir(&pkg_dir, None)?.into_iter() {
+        for pb in build_decls_in_dir(layer_dir.as_ref().join("packages"), None)?.into_iter() {
             src.push_str("\t\timport \"");
             src.push_str(pb.to_str().unwrap());
             src.push_str("\",\n");
         }
         src.push_str("\t],\n");
 
-        match std::fs::read_dir(pkg_dir.as_ref().join("profiles")) {
+        match std::fs::read_dir(layer_dir.as_ref().join("profiles")) {
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     return Err(e.into());
@@ -208,21 +221,23 @@ impl Loader {
     /// Loads the specified build decls in the given directory following the standard directory layout.
     pub fn new_with_pkgs<P: AsRef<Path>>(
         packages: &[String],
-        pkg_dir: P,
+        layer_dir: P,
         opts: &LoadOptions,
     ) -> Result<Self, Error> {
         let mut src = String::with_capacity(2048);
         src.push_str("let {layer, ..} = import \"minimal.ncl\" in\n");
         src.push_str("layer {\n");
         src.push_str("\tbuilds = [\n");
-        for pb in build_decls_in_dir(&pkg_dir, Some(packages))?.into_iter() {
+        for pb in
+            build_decls_in_dir(layer_dir.as_ref().join("packages"), Some(packages))?.into_iter()
+        {
             src.push_str("  import \"");
             src.push_str(pb.to_str().unwrap());
             src.push_str("\",\n");
         }
         src.push_str("\t],\n");
 
-        match std::fs::read_dir(pkg_dir.as_ref().join("profiles")) {
+        match std::fs::read_dir(layer_dir.as_ref().join("profiles")) {
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     return Err(e.into());
@@ -454,10 +469,11 @@ mod tests {
     #[test]
     fn loader_new_with_all_pkgs() {
         let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp_dir.path().join("packages")).unwrap();
 
         // Create multiple packages
         for pkg_name in &["package-a", "package-b", "package-c"] {
-            let pkg_dir = temp_dir.path().join(pkg_name);
+            let pkg_dir = temp_dir.path().join("packages").join(pkg_name);
             std::fs::create_dir(&pkg_dir).unwrap();
             std::fs::write(
                 pkg_dir.join("build.ncl"),
@@ -489,10 +505,11 @@ mod tests {
     #[test]
     fn loader_new_with_pkgs() {
         let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp_dir.path().join("packages")).unwrap();
 
         // Create multiple packages
         for pkg_name in &["package-a", "package-b", "package-c"] {
-            let pkg_dir = temp_dir.path().join(pkg_name);
+            let pkg_dir = temp_dir.path().join("packages").join(pkg_name);
             std::fs::create_dir(&pkg_dir).unwrap();
             std::fs::write(
                 pkg_dir.join("build.ncl"),

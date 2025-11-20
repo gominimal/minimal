@@ -75,17 +75,17 @@ impl Layer {
     /// Loads the specified build decls in the given directory following the standard directory layout.
     pub fn new_with_pkgs<P: AsRef<Path>>(
         packages: &[String],
-        pkg_dir: P,
+        layer_dir: P,
         opts: &LoadOptions,
     ) -> Result<Self, Error> {
-        Self::from_loader(load::Loader::new_with_pkgs(packages, pkg_dir, opts)?)
+        Self::from_loader(load::Loader::new_with_pkgs(packages, layer_dir, opts)?)
     }
     /// Loads all build decls in the given directory following the standard directory layout.
     pub fn new_with_all_pkgs<P: AsRef<Path>>(
-        pkg_dir: P,
+        layer_dir: P,
         opts: &LoadOptions,
     ) -> Result<Self, Error> {
-        Self::from_loader(load::Loader::new_with_all_pkgs(pkg_dir, opts)?)
+        Self::from_loader(load::Loader::new_with_all_pkgs(layer_dir, opts)?)
     }
 
     fn from_loader(loader: load::Loader) -> Result<Self, Error> {
