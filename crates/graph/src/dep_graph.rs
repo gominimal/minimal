@@ -3,7 +3,7 @@
 #![allow(clippy::result_large_err)]
 #![allow(clippy::single_match)]
 
-use common::{SpecOrigin, SubsetSpec, Target};
+use common::{SpecOrigin, SubsetSpec, Target, mfile};
 use decode::{Layer, Profile, builds};
 use nickel_lang_core::term::IndexMap;
 
@@ -554,6 +554,36 @@ impl DepGraph {
                     self.collect_transitive_buildspecs(bsr, seen, reachable);
                 }
             })
+    }
+
+    /// Hydrates a minimal environment with configuration based on the profile it calls for, if any.
+    pub fn hydrate_env(&self, env: &mut mfile::Env) -> Result<(), Error> {
+        if env.from_profile.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(profile) = self.profiles.get(&env.from_profile) {
+            // Upsert the packages list
+            env.packages.extend(
+                profile
+                    .packages
+                    .iter()
+                    .filter(|p| !env.packages.contains(p))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            );
+            // Set environment variables, but only if they are not set already
+            for (k, v) in &profile.env_vars {
+                if !env.vars.contains_key(k) {
+                    env.vars.insert(k.clone(), v.clone());
+                }
+            }
+            Ok(())
+        } else {
+            Err(Error::NoSuchProfile {
+                name: env.from_profile.clone(),
+            })
+        }
     }
 }
 

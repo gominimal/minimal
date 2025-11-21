@@ -12,6 +12,8 @@ pub enum Error {
         from: (BuildSpecRef, String),
         build: (BuildSpecRef, String),
     },
+    /// A profile with a certain name was requested, but did not exist.
+    NoSuchProfile { name: String },
 }
 
 impl Error {
@@ -23,12 +25,15 @@ impl Error {
                 from,
                 output,
                 build: _,
-            } => write!(
+            } => writeln!(
                 writer,
                 "Error: subset referenced output '{}' on '{}' which does not exist",
                 output, from.1,
             )
             .unwrap(),
+            Error::NoSuchProfile { name } => {
+                writeln!(writer, "Error: profile '{}' does not exist", name,).unwrap()
+            }
         }
     }
 

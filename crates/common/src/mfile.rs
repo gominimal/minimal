@@ -72,6 +72,9 @@ pub struct EnvPatches {
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct Env {
     #[serde(default)]
+    pub from_profile: String,
+
+    #[serde(default)]
     pub packages: Vec<String>,
     #[serde(default, alias = "env_vars")]
     pub vars: HashMap<String, String>,
@@ -262,6 +265,7 @@ mod tests {
                 envs: [(
                     "test".to_string(),
                     Env {
+                        from_profile: "".to_string(),
                         packages: vec!["base".to_string(), "go".to_string()],
                         vars: HashMap::new(),
                         patch: EnvPatches {
