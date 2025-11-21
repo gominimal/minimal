@@ -3,16 +3,15 @@ repo = "git@github.com:gominimal/pkgs.git"
 branch = "main"
 
 [envs.dev]
-env_vars.CC = "gcc"
+from_profile = "rust"
 packages = [
-    # Build needs
-    "rust", "gcc", "binutils",
+    # Additional build needs
     "pkgconf", "openssl", "linux_headers", "zlib",
     # Shell and claude-code needs
-    "bash", "claude-code",
+    "base", "bash", "claude-code",
     "git", "skopeo", "coreutils",
     # Network, for now
-    "base", "ca-certificates", "resolver-quad8",
+    "ca-certificates",
 ]
 
 [envs.demo]
@@ -22,10 +21,10 @@ packages = [
     "gcc", "binutils", "python",
     "pkgconf", "openssl", "linux_headers", "zlib",
     # Shell
-    "bash",
+    "base", "bash",
     "git", "coreutils",
     # Network,
-    "base", "ca-certificates", "resolver-quad8",
+    "ca-certificates",
     # Vim
     "vim", "btop",
 ]
