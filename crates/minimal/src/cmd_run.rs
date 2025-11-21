@@ -9,7 +9,9 @@ pub struct RunArgs {
 }
 
 pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
+    let mut graph = ctx.graph_from_all_packages()?;
     let env_base_dir = ctx.paths().env_base_dir().to_path_buf();
+
     let mfile = ctx.minimal_file()?;
     let task = match mfile.tasks.get(&args.task_name) {
         Some(t) => t.clone(),
@@ -20,12 +22,15 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
             )));
         }
     };
-    let env = match mfile.envs.get(&task.env) {
+    let mut env = match mfile.envs.get(&task.env) {
         Some(e) => e.clone(),
         None => {
             return Err(Error::Other(anyhow!("no such env named '{}'", task.env)));
         }
     };
+    graph.hydrate_env(&mut env)?;
+    graph.top_levels = env.packages.iter().flat_map(|p| graph.by_name(p)).collect(); // TODO: Probably time to retire this top_levels concept
+
     let cwd = if task.inherit_cwd {
         std::env::current_dir().unwrap()
     } else {
@@ -33,11 +38,6 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
     };
     let state_base_dir = mfile.env_state_dir(&task.env, env_base_dir).unwrap();
 
-    let graph = match env.packages.len() {
-        0 => ctx.graph_from_package_name("base")?,
-        1 => ctx.graph_from_package_name(&env.packages[0])?,
-        _ => ctx.graph_from_package_names(&env.packages)?,
-    };
     let cache = ctx.local_cache();
     // Make sure the packages are built
     crate::cmd_build::cmd_build_impl(&graph, ctx, cache.clone(), ctx.num_parallel_builds).await?;

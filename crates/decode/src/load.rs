@@ -205,8 +205,8 @@ impl Loader {
                 for e in d {
                     let e = e?;
                     if e.file_type()?.is_dir() {
-                        src.push_str("  import \"profiles/");
-                        src.push_str(e.file_name().to_str().unwrap());
+                        src.push_str("  import \"");
+                        src.push_str(e.path().to_str().unwrap());
                         src.push_str("/profile.ncl\",\n");
                     }
                 }
@@ -248,8 +248,8 @@ impl Loader {
                 for e in d {
                     let e = e?;
                     if e.file_type()?.is_dir() {
-                        src.push_str("  import \"profiles/");
-                        src.push_str(e.file_name().to_str().unwrap());
+                        src.push_str("  import \"");
+                        src.push_str(e.path().to_str().unwrap());
                         src.push_str("/profile.ncl\",\n");
                     }
                 }
@@ -506,6 +506,7 @@ mod tests {
     fn loader_new_with_pkgs() {
         let temp_dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp_dir.path().join("packages")).unwrap();
+        std::fs::create_dir(temp_dir.path().join("profiles")).unwrap();
 
         // Create multiple packages
         for pkg_name in &["package-a", "package-b", "package-c"] {
@@ -526,6 +527,22 @@ mod tests {
             )
             .unwrap();
         }
+
+        // Make a profile called rust
+        let profile_dir = temp_dir.path().join("profiles").join("rust");
+        std::fs::create_dir(&profile_dir).unwrap();
+        std::fs::write(
+            profile_dir.join("profile.ncl"),
+            indoc! {
+            "
+            let {profile, ..} = import \"minimal.ncl\" in
+            profile {
+        		name = \"rust\"
+        	}
+			"
+            },
+        )
+        .unwrap();
 
         let sr = Loader::new_with_pkgs(
             &["package-a".to_string(), "package-c".to_string()],
