@@ -218,49 +218,6 @@ impl Loader {
         Self::new(src, opts)
     }
 
-    /// Loads the specified build decls in the given directory following the standard directory layout.
-    pub fn new_with_pkgs<P: AsRef<Path>>(
-        packages: &[String],
-        layer_dir: P,
-        opts: &LoadOptions,
-    ) -> Result<Self, Error> {
-        let mut src = String::with_capacity(2048);
-        src.push_str("let {layer, ..} = import \"minimal.ncl\" in\n");
-        src.push_str("layer {\n");
-        src.push_str("\tbuilds = [\n");
-        for pb in
-            build_decls_in_dir(layer_dir.as_ref().join("packages"), Some(packages))?.into_iter()
-        {
-            src.push_str("  import \"");
-            src.push_str(pb.to_str().unwrap());
-            src.push_str("\",\n");
-        }
-        src.push_str("\t],\n");
-
-        match std::fs::read_dir(layer_dir.as_ref().join("profiles")) {
-            Err(e) => {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    return Err(e.into());
-                }
-            }
-            Ok(d) => {
-                src.push_str("\tprofiles = [\n");
-                for e in d {
-                    let e = e?;
-                    if e.file_type()?.is_dir() {
-                        src.push_str("  import \"");
-                        src.push_str(e.path().to_str().unwrap());
-                        src.push_str("/profile.ncl\",\n");
-                    }
-                }
-                src.push_str("\t],\n");
-            }
-        }
-        src.push('}');
-
-        Self::new(src, opts)
-    }
-
     /// Walks the AST to find unique build-spec declarations, annotating them with a unique ID.
     fn annotate(&mut self) -> Result<(), Error> {
         use nickel_lang_core::traverse::{Traverse as _, TraverseOrder};
@@ -470,42 +427,6 @@ mod tests {
     fn loader_new_with_all_pkgs() {
         let temp_dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp_dir.path().join("packages")).unwrap();
-
-        // Create multiple packages
-        for pkg_name in &["package-a", "package-b", "package-c"] {
-            let pkg_dir = temp_dir.path().join("packages").join(pkg_name);
-            std::fs::create_dir(&pkg_dir).unwrap();
-            std::fs::write(
-                pkg_dir.join("build.ncl"),
-                indoc! {
-                "
-                let {BuildSpec, ..} = import \"minimal.ncl\" in
-                {
-	        		name = \"NAMEE\"
-	        	} | BuildSpec
-				"
-                }
-                .to_string()
-                .replace("NAMEE", pkg_name),
-            )
-            .unwrap();
-        }
-
-        let sr = Loader::new_with_all_pkgs(temp_dir.path(), &LoadOptions::for_test());
-        // So we can see the actual error when the test fails
-        sr.as_ref().err().iter().for_each(|e| {
-            e.report_to_stderr();
-            panic!();
-        });
-
-        let sr = sr.unwrap();
-        assert_eq!(sr.last_id, 3); // three build specs
-    }
-
-    #[test]
-    fn loader_new_with_pkgs() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(temp_dir.path().join("packages")).unwrap();
         std::fs::create_dir(temp_dir.path().join("profiles")).unwrap();
 
         // Create multiple packages
@@ -544,11 +465,7 @@ mod tests {
         )
         .unwrap();
 
-        let sr = Loader::new_with_pkgs(
-            &["package-a".to_string(), "package-c".to_string()],
-            temp_dir.path(),
-            &LoadOptions::for_test(),
-        );
+        let sr = Loader::new_with_all_pkgs(temp_dir.path(), &LoadOptions::for_test());
         // So we can see the actual error when the test fails
         sr.as_ref().err().iter().for_each(|e| {
             e.report_to_stderr();
@@ -556,6 +473,6 @@ mod tests {
         });
 
         let sr = sr.unwrap();
-        assert_eq!(sr.last_id, 2); // two build specs
+        assert_eq!(sr.last_id, 3); // three build specs
     }
 }

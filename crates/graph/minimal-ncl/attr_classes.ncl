@@ -37,4 +37,10 @@
             prefix | String,
         },
     },
+
+    needed_for_internet = {
+        name = "needed for internet",
+        desc = "A marker attribute - indicates this package should be present for any environment that needs internet access.",
+        validate = {},
+    },
 }

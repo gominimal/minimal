@@ -300,6 +300,17 @@ impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
         toplevels: &[BuildSpecRef],
     ) -> ExecPlan<'a, BP> {
         let mut toplevels = toplevels.to_owned();
+
+        // HACK: We bring in any packages that are needed to satisfy a needs.internet, irrespective of
+        // whether anything needs it. We should instead detect if needs.internet is set on any build we
+        // landed on during make_reachable(), at which point we know if we need internet-providing packages or not.
+        toplevels.extend(
+            graph
+                .iter()
+                .filter(|(_bsr, b)| b.attrs.contains_key("needed_for_internet"))
+                .map(|(bsr, _b)| bsr),
+        );
+
         toplevels.sort();
         toplevels.dedup();
 

@@ -230,7 +230,16 @@ async fn path_transitive_deps_of(
     out_paths: &mut HashSet<PathBuf>,
     remote_cache: Option<&RemoteCache<GcsStorage>>,
 ) -> Result<()> {
-    for dep in input_build.runtime_deps.iter() {
+    let additionals = if input_build.abstract_deps.contains_key("internet") {
+        graph
+            .iter()
+            .filter(|(_bsr, b)| b.attrs.contains_key("needed_for_internet"))
+            .map(|(bsr, _b)| RuntimeDep::Build(bsr))
+            .collect()
+    } else {
+        vec![]
+    };
+    for dep in input_build.runtime_deps.iter().chain(additionals.iter()) {
         let (dep_bsr, dep_paths) = match dep {
             RuntimeDep::Build(bsr) => {
                 path_for_self_spec(

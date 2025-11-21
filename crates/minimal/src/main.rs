@@ -1,6 +1,6 @@
 #![allow(clippy::result_large_err)]
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use cache::{Cache, LocalDir, RemoteCache, RemoteError};
 use clap::{Args, Parser, Subcommand};
 use common::{SpecOrigin, mfile, repo_spec::GitRef};
@@ -307,50 +307,49 @@ impl Context {
 
     /// Returns a [DepGraph] with the given package and its transitive dependencies loaded.
     pub fn graph_from_package_name(&mut self, package_name: &str) -> Result<DepGraph, Error> {
-        let (upstream_dir, upstream_origin) = self.upstream_dir_and_origin()?;
-        let layer = Layer::new_with_pkgs(
-            &[package_name.to_owned()],
-            upstream_dir,
-            &LoadOptions {
-                minimal_lib_path: self.stdlib_dir(),
-                from: upstream_origin,
-            },
-        )
-        .map_err(|e| Error::Graph(GraphError::Decode(e)))?;
+        let mut graph = self.graph_from_all_packages()?;
+        let top = match graph.by_name(package_name).next() {
+            Some(bsr) => bsr,
+            None => {
+                return Err(Error::Other(anyhow!("No such package: {}", package_name)));
+            }
+        };
+        graph.top_levels = vec![top];
 
-        DepGraph::new().ingest(layer).map_err(Error::Graph)
+        Ok(graph)
     }
 
     #[tracing::instrument]
     pub fn graph_from_package_names(&mut self, names: &[String]) -> Result<DepGraph, Error> {
-        let (upstream_dir, upstream_origin) = self.upstream_dir_and_origin()?;
+        let mut graph = self.graph_from_all_packages()?;
+        graph.top_levels = names
+            .iter()
+            .map(|n| match graph.by_name(n).next() {
+                Some(bsr) => Ok(bsr),
+                None => Err(Error::Other(anyhow!("No such package: {}", n))),
+            })
+            .collect::<Result<_, _>>()?;
 
-        let layer = Layer::new_with_pkgs(
-            names,
-            upstream_dir,
-            &LoadOptions {
-                minimal_lib_path: self.stdlib_dir(),
-                from: upstream_origin,
-            },
-        )
-        .map_err(|e| Error::Graph(GraphError::Decode(e)))?;
-
-        DepGraph::new().ingest(layer).map_err(Error::Graph)
+        Ok(graph)
     }
 
     pub fn graph_from_all_packages(&mut self) -> Result<DepGraph, Error> {
+        DepGraph::new()
+            .ingest(self.load_layer()?)
+            .map_err(Error::Graph)
+    }
+
+    fn load_layer(&mut self) -> Result<Layer, Error> {
         let (upstream_dir, upstream_origin) = self.upstream_dir_and_origin()?;
 
-        let layer = Layer::new_with_all_pkgs(
+        Layer::new(
             upstream_dir,
             &LoadOptions {
                 minimal_lib_path: self.stdlib_dir(),
                 from: upstream_origin,
             },
         )
-        .map_err(|e| Error::Graph(GraphError::Decode(e)))?;
-
-        DepGraph::new().ingest(layer).map_err(Error::Graph)
+        .map_err(|e| Error::Graph(GraphError::Decode(e)))
     }
 }
 

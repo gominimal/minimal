@@ -81,7 +81,7 @@ impl Transitives {
         let mut out = Transitives {
             build: *bsr,
             transitive_runtime_deps: HashMap::with_capacity(
-                2 * (build.inputs.len() + build.runtime_deps.len()),
+                2 * (build.inputs.len() + 2 * build.runtime_deps.len()),
             ),
         };
 
@@ -128,6 +128,18 @@ impl Transitives {
                     Source(_) | Prebuilt(_, _) | Local { .. } | HostPath(_) => {}
                 }
             }
+        }
+        if build.abstract_deps.contains_key("internet") {
+            g.iter()
+                .filter(|(_bsr, b)| b.attrs.contains_key("needed_for_internet"))
+                .for_each(|(bsr, _b)| {
+                    Self::upsert(
+                        &mut out.transitive_runtime_deps,
+                        &bsr,
+                        [Attribution::Ours].into_iter(),
+                        None::<Vec<String>>,
+                    )
+                });
         }
 
         // Collect all transitive runtime_deps by recursing into the [BuildManifest] of
@@ -583,5 +595,59 @@ mod tests {
                 ),
             ],
         );
+    }
+
+    #[test]
+    fn nested_needs_internet() {
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+                let {build, Needs, ..} = import \"minimal.ncl\" in
+
+                let nested = build {
+                    name = \"nested\",
+                    inputs = [],
+                    needs = {
+                        internet = {},
+                    } | Needs,
+                    cmd = \"\",
+                }
+                in
+
+                [
+                    build {
+                        name = \"top build\",
+                        inputs = [nested],
+                        cmd = \"\",
+                    },
+                    build {
+                        name = \"internet provider\",
+                        inputs = [],
+                        cmd = \"\",
+                        attrs.needed_for_internet = {},
+                    },
+                ]
+                "
+            }
+            .to_string(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        let dg = DepGraph::new().ingest(layer).unwrap();
+
+        let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], true);
+        assert_eq!(
+            toplevel_manifest.build,
+            dg.by_name("top build").next().unwrap()
+        );
+
+        assert!(
+            toplevel_manifest
+                .transitive_runtime_deps
+                .contains_key(&dg.by_name("internet provider").next().unwrap())
+        )
     }
 }
