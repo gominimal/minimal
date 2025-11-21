@@ -10,8 +10,6 @@ packages = [
     # Shell and claude-code needs
     "base", "bash", "claude-code",
     "git", "skopeo", "coreutils",
-    # Network, for now
-    "ca-certificates",
 ]
 
 [envs.demo]
@@ -23,8 +21,6 @@ packages = [
     # Shell
     "base", "bash",
     "git", "coreutils",
-    # Network,
-    "ca-certificates",
     # Vim
     "vim", "btop",
 ]
