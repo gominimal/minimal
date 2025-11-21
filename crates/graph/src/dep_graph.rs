@@ -399,12 +399,37 @@ impl DepGraph {
         slf.top_levels.extend(new_toplevels);
 
         // Load/union profiles
-        for (name, profile) in loader.from.profiles {
-            // TODO: verify that all the packages referenced by the profile exist
+        for (name, mut profile) in loader.from.profiles {
+            // Apply any inheritance
+            if let Some(base_profile_name) = &profile.from_profile {
+                match slf.profiles.get(base_profile_name) {
+                    None => {
+                        return Err(Error::NoSuchProfile {
+                            name: base_profile_name.clone(),
+                        });
+                    }
+                    Some(base_profile) => {
+                        let mut new = base_profile.clone();
+                        new.union(&profile);
+                        profile = new;
+                    }
+                }
+            }
 
-            // TODO: Handle compositionality a bit better? Maybe a key on profiles for explicit merging, otherwise error?
+            // Verify all packages exist
+            for pkg in &profile.packages {
+                if slf.by_name(pkg).count() < 1 {
+                    return Err(Error::NoSuchPkg { name: pkg.clone() });
+                }
+            }
+
             if let Some(existing) = slf.profiles.get_mut(&name) {
-                existing.union(&profile);
+                // Its illegal to shadow a profile of the same name from upstream,
+                // unless you inherit from some upstream profile.
+                if profile.from_profile.is_none() {
+                    return Err(Error::ConflictingProfile { name });
+                }
+                *existing = profile;
             } else {
                 slf.profiles.insert(name, profile);
             }
@@ -751,6 +776,7 @@ mod tests {
             dp.profiles.get("profile 1"),
             Some(&Profile {
                 name: "profile 1".to_string(),
+                from_profile: None,
                 packages: vec![],
                 env_vars: Default::default()
             })
@@ -764,21 +790,29 @@ mod tests {
             "prof".to_string(),
             Profile {
                 name: "prof".to_string(),
+                from_profile: None,
                 packages: vec!["base".to_string()],
                 env_vars: IndexMap::from_iter([("CC".to_string(), "gcc".to_string())]),
             },
         );
+        dp.builds.insert(BuildSpec {
+            name: "base".to_string(),
+            ..Default::default()
+        });
 
         let layer = Layer::new_for_test(
             indoc! {
                 "
-                let {layer, profile, ..} = import \"minimal.ncl\" in
+                let {build, layer, profile, ..} = import \"minimal.ncl\" in
 
                 layer {
-                  builds = [],
+                  builds = [
+                    build{name = \"extra\", inputs = [], cmd = \"\"},
+                  ],
                   profiles = [
                     profile {
                       name = \"prof\",
+                      from_profile = \"prof\",
                       packages = [\"extra\"],
                       env_vars = {
                         CC = \"clang\",
@@ -800,6 +834,7 @@ mod tests {
             dp.profiles.get("prof"),
             Some(&Profile {
                 name: "prof".to_string(),
+                from_profile: Some("prof".to_string()),
                 packages: vec!["base".to_string(), "extra".to_string()],
                 env_vars: IndexMap::from_iter([("CC".to_string(), "clang".to_string())]),
             })

@@ -13,6 +13,9 @@ use crate::{Error, ObjTy, eval_if_closure};
 pub struct Profile {
     /// The human-readable name declared on the profile. Unique within a repo/layer.
     pub name: String,
+    /// The profile which this profile extends.
+    pub from_profile: Option<String>,
+
     /// The names of build-specs/packages that should be present in any environment using this profile.
     pub packages: Vec<String>,
 
@@ -23,6 +26,8 @@ pub struct Profile {
 impl Profile {
     /// Combines two profiles into one. On conflict, the values from other takes precedent.
     pub fn union(&mut self, other: &Profile) {
+        self.from_profile = other.from_profile.clone();
+
         self.packages.extend_from_slice(&other.packages);
         self.packages.sort();
         self.packages.dedup();
@@ -40,6 +45,7 @@ impl Profile {
 
         let mut ty: Option<ObjTy> = None;
         let mut name: Option<String> = None;
+        let mut from_profile: Option<String> = None;
         let mut packages: Option<Vec<String>> = None;
         let mut env_vars: Option<IndexMap<String, String>> = None;
         match rt.term.as_ref() {
@@ -66,6 +72,14 @@ impl Profile {
                                     )?)
                                     .unwrap(),
                                 );
+                                Ok(())
+                            }
+                            "from_profile" => {
+                                if let Some(rt) = field.value.as_ref() {
+                                from_profile = Some(
+                                    String::deserialize(eval_if_closure(rt,program,)?).unwrap(),
+                                );
+                                }
                                 Ok(())
                             }
 
@@ -156,6 +170,7 @@ impl Profile {
 
         Ok(Self {
             name,
+            from_profile,
             packages,
             env_vars,
         })
@@ -199,6 +214,7 @@ mod tests {
             p,
             Profile {
                 name: "uwu".to_string(),
+                from_profile: None,
                 packages: vec!["gcc".to_string(), "rust".to_string()],
                 env_vars: Default::default(),
             }

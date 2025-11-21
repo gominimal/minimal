@@ -184,6 +184,8 @@ let needs_schema = import "need_classes.ncl" in
         ty | Tys = 'Profile,
         name
           | String,
+        from_profile
+          | String | optional,
 
         packages
           | Array String | optional,
