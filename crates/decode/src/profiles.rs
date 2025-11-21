@@ -21,6 +21,17 @@ pub struct Profile {
 }
 
 impl Profile {
+    /// Combines two profiles into one. On conflict, the values from other takes precedent.
+    pub fn union(&mut self, other: &Profile) {
+        self.packages.extend_from_slice(&other.packages);
+        self.packages.sort();
+        self.packages.dedup();
+
+        self.env_vars
+            .extend(other.env_vars.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+
+    /// Deserializes a profile structure from the given nickel term tree.
     pub(crate) fn from_term(
         rt: &RichTerm,
         program: &mut Program<CacheImpl>,

@@ -4,7 +4,7 @@
 #![allow(clippy::single_match)]
 
 use common::{SpecOrigin, SubsetSpec, Target};
-use decode::{Layer, builds};
+use decode::{Layer, Profile, builds};
 use nickel_lang_core::term::IndexMap;
 
 use generational_arena::Arena;
@@ -351,6 +351,9 @@ pub struct DepGraph {
     /// constructing this dependency graph.
     pub top_levels: Vec<BuildSpecRef>,
 
+    /// Profiles (initial env configuration) by name.
+    profiles: HashMap<String, Profile>,
+
     /// The cache of build specs to their [SpecHash]. There is also a
     /// reverse cache of [SpecHash]'s to the build spec they correspond to.
     #[allow(clippy::type_complexity)]
@@ -374,6 +377,7 @@ impl DepGraph {
         Self {
             builds: Arena::with_capacity(4096),
             top_levels: Vec::new(),
+            profiles: HashMap::with_capacity(32),
             hash_cache: Arc::new(RwLock::new((
                 HashMap::with_capacity(4096),
                 HashMap::with_capacity(4096),
@@ -393,6 +397,18 @@ impl DepGraph {
 
         let mut slf = loader.into_graph.into_inner();
         slf.top_levels.extend(new_toplevels);
+
+        // Load/union profiles
+        for (name, profile) in loader.from.profiles {
+            // TODO: verify that all the packages referenced by the profile exist
+
+            // TODO: Handle compositionality a bit better? Maybe a key on profiles for explicit merging, otherwise error?
+            if let Some(existing) = slf.profiles.get_mut(&name) {
+                existing.union(&profile);
+            } else {
+                slf.profiles.insert(name, profile);
+            }
+        }
 
         // Subsets reference outputs by name. Validate for these new
         // build-specs that any subsets reference outputs that exist.
@@ -673,6 +689,90 @@ mod tests {
                 .into_iter()
                 .map(|b| b.name)
                 .collect::<Vec<String>>()
+        );
+    }
+
+    #[test]
+    fn ingest_profile() {
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+                let {layer, profile, ..} = import \"minimal.ncl\" in
+
+                layer {
+                  builds = [],
+                  profiles = [
+                    profile {
+                      name = \"profile 1\",
+                    }
+                  ],
+                }
+                "
+            }
+            .to_string(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        let dp = DepGraph::new().ingest(layer).unwrap();
+        assert_eq!(
+            dp.profiles.get("profile 1"),
+            Some(&Profile {
+                name: "profile 1".to_string(),
+                packages: vec![],
+                env_vars: Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn profile_overwrites_on_conflict() {
+        let mut dp = DepGraph::new();
+        dp.profiles.insert(
+            "prof".to_string(),
+            Profile {
+                name: "prof".to_string(),
+                packages: vec!["base".to_string()],
+                env_vars: IndexMap::from_iter([("CC".to_string(), "gcc".to_string())]),
+            },
+        );
+
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+                let {layer, profile, ..} = import \"minimal.ncl\" in
+
+                layer {
+                  builds = [],
+                  profiles = [
+                    profile {
+                      name = \"prof\",
+                      packages = [\"extra\"],
+                      env_vars = {
+                        CC = \"clang\",
+                      }
+                    }
+                  ],
+                }
+                "
+            }
+            .to_string(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+        let dp = dp.ingest(layer).unwrap();
+
+        assert_eq!(
+            dp.profiles.get("prof"),
+            Some(&Profile {
+                name: "prof".to_string(),
+                packages: vec!["base".to_string(), "extra".to_string()],
+                env_vars: IndexMap::from_iter([("CC".to_string(), "clang".to_string())]),
+            })
         );
     }
 }
