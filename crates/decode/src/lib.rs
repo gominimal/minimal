@@ -556,6 +556,7 @@ mod tests {
                   profiles = [
                     profile {
                         name = \"uwu\",
+                        from_profile = \"rust\",
                         packages = [\"gcc\", \"rust\"],
                         env_vars = {
                             CC = \"gcc\",
@@ -583,6 +584,7 @@ mod tests {
             layer.profiles.get("uwu"),
             Some(&Profile {
                 name: "uwu".to_string(),
+                from_profile: Some("rust".to_string()),
                 packages: vec!["gcc".to_string(), "rust".to_string()],
                 env_vars: IndexMap::from_iter([("CC".to_string(), "gcc".to_string())])
             }),

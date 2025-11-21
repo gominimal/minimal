@@ -14,6 +14,10 @@ pub enum Error {
     },
     /// A profile with a certain name was requested, but did not exist.
     NoSuchProfile { name: String },
+    /// A profile has the same name as a profile in a higher layer, but did not extend it.
+    ConflictingProfile { name: String },
+    /// A package with a certain name was requested, but not found in the graph.
+    NoSuchPkg { name: String },
 }
 
 impl Error {
@@ -33,6 +37,15 @@ impl Error {
             .unwrap(),
             Error::NoSuchProfile { name } => {
                 writeln!(writer, "Error: profile '{}' does not exist", name,).unwrap()
+            }
+            Error::ConflictingProfile { name } => writeln!(
+                writer,
+                "Error: profile '{}' already exists - if you want to extend it, set 'from_profile'",
+                name,
+            )
+            .unwrap(),
+            Error::NoSuchPkg { name } => {
+                writeln!(writer, "Error: package '{}' does not exist", name,).unwrap()
             }
         }
     }
