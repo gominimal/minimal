@@ -53,7 +53,7 @@ impl<'a> Runnable for EnvSetup<'a> {
         std::fs::create_dir_all(self.state_base_dir.join("state")).map_err(anyhow::Error::from)?; // XDG_STATE_HOME  ala ~/.local/state
 
         // Check attributes on each dependency to see if theres any additional env wiring.
-        let (mut needs_dns, mut _needs_internet) = (false, false);
+        let mut needs_dns = false;
         for dep in self.transitives.keys() {
             let b = opts.graph.get(dep).unwrap();
             if let Some(dirs) = b.attrs.get("env_dir_mappings") {
@@ -98,7 +98,6 @@ impl<'a> Runnable for EnvSetup<'a> {
             }
 
             needs_dns |= b.abstract_deps.get("dns").is_some();
-            _needs_internet |= b.abstract_deps.get("internet").is_some();
         }
 
         if needs_dns {
