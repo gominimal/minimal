@@ -4,7 +4,6 @@ use anyhow::{Result, anyhow, bail};
 use cache::{Cache, LocalDir, RemoteCache, RemoteError};
 use clap::{Args, Parser, Subcommand};
 use common::{SpecOrigin, mfile, repo_spec::GitRef};
-use decode::{Layer, LoadOptions};
 use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
 use graph::{DepGraph, Error as GraphError, PlanErr};
 use std::path::PathBuf;
@@ -305,20 +304,6 @@ impl Context {
         .await
     }
 
-    /// Returns a [DepGraph] with the given package and its transitive dependencies loaded.
-    pub fn graph_from_package_name(&mut self, package_name: &str) -> Result<DepGraph, Error> {
-        let mut graph = self.graph_from_all_packages()?;
-        let top = match graph.by_name(package_name).next() {
-            Some(bsr) => bsr,
-            None => {
-                return Err(Error::Other(anyhow!("No such package: {}", package_name)));
-            }
-        };
-        graph.top_levels = vec![top];
-
-        Ok(graph)
-    }
-
     #[tracing::instrument]
     pub fn graph_from_package_names(&mut self, names: &[String]) -> Result<DepGraph, Error> {
         let mut graph = self.graph_from_all_packages()?;
@@ -334,22 +319,10 @@ impl Context {
     }
 
     pub fn graph_from_all_packages(&mut self) -> Result<DepGraph, Error> {
-        DepGraph::new()
-            .ingest(self.load_layer()?)
-            .map_err(Error::Graph)
-    }
+        let (_dir, origin) = self.upstream_dir_and_origin()?;
 
-    fn load_layer(&mut self) -> Result<Layer, Error> {
-        let (upstream_dir, upstream_origin) = self.upstream_dir_and_origin()?;
-
-        Layer::new(
-            upstream_dir,
-            &LoadOptions {
-                minimal_lib_path: self.stdlib_dir(),
-                from: upstream_origin,
-            },
-        )
-        .map_err(|e| Error::Graph(GraphError::Decode(e)))
+        let stdlib_dir = self.stdlib_dir();
+        DepGraph::new_from_chain(self.vcs_manager(), origin, stdlib_dir).map_err(Error::Graph)
     }
 }
 
@@ -377,7 +350,6 @@ impl PackagesArg {
         match self.packages {
             Some(ref packages) => match packages.len() {
                 0 => ctx.graph_from_all_packages(),
-                1 => ctx.graph_from_package_name(&packages[0]),
                 _ => ctx.graph_from_package_names(packages),
             },
             None => ctx.graph_from_all_packages(),

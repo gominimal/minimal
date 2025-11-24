@@ -3,8 +3,9 @@
 #![allow(clippy::result_large_err)]
 #![allow(clippy::single_match)]
 
+use common::repo_spec::Repo;
 use common::{SpecOrigin, SubsetSpec, Target, mfile};
-use decode::{Layer, Profile, builds};
+use decode::{Layer, Profile, UpstreamConfig, builds};
 use nickel_lang_core::term::IndexMap;
 
 use generational_arena::Arena;
@@ -341,6 +342,27 @@ impl Loader {
     }
 }
 
+/// Describes something that can resolve the upstream a layer declares it chains from, into the
+/// source tree on disk it represents.
+pub trait SourceProvider {
+    type Error: std::fmt::Debug + std::error::Error;
+
+    fn checkout_of(&mut self, upstream: &UpstreamConfig) -> Result<PathBuf, Self::Error>;
+}
+
+impl SourceProvider for checkouts::Manager {
+    type Error = checkouts::Error;
+
+    fn checkout_of(&mut self, upstream: &UpstreamConfig) -> Result<PathBuf, Self::Error> {
+        let (path, _hash) = checkouts::Manager::checkout_of(
+            self,
+            &upstream.repo,
+            checkouts::GitRef::Commit(upstream.hash.clone()),
+        )?;
+        Ok(path)
+    }
+}
+
 /// The dependency graph.
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -383,6 +405,73 @@ impl DepGraph {
                 HashMap::with_capacity(4096),
             ))),
         }
+    }
+
+    /// Constructs a dependency graph using the given origin to load the leaf layer,
+    /// and resolving source code using the given implementation of [SourceProvider].
+    ///
+    /// The given leaf paramater must not be `SpecOrigin::Inline`, or this function will panic.
+    pub fn new_from_chain<SP: SourceProvider>(
+        sp: &mut SP,
+        leaf: SpecOrigin,
+        minimal_lib_path: PathBuf,
+    ) -> Result<Self, Error> {
+        let mut layers = Vec::with_capacity(6);
+
+        let mut cursor = match leaf {
+            SpecOrigin::Inline => panic!("SpecOrigin::Inline given as leaf to new_from_chain()"),
+            SpecOrigin::Repo(Repo::Git { url, rev, tracking }) => Some(UpstreamConfig {
+                repo: url.clone(),
+                branch: tracking
+                    .map(|b| match b {
+                        common::repo_spec::GitRef::Branch(b) => Some(b),
+                        common::repo_spec::GitRef::Tag(_t) => None,
+                    })
+                    .to_owned()
+                    .flatten(),
+                hash: rev.clone(),
+            }),
+            SpecOrigin::LocalDir { ref absolute, .. } => {
+                let layer = Layer::new(
+                    absolute,
+                    &decode::LoadOptions {
+                        minimal_lib_path: minimal_lib_path.clone(),
+                        from: leaf.clone(),
+                    },
+                )
+                .map_err(Error::Decode)?;
+                let cursor = layer.upstream().cloned();
+                layers.push(layer);
+                cursor
+            }
+        };
+
+        while let Some(upstream) = cursor.take() {
+            let from: SpecOrigin = upstream.clone().into();
+            let src_path = sp
+                .checkout_of(&upstream)
+                .map_err(|e| Error::Fetch(e.to_string()))?;
+
+            let layer = Layer::new(
+                src_path,
+                &decode::LoadOptions {
+                    minimal_lib_path: minimal_lib_path.clone(),
+                    from,
+                },
+            )
+            .map_err(Error::Decode)?;
+
+            if let Some(upstream) = layer.upstream() {
+                cursor = Some(upstream.clone());
+            }
+            layers.push(layer);
+        }
+
+        let mut out = Self::new();
+        for layer in layers.into_iter().rev() {
+            out = out.ingest(layer)?;
+        }
+        Ok(out)
     }
 
     /// Loads build declarations in from the given layer.

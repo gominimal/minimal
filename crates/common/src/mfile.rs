@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::{env, fmt};
 
-const MFILE_NAME: &str = "minimal.toml";
+pub const MFILE_NAME: &str = "minimal.toml";
 
 /// The errors possible when working with the minimal file.
 #[derive(Debug)]
@@ -134,6 +134,7 @@ pub struct Output {
 /// The loaded representation of the `minimal.toml` file.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct File {
+    #[serde(alias = "upstream")]
     pub base: Base,
     #[serde(default)]
     pub envs: HashMap<String, Env>,

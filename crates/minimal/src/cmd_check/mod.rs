@@ -150,7 +150,7 @@ fn check_package_parses(
         err: vec![],
     };
 
-    result.verdict = match ctx.graph_from_package_name(pkg) {
+    result.verdict = match ctx.graph_from_package_names(&[pkg.to_string()]) {
         Ok(_) => CheckVerdict::Pass,
         Err(e) => {
             result.err.push(format!("{:?}", e));

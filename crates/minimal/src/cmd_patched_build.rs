@@ -12,7 +12,7 @@ pub struct PatchedBuildArgs {
 pub async fn cmd_patched_build(args: PatchedBuildArgs, ctx: &mut Context) -> Result<(), Error> {
     crate::enforce_science_mode()?;
 
-    let graph = ctx.graph_from_package_name(&args.package)?;
+    let graph = ctx.graph_from_package_names(&[args.package])?;
     let cache = ctx.local_cache();
     let remote_storage = RemoteStorage::new(ctx.paths().download_cache_dir().to_path_buf())
         .await
