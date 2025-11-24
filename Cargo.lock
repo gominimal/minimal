@@ -854,6 +854,7 @@ dependencies = [
 name = "decode"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "blake3",
  "codespan-reporting 0.13.1",
  "common",
@@ -863,6 +864,7 @@ dependencies = [
  "serde",
  "smallvec",
  "tempfile",
+ "toml",
 ]
 
 [[package]]
@@ -1549,6 +1551,7 @@ name = "graph"
 version = "0.0.1"
 dependencies = [
  "blake3",
+ "checkouts",
  "codespan-reporting 0.13.1",
  "common",
  "decode",

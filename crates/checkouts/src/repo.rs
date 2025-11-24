@@ -124,7 +124,6 @@ impl Repo {
                 "add",
                 "-f",
                 "--checkout",
-                "--track",
                 path.to_str().unwrap(),
                 git_ref.as_str(),
             ])?;

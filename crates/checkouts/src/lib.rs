@@ -208,6 +208,14 @@ impl Manager {
                     if checkout.version == at {
                         return Ok((self.git_checkouts_dir().join(dir), checkout.rev.clone()));
                     }
+                    // Its possible to have a checkout thats tracking a branch, but right now it points
+                    // to a commit which was requested. We can just use that checkout rather than making
+                    // one that points to just a commit in this case.
+                    if let GitRef::Commit(ref rev) = at
+                        && &checkout.rev == rev
+                    {
+                        return Ok((self.git_checkouts_dir().join(dir), rev.clone()));
+                    }
                 }
                 // There's not a checkout of this ref, lets create it.
                 let checkout_dir = tempdir_in(self.git_checkouts_dir()).unwrap().keep();

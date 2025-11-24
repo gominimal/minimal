@@ -14,7 +14,7 @@ pub(crate) fn package_spec_name_matches_dir(
         err: vec![],
     };
 
-    result.verdict = match ctx.graph_from_package_name(pkg) {
+    result.verdict = match ctx.graph_from_package_names(&[pkg.to_string()]) {
         Ok(graph) => {
             if graph.get(&graph.top_levels[0]).unwrap().name == *pkg {
                 CheckVerdict::Pass

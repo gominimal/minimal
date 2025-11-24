@@ -18,4 +18,5 @@ smallvec.workspace = true
 tracing.workspace = true
 
 common.workspace = true
+checkouts.workspace = true
 decode.workspace = true

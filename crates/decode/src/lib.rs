@@ -1,6 +1,7 @@
 //! Decodes a layer of build specs into objects.
 
 use common::SpecOrigin;
+use common::mfile::MFILE_NAME;
 use generational_arena::Arena;
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::term::{RichTerm, Term};
@@ -28,8 +29,10 @@ pub use profiles::Profile;
 /// A collection of nickel objects, defined together in a single codebase.
 #[derive(Debug)]
 pub struct Layer {
-    pub builds: Arena<BuildDecl>,
+    config: LayerConfig,
     pub origin: SpecOrigin,
+
+    pub builds: Arena<BuildDecl>,
     pub top_levels: Vec<generational_arena::Index>,
 
     pub profiles: HashMap<String, Profile>,
@@ -49,6 +52,7 @@ impl Layer {
                 annotated_id,
                 name: _,
             } => self.read_ids.get(annotated_id),
+            builds::BuildRef::Upstream { .. } => None,
         }
     }
 
@@ -66,21 +70,40 @@ impl Layer {
         })
     }
 
+    /// Returns the upstream layer this layer depends on, if any.
+    pub fn upstream(&self) -> Option<&UpstreamConfig> {
+        self.config.upstream.as_ref()
+    }
+
     /// Simple builder of literal nickel for a test.
     pub fn new_for_test(s: String) -> Result<Self, Error> {
         let l = load::Loader::new(s, &load::LoadOptions::for_test())?;
-        Self::from_loader(l)
+        Self::from_loader(l, LayerConfig::default())
     }
 
     /// Loads all objects in the given directory following the standard directory layout.
     pub fn new<P: AsRef<Path>>(layer_dir: P, opts: &LoadOptions) -> Result<Self, Error> {
-        Self::from_loader(load::Loader::new_with_all_pkgs(layer_dir, opts)?)
+        let conf_path = layer_dir.as_ref().join(MFILE_NAME);
+        let layer_conf: LayerConfig = match std::fs::read(conf_path) {
+            Ok(b) => toml::from_slice(&b).map_err(anyhow::Error::from)?,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    LayerConfig::default()
+                } else {
+                    return Err(Error::IO(e));
+                }
+            }
+        };
+
+        let loader = load::Loader::new_with_all_pkgs(layer_dir, opts)?;
+        Self::from_loader(loader, layer_conf)
     }
 
-    fn from_loader(loader: load::Loader) -> Result<Self, Error> {
+    fn from_loader(loader: load::Loader, config: LayerConfig) -> Result<Self, Error> {
         let (ncl_tree, mut program, origin) = loader.finish()?;
         let mut layer = Self {
             origin,
+            config,
             top_levels: Vec::new(),
             builds: Arena::with_capacity(1024),
             read_ids: HashMap::with_capacity(1024),
@@ -163,6 +186,12 @@ impl Layer {
                 annotated_id,
                 name: _,
             } => annotated_id,
+            builds::BuildRef::Upstream { name } => {
+                return Err(Error::Other(format!(
+                    "expected build, found upstream '{}'",
+                    name
+                )));
+            }
         };
 
         // Thanks to [DeclAccumulator], all transitive builds would have been ingested
@@ -278,6 +307,34 @@ pub(crate) fn eval_if_closure(
     }
 }
 
+/// The `[upstream]` section of [LayerConfig], describing the upstream to use.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct UpstreamConfig {
+    /// The URL the repository can be fetched from.
+    pub repo: String,
+    /// The commit hash.
+    pub hash: String,
+    /// The name of the branch this points to, if relevant.
+    pub branch: Option<String>,
+}
+
+impl From<UpstreamConfig> for SpecOrigin {
+    fn from(val: UpstreamConfig) -> Self {
+        SpecOrigin::Repo(common::repo_spec::Repo::Git {
+            url: val.repo,
+            rev: val.hash,
+            tracking: val.branch.map(common::repo_spec::GitRef::Branch),
+        })
+    }
+}
+
+/// Describes the minimal.toml configuration file present in a layer repo.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct LayerConfig {
+    #[serde(default)]
+    pub upstream: Option<UpstreamConfig>,
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -317,7 +374,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let l = Layer::from_loader(l).unwrap();
+        let l = Layer::from_loader(l, Default::default()).unwrap();
         // We expect a single buildspec with a known name
         assert_eq!(
             vec!["single buildspec".to_string()],
@@ -383,7 +440,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let l = Layer::from_loader(l).unwrap();
+        let l = Layer::from_loader(l, Default::default()).unwrap();
         // We expect three buildspecs - four buildspecs would mean that `shared` (referenced twice) was duplicated
         assert_eq!(
             vec![
@@ -424,7 +481,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let l = Layer::from_loader(l).unwrap();
+        let l = Layer::from_loader(l, Default::default()).unwrap();
         // We expect two buildspecs - shallow first
         assert_eq!(
             vec!["top build".to_string(), "nested build".to_string(),],
@@ -466,7 +523,7 @@ mod tests {
             e.report_to_stderr();
             panic!("spec parsing failed");
         });
-        let l = Layer::from_loader(l)
+        let l = Layer::from_loader(l, Default::default())
             .map_err(|e| {
                 e.report_to_stderr();
                 Err::<Layer, ()>(())

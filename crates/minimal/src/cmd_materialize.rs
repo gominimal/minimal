@@ -28,8 +28,7 @@ pub async fn cmd_materialize(args: MaterializeArgs, ctx: &mut Context) -> Result
     };
 
     let graph = match output.packages.len() {
-        0 => ctx.graph_from_package_name("base")?,
-        1 => ctx.graph_from_package_name(&output.packages[0])?,
+        0 => ctx.graph_from_package_names(&["base".to_string()])?,
         _ => ctx.graph_from_package_names(&output.packages)?,
     };
     let cache = ctx.local_cache();

@@ -20,7 +20,10 @@ type OutputMap = IndexMap<String, BuildOutput>;
 /// A reference to some other build.
 #[derive(Debug, Clone, Eq, PartialOrd, Ord)]
 pub enum BuildRef {
+    /// A build within the same layer.
     Local { annotated_id: u64, name: String },
+    /// A build/package with a given name from an upstream layer.
+    Upstream { name: String },
 }
 
 impl PartialEq for BuildRef {
@@ -34,6 +37,9 @@ impl PartialEq for BuildRef {
                     annotated_id: id2, ..
                 },
             ) => id1 == id2,
+            (BuildRef::Upstream { name: n1 }, BuildRef::Upstream { name: n2 }) => n1 == n2,
+            (BuildRef::Local { .. }, BuildRef::Upstream { .. })
+            | (BuildRef::Upstream { .. }, BuildRef::Local { .. }) => false,
         }
     }
 }
@@ -44,6 +50,10 @@ impl core::hash::Hash for BuildRef {
             BuildRef::Local {
                 annotated_id: id, ..
             } => state.write_u64(*id),
+            BuildRef::Upstream { name } => {
+                state.write(b"upstream");
+                state.write(name.as_bytes());
+            }
         }
     }
 }

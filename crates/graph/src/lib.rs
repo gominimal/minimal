@@ -18,6 +18,8 @@ pub enum Error {
     ConflictingProfile { name: String },
     /// A package with a certain name was requested, but not found in the graph.
     NoSuchPkg { name: String },
+    /// Failed to load the source code for an upstream.
+    Fetch(String),
 }
 
 impl Error {
@@ -46,6 +48,9 @@ impl Error {
             .unwrap(),
             Error::NoSuchPkg { name } => {
                 writeln!(writer, "Error: package '{}' does not exist", name,).unwrap()
+            }
+            Error::Fetch(e) => {
+                writeln!(writer, "Error: failed to fetch upstream layer: {}", e).unwrap()
             }
         }
     }
