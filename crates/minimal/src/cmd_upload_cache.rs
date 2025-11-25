@@ -55,7 +55,7 @@ pub async fn cmd_upload_cache(args: UploadArgs, ctx: &mut Context) -> Result<(),
         });
 
         s.spawn(move || {
-            let mut remote_cache = handle.block_on(ctx.remote_cache()).unwrap();
+            let mut remote_cache = handle.block_on(ctx.remote_cache(true)).unwrap();
             for (bsr, (tar_file, sha256)) in rx {
                 let build = graph.get(&bsr).unwrap();
                 let bsh = graph.spec_hash(&bsr);

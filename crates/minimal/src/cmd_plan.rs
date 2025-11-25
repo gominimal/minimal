@@ -18,7 +18,7 @@ pub async fn cmd_plan(args: PlanArgs, ctx: &mut Context) -> Result<(), Error> {
         // both local and remote cache
         (false, false) => {
             let local_adapter = CacheBinProvider::new(&graph, cache.clone());
-            let remote_cache = ctx.remote_cache().await.unwrap();
+            let remote_cache = ctx.remote_cache(false).await.unwrap();
             let remote_adapter = RemoteBinProvider::new(&graph, &remote_cache);
             print_plan(
                 &graph,
@@ -29,7 +29,7 @@ pub async fn cmd_plan(args: PlanArgs, ctx: &mut Context) -> Result<(), Error> {
 
         // Only remote cache
         (true, false) => {
-            let remote_cache = ctx.remote_cache().await.unwrap();
+            let remote_cache = ctx.remote_cache(false).await.unwrap();
             let remote_adapter = RemoteBinProvider::new(&graph, &remote_cache);
             print_plan(
                 &graph,

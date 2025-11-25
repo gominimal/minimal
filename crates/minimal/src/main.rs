@@ -296,12 +296,21 @@ impl Context {
     }
 
     /// Builds and returns a remote cache with default configurations.
-    pub async fn remote_cache(&self) -> Result<RemoteCache<GcsStorage>, RemoteError<GcsError>> {
-        RemoteCache::new_with_gcs_bucket(
-            GcsStorage::builder().build().await.unwrap(),
-            "minimal-staging-cache",
-        )
-        .await
+    pub async fn remote_cache(
+        &self,
+        auth: bool,
+    ) -> Result<RemoteCache<GcsStorage>, RemoteError<GcsError>> {
+        let backend = if auth {
+            GcsStorage::builder().build().await.unwrap()
+        } else {
+            GcsStorage::builder()
+                .with_credentials(google_cloud_auth::credentials::anonymous::Builder::new().build())
+                .build()
+                .await
+                .unwrap()
+        };
+
+        RemoteCache::new_with_gcs_bucket(backend, "minimal-staging-cache").await
     }
 
     #[tracing::instrument]

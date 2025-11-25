@@ -32,6 +32,7 @@ flate2 = "1.1"
 futures = "0.3"
 generational-arena = "^0.2"
 google-cloud-gax = "1.2.0"
+google-cloud-auth = "1.2.0"
 google-cloud-storage = "1.2.0"
 hakoniwa = { git = "https://github.com/souk4711/hakoniwa", branch = "main" }
 hex = "0.4"

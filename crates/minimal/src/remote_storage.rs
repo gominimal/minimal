@@ -25,7 +25,10 @@ impl RemoteStorage {
             }
         };
 
-        let client = Storage::builder().build().await?;
+        let client = Storage::builder()
+            .with_credentials(google_cloud_auth::credentials::anonymous::Builder::new().build())
+            .build()
+            .await?;
         Ok(Self { client, cache_dir })
     }
 
