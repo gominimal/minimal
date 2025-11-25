@@ -127,7 +127,7 @@ pub async fn cmd_build_impl(
         // Both caches
         (false, false) => {
             let local_adapter = CacheBinProvider::new(graph, cache.clone());
-            let remote_cache = ctx.remote_cache().await.unwrap();
+            let remote_cache = ctx.remote_cache(false).await.unwrap();
             let remote_adapter = RemoteBinProvider::new(graph, &remote_cache);
             run.execute(
                 ExecPlan::new_with_bin_provider(graph, (local_adapter, remote_adapter)),
@@ -137,7 +137,7 @@ pub async fn cmd_build_impl(
         }
         // Only remote cache
         (true, false) => {
-            let remote_cache = ctx.remote_cache().await.unwrap();
+            let remote_cache = ctx.remote_cache(false).await.unwrap();
             let remote_adapter = RemoteBinProvider::new(graph, &remote_cache);
             run.execute(
                 ExecPlan::new_with_bin_provider(graph, remote_adapter),
@@ -189,7 +189,7 @@ pub async fn cmd_build_impl(
         needs_materialize.dedup();
 
         if !needs_materialize.is_empty() {
-            let remote_cache = ctx.remote_cache().await.unwrap();
+            let remote_cache = ctx.remote_cache(false).await.unwrap();
             let tokio_runtime = tokio::runtime::Handle::current();
             rayon::scope(|s| {
                 let remote_cache = &remote_cache;

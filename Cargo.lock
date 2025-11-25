@@ -2371,6 +2371,7 @@ dependencies = [
  "decode",
  "dirs",
  "futures",
+ "google-cloud-auth",
  "google-cloud-storage",
  "graph",
  "hakoniwa",
