@@ -1,4 +1,4 @@
-[base]
+[upstream]
 repo = "git@github.com:gominimal/pkgs.git"
 branch = "main"
 

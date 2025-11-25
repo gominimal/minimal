@@ -44,9 +44,9 @@ pub enum StrOrList {
     Multiple(Vec<String>),
 }
 
-/// The `[base]` section of [File], describing the upstream to use.
+/// The `[upstream]` section of [File], describing the upstream to use.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct Base {
+pub struct Upstream {
     pub repo: String,
     pub branch: Option<String>,
 }
@@ -134,8 +134,8 @@ pub struct Output {
 /// The loaded representation of the `minimal.toml` file.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct File {
-    #[serde(alias = "upstream")]
-    pub base: Base,
+    #[serde(alias = "base")]
+    pub upstream: Upstream,
     #[serde(default)]
     pub envs: HashMap<String, Env>,
     #[serde(default)]
@@ -259,7 +259,7 @@ mod tests {
         assert_eq!(
             mf,
             File {
-                base: Base {
+                upstream: Upstream {
                     repo: "https://github.com/gominimal/pkgs".to_string(),
                     branch: Some("main".to_string()),
                 },
