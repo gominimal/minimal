@@ -266,6 +266,7 @@ pub enum ObjTy {
     Subset,
     Profile,
     Layer,
+    Upstream,
 }
 
 pub(crate) fn read_ty(rt: &RichTerm, program: &mut Program<CacheImpl>) -> Result<ObjTy, Error> {

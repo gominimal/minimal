@@ -69,13 +69,33 @@ impl BuildRef {
         // The type hint ty identifies which variant this term represents
         let ty = read_ty(&rt, program)?;
         match ty {
+            ObjTy::Upstream => {
+                let record = match rt.as_ref() {
+                    Term::RecRecord(record_data, _, _, _) => record_data,
+                    Term::Record(record_data) => record_data,
+                    _ => unreachable!(),
+                };
+
+                let name =
+                    if let Ok(Some(n_rt)) = record.get_value_with_ctrs(&LocIdent::new("name")) {
+                        String::deserialize(eval_if_closure(&n_rt, program)?).unwrap()
+                    } else {
+                        return Err(Error::MissingField {
+                            files: program.files(),
+                            obj: ObjTy::Upstream,
+                            pos: rt.pos,
+                            field: "name",
+                        });
+                    };
+
+                Ok(BuildRef::Upstream { name })
+            }
+
             ObjTy::Builder => {
                 let record = match rt.as_ref() {
                     Term::RecRecord(record_data, _, _, _) => record_data,
                     Term::Record(record_data) => record_data,
-                    _ => {
-                        return Err(Error::MissingID(program.files(), rt.pos));
-                    }
+                    _ => unreachable!(),
                 };
                 let id = if let Ok(Some(id_rt)) =
                     record.get_value_with_ctrs(&LocIdent::new("__magic_buildspec_id"))
@@ -325,7 +345,7 @@ impl SubsetInput {
 /// An input to a build spec.
 ///
 /// Each entry in a build-spec's `inputs` array corresponds to one [BuildSpecInput].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum BuildDeclInput {
     Build(BuildRef),
@@ -362,7 +382,9 @@ impl BuildDeclInput {
         // The type hint ty identifies which input variant this term represents
         let ty = read_ty(&rt, program)?;
         match ty {
-            ObjTy::Builder => Ok(Self::Build(BuildRef::from_term(&rt, program, acc)?)),
+            ObjTy::Builder | ObjTy::Upstream => {
+                Ok(Self::Build(BuildRef::from_term(&rt, program, acc)?))
+            }
             ObjTy::Subset => Ok(Self::Subset(SubsetInput::from_term(&rt, program, acc)?)),
             ObjTy::Source => Ok(Self::Source(SourceInput::from_term(&rt, program)?)),
             ObjTy::Path => Ok(BuildDeclInput::HostPath(
@@ -654,7 +676,9 @@ impl RuntimeDep {
         // The type hint ty identifies which input variant this term represents
         let ty = read_ty(&rt, program)?;
         match ty {
-            ObjTy::Builder => Ok(RuntimeDep::Build(BuildRef::from_term(&rt, program, acc)?)),
+            ObjTy::Builder | ObjTy::Upstream => {
+                Ok(RuntimeDep::Build(BuildRef::from_term(&rt, program, acc)?))
+            }
             ObjTy::Subset => Ok(RuntimeDep::Subset(SubsetInput::from_term(
                 &rt, program, acc,
             )?)),
@@ -1382,6 +1406,44 @@ mod tests {
                 "dns".to_string(),
                 AttrValue::Map(Default::default())
             )])),
+        );
+    }
+
+    #[test]
+    fn parse_upstream() {
+        let (term, mut program, _origin) = Loader::new(
+            indoc! {
+                "
+                let {upstream, BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
+                {
+        			name = \"single buildspec\",
+        			inputs = [upstream \"upstream-pkg\"],
+        			cmd = \"./build.sh\",
+        		} | BuildSpec"
+            }
+            .to_string(),
+            &LoadOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("load failed");
+        })
+        .finish()
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("finish failed");
+        });
+
+        let build = BuildDecl::from_term(&term, &mut program, &mut ()).unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("from_term failed");
+        });
+
+        assert_eq!(
+            build.inputs[0],
+            BuildDeclInput::Build(BuildRef::Upstream {
+                name: "upstream-pkg".to_string()
+            })
         );
     }
 }

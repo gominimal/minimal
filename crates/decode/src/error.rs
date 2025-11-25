@@ -204,9 +204,7 @@ impl Error {
                     got, want
                 ));
                 let diagnostic = if let Some(pos) = pos.into_opt() {
-                    diagnostic
-                        .with_label(primary(&pos))
-                        .with_message("at this record")
+                    diagnostic.with_label(primary(&pos))
                 } else {
                     diagnostic
                 };

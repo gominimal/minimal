@@ -1,4 +1,4 @@
-let Tys = [| 'Builder, 'Path, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Prebuilt, 'Subset, 'Profile, 'Layer |]
+let Tys = [| 'Builder, 'Path, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Prebuilt, 'Subset, 'Profile, 'Layer, 'Upstream |]
 in
 let attrs_schema = import "attr_classes.ncl" in
 let needs_schema = import "need_classes.ncl" in
@@ -204,4 +204,12 @@ let needs_schema = import "need_classes.ncl" in
     },
     layer | Dyn -> Layer | doc "Constructs a layer." =
         fun spec => spec | Layer,
+
+    UpstreamPkg = {
+        ty | Tys = 'Upstream,
+        name
+        | String,
+    },
+    upstream | String -> UpstreamPkg | doc "Symbolizes a build with the given name from upstream." =
+        fun n => {name = n},
 }
