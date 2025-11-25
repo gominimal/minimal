@@ -263,7 +263,7 @@ impl Context {
 
         let minimal_file = self.minimal_file()?.clone();
         let base_target = minimal_file
-            .base
+            .upstream
             .branch
             .to_owned()
             .unwrap_or_else(|| "main".to_string());
@@ -271,7 +271,7 @@ impl Context {
         let (dir, git_hash) = self
             .vcs
             .checkout_of(
-                &minimal_file.base.repo,
+                &minimal_file.upstream.repo,
                 checkouts::GitRef::Branch(base_target.clone()),
             )
             .map_err(anyhow::Error::from)?;
@@ -279,7 +279,7 @@ impl Context {
         self.upstream_dir_and_origin = Some((
             dir,
             SpecOrigin::Repo(common::repo_spec::Repo::Git {
-                url: minimal_file.base.repo,
+                url: minimal_file.upstream.repo,
                 rev: git_hash,
                 tracking: Some(GitRef::Branch(base_target)),
             }),
