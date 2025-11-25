@@ -1559,6 +1559,7 @@ dependencies = [
  "indoc",
  "nickel-lang-core",
  "smallvec",
+ "tempfile",
  "tracing",
 ]
 

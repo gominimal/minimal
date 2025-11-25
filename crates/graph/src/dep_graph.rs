@@ -5,6 +5,7 @@
 
 use common::repo_spec::Repo;
 use common::{SpecOrigin, SubsetSpec, Target, mfile};
+use decode::builds::BuildRef;
 use decode::{Layer, Profile, UpstreamConfig, builds};
 use nickel_lang_core::term::IndexMap;
 
@@ -81,11 +82,11 @@ impl SubsetInput {
         SubsetSpec::new_single(&graph.spec_hash(&self.from), self.outputs.to_vec())
     }
 
-    fn from_decoded(si: &builds::SubsetInput, loader: &Loader) -> Self {
-        Self {
-            from: loader.load(&si.from),
+    fn from_decoded(si: &builds::SubsetInput, loader: &Loader) -> Result<Self, Error> {
+        Ok(Self {
+            from: loader.load(&si.from)?,
             outputs: si.outputs.clone(),
-        }
+        })
     }
 }
 
@@ -117,9 +118,9 @@ impl BuildSpecInput {
         }
     }
 
-    fn from_decoded(i: &builds::BuildDeclInput, loader: &Loader) -> Self {
-        match i {
-            builds::BuildDeclInput::Build(br) => Self::Build(loader.load(br)),
+    fn from_decoded(i: &builds::BuildDeclInput, loader: &Loader) -> Result<Self, Error> {
+        Ok(match i {
+            builds::BuildDeclInput::Build(br) => Self::Build(loader.load(br)?),
             builds::BuildDeclInput::Source(s) => Self::Source(s.clone().into()),
             builds::BuildDeclInput::HostPath(p) => Self::HostPath(p.clone()),
             builds::BuildDeclInput::Local {
@@ -135,9 +136,9 @@ impl BuildSpecInput {
                 Self::Prebuilt(name.clone(), sha256.clone())
             }
             builds::BuildDeclInput::Subset(si) => {
-                Self::Subset(SubsetInput::from_decoded(si, loader))
+                Self::Subset(SubsetInput::from_decoded(si, loader)?)
             }
-        }
+        })
     }
 }
 
@@ -191,11 +192,11 @@ impl RuntimeDep {
         }
     }
 
-    fn from_decoded(d: &builds::RuntimeDep, loader: &Loader) -> Self {
-        match d {
-            builds::RuntimeDep::Build(br) => Self::Build(loader.load(br)),
-            builds::RuntimeDep::Subset(si) => Self::Subset(SubsetInput::from_decoded(si, loader)),
-        }
+    fn from_decoded(d: &builds::RuntimeDep, loader: &Loader) -> Result<Self, Error> {
+        Ok(match d {
+            builds::RuntimeDep::Build(br) => Self::Build(loader.load(br)?),
+            builds::RuntimeDep::Subset(si) => Self::Subset(SubsetInput::from_decoded(si, loader)?),
+        })
     }
 }
 
@@ -255,8 +256,8 @@ impl BuildSpec {
         self.inputs.is_empty() && self.cmd.is_empty()
     }
 
-    fn from_decoded(bd: &builds::BuildDecl, loader: &Loader) -> Self {
-        Self {
+    fn from_decoded(bd: &builds::BuildDecl, loader: &Loader) -> Result<Self, Error> {
+        Ok(Self {
             name: bd.name.clone(),
             target: bd.target.clone(),
             cmd: bd.cmd.clone(),
@@ -266,12 +267,12 @@ impl BuildSpec {
                 .inputs
                 .iter()
                 .map(|i| BuildSpecInput::from_decoded(i, loader))
-                .collect::<SmallVec<_>>(),
+                .collect::<Result<SmallVec<_>, _>>()?,
             runtime_deps: bd
                 .runtime_deps
                 .iter()
                 .map(|d| RuntimeDep::from_decoded(d, loader))
-                .collect::<SmallVec<_>>(),
+                .collect::<Result<SmallVec<_>, _>>()?,
             abstract_deps: bd
                 .abstract_deps
                 .as_ref()
@@ -283,12 +284,15 @@ impl BuildSpec {
                 .iter()
                 .map(|(k, v)| (k.clone(), BuildOutput::from_decoded(v)))
                 .collect(),
-            replace_on_cycle: bd.replace_on_cycle.as_ref().map(|br| loader.load(br)),
+            replace_on_cycle: match &bd.replace_on_cycle {
+                Some(br) => Some(loader.load(br)?),
+                None => None,
+            },
 
             attrs: bd.attrs.as_ref().cloned().unwrap_or(IndexMap::new()),
 
             from: loader.origin.clone(),
-        }
+        })
     }
 }
 
@@ -302,16 +306,23 @@ struct Loader {
 
 impl Loader {
     /// upserts the specified build ref, returning the new or already-existing BSR.
-    fn load(&self, br: &builds::BuildRef) -> BuildSpecRef {
+    fn load(&self, br: &builds::BuildRef) -> Result<BuildSpecRef, Error> {
+        if let BuildRef::Upstream { name } = br {
+            return match self.into_graph.borrow().by_name(name).next() {
+                Some(bsr) => Ok(bsr),
+                None => Err(Error::NoSuchPkg { name: name.clone() }),
+            };
+        }
+
         let idx = self.from.resolve(br).unwrap();
         self.load_idx(idx)
     }
 
     /// upserts the specified layer idx, returning the new or already-existing BSR.
-    fn load_idx(&self, idx: &generational_arena::Index) -> BuildSpecRef {
+    fn load_idx(&self, idx: &generational_arena::Index) -> Result<BuildSpecRef, Error> {
         // Fast path: already loaded.
         if let Some(bsr) = self.resolved.borrow().get(idx) {
-            return *bsr;
+            return Ok(*bsr);
         }
 
         let decl = self.from.get(*idx).unwrap();
@@ -326,19 +337,19 @@ impl Loader {
         self.resolved.borrow_mut().insert(*idx, bsr);
 
         // Decode the build-spec and write it back to the allocated position.
-        let build = BuildSpec::from_decoded(decl, self);
+        let build = BuildSpec::from_decoded(decl, self)?;
         *self.into_graph.borrow_mut().builds.get_mut(bsr.0).unwrap() = build;
 
-        bsr
+        Ok(bsr)
     }
 
-    fn load_toplevels(&mut self) -> Vec<BuildSpecRef> {
+    fn load_toplevels(&mut self) -> Result<Vec<BuildSpecRef>, Error> {
         self.from
             .top_levels
             .clone()
             .iter()
             .map(|idx| self.load_idx(idx))
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, _>>()
     }
 }
 
@@ -482,7 +493,7 @@ impl DepGraph {
             into_graph: RefCell::new(self),
             resolved: RefCell::new(HashMap::with_capacity(1024)),
         };
-        let new_toplevels = loader.load_toplevels();
+        let new_toplevels = loader.load_toplevels()?;
 
         let mut slf = loader.into_graph.into_inner();
         slf.top_levels.extend(new_toplevels);
@@ -704,8 +715,10 @@ impl DepGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use decode::Layer;
+    use common::mfile::MFILE_NAME;
+    use decode::{Layer, LoadOptions};
     use indoc::indoc;
+    use tempfile::TempDir;
 
     #[test]
     fn spec_hash_doesnt_explode_on_cycles() {
@@ -927,6 +940,108 @@ mod tests {
                 packages: vec!["base".to_string(), "extra".to_string()],
                 env_vars: IndexMap::from_iter([("CC".to_string(), "clang".to_string())]),
             })
+        );
+    }
+
+    struct SourceProviderFake(HashMap<UpstreamConfig, TempDir>);
+
+    impl SourceProvider for SourceProviderFake {
+        type Error = std::io::Error;
+
+        fn checkout_of(&mut self, upstream: &UpstreamConfig) -> Result<PathBuf, Self::Error> {
+            match self.0.get(upstream) {
+                None => Err(std::io::Error::other("not found")),
+                Some(td) => Ok(td.path().to_path_buf()),
+            }
+        }
+    }
+
+    #[test]
+    fn basic_chain() {
+        let apex = TempDir::new().unwrap();
+        std::fs::create_dir_all(apex.path().join("packages").join("top")).unwrap();
+        std::fs::write(
+            apex.path().join("packages").join("top").join("build.ncl"),
+            indoc! {
+            "
+            let {build, ..} = import \"minimal.ncl\" in
+
+            build {
+                name = \"top\",
+                inputs = [],
+                cmd = \"\",
+            }"
+            },
+        )
+        .unwrap();
+        let apex_repo = UpstreamConfig {
+            repo: "git@fakehub.com:minimal/apex.git".to_string(),
+            hash: "abc123".to_string(),
+            branch: None,
+        };
+
+        let middle = TempDir::new().unwrap();
+        std::fs::write(
+            middle.path().join(MFILE_NAME),
+            indoc! {
+            "
+            [upstream]
+            repo = \"git@fakehub.com:minimal/apex.git\"
+            hash = \"abc123\"
+            "
+            },
+        )
+        .unwrap();
+        std::fs::create_dir_all(middle.path().join("packages").join("middle")).unwrap();
+        std::fs::write(
+            middle
+                .path()
+                .join("packages")
+                .join("middle")
+                .join("build.ncl"),
+            indoc! {
+            "
+            let {build, upstream, ..} = import \"minimal.ncl\" in
+
+            build {
+                name = \"middle\",
+                inputs = [upstream \"top\"],
+                cmd = \"\",
+            }"
+            },
+        )
+        .unwrap();
+        let middle_repo = UpstreamConfig {
+            repo: "git@fakehub.com:minimal/middle.git".to_string(),
+            hash: "abc123".to_string(),
+            branch: None,
+        };
+
+        let mut sp = SourceProviderFake(HashMap::from_iter([
+            (apex_repo.clone(), apex),
+            (middle_repo.clone(), middle),
+        ]));
+        let graph = DepGraph::new_from_chain(
+            &mut sp,
+            middle_repo.into(),
+            LoadOptions::for_test().minimal_lib_path,
+        )
+        .unwrap();
+
+        // Make sure the build from both layers is present
+        assert_eq!(
+            graph
+                .builds
+                .iter()
+                .map(|(_, b)| &b.name)
+                .collect::<Vec<_>>(),
+            vec!["top", "middle"]
+        );
+        // Make sure the middle reference to the upstream package is well formed
+        let m = graph.get(&graph.by_name("middle").next().unwrap()).unwrap();
+        assert_eq!(
+            m.inputs[0].as_build().unwrap(),
+            &graph.by_name("top").next().unwrap()
         );
     }
 }
