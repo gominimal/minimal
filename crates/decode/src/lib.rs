@@ -309,7 +309,7 @@ pub(crate) fn eval_if_closure(
 }
 
 /// The `[upstream]` section of [LayerConfig], describing the upstream to use.
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 pub struct UpstreamConfig {
     /// The URL the repository can be fetched from.
     pub repo: String,

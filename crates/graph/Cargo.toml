@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dev-dependencies]
 indoc.workspace = true
+tempfile.workspace = true
 
 [dependencies]
 nickel-lang-core.workspace = true
