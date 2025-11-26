@@ -31,6 +31,8 @@ pub struct EnvSetup<'a> {
     pub patches: Option<&'a EnvPatches>,
     /// Environment variables, if any.
     pub env_vars: Option<&'a HashMap<String, String>>,
+    /// The hostname to set in the environment, if any.
+    pub hostname: Option<String>,
 }
 
 impl<'a> Runnable for EnvSetup<'a> {
@@ -192,6 +194,14 @@ impl<'a> Runnable for EnvSetup<'a> {
                     .bindmount_rw(self.state_base_dir.to_str().unwrap(), "/state")
                     .symlink("/usr/bin", "/bin")
                     .symlink("/usr/lib", "/lib64");
+                if let Some(hn) = &self.hostname {
+                    let etc_hostname = opts.exec_base.join("etc").join("hostname");
+                    if !std::fs::exists(&etc_hostname)? {
+                        std::fs::write(etc_hostname, format!("{}\n", hn))?;
+                    }
+                    container.unshare(hakoniwa::Namespace::Uts);
+                    container.hostname(hn);
+                }
                 container
             },
 

@@ -53,6 +53,7 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
         cwd: &cwd,
         patches: Some(&env.patch),
         env_vars: Some(&env.vars),
+        hostname: Some(task.env.clone()),
     };
     let opts = op::Options {
         cache,
