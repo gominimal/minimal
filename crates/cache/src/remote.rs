@@ -97,6 +97,7 @@ impl RemoteCache<Storage> {
                     .object,
                 tokio::fs::File::from_std(tar_file),
             )
+            .set_cache_control("public, max-age=7200")
             .send_buffered()
             .await?;
 
@@ -126,6 +127,7 @@ impl RemoteCache<Storage> {
                 base.join(INDEX_FILENAME).unwrap().object,
                 bytes_data,
             )
+            .set_cache_control("public, max-age=300")
             .send_buffered()
             .await?;
         Ok(())
