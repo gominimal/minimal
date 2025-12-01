@@ -110,7 +110,7 @@ mod tests {
         // Make + run a subset with just outputs a and c.
         let mut sb = SubsetBuild {
             subset: &SubsetInput {
-                from: dg.by_name("fake build").unwrap().clone(),
+                from: *dg.by_name("fake build").unwrap(),
                 outputs: smallvec!["a".to_string(), "c".to_string()],
             },
         };
