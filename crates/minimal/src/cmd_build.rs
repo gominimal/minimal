@@ -240,9 +240,28 @@ fn display_build_summary(
 
             // Check if the package exists in cache
             if let Ok(e) = cache.read_dir(&spec_hash) {
-                info!("  {} -> {}", build.name, e.path().display());
-            } else {
-                info!("  {} -> (not in cache)", build.name);
+                let suffix = if let Ok(meta) = cache.read_meta(&spec_hash) {
+                    if let Some(fetch_ms) = meta.fetch_ms
+                        && meta.fetched
+                    {
+                        if fetch_ms > 1000 {
+                            format!("(fetched in {:.1}s)", fetch_ms as f32 / 1000.0)
+                        } else {
+                            format!("(fetched in {}ms)", fetch_ms)
+                        }
+                    } else if let Some(build_ms) = meta.build_ms {
+                        if build_ms > 1000 {
+                            format!("(built in {:.1}s)", build_ms as f32 / 1000.0)
+                        } else {
+                            format!("(built in {}ms)", build_ms)
+                        }
+                    } else {
+                        "".to_string()
+                    }
+                } else {
+                    "".to_string()
+                };
+                info!("  {} -> {} {}", build.name, e.path().display(), suffix);
             }
         }
     }
