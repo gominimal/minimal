@@ -765,16 +765,13 @@ mod tests {
                 .into_iter()
                 .collect::<Vec<(BuildSpecRef, BuildInfo)>>(),
             vec![
+                (*dp.by_name("top").unwrap(), BuildInfo::default_not_built()),
                 (
-                    dp.by_name("top").unwrap().clone(),
+                    *dp.by_name("no deps").unwrap(),
                     BuildInfo::default_not_built()
                 ),
                 (
-                    dp.by_name("no deps").unwrap().clone(),
-                    BuildInfo::default_not_built()
-                ),
-                (
-                    dp.by_name("no deps 2").unwrap().clone(),
+                    *dp.by_name("no deps 2").unwrap(),
                     BuildInfo::default_not_built()
                 ),
             ],
@@ -825,15 +822,15 @@ mod tests {
             vec![
                 BuildPhase {
                     builds: vec![Build {
-                        spec: dp.by_name("nested dep").unwrap().clone(),
+                        spec: *dp.by_name("nested dep").unwrap(),
                         with_deps: vec![],
                     },],
                 },
                 BuildPhase {
                     builds: vec![Build {
-                        spec: dp.by_name("dep").unwrap().clone(),
+                        spec: *dp.by_name("dep").unwrap(),
                         with_deps: vec![Dep::Built {
-                            bsr: dp.by_name("nested dep").unwrap().clone(),
+                            bsr: *dp.by_name("nested dep").unwrap(),
                             cycle_breaker_for: None,
                             built_with_breakers: false,
                             outputs: None
@@ -842,9 +839,9 @@ mod tests {
                 },
                 BuildPhase {
                     builds: vec![Build {
-                        spec: dp.by_name("top").unwrap().clone(),
+                        spec: *dp.by_name("top").unwrap(),
                         with_deps: vec![Dep::Built {
-                            bsr: dp.by_name("dep").unwrap().clone(),
+                            bsr: *dp.by_name("dep").unwrap(),
                             cycle_breaker_for: None,
                             built_with_breakers: false,
                             outputs: None
@@ -951,15 +948,15 @@ mod tests {
             vec![
                 BuildPhase {
                     builds: vec![Build {
-                        spec: dp.by_name("breaker dep").unwrap().clone(),
+                        spec: *dp.by_name("breaker dep").unwrap(),
                         with_deps: vec![],
                     },],
                 },
                 BuildPhase {
                     builds: vec![Build {
-                        spec: dp.by_name("breaker").unwrap().clone(),
+                        spec: *dp.by_name("breaker").unwrap(),
                         with_deps: vec![Dep::Built {
-                            bsr: dp.by_name("breaker dep").unwrap().clone(),
+                            bsr: *dp.by_name("breaker dep").unwrap(),
                             cycle_breaker_for: None,
                             built_with_breakers: false,
                             outputs: None
@@ -969,19 +966,19 @@ mod tests {
                 BuildPhase {
                     builds: vec![
                         Build {
-                            spec: dp.by_name("top").unwrap().clone(),
+                            spec: *dp.by_name("top").unwrap(),
                             with_deps: vec![Dep::Built {
-                                bsr: dp.by_name("breaker").unwrap().clone(),
-                                cycle_breaker_for: Some(dp.by_name("self ref").unwrap().clone()),
+                                bsr: *dp.by_name("breaker").unwrap(),
+                                cycle_breaker_for: Some(*dp.by_name("self ref").unwrap()),
                                 built_with_breakers: false,
                                 outputs: None
                             },],
                         },
                         Build {
-                            spec: dp.by_name("self ref").unwrap().clone(),
+                            spec: *dp.by_name("self ref").unwrap(),
                             with_deps: vec![Dep::Built {
-                                bsr: dp.by_name("breaker").unwrap().clone(),
-                                cycle_breaker_for: Some(dp.by_name("self ref").unwrap().clone()),
+                                bsr: *dp.by_name("breaker").unwrap(),
+                                cycle_breaker_for: Some(*dp.by_name("self ref").unwrap()),
                                 built_with_breakers: false,
                                 outputs: None
                             },],
@@ -991,18 +988,18 @@ mod tests {
                 BuildPhase {
                     builds: vec![
                         Build {
-                            spec: dp.by_name("top").unwrap().clone(),
+                            spec: *dp.by_name("top").unwrap(),
                             with_deps: vec![Dep::Built {
-                                bsr: dp.by_name("self ref").unwrap().clone(),
+                                bsr: *dp.by_name("self ref").unwrap(),
                                 cycle_breaker_for: None,
                                 built_with_breakers: true,
                                 outputs: None
                             },],
                         },
                         Build {
-                            spec: dp.by_name("self ref").unwrap().clone(),
+                            spec: *dp.by_name("self ref").unwrap(),
                             with_deps: vec![Dep::Built {
-                                bsr: dp.by_name("self ref").unwrap().clone(),
+                                bsr: *dp.by_name("self ref").unwrap(),
                                 cycle_breaker_for: None,
                                 built_with_breakers: true,
                                 outputs: None
@@ -1067,7 +1064,7 @@ mod tests {
         let dp = DepGraph::new().ingest(layer).unwrap();
 
         let bin_provider: BinProviderFake =
-            HashMap::from([(dp.by_name("nested dep").unwrap().clone(), ())]).into();
+            HashMap::from([(*dp.by_name("nested dep").unwrap(), ())]).into();
 
         let planner: ExecPlan<BinProviderFake> = ExecPlan::new_with_bin_provider(&dp, bin_provider);
 
@@ -1078,18 +1075,15 @@ mod tests {
             vec![
                 BuildPhase {
                     builds: vec![Build {
-                        spec: dp.by_name("dep").unwrap().clone(),
-                        with_deps: vec![Dep::Cached(
-                            dp.by_name("nested dep").unwrap().clone(),
-                            None
-                        ),],
+                        spec: *dp.by_name("dep").unwrap(),
+                        with_deps: vec![Dep::Cached(*dp.by_name("nested dep").unwrap(), None),],
                     },],
                 },
                 BuildPhase {
                     builds: vec![Build {
-                        spec: dp.by_name("top").unwrap().clone(),
+                        spec: *dp.by_name("top").unwrap(),
                         with_deps: vec![Dep::Built {
-                            bsr: dp.by_name("dep").unwrap().clone(),
+                            bsr: *dp.by_name("dep").unwrap(),
                             cycle_breaker_for: None,
                             built_with_breakers: false,
                             outputs: None
@@ -1146,8 +1140,8 @@ mod tests {
         let dp = DepGraph::new().ingest(layer).unwrap();
 
         let bin_provider: BinProviderFake = HashMap::from([
-            (dp.by_name("top").unwrap().clone(), ()),
-            (dp.by_name("nested dep").unwrap().clone(), ()),
+            (*dp.by_name("top").unwrap(), ()),
+            (*dp.by_name("nested dep").unwrap(), ()),
         ])
         .into();
 
@@ -1165,17 +1159,17 @@ mod tests {
             vec![
                 BuildPhase {
                     builds: vec![Build {
-                        spec: dp.by_name("nested deeper dep").unwrap().clone(),
+                        spec: *dp.by_name("nested deeper dep").unwrap(),
                         with_deps: vec![],
                     },],
                 },
                 BuildPhase {
                     builds: vec![Build {
-                        spec: dp.by_name("dep").unwrap().clone(),
+                        spec: *dp.by_name("dep").unwrap(),
                         with_deps: vec![
-                            Dep::Cached(dp.by_name("nested dep").unwrap().clone(), None),
+                            Dep::Cached(*dp.by_name("nested dep").unwrap(), None),
                             Dep::Built {
-                                bsr: dp.by_name("nested deeper dep").unwrap().clone(),
+                                bsr: *dp.by_name("nested deeper dep").unwrap(),
                                 cycle_breaker_for: None,
                                 built_with_breakers: false,
                                 outputs: None

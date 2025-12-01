@@ -276,7 +276,7 @@ mod tests {
                 .into_iter()
                 .collect::<Vec<_>>(),
             vec![(
-                dg.by_name("runtime dep").unwrap().clone(),
+                *dg.by_name("runtime dep").unwrap(),
                 Dep {
                     needed_by: vec![Attribution::Ours],
                     outputs: None,
@@ -338,17 +338,17 @@ mod tests {
             deps,
             vec![
                 (
-                    dg.by_name("nested input").unwrap().clone(),
+                    *dg.by_name("nested input").unwrap(),
                     Dep {
                         needed_by: vec![Attribution::Ours],
                         outputs: None,
                     }
                 ),
                 (
-                    dg.by_name("runtime dep").unwrap().clone(),
+                    *dg.by_name("runtime dep").unwrap(),
                     Dep {
                         needed_by: vec![Attribution::Inherited {
-                            from: dg.by_name("nested input").unwrap().clone()
+                            from: *dg.by_name("nested input").unwrap()
                         }],
                         outputs: None,
                     }
@@ -412,17 +412,17 @@ mod tests {
             deps,
             vec![
                 (
-                    dg.by_name("top dep").unwrap().clone(),
+                    *dg.by_name("top dep").unwrap(),
                     Dep {
                         needed_by: vec![Attribution::Ours],
                         outputs: None,
                     }
                 ),
                 (
-                    dg.by_name("nested dep").unwrap().clone(),
+                    *dg.by_name("nested dep").unwrap(),
                     Dep {
                         needed_by: vec![Attribution::Inherited {
-                            from: dg.by_name("top dep").unwrap().clone()
+                            from: *dg.by_name("top dep").unwrap()
                         }],
                         outputs: None,
                     }
@@ -498,19 +498,19 @@ mod tests {
             result,
             vec![
                 (
-                    dg.by_name("collection").unwrap().clone(),
+                    *dg.by_name("collection").unwrap(),
                     Dep {
                         needed_by: vec![Attribution::Ours],
                         outputs: None,
                     }
                 ),
                 (
-                    dg.by_name("runtime dep").unwrap().clone(),
+                    *dg.by_name("runtime dep").unwrap(),
                     Dep {
                         needed_by: vec![
                             Attribution::Ours,
                             Attribution::Inherited {
-                                from: dg.by_name("collection").unwrap().clone()
+                                from: *dg.by_name("collection").unwrap()
                             }
                         ],
                         outputs: Some(["a", "b"].into_iter().map(|s| s.to_string()).collect()),
@@ -580,14 +580,14 @@ mod tests {
             result,
             vec![
                 (
-                    dg.by_name("input").unwrap().clone(),
+                    *dg.by_name("input").unwrap(),
                     Dep {
                         needed_by: vec![Attribution::Ours],
                         outputs: None,
                     }
                 ),
                 (
-                    dg.by_name("runtime dep").unwrap().clone(),
+                    *dg.by_name("runtime dep").unwrap(),
                     Dep {
                         needed_by: vec![Attribution::Ours],
                         outputs: None,
