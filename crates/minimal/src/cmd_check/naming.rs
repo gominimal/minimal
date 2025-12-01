@@ -30,7 +30,7 @@ pub(crate) fn package_spec_name_matches_dir(
 
 pub(crate) fn package_name(
     pkg: &str,
-    all_graph: &Option<DepGraph>,
+    _all_graph: &Option<DepGraph>,
     _fix: bool,
     _ctx: &mut Context,
 ) -> Result<CheckResult, Error> {
@@ -46,19 +46,7 @@ pub(crate) fn package_name(
             || x == '-'
             || x == '.'
     }) {
-        if all_graph
-            .as_ref()
-            .map(|g| g.by_name(pkg).count())
-            .unwrap_or(1)
-            != 1
-        {
-            result
-                .err
-                .push("Multiple build-specs exist with the same name".to_string());
-            CheckVerdict::Fail
-        } else {
-            CheckVerdict::Pass
-        }
+        CheckVerdict::Pass
     } else {
         result
             .err
@@ -86,8 +74,8 @@ pub(crate) fn cycle_breaker_naming(
     } else {
         return Ok(result); // skip, we need the full graph
     };
-    let bsr = match all_graph.by_name(pkg).next() {
-        Some(b) => b,
+    let bsr = match all_graph.by_name(pkg) {
+        Some(b) => *b,
         None => {
             return Ok(result); // skip, we need the build
         }
@@ -129,8 +117,8 @@ pub(crate) fn output_naming(
     } else {
         return Ok(result); // skip, we need the full graph
     };
-    let bsr = match all_graph.by_name(pkg).next() {
-        Some(b) => b,
+    let bsr = match all_graph.by_name(pkg) {
+        Some(b) => *b,
         None => {
             return Ok(result); // skip, we need the build
         }

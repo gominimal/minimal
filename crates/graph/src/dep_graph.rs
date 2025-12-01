@@ -308,8 +308,8 @@ impl Loader {
     /// upserts the specified build ref, returning the new or already-existing BSR.
     fn load(&self, br: &builds::BuildRef) -> Result<BuildSpecRef, Error> {
         if let BuildRef::Upstream { name } = br {
-            return match self.into_graph.borrow().by_name(name).next() {
-                Some(bsr) => Ok(bsr),
+            return match self.into_graph.borrow().by_name(name) {
+                Some(bsr) => Ok(*bsr),
                 None => Err(Error::NoSuchPkg { name: name.clone() }),
             };
         }
@@ -387,6 +387,9 @@ pub struct DepGraph {
     /// Profiles (initial env configuration) by name.
     profiles: HashMap<String, Profile>,
 
+    /// Indexes build-specs by name.
+    by_name: HashMap<String, BuildSpecRef>,
+
     /// The cache of build specs to their [SpecHash]. There is also a
     /// reverse cache of [SpecHash]'s to the build spec they correspond to.
     #[allow(clippy::type_complexity)]
@@ -409,6 +412,7 @@ impl DepGraph {
     pub fn new() -> Self {
         Self {
             builds: Arena::with_capacity(4096),
+            by_name: HashMap::with_capacity(2048),
             top_levels: Vec::new(),
             profiles: HashMap::with_capacity(32),
             hash_cache: Arc::new(RwLock::new((
@@ -498,50 +502,14 @@ impl DepGraph {
         let mut slf = loader.into_graph.into_inner();
         slf.top_levels.extend(new_toplevels);
 
-        // Load/union profiles
-        for (name, mut profile) in loader.from.profiles {
-            // Apply any inheritance
-            if let Some(base_profile_name) = &profile.from_profile {
-                match slf.profiles.get(base_profile_name) {
-                    None => {
-                        return Err(Error::NoSuchProfile {
-                            name: base_profile_name.clone(),
-                        });
-                    }
-                    Some(base_profile) => {
-                        let mut new = base_profile.clone();
-                        new.union(&profile);
-                        profile = new;
-                    }
-                }
-            }
-
-            // Verify all packages exist
-            for pkg in &profile.packages {
-                if slf.by_name(pkg).count() < 1 {
-                    return Err(Error::NoSuchPkg { name: pkg.clone() });
-                }
-            }
-
-            if let Some(existing) = slf.profiles.get_mut(&name) {
-                // Its illegal to shadow a profile of the same name from upstream,
-                // unless you inherit from some upstream profile.
-                if profile.from_profile.is_none() {
-                    return Err(Error::ConflictingProfile { name });
-                }
-                *existing = profile;
-            } else {
-                slf.profiles.insert(name, profile);
-            }
-        }
-
-        // Subsets reference outputs by name. Validate for these new
-        // build-specs that any subsets reference outputs that exist.
+        // Iterate all the builds that were just added.
         for (bsr, b) in slf
             .builds
             .iter()
             .filter(|(_bsr, b)| b.from.as_ref() == &loader.from.origin)
         {
+            // Subsets reference outputs by name. Validate for these new
+            // build-specs that any subsets reference outputs that exist.
             for subset in b
                 .inputs
                 .iter()
@@ -571,6 +539,51 @@ impl DepGraph {
                     }
                 }
             }
+
+            // Add new builds by name to the name index. Error out if there are duplicates - thats illegal for now.
+            if let Some(exists) = slf.by_name.insert(b.name.clone(), BuildSpecRef(bsr)) {
+                return Err(Error::ConflictingPackage {
+                    from: (exists, b.name.clone()),
+                    build: (BuildSpecRef(bsr), b.name.clone()),
+                });
+            }
+        }
+
+        // Load/union profiles
+        for (name, mut profile) in loader.from.profiles {
+            // Apply any inheritance
+            if let Some(base_profile_name) = &profile.from_profile {
+                match slf.profiles.get(base_profile_name) {
+                    None => {
+                        return Err(Error::NoSuchProfile {
+                            name: base_profile_name.clone(),
+                        });
+                    }
+                    Some(base_profile) => {
+                        let mut new = base_profile.clone();
+                        new.union(&profile);
+                        profile = new;
+                    }
+                }
+            }
+
+            // Verify all packages exist
+            for pkg in &profile.packages {
+                if slf.by_name(pkg).is_none() {
+                    return Err(Error::NoSuchPkg { name: pkg.clone() });
+                }
+            }
+
+            if let Some(existing) = slf.profiles.get_mut(&name) {
+                // Its illegal to shadow a profile of the same name from upstream,
+                // unless you inherit from some upstream profile.
+                if profile.from_profile.is_none() {
+                    return Err(Error::ConflictingProfile { name });
+                }
+                *existing = profile;
+            } else {
+                slf.profiles.insert(name, profile);
+            }
         }
 
         Ok(slf)
@@ -581,18 +594,9 @@ impl DepGraph {
         self.builds.get(bsr.0)
     }
 
-    /// Returns an iterator over all build-spec references with the given name.
-    pub fn by_name<S: AsRef<str>>(
-        &self,
-        name: S,
-    ) -> impl Iterator<Item = BuildSpecRef> + use<'_, S> {
-        self.builds.iter().filter_map(move |(bsr, b)| {
-            if b.name == name.as_ref() {
-                Some(BuildSpecRef(bsr))
-            } else {
-                None
-            }
-        })
+    /// Returns the build-spec reference with the given name.
+    pub fn by_name<S: AsRef<str>>(&self, name: S) -> Option<&BuildSpecRef> {
+        self.by_name.get(name.as_ref())
     }
 
     /// Returns the specification hash of the given build spec.
@@ -752,10 +756,7 @@ mod tests {
         });
 
         let dp = DepGraph::new().ingest(layer).unwrap();
-        assert!(
-            dp.spec_hash(&dp.by_name("b1").next().unwrap())
-                != dp.spec_hash(&dp.by_name("b2").next().unwrap()),
-        );
+        assert!(dp.spec_hash(dp.by_name("b1").unwrap()) != dp.spec_hash(dp.by_name("b2").unwrap()),);
     }
 
     #[test]
@@ -1038,10 +1039,10 @@ mod tests {
             vec!["top", "middle"]
         );
         // Make sure the middle reference to the upstream package is well formed
-        let m = graph.get(&graph.by_name("middle").next().unwrap()).unwrap();
+        let m = graph.get(graph.by_name("middle").unwrap()).unwrap();
         assert_eq!(
             m.inputs[0].as_build().unwrap(),
-            &graph.by_name("top").next().unwrap()
+            graph.by_name("top").unwrap()
         );
     }
 }
