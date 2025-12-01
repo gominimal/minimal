@@ -7,6 +7,7 @@ use graph::{BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph};
 use op::{Runnable, SpecBuild, SpecBuildResult, SubsetBuild};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tempfile::Builder;
 use tracing::{debug, info};
 
@@ -18,7 +19,10 @@ enum ResolvedBuild {
     /// Something that was resolved from the local cache
     CacheHit,
     /// Something that was fetched into the local cache, but wasnt built locally
-    CacheFill(PendingDir),
+    CacheFill {
+        pending: PendingDir,
+        fetch_ms: usize,
+    },
 }
 
 /// yields 'dependencies' mappings for making the given input or runtime_dep available to a sandbox build.
@@ -478,6 +482,7 @@ impl<'a> Run<'a> {
         }
         if build.is_pure_prebuilt() {
             info!("Materializing prebuilt package: {}", build.name);
+            let start = Instant::now();
             let result = materialize_prebuilt(
                 build,
                 &bsh,
@@ -487,7 +492,10 @@ impl<'a> Run<'a> {
             )
             .await?;
             info!("Successfully materialized prebuilt package: {}", build.name);
-            return Ok(ResolvedBuild::CacheFill(result));
+            return Ok(ResolvedBuild::CacheFill {
+                pending: result,
+                fetch_ms: Instant::now().duration_since(start).as_millis() as usize,
+            });
         }
 
         let dependencies = self
@@ -569,12 +577,13 @@ impl<'a> Run<'a> {
 
                                 match res {
                                     ResolvedBuild::CacheHit => {} // nothing to write
-                                    ResolvedBuild::CacheFill(cache_handle) => {
+                                    ResolvedBuild::CacheFill { pending, fetch_ms } => {
                                         pending_cache_entries.lock().unwrap().push((
-                                            cache_handle,
+                                            pending,
                                             cache::EntryMeta {
                                                 inner: MetaInner::Spec(build.name.clone()),
-                                                fetched: false,
+                                                fetched: true,
+                                                fetch_ms: Some(fetch_ms),
                                                 breaker_build: !full_build,
                                                 origin: Some(build.from.as_ref().clone()),
                                                 ..Default::default()
