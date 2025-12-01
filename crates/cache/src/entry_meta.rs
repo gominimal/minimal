@@ -31,6 +31,12 @@ pub struct EntryMeta {
     pub fetched: bool,
     #[serde(default)]
     pub breaker_build: bool,
+
+    #[serde(default)]
+    pub fetch_ms: Option<usize>,
+    #[serde(default)]
+    pub build_ms: Option<usize>,
+
     pub epoch_millis: u128,
     pub origin: Option<SpecOrigin>,
 }
@@ -41,6 +47,8 @@ impl Default for EntryMeta {
             inner: MetaInner::Spec("".to_string()),
             fetched: false,
             breaker_build: false,
+            fetch_ms: None,
+            build_ms: None,
             epoch_millis: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -158,6 +166,8 @@ mod tests {
             EntryMeta {
                 fetched: true,
                 breaker_build: false,
+                fetch_ms: None,
+                build_ms: None,
                 epoch_millis: 1760653637323,
                 inner: MetaInner::Spec("setuptools".to_string()),
                 origin: None,

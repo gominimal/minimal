@@ -37,7 +37,7 @@ pub async fn cmd_patched_build(args: PatchedBuildArgs, ctx: &mut Context) -> Res
 
     let output_base = ctx.paths().sandbox_base_dir().to_path_buf();
     std::fs::create_dir_all(&output_base).ok();
-    let out_dir = SpecBuild {
+    let res = SpecBuild {
         spec: &bsr,
         override_deps: Some(dependencies),
         remote_fetcher: &remote_storage,
@@ -50,10 +50,11 @@ pub async fn cmd_patched_build(args: PatchedBuildArgs, ctx: &mut Context) -> Res
     .await
     .map_err(anyhow::Error::from)?;
 
-    out_dir
+    res.outputs
         .finalize(EntryMeta {
             inner: MetaInner::Spec(build.name.clone()),
             breaker_build: true,
+            build_ms: Some(res.build_ms),
             origin: Some(build.from.as_ref().clone()),
             ..Default::default()
         })
