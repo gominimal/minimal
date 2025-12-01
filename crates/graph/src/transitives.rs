@@ -267,7 +267,7 @@ mod tests {
         let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], false);
         assert_eq!(
             toplevel_manifest.build,
-            dg.by_name("top build").next().unwrap()
+            dg.by_name("top build").unwrap().clone()
         );
 
         assert_eq!(
@@ -276,7 +276,7 @@ mod tests {
                 .into_iter()
                 .collect::<Vec<_>>(),
             vec![(
-                dg.by_name("runtime dep").next().unwrap(),
+                dg.by_name("runtime dep").unwrap().clone(),
                 Dep {
                     needed_by: vec![Attribution::Ours],
                     outputs: None,
@@ -326,7 +326,7 @@ mod tests {
         let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], true);
         assert_eq!(
             toplevel_manifest.build,
-            dg.by_name("top build").next().unwrap()
+            dg.by_name("top build").unwrap().clone()
         );
 
         let mut deps = toplevel_manifest
@@ -338,17 +338,17 @@ mod tests {
             deps,
             vec![
                 (
-                    dg.by_name("nested input").next().unwrap(),
+                    dg.by_name("nested input").unwrap().clone(),
                     Dep {
                         needed_by: vec![Attribution::Ours],
                         outputs: None,
                     }
                 ),
                 (
-                    dg.by_name("runtime dep").next().unwrap(),
+                    dg.by_name("runtime dep").unwrap().clone(),
                     Dep {
                         needed_by: vec![Attribution::Inherited {
-                            from: dg.by_name("nested input").next().unwrap()
+                            from: dg.by_name("nested input").unwrap().clone()
                         }],
                         outputs: None,
                     }
@@ -399,7 +399,7 @@ mod tests {
         let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], true);
         assert_eq!(
             toplevel_manifest.build,
-            dg.by_name("top build").next().unwrap()
+            dg.by_name("top build").unwrap().clone()
         );
 
         let mut deps = toplevel_manifest
@@ -412,17 +412,17 @@ mod tests {
             deps,
             vec![
                 (
-                    dg.by_name("top dep").next().unwrap(),
+                    dg.by_name("top dep").unwrap().clone(),
                     Dep {
                         needed_by: vec![Attribution::Ours],
                         outputs: None,
                     }
                 ),
                 (
-                    dg.by_name("nested dep").next().unwrap(),
+                    dg.by_name("nested dep").unwrap().clone(),
                     Dep {
                         needed_by: vec![Attribution::Inherited {
-                            from: dg.by_name("top dep").next().unwrap()
+                            from: dg.by_name("top dep").unwrap().clone()
                         }],
                         outputs: None,
                     }
@@ -486,7 +486,7 @@ mod tests {
         let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], false);
         assert_eq!(
             toplevel_manifest.build,
-            dg.by_name("top build").next().unwrap()
+            dg.by_name("top build").unwrap().clone()
         );
 
         let mut result = toplevel_manifest
@@ -498,19 +498,19 @@ mod tests {
             result,
             vec![
                 (
-                    dg.by_name("collection").next().unwrap(),
+                    dg.by_name("collection").unwrap().clone(),
                     Dep {
                         needed_by: vec![Attribution::Ours],
                         outputs: None,
                     }
                 ),
                 (
-                    dg.by_name("runtime dep").next().unwrap(),
+                    dg.by_name("runtime dep").unwrap().clone(),
                     Dep {
                         needed_by: vec![
                             Attribution::Ours,
                             Attribution::Inherited {
-                                from: dg.by_name("collection").next().unwrap()
+                                from: dg.by_name("collection").unwrap().clone()
                             }
                         ],
                         outputs: Some(["a", "b"].into_iter().map(|s| s.to_string()).collect()),
@@ -568,7 +568,7 @@ mod tests {
         let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], true);
         assert_eq!(
             toplevel_manifest.build,
-            dg.by_name("top build").next().unwrap()
+            dg.by_name("top build").unwrap().clone()
         );
 
         let mut result = toplevel_manifest
@@ -580,14 +580,14 @@ mod tests {
             result,
             vec![
                 (
-                    dg.by_name("input").next().unwrap(),
+                    dg.by_name("input").unwrap().clone(),
                     Dep {
                         needed_by: vec![Attribution::Ours],
                         outputs: None,
                     }
                 ),
                 (
-                    dg.by_name("runtime dep").next().unwrap(),
+                    dg.by_name("runtime dep").unwrap().clone(),
                     Dep {
                         needed_by: vec![Attribution::Ours],
                         outputs: None,
@@ -641,13 +641,13 @@ mod tests {
         let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], true);
         assert_eq!(
             toplevel_manifest.build,
-            dg.by_name("top build").next().unwrap()
+            dg.by_name("top build").unwrap().clone()
         );
 
         assert!(
             toplevel_manifest
                 .transitive_runtime_deps
-                .contains_key(&dg.by_name("internet provider").next().unwrap())
+                .contains_key(&dg.by_name("internet provider").unwrap().clone())
         )
     }
 }

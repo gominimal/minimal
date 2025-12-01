@@ -29,7 +29,12 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
         }
     };
     graph.hydrate_env(&mut env)?;
-    graph.top_levels = env.packages.iter().flat_map(|p| graph.by_name(p)).collect(); // TODO: Probably time to retire this top_levels concept
+    graph.top_levels = env
+        .packages
+        .iter()
+        .flat_map(|p| graph.by_name(p))
+        .cloned()
+        .collect(); // TODO: Probably time to retire this top_levels concept
 
     let cwd = if task.inherit_cwd {
         std::env::current_dir().unwrap()

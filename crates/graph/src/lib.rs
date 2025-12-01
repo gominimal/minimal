@@ -12,6 +12,11 @@ pub enum Error {
         from: (BuildSpecRef, String),
         build: (BuildSpecRef, String),
     },
+    /// A package existed that shadowed an existing package.
+    ConflictingPackage {
+        from: (BuildSpecRef, String),
+        build: (BuildSpecRef, String),
+    },
     /// A profile with a certain name was requested, but did not exist.
     NoSuchProfile { name: String },
     /// A profile has the same name as a profile in a higher layer, but did not extend it.
@@ -51,6 +56,9 @@ impl Error {
             }
             Error::Fetch(e) => {
                 writeln!(writer, "Error: failed to fetch upstream layer: {}", e).unwrap()
+            }
+            Error::ConflictingPackage { from, .. } => {
+                writeln!(writer, "Error: package '{}' already exists", from.1,).unwrap()
             }
         }
     }

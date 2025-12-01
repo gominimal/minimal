@@ -27,8 +27,8 @@ pub(crate) fn output_types_valid(
         return Ok(result); // skip, we need the full graph
     };
 
-    let bsr = match all_graph.by_name(pkg).next() {
-        Some(b) => b,
+    let bsr = match all_graph.by_name(pkg) {
+        Some(b) => *b,
         None => {
             return Ok(result); // skip, we need the build
         }
@@ -104,8 +104,8 @@ pub(crate) fn missing_runtime_deps(
         return Ok(result); // skip, we need the full graph
     };
 
-    let bsr = match all_graph.by_name(pkg).next() {
-        Some(b) => b,
+    let bsr = match all_graph.by_name(pkg) {
+        Some(b) => *b,
         None => {
             return Ok(result); // skip, we need the build
         }

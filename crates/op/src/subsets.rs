@@ -91,7 +91,7 @@ mod tests {
             )
             .unwrap();
         // Write some files into a cache entry to fake existence of a completed build of it.
-        let build_hash = dg.spec_hash(&dg.by_name("fake build").next().unwrap());
+        let build_hash = dg.spec_hash(dg.by_name("fake build").unwrap());
         let build_files_dir = cache.write_dir(&build_hash).unwrap();
         for letter in &["a", "b", "c"] {
             std::fs::write(
@@ -110,7 +110,7 @@ mod tests {
         // Make + run a subset with just outputs a and c.
         let mut sb = SubsetBuild {
             subset: &SubsetInput {
-                from: dg.by_name("fake build").next().unwrap(),
+                from: dg.by_name("fake build").unwrap().clone(),
                 outputs: smallvec!["a".to_string(), "c".to_string()],
             },
         };
@@ -125,7 +125,7 @@ mod tests {
                 inner: MetaInner::Subset(sb.subset.as_spec(&dg)),
                 fetched: false,
                 origin: Some(
-                    dg.get(&dg.by_name("fake build").next().unwrap())
+                    dg.get(dg.by_name("fake build").unwrap())
                         .unwrap()
                         .from
                         .as_ref()

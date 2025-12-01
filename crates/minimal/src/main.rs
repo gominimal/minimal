@@ -318,8 +318,8 @@ impl Context {
         let mut graph = self.graph_from_all_packages()?;
         graph.top_levels = names
             .iter()
-            .map(|n| match graph.by_name(n).next() {
-                Some(bsr) => Ok(bsr),
+            .map(|n| match graph.by_name(n) {
+                Some(bsr) => Ok(*bsr),
                 None => Err(Error::Other(anyhow!("No such package: {}", n))),
             })
             .collect::<Result<_, _>>()?;
