@@ -1,6 +1,7 @@
 use crate::{Cache, EntryMeta, LocalDir, MetaInner, remote_index::RemoteIndex};
 use common::{SpecHash, SpecOrigin, archive};
 use std::io::{Seek, Write};
+use std::time::Instant;
 
 use common::fetchers::*;
 use google_cloud_storage::{Error as GcsError, client::Storage};
@@ -188,6 +189,7 @@ impl<B: FetchBackend> RemoteCache<B> {
         );
         span.pb_set_message(span_name);
 
+        let start = Instant::now();
         let req = self.backend.get(
             self.base
                 .join(&format!("{}.zst", hex::encode(sha256)))
@@ -224,6 +226,7 @@ impl<B: FetchBackend> RemoteCache<B> {
                 inner,
                 origin,
                 fetched: true,
+                fetch_ms: Some(Instant::now().duration_since(start).as_millis() as usize),
                 ..Default::default()
             })
             .map_err(Error::Cache)?;

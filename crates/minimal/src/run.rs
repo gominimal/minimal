@@ -4,13 +4,22 @@ use common::SpecHash;
 use google_cloud_storage::client::Storage as GcsStorage;
 use graph::{BinProvider, ExecPlan, RuntimeDep, SubsetInput};
 use graph::{BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph};
-use op::{Runnable, SpecBuild, SubsetBuild};
+use op::{Runnable, SpecBuild, SpecBuildResult, SubsetBuild};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tempfile::Builder;
 use tracing::{debug, info};
 
 use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage};
+
+enum ResolvedBuild {
+    /// Something that was literally just built
+    SpecBuild(SpecBuildResult),
+    /// Something that was resolved from the local cache
+    CacheHit,
+    /// Something that was fetched into the local cache, but wasnt built locally
+    CacheFill(PendingDir),
+}
 
 /// yields 'dependencies' mappings for making the given input or runtime_dep available to a sandbox build.
 ///
@@ -454,7 +463,7 @@ impl<'a> Run<'a> {
         bsr: &BuildSpecRef,
         _full_build: bool,
         remote_cache: Option<&RemoteCache<GcsStorage>>,
-    ) -> Result<Option<PendingDir>> {
+    ) -> Result<ResolvedBuild> {
         let bsh = self.graph.spec_hash(bsr);
         let build = self.graph.get(bsr).unwrap();
 
@@ -465,8 +474,7 @@ impl<'a> Run<'a> {
                 build.name,
                 e.path().display(),
             );
-            // Return None to indicate this was a cache hit, not a new build
-            return Ok(None);
+            return Ok(ResolvedBuild::CacheHit);
         }
         if build.is_pure_prebuilt() {
             info!("Materializing prebuilt package: {}", build.name);
@@ -479,7 +487,7 @@ impl<'a> Run<'a> {
             )
             .await?;
             info!("Successfully materialized prebuilt package: {}", build.name);
-            return Ok(Some(result));
+            return Ok(ResolvedBuild::CacheFill(result));
         }
 
         let dependencies = self
@@ -492,10 +500,13 @@ impl<'a> Run<'a> {
                 build.name
             );
             let cache_handle = self.cache.write_dir(&bsh).unwrap();
-            return Ok(Some(cache_handle));
+            return Ok(ResolvedBuild::SpecBuild(SpecBuildResult {
+                outputs: cache_handle,
+                build_ms: 0,
+            }));
         }
 
-        let out_dir = SpecBuild {
+        let build_result = SpecBuild {
             spec: bsr,
             override_deps: Some(dependencies),
             remote_fetcher: &self.remote_storage,
@@ -509,7 +520,7 @@ impl<'a> Run<'a> {
         .map_err(anyhow::Error::from)?;
 
         info!("Successfully built package: {}", build.name);
-        Ok(Some(out_dir))
+        Ok(ResolvedBuild::SpecBuild(build_result))
     }
 
     pub async fn execute<BP: BinProvider>(
@@ -526,7 +537,7 @@ impl<'a> Run<'a> {
             use std::sync::{Arc, Mutex};
             let self2 = Arc::new(&*self);
             let build_which_errored = Arc::new(Mutex::new(None));
-            let outputs = Arc::new(Mutex::new(Vec::with_capacity(
+            let pending_cache_entries = Arc::new(Mutex::new(Vec::with_capacity(
                 phase.as_ref().unwrap().builds.len(),
             )));
 
@@ -539,7 +550,7 @@ impl<'a> Run<'a> {
                     let full_build = build.full_build();
                     let self2 = self2.clone();
                     let err_bsr = build_which_errored.clone();
-                    let outputs = outputs.clone();
+                    let pending_cache_entries = pending_cache_entries.clone();
 
                     s.spawn(move |_| {
                         let _rt = tokio_runtime.enter();
@@ -553,20 +564,37 @@ impl<'a> Run<'a> {
                             Err(e) => {
                                 *err_bsr.lock().unwrap() = Some((bsr, e));
                             }
-                            Ok(cache_handle) => {
-                                if let Some(cache_handle) = cache_handle {
-                                    let build = self2.graph.get(&bsr).unwrap();
-                                    outputs.lock().unwrap().push((
-                                        cache_handle,
-                                        cache::EntryMeta {
-                                            inner: MetaInner::Spec(build.name.clone()),
-                                            fetched: false,
-                                            breaker_build: !full_build,
-                                            origin: Some(build.from.as_ref().clone()),
-                                            ..Default::default()
-                                        },
-                                    ));
-                                }
+                            Ok(res) => {
+                                let build = self2.graph.get(&bsr).unwrap();
+
+                                match res {
+                                    ResolvedBuild::CacheHit => {} // nothing to write
+                                    ResolvedBuild::CacheFill(cache_handle) => {
+                                        pending_cache_entries.lock().unwrap().push((
+                                            cache_handle,
+                                            cache::EntryMeta {
+                                                inner: MetaInner::Spec(build.name.clone()),
+                                                fetched: false,
+                                                breaker_build: !full_build,
+                                                origin: Some(build.from.as_ref().clone()),
+                                                ..Default::default()
+                                            },
+                                        ))
+                                    }
+                                    ResolvedBuild::SpecBuild(b) => {
+                                        pending_cache_entries.lock().unwrap().push((
+                                            b.outputs,
+                                            cache::EntryMeta {
+                                                inner: MetaInner::Spec(build.name.clone()),
+                                                fetched: false,
+                                                build_ms: Some(b.build_ms),
+                                                breaker_build: !full_build,
+                                                origin: Some(build.from.as_ref().clone()),
+                                                ..Default::default()
+                                            },
+                                        ))
+                                    }
+                                };
                             }
                         }
                     });
@@ -579,7 +607,7 @@ impl<'a> Run<'a> {
                 .unwrap();
 
             // Commit all the builds to the build cache
-            Arc::into_inner(outputs)
+            Arc::into_inner(pending_cache_entries)
                 .unwrap()
                 .into_inner()
                 .unwrap()

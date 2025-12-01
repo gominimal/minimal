@@ -1,10 +1,16 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{collections::HashSet, path::PathBuf, time::Instant};
 
 use crate::{Error, Materialized, Options, Runnable, SubsetBuild};
 use cache::{CacheErr, MetaInner, PendingDir};
 use graph::{BuildSpec, BuildSpecInput, BuildSpecRef, SubsetInput, Transitives};
 use tempfile::TempDir;
 use tracing::info;
+
+/// The return value of a successful build of a build-spec.
+pub struct SpecBuildResult {
+    pub outputs: PendingDir,
+    pub build_ms: usize,
+}
 
 /// Builds a spec, storing the resulting outputs in the cache.
 pub struct SpecBuild<'a, SF: crate::SourceFetcher> {
@@ -139,7 +145,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
 }
 
 impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
-    type Result = PendingDir;
+    type Result = SpecBuildResult;
 
     async fn run<'b>(&mut self, opts: &Options<'b>) -> Result<Self::Result, Error> {
         let build = opts.graph.get(self.spec).unwrap();
@@ -179,14 +185,20 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
             .write_dir(&opts.graph.spec_hash(self.spec))
             .unwrap();
         info!("Building package: {}", build.name);
+
+        let start = Instant::now();
         let target_id = build.name.clone();
         build_sandbox::run_build(&config, out_dir.path(), opts.exec_base.clone(), &target_id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to build {}: {}", build.name, e))?;
+        let build_ms = Instant::now().duration_since(start).as_millis() as usize;
 
         for tempdir in temp_dirs.into_iter() {
             drop(tempdir);
         }
-        Ok(out_dir)
+        Ok(SpecBuildResult {
+            outputs: out_dir,
+            build_ms,
+        })
     }
 }

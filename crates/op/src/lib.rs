@@ -40,7 +40,7 @@ pub use subsets::SubsetBuild;
 mod sources;
 pub use sources::{SourceFetcher, SourceLoad};
 mod specs;
-pub use specs::SpecBuild;
+pub use specs::{SpecBuild, SpecBuildResult};
 
 mod oci_image;
 pub use oci_image::OciImageCreate;
