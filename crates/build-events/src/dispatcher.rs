@@ -6,7 +6,7 @@
 use crate::events::BuildEvent;
 use crate::subscriber::BuildEventSubscriber;
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 /// Dispatcher that distributes events to multiple subscribers
 ///
@@ -71,7 +71,7 @@ impl BuildEventDispatcher {
     /// dispatcher.add_subscriber(Box::new(LoggerSubscriber::new()));
     /// ```
     pub fn add_subscriber(&mut self, subscriber: Box<dyn BuildEventSubscriber>) {
-        info!("Registered subscriber: {}", subscriber.name());
+        debug!("Registered subscriber: {}", subscriber.name());
         self.subscribers.push(subscriber);
     }
 
@@ -99,7 +99,7 @@ impl BuildEventDispatcher {
     /// }
     /// ```
     pub async fn run(mut self) {
-        info!(
+        debug!(
             "BuildEventDispatcher started with {} subscribers",
             self.subscribers.len()
         );
@@ -120,7 +120,7 @@ impl BuildEventDispatcher {
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     // Channel closed, shutdown gracefully
-                    info!("Event channel closed, shutting down dispatcher");
+                    debug!("Event channel closed, shutting down dispatcher");
                     break;
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -141,7 +141,7 @@ impl BuildEventDispatcher {
             }
         }
 
-        info!("BuildEventDispatcher shutdown complete");
+        debug!("BuildEventDispatcher shutdown complete");
     }
 }
 
