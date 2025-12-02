@@ -200,6 +200,18 @@ fn extract_tar_impl<R: Read>(
                 continue;
             }
             let path = p.strip_prefix(prefix)?.to_owned();
+
+            // Ensure any containing directory exists - most tarballs are good about ordering directory entries
+            // ahead of files within them, but not all.
+            if let Some(dirs) = path.parent()
+                && !dirs.as_os_str().is_empty()
+            {
+                let dir_path = dest_dir.join(dirs);
+                if !std::fs::exists(&dir_path)? {
+                    std::fs::create_dir_all(dir_path)?;
+                }
+            }
+
             entry.unpack(dest_dir.join(path))?;
         }
     } else {
