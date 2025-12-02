@@ -65,7 +65,7 @@ impl SpongeBob {
         let (request_tx, request_rx) = mpsc::channel(100);
 
         // Log invocation URL at start
-        tracing::info!("https://dash.minimal.farm/invocations/{}", invocation_id);
+        tracing::debug!("https://dash.minimal.farm/invocations/{}", invocation_id);
 
         // Spawn task to handle stream and wait for response
         let invocation_id_for_task = invocation_id.clone();
@@ -73,11 +73,7 @@ impl SpongeBob {
             let request_stream = ReceiverStream::new(request_rx);
             match client.publish_build_event_stream(request_stream).await {
                 Ok(_response) => {
-                    tracing::info!("Stream closed successfully");
-                    tracing::info!(
-                        "https://dash.minimal.farm/invocations/{}",
-                        invocation_id_for_task
-                    );
+                    tracing::debug!("Stream closed successfully");
                 }
                 Err(e) => {
                     tracing::error!("Stream error: {}", e);

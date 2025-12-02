@@ -5,7 +5,7 @@ use hakoniwa::Container;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{error, info, warn};
+use tracing::{debug, error, warn};
 
 use crate::config::{BuildConfig, Input};
 use crate::error::{ExecutionError, Result};
@@ -57,18 +57,18 @@ impl BuildExecutor {
 
     #[tracing::instrument(skip(config), fields(indicatif.pb_hide, package = %config.name))]
     pub async fn execute(&self, config: &BuildConfig, target_id: &str) -> Result<i32> {
-        info!(
+        debug!(
             "Linking {} inputs to build environment",
             config.inputs.len()
         );
         for input in &config.inputs {
             match input {
                 Input::File(p) => {
-                    info!("  Linking input: {}", p.display());
+                    debug!("  Linking input: {}", p.display());
                     self.hardlink_to_tmpdir(p)?;
                 }
                 Input::Dir(p) => {
-                    info!("  Linking input dir: {}", p.display());
+                    debug!("  Linking input dir: {}", p.display());
                     for entry in fs::read_dir(p)? {
                         let entry = entry?;
                         self.hardlink_to_tmpdir(&entry.path())?;
@@ -237,7 +237,7 @@ impl BuildExecutor {
             }));
         }
 
-        info!(
+        debug!(
             "Executing: {} {}",
             config.build_script.executable.display(),
             config.build_script.args.join(" ")
