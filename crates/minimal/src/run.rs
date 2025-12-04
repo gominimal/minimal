@@ -502,7 +502,7 @@ impl<'a> Run<'a> {
             .sandbox_paths_from_buildspec(build, remote_cache)
             .await?;
 
-        if build.cmds.is_empty() || build.cmds[0][0].trim().is_empty() {
+        if build.cmds.is_empty() || build.cmds[0].is_empty() || build.cmds[0][0].trim().is_empty() {
             info!(
                 "No-op package with empty cmd: {}, creating cache entry",
                 build.name
