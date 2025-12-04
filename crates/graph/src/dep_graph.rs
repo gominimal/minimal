@@ -209,8 +209,8 @@ pub struct BuildSpec {
     /// The system this build-spec is meant to run on. Defaults to amd64 Linux.
     pub target: Target,
 
-    /// The build command declared on the build spec.
-    pub cmd: String,
+    /// The build commands declared on the build spec.
+    pub cmds: Vec<Vec<String>>,
     /// Any arguments to the build command, ultimately passed as environment variables.
     pub build_args: Option<IndexMap<String, String>>,
 
@@ -253,14 +253,15 @@ impl BuildSpec {
 
     /// Returns true if the build-spec represents a rollup of runtime_deps but no substance or computation of its own.
     pub fn is_pure_collection(&self) -> bool {
-        self.inputs.is_empty() && self.cmd.is_empty()
+        self.inputs.is_empty()
+            && (self.cmds.is_empty() || (self.cmds.len() == 1 && self.cmds[0][0].is_empty()))
     }
 
     fn from_decoded(bd: &builds::BuildDecl, loader: &Loader) -> Result<Self, Error> {
         Ok(Self {
             name: bd.name.clone(),
             target: bd.target.clone(),
-            cmd: bd.cmd.clone(),
+            cmds: bd.cmds.clone(),
             build_args: bd.build_args.clone(),
 
             inputs: bd

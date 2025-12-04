@@ -836,6 +836,7 @@ dependencies = [
  "indoc",
  "nickel-lang-core",
  "serde",
+ "shlex",
  "smallvec",
  "tempfile",
  "toml",

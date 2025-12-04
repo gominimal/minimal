@@ -703,8 +703,8 @@ pub struct BuildDecl {
     /// Any attributes explicitly set on this build-decl.
     pub attrs: Option<IndexMap<String, AttrValue>>,
 
-    /// The build command declared on the build spec.
-    pub cmd: String,
+    /// The build commands declared on the build spec.
+    pub cmds: Vec<Vec<String>>,
     /// Any arguments to the build command, ultimately passed as environment variables.
     pub build_args: Option<IndexMap<String, String>>,
 
@@ -741,7 +741,8 @@ impl BuildDecl {
 
     /// Returns true if the build-spec represents a rollup of runtime_deps but no substance or computation of its own.
     pub fn is_pure_collection(&self) -> bool {
-        self.inputs.is_empty() && self.cmd.is_empty()
+        self.inputs.is_empty()
+            && (self.cmds.is_empty() || (self.cmds.len() == 1 && self.cmds[0][0].is_empty()))
     }
 }
 
@@ -755,7 +756,7 @@ impl BuildDecl {
 
         // Read out the attributes
         let mut name: Option<String> = None;
-        let mut cmd: Option<String> = None;
+        let mut cmds: Option<Vec<Vec<String>>> = None;
         let mut ty: Option<ObjTy> = None;
         let mut target: Option<Target> = None;
         let mut build_args: Option<IndexMap<String, String>> = None;
@@ -792,13 +793,28 @@ impl BuildDecl {
                                 Ok(())
                             }
                             "cmd" => {
-                                cmd = Some(
-                                    String::deserialize(eval_if_closure(
-                                        field.value.as_ref().unwrap(),
-                                        program,
-                                    )?)
-                                    .unwrap(),
-                                );
+                                let rt = eval_if_closure(
+                                    field.value.as_ref().unwrap(),
+                                    program,
+                                )?;
+                                match rt.term.as_ref() {
+                                    Term::Str(s) => {
+                                        cmds = Some(vec![
+                                            shlex::split(s).unwrap(),
+                                        ]);
+                                    }
+                                    Term::Array(a, _attrs) => {
+                                        cmds = Some(vec![
+                                            a.iter()
+                                                .map(|rt| eval_if_closure(rt, program))
+                                                .collect::<Result<Vec<_>, _>>()?
+                                                .into_iter()
+                                                .map(|rt| String::deserialize(rt).unwrap())
+                                                .collect(),
+                                        ]);
+                                    }
+                                    _ => todo!("error for 'cmd' field being non-string & non-array, got {:?}", rt.term.as_ref()),
+                                };
                                 Ok(())
                             }
                             "target" => {
@@ -1006,7 +1022,7 @@ impl BuildDecl {
                 });
             }
         };
-        let cmd = cmd.unwrap_or_default();
+        let cmds = cmds.unwrap_or_default();
         let inputs = match inputs {
             Some(inputs) => inputs,
             None => {
@@ -1037,7 +1053,7 @@ impl BuildDecl {
 
         Ok(Self {
             name,
-            cmd,
+            cmds,
             attrs,
             build_args,
             target: target.unwrap_or(Target::new(Arch::Amd64, OS::Linux)),
@@ -1224,7 +1240,7 @@ mod tests {
             BuildDecl {
                 name,
                 target,
-                cmd,
+                cmds,
                 attrs: _,
                 build_args,
                 inputs: _,
@@ -1234,10 +1250,44 @@ mod tests {
                 replace_on_cycle
             } if name == "single buildspec" &&
                 target == Target::default() &&
-                cmd == "./build.sh" &&
+                cmds == vec![vec!["./build.sh"]] &&
                 replace_on_cycle.is_none() &&
                 build_args == Some([("fish".to_string(), "swiggity swooty".to_string())].into()) &&
                 outputs == [("something".to_string(), BuildOutput::Library{ glob: "/usr/lib/something.*.so".to_string()})].into(),
+        ));
+    }
+
+    #[test]
+    fn build_cmd_as_array() {
+        let (term, mut program, _origin) = Loader::new(
+            indoc! {
+                "
+                let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
+                {
+        			name = \"simple\",
+        			inputs = [],
+        			cmd = [\"bash\", \"-c\", \"echo uwu\"],
+        		} | BuildSpec"
+            }
+            .to_string(),
+            &LoadOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("load failed");
+        })
+        .finish()
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("finish failed");
+        });
+
+        let build = BuildDecl::from_term(&term, &mut program, &mut ()).unwrap();
+
+        assert!(matches!(
+            build,
+            BuildDecl {cmds, .. } if
+                cmds == vec![vec!["bash", "-c", "echo uwu"]]
         ));
     }
 

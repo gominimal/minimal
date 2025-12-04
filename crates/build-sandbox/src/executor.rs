@@ -3,6 +3,7 @@ use build_events::events::{
 };
 use hakoniwa::Container;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, warn};
@@ -191,8 +192,8 @@ impl BuildExecutor {
     async fn execute_in_container(&self, config: &BuildConfig, target_id: &str) -> Result<()> {
         let rootfs = self.prepare_rootfs(config)?;
         let sandbox_mount_point = "/build";
-        let program = &config.build_script.executable.to_string_lossy();
-        let mut cmd = Container::new()
+        let mut container = Container::new();
+        container
             .rootfs(&rootfs)
             .map_err(|e| ExecutionError::SandboxFailed {
                 message: format!("Failed to set rootfs: {}", e),
@@ -208,86 +209,102 @@ impl BuildExecutor {
                 format!("{}/output", sandbox_mount_point).as_str(),
             )
             .symlink("/usr/bin", "/bin")
-            .symlink("/usr/lib", "/lib64")
-            .command(program);
+            .symlink("/usr/lib", "/lib64");
 
-        for arg in &config.build_script.args {
-            cmd.arg(arg);
-        }
-
-        cmd.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-            .env("HOME", sandbox_mount_point)
-            .env("OUTPUT_DIR", &format!("{}/output", sandbox_mount_point))
-            .env("LANG", "en_US.utf8")
-            .env("LC_ALL", "en_US.utf8");
-        if let Some(build_args) = &config.build_script.build_args {
-            cmd.envs(build_args.iter().map(|(k, v)| {
-                (
-                    "MINIMAL_ARG_".to_owned()
-                        + &k.as_str()
-                            .trim()
-                            .replace("=", "")
-                            .replace(":", "")
-                            .replace("/", "")
-                            .replace("\"", "")
-                            .replace("'", "")
-                            .to_uppercase(),
-                    v,
-                )
-            }));
-        }
-
-        debug!(
-            "Executing: {} {}",
-            config.build_script.executable.display(),
-            config.build_script.args.join(" ")
-        );
-
-        cmd.current_dir(sandbox_mount_point);
-
-        let output = cmd.output().map_err(|e| ExecutionError::SandboxFailed {
-            message: format!("Container execution failed: {}", e),
-        })?;
-
-        fs::write(self.build_workspace_dir.join("stdout"), &output.stdout).map_err(|e| {
-            ExecutionError::SandboxFailed {
-                message: format!("Failed to write stdout: {}", e),
+        let mut stdout_f =
+            fs::File::create(self.build_workspace_dir.join("stdout")).map_err(|e| {
+                ExecutionError::SandboxFailed {
+                    message: format!("Failed to create ./stdout: {}", e),
+                }
+            })?;
+        let mut stderr_f =
+            fs::File::create(self.build_workspace_dir.join("stderr")).map_err(|e| {
+                ExecutionError::SandboxFailed {
+                    message: format!("Failed to create ./stderr: {}", e),
+                }
+            })?;
+        for exec in config.invocations.iter() {
+            let program = &exec.executable.to_string_lossy();
+            let mut cmd = container.command(program);
+            for arg in &exec.args {
+                cmd.arg(arg);
             }
-        })?;
-        fs::write(self.build_workspace_dir.join("stderr"), &output.stderr).map_err(|e| {
-            ExecutionError::SandboxFailed {
-                message: format!("Failed to write stderr: {}", e),
+
+            cmd.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+                .env("HOME", sandbox_mount_point)
+                .env("OUTPUT_DIR", &format!("{}/output", sandbox_mount_point))
+                .env("LANG", "en_US.utf8")
+                .env("LC_ALL", "en_US.utf8");
+            if let Some(build_args) = &config.build_args {
+                cmd.envs(build_args.iter().map(|(k, v)| {
+                    (
+                        "MINIMAL_ARG_".to_owned()
+                            + &k.as_str()
+                                .trim()
+                                .replace("=", "")
+                                .replace(":", "")
+                                .replace("/", "")
+                                .replace("\"", "")
+                                .replace("'", "")
+                                .to_uppercase(),
+                        v,
+                    )
+                }));
             }
-        })?;
 
-        if !output.status.success() {
-            let exit_code = output.status.code;
-
-            // Read the last few lines of stderr for immediate context
-            let stderr_snippet = fs::read_to_string(self.build_workspace_dir.join("stderr"))
-                .unwrap_or_default()
-                .lines()
-                .rev()
-                .take(5)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            error!(
-                exit_code = exit_code,
-                temp_dir = self.build_workspace_dir.to_str().unwrap(),
-                stderr_snippet = %stderr_snippet,
-                "Build command failed"
+            debug!(
+                "Executing: {} {}",
+                exec.executable.display(),
+                exec.args.join(" ")
             );
 
-            return Err(ExecutionError::BuildFailed {
-                code: exit_code,
-                temp_dir: self.build_workspace_dir.clone(),
-                spongebob_url: None, // URL is now tracked at invocation level
+            cmd.current_dir(sandbox_mount_point);
+
+            let output = cmd.output().map_err(|e| ExecutionError::SandboxFailed {
+                message: format!("Container execution failed: {}", e),
+            })?;
+            stdout_f
+                .write_all(&output.stdout)
+                .map_err(|e| ExecutionError::SandboxFailed {
+                    message: format!("Failed to write stdout: {}", e),
+                })?;
+            stderr_f
+                .write_all(&output.stderr)
+                .map_err(|e| ExecutionError::SandboxFailed {
+                    message: format!("Failed to write stderr: {}", e),
+                })?;
+            stdout_f.flush()?;
+            stderr_f.flush()?;
+
+            if !output.status.success() {
+                let exit_code = output.status.code;
+
+                // Read the last few lines of stderr for immediate context
+                let stderr_snippet = fs::read_to_string(self.build_workspace_dir.join("stderr"))
+                    .unwrap_or_default()
+                    .lines()
+                    .rev()
+                    .take(5)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                error!(
+                    exit_code = exit_code,
+                    temp_dir = self.build_workspace_dir.to_str().unwrap(),
+                    stderr_snippet = %stderr_snippet,
+                    "Build command failed"
+                );
+
+                return Err(ExecutionError::BuildFailed {
+                    code: exit_code,
+                    temp_dir: self.build_workspace_dir.clone(),
+                    spongebob_url: None, // URL is now tracked at invocation level
+                }
+                .into());
             }
-            .into());
         }
 
         Ok(())

@@ -1,6 +1,7 @@
 use std::{collections::HashSet, path::PathBuf, time::Instant};
 
 use crate::{Error, Materialized, Options, Runnable, SubsetBuild};
+use anyhow::anyhow;
 use cache::{CacheErr, MetaInner, PendingDir};
 use graph::{BuildSpec, BuildSpecInput, BuildSpecRef, SubsetInput, Transitives};
 use tempfile::TempDir;
@@ -129,18 +130,19 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         Ok((dependencies, needs_dns))
     }
 
-    fn invocation(&self, build: &BuildSpec) -> Result<(String, Vec<String>), Error> {
-        let cmd_parts: Vec<String> =
-            shlex::split(&build.cmd).unwrap_or_else(|| vec![build.cmd.clone()]);
-        let (executable, args) = if !cmd_parts.is_empty() {
-            let exe = cmd_parts[0].clone();
-            let args = cmd_parts[1..].to_vec();
-            (exe, args)
-        } else {
-            (build.cmd.clone(), vec![])
-        };
+    fn invocations(&self, build: &BuildSpec) -> Result<Vec<(String, Vec<String>)>, Error> {
+        if build.cmds.is_empty() || build.cmds[0].is_empty() {
+            return Err(Error::Other(anyhow!(
+                "cannot build spec: no build command specified"
+            )));
+        }
 
-        Ok((executable, args))
+        Ok(build
+            .cmds
+            .iter()
+            .filter_map(|e| e.split_at_checked(1))
+            .map(|(exec, args)| (exec[0].clone(), args.to_vec()))
+            .collect())
     }
 }
 
@@ -151,7 +153,6 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
         let build = opts.graph.get(self.spec).unwrap();
         let (inputs, mut temp_dirs) = self.inputs(build, opts).await?;
         let (mut dependencies, needs_dns) = self.dependencies(build, opts).await?;
-        let (executable, args) = self.invocation(build)?;
 
         let synth_files = opts.cache.temp_dir()?;
         if needs_dns {
@@ -164,11 +165,15 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
             name: build.name.clone(),
             dependencies,
             inputs,
-            build_script: build_sandbox::config::BuildScript {
-                executable: executable.into(),
-                args,
-                build_args: build.build_args.clone(),
-            },
+            build_args: build.build_args.clone(),
+            invocations: self
+                .invocations(build)?
+                .into_iter()
+                .map(|(executable, args)| build_sandbox::config::Invocation {
+                    executable: executable.into(),
+                    args,
+                })
+                .collect(),
             outputs: build
                 .outputs
                 .values()

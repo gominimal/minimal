@@ -390,7 +390,10 @@ mod tests {
             builds::BuildDeclInput::HostPath(_)
         ));
 
-        assert_eq!(l.builds.iter().next().unwrap().1.cmd, "./build.sh",);
+        assert_eq!(
+            l.builds.iter().next().unwrap().1.cmds,
+            vec![vec!["./build.sh"]]
+        );
         assert_eq!(
             l.builds
                 .iter()
