@@ -450,6 +450,17 @@ impl From<op::Error> for Error {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let build_timestamp: u64 = env!("BUILD_TIMESTAMP")
+        .parse()
+        .expect("Invalid BUILD_TIMESTAMP");
+    let build_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(build_timestamp);
+
+    if build_time.elapsed().unwrap() > std::time::Duration::from_hours(30 * 24) {
+        eprintln!("Error: This binary has expired (built more than 30 days ago).");
+        eprintln!("Please rebuild to continue.");
+        std::process::exit(1);
+    }
+
     let indicatif_layer = IndicatifLayer::new()
         .with_max_progress_bars(32, None)
         .with_span_field_formatter(hide_indicatif_span_fields(fmt::format::DefaultFields::new()));
