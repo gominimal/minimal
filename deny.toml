@@ -49,9 +49,6 @@ skip = [
     # google-cloud-auth -> rustls -> ring
     # https://github.com/briansmith/ring/issues/2341
     { name = "getrandom", version = "0.2.16" },
-    # minimal_spongebob_community_neoeinstein-tonic -> tonic
-    # due to neoeinstein using an outdated tonic
-    { name = "hashbrown", version = "0.12.3" },
     # nickel-lang-core -> saphyr-parser -> hashlink
     # https://github.com/djc/hashlink/pull/38
     { name = "hashbrown", version = "0.15.5" },
@@ -61,28 +58,19 @@ skip = [
     # nickel-lang-core -> malachite -> malachite-base
     # https://github.com/tweag/nickel/pull/2367
     { name = "itertools", version = "0.11.0" },
+    # google-cloud-auth -> jsonwebtoken
+    { name = "rand", version = "0.8.5" },
+    { name = "rand_chacha", version = "0.3.1" },
+    { name = "rand_core", version = "0.6.4" },
     # reqwest -> hyper-tls -> native-tls -> security-framework
     # https://github.com/sfackler/rust-native-tls/pull/338
     { name = "security-framework", version = "2.11.1" },
     # nickel-lang-core -> strip-ansi-escapes
     # https://github.com/luser/strip-ansi-escapes/pull/23
     { name = "vte", version = "0.14.1" },
-
-
-    { name = "indexmap", version = "1.9.3" },
-    { name = "prost", version = "0.13.5" },
-    { name = "prost-derive", version = "0.13.5" },
-    { name = "prost-types", version = "0.13.5" },
-    { name = "rand", version = "0.8.5" },
-    { name = "rand_chacha", version = "0.3.1" },
-    { name = "rand_core", version = "0.6.4" },
-    { name = "socket2", version = "0.5.10" },
-    { name = "tonic", version = "0.12.3" },
-    { name = "tower", version = "0.4.13" },
 ]
 
 skip-tree = [
-    { name = "windows-registry", version = "=0.5.3" },
     { name = "windows-sys", version = "=0.52.0" },
     { name = "windows-sys", version = "=0.60.2" },
     { name = "windows-targets", version = "=0.52.6" },

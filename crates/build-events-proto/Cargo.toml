@@ -9,12 +9,12 @@ publish.workspace = true
 [dependencies]
 async-trait = "0.1"
 build-events.workspace = true
-minimal_spongebob_community_neoeinstein-prost = { version = "=0.4.0-20251016192339-b653b5c17f28.1", registry = "buf" }
-minimal_spongebob_community_neoeinstein-tonic = { version = "=0.4.1-20251016192339-b653b5c17f28.1", registry = "buf" }
+minimal_spongebob_community_neoeinstein-prost = { version = "0.5.0-20251016192339-b653b5c17f28.2", registry = "buf" }
+minimal_spongebob_community_neoeinstein-tonic = { version = "0.5.0-20251016192339-b653b5c17f28.4", registry = "buf" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 tokio-stream = "0.1"
-tonic = { version = "0.12.3", features = ["tls", "tls-native-roots"] }
+tonic = { version = "0.14.2", features = [ "tls-native-roots"] }
 tracing.workspace = true
 
 [dev-dependencies]
