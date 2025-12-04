@@ -68,15 +68,15 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         &self,
         build: &BuildSpec,
         opts: &Options<'a>,
-    ) -> Result<(HashSet<PathBuf>, bool), Error> {
+    ) -> Result<(HashSet<PathBuf>, bool, bool), Error> {
         if let Some(deps) = &self.override_deps {
-            return Ok((deps.clone(), true));
+            return Ok((deps.clone(), true, true));
         }
 
         let mut dependencies = HashSet::new();
         let transitives = Transitives::new(opts.graph, self.spec, true);
 
-        let mut needs_dns = false;
+        let (mut needs_dns, mut need_internet) = (false, false);
         let build_deps: Vec<_> = transitives.transitive_runtime_deps.into_iter().collect();
         for (bsr, dep_info) in build_deps.into_iter() {
             match dep_info.outputs {
@@ -126,8 +126,15 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                 .abstract_deps
                 .get("dns")
                 .is_some();
+            need_internet |= opts
+                .graph
+                .get(&bsr)
+                .unwrap()
+                .abstract_deps
+                .get("internet")
+                .is_some();
         }
-        Ok((dependencies, needs_dns))
+        Ok((dependencies, needs_dns, need_internet))
     }
 
     fn invocations(&self, build: &BuildSpec) -> Result<Vec<(String, Vec<String>)>, Error> {
@@ -152,7 +159,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
     async fn run<'b>(&mut self, opts: &Options<'b>) -> Result<Self::Result, Error> {
         let build = opts.graph.get(self.spec).unwrap();
         let (inputs, mut temp_dirs) = self.inputs(build, opts).await?;
-        let (mut dependencies, needs_dns) = self.dependencies(build, opts).await?;
+        let (mut dependencies, needs_dns, need_internet) = self.dependencies(build, opts).await?;
 
         let synth_files = opts.cache.temp_dir()?;
         if needs_dns {
@@ -165,6 +172,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
             name: build.name.clone(),
             dependencies,
             inputs,
+            disable_networking: !need_internet,
             build_args: build.build_args.clone(),
             invocations: self
                 .invocations(build)?

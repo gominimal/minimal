@@ -14,6 +14,8 @@ pub enum Input {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BuildConfig {
     pub name: String,
+    pub disable_networking: bool,
+
     pub dependencies: HashSet<PathBuf>,
     pub inputs: Vec<Input>,
 
