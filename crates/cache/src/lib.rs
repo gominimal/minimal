@@ -1,6 +1,7 @@
 //! Implementations of caches storing artifacts keyed by [SpecHash].
 
 use common::SpecHash;
+use nix::fcntl::{AT_FDCWD, RenameFlags, renameat2};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -95,8 +96,12 @@ impl PendingDir {
         inner.fs.mkdir(&subpath)?;
 
         let st = inner.fs.subtree(&subpath)?;
-        std::fs::remove_dir_all(st.path())?;
-        std::fs::rename(self.tempdir.keep(), st.path())?;
+        let (from, to) = (self.tempdir.keep(), st.path());
+
+        renameat2(AT_FDCWD, &from, AT_FDCWD, to, RenameFlags::RENAME_EXCHANGE)
+            .map_err(|e| CacheErr::IO(e.into()))?;
+
+        std::fs::remove_dir_all(from)?;
         drop(st);
 
         meta.write(&inner.fs, &self.hash)?;

@@ -397,6 +397,7 @@ dependencies = [
  "google-cloud-storage",
  "graph",
  "hex",
+ "nix",
  "path-absolutize",
  "reqwest",
  "serde",
