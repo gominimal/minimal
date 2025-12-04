@@ -75,3 +75,11 @@ jobs:
             minimal \
             --repo="${GITHUB_REPOSITORY}" \
             --title="${{ steps.release_info.outputs.name }}"
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCS_SERVICE_ACCOUNT_KEY }}
+      - name: Update shim config
+        run: |
+          echo '{"version": "${{ steps.release_info.outputs.short_sha }}"}' > config.json
+          gcloud storage cp config.json gs://minimal-shim-config/config.json
