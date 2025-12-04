@@ -16,25 +16,28 @@ pub struct BuildConfig {
     pub name: String,
     pub dependencies: HashSet<PathBuf>,
     pub inputs: Vec<Input>,
-    pub build_script: BuildScript,
+
+    pub build_args: Option<IndexMap<String, String>>,
+    pub invocations: Vec<Invocation>,
+
     pub outputs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct BuildScript {
+pub struct Invocation {
     pub executable: PathBuf,
     pub args: Vec<String>,
-
-    pub build_args: Option<IndexMap<String, String>>,
 }
 
 impl BuildConfig {
     pub fn validate(&self) -> Result<()> {
-        if !self.build_script.executable.exists() {
-            return Err(ConfigError::InvalidExecutable {
-                path: self.build_script.executable.clone(),
+        for cmd in self.invocations.iter() {
+            if !cmd.executable.exists() {
+                return Err(ConfigError::InvalidExecutable {
+                    path: cmd.executable.clone(),
+                }
+                .into());
             }
-            .into());
         }
 
         for dep in &self.dependencies {

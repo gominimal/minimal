@@ -200,7 +200,9 @@ fn build_input_hash(input: &BuildSpecInput, h: &mut Hasher) {
 fn build_attrs_hash(spec: &BuildSpec, h: &mut Hasher) {
     h.write_all(b"build spec").unwrap();
     h.write_all(spec.name.as_bytes()).unwrap();
-    h.write_all(spec.cmd.as_bytes()).unwrap();
+    for cmd in &spec.cmds {
+        cmd.iter().for_each(|e| h.write_all(e.as_bytes()).unwrap());
+    }
     if let Some(build_args) = &spec.build_args {
         if !build_args.is_empty() {
             h.write_all(b"-build args").unwrap();
