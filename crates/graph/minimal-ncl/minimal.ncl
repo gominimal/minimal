@@ -15,7 +15,8 @@ let needs_schema = import "need_classes.ncl" in
 
         attrs | Attrs | optional,
 
-        cmd | String,
+        cmd | String | optional,
+        cmds | Array (Array String) | optional,
         build_args | {_: String} | optional,
 
         # Do NOT set this yourself

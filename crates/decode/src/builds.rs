@@ -793,29 +793,62 @@ impl BuildDecl {
                                 Ok(())
                             }
                             "cmd" => {
-                                let rt = eval_if_closure(
-                                    field.value.as_ref().unwrap(),
-                                    program,
-                                )?;
-                                match rt.term.as_ref() {
-                                    Term::Str(s) => {
-                                        cmds = Some(vec![
-                                            shlex::split(s).unwrap(),
-                                        ]);
+                                if let Some(rt) = field.value.as_ref() {
+                                    let rt = eval_if_closure(rt, program)?;
+                                    match rt.term.as_ref() {
+                                        Term::Str(s) => {
+                                            cmds = Some(vec![
+                                                shlex::split(s).unwrap(),
+                                            ]);
+                                        }
+                                        Term::Array(a, _attrs) => {
+                                            cmds = Some(vec![
+                                                a.iter()
+                                                    .map(|rt| eval_if_closure(rt, program))
+                                                    .collect::<Result<Vec<_>, _>>()?
+                                                    .into_iter()
+                                                    .map(|rt| String::deserialize(rt).unwrap())
+                                                    .collect(),
+                                            ]);
+                                        }
+                                        _ => todo!("error for 'cmd' field being non-string & non-array, got {:?}", rt.term.as_ref()),
+                                    };
+                                    Ok(())
+                                } else {
+                                    Ok(())
+                                }
+                            }
+                            "cmds" => {
+                                if let Some(rt) = field.value.as_ref() {
+                                    let rt = eval_if_closure(rt,program)?;
+                                    if let Term::Array(cmds_rt, _attrs) = rt.term.as_ref() {
+                                        cmds = Some(
+                                            cmds_rt.iter()
+                                                .map(|rt| {
+                                                    let rt = eval_if_closure(rt, program)?;
+                                                    if let Term::Array(a, _attrs) = rt.term.as_ref() {
+                                                        Ok::<_, Error>(a.iter()
+                                                            .map(|rt| eval_if_closure(rt, program))
+                                                            .collect::<Result<Vec<_>, _>>()?
+                                                            .into_iter()
+                                                            .map(|rt| String::deserialize(rt).unwrap())
+                                                            .collect())
+                                                    } else if let Term::Str(s) = rt.term.as_ref() {
+                                                        Ok::<_, Error>(shlex::split(s).unwrap())
+                                                    } else {
+                                                        todo!("error for 'cmds' field being non-array & non-string, got {:?}", rt.term.as_ref());
+                                                    }
+                                                })
+                                                .collect::<Result<Vec<_>, _>>()?,
+                                        );
+
+                                        Ok(())
+                                    } else {
+                                        todo!("error for 'cmds' field being non-array, got {:?}", rt.term.as_ref());
                                     }
-                                    Term::Array(a, _attrs) => {
-                                        cmds = Some(vec![
-                                            a.iter()
-                                                .map(|rt| eval_if_closure(rt, program))
-                                                .collect::<Result<Vec<_>, _>>()?
-                                                .into_iter()
-                                                .map(|rt| String::deserialize(rt).unwrap())
-                                                .collect(),
-                                        ]);
-                                    }
-                                    _ => todo!("error for 'cmd' field being non-string & non-array, got {:?}", rt.term.as_ref()),
-                                };
-                                Ok(())
+                                } else {
+                                    Ok(())
+                                }
                             }
                             "target" => {
                                 if let Some(target_rt) = field.value.as_ref() {
@@ -1288,6 +1321,45 @@ mod tests {
             build,
             BuildDecl {cmds, .. } if
                 cmds == vec![vec!["bash", "-c", "echo uwu"]]
+        ));
+    }
+    #[test]
+    fn build_cmds() {
+        let (term, mut program, _origin) = Loader::new(
+            indoc! {
+                "
+                let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
+                {
+        			name = \"simple\",
+        			inputs = [],
+        			cmds = [
+                        [\"bash\", \"-c\", \"echo uwu\"],
+                        \"/bin/pip3 wheel -w dist --no-build-isolation --no-deps --no-cache-dir ./\",
+                    ],
+        		} | BuildSpec"
+            }
+            .to_string(),
+            &LoadOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("load failed");
+        })
+        .finish()
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("finish failed");
+        });
+
+        let build = BuildDecl::from_term(&term, &mut program, &mut ()).unwrap();
+
+        assert!(matches!(
+            build,
+            BuildDecl {cmds, .. } if
+                cmds == vec![
+                    vec!["bash", "-c", "echo uwu"],
+                    vec!["/bin/pip3", "wheel", "-w", "dist", "--no-build-isolation", "--no-deps", "--no-cache-dir", "./"],
+                ]
         ));
     }
 
