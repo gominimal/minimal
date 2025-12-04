@@ -28,3 +28,5 @@ serde_json.workspace = true
 
 common = { workspace = true }
 graph = { workspace = true }
+
+nix = "0.30"
