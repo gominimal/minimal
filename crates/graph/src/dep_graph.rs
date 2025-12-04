@@ -254,7 +254,9 @@ impl BuildSpec {
     /// Returns true if the build-spec represents a rollup of runtime_deps but no substance or computation of its own.
     pub fn is_pure_collection(&self) -> bool {
         self.inputs.is_empty()
-            && (self.cmds.is_empty() || (self.cmds.len() == 1 && self.cmds[0][0].is_empty()))
+            && (self.cmds.is_empty()
+                || (self.cmds.len() == 1
+                    && (self.cmds[0].is_empty() || self.cmds[0][0].is_empty())))
     }
 
     fn from_decoded(bd: &builds::BuildDecl, loader: &Loader) -> Result<Self, Error> {
