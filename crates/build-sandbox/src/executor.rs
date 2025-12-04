@@ -210,6 +210,9 @@ impl BuildExecutor {
             )
             .symlink("/usr/bin", "/bin")
             .symlink("/usr/lib", "/lib64");
+        if config.disable_networking {
+            container.unshare(hakoniwa::Namespace::Network);
+        }
 
         let mut stdout_f =
             fs::File::create(self.build_workspace_dir.join("stdout")).map_err(|e| {
