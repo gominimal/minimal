@@ -227,8 +227,17 @@ impl BuildExecutor {
                 }
             })?;
         for exec in config.invocations.iter() {
-            let program = &exec.executable.to_string_lossy();
-            let mut cmd = container.command(program);
+            let mut program = exec.executable.to_string_lossy();
+
+            // Add /usr/bin/ for commands that are not absolute, and don't shadow anything in cwd
+            if !program.starts_with("/")
+                && !fs::exists(rootfs.join("build").join(program.as_ref()))?
+                && fs::exists(rootfs.join("usr/bin").join(program.as_ref()))?
+            {
+                *program.to_mut() = format!("/bin/{}", &program);
+            }
+
+            let mut cmd = container.command(&program);
             for arg in &exec.args {
                 cmd.arg(arg);
             }
