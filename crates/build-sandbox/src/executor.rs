@@ -234,7 +234,7 @@ impl BuildExecutor {
                 && !fs::exists(rootfs.join("build").join(program.as_ref()))?
                 && fs::exists(rootfs.join("usr/bin").join(program.as_ref()))?
             {
-                *program.to_mut() = format!("/bin/{}", &program);
+                *program.to_mut() = format!("/usr/bin/{}", &program);
             }
 
             let mut cmd = container.command(&program);
