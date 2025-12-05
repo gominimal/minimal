@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+import "command_parameters.proto";
+import "injected_files.proto";
+import "tarball_format.proto";
+
+// Describes a set of files which are captured from a successful build
+// and uploaded. Files which match one of the globs are serialized into
+// the tarball which is posted to the given output URL.
+message OutputArtifact {
+    // The HTTP or HTTPS URL to PUT to upload the output.
+    string upload_url = 1;
+    // The format to serialize the output as.
+    TarballFormat format = 2;
+
+    // A series of globs for which any match includes a file in the output artifact.
+    repeated string capture_globs = 10;
+}
+
+// A request to RES to create a new build.
+message CreateBuildRequest {
+    // A client-provided identifier for the build.
+    string client_id = 1;
+    // Command(s) to run in the sandbox.
+    CommandParameters command_parameters = 2;
+    reserved 3 to 9;
+
+    // The files to inject into the build sandbox.
+    repeated InjectedFiles files = 10;
+
+    // the output artifacts to be collected as files from the successful build
+    repeated OutputArtifact build_outputs = 20;
+}
+
+// A response from RES indicating a build was successfully initialized under the given identifiers.
+//
+// One of these identifiers must be used in subsequent RPCs querying or mutating this build.
+message CreateBuildResponse {
+  // Client-provided identifier, corresponding to `CreateBuildRequest.client_id`.
+  string client_id = 1;
+  // RES-generated identifier.
+  string server_id = 2;
+}
