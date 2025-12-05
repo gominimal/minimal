@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+// Describes a tarball.
+message TarballFormat {
+    TarballCompression compression = 1;
+}
+
+// Describes the compression of a tarball.
+enum TarballCompression {
+  TarZst = 0; // zstd-compressed tarball, `.tar.zst`, our standard.
+}
