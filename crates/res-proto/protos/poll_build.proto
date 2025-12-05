@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+// Describes the state of a build.
+enum BuildStatus {
+    StatusUnspecified = 0;
+
+    // Build was initialized using CreateBuild()
+    StatusCreated = 1;
+    // Build is waiting for all the declared FilesUpload files to be streamed
+    StatusNeedUploads = 2;
+    // Build is ready to go, just fetching any remaining files
+    StatusFetching = 3;
+    // Build is executing
+    StatusRunning = 4;
+    // Build is complete, either success or failure
+    StatusDone = 5;
+}
+
+// A request to RES for the status of a build.
+message PollBuildRequest {
+    // Identifies the build this PollBuildRequest is for.
+	message ID {
+		oneof id {
+			// client-provided identifier
+			string client_id = 1;
+			// RES-generated identifier
+			string server_id = 2;
+		}
+	}
+	// Identifies the build this PollBuildRequest is for.
+	ID id = 1;
+}
+
+// A response from RES regarding the status of a build.
+message PollBuildResponse {
+    // Client-provided identifier, corresponding to `CreateBuildRequest.client_id`.
+    string client_id = 1;
+    // RES-generated identifier.
+    string server_id = 2;
+
+    // The status of the build.
+    BuildStatus status = 3;
+    // Whether the build completed successfully or not. Set to false if `status` is less than `StatusDone`.
+    bool success = 4;
+}

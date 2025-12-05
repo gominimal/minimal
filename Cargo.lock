@@ -3393,6 +3393,7 @@ version = "0.0.1"
 dependencies = [
  "prost",
  "prost-build",
+ "tonic",
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
