@@ -548,10 +548,12 @@ version = "0.0.1"
 dependencies = [
  "blake3",
  "bytes",
+ "either",
  "flate2",
  "futures",
  "globset",
  "google-cloud-storage",
+ "hex",
  "indoc",
  "lzma-rs",
  "reqwest",
