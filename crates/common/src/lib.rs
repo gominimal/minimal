@@ -2,6 +2,7 @@
 
 pub mod archive;
 pub mod fetchers;
+pub mod file_cache;
 pub mod mfile;
 
 pub mod repo_spec;

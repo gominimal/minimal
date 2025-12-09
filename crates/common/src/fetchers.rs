@@ -77,6 +77,8 @@ impl FetchResponse for Response {
 pub trait FetchUrl: std::fmt::Debug + Clone {
     type JoinError: std::fmt::Debug;
     fn join(&self, input: &str) -> Result<Self, Self::JoinError>;
+
+    fn filename(&self) -> String;
 }
 
 impl FetchUrl for ReqwestUrl {
@@ -84,6 +86,10 @@ impl FetchUrl for ReqwestUrl {
 
     fn join(&self, input: &str) -> Result<Self, Self::JoinError> {
         UpstreamReqwestUrl::join(&self.0, input).map(ReqwestUrl)
+    }
+    fn filename(&self) -> String {
+        let path = self.0.path();
+        path[path.rfind("/").unwrap() + 1..].to_string()
     }
 }
 
@@ -148,6 +154,10 @@ impl FetchUrl for GcsUrl {
             out.object.push_str(input);
             Ok(out)
         }
+    }
+    fn filename(&self) -> String {
+        let url = &self.object;
+        url[url.rfind("/").unwrap() + 1..].to_string()
     }
 }
 
