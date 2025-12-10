@@ -1,6 +1,5 @@
 [advisories]
 ignore = [
-    "RUSTSEC-2023-0071",
     "RUSTSEC-2024-0014",
     # google-cloud-auth depends on rustls-pemfile, which is unmaintained.
     "RUSTSEC-2025-0134",
@@ -63,10 +62,6 @@ skip = [
     # nickel-lang-core -> malachite -> malachite-base
     # https://github.com/tweag/nickel/pull/2367
     { name = "itertools", version = "0.11.0" },
-    # google-cloud-auth -> jsonwebtoken
-    { name = "rand", version = "0.8.5" },
-    { name = "rand_chacha", version = "0.3.1" },
-    { name = "rand_core", version = "0.6.4" },
     # reqwest -> hyper-tls -> native-tls -> security-framework
     # https://github.com/sfackler/rust-native-tls/pull/338
     { name = "security-framework", version = "2.11.1" },
