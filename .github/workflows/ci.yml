@@ -54,7 +54,7 @@ jobs:
     needs: build
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
-      contents: "write"
+      contents: "read"
       id-token: "write"
     steps:
       - uses: actions/checkout@v6
@@ -86,4 +86,4 @@ jobs:
       - name: Update shim config
         run: |
           echo '{"version": "${{ steps.release_info.outputs.short_sha }}"}' > config.json
-          gcloud storage cp config.json gs://minimal-shim/config.json
+          gcloud storage cp config.json gs://minimal-shim-config/config.json
