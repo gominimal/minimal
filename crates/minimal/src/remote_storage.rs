@@ -1,63 +1,29 @@
-use anyhow::{Result, bail};
-use common::Tee;
+use anyhow::Result;
+use common::fetchers::{GcsUrl, ReqwestUrl};
+use common::file_cache;
+use common::file_cache::CachingDownloader;
 use google_cloud_storage::client::Storage;
-use sha2::{Digest, Sha256};
 
-use std::fs::{self, File};
-use std::io::{ErrorKind, Write};
+use std::fs::File;
+use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct RemoteStorage {
     client: Storage,
-    cache_dir: PathBuf,
+    cache: file_cache::FileCache,
 }
 
 impl RemoteStorage {
     #[tracing::instrument]
     pub async fn new(cache_dir: PathBuf) -> Result<Self> {
-        match fs::create_dir_all(&cache_dir) {
-            Ok(_) => {}
-            Err(e) => {
-                if e.kind() != std::io::ErrorKind::AlreadyExists {
-                    panic!("failed to create fetch-cache dir: {}", e);
-                }
-            }
-        };
+        let cache = file_cache::FileCache::new(cache_dir)?;
 
         let client = Storage::builder()
             .with_credentials(google_cloud_auth::credentials::anonymous::Builder::new().build())
             .build()
             .await?;
-        Ok(Self { client, cache_dir })
-    }
-
-    fn sha_dir(&self, sha256: &str) -> Result<PathBuf> {
-        if sha256.contains("/") {
-            bail!("SHA256 had a slash in it");
-        }
-
-        let dir_path = self.cache_dir.join(sha256);
-        match fs::metadata(&dir_path) {
-            Ok(stat) => {
-                if stat.is_dir() {
-                    Ok(dir_path)
-                } else {
-                    bail!(
-                        "unexpected: {} is not a directory",
-                        dir_path.to_str().unwrap()
-                    )
-                }
-            }
-            Err(e) => {
-                if e.kind() == ErrorKind::NotFound {
-                    fs::create_dir(&dir_path)?;
-                    Ok(dir_path)
-                } else {
-                    Err(e.into())
-                }
-            }
-        }
+        Ok(Self { client, cache })
     }
 
     #[tracing::instrument]
@@ -66,55 +32,12 @@ impl RemoteStorage {
         url: &str,
         sha256: &str,
     ) -> Result<PathBuf> {
-        if sha256.contains("/") {
-            bail!("SHA256 had a slash in it");
-        }
-        let filename = &url[url.rfind("/").unwrap() + 1..];
-        let cached_path = self.sha_dir(sha256)?.join(filename);
-
-        // File exists in cache, try and use it if the hash matches
-        if fs::exists(&cached_path)? {
-            let computed_hash = {
-                let mut f = fs::File::open(&cached_path)?;
-                let mut hasher = Sha256::new();
-                std::io::copy(&mut f, &mut hasher)?;
-
-                hasher.finalize()
-            };
-
-            if hex::encode(computed_hash) == sha256 {
-                return Ok(cached_path);
-            } else {
-                fs::remove_file(&cached_path)?;
-            }
-        }
-
-        // Otherwise download, writing to the file and hashing as we go
-        let mut hasher = Sha256::new();
-        {
-            let mut f = fs::File::create(&cached_path)?;
-            let mut res = reqwest::get(url).await?.error_for_status()?;
-
-            let mut w = Tee::new(&mut f, &mut hasher);
-            while let Some(chunk) = res.chunk().await? {
-                w.write_all(&chunk).unwrap();
-            }
-            f.sync_all()?;
-        }
-
-        let computed_hash = hasher.finalize();
-        let computed_hex = hex::encode(computed_hash);
-
-        if computed_hex != sha256 {
-            fs::remove_file(&cached_path).ok(); // ignore error, best effort
-            bail!(
-                "SHA256 mismatch for {}: expected {}, got {}",
-                url,
-                sha256,
-                computed_hex
-            );
-        }
-        Ok(cached_path)
+        let client = reqwest::Client::new();
+        let backend = (&client, &self.cache);
+        backend
+            .download(ReqwestUrl::try_from(url)?, sha256)
+            .await
+            .map_err(anyhow::Error::from)
     }
 
     #[tracing::instrument]
@@ -124,55 +47,17 @@ impl RemoteStorage {
         file: &str,
         sha256: &str,
     ) -> Result<PathBuf> {
-        if sha256.contains("/") {
-            bail!("SHA256 had a slash in it");
-        }
-        let filename = match file.rfind("/") {
-            Some(idx) => &file[idx + 1..],
-            None => file,
-        };
-        let cached_path = self.sha_dir(sha256)?.join(filename);
-
-        // File exists in cache, try and use it if the hash matches
-        if fs::exists(&cached_path)? {
-            let computed_hash = {
-                let mut f = fs::File::open(&cached_path)?;
-                let mut hasher = Sha256::new();
-                std::io::copy(&mut f, &mut hasher)?;
-
-                hasher.finalize()
-            };
-
-            if hex::encode(computed_hash) == sha256 {
-                return Ok(cached_path);
-            } else {
-                fs::remove_file(&cached_path)?;
-            }
-        }
-
-        // Otherwise download, writing to the file and hashing as we go
-        let mut hasher = Sha256::new();
-        {
-            let mut f = fs::File::create(&cached_path)?;
-            self.download(bucket_id.clone(), file, &mut Tee::new(&mut f, &mut hasher))
-                .await?;
-            f.sync_data()?;
-        }
-        let computed_hash = hasher.finalize();
-        let computed_hex = hex::encode(computed_hash);
-
-        if computed_hex != sha256 {
-            fs::remove_file(&cached_path).ok(); // ignore error, best effort
-            bail!(
-                "SHA256 mismatch for {}//{}: expected {}, got {}",
-                bucket_id,
-                file,
+        let backend = (&self.client, &self.cache);
+        backend
+            .download(
+                GcsUrl {
+                    bucket: format!("projects/_/buckets/{bucket_id}"),
+                    object: file.to_string(),
+                },
                 sha256,
-                computed_hex
-            );
-        }
-
-        Ok(cached_path)
+            )
+            .await
+            .map_err(anyhow::Error::from)
     }
 
     #[tracing::instrument]
