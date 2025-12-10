@@ -207,8 +207,7 @@ impl BuildExecutor {
             .bindmount_rw(
                 self.output_staging_dir().to_str().unwrap(),
                 format!("{}/output", sandbox_mount_point).as_str(),
-            )
-            .symlink("/usr/lib", "/lib64");
+            );
 
         let needs_bin_symlink = config
             .dependencies
@@ -216,6 +215,13 @@ impl BuildExecutor {
             .all(|p| !fs::exists(p.join("bin")).unwrap());
         if needs_bin_symlink {
             container.symlink("/usr/bin", "/bin");
+        }
+        let needs_lib64_symlink = config
+            .dependencies
+            .iter()
+            .all(|p| !fs::exists(p.join("lib64")).unwrap());
+        if needs_lib64_symlink {
+            container.symlink("/usr/lib", "/lib64");
         }
 
         if config.disable_networking {
