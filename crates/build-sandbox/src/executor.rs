@@ -208,8 +208,16 @@ impl BuildExecutor {
                 self.output_staging_dir().to_str().unwrap(),
                 format!("{}/output", sandbox_mount_point).as_str(),
             )
-            .symlink("/usr/bin", "/bin")
             .symlink("/usr/lib", "/lib64");
+
+        let needs_bin_symlink = config
+            .dependencies
+            .iter()
+            .all(|p| !fs::exists(p.join("bin")).unwrap());
+        if needs_bin_symlink {
+            container.symlink("/usr/bin", "/bin");
+        }
+
         if config.disable_networking {
             container.unshare(hakoniwa::Namespace::Network);
         }
