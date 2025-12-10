@@ -58,7 +58,7 @@ pub struct FileCache {
 
 impl FileCache {
     /// Creates a new file cache rooted at the given directory.
-    pub async fn new(dir: PathBuf) -> Result<Self, FileCacheError> {
+    pub fn new(dir: PathBuf) -> Result<Self, FileCacheError> {
         match fs::create_dir_all(&dir) {
             Ok(_) => {}
             Err(e) => {
@@ -189,7 +189,7 @@ pub trait CachingDownloader<B: fetchers::FetchBackend> {
     >;
 }
 
-impl<B: fetchers::FetchBackend> CachingDownloader<B> for (B, FileCache) {
+impl<B: fetchers::FetchBackend> CachingDownloader<B> for (&B, &FileCache) {
     async fn download(
         &self,
         url: <B as fetchers::FetchBackend>::Url,

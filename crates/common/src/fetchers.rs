@@ -20,6 +20,14 @@ impl TryFrom<String> for ReqwestUrl {
     }
 }
 
+impl TryFrom<&str> for ReqwestUrl {
+    type Error = url::ParseError;
+
+    fn try_from(s: &str) -> Result<Self, url::ParseError> {
+        UpstreamReqwestUrl::parse(s).map(ReqwestUrl)
+    }
+}
+
 impl core::str::FromStr for ReqwestUrl {
     type Err = url::ParseError;
 
@@ -89,7 +97,10 @@ impl FetchUrl for ReqwestUrl {
     }
     fn filename(&self) -> String {
         let path = self.0.path();
-        path[path.rfind("/").unwrap() + 1..].to_string()
+        match path.rfind("/") {
+            Some(idx) => path[idx + 1..].to_string(),
+            None => path.to_string(),
+        }
     }
 }
 
@@ -157,7 +168,10 @@ impl FetchUrl for GcsUrl {
     }
     fn filename(&self) -> String {
         let url = &self.object;
-        url[url.rfind("/").unwrap() + 1..].to_string()
+        match url.rfind("/") {
+            Some(idx) => url[idx + 1..].to_string(),
+            None => url.to_string(),
+        }
     }
 }
 
