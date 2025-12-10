@@ -4,11 +4,14 @@ syntax = "proto3";
 message Invocation {
     // The program and its arguments to execute.
     repeated string argv = 1;
-    // Any environment variables that must be set.
-    map<string, string> env_vars = 2;
+    // Any build args that should be set.
+    map<string, string> build_args = 2;
 }
 
 // The runtime parameters of a build.
 message CommandParameters {
     repeated Invocation invocations = 1;
+    reserved 2 to 9;
+
+    bool disable_networking = 10;
 }
