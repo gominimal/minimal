@@ -285,3 +285,19 @@ pub fn synth_dns_config(p: &Path) -> Result<(), io::Error> {
     std::fs::create_dir_all(p.join("etc"))?;
     std::fs::write(p.join("etc").join("resolv.conf"), format!("{}", conf))
 }
+
+pub fn random_alphanumeric(length: usize) -> String {
+    use rand::Rng;
+    let mut rng = rand::rng();
+
+    (0..length)
+        .map(|_| {
+            let idx = rng.random_range(0..36);
+            if idx < 10 {
+                (b'0' + idx) as char
+            } else {
+                (b'a' + idx - 10) as char
+            }
+        })
+        .collect()
+}
