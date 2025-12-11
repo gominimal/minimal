@@ -1,0 +1,250 @@
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
+
+use crate::{Error, Options, Runnable};
+use graph::{BuildSpec, BuildSpecInput, BuildSpecRef, SourceInput, dep_graph::SourceFetch};
+use res_proto::{
+    CommandParameters, CreateBuildRequest, InjectedFiles, Invocation, OutputArtifact,
+    TarballCompression, TarballFormat, UploadMessage, UploadRequest,
+    injected_files::{FilesUpload, InjectedVariant, UnpackDest},
+    remote_execution_service_client::RemoteExecutionServiceClient,
+};
+use tokio_stream::StreamExt;
+use tonic::transport::Channel;
+
+/// The return value of a successful remote build of a build-spec.
+pub struct RemoteSpecBuildResult {
+    pub build_ms: usize,
+}
+
+/// Something in a remote cache.
+///
+/// TODO: This interface is gonna need work. For starters, we need a type that describes a remote
+/// cache rather than duplicating the details into here.
+#[derive(Debug)]
+pub struct RemoteDep {}
+
+/// Details about where a dependency for a remote build is sourced.
+#[derive(Debug)]
+pub enum DepInner {
+    /// Stream from the local cache.
+    Local(BuildSpecRef, PathBuf),
+    /// The executor should fetch.
+    Remote(RemoteDep),
+}
+
+/// Describes a dependency for a build that will occur remotely.
+pub struct Dep {
+    /// The build-spec that this build satisfies.
+    ///
+    /// If a cycle-breaker is used, this field differs from the one
+    /// described by inner.
+    pub bsr: BuildSpecRef,
+    /// Specific outputs to use instead of the whole build.
+    pub outputs: Option<HashSet<String>>,
+    /// Details about where the dependency is sourced.
+    pub inner: DepInner,
+}
+
+/// Builds a spec on something implementing RES.
+pub struct RemoteSpecBuild<'a> {
+    /// The spec to be built.
+    pub spec: &'a BuildSpecRef,
+    /// The dependencies to be wired.
+    pub deps: Vec<Dep>,
+
+    pub client: RemoteExecutionServiceClient<Channel>,
+}
+
+impl<'a> RemoteSpecBuild<'a> {
+    // Construct the array of layers which will form the execution environment.
+    // self.deps[i] corresponds to layers[i], and any extra layers beyond the len
+    // of self.deps corresponds to Local or Source inputs.
+    fn layers(&self, build: &BuildSpec) -> Vec<InjectedFiles> {
+        self.deps
+            .iter()
+            .map(|d| match &d.inner {
+                DepInner::Local(_bsr, _path) => InjectedFiles {
+                    unpack_to: UnpackDest::DestRootfs.into(),
+                    injected_variant: Some(InjectedVariant::FilesUpload(
+                        res_proto::injected_files::FilesUpload {
+                            upload_id: common::random_alphanumeric(8),
+                            format: Some(TarballFormat {
+                                compression: TarballCompression::TarZst.into(),
+                            }),
+                        },
+                    )),
+                },
+                DepInner::Remote(remote) => todo!("remote dep: {:?}", remote),
+            })
+            .chain(build.inputs.iter().filter_map(|i| match i {
+                // Should be represented in the deps array
+                BuildSpecInput::Build(_) | BuildSpecInput::Subset(_) => None,
+                // Handle local files as additional uploads
+                BuildSpecInput::Local {
+                    full_path,
+                    filename,
+                    file_hash: _,
+                } => Some(InjectedFiles {
+                    unpack_to: UnpackDest::DestBuilddir.into(),
+                    injected_variant: Some(InjectedVariant::InlineFile(
+                        res_proto::injected_files::InlineFile {
+                            path: filename.clone(),
+                            data: std::fs::read(full_path).unwrap(),
+                        },
+                    )),
+                }),
+                // Source entries map 1:1 to a Source proto
+                BuildSpecInput::Source(SourceInput {
+                    extract,
+                    from: SourceFetch::URL(url),
+                    sha256,
+                    strip_prefix,
+                }) => Some(InjectedFiles {
+                    unpack_to: UnpackDest::DestBuilddir.into(),
+                    injected_variant: Some(InjectedVariant::Source(
+                        res_proto::injected_files::Source {
+                            url: url.clone(),
+                            sha256: sha256.clone(),
+                            extract: *extract,
+                            strip_prefix: strip_prefix.to_owned().unwrap_or_default(),
+                        },
+                    )),
+                }),
+
+                BuildSpecInput::HostPath(_) | BuildSpecInput::Prebuilt(_, _) => todo!(),
+            }))
+            .collect()
+    }
+
+    /// Constructs the sub-proto describing the invocations in the execution environment.
+    fn command_parameters(&self, build: &BuildSpec) -> Result<CommandParameters, Error> {
+        if build.cmds.is_empty() || build.cmds[0].is_empty() {
+            return Err(Error::Other(anyhow::anyhow!(
+                "cannot build spec: no build command specified"
+            )));
+        }
+
+        Ok(CommandParameters {
+            invocations: build
+                .cmds
+                .iter()
+                .map(|argv| Invocation {
+                    argv: argv.clone(),
+                    build_args: build
+                        .build_args
+                        .as_ref()
+                        .map(|a| HashMap::from_iter(a.clone()))
+                        .unwrap_or_default(),
+                })
+                .collect(),
+            disable_networking: false, // TODO: set this properly
+        })
+    }
+}
+
+impl<'a> Runnable for RemoteSpecBuild<'a> {
+    type Result = RemoteSpecBuildResult;
+
+    async fn run<'b>(&mut self, opts: &Options<'b>) -> Result<Self::Result, Error> {
+        let build = opts.graph.get(self.spec).unwrap();
+        let client_id = format!("{}-{}", common::random_alphanumeric(8), build.name);
+
+        let layers = self.layers(build);
+        let _server_id = self
+            .client
+            .create_build(CreateBuildRequest {
+                client_id: client_id.clone(),
+                files: layers.clone(),
+                command_parameters: Some(self.command_parameters(build)?),
+                build_outputs: vec![OutputArtifact {
+                    capture_globs: build.outputs.iter().map(|o| o.0.clone()).collect(),
+                    ..Default::default()
+                }],
+            })
+            .await
+            .map_err(|e| Error::Other(anyhow::Error::from(e)))?
+            .into_inner()
+            .server_id;
+
+        // Build was accepted, lets upload everything that needs to be uploaded next, namely:
+        // Layers which correspond to a [DepInner::Local]
+        //
+        // Layers which correspond to a Local input or Source input are not uploads, so we never
+        // have to look at layers[i] where i exceeds self.deps.len().
+        let uploads: Vec<_> = layers
+            .iter()
+            .zip(self.deps.iter())
+            // Iterate layers and generate futures for uploading the local dep
+            .filter_map(|(layer, dep)| {
+                if let (
+                    Some(InjectedVariant::FilesUpload(FilesUpload { upload_id, .. })),
+                    DepInner::Local(_bsr, dir),
+                ) = (&layer.injected_variant, &dep.inner)
+                {
+                    let upload_id = upload_id.clone();
+                    let dir = dir.clone();
+                    let client_id = client_id.clone();
+                    let mut client = self.client.clone();
+
+                    Some(async move {
+                        let file =
+                            tokio::task::spawn_blocking(move || -> Result<std::fs::File, Error> {
+                                let (mut file, _hash) =
+                                    common::archive::compress_dir(&dir, Some(1))
+                                        .map_err(|e| Error::Other(e.into()))?;
+                                std::io::Seek::rewind(&mut file)
+                                    .map_err(|e| Error::Other(e.into()))?;
+                                Ok(file)
+                            })
+                            .await
+                            .map_err(|e| Error::Other(e.into()))??;
+
+                        let data_stream = tokio_util::io::ReaderStream::new(
+                            tokio::fs::File::from_std(file),
+                        )
+                        .map(|chunk| UploadMessage {
+                            msg: Some(res_proto::upload_message::Msg::Chunk(
+                                res_proto::UploadChunk {
+                                    data: chunk.unwrap().to_vec(),
+                                },
+                            )),
+                        });
+
+                        client
+                            .upload(
+                                tokio_stream::once(UploadMessage {
+                                    msg: Some(res_proto::upload_message::Msg::Request(
+                                        UploadRequest {
+                                            id: Some(res_proto::upload_request::Id {
+                                                id: Some(
+                                                    res_proto::upload_request::id::Id::ClientId(
+                                                        client_id,
+                                                    ),
+                                                ),
+                                            }),
+                                            upload_id,
+                                        },
+                                    )),
+                                })
+                                .chain(data_stream),
+                            )
+                            .await
+                            .map_err(|e| Error::Other(e.into()))?;
+
+                        Ok::<(), Error>(())
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Await all uploads concurrently, failing fast if any error occurs
+        futures::future::try_join_all(uploads).await?;
+
+        todo!();
+    }
+}
