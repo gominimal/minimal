@@ -16,6 +16,26 @@ enum BuildStatus {
     StatusDone = 5;
 }
 
+// Describes how a build failed.
+message BuildFailure {
+    message FetchError {
+        int64 injected_files_idx = 1;
+        string msg = 2;
+    }
+    message ExecutionError {
+        int64 invocation_idx = 1;
+        int64 exit_code = 2;
+        string msg = 3;
+    }
+
+    oneof error {
+        // An injected file failed to be fetched.
+        FetchError fetch = 1;
+        // An execution failed.
+        ExecutionError execution = 2;
+    }
+}
+
 // A request to RES for the status of a build.
 message PollBuildRequest {
     // Identifies the build this PollBuildRequest is for.
@@ -42,4 +62,6 @@ message PollBuildResponse {
     BuildStatus status = 3;
     // Whether the build completed successfully or not. Set to false if `status` is less than `StatusDone`.
     bool success = 4;
+    // Details about the failure.
+    optional BuildFailure build_failure = 5;
 }
