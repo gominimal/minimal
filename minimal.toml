@@ -1,5 +1,5 @@
 [upstream]
-repo = "git@github.com:gominimal/pkgs.git"
+repo = "https://github.com/gominimal/pkgs"
 branch = "main"
 
 [envs.dev]
