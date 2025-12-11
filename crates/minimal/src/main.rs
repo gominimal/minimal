@@ -186,7 +186,7 @@ impl Context {
         let paths = paths.with_stdlib_dir(match args.stdlib_dir {
             None => {
                 vcs.checkout_of(
-                    "git@github.com:gominimal/std.git",
+                    "https://github.com/gominimal/std",
                     checkouts::GitRef::Branch("main".to_string()),
                 )
                 .map_err(anyhow::Error::from)?
