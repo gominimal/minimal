@@ -36,6 +36,7 @@ message InjectedFiles {
     message InlineFile {
         string path = 1;
         bytes data = 2;
+        uint32 mode = 3;
     }
 
 
