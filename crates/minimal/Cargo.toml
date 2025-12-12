@@ -13,6 +13,7 @@ common.workspace = true
 checkouts.workspace = true
 decode.workspace = true
 op.workspace = true
+res-proto.workspace = true
 
 nickel-lang-core.workspace = true
 codespan-reporting.workspace = true
@@ -29,6 +30,7 @@ blake3.workspace = true
 serde.workspace = true
 
 rayon.workspace = true
+tonic.workspace = true
 tokio.workspace = true
 futures.workspace = true
 uuid.workspace = true
