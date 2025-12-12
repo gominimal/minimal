@@ -35,7 +35,7 @@ mod envs;
 pub use envs::EnvSetup;
 
 #[allow(dead_code)]
-mod remote_build;
+pub mod remote_build;
 
 mod subsets;
 pub use subsets::SubsetBuild;

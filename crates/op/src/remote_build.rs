@@ -1,13 +1,14 @@
 use std::{
     collections::{HashMap, HashSet},
+    os::unix::fs::MetadataExt,
     path::PathBuf,
 };
 
 use crate::{Error, Options, Runnable};
 use graph::{BuildSpec, BuildSpecInput, BuildSpecRef, SourceInput, dep_graph::SourceFetch};
 use res_proto::{
-    CommandParameters, CreateBuildRequest, InjectedFiles, Invocation, OutputArtifact,
-    TarballCompression, TarballFormat, UploadMessage, UploadRequest,
+    BuildStatus, CommandParameters, CreateBuildRequest, InjectedFiles, Invocation, OutputArtifact,
+    PollBuildRequest, TarballCompression, TarballFormat, UploadMessage, UploadRequest,
     injected_files::{FilesUpload, InjectedVariant, UnpackDest},
     remote_execution_service_client::RemoteExecutionServiceClient,
 };
@@ -92,6 +93,7 @@ impl<'a> RemoteSpecBuild<'a> {
                     injected_variant: Some(InjectedVariant::InlineFile(
                         res_proto::injected_files::InlineFile {
                             path: filename.clone(),
+                            mode: std::fs::metadata(full_path).unwrap().mode(),
                             data: std::fs::read(full_path).unwrap(),
                         },
                     )),
@@ -160,7 +162,15 @@ impl<'a> Runnable for RemoteSpecBuild<'a> {
                 files: layers.clone(),
                 command_parameters: Some(self.command_parameters(build)?),
                 build_outputs: vec![OutputArtifact {
-                    capture_globs: build.outputs.iter().map(|o| o.0.clone()).collect(),
+                    capture_globs: build
+                        .outputs
+                        .values()
+                        .map(|output| match output {
+                            graph::BuildOutput::Library { glob } => glob.clone(),
+                            graph::BuildOutput::Data { glob } => glob.clone(),
+                            graph::BuildOutput::Binary { glob } => glob.clone(),
+                        })
+                        .collect(),
                     ..Default::default()
                 }],
             })
@@ -245,6 +255,36 @@ impl<'a> Runnable for RemoteSpecBuild<'a> {
         // Await all uploads concurrently, failing fast if any error occurs
         futures::future::try_join_all(uploads).await?;
 
-        todo!();
+        // Now we poll the build until its done!
+        let start_time = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(60 * 30);
+
+        loop {
+            // Check if we've exceeded the timeout
+            if start_time.elapsed() > timeout {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "Remote build timed out after 30 minutes"
+                )));
+            }
+
+            let status = self
+                .client
+                .poll_build(PollBuildRequest {
+                    id: Some(res_proto::poll_build_request::Id {
+                        id: Some(res_proto::poll_build_request::id::Id::ClientId(
+                            client_id.clone(),
+                        )),
+                    }),
+                })
+                .await
+                .map_err(|e| Error::Other(e.into()))?;
+
+            if status.get_ref().status() == BuildStatus::StatusDone {
+                return Ok(RemoteSpecBuildResult { build_ms: 67 });
+            }
+
+            // Sleep for a bit before polling again
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        }
     }
 }
