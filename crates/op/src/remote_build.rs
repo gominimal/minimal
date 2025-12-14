@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    io::SeekFrom,
     os::unix::fs::MetadataExt,
     path::PathBuf,
 };
@@ -7,11 +8,13 @@ use std::{
 use crate::{Error, Options, Runnable};
 use graph::{BuildSpec, BuildSpecInput, BuildSpecRef, SourceInput, dep_graph::SourceFetch};
 use res_proto::{
-    BuildStatus, CommandParameters, CreateBuildRequest, InjectedFiles, Invocation, OutputArtifact,
-    PollBuildRequest, TarballCompression, TarballFormat, UploadMessage, UploadRequest,
+    BuildStatus, CommandParameters, CreateBuildRequest, DownloadRequest, InjectedFiles, Invocation,
+    OutputArtifact, PollBuildRequest, TarballCompression, TarballFormat, UploadMessage,
+    UploadRequest,
     injected_files::{FilesUpload, InjectedVariant, UnpackDest},
     remote_execution_service_client::RemoteExecutionServiceClient,
 };
+use tempfile::tempfile;
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
 
@@ -280,11 +283,52 @@ impl<'a> Runnable for RemoteSpecBuild<'a> {
                 .map_err(|e| Error::Other(e.into()))?;
 
             if status.get_ref().status() == BuildStatus::StatusDone {
+                let mut output_stream = self
+                    .client
+                    .download(DownloadRequest {
+                        id: Some(res_proto::download_request::Id {
+                            id: Some(res_proto::download_request::id::Id::ClientId(
+                                client_id.clone(),
+                            )),
+                        }),
+                    })
+                    .await
+                    .map_err(|e| Error::Other(e.into()))?
+                    .into_inner();
+
+                let mut temp_file =
+                    tokio::fs::File::from_std(tempfile().map_err(|e| Error::Other(e.into()))?);
+                // Stream the download data and write to the temporary file
+                while let Some(download_data) = output_stream.next().await {
+                    let download_data = download_data.map_err(|e| Error::Other(e.into()))?;
+                    tokio::io::AsyncWriteExt::write_all(&mut temp_file, &download_data.data)
+                        .await
+                        .map_err(|e| Error::Other(e.into()))?;
+                }
+                // Decompress the data into the local cache.
+                let into_dir = opts.cache.write_dir(&opts.graph.spec_hash(self.spec))?;
+                tokio::io::AsyncSeekExt::seek(&mut temp_file, SeekFrom::Start(0))
+                    .await
+                    .unwrap();
+                common::archive::extract_compressed_tar(
+                    &mut temp_file.into_std().await,
+                    common::archive::Compression::Zstd,
+                    into_dir.path(),
+                    None,
+                )
+                .map_err(|e| Error::Other(e.into()))?;
+
+                into_dir.finalize(cache::EntryMeta {
+                    inner: cache::MetaInner::Spec(build.name.clone()),
+                    origin: Some(build.from.as_ref().clone()),
+                    ..Default::default()
+                })?;
+
                 return Ok(RemoteSpecBuildResult { build_ms: 67 });
             }
 
             // Sleep for a bit before polling again
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
         }
     }
 }
