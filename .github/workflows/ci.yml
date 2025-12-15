@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@v6
       - name: Install protoc
         run: sudo apt-get install -y protobuf-compiler
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/bin/
@@ -37,7 +37,7 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: minimal-binary
           path: target/debug/minimal
@@ -59,7 +59,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Download binary artifact
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           name: minimal-binary
           path: .
