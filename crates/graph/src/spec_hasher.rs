@@ -184,14 +184,6 @@ fn build_input_hash(input: &BuildSpecInput, h: &mut Hasher) {
             h.write_all(filename.as_bytes()).unwrap();
             h.write_all(file_hash.as_bytes()).unwrap();
         }
-        Prebuilt(package, sha256) => {
-            h.write_all(b"prebuilt").unwrap();
-            h.write_all(package.as_bytes()).unwrap();
-            if let Some(hash) = sha256 {
-                h.write_all(b"sha256").unwrap();
-                h.write_all(hash.as_bytes()).unwrap();
-            }
-        }
     }
 }
 
@@ -327,12 +319,11 @@ mod tests {
         let layer = Layer::new_for_test(
             indoc! {
                 "
-                let {BuildSpec, HostPath, Source, Prebuilt, OutputLib, OutputBin, OutputData, ..} = import \"minimal.ncl\" in
+                let {BuildSpec, HostPath, Source, OutputLib, OutputBin, OutputData, ..} = import \"minimal.ncl\" in
                 {
                     name = \"single buildspec\",
                     inputs = [
                         {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
-                        {package = \"uwu\"} | Prebuilt,
                         {path = \"/\"} | HostPath,
                     ],
                     outputs = {
@@ -355,7 +346,7 @@ mod tests {
         // println!("{}", SpecHasher::hash(&dp, &dp.top_levels[0]).0.to_hex());
         assert_eq!(
             SpecHasher::hash(&dp, &dp.top_levels[0]),
-            SpecHash::from_hex("48d0229ccc7973402752c4a62a5d09875c5db3c426d31655520710626340a4b8")
+            SpecHash::from_hex("1b0191397ab3b84580087f4ff975dcdbdfc1ef73029ad4413e4deafdaa5710b4")
                 .unwrap(),
         );
     }
@@ -503,12 +494,11 @@ mod tests {
         let layer = Layer::new_for_test(
             indoc! {
                 "
-                let {BuildSpec, HostPath, Source, Prebuilt, OutputLib, OutputBin, OutputData, ..} = import \"minimal.ncl\" in
+                let {BuildSpec, HostPath, Source, OutputLib, OutputBin, OutputData, ..} = import \"minimal.ncl\" in
                 {
                     name = \"single buildspec\",
                     inputs = [
                         {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
-                        {package = \"uwu\"} | Prebuilt,
                         {path = \"/\"} | HostPath,
                     ],
                     outputs = {
@@ -531,7 +521,7 @@ mod tests {
         // println!("{}", SpecHasher::hash(&dp, &dp.top_levels[0]).0.to_hex());
         assert_eq!(
             SubsetHasher::hash_single(&dp, &dp.top_levels[0], vec!["uwu_tool", "something"]),
-            SpecHash::from_hex("23d6c828d07f1572f7d8ec315c0a0fb92b00079d290692358cefad45b4b51cc5")
+            SpecHash::from_hex("e9a11fd6fd4f283d68b5835a577ced9a0b864e9765d753a49527aaf5736a5699")
                 .unwrap(),
         );
     }

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use cache::{Cache, LocalDir, MetaInner, PendingDir, RemoteCache};
 use common::SpecHash;
 use google_cloud_storage::client::Storage as GcsStorage;
@@ -354,10 +354,6 @@ impl<'a> Run<'a> {
                 Source(source) => {
                     debug!("  Input {}: Source({:?})", i, source.from);
                     // Handled by [SpecBuild]
-                }
-                Prebuilt(package_name, _sha256) => {
-                    debug!("  Input {}: Prebuilt({})", i, package_name);
-                    bail!("prebuilt input cannot exist in a non-prebuilt build spec");
                 }
             }
         }

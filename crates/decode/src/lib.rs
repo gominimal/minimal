@@ -262,7 +262,6 @@ pub enum ObjTy {
     OutputData,
     Source,
     Local,
-    Prebuilt,
     Subset,
     Profile,
     Layer,

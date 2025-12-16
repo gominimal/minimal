@@ -64,6 +64,7 @@ impl RemoteStorage {
     }
 
     #[tracing::instrument(skip(file))]
+    #[allow(dead_code)]
     pub async fn upload(&self, bucket_id: &str, file_path: &str, file: File) -> Result<()> {
         let _response = self
             .client

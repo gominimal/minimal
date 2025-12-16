@@ -119,7 +119,7 @@ impl<'a> RemoteSpecBuild<'a> {
                     )),
                 }),
 
-                BuildSpecInput::HostPath(_) | BuildSpecInput::Prebuilt(_, _) => todo!(),
+                BuildSpecInput::HostPath(_) => todo!(),
             }))
             .collect()
     }

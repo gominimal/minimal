@@ -104,7 +104,6 @@ pub enum BuildSpecInput {
         filename: String,
         file_hash: blake3::Hash,
     },
-    Prebuilt(String, Option<String>), // Package name, sha256
     Subset(SubsetInput),
 }
 
@@ -132,9 +131,6 @@ impl BuildSpecInput {
                 filename: filename.clone(),
                 file_hash: *file_hash,
             },
-            builds::BuildDeclInput::Prebuilt(name, sha256) => {
-                Self::Prebuilt(name.clone(), sha256.clone())
-            }
             builds::BuildDeclInput::Subset(si) => {
                 Self::Subset(SubsetInput::from_decoded(si, loader)?)
             }
@@ -665,7 +661,7 @@ impl DepGraph {
             .filter_map(|input| match input {
                 Build(bsr) => Some(bsr),
                 Subset(si) => Some(&si.from),
-                Source(_) | HostPath(_) | Local { .. } | Prebuilt(_, _) => None,
+                Source(_) | HostPath(_) | Local { .. } => None,
             })
             .chain(build_spec.runtime_deps.iter().map(|dep| match dep {
                 RuntimeDep::Build(bsr) => bsr,
