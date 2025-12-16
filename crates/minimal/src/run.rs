@@ -6,12 +6,11 @@ use graph::{BinProvider, ExecPlan, RuntimeDep, SubsetInput};
 use graph::{BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph};
 use op::{Runnable, SpecBuild, SpecBuildResult, SubsetBuild};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
-use tempfile::Builder;
 use tracing::{debug, info};
 
-use crate::{lockfile::PrebuiltsLock, remote_storage::RemoteStorage};
+use crate::remote_storage::RemoteStorage;
 
 enum ResolvedBuild {
     /// Something that was literally just built
@@ -293,87 +292,12 @@ async fn path_transitive_deps_of(
     Ok(())
 }
 
-#[tracing::instrument(skip_all, fields(name = build.name, indicatif.pb_show))]
-async fn materialize_prebuilt(
-    build: &BuildSpec,
-    build_hash: &SpecHash,
-    cache: &Cache<LocalDir>,
-    lockfile: &PrebuiltsLock,
-    remote_storage: &RemoteStorage,
-) -> Result<PendingDir> {
-    let cache_handle = cache.write_dir(build_hash).unwrap();
-    let output_dir = cache_handle.path();
-
-    // Find the prebuilt input and copy its contents
-    for input in build.inputs.iter() {
-        if let BuildSpecInput::Prebuilt(package_name, sha256) = input {
-            // First check if we have a locked hash for this package
-            let package_hash = if let Some(locked_hash) = lockfile.get_hash(package_name) {
-                debug!("  Using locked hash for {}: {}", package_name, locked_hash);
-                SpecHash(blake3::Hash::from_hex(locked_hash).with_context(|| {
-                    format!("Invalid hex hash in lockfile for {}", package_name)
-                })?)
-            } else {
-                panic!("No locked hash found for {}", package_name);
-            };
-
-            let bucket_id = "minimal-staging-archives";
-            let file_path = format!(
-                "prebuilts/{}/{}.tar.zst",
-                package_name,
-                package_hash.0.to_hex()
-            );
-
-            // Download the prebuilt archive
-            let archive_path = if let Some(sha256) = sha256 {
-                remote_storage
-                    .download_with_verification_and_caching(
-                        bucket_id.to_string(),
-                        &file_path,
-                        sha256,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!("Failed to download prebuilt archive for {}", package_name)
-                    })?
-            } else {
-                let (mut f, archive_path) = Builder::new()
-                    .prefix("minpkgs-prebuilt")
-                    .suffix(".tar.zst")
-                    .tempfile()?
-                    .keep()?;
-
-                remote_storage
-                    .download(bucket_id.to_string(), &file_path, &mut f)
-                    .await
-                    .with_context(|| {
-                        format!("Failed to download prebuilt archive for {}", package_name)
-                    })?;
-
-                f.sync_all()?;
-                drop(f);
-                archive_path
-            };
-
-            extract_prebuilt_archive(&archive_path, output_dir)?;
-
-            debug!(
-                "  Downloaded and extracted prebuilt archive for {} to {}",
-                package_name,
-                archive_path.display()
-            );
-        }
-    }
-    Ok(cache_handle)
-}
-
 /// A run executes builds according to some plan.
 #[derive(Debug)]
 pub struct Run<'a> {
     graph: &'a DepGraph,
     cache: Cache<LocalDir>,
     remote_storage: RemoteStorage,
-    lockfile: PrebuiltsLock,
     output_base: PathBuf,
 }
 
@@ -382,14 +306,12 @@ impl<'a> Run<'a> {
         graph: &'a DepGraph,
         cache: Cache<LocalDir>,
         remote_storage: RemoteStorage,
-        lockfile: PrebuiltsLock,
         output_base: PathBuf,
     ) -> Self {
         Self {
             graph,
             cache,
             remote_storage,
-            lockfile,
             output_base,
         }
     }
@@ -483,17 +405,24 @@ impl<'a> Run<'a> {
         if build.is_pure_prebuilt() {
             info!("Materializing prebuilt package: {}", build.name);
             let start = Instant::now();
-            let result = materialize_prebuilt(
-                build,
-                &bsh,
-                &self.cache,
-                &self.lockfile,
-                &self.remote_storage,
-            )
-            .await?;
+
+            let build_result = SpecBuild {
+                spec: bsr,
+                override_deps: None,
+                remote_fetcher: &self.remote_storage,
+            }
+            .run(&op::Options {
+                cache: self.cache.clone(),
+                graph: self.graph,
+                exec_base: self.output_base.clone(),
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("materializing {}", build.name))?;
+
             info!("Successfully materialized prebuilt package: {}", build.name);
             return Ok(ResolvedBuild::CacheFill {
-                pending: result,
+                pending: build_result.outputs,
                 fetch_ms: Instant::now().duration_since(start).as_millis() as usize,
             });
         }
@@ -525,7 +454,8 @@ impl<'a> Run<'a> {
             exec_base: self.output_base.clone(),
         })
         .await
-        .map_err(anyhow::Error::from)?;
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("building {}", build.name))?;
 
         info!("Successfully built package: {}", build.name);
         Ok(ResolvedBuild::SpecBuild(build_result))
@@ -628,12 +558,4 @@ impl<'a> Run<'a> {
 
         Ok(())
     }
-}
-
-fn extract_prebuilt_archive(archive_path: &PathBuf, extract_dir: &Path) -> Result<()> {
-    let file = std::fs::File::open(archive_path)?;
-    use common::archive;
-    archive::extract_compressed_tar(file, archive::Compression::Zstd, extract_dir, None)?;
-
-    Ok(())
 }

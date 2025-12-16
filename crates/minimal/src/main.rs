@@ -13,7 +13,6 @@ use tracing_indicatif::{filter::IndicatifFilter, filter::hide_indicatif_span_fie
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use uuid::Uuid;
 
-mod lockfile;
 mod paths;
 use paths::PathConfig;
 mod remote_storage;

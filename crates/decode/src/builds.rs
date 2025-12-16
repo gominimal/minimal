@@ -702,6 +702,10 @@ pub struct BuildDecl {
     pub target: Target,
     /// Any attributes explicitly set on this build-decl.
     pub attrs: Option<IndexMap<String, AttrValue>>,
+    /// Marker that this build-spec is a prebuilt, meaning:
+    ///  - No cmds may be defined.
+    ///  - inputs must consist of a single source input.
+    pub prebuilt: bool,
 
     /// The build commands declared on the build spec.
     pub cmds: Vec<Vec<String>>,
@@ -723,22 +727,6 @@ pub struct BuildDecl {
 }
 
 impl BuildDecl {
-    /// Returns true if the build-spec represents a fetch of files but no actual computation.
-    pub fn is_pure_prebuilt(&self) -> bool {
-        let has_prebuilt = self
-            .inputs
-            .iter()
-            .any(|input| matches!(input, BuildDeclInput::Prebuilt(_, _)));
-        let has_local_or_source = self.inputs.iter().any(|input| {
-            matches!(
-                input,
-                BuildDeclInput::Local { .. } | BuildDeclInput::Source(_)
-            )
-        });
-
-        has_prebuilt && !has_local_or_source
-    }
-
     /// Returns true if the build-spec represents a rollup of runtime_deps but no substance or computation of its own.
     pub fn is_pure_collection(&self) -> bool {
         self.inputs.is_empty()
@@ -766,6 +754,7 @@ impl BuildDecl {
         let mut outputs: Option<OutputMap> = None;
         let mut replace_on_cycle: Option<BuildRef> = None;
         let mut attrs: Option<IndexMap<String, AttrValue>> = None;
+        let mut prebuilt: Option<bool> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                 r.fields
@@ -790,6 +779,18 @@ impl BuildDecl {
                                     )?)
                                     .unwrap(),
                                 );
+                                Ok(())
+                            }
+                            "prebuilt" => {
+                                if let Some(rt) = field.value.as_ref() {
+                                prebuilt = Some(
+                                    bool::deserialize(eval_if_closure(
+                                        rt,
+                                        program,
+                                    )?)
+                                    .unwrap(),
+                                );
+                                }
                                 Ok(())
                             }
                             "cmd" => {
@@ -1055,6 +1056,7 @@ impl BuildDecl {
                 });
             }
         };
+        let prebuilt = prebuilt.unwrap_or_default();
         let cmds = cmds.unwrap_or_default();
         let inputs = match inputs {
             Some(inputs) => inputs,
@@ -1084,10 +1086,31 @@ impl BuildDecl {
         };
         let runtime_deps = runtime_deps.unwrap_or_default();
 
+        // Validate our magic prebuilt-marked decls
+        if prebuilt {
+            if let [BuildDeclInput::Source(_)] = inputs.as_slice() {
+                if !cmds.is_empty() {
+                    return Err(Error::Other(
+                        "prebuilt decls must not declare commands to execute".to_string(),
+                    ));
+                }
+                if replace_on_cycle.is_some() {
+                    return Err(Error::Other(
+                        "prebuilt decls must not set replace_on_cycle".to_string(),
+                    ));
+                }
+            } else {
+                return Err(Error::Other(
+                    "prebuilt decls must have a single source input".to_string(),
+                ));
+            }
+        }
+
         Ok(Self {
             name,
             cmds,
             attrs,
+            prebuilt,
             build_args,
             target: target.unwrap_or(Target::new(Arch::Amd64, OS::Linux)),
             inputs,
@@ -1274,6 +1297,7 @@ mod tests {
                 name,
                 target,
                 cmds,
+                prebuilt: false,
                 attrs: _,
                 build_args,
                 inputs: _,

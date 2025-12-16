@@ -21,6 +21,7 @@ let needs_schema = import "need_classes.ncl" in
 
         # Do NOT set this yourself
         __magic_buildspec_id | optional,
+        prebuilt | Bool | optional,
 
         target | String | optional,
 

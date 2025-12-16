@@ -1,4 +1,5 @@
 use crate::{Error, Materialized, Options, Runnable};
+use cache::PendingDir;
 use graph::SourceInput;
 
 use anyhow::{Context, Result, anyhow};
@@ -32,6 +33,7 @@ pub trait SourceFetcher: Sync {
 pub struct SourceLoad<'a, SF: SourceFetcher> {
     pub source: &'a SourceInput,
     pub remote_fetcher: &'a SF,
+    pub into: Option<PendingDir>,
 }
 
 impl<'a, SF: SourceFetcher> Runnable for SourceLoad<'a, SF> {
@@ -91,12 +93,15 @@ impl<'a, SF: SourceFetcher> Runnable for SourceLoad<'a, SF> {
                         .path_segments()
                         .map(|mut s| s.next_back().unwrap())
                         .unwrap();
-                    let tempdir = opts.cache.temp_dir()?;
-                    let tempdir_path = tempdir.path();
 
                     use common::archive;
-                    match archive::Compression::from_extension(file_name) {
-                        Some(compression) => {
+                    match (
+                        archive::Compression::from_extension(file_name),
+                        self.into.take(),
+                    ) {
+                        (Some(compression), None) => {
+                            let tempdir = opts.cache.temp_dir()?;
+                            let tempdir_path = tempdir.path();
                             let f = std::fs::File::open(cached_path)?;
                             archive::extract_compressed_tar(
                                 f,
@@ -107,7 +112,19 @@ impl<'a, SF: SourceFetcher> Runnable for SourceLoad<'a, SF> {
                             .map_err(anyhow::Error::from)?;
                             Ok(Materialized::TempDir(tempdir))
                         }
-                        None => Err(anyhow!(
+                        (Some(compression), Some(pending_dir)) => {
+                            let f = std::fs::File::open(cached_path)?;
+                            archive::extract_compressed_tar(
+                                f,
+                                compression,
+                                pending_dir.path(),
+                                self.source.strip_prefix.as_ref(),
+                            )
+                            .map_err(anyhow::Error::from)?;
+                            Ok(Materialized::Given(pending_dir))
+                        }
+
+                        (None, _) => Err(anyhow!(
                             "cannot extract archive {}: unhandled extension",
                             file_name
                         )

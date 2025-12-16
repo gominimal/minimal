@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use cache::{Cache, LocalDir};
+use cache::{Cache, LocalDir, PendingDir};
 use graph::DepGraph;
 
 mod error;
@@ -24,11 +24,12 @@ pub trait Runnable {
     ) -> impl std::future::Future<Output = Result<Self::Result, Error>> + Send;
 }
 
-/// A materialized source, either a file or directory tree.
+/// A materialized source, either a file, directory tree, or pending cache dir passed into the operation.
 #[derive(Debug)]
 pub enum Materialized {
     File(PathBuf),
     TempDir(tempfile::TempDir),
+    Given(PendingDir),
 }
 
 mod envs;
