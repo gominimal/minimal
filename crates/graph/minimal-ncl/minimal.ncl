@@ -1,4 +1,4 @@
-let Tys = [| 'Builder, 'Path, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Prebuilt, 'Subset, 'Profile, 'Layer, 'Upstream |]
+let Tys = [| 'Builder, 'Path, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Subset, 'Profile, 'Layer, 'Upstream |]
 in
 let attrs_schema = import "attr_classes.ncl" in
 let needs_schema = import "need_classes.ncl" in
@@ -81,7 +81,6 @@ let needs_schema = import "need_classes.ncl" in
                 {ty = 'Path, ..} => std.contract.check HostPath label value,
                 {ty = 'Source, ..} => std.contract.check Source label value,
                 {ty = 'Local, ..}  => std.contract.check Local label value,
-                {ty = 'Prebuilt, ..} => std.contract.check Prebuilt label value,
                 {ty = 'Subset, ..} => std.contract.check Subset label value,
                 _ => 'Error {
                     message = "Expected Input type",
@@ -112,14 +111,6 @@ let needs_schema = import "need_classes.ncl" in
         ty | Tys = 'Local,
         file
           | String,
-    },
-
-    Prebuilt | doc "An input to a build spec which represents a prebuilt package from remote storage." = {
-        ty | Tys = 'Prebuilt,
-        package
-          | String,
-        sha256
-          | String | optional,
     },
 
     Subset | doc "A dependency on a subset of the outputs from another build spec." = {

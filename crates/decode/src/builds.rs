@@ -356,7 +356,6 @@ pub enum BuildDeclInput {
         filename: String,
         file_hash: blake3::Hash,
     },
-    Prebuilt(String, Option<String>), // Package name, sha256
     Subset(SubsetInput),
 }
 
@@ -397,10 +396,6 @@ impl BuildDeclInput {
                     filename,
                     file_hash,
                 })
-            }
-            ObjTy::Prebuilt => {
-                let pb = Self::from_term_prebuilt(&rt, program)?;
-                Ok(BuildDeclInput::Prebuilt(pb.0, pb.1))
             }
             ObjTy::OutputLib
             | ObjTy::OutputBin
@@ -511,58 +506,6 @@ impl BuildDeclInput {
         }));
 
         Ok((full_path, file, file_hash))
-    }
-
-    fn from_term_prebuilt(
-        rt: &RichTerm,
-        program: &mut Program<CacheImpl>,
-    ) -> Result<(String, Option<String>), Error> {
-        let mut package: Option<String> = None;
-        let mut sha256: Option<String> = None;
-        match rt.term.as_ref() {
-            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                r.fields
-                    .iter()
-                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
-                        match ident_and_loc.label() {
-                            "package" => {
-                                package = Some(
-                                    String::deserialize(eval_if_closure(
-                                        field.value.as_ref().unwrap(),
-                                        program,
-                                    )?)
-                                    .unwrap(),
-                                );
-                                Ok(())
-                            }
-                            "sha256" => {
-                                if let Some(field) = field.value.as_ref() {
-                                    sha256 = Some(
-                                        String::deserialize(eval_if_closure(field, program)?)
-                                            .unwrap(),
-                                    );
-                                }
-                                Ok(())
-                            }
-                            _ => Ok(()), // TODO: Should we error if we see an unknown field?
-                        }
-                    })?;
-            }
-            _ => {}
-        }
-        let package = match package {
-            Some(package) => package,
-            None => {
-                return Err(Error::MissingField {
-                    files: program.files(),
-                    obj: ObjTy::Prebuilt,
-                    pos: rt.pos,
-                    field: "package",
-                });
-            }
-        };
-
-        Ok((package, sha256))
     }
 }
 
