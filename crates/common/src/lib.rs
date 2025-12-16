@@ -301,3 +301,9 @@ pub fn random_alphanumeric(length: usize) -> String {
         })
         .collect()
 }
+
+/// Recursively copies a directory from one path to another.
+pub fn copy_directory<Q: AsRef<Path>, P: AsRef<Path>>(from: P, to: Q) -> Result<(), io::Error> {
+    copy_dir::copy_dir(from, to)?;
+    Ok(())
+}

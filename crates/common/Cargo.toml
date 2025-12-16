@@ -16,6 +16,7 @@ toml.workspace = true
 blake3.workspace = true
 tracing.workspace = true
 
+copy_dir.workspace = true
 shlex.workspace = true
 globset.workspace = true
 

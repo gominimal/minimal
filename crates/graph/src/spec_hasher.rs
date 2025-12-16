@@ -200,6 +200,9 @@ fn build_input_hash(input: &BuildSpecInput, h: &mut Hasher) {
 fn build_attrs_hash(spec: &BuildSpec, h: &mut Hasher) {
     h.write_all(b"build spec").unwrap();
     h.write_all(spec.name.as_bytes()).unwrap();
+    if spec.prebuilt {
+        h.write_all(b"-prebuilt").unwrap();
+    }
     for cmd in &spec.cmds {
         cmd.iter().for_each(|e| h.write_all(e.as_bytes()).unwrap());
     }

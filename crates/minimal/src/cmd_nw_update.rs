@@ -1,6 +1,5 @@
-use crate::{Context, Error, PackagesArg, lockfile::PrebuiltsLock, remote_storage::RemoteStorage};
+use crate::{Context, Error, PackagesArg, remote_storage::RemoteStorage};
 use graph::BuildSpecInput;
-use std::path::Path;
 use tracing::{info, warn};
 
 static BUCKET_ID: &str = "minimal-staging-archives";
@@ -17,11 +16,9 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs, ctx: &mut Context) -> Resu
 
     crate::cmd_build::cmd_build_impl(&graph, ctx, cache.clone(), ctx.num_parallel_builds).await?;
 
-    let remote_storage = RemoteStorage::new(ctx.paths().download_cache_dir().to_path_buf())
+    let remote_storage = RemoteStorage::new(ctx.paths().download_cache_dir().to_path_buf(), true)
         .await
         .unwrap();
-
-    let mut lockfile = PrebuiltsLock::load(Path::new("prebuilts.lock")).unwrap();
 
     for bsr in &graph.top_levels {
         // Work out the name of the prebuilt by looking at replace_by_cycle and then the first input
@@ -64,7 +61,7 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs, ctx: &mut Context) -> Resu
         );
 
         // Update the prebuilts lockfile
-        lockfile.update_hash(prebuilt_name.clone(), package_hash.0.to_hex().to_string());
+        // lockfile.update_hash(prebuilt_name.clone(), package_hash.0.to_hex().to_string());
         info!("Updated prebuilts.lock with new hash for {}", prebuilt_name);
 
         if let Some(old_hash_hex) = prebuilt_sha256 {
@@ -76,7 +73,7 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs, ctx: &mut Context) -> Resu
 
             let status = Command::new("find")
                 .args([
-                    "packages/",
+                    "/home/xxx/pkgs/packages/",
                     "-type",
                     "f",
                     "-exec",
@@ -96,8 +93,7 @@ pub async fn cmd_new_world_update(args: NWUpdateArgs, ctx: &mut Context) -> Resu
             }
         }
     }
-    let lockfile_path = std::path::Path::new("prebuilts.lock");
-    lockfile.save(lockfile_path)?;
+    //lockfile.save(lockfile_path)?;
 
     Ok(())
 }

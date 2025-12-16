@@ -208,6 +208,8 @@ pub struct BuildSpec {
     pub name: String,
     /// The system this build-spec is meant to run on. Defaults to amd64 Linux.
     pub target: Target,
+    /// This spec was marked as a prebuilt - no computation, fetch the output from an archive directly.
+    pub(crate) prebuilt: bool,
 
     /// The build commands declared on the build spec.
     pub cmds: Vec<Vec<String>>,
@@ -237,18 +239,7 @@ pub struct BuildSpec {
 impl BuildSpec {
     /// Returns true if the build-spec represents a fetch of files but no actual computation.
     pub fn is_pure_prebuilt(&self) -> bool {
-        let has_prebuilt = self
-            .inputs
-            .iter()
-            .any(|input| matches!(input, BuildSpecInput::Prebuilt(_, _)));
-        let has_local_or_source = self.inputs.iter().any(|input| {
-            matches!(
-                input,
-                BuildSpecInput::Local { .. } | BuildSpecInput::Source(_)
-            )
-        });
-
-        has_prebuilt && !has_local_or_source
+        self.prebuilt
     }
 
     /// Returns true if the build-spec represents a rollup of runtime_deps but no substance or computation of its own.
@@ -263,6 +254,7 @@ impl BuildSpec {
         Ok(Self {
             name: bd.name.clone(),
             target: bd.target.clone(),
+            prebuilt: bd.prebuilt,
             cmds: bd.cmds.clone(),
             build_args: bd.build_args.clone(),
 

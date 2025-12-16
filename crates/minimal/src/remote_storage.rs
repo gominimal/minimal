@@ -5,7 +5,6 @@ use common::file_cache::CachingDownloader;
 use google_cloud_storage::client::Storage;
 
 use std::fs::File;
-use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -16,13 +15,17 @@ pub struct RemoteStorage {
 
 impl RemoteStorage {
     #[tracing::instrument]
-    pub async fn new(cache_dir: PathBuf) -> Result<Self> {
+    pub async fn new(cache_dir: PathBuf, with_gcloud_auth: bool) -> Result<Self> {
         let cache = file_cache::FileCache::new(cache_dir)?;
 
-        let client = Storage::builder()
-            .with_credentials(google_cloud_auth::credentials::anonymous::Builder::new().build())
-            .build()
-            .await?;
+        let client = if with_gcloud_auth {
+            Storage::builder().build().await?
+        } else {
+            Storage::builder()
+                .with_credentials(google_cloud_auth::credentials::anonymous::Builder::new().build())
+                .build()
+                .await?
+        };
         Ok(Self { client, cache })
     }
 
@@ -58,25 +61,6 @@ impl RemoteStorage {
             )
             .await
             .map_err(anyhow::Error::from)
-    }
-
-    #[tracing::instrument]
-    pub async fn download<B: Write + std::fmt::Debug>(
-        &self,
-        bucket_id: String,
-        file: &str,
-        into: &mut B,
-    ) -> Result<()> {
-        let mut reader = self
-            .client
-            .read_object(format!("projects/_/buckets/{bucket_id}"), file)
-            .send()
-            .await?;
-        while let Some(chunk) = reader.next().await.transpose()? {
-            into.write_all(&chunk)?;
-        }
-
-        Ok(())
     }
 
     #[tracing::instrument(skip(file))]

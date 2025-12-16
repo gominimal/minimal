@@ -46,10 +46,12 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                     let resolved_src = crate::SourceLoad {
                         source,
                         remote_fetcher: self.remote_fetcher,
+                        into: None,
                     }
                     .run(opts)
                     .await?;
                     match resolved_src {
+                        Materialized::Given(_) => unreachable!(),
                         Materialized::File(path) => inputs.push(build_sandbox::Input::File(path)),
                         Materialized::TempDir(td) => {
                             inputs.push(build_sandbox::Input::Dir(td.path().to_path_buf()));
@@ -151,6 +153,42 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
             .map(|(exec, args)| (exec[0].clone(), args.to_vec()))
             .collect())
     }
+
+    async fn materialize_prebuilt<'b>(
+        &mut self,
+        opts: &Options<'b>,
+        build: &BuildSpec,
+    ) -> Result<SpecBuildResult, Error> {
+        if let BuildSpecInput::Source(source) = &build.inputs[0] {
+            let start = Instant::now();
+            let out_dir = opts
+                .cache
+                .write_dir(&opts.graph.spec_hash(self.spec))
+                .unwrap();
+            let resolved_src = crate::SourceLoad {
+                source,
+                remote_fetcher: self.remote_fetcher,
+                into: Some(out_dir),
+            }
+            .run(opts)
+            .await?;
+
+            if let Materialized::Given(d) = resolved_src {
+                let build_ms = Instant::now().duration_since(start).as_millis() as usize;
+                Ok(SpecBuildResult {
+                    outputs: d,
+                    build_ms,
+                })
+            } else {
+                panic!(
+                    "prebuilt source materialized as non-tempdir: {:?}",
+                    resolved_src
+                );
+            }
+        } else {
+            panic!("prebuilt input was not source: {:?}", &build.inputs[0]);
+        }
+    }
 }
 
 impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
@@ -158,6 +196,11 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
 
     async fn run<'b>(&mut self, opts: &Options<'b>) -> Result<Self::Result, Error> {
         let build = opts.graph.get(self.spec).unwrap();
+        // Special case: prebuilts
+        if build.is_pure_prebuilt() {
+            return self.materialize_prebuilt(opts, build).await;
+        }
+
         let (inputs, mut temp_dirs) = self.inputs(build, opts).await?;
         let (mut dependencies, needs_dns, need_internet) = self.dependencies(build, opts).await?;
 

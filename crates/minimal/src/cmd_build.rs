@@ -1,5 +1,5 @@
 use crate::{Context, PackagesArg};
-use crate::{Error, lockfile::PrebuiltsLock, remote_storage::RemoteStorage, run::Run};
+use crate::{Error, remote_storage::RemoteStorage, run::Run};
 use anyhow::Context as _;
 use build_events::events::{
     BuildEvent, BuildFinished, BuildMetadata, BuildStarted, build_event, current_millis,
@@ -7,7 +7,6 @@ use build_events::events::{
 use cache::{Cache, CacheBinProvider, LocalDir, RemoteBinProvider};
 use graph::{DepGraph, ExecPlan, Transitives};
 use std::collections::HashMap;
-use std::path::Path;
 use std::process::Command;
 use tracing::info;
 
@@ -43,10 +42,9 @@ pub async fn cmd_build_impl(
     let mut run = Run::new(
         graph,
         cache.clone(),
-        RemoteStorage::new(ctx.paths().download_cache_dir().to_path_buf())
+        RemoteStorage::new(ctx.paths().download_cache_dir().to_path_buf(), false)
             .await
             .unwrap(),
-        PrebuiltsLock::load(Path::new("prebuilts.lock")).unwrap(),
         output_base,
     );
 
