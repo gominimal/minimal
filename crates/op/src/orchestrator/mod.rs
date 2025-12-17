@@ -1,6 +1,13 @@
+//! The orchestration module performs the operations neccessary to make some given software (i.e. build-specs) runnable.
+//!
+//! The primary type here is [Orchestrator], which is parameterized by a [Backend]. The intention is that
+//! different backends can be used for local builds vs remote builds and other architectural variants, while all
+//! the main/control logic stays the same.
+
 use std::{path::PathBuf, sync::Arc};
 
-use cache::{Cache, DirCacheEntry, LocalDir, PendingDir, RemoteCache};
+use crate::{Error, SourceFetcher};
+use cache::{Cache, LocalDir, PendingDir, RemoteCache};
 use common::SpecHash;
 use either::Either;
 use google_cloud_storage::client::Storage as GcsStorage;
@@ -14,11 +21,12 @@ mod state;
 use state::{DeliverableRef, DeliverableState, State, StateHandle};
 
 mod traits;
-use traits::Backend;
-
-use crate::{Error, SourceFetcher};
+pub(crate) use traits::Backend;
 
 /// The shared state used heavily everywhere.
+///
+/// This structure exists so it can be wrapped up in something that is tokio async friendly and
+/// passed around as needed. Namely, a [SharedHandle].
 #[derive(Debug)]
 pub(crate) struct Shared<B: Backend> {
     graph: DepGraph,
@@ -41,6 +49,9 @@ impl<B: Backend> SharedHandle<B> {
         Self(Arc::new(RwLock::new(shared)))
     }
 
+    /// Takes a lock and returns &[DepGraph].
+    ///
+    /// Make sure to drop as soon as possible to release the lock.
     pub async fn graph(&self) -> RwLockReadGuard<'_, DepGraph> {
         RwLockReadGuard::map(self.0.read().await, |s| &s.graph)
     }
@@ -53,6 +64,7 @@ pub struct Orchestrator<B: Backend> {
 }
 
 impl<SF: SourceFetcher> Orchestrator<traits::LocalBackend<SF>> {
+    /// Initializes an orchestrator to perform a local build.
     pub fn new_for_local_build(
         top_levels: Vec<BuildSpecRef>,
         output_base: PathBuf,
@@ -68,18 +80,26 @@ impl<SF: SourceFetcher> Orchestrator<traits::LocalBackend<SF>> {
             },
         })
     }
+    /// Executes the local build.
     pub async fn run(
         self,
         graph: DepGraph,
         cache: Cache<LocalDir>,
-    ) -> Result<Vec<Either<PendingDir, DirCacheEntry<LocalDir>>>, crate::Error> {
+    ) -> Result<Vec<PendingDir>, crate::Error> {
         let shared = Shared {
             graph,
             cache,
             backend: self.backend,
         };
 
-        Self::run_impl(&self.top_levels, shared).await
+        Ok(Self::run_impl(&self.top_levels, shared)
+            .await?
+            .into_iter()
+            .filter_map(|a| match a {
+                Either::Left(pd) => Some(pd),
+                Either::Right(_cache_dir) => None,
+            })
+            .collect())
     }
 }
 

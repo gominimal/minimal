@@ -28,8 +28,8 @@ pub enum DeliverableInner {
         /// True if no cycle breakers are used.
         full_build: bool,
         /// Which dependencies to be wired to the build.
-        /// Subsets are represented as pointers to a [Deliverable] of the
-        /// subset.
+        /// Subsets are represented as pointers to a [Deliverable] with
+        /// a field `inner` of variant [DeliverableInner::Subset].
         dependencies: Vec<DeliverableRef>,
     },
     /// A subset that needs to be materialized.
@@ -40,10 +40,12 @@ pub enum DeliverableInner {
         subset: SubsetInput,
         /// The hash of the subset.
         spec_hash: SpecHash,
-        /// The build this subset depends on.
+        /// The build this subset depends on. May point to any kind of [Deliverable].
         build: DeliverableRef,
     },
-    /// Something that needs to be fetched from a remote cache.
+    /// Something that needs to be fetched from a cache.
+    ///
+    /// Note that `CacheFill` deliverables are generated for stuff thats in the local cache too.
     CacheFill {
         /// The spec being fetched.
         bsr: BuildSpecRef,
@@ -53,6 +55,7 @@ pub enum DeliverableInner {
 }
 
 impl DeliverableInner {
+    /// If the enum is variant `Build`, returns the list of deliverables that build depends on.
     pub fn build_deps(&self) -> Option<&Vec<DeliverableRef>> {
         if let DeliverableInner::Build { dependencies, .. } = self {
             Some(dependencies)
@@ -70,17 +73,21 @@ pub enum DeliverableState<B: super::Backend> {
     Pending,
     /// A task has been started to construct this deliverable.
     InProgress(AbortHandle),
-    /// The task is complete.
+    /// The task is complete, and the contained output [B::Artifact] can be used.
     Complete(B::Artifact),
 }
 
-/// A unit of action that results in some artifact stored somewhere.
+/// A unit of work: Something that needs to be built, fetched, or materialized,
+///
+/// This is the core unit of action within the orchestration system. See [DeliverableInner] for
+/// the different kinds of work a deliverable can be.
 #[derive(Debug)]
 pub struct Deliverable<B: super::Backend> {
     pub inner: DeliverableInner,
     pub state: DeliverableState<B>,
 }
 
+/// A wrapper type for all the underlying storage within a [State] object.
 #[derive(Debug)]
 pub(crate) struct StateInner<B: super::Backend> {
     pub(crate) deliverables: Arena<Deliverable<B>>,
@@ -205,11 +212,15 @@ impl<B: super::Backend> StateHandle<B> {
         self.0.lock().await.s.runnable().map(|(r, _d)| r).collect()
     }
     /// Takes the lock, allowing mutable access to [State].
+    ///
+    /// Drop the result as quickly as possible to yield the lock for other async tasks.
     pub async fn lock(&self) -> MutexGuard<'_, State<B>> {
         self.0.lock().await
     }
 
     /// Takes the lock, allowing mutable access to the given [Deliverable] under [State].
+    ///
+    /// Drop the result as quickly as possible to yield the lock for other async tasks.
     pub async fn lock_for_deliverable(
         &self,
         dr: &DeliverableRef,
@@ -217,13 +228,16 @@ impl<B: super::Backend> StateHandle<B> {
         MutexGuard::map(self.0.lock().await, |s| s.get_mut(dr).unwrap())
     }
 
+    /// If there is only one remaining instance of [State], it unwraps the mutex and arc to
+    /// return that instance.
     pub fn into_inner(self) -> Option<State<B>> {
         Arc::into_inner(self.0).map(Mutex::into_inner)
     }
 }
 
+/// The runtime state of an orchestration, notably storing [Deliverable]'s (the units of work).
 #[derive(Debug)]
-pub struct State<B: super::Backend> {
+pub(crate) struct State<B: super::Backend> {
     pub(crate) s: StateInner<B>,
 }
 
@@ -481,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn next_pending() {
+    fn runnable() {
         let layer = Layer::new_for_test(
             indoc! {
                 "
@@ -517,15 +531,15 @@ mod tests {
         // runnable() should yield the build with no deps, but once
         // thats done, it can yield the one that depends on that one.
         assert_eq!(
-            state.runnable().next().map(|r| r.0),
-            Some(
+            state.runnable().map(|r| r.0).collect::<Vec<_>>(),
+            vec![
                 *state
                     .s
                     .get_built(dp.by_name("no deps").unwrap())
                     .unwrap()
                     .first()
                     .unwrap(),
-            )
+            ]
         );
         state
             .s
@@ -541,15 +555,31 @@ mod tests {
             .unwrap()
             .state = DeliverableState::Complete(());
         assert_eq!(
-            state.runnable().next().map(|r| r.0),
-            Some(
+            state.runnable().map(|r| r.0).collect::<Vec<_>>(),
+            vec![
                 *state
                     .s
                     .get_built(dp.by_name("top").unwrap())
                     .unwrap()
                     .first()
                     .unwrap(),
-            )
+            ]
         );
+
+        // Make sure done() works while we are at it.
+        state
+            .s
+            .get_mut(
+                state
+                    .s
+                    .get_built(dp.by_name("top").unwrap())
+                    .cloned()
+                    .unwrap()
+                    .first()
+                    .unwrap(),
+            )
+            .unwrap()
+            .state = DeliverableState::Complete(());
+        assert_eq!(state.done(), true);
     }
 }
