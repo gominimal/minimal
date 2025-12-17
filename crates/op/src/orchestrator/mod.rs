@@ -185,7 +185,7 @@ impl<B: Backend> Orchestrator<B> {
                                 e
                             );
                             pending.abort_all();
-                            break;
+                            return Err(e);
                         }
                     },
                     Err(e) => {
@@ -195,7 +195,7 @@ impl<B: Backend> Orchestrator<B> {
                             tracing::error!("execution for a deliverable panicked! {}", e);
                         }
                         pending.abort_all();
-                        break;
+                        return Err(Error::Other(e.into()));
                     }
                 }
             }
@@ -212,6 +212,8 @@ impl<B: Backend> Orchestrator<B> {
                             state.lock_for_deliverable(&dr).await.inner,
                             e
                         );
+                        pending.abort_all();
+                        return Err(e);
                     }
                 },
                 Err(e) => {
@@ -220,6 +222,8 @@ impl<B: Backend> Orchestrator<B> {
                     } else {
                         tracing::error!("execution for a deliverable panicked! {}", e);
                     }
+                    pending.abort_all();
+                    return Err(Error::Other(e.into()));
                 }
             }
         }
