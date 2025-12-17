@@ -276,7 +276,10 @@ impl<B: Backend> OrchestratedBuild<B> {
         )
         .await
         .map_err(|e| (d, e))?;
-        self.state_hnd.lock_for_deliverable(&d).await.state = DeliverableState::Complete(r);
+
+        let mut d = self.state_hnd.lock_for_deliverable(&d).await;
+        d.state = DeliverableState::Complete(r);
+        drop(d);
         Ok(())
     }
 }
@@ -303,7 +306,10 @@ impl<B: Backend> OrchestratedCacheFill<B> {
         )
         .await
         .map_err(|e| (d, e))?;
-        self.state_hnd.lock_for_deliverable(&d).await.state = DeliverableState::Complete(r);
+
+        let mut d = self.state_hnd.lock_for_deliverable(&d).await;
+        d.state = DeliverableState::Complete(r);
+        drop(d);
         Ok(())
     }
 }
@@ -332,7 +338,10 @@ impl<B: Backend> OrchestratedSubset<B> {
         )
         .await
         .map_err(|e| (d, e))?;
-        self.state_hnd.lock_for_deliverable(&d).await.state = DeliverableState::Complete(r);
+
+        let mut d = self.state_hnd.lock_for_deliverable(&d).await;
+        d.state = DeliverableState::Complete(r);
+        drop(d);
         Ok(())
     }
 }
