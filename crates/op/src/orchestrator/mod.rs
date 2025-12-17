@@ -13,7 +13,7 @@ use either::Either;
 use google_cloud_storage::client::Storage as GcsStorage;
 use graph::{BinProvider, BuildSpecRef, DepGraph, ExecPlan, SubsetInput};
 use tokio::{
-    sync::{RwLock, RwLockReadGuard},
+    sync::{RwLock, RwLockReadGuard, Semaphore},
     task::{JoinSet, yield_now},
 };
 
@@ -70,6 +70,7 @@ impl<SF: SourceFetcher> Orchestrator<traits::LocalBackend<SF>> {
         output_base: PathBuf,
         remote_cache: Option<RemoteCache<GcsStorage>>,
         sf: SF,
+        num_concurrent_builds: usize,
     ) -> Result<Self, crate::Error> {
         Ok(Self {
             top_levels,
@@ -77,6 +78,7 @@ impl<SF: SourceFetcher> Orchestrator<traits::LocalBackend<SF>> {
                 output_base,
                 remote_cache,
                 sf,
+                build_semaphore: Semaphore::new(num_concurrent_builds),
             },
         })
     }

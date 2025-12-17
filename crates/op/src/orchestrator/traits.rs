@@ -5,6 +5,7 @@ use common::SpecHash;
 use either::Either;
 use google_cloud_storage::client::Storage as GcsStorage;
 use graph::{BuildSpecRef, SubsetInput};
+use tokio::sync::Semaphore;
 
 use super::state::{Deliverable, DeliverableRef, DeliverableState};
 use super::{SharedHandle, StateHandle};
@@ -107,6 +108,7 @@ pub struct LocalBackend<SF: crate::SourceFetcher + 'static> {
     pub(crate) sf: SF,
     pub(crate) output_base: PathBuf,
     pub(crate) remote_cache: Option<RemoteCache<GcsStorage>>,
+    pub(crate) build_semaphore: Semaphore,
 }
 
 impl Artifact for (PendingDir, EntryMeta) {}
@@ -153,6 +155,7 @@ impl<SF: crate::SourceFetcher> Backend for LocalBackend<SF> {
         };
 
         let shared = shared_hnd.0.read().await;
+        let permit = shared.backend.build_semaphore.acquire().await.unwrap();
         let mut b = crate::SpecBuild {
             override_deps: Some(dep_paths.into_iter().collect()),
             spec: &bsr,
@@ -165,6 +168,7 @@ impl<SF: crate::SourceFetcher> Backend for LocalBackend<SF> {
                 exec_base: shared.backend.output_base.clone(),
             })
             .await?;
+        drop(permit);
         let build = shared.graph.get(&bsr).unwrap();
 
         Ok(Either::Left((
