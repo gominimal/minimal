@@ -15,7 +15,6 @@ use uuid::Uuid;
 
 mod paths;
 use paths::PathConfig;
-mod run;
 
 mod cmd_build;
 use cmd_build::{BuildArgs, cmd_build};

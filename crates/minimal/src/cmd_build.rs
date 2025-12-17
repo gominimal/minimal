@@ -1,11 +1,11 @@
-use crate::{Context, Error, PackagesArg, run::Run};
+use crate::{Context, Error, PackagesArg};
 use anyhow::Context as _;
 use build_events::events::{
     BuildEvent, BuildFinished, BuildMetadata, BuildStarted, build_event, current_millis,
 };
 use cache::{Cache, CacheBinProvider, LocalDir, RemoteBinProvider};
-use common::RemoteStorage;
-use graph::{DepGraph, ExecPlan, Transitives};
+use graph::DepGraph;
+use op::orchestrator::Orchestrator;
 use std::collections::HashMap;
 use std::process::Command;
 use tracing::info;
@@ -38,15 +38,6 @@ pub async fn cmd_build_impl(
 
     let output_base = ctx.paths().sandbox_base_dir().to_path_buf();
     std::fs::create_dir_all(&output_base).ok();
-
-    let mut run = Run::new(
-        graph,
-        cache.clone(),
-        RemoteStorage::new(ctx.paths().download_cache_dir().to_path_buf(), false)
-            .await
-            .unwrap(),
-        output_base,
-    );
 
     // Get command for BuildStarted event (skip binary path at index 0)
     let args: Vec<String> = std::env::args().collect();
@@ -119,41 +110,55 @@ pub async fn cmd_build_impl(
         });
     }
 
-    let build_success = match (ctx.no_cache, ctx.no_fetch) {
+    let orchestrator = Orchestrator::new_for_local_build(
+        graph.top_levels.clone(),
+        output_base,
+        if ctx.no_fetch {
+            None
+        } else {
+            Some(ctx.remote_cache(false).await.unwrap())
+        },
+        common::RemoteStorage::new(ctx.paths().download_cache_dir().to_path_buf(), false)
+            .await
+            .unwrap(),
+    )?;
+
+    let run_result = match (ctx.no_cache, ctx.no_fetch) {
         // No local or remote cache
-        (true, true) => run.execute(ExecPlan::new(graph), None).await,
+        (true, true) => orchestrator.run((), graph.clone(), cache.clone()).await,
         // Both caches
         (false, false) => {
             let local_adapter = CacheBinProvider::new(graph, cache.clone());
             let remote_cache = ctx.remote_cache(false).await.unwrap();
             let remote_adapter = RemoteBinProvider::new(graph, &remote_cache);
-            run.execute(
-                ExecPlan::new_with_bin_provider(graph, (local_adapter, remote_adapter)),
-                Some(&remote_cache),
-            )
-            .await
+            orchestrator
+                .run(
+                    (local_adapter, remote_adapter),
+                    graph.clone(),
+                    cache.clone(),
+                )
+                .await
         }
         // Only remote cache
         (true, false) => {
             let remote_cache = ctx.remote_cache(false).await.unwrap();
             let remote_adapter = RemoteBinProvider::new(graph, &remote_cache);
-            run.execute(
-                ExecPlan::new_with_bin_provider(graph, remote_adapter),
-                Some(&remote_cache),
-            )
-            .await
+            orchestrator
+                .run(remote_adapter, graph.clone(), cache.clone())
+                .await
         }
         // Only local cache
         (false, true) => {
             let local_adapter = CacheBinProvider::new(graph, cache.clone());
-            run.execute(ExecPlan::new_with_bin_provider(graph, local_adapter), None)
+            orchestrator
+                .run(local_adapter, graph.clone(), cache.clone())
                 .await
         }
     };
 
     // Determine if build was successful
-    let build_succeeded = build_success.is_ok();
-    let error_message = build_success.as_ref().err().map(|e| e.to_string());
+    let build_succeeded = run_result.is_ok();
+    let error_message = run_result.as_ref().err().map(|e| e.to_string());
 
     // Emit BuildFinished event using global event bus
     build_events::event_bus().emit(BuildEvent {
@@ -164,74 +169,19 @@ pub async fn cmd_build_impl(
         })),
     });
 
-    // Propagate error if build failed
-    build_success.context("Failed to execute build")?;
-
-    // If we got this far, everything we need is either fetchable or built.
-    //
-    // There could still be stuff thats fetchable but not in the local cache. We
-    // can materialize that locally now.
-    if !ctx.no_fetch {
-        let mut needs_materialize: Vec<_> =
-            Transitives::for_toplevels(graph, graph.top_levels.to_vec(), false)
-                .into_keys()
-                .filter_map(|bsr| {
-                    // Filter runtime_deps that are in the local cache
-                    cache
-                        .read_dir(&graph.spec_hash(&bsr))
-                        .map(|_| None)
-                        .unwrap_or(Some(bsr))
-                })
-                .collect();
-        needs_materialize.sort();
-        needs_materialize.dedup();
-
-        if !needs_materialize.is_empty() {
-            let remote_cache = ctx.remote_cache(false).await.unwrap();
-            let tokio_runtime = tokio::runtime::Handle::current();
-            rayon::scope(|s| {
-                let remote_cache = &remote_cache;
-                let cache = &cache;
-                for bsr in needs_materialize.into_iter() {
-                    let tokio_runtime = tokio_runtime.clone();
-
-                    s.spawn(move |_| {
-                        let _rt = tokio_runtime.enter();
-                        let build = graph.get(&bsr).unwrap();
-                        let (name, origin) = (&build.name, &build.from);
-
-                        let (fetch_time, pending_dir) = futures::executor::block_on(
-                            remote_cache.materialize(&graph.spec_hash(&bsr), cache, name.as_str()),
-                        )
-                        .unwrap();
-                        pending_dir
-                            .finalize(cache::EntryMeta {
-                                inner: cache::MetaInner::Spec(name.clone()),
-                                origin: Some(origin.as_ref().clone()),
-                                fetched: true,
-                                fetch_ms: Some(fetch_time.as_millis() as usize),
-                                ..Default::default()
-                            })
-                            .unwrap();
-                    });
-                }
-            });
-        }
+    // Propagate error if build failed, and commit all artifacts to the local cache
+    for (pending_dir, meta) in run_result.context("Failed to execute build")? {
+        pending_dir.finalize(meta)?;
     }
 
     // Display build summary
-    display_build_summary(graph, &cache, ctx, &run);
+    display_build_summary(graph, &cache, ctx);
 
     Ok(())
 }
 
 /// Display a summary of what was built and where outputs can be found
-fn display_build_summary(
-    graph: &DepGraph,
-    cache: &Cache<LocalDir>,
-    _ctx: &mut Context,
-    _run: &Run,
-) {
+fn display_build_summary(graph: &DepGraph, cache: &Cache<LocalDir>, _ctx: &mut Context) {
     info!("Build completed successfully!");
 
     // Show target packages and their cache locations

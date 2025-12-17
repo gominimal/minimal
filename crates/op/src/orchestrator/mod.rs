@@ -7,11 +7,11 @@
 use std::{path::PathBuf, sync::Arc};
 
 use crate::{Error, SourceFetcher};
-use cache::{Cache, LocalDir, PendingDir, RemoteCache};
+use cache::{Cache, EntryMeta, LocalDir, PendingDir, RemoteCache};
 use common::SpecHash;
 use either::Either;
 use google_cloud_storage::client::Storage as GcsStorage;
-use graph::{BuildSpecRef, DepGraph, ExecPlan, SubsetInput};
+use graph::{BinProvider, BuildSpecRef, DepGraph, ExecPlan, SubsetInput};
 use tokio::{
     sync::{RwLock, RwLockReadGuard},
     task::JoinSet,
@@ -21,7 +21,7 @@ mod state;
 use state::{DeliverableRef, DeliverableState, State, StateHandle};
 
 mod traits;
-pub(crate) use traits::Backend;
+pub use traits::Backend;
 
 /// The shared state used heavily everywhere.
 ///
@@ -36,7 +36,7 @@ pub(crate) struct Shared<B: Backend> {
 
 /// An async / task-friendly wrapper around state used everywhere.
 #[derive(Debug)]
-pub(crate) struct SharedHandle<B: Backend>(Arc<RwLock<Shared<B>>>);
+pub struct SharedHandle<B: Backend>(Arc<RwLock<Shared<B>>>);
 
 impl<B: Backend> Clone for SharedHandle<B> {
     fn clone(&self) -> Self {
@@ -81,22 +81,27 @@ impl<SF: SourceFetcher> Orchestrator<traits::LocalBackend<SF>> {
         })
     }
     /// Executes the local build.
-    pub async fn run(
+    pub async fn run<BP: BinProvider>(
         self,
+        bp: BP,
         graph: DepGraph,
         cache: Cache<LocalDir>,
-    ) -> Result<Vec<PendingDir>, crate::Error> {
+    ) -> Result<Vec<(PendingDir, EntryMeta)>, crate::Error> {
         let shared = Shared {
             graph,
             cache,
             backend: self.backend,
         };
+        let state = State::from_plan(
+            &shared.graph,
+            ExecPlan::with_toplevels(bp, &shared.graph, &self.top_levels),
+        )?;
 
-        Ok(Self::run_impl(&self.top_levels, shared)
+        Ok(Self::run_impl(state, shared)
             .await?
             .into_iter()
             .filter_map(|a| match a {
-                Either::Left(pd) => Some(pd),
+                Either::Left((pd, meta)) => Some((pd, meta)),
                 Either::Right(_cache_dir) => None,
             })
             .collect())
@@ -105,14 +110,10 @@ impl<SF: SourceFetcher> Orchestrator<traits::LocalBackend<SF>> {
 
 impl<B: Backend> Orchestrator<B> {
     async fn run_impl(
-        top_levels: &[BuildSpecRef],
+        state: State<B>,
         shared: Shared<B>,
     ) -> Result<Vec<B::Artifact>, crate::Error> {
-        let state = State::<B>::from_plan(
-            &shared.graph,
-            ExecPlan::with_toplevels((), &shared.graph, top_levels),
-        )?
-        .into_handle();
+        let state = state.into_handle();
         let shared_hnd = SharedHandle::new(shared);
 
         let mut pending: JoinSet<Result<(), Error>> = JoinSet::new();
@@ -173,13 +174,41 @@ impl<B: Backend> Orchestrator<B> {
                 drop(deliverable);
             }
 
-            while let Some(task_result) = pending.join_next().await {
-                println!("task joined: {:?}", task_result);
+            if let Some(task_result) = pending.join_next().await {
+                match task_result {
+                    Ok(r) => match r {
+                        Ok(()) => {}
+                        Err(e) => {
+                            tracing::error!("deliverable construction failed: {}", e);
+                        }
+                    },
+                    Err(e) => {
+                        if e.is_cancelled() {
+                            tracing::warn!("execution for a deliverable was cancelled: {}", e);
+                        } else {
+                            tracing::error!("execution for a deliverable panicked! {}", e);
+                        }
+                    }
+                }
             }
         }
 
         while let Some(task_result) = pending.join_next().await {
-            println!("task joined: {:?}", task_result);
+            match task_result {
+                Ok(r) => match r {
+                    Ok(()) => {}
+                    Err(e) => {
+                        tracing::error!("deliverable construction failed: {}", e);
+                    }
+                },
+                Err(e) => {
+                    if e.is_cancelled() {
+                        tracing::warn!("execution for a deliverable was cancelled: {}", e);
+                    } else {
+                        tracing::error!("execution for a deliverable panicked! {}", e);
+                    }
+                }
+            }
         }
 
         Ok(state

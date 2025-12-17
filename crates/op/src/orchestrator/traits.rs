@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use cache::{CacheErr, DirCacheEntry, LocalDir, PendingDir, RemoteCache};
+use cache::{CacheErr, DirCacheEntry, EntryMeta, LocalDir, MetaInner, PendingDir, RemoteCache};
 use common::SpecHash;
 use either::Either;
 use google_cloud_storage::client::Storage as GcsStorage;
@@ -8,11 +8,12 @@ use graph::{BuildSpecRef, SubsetInput};
 
 use super::state::{Deliverable, DeliverableRef, DeliverableState};
 use super::{SharedHandle, StateHandle};
+use crate::orchestrator::state::DeliverableInner;
 use crate::{Error, Runnable};
 
 /// A structure describing a constructed deliverable. For instance, this might
 /// be a PendingDir for local builds.
-pub(crate) trait Artifact: std::fmt::Debug + Send {}
+pub trait Artifact: std::fmt::Debug + Send {}
 
 impl<A: Artifact, B: Artifact> Artifact for Either<A, B> {}
 
@@ -20,7 +21,7 @@ impl<A: Artifact, B: Artifact> Artifact for Either<A, B> {}
 impl Artifact for () {}
 
 /// An implementation of the core functions needed by the orchestrator.
-pub(crate) trait Backend: Sized + Send + Sync + std::fmt::Debug + 'static {
+pub trait Backend: Sized + Send + Sync + std::fmt::Debug + 'static {
     /// Describes a constructed deliverable.
     type Artifact: Artifact;
 
@@ -108,14 +109,14 @@ pub struct LocalBackend<SF: crate::SourceFetcher + 'static> {
     pub(crate) remote_cache: Option<RemoteCache<GcsStorage>>,
 }
 
-impl Artifact for PendingDir {}
+impl Artifact for (PendingDir, EntryMeta) {}
 impl Artifact for DirCacheEntry<LocalDir> {}
 
 impl<SF: crate::SourceFetcher> Backend for LocalBackend<SF> {
-    type Artifact = Either<PendingDir, DirCacheEntry<LocalDir>>;
+    type Artifact = Either<(PendingDir, EntryMeta), DirCacheEntry<LocalDir>>;
 
     async fn build(
-        _dr: DeliverableRef,
+        dr: DeliverableRef,
         bsr: BuildSpecRef,
         _spec_hash: SpecHash,
         dependencies: Vec<DeliverableRef>,
@@ -131,7 +132,7 @@ impl<SF: crate::SourceFetcher> Backend for LocalBackend<SF> {
                         inner: _,
                         state: DeliverableState::Complete(a),
                     } => match a {
-                        Either::Left(pd) => pd.path().to_path_buf(),
+                        Either::Left((pd, _meta)) => pd.path().to_path_buf(),
                         Either::Right(c) => c.path().to_path_buf(),
                     },
                     _ => unreachable!(),
@@ -139,6 +140,16 @@ impl<SF: crate::SourceFetcher> Backend for LocalBackend<SF> {
                 .collect();
             drop(s);
             out
+        };
+
+        let breaker_build = {
+            if let DeliverableInner::Build { full_build, .. } =
+                &state_hnd.lock_for_deliverable(&dr).await.inner
+            {
+                !full_build
+            } else {
+                unreachable!()
+            }
         };
 
         let shared = shared_hnd.0.read().await;
@@ -154,9 +165,18 @@ impl<SF: crate::SourceFetcher> Backend for LocalBackend<SF> {
                 exec_base: shared.backend.output_base.clone(),
             })
             .await?;
-        drop(shared);
+        let build = shared.graph.get(&bsr).unwrap();
 
-        Ok(Either::Left(artifact.outputs))
+        Ok(Either::Left((
+            artifact.outputs,
+            EntryMeta {
+                breaker_build,
+                inner: MetaInner::Spec(build.name.clone()),
+                origin: Some(build.from.as_ref().clone()),
+                build_ms: Some(artifact.build_ms),
+                ..Default::default()
+            },
+        )))
     }
 
     async fn cache_hydrate(
@@ -171,17 +191,24 @@ impl<SF: crate::SourceFetcher> Backend for LocalBackend<SF> {
             return Ok(Either::Right(cd));
         }
 
-        let build = shared_hnd.graph().await.get(&bsr).unwrap().clone();
-
         let shared = shared_hnd.0.read().await;
         if let Some(remote_cache) = shared.backend.remote_cache.as_ref() {
-            let (_fetch_time, pending_dir) = remote_cache
+            let build = shared.graph.get(&bsr).unwrap();
+            let (fetch_time, pending_dir) = remote_cache
                 .materialize(&spec_hash, &shared.cache, build.name.as_str())
                 .await
                 .map_err(|e| Error::Other(e.into()))?;
-            drop(shared);
 
-            Ok(Either::Left(pending_dir))
+            Ok(Either::Left((
+                pending_dir,
+                EntryMeta {
+                    inner: MetaInner::Spec(build.name.clone()),
+                    fetched: true,
+                    fetch_ms: Some(fetch_time.as_millis() as usize),
+                    origin: Some(build.from.as_ref().clone()),
+                    ..Default::default()
+                },
+            )))
         } else {
             Err(Error::Cache(CacheErr::NotFound))
         }
@@ -195,18 +222,27 @@ impl<SF: crate::SourceFetcher> Backend for LocalBackend<SF> {
         shared_hnd: &mut SharedHandle<Self>,
         state_hnd: &mut StateHandle<Self>,
     ) -> Result<Self::Artifact, Error> {
-        let build_dir = if let DeliverableState::Complete(ref a) =
-            state_hnd.lock_for_deliverable(&build).await.state
-        {
-            match a {
-                Either::Left(a) => a.path().to_path_buf(),
-                Either::Right(a) => a.path().to_path_buf(),
-            }
-        } else {
-            return Err(Error::Cache(CacheErr::NotFound));
+        let (build_dir, build_bsr) = {
+            let deliverable = state_hnd.lock_for_deliverable(&build).await;
+            (
+                if let DeliverableState::Complete(ref a) = deliverable.state {
+                    match a {
+                        Either::Left((pd, _meta)) => pd.path().to_path_buf(),
+                        Either::Right(cd) => cd.path().to_path_buf(),
+                    }
+                } else {
+                    return Err(Error::Cache(CacheErr::NotFound));
+                },
+                match deliverable.inner {
+                    DeliverableInner::Build { bsr, .. } => bsr,
+                    DeliverableInner::CacheFill { bsr, .. } => bsr,
+                    _ => unreachable!(),
+                },
+            )
         };
 
         let shared = shared_hnd.0.read().await;
+        let build = shared.graph.get(&build_bsr).unwrap();
         let pending_dir = crate::SubsetBuild {
             from_dir: Some(build_dir),
             subset: &subset,
@@ -218,6 +254,13 @@ impl<SF: crate::SourceFetcher> Backend for LocalBackend<SF> {
         })
         .await?;
 
-        Ok(Either::Left(pending_dir))
+        Ok(Either::Left((
+            pending_dir,
+            EntryMeta {
+                inner: MetaInner::Subset(subset.as_spec(&shared.graph)),
+                origin: Some(build.from.as_ref().clone()),
+                ..Default::default()
+            },
+        )))
     }
 }

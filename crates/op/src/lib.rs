@@ -51,4 +51,4 @@ mod oci_image;
 pub use oci_image::OciImageCreate;
 
 #[allow(dead_code)]
-mod orchestrator;
+pub mod orchestrator;
