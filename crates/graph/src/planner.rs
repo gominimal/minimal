@@ -538,6 +538,16 @@ pub enum PlanErr {
     Cycles(Vec<Vec<BuildSpecRef>>),
 }
 
+impl std::fmt::Display for PlanErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PlanErr::Cycles(c) => write!(f, "PlanErr::Cycles({:?})", c),
+        }
+    }
+}
+
+impl std::error::Error for PlanErr {}
+
 /// Describes a build which should be performed using a given set of dependencies as part of a build plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Build {

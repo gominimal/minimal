@@ -3,14 +3,18 @@
 use std::fmt;
 
 use cache::CacheErr;
+use graph::{DepGraph, PlanErr};
 
 /// Error type for the op crate.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Error {
     /// An I/O error occurred.
     IO(std::io::Error),
     /// An error interacting with the Cache occurred.
     Cache(CacheErr),
+    /// An error during planning occurred.
+    Plan(DepGraph, PlanErr),
     Other(anyhow::Error),
 }
 
@@ -49,6 +53,7 @@ impl fmt::Display for Error {
         match self {
             Error::IO(e) => write!(f, "i/o error: {}", e),
             Error::Cache(e) => write!(f, "cache error: {}", e),
+            Error::Plan(_, e) => write!(f, "plan error: {:?}", e),
             Error::Other(e) => write!(f, "other: {}", e),
         }
     }
@@ -59,6 +64,7 @@ impl std::error::Error for Error {
         match self {
             Error::IO(e) => Some(e),
             Error::Cache(e) => Some(e),
+            Error::Plan(_, e) => Some(e),
             _ => None,
         }
     }

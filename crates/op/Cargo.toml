@@ -12,8 +12,10 @@ smallvec.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+either.workspace = true
 flate2.workspace = true
 futures.workspace = true
+generational-arena.workspace = true
 globset.workspace = true
 hakoniwa.workspace = true
 oci-spec.workspace = true

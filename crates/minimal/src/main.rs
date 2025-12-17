@@ -438,6 +438,7 @@ impl From<op::Error> for Error {
             op::Error::IO(e) => Self::Other(e.into()),
             op::Error::Cache(e) => Self::Other(e.into()),
             op::Error::Other(e) => Self::Other(e),
+            op::Error::Plan(graph, e) => Self::PlanErr(graph, e),
         }
     }
 }
