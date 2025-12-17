@@ -121,6 +121,7 @@ pub async fn cmd_build_impl(
         common::RemoteStorage::new(ctx.paths().download_cache_dir().to_path_buf(), false)
             .await
             .unwrap(),
+        num_parallel_builds,
     )?;
 
     let run_result = match (ctx.no_cache, ctx.no_fetch) {
