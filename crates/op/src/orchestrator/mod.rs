@@ -1,7 +1,9 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
-use cache::{Cache, LocalDir};
+use cache::{Cache, DirCacheEntry, LocalDir, PendingDir, RemoteCache};
 use common::SpecHash;
+use either::Either;
+use google_cloud_storage::client::Storage as GcsStorage;
 use graph::{BuildSpecRef, DepGraph, ExecPlan, SubsetInput};
 use tokio::{
     sync::{RwLock, RwLockReadGuard},
@@ -14,19 +16,28 @@ use state::{DeliverableRef, DeliverableState, State, StateHandle};
 mod traits;
 use traits::Backend;
 
+use crate::{Error, SourceFetcher};
+
 /// The shared state used heavily everywhere.
 #[derive(Debug)]
-pub struct Shared {
+pub(crate) struct Shared<B: Backend> {
     graph: DepGraph,
     cache: Cache<LocalDir>,
+    backend: B,
 }
 
 /// An async / task-friendly wrapper around state used everywhere.
-#[derive(Debug, Clone)]
-struct SharedHandle(Arc<RwLock<Shared>>);
+#[derive(Debug)]
+pub(crate) struct SharedHandle<B: Backend>(Arc<RwLock<Shared<B>>>);
 
-impl SharedHandle {
-    fn new(shared: Shared) -> Self {
+impl<B: Backend> Clone for SharedHandle<B> {
+    fn clone(&self) -> Self {
+        SharedHandle(self.0.clone())
+    }
+}
+
+impl<B: Backend> SharedHandle<B> {
+    fn new(shared: Shared<B>) -> Self {
         Self(Arc::new(RwLock::new(shared)))
     }
 
@@ -41,16 +52,50 @@ pub struct Orchestrator<B: Backend> {
     pub backend: B,
 }
 
+impl<SF: SourceFetcher> Orchestrator<traits::LocalBackend<SF>> {
+    pub fn new_for_local_build(
+        top_levels: Vec<BuildSpecRef>,
+        output_base: PathBuf,
+        remote_cache: Option<RemoteCache<GcsStorage>>,
+        sf: SF,
+    ) -> Result<Self, crate::Error> {
+        Ok(Self {
+            top_levels,
+            backend: traits::LocalBackend::<SF> {
+                output_base,
+                remote_cache,
+                sf,
+            },
+        })
+    }
+    pub async fn run(
+        self,
+        graph: DepGraph,
+        cache: Cache<LocalDir>,
+    ) -> Result<Vec<Either<PendingDir, DirCacheEntry<LocalDir>>>, crate::Error> {
+        let shared = Shared {
+            graph,
+            cache,
+            backend: self.backend,
+        };
+
+        Self::run_impl(&self.top_levels, shared).await
+    }
+}
+
 impl<B: Backend> Orchestrator<B> {
-    async fn run(&mut self, shared: Shared) -> Result<(), crate::Error> {
+    async fn run_impl(
+        top_levels: &[BuildSpecRef],
+        shared: Shared<B>,
+    ) -> Result<Vec<B::Artifact>, crate::Error> {
         let state = State::<B>::from_plan(
             &shared.graph,
-            ExecPlan::with_toplevels((), &shared.graph, &self.top_levels),
+            ExecPlan::with_toplevels((), &shared.graph, top_levels),
         )?
         .into_handle();
         let shared_hnd = SharedHandle::new(shared);
 
-        let mut pending: JoinSet<()> = JoinSet::new();
+        let mut pending: JoinSet<Result<(), Error>> = JoinSet::new();
         while !state.done().await {
             // Spawn tasks for all runnables
             for dr in state.runnables().await.into_iter() {
@@ -113,13 +158,27 @@ impl<B: Backend> Orchestrator<B> {
             }
         }
 
-        pending.join_all().await;
-        todo!()
+        while let Some(task_result) = pending.join_next().await {
+            println!("task joined: {:?}", task_result);
+        }
+
+        Ok(state
+            .into_inner()
+            .unwrap()
+            .s
+            .deliverables
+            .into_iter()
+            .map(|d| match d.state {
+                DeliverableState::Complete(a) => a,
+                _ => unreachable!(),
+            })
+            .collect())
     }
 }
 
+/// Adapter encapsulating the state needed when calling out to the generic backend for a build.
 struct OrchestratedBuild<B: Backend> {
-    shared_hnd: SharedHandle,
+    shared_hnd: SharedHandle<B>,
     state_hnd: StateHandle<B>,
     deliverable: DeliverableRef,
 
@@ -129,13 +188,25 @@ struct OrchestratedBuild<B: Backend> {
 }
 
 impl<B: Backend> OrchestratedBuild<B> {
-    async fn run(self) -> () {
-        todo!()
+    async fn run(mut self) -> Result<(), Error> {
+        let d = self.deliverable;
+        let r = B::build(
+            d,
+            self.bsr,
+            self.spec_hash,
+            self.dependencies,
+            &mut self.shared_hnd,
+            &mut self.state_hnd,
+        )
+        .await?;
+        self.state_hnd.lock_for_deliverable(&d).await.state = DeliverableState::Complete(r);
+        Ok(())
     }
 }
 
+/// Adapter encapsulating the state needed when calling out to the generic backend for a cache fetch.
 struct OrchestratedCacheFill<B: Backend> {
-    shared_hnd: SharedHandle,
+    shared_hnd: SharedHandle<B>,
     state_hnd: StateHandle<B>,
     deliverable: DeliverableRef,
 
@@ -144,13 +215,24 @@ struct OrchestratedCacheFill<B: Backend> {
 }
 
 impl<B: Backend> OrchestratedCacheFill<B> {
-    async fn run(self) -> () {
-        todo!()
+    async fn run(mut self) -> Result<(), Error> {
+        let d = self.deliverable;
+        let r = B::cache_hydrate(
+            d,
+            self.bsr,
+            self.spec_hash,
+            &mut self.shared_hnd,
+            &mut self.state_hnd,
+        )
+        .await?;
+        self.state_hnd.lock_for_deliverable(&d).await.state = DeliverableState::Complete(r);
+        Ok(())
     }
 }
 
+/// Adapter encapsulating the state needed when calling out to the generic backend for materializing a subset.
 struct OrchestratedSubset<B: Backend> {
-    shared_hnd: SharedHandle,
+    shared_hnd: SharedHandle<B>,
     state_hnd: StateHandle<B>,
     deliverable: DeliverableRef,
 
@@ -160,7 +242,18 @@ struct OrchestratedSubset<B: Backend> {
 }
 
 impl<B: Backend> OrchestratedSubset<B> {
-    async fn run(self) -> () {
-        todo!()
+    async fn run(mut self) -> Result<(), Error> {
+        let d = self.deliverable;
+        let r = B::materialize_subset(
+            d,
+            self.subset,
+            self.build,
+            self.spec_hash,
+            &mut self.shared_hnd,
+            &mut self.state_hnd,
+        )
+        .await?;
+        self.state_hnd.lock_for_deliverable(&d).await.state = DeliverableState::Complete(r);
+        Ok(())
     }
 }

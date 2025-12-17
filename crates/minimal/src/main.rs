@@ -15,7 +15,6 @@ use uuid::Uuid;
 
 mod paths;
 use paths::PathConfig;
-mod remote_storage;
 mod run;
 
 mod cmd_build;

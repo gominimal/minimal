@@ -52,6 +52,16 @@ pub enum DeliverableInner {
     },
 }
 
+impl DeliverableInner {
+    pub fn build_deps(&self) -> Option<&Vec<DeliverableRef>> {
+        if let DeliverableInner::Build { dependencies, .. } = self {
+            Some(dependencies)
+        } else {
+            None
+        }
+    }
+}
+
 /// The runtime/action state regarding the creation of a [Deliverable].
 #[derive(Debug, Default)]
 pub enum DeliverableState<B: super::Backend> {
@@ -72,8 +82,8 @@ pub struct Deliverable<B: super::Backend> {
 }
 
 #[derive(Debug)]
-struct StateInner<B: super::Backend> {
-    deliverables: Arena<Deliverable<B>>,
+pub(crate) struct StateInner<B: super::Backend> {
+    pub(crate) deliverables: Arena<Deliverable<B>>,
     fills_by_ref: HashMap<BuildSpecRef, DeliverableRef>,
     builds_by_ref: HashMap<BuildSpecRef, Vec<DeliverableRef>>,
     subsets_by_ref: HashMap<SubsetInput, DeliverableRef>,
@@ -206,11 +216,15 @@ impl<B: super::Backend> StateHandle<B> {
     ) -> MappedMutexGuard<'_, Deliverable<B>> {
         MutexGuard::map(self.0.lock().await, |s| s.get_mut(dr).unwrap())
     }
+
+    pub fn into_inner(self) -> Option<State<B>> {
+        Arc::into_inner(self.0).map(Mutex::into_inner)
+    }
 }
 
 #[derive(Debug)]
 pub struct State<B: super::Backend> {
-    s: StateInner<B>,
+    pub(crate) s: StateInner<B>,
 }
 
 impl<B: super::Backend> State<B> {

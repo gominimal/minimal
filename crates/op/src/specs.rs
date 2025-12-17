@@ -100,7 +100,10 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                         match opts.cache.read_dir(&subset_hash) {
                             Ok(cache_dir) => cache_dir,
                             Err(CacheErr::NotFound) => {
-                                let mut sb = SubsetBuild { subset: &subset };
+                                let mut sb = SubsetBuild {
+                                    subset: &subset,
+                                    from_dir: None,
+                                };
                                 let pending_dir = sb.run(opts).await?;
                                 pending_dir.finalize(cache::EntryMeta {
                                     inner: MetaInner::Subset(subset.as_spec(opts.graph)),

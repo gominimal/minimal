@@ -1,7 +1,7 @@
+use crate::fetchers::{GcsUrl, ReqwestUrl};
+use crate::file_cache;
+use crate::file_cache::CachingDownloader;
 use anyhow::Result;
-use common::fetchers::{GcsUrl, ReqwestUrl};
-use common::file_cache;
-use common::file_cache::CachingDownloader;
 use google_cloud_storage::client::Storage;
 
 use std::fs::File;
@@ -77,22 +77,5 @@ impl RemoteStorage {
             .await?;
 
         Ok(())
-    }
-}
-
-impl op::SourceFetcher for RemoteStorage {
-    async fn download_https(&self, url: &str, sha256: &str) -> Result<PathBuf, anyhow::Error> {
-        self.download_https_with_verification_and_caching(url, sha256)
-            .await
-    }
-
-    async fn download_gcs(
-        &self,
-        bucket_id: String,
-        file: &str,
-        sha256: &str,
-    ) -> Result<PathBuf, anyhow::Error> {
-        self.download_with_verification_and_caching(bucket_id, file, sha256)
-            .await
     }
 }

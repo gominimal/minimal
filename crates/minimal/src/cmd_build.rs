@@ -1,10 +1,10 @@
-use crate::{Context, PackagesArg};
-use crate::{Error, remote_storage::RemoteStorage, run::Run};
+use crate::{Context, Error, PackagesArg, run::Run};
 use anyhow::Context as _;
 use build_events::events::{
     BuildEvent, BuildFinished, BuildMetadata, BuildStarted, build_event, current_millis,
 };
 use cache::{Cache, CacheBinProvider, LocalDir, RemoteBinProvider};
+use common::RemoteStorage;
 use graph::{DepGraph, ExecPlan, Transitives};
 use std::collections::HashMap;
 use std::process::Command;
@@ -200,14 +200,19 @@ pub async fn cmd_build_impl(
                         let build = graph.get(&bsr).unwrap();
                         let (name, origin) = (&build.name, &build.from);
 
-                        futures::executor::block_on(remote_cache.materialize(
-                            &graph.spec_hash(&bsr),
-                            cache::MetaInner::Spec(name.clone()),
-                            Some(origin.as_ref().clone()),
-                            cache,
-                            name.as_str(),
-                        ))
+                        let (fetch_time, pending_dir) = futures::executor::block_on(
+                            remote_cache.materialize(&graph.spec_hash(&bsr), cache, name.as_str()),
+                        )
                         .unwrap();
+                        pending_dir
+                            .finalize(cache::EntryMeta {
+                                inner: cache::MetaInner::Spec(name.clone()),
+                                origin: Some(origin.as_ref().clone()),
+                                fetched: true,
+                                fetch_ms: Some(fetch_time.as_millis() as usize),
+                                ..Default::default()
+                            })
+                            .unwrap();
                     });
                 }
             });
