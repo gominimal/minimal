@@ -1,4 +1,5 @@
 //! Implements operations using the minimal graph, such as builds or constructing cache objects.
+#![allow(clippy::result_large_err)]
 
 use std::path::PathBuf;
 
@@ -48,3 +49,6 @@ pub use specs::{SpecBuild, SpecBuildResult};
 
 mod oci_image;
 pub use oci_image::OciImageCreate;
+
+#[allow(dead_code)]
+mod orchestrator;

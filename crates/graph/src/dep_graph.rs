@@ -12,7 +12,7 @@ use nickel_lang_core::term::IndexMap;
 use generational_arena::Arena;
 use smallvec::SmallVec;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -63,7 +63,7 @@ impl From<builds::SourceInput> for SourceInput {
 }
 
 /// A dependency on some of the outputs of a build-spec.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SubsetInput {
     pub from: BuildSpecRef,
     pub outputs: SmallVec<[String; 4]>,
@@ -87,6 +87,16 @@ impl SubsetInput {
             from: loader.load(&si.from)?,
             outputs: si.outputs.clone(),
         })
+    }
+}
+
+impl From<(BuildSpecRef, HashSet<String>)> for SubsetInput {
+    fn from(value: (BuildSpecRef, HashSet<String>)) -> Self {
+        let (from, outputs) = value;
+        let mut outputs: SmallVec<[String; 4]> = outputs.into_iter().collect();
+        outputs.sort();
+        outputs.dedup();
+        Self { from, outputs }
     }
 }
 
@@ -366,7 +376,7 @@ impl SourceProvider for checkouts::Manager {
 }
 
 /// The dependency graph.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct DepGraph {
     /// All the build-specs known to this dependency graph.
