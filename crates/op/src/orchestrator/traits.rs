@@ -6,6 +6,7 @@ use either::Either;
 use google_cloud_storage::client::Storage as GcsStorage;
 use graph::{BuildSpecRef, SubsetInput};
 use tokio::sync::Semaphore;
+use tokio::task::spawn_blocking;
 
 use super::state::{Deliverable, DeliverableRef, DeliverableState};
 use super::{SharedHandle, StateHandle};
@@ -144,43 +145,56 @@ impl<SF: crate::SourceFetcher> Backend for LocalBackend<SF> {
             out
         };
 
-        let breaker_build = {
-            if let DeliverableInner::Build { full_build, .. } =
-                &state_hnd.lock_for_deliverable(&dr).await.inner
-            {
-                !full_build
-            } else {
-                unreachable!()
-            }
-        };
+        let shared_hnd2 = shared_hnd.clone();
+        let artifact = spawn_blocking(async move || {
+            let shared = shared_hnd2.0.read().await;
+            let permit = shared.backend.build_semaphore.acquire().await.unwrap();
+            let mut b = crate::SpecBuild {
+                override_deps: Some(dep_paths.into_iter().collect()),
+                spec: &bsr,
+                remote_fetcher: &shared.backend.sf,
+            };
 
-        let shared = shared_hnd.0.read().await;
-        let permit = shared.backend.build_semaphore.acquire().await.unwrap();
-        let mut b = crate::SpecBuild {
-            override_deps: Some(dep_paths.into_iter().collect()),
-            spec: &bsr,
-            remote_fetcher: &shared.backend.sf,
-        };
-        let artifact = b
-            .run(&crate::Options {
-                cache: shared.cache.clone(),
-                graph: &shared.graph,
-                exec_base: shared.backend.output_base.clone(),
-            })
-            .await?;
-        drop(permit);
-        let build = shared.graph.get(&bsr).unwrap();
+            let res = b
+                .run(&crate::Options {
+                    cache: shared.cache.clone(),
+                    graph: &shared.graph,
+                    exec_base: shared.backend.output_base.clone(),
+                })
+                .await;
+            drop(permit);
+            drop(shared);
+            res
+        })
+        .await
+        .unwrap()
+        .await?;
 
-        Ok(Either::Left((
-            artifact.outputs,
-            EntryMeta {
-                breaker_build,
-                inner: MetaInner::Spec(build.name.clone()),
-                origin: Some(build.from.as_ref().clone()),
-                build_ms: Some(artifact.build_ms),
-                ..Default::default()
-            },
-        )))
+        {
+            let breaker_build = {
+                let d = state_hnd.lock_for_deliverable(&dr).await;
+                let out = if let DeliverableInner::Build { full_build, .. } = &d.inner {
+                    !full_build
+                } else {
+                    unreachable!()
+                };
+                drop(d);
+                out
+            };
+
+            let shared = shared_hnd.0.read().await;
+            let build = shared.graph.get(&bsr).unwrap();
+            Ok(Either::Left((
+                artifact.outputs,
+                EntryMeta {
+                    breaker_build,
+                    inner: MetaInner::Spec(build.name.clone()),
+                    origin: Some(build.from.as_ref().clone()),
+                    build_ms: Some(artifact.build_ms),
+                    ..Default::default()
+                },
+            )))
+        }
     }
 
     async fn cache_hydrate(
