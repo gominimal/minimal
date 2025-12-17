@@ -103,6 +103,14 @@ impl<SF: SourceFetcher> Orchestrator<traits::LocalBackend<SF>> {
             .await?
             .into_iter()
             .filter_map(|a| match a {
+                // We don't actually want to store breaker builds, they are just a stepping stone.
+                Either::Left((
+                    _pd,
+                    EntryMeta {
+                        breaker_build: true,
+                        ..
+                    },
+                )) => None,
                 Either::Left((pd, meta)) => Some((pd, meta)),
                 Either::Right(_cache_dir) => None,
             })
