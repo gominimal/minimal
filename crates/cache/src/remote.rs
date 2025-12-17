@@ -1,7 +1,8 @@
-use crate::{Cache, EntryMeta, LocalDir, MetaInner, remote_index::RemoteIndex};
-use common::{SpecHash, SpecOrigin, archive};
+use crate::PendingDir;
+use crate::{Cache, LocalDir, remote_index::RemoteIndex};
+use common::{SpecHash, archive};
 use std::io::{Seek, Write};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use common::fetchers::*;
 use google_cloud_storage::{Error as GcsError, client::Storage};
@@ -172,11 +173,9 @@ impl<B: FetchBackend> RemoteCache<B> {
     pub async fn materialize(
         &self,
         spec_hash: &SpecHash,
-        inner: MetaInner,
-        origin: Option<SpecOrigin>,
         cache: &Cache<LocalDir>,
         span_name: &str,
-    ) -> Result<(), Error<<B::Response as FetchResponse>::Error>> {
+    ) -> Result<(Duration, PendingDir), Error<<B::Response as FetchResponse>::Error>> {
         let sha256: [u8; 32] = self.index.sha256(spec_hash).ok_or(Error::NotFound)?;
 
         let span = tracing::info_span!("materialize", "indicatif.pb_show" = tracing::field::Empty,);
@@ -221,18 +220,8 @@ impl<B: FetchBackend> RemoteCache<B> {
         )
         .map_err(Error::ArchiveError)?;
 
-        cache_hnd
-            .finalize(EntryMeta {
-                inner,
-                origin,
-                fetched: true,
-                fetch_ms: Some(Instant::now().duration_since(start).as_millis() as usize),
-                ..Default::default()
-            })
-            .map_err(Error::Cache)?;
-
         drop(span_enter);
         drop(span);
-        Ok(())
+        Ok((Instant::now().duration_since(start), cache_hnd))
     }
 }

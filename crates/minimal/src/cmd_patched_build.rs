@@ -1,6 +1,7 @@
-use crate::{Context, Error, remote_storage::RemoteStorage};
+use crate::{Context, Error};
 use anyhow::anyhow;
 use cache::{Cache, EntryMeta, LocalDir, MetaInner};
+use common::RemoteStorage;
 use graph::{BuildSpecRef, DepGraph, Transitives};
 use op::{Runnable, SpecBuild};
 use std::{collections::HashSet, path::PathBuf};

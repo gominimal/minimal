@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use tracing::debug;
 use url::Url;
 
-pub trait SourceFetcher: Sync {
+pub trait SourceFetcher: Send + Sync + std::fmt::Debug {
     /// Returns a path to the specified URL, after sha256 verification.
     ///
     /// The returned path may be cached - there's no expectation a fresh fetch is performed.
@@ -27,6 +27,23 @@ pub trait SourceFetcher: Sync {
         file: &str,
         sha256: &str,
     ) -> impl Future<Output = Result<PathBuf, anyhow::Error>> + Send;
+}
+
+impl SourceFetcher for common::RemoteStorage {
+    async fn download_https(&self, url: &str, sha256: &str) -> Result<PathBuf, anyhow::Error> {
+        self.download_https_with_verification_and_caching(url, sha256)
+            .await
+    }
+
+    async fn download_gcs(
+        &self,
+        bucket_id: String,
+        file: &str,
+        sha256: &str,
+    ) -> Result<PathBuf, anyhow::Error> {
+        self.download_with_verification_and_caching(bucket_id, file, sha256)
+            .await
+    }
 }
 
 /// Loads a source.

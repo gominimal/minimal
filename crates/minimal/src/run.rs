@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use cache::{Cache, LocalDir, MetaInner, PendingDir, RemoteCache};
-use common::SpecHash;
+use cache::{Cache, EntryMeta, LocalDir, MetaInner, PendingDir, RemoteCache};
+use common::{RemoteStorage, SpecHash};
 use google_cloud_storage::client::Storage as GcsStorage;
 use graph::{BinProvider, ExecPlan, RuntimeDep, SubsetInput};
 use graph::{BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph};
@@ -9,8 +9,6 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
 use tracing::{debug, info};
-
-use crate::remote_storage::RemoteStorage;
 
 enum ResolvedBuild {
     /// Something that was literally just built
@@ -78,17 +76,20 @@ async fn path_for_self_spec(
         }
         // In the remote cache but not the local cache.
         (_, Some(true)) => {
-            remote_cache
+            let (fetch_time, pending_dir) = remote_cache
                 .as_ref()
                 .unwrap()
-                .materialize(
-                    input_hash,
-                    MetaInner::Spec(input_build.name.clone()),
-                    Some(input_build.from.as_ref().clone()),
-                    cache,
-                    input_build.name.as_str(),
-                )
+                .materialize(input_hash, cache, input_build.name.as_str())
                 .await?;
+
+            pending_dir.finalize(EntryMeta {
+                fetched: true,
+                fetch_ms: Some(fetch_time.as_millis() as usize),
+                inner: MetaInner::Spec(input_build.name.clone()),
+                origin: Some(input_build.from.as_ref().clone()),
+                ..Default::default()
+            })?;
+
             let cache_path = cache.read_dir(input_hash).unwrap().path().to_path_buf();
             Ok((*input_ref, (cache_path, PathBuf::from("/"))))
         }
@@ -157,17 +158,20 @@ pub async fn materialize_subset(
         (_, Some(true)) => {
             let name = format!("{} (subset)", build.name);
 
-            remote_cache
+            let (fetch_time, pending_dir) = remote_cache
                 .as_ref()
                 .unwrap()
-                .materialize(
-                    &subset_hash,
-                    MetaInner::Subset(subset_spec),
-                    Some(graph.get(&subset.from).unwrap().from.as_ref().clone()),
-                    cache,
-                    name.as_str(),
-                )
+                .materialize(&subset_hash, cache, name.as_str())
                 .await?;
+
+            pending_dir.finalize(EntryMeta {
+                fetched: true,
+                fetch_ms: Some(fetch_time.as_millis() as usize),
+                inner: MetaInner::Subset(subset_spec),
+                origin: Some(graph.get(&subset.from).unwrap().from.as_ref().clone()),
+                ..Default::default()
+            })?;
+
             let cache_path = cache.read_dir(&subset_hash).unwrap().path().to_path_buf();
             Ok((subset.from, (cache_path, PathBuf::from("/"))))
         }
@@ -179,14 +183,17 @@ pub async fn materialize_subset(
             let dep_hash = graph.spec_hash(&subset.from);
             if let Ok(cache_dir) = cache.read_dir(&dep_hash) {
                 drop(cache_dir);
-                let pending_dir = SubsetBuild { subset }
-                    .run(&op::Options {
-                        cache: cache.clone(),
-                        graph,
-                        exec_base: "/invalid".into(),
-                    })
-                    .await
-                    .unwrap();
+                let pending_dir = SubsetBuild {
+                    subset,
+                    from_dir: None,
+                }
+                .run(&op::Options {
+                    cache: cache.clone(),
+                    graph,
+                    exec_base: "/invalid".into(),
+                })
+                .await
+                .unwrap();
                 pending_dir.finalize(cache::EntryMeta {
                     inner: MetaInner::Subset(subset_spec),
                     fetched: false,
