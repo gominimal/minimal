@@ -1,0 +1,26 @@
+[package]
+name = "orchestrator"
+version = "0.0.1"
+edition.workspace = true
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish.workspace = true
+
+[dev-dependencies]
+indoc.workspace = true
+decode.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+either.workspace = true
+futures.workspace = true
+generational-arena.workspace = true
+google-cloud-storage.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+build-sandbox.workspace = true
+cache.workspace = true
+common.workspace = true
+graph.workspace = true
+op.workspace = true
