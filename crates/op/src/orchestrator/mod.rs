@@ -14,7 +14,7 @@ use google_cloud_storage::client::Storage as GcsStorage;
 use graph::{BinProvider, BuildSpecRef, DepGraph, ExecPlan, SubsetInput};
 use tokio::{
     sync::{RwLock, RwLockReadGuard},
-    task::JoinSet,
+    task::{JoinSet, yield_now},
 };
 
 mod state;
@@ -116,7 +116,7 @@ impl<B: Backend> Orchestrator<B> {
         let state = state.into_handle();
         let shared_hnd = SharedHandle::new(shared);
 
-        let mut pending: JoinSet<Result<(), Error>> = JoinSet::new();
+        let mut pending: JoinSet<Result<(), (DeliverableRef, Error)>> = JoinSet::new();
         while !state.done().await {
             // Spawn tasks for all runnables
             for dr in state.runnables().await.into_iter() {
@@ -178,8 +178,14 @@ impl<B: Backend> Orchestrator<B> {
                 match task_result {
                     Ok(r) => match r {
                         Ok(()) => {}
-                        Err(e) => {
-                            tracing::error!("deliverable construction failed: {}", e);
+                        Err((dr, e)) => {
+                            tracing::error!(
+                                "{:?} construction failed: {}",
+                                state.lock_for_deliverable(&dr).await.inner,
+                                e
+                            );
+                            pending.abort_all();
+                            break;
                         }
                     },
                     Err(e) => {
@@ -188,17 +194,24 @@ impl<B: Backend> Orchestrator<B> {
                         } else {
                             tracing::error!("execution for a deliverable panicked! {}", e);
                         }
+                        pending.abort_all();
+                        break;
                     }
                 }
             }
+            yield_now().await;
         }
 
         while let Some(task_result) = pending.join_next().await {
             match task_result {
                 Ok(r) => match r {
                     Ok(()) => {}
-                    Err(e) => {
-                        tracing::error!("deliverable construction failed: {}", e);
+                    Err((dr, e)) => {
+                        tracing::error!(
+                            "{:?} construction failed: {}",
+                            state.lock_for_deliverable(&dr).await.inner,
+                            e
+                        );
                     }
                 },
                 Err(e) => {
@@ -237,7 +250,7 @@ struct OrchestratedBuild<B: Backend> {
 }
 
 impl<B: Backend> OrchestratedBuild<B> {
-    async fn run(mut self) -> Result<(), Error> {
+    async fn run(mut self) -> Result<(), (DeliverableRef, Error)> {
         let d = self.deliverable;
         let r = B::build(
             d,
@@ -247,7 +260,8 @@ impl<B: Backend> OrchestratedBuild<B> {
             &mut self.shared_hnd,
             &mut self.state_hnd,
         )
-        .await?;
+        .await
+        .map_err(|e| (d, e))?;
         self.state_hnd.lock_for_deliverable(&d).await.state = DeliverableState::Complete(r);
         Ok(())
     }
@@ -264,7 +278,7 @@ struct OrchestratedCacheFill<B: Backend> {
 }
 
 impl<B: Backend> OrchestratedCacheFill<B> {
-    async fn run(mut self) -> Result<(), Error> {
+    async fn run(mut self) -> Result<(), (DeliverableRef, Error)> {
         let d = self.deliverable;
         let r = B::cache_hydrate(
             d,
@@ -273,7 +287,8 @@ impl<B: Backend> OrchestratedCacheFill<B> {
             &mut self.shared_hnd,
             &mut self.state_hnd,
         )
-        .await?;
+        .await
+        .map_err(|e| (d, e))?;
         self.state_hnd.lock_for_deliverable(&d).await.state = DeliverableState::Complete(r);
         Ok(())
     }
@@ -291,7 +306,7 @@ struct OrchestratedSubset<B: Backend> {
 }
 
 impl<B: Backend> OrchestratedSubset<B> {
-    async fn run(mut self) -> Result<(), Error> {
+    async fn run(mut self) -> Result<(), (DeliverableRef, Error)> {
         let d = self.deliverable;
         let r = B::materialize_subset(
             d,
@@ -301,7 +316,8 @@ impl<B: Backend> OrchestratedSubset<B> {
             &mut self.shared_hnd,
             &mut self.state_hnd,
         )
-        .await?;
+        .await
+        .map_err(|e| (d, e))?;
         self.state_hnd.lock_for_deliverable(&d).await.state = DeliverableState::Complete(r);
         Ok(())
     }
