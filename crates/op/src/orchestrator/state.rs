@@ -1,10 +1,10 @@
 //! Represents the state of deliverables and activity within an orchestration.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use common::SpecHash;
 use generational_arena::{Arena, Index};
-use graph::{BinProvider, BuildSpecRef, DepGraph, ExecPlan, SubsetInput};
+use graph::{BinProvider, BuildSpecRef, DepGraph, ExecPlan, SubsetInput, Transitives};
 use tokio::{
     sync::{MappedMutexGuard, Mutex, MutexGuard},
     task::AbortHandle,
@@ -237,8 +237,18 @@ impl<B: super::Backend> StateHandle<B> {
 
 /// The runtime state of an orchestration, notably storing [Deliverable]'s (the units of work).
 #[derive(Debug)]
-pub(crate) struct State<B: super::Backend> {
+pub struct State<B: super::Backend> {
     pub(crate) s: StateInner<B>,
+}
+
+impl<B: super::Backend> Display for State<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f)?;
+        for (k, v) in self.s.deliverables.iter() {
+            write!(f, "{:?}:\n\t{:?}", k, v)?;
+        }
+        Ok(())
+    }
 }
 
 impl<B: super::Backend> State<B> {
@@ -309,9 +319,10 @@ impl<B: super::Backend> State<B> {
                                             inner.get_subset(&subset).copied().unwrap_or_else(
                                                 || {
                                                     // No entry for that subset, populate it
+                                                    let subset_hash = graph.subset_hash(&subset);
                                                     inner.insert(DeliverableInner::Subset {
                                                         subset,
-                                                        spec_hash: graph.spec_hash(&bsr),
+                                                        spec_hash: subset_hash,
                                                         build: build_deliverable,
                                                     })
                                                 },
@@ -326,6 +337,59 @@ impl<B: super::Backend> State<B> {
                 inner.insert(d);
             }
         }
+
+        // So the planner ignores stuff that was requested which is fully provided by a cache.
+        // We need to represent those as cache fill events.
+        Transitives::for_toplevels(graph, graph.top_levels.to_vec(), false)
+            .iter()
+            .for_each(|(bsr, dep)| {
+                let bsr_represented =
+                    inner.builds_by_ref.contains_key(bsr) | inner.fills_by_ref.contains_key(bsr);
+
+                match &dep.outputs {
+                    // Full build
+                    None => {
+                        if bsr_represented {
+                            // Already brought in
+                        } else {
+                            inner.insert(DeliverableInner::CacheFill {
+                                bsr: *bsr,
+                                spec_hash: graph.spec_hash(bsr),
+                            });
+                        }
+                    }
+                    // Subset needed
+                    Some(outputs) => {
+                        let si: SubsetInput = (*bsr, outputs.clone()).into();
+                        if inner.subsets_by_ref.contains_key(&si) {
+                            // Subset already represented
+                        } else if bsr_represented {
+                            let subset_hash = graph.subset_hash(&si);
+                            inner.insert(DeliverableInner::Subset {
+                                subset: si,
+                                spec_hash: subset_hash,
+                                build: if let Some(dr) = inner.builds_by_ref.get(bsr) {
+                                    *dr.last().unwrap()
+                                } else {
+                                    *inner.fills_by_ref.get(bsr).unwrap()
+                                },
+                            });
+                        } else {
+                            // Emit both the cache fill and the subset
+                            let dr = inner.insert(DeliverableInner::CacheFill {
+                                bsr: *bsr,
+                                spec_hash: graph.spec_hash(bsr),
+                            });
+                            let subset_hash = graph.subset_hash(&si);
+                            inner.insert(DeliverableInner::Subset {
+                                subset: si,
+                                spec_hash: subset_hash,
+                                build: dr,
+                            });
+                        }
+                    }
+                }
+            });
 
         Ok(Self { s: inner })
     }
