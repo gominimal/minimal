@@ -1,121 +1,32 @@
 use std::path::PathBuf;
 
-use cache::{CacheErr, DirCacheEntry, EntryMeta, LocalDir, MetaInner, PendingDir, RemoteCache};
+use crate::{
+    Backend, Deliverable, DeliverableInner, DeliverableRef, DeliverableState, Orchestrator,
+    SharedHandle, StateHandle,
+};
+use cache::{
+    Cache, CacheErr, DirCacheEntry, EntryMeta, LocalDir, MetaInner, PendingDir, RemoteCache,
+};
 use common::SpecHash;
 use either::Either;
 use google_cloud_storage::client::Storage as GcsStorage;
-use graph::{BuildSpecRef, SubsetInput};
+use graph::{BinProvider, BuildSpecRef, DepGraph, SubsetInput};
+use op::{Runnable, SourceFetcher};
 use tokio::sync::Semaphore;
 use tokio::task::spawn_blocking;
 
-use super::state::{Deliverable, DeliverableRef, DeliverableState};
-use super::{SharedHandle, StateHandle};
-use crate::orchestrator::state::DeliverableInner;
-use crate::{Error, Runnable};
-
-/// A structure describing a constructed deliverable. For instance, this might
-/// be a PendingDir for local builds.
-pub trait Artifact: std::fmt::Debug + Send {}
-
-impl<A: Artifact, B: Artifact> Artifact for Either<A, B> {}
-
-// For tests.
-impl Artifact for () {}
-
-/// An implementation of the core functions needed by the orchestrator.
-pub trait Backend: Sized + Send + Sync + std::fmt::Debug + 'static {
-    /// Describes a constructed deliverable.
-    type Artifact: Artifact;
-
-    /// Performs a build using the given dependencies.
-    fn build(
-        dr: DeliverableRef,
-        bsr: BuildSpecRef,
-        spec_hash: SpecHash,
-        dependencies: Vec<DeliverableRef>,
-        shared_hnd: &mut SharedHandle<Self>,
-        state_hnd: &mut StateHandle<Self>,
-    ) -> impl Future<Output = Result<Self::Artifact, Error>> + Send;
-
-    /// Fetches something from a cache.
-    fn cache_hydrate(
-        dr: DeliverableRef,
-        bsr: BuildSpecRef,
-        spec_hash: SpecHash,
-        shared_hnd: &mut SharedHandle<Self>,
-        state_hnd: &mut StateHandle<Self>,
-    ) -> impl Future<Output = Result<Self::Artifact, Error>> + Send;
-
-    /// Builds a subset.
-    fn materialize_subset(
-        dr: DeliverableRef,
-        subset: SubsetInput,
-        build: DeliverableRef,
-        spec_hash: SpecHash,
-        shared_hnd: &mut SharedHandle<Self>,
-        state_hnd: &mut StateHandle<Self>,
-    ) -> impl Future<Output = Result<Self::Artifact, Error>> + Send;
-}
-
-// For tests.
-impl Backend for () {
-    type Artifact = ();
-
-    async fn build(
-        dr: DeliverableRef,
-        bsr: BuildSpecRef,
-        spec_hash: SpecHash,
-        _dependencies: Vec<DeliverableRef>,
-        _shared_hnd: &mut SharedHandle<Self>,
-        _state_hnd: &mut StateHandle<Self>,
-    ) -> Result<Self::Artifact, Error> {
-        panic!(
-            "B::build({:?}, {:?}, {:?}) called during test",
-            dr, bsr, spec_hash
-        )
-    }
-
-    async fn cache_hydrate(
-        dr: DeliverableRef,
-        bsr: BuildSpecRef,
-        spec_hash: SpecHash,
-        _shared_hnd: &mut SharedHandle<Self>,
-        _state_hnd: &mut StateHandle<Self>,
-    ) -> Result<Self::Artifact, Error> {
-        panic!(
-            "B::cache_hydrate({:?}, {:?}, {:?}) called during test",
-            dr, bsr, spec_hash
-        )
-    }
-
-    async fn materialize_subset(
-        dr: DeliverableRef,
-        subset: SubsetInput,
-        build: DeliverableRef,
-        spec_hash: SpecHash,
-        _shared_hnd: &mut SharedHandle<Self>,
-        _state_hnd: &mut StateHandle<Self>,
-    ) -> Result<Self::Artifact, Error> {
-        panic!(
-            "B::materialize_subset({:?}, {:?}, {:?}, {:?}) called during test",
-            dr, subset, build, spec_hash
-        )
-    }
-}
+use crate::Error;
 
 /// A type which implements [Backend] by building everything locally.
 #[derive(Debug)]
-pub struct LocalBackend<SF: crate::SourceFetcher + 'static> {
+pub struct LocalBackend<SF: SourceFetcher + 'static> {
     pub(crate) sf: SF,
     pub(crate) output_base: PathBuf,
     pub(crate) remote_cache: Option<RemoteCache<GcsStorage>>,
     pub(crate) build_semaphore: Semaphore,
 }
 
-impl Artifact for (PendingDir, EntryMeta) {}
-impl Artifact for DirCacheEntry<LocalDir> {}
-
-impl<SF: crate::SourceFetcher> Backend for LocalBackend<SF> {
+impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
     type Artifact = Either<(PendingDir, EntryMeta), DirCacheEntry<LocalDir>>;
 
     async fn build(
@@ -147,16 +58,16 @@ impl<SF: crate::SourceFetcher> Backend for LocalBackend<SF> {
 
         let shared_hnd2 = shared_hnd.clone();
         let artifact = spawn_blocking(async move || {
-            let shared = shared_hnd2.0.read().await;
+            let shared = shared_hnd2.inner().read().await;
             let permit = shared.backend.build_semaphore.acquire().await.unwrap();
-            let mut b = crate::SpecBuild {
+            let mut b = op::SpecBuild {
                 override_deps: Some(dep_paths.into_iter().collect()),
                 spec: &bsr,
                 remote_fetcher: &shared.backend.sf,
             };
 
             let res = b
-                .run(&crate::Options {
+                .run(&op::Options {
                     cache: shared.cache.clone(),
                     graph: &shared.graph,
                     exec_base: shared.backend.output_base.clone(),
@@ -182,7 +93,7 @@ impl<SF: crate::SourceFetcher> Backend for LocalBackend<SF> {
                 out
             };
 
-            let shared = shared_hnd.0.read().await;
+            let shared = shared_hnd.inner().read().await;
             let build = shared.graph.get(&bsr).unwrap();
             Ok(Either::Left((
                 artifact.outputs,
@@ -205,11 +116,11 @@ impl<SF: crate::SourceFetcher> Backend for LocalBackend<SF> {
         _state_hnd: &mut StateHandle<Self>,
     ) -> Result<Self::Artifact, Error> {
         // Check local cache
-        if let Ok(cd) = shared_hnd.0.read().await.cache.read_dir(&spec_hash) {
+        if let Ok(cd) = shared_hnd.inner().read().await.cache.read_dir(&spec_hash) {
             return Ok(Either::Right(cd));
         }
 
-        let shared = shared_hnd.0.read().await;
+        let shared = shared_hnd.inner().read().await;
         if let Some(remote_cache) = shared.backend.remote_cache.as_ref() {
             let build = shared.graph.get(&bsr).unwrap();
             let (fetch_time, pending_dir) = remote_cache
@@ -259,13 +170,13 @@ impl<SF: crate::SourceFetcher> Backend for LocalBackend<SF> {
             )
         };
 
-        let shared = shared_hnd.0.read().await;
+        let shared = shared_hnd.inner().read().await;
         let build = shared.graph.get(&build_bsr).unwrap();
-        let pending_dir = crate::SubsetBuild {
+        let pending_dir = op::SubsetBuild {
             from_dir: Some(build_dir),
             subset: &subset,
         }
-        .run(&crate::Options {
+        .run(&op::Options {
             cache: shared.cache.clone(),
             graph: &shared.graph,
             exec_base: shared.backend.output_base.clone(),
@@ -280,5 +191,54 @@ impl<SF: crate::SourceFetcher> Backend for LocalBackend<SF> {
                 ..Default::default()
             },
         )))
+    }
+}
+
+impl<SF: SourceFetcher> LocalBackend<SF> {
+    /// Creates a new orchestrator for local builds.
+    pub fn new_orchestrator(
+        top_levels: Vec<BuildSpecRef>,
+        output_base: PathBuf,
+        remote_cache: Option<RemoteCache<GcsStorage>>,
+        sf: SF,
+        num_concurrent_builds: usize,
+        graph: DepGraph,
+        cache: Cache<LocalDir>,
+    ) -> Result<Orchestrator<Self>, Error> {
+        Ok(Orchestrator {
+            top_levels,
+            backend: LocalBackend::<SF> {
+                output_base,
+                remote_cache,
+                sf,
+                build_semaphore: Semaphore::new(num_concurrent_builds),
+            },
+            graph,
+            cache,
+        })
+    }
+
+    /// Executes a local build with the orchestrator.
+    pub async fn run_local_build<BP: BinProvider>(
+        orch: Orchestrator<Self>,
+        bp: BP,
+    ) -> Result<Vec<(PendingDir, EntryMeta)>, Error> {
+        let result = orch.run(bp).await?;
+
+        Ok(result
+            .into_iter()
+            .filter_map(|a| match a {
+                // We don't actually want to store breaker builds, they are just a stepping stone.
+                Either::Left((
+                    _pd,
+                    EntryMeta {
+                        breaker_build: true,
+                        ..
+                    },
+                )) => None,
+                Either::Left((pd, meta)) => Some((pd, meta)),
+                Either::Right(_cache_dir) => None,
+            })
+            .collect())
     }
 }

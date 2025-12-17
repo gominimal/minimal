@@ -5,7 +5,7 @@ use build_events::events::{
 };
 use cache::{Cache, CacheBinProvider, LocalDir, RemoteBinProvider};
 use graph::DepGraph;
-use op::orchestrator::Orchestrator;
+use orchestrator::LocalBackend;
 use std::collections::HashMap;
 use std::process::Command;
 use tracing::info;
@@ -110,7 +110,7 @@ pub async fn cmd_build_impl(
         });
     }
 
-    let orchestrator = Orchestrator::new_for_local_build(
+    let orchestrator = LocalBackend::new_orchestrator(
         graph.top_levels.clone(),
         output_base,
         if ctx.no_fetch {
@@ -122,38 +122,30 @@ pub async fn cmd_build_impl(
             .await
             .unwrap(),
         num_parallel_builds,
+        graph.clone(),
+        cache.clone(),
     )?;
 
     let run_result = match (ctx.no_cache, ctx.no_fetch) {
         // No local or remote cache
-        (true, true) => orchestrator.run((), graph.clone(), cache.clone()).await,
+        (true, true) => LocalBackend::run_local_build(orchestrator, ()).await,
         // Both caches
         (false, false) => {
             let local_adapter = CacheBinProvider::new(graph, cache.clone());
             let remote_cache = ctx.remote_cache(false).await.unwrap();
             let remote_adapter = RemoteBinProvider::new(graph, &remote_cache);
-            orchestrator
-                .run(
-                    (local_adapter, remote_adapter),
-                    graph.clone(),
-                    cache.clone(),
-                )
-                .await
+            LocalBackend::run_local_build(orchestrator, (local_adapter, remote_adapter)).await
         }
         // Only remote cache
         (true, false) => {
             let remote_cache = ctx.remote_cache(false).await.unwrap();
             let remote_adapter = RemoteBinProvider::new(graph, &remote_cache);
-            orchestrator
-                .run(remote_adapter, graph.clone(), cache.clone())
-                .await
+            LocalBackend::run_local_build(orchestrator, remote_adapter).await
         }
         // Only local cache
         (false, true) => {
             let local_adapter = CacheBinProvider::new(graph, cache.clone());
-            orchestrator
-                .run(local_adapter, graph.clone(), cache.clone())
-                .await
+            LocalBackend::run_local_build(orchestrator, local_adapter).await
         }
     };
 

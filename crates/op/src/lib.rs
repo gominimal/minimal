@@ -49,6 +49,3 @@ pub use specs::{SpecBuild, SpecBuildResult};
 
 mod oci_image;
 pub use oci_image::OciImageCreate;
-
-#[allow(dead_code)]
-pub mod orchestrator;

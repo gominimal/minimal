@@ -9,6 +9,7 @@ members = [
     "crates/decode",
     "crates/graph",
     "crates/op",
+    "crates/orchestrator",
     "crates/minimal",
     "crates/res-proto",
 ]
@@ -88,4 +89,5 @@ checkouts = { version = "0.0.1", path = "crates/checkouts" }
 common = { version = "0.0.1", path = "crates/common" }
 decode = { version = "0.0.1", path = "crates/decode" }
 op = { version = "0.0.1", path = "crates/op" }
+orchestrator = { version = "0.0.1", path = "crates/orchestrator" }
 res-proto = { version = "0.0.1", path = "crates/res-proto" }

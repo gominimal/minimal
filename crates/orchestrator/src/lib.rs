@@ -1,42 +1,48 @@
-//! The orchestration module performs the operations neccessary to make some given software (i.e. build-specs) runnable.
+//! The orchestration module performs the operations necessary to make some given software (i.e. build-specs) runnable.
 //!
 //! The primary type here is [Orchestrator], which is parameterized by a [Backend]. The intention is that
 //! different backends can be used for local builds vs remote builds and other architectural variants, while all
 //! the main/control logic stays the same.
+#![allow(clippy::result_large_err)]
 
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
-use crate::{Error, SourceFetcher};
-use cache::{Cache, EntryMeta, LocalDir, PendingDir, RemoteCache};
+use cache::{Cache, LocalDir};
 use common::SpecHash;
-use either::Either;
-use google_cloud_storage::client::Storage as GcsStorage;
 use graph::{BinProvider, BuildSpecRef, DepGraph, ExecPlan, SubsetInput};
 use tokio::{
-    sync::{RwLock, RwLockReadGuard, Semaphore},
+    sync::{RwLock, RwLockReadGuard},
     task::{JoinSet, yield_now},
 };
 
+mod local_backend;
+pub use local_backend::LocalBackend;
+
 mod state;
-use state::{DeliverableRef, DeliverableState, State, StateHandle};
+pub use state::{
+    Deliverable, DeliverableInner, DeliverableRef, DeliverableState, State, StateHandle,
+};
 
 mod traits;
-pub use traits::Backend;
+pub use traits::{Artifact, Backend};
+
+mod error;
+pub use error::Error;
 
 /// The shared state used heavily everywhere.
 ///
 /// This structure exists so it can be wrapped up in something that is tokio async friendly and
 /// passed around as needed. Namely, a [SharedHandle].
 #[derive(Debug)]
-pub(crate) struct Shared<B: Backend> {
-    graph: DepGraph,
-    cache: Cache<LocalDir>,
-    backend: B,
+pub struct Shared<B: Backend> {
+    pub graph: DepGraph,
+    pub cache: Cache<LocalDir>,
+    pub backend: B,
 }
 
 /// An async / task-friendly wrapper around state used everywhere.
 #[derive(Debug)]
-pub struct SharedHandle<B: Backend>(Arc<RwLock<Shared<B>>>);
+pub struct SharedHandle<B: Backend>(pub(crate) Arc<RwLock<Shared<B>>>);
 
 impl<B: Backend> Clone for SharedHandle<B> {
     fn clone(&self) -> Self {
@@ -45,7 +51,7 @@ impl<B: Backend> Clone for SharedHandle<B> {
 }
 
 impl<B: Backend> SharedHandle<B> {
-    fn new(shared: Shared<B>) -> Self {
+    pub(crate) fn new(shared: Shared<B>) -> Self {
         Self(Arc::new(RwLock::new(shared)))
     }
 
@@ -55,43 +61,28 @@ impl<B: Backend> SharedHandle<B> {
     pub async fn graph(&self) -> RwLockReadGuard<'_, DepGraph> {
         RwLockReadGuard::map(self.0.read().await, |s| &s.graph)
     }
+
+    /// Access the inner shared state.
+    #[inline]
+    pub fn inner(&self) -> &Arc<RwLock<Shared<B>>> {
+        &self.0
+    }
 }
 
 /// Manages the materialization of some built artifacts end-to-end.
 pub struct Orchestrator<B: Backend> {
     pub top_levels: Vec<BuildSpecRef>,
     pub backend: B,
+    pub graph: DepGraph,
+    pub cache: Cache<LocalDir>,
 }
 
-impl<SF: SourceFetcher> Orchestrator<traits::LocalBackend<SF>> {
-    /// Initializes an orchestrator to perform a local build.
-    pub fn new_for_local_build(
-        top_levels: Vec<BuildSpecRef>,
-        output_base: PathBuf,
-        remote_cache: Option<RemoteCache<GcsStorage>>,
-        sf: SF,
-        num_concurrent_builds: usize,
-    ) -> Result<Self, crate::Error> {
-        Ok(Self {
-            top_levels,
-            backend: traits::LocalBackend::<SF> {
-                output_base,
-                remote_cache,
-                sf,
-                build_semaphore: Semaphore::new(num_concurrent_builds),
-            },
-        })
-    }
-    /// Executes the local build.
-    pub async fn run<BP: BinProvider>(
-        self,
-        bp: BP,
-        graph: DepGraph,
-        cache: Cache<LocalDir>,
-    ) -> Result<Vec<(PendingDir, EntryMeta)>, crate::Error> {
+impl<B: Backend> Orchestrator<B> {
+    /// Executes the build.
+    pub async fn run<BP: BinProvider>(self, bp: BP) -> Result<Vec<B::Artifact>, Error> {
         let shared = Shared {
-            graph,
-            cache,
+            graph: self.graph.clone(),
+            cache: self.cache.clone(),
             backend: self.backend,
         };
         let state = State::from_plan(
@@ -99,30 +90,10 @@ impl<SF: SourceFetcher> Orchestrator<traits::LocalBackend<SF>> {
             ExecPlan::with_toplevels(bp, &shared.graph, &self.top_levels),
         )?;
 
-        Ok(Self::run_impl(state, shared)
-            .await?
-            .into_iter()
-            .filter_map(|a| match a {
-                // We don't actually want to store breaker builds, they are just a stepping stone.
-                Either::Left((
-                    _pd,
-                    EntryMeta {
-                        breaker_build: true,
-                        ..
-                    },
-                )) => None,
-                Either::Left((pd, meta)) => Some((pd, meta)),
-                Either::Right(_cache_dir) => None,
-            })
-            .collect())
+        Self::run_impl(state, shared).await
     }
-}
 
-impl<B: Backend> Orchestrator<B> {
-    async fn run_impl(
-        state: State<B>,
-        shared: Shared<B>,
-    ) -> Result<Vec<B::Artifact>, crate::Error> {
+    async fn run_impl(state: State<B>, shared: Shared<B>) -> Result<Vec<B::Artifact>, Error> {
         let state = state.into_handle();
         let shared_hnd = SharedHandle::new(shared);
 
