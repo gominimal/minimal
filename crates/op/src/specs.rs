@@ -203,6 +203,13 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
         if build.is_pure_prebuilt() {
             return self.materialize_prebuilt(opts, build).await;
         }
+        if build.is_pure_collection() {
+            // A collection is an empty package that only has runtime deps, so lets just commit an empty package
+            return Ok(SpecBuildResult {
+                outputs: opts.cache.write_dir(&opts.graph.spec_hash(self.spec))?,
+                build_ms: 0,
+            });
+        }
 
         let (inputs, mut temp_dirs) = self.inputs(build, opts).await?;
         let (mut dependencies, needs_dns, need_internet) = self.dependencies(build, opts).await?;
