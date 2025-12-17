@@ -24,6 +24,7 @@ pub(crate) trait Backend: Sized + Send + Sync + std::fmt::Debug + 'static {
     /// Describes a constructed deliverable.
     type Artifact: Artifact;
 
+    /// Performs a build using the given dependencies.
     fn build(
         dr: DeliverableRef,
         bsr: BuildSpecRef,
@@ -33,6 +34,7 @@ pub(crate) trait Backend: Sized + Send + Sync + std::fmt::Debug + 'static {
         state_hnd: &mut StateHandle<Self>,
     ) -> impl Future<Output = Result<Self::Artifact, Error>> + Send;
 
+    /// Fetches something from a cache.
     fn cache_hydrate(
         dr: DeliverableRef,
         bsr: BuildSpecRef,
@@ -41,6 +43,7 @@ pub(crate) trait Backend: Sized + Send + Sync + std::fmt::Debug + 'static {
         state_hnd: &mut StateHandle<Self>,
     ) -> impl Future<Output = Result<Self::Artifact, Error>> + Send;
 
+    /// Builds a subset.
     fn materialize_subset(
         dr: DeliverableRef,
         subset: SubsetInput,
