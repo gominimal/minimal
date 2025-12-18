@@ -170,24 +170,37 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
             )
         };
 
-        let shared = shared_hnd.inner().read().await;
-        let build = shared.graph.get(&build_bsr).unwrap();
-        let pending_dir = op::SubsetBuild {
-            from_dir: Some(build_dir),
-            subset: &subset,
-        }
-        .run(&op::Options {
-            cache: shared.cache.clone(),
-            graph: &shared.graph,
-            exec_base: shared.backend.output_base.clone(),
+        let shared_hnd2 = shared_hnd.clone();
+        let subset2 = subset.clone();
+        let pending_dir = spawn_blocking(async move || {
+            let shared = shared_hnd2.inner().read().await;
+            let res = op::SubsetBuild {
+                from_dir: Some(build_dir),
+                subset: &subset2,
+            }
+            .run(&op::Options {
+                cache: shared.cache.clone(),
+                graph: &shared.graph,
+                exec_base: shared.backend.output_base.clone(),
+            })
+            .await;
+            drop(shared);
+            res
         })
+        .await
+        .unwrap()
         .await?;
+
+        let shared = shared_hnd.inner().read().await;
+        let build_origin = shared.graph.get(&build_bsr).unwrap().from.clone();
+        let subset_spec = subset.as_spec(&shared.graph);
+        drop(shared);
 
         Ok(Either::Left((
             pending_dir,
             EntryMeta {
-                inner: MetaInner::Subset(subset.as_spec(&shared.graph)),
-                origin: Some(build.from.as_ref().clone()),
+                inner: MetaInner::Subset(subset_spec),
+                origin: Some(build_origin.as_ref().clone()),
                 ..Default::default()
             },
         )))
