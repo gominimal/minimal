@@ -162,6 +162,20 @@ impl Dep {
         }
         self
     }
+
+    fn with_breaker_for(mut self, new_cycle_breaker_for: Option<BuildSpecRef>) -> Self {
+        match &mut self {
+            Dep::Built {
+                cycle_breaker_for, ..
+            }
+            | Dep::Cached {
+                cycle_breaker_for, ..
+            } => {
+                *cycle_breaker_for = new_cycle_breaker_for;
+            }
+        }
+        self
+    }
 }
 
 /// Types which can tell the planner what build-specs are built & available.
@@ -214,6 +228,15 @@ fn make_reachable<BP: BinProvider>(
     builds: &mut IndexMap<BuildSpecRef, BuildInfo>,
     path: &mut Vec<BuildSpecRef>,
 ) -> Result<(), ()> {
+    // println!(
+    //     "{}: {} (cached={})",
+    //     path.iter()
+    //         .map(|bsr| graph.get(bsr).unwrap().name.clone())
+    //         .collect::<Vec<_>>()
+    //         .join(","),
+    //     graph.get(bsr).unwrap().name,
+    //     bin_provider.exists(bsr)
+    // );
     let mut upsert = |bsr: &BuildSpecRef, info: BuildInfo| -> bool {
         if let Some(stored_info) = builds.get_mut(bsr) {
             stored_info.union(info);
@@ -386,30 +409,11 @@ impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
 
                 if cycle_breakers_allowed {
                     if let Some(cycle_breaker) = info.cycle_breaker.as_ref() {
-                        if self.is_built(cycle_breaker, cycle_breakers_allowed) {
-                            if matches!(
-                                self.builds.get(cycle_breaker),
-                                Some(BuildInfo {
-                                    state: BuildState::Fetched,
-                                    ..
-                                })
-                            ) {
-                                return Some(Dep::Cached {
-                                    bsr: *cycle_breaker,
-                                    outputs: None,
-                                    cycle_breaker_for: Some(*dependency),
-                                });
-                            }
-                            return Some(Dep::Built {
-                                bsr: *cycle_breaker,
-                                cycle_breaker_for: Some(*dependency),
-                                built_with_breakers: self
-                                    .builds
-                                    .get(cycle_breaker)
-                                    .map(|i| i.state == BuildState::BuiltUsingBreakers)
-                                    .unwrap_or(false),
-                                outputs: None,
-                            });
+                        // NOTE: For a cycle breaker that wasn't reached in make_reachable,
+                        // there may not be an entry in self.builds - so we can't just consult that.
+                        if let Some(res) = self.dep_candidate(cycle_breaker, cycle_breakers_allowed)
+                        {
+                            return Some(res.with_breaker_for(Some(*dependency)));
                         }
                     }
                 }
