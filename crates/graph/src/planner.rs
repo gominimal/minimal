@@ -679,36 +679,36 @@ impl<'a, BP: BinProvider> Iterator for ExecPlan<'a, BP> {
                 })
                 .collect::<Vec<_>>();
 
-            // let mut added_cycle_breaker = false;
-            // for path in &cycles {
-            //     let (first, last) = (path.first().unwrap(), path.last().unwrap());
-            //     for cycle in &[first, last] {
-            //         if let Some(cycle_breaker) = self.graph.get(cycle).unwrap().replace_on_cycle {
-            //             if !self.builds.contains_key(&cycle_breaker) {
-            //                 let mut path = Vec::new();
-            //                 // We found a new cycle breaker we haven't brought into the fray yet.
-            //                 make_reachable(
-            //                     &cycle_breaker,
-            //                     self.graph,
-            //                     &mut self.bin_provider,
-            //                     &mut self.builds,
-            //                     &mut path,
-            //                 )
-            //                 .unwrap();
-            //                 self.builds
-            //                     .get_mut(&cycle_breaker)
-            //                     .unwrap()
-            //                     .cycle_breaker_of = Some(**cycle);
-            //                 added_cycle_breaker = true;
-            //             }
-            //         }
-            //     }
-            // }
-            // if !added_cycle_breaker {
-            return Some(Err(PlanErr::Cycles(cycles)));
-            // } else {
-            //     return self.next();
-            // }
+            let mut added_cycle_breaker = false;
+            for path in &cycles {
+                let (first, last) = (path.first().unwrap(), path.last().unwrap());
+                for cycle in &[first, last] {
+                    if let Some(cycle_breaker) = self.graph.get(cycle).unwrap().replace_on_cycle {
+                        if !self.builds.contains_key(&cycle_breaker) {
+                            let mut path = Vec::new();
+                            // We found a new cycle breaker we haven't brought into the fray yet.
+                            make_reachable(
+                                &cycle_breaker,
+                                self.graph,
+                                &mut self.bin_provider,
+                                &mut self.builds,
+                                &mut path,
+                            )
+                            .unwrap();
+                            self.builds
+                                .get_mut(&cycle_breaker)
+                                .unwrap()
+                                .cycle_breaker_of = Some(**cycle);
+                            added_cycle_breaker = true;
+                        }
+                    }
+                }
+            }
+            if !added_cycle_breaker {
+                return Some(Err(PlanErr::Cycles(cycles)));
+            } else {
+                return self.next();
+            }
         }
 
         let out = BuildPhase { builds: met };
