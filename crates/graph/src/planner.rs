@@ -100,7 +100,13 @@ impl BuildInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dep {
     /// Use the cached build artifacts corresponding to the given bsr.
-    Cached(BuildSpecRef, Option<HashSet<String>>),
+    Cached {
+        bsr: BuildSpecRef,
+        /// If the dependency is a cycle-breaker substitution.
+        cycle_breaker_for: Option<BuildSpecRef>,
+        /// Specific outputs to use instead of the whole build
+        outputs: Option<HashSet<String>>,
+    },
     /// Use the previously-built artifacts specified as a dependency.
     Built {
         bsr: BuildSpecRef,
@@ -119,8 +125,10 @@ impl Dep {
     pub fn fully_built(&self) -> bool {
         use Dep::*;
         match self {
-            Cached(..) => true,
-            Built {
+            Cached {
+                cycle_breaker_for, ..
+            }
+            | Built {
                 cycle_breaker_for, ..
             } => !cycle_breaker_for.is_some(),
         }
@@ -129,7 +137,7 @@ impl Dep {
     fn bsr(&self) -> &BuildSpecRef {
         use Dep::*;
         match self {
-            Cached(bsr, _) => bsr,
+            Cached { bsr, .. } => bsr,
             Built { bsr, .. } => bsr,
         }
     }
@@ -137,7 +145,9 @@ impl Dep {
     pub fn cycle_breaker(&self) -> &Option<BuildSpecRef> {
         use Dep::*;
         match self {
-            Cached(..) => &None,
+            Cached {
+                cycle_breaker_for, ..
+            } => cycle_breaker_for,
             Built {
                 cycle_breaker_for, ..
             } => cycle_breaker_for,
@@ -146,7 +156,7 @@ impl Dep {
 
     fn with_outputs(mut self, new_outputs: Option<HashSet<String>>) -> Self {
         match &mut self {
-            Dep::Built { outputs, .. } | Dep::Cached(_, outputs) => {
+            Dep::Built { outputs, .. } | Dep::Cached { outputs, .. } => {
                 *outputs = new_outputs;
             }
         }
@@ -344,7 +354,11 @@ impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
         cycle_breakers_allowed: bool,
     ) -> Option<Dep> {
         if self.bin_provider.exists(dependency) {
-            return Some(Dep::Cached(*dependency, None));
+            return Some(Dep::Cached {
+                bsr: *dependency,
+                cycle_breaker_for: None,
+                outputs: None,
+            });
         }
 
         match self.builds.get(dependency) {
@@ -355,6 +369,13 @@ impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
             }
             Some(info) => {
                 if info.state.is_built() {
+                    if matches!(info.state, BuildState::Fetched) {
+                        return Some(Dep::Cached {
+                            bsr: *dependency,
+                            outputs: None,
+                            cycle_breaker_for: None,
+                        });
+                    }
                     return Some(Dep::Built {
                         bsr: *dependency,
                         cycle_breaker_for: None,
@@ -366,6 +387,19 @@ impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
                 if cycle_breakers_allowed {
                     if let Some(cycle_breaker) = info.cycle_breaker.as_ref() {
                         if self.is_built(cycle_breaker, cycle_breakers_allowed) {
+                            if matches!(
+                                self.builds.get(cycle_breaker),
+                                Some(BuildInfo {
+                                    state: BuildState::Fetched,
+                                    ..
+                                })
+                            ) {
+                                return Some(Dep::Cached {
+                                    bsr: *cycle_breaker,
+                                    outputs: None,
+                                    cycle_breaker_for: Some(*dependency),
+                                });
+                            }
                             return Some(Dep::Built {
                                 bsr: *cycle_breaker,
                                 cycle_breaker_for: Some(*dependency),
@@ -695,10 +729,10 @@ impl<'a, BP: BinProvider> Iterator for ExecPlan<'a, BP> {
                                 &mut path,
                             )
                             .unwrap();
-                            self.builds
-                                .get_mut(&cycle_breaker)
-                                .unwrap()
-                                .cycle_breaker_of = Some(**cycle);
+                            // self.builds
+                            //     .get_mut(&cycle_breaker)
+                            //     .unwrap()
+                            //     .cycle_breaker_of = Some(**cycle);
                             added_cycle_breaker = true;
                         }
                     }
@@ -1086,7 +1120,11 @@ mod tests {
                 BuildPhase {
                     builds: vec![Build {
                         spec: *dp.by_name("dep").unwrap(),
-                        with_deps: vec![Dep::Cached(*dp.by_name("nested dep").unwrap(), None),],
+                        with_deps: vec![Dep::Cached {
+                            bsr: *dp.by_name("nested dep").unwrap(),
+                            outputs: None,
+                            cycle_breaker_for: None
+                        },],
                     },],
                 },
                 BuildPhase {
@@ -1177,7 +1215,11 @@ mod tests {
                     builds: vec![Build {
                         spec: *dp.by_name("dep").unwrap(),
                         with_deps: vec![
-                            Dep::Cached(*dp.by_name("nested dep").unwrap(), None),
+                            Dep::Cached {
+                                bsr: *dp.by_name("nested dep").unwrap(),
+                                outputs: None,
+                                cycle_breaker_for: None
+                            },
                             Dep::Built {
                                 bsr: *dp.by_name("nested deeper dep").unwrap(),
                                 cycle_breaker_for: None,
@@ -1186,6 +1228,73 @@ mod tests {
                             },
                         ],
                     },],
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn cached_cycle_breaker_is_cached_dep() {
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+                let {BuildSpec, ..} = import \"minimal.ncl\" in
+
+                let rec self_ref = {
+                    name = \"self ref\",
+                    inputs = [self_ref],
+                    cmd = \"\",
+                    replace_on_cycle = {
+                        name = \"breaker\",
+                        inputs = [],
+                        cmd = \"\",
+                    } | BuildSpec,
+                } | BuildSpec,
+                in
+                self_ref
+                "
+            }
+            .to_string(),
+        );
+        // So we can see the actual error when parsing fails
+        layer.as_ref().err().into_iter().for_each(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+        let layer = layer.unwrap();
+
+        let dp = DepGraph::new().ingest(layer).unwrap();
+        // Pretend that the breaker is in the local cache.
+        let bp: BinProviderFake = HashMap::from([(*dp.by_name("breaker").unwrap(), ())]).into();
+        let plan: Vec<BuildPhase> = ExecPlan::new_with_bin_provider(&dp, bp)
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert_eq!(
+            plan,
+            vec![
+                BuildPhase {
+                    builds: vec![Build {
+                        spec: *dp.by_name("self ref").unwrap(),
+                        // We expect this to be Dep::Cached because the breaker
+                        // build is in the cache
+                        with_deps: vec![Dep::Cached {
+                            bsr: *dp.by_name("breaker").unwrap(),
+                            cycle_breaker_for: Some(*dp.by_name("self ref").unwrap()),
+                            outputs: None
+                        },],
+                    },]
+                },
+                BuildPhase {
+                    builds: vec![Build {
+                        spec: *dp.by_name("self ref").unwrap(),
+                        with_deps: vec![Dep::Built {
+                            bsr: *dp.by_name("self ref").unwrap(),
+                            cycle_breaker_for: None,
+                            built_with_breakers: true,
+                            outputs: None
+                        },],
+                    },]
                 },
             ],
         );

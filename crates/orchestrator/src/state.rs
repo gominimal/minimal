@@ -70,6 +70,7 @@ impl DeliverableInner {
     }
 }
 
+/// A wrapper which implements pretty-printing for errors and debugging.
 pub struct DeliverableInnerDisplay<'a>(&'a DeliverableInner, &'a DepGraph);
 
 impl<'a> Display for DeliverableInnerDisplay<'a> {
@@ -294,7 +295,7 @@ impl<B: super::Backend> Display for State<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f)?;
         for (k, v) in self.s.deliverables.iter() {
-            write!(f, "{:?}:\n\t{:?}", k, v)?;
+            write!(f, "{}:\n\t{:?}", k.into_raw_parts().0, v)?;
         }
         Ok(())
     }
@@ -324,7 +325,11 @@ impl<B: super::Backend> State<B> {
                         .map(|d| {
                             use graph::planner::Dep;
                             match d {
-                                Dep::Cached(bsr, outputs) => {
+                                Dep::Cached {
+                                    bsr,
+                                    outputs,
+                                    cycle_breaker_for: _,
+                                } => {
                                     let fill_deliverable =
                                         inner.get_cached(&bsr).copied().unwrap_or_else(|| {
                                             // No entry for fetching from the cache, populate it
