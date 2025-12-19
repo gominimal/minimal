@@ -24,7 +24,17 @@ impl BuildExecutor {
     /// * `package_name` - Name of the package being built (used in directory naming for debugging)
     #[tracing::instrument]
     pub fn new(sandbox_base_dir: PathBuf, package_name: String) -> Result<Self> {
-        // Create a unique directory name using timestamp and process ID
+        // Make sure the parent directory exists
+        fs::create_dir_all(&sandbox_base_dir).map_err(|e| ExecutionError::FileOperation {
+            operation: "create sandbox base directory".to_string(),
+            path: sandbox_base_dir.display().to_string(),
+            source: e,
+        })?;
+
+        // Create a unique directory name using package name, timestamp, and process ID.
+        // At this layer its plausible that there might be two packages of the same name
+        // built at the same time, so we do an atomic directory creation dance /w an attempt
+        // counter to make sure each build gets its own folder.
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| ExecutionError::FileOperation {
@@ -34,18 +44,44 @@ impl BuildExecutor {
             })?
             .as_secs();
         let pid = std::process::id();
+        let build_workspace_dir = {
+            let mut attempt = 0u32;
+            loop {
+                let dir_name = if attempt == 0 {
+                    format!("{}-{}-{}", package_name, timestamp, pid)
+                } else {
+                    format!("{}-{}-{}-{}", package_name, timestamp, pid, attempt)
+                };
 
-        // Include package name if provided for better debugging
-        let dir_name = format!("{}-{}-{}", package_name, timestamp, pid);
-
-        let build_workspace_dir = sandbox_base_dir.join(dir_name);
-
-        // Create the build directory
-        fs::create_dir_all(&build_workspace_dir).map_err(|e| ExecutionError::FileOperation {
-            operation: "create build directory".to_string(),
-            path: build_workspace_dir.display().to_string(),
-            source: e,
-        })?;
+                let candidate_dir = sandbox_base_dir.join(dir_name);
+                match fs::create_dir(&candidate_dir) {
+                    Ok(()) => break candidate_dir,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        attempt += 1;
+                        if attempt > 20 {
+                            return Err(ExecutionError::FileOperation {
+                                operation: "create build directory".to_string(),
+                                path: candidate_dir.display().to_string(),
+                                source: std::io::Error::new(
+                                    std::io::ErrorKind::AlreadyExists,
+                                    "too many directory creation attempts",
+                                ),
+                            }
+                            .into());
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(ExecutionError::FileOperation {
+                            operation: "create build directory".to_string(),
+                            path: candidate_dir.display().to_string(),
+                            source: e,
+                        }
+                        .into());
+                    }
+                }
+            }
+        };
 
         let executor = BuildExecutor {
             build_workspace_dir,
