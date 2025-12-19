@@ -63,6 +63,55 @@ impl DeliverableInner {
             None
         }
     }
+
+    /// Pretty-prints the structure.
+    pub fn display<'a>(&'a self, g: &'a DepGraph) -> DeliverableInnerDisplay<'a> {
+        DeliverableInnerDisplay(self, g)
+    }
+}
+
+pub struct DeliverableInnerDisplay<'a>(&'a DeliverableInner, &'a DepGraph);
+
+impl<'a> Display for DeliverableInnerDisplay<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let DeliverableInnerDisplay(i, graph) = self;
+
+        match i {
+            DeliverableInner::Build {
+                bsr,
+                spec_hash,
+                full_build,
+                dependencies: _,
+            } => {
+                let build = graph.get(bsr).unwrap();
+                f.debug_struct("build")
+                    .field("full", full_build)
+                    .field("hash", &spec_hash.0.to_hex())
+                    .field("spec", &build.name)
+                    .finish()
+            }
+            DeliverableInner::CacheFill { bsr, spec_hash } => {
+                let build = graph.get(bsr).unwrap();
+                f.debug_struct("cache_fetch")
+                    .field("hash", &spec_hash.0.to_hex())
+                    .field("spec", &build.name)
+                    .finish()
+            }
+            DeliverableInner::Subset {
+                build: _,
+                spec_hash,
+                subset,
+            } => {
+                let build = graph.get(&subset.from).unwrap();
+                f.debug_struct("cache_fetch")
+                    .field("hash", &spec_hash.0.to_hex())
+                    .field("from_spec", &build.name)
+                    .field("from_spec_hash", &graph.spec_hash(&subset.from))
+                    .field("outputs", &subset.outputs)
+                    .finish()
+            }
+        }
+    }
 }
 
 /// The runtime/action state regarding the creation of a [Deliverable].
