@@ -161,8 +161,12 @@ impl<B: Backend> Orchestrator<B> {
                         Ok(()) => {}
                         Err((dr, e)) => {
                             tracing::error!(
-                                "{:?} construction failed: {}",
-                                state.lock_for_deliverable(&dr).await.inner,
+                                "{} construction failed: {}",
+                                state
+                                    .lock_for_deliverable(&dr)
+                                    .await
+                                    .inner
+                                    .display(&*shared_hnd.graph().await),
                                 e
                             );
                             pending.abort_all();
@@ -189,8 +193,12 @@ impl<B: Backend> Orchestrator<B> {
                     Ok(()) => {}
                     Err((dr, e)) => {
                         tracing::error!(
-                            "{:?} construction failed: {}",
-                            state.lock_for_deliverable(&dr).await.inner,
+                            "{} construction failed: {}",
+                            state
+                                .lock_for_deliverable(&dr)
+                                .await
+                                .inner
+                                .display(&*shared_hnd.graph().await),
                             e
                         );
                         pending.abort_all();
