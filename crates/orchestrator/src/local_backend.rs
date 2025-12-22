@@ -37,9 +37,9 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
         shared_hnd: &mut SharedHandle<Self>,
         state_hnd: &mut StateHandle<Self>,
     ) -> Result<Self::Artifact, Error> {
-        let dep_paths = {
+        let (dep_paths, breaker_build) = {
             let s = state_hnd.lock().await;
-            let out: Vec<PathBuf> = dependencies
+            let dep_paths: Vec<PathBuf> = dependencies
                 .into_iter()
                 .map(|dr| match s.get(&dr).unwrap() {
                     Deliverable {
@@ -52,8 +52,15 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                     _ => unreachable!(),
                 })
                 .collect();
+            let breaker_build =
+                if let DeliverableInner::Build { full_build, .. } = s.get(&dr).unwrap().inner {
+                    !full_build
+                } else {
+                    unreachable!()
+                };
             drop(s);
-            out
+
+            (dep_paths, breaker_build)
         };
 
         let shared_hnd2 = shared_hnd.clone();
@@ -82,17 +89,6 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
         .await?;
 
         {
-            let breaker_build = {
-                let d = state_hnd.lock_for_deliverable(&dr).await;
-                let out = if let DeliverableInner::Build { full_build, .. } = &d.inner {
-                    !full_build
-                } else {
-                    unreachable!()
-                };
-                drop(d);
-                out
-            };
-
             let shared = shared_hnd.inner().read().await;
             let build = shared.graph.get(&bsr).unwrap();
             Ok(Either::Left((

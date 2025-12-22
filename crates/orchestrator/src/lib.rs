@@ -58,7 +58,7 @@ impl<B: Backend> SharedHandle<B> {
     /// Takes a lock and returns &[DepGraph].
     ///
     /// Make sure to drop as soon as possible to release the lock.
-    pub async fn graph(&self) -> RwLockReadGuard<'_, DepGraph> {
+    pub async fn graph<'a>(&'a self) -> RwLockReadGuard<'a, DepGraph> {
         RwLockReadGuard::map(self.0.read().await, |s| &s.graph)
     }
 
@@ -94,13 +94,13 @@ impl<B: Backend> Orchestrator<B> {
     }
 
     async fn run_impl(state: State<B>, shared: Shared<B>) -> Result<Vec<B::Artifact>, Error> {
-        let state = state.into_handle();
+        let state_hnd = state.into_handle();
         let shared_hnd = SharedHandle::new(shared);
 
         let mut pending: JoinSet<Result<(), (DeliverableRef, Error)>> = JoinSet::new();
-        while !state.done().await {
+        while !state_hnd.done().await {
             // Spawn tasks for all runnables
-            let mut s = state.lock().await;
+            let mut s = state_hnd.lock().await;
             for dr in s
                 .runnable()
                 .map(|(dr, _)| dr)
@@ -120,7 +120,7 @@ impl<B: Backend> Orchestrator<B> {
                     } => pending.spawn(
                         OrchestratedBuild {
                             shared_hnd: shared_hnd.clone(),
-                            state_hnd: state.clone(),
+                            state_hnd: state_hnd.clone(),
                             deliverable: dr,
 
                             bsr: *bsr,
@@ -132,7 +132,7 @@ impl<B: Backend> Orchestrator<B> {
                     state::DeliverableInner::CacheFill { bsr, spec_hash } => pending.spawn(
                         OrchestratedCacheFill {
                             shared_hnd: shared_hnd.clone(),
-                            state_hnd: state.clone(),
+                            state_hnd: state_hnd.clone(),
                             deliverable: dr,
 
                             bsr: *bsr,
@@ -147,7 +147,7 @@ impl<B: Backend> Orchestrator<B> {
                     } => pending.spawn(
                         OrchestratedSubset {
                             shared_hnd: shared_hnd.clone(),
-                            state_hnd: state.clone(),
+                            state_hnd: state_hnd.clone(),
                             deliverable: dr,
 
                             subset: subset.clone(),
@@ -168,7 +168,7 @@ impl<B: Backend> Orchestrator<B> {
                         Err((dr, e)) => {
                             tracing::error!(
                                 "{} construction failed: {}",
-                                state
+                                state_hnd
                                     .lock_for_deliverable(&dr)
                                     .await
                                     .inner
@@ -200,7 +200,7 @@ impl<B: Backend> Orchestrator<B> {
                     Err((dr, e)) => {
                         tracing::error!(
                             "{} construction failed: {}",
-                            state
+                            state_hnd
                                 .lock_for_deliverable(&dr)
                                 .await
                                 .inner
@@ -223,7 +223,7 @@ impl<B: Backend> Orchestrator<B> {
             }
         }
 
-        Ok(state
+        Ok(state_hnd
             .into_inner()
             .unwrap()
             .s

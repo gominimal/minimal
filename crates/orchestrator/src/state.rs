@@ -255,26 +255,25 @@ impl<B: super::Backend> Clone for StateHandle<B> {
 impl<B: super::Backend> StateHandle<B> {
     /// Returns true when all deliverables are complete or in an error state.
     pub async fn done(&self) -> bool {
-        self.0.lock().await.s.done()
-    }
-    /// Returns a list of all deliverables which are ready to be executed.
-    pub async fn runnables(&self) -> Vec<DeliverableRef> {
-        self.0.lock().await.s.runnable().map(|(r, _d)| r).collect()
+        let g = self.0.lock().await;
+        let res = g.s.done();
+        drop(g);
+        res
     }
     /// Takes the lock, allowing mutable access to [State].
     ///
     /// Drop the result as quickly as possible to yield the lock for other async tasks.
-    pub async fn lock(&self) -> MutexGuard<'_, State<B>> {
+    pub async fn lock<'a>(&'a self) -> MutexGuard<'a, State<B>> {
         self.0.lock().await
     }
 
     /// Takes the lock, allowing mutable access to the given [Deliverable] under [State].
     ///
     /// Drop the result as quickly as possible to yield the lock for other async tasks.
-    pub async fn lock_for_deliverable(
-        &self,
+    pub async fn lock_for_deliverable<'a>(
+        &'a self,
         dr: &DeliverableRef,
-    ) -> MappedMutexGuard<'_, Deliverable<B>> {
+    ) -> MappedMutexGuard<'a, Deliverable<B>> {
         MutexGuard::map(self.0.lock().await, |s| s.get_mut(dr).unwrap())
     }
 
