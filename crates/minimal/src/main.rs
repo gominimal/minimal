@@ -468,14 +468,17 @@ async fn main() -> Result<()> {
         .with_max_progress_bars(32, None)
         .with_span_field_formatter(hide_indicatif_span_fields(fmt::format::DefaultFields::new()));
 
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("info")
+            .add_directive("topiary=off".parse().unwrap())
+            .add_directive("build_events=off".parse().unwrap())
+            .add_directive("build_events_proto=off".parse().unwrap())
+    });
+
     tracing_subscriber::registry()
-        // .with(fmt::layer().with_target(false).with_thread_ids(true))
         .with(fmt::layer().with_writer(indicatif_layer.get_stderr_writer()))
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(indicatif_layer.with_filter(IndicatifFilter::new(false)))
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new("debug").add_directive("topiary=off".parse().unwrap())
-        }))
+        .with(filter)
         .init();
 
     let cli = Cli::parse();
