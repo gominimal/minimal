@@ -116,31 +116,44 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
         _state_hnd: &mut StateHandle<Self>,
     ) -> Result<Self::Artifact, Error> {
         // Check local cache
-        if let Ok(cd) = shared_hnd.inner().read().await.cache.read_dir(&spec_hash) {
-            return Ok(Either::Right(cd));
+        {
+            let s = shared_hnd.inner().read().await;
+            let cache_res = s.cache.read_dir(&spec_hash);
+            drop(s);
+            if let Ok(cd) = cache_res {
+                return Ok(Either::Right(cd));
+            }
         }
 
-        let shared = shared_hnd.inner().read().await;
-        if let Some(remote_cache) = shared.backend.remote_cache.as_ref() {
-            let build = shared.graph.get(&bsr).unwrap();
-            let (fetch_time, pending_dir) = remote_cache
-                .materialize(&spec_hash, &shared.cache, build.name.as_str())
-                .await
-                .map_err(|e| Error::Other(e.into()))?;
+        let shared_hnd2 = shared_hnd.clone();
+        spawn_blocking(async move || {
+            let shared = shared_hnd2.inner().read().await;
+            let res = if let Some(remote_cache) = shared.backend.remote_cache.as_ref() {
+                let build = shared.graph.get(&bsr).unwrap();
+                let (fetch_time, pending_dir) = remote_cache
+                    .materialize(&spec_hash, &shared.cache, build.name.as_str())
+                    .await
+                    .map_err(|e| Error::Other(e.into()))?;
 
-            Ok(Either::Left((
-                pending_dir,
-                EntryMeta {
-                    inner: MetaInner::Spec(build.name.clone()),
-                    fetched: true,
-                    fetch_ms: Some(fetch_time.as_millis() as usize),
-                    origin: Some(build.from.as_ref().clone()),
-                    ..Default::default()
-                },
-            )))
-        } else {
-            Err(Error::Cache(CacheErr::NotFound))
-        }
+                Ok(Either::Left((
+                    pending_dir,
+                    EntryMeta {
+                        inner: MetaInner::Spec(build.name.clone()),
+                        fetched: true,
+                        fetch_ms: Some(fetch_time.as_millis() as usize),
+                        origin: Some(build.from.as_ref().clone()),
+                        ..Default::default()
+                    },
+                )))
+            } else {
+                Err(Error::Cache(CacheErr::NotFound))
+            };
+            drop(shared);
+            res
+        })
+        .await
+        .unwrap()
+        .await
     }
 
     async fn materialize_subset(
