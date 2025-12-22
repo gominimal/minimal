@@ -100,8 +100,14 @@ impl<B: Backend> Orchestrator<B> {
         let mut pending: JoinSet<Result<(), (DeliverableRef, Error)>> = JoinSet::new();
         while !state.done().await {
             // Spawn tasks for all runnables
-            for dr in state.runnables().await.into_iter() {
-                let mut deliverable = state.lock_for_deliverable(&dr).await;
+            let mut s = state.lock().await;
+            for dr in s
+                .runnable()
+                .map(|(dr, _)| dr)
+                .collect::<Vec<_>>()
+                .into_iter()
+            {
+                let deliverable = s.get_mut(&dr).unwrap();
                 assert!(matches!(deliverable.state, DeliverableState::Pending));
 
                 // Spawn a task for the corresponding deliverable type
@@ -152,8 +158,8 @@ impl<B: Backend> Orchestrator<B> {
                     ),
                 };
                 deliverable.state = DeliverableState::InProgress(abort_handle);
-                drop(deliverable);
             }
+            drop(s);
 
             if let Some(task_result) = pending.join_next().await {
                 match task_result {
