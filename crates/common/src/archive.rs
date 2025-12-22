@@ -212,7 +212,10 @@ fn extract_tar_impl<R: Read>(
                 }
             }
 
-            entry.unpack(dest_dir.join(path))?;
+            if let tar::Unpacked::File(f) = entry.unpack(dest_dir.join(&path))? {
+                f.sync_all()?;
+                drop(f);
+            };
         }
     } else {
         archive.unpack(dest_dir)?;
