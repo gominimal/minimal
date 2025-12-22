@@ -698,6 +698,6 @@ mod tests {
             )
             .unwrap()
             .state = DeliverableState::Complete(());
-        assert_eq!(state.done(), true);
+        assert!(state.done());
     }
 }
