@@ -440,6 +440,16 @@ impl From<op::Error> for Error {
         }
     }
 }
+impl From<orchestrator::Error> for Error {
+    fn from(e: orchestrator::Error) -> Self {
+        match e {
+            orchestrator::Error::IO(e) => Self::Other(e.into()),
+            orchestrator::Error::Cache(e) => Self::Other(e.into()),
+            orchestrator::Error::Other(e) => Self::Other(e),
+            orchestrator::Error::Plan(graph, e) => Self::PlanErr(graph, e),
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {

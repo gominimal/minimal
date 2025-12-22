@@ -30,7 +30,7 @@ pub async fn cmd_build_impl(
     ctx: &mut Context,
     cache: Cache<LocalDir>,
     num_parallel_builds: usize,
-) -> anyhow::Result<()> {
+) -> Result<(), Error> {
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_parallel_builds)
         .build_global()
@@ -164,7 +164,9 @@ pub async fn cmd_build_impl(
 
     // Propagate error if build failed, and commit all artifacts to the local cache
     for (pending_dir, meta) in run_result.context("Failed to execute build")? {
-        pending_dir.finalize(meta)?;
+        pending_dir
+            .finalize(meta)
+            .map_err(|e| Error::Other(e.into()))?;
     }
 
     // Display build summary
