@@ -5,6 +5,7 @@ use hakoniwa::Container;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, warn};
 
@@ -15,6 +16,8 @@ use crate::error::{ExecutionError, Result};
 pub struct BuildExecutor {
     build_workspace_dir: PathBuf,
 }
+
+static HAKONIWA_SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 impl BuildExecutor {
     /// Create a new build executor with a unique sandbox workspace
@@ -289,6 +292,8 @@ impl BuildExecutor {
             }
 
             let mut cmd = container.command(&program);
+            cmd.stderr(hakoniwa::Stdio::MakePipe);
+            cmd.stdout(hakoniwa::Stdio::MakePipe);
             for arg in &exec.args {
                 cmd.arg(arg);
             }
@@ -323,9 +328,29 @@ impl BuildExecutor {
 
             cmd.current_dir(sandbox_mount_point);
 
-            let output = cmd.output().map_err(|e| ExecutionError::SandboxFailed {
+            // Exclusive section: only one hakoniwa command can be spawned
+            // at a time. This prevents races with a file descriptor being held
+            // by one forked process while being needed closed in another process.
+            //
+            // Waiting for spawn lets us wait till exec, at which point all such
+            // file descriptors (which have O_CLOEXEC) will have been closed.
+            let mut child = {
+                // recover from poisoned lock - no need to permanently break
+                // all container invocations forever.
+                let _guard = HAKONIWA_SPAWN_LOCK
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                cmd.spawn()
+            }
+            .map_err(|e| ExecutionError::SandboxFailed {
                 message: format!("Container execution failed: {}", e),
             })?;
+
+            let output = child
+                .wait_with_output()
+                .map_err(|e| ExecutionError::SandboxFailed {
+                    message: format!("Container output collection failed: {}", e),
+                })?;
             stdout_f
                 .write_all(&output.stdout)
                 .map_err(|e| ExecutionError::SandboxFailed {
