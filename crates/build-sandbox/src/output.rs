@@ -1,3 +1,4 @@
+use common::FdSynchronizer;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{error, warn};
@@ -59,6 +60,7 @@ impl OutputValidator {
         found_files.dedup();
 
         // Copy enumerated output files to final destination
+        let l = FdSynchronizer::lock_writing_files();
         for output_file in &found_files {
             let relative_path =
                 output_file
@@ -118,6 +120,7 @@ impl OutputValidator {
 
             collected_outputs.push(dest_path);
         }
+        drop(l);
 
         // Self::warn_about_leftover_files(staging_dir, &found_files)?;
 

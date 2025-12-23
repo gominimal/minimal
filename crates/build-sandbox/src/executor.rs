@@ -1,11 +1,11 @@
 use build_events::events::{
     BuildEvent, FileCreated, TargetCompleted, TargetKind, TargetStarted, build_event,
 };
+use common::FdSynchronizer;
 use hakoniwa::Container;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, warn};
 
@@ -16,8 +16,6 @@ use crate::error::{ExecutionError, Result};
 pub struct BuildExecutor {
     build_workspace_dir: PathBuf,
 }
-
-static HAKONIWA_SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 impl BuildExecutor {
     /// Create a new build executor with a unique sandbox workspace
@@ -335,11 +333,7 @@ impl BuildExecutor {
             // Waiting for spawn lets us wait till exec, at which point all such
             // file descriptors (which have O_CLOEXEC) will have been closed.
             let mut child = {
-                // recover from poisoned lock - no need to permanently break
-                // all container invocations forever.
-                let _guard = HAKONIWA_SPAWN_LOCK
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let _guard = FdSynchronizer::lock_fork();
                 cmd.spawn()
             }
             .map_err(|e| ExecutionError::SandboxFailed {
