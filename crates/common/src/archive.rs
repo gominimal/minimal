@@ -190,6 +190,7 @@ fn extract_tar_impl<R: Read>(
     dest_dir: &Path,
     strip_prefix: Option<&String>,
 ) -> Result<(), ArchiveError> {
+    let _guard = super::FdSynchronizer::lock_writing_files();
     let mut archive = tar::Archive::new(reader);
 
     if let Some(prefix) = strip_prefix {

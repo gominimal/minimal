@@ -51,6 +51,7 @@ impl<'a> Runnable for SubsetBuild<'a> {
 
         // Copy all matched files into the under-construction subset
         let out_base = out.path();
+        let l = common::FdSynchronizer::lock_writing_files();
         for file in files.into_iter() {
             let trimmed = file.strip_prefix(&build_dir).unwrap();
             if let Some(parent) = trimmed.parent() {
@@ -58,6 +59,7 @@ impl<'a> Runnable for SubsetBuild<'a> {
             }
             std::fs::copy(&file, out_base.join(trimmed))?;
         }
+        drop(l);
 
         Ok(out)
     }

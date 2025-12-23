@@ -19,8 +19,30 @@ use std::{
     env, fmt,
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::{RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 use tracing::warn;
+
+static HAKONIWA_SPAWN_LOCK: RwLock<()> = RwLock::new(());
+
+/// Global lock to synchronize the creation of files with any calls to fork(),
+/// which may in-advertently inherit them.
+pub struct FdSynchronizer;
+
+impl FdSynchronizer {
+    /// Returns a RAII guard that symbolizes that files may be written.
+    pub fn lock_writing_files() -> RwLockReadGuard<'static, ()> {
+        HAKONIWA_SPAWN_LOCK
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+    /// Returns a RAII guard that symbolizes that you may fork+exec.
+    pub fn lock_fork() -> RwLockWriteGuard<'static, ()> {
+        HAKONIWA_SPAWN_LOCK
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
 
 /// Describes where a build-spec came from.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
