@@ -243,7 +243,8 @@ impl BuildExecutor {
             .bindmount_rw(
                 self.output_staging_dir().to_str().unwrap(),
                 format!("{}/output", sandbox_mount_point).as_str(),
-            );
+            )
+            .unshare(hakoniwa::Namespace::Cgroup);
 
         let needs_bin_symlink = config
             .dependencies
