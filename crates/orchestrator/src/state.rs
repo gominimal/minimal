@@ -696,13 +696,12 @@ mod tests {
                     .unwrap(),
             ]
         );
-        let no_deps = state
+        let no_deps = *state
             .s
             .get_built(None, dp.by_name("no deps").unwrap())
             .unwrap()
             .next()
-            .unwrap()
-            .clone();
+            .unwrap();
         state.s.get_mut(&no_deps).unwrap().state = DeliverableState::Complete(());
         assert_eq!(
             state.runnable().map(|r| r.0).collect::<Vec<_>>(),
@@ -717,13 +716,12 @@ mod tests {
         );
 
         // Make sure done() works while we are at it.
-        let top = state
+        let top = *state
             .s
             .get_built(None, dp.by_name("top").unwrap())
             .unwrap()
             .next()
-            .unwrap()
-            .clone();
+            .unwrap();
         state.s.get_mut(&top).unwrap().state = DeliverableState::Complete(());
         assert!(state.done());
     }
