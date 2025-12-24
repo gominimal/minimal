@@ -142,7 +142,7 @@ pub struct Deliverable<B: super::Backend> {
 pub(crate) struct StateInner<B: super::Backend> {
     pub(crate) deliverables: Arena<Deliverable<B>>,
     fills_by_ref: HashMap<BuildSpecRef, DeliverableRef>,
-    builds_by_ref: HashMap<BuildSpecRef, Vec<DeliverableRef>>,
+    builds_by_ref: HashMap<BuildSpecRef, Vec<(Option<usize>, DeliverableRef)>>,
     subsets_by_ref: HashMap<SubsetInput, DeliverableRef>,
 }
 
@@ -163,7 +163,7 @@ impl<B: super::Backend> StateInner<B> {
         self.deliverables.get_mut(dr.0)
     }
 
-    fn insert(&mut self, di: DeliverableInner) -> DeliverableRef {
+    fn insert(&mut self, phase_idx: Option<usize>, di: DeliverableInner) -> DeliverableRef {
         let (fills_key, builds_key, subsets_key) = match &di {
             DeliverableInner::Build { bsr, .. } => (None, Some(*bsr), None),
             DeliverableInner::CacheFill { bsr, spec_hash: _ } => (Some(*bsr), None, None),
@@ -180,9 +180,9 @@ impl<B: super::Backend> StateInner<B> {
         if let Some(builds_key) = builds_key {
             match self.builds_by_ref.get_mut(&builds_key) {
                 None => {
-                    self.builds_by_ref.insert(builds_key, vec![dr]);
+                    self.builds_by_ref.insert(builds_key, vec![(phase_idx, dr)]);
                 }
-                Some(v) => v.push(dr),
+                Some(v) => v.push((phase_idx, dr)),
             };
         }
         if let Some(subsets_key) = subsets_key {
@@ -195,8 +195,25 @@ impl<B: super::Backend> StateInner<B> {
     fn get_cached(&self, bsr: &BuildSpecRef) -> Option<&DeliverableRef> {
         self.fills_by_ref.get(bsr)
     }
-    fn get_built(&self, bsr: &BuildSpecRef) -> Option<&Vec<DeliverableRef>> {
-        self.builds_by_ref.get(bsr)
+    fn get_built(
+        &self,
+        phase_less_than: Option<usize>,
+        bsr: &BuildSpecRef,
+    ) -> Option<impl Iterator<Item = &DeliverableRef>> {
+        self.builds_by_ref.get(bsr).map(move |v| {
+            v.iter()
+                .filter_map(move |(idx, dr)| match (idx, phase_less_than) {
+                    (None, _) => Some(dr),
+                    (Some(idx), Some(lt)) => {
+                        if *idx < lt {
+                            Some(dr)
+                        } else {
+                            None
+                        }
+                    }
+                    (Some(_), None) => Some(dr),
+                })
+        })
     }
     fn get_subset(&self, si: &SubsetInput) -> Option<&DeliverableRef> {
         self.subsets_by_ref.get(si)
@@ -312,7 +329,7 @@ impl<B: super::Backend> State<B> {
 
         let mut inner = StateInner::<B>::new();
 
-        for phase in plan.into_iter() {
+        for (pi, phase) in plan.into_iter().enumerate() {
             for build in phase.builds.into_iter() {
                 let d = DeliverableInner::Build {
                     bsr: build.spec,
@@ -332,10 +349,13 @@ impl<B: super::Backend> State<B> {
                                     let fill_deliverable =
                                         inner.get_cached(&bsr).copied().unwrap_or_else(|| {
                                             // No entry for fetching from the cache, populate it
-                                            inner.insert(DeliverableInner::CacheFill {
-                                                bsr,
-                                                spec_hash: graph.spec_hash(&bsr),
-                                            })
+                                            inner.insert(
+                                                None,
+                                                DeliverableInner::CacheFill {
+                                                    bsr,
+                                                    spec_hash: graph.spec_hash(&bsr),
+                                                },
+                                            )
                                         });
                                     match outputs {
                                         None => fill_deliverable,
@@ -344,11 +364,14 @@ impl<B: super::Backend> State<B> {
                                             inner.get_subset(&subset).copied().unwrap_or_else(
                                                 || {
                                                     // No entry for that subset, populate it
-                                                    inner.insert(DeliverableInner::Subset {
-                                                        subset,
-                                                        spec_hash: graph.spec_hash(&bsr),
-                                                        build: fill_deliverable,
-                                                    })
+                                                    inner.insert(
+                                                        None,
+                                                        DeliverableInner::Subset {
+                                                            subset,
+                                                            spec_hash: graph.spec_hash(&bsr),
+                                                            build: fill_deliverable,
+                                                        },
+                                                    )
                                                 },
                                             )
                                         }
@@ -361,7 +384,7 @@ impl<B: super::Backend> State<B> {
                                     outputs,
                                 } => {
                                     let build_deliverable = inner
-                                        .get_built(&bsr)
+                                        .get_built(Some(pi), &bsr)
                                         .map(|v| v.last().unwrap())
                                         .copied()
                                         .unwrap(); // Must reference something which is already built
@@ -373,11 +396,14 @@ impl<B: super::Backend> State<B> {
                                                 || {
                                                     // No entry for that subset, populate it
                                                     let subset_hash = graph.subset_hash(&subset);
-                                                    inner.insert(DeliverableInner::Subset {
-                                                        subset,
-                                                        spec_hash: subset_hash,
-                                                        build: build_deliverable,
-                                                    })
+                                                    inner.insert(
+                                                        None,
+                                                        DeliverableInner::Subset {
+                                                            subset,
+                                                            spec_hash: subset_hash,
+                                                            build: build_deliverable,
+                                                        },
+                                                    )
                                                 },
                                             )
                                         }
@@ -387,7 +413,7 @@ impl<B: super::Backend> State<B> {
                         })
                         .collect(),
                 };
-                inner.insert(d);
+                inner.insert(Some(pi), d);
             }
         }
 
@@ -405,10 +431,13 @@ impl<B: super::Backend> State<B> {
                         if bsr_represented {
                             // Already brought in
                         } else {
-                            inner.insert(DeliverableInner::CacheFill {
-                                bsr: *bsr,
-                                spec_hash: graph.spec_hash(bsr),
-                            });
+                            inner.insert(
+                                None,
+                                DeliverableInner::CacheFill {
+                                    bsr: *bsr,
+                                    spec_hash: graph.spec_hash(bsr),
+                                },
+                            );
                         }
                     }
                     // Subset needed
@@ -418,27 +447,36 @@ impl<B: super::Backend> State<B> {
                             // Subset already represented
                         } else if bsr_represented {
                             let subset_hash = graph.subset_hash(&si);
-                            inner.insert(DeliverableInner::Subset {
-                                subset: si,
-                                spec_hash: subset_hash,
-                                build: if let Some(dr) = inner.builds_by_ref.get(bsr) {
-                                    *dr.last().unwrap()
-                                } else {
-                                    *inner.fills_by_ref.get(bsr).unwrap()
+                            inner.insert(
+                                None,
+                                DeliverableInner::Subset {
+                                    subset: si,
+                                    spec_hash: subset_hash,
+                                    build: if let Some(dr) = inner.get_built(None, bsr) {
+                                        *dr.last().unwrap()
+                                    } else {
+                                        *inner.fills_by_ref.get(bsr).unwrap()
+                                    },
                                 },
-                            });
+                            );
                         } else {
                             // Emit both the cache fill and the subset
-                            let dr = inner.insert(DeliverableInner::CacheFill {
-                                bsr: *bsr,
-                                spec_hash: graph.spec_hash(bsr),
-                            });
+                            let dr = inner.insert(
+                                None,
+                                DeliverableInner::CacheFill {
+                                    bsr: *bsr,
+                                    spec_hash: graph.spec_hash(bsr),
+                                },
+                            );
                             let subset_hash = graph.subset_hash(&si);
-                            inner.insert(DeliverableInner::Subset {
-                                subset: si,
-                                spec_hash: subset_hash,
-                                build: dr,
-                            });
+                            inner.insert(
+                                None,
+                                DeliverableInner::Subset {
+                                    subset: si,
+                                    spec_hash: subset_hash,
+                                    build: dr,
+                                },
+                            );
                         }
                     }
                 }
@@ -550,15 +588,15 @@ mod tests {
                     dependencies: vec![
                         *state
                             .s
-                            .get_built(dp.by_name("no deps").unwrap())
+                            .get_built(None, dp.by_name("no deps").unwrap())
                             .unwrap()
-                            .first()
+                            .next()
                             .unwrap(),
                         *state
                             .s
-                            .get_built(dp.by_name("breaker").unwrap())
+                            .get_built(None, dp.by_name("breaker").unwrap())
                             .unwrap()
-                            .first()
+                            .next()
                             .unwrap(),
                     ],
                 },
@@ -569,9 +607,9 @@ mod tests {
                     dependencies: vec![
                         *state
                             .s
-                            .get_built(dp.by_name("breaker").unwrap())
+                            .get_built(None, dp.by_name("breaker").unwrap())
                             .unwrap()
-                            .first()
+                            .next()
                             .unwrap(),
                     ],
                 },
@@ -582,15 +620,15 @@ mod tests {
                     dependencies: vec![
                         *state
                             .s
-                            .get_built(dp.by_name("no deps").unwrap())
+                            .get_built(None, dp.by_name("no deps").unwrap())
                             .unwrap()
-                            .first()
+                            .next()
                             .unwrap(),
                         *state
                             .s
-                            .get_built(dp.by_name("self ref").unwrap())
+                            .get_built(None, dp.by_name("self ref").unwrap())
                             .unwrap()
-                            .first()
+                            .next()
                             .unwrap(),
                     ],
                 },
@@ -601,9 +639,9 @@ mod tests {
                     dependencies: vec![
                         *state
                             .s
-                            .get_built(dp.by_name("self ref").unwrap())
+                            .get_built(None, dp.by_name("self ref").unwrap())
                             .unwrap()
-                            .first()
+                            .next()
                             .unwrap(),
                     ],
                 },
@@ -652,51 +690,41 @@ mod tests {
             vec![
                 *state
                     .s
-                    .get_built(dp.by_name("no deps").unwrap())
+                    .get_built(None, dp.by_name("no deps").unwrap())
                     .unwrap()
-                    .first()
+                    .next()
                     .unwrap(),
             ]
         );
-        state
+        let no_deps = state
             .s
-            .get_mut(
-                state
-                    .s
-                    .get_built(dp.by_name("no deps").unwrap())
-                    .cloned()
-                    .unwrap()
-                    .first()
-                    .unwrap(),
-            )
+            .get_built(None, dp.by_name("no deps").unwrap())
             .unwrap()
-            .state = DeliverableState::Complete(());
+            .next()
+            .unwrap()
+            .clone();
+        state.s.get_mut(&no_deps).unwrap().state = DeliverableState::Complete(());
         assert_eq!(
             state.runnable().map(|r| r.0).collect::<Vec<_>>(),
             vec![
                 *state
                     .s
-                    .get_built(dp.by_name("top").unwrap())
+                    .get_built(None, dp.by_name("top").unwrap())
                     .unwrap()
-                    .first()
+                    .next()
                     .unwrap(),
             ]
         );
 
         // Make sure done() works while we are at it.
-        state
+        let top = state
             .s
-            .get_mut(
-                state
-                    .s
-                    .get_built(dp.by_name("top").unwrap())
-                    .cloned()
-                    .unwrap()
-                    .first()
-                    .unwrap(),
-            )
+            .get_built(None, dp.by_name("top").unwrap())
             .unwrap()
-            .state = DeliverableState::Complete(());
+            .next()
+            .unwrap()
+            .clone();
+        state.s.get_mut(&top).unwrap().state = DeliverableState::Complete(());
         assert!(state.done());
     }
 }
