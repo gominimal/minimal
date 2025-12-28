@@ -21,6 +21,7 @@ copy_dir.workspace = true
 shlex.workspace = true
 globset.workspace = true
 
+bzip2.workspace = true
 either.workspace = true
 hex.workspace = true
 rand.workspace = true
