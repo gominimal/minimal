@@ -137,6 +137,7 @@ pub enum Compression {
     Gzip,
     Xz,
     Zstd,
+    Bz2,
 }
 
 impl Compression {
@@ -148,6 +149,8 @@ impl Compression {
             Some(Compression::Xz)
         } else if path.ends_with(".tar.zst") {
             Some(Compression::Zstd)
+        } else if path.ends_with(".tar.bz2") {
+            Some(Compression::Bz2)
         } else if path.ends_with(".tar") {
             Some(Compression::None)
         } else {
@@ -179,6 +182,10 @@ pub fn extract_compressed_tar<R: Read>(
             lzma_rs::xz_decompress(&mut std::io::BufReader::new(reader), &mut decomp_buf)?;
             std::io::Seek::rewind(&mut decomp_buf)?;
             extract_tar_impl(decomp_buf, dest_dir, strip_prefix)
+        }
+        Compression::Bz2 => {
+            let decoder = bzip2::read::BzDecoder::new(reader);
+            extract_tar_impl(decoder, dest_dir, strip_prefix)
         }
     }
 }
