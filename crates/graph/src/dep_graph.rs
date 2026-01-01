@@ -31,7 +31,7 @@ pub struct BuildSpecRef(pub(crate) generational_arena::Index);
 impl BuildSpecRef {
     /// returns the index of the BuildSpec in the arena
     pub fn index(&self) -> usize {
-	self.0.into_raw_parts().0
+        self.0.into_raw_parts().0
     }
 }
 /// A description of pulling source code regardless of form.
