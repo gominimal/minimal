@@ -32,6 +32,8 @@ use cmd_patched_build::{PatchedBuildArgs, cmd_patched_build};
 mod cmd_run;
 #[cfg(target_os = "linux")]
 use cmd_run::{RunArgs, cmd_run};
+mod cmd_dependencies;
+use cmd_dependencies::{DependenciesArgs, cmd_dependencies};
 
 #[derive(Parser)]
 #[command(name = "minimal", version = env!("GIT_HASH"))]
@@ -66,6 +68,10 @@ enum Command {
     /// Executes the build for a package, using stale dependencies.
     #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
     PatchedBuild(PatchedBuildArgs),
+    /// Generates Graphviz source code of the dependency graph
+    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
+    #[command(long_about = "Generate an image of the dependency graph using graphviz's \"dot\" program.\n\n  minimal dependencies -p gcc | dot -Tpng > deps.png\n")]
+    Dependencies(DependenciesArgs),
 }
 
 /// Shared arguments and builders across all subcommands
@@ -547,6 +553,7 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         Command::PatchedBuild(args) => cmd_patched_build(args, &mut ctx).await,
         #[cfg(target_os = "linux")]
         Command::Run(args) => cmd_run(args, &mut ctx).await,
+        Command::Dependencies(args) => cmd_dependencies(args, &mut ctx).await,
 
         Command::Update => ctx
             .vcs_manager()
