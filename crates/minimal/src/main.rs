@@ -70,7 +70,9 @@ enum Command {
     PatchedBuild(PatchedBuildArgs),
     /// Generates Graphviz source code of the dependency graph
     #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
-    #[command(long_about = "Generate an image of the dependency graph using graphviz's \"dot\" program.\n\n  minimal dependencies -p gcc | dot -Tpng > deps.png\n")]
+    #[command(
+        long_about = "Generate an image of the dependency graph using graphviz's \"dot\" program.\n\n  minimal dependencies -p gcc | dot -Tpng > deps.png\n"
+    )]
     Dependencies(DependenciesArgs),
 }
 
