@@ -81,8 +81,8 @@ pub use spec_hasher::SpecHasher;
 
 pub mod dep_graph;
 pub use dep_graph::{
-    BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, RuntimeDep, SourceInput,
-    SubsetInput, SourceFetch
+    BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, RuntimeDep, SourceFetch,
+    SourceInput, SubsetInput,
 };
 
 pub mod planner;
