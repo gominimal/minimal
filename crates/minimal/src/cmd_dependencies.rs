@@ -69,7 +69,7 @@ pub async fn cmd_dependencies(args: DependenciesArgs, ctx: &mut Context) -> Resu
     let iter = graph.iter();
     for (bsr, bs) in iter {
         // if packages were explicitly specified, only create nodes for those and their deps
-        if specified_pkgs_and_deps.len() > 0 && !specified_pkgs_and_deps.contains(&bsr) {
+        if !specified_pkgs_and_deps.is_empty() && !specified_pkgs_and_deps.contains(&bsr) {
             continue;
         }
         let id = bsr.index();
@@ -82,7 +82,7 @@ pub async fn cmd_dependencies(args: DependenciesArgs, ctx: &mut Context) -> Resu
     let iter = graph.iter();
     for (bsr, bs) in iter {
         // if packages were explicitly specified, skip those not specified
-        if specified_pkgs_and_deps.len() > 0 && !specified_pkgs_and_deps.contains(&bsr) {
+        if !specified_pkgs_and_deps.is_empty() && !specified_pkgs_and_deps.contains(&bsr) {
             continue;
         }
         // INPUTS EDGES - ignores local ones (e.g. build.sh refs)
