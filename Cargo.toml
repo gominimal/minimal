@@ -44,14 +44,14 @@ hakoniwa = { git = "https://github.com/souk4711/hakoniwa", branch = "main" }
 hex = "0.4"
 indoc = "^2.0"
 lzma-rs = "0.3"
-nickel-lang-core = { version = "0.15.3", default-features = false, features = ["format"] }
+nickel-lang-core = { version = "0.16.1", default-features = false, features = ["format"] }
 object = { version = "0.38", default-features = false, features = ["archive", "elf", "read_core", "std"] }
-oci-spec = "0.8.3"
+oci-spec = "0.8.4"
 path-absolutize = "^3.1"
 rand = "0.9"
 rayon = "1.11"
 regex = "1" # keep in sync with nickel-lang-core
-reqwest = { version = "0.12", features = ["stream"] } # keep in sync with google-cloud-gax
+reqwest = { version = "0.13", features = ["stream"] } # keep in sync with google-cloud-gax
 rustc-hash = "2.1.1"
 serde = { version = "1.0", features = ["derive"] } # Keep within the same minor version as nickel-lang-core
 prost = "0.14.1"
@@ -63,9 +63,9 @@ shlex = "1.3"
 size = "0.5"
 smallvec = "1.15"
 tar = "0.4"
-tempfile = "3.23"
+tempfile = "3.24"
 thiserror = "2.0"
-tokio = { version = "1.48.0", features = ["full"] }
+tokio = { version = "1.49.0", features = ["full"] }
 tokio-stream = "0.1"
 tokio-util = "0.7"
 toml = "0.9"
