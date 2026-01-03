@@ -3,7 +3,7 @@ use clap::ArgAction;
 use graph::{BuildSpecInput, RuntimeDep, SourceFetch, Transitives};
 use std::collections::HashSet;
 
-#[derive(clap::Args)]
+#[derive(Debug, clap::Args)]
 pub struct DependenciesArgs {
     #[command(flatten)]
     packages: PackagesArg,

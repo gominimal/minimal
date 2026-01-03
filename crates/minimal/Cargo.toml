@@ -25,6 +25,7 @@ tracing-subscriber.workspace = true
 tracing-indicatif.workspace = true
 
 clap.workspace = true
+clap_complete.workspace = true
 tempfile.workspace = true
 dirs.workspace = true
 blake3.workspace = true

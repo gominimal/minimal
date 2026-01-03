@@ -2,10 +2,12 @@
 
 use anyhow::{Result, anyhow, bail};
 use cache::{Cache, LocalDir, RemoteCache, RemoteError};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use common::{SpecOrigin, mfile, repo_spec::GitRef};
 use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
 use graph::{DepGraph, Error as GraphError, PlanErr};
+use std::io;
 use std::path::PathBuf;
 use tracing::warn;
 use tracing_indicatif::IndicatifLayer;
@@ -74,6 +76,16 @@ enum Command {
         long_about = "Generate an image of the dependency graph using graphviz's \"dot\" program.\n\n  minimal dependencies -p gcc | dot -Tpng > deps.png\n"
     )]
     Dependencies(DependenciesArgs),
+    /// Generate shell completion script
+    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
+    GenerateCompletions(GenerateCompletionsArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct GenerateCompletionsArgs {
+    /// The shell type for a CLI completion script should be printed
+    #[arg(value_parser)]
+    shell: Shell,
 }
 
 /// Shared arguments and builders across all subcommands
@@ -491,6 +503,13 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    if let Command::GenerateCompletions(GenerateCompletionsArgs { shell }) = &cli.command {
+        let mut cmd = Cli::command();
+        let name = cmd.get_name().to_string();
+        clap_complete::generate(*shell, &mut cmd, name, &mut io::stdout());
+        return Ok(());
+    }
+
     // Generate invocation ID for this build
     let invocation_id = Uuid::new_v4().to_string();
 
@@ -556,6 +575,7 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         #[cfg(target_os = "linux")]
         Command::Run(args) => cmd_run(args, &mut ctx).await,
         Command::Dependencies(args) => cmd_dependencies(args, &mut ctx).await,
+        Command::GenerateCompletions(_) => Ok(()),
 
         Command::Update => ctx
             .vcs_manager()
