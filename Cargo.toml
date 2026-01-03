@@ -29,6 +29,7 @@ blake3 = "1"
 bytes = "1.11.0" # keep in sync with reqwest
 bzip2 = "0.6"
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = { version = "4.5" }
 codespan-reporting = { version = "0.13", features = ["serialization"] } # Keep in sync with nickel-lang-core
 copy_dir = "0.1.3"
 dirs = "6"
