@@ -18,6 +18,7 @@ allow = [
     "MPL-2.0",
     "Unicode-3.0",
     "Zlib",
+    "bzip2-1.0.6",
 ]
 
 exceptions = [
