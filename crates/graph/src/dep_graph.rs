@@ -375,7 +375,7 @@ impl SourceProvider for checkouts::Manager {
         let (path, _hash) = checkouts::Manager::checkout_of(
             self,
             &upstream.repo,
-            checkouts::GitRef::Commit(upstream.hash.clone()),
+            checkouts::GitRef::Commit(upstream.rev.clone()),
         )?;
         Ok(path)
     }
@@ -451,7 +451,7 @@ impl DepGraph {
                     })
                     .to_owned()
                     .flatten(),
-                hash: rev.clone(),
+                rev: rev.clone(),
             }),
             SpecOrigin::LocalDir { ref absolute, .. } => {
                 let layer = Layer::new(
@@ -984,7 +984,7 @@ mod tests {
         .unwrap();
         let apex_repo = UpstreamConfig {
             repo: "git@fakehub.com:minimal/apex.git".to_string(),
-            hash: "abc123".to_string(),
+            rev: "abc123".to_string(),
             branch: None,
         };
 
@@ -1021,7 +1021,7 @@ mod tests {
         .unwrap();
         let middle_repo = UpstreamConfig {
             repo: "git@fakehub.com:minimal/middle.git".to_string(),
-            hash: "abc123".to_string(),
+            rev: "abc123".to_string(),
             branch: None,
         };
 
