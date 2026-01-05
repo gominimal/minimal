@@ -313,7 +313,8 @@ pub struct UpstreamConfig {
     /// The URL the repository can be fetched from.
     pub repo: String,
     /// The commit hash.
-    pub hash: String,
+    #[serde(alias = "hash")]
+    pub rev: String,
     /// The name of the branch this points to, if relevant.
     pub branch: Option<String>,
 }
@@ -322,7 +323,7 @@ impl From<UpstreamConfig> for SpecOrigin {
     fn from(val: UpstreamConfig) -> Self {
         SpecOrigin::Repo(common::repo_spec::Repo::Git {
             url: val.repo,
-            rev: val.hash,
+            rev: val.rev,
             tracking: val.branch.map(common::repo_spec::GitRef::Branch),
         })
     }
