@@ -49,6 +49,7 @@ pub enum StrOrList {
 pub struct Upstream {
     pub repo: String,
     pub branch: Option<String>,
+    pub rev: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -186,6 +187,10 @@ impl File {
             Some(fname) => fname.parent(),
         }
     }
+    /// Returns the path to the minimal file.
+    pub fn file_path(&self) -> Option<&PathBuf> {
+        self.from.as_ref()
+    }
 
     /// Returns the path to where durable state for the given environment should be stored.
     ///
@@ -262,6 +267,7 @@ mod tests {
                 upstream: Upstream {
                     repo: "https://github.com/gominimal/pkgs".to_string(),
                     branch: Some("main".to_string()),
+                    rev: None,
                 },
                 envs: [(
                     "test".to_string(),

@@ -36,6 +36,8 @@ mod cmd_run;
 use cmd_run::{RunArgs, cmd_run};
 mod cmd_dependencies;
 use cmd_dependencies::{DependenciesArgs, cmd_dependencies};
+mod cmd_update;
+use cmd_update::{UpdateArgs, cmd_update};
 
 #[derive(Parser)]
 #[command(name = "minimal", version = env!("GIT_HASH"))]
@@ -58,7 +60,7 @@ enum Command {
     /// Materializes an output specified in `minimal.toml`.
     Materialize(MaterializeArgs),
     /// Refreshes local checkouts of upstream packages & the standard library.
-    Update,
+    Update(UpdateArgs),
 
     /// Prints the build plan for the specified package(s)
     Plan(PlanArgs),
@@ -284,7 +286,10 @@ impl Context {
             .vcs
             .checkout_of(
                 &minimal_file.upstream.repo,
-                checkouts::GitRef::Branch(base_target.clone()),
+                match &minimal_file.upstream.rev {
+                    None => checkouts::GitRef::Branch(base_target.clone()),
+                    Some(hash) => checkouts::GitRef::Commit(hash.clone()),
+                },
             )
             .map_err(anyhow::Error::from)?;
 
@@ -577,9 +582,6 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         Command::Dependencies(args) => cmd_dependencies(args, &mut ctx).await,
         Command::GenerateCompletions(_) => Ok(()),
 
-        Command::Update => ctx
-            .vcs_manager()
-            .update()
-            .map_err(|e| Error::Other(anyhow::Error::from(e))),
+        Command::Update(args) => cmd_update(args, &mut ctx).await,
     }
 }

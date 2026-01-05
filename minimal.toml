@@ -1,6 +1,7 @@
 [upstream]
 repo = "https://github.com/gominimal/pkgs"
 branch = "main"
+rev = "bf2bd22e8ecd48818131a1306f6e5e507e8505ce"
 
 [envs.dev]
 from_profile = "rust"

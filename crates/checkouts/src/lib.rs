@@ -182,7 +182,7 @@ impl Manager {
         self.base_dir.join("git").join("db")
     }
 
-    /// Updates all repos to latest - does nothing for refs which arent symbolic (i.e. branches).
+    /// Updates all repos to latest - does nothing for refs which arent symbolic (i.e. commits).
     pub fn update(&mut self) -> Result<(), Error> {
         let checkouts_dir = self.git_checkouts_dir();
         for (_remote, id) in self.state.git_remotes.iter_mut() {
