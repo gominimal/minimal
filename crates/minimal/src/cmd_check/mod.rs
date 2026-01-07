@@ -1,5 +1,7 @@
+use crate::cmd_check::outputs::{MissingRuntimeDeps, OutputTypesValid};
 use crate::{Context, Error, PackagesArg};
 use anyhow::anyhow;
+use cache::{Cache, LocalDir};
 use graph::DepGraph;
 
 use codespan_reporting::term::termcolor::{
@@ -8,6 +10,7 @@ use codespan_reporting::term::termcolor::{
 use regex::Regex;
 use std::cmp::Ordering;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 mod naming;
@@ -27,7 +30,7 @@ pub struct CheckArgs {
     skip_checkers: Option<Vec<String>>,
 }
 
-pub fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> {
+pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> {
     let all_graph = ctx.graph_from_all_packages().ok();
     let packages_dir = ctx.upstream_dir_and_origin()?.0.join("packages");
 
@@ -50,6 +53,7 @@ pub fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(anyhow::Error::from)?;
 
+    let upstream_dir = ctx.upstream_dir_and_origin()?.0;
     let iter = packages_dirs
         .into_iter()
         // Filter based on the packages argument
@@ -63,12 +67,17 @@ pub fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> {
             }
         })
         .map(|pkg| {
+            let packages_dir = upstream_dir.join("packages");
+            let stdlib_dir = ctx.stdlib_dir();
+
             let result = check_package(
-                &pkg,
+                pkg.clone(),
                 &all_graph,
                 args.fix,
                 args.skip_checkers.clone().unwrap_or_default(),
-                ctx,
+                packages_dir,
+                stdlib_dir,
+                ctx.local_cache(),
             );
             (pkg, result)
         });
@@ -76,7 +85,7 @@ pub fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> {
     let mut had_error = false;
     let mut stdout = StandardStream::stdout(ColorChoice::Always);
     for (pkg, result) in iter {
-        let result = result?;
+        let result = result.await?;
 
         stdout.set_color(ColorSpec::new().set_fg(None)).unwrap();
         writeln!(&mut stdout, "\npackage: {}", pkg).unwrap();
@@ -138,27 +147,169 @@ struct CheckResult {
     err: Vec<String>,
 }
 
-fn check_package_parses(
-    pkg: &str,
-    _all_graph: &Option<DepGraph>,
-    _fix: bool,
-    ctx: &mut Context,
-) -> Result<CheckResult, Error> {
-    let mut result = CheckResult {
-        verdict: CheckVerdict::Skip,
-        check: "parse",
-        err: vec![],
-    };
+async fn check_package(
+    pkg: String,
+    all_graph: &Option<DepGraph>,
+    fix: bool,
+    skip_checkers: Vec<String>,
+    packages_dir: PathBuf,
+    stdlib_dir: PathBuf,
+    cache: Cache<LocalDir>,
+) -> Result<Vec<CheckResult>, Error> {
+    let mut out = Vec::new();
 
-    result.verdict = match ctx.graph_from_package_names(&[pkg.to_string()]) {
-        Ok(_) => CheckVerdict::Pass,
-        Err(e) => {
-            result.err.push(format!("{:?}", e));
-            CheckVerdict::Fail
+    if let Some(graph) = all_graph {
+        out.push(
+            naming::SpecNameMatchesDir
+                .check(&skip_checkers, fix, pkg.clone(), graph, cache.clone())
+                .await?,
+        );
+        out.push(
+            naming::SpecNameValid
+                .check(&skip_checkers, fix, pkg.clone(), graph, cache.clone())
+                .await?,
+        );
+        out.push(
+            naming::CycleBreakerNaming
+                .check(&skip_checkers, fix, pkg.clone(), graph, cache.clone())
+                .await?,
+        );
+        out.push(
+            naming::OutputNaming
+                .check(&skip_checkers, fix, pkg.clone(), graph, cache.clone())
+                .await?,
+        );
+        out.push(
+            OutputTypesValid
+                .check(&skip_checkers, fix, pkg.clone(), graph, cache.clone())
+                .await?,
+        );
+        out.push(
+            MissingRuntimeDeps
+                .check(&skip_checkers, fix, pkg.clone(), graph, cache.clone())
+                .await?,
+        );
+    }
+
+    let file_based: Vec<Box<dyn FileBasedChecker>> = vec![
+        Box::new(ParseCheck),
+        Box::new(ImportLineCheck),
+        Box::new(FmtCheck),
+    ];
+    for mut c in file_based.into_iter() {
+        let check_result = c.as_mut().check(
+            &skip_checkers,
+            fix,
+            &pkg,
+            &packages_dir.join(&pkg),
+            &stdlib_dir,
+        )?;
+        out.push(check_result);
+    }
+
+    Ok(out)
+}
+
+/// A checker which checks a package by looking at its files. These checkers
+/// are run serially.
+trait FileBasedChecker {
+    fn check(
+        &mut self,
+        skip_checkers: &Vec<String>,
+        fix: bool,
+        pkg: &str,
+        pkg_dir: &Path,
+        stdlib_dir: &Path,
+    ) -> Result<CheckResult, Error>;
+}
+
+/// A checker which checks a package by looking at its representation in the graph.
+/// These checkers are run in parallel.
+trait GraphBasedChecker {
+    async fn check(
+        self,
+        skip_checkers: &Vec<String>,
+        fix: bool,
+        pkg: String,
+        graph: &DepGraph,
+        cache: Cache<LocalDir>,
+    ) -> Result<CheckResult, Error>;
+}
+
+/// A [FileBasedChecker] that check the build.ncl file parses.
+struct ParseCheck;
+
+impl FileBasedChecker for ParseCheck {
+    fn check(
+        &mut self,
+        skip_checkers: &Vec<String>,
+        _fix: bool,
+        _pkg: &str,
+        pkg_dir: &Path,
+        stdlib_dir: &Path,
+    ) -> Result<CheckResult, Error> {
+        if skip_checkers.contains(&"parse".to_string()) {
+            return Ok(CheckResult {
+                check: "parse",
+                verdict: CheckVerdict::Skip,
+                err: vec![],
+            });
         }
-    };
 
-    Ok(result)
+        use nickel_lang_core::error::report::report_as_str;
+        use nickel_lang_core::{error::NullReporter, eval::cache::CacheImpl, program::Program};
+
+        let program_res = Program::new_from_source(
+            std::io::Cursor::new(format!(
+                "import \"{}\"",
+                pkg_dir.join("build.ncl").as_os_str().to_str().unwrap()
+            )),
+            "toplevel",
+            std::io::stderr(),
+            NullReporter {},
+        );
+
+        let mut program: Program<CacheImpl> = match program_res {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(CheckResult {
+                    check: "parse",
+                    verdict: CheckVerdict::Fail,
+                    err: vec![format!("{}", e)],
+                });
+            }
+        };
+        program.add_import_paths([stdlib_dir].iter());
+
+        if let Err(e) = program.typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk) {
+            return Ok(CheckResult {
+                check: "parse",
+                verdict: CheckVerdict::Fail,
+                err: vec![report_as_str(
+                    &mut program.files(),
+                    e,
+                    nickel_lang_core::error::report::ColorOpt::Never,
+                )],
+            });
+        }
+        if let Err(e) = program.compile() {
+            return Ok(CheckResult {
+                check: "parse",
+                verdict: CheckVerdict::Fail,
+                err: vec![report_as_str(
+                    &mut program.files(),
+                    e,
+                    nickel_lang_core::error::report::ColorOpt::Never,
+                )],
+            });
+        }
+
+        return Ok(CheckResult {
+            check: "parse",
+            verdict: CheckVerdict::Pass,
+            err: vec![],
+        });
+    }
 }
 
 static MINIMAL_IMPORT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -166,196 +317,172 @@ static MINIMAL_IMPORT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
         .expect("Invalid regex pattern")
 });
 
-fn check_minimal_import_line(
-    pkg: &str,
-    _all_graph: &Option<DepGraph>,
-    fix: bool,
-    ctx: &mut Context,
-) -> Result<CheckResult, Error> {
-    let mut result = CheckResult {
-        verdict: CheckVerdict::Pass,
-        check: "import line",
-        err: vec![],
-    };
+struct ImportLineCheck;
 
-    let base = ctx.upstream_dir_and_origin()?.0.join("packages").join(pkg);
-    for e in std::fs::read_dir(base).map_err(anyhow::Error::from)? {
-        let e = e.map_err(anyhow::Error::from)?;
-        if e.file_type().unwrap().is_dir() {
-            continue;
-        }
-        let name = e.file_name();
-        if !name.to_str().unwrap().ends_with(".ncl") {
-            continue;
+impl FileBasedChecker for ImportLineCheck {
+    fn check(
+        &mut self,
+        skip_checkers: &Vec<String>,
+        fix: bool,
+        _pkg: &str,
+        pkg_dir: &Path,
+        _stdlib_dir: &Path,
+    ) -> Result<CheckResult, Error> {
+        let mut result = CheckResult {
+            verdict: CheckVerdict::Pass,
+            check: "import line",
+            err: vec![],
+        };
+        if skip_checkers.contains(&"import line".to_string()) {
+            result.verdict = CheckVerdict::Skip;
+            return Ok(result);
         }
 
-        let file_contents =
-            String::from_utf8(std::fs::read(e.path()).map_err(anyhow::Error::from)?)
-                .map_err(anyhow::Error::from)?;
+        for e in std::fs::read_dir(pkg_dir).map_err(anyhow::Error::from)? {
+            let e = e.map_err(anyhow::Error::from)?;
+            if e.file_type().unwrap().is_dir() {
+                continue;
+            }
+            let name = e.file_name();
+            if !name.to_str().unwrap().ends_with(".ncl") {
+                continue;
+            }
 
-        if let Some(captures) = &MINIMAL_IMPORT_REGEX.captures(&file_contents) {
-            let overall = captures.get(0).unwrap();
-            let identifiers_str = captures.get(1).unwrap().as_str();
+            let file_contents =
+                String::from_utf8(std::fs::read(e.path()).map_err(anyhow::Error::from)?)
+                    .map_err(anyhow::Error::from)?;
 
-            // Split by comma and clean up whitespace, filter out ".."
-            let identifiers: Vec<&str> = identifiers_str
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty() && *s != "..")
-                .collect();
+            if let Some(captures) = &MINIMAL_IMPORT_REGEX.captures(&file_contents) {
+                let overall = captures.get(0).unwrap();
+                let identifiers_str = captures.get(1).unwrap().as_str();
 
-            // Filter identifiers which arent used, if not in fix mode then report
-            let rest = &file_contents[overall.end()..];
-            let used_identifiers = identifiers
-                .iter()
-                .filter_map(|ident| {
-                    if !rest.contains(ident) {
-                        if !fix {
-                            result.err.push(format!(
-                                "{}: {} imported but not used",
-                                name.to_str().unwrap(),
-                                ident
-                            ));
+                // Split by comma and clean up whitespace, filter out ".."
+                let identifiers: Vec<&str> = identifiers_str
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty() && *s != "..")
+                    .collect();
+
+                // Filter identifiers which arent used, if not in fix mode then report
+                let rest = &file_contents[overall.end()..];
+                let used_identifiers = identifiers
+                    .iter()
+                    .filter_map(|ident| {
+                        if !rest.contains(ident) {
+                            if !fix {
+                                result.err.push(format!(
+                                    "{}: {} imported but not used",
+                                    name.to_str().unwrap(),
+                                    ident
+                                ));
+                            }
+                            None
+                        } else {
+                            Some(*ident)
                         }
-                        None
-                    } else {
-                        Some(*ident)
+                    })
+                    .collect::<Vec<_>>();
+
+                let mut sorted_identifiers = used_identifiers.clone();
+                sorted_identifiers.sort_by(|a, b| {
+                    let a_is_lower = a.chars().next().unwrap_or('\0').is_ascii_lowercase();
+                    let b_is_lower = b.chars().next().unwrap_or('\0').is_ascii_lowercase();
+
+                    match (a_is_lower, b_is_lower) {
+                        // Both lowercase or both uppercase - use normal string comparison
+                        (true, true) | (false, false) => a.cmp(b),
+                        // a is lowercase, b is uppercase - a comes first
+                        (true, false) => Ordering::Less,
+                        // a is uppercase, b is lowercase - b comes first
+                        (false, true) => Ordering::Greater,
                     }
-                })
-                .collect::<Vec<_>>();
+                });
 
-            let mut sorted_identifiers = used_identifiers.clone();
-            sorted_identifiers.sort_by(|a, b| {
-                let a_is_lower = a.chars().next().unwrap_or('\0').is_ascii_lowercase();
-                let b_is_lower = b.chars().next().unwrap_or('\0').is_ascii_lowercase();
-
-                match (a_is_lower, b_is_lower) {
-                    // Both lowercase or both uppercase - use normal string comparison
-                    (true, true) | (false, false) => a.cmp(b),
-                    // a is lowercase, b is uppercase - a comes first
-                    (true, false) => Ordering::Less,
-                    // a is uppercase, b is lowercase - b comes first
-                    (false, true) => Ordering::Greater,
+                if !fix && sorted_identifiers != used_identifiers {
+                    result.err.push(format!(
+                        "{}: identifiers not in canonical order",
+                        name.to_str().unwrap()
+                    ));
                 }
-            });
-
-            if !fix && sorted_identifiers != used_identifiers {
-                result.err.push(format!(
-                    "{}: identifiers not in canonical order",
-                    name.to_str().unwrap()
-                ));
-            }
-            if fix && (sorted_identifiers != used_identifiers || identifiers != used_identifiers) {
-                let fixed = format!(
-                    "let {{ {}, .. }} = import \"minimal.ncl\" in",
-                    sorted_identifiers.join(", ")
-                );
-                let mut new_file_contents = file_contents.clone();
-                new_file_contents.replace_range(overall.start()..overall.end(), &fixed);
-                std::fs::write(e.path(), new_file_contents).map_err(anyhow::Error::from)?;
-                result.verdict = CheckVerdict::Fixed;
-            }
-        }
-    }
-
-    if !result.err.is_empty() {
-        result.verdict = CheckVerdict::Fail;
-    }
-    Ok(result)
-}
-
-fn check_package_fmt(
-    pkg: &str,
-    _all_graph: &Option<DepGraph>,
-    fix: bool,
-    ctx: &mut Context,
-) -> Result<CheckResult, Error> {
-    let mut result = CheckResult {
-        verdict: CheckVerdict::Skip,
-        check: "fmt",
-        err: vec![],
-    };
-
-    let base = ctx.upstream_dir_and_origin()?.0.join("packages").join(pkg);
-    for e in std::fs::read_dir(base).map_err(anyhow::Error::from)? {
-        let e = e.map_err(anyhow::Error::from)?;
-        if e.file_type().unwrap().is_dir() {
-            continue;
-        }
-        let name = e.file_name();
-        if !name.to_str().unwrap().ends_with(".ncl") {
-            continue;
-        }
-
-        let data = std::fs::read(e.path()).map_err(anyhow::Error::from)?;
-        let mut out: Vec<u8> = Vec::with_capacity(2048);
-
-        match nickel_lang_core::format::format(&data[..], &mut out) {
-            Err(e) => {
-                result.err.push(format!(
-                    "formatting {} failed: {:?}",
-                    name.to_str().unwrap(),
-                    e
-                ));
-                result.verdict = CheckVerdict::Skip;
-            }
-            Ok(()) => {
-                if data != out {
-                    if fix {
-                        std::fs::write(e.path(), out).map_err(anyhow::Error::from)?;
-                        result.verdict = CheckVerdict::Fixed;
-                    } else {
-                        result.verdict = CheckVerdict::Fail;
-                    }
-                } else {
-                    result.verdict = CheckVerdict::Pass;
+                if fix
+                    && (sorted_identifiers != used_identifiers || identifiers != used_identifiers)
+                {
+                    let fixed = format!(
+                        "let {{ {}, .. }} = import \"minimal.ncl\" in",
+                        sorted_identifiers.join(", ")
+                    );
+                    let mut new_file_contents = file_contents.clone();
+                    new_file_contents.replace_range(overall.start()..overall.end(), &fixed);
+                    std::fs::write(e.path(), new_file_contents).map_err(anyhow::Error::from)?;
+                    result.verdict = CheckVerdict::Fixed;
                 }
             }
         }
-    }
 
-    Ok(result)
+        if !result.err.is_empty() {
+            result.verdict = CheckVerdict::Fail;
+        }
+        Ok(result)
+    }
 }
 
-fn check_package(
-    pkg: &str,
-    all_graph: &Option<DepGraph>,
-    fix: bool,
-    skip_checkers: Vec<String>,
-    ctx: &mut Context,
-) -> Result<Vec<CheckResult>, Error> {
-    let mut out = Vec::new();
+struct FmtCheck;
 
-    // TODO: This is garbage
-    if !skip_checkers.contains(&"parse".to_string()) {
-        out.push(check_package_parses(pkg, all_graph, fix, ctx)?);
-    }
-    if !skip_checkers.contains(&"spec name valid".to_string()) {
-        out.push(naming::package_name(pkg, all_graph, fix, ctx)?);
-    }
-    if !skip_checkers.contains(&"spec name matches dir".to_string()) {
-        out.push(naming::package_spec_name_matches_dir(
-            pkg, all_graph, fix, ctx,
-        )?);
-    }
-    if !skip_checkers.contains(&"cycle breaker naming".to_string()) {
-        out.push(naming::cycle_breaker_naming(pkg, all_graph, fix, ctx)?);
-    }
-    if !skip_checkers.contains(&"output naming".to_string()) {
-        out.push(naming::output_naming(pkg, all_graph, fix, ctx)?);
-    }
-    if !skip_checkers.contains(&"output types valid".to_string()) {
-        out.push(outputs::output_types_valid(pkg, all_graph, fix, ctx)?);
-    }
-    if !skip_checkers.contains(&"missing runtime_deps".to_string()) {
-        out.push(outputs::missing_runtime_deps(pkg, all_graph, fix, ctx)?);
-    }
-    if !skip_checkers.contains(&"import line".to_string()) {
-        out.push(check_minimal_import_line(pkg, all_graph, fix, ctx)?);
-    }
-    if !skip_checkers.contains(&"fmt".to_string()) {
-        out.push(check_package_fmt(pkg, all_graph, fix, ctx)?);
-    }
+impl FileBasedChecker for FmtCheck {
+    fn check(
+        &mut self,
+        skip_checkers: &Vec<String>,
+        fix: bool,
+        _pkg: &str,
+        pkg_dir: &Path,
+        _stdlib_dir: &Path,
+    ) -> Result<CheckResult, Error> {
+        let mut result = CheckResult {
+            verdict: CheckVerdict::Skip,
+            check: "fmt",
+            err: vec![],
+        };
+        if skip_checkers.contains(&"fmt".to_string()) {
+            return Ok(result);
+        }
 
-    Ok(out)
+        for e in std::fs::read_dir(pkg_dir).map_err(anyhow::Error::from)? {
+            let e = e.map_err(anyhow::Error::from)?;
+            if e.file_type().unwrap().is_dir() {
+                continue;
+            }
+            let name = e.file_name();
+            if !name.to_str().unwrap().ends_with(".ncl") {
+                continue;
+            }
+
+            let data = std::fs::read(e.path()).map_err(anyhow::Error::from)?;
+            let mut out: Vec<u8> = Vec::with_capacity(2048);
+
+            match nickel_lang_core::format::format(&data[..], &mut out) {
+                Err(e) => {
+                    result.err.push(format!(
+                        "formatting {} failed: {:?}",
+                        name.to_str().unwrap(),
+                        e
+                    ));
+                    result.verdict = CheckVerdict::Skip;
+                }
+                Ok(()) => {
+                    if data != out {
+                        if fix {
+                            std::fs::write(e.path(), out).map_err(anyhow::Error::from)?;
+                            result.verdict = CheckVerdict::Fixed;
+                        } else {
+                            result.verdict = CheckVerdict::Fail;
+                        }
+                    } else {
+                        result.verdict = CheckVerdict::Pass;
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
 }
