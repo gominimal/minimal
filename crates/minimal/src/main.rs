@@ -572,7 +572,7 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
 
     match command {
         Command::Build(args) => cmd_build(args, &mut ctx).await,
-        Command::Check(args) => cmd_check(args, &mut ctx),
+        Command::Check(args) => cmd_check(args, &mut ctx).await,
         Command::Plan(args) => cmd_plan(args, &mut ctx).await,
         Command::UploadCache(args) => cmd_upload_cache(args, &mut ctx).await,
         Command::Materialize(args) => cmd_materialize(args, &mut ctx).await,
