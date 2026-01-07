@@ -212,6 +212,34 @@ impl RuntimeDep {
     }
 }
 
+/// A unit test defined on a build spec.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SpecTest {
+    /// The test needs to run in the build sandbox, rather than standalone.
+    pub build_test: bool,
+    /// Additional dependencies needed for the test.
+    pub deps: Option<SmallVec<[BuildSpecRef; 6]>>,
+    /// The tests commands.
+    pub cmds: Vec<Vec<String>>,
+}
+
+impl SpecTest {
+    fn from_decoded(t: &decode::Test, loader: &Loader) -> Result<Self, Error> {
+        Ok(Self {
+            build_test: t.build_test,
+            deps: match &t.deps {
+                None => None,
+                Some(deps) => Some(
+                    deps.iter()
+                        .map(|d| loader.load(d))
+                        .collect::<Result<SmallVec<_>, _>>()?,
+                ),
+            },
+            cmds: t.cmds.clone(),
+        })
+    }
+}
+
 /// Some task or build in the dependency graph.
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
@@ -243,6 +271,9 @@ pub struct BuildSpec {
 
     /// The attributes defined on the build-spec.
     pub attrs: IndexMap<String, AttrValue>,
+
+    /// Any unit tests defined on the build-spec.
+    pub tests: Option<IndexMap<String, SpecTest>>,
 
     /// Identifies the collection of build-specs where this was defined.
     pub from: Arc<SpecOrigin>,
@@ -297,6 +328,19 @@ impl BuildSpec {
             },
 
             attrs: bd.attrs.as_ref().cloned().unwrap_or(IndexMap::new()),
+
+            tests: match &bd.tests {
+                None => None,
+                Some(tests) => Some(
+                    tests
+                        .iter()
+                        .map(|(n, t)| match SpecTest::from_decoded(t, loader) {
+                            Ok(t) => Ok((n.clone(), t)),
+                            Err(e) => Err(e),
+                        })
+                        .collect::<Result<IndexMap<String, SpecTest>, _>>()?,
+                ),
+            },
 
             from: loader.origin.clone(),
         })
@@ -1050,6 +1094,54 @@ mod tests {
         assert_eq!(
             m.inputs[0].as_build().unwrap(),
             graph.by_name("top").unwrap()
+        );
+    }
+
+    #[test]
+    fn ingest_test() {
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+                let {standaloneTest, BuildSpec, ..} = import \"minimal.ncl\" in
+
+                let
+                    b1 = {
+                        name = \"build 1\",
+                        inputs = [],
+                        cmd = \"\",
+                    } | BuildSpec,
+                    b2 = {
+                        name = \"build 2\",
+                        inputs = [],
+                        tests.smoketest = standaloneTest \"some_cmd\",
+                        cmd = \"\",
+                    } | BuildSpec,
+                in
+                b2
+                "
+            }
+            .to_string(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        let dp = DepGraph::new().ingest(layer).unwrap();
+        let build = dp.get(dp.by_name("build 2").unwrap()).unwrap();
+        assert_eq!(
+            build.tests,
+            Some(
+                [(
+                    "smoketest".to_string(),
+                    SpecTest {
+                        build_test: false,
+                        deps: None,
+                        cmds: vec![vec!["some_cmd".to_string()]],
+                    }
+                )]
+                .into()
+            )
         );
     }
 }
