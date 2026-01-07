@@ -1,4 +1,4 @@
-let Tys = [| 'Builder, 'Path, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Subset, 'Profile, 'Layer, 'Upstream |]
+let Tys = [| 'Builder, 'Path, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Subset, 'Profile, 'Layer, 'Upstream, 'Test |]
 in
 let attrs_schema = import "attr_classes.ncl" in
 let needs_schema = import "need_classes.ncl" in
@@ -29,6 +29,8 @@ let needs_schema = import "need_classes.ncl" in
 
         outputs
           | {_ : Output} | optional = {},
+
+        tests | {_: Test} | optional,
     },
     build | Dyn -> BuildSpec | doc "Constructs a minimal build spec." =
       fun spec => spec | BuildSpec,
@@ -67,6 +69,7 @@ let needs_schema = import "need_classes.ncl" in
             match {
                 {ty = 'Builder, ..} => std.contract.check BuildSpec label value,
                 {ty = 'Subset, ..} => std.contract.check Subset label value,
+                {ty = 'Upstream, ..} => std.contract.check UpstreamPkg label value,
                 _ => 'Error {
                     message = "Expected Input type",
                 },
@@ -82,6 +85,7 @@ let needs_schema = import "need_classes.ncl" in
                 {ty = 'Source, ..} => std.contract.check Source label value,
                 {ty = 'Local, ..}  => std.contract.check Local label value,
                 {ty = 'Subset, ..} => std.contract.check Subset label value,
+                {ty = 'Upstream, ..} => std.contract.check UpstreamPkg label value,
                 _ => 'Error {
                     message = "Expected Input type",
                 },
@@ -200,9 +204,29 @@ let needs_schema = import "need_classes.ncl" in
 
     UpstreamPkg = {
         ty | Tys = 'Upstream,
-        name
-        | String,
+        name | String,
     },
     upstream | String -> UpstreamPkg | doc "Symbolizes a build with the given name from upstream." =
         fun n => {name = n},
+
+    Test | doc "A unit test for a decl." = {
+        ty | Tys = 'Test,
+        class | [| 'Standalone, 'Build |],
+
+        test_deps
+          | Array RuntimeDep | optional,
+
+        cmd | String | optional,
+        cmds | Array (Array String) | optional,
+    },
+    standaloneTest | String -> Test | doc "A test, run using the outputs of the build." =
+        fun cmd => {
+            class = 'Standalone,
+            include cmd,
+        },
+    buildTest | String -> Test | doc "A test, run in the build container once the build is completed." =
+        fun cmd => {
+            class = 'Build,
+            include cmd,
+        },
 }
