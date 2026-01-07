@@ -215,7 +215,7 @@ async fn check_package(
 trait FileBasedChecker {
     fn check(
         &mut self,
-        skip_checkers: &Vec<String>,
+        skip_checkers: &[String],
         fix: bool,
         pkg: &str,
         pkg_dir: &Path,
@@ -228,7 +228,7 @@ trait FileBasedChecker {
 trait GraphBasedChecker {
     async fn check(
         self,
-        skip_checkers: &Vec<String>,
+        skip_checkers: &[String],
         fix: bool,
         pkg: String,
         graph: &DepGraph,
@@ -242,7 +242,7 @@ struct ParseCheck;
 impl FileBasedChecker for ParseCheck {
     fn check(
         &mut self,
-        skip_checkers: &Vec<String>,
+        skip_checkers: &[String],
         _fix: bool,
         _pkg: &str,
         pkg_dir: &Path,
@@ -304,11 +304,11 @@ impl FileBasedChecker for ParseCheck {
             });
         }
 
-        return Ok(CheckResult {
+        Ok(CheckResult {
             check: "parse",
             verdict: CheckVerdict::Pass,
             err: vec![],
-        });
+        })
     }
 }
 
@@ -322,7 +322,7 @@ struct ImportLineCheck;
 impl FileBasedChecker for ImportLineCheck {
     fn check(
         &mut self,
-        skip_checkers: &Vec<String>,
+        skip_checkers: &[String],
         fix: bool,
         _pkg: &str,
         pkg_dir: &Path,
@@ -431,7 +431,7 @@ struct FmtCheck;
 impl FileBasedChecker for FmtCheck {
     fn check(
         &mut self,
-        skip_checkers: &Vec<String>,
+        skip_checkers: &[String],
         fix: bool,
         _pkg: &str,
         pkg_dir: &Path,

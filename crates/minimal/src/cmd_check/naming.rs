@@ -8,7 +8,7 @@ pub struct SpecNameMatchesDir;
 impl super::GraphBasedChecker for SpecNameMatchesDir {
     async fn check(
         self,
-        skip_checkers: &Vec<String>,
+        skip_checkers: &[String],
         _fix: bool,
         pkg: String,
         graph: &DepGraph,
@@ -45,7 +45,7 @@ pub struct SpecNameValid;
 impl super::GraphBasedChecker for SpecNameValid {
     async fn check(
         self,
-        skip_checkers: &Vec<String>,
+        skip_checkers: &[String],
         _fix: bool,
         pkg: String,
         _graph: &DepGraph,
@@ -83,7 +83,7 @@ pub struct CycleBreakerNaming;
 impl super::GraphBasedChecker for CycleBreakerNaming {
     async fn check(
         self,
-        skip_checkers: &Vec<String>,
+        skip_checkers: &[String],
         _fix: bool,
         pkg: String,
         graph: &DepGraph,
@@ -130,7 +130,7 @@ pub struct OutputNaming;
 impl super::GraphBasedChecker for OutputNaming {
     async fn check(
         self,
-        skip_checkers: &Vec<String>,
+        skip_checkers: &[String],
         _fix: bool,
         pkg: String,
         graph: &DepGraph,

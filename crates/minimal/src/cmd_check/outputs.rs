@@ -14,7 +14,7 @@ pub struct OutputTypesValid;
 impl super::GraphBasedChecker for OutputTypesValid {
     async fn check(
         self,
-        skip_checkers: &Vec<String>,
+        skip_checkers: &[String],
         _fix: bool,
         pkg: String,
         graph: &DepGraph,
@@ -93,7 +93,7 @@ pub struct MissingRuntimeDeps;
 impl super::GraphBasedChecker for MissingRuntimeDeps {
     async fn check(
         self,
-        skip_checkers: &Vec<String>,
+        skip_checkers: &[String],
         _fix: bool,
         pkg: String,
         graph: &DepGraph,
