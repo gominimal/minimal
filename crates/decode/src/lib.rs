@@ -25,6 +25,8 @@ pub mod builds;
 use builds::BuildDecl;
 mod profiles;
 pub use profiles::Profile;
+mod decl_tests;
+pub use decl_tests::Test;
 
 /// A collection of nickel objects, defined together in a single codebase.
 #[derive(Debug)]
@@ -266,6 +268,7 @@ pub enum ObjTy {
     Profile,
     Layer,
     Upstream,
+    Test,
 }
 
 pub(crate) fn read_ty(rt: &RichTerm, program: &mut Program<CacheImpl>) -> Result<ObjTy, Error> {

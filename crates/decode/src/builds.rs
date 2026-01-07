@@ -401,7 +401,8 @@ impl BuildDeclInput {
             | ObjTy::OutputBin
             | ObjTy::OutputData
             | ObjTy::Profile
-            | ObjTy::Layer => Err(Error::UnexpectedObject {
+            | ObjTy::Layer
+            | ObjTy::Test => Err(Error::UnexpectedObject {
                 files: program.files(),
                 got: ty,
                 want: ObjTy::Builder,
@@ -667,6 +668,9 @@ pub struct BuildDecl {
 
     /// An alternative build spec to use to break cycles in resolving dependencies on this build spec.
     pub replace_on_cycle: Option<BuildRef>,
+
+    /// Unit tests declared on this build spec.
+    pub tests: Option<IndexMap<String, crate::Test>>,
 }
 
 impl BuildDecl {
@@ -698,6 +702,7 @@ impl BuildDecl {
         let mut replace_on_cycle: Option<BuildRef> = None;
         let mut attrs: Option<IndexMap<String, AttrValue>> = None;
         let mut prebuilt: Option<bool> = None;
+        let mut tests: Option<IndexMap<String, crate::Test>> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                 r.fields
@@ -970,6 +975,31 @@ impl BuildDecl {
 
                                 Ok(())
                             }
+                            "tests" => {
+                                if let Some(tests_res) = field
+                                    .value
+                                    .as_ref()
+                                    .map(|rt| eval_if_closure(rt, program)) {
+                                        let tests_rt = tests_res?;
+
+                                        if let Term::Record(r) = tests_rt.as_ref() {
+                                            tests = Some(
+                                                r.iter_serializable()
+                                                    .map(|entry| entry.unwrap())
+                                                    .map(|(ident, val)| {
+                                                        Ok((
+                                                            ident.label().to_string(),
+                                                            crate::Test::from_term(val, program, acc)?,
+                                                        ))
+                                                    })
+                                                    .collect::<Result<_, Error>>()?,
+                                            );
+                                        } else {
+                                            todo!("handle value being non-dict {:?}", field.value);
+                                        };
+                                    }
+                                Ok(())
+                            }
                             _ => Ok(()), // TODO: Should we error if we see an unknown field?
                         }
                     })?;
@@ -1061,6 +1091,7 @@ impl BuildDecl {
             abstract_deps: needs,
             outputs,
             replace_on_cycle,
+            tests,
         })
     }
 }
@@ -1068,7 +1099,7 @@ impl BuildDecl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::load::*;
+    use crate::{Test, load::*};
     use indoc::indoc;
 
     #[test]
@@ -1247,7 +1278,8 @@ mod tests {
                 runtime_deps: _,
                 abstract_deps: _,
                 outputs,
-                replace_on_cycle
+                replace_on_cycle,
+                tests: None,
             } if name == "single buildspec" &&
                 target == Target::default() &&
                 cmds == vec![vec!["./build.sh"]] &&
@@ -1328,6 +1360,42 @@ mod tests {
                     vec!["/bin/pip3", "wheel", "-w", "dist", "--no-build-isolation", "--no-deps", "--no-cache-dir", "./"],
                 ]
         ));
+    }
+    #[test]
+    fn build_tests() {
+        let (term, mut program, _origin) = Loader::new(
+            indoc! {
+                "
+                let {standaloneTest, BuildSpec, ..} = import \"minimal.ncl\" in
+                {
+        			name = \"simple\",
+        			inputs = [],
+                    tests.uwu = standaloneTest \"/usr/bin/yes\",
+        		} | BuildSpec"
+            }
+            .to_string(),
+            &LoadOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("load failed");
+        })
+        .finish()
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("finish failed");
+        });
+
+        let build = BuildDecl::from_term(&term, &mut program, &mut ()).unwrap();
+
+        assert!(
+            matches!(build, BuildDecl { tests, .. } if tests == Some([("uwu".to_string(),
+            Test{
+                build_test: false,
+                deps: None,
+                cmds: vec![vec!["/usr/bin/yes".to_string()]],
+            })].into()),)
+        );
     }
 
     #[test]
