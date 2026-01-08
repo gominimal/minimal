@@ -1,12 +1,13 @@
 use crate::cmd_check::outputs::{MissingRuntimeDeps, OutputTypesValid};
 use crate::{Context, Error, PackagesArg};
 use anyhow::anyhow;
-use cache::{Cache, LocalDir};
+use cache::{Cache, CacheErr, LocalDir};
 use graph::DepGraph;
 
 use codespan_reporting::term::termcolor::{
     Color, ColorChoice, ColorSpec, StandardStream, WriteColor,
 };
+use op::{Options, Runnable, StandaloneTest};
 use regex::Regex;
 use std::cmp::Ordering;
 use std::io::Write;
@@ -31,7 +32,7 @@ pub struct CheckArgs {
 }
 
 pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> {
-    let all_graph = ctx.graph_from_all_packages().ok();
+    let all_graph = ctx.graph_from_all_packages();
     let packages_dir = ctx.upstream_dir_and_origin()?.0.join("packages");
 
     if args.fix && packages_dir.strip_prefix(ctx.paths().vcs_dir()).is_ok() {
@@ -72,7 +73,7 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
 
             let result = check_package(
                 pkg.clone(),
-                &all_graph,
+                all_graph.as_ref().ok(),
                 args.fix,
                 args.skip_checkers.clone().unwrap_or_default(),
                 packages_dir,
@@ -128,7 +129,10 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
 
     match had_error {
         true => Err(anyhow::anyhow!("One or more checkers reported a failure").into()),
-        false => Ok(()),
+        false => match all_graph {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        },
     }
 }
 
@@ -149,7 +153,7 @@ struct CheckResult {
 
 async fn check_package(
     pkg: String,
-    all_graph: &Option<DepGraph>,
+    all_graph: Option<&DepGraph>,
     fix: bool,
     skip_checkers: Vec<String>,
     packages_dir: PathBuf,
@@ -186,6 +190,11 @@ async fn check_package(
         );
         out.push(
             MissingRuntimeDeps
+                .check(&skip_checkers, fix, pkg.clone(), graph, cache.clone())
+                .await?,
+        );
+        out.push(
+            StandaloneTestCheck
                 .check(&skip_checkers, fix, pkg.clone(), graph, cache.clone())
                 .await?,
         );
@@ -478,6 +487,85 @@ impl FileBasedChecker for FmtCheck {
                         }
                     } else {
                         result.verdict = CheckVerdict::Pass;
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+struct StandaloneTestCheck;
+
+impl GraphBasedChecker for StandaloneTestCheck {
+    async fn check(
+        self,
+        skip_checkers: &[String],
+        _fix: bool,
+        pkg: String,
+        graph: &DepGraph,
+        cache: Cache<LocalDir>,
+    ) -> Result<CheckResult, Error> {
+        let mut result = CheckResult {
+            verdict: CheckVerdict::Skip,
+            check: "standalone tests",
+            err: vec![],
+        };
+        if skip_checkers.contains(&"standalone tests".to_string()) {
+            return Ok(result);
+        }
+
+        let bsr = match graph.by_name(&pkg) {
+            Some(b) => *b,
+            None => {
+                return Ok(result); // skip, we need the build
+            }
+        };
+        let build = graph.get(&bsr).unwrap();
+
+        result.verdict = CheckVerdict::Pass;
+        if let Some(tests) = &build.tests {
+            for (name, test) in tests {
+                if test.build_test {
+                    continue; // We only do standalone tests here
+                }
+                let temp_dir = cache.temp_dir().map_err(anyhow::Error::from)?;
+
+                let mut t = StandaloneTest {
+                    spec: &bsr,
+                    test_name: name.as_str(),
+                };
+                let opts = Options {
+                    cache: cache.clone(),
+                    exec_base: temp_dir.path().to_path_buf(),
+                    graph,
+                };
+
+                match t.run(&opts).await {
+                    Ok(errors) => {
+                        if !errors.is_empty() {
+                            result.verdict = CheckVerdict::Fail;
+                            errors.iter().for_each(|e| {
+                                result.err.push(format!(
+                                    "{}: {} {} had exit code {}",
+                                    name,
+                                    e.program,
+                                    e.args.join(" "),
+                                    e.exit_code
+                                ))
+                            });
+                        }
+                    }
+                    Err(op::Error::Cache(CacheErr::NotFound)) => {
+                        result.verdict = CheckVerdict::Skip;
+                        return Ok(result);
+                    }
+                    Err(e) => {
+                        return Err(anyhow::Error::from(e)
+                            .context(format!("running tests for spec {}", build.name))
+                            .context(format!("failed setup for test {}", name))
+                            .into());
                     }
                 }
             }

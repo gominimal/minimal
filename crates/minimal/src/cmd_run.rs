@@ -45,7 +45,7 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
 
     let cache = ctx.local_cache();
     // Make sure the packages are built
-    crate::cmd_build::cmd_build_impl(&graph, ctx, cache.clone(), ctx.num_parallel_builds).await?;
+    crate::cmd_build::cmd_build_impl(&graph, ctx, cache.clone()).await?;
 
     let transitive_deps = Transitives::for_toplevels(&graph, graph.top_levels.clone(), false);
     let base = tempfile::tempdir_in(ctx.paths().run_base_dir()).map_err(anyhow::Error::from)?;

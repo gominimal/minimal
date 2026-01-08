@@ -20,7 +20,7 @@ pub async fn cmd_build(args: BuildArgs, ctx: &mut Context) -> Result<(), Error> 
     let graph = args.packages.graph(ctx)?;
     let cache = ctx.local_cache();
 
-    cmd_build_impl(&graph, ctx, cache, ctx.num_parallel_builds).await?;
+    cmd_build_impl(&graph, ctx, cache).await?;
 
     Ok(())
 }
@@ -29,13 +29,7 @@ pub async fn cmd_build_impl(
     graph: &DepGraph,
     ctx: &mut Context,
     cache: Cache<LocalDir>,
-    num_parallel_builds: usize,
 ) -> Result<(), Error> {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(num_parallel_builds)
-        .build_global()
-        .unwrap();
-
     let output_base = ctx.paths().sandbox_base_dir().to_path_buf();
     std::fs::create_dir_all(&output_base).ok();
 
@@ -121,7 +115,7 @@ pub async fn cmd_build_impl(
         common::RemoteStorage::new(ctx.paths().download_cache_dir().to_path_buf(), false)
             .await
             .unwrap(),
-        num_parallel_builds,
+        ctx.num_parallel_builds,
         graph.clone(),
         cache.clone(),
     )?;
