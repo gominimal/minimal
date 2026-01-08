@@ -11,6 +11,11 @@ pub struct UploadArgs {
 }
 
 pub async fn cmd_upload_cache(args: UploadArgs, ctx: &mut Context) -> Result<(), Error> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(ctx.num_parallel_builds)
+        .build_global()
+        .unwrap();
+
     let graph = args.packages.graph(ctx)?;
     let cache = ctx.local_cache();
     let upload_bsrs: Vec<_> = Transitives::for_toplevels(&graph, graph.top_levels.to_vec(), false)
