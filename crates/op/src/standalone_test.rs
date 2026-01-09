@@ -174,6 +174,11 @@ impl<'a> Runnable for StandaloneTest<'a> {
         let mut out = Vec::new();
         for (program, args) in self.invocations(test)? {
             let mut command = container.command(&program);
+            command
+                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+                .env("LANG", "en_US.utf8")
+                .env("LC_ALL", "en_US.utf8")
+                .env("HOME", "/tmp");
             command.args(args.clone());
             command.current_dir("/tmp");
             command.stdin(hakoniwa::Stdio::Inherit);
