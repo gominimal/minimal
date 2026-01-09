@@ -19,12 +19,7 @@ impl<'a> Runnable for SubsetBuild<'a> {
         let subset_hash = opts.graph.subset_hash(self.subset);
 
         let build_dir = match &self.from_dir {
-            None => opts
-                .cache
-                .read_dir(&build_hash)
-                .unwrap()
-                .path()
-                .to_path_buf(),
+            None => opts.cache.read_dir(&build_hash)?.path().to_path_buf(),
             Some(dir) => dir.clone(),
         };
         let out = opts.cache.write_dir(&subset_hash).unwrap();

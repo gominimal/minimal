@@ -84,11 +84,12 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
         });
 
     let mut had_error = false;
-    let mut stdout = StandardStream::stdout(ColorChoice::Always);
+    let mut stdout = StandardStream::stdout(ColorChoice::Auto);
     for (pkg, result) in iter {
-        let result = result.await?;
-
         stdout.set_color(ColorSpec::new().set_fg(None)).unwrap();
+        let result = result.await?;
+        stdout.set_color(ColorSpec::new().set_fg(None)).unwrap();
+
         writeln!(&mut stdout, "\npackage: {}", pkg).unwrap();
         for check in result {
             write!(&mut stdout, "{}...", check.check).unwrap();
