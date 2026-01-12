@@ -44,7 +44,7 @@ pub enum StrOrList {
     Multiple(Vec<String>),
 }
 
-/// The `[upstream]` section of [File], describing the upstream to use.
+/// The `[upstream]` or `[stdlib]` section of [File], describing the upstream or stdlib to use.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct Upstream {
     pub repo: String,
@@ -137,6 +137,9 @@ pub struct Output {
 pub struct File {
     #[serde(alias = "base")]
     pub upstream: Upstream,
+    #[serde(default = "default_stdlib")]
+    pub stdlib: Upstream,
+
     #[serde(default)]
     pub envs: HashMap<String, Env>,
     #[serde(default)]
@@ -146,6 +149,14 @@ pub struct File {
 
     #[serde(skip)]
     from: Option<PathBuf>,
+}
+
+fn default_stdlib() -> Upstream {
+    Upstream {
+        repo: "https://github.com/gominimal/std".to_string(),
+        branch: None,
+        rev: None,
+    }
 }
 
 impl File {
@@ -269,6 +280,7 @@ mod tests {
                     branch: Some("main".to_string()),
                     rev: None,
                 },
+                stdlib: default_stdlib(),
                 envs: [(
                     "test".to_string(),
                     Env {
