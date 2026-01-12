@@ -167,9 +167,11 @@ pub struct Context {
     pub num_parallel_builds: usize,
 
     upstream_dir_and_origin: Option<(PathBuf, SpecOrigin)>,
+    stdlib_dir_and_origin: Option<(PathBuf, SpecOrigin)>,
 
     mfile: Option<mfile::File>,
     upstream_dir_override: Option<PathBuf>,
+    stdlib_dir_override: Option<PathBuf>,
     paths: PathConfig,
     cache: Cache<LocalDir>,
     vcs: checkouts::Manager,
@@ -183,7 +185,7 @@ impl Context {
         paths.ensure_directories().map_err(anyhow::Error::from)?;
 
         // Setup VCS manager
-        let mut vcs = checkouts::Manager::new(paths.vcs_dir()).map_err(anyhow::Error::from)?;
+        let vcs = checkouts::Manager::new(paths.vcs_dir()).map_err(anyhow::Error::from)?;
 
         // Setup local cache
         let cache_dir = paths.cache_dir().to_path_buf();
@@ -197,25 +199,15 @@ impl Context {
         };
         let cache = Cache::at_dir(cache_dir).map_err(anyhow::Error::from)?;
 
-        let paths = paths.with_stdlib_dir(match args.stdlib_dir {
-            None => {
-                vcs.checkout_of(
-                    "https://github.com/gominimal/std",
-                    checkouts::GitRef::Branch("main".to_string()),
-                )
-                .map_err(anyhow::Error::from)?
-                .0
-            }
-            Some(dir) => dir,
-        });
-
         Ok(Self {
             no_cache: args.no_cache,
             no_fetch: args.no_fetch,
             num_parallel_builds: args.num_parallel_builds,
             upstream_dir_override: args.upstream_dir,
+            stdlib_dir_override: args.stdlib_dir,
 
             upstream_dir_and_origin: None,
+            stdlib_dir_and_origin: None,
             mfile: None,
 
             paths,
@@ -250,9 +242,6 @@ impl Context {
 
 // API surface of Context
 impl Context {
-    pub fn stdlib_dir(&self) -> PathBuf {
-        self.paths.stdlib_dir().unwrap().to_path_buf()
-    }
     pub fn vcs_manager(&mut self) -> &mut checkouts::Manager {
         &mut self.vcs
     }
@@ -261,6 +250,47 @@ impl Context {
     }
     pub fn paths(&self) -> &PathConfig {
         &self.paths
+    }
+
+    /// Returns the path to the stdlib directory as well as info about where its from.
+    ///
+    /// This is computed either from the `--stdlib-dir` argument or the minimal file.
+    /// The result is cached for future invocations.
+    pub fn stdlib_dir_and_origin(&mut self) -> Result<(PathBuf, SpecOrigin), Error> {
+        if let Some(dir) = &self.stdlib_dir_override {
+            return Ok((dir.clone(), SpecOrigin::from_dir(dir)));
+        }
+        if let Some(res) = &self.stdlib_dir_and_origin {
+            return Ok(res.clone());
+        }
+
+        let minimal_file = self.minimal_file()?.clone();
+
+        let (dir, git_hash) = self
+            .vcs
+            .checkout_of(
+                &minimal_file.stdlib.repo,
+                match &minimal_file.stdlib.rev {
+                    None => checkouts::GitRef::Branch(
+                        minimal_file
+                            .stdlib
+                            .branch
+                            .to_owned()
+                            .unwrap_or_else(|| "main".to_string()),
+                    ),
+                    Some(hash) => checkouts::GitRef::Commit(hash.clone()),
+                },
+            )
+            .map_err(anyhow::Error::from)?;
+        self.stdlib_dir_and_origin = Some((
+            dir,
+            SpecOrigin::Repo(common::repo_spec::Repo::Git {
+                url: minimal_file.stdlib.repo,
+                rev: git_hash,
+                tracking: minimal_file.stdlib.branch.to_owned().map(GitRef::Branch),
+            }),
+        ));
+        Ok(self.stdlib_dir_and_origin.as_ref().unwrap().clone())
     }
 
     /// Returns the path to the upstream directory as well as info about where its from.
@@ -276,18 +306,19 @@ impl Context {
         }
 
         let minimal_file = self.minimal_file()?.clone();
-        let base_target = minimal_file
-            .upstream
-            .branch
-            .to_owned()
-            .unwrap_or_else(|| "main".to_string());
 
         let (dir, git_hash) = self
             .vcs
             .checkout_of(
                 &minimal_file.upstream.repo,
                 match &minimal_file.upstream.rev {
-                    None => checkouts::GitRef::Branch(base_target.clone()),
+                    None => checkouts::GitRef::Branch(
+                        minimal_file
+                            .upstream
+                            .branch
+                            .to_owned()
+                            .unwrap_or_else(|| "main".to_string()),
+                    ),
                     Some(hash) => checkouts::GitRef::Commit(hash.clone()),
                 },
             )
@@ -298,7 +329,7 @@ impl Context {
             SpecOrigin::Repo(common::repo_spec::Repo::Git {
                 url: minimal_file.upstream.repo,
                 rev: git_hash,
-                tracking: Some(GitRef::Branch(base_target)),
+                tracking: minimal_file.upstream.branch.to_owned().map(GitRef::Branch),
             }),
         ));
         Ok(self.upstream_dir_and_origin.as_ref().unwrap().clone())
@@ -347,7 +378,7 @@ impl Context {
     pub fn graph_from_all_packages(&mut self) -> Result<DepGraph, Error> {
         let (_dir, origin) = self.upstream_dir_and_origin()?;
 
-        let stdlib_dir = self.stdlib_dir();
+        let stdlib_dir = self.stdlib_dir_and_origin()?.0;
         DepGraph::new_from_chain(self.vcs_manager(), origin, stdlib_dir).map_err(Error::Graph)
     }
 }

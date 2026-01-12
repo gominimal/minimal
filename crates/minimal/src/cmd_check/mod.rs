@@ -55,6 +55,7 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
         .map_err(anyhow::Error::from)?;
 
     let upstream_dir = ctx.upstream_dir_and_origin()?.0;
+    let stdlib_dir = ctx.stdlib_dir_and_origin()?.0;
     let iter = packages_dirs
         .into_iter()
         // Filter based on the packages argument
@@ -69,7 +70,6 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
         })
         .map(|pkg| {
             let packages_dir = upstream_dir.join("packages");
-            let stdlib_dir = ctx.stdlib_dir();
 
             let result = check_package(
                 pkg.clone(),
@@ -77,7 +77,7 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
                 args.fix,
                 args.skip_checkers.clone().unwrap_or_default(),
                 packages_dir,
-                stdlib_dir,
+                stdlib_dir.clone(),
                 ctx.local_cache(),
             );
             (pkg, result)

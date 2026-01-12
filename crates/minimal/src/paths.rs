@@ -26,9 +26,6 @@ pub struct PathConfig {
     /// Directory containing VCS checkouts
     /// Default: ~/.cache/minimal/vcs/
     vcs_dir: PathBuf,
-
-    /// Directory containing minimal standard library
-    stdlib_dir: Option<PathBuf>,
 }
 
 impl Default for PathConfig {
@@ -46,7 +43,6 @@ impl PathConfig {
 
     /// Create a new PathConfig rooted at a given directory.
     pub fn new_with_base(root_dir: PathBuf) -> Self {
-        let stdlib_dir = None;
         Self {
             cache_dir: root_dir.join("builds"),
             download_cache_dir: root_dir.join("downloads"),
@@ -55,7 +51,6 @@ impl PathConfig {
             run_base_dir: root_dir.join("runs"),
             vcs_dir: root_dir.join("vcs"),
             root_dir,
-            stdlib_dir,
         }
     }
 
@@ -92,12 +87,6 @@ impl PathConfig {
     /// Create a PathConfig with custom vcs base directory
     pub fn with_vcs_dir(mut self, vcs_dir: PathBuf) -> Self {
         self.vcs_dir = vcs_dir;
-        self
-    }
-
-    /// Create a PathConfig with the given stdlib directory
-    pub fn with_stdlib_dir(mut self, stdlib_dir: PathBuf) -> Self {
-        self.stdlib_dir = Some(stdlib_dir);
         self
     }
 
@@ -143,11 +132,6 @@ impl PathConfig {
         &self.vcs_dir
     }
 
-    /// Get the stdlib directory
-    pub fn stdlib_dir(&self) -> Option<&Path> {
-        self.stdlib_dir.as_deref()
-    }
-
     /// Create all necessary directories
     pub fn ensure_directories(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.cache_dir)?;
@@ -172,13 +156,6 @@ impl PathConfig {
         println!(
             "  Sandbox base:            {}",
             self.sandbox_base_dir.display()
-        );
-        println!(
-            "  Minimal stdlib directory:      {}",
-            self.stdlib_dir
-                .as_ref()
-                .map(|d| d.display().to_string())
-                .unwrap_or("<unset>".to_string())
         );
     }
 }
