@@ -49,5 +49,8 @@ toml_edit.workspace = true
 
 object.workspace = true
 
+petgraph.workspace = true
+smallvec.workspace = true
+
 [target.'cfg(target_os = "linux")'.dependencies]
 hakoniwa.workspace = true
