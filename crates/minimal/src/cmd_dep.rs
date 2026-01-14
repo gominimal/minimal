@@ -171,9 +171,7 @@ fn add_uniq_node(
 /// Returns a perhaps easier to understand and work with petgraph DiGraph derived
 /// from the given [`graph::DepGraph`].  See the [`NodeData`] and [`EdgeData`] types and the
 /// petgraph API docs for how to work with them
-fn pgraph_from(
-    graph: &graph::DepGraph,
-) -> Result<GraphData, Error> {
+fn pgraph_from(graph: &graph::DepGraph) -> Result<GraphData, Error> {
     let mut pgraph: DiGraph<NodeData, EdgeData> = DiGraph::new();
     let mut processed_nodes = HashMap::new();
     let mut bsname_to_node_index = HashMap::new();
@@ -316,7 +314,10 @@ fn pgraph_from(
         });
     }
 
-    Ok(GraphData { pgraph, bsname_to_node_index})
+    Ok(GraphData {
+        pgraph,
+        bsname_to_node_index,
+    })
 }
 
 /// Creates a copy of the pgraph with only the nodes and edges as specified by the args
@@ -522,7 +523,10 @@ pub async fn cmd_dep(args: DepArgs, ctx: &mut Context) -> Result<(), Error> {
     crate::enforce_science_mode()?;
 
     let graph = args.packages.graph(ctx)?; // load build-decls from local and upstreams    
-    let GraphData { pgraph, bsname_to_node_index } = pgraph_from(&graph)?;
+    let GraphData {
+        pgraph,
+        bsname_to_node_index,
+    } = pgraph_from(&graph)?;
     let mut cpy = pgraph_copy_subset(&graph, &pgraph, &bsname_to_node_index, &args)?;
 
     if args.prune_edgeless {
