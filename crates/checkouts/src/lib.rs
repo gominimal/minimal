@@ -10,6 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use tempfile::tempdir_in;
+use tracing::trace;
 
 mod error;
 pub use error::Error;
@@ -187,6 +188,7 @@ impl Manager {
         let checkouts_dir = self.git_checkouts_dir();
         for (_remote, id) in self.state.git_remotes.iter_mut() {
             let repo = self.repos.get_mut(id).unwrap();
+            trace!("updating repo {}", repo.url());
             repo.fetch()?;
             for (dir, checkout) in self.state.repos.get_mut(id).unwrap().checkouts.iter_mut() {
                 checkout.rev =
@@ -200,6 +202,8 @@ impl Manager {
     /// Returns the path to a checkout described by the given parameters, as well as the
     /// commit hash at the given ref.
     pub fn checkout_of(&mut self, remote: &str, at: GitRef) -> Result<(PathBuf, String), Error> {
+        trace!("checkout_of {} at {:?}", remote, at);
+
         let out = match self.state.git_remotes.get(remote) {
             // This remote is already managed
             Some(id) => {

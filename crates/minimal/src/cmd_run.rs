@@ -2,6 +2,7 @@ use crate::{Context, Error};
 use anyhow::anyhow;
 use graph::Transitives;
 use op::Runnable;
+use tracing::trace;
 
 #[derive(Debug, clap::Args)]
 pub struct RunArgs {
@@ -9,6 +10,7 @@ pub struct RunArgs {
 }
 
 pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
+    trace!("cmd_run");
     let mut graph = ctx.graph_from_all_packages()?;
     let env_base_dir = ctx.paths().env_base_dir().to_path_buf();
 

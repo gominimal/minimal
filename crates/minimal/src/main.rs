@@ -9,7 +9,7 @@ use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
 use graph::{DepGraph, Error as GraphError, PlanErr};
 use std::io;
 use std::path::PathBuf;
-use tracing::warn;
+use tracing::{trace, warn};
 use tracing_indicatif::IndicatifLayer;
 use tracing_indicatif::{filter::IndicatifFilter, filter::hide_indicatif_span_fields};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -341,6 +341,7 @@ impl Context {
     /// Returns the decoded minimal-file, reading it from disk if necessary.
     pub fn minimal_file(&mut self) -> Result<&mfile::File, Error> {
         if self.mfile.is_none() {
+            trace!("loading minimal file");
             self.mfile = Some(mfile::File::from_dir(std::env::current_dir().unwrap())?);
         }
         Ok(self.mfile.as_ref().unwrap())
