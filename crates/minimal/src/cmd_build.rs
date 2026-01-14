@@ -8,7 +8,7 @@ use graph::DepGraph;
 use orchestrator::LocalBackend;
 use std::collections::HashMap;
 use std::process::Command;
-use tracing::info;
+use tracing::{info, trace};
 
 #[derive(Debug, clap::Args)]
 pub struct BuildArgs {
@@ -17,6 +17,7 @@ pub struct BuildArgs {
 }
 
 pub async fn cmd_build(args: BuildArgs, ctx: &mut Context) -> Result<(), Error> {
+    trace!("cmd_build");
     let graph = args.packages.graph(ctx)?;
     let cache = ctx.local_cache();
 
@@ -30,6 +31,7 @@ pub async fn cmd_build_impl(
     ctx: &mut Context,
     cache: Cache<LocalDir>,
 ) -> Result<(), Error> {
+    trace!("build_impl");
     let output_base = ctx.paths().sandbox_base_dir().to_path_buf();
     std::fs::create_dir_all(&output_base).ok();
 
