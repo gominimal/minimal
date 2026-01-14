@@ -168,6 +168,15 @@ impl Manager {
             repos.insert(id.clone(), Repo::new(remote, db_path.join(id))?);
         }
 
+        // For now we depend on the git command line tool. Shelling out when git doesn't exist
+        // gives an incomprehensible NotFound error, so lets explicitly check that git is in PATH
+        // and give a reasonable error if it is not.
+        if !common::command_exists("git")? {
+            return Err(Error::Other(
+                "The git command was not found in path - is it installed?".into(),
+            ));
+        }
+
         let manager = Manager {
             base_dir,
             state,
