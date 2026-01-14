@@ -36,6 +36,8 @@ mod cmd_run;
 use cmd_run::{RunArgs, cmd_run};
 mod cmd_dependencies;
 use cmd_dependencies::{DependenciesArgs, cmd_dependencies};
+mod cmd_dep;
+use cmd_dep::{DepArgs, cmd_dep};
 mod cmd_update;
 use cmd_update::{UpdateArgs, cmd_update};
 
@@ -78,6 +80,13 @@ enum Command {
         long_about = "Generate an image of the dependency graph using graphviz's \"dot\" program.\n\n  minimal dependencies -p gcc | dot -Tpng > deps.png\n"
     )]
     Dependencies(DependenciesArgs),
+    /// Generates Graphviz source code of the dependency graph
+    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
+    #[command(
+        long_about = "Generate an image of the dependency graph using graphviz's \"dot\" program.\n\n  minimal dep --input_deps_depth=0 -p file | dot -Tpng > deps.png"
+    )]
+    Dep(DepArgs),
+
     /// Generate shell completion script
     #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
     GenerateCompletions(GenerateCompletionsArgs),
@@ -614,5 +623,6 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         Command::GenerateCompletions(_) => Ok(()),
 
         Command::Update(args) => cmd_update(args, &mut ctx).await,
+        Command::Dep(args) => cmd_dep(args, &mut ctx).await,
     }
 }
