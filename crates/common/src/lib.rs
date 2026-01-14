@@ -331,3 +331,30 @@ pub fn copy_directory<Q: AsRef<Path>, P: AsRef<Path>>(from: P, to: Q) -> Result<
     copy_dir::copy_dir(from, to)?;
     Ok(())
 }
+
+/// Returns true if the specified command exists in a directory configured by the PATH variable.
+pub fn command_exists(command: &str) -> Result<bool, io::Error> {
+    let path_var = match env::var_os("PATH") {
+        Some(p) => p,
+        None => return Ok(false),
+    };
+
+    for dir in env::split_paths(&path_var) {
+        let candidate = dir.join(command);
+
+        let candidates = vec![candidate];
+        for path in candidates {
+            match std::fs::metadata(&path) {
+                Ok(metadata) => {
+                    if metadata.is_file() {
+                        return Ok(true);
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    Ok(false)
+}
