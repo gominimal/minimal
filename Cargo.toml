@@ -37,16 +37,16 @@ either = { version = "1.15", default-features = false }
 flate2 = "1.1"
 futures = "0.3"
 generational-arena = "^0.2"
-google-cloud-gax = "1.4.0"
-google-cloud-auth = "1.3.0"
-google-cloud-storage = "1.5.0"
+google-cloud-gax = "1.5.0"
+google-cloud-auth = "1.4.0"
+google-cloud-storage = "1.6.0"
 hakoniwa = { git = "https://github.com/souk4711/hakoniwa", branch = "main" }
 hex = "0.4"
 indoc = "^2.0"
 lzma-rs = "0.3"
-nickel-lang-core = { version = "0.15.3", default-features = false, features = ["format"] }
+nickel-lang-core = { version = "0.16.1", default-features = false, features = ["format"] }
 object = { version = "0.38", default-features = false, features = ["archive", "elf", "read_core", "std"] }
-oci-spec = "0.8.3"
+oci-spec = "0.8.4"
 path-absolutize = "^3.1"
 rand = "0.9"
 rayon = "1.11"
@@ -65,11 +65,11 @@ smallvec = "1.15"
 tar = "0.4"
 tempfile = "3.23"
 thiserror = "2.0"
-tokio = { version = "1.48.0", features = ["full"] }
+tokio = { version = "1.49.0", features = ["full"] }
 tokio-stream = "0.1"
 tokio-util = "0.7"
 toml = "0.9"
-toml_edit = "0.23"
+toml_edit = "0.24"
 tonic = "0.14.2"
 tonic-prost = "0.14.2"
 tonic-prost-build = "0.14.2"
