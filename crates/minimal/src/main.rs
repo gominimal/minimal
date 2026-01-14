@@ -80,12 +80,14 @@ enum Command {
     Dep(DepArgs),
 
     /// Generate shell completion script
-    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
-    GenerateCompletions(GenerateCompletionsArgs),
+    #[command(
+        long_about = "Generate a shell tab-completion script for the minimal CLI for your shell.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(minimal completions bash)"
+    )]
+    Completions(CompletionsArgs),
 }
 
 #[derive(Debug, clap::Args)]
-struct GenerateCompletionsArgs {
+struct CompletionsArgs {
     /// The shell type for a CLI completion script should be printed
     #[arg(value_parser)]
     shell: Shell,
@@ -540,7 +542,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    if let Command::GenerateCompletions(GenerateCompletionsArgs { shell }) = &cli.command {
+    if let Command::Completions(CompletionsArgs { shell }) = &cli.command {
         let mut cmd = Cli::command();
         let name = cmd.get_name().to_string();
         clap_complete::generate(*shell, &mut cmd, name, &mut io::stdout());
@@ -613,6 +615,6 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         Command::Run(args) => cmd_run(args, &mut ctx).await,
         Command::Update(args) => cmd_update(args, &mut ctx).await,
         Command::Dep(args) => cmd_dep(args, &mut ctx).await,
-        Command::GenerateCompletions(_) => Ok(()),
+        Command::Completions(_) => Ok(()),
     }
 }
