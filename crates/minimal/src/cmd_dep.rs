@@ -26,13 +26,19 @@ pub struct DepArgs {
     #[arg(short, long, alias="exclude", value_delimiter=',', num_args=0..)]
     excludes: Option<Vec<String>>,
 
+    /// Whether build spec "inputs" are in the graph (does not affect runtime deps)
+    #[arg(
+        long,num_args(0..=1),default_missing_value("true"),default_value("true"),action = ArgAction::Set,
+    )]
+    build_spec_deps: bool,
+
     /// Whether source code "inputs" are in the graph
     #[arg(
         long,num_args(0..=1),default_missing_value("true"),default_value("false"),action = ArgAction::Set,
     )]
     source_deps: bool,
 
-    /// Whether Local (build.ncl) deps are in the graph
+    /// Whether Local (build.ncl) "input" deps are in the graph
     #[arg(
         long,num_args(0..=1),default_missing_value("true"),default_value("false"),action = ArgAction::Set,
     )]
@@ -384,6 +390,7 @@ fn pgraph_copy_subset_for_node(
         let target = e.target();
         let edge_data = e.weight();
         let target_data = &pgraph[target];
+
         match edge_data {
             EdgeData::InputDep(InputDepEdge {
                 outputs,
@@ -395,22 +402,31 @@ fn pgraph_copy_subset_for_node(
             {
                 match target_data {
                     NodeData::BuildSpec(target_bsr) => {
-                        let (cpy_target, already_exists) =
-                            add_uniq_node(cpy, copied_nodes, target_data.clone());
-                        cpy.add_edge(cpy_node_index, cpy_target, edge_data.clone());
-                        if !already_exists {
-                            pgraph_copy_subset_for_node(
-                                graph,
-                                pgraph,
-                                args,
-                                target,
-                                target_bsr,
-                                &TraversalState {
-                                    depth: state.depth + 1,
-                                },
-                                cpy,
-                                copied_nodes,
-                            );
+                        let target_data_bsname =
+                            graph.get(target_bsr).map(|bs| bs.name.clone()).unwrap();
+                        if args.build_spec_deps
+                            && !args
+                                .excludes
+                                .as_ref()
+                                .is_some_and(|names| names.contains(&target_data_bsname))
+                        {
+                            let (cpy_target, already_exists) =
+                                add_uniq_node(cpy, copied_nodes, target_data.clone());
+                            cpy.add_edge(cpy_node_index, cpy_target, edge_data.clone());
+                            if !already_exists {
+                                pgraph_copy_subset_for_node(
+                                    graph,
+                                    pgraph,
+                                    args,
+                                    target,
+                                    target_bsr,
+                                    &TraversalState {
+                                        depth: state.depth + 1,
+                                    },
+                                    cpy,
+                                    copied_nodes,
+                                );
+                            }
                         }
                     }
                     NodeData::HostPath(path) => {
@@ -448,22 +464,30 @@ fn pgraph_copy_subset_for_node(
             {
                 match target_data {
                     NodeData::BuildSpec(target_bsr) => {
-                        let (cpy_target, already_exists) =
-                            add_uniq_node(cpy, copied_nodes, target_data.clone());
-                        cpy.add_edge(cpy_node_index, cpy_target, edge_data.clone());
-                        if !already_exists {
-                            pgraph_copy_subset_for_node(
-                                graph,
-                                pgraph,
-                                args,
-                                target,
-                                target_bsr,
-                                &TraversalState {
-                                    depth: state.depth + 1,
-                                },
-                                cpy,
-                                copied_nodes,
-                            );
+                        let target_data_bsname =
+                            graph.get(target_bsr).map(|bs| bs.name.clone()).unwrap();
+                        if !args
+                            .excludes
+                            .as_ref()
+                            .is_some_and(|names| names.contains(&target_data_bsname))
+                        {
+                            let (cpy_target, already_exists) =
+                                add_uniq_node(cpy, copied_nodes, target_data.clone());
+                            cpy.add_edge(cpy_node_index, cpy_target, edge_data.clone());
+                            if !already_exists {
+                                pgraph_copy_subset_for_node(
+                                    graph,
+                                    pgraph,
+                                    args,
+                                    target,
+                                    target_bsr,
+                                    &TraversalState {
+                                        depth: state.depth + 1,
+                                    },
+                                    cpy,
+                                    copied_nodes,
+                                );
+                            }
                         }
                     }
                     _ => panic!("Unexpected input dep target node type"),
