@@ -199,13 +199,33 @@ impl super::GraphBasedChecker for MissingRuntimeDeps {
                         .map_err(anyhow::Error::from)?;
                     match object::File::parse(&*data) {
                         Ok(elf) => {
+                            let exports = elf.exports().unwrap();
+                            let likely_glibc_stub_lib = exports.iter().any(|e| {
+                                e.name().ends_with(b"__libpthread_version_placeholder")
+                                    || e.name().ends_with(b"__libdl_version_placeholder")
+                            });
+
                             // Valid executable, lets check all the imported symbols are present as exports.
-                            let avail_symbols: HashSet<String> = elf
-                                .exports()
-                                .unwrap()
+                            let avail_symbols: HashSet<String> = exports
                                 .iter()
                                 .map(|e| String::from_utf8(e.name().to_vec()).unwrap())
                                 .chain(elf.dynamic_symbols().map(|s| s.name().unwrap().to_string()))
+                                .chain(
+                                    if likely_glibc_stub_lib {
+                                        let data = std::fs::read(
+                                            deps[idx].1.path().join("usr/lib/libc.so.6"),
+                                        )
+                                        .map_err(anyhow::Error::from)?;
+                                        object::File::parse(&*data)
+                                            .unwrap()
+                                            .dynamic_symbols()
+                                            .map(|s| s.name().unwrap().to_string())
+                                            .collect()
+                                    } else {
+                                        vec![]
+                                    }
+                                    .into_iter(),
+                                )
                                 .collect();
                             let missing_symbols: Vec<&String> = outputs
                                 .values()
