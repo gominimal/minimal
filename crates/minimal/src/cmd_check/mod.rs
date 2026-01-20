@@ -204,6 +204,7 @@ async fn check_package(
     let file_based: Vec<Box<dyn FileBasedChecker>> = vec![
         Box::new(ParseCheck),
         Box::new(ImportLineCheck),
+        Box::new(AdjacentImportCheck),
         Box::new(FmtCheck),
     ];
     for mut c in file_based.into_iter() {
@@ -568,6 +569,66 @@ impl GraphBasedChecker for StandaloneTestCheck {
                             .context(format!("failed setup for test {}", name))
                             .into());
                     }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+static ADJACENT_IMPORT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"let\s+(\w+)\s+=\s+import\s+"\.\.\/([^\/]+)\/[^"]+"\s+in"#)
+        .expect("Invalid regex pattern")
+});
+
+struct AdjacentImportCheck;
+
+impl FileBasedChecker for AdjacentImportCheck {
+    fn check(
+        &mut self,
+        skip_checkers: &[String],
+        _fix: bool,
+        _pkg: &str,
+        pkg_dir: &Path,
+        _stdlib_dir: &Path,
+    ) -> Result<CheckResult, Error> {
+        let mut result = CheckResult {
+            verdict: CheckVerdict::Pass,
+            check: "adjacent import",
+            err: vec![],
+        };
+        if skip_checkers.contains(&"adjacent import".to_string()) {
+            result.verdict = CheckVerdict::Skip;
+            return Ok(result);
+        }
+
+        for e in std::fs::read_dir(pkg_dir).map_err(anyhow::Error::from)? {
+            let e = e.map_err(anyhow::Error::from)?;
+            if e.file_type().unwrap().is_dir() {
+                continue;
+            }
+            let name = e.file_name();
+            if !name.to_str().unwrap().ends_with(".ncl") {
+                continue;
+            }
+
+            let file_contents =
+                String::from_utf8(std::fs::read(e.path()).map_err(anyhow::Error::from)?)
+                    .map_err(anyhow::Error::from)?;
+
+            for captures in ADJACENT_IMPORT_REGEX.captures_iter(&file_contents) {
+                let identifier = captures.get(1).unwrap().as_str();
+                let folder = captures.get(2).unwrap().as_str();
+
+                if identifier != folder {
+                    result.err.push(format!(
+                        "{}: identifier '{}' doesn't match folder '{}' in import",
+                        name.to_str().unwrap(),
+                        identifier,
+                        folder
+                    ));
+                    result.verdict = CheckVerdict::Fail;
                 }
             }
         }
