@@ -1,4 +1,4 @@
-let Tys = [| 'Builder, 'Path, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Subset, 'Profile, 'Layer, 'Upstream, 'Test |]
+let Tys = [| 'Builder, 'Path, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Subset, 'Profile, 'Layer, 'Upstream, 'Test, 'Harness |]
 in
 let attrs_schema = import "attr_classes.ncl" in
 let needs_schema = import "need_classes.ncl" in
@@ -198,6 +198,7 @@ let needs_schema = import "need_classes.ncl" in
 
         builds | Array BuildSpec,
         profiles | Array Profile,
+        harnesses | Array Harness,
     },
     layer | Dyn -> Layer | doc "Constructs a layer." =
         fun spec => spec | Layer,
@@ -229,4 +230,23 @@ let needs_schema = import "need_classes.ncl" in
             class = 'Build,
             include cmd,
         },
+
+
+    Harness | doc "A specific way to build a directory of source into software." = {
+        ty | Tys = 'Harness,
+        name
+            | String,
+
+        build_packages
+            | Array String | optional,
+        runtime_packages
+        | Array String | optional,
+        build_env_vars
+            | {_ : String} | optional,
+
+        build_cmd | String | optional,
+        build_cmds | Array (Array String) | optional,
+    },
+    harness | Dyn -> Harness | doc "Constructs a harness." =
+        fun spec => spec | Harness,
 }
