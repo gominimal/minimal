@@ -27,6 +27,8 @@ mod profiles;
 pub use profiles::Profile;
 mod decl_tests;
 pub use decl_tests::Test;
+mod harnesses;
+pub use harnesses::Harness;
 
 /// A collection of nickel objects, defined together in a single codebase.
 #[derive(Debug)]
@@ -38,6 +40,7 @@ pub struct Layer {
     pub top_levels: Vec<generational_arena::Index>,
 
     pub profiles: HashMap<String, Profile>,
+    pub harnesses: HashMap<String, Harness>,
 
     read_ids: HashMap<u64, generational_arena::Index>,
 }
@@ -111,6 +114,7 @@ impl Layer {
             read_ids: HashMap::with_capacity(1024),
 
             profiles: HashMap::with_capacity(32),
+            harnesses: HashMap::with_capacity(32),
         };
 
         // The top-level of the nickel tree can either evaluate to:
@@ -143,6 +147,21 @@ impl Layer {
                                 layer.profiles = HashMap::from_iter(
                                     a.iter()
                                         .map(|p| layer.ingest_profile(p, &mut program))
+                                        .collect::<Result<Vec<_>, Error>>()?
+                                        .into_iter()
+                                        .map(|p| (p.name.clone(), p)),
+                                );
+                            }
+                        };
+                        if let Ok(Some(rt)) =
+                            record.get_value_with_ctrs(&LocIdent::new("harnesses"))
+                        {
+                            if let Term::Array(a, _attrs) =
+                                eval_if_closure(&rt, &mut program)?.term.as_ref()
+                            {
+                                layer.harnesses = HashMap::from_iter(
+                                    a.iter()
+                                        .map(|p| layer.ingest_harness(p, &mut program))
                                         .collect::<Result<Vec<_>, Error>>()?
                                         .into_iter()
                                         .map(|p| (p.name.clone(), p)),
@@ -207,6 +226,14 @@ impl Layer {
     ) -> Result<Profile, Error> {
         Profile::from_term(rt, program)
     }
+
+    fn ingest_harness(
+        &mut self,
+        rt: &RichTerm,
+        program: &mut Program<CacheImpl>,
+    ) -> Result<Harness, Error> {
+        Harness::from_term(rt, program)
+    }
 }
 
 impl DeclAccumulator for Layer {
@@ -269,6 +296,7 @@ pub enum ObjTy {
     Layer,
     Upstream,
     Test,
+    Harness,
 }
 
 pub(crate) fn read_ty(rt: &RichTerm, program: &mut Program<CacheImpl>) -> Result<ObjTy, Error> {
@@ -606,7 +634,7 @@ mod tests {
         let layer = Layer::new_for_test(
             indoc! {
                 "
-                let {layer, profile, BuildSpec, ..} = import \"minimal.ncl\" in
+                let {layer, harness, profile, BuildSpec, ..} = import \"minimal.ncl\" in
 
                 layer {
                   builds = [
@@ -625,6 +653,19 @@ mod tests {
                         env_vars = {
                             CC = \"gcc\",
                         },
+                    }
+                  ],
+
+                  harnesses = [
+                    harness {
+                        name = \"uwu\",
+                        runtime_packages = [\"glibc\"],
+                        build_packages = [\"gcc\", \"rust\"],
+                        build_env_vars = {
+                            CC = \"gcc\",
+                        },
+
+                        build_cmd = [\"uwu\", \"build\"],
                     }
                   ],
                 }
@@ -651,6 +692,17 @@ mod tests {
                 from_profile: Some("rust".to_string()),
                 packages: vec!["gcc".to_string(), "rust".to_string()],
                 env_vars: IndexMap::from_iter([("CC".to_string(), "gcc".to_string())])
+            }),
+        );
+        assert_eq!(
+            layer.harnesses.get("uwu"),
+            Some(&Harness {
+                name: "uwu".to_string(),
+                runtime_packages: vec!["glibc".to_string()],
+                build_packages: vec!["gcc".to_string(), "rust".to_string()],
+                build_env_vars: IndexMap::from_iter([("CC".to_string(), "gcc".to_string())]),
+                build_cmds_cmd: None,
+                build_cmds: Some(vec![vec!["uwu".to_string(), "build".to_string()]]),
             }),
         );
     }

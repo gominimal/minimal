@@ -401,6 +401,7 @@ impl BuildDeclInput {
             | ObjTy::OutputBin
             | ObjTy::OutputData
             | ObjTy::Profile
+            | ObjTy::Harness
             | ObjTy::Layer
             | ObjTy::Test => Err(Error::UnexpectedObject {
                 files: program.files(),

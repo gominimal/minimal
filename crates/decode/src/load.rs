@@ -213,6 +213,26 @@ impl Loader {
                 src.push_str("\t],\n");
             }
         }
+        match std::fs::read_dir(layer_dir.as_ref().join("harnesses")) {
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(e.into());
+                }
+            }
+            Ok(d) => {
+                src.push_str("\tharnesses = [\n");
+                for e in d {
+                    let e = e?;
+                    if e.file_type()?.is_dir() {
+                        src.push_str("  import \"");
+                        src.push_str(e.path().to_str().unwrap());
+                        src.push_str("/harness.ncl\",\n");
+                    }
+                }
+                src.push_str("\t],\n");
+            }
+        }
+
         src.push('}');
 
         Self::new(src, opts)
@@ -306,6 +326,8 @@ impl Loader {
 
 #[cfg(test)]
 mod tests {
+    use crate::eval_if_closure;
+
     use super::*;
     use indoc::indoc;
 
@@ -428,6 +450,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp_dir.path().join("packages")).unwrap();
         std::fs::create_dir(temp_dir.path().join("profiles")).unwrap();
+        std::fs::create_dir(temp_dir.path().join("harnesses")).unwrap();
 
         // Create multiple packages
         for pkg_name in &["package-a", "package-b", "package-c"] {
@@ -464,6 +487,21 @@ mod tests {
             },
         )
         .unwrap();
+        // Make a harness called rust
+        let harness_dir = temp_dir.path().join("harnesses").join("rust");
+        std::fs::create_dir(&harness_dir).unwrap();
+        std::fs::write(
+            harness_dir.join("harness.ncl"),
+            indoc! {
+            "
+            let {harness, ..} = import \"minimal.ncl\" in
+            harness {
+        		name = \"rust\"
+        	}
+			"
+            },
+        )
+        .unwrap();
 
         let sr = Loader::new_with_all_pkgs(temp_dir.path(), &LoadOptions::for_test());
         // So we can see the actual error when the test fails
@@ -472,7 +510,35 @@ mod tests {
             panic!();
         });
 
-        let sr = sr.unwrap();
+        let mut sr = sr.unwrap();
         assert_eq!(sr.last_id, 3); // three build specs
+
+        if let Term::Record(rd) = sr.p.eval().unwrap().as_ref() {
+            // Check a field 'profiles' was an array with one object
+            assert!(matches!(
+                eval_if_closure(
+                    &rd.get_value_with_ctrs(&LocIdent::new("profiles"))
+                        .unwrap()
+                        .unwrap(),
+                    &mut sr.p,
+                )
+                .unwrap()
+                .as_ref(),
+                Term::Array(a, _attrs) if a.len() == 1,
+            ));
+
+            // Check a field 'harnesses' was an array with one object
+            assert!(matches!(
+                eval_if_closure(
+                    &rd.get_value_with_ctrs(&LocIdent::new("harnesses"))
+                        .unwrap()
+                        .unwrap(),
+                    &mut sr.p,
+                )
+                .unwrap()
+                .as_ref(),
+                Term::Array(a, _attrs) if a.len() == 1,
+            ));
+        }
     }
 }
