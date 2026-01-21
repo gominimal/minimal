@@ -6,7 +6,7 @@
 use common::repo_spec::Repo;
 use common::{SpecOrigin, SubsetSpec, Target, mfile};
 use decode::builds::BuildRef;
-use decode::{Layer, Profile, UpstreamConfig, builds};
+use decode::{Harness, Layer, Profile, UpstreamConfig, builds};
 use nickel_lang_core::term::IndexMap;
 
 use generational_arena::Arena;
@@ -435,8 +435,10 @@ pub struct DepGraph {
     /// constructing this dependency graph.
     pub top_levels: Vec<BuildSpecRef>,
 
-    /// Profiles (initial env configuration) by name.
+    /// Profiles (custom packages, env vars etc) by name.
     profiles: HashMap<String, Profile>,
+    /// Harnesses (a way to build a directory of software) by name.
+    harnesses: HashMap<String, Harness>,
 
     /// Indexes build-specs by name.
     by_name: HashMap<String, BuildSpecRef>,
@@ -466,6 +468,7 @@ impl DepGraph {
             by_name: HashMap::with_capacity(2048),
             top_levels: Vec::new(),
             profiles: HashMap::with_capacity(32),
+            harnesses: HashMap::with_capacity(32),
             hash_cache: Arc::new(RwLock::new((
                 HashMap::with_capacity(4096),
                 HashMap::with_capacity(4096),
@@ -634,6 +637,27 @@ impl DepGraph {
                 *existing = profile;
             } else {
                 slf.profiles.insert(name, profile);
+            }
+        }
+        // Load harnesses
+        for (name, harness) in loader.from.harnesses {
+            // Verify all packages exist
+            for pkg in &harness.build_packages {
+                if slf.by_name(pkg).is_none() {
+                    return Err(Error::NoSuchPkg { name: pkg.clone() });
+                }
+            }
+            for pkg in &harness.runtime_packages {
+                if slf.by_name(pkg).is_none() {
+                    return Err(Error::NoSuchPkg { name: pkg.clone() });
+                }
+            }
+
+            if let Some(_) = slf.harnesses.get_mut(&name) {
+                // Its illegal to shadow a harness of the same name from upstream.
+                return Err(Error::ConflictingHarness { name });
+            } else {
+                slf.harnesses.insert(name, harness);
             }
         }
 
@@ -991,6 +1015,41 @@ mod tests {
                 from_profile: Some("prof".to_string()),
                 packages: vec!["base".to_string(), "extra".to_string()],
                 env_vars: IndexMap::from_iter([("CC".to_string(), "clang".to_string())]),
+            })
+        );
+    }
+    #[test]
+    fn ingest_harness() {
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+                let {layer, harness, ..} = import \"minimal.ncl\" in
+
+                layer {
+                  builds = [],
+                  harnesses = [
+                    harness {
+                      name = \"harness 1\",
+                      build_cmd = \"beep boop\",
+                    }
+                  ],
+                }
+                "
+            }
+            .to_string(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        let dp = DepGraph::new().ingest(layer).unwrap();
+        assert_eq!(
+            dp.harnesses.get("harness 1"),
+            Some(&Harness {
+                name: "harness 1".to_string(),
+                build_cmds: Some(vec![vec!["beep".to_string(), "boop".to_string()]]),
+                ..Default::default()
             })
         );
     }
