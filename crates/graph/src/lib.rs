@@ -21,6 +21,8 @@ pub enum Error {
     NoSuchProfile { name: String },
     /// A profile has the same name as a profile in a higher layer, but did not extend it.
     ConflictingProfile { name: String },
+    /// A harness has the same name as a harness in a higher layer.
+    ConflictingHarness { name: String },
     /// A package with a certain name was requested, but not found in the graph.
     NoSuchPkg { name: String },
     /// Failed to load the source code for an upstream.
@@ -51,6 +53,9 @@ impl Error {
                 name,
             )
             .unwrap(),
+            Error::ConflictingHarness { name } => {
+                writeln!(writer, "Error: harness '{}' already exists", name,).unwrap()
+            }
             Error::NoSuchPkg { name } => {
                 writeln!(writer, "Error: package '{}' does not exist", name,).unwrap()
             }
