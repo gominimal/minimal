@@ -653,12 +653,11 @@ impl DepGraph {
                 }
             }
 
-            if let Some(_) = slf.harnesses.get_mut(&name) {
+            if slf.harnesses.contains_key(&name) {
                 // Its illegal to shadow a harness of the same name from upstream.
                 return Err(Error::ConflictingHarness { name });
-            } else {
-                slf.harnesses.insert(name, harness);
             }
+            slf.harnesses.insert(name, harness);
         }
 
         Ok(slf)
