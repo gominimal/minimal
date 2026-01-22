@@ -7,6 +7,7 @@ use graph::DepGraph;
 use codespan_reporting::term::termcolor::{
     Color, ColorChoice, ColorSpec, StandardStream, WriteColor,
 };
+use futures::stream::{FuturesUnordered, StreamExt};
 use op::{Options, Runnable, StandaloneTest};
 use regex::Regex;
 use std::cmp::Ordering;
@@ -16,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::{Mutex, MutexGuard};
 
+mod harness;
 mod naming;
 mod outputs;
 mod profile;
@@ -163,6 +165,73 @@ fn profile_check_futures(
         .collect())
 }
 
+fn harness_check_futures(
+    harnesses_dir: PathBuf,
+    packages_arg: PackagesArg,
+    graph_hnd: Option<Arc<Mutex<DepGraph>>>,
+    skip_checkers: Option<Vec<String>>,
+    stdlib_dir: PathBuf,
+    cache: Cache<LocalDir>,
+    fix: bool,
+) -> Result<Vec<CheckFuture>, Error> {
+    // Only check harnesses if the check is being run over the whole layer, or the empty string
+    // was given for selecting packages
+    let dirs = match (
+        packages_arg.packages.is_some() && !packages_arg.names().iter().all(|p| p.is_empty()),
+        std::fs::read_dir(&harnesses_dir),
+    ) {
+        (true, _) => vec![],
+        (_, Err(e)) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(anyhow::Error::from(e).into());
+            };
+            vec![]
+        }
+        (_, Ok(dirs)) => dirs
+            .filter_map(|e| match e {
+                Err(e) => Some(Err(e)),
+                Ok(e) => {
+                    if !e.file_type().unwrap().is_dir() {
+                        None
+                    } else {
+                        Some(Ok(e.file_name()))
+                    }
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::from)?
+            .into_iter()
+            .collect(),
+    };
+
+    Ok(dirs
+        .into_iter()
+        .map::<CheckFuture, _>(move |pd| {
+            let graph_hnd = graph_hnd.clone();
+            let skip_checkers = skip_checkers.clone();
+            let stdlib_dir = stdlib_dir.clone();
+            let cache = cache.clone();
+            let harnesses_dir = harnesses_dir.clone();
+
+            Box::pin(async move {
+                (
+                    format!("harness: {}", pd.to_str().unwrap(),),
+                    harness::check_harness(
+                        pd.to_str().unwrap().to_string(),
+                        graph_hnd,
+                        fix,
+                        skip_checkers.unwrap_or_default(),
+                        harnesses_dir,
+                        stdlib_dir,
+                        cache,
+                    )
+                    .await,
+                )
+            })
+        })
+        .collect())
+}
+
 pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> {
     let all_graph = ctx.graph_from_all_packages();
     let upstream_dir = ctx.upstream_dir_and_origin()?.0;
@@ -186,9 +255,17 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
         ctx.local_cache(),
         args.fix,
     )?;
-
     let profile_results = profile_check_futures(
         upstream_dir.join("profiles"),
+        args.packages.clone(),
+        graph_hnd.clone(),
+        args.skip_checkers.clone(),
+        stdlib_dir.clone(),
+        ctx.local_cache(),
+        args.fix,
+    )?;
+    let harnesses_results = harness_check_futures(
+        upstream_dir.join("harnesses"),
         args.packages.clone(),
         graph_hnd.clone(),
         args.skip_checkers.clone(),
@@ -199,10 +276,16 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
 
     let mut had_error = false;
     let mut stdout = StandardStream::stdout(ColorChoice::Auto);
-    for (heading, result) in
-        futures::future::join_all(results.into_iter().chain(profile_results)).await
-    {
-        stdout.set_color(ColorSpec::new().set_fg(None)).unwrap();
+
+    // Collect futures into FuturesUnordered for concurrent execution with incremental results
+    let mut futures_unordered = results
+        .into_iter()
+        .chain(profile_results)
+        .chain(harnesses_results)
+        .collect::<FuturesUnordered<_>>();
+
+    while let Some((heading, result)) = futures_unordered.next().await {
+        stdout.reset().unwrap();
         let result = result?;
         stdout.set_color(ColorSpec::new().set_fg(None)).unwrap();
 
@@ -300,6 +383,29 @@ impl CheckResult {
             err: vec![msg],
         }
     }
+    fn harness_name_skip() -> Self {
+        CheckResult {
+            check: "harness name matches dir",
+            verdict: CheckVerdict::Skip,
+            err: vec![],
+        }
+    }
+
+    fn harness_name_pass() -> Self {
+        CheckResult {
+            check: "harness name matches dir",
+            verdict: CheckVerdict::Pass,
+            err: vec![],
+        }
+    }
+
+    fn harness_name_fail(msg: String) -> Self {
+        CheckResult {
+            check: "harness name matches dir",
+            verdict: CheckVerdict::Fail,
+            err: vec![msg],
+        }
+    }
 }
 
 async fn check_package(
@@ -393,29 +499,44 @@ async fn check_package(
         );
     }
 
-    let file_based: Vec<Box<dyn FileBasedChecker>> = vec![
-        Box::new(ParseCheck),
-        Box::new(ImportLineCheck),
-        Box::new(AdjacentImportCheck),
-        Box::new(FmtCheck),
-    ];
-    for mut c in file_based.into_iter() {
-        let check_result = c.as_mut().check(
-            &skip_checkers,
-            fix,
-            &pkg,
-            &packages_dir.join(&pkg),
-            &stdlib_dir,
-        )?;
-        out.push(check_result);
-    }
+    // Run file-based checkers in a separate thread as they're computation-heavy
+    let file_based_results = {
+        let skip_checkers = skip_checkers.clone();
+        let pkg = pkg.clone();
+        let pkg_dir = packages_dir.join(&pkg);
+        let stdlib_dir = stdlib_dir.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let file_based: Vec<Box<dyn FileBasedChecker>> = vec![
+                Box::new(ParseCheck),
+                Box::new(ImportLineCheck),
+                Box::new(AdjacentImportCheck),
+                Box::new(FmtCheck),
+            ];
+
+            let mut results = Vec::new();
+            for mut c in file_based.into_iter() {
+                let check_result = c
+                    .as_mut()
+                    .check(&skip_checkers, fix, &pkg, &pkg_dir, &stdlib_dir)
+                    .map_err(|e| format!("{:?}", e))?;
+                results.push(check_result);
+            }
+            Ok::<Vec<CheckResult>, String>(results)
+        })
+        .await
+        .map_err(anyhow::Error::from)?
+        .map_err(|e| anyhow::anyhow!(e))?
+    };
+
+    out.extend(file_based_results);
 
     Ok(out)
 }
 
 /// A checker which checks a package by looking at its files. These checkers
 /// are run serially.
-trait FileBasedChecker {
+trait FileBasedChecker: Send {
     fn check(
         &mut self,
         skip_checkers: &[String],
