@@ -388,7 +388,7 @@ impl Context {
 }
 
 /// Argument parser for `[--packages <package 1>[,<package N>]]`.
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub struct PackagesArg {
     /// Package names to build, comma-separated
     #[arg(short, long, alias="package", value_delimiter=',', num_args=0..)]
