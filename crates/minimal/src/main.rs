@@ -2,9 +2,10 @@
 
 use anyhow::{Result, anyhow, bail};
 use cache::{Cache, LocalDir, RemoteCache, RemoteError};
+use checkouts::GitRef;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
-use common::{SpecOrigin, mfile, repo_spec::GitRef};
+use common::{SpecOrigin, mfile};
 use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
 use graph::{DepGraph, Error as GraphError, PlanErr};
 use std::io;
@@ -269,29 +270,14 @@ impl Context {
 
         let minimal_file = self.minimal_file()?.clone();
 
+        let git_ref: GitRef = (&minimal_file.stdlib).into();
         let (dir, git_hash) = self
             .vcs
-            .checkout_of(
-                &minimal_file.stdlib.repo,
-                match &minimal_file.stdlib.rev {
-                    None => checkouts::GitRef::Branch(
-                        minimal_file
-                            .stdlib
-                            .branch
-                            .to_owned()
-                            .unwrap_or_else(|| "main".to_string()),
-                    ),
-                    Some(hash) => checkouts::GitRef::Commit(hash.clone()),
-                },
-            )
+            .checkout_of(&minimal_file.stdlib.repo, git_ref.clone())
             .map_err(anyhow::Error::from)?;
         self.stdlib_dir_and_origin = Some((
             dir,
-            SpecOrigin::Repo(common::repo_spec::Repo::Git {
-                url: minimal_file.stdlib.repo,
-                rev: git_hash,
-                tracking: minimal_file.stdlib.branch.to_owned().map(GitRef::Branch),
-            }),
+            SpecOrigin::Repo(git_ref.as_repo(minimal_file.stdlib.repo, git_hash)),
         ));
         Ok(self.stdlib_dir_and_origin.as_ref().unwrap().clone())
     }
@@ -310,30 +296,15 @@ impl Context {
 
         let minimal_file = self.minimal_file()?.clone();
 
+        let git_ref: GitRef = (&minimal_file.upstream).into();
         let (dir, git_hash) = self
             .vcs
-            .checkout_of(
-                &minimal_file.upstream.repo,
-                match &minimal_file.upstream.rev {
-                    None => checkouts::GitRef::Branch(
-                        minimal_file
-                            .upstream
-                            .branch
-                            .to_owned()
-                            .unwrap_or_else(|| "main".to_string()),
-                    ),
-                    Some(hash) => checkouts::GitRef::Commit(hash.clone()),
-                },
-            )
+            .checkout_of(&minimal_file.upstream.repo, git_ref.clone())
             .map_err(anyhow::Error::from)?;
 
         self.upstream_dir_and_origin = Some((
             dir,
-            SpecOrigin::Repo(common::repo_spec::Repo::Git {
-                url: minimal_file.upstream.repo,
-                rev: git_hash,
-                tracking: minimal_file.upstream.branch.to_owned().map(GitRef::Branch),
-            }),
+            SpecOrigin::Repo(git_ref.as_repo(minimal_file.upstream.repo, git_hash)),
         ));
         Ok(self.upstream_dir_and_origin.as_ref().unwrap().clone())
     }

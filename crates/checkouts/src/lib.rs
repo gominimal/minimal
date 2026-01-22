@@ -35,6 +35,35 @@ impl GitRef {
             GitRef::Branch(s) | GitRef::Tag(s) | GitRef::Commit(s) => s,
         }
     }
+
+    /// Returns the [common::repo_spec::Repo] representation.
+    pub fn as_repo<U: Into<String>, H: Into<String>>(
+        &self,
+        url: U,
+        checkout_git_hash: H,
+    ) -> common::repo_spec::Repo {
+        common::repo_spec::Repo::Git {
+            url: url.into(),
+            rev: checkout_git_hash.into(),
+            tracking: match self {
+                GitRef::Branch(b) => Some(common::repo_spec::GitRef::Branch(b.clone())),
+                GitRef::Tag(t) => Some(common::repo_spec::GitRef::Tag(t.clone())),
+                GitRef::Commit(_) => None,
+            },
+        }
+    }
+}
+
+/// Converts from an (Upstream)[common::mfile::Upstream] stanza in the minimal-file
+/// to a [GitRef].
+impl From<&common::mfile::Upstream> for GitRef {
+    fn from(upstream: &common::mfile::Upstream) -> Self {
+        match (&upstream.rev, &upstream.branch) {
+            (Some(hash), _) => GitRef::Commit(hash.clone()),
+            (None, Some(branch)) => GitRef::Branch(branch.clone()),
+            (None, None) => GitRef::Branch("main".to_string()),
+        }
+    }
 }
 
 impl std::fmt::Display for GitRef {
