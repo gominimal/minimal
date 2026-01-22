@@ -54,10 +54,10 @@ impl GitRef {
     }
 }
 
-/// Converts from an (Upstream)[common::mfile::Upstream] stanza in the minimal-file
+/// Converts from an (Upstream)[mfile::Upstream] stanza in the minimal-file
 /// to a [GitRef].
-impl From<&common::mfile::Upstream> for GitRef {
-    fn from(upstream: &common::mfile::Upstream) -> Self {
+impl From<&mfile::Upstream> for GitRef {
+    fn from(upstream: &mfile::Upstream) -> Self {
         match (&upstream.rev, &upstream.branch) {
             (Some(hash), _) => GitRef::Commit(hash.clone()),
             (None, Some(branch)) => GitRef::Branch(branch.clone()),

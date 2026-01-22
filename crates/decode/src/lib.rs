@@ -1,8 +1,8 @@
 //! Decodes a layer of build specs into objects.
 
 use common::SpecOrigin;
-use common::mfile::MFILE_NAME;
 use generational_arena::Arena;
+use mfile::MFILE_NAME;
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::term::{RichTerm, Term};
 use nickel_lang_core::{

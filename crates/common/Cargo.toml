@@ -20,6 +20,7 @@ tracing.workspace = true
 copy_dir.workspace = true
 shlex.workspace = true
 globset.workspace = true
+mfile.workspace = true
 
 bzip2.workspace = true
 either.workspace = true

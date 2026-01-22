@@ -3,7 +3,6 @@
 pub mod archive;
 pub mod fetchers;
 pub mod file_cache;
-pub mod mfile;
 mod remote_storage;
 pub use remote_storage::RemoteStorage;
 

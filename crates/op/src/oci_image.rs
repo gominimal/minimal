@@ -5,11 +5,11 @@
 //! becomes a separate layer.
 
 use crate::{Error, Options, Runnable};
-use common::mfile::StrOrList;
-use common::{SpecHash, mfile};
+use common::SpecHash;
 use flate2::{Compression, write::GzEncoder};
 use globset::{Glob, GlobSet};
 use graph::{BuildSpecRef, Transitives, TransitivesDep};
+use mfile::StrOrList;
 use oci_spec::image::{
     ANNOTATION_REF_NAME, ConfigBuilder, Descriptor, DescriptorBuilder, ImageConfigurationBuilder,
     ImageIndexBuilder, ImageManifestBuilder, MediaType, PlatformBuilder, RootFsBuilder,
