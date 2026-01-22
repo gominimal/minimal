@@ -7,13 +7,13 @@ use nickel_lang_core::program::Program;
 use nickel_lang_core::term::Term;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 use super::CheckResult;
 
 pub(super) async fn check_harness(
     harness: String,
-    all_graph: Option<Arc<Mutex<DepGraph>>>,
+    all_graph: Option<Arc<RwLock<DepGraph>>>,
     fix: bool,
     skip_checkers: Vec<String>,
     harnesses_dir: PathBuf,
@@ -80,7 +80,7 @@ pub(super) async fn check_harness(
 
 fn check_harness_name(
     harness: String,
-    _all_graph: Option<Arc<Mutex<DepGraph>>>,
+    _all_graph: Option<Arc<RwLock<DepGraph>>>,
     _fix: bool,
     skip_checkers: Vec<String>,
     _harnesses_dir: PathBuf,

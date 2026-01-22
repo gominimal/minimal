@@ -8,7 +8,7 @@ use crate::Error;
 use cache::{CacheErr, DirCacheEntry, LocalDir};
 use graph::{BuildOutput, BuildSpecRef, DepGraph, Transitives};
 use object::{Object, ObjectSymbol};
-use tokio::sync::MutexGuard;
+use tokio::sync::RwLockReadGuard;
 
 pub struct OutputTypesValid;
 
@@ -18,7 +18,7 @@ impl super::GraphBasedChecker for OutputTypesValid {
         skip_checkers: &[String],
         _fix: bool,
         pkg: String,
-        graph: MutexGuard<'_, DepGraph>,
+        graph: RwLockReadGuard<'_, DepGraph>,
         cache: cache::Cache<LocalDir>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
@@ -97,7 +97,7 @@ impl super::GraphBasedChecker for MissingRuntimeDeps {
         skip_checkers: &[String],
         _fix: bool,
         pkg: String,
-        graph: MutexGuard<'_, DepGraph>,
+        graph: RwLockReadGuard<'_, DepGraph>,
         cache: cache::Cache<LocalDir>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {

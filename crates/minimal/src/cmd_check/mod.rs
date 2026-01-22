@@ -13,9 +13,10 @@ use regex::Regex;
 use std::cmp::Ordering;
 use std::future::Future;
 use std::io::Write;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{RwLock, RwLockReadGuard};
 
 mod harness;
 mod naming;
@@ -42,7 +43,7 @@ type CheckFuture =
 fn package_check_futures(
     packages_dir: PathBuf,
     packages_arg: PackagesArg,
-    graph_hnd: Option<Arc<Mutex<DepGraph>>>,
+    graph_hnd: Option<Arc<RwLock<DepGraph>>>,
     skip_checkers: Option<Vec<String>>,
     stdlib_dir: PathBuf,
     cache: Cache<LocalDir>,
@@ -101,7 +102,7 @@ fn package_check_futures(
 fn profile_check_futures(
     profiles_dir: PathBuf,
     packages_arg: PackagesArg,
-    graph_hnd: Option<Arc<Mutex<DepGraph>>>,
+    graph_hnd: Option<Arc<RwLock<DepGraph>>>,
     skip_checkers: Option<Vec<String>>,
     stdlib_dir: PathBuf,
     cache: Cache<LocalDir>,
@@ -168,7 +169,7 @@ fn profile_check_futures(
 fn harness_check_futures(
     harnesses_dir: PathBuf,
     packages_arg: PackagesArg,
-    graph_hnd: Option<Arc<Mutex<DepGraph>>>,
+    graph_hnd: Option<Arc<RwLock<DepGraph>>>,
     skip_checkers: Option<Vec<String>>,
     stdlib_dir: PathBuf,
     cache: Cache<LocalDir>,
@@ -243,7 +244,7 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
     }
     let (graph_hnd, graph_err) = match all_graph {
         Err(e) => (None, Some(e)),
-        Ok(g) => (Some(Arc::new(Mutex::new(g))), None),
+        Ok(g) => (Some(Arc::new(RwLock::new(g))), None),
     };
 
     let results = package_check_futures(
@@ -410,7 +411,7 @@ impl CheckResult {
 
 async fn check_package(
     pkg: String,
-    all_graph: Option<Arc<Mutex<DepGraph>>>,
+    all_graph: Option<Arc<RwLock<DepGraph>>>,
     fix: bool,
     skip_checkers: Vec<String>,
     packages_dir: PathBuf,
@@ -426,7 +427,7 @@ async fn check_package(
                     &skip_checkers,
                     fix,
                     pkg.clone(),
-                    graph.lock().await,
+                    graph.read().await,
                     cache.clone(),
                 )
                 .await?,
@@ -437,7 +438,7 @@ async fn check_package(
                     &skip_checkers,
                     fix,
                     pkg.clone(),
-                    graph.lock().await,
+                    graph.read().await,
                     cache.clone(),
                 )
                 .await?,
@@ -448,7 +449,7 @@ async fn check_package(
                     &skip_checkers,
                     fix,
                     pkg.clone(),
-                    graph.lock().await,
+                    graph.read().await,
                     cache.clone(),
                 )
                 .await?,
@@ -459,7 +460,7 @@ async fn check_package(
                     &skip_checkers,
                     fix,
                     pkg.clone(),
-                    graph.lock().await,
+                    graph.read().await,
                     cache.clone(),
                 )
                 .await?,
@@ -470,7 +471,7 @@ async fn check_package(
                     &skip_checkers,
                     fix,
                     pkg.clone(),
-                    graph.lock().await,
+                    graph.read().await,
                     cache.clone(),
                 )
                 .await?,
@@ -481,7 +482,7 @@ async fn check_package(
                     &skip_checkers,
                     fix,
                     pkg.clone(),
-                    graph.lock().await,
+                    graph.read().await,
                     cache.clone(),
                 )
                 .await?,
@@ -492,7 +493,7 @@ async fn check_package(
                     &skip_checkers,
                     fix,
                     pkg.clone(),
-                    graph.lock().await,
+                    graph.read().await,
                     cache.clone(),
                 )
                 .await?,
@@ -555,7 +556,7 @@ trait GraphBasedChecker {
         skip_checkers: &[String],
         fix: bool,
         pkg: String,
-        graph: MutexGuard<'_, DepGraph>,
+        graph: RwLockReadGuard<'_, DepGraph>,
         cache: Cache<LocalDir>,
     ) -> Result<CheckResult, Error>;
 }
@@ -819,7 +820,7 @@ impl GraphBasedChecker for StandaloneTestCheck {
         skip_checkers: &[String],
         _fix: bool,
         pkg: String,
-        graph: MutexGuard<'_, DepGraph>,
+        graph: RwLockReadGuard<'_, DepGraph>,
         cache: Cache<LocalDir>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
@@ -837,53 +838,61 @@ impl GraphBasedChecker for StandaloneTestCheck {
                 return Ok(result); // skip, we need the build
             }
         };
-        let build = graph.get(&bsr).unwrap();
+        let build = graph.get(&bsr).unwrap().clone();
 
         result.verdict = CheckVerdict::Pass;
-        if let Some(tests) = &build.tests {
-            for (name, test) in tests {
-                if test.build_test {
-                    continue; // We only do standalone tests here
-                }
-                let temp_dir = cache.temp_dir().map_err(anyhow::Error::from)?;
+        if let Some(tests) = build.tests {
+            let graph2 = graph.deref().clone();
+            drop(graph);
+            result =
+                tokio::task::spawn_blocking(async move || -> Result<CheckResult, anyhow::Error> {
+                    for (name, test) in tests {
+                        if test.build_test {
+                            continue; // We only do standalone tests here
+                        }
+                        let temp_dir = cache.temp_dir().map_err(anyhow::Error::from)?;
 
-                let mut t = StandaloneTest {
-                    spec: &bsr,
-                    test_name: name.as_str(),
-                };
-                let opts = Options {
-                    cache: cache.clone(),
-                    exec_base: temp_dir.path().to_path_buf(),
-                    graph: &graph,
-                };
+                        let mut t = StandaloneTest {
+                            spec: &bsr,
+                            test_name: name.as_str(),
+                        };
+                        let opts = Options {
+                            cache: cache.clone(),
+                            exec_base: temp_dir.path().to_path_buf(),
+                            graph: &graph2,
+                        };
 
-                match t.run(&opts).await {
-                    Ok(errors) => {
-                        if !errors.is_empty() {
-                            result.verdict = CheckVerdict::Fail;
-                            errors.iter().for_each(|e| {
-                                result.err.push(format!(
-                                    "{}: {} {} had exit code {}",
-                                    name,
-                                    e.program,
-                                    e.args.join(" "),
-                                    e.exit_code
-                                ))
-                            });
+                        match t.run(&opts).await {
+                            Ok(errors) => {
+                                if !errors.is_empty() {
+                                    result.verdict = CheckVerdict::Fail;
+                                    errors.iter().for_each(|e| {
+                                        result.err.push(format!(
+                                            "{}: {} {} had exit code {}",
+                                            name,
+                                            e.program,
+                                            e.args.join(" "),
+                                            e.exit_code
+                                        ))
+                                    });
+                                }
+                            }
+                            Err(op::Error::Cache(CacheErr::NotFound)) => {
+                                result.verdict = CheckVerdict::Skip;
+                                return Ok(result);
+                            }
+                            Err(e) => {
+                                return Err(anyhow::Error::from(e)
+                                    .context(format!("running tests for spec {}", build.name))
+                                    .context(format!("failed setup for test {}", name)));
+                            }
                         }
                     }
-                    Err(op::Error::Cache(CacheErr::NotFound)) => {
-                        result.verdict = CheckVerdict::Skip;
-                        return Ok(result);
-                    }
-                    Err(e) => {
-                        return Err(anyhow::Error::from(e)
-                            .context(format!("running tests for spec {}", build.name))
-                            .context(format!("failed setup for test {}", name))
-                            .into());
-                    }
-                }
-            }
+                    Ok(result)
+                })
+                .await
+                .unwrap()
+                .await?;
         }
 
         Ok(result)
