@@ -1,7 +1,7 @@
 [upstream]
 repo = "https://github.com/gominimal/pkgs"
 branch = "main"
-rev = "baea11d17f98381c884cb8b1ba1a1f7cad7f517c"
+rev = "822d78a4a08918a8f7c77a5941663a14f35dc4dc"
 
 [envs.dev]
 from_profile = "rust"
@@ -70,4 +70,4 @@ cmd = "python3"
 [stdlib]
 repo = "https://github.com/gominimal/std"
 branch = "main"
-rev = "3f67d70cfa2e137564709a58ca0c321f9dcc5417"
+rev = "9b7d866af28eb84330bbe4f961a18b16a6691f64"
