@@ -1,7 +1,14 @@
 //! Implementations of caches storing artifacts keyed by [SpecHash].
 
 use common::SpecHash;
+#[cfg(target_env = "gnu")]
 use nix::fcntl::{AT_FDCWD, RenameFlags, renameat2};
+
+#[cfg(target_env = "musl")]
+use std::ffi::CString;
+#[cfg(target_env = "musl")]
+use std::os::unix::ffi::OsStrExt;
+
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -98,10 +105,45 @@ impl PendingDir {
         let st = inner.fs.subtree(&subpath)?;
         let (from, to) = (self.tempdir.keep(), st.path());
 
-        renameat2(AT_FDCWD, &from, AT_FDCWD, to, RenameFlags::RENAME_EXCHANGE)
-            .map_err(|e| CacheErr::IO(e.into()))?;
+        #[cfg(target_env = "gnu")]
+        {
+            renameat2(AT_FDCWD, &from, AT_FDCWD, to, RenameFlags::RENAME_EXCHANGE)
+                .map_err(|e| CacheErr::IO(e.into()))?;
+            std::fs::remove_dir_all(from)?;
+        }
 
-        std::fs::remove_dir_all(from)?;
+        #[cfg(target_env = "musl")]
+        {
+            // musl: remove existing entry if present, then rename
+            // Note: This is not atomic like RENAME_EXCHANGE, but works for musl
+            //
+            // TODO: change this to renameat2 when musl pervasively supports it across distros
+            // TODO: change this to use nix like the gnu/glibc section above when nix exposes renameat2 for musl
+            if to.exists() {
+                std::fs::remove_dir_all(to)?;
+            }
+
+            let from_cstr = CString::new(from.as_os_str().as_bytes()).map_err(|e| {
+                CacheErr::IO(std::io::Error::new(std::io::ErrorKind::InvalidInput, e).into())
+            })?;
+            let to_cstr = CString::new(to.as_os_str().as_bytes()).map_err(|e| {
+                CacheErr::IO(std::io::Error::new(std::io::ErrorKind::InvalidInput, e).into())
+            })?;
+
+            let ret = unsafe {
+                libc::renameat(
+                    libc::AT_FDCWD,
+                    from_cstr.as_ptr(),
+                    libc::AT_FDCWD,
+                    to_cstr.as_ptr(),
+                )
+            };
+
+            if ret != 0 {
+                return Err(CacheErr::IO(std::io::Error::last_os_error().into()));
+            }
+        }
+
         drop(st);
 
         meta.write(&inner.fs, &self.hash)?;

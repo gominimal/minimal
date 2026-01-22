@@ -29,4 +29,8 @@ serde_json.workspace = true
 common = { workspace = true }
 graph = { workspace = true }
 
+[target.'cfg(target_env = "gnu")'.dependencies]
 nix = { version = "0.30", features = ["fs"]}
+
+[target.'cfg(target_env = "musl")'.dependencies]
+libc = "0.2"
