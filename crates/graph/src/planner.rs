@@ -1,6 +1,9 @@
 use crate::{BuildSpecInput, BuildSpecRef, DepGraph, SubsetInput, Transitives, transitives};
 use nickel_lang_core::term::IndexMap;
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+};
 
 /// The status of a build spec / dependency at some moment during planning.
 #[derive(Debug, Default, Clone, Ord, PartialOrd, PartialEq, Eq)]
@@ -624,6 +627,9 @@ impl<'a, BP: BinProvider> Iterator for ExecPlan<'a, BP> {
     type Item = Result<BuildPhase, PlanErr>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let unsafe_skip_double_builds = env::var("MINIMAL_SCIENCE_MODE")
+            .is_ok_and(|v| v.eq("yeppers"))
+            && env::var("UNSAFE_SKIP_DOUBLE_BUILDS").is_ok_and(|v| v.eq("1") || v.eq("true"));
         if self.finished() {
             return None;
         }
@@ -686,12 +692,15 @@ impl<'a, BP: BinProvider> Iterator for ExecPlan<'a, BP> {
                         // true = mark candidate as built with breakers, false = fully built
                         //
                         // We typically return true here as it WAS built with breakers,
-                        // but we do consider a spec fully-built in the following two cases:
+                        // but we do consider a spec fully-built in the following cases:
                         // - Prebuilts - stuff thats just a fetch, so wont change with a rebuild
                         // - Collections - stuff thats just a rollup of runtime deps, so wont change with a rebuild
+                        // - Configuration - When the unsafe configuration skip_double_builds is set
 
                         let build = self.graph.get(candidate).unwrap();
-                        !(build.is_pure_prebuilt() || build.is_pure_collection())
+                        !(build.is_pure_prebuilt()
+                            || build.is_pure_collection()
+                            || unsafe_skip_double_builds)
                     };
 
                     built_this_phase.insert(*candidate, consider_built_with_breakers);
