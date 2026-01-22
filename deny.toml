@@ -1,8 +1,6 @@
 [advisories]
 ignore = [
     "RUSTSEC-2024-0014",
-    # google-cloud-auth depends on rustls-pemfile, which is unmaintained.
-    "RUSTSEC-2025-0134",
     # heapless depends on atomic-polyfill 1.0.3, which is unmaintained.
     "RUSTSEC-2023-0089",
 ]
