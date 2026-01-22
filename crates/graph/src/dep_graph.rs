@@ -4,9 +4,10 @@
 #![allow(clippy::single_match)]
 
 use common::repo_spec::Repo;
-use common::{SpecOrigin, SubsetSpec, Target, mfile};
+use common::{SpecOrigin, SubsetSpec, Target};
 use decode::builds::BuildRef;
 use decode::{Harness, Layer, Profile, UpstreamConfig, builds};
+use mfile;
 use nickel_lang_core::term::IndexMap;
 
 use generational_arena::Arena;
@@ -793,9 +794,9 @@ impl DepGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::mfile::MFILE_NAME;
     use decode::{Layer, LoadOptions};
     use indoc::indoc;
+    use mfile::MFILE_NAME;
     use tempfile::TempDir;
 
     #[test]

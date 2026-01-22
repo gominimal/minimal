@@ -5,8 +5,8 @@ use std::{
 };
 
 use crate::{Error, Options, Runnable};
-use common::mfile::{EnvPatches, PatchSetting};
 use graph::{BuildSpecRef, TransitivesDep};
+use mfile::{EnvPatches, PatchSetting};
 
 /// Considers the transitive deps & toplevels which are going into the a runnable environment, and constructs
 /// scaffolding as necessary.

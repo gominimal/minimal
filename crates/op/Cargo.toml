@@ -39,4 +39,5 @@ cache.workspace = true
 common.workspace = true
 decode.workspace = true
 graph.workspace = true
+mfile.workspace = true
 res-proto.workspace = true
