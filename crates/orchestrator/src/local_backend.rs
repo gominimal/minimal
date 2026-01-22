@@ -245,21 +245,28 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
         orch: Orchestrator<Self>,
         bp: BP,
     ) -> Result<Vec<(PendingDir, EntryMeta)>, Error> {
+        let unsafe_skip_double_builds = std::env::var("MINIMAL_SCIENCE_MODE")
+            .is_ok_and(|v| v.eq("yeppers"))
+            && std::env::var("UNSAFE_SKIP_DOUBLE_BUILDS").is_ok_and(|v| v.eq("1") || v.eq("true"));
+
         let result = orch.run(bp).await?;
 
         Ok(result
             .into_iter()
-            .filter_map(|a| match a {
+            .filter_map(|a| match (unsafe_skip_double_builds, a) {
                 // We don't actually want to store breaker builds, they are just a stepping stone.
-                Either::Left((
-                    _pd,
-                    EntryMeta {
-                        breaker_build: true,
-                        ..
-                    },
-                )) => None,
-                Either::Left((pd, meta)) => Some((pd, meta)),
-                Either::Right(_cache_dir) => None,
+                (
+                    false,
+                    Either::Left((
+                        _pd,
+                        EntryMeta {
+                            breaker_build: true,
+                            ..
+                        },
+                    )),
+                ) => None,
+                (_, Either::Left((pd, meta))) => Some((pd, meta)),
+                (_, Either::Right(_cache_dir)) => None,
             })
             .collect())
     }
