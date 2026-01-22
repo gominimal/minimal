@@ -51,7 +51,7 @@ path-absolutize = "^3.1"
 rand = "0.9"
 rayon = "1.11"
 regex = "1" # keep in sync with nickel-lang-core
-reqwest = { version = "0.13", features = ["stream"] } # keep in sync with google-cloud-gax
+reqwest = { version = "0.12", features = ["stream"] } # keep in sync with google-cloud-gax
 rustc-hash = "2.1.1"
 serde = { version = "1.0", features = ["derive"] } # Keep within the same minor version as nickel-lang-core
 prost = "0.14.1"
@@ -82,7 +82,7 @@ zstd = "0.13"
 
 globset = "0.4"
 
-petgraph = "0.7.1"
+petgraph = "0.8"
 
 # our crates
 build-events = { version = "0.0.1", path = "crates/build-events" }
