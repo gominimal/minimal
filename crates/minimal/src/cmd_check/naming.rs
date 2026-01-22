@@ -2,6 +2,7 @@ use super::{CheckResult, CheckVerdict};
 use crate::Error;
 use cache::{Cache, LocalDir};
 use graph::{BuildOutput, DepGraph};
+use tokio::sync::MutexGuard;
 
 pub struct SpecNameMatchesDir;
 
@@ -11,7 +12,7 @@ impl super::GraphBasedChecker for SpecNameMatchesDir {
         skip_checkers: &[String],
         _fix: bool,
         pkg: String,
-        graph: &DepGraph,
+        graph: MutexGuard<'_, DepGraph>,
         _cache: Cache<LocalDir>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
@@ -48,7 +49,7 @@ impl super::GraphBasedChecker for SpecNameValid {
         skip_checkers: &[String],
         _fix: bool,
         pkg: String,
-        _graph: &DepGraph,
+        _graph: MutexGuard<'_, DepGraph>,
         _cache: Cache<LocalDir>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
@@ -86,7 +87,7 @@ impl super::GraphBasedChecker for CycleBreakerNaming {
         skip_checkers: &[String],
         _fix: bool,
         pkg: String,
-        graph: &DepGraph,
+        graph: MutexGuard<'_, DepGraph>,
         _cache: Cache<LocalDir>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
@@ -133,7 +134,7 @@ impl super::GraphBasedChecker for OutputNaming {
         skip_checkers: &[String],
         _fix: bool,
         pkg: String,
-        graph: &DepGraph,
+        graph: MutexGuard<'_, DepGraph>,
         _cache: Cache<LocalDir>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {

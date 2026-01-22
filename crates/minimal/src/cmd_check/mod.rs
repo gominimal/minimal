@@ -10,12 +10,15 @@ use codespan_reporting::term::termcolor::{
 use op::{Options, Runnable, StandaloneTest};
 use regex::Regex;
 use std::cmp::Ordering;
+use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
+use tokio::sync::{Mutex, MutexGuard};
 
 mod naming;
 mod outputs;
+mod profile;
 
 #[derive(clap::Args)]
 pub struct CheckArgs {
@@ -31,15 +34,19 @@ pub struct CheckArgs {
     skip_checkers: Option<Vec<String>>,
 }
 
-pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> {
-    let all_graph = ctx.graph_from_all_packages();
-    let packages_dir = ctx.upstream_dir_and_origin()?.0.join("packages");
+type CheckFuture =
+    std::pin::Pin<Box<dyn Future<Output = (String, Result<Vec<CheckResult>, Error>)> + Send>>;
 
-    if args.fix && packages_dir.strip_prefix(ctx.paths().vcs_dir()).is_ok() {
-        return Err(anyhow!("--fix can only be used when --upstream-dir is specified").into());
-    }
-
-    let packages_dirs = std::fs::read_dir(packages_dir)
+fn package_check_futures(
+    packages_dir: PathBuf,
+    packages_arg: PackagesArg,
+    graph_hnd: Option<Arc<Mutex<DepGraph>>>,
+    skip_checkers: Option<Vec<String>>,
+    stdlib_dir: PathBuf,
+    cache: Cache<LocalDir>,
+    fix: bool,
+) -> Result<Vec<CheckFuture>, Error> {
+    let package_dirs = std::fs::read_dir(&packages_dir)
         .map_err(anyhow::Error::from)?
         .filter_map(|e| match e {
             Err(e) => Some(Err(e)),
@@ -52,45 +59,154 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
             }
         })
         .collect::<Result<Vec<_>, _>>()
-        .map_err(anyhow::Error::from)?;
-
-    let upstream_dir = ctx.upstream_dir_and_origin()?.0;
-    let stdlib_dir = ctx.stdlib_dir_and_origin()?.0;
-    let iter = packages_dirs
+        .map_err(anyhow::Error::from)?
         .into_iter()
         // Filter based on the packages argument
         .filter_map(|pkg| {
-            let want_pkgs = args.packages.names();
+            let want_pkgs = packages_arg.names();
             let pkg = pkg.to_str().unwrap().to_string();
             if want_pkgs.is_empty() || want_pkgs.contains(&pkg) {
                 Some(pkg)
             } else {
                 None
             }
-        })
-        .map(|pkg| {
-            let packages_dir = upstream_dir.join("packages");
-
-            let result = check_package(
-                pkg.clone(),
-                all_graph.as_ref().ok(),
-                args.fix,
-                args.skip_checkers.clone().unwrap_or_default(),
-                packages_dir,
-                stdlib_dir.clone(),
-                ctx.local_cache(),
-            );
-            (pkg, result)
         });
+
+    Ok(package_dirs
+        .into_iter()
+        .map::<CheckFuture, _>(move |pkg| {
+            let graph_hnd = graph_hnd.clone();
+            let skip_checkers = skip_checkers.clone();
+            let stdlib_dir = stdlib_dir.clone();
+            let cache = cache.clone();
+            let packages_dir = packages_dir.clone();
+            Box::pin(async move {
+                let result = check_package(
+                    pkg.clone(),
+                    graph_hnd,
+                    fix,
+                    skip_checkers.unwrap_or_default(),
+                    packages_dir,
+                    stdlib_dir,
+                    cache,
+                );
+                (format!("package: {}", pkg), result.await)
+            })
+        })
+        .collect::<Vec<_>>())
+}
+
+fn profile_check_futures(
+    profiles_dir: PathBuf,
+    packages_arg: PackagesArg,
+    graph_hnd: Option<Arc<Mutex<DepGraph>>>,
+    skip_checkers: Option<Vec<String>>,
+    stdlib_dir: PathBuf,
+    cache: Cache<LocalDir>,
+    fix: bool,
+) -> Result<Vec<CheckFuture>, Error> {
+    // Only check profiles if the check is being run over the whole layer, or the empty string
+    // was given for selecting packages
+    let dirs = match (
+        packages_arg.packages.is_some() && !packages_arg.names().iter().all(|p| p.is_empty()),
+        std::fs::read_dir(&profiles_dir),
+    ) {
+        (true, _) => vec![],
+        (_, Err(e)) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(anyhow::Error::from(e).into());
+            };
+            vec![]
+        }
+        (_, Ok(dirs)) => dirs
+            .filter_map(|e| match e {
+                Err(e) => Some(Err(e)),
+                Ok(e) => {
+                    if !e.file_type().unwrap().is_dir() {
+                        None
+                    } else {
+                        Some(Ok(e.file_name()))
+                    }
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::from)?
+            .into_iter()
+            .collect(),
+    };
+
+    Ok(dirs
+        .into_iter()
+        .map::<CheckFuture, _>(move |pd| {
+            let graph_hnd = graph_hnd.clone();
+            let skip_checkers = skip_checkers.clone();
+            let stdlib_dir = stdlib_dir.clone();
+            let cache = cache.clone();
+            let profiles_dir = profiles_dir.clone();
+
+            Box::pin(async move {
+                (
+                    format!("profile: {}", pd.to_str().unwrap(),),
+                    profile::check_profile(
+                        pd.to_str().unwrap().to_string(),
+                        graph_hnd,
+                        fix,
+                        skip_checkers.unwrap_or_default(),
+                        profiles_dir,
+                        stdlib_dir,
+                        cache,
+                    )
+                    .await,
+                )
+            })
+        })
+        .collect())
+}
+
+pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> {
+    let all_graph = ctx.graph_from_all_packages();
+    let upstream_dir = ctx.upstream_dir_and_origin()?.0;
+    let stdlib_dir = ctx.stdlib_dir_and_origin()?.0;
+    let packages_dir = upstream_dir.join("packages");
+
+    if args.fix && packages_dir.strip_prefix(ctx.paths().vcs_dir()).is_ok() {
+        return Err(anyhow!("--fix can only be used when --upstream-dir is specified").into());
+    }
+    let (graph_hnd, graph_err) = match all_graph {
+        Err(e) => (None, Some(e)),
+        Ok(g) => (Some(Arc::new(Mutex::new(g))), None),
+    };
+
+    let results = package_check_futures(
+        packages_dir.clone(),
+        args.packages.clone(),
+        graph_hnd.clone(),
+        args.skip_checkers.clone(),
+        stdlib_dir.clone(),
+        ctx.local_cache(),
+        args.fix,
+    )?;
+
+    let profile_results = profile_check_futures(
+        upstream_dir.join("profiles"),
+        args.packages.clone(),
+        graph_hnd.clone(),
+        args.skip_checkers.clone(),
+        stdlib_dir.clone(),
+        ctx.local_cache(),
+        args.fix,
+    )?;
 
     let mut had_error = false;
     let mut stdout = StandardStream::stdout(ColorChoice::Auto);
-    for (pkg, result) in iter {
+    for (heading, result) in
+        futures::future::join_all(results.into_iter().chain(profile_results)).await
+    {
         stdout.set_color(ColorSpec::new().set_fg(None)).unwrap();
-        let result = result.await?;
+        let result = result?;
         stdout.set_color(ColorSpec::new().set_fg(None)).unwrap();
 
-        writeln!(&mut stdout, "\npackage: {}", pkg).unwrap();
+        writeln!(&mut stdout, "\n{}", heading).unwrap();
         for check in result {
             write!(&mut stdout, "{}...", check.check).unwrap();
             match check.verdict {
@@ -130,9 +246,9 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
 
     match had_error {
         true => Err(anyhow::anyhow!("One or more checkers reported a failure").into()),
-        false => match all_graph {
-            Ok(_) => Ok(()),
-            Err(e) => Err(e),
+        false => match graph_err {
+            None => Ok(()),
+            Some(e) => Err(e),
         },
     }
 }
@@ -152,9 +268,43 @@ struct CheckResult {
     err: Vec<String>,
 }
 
+impl CheckResult {
+    fn parse_failure(msg: String) -> Self {
+        CheckResult {
+            check: "parse",
+            verdict: CheckVerdict::Fail,
+            err: vec![msg],
+        }
+    }
+
+    fn profile_name_skip() -> Self {
+        CheckResult {
+            check: "profile name matches dir",
+            verdict: CheckVerdict::Skip,
+            err: vec![],
+        }
+    }
+
+    fn profile_name_pass() -> Self {
+        CheckResult {
+            check: "profile name matches dir",
+            verdict: CheckVerdict::Pass,
+            err: vec![],
+        }
+    }
+
+    fn profile_name_fail(msg: String) -> Self {
+        CheckResult {
+            check: "profile name matches dir",
+            verdict: CheckVerdict::Fail,
+            err: vec![msg],
+        }
+    }
+}
+
 async fn check_package(
     pkg: String,
-    all_graph: Option<&DepGraph>,
+    all_graph: Option<Arc<Mutex<DepGraph>>>,
     fix: bool,
     skip_checkers: Vec<String>,
     packages_dir: PathBuf,
@@ -166,37 +316,79 @@ async fn check_package(
     if let Some(graph) = all_graph {
         out.push(
             naming::SpecNameMatchesDir
-                .check(&skip_checkers, fix, pkg.clone(), graph, cache.clone())
+                .check(
+                    &skip_checkers,
+                    fix,
+                    pkg.clone(),
+                    graph.lock().await,
+                    cache.clone(),
+                )
                 .await?,
         );
         out.push(
             naming::SpecNameValid
-                .check(&skip_checkers, fix, pkg.clone(), graph, cache.clone())
+                .check(
+                    &skip_checkers,
+                    fix,
+                    pkg.clone(),
+                    graph.lock().await,
+                    cache.clone(),
+                )
                 .await?,
         );
         out.push(
             naming::CycleBreakerNaming
-                .check(&skip_checkers, fix, pkg.clone(), graph, cache.clone())
+                .check(
+                    &skip_checkers,
+                    fix,
+                    pkg.clone(),
+                    graph.lock().await,
+                    cache.clone(),
+                )
                 .await?,
         );
         out.push(
             naming::OutputNaming
-                .check(&skip_checkers, fix, pkg.clone(), graph, cache.clone())
+                .check(
+                    &skip_checkers,
+                    fix,
+                    pkg.clone(),
+                    graph.lock().await,
+                    cache.clone(),
+                )
                 .await?,
         );
         out.push(
             OutputTypesValid
-                .check(&skip_checkers, fix, pkg.clone(), graph, cache.clone())
+                .check(
+                    &skip_checkers,
+                    fix,
+                    pkg.clone(),
+                    graph.lock().await,
+                    cache.clone(),
+                )
                 .await?,
         );
         out.push(
             MissingRuntimeDeps
-                .check(&skip_checkers, fix, pkg.clone(), graph, cache.clone())
+                .check(
+                    &skip_checkers,
+                    fix,
+                    pkg.clone(),
+                    graph.lock().await,
+                    cache.clone(),
+                )
                 .await?,
         );
         out.push(
             StandaloneTestCheck
-                .check(&skip_checkers, fix, pkg.clone(), graph, cache.clone())
+                .check(
+                    &skip_checkers,
+                    fix,
+                    pkg.clone(),
+                    graph.lock().await,
+                    cache.clone(),
+                )
                 .await?,
         );
     }
@@ -242,7 +434,7 @@ trait GraphBasedChecker {
         skip_checkers: &[String],
         fix: bool,
         pkg: String,
-        graph: &DepGraph,
+        graph: MutexGuard<'_, DepGraph>,
         cache: Cache<LocalDir>,
     ) -> Result<CheckResult, Error>;
 }
@@ -506,7 +698,7 @@ impl GraphBasedChecker for StandaloneTestCheck {
         skip_checkers: &[String],
         _fix: bool,
         pkg: String,
-        graph: &DepGraph,
+        graph: MutexGuard<'_, DepGraph>,
         cache: Cache<LocalDir>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
@@ -541,7 +733,7 @@ impl GraphBasedChecker for StandaloneTestCheck {
                 let opts = Options {
                     cache: cache.clone(),
                     exec_base: temp_dir.path().to_path_buf(),
-                    graph,
+                    graph: &graph,
                 };
 
                 match t.run(&opts).await {
