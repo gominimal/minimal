@@ -7,13 +7,13 @@ use nickel_lang_core::program::Program;
 use nickel_lang_core::term::Term;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 use super::CheckResult;
 
 pub(super) async fn check_profile(
     profile: String,
-    all_graph: Option<Arc<Mutex<DepGraph>>>,
+    all_graph: Option<Arc<RwLock<DepGraph>>>,
     fix: bool,
     skip_checkers: Vec<String>,
     profiles_dir: PathBuf,
@@ -80,7 +80,7 @@ pub(super) async fn check_profile(
 
 fn check_profile_name(
     profile: String,
-    _all_graph: Option<Arc<Mutex<DepGraph>>>,
+    _all_graph: Option<Arc<RwLock<DepGraph>>>,
     _fix: bool,
     skip_checkers: Vec<String>,
     _profiles_dir: PathBuf,
