@@ -656,7 +656,7 @@ impl<'a, BP: BinProvider> Iterator for ExecPlan<'a, BP> {
 
             // Something is ready to be built if all its inputs are built, and all its transitive
             // runtime deps (and the transitive runtime deps of its inputs) are built.
-            let deps: Vec<(Option<Dep>, transitives::Dep)> =
+            let mut deps: Vec<(Option<Dep>, transitives::Dep)> =
                 Transitives::new(self.graph, candidate, true)
                     .transitive_runtime_deps
                     .into_iter()
@@ -665,7 +665,7 @@ impl<'a, BP: BinProvider> Iterator for ExecPlan<'a, BP> {
 
             // Determine if all deps are satisfied somehow (can_build_breakers=true), as well
             // as determine if all deps are satisfied without cycle-breakers (can_build_full=true).
-            let (can_build_full, can_build_breakers) =
+            let (mut can_build_full, can_build_breakers) =
                 deps.iter()
                     .fold((true, true), |acc, (built_candidate, _info)| {
                         (
@@ -677,6 +677,18 @@ impl<'a, BP: BinProvider> Iterator for ExecPlan<'a, BP> {
                             acc.1 & built_candidate.is_some(),
                         )
                     });
+
+            let build = self.graph.get(candidate).unwrap();
+
+            // Special case: Prebuilts can form cycles amongst themselves through runtime_deps,
+            // and these cycles can lead to situations where its impossible to progress. Fortunately
+            // prebuilts don't actually need their runtime_deps at 'build' time, as for a prebuilt
+            // that just means download+unpack, so we magically consider a package ready to be built
+            // if its a prebuilt.
+            if build.is_pure_prebuilt() {
+                can_build_full = true;
+                deps.clear();
+            }
 
             // Prefer a full build if all the deps have been fully built. If deps are satisfied
             // by cycle breakers, we can do a cycle-breaker build.
@@ -697,7 +709,6 @@ impl<'a, BP: BinProvider> Iterator for ExecPlan<'a, BP> {
                         // - Collections - stuff thats just a rollup of runtime deps, so wont change with a rebuild
                         // - Configuration - When the unsafe configuration skip_double_builds is set
 
-                        let build = self.graph.get(candidate).unwrap();
                         !(build.is_pure_prebuilt()
                             || build.is_pure_collection()
                             || unsafe_skip_double_builds)
