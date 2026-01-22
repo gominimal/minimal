@@ -1,5 +1,8 @@
 use crate::{BuildSpecInput, BuildSpecRef, DepGraph, RuntimeDep, SubsetInput};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Deref,
+};
 
 /// Information about a dependency.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,7 +39,7 @@ pub struct Transitives {
 }
 
 impl Transitives {
-    fn upsert<I: Iterator<Item = Attribution>, O: IntoIterator<Item = String>>(
+    fn upsert<I: Iterator<Item = Attribution>, IT: Into<String>, O: IntoIterator<Item = IT>>(
         transitive_runtime_deps: &mut HashMap<BuildSpecRef, Dep>,
         bsr: &BuildSpecRef,
         needed_by: I,
@@ -57,7 +60,7 @@ impl Transitives {
                     }
                     (Some(stored), Some(new)) => {
                         // Both stored & incoming are subsets, union the outputs they are requesting
-                        stored.extend(new);
+                        stored.extend(new.into_iter().map(|s| s.into()));
                     }
                 }
             }
@@ -67,7 +70,7 @@ impl Transitives {
                     *bsr,
                     Dep {
                         needed_by: needed_by.collect(),
-                        outputs: outputs.map(|v| v.into_iter().collect()),
+                        outputs: outputs.map(|v| v.into_iter().map(|s| s.into()).collect()),
                     },
                 );
             }
@@ -76,6 +79,14 @@ impl Transitives {
 
     /// Constructs the set of transitive dependencies for the given build.
     pub fn new(g: &DepGraph, bsr: &BuildSpecRef, include_inputs: bool) -> Self {
+        Self::new_with_seenset(&mut HashSet::with_capacity(256), g, bsr, include_inputs)
+    }
+    fn new_with_seenset(
+        seen: &mut HashSet<BuildSpecRef>,
+        g: &DepGraph,
+        bsr: &BuildSpecRef,
+        include_inputs: bool,
+    ) -> Self {
         let build = g.get(bsr).unwrap();
 
         let mut out = Transitives {
@@ -158,23 +169,33 @@ impl Transitives {
                 RuntimeDep::Build(bsr) => (bsr, None),
                 RuntimeDep::Subset(SubsetInput { from: bsr, outputs }) => (bsr, Some(outputs)),
             }))
-            .for_each(|(bsr, _)| {
-                for (dep_bsr, info) in Transitives::new(g, bsr, false)
-                    .transitive_runtime_deps
-                    .into_iter()
-                    .map(|(dep_bsr, mut info)| {
-                        (dep_bsr, {
-                            info.needed_by.clear();
-                            info.needed_by.push(Attribution::Inherited { from: *bsr });
-                            info
+            .for_each(|(bsr, outputs)| {
+                if !seen.contains(bsr) {
+                    seen.insert(*bsr);
+                    for (dep_bsr, info) in Transitives::new_with_seenset(seen, g, bsr, false)
+                        .transitive_runtime_deps
+                        .into_iter()
+                        .map(|(dep_bsr, mut info)| {
+                            (dep_bsr, {
+                                info.needed_by.clear();
+                                info.needed_by.push(Attribution::Inherited { from: *bsr });
+                                info
+                            })
                         })
-                    })
-                {
+                    {
+                        Self::upsert(
+                            &mut out.transitive_runtime_deps,
+                            &dep_bsr,
+                            info.needed_by.into_iter(),
+                            info.outputs,
+                        );
+                    }
+                } else {
                     Self::upsert(
                         &mut out.transitive_runtime_deps,
-                        &dep_bsr,
-                        info.needed_by.into_iter(),
-                        info.outputs,
+                        bsr,
+                        [Attribution::Ours].into_iter(),
+                        outputs.map(|v| v.deref()),
                     );
                 }
             });
@@ -188,11 +209,13 @@ impl Transitives {
         top_levels: Vec<BuildSpecRef>,
         include_inputs: bool,
     ) -> HashMap<BuildSpecRef, Dep> {
+        let mut seenset = HashSet::with_capacity(256);
         let mut out: HashMap<BuildSpecRef, Dep> = HashMap::with_capacity(512);
         top_levels
             .iter()
             .flat_map(|base| {
-                Transitives::new(graph, base, include_inputs)
+                seenset.clear();
+                Transitives::new_with_seenset(&mut seenset, graph, base, include_inputs)
                     .transitive_runtime_deps
                     .into_iter()
                     .map(|(dep_bsr, mut info)| {
