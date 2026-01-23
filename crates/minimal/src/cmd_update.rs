@@ -13,12 +13,12 @@ pub async fn cmd_update(_args: UpdateArgs, ctx: &mut Context) -> Result<(), Erro
             (
                 upstream.repo.clone(),
                 upstream.branch.to_owned(),
-                upstream.rev.to_owned(),
+                upstream.locked_commit.to_owned(),
             ),
             (
                 stdlib.repo.clone(),
                 stdlib.branch.to_owned(),
-                stdlib.rev.to_owned(),
+                stdlib.locked_commit.to_owned(),
             ),
         )
     };
@@ -61,7 +61,10 @@ pub async fn cmd_update(_args: UpdateArgs, ctx: &mut Context) -> Result<(), Erro
         if let Some(new_rev) = new_up_rev
             && Some(&new_rev) != up_ref.as_ref()
         {
-            doc["upstream"]["rev"] = value(new_rev.clone());
+            doc["upstream"]["locked_commit"] = value(new_rev.clone());
+            if let Some(t) = doc["upstream"].as_table_like_mut() {
+                t.remove("rev"); // Old name, safe to remove ~feb
+            }
             did_update = true;
 
             println!(
@@ -79,7 +82,10 @@ pub async fn cmd_update(_args: UpdateArgs, ctx: &mut Context) -> Result<(), Erro
         if let Some(new_rev) = new_std_rev
             && Some(&new_rev) != std_ref.as_ref()
         {
-            doc["stdlib"]["rev"] = value(new_rev.clone());
+            doc["stdlib"]["locked_commit"] = value(new_rev.clone());
+            if let Some(t) = doc["stdlib"].as_table_like_mut() {
+                t.remove("rev"); // Old name, safe to remove ~feb
+            }
             did_update = true;
 
             println!(

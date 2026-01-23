@@ -54,7 +54,7 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
     } else {
         mfile.dir_path().unwrap().to_path_buf()
     };
-    let state_base_dir = mfile.env_state_dir(&task.env, env_base_dir).unwrap();
+    let state_base_dir = mfile.state_dir(&task.env, env_base_dir).unwrap();
 
     let cache = ctx.local_cache();
     // Make sure the packages are built
