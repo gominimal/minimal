@@ -1,17 +1,7 @@
 [target.aarch64-unknown-linux-musl]
 pre-build = [
-    "apt-get update && apt-get install --assume-yes musl-dev musl-tools pkg-config wget make perl unzip",
     # protoc version in apt is too old and chokes on optional keyword in proto3 fmt
+    "apt-get update && apt-get install --assume-yes wget unzip",
     "wget https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-linux-x86_64.zip -O /tmp/protoc.zip",
     "unzip /tmp/protoc.zip -d /usr/local",
-    "cd /tmp && wget https://www.openssl.org/source/openssl-1.1.1w.tar.gz",
-    "cd /tmp && tar xzf openssl-1.1.1w.tar.gz",
-    "cd /tmp/openssl-1.1.1w && CC=aarch64-linux-musl-gcc ./Configure no-shared no-async --prefix=/usr/local/musl --openssldir=/usr/local/musl/ssl linux-aarch64",
-    "cd /tmp/openssl-1.1.1w && make -j$(nproc) && make install",
-]
-
-[target.aarch64-unknown-linux-musl.env]
-passthrough = [
-    "OPENSSL_DIR=/usr/local/musl",
-    "OPENSSL_STATIC=1",
 ]
