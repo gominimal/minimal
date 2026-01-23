@@ -396,8 +396,11 @@ impl<'a, B: common::fetchers::FetchBackend> graph::BinProvider for RemoteBinProv
     }
 }
 
-// Syscall number for renameat2 on x86_64
+#[cfg(target_arch = "x86_64")]
 const SYS_RENAMEAT2: i64 = 316;
+
+#[cfg(target_arch = "aarch64")]
+const SYS_RENAMEAT2: i64 = 276;
 
 // Special value for AT_FDCWD
 const AT_FDCWD: i32 = -100;
