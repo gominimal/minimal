@@ -216,7 +216,7 @@ impl File {
                 let mut mfile: Self = toml::from_slice(&file_data).map_err(Error::Format)?;
                 mfile.mfile_path = Some(path.to_path_buf());
                 mfile.layout = Some(Layout::DotMinimal);
-                return Ok(mfile);
+                Ok(mfile)
             }
             Err(e) => Err(Error::IO("minimal file", path, e)),
         }
