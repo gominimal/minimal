@@ -30,7 +30,18 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
             return Err(Error::Other(anyhow!("no such env named '{}'", task.env)));
         }
     };
+
     graph.hydrate_env(&mut env)?;
+    // Apply any task-specific overrides.
+    if !task.packages.is_empty() {
+        env.packages.extend(task.packages.iter().cloned());
+        env.packages.sort();
+        env.packages.dedup();
+    }
+    env.vars
+        .extend(task.vars.iter().map(|(k, v)| (k.clone(), v.clone())));
+    env.patch.union(&task.patch);
+
     graph.top_levels = env
         .packages
         .iter()

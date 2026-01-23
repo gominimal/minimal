@@ -52,6 +52,7 @@ pub struct Upstream {
     pub rev: Option<String>,
 }
 
+/// Describes options for how a directory or file is patched into some task environment.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum PatchSetting {
     #[default]
@@ -61,6 +62,7 @@ pub enum PatchSetting {
     ReadWrite,
 }
 
+/// Describes the set of directories/files patched into a task environment, from the host environment.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct EnvPatches {
     #[serde(default, alias = "dirs")]
@@ -69,7 +71,18 @@ pub struct EnvPatches {
     pub file: HashMap<String, PatchSetting>,
 }
 
+impl EnvPatches {
+    /// Combines the given [EnvPatches] into `self`. If keys conflict, `other` takes precedence.
+    pub fn union(&mut self, other: &Self) {
+        self.dir
+            .extend(other.dir.iter().map(|(k, v)| (k.clone(), v.clone())));
+        self.file
+            .extend(other.file.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+}
+
 /// An environment, defined in a `[envs.<env_name>]` section of [File].
+/// TODO: Rip out
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct Env {
     #[serde(default)]
@@ -87,9 +100,22 @@ pub struct Env {
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct Task {
     /// The name of the environment to use.
+    ///
+    /// TODO: Rip out
     pub env: String,
     /// The command invocation to use.
     pub cmd: String,
+
+    /// Additional packages to be present in the sandbox this task executes in.
+    #[serde(default)]
+    pub packages: Vec<String>,
+    /// Environment variables to set on the process this task launches.
+    #[serde(default, alias = "env_vars")]
+    pub vars: HashMap<String, String>,
+    /// Files/directories to be patched into the sandbox this task executes in.
+    #[serde(default, alias = "patches")]
+    pub patch: EnvPatches,
+
     /// Whether to use the current working directory of the invocation, instead
     /// of the default which is the directory containing the minimal file.
     #[serde(default)]
@@ -262,6 +288,8 @@ mod tests {
 
             [tasks.test]
             env = "test"
+            patch.dir."~/.claude" = "read-write"
+            packages = ["base", "go"]
             cmd = "go test ./..."
 
             [outputs.test]
@@ -298,6 +326,12 @@ mod tests {
                     "test".to_string(),
                     Task {
                         env: "test".to_string(),
+                        vars: HashMap::new(),
+                        patch: EnvPatches {
+                            dir: [("~/.claude".to_string(), PatchSetting::ReadWrite)].into(),
+                            file: HashMap::new()
+                        },
+                        packages: vec!["base".to_string(), "go".to_string()],
                         cmd: "go test ./...".to_string(),
                         inherit_cwd: false,
                     }
@@ -360,6 +394,39 @@ mod tests {
                 "/bin/go".to_string(),
                 vec!["test".to_string(), "./...".to_string()]
             )
+        );
+    }
+
+    #[test]
+    fn env_patches_union() {
+        let mut slf: EnvPatches = toml::from_str(indoc! {
+            r#"
+            dir."slf" = "read-write"
+            dir."~/.claude" = "read-write"
+            "#
+        })
+        .unwrap();
+        let other = EnvPatches {
+            dir: HashMap::from_iter([
+                ("~/.claude".to_string(), PatchSetting::ReadOnly),
+                ("other".to_string(), PatchSetting::ReadOnly),
+            ]),
+            ..Default::default()
+        };
+
+        slf.union(&other);
+
+        assert_eq!(
+            slf,
+            EnvPatches {
+                dir: [
+                    ("~/.claude".to_string(), PatchSetting::ReadOnly),
+                    ("slf".to_string(), PatchSetting::ReadWrite),
+                    ("other".to_string(), PatchSetting::ReadOnly),
+                ]
+                .into(),
+                file: HashMap::new()
+            }
         );
     }
 }
