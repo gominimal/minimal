@@ -45,7 +45,7 @@ hakoniwa = { git = "https://github.com/souk4711/hakoniwa", branch = "main" }
 hex = "0.4"
 indoc = "^2.0"
 lzma-rs = "0.3"
-nickel-lang-core = { version = "0.15.3", default-features = false, features = ["format"] }
+nickel-lang-core = { version = "0.16.1", default-features = false, features = ["format"] }
 object = { version = "0.38", default-features = false, features = ["archive", "elf", "read_core", "std"] }
 oci-spec = "0.8.3"
 path-absolutize = "^3.1"
@@ -70,7 +70,7 @@ tokio = { version = "1.48.0", features = ["full"] }
 tokio-stream = "0.1"
 tokio-util = "0.7"
 toml = "0.9"
-toml_edit = "0.23"
+toml_edit = "0.24"
 tonic = "0.14.2"
 tonic-prost = "0.14.2"
 tonic-prost-build = "0.14.2"
