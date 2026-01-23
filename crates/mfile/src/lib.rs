@@ -1,40 +1,15 @@
 //! Finding & reading the `minimal.toml` file.
 
 use std::collections::HashMap;
+use std::env;
 use std::path::{Component, Path, PathBuf};
-use std::{env, fmt};
+
+mod error;
+pub use error::Error;
+mod tasks;
+pub use tasks::Task;
 
 pub const MFILE_NAME: &str = "minimal.toml";
-
-/// The errors possible when working with the minimal file.
-#[derive(Debug)]
-pub enum Error {
-    IO(&'static str, PathBuf, std::io::Error),
-    Format(toml::de::Error),
-    NotFound,
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::IO(ctx, path, e) => {
-                write!(f, "{} I/O error at path {}: {}", ctx, path.display(), e)
-            }
-            Error::Format(e) => write!(f, "invalid TOML: {}", e),
-            Error::NotFound => write!(f, "not found"),
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Error::IO(_, _, e) => Some(e),
-            Error::Format(e) => Some(e),
-            Error::NotFound => None,
-        }
-    }
-}
 
 /// A value from serde that can either be a string, or an array of strings.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -44,12 +19,20 @@ pub enum StrOrList {
     Multiple(Vec<String>),
 }
 
-/// The `[upstream]` or `[stdlib]` section of [File], describing the upstream or stdlib to use.
+/// Defines a link to an upper layer (repo which contains a minimal file).
+///
+/// This is typically the `[upstream]` or `[stdlib]` section of [File], describing the upstream or stdlib to use.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct Upstream {
+pub struct LinkConfig {
+    /// The URL passed to git to fetch the repository.
     pub repo: String,
+    /// If set, the branch of the repo to track. `rev` is bumped to the HEAD of this branch on `minimal update`.
     pub branch: Option<String>,
-    pub rev: Option<String>,
+    /// The pinned git commit hash to use for this link.
+    ///
+    /// TODO: Remove the `rev` alias ~feb, that was the old key.
+    #[serde(alias = "rev")]
+    pub locked_commit: Option<String>,
 }
 
 /// Describes options for how a directory or file is patched into some task environment.
@@ -63,10 +46,16 @@ pub enum PatchSetting {
 }
 
 /// Describes the set of directories/files patched into a task environment, from the host environment.
+///
+/// TODO: Move to `tasks.rs`.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct EnvPatches {
+    /// The list of directories to be patched into the environment. Keys are expected to be path strings,
+    /// either absolute paths are starting with the prefix `~/` to be rooted in the users home directory.
     #[serde(default, alias = "dirs")]
     pub dir: HashMap<String, PatchSetting>,
+    /// The list of files to be patched into the environment. Keys are expected to be path strings,
+    /// either absolute paths are starting with the prefix `~/` to be rooted in the users home directory.
     #[serde(default, alias = "files")]
     pub file: HashMap<String, PatchSetting>,
 }
@@ -96,45 +85,7 @@ pub struct Env {
     pub patch: EnvPatches,
 }
 
-/// A task, defined in a `[tasks.<task_name>]` section of [File].
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct Task {
-    /// The name of the environment to use.
-    ///
-    /// TODO: Rip out
-    pub env: String,
-    /// The command invocation to use.
-    pub cmd: String,
-
-    /// Additional packages to be present in the sandbox this task executes in.
-    #[serde(default)]
-    pub packages: Vec<String>,
-    /// Environment variables to set on the process this task launches.
-    #[serde(default, alias = "env_vars")]
-    pub vars: HashMap<String, String>,
-    /// Files/directories to be patched into the sandbox this task executes in.
-    #[serde(default, alias = "patches")]
-    pub patch: EnvPatches,
-
-    /// Whether to use the current working directory of the invocation, instead
-    /// of the default which is the directory containing the minimal file.
-    #[serde(default)]
-    pub inherit_cwd: bool,
-}
-
-impl Task {
-    /// returns the program this task exec's, and the args to use.
-    pub fn cmd_and_args(&self) -> (String, Vec<String>) {
-        let mut cmd = shlex::Shlex::new(self.cmd.trim());
-        let mut exec = cmd.next().unwrap();
-        if !(exec.starts_with("/") || exec.starts_with("./")) {
-            exec = format!("/bin/{}", exec);
-        }
-
-        (exec, cmd.collect())
-    }
-}
-
+/// Describes the specific type of output being generated.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum OutputKind {
     #[default]
@@ -158,85 +109,139 @@ pub struct Output {
     pub vars: HashMap<String, String>,
 }
 
+/// Which directory layout this layer/repo used for minimal configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Layout {
+    /// The 'abridged' layout. The minimal file is located at `./{MFILE_NAME}`.
+    ///
+    /// If present, the packages directory is at ./packages.
+    /// If present, the profiles directory is at ./profiles.
+    /// If present, the harnesses directory is at ./harnesses.
+    Root,
+    /// The 'full' layout. The minimal file is located at `./.minimal/{MFILE_NAME}`.
+    ///
+    /// If present, the packages directory is at ./.minimal/packages.
+    /// If present, the profiles directory is at ./.minimal/profiles.
+    /// If present, the harnesses directory is at ./.minimal/harnesses.
+    DotMinimal,
+}
+
 /// The loaded representation of the `minimal.toml` file.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct File {
+    /// The previous link in the software supply chain.
     #[serde(alias = "base")]
-    pub upstream: Upstream,
+    pub upstream: LinkConfig,
+    /// What version of the standard library to use.
     #[serde(default = "default_stdlib")]
-    pub stdlib: Upstream,
+    pub stdlib: LinkConfig,
 
+    /// Environment definitions. TODO: Rip out.
     #[serde(default)]
     pub envs: HashMap<String, Env>,
+    /// Task definitions, invoked with `minimal run <task name>`.
     #[serde(default)]
     pub tasks: HashMap<String, Task>,
+    /// Output definitions.
     #[serde(default)]
     pub outputs: HashMap<String, Output>,
 
+    /// Where the minimal file is located on disk, if it was loaded from disk.
     #[serde(skip)]
-    from: Option<PathBuf>,
+    mfile_path: Option<PathBuf>,
+    /// What layout this repo/layer is using, if loaded from disk.
+    #[serde(skip)]
+    layout: Option<Layout>,
 }
 
-fn default_stdlib() -> Upstream {
-    Upstream {
+fn default_stdlib() -> LinkConfig {
+    LinkConfig {
         repo: "https://github.com/gominimal/std".to_string(),
         branch: None,
-        rev: None,
+        locked_commit: None,
     }
 }
 
 impl File {
     /// Searches from the given directory backwards to load the `minimal.toml` file.
-    pub fn from_dir<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
-        let path = dir.as_ref().join(MFILE_NAME);
-        match std::fs::read(&path) {
-            Ok(b) => {
-                let mut mfile: Self = toml::from_slice(&b).map_err(Error::Format)?;
-                mfile.from = Some(path.to_path_buf());
-                Ok(mfile)
-            }
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    // Not found at this directory, try the parent
-                    if let Some(parent) = dir.as_ref().parent() {
-                        // We don't traverse outside of a users HOME if its set.
-                        if let Some(home) = env::home_dir()
-                            && home == parent
-                        {
-                            return Err(Error::NotFound);
-                        }
-
-                        Self::from_dir(parent)
-                    } else {
-                        Err(Error::NotFound)
+    pub fn from_dir_recursive<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
+        match Self::from_dir(&dir) {
+            Ok(f) => Ok(f),
+            Err(Error::IO("minimal file", _p, e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Not found at this directory, try the parent
+                if let Some(parent) = dir.as_ref().parent() {
+                    // We don't traverse outside of a users HOME if its set.
+                    if let Some(home) = env::home_dir()
+                        && home == parent
+                    {
+                        return Err(Error::NotFound);
                     }
+
+                    Self::from_dir_recursive(parent)
                 } else {
-                    Err(Error::IO("read", path, e))
+                    Err(Error::NotFound)
                 }
             }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Loads the minimal file from the given directory path. The given
+    /// directory must be a repository / minimalfile root.
+    pub fn from_dir<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
+        // Check for the minimal file at the directory root.
+        let path = dir.as_ref().join(MFILE_NAME);
+        match std::fs::read(&path) {
+            Ok(file_data) => {
+                let conflicting_path = dir.as_ref().join(".minimal").join(MFILE_NAME);
+                if std::fs::exists(&conflicting_path)
+                    .map_err(|e| Error::IO("stat", conflicting_path.clone(), e))?
+                {
+                    return Err(Error::ConflictingLayouts(vec![path, conflicting_path]));
+                }
+
+                let mut mfile: Self = toml::from_slice(&file_data).map_err(Error::Format)?;
+                mfile.mfile_path = Some(path.to_path_buf());
+                mfile.layout = Some(Layout::Root);
+                return Ok(mfile);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::IO("minimal file", path, e)),
+        };
+
+        // Check for the minimal file at `./.minimal`.
+        let path = dir.as_ref().join(".minimal").join(MFILE_NAME);
+        match std::fs::read(&path) {
+            Ok(file_data) => {
+                let mut mfile: Self = toml::from_slice(&file_data).map_err(Error::Format)?;
+                mfile.mfile_path = Some(path.to_path_buf());
+                mfile.layout = Some(Layout::DotMinimal);
+                return Ok(mfile);
+            }
+            Err(e) => Err(Error::IO("minimal file", path, e)),
         }
     }
 
     /// Returns the path to the directory where the minimal file is located.
     pub fn dir_path(&self) -> Option<&Path> {
-        match &self.from {
+        match &self.mfile_path {
             None => None,
             Some(fname) => fname.parent(),
         }
     }
     /// Returns the path to the minimal file.
     pub fn file_path(&self) -> Option<&PathBuf> {
-        self.from.as_ref()
+        self.mfile_path.as_ref()
+    }
+    /// Returns the layout this minimal file was on disk.
+    pub fn layout(&self) -> Option<&Layout> {
+        self.layout.as_ref()
     }
 
-    /// Returns the path to where durable state for the given environment should be stored.
+    /// Returns the path to the durable state directory for the given key.
     ///
     /// None is returned if the location of the minimal file on disk is not known.
-    pub fn env_state_dir<P: AsRef<Path>>(
-        &self,
-        env_name: &str,
-        env_base_dir: P,
-    ) -> Option<PathBuf> {
+    pub fn state_dir<P: AsRef<Path>>(&self, state_key: &str, env_base_dir: P) -> Option<PathBuf> {
         self.dir_path().map(|mfile_dir| {
             let hd = env::home_dir();
 
@@ -263,7 +268,7 @@ impl File {
                         .collect::<Vec<_>>()
                         .join("-")
                 ))
-                .join(env_name)
+                .join(state_key)
         })
     }
 }
@@ -278,7 +283,7 @@ mod tests {
     fn deserialize_smoketest() {
         let mf: File = toml::from_str(indoc! {
             r#"
-            [base]
+            [upstream]
             repo = "https://github.com/gominimal/pkgs"
             branch = "main"
 
@@ -303,10 +308,10 @@ mod tests {
         assert_eq!(
             mf,
             File {
-                upstream: Upstream {
+                upstream: LinkConfig {
                     repo: "https://github.com/gominimal/pkgs".to_string(),
                     branch: Some("main".to_string()),
-                    rev: None,
+                    locked_commit: None,
                 },
                 stdlib: default_stdlib(),
                 envs: [(
@@ -348,13 +353,14 @@ mod tests {
                     }
                 )]
                 .into(),
-                from: None,
+                mfile_path: None,
+                layout: None,
             }
         )
     }
 
     #[test]
-    fn from_dir() {
+    fn from_dir_abridged() {
         let dir = tempdir().unwrap();
 
         // write `minimal.toml`.
@@ -371,12 +377,64 @@ mod tests {
         .unwrap();
 
         // test from `./`, also check if `from` is set
-        let mfile = File::from_dir(dir.path());
-        assert!(matches!(mfile, Ok(File { from: Some(_), .. })));
+        let mfile = File::from_dir_recursive(dir.path());
+        assert!(
+            matches!(
+                mfile,
+                Ok(File {
+                    mfile_path: Some(_),
+                    layout: Some(Layout::Root),
+                    ..
+                })
+            ),
+            "unexpected mfile {:?}",
+            mfile
+        );
         assert_eq!(mfile.unwrap().dir_path().unwrap(), dir.path());
 
         std::fs::create_dir(dir.path().join("nested")).unwrap();
-        assert!(File::from_dir(dir.path().join("nested")).is_ok()); // test from `./nested`
+        assert!(File::from_dir_recursive(dir.path().join("nested")).is_ok()); // test from `./nested`
+    }
+
+    #[test]
+    fn from_dir_full() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".minimal")).unwrap();
+
+        // write `minimal.toml`.
+        std::fs::write(
+            dir.path().join(".minimal").join(MFILE_NAME),
+            indoc! {
+                r#"
+            [base]
+            repo = "https://github.com/gominimal/pkgs"
+            branch = "main"
+            "#
+            },
+        )
+        .unwrap();
+
+        // test from `./`, also check if `from` is set
+        let mfile = File::from_dir_recursive(dir.path());
+        assert!(
+            matches!(
+                mfile,
+                Ok(File {
+                    mfile_path: Some(_),
+                    layout: Some(Layout::DotMinimal),
+                    ..
+                })
+            ),
+            "unexpected mfile {:?}",
+            mfile
+        );
+        assert_eq!(
+            mfile.unwrap().dir_path().unwrap(),
+            dir.path().join(".minimal")
+        );
+
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        assert!(File::from_dir_recursive(dir.path().join("nested")).is_ok()); // test from `./nested`
     }
 
     #[test]

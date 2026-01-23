@@ -313,7 +313,9 @@ impl Context {
     pub fn minimal_file(&mut self) -> Result<&mfile::File, Error> {
         if self.mfile.is_none() {
             trace!("loading minimal file");
-            self.mfile = Some(mfile::File::from_dir(std::env::current_dir().unwrap())?);
+            self.mfile = Some(mfile::File::from_dir_recursive(
+                std::env::current_dir().unwrap(),
+            )?);
         }
         Ok(self.mfile.as_ref().unwrap())
     }

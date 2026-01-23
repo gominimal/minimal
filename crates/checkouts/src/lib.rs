@@ -56,9 +56,9 @@ impl GitRef {
 
 /// Converts from an (Upstream)[mfile::Upstream] stanza in the minimal-file
 /// to a [GitRef].
-impl From<&mfile::Upstream> for GitRef {
-    fn from(upstream: &mfile::Upstream) -> Self {
-        match (&upstream.rev, &upstream.branch) {
+impl From<&mfile::LinkConfig> for GitRef {
+    fn from(upstream: &mfile::LinkConfig) -> Self {
+        match (&upstream.locked_commit, &upstream.branch) {
             (Some(hash), _) => GitRef::Commit(hash.clone()),
             (None, Some(branch)) => GitRef::Branch(branch.clone()),
             (None, None) => GitRef::Branch("main".to_string()),
