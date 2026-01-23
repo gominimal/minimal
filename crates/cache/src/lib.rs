@@ -1,12 +1,9 @@
 //! Implementations of caches storing artifacts keyed by [SpecHash].
 
 use common::SpecHash;
-#[cfg(target_env = "gnu")]
-use nix::fcntl::{AT_FDCWD, RenameFlags, renameat2};
 
-#[cfg(target_env = "musl")]
 use std::ffi::CString;
-#[cfg(target_env = "musl")]
+use std::io;
 use std::os::unix::ffi::OsStrExt;
 
 use std::fmt;
@@ -104,45 +101,11 @@ impl PendingDir {
 
         let st = inner.fs.subtree(&subpath)?;
         let (from, to) = (self.tempdir.keep(), st.path());
+        let from_path = from.as_path();
 
-        #[cfg(target_env = "gnu")]
-        {
-            renameat2(AT_FDCWD, &from, AT_FDCWD, to, RenameFlags::RENAME_EXCHANGE)
-                .map_err(|e| CacheErr::IO(e.into()))?;
-            std::fs::remove_dir_all(from)?;
-        }
-
-        #[cfg(target_env = "musl")]
-        {
-            // musl: remove existing entry if present, then rename
-            // Note: This is not atomic like RENAME_EXCHANGE, but works for musl
-            //
-            // TODO: change this to renameat2 when musl pervasively supports it across distros
-            // TODO: change this to use nix like the gnu/glibc section above when nix exposes renameat2 for musl
-            if to.exists() {
-                std::fs::remove_dir_all(to)?;
-            }
-
-            let from_cstr = CString::new(from.as_os_str().as_bytes()).map_err(|e| {
-                CacheErr::IO(std::io::Error::new(std::io::ErrorKind::InvalidInput, e).into())
-            })?;
-            let to_cstr = CString::new(to.as_os_str().as_bytes()).map_err(|e| {
-                CacheErr::IO(std::io::Error::new(std::io::ErrorKind::InvalidInput, e).into())
-            })?;
-
-            let ret = unsafe {
-                libc::renameat(
-                    libc::AT_FDCWD,
-                    from_cstr.as_ptr(),
-                    libc::AT_FDCWD,
-                    to_cstr.as_ptr(),
-                )
-            };
-
-            if ret != 0 {
-                return Err(CacheErr::IO(std::io::Error::last_os_error().into()));
-            }
-        }
+        // use our direct syscall impl
+        renameat2(AT_FDCWD, from_path, AT_FDCWD, to, RENAME_EXCHANGE).map_err(CacheErr::IO)?;
+        std::fs::remove_dir_all(from)?;
 
         drop(st);
 
@@ -433,12 +396,96 @@ impl<'a, B: common::fetchers::FetchBackend> graph::BinProvider for RemoteBinProv
     }
 }
 
+// Syscall number for renameat2 on x86_64
+const SYS_RENAMEAT2: i64 = 316;
+
+// Special value for AT_FDCWD
+const AT_FDCWD: i32 = -100;
+
+// Flags for renameat2
+pub const RENAME_NOREPLACE: u32 = 1 << 0; // Don't overwrite target
+pub const RENAME_EXCHANGE: u32 = 1 << 1; // Atomically exchange paths
+pub const RENAME_WHITEOUT: u32 = 1 << 2; // Create whiteout object
+
+pub fn renameat2<P: AsRef<Path>>(
+    olddirfd: i32,
+    oldpath: P,
+    newdirfd: i32,
+    newpath: P,
+    flags: u32,
+) -> io::Result<()> {
+    let oldpath_c = path_to_cstring(oldpath.as_ref())?;
+    let newpath_c = path_to_cstring(newpath.as_ref())?;
+
+    let ret = unsafe {
+        libc::syscall(
+            SYS_RENAMEAT2,
+            olddirfd,
+            oldpath_c.as_ptr(),
+            newdirfd,
+            newpath_c.as_ptr(),
+            flags,
+        )
+    };
+
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+// Helper for the common case of renaming with AT_FDCWD
+pub fn renameat2_cwd<P: AsRef<Path>>(oldpath: P, newpath: P, flags: u32) -> io::Result<()> {
+    renameat2(AT_FDCWD, oldpath, AT_FDCWD, newpath, flags)
+}
+
+fn path_to_cstring(path: &Path) -> io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contained null byte"))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::entry_meta::MetaInner;
 
     use super::*;
+    use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_rename_noreplace() {
+        let old = "/tmp/test_old";
+        let new = "/tmp/test_new";
+
+        fs::write(old, "test").unwrap();
+
+        // Should succeed
+        renameat2_cwd(old, new, RENAME_NOREPLACE).unwrap();
+        assert!(Path::new(new).exists());
+
+        // Cleanup
+        fs::remove_file(new).unwrap();
+    }
+
+    #[test]
+    fn test_rename_exchange() {
+        let path1 = "/tmp/test_exchange1";
+        let path2 = "/tmp/test_exchange2";
+
+        fs::write(path1, "content1").unwrap();
+        fs::write(path2, "content2").unwrap();
+
+        // Exchange the files
+        renameat2_cwd(path1, path2, RENAME_EXCHANGE).unwrap();
+
+        assert_eq!(fs::read_to_string(path1).unwrap(), "content2");
+        assert_eq!(fs::read_to_string(path2).unwrap(), "content1");
+
+        // Cleanup
+        fs::remove_file(path1).unwrap();
+        fs::remove_file(path2).unwrap();
+    }
 
     #[test]
     fn smoketest_folder() {
