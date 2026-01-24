@@ -498,12 +498,10 @@ impl DepGraph {
                 SpecOrigin::Repo(Repo::Git { url, rev, tracking }) => sp
                     .checkout_of(&LinkConfig {
                         repo: url.clone(),
-                        branch: tracking
-                            .as_ref()
-                            .and_then(|b| match b {
-                                common::repo_spec::GitRef::Branch(b) => Some(b.clone()),
-                                common::repo_spec::GitRef::Tag(_t) => None,
-                            }),
+                        branch: tracking.as_ref().and_then(|b| match b {
+                            common::repo_spec::GitRef::Branch(b) => Some(b.clone()),
+                            common::repo_spec::GitRef::Tag(_t) => None,
+                        }),
                         locked_commit: Some(rev.clone()),
                     })
                     .map_err(|e| Error::Fetch(e.to_string()))?,
