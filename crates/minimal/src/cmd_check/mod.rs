@@ -49,31 +49,34 @@ fn package_check_futures(
     cache: Cache<LocalDir>,
     fix: bool,
 ) -> Result<Vec<CheckFuture>, Error> {
-    let package_dirs = std::fs::read_dir(&packages_dir)
-        .map_err(anyhow::Error::from)?
-        .filter_map(|e| match e {
-            Err(e) => Some(Err(e)),
-            Ok(e) => {
-                if !e.file_type().unwrap().is_dir() {
-                    None
-                } else {
-                    Some(Ok(e.file_name()))
-                }
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(anyhow::Error::from)?
-        .into_iter()
-        // Filter based on the packages argument
-        .filter_map(|pkg| {
-            let want_pkgs = packages_arg.names();
-            let pkg = pkg.to_str().unwrap().to_string();
-            if want_pkgs.is_empty() || want_pkgs.contains(&pkg) {
-                Some(pkg)
-            } else {
+    let package_dirs = match std::fs::read_dir(&packages_dir) {
+        Ok(i) => i,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(anyhow::Error::from(e).into()),
+    }
+    .filter_map(|e| match e {
+        Err(e) => Some(Err(e)),
+        Ok(e) => {
+            if !e.file_type().unwrap().is_dir() {
                 None
+            } else {
+                Some(Ok(e.file_name()))
             }
-        });
+        }
+    })
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(anyhow::Error::from)?
+    .into_iter()
+    // Filter based on the packages argument
+    .filter_map(|pkg| {
+        let want_pkgs = packages_arg.names();
+        let pkg = pkg.to_str().unwrap().to_string();
+        if want_pkgs.is_empty() || want_pkgs.contains(&pkg) {
+            Some(pkg)
+        } else {
+            None
+        }
+    });
 
     Ok(package_dirs
         .into_iter()
@@ -235,12 +238,20 @@ fn harness_check_futures(
 
 pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> {
     let all_graph = ctx.graph_from_all_packages();
-    let upstream_dir = ctx.upstream_dir_and_origin()?.0;
-    let stdlib_dir = ctx.stdlib_dir_and_origin()?.0;
+    let upstream_dir = match ctx.minimal_file() {
+        Ok(mfile) => mfile.dir_path().unwrap().to_path_buf(),
+        Err(Error::MFile(mfile::Error::NotFound)) => ctx
+            .base_dir_override
+            .clone()
+            .ok_or(mfile::Error::NotFound)?,
+        Err(e) => return Err(e),
+    };
+
     let packages_dir = upstream_dir.join("packages");
+    let stdlib_dir = ctx.stdlib_dir_and_origin()?.0;
 
     if args.fix && packages_dir.strip_prefix(ctx.paths().vcs_dir()).is_ok() {
-        return Err(anyhow!("--fix can only be used when --upstream-dir is specified").into());
+        return Err(anyhow!("--fix can only be used on a local repository").into());
     }
     let (graph_hnd, graph_err) = match all_graph {
         Err(e) => (None, Some(e)),

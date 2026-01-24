@@ -2,7 +2,7 @@
 
 use common::SpecOrigin;
 use generational_arena::Arena;
-use mfile::MFILE_NAME;
+use mfile::LinkConfig;
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::term::{RichTerm, Term};
 use nickel_lang_core::{
@@ -33,7 +33,7 @@ pub use harnesses::Harness;
 /// A collection of nickel objects, defined together in a single codebase.
 #[derive(Debug)]
 pub struct Layer {
-    config: LayerConfig,
+    upstream: Option<LinkConfig>,
     pub origin: SpecOrigin,
 
     pub builds: Arena<BuildDecl>,
@@ -76,39 +76,35 @@ impl Layer {
     }
 
     /// Returns the upstream layer this layer depends on, if any.
-    pub fn upstream(&self) -> Option<&UpstreamConfig> {
-        self.config.upstream.as_ref()
+    pub fn upstream(&self) -> Option<&LinkConfig> {
+        self.upstream.as_ref()
     }
 
     /// Simple builder of literal nickel for a test.
     pub fn new_for_test(s: String) -> Result<Self, Error> {
         let l = load::Loader::new(s, &load::LoadOptions::for_test())?;
-        Self::from_loader(l, LayerConfig::default())
+        Self::from_loader(l, None)
     }
 
     /// Loads all objects in the given directory following the standard directory layout.
     pub fn new<P: AsRef<Path>>(layer_dir: P, opts: &LoadOptions) -> Result<Self, Error> {
-        let conf_path = layer_dir.as_ref().join(MFILE_NAME);
-        let layer_conf: LayerConfig = match std::fs::read(conf_path) {
-            Ok(b) => toml::from_slice(&b).map_err(anyhow::Error::from)?,
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    LayerConfig::default()
-                } else {
-                    return Err(Error::IO(e));
-                }
-            }
+        let upstream = match mfile::File::from_dir(layer_dir.as_ref()) {
+            Ok(mfile) => Some(mfile.upstream),
+            Err(mfile::Error::IO(_, _, e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(mfile::Error::NotFound) => None,
+            Err(mfile::Error::IO(_, _, e)) => return Err(Error::IO(e)),
+            Err(e) => return Err(Error::Other(e.to_string())),
         };
 
         let loader = load::Loader::new_with_all_pkgs(layer_dir, opts)?;
-        Self::from_loader(loader, layer_conf)
+        Self::from_loader(loader, upstream)
     }
 
-    fn from_loader(loader: load::Loader, config: LayerConfig) -> Result<Self, Error> {
+    fn from_loader(loader: load::Loader, upstream: Option<LinkConfig>) -> Result<Self, Error> {
         let (ncl_tree, mut program, origin) = loader.finish()?;
         let mut layer = Self {
             origin,
-            config,
+            upstream,
             top_levels: Vec::new(),
             builds: Arena::with_capacity(1024),
             read_ids: HashMap::with_capacity(1024),
@@ -336,35 +332,6 @@ pub(crate) fn eval_if_closure(
     } else {
         Ok(rt.clone())
     }
-}
-
-/// The `[upstream]` section of [LayerConfig], describing the upstream to use.
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
-pub struct UpstreamConfig {
-    /// The URL the repository can be fetched from.
-    pub repo: String,
-    /// The commit hash.
-    #[serde(alias = "hash")]
-    pub rev: String,
-    /// The name of the branch this points to, if relevant.
-    pub branch: Option<String>,
-}
-
-impl From<UpstreamConfig> for SpecOrigin {
-    fn from(val: UpstreamConfig) -> Self {
-        SpecOrigin::Repo(common::repo_spec::Repo::Git {
-            url: val.repo,
-            rev: val.rev,
-            tracking: val.branch.map(common::repo_spec::GitRef::Branch),
-        })
-    }
-}
-
-/// Describes the minimal.toml configuration file present in a layer repo.
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-struct LayerConfig {
-    #[serde(default)]
-    pub upstream: Option<UpstreamConfig>,
 }
 
 #[cfg(test)]

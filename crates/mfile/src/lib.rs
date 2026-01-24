@@ -22,7 +22,7 @@ pub enum StrOrList {
 /// Defines a link to an upper layer (repo which contains a minimal file).
 ///
 /// This is typically the `[upstream]` or `[stdlib]` section of [File], describing the upstream or stdlib to use.
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 pub struct LinkConfig {
     /// The URL passed to git to fetch the repository.
     pub repo: String,
@@ -33,6 +33,21 @@ pub struct LinkConfig {
     /// TODO: Remove the `rev` alias ~feb, that was the old key.
     #[serde(alias = "rev")]
     pub locked_commit: Option<String>,
+}
+
+impl LinkConfig {
+    pub fn as_spec_origin(&self) -> Option<common::SpecOrigin> {
+        self.locked_commit.as_ref().map(|rev| {
+            common::SpecOrigin::Repo(common::repo_spec::Repo::Git {
+                url: self.repo.clone(),
+                rev: rev.clone(),
+                tracking: self
+                    .branch
+                    .as_ref()
+                    .map(|b| common::repo_spec::GitRef::Branch(b.clone())),
+            })
+        })
+    }
 }
 
 /// Describes options for how a directory or file is patched into some task environment.
@@ -154,7 +169,7 @@ pub struct File {
     layout: Option<Layout>,
 }
 
-fn default_stdlib() -> LinkConfig {
+pub fn default_stdlib() -> LinkConfig {
     LinkConfig {
         repo: "https://github.com/gominimal/std".to_string(),
         branch: None,
@@ -167,7 +182,7 @@ impl File {
     pub fn from_dir_recursive<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
         match Self::from_dir(&dir) {
             Ok(f) => Ok(f),
-            Err(Error::IO("minimal file", _p, e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(Error::NotFound) => {
                 // Not found at this directory, try the parent
                 if let Some(parent) = dir.as_ref().parent() {
                     // We don't traverse outside of a users HOME if its set.
@@ -218,6 +233,7 @@ impl File {
                 mfile.layout = Some(Layout::DotMinimal);
                 Ok(mfile)
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::NotFound),
             Err(e) => Err(Error::IO("minimal file", path, e)),
         }
     }
