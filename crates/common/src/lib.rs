@@ -72,6 +72,14 @@ impl SpecOrigin {
             },
         }
     }
+
+    pub fn as_repo(&self) -> Option<&repo_spec::Repo> {
+        if let SpecOrigin::Repo(r) = self {
+            Some(r)
+        } else {
+            None
+        }
+    }
 }
 
 /// Implements [Write], mirroring all writes to two underlying writers.

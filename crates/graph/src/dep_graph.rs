@@ -6,8 +6,8 @@
 use common::repo_spec::Repo;
 use common::{SpecOrigin, SubsetSpec, Target};
 use decode::builds::BuildRef;
-use decode::{Harness, Layer, Profile, UpstreamConfig, builds};
-use mfile;
+use decode::{Harness, Layer, Profile, builds};
+use mfile::{self, LinkConfig};
 use nickel_lang_core::term::IndexMap;
 
 use generational_arena::Arena;
@@ -410,17 +410,17 @@ impl Loader {
 pub trait SourceProvider {
     type Error: std::fmt::Debug + std::error::Error;
 
-    fn checkout_of(&mut self, upstream: &UpstreamConfig) -> Result<PathBuf, Self::Error>;
+    fn checkout_of(&mut self, upstream: &LinkConfig) -> Result<PathBuf, Self::Error>;
 }
 
 impl SourceProvider for checkouts::Manager {
     type Error = checkouts::Error;
 
-    fn checkout_of(&mut self, upstream: &UpstreamConfig) -> Result<PathBuf, Self::Error> {
+    fn checkout_of(&mut self, upstream: &LinkConfig) -> Result<PathBuf, Self::Error> {
         let (path, _hash) = checkouts::Manager::checkout_of(
             self,
             &upstream.repo,
-            checkouts::GitRef::Commit(upstream.rev.clone()),
+            checkouts::GitRef::Commit(upstream.locked_commit.clone().unwrap()),
         )?;
         Ok(path)
     }
@@ -478,7 +478,7 @@ impl DepGraph {
     }
 
     /// Constructs a dependency graph using the given origin to load the leaf layer,
-    /// and resolving source code using the given implementation of [SourceProvider].
+    /// and resolving the files for upstream layers using the given implementation of [SourceProvider].
     ///
     /// The given leaf paramater must not be `SpecOrigin::Inline`, or this function will panic.
     pub fn new_from_chain<SP: SourceProvider>(
@@ -488,52 +488,55 @@ impl DepGraph {
     ) -> Result<Self, Error> {
         let mut layers = Vec::with_capacity(6);
 
-        let mut cursor = match leaf {
-            SpecOrigin::Inline => panic!("SpecOrigin::Inline given as leaf to new_from_chain()"),
-            SpecOrigin::Repo(Repo::Git { url, rev, tracking }) => Some(UpstreamConfig {
-                repo: url.clone(),
-                branch: tracking
-                    .map(|b| match b {
-                        common::repo_spec::GitRef::Branch(b) => Some(b),
-                        common::repo_spec::GitRef::Tag(_t) => None,
-                    })
-                    .to_owned()
-                    .flatten(),
-                rev: rev.clone(),
-            }),
-            SpecOrigin::LocalDir { ref absolute, .. } => {
-                let layer = Layer::new(
-                    absolute,
-                    &decode::LoadOptions {
-                        minimal_lib_path: minimal_lib_path.clone(),
-                        from: leaf.clone(),
-                    },
-                )
-                .map_err(Error::Decode)?;
-                let cursor = layer.upstream().cloned();
-                layers.push(layer);
-                cursor
-            }
-        };
+        let mut cursor = Some(leaf);
 
         while let Some(upstream) = cursor.take() {
-            let from: SpecOrigin = upstream.clone().into();
-            let src_path = sp
-                .checkout_of(&upstream)
-                .map_err(|e| Error::Fetch(e.to_string()))?;
+            let src_path = match &upstream {
+                SpecOrigin::Inline => {
+                    panic!("SpecOrigin::Inline given as leaf to new_from_chain()")
+                }
+                SpecOrigin::Repo(Repo::Git { url, rev, tracking }) => sp
+                    .checkout_of(&LinkConfig {
+                        repo: url.clone(),
+                        branch: tracking
+                            .as_ref()
+                            .and_then(|b| match b {
+                                common::repo_spec::GitRef::Branch(b) => Some(b.clone()),
+                                common::repo_spec::GitRef::Tag(_t) => None,
+                            }),
+                        locked_commit: Some(rev.clone()),
+                    })
+                    .map_err(|e| Error::Fetch(e.to_string()))?,
+                SpecOrigin::LocalDir { absolute, .. } => absolute.clone(),
+            };
 
             let layer = Layer::new(
                 src_path,
                 &decode::LoadOptions {
                     minimal_lib_path: minimal_lib_path.clone(),
-                    from,
+                    from: upstream.clone(),
                 },
             )
             .map_err(Error::Decode)?;
 
-            if let Some(upstream) = layer.upstream() {
-                cursor = Some(upstream.clone());
-            }
+            cursor = if let Some(next_upstream) = layer.upstream() {
+                if upstream.as_repo().is_some_and(
+                    |r| matches!(r, Repo::Git { url, ..} if url == &next_upstream.repo),
+                ) {
+                    return Err(Error::Fetch(format!(
+                        "layer at {} defines an upstream that points to itself",
+                        next_upstream.repo.clone(),
+                    )));
+                }
+                Some(next_upstream.as_spec_origin().ok_or_else(|| {
+                    Error::Fetch(format!(
+                        "layer {:?} defines an upstream {} without a locked commit",
+                        layer.origin, next_upstream.repo,
+                    ))
+                })?)
+            } else {
+                None
+            };
             layers.push(layer);
         }
 
@@ -1054,12 +1057,12 @@ mod tests {
         );
     }
 
-    struct SourceProviderFake(HashMap<UpstreamConfig, TempDir>);
+    struct SourceProviderFake(HashMap<LinkConfig, TempDir>);
 
     impl SourceProvider for SourceProviderFake {
         type Error = std::io::Error;
 
-        fn checkout_of(&mut self, upstream: &UpstreamConfig) -> Result<PathBuf, Self::Error> {
+        fn checkout_of(&mut self, upstream: &LinkConfig) -> Result<PathBuf, Self::Error> {
             match self.0.get(upstream) {
                 None => Err(std::io::Error::other("not found")),
                 Some(td) => Ok(td.path().to_path_buf()),
@@ -1085,9 +1088,9 @@ mod tests {
             },
         )
         .unwrap();
-        let apex_repo = UpstreamConfig {
+        let apex_repo = LinkConfig {
             repo: "git@fakehub.com:minimal/apex.git".to_string(),
-            rev: "abc123".to_string(),
+            locked_commit: Some("abc123".to_string()),
             branch: None,
         };
 
@@ -1098,7 +1101,7 @@ mod tests {
             "
             [upstream]
             repo = \"git@fakehub.com:minimal/apex.git\"
-            hash = \"abc123\"
+            locked_commit = \"abc123\"
             "
             },
         )
@@ -1122,9 +1125,9 @@ mod tests {
             },
         )
         .unwrap();
-        let middle_repo = UpstreamConfig {
+        let middle_repo = LinkConfig {
             repo: "git@fakehub.com:minimal/middle.git".to_string(),
-            rev: "abc123".to_string(),
+            locked_commit: Some("abc123".to_string()),
             branch: None,
         };
 
@@ -1134,7 +1137,7 @@ mod tests {
         ]));
         let graph = DepGraph::new_from_chain(
             &mut sp,
-            middle_repo.into(),
+            middle_repo.as_spec_origin().unwrap(),
             LoadOptions::for_test().minimal_lib_path,
         )
         .unwrap();

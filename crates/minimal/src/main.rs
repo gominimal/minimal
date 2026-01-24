@@ -116,9 +116,9 @@ pub struct GlobalArgs {
     /// Load the minimal standard library from the given path instead
     #[arg(long)]
     stdlib_dir: Option<PathBuf>,
-    /// Load the upstream from the given path instead of using `[base]` in `minimal.toml`
-    #[arg(long)]
-    upstream_dir: Option<PathBuf>,
+    /// Use the given directory as the repository root, instead of searching from the current working directory.
+    #[arg(long, short = 'C')]
+    repo_dir: Option<PathBuf>,
 
     /// Ignore locally-available binary artifacts (results in rebuilds unless present in a remote cache)
     #[arg(long, default_value_t = false)]
@@ -170,11 +170,10 @@ pub struct Context {
     pub no_fetch: bool,
     pub num_parallel_builds: usize,
 
-    upstream_dir_and_origin: Option<(PathBuf, SpecOrigin)>,
     stdlib_dir_and_origin: Option<(PathBuf, SpecOrigin)>,
 
     mfile: Option<mfile::File>,
-    upstream_dir_override: Option<PathBuf>,
+    base_dir_override: Option<PathBuf>,
     stdlib_dir_override: Option<PathBuf>,
     paths: PathConfig,
     cache: Cache<LocalDir>,
@@ -207,10 +206,9 @@ impl Context {
             no_cache: args.no_cache,
             no_fetch: args.no_fetch,
             num_parallel_builds: args.num_parallel_builds,
-            upstream_dir_override: args.upstream_dir,
+            base_dir_override: args.repo_dir,
             stdlib_dir_override: args.stdlib_dir,
 
-            upstream_dir_and_origin: None,
             stdlib_dir_and_origin: None,
             mfile: None,
 
@@ -258,7 +256,11 @@ impl Context {
 
     /// Returns the path to the stdlib directory as well as info about where its from.
     ///
-    /// This is computed either from the `--stdlib-dir` argument or the minimal file.
+    /// This is computed from, in order:
+    ///  - the `--stdlib-dir` argument, or if not set
+    ///  - the minimal file, or if not found
+    ///  - the default `mfile::default_stdlib()`
+    ///
     /// The result is cached for future invocations.
     pub fn stdlib_dir_and_origin(&mut self) -> Result<(PathBuf, SpecOrigin), Error> {
         if let Some(dir) = &self.stdlib_dir_override {
@@ -268,54 +270,36 @@ impl Context {
             return Ok(res.clone());
         }
 
-        let minimal_file = self.minimal_file()?.clone();
+        let stdlib = match self.minimal_file() {
+            Ok(f) => f.stdlib.clone(),
+            Err(Error::MFile(mfile::Error::NotFound)) => mfile::default_stdlib(),
+            Err(e) => return Err(e),
+        };
 
-        let git_ref: GitRef = (&minimal_file.stdlib).into();
+        let git_ref: GitRef = (&stdlib).into();
         let (dir, git_hash) = self
             .vcs
-            .checkout_of(&minimal_file.stdlib.repo, git_ref.clone())
+            .checkout_of(&stdlib.repo, git_ref.clone())
             .map_err(anyhow::Error::from)?;
         self.stdlib_dir_and_origin = Some((
             dir,
-            SpecOrigin::Repo(git_ref.as_repo(minimal_file.stdlib.repo, git_hash)),
+            SpecOrigin::Repo(git_ref.as_repo(stdlib.repo, git_hash)),
         ));
         Ok(self.stdlib_dir_and_origin.as_ref().unwrap().clone())
-    }
-
-    /// Returns the path to the upstream directory as well as info about where its from.
-    ///
-    /// This is computed either from the `--upstream-dir` argument or the minimal file.
-    /// The result is cached for future invocations.
-    fn upstream_dir_and_origin(&mut self) -> Result<(PathBuf, SpecOrigin), Error> {
-        if let Some(dir) = &self.upstream_dir_override {
-            return Ok((dir.clone(), SpecOrigin::from_dir(dir)));
-        }
-        if let Some(res) = &self.upstream_dir_and_origin {
-            return Ok(res.clone());
-        }
-
-        let minimal_file = self.minimal_file()?.clone();
-
-        let git_ref: GitRef = (&minimal_file.upstream).into();
-        let (dir, git_hash) = self
-            .vcs
-            .checkout_of(&minimal_file.upstream.repo, git_ref.clone())
-            .map_err(anyhow::Error::from)?;
-
-        self.upstream_dir_and_origin = Some((
-            dir,
-            SpecOrigin::Repo(git_ref.as_repo(minimal_file.upstream.repo, git_hash)),
-        ));
-        Ok(self.upstream_dir_and_origin.as_ref().unwrap().clone())
     }
 
     /// Returns the decoded minimal-file, reading it from disk if necessary.
     pub fn minimal_file(&mut self) -> Result<&mfile::File, Error> {
         if self.mfile.is_none() {
             trace!("loading minimal file");
-            self.mfile = Some(mfile::File::from_dir_recursive(
-                std::env::current_dir().unwrap(),
-            )?);
+            self.mfile = Some(
+                self.base_dir_override
+                    .as_ref()
+                    .map(|d| mfile::File::from_dir(d.clone()))
+                    .unwrap_or_else(|| {
+                        mfile::File::from_dir_recursive(std::env::current_dir().unwrap())
+                    })?,
+            );
         }
         Ok(self.mfile.as_ref().unwrap())
     }
@@ -353,10 +337,13 @@ impl Context {
     }
 
     pub fn graph_from_all_packages(&mut self) -> Result<DepGraph, Error> {
-        let (_dir, origin) = self.upstream_dir_and_origin()?;
+        let leaf_layer = match &self.base_dir_override {
+            Some(d) => SpecOrigin::from_dir(d),
+            None => SpecOrigin::from_dir(self.minimal_file()?.dir_path().unwrap()),
+        };
 
         let stdlib_dir = self.stdlib_dir_and_origin()?.0;
-        DepGraph::new_from_chain(self.vcs_manager(), origin, stdlib_dir).map_err(Error::Graph)
+        DepGraph::new_from_chain(self.vcs_manager(), leaf_layer, stdlib_dir).map_err(Error::Graph)
     }
 }
 
