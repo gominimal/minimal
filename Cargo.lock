@@ -498,23 +498,12 @@ dependencies = [
 
 [[package]]
 name = "codespan"
-version = "0.12.0"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e4b418d52c9206820a56fc1aa28db73d67e346ba8ba6aa90987e8d6becef7e4"
+checksum = "583f52b0658b321b25fd6b209b6c76cf058f433071297de64e5980c3d9aad937"
 dependencies = [
- "codespan-reporting 0.12.0",
+ "codespan-reporting",
  "serde",
-]
-
-[[package]]
-name = "codespan-reporting"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe6d2e5af09e8c8ad56c969f2157a3d4238cebc7c55f0a517728c38f7b200f81"
-dependencies = [
- "serde",
- "termcolor",
- "unicode-width",
 ]
 
 [[package]]
@@ -791,7 +780,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "blake3",
- "codespan-reporting 0.13.1",
+ "codespan-reporting",
  "common",
  "generational-arena",
  "indoc",
@@ -1392,7 +1381,7 @@ version = "0.0.1"
 dependencies = [
  "blake3",
  "checkouts",
- "codespan-reporting 0.13.1",
+ "codespan-reporting",
  "common",
  "decode",
  "generational-arena",
@@ -1888,6 +1877,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "json_scanner"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe0a2dc336065c75719cffd3c6c929e0ec4ed85b92b8248a7bbd999acb0e419c"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "keccak"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2179,7 +2177,7 @@ dependencies = [
  "checkouts",
  "clap",
  "clap_complete",
- "codespan-reporting 0.13.1",
+ "codespan-reporting",
  "common",
  "decode",
  "dirs",
@@ -2205,7 +2203,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
- "toml_edit",
+ "toml_edit 0.24.0+spec-1.1.0",
  "tonic",
  "tracing",
  "tracing-indicatif",
@@ -2269,25 +2267,29 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nickel-lang-core"
-version = "0.15.3"
+version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94cdfc3035139574c1c362e19d62c411da194ec5b541c9ebb4716393ce83af1f"
+checksum = "51647f09e6e385c140226867c62292f23c31241ee2b4986f3f71a40d48e88a60"
 dependencies = [
+ "base64",
  "bumpalo",
  "codespan",
- "codespan-reporting 0.12.0",
+ "codespan-reporting",
  "colorchoice",
  "indexmap 2.13.0",
  "indoc",
+ "json_scanner",
  "lalrpop",
  "lalrpop-util",
  "logos",
  "malachite",
  "malachite-q",
  "md-5",
+ "nickel-lang-parser",
  "nickel-lang-vector",
  "once_cell",
  "ouroboros",
+ "paste",
  "pretty",
  "regex",
  "saphyr-parser",
@@ -2301,12 +2303,38 @@ dependencies = [
  "strip-ansi-escapes",
  "strsim",
  "toml",
- "toml_edit",
+ "toml_edit 0.23.10+spec-1.0.0",
  "topiary-core",
  "topiary-queries",
  "tree-sitter-nickel",
  "typed-arena",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "nickel-lang-parser"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20d8810705f1a243b1996c83fe9f173d8fb33f1cc97ea5ff7486cc6ef8981f81"
+dependencies = [
+ "bumpalo",
+ "codespan",
+ "codespan-reporting",
+ "indexmap 2.13.0",
+ "lalrpop",
+ "lalrpop-util",
+ "logos",
+ "malachite",
+ "nickel-lang-vector",
+ "ouroboros",
+ "pretty",
+ "regex",
+ "saphyr-parser",
+ "serde",
+ "serde_json",
+ "simple-counter",
+ "toml_edit 0.23.10+spec-1.0.0",
+ "typed-arena",
 ]
 
 [[package]]
@@ -2520,6 +2548,12 @@ dependencies = [
  "smallvec",
  "windows-link",
 ]
+
+[[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "path-absolutize"
@@ -3864,6 +3898,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml_edit"
+version = "0.24.0+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c740b185920170a6d9191122cafef7010bd6270a3824594bff6784c04d7f09e"
+dependencies = [
+ "indexmap 2.13.0",
+ "toml_datetime",
+ "toml_parser",
+ "toml_writer",
+ "winnow",
+]
+
+[[package]]
 name = "toml_parser"
 version = "1.0.6+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4247,9 +4294,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.19.0"
+version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2e054861b4bd027cd373e18e8d8d8e6548085000e41290d95ce0c373a654b4a"
+checksum = "ee48d38b119b0cd71fe4141b30f5ba9c7c5d9f4e7a3a8b4a674e4b6ef789976f"
 dependencies = [
  "getrandom 0.3.4",
  "js-sys",
