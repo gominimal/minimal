@@ -1,7 +1,6 @@
 use crate::{Context, Error};
 use anyhow::anyhow;
 use graph::Transitives;
-use mfile::Layout;
 use op::Runnable;
 use tracing::trace;
 
@@ -40,13 +39,7 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
     let cwd = if task.inherit_cwd {
         std::env::current_dir().unwrap()
     } else {
-        let mfile_dir = mfile.dir_path().unwrap();
-        if let Some(&Layout::DotMinimal) = mfile.layout() {
-            mfile_dir.parent().unwrap()
-        } else {
-            mfile_dir
-        }
-        .to_path_buf()
+        mfile.repo_path().unwrap().to_path_buf()
     };
 
     let state_base_dir = match &task.state_key {
