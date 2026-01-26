@@ -1,6 +1,7 @@
 use crate::{Context, Error};
 use anyhow::anyhow;
 use graph::Transitives;
+use mfile::Layout;
 use op::Runnable;
 use tracing::trace;
 
@@ -12,10 +13,12 @@ pub struct RunArgs {
 pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
     trace!("cmd_run");
     let mut graph = ctx.graph_from_all_packages()?;
+    let mut temp_dirs = vec![];
     let env_base_dir = ctx.paths().env_base_dir().to_path_buf();
 
+    let cache = ctx.local_cache();
     let mfile = ctx.minimal_file()?;
-    let task = match mfile.tasks.get(&args.task_name) {
+    let mut task = match mfile.tasks.get(&args.task_name) {
         Some(t) => t.clone(),
         None => {
             return Err(Error::Other(anyhow!(
@@ -24,25 +27,10 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
             )));
         }
     };
-    let mut env = match mfile.envs.get(&task.env) {
-        Some(e) => e.clone(),
-        None => {
-            return Err(Error::Other(anyhow!("no such env named '{}'", task.env)));
-        }
-    };
 
-    graph.hydrate_env(&mut env)?;
-    // Apply any task-specific overrides.
-    if !task.packages.is_empty() {
-        env.packages.extend(task.packages.iter().cloned());
-        env.packages.sort();
-        env.packages.dedup();
-    }
-    env.vars
-        .extend(task.vars.iter().map(|(k, v)| (k.clone(), v.clone())));
-    env.patch.union(&task.patch);
+    graph.hydrate_task(&mut task)?; // Apply profile settings
 
-    graph.top_levels = env
+    graph.top_levels = task
         .packages
         .iter()
         .flat_map(|p| graph.by_name(p))
@@ -52,11 +40,27 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
     let cwd = if task.inherit_cwd {
         std::env::current_dir().unwrap()
     } else {
-        mfile.dir_path().unwrap().to_path_buf()
+        let mfile_dir = mfile.dir_path().unwrap();
+        if let Some(&Layout::DotMinimal) = mfile.layout() {
+            mfile_dir.parent().unwrap()
+        } else {
+            mfile_dir
+        }
+        .to_path_buf()
     };
-    let state_base_dir = mfile.state_dir(&task.env, env_base_dir).unwrap();
 
-    let cache = ctx.local_cache();
+    let state_base_dir = match &task.state_key {
+        Some(name) => mfile.state_dir(name, env_base_dir).unwrap(),
+        None => {
+            let tmp = cache.temp_dir().map_err(|e| {
+                Error::Other(anyhow::Error::from(e).context("creating temporary state directory"))
+            })?;
+            let tmp_path = tmp.path().to_path_buf();
+            temp_dirs.push(tmp);
+            tmp_path
+        }
+    };
+
     // Make sure the packages are built
     crate::cmd_build::cmd_build_impl(&graph, ctx, cache.clone()).await?;
 
@@ -69,9 +73,9 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
         transitives: &transitive_deps,
 
         cwd: &cwd,
-        patches: Some(&env.patch),
-        env_vars: Some(&env.vars),
-        hostname: Some(task.env.clone()),
+        patches: Some(&task.patch),
+        env_vars: Some(&task.vars),
+        hostname: task.state_key.to_owned(),
     };
     let opts = op::Options {
         cache,
@@ -87,5 +91,6 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
         .wait()
         .map_err(anyhow::Error::from)?;
 
+    drop(temp_dirs);
     Ok(())
 }

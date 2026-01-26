@@ -85,21 +85,6 @@ impl EnvPatches {
     }
 }
 
-/// An environment, defined in a `[envs.<env_name>]` section of [File].
-/// TODO: Rip out
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct Env {
-    #[serde(default)]
-    pub from_profile: String,
-
-    #[serde(default)]
-    pub packages: Vec<String>,
-    #[serde(default, alias = "env_vars")]
-    pub vars: HashMap<String, String>,
-    #[serde(default, alias = "patches")]
-    pub patch: EnvPatches,
-}
-
 /// Describes the specific type of output being generated.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum OutputKind {
@@ -151,9 +136,6 @@ pub struct File {
     #[serde(default = "default_stdlib")]
     pub stdlib: LinkConfig,
 
-    /// Environment definitions. TODO: Rip out.
-    #[serde(default)]
-    pub envs: HashMap<String, Env>,
     /// Task definitions, invoked with `minimal run <task name>`.
     #[serde(default)]
     pub tasks: HashMap<String, Task>,
@@ -303,12 +285,8 @@ mod tests {
             repo = "https://github.com/gominimal/pkgs"
             branch = "main"
 
-            [envs.test]
-            patch.dir."~/.claude" = "read-write"
-            packages = ["base", "go"]
-
             [tasks.test]
-            env = "test"
+            state_key = "test"
             patch.dir."~/.claude" = "read-write"
             packages = ["base", "go"]
             cmd = "go test ./..."
@@ -330,23 +308,11 @@ mod tests {
                     locked_commit: None,
                 },
                 stdlib: default_stdlib(),
-                envs: [(
-                    "test".to_string(),
-                    Env {
-                        from_profile: "".to_string(),
-                        packages: vec!["base".to_string(), "go".to_string()],
-                        vars: HashMap::new(),
-                        patch: EnvPatches {
-                            dir: [("~/.claude".to_string(), PatchSetting::ReadWrite)].into(),
-                            file: HashMap::new()
-                        },
-                    }
-                )]
-                .into(),
                 tasks: [(
                     "test".to_string(),
                     Task {
-                        env: "test".to_string(),
+                        state_key: Some("test".to_string()),
+                        profile: None,
                         vars: HashMap::new(),
                         patch: EnvPatches {
                             dir: [("~/.claude".to_string(), PatchSetting::ReadWrite)].into(),

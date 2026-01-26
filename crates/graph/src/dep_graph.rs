@@ -761,33 +761,38 @@ impl DepGraph {
             })
     }
 
-    /// Hydrates a minimal environment with configuration based on the profile it calls for, if any.
-    pub fn hydrate_env(&self, env: &mut mfile::Env) -> Result<(), Error> {
-        if env.from_profile.is_empty() {
-            return Ok(());
-        }
-
-        if let Some(profile) = self.profiles.get(&env.from_profile) {
-            // Upsert the packages list
-            env.packages.extend(
-                profile
-                    .packages
-                    .iter()
-                    .filter(|p| !env.packages.contains(p))
-                    .cloned()
-                    .collect::<Vec<_>>(),
-            );
-            // Set environment variables, but only if they are not set already
-            for (k, v) in &profile.env_vars {
-                if !env.vars.contains_key(k) {
-                    env.vars.insert(k.clone(), v.clone());
+    /// Hydrates a minimal task with configuration based on the profile it calls for, if any.
+    pub fn hydrate_task(&self, task: &mut mfile::Task) -> Result<(), Error> {
+        match &task.profile {
+            None => Ok(()),
+            Some(profile) => {
+                if let Some(profile) = self.profiles.get(profile) {
+                    // Upsert the packages list
+                    task.packages.extend(
+                        profile
+                            .packages
+                            .iter()
+                            .filter(|p| !task.packages.contains(p))
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                    );
+                    // Set environment variables, but only if they are not set already
+                    for (k, v) in &profile.env_vars {
+                        if !task.vars.contains_key(k) {
+                            task.vars.insert(k.clone(), v.clone());
+                        }
+                    }
+                    // Union any file patches, if they are not set already
+                    let mut patches = profile.patch.clone();
+                    patches.union(&task.patch);
+                    task.patch = patches;
+                    Ok(())
+                } else {
+                    Err(Error::NoSuchProfile {
+                        name: profile.clone(),
+                    })
                 }
             }
-            Ok(())
-        } else {
-            Err(Error::NoSuchProfile {
-                name: env.from_profile.clone(),
-            })
         }
     }
 }
@@ -957,7 +962,8 @@ mod tests {
                 name: "profile 1".to_string(),
                 from_profile: None,
                 packages: vec![],
-                env_vars: Default::default()
+                env_vars: Default::default(),
+                patch: Default::default(),
             })
         );
     }
@@ -972,6 +978,7 @@ mod tests {
                 from_profile: None,
                 packages: vec!["base".to_string()],
                 env_vars: IndexMap::from_iter([("CC".to_string(), "gcc".to_string())]),
+                patch: Default::default(),
             },
         );
         dp.builds.insert(BuildSpec {
@@ -1016,6 +1023,7 @@ mod tests {
                 from_profile: Some("prof".to_string()),
                 packages: vec!["base".to_string(), "extra".to_string()],
                 env_vars: IndexMap::from_iter([("CC".to_string(), "clang".to_string())]),
+                patch: Default::default(),
             })
         );
     }

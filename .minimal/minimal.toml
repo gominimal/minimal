@@ -1,0 +1,57 @@
+[upstream] # Source of software & tooling
+repo = "https://github.com/gominimal/pkgs"
+branch = "main"
+locked_commit = "3c8337a0507476b12fb08f9e9bb4dcab71f9fbe7"
+
+
+[tasks.claude]
+profile = "dev"
+state_key = "dev"
+cmd = "claude"
+
+[tasks.test]
+profile = "dev"
+state_key = "dev"
+cmd = "cargo test"
+
+[tasks.shell]
+profile = "dev"
+state_key = "dev"
+cmd = "bash -l"
+
+[outputs.bash-img]
+type = "oci-image"
+packages = ["bash", "coreutils", "diffutils", "findutils", "tar"]
+env_vars.test = "ello"
+cmd = ["/usr/bin/bash", "-l"]
+
+[tasks.vim]
+profile = "demo"
+cmd = "vim"
+
+[tasks.btop]
+profile = "demo"
+cmd = "btop"
+
+[tasks.demo-shell]
+profile = "demo"
+state_key = "demo"
+cmd = "bash -l"
+
+[tasks.python]
+profile = "demo"
+state_key = "demo"
+cmd = "python3"
+
+
+[tasks.env-smoketest]
+profile = "dev"
+inherit_cwd = true
+cmd = """
+bash -c "echo 'env:' && env && echo \\"pwd: $(pwd)\\""
+"""
+
+[stdlib]
+repo = "https://github.com/gominimal/std"
+branch = "main"
+rev = "9b7d866af28eb84330bbe4f961a18b16a6691f64"

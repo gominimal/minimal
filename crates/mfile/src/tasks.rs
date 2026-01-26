@@ -4,10 +4,13 @@ use std::collections::HashMap;
 /// A task, defined in a `[tasks.<task_name>]` section of [File].
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct Task {
-    /// The name of the environment to use.
-    ///
-    /// TODO: Rip out
-    pub env: String,
+    /// Indicates that this task should share durable state with other tasks with the same key.
+    #[serde(default)]
+    pub state_key: Option<String>,
+    /// Load packages, environment variables etc from the given profile.
+    #[serde(default)]
+    pub profile: Option<String>,
+
     /// The command invocation to use.
     pub cmd: String,
 

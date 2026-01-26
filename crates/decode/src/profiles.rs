@@ -1,3 +1,4 @@
+use mfile::EnvPatches;
 use nickel_lang_core::{
     eval::cache::CacheImpl,
     program::Program,
@@ -21,6 +22,9 @@ pub struct Profile {
 
     /// The environment variables that should be applied to any environment using this profile.
     pub env_vars: IndexMap<String, String>,
+
+    /// Files/directories to be patched into the sandbox this task executes in.
+    pub patch: EnvPatches,
 }
 
 impl Profile {
@@ -173,6 +177,7 @@ impl Profile {
             from_profile,
             packages,
             env_vars,
+            patch: EnvPatches::default(),
         })
     }
 }
@@ -217,6 +222,7 @@ mod tests {
                 from_profile: None,
                 packages: vec!["gcc".to_string(), "rust".to_string()],
                 env_vars: Default::default(),
+                patch: Default::default(),
             }
         )
     }
