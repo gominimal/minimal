@@ -188,6 +188,12 @@ let needs_schema = import "need_classes.ncl" in
           | Array String | optional,
         env_vars
           | {_ : String} | optional,
+
+        # Only one of patch or patches may be set.
+        patch
+          | {_: {_ : String}} | optional,
+        patches
+        | {_: {_ : String}} | optional,
     },
     profile | Dyn -> Profile | doc "Constructs a profile." =
       fun spec => spec | Profile,

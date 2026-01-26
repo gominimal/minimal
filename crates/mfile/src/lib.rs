@@ -61,8 +61,6 @@ pub enum PatchSetting {
 }
 
 /// Describes the set of directories/files patched into a task environment, from the host environment.
-///
-/// TODO: Move to `tasks.rs`.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct EnvPatches {
     /// The list of directories to be patched into the environment. Keys are expected to be path strings,
@@ -234,6 +232,14 @@ impl File {
     /// Returns the layout this minimal file was on disk.
     pub fn layout(&self) -> Option<&Layout> {
         self.layout.as_ref()
+    }
+    /// Returns the path to the 'repo root', based on the detected layout when the minimal file was read from disk.
+    pub fn repo_path(&self) -> Option<&Path> {
+        match self.layout {
+            None => None,
+            Some(Layout::Root) => self.dir_path(),
+            Some(Layout::DotMinimal) => self.dir_path().and_then(|p| p.parent()),
+        }
     }
 
     /// Returns the path to the durable state directory for the given key.

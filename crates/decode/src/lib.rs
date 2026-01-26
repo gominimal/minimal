@@ -2,7 +2,7 @@
 
 use common::SpecOrigin;
 use generational_arena::Arena;
-use mfile::LinkConfig;
+use mfile::{EnvPatches, LinkConfig, PatchSetting};
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::term::{RichTerm, Term};
 use nickel_lang_core::{
@@ -332,6 +332,93 @@ pub(crate) fn eval_if_closure(
     } else {
         Ok(rt.clone())
     }
+}
+
+pub(crate) fn patches_from_term(
+    rt: &RichTerm,
+    program: &mut Program<CacheImpl>,
+) -> Result<EnvPatches, Error> {
+    let patch_rt = eval_if_closure(rt, program)?;
+
+    let mut dirs: Option<HashMap<String, PatchSetting>> = None;
+    let mut files: Option<HashMap<String, PatchSetting>> = None;
+    match patch_rt.term.as_ref() {
+        Term::Record(r) | Term::RecRecord(r, _, _, _) => {
+            r.fields
+                .iter()
+                .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                    match ident_and_loc.label() {
+                        "dir" | "dirs" => {
+                            let dir_rt =
+                                eval_if_closure(field.value.as_ref().unwrap(), program)?;
+
+                            match dir_rt.term.as_ref() {
+                                Term::Record(r) | Term::RecRecord(r, _, _, _) => {
+                                    if dirs.is_some() {
+                                        todo!("error for both 'dirs' and 'dir' set");
+                                    }
+                                    dirs = Some(r.fields.iter().map(
+                                        |(ident_and_loc, field)| -> Result<(String, PatchSetting), Error> {
+                                            let val = String::deserialize(eval_if_closure(
+                                                field.value.as_ref().unwrap(),
+                                                program,
+                                            )?).unwrap();
+                                            Ok((
+                                                ident_and_loc.label().to_string(),
+                                                match val.as_str() {
+                                                    "ReadOnly" | "read-only" | "ro" => PatchSetting::ReadOnly,
+                                                    "ReadWrite" | "read-write" | "rw" => PatchSetting::ReadWrite,
+                                                    _ => todo!("unexpected patch setting: {}", val),
+                                                },
+                                            ))
+                                        },
+                                    ).collect::<Result<HashMap<_, _>, Error>>()?);
+                                    Ok(())
+                                }
+                                _ => todo!("error for unexpected term for dir: {:?}", dir_rt.term.as_ref()),
+                            }
+                        },
+                        "file" | "files" => {
+                            let file_rt =
+                                eval_if_closure(field.value.as_ref().unwrap(), program)?;
+
+                            match file_rt.term.as_ref() {
+                                Term::Record(r) | Term::RecRecord(r, _, _, _) => {
+                                    if files.is_some() {
+                                        todo!("error for both 'file' and 'files' set");
+                                    }
+                                    files = Some(r.fields.iter().map(
+                                        |(ident_and_loc, field)| -> Result<(String, PatchSetting), Error> {
+                                            let val = String::deserialize(eval_if_closure(
+                                                field.value.as_ref().unwrap(),
+                                                program,
+                                            )?).unwrap();
+                                            Ok((
+                                                ident_and_loc.label().to_string(),
+                                                match val.as_str() {
+                                                    "ReadOnly" | "read-only" | "ro" => PatchSetting::ReadOnly,
+                                                    "ReadWrite" | "read-write" | "rw" => PatchSetting::ReadWrite,
+                                                    _ => todo!("unexpected patch setting: {}", val),
+                                                },
+                                            ))
+                                        },
+                                    ).collect::<Result<HashMap<_, _>, Error>>()?);
+                                    Ok(())
+                                }
+                                _ => todo!("error for unexpected term for file: {:?}", file_rt.term.as_ref()),
+                            }
+                        },
+                        _ => Ok(()),
+                    }
+                })?;
+        }
+        _ => todo!("unexpected term for patches: {:?}", patch_rt.term.as_ref()),
+    };
+
+    Ok(EnvPatches {
+        file: files.unwrap_or_default(),
+        dir: dirs.unwrap_or_default(),
+    })
 }
 
 #[cfg(test)]

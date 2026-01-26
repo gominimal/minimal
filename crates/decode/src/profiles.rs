@@ -38,6 +38,7 @@ impl Profile {
 
         self.env_vars
             .extend(other.env_vars.iter().map(|(k, v)| (k.clone(), v.clone())));
+        self.patch.union(&other.patch);
     }
 
     /// Deserializes a profile structure from the given nickel term tree.
@@ -52,6 +53,7 @@ impl Profile {
         let mut from_profile: Option<String> = None;
         let mut packages: Option<Vec<String>> = None;
         let mut env_vars: Option<IndexMap<String, String>> = None;
+        let mut patches: Option<EnvPatches> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                 r.fields
@@ -139,6 +141,15 @@ impl Profile {
 
                                 Ok(())
                             }
+                            "patch" | "patches" => {
+                                if let Some(patch_rt) = field.value.as_ref() {
+                                    if patches.is_some() {
+                                        todo!("error for both 'patch' and 'patches' set");
+                                    }
+                                    patches = Some(crate::patches_from_term(patch_rt, program)?);
+                                }
+                                Ok(())
+                            }
                             _ => Ok(()),
                         }
                     })?;
@@ -177,7 +188,7 @@ impl Profile {
             from_profile,
             packages,
             env_vars,
-            patch: EnvPatches::default(),
+            patch: patches.unwrap_or_default(),
         })
     }
 }
@@ -187,6 +198,7 @@ mod tests {
     use super::*;
     use crate::load::*;
     use indoc::indoc;
+    use mfile::PatchSetting;
 
     #[test]
     fn parse() {
@@ -197,6 +209,8 @@ mod tests {
                 profile {
                     name = \"uwu\",
                     packages = [\"gcc\", \"rust\"],
+
+                    patch.file.\"~/uwu.json\" = \"ro\",
                 }
                 "
             }
@@ -222,7 +236,10 @@ mod tests {
                 from_profile: None,
                 packages: vec!["gcc".to_string(), "rust".to_string()],
                 env_vars: Default::default(),
-                patch: Default::default(),
+                patch: EnvPatches {
+                    file: [("~/uwu.json".to_string(), PatchSetting::ReadOnly)].into(),
+                    ..Default::default()
+                },
             }
         )
     }
