@@ -658,7 +658,8 @@ mod tests {
                 name: "uwu".to_string(),
                 from_profile: Some("rust".to_string()),
                 packages: vec!["gcc".to_string(), "rust".to_string()],
-                env_vars: IndexMap::from_iter([("CC".to_string(), "gcc".to_string())])
+                env_vars: IndexMap::from_iter([("CC".to_string(), "gcc".to_string())]),
+                patch: Default::default(),
             }),
         );
         assert_eq!(
