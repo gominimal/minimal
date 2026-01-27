@@ -765,6 +765,7 @@ impl DepGraph {
     pub fn hydrate_task(&self, task: &mut mfile::Task) -> Result<(), Error> {
         match &task.profile {
             None => Ok(()),
+            Some(s) if s.is_empty() => Ok(()),
             Some(profile) => {
                 if let Some(profile) = self.profiles.get(profile) {
                     // Upsert the packages list

@@ -27,6 +27,11 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
         }
     };
 
+    if let Some(default_profile) = &mfile.defaults.profile
+        && task.profile.is_none()
+    {
+        task.profile = Some(default_profile.clone());
+    }
     graph.hydrate_task(&mut task)?; // Apply profile settings
 
     graph.top_levels = task
