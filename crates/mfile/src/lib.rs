@@ -83,6 +83,17 @@ impl EnvPatches {
     }
 }
 
+/// Default settings applied to minimal's use in the repo and to objects in the mfile.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct Defaults {
+    /// The harness to use for this repo.
+    #[serde(default)]
+    pub harness: Option<String>,
+    /// The default profile to use for tasks which don't set their own profile.
+    #[serde(default)]
+    pub profile: Option<String>,
+}
+
 /// Describes the specific type of output being generated.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum OutputKind {
@@ -133,6 +144,9 @@ pub struct File {
     /// What version of the standard library to use.
     #[serde(default = "default_stdlib")]
     pub stdlib: LinkConfig,
+    /// Default harness, profile etc.
+    #[serde(default, alias = "default")]
+    pub defaults: Defaults,
 
     /// Task definitions, invoked with `minimal run <task name>`.
     #[serde(default)]
@@ -314,6 +328,7 @@ mod tests {
                     locked_commit: None,
                 },
                 stdlib: default_stdlib(),
+                defaults: Default::default(),
                 tasks: [(
                     "test".to_string(),
                     Task {

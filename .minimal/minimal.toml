@@ -3,19 +3,18 @@ repo = "https://github.com/gominimal/pkgs"
 branch = "main"
 locked_commit = "3c8337a0507476b12fb08f9e9bb4dcab71f9fbe7"
 
+[defaults]
+profile = "dev"
 
 [tasks.claude]
-profile = "dev"
 state_key = "dev"
 cmd = "claude"
 
 [tasks.test]
-profile = "dev"
 state_key = "dev"
 cmd = "cargo test"
 
 [tasks.shell]
-profile = "dev"
 state_key = "dev"
 cmd = "bash -l"
 
@@ -45,7 +44,6 @@ cmd = "python3"
 
 
 [tasks.env-smoketest]
-profile = "dev"
 inherit_cwd = true
 cmd = """
 bash -c "echo 'env:' && env && echo \\"pwd: $(pwd)\\""
