@@ -92,6 +92,9 @@ pub struct Defaults {
     /// The default profile to use for tasks which don't set their own profile.
     #[serde(default)]
     pub profile: Option<String>,
+    /// The default state_key to use for tasks which don't set their own state_key.
+    #[serde(default)]
+    pub state_key: Option<String>,
 }
 
 /// Describes the specific type of output being generated.
@@ -254,6 +257,25 @@ impl File {
             Some(Layout::Root) => self.dir_path(),
             Some(Layout::DotMinimal) => self.dir_path().and_then(|p| p.parent()),
         }
+    }
+
+    /// Returns the task of the given name, if one exists. Default settings for unset fields such as profile have
+    /// been applied to the returned object.
+    pub fn task(&self, name: &str) -> Option<Task> {
+        self.tasks.get(name).map(|t| {
+            let mut task = t.clone();
+            if let Some(default_profile) = &self.defaults.profile
+                && task.profile.is_none()
+            {
+                task.profile = Some(default_profile.clone());
+            }
+            if let Some(default_state_key) = &self.defaults.state_key
+                && task.state_key.is_none()
+            {
+                task.state_key = Some(default_state_key.clone());
+            }
+            task
+        })
     }
 
     /// Returns the path to the durable state directory for the given key.
