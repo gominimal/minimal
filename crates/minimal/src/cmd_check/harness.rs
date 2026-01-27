@@ -49,7 +49,7 @@ pub(super) async fn check_harness(
             ))]);
         }
     };
-    program.add_import_paths([stdlib_dir].iter());
+    program.add_import_paths([stdlib_dir.clone()].iter());
 
     if let Err(e) = program.typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk) {
         return Ok(vec![CheckResult::parse_failure(report_as_str(
@@ -67,13 +67,28 @@ pub(super) async fn check_harness(
     }
 
     out.push(check_harness_name(
-        harness,
+        harness.clone(),
         all_graph,
         fix,
-        skip_checkers,
-        harnesses_dir,
+        skip_checkers.clone(),
+        harnesses_dir.clone(),
         &mut program,
         cache,
+    )?);
+    use super::FileBasedChecker;
+    out.push(super::ImportLineCheck.check(
+        &skip_checkers,
+        fix,
+        &harness,
+        &harnesses_dir.join(&harness),
+        &stdlib_dir,
+    )?);
+    out.push(super::FmtCheck.check(
+        &skip_checkers,
+        fix,
+        &harness,
+        &harnesses_dir.join(&harness),
+        &stdlib_dir,
     )?);
     Ok(out)
 }
