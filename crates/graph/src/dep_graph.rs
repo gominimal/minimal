@@ -796,6 +796,11 @@ impl DepGraph {
             }
         }
     }
+
+    /// Returns the named harness, if it exists.
+    pub fn harness(&self, name: &str) -> Option<&Harness> {
+        self.harnesses.get(name)
+    }
 }
 
 #[cfg(test)]

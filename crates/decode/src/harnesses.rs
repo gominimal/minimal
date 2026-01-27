@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use nickel_lang_core::{
     eval::cache::CacheImpl,
     program::Program,
@@ -267,6 +269,31 @@ impl Harness {
             build_cmds,
             build_cmds_cmd,
         })
+    }
+
+    /// Synthesizes a task representing the build using this harness.
+    pub fn build_task(&self) -> mfile::Task {
+        mfile::Task {
+            state_key: None,
+            profile: None,
+            cmd: match (&self.build_cmds, &self.build_cmds_cmd) {
+                (Some(cmds), _) => cmds[0].join(" "), // TODO: this is trash
+                _ => todo!(),
+            },
+            packages: self
+                .build_packages
+                .iter()
+                .chain(self.runtime_packages.iter())
+                .cloned()
+                .collect(),
+            vars: HashMap::from_iter(
+                self.build_env_vars
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            ),
+            patch: Default::default(),
+            inherit_cwd: false,
+        }
     }
 }
 

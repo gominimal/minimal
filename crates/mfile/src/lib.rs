@@ -264,18 +264,23 @@ impl File {
     pub fn task(&self, name: &str) -> Option<Task> {
         self.tasks.get(name).map(|t| {
             let mut task = t.clone();
-            if let Some(default_profile) = &self.defaults.profile
-                && task.profile.is_none()
-            {
-                task.profile = Some(default_profile.clone());
-            }
-            if let Some(default_state_key) = &self.defaults.state_key
-                && task.state_key.is_none()
-            {
-                task.state_key = Some(default_state_key.clone());
-            }
+            self.hydrate_task_defaults(&mut task);
             task
         })
+    }
+
+    /// Applies default task settings to any unset task fields.
+    pub fn hydrate_task_defaults(&self, task: &mut Task) {
+        if let Some(default_profile) = &self.defaults.profile
+            && task.profile.is_none()
+        {
+            task.profile = Some(default_profile.clone());
+        }
+        if let Some(default_state_key) = &self.defaults.state_key
+            && task.state_key.is_none()
+        {
+            task.state_key = Some(default_state_key.clone());
+        }
     }
 
     /// Returns the path to the durable state directory for the given key.

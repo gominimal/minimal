@@ -1,6 +1,6 @@
 use crate::{Context, Error};
 use anyhow::anyhow;
-use graph::Transitives;
+use graph::{DepGraph, Transitives};
 use op::Runnable;
 use tracing::trace;
 
@@ -12,14 +12,33 @@ pub struct RunArgs {
 pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
     trace!("cmd_run");
     let mut graph = ctx.graph_from_all_packages()?;
-    let mut temp_dirs = vec![];
-    let env_base_dir = ctx.paths().env_base_dir().to_path_buf();
 
-    let cache = ctx.local_cache();
     let mfile = ctx.minimal_file()?;
-    let mut task = mfile
-        .task(&args.task_name)
-        .ok_or_else(|| Error::Other(anyhow!("no such task named '{}'", args.task_name)))?;
+    let mut task = match mfile.task(&args.task_name) {
+        Some(t) => Ok(t),
+        None if args.task_name == "build" => {
+            // Task 'build' requested but none defined, lets see if theres a harness we can use instead.
+            if let Some(n) = &mfile.defaults.harness {
+                if let Some(harness) = graph.harness(n) {
+                    let mut task = harness.build_task();
+                    mfile.hydrate_task_defaults(&mut task);
+                    Ok(task)
+                } else {
+                    Err(Error::Other(anyhow!(
+                        "no task named 'build' nor default harness set"
+                    )))
+                }
+            } else {
+                Err(Error::Other(anyhow!(
+                    "no task named 'build' nor default harness set"
+                )))
+            }
+        }
+        _ => Err(Error::Other(anyhow!(
+            "no such task named '{}'",
+            args.task_name
+        ))),
+    }?;
     graph.hydrate_task(&mut task)?; // Apply profile settings
 
     graph.top_levels = task
@@ -28,6 +47,19 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
         .flat_map(|p| graph.by_name(p))
         .cloned()
         .collect(); // TODO: Probably time to retire this top_levels concept
+
+    run_task(&task, &graph, ctx).await
+}
+
+pub async fn run_task(
+    task: &mfile::Task,
+    graph: &DepGraph,
+    ctx: &mut Context,
+) -> Result<(), Error> {
+    let mut temp_dirs = vec![];
+    let env_base_dir = ctx.paths().env_base_dir().to_path_buf();
+    let cache = ctx.local_cache();
+    let mfile = ctx.minimal_file()?;
 
     let cwd = if task.inherit_cwd {
         std::env::current_dir().unwrap()
@@ -48,9 +80,9 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
     };
 
     // Make sure the packages are built
-    crate::cmd_build::cmd_build_impl(&graph, ctx, cache.clone()).await?;
+    crate::cmd_build::cmd_build_impl(graph, ctx, cache.clone(), true).await?;
 
-    let transitive_deps = Transitives::for_toplevels(&graph, graph.top_levels.clone(), false);
+    let transitive_deps = Transitives::for_toplevels(graph, graph.top_levels.clone(), false);
     let base = tempfile::tempdir_in(ctx.paths().run_base_dir()).map_err(anyhow::Error::from)?;
 
     let mut op = op::EnvSetup {
@@ -65,7 +97,7 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
     };
     let opts = op::Options {
         cache,
-        graph: &graph,
+        graph,
         exec_base: base.path().to_path_buf(),
     };
     let runnable_env = op.run(&opts).await?;

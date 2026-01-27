@@ -4,6 +4,7 @@ branch = "main"
 locked_commit = "3c8337a0507476b12fb08f9e9bb4dcab71f9fbe7"
 
 [defaults]
+harness = "test-harness"
 profile = "dev"
 state_key = "dev"
 

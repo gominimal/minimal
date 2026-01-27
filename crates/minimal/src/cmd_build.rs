@@ -21,7 +21,7 @@ pub async fn cmd_build(args: BuildArgs, ctx: &mut Context) -> Result<(), Error> 
     let graph = args.packages.graph(ctx)?;
     let cache = ctx.local_cache();
 
-    cmd_build_impl(&graph, ctx, cache).await?;
+    cmd_build_impl(&graph, ctx, cache, false).await?;
 
     Ok(())
 }
@@ -30,6 +30,7 @@ pub async fn cmd_build_impl(
     graph: &DepGraph,
     ctx: &mut Context,
     cache: Cache<LocalDir>,
+    quiet: bool,
 ) -> Result<(), Error> {
     trace!("build_impl");
     let output_base = ctx.paths().sandbox_base_dir().to_path_buf();
@@ -166,7 +167,9 @@ pub async fn cmd_build_impl(
     }
 
     // Display build summary
-    display_build_summary(graph, &cache, ctx);
+    if !quiet {
+        display_build_summary(graph, &cache, ctx);
+    }
 
     Ok(())
 }
