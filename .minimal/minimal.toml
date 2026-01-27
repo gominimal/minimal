@@ -5,17 +5,15 @@ locked_commit = "3c8337a0507476b12fb08f9e9bb4dcab71f9fbe7"
 
 [defaults]
 profile = "dev"
+state_key = "dev"
 
 [tasks.claude]
-state_key = "dev"
 cmd = "claude"
 
 [tasks.test]
-state_key = "dev"
 cmd = "cargo test"
 
 [tasks.shell]
-state_key = "dev"
 cmd = "bash -l"
 
 [outputs.bash-img]
@@ -26,10 +24,12 @@ cmd = ["/usr/bin/bash", "-l"]
 
 [tasks.vim]
 profile = "demo"
+state_key = ""
 cmd = "vim"
 
 [tasks.btop]
 profile = "demo"
+state_key = ""
 cmd = "btop"
 
 [tasks.demo-shell]

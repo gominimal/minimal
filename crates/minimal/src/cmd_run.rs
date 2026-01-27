@@ -17,21 +17,9 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
 
     let cache = ctx.local_cache();
     let mfile = ctx.minimal_file()?;
-    let mut task = match mfile.tasks.get(&args.task_name) {
-        Some(t) => t.clone(),
-        None => {
-            return Err(Error::Other(anyhow!(
-                "no such task named '{}'",
-                args.task_name
-            )));
-        }
-    };
-
-    if let Some(default_profile) = &mfile.defaults.profile
-        && task.profile.is_none()
-    {
-        task.profile = Some(default_profile.clone());
-    }
+    let mut task = mfile
+        .task(&args.task_name)
+        .ok_or_else(|| Error::Other(anyhow!("no such task named '{}'", args.task_name)))?;
     graph.hydrate_task(&mut task)?; // Apply profile settings
 
     graph.top_levels = task
@@ -48,8 +36,8 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
     };
 
     let state_base_dir = match &task.state_key {
-        Some(name) => mfile.state_dir(name, env_base_dir).unwrap(),
-        None => {
+        Some(name) if !name.is_empty() => mfile.state_dir(name, env_base_dir).unwrap(),
+        _ => {
             let tmp = cache.temp_dir().map_err(|e| {
                 Error::Other(anyhow::Error::from(e).context("creating temporary state directory"))
             })?;
