@@ -1,17 +1,25 @@
-let {profile, ..} = import "minimal.ncl" in
+let { profile, .. } = import "minimal.ncl" in
 profile {
-    name = "demo",
+  name = "demo",
 
-    env_vars.CC = "gcc",
+  env_vars.CC = "gcc",
 
-    packages = [
-        # Build needs
-        "gcc", "binutils", "python",
-        "pkgconf", "openssl", "linux_headers", "zlib",
-        # Shell
-        "base", "bash",
-        "git", "coreutils",
-        # Vim
-        "vim", "btop",
-    ],
+  packages = [
+    # Build needs
+    "gcc",
+    "binutils",
+    "python",
+    "pkgconf",
+    "openssl",
+    "linux_headers",
+    "zlib",
+    # Shell
+    "base",
+    "bash",
+    "git",
+    "coreutils",
+    # Vim
+    "vim",
+    "btop",
+  ],
 }

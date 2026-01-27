@@ -1,4 +1,5 @@
 use crate::Error;
+use crate::cmd_check::FileBasedChecker;
 use cache::{Cache, LocalDir};
 use graph::DepGraph;
 use nickel_lang_core::eval::cache::CacheImpl;
@@ -49,7 +50,7 @@ pub(super) async fn check_profile(
             ))]);
         }
     };
-    program.add_import_paths([stdlib_dir].iter());
+    program.add_import_paths([stdlib_dir.clone()].iter());
 
     if let Err(e) = program.typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk) {
         return Ok(vec![CheckResult::parse_failure(report_as_str(
@@ -67,13 +68,27 @@ pub(super) async fn check_profile(
     }
 
     out.push(check_profile_name(
-        profile,
+        profile.clone(),
         all_graph,
         fix,
-        skip_checkers,
-        profiles_dir,
+        skip_checkers.clone(),
+        profiles_dir.clone(),
         &mut program,
         cache,
+    )?);
+    out.push(super::ImportLineCheck.check(
+        &skip_checkers,
+        fix,
+        &profile,
+        &profiles_dir.join(&profile),
+        &stdlib_dir,
+    )?);
+    out.push(super::FmtCheck.check(
+        &skip_checkers,
+        fix,
+        &profile,
+        &profiles_dir.join(&profile),
+        &stdlib_dir,
     )?);
     Ok(out)
 }
