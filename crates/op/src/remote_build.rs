@@ -104,8 +104,7 @@ impl<'a> RemoteSpecBuild<'a> {
                 // Source entries map 1:1 to a Source proto
                 BuildSpecInput::Source(SourceInput {
                     extract,
-                    from: SourceFetch::URL(url),
-                    sha256,
+                    from: SourceFetch::Web { url, sha256 },
                     strip_prefix,
                 }) => Some(InjectedFiles {
                     unpack_to: UnpackDest::DestBuilddir.into(),
@@ -118,6 +117,11 @@ impl<'a> RemoteSpecBuild<'a> {
                         },
                     )),
                 }),
+                BuildSpecInput::Source(SourceInput {
+                    extract: _,
+                    from: SourceFetch::Local { filename, .. },
+                    strip_prefix: _,
+                }) => todo!("supporting local sources, i.e. {}", filename),
 
                 BuildSpecInput::HostPath(_) => todo!(),
             }))

@@ -142,22 +142,32 @@ impl BuildRef {
 /// A description of pulling source code regardless of form.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceFetch {
-    URL(String),
+    Web {
+        url: String,
+        sha256: String,
+    },
+    Local {
+        full_path: PathBuf,
+        filename: String,
+        file_hash: blake3::Hash,
+    },
 }
 
 /// A description of source code thats used as an input.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceInput {
     pub from: SourceFetch,
-    pub sha256: String,
     pub extract: bool,
     pub strip_prefix: Option<String>,
 }
 
 impl SourceInput {
     fn from_term(rt: &RichTerm, program: &mut Program<CacheImpl>) -> Result<Self, Error> {
+        let mut filename: Option<(String, FileId)> = None;
+
         let mut url: Option<String> = None;
         let mut sha256: Option<String> = None;
+
         let mut extract: Option<bool> = None;
         let mut strip_prefix: Option<String> = None;
         match rt.term.as_ref() {
@@ -166,24 +176,29 @@ impl SourceInput {
                     .iter()
                     .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
                         match ident_and_loc.label() {
+                            "file" => {
+                                if let Some(rt) = field.value.as_ref() {
+                                    filename = Some((
+                                        String::deserialize(eval_if_closure(rt, program)?).unwrap(),
+                                        field.value.as_ref().unwrap().pos.src_id().unwrap(),
+                                    ));
+                                }
+                                Ok(())
+                            }
                             "url" => {
-                                url = Some(
-                                    String::deserialize(eval_if_closure(
-                                        field.value.as_ref().unwrap(),
-                                        program,
-                                    )?)
-                                    .unwrap(),
-                                );
+                                if let Some(rt) = field.value.as_ref() {
+                                    url = Some(
+                                        String::deserialize(eval_if_closure(rt, program)?).unwrap(),
+                                    );
+                                }
                                 Ok(())
                             }
                             "sha256" => {
-                                sha256 = Some(
-                                    String::deserialize(eval_if_closure(
-                                        field.value.as_ref().unwrap(),
-                                        program,
-                                    )?)
-                                    .unwrap(),
-                                );
+                                if let Some(rt) = field.value.as_ref() {
+                                    sha256 = Some(
+                                        String::deserialize(eval_if_closure(rt, program)?).unwrap(),
+                                    );
+                                }
                                 Ok(())
                             }
                             "extract" => {
@@ -210,32 +225,55 @@ impl SourceInput {
             }
             _ => {}
         }
-        let url = match url {
-            Some(url) => url,
-            None => {
-                return Err(Error::MissingField {
-                    files: program.files(),
-                    obj: ObjTy::Source,
-                    pos: rt.pos,
-                    field: "url",
-                });
+
+        let from = if let Some((file, file_id)) = filename {
+            let full_path = Path::new(program.files().name(file_id))
+                .parent()
+                .unwrap()
+                .join(&file);
+
+            let file_hash = blake3::hash(&std::fs::read(&full_path).unwrap_or_else(|err| {
+                panic!(
+                    "Source input could not be read: {} (file: {})",
+                    err,
+                    full_path.display()
+                )
+            }));
+
+            SourceFetch::Local {
+                full_path,
+                file_hash,
+                filename: file,
             }
-        };
-        let sha256 = match sha256 {
-            Some(sha256) => sha256,
-            None => {
-                return Err(Error::MissingField {
-                    files: program.files(),
-                    obj: ObjTy::Source,
-                    pos: rt.pos,
-                    field: "sha256",
-                });
-            }
+        } else {
+            let url = match url {
+                Some(url) => url,
+                None => {
+                    return Err(Error::MissingField {
+                        files: program.files(),
+                        obj: ObjTy::Source,
+                        pos: rt.pos,
+                        field: "url",
+                    });
+                }
+            };
+            let sha256 = match sha256 {
+                Some(sha256) => sha256,
+                None => {
+                    return Err(Error::MissingField {
+                        files: program.files(),
+                        obj: ObjTy::Source,
+                        pos: rt.pos,
+                        field: "sha256",
+                    });
+                }
+            };
+
+            SourceFetch::Web { url, sha256 }
         };
 
         Ok(SourceInput {
-            from: SourceFetch::URL(url),
-            sha256,
+            from,
             extract: extract.unwrap_or(false),
             strip_prefix,
         })
@@ -1130,8 +1168,7 @@ mod tests {
         assert!(matches!(
             source,
             BuildDeclInput::Source( SourceInput {
-                from: SourceFetch::URL(url),
-                sha256: sha,
+                from: SourceFetch::Web{url, sha256: sha},
                 extract: true,
                 strip_prefix: None,
             }) if url == "http://uwu.com" && sha == "abcdef",

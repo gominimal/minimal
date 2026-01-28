@@ -38,13 +38,30 @@ impl BuildSpecRef {
 /// A description of pulling source code regardless of form.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceFetch {
-    URL(String),
+    Web {
+        url: String,
+        sha256: String,
+    },
+    Local {
+        full_path: PathBuf,
+        filename: String,
+        file_hash: blake3::Hash,
+    },
 }
 
 impl From<builds::SourceFetch> for SourceFetch {
     fn from(value: builds::SourceFetch) -> Self {
         match value {
-            builds::SourceFetch::URL(url) => SourceFetch::URL(url),
+            builds::SourceFetch::Web { url, sha256 } => SourceFetch::Web { url, sha256 },
+            builds::SourceFetch::Local {
+                full_path,
+                filename,
+                file_hash,
+            } => SourceFetch::Local {
+                full_path,
+                filename,
+                file_hash,
+            },
         }
     }
 }
@@ -53,7 +70,6 @@ impl From<builds::SourceFetch> for SourceFetch {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceInput {
     pub from: SourceFetch,
-    pub sha256: String,
     pub extract: bool,
     pub strip_prefix: Option<String>,
 }
@@ -62,7 +78,6 @@ impl From<builds::SourceInput> for SourceInput {
     fn from(value: builds::SourceInput) -> Self {
         Self {
             from: value.from.into(),
-            sha256: value.sha256,
             extract: value.extract,
             strip_prefix: value.strip_prefix,
         }

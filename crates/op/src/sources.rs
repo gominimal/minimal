@@ -65,20 +65,30 @@ impl<'a, SF: SourceFetcher> Runnable for SourceLoad<'a, SF> {
         let _enter = span.enter();
 
         use graph::dep_graph::SourceFetch;
-        match &self.source.from {
-            SourceFetch::URL(url) => {
+        let (cached_path, filename) = match &self.source.from {
+            SourceFetch::Local {
+                full_path,
+                filename,
+                file_hash: _,
+            } => (full_path.clone(), filename.clone()),
+            SourceFetch::Web { url, sha256 } => {
                 let url =
                     Url::parse(url).with_context(|| format!("Failed to parse URL '{}'", url))?;
+                let filename = url
+                    .path_segments()
+                    .map(|mut s| s.next_back().unwrap())
+                    .unwrap()
+                    .to_string();
 
-                let cached_path = match url.scheme() {
+                match url.scheme() {
                     "https" => {
                         let cached_path = self
                             .remote_fetcher
-                            .download_https(url.as_str(), &self.source.sha256)
+                            .download_https(url.as_str(), sha256)
                             .await?;
 
                         debug!("  Downloaded and verified source from {}", url);
-                        cached_path
+                        (cached_path, filename)
                     }
 
                     "gs" => {
@@ -93,64 +103,57 @@ impl<'a, SF: SourceFetcher> Runnable for SourceLoad<'a, SF> {
 
                         let cached_path = self
                             .remote_fetcher
-                            .download_gcs(bucket_id.to_string(), file_name, &self.source.sha256)
+                            .download_gcs(bucket_id.to_string(), file_name, sha256)
                             .await?;
 
                         debug!(
                             "  Downloaded and verified source from gs://{}/{}",
                             bucket_id, file_name
                         );
-                        cached_path
+                        (cached_path, filename)
                     }
                     _ => todo!(),
-                };
-
-                if self.source.extract {
-                    let file_name = url
-                        .path_segments()
-                        .map(|mut s| s.next_back().unwrap())
-                        .unwrap();
-
-                    use common::archive;
-                    match (
-                        archive::Compression::from_extension(file_name),
-                        self.into.take(),
-                    ) {
-                        (Some(compression), None) => {
-                            let tempdir = opts.cache.temp_dir()?;
-                            let tempdir_path = tempdir.path();
-                            let f = std::fs::File::open(cached_path)?;
-                            archive::extract_compressed_tar(
-                                f,
-                                compression,
-                                tempdir_path,
-                                self.source.strip_prefix.as_ref(),
-                            )
-                            .map_err(anyhow::Error::from)?;
-                            Ok(Materialized::TempDir(tempdir))
-                        }
-                        (Some(compression), Some(pending_dir)) => {
-                            let f = std::fs::File::open(cached_path)?;
-                            archive::extract_compressed_tar(
-                                f,
-                                compression,
-                                pending_dir.path(),
-                                self.source.strip_prefix.as_ref(),
-                            )
-                            .map_err(anyhow::Error::from)?;
-                            Ok(Materialized::Given(pending_dir))
-                        }
-
-                        (None, _) => Err(anyhow!(
-                            "cannot extract archive {}: unhandled extension",
-                            file_name
-                        )
-                        .into()),
-                    }
-                } else {
-                    Ok(Materialized::File(cached_path))
                 }
             }
+        };
+
+        if self.source.extract {
+            use common::archive;
+            match (
+                archive::Compression::from_extension(&filename),
+                self.into.take(),
+            ) {
+                (Some(compression), None) => {
+                    let tempdir = opts.cache.temp_dir()?;
+                    let tempdir_path = tempdir.path();
+                    let f = std::fs::File::open(cached_path)?;
+                    archive::extract_compressed_tar(
+                        f,
+                        compression,
+                        tempdir_path,
+                        self.source.strip_prefix.as_ref(),
+                    )
+                    .map_err(anyhow::Error::from)?;
+                    Ok(Materialized::TempDir(tempdir))
+                }
+                (Some(compression), Some(pending_dir)) => {
+                    let f = std::fs::File::open(cached_path)?;
+                    archive::extract_compressed_tar(
+                        f,
+                        compression,
+                        pending_dir.path(),
+                        self.source.strip_prefix.as_ref(),
+                    )
+                    .map_err(anyhow::Error::from)?;
+                    Ok(Materialized::Given(pending_dir))
+                }
+
+                (None, _) => {
+                    Err(anyhow!("cannot extract archive {}: unhandled extension", filename).into())
+                }
+            }
+        } else {
+            Ok(Materialized::File(cached_path))
         }
     }
 }

@@ -8,6 +8,7 @@ members = [
     "crates/common",
     "crates/decode",
     "crates/graph",
+    "crates/mctx",
     "crates/mfile",
     "crates/op",
     "crates/orchestrator",
@@ -94,6 +95,7 @@ cache = { version = "0.0.1", path = "crates/cache" }
 checkouts = { version = "0.0.1", path = "crates/checkouts" }
 common = { version = "0.0.1", path = "crates/common" }
 decode = { version = "0.0.1", path = "crates/decode" }
+mctx = { version = "0.0.1", path = "crates/mctx" }
 mfile = { version = "0.0.1", path = "crates/mfile" }
 op = { version = "0.0.1", path = "crates/op" }
 orchestrator = { version = "0.0.1", path = "crates/orchestrator" }
