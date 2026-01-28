@@ -156,12 +156,21 @@ fn build_input_hash(input: &BuildSpecInput, h: &mut Hasher) {
         Source(s) => {
             h.write_all(b"src").unwrap();
             match &s.from {
-                SourceFetch::URL(url) => {
+                SourceFetch::Web { url, sha256 } => {
                     h.write_all(b"url").unwrap();
-                    h.write_all(url.as_bytes()).unwrap()
+                    h.write_all(url.as_bytes()).unwrap();
+                    h.write_all(sha256.as_bytes()).unwrap();
+                }
+                SourceFetch::Local {
+                    filename,
+                    file_hash,
+                    full_path: _,
+                } => {
+                    h.write_all(b"local source").unwrap();
+                    h.write_all(filename.as_bytes()).unwrap();
+                    h.write_all(file_hash.as_bytes()).unwrap();
                 }
             };
-            h.write_all(s.sha256.as_bytes()).unwrap();
             if s.extract {
                 h.write_all(b"ext").unwrap();
             }

@@ -224,8 +224,7 @@ fn pgraph_from(graph: &graph::DepGraph) -> Result<GraphData, Error> {
                 pgraph.add_edge(node_index, inode_index, edge_data);
             }
             BuildSpecInput::Source(SourceInput {
-                from: SourceFetch::URL(url),
-                sha256,
+                from: SourceFetch::Web { url, sha256 },
                 extract,
                 strip_prefix,
             }) => {
@@ -244,6 +243,10 @@ fn pgraph_from(graph: &graph::DepGraph) -> Result<GraphData, Error> {
                 });
                 pgraph.add_edge(node_index, inode_index, edge_data);
             }
+            BuildSpecInput::Source(SourceInput {
+                from: SourceFetch::Local { .. },
+                ..
+            }) => todo!(),
             BuildSpecInput::Subset(SubsetInput { from, outputs }) => {
                 let (inode_index, _) = add_uniq_node(
                     &mut pgraph,
@@ -546,7 +549,7 @@ fn prune_edgeless(pgraph: &mut DiGraph<NodeData, EdgeData>) {
 pub async fn cmd_dep(args: DepArgs, ctx: &mut Context) -> Result<(), Error> {
     crate::enforce_science_mode()?;
 
-    let graph = args.packages.graph(ctx)?; // load build-decls from local and upstreams    
+    let graph = args.packages.graph(ctx)?; // load build-decls from local and upstreams
     let GraphData {
         pgraph,
         bsname_to_node_index,

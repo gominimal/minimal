@@ -101,10 +101,14 @@ let needs_schema = import "need_classes.ncl" in
 
     Source | doc "An input to a build spec which represents source code from some location." = {
         ty | Tys = 'Source,
+        file
+          | String | optional,
+
         url
-          | String,
+          | String | optional,
         sha256
-          | String,
+          | String | optional,
+
         extract
           | Bool | optional,
         strip_prefix
