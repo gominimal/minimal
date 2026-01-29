@@ -1,6 +1,8 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use graph::{DepGraph, PlanErr};
+
 /// The errors possible when driving top-level minimal APIs.
 #[derive(Debug)]
 pub enum Error {
@@ -9,6 +11,8 @@ pub enum Error {
     Format(toml::de::Error),
     MFile(mfile::Error),
     Graph(Box<graph::Error>),
+
+    Plan(Box<(DepGraph, PlanErr)>),
     Other(anyhow::Error),
 }
 
@@ -22,6 +26,27 @@ impl fmt::Display for Error {
             Error::Format(e) => write!(f, "invalid TOML: {}", e),
             Error::MFile(e) => write!(f, "{}: {}", mfile::MFILE_NAME, e),
             Error::Graph(e) => write!(f, "graph: {:?}", e),
+            Error::Plan(e) => {
+                let (graph, PlanErr::Cycles(c)) = e.as_ref();
+                {
+                    write!(
+                        f,
+                        "Planning failed: unable to progress with unresolvable dependency cycles"
+                    )?;
+                    write!(f, "Cycles:")?;
+                    for c in c.iter() {
+                        write!(
+                            f,
+                            "\t{}",
+                            c.iter()
+                                .map(|bsr| graph.get(bsr).unwrap().name.clone())
+                                .collect::<Vec<_>>()
+                                .join(" -> "),
+                        )?;
+                    }
+                    Ok(())
+                }
+            }
             Error::Other(e) => write!(f, "{}", e),
         }
     }
@@ -35,6 +60,7 @@ impl std::error::Error for Error {
             Error::Format(e) => Some(e),
             Error::MFile(e) => Some(e),
             Error::Graph(_e) => None,
+            Error::Plan(_) => None,
             Error::Other(_e) => None,
         }
     }
@@ -70,5 +96,16 @@ impl From<checkouts::Error> for Error {
 impl From<graph::Error> for Error {
     fn from(value: graph::Error) -> Self {
         Error::Graph(Box::new(value))
+    }
+}
+
+impl From<orchestrator::Error> for Error {
+    fn from(value: orchestrator::Error) -> Self {
+        match value {
+            orchestrator::Error::IO(e) => Self::IO("vcs", PathBuf::new(), e),
+            orchestrator::Error::Other(e) => Self::Other(anyhow::anyhow!(e)),
+            orchestrator::Error::Cache(e) => Self::Other(anyhow::anyhow!(e)), // TODO: better error
+            orchestrator::Error::Plan(graph, e) => Self::Plan(Box::new((graph, e))),
+        }
     }
 }

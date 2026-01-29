@@ -13,8 +13,12 @@ tempfile.workspace = true
 [dependencies]
 anyhow.workspace = true
 dirs.workspace = true
+google-cloud-auth.workspace = true
+google-cloud-storage.workspace = true
 toml.workspace = true
 shlex.workspace = true
+
+tokio.workspace = true
 
 cache.workspace = true
 common.workspace = true
@@ -22,3 +26,4 @@ checkouts.workspace = true
 graph.workspace = true
 mfile.workspace = true
 op.workspace = true
+orchestrator.workspace = true

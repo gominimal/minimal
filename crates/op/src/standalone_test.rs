@@ -146,6 +146,12 @@ impl<'a> Runnable for StandaloneTest<'a> {
             common::synth_dns_config(synth_files.path()).map_err(anyhow::Error::from)?;
         }
         dep_paths.insert(synth_files.path().to_path_buf());
+        let needs_bin_symlink = dep_paths
+            .iter()
+            .all(|p| !std::fs::exists(p.join("bin")).unwrap());
+        let needs_lib64_symlink = dep_paths
+            .iter()
+            .all(|p| !std::fs::exists(p.join("lib64")).unwrap());
 
         // Hardlink in the files which represent each dependency.
         for dep in dep_paths {
@@ -156,9 +162,13 @@ impl<'a> Runnable for StandaloneTest<'a> {
         container
             .rootfs(&opts.exec_base)
             .map_err(anyhow::Error::from)?
-            .devfsmount("/dev")
-            .symlink("/usr/bin", "/bin")
-            .symlink("/usr/lib", "/lib64");
+            .devfsmount("/dev");
+        if needs_bin_symlink {
+            container.symlink("/usr/bin", "/bin");
+        }
+        if needs_lib64_symlink {
+            container.symlink("/usr/lib", "/lib64");
+        }
 
         std::fs::create_dir_all(opts.exec_base.join("tmp"))?;
         container.bindmount_rw(opts.exec_base.join("tmp").to_str().unwrap(), "/tmp");

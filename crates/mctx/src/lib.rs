@@ -3,8 +3,10 @@
 use std::{fmt, path::PathBuf};
 
 use anyhow::anyhow;
+use cache::{CacheBinProvider, RemoteBinProvider, RemoteCache, RemoteError};
 use checkouts::{GitRef, Manager as VcsManager};
 use common::SpecOrigin;
+use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
 
 mod error;
 pub use error::Error;
@@ -134,6 +136,24 @@ impl Context {
         }
     }
 
+    /// Builds and returns a remote cache with default configurations.
+    pub async fn remote_cache(
+        &self,
+        auth: bool,
+    ) -> Result<RemoteCache<GcsStorage>, RemoteError<GcsError>> {
+        let backend = if auth {
+            GcsStorage::builder().build().await.unwrap()
+        } else {
+            GcsStorage::builder()
+                .with_credentials(google_cloud_auth::credentials::anonymous::Builder::new().build())
+                .build()
+                .await
+                .unwrap()
+        };
+
+        RemoteCache::new_with_gcs_bucket(backend, "minimal-staging-cache").await
+    }
+
     /// Builds & returns the graph with the given packages specified as top levels.
     pub fn graph_from_package_names(&mut self, names: &[String]) -> Result<DepGraph, Error> {
         let mut graph = self.graph_from_all_packages()?;
@@ -161,13 +181,77 @@ impl Context {
     }
 }
 
+/// Outcome-oriented API
+impl Context {
+    pub async fn build_packages(&mut self, packages: &[String]) -> Result<(), Error> {
+        let graph = self.graph_from_package_names(packages)?;
+        let cache = self.local_cache();
+
+        use orchestrator::LocalBackend;
+        let orchestrator = LocalBackend::new_orchestrator(
+            graph.top_levels.clone(),
+            self.config.builds_base_dir(),
+            if self.config.use_remote_cache() {
+                Some(self.remote_cache(false).await.unwrap())
+            } else {
+                None
+            },
+            common::RemoteStorage::new(self.config.downloads_dir(), false)
+                .await
+                .unwrap(),
+            self.config.num_parallel_builds(),
+            graph.clone(),
+            cache.clone(),
+        )?;
+
+        let run_result = match (
+            self.config.use_local_cache(),
+            self.config.use_remote_cache(),
+        ) {
+            // No local or remote cache
+            (false, false) => LocalBackend::run_local_build(orchestrator, ()).await,
+            // Both caches
+            (true, true) => {
+                let local_adapter = CacheBinProvider::new(&graph, cache.clone());
+                let remote_cache = self.remote_cache(false).await.unwrap();
+                let remote_adapter = RemoteBinProvider::new(&graph, &remote_cache);
+                LocalBackend::run_local_build(orchestrator, (local_adapter, remote_adapter)).await
+            }
+            // Only remote cache
+            (false, true) => {
+                let remote_cache = self.remote_cache(false).await.unwrap();
+                let remote_adapter = RemoteBinProvider::new(&graph, &remote_cache);
+                LocalBackend::run_local_build(orchestrator, remote_adapter).await
+            }
+            // Only local cache
+            (true, false) => {
+                let local_adapter = CacheBinProvider::new(&graph, cache.clone());
+                LocalBackend::run_local_build(orchestrator, local_adapter).await
+            }
+        };
+
+        // let build_succeeded = run_result.is_ok();
+        // let error_message = run_result.as_ref().err().map(|e| e.to_string());
+
+        // Propagate error if build failed, and commit all artifacts to the local cache
+        for (pending_dir, meta) in run_result? {
+            pending_dir
+                .finalize(meta)
+                .map_err(|e| Error::Other(e.into()))?;
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use op::{Runnable, StandaloneTest};
     use tempfile::tempdir;
 
     #[test]
-    fn init_no_mfile() {
+    fn toplevel_layer_init_and_build() {
         let state = tempdir().unwrap();
         let config = ConfigBuilder::new()
             .state_dir(state.path().to_path_buf())
@@ -184,16 +268,38 @@ mod tests {
             .unwrap();
 
         let mut ctx = Context::new(config).unwrap();
-        assert!(
-            ctx.graph_from_all_packages()
-                .inspect_err(|e| {
-                    if let Error::Graph(e) = e {
-                        e.report_to_stderr();
-                    }
-                })
-                .unwrap()
-                .by_name("uroot")
-                .is_some()
-        );
+        let graph = ctx
+            .graph_from_all_packages()
+            .inspect_err(|e| {
+                if let Error::Graph(e) = e {
+                    e.report_to_stderr();
+                }
+            })
+            .unwrap();
+        assert!(graph.by_name("uroot").is_some());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            ctx.build_packages(&["uroot".to_string()]).await.unwrap();
+
+            let temp_dir = ctx.local_cache().temp_dir().unwrap();
+            let mut t = StandaloneTest {
+                spec: graph.by_name("uroot").unwrap(),
+                test_name: "smoke",
+            };
+            let opts = op::Options {
+                cache: ctx.local_cache(),
+                exec_base: temp_dir.path().to_path_buf(),
+                graph: &graph,
+            };
+
+            t.run(&opts).await.unwrap();
+
+            assert!(std::fs::exists(temp_dir.path().join("tmp/uwu")).unwrap());
+        });
     }
 }
