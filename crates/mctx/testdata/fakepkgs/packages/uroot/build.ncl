@@ -1,4 +1,4 @@
-let { BuildSpec, OutputLib, Source, .. } = import "minimal.ncl" in
+let { standaloneTest, BuildSpec, OutputLib, Source, .. } = import "minimal.ncl" in
 {
   name = "uroot",
   prebuilt = true,
@@ -12,4 +12,6 @@ let { BuildSpec, OutputLib, Source, .. } = import "minimal.ncl" in
   outputs = {
     usr = { glob = "usr/**/*" } | OutputLib,
   },
+
+  tests.smoke = standaloneTest "/bbin/touch uwu",
 } | BuildSpec

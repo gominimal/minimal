@@ -2126,12 +2126,16 @@ dependencies = [
  "checkouts",
  "common",
  "dirs",
+ "google-cloud-auth",
+ "google-cloud-storage",
  "graph",
  "indoc",
  "mfile",
  "op",
+ "orchestrator",
  "shlex",
  "tempfile",
+ "tokio",
  "toml",
 ]
 
