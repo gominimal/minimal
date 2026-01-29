@@ -252,6 +252,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    #[ignore] // Do not run in github- does not support nested namespaces
     fn toplevel_layer_init_and_build() {
         let state = tempdir().unwrap();
         let config = ConfigBuilder::new()
@@ -301,6 +302,7 @@ mod tests {
             assert_eq!(t.run(&opts).await.unwrap(), vec![]);
 
             assert!(std::fs::exists(temp_dir.path().join("tmp/uwu")).unwrap());
+            drop(temp_dir);
         });
     }
 }
