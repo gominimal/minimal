@@ -227,6 +227,13 @@ impl SourceInput {
         }
 
         let from = if let Some((file, file_id)) = filename {
+            if file.contains("..") {
+                return Err(Error::Other(format!(
+                    "{}: file sources cannot contain '..'",
+                    file
+                )));
+            }
+
             let full_path = Path::new(program.files().name(file_id))
                 .parent()
                 .unwrap()
