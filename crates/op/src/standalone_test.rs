@@ -6,6 +6,7 @@ use graph::{BuildSpec, BuildSpecRef, SubsetInput, Transitives, dep_graph::SpecTe
 
 use crate::{Error, Options, Runnable, SubsetBuild};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StandaloneTestError {
     pub program: String,
     pub args: Vec<String>,
