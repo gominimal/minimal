@@ -183,6 +183,7 @@ impl Context {
 
 /// Outcome-oriented API
 impl Context {
+    /// Ensures the specified packages are built and available locally.
     pub async fn build_packages(&mut self, packages: &[String]) -> Result<(), Error> {
         let graph = self.graph_from_package_names(packages)?;
         let cache = self.local_cache();
@@ -297,7 +298,7 @@ mod tests {
                 graph: &graph,
             };
 
-            t.run(&opts).await.unwrap();
+            assert_eq!(t.run(&opts).await.unwrap(), vec![]);
 
             assert!(std::fs::exists(temp_dir.path().join("tmp/uwu")).unwrap());
         });
