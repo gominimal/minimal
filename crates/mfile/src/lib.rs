@@ -52,6 +52,9 @@ impl Default for LinkConfig {
 }
 
 impl LinkConfig {
+    /// Represents this [LinkConfig] as a [common::SpecOrigin], if possible.
+    ///
+    /// This method returns `None` for git links with no `locked_commit` set.
     pub fn as_spec_origin(&self) -> Option<common::SpecOrigin> {
         match self {
             LinkConfig::Git {
@@ -117,15 +120,19 @@ impl EnvPatches {
 /// Default settings applied to minimal's use in the repo and to objects in the mfile.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct Defaults {
-    /// The harness to use for this repo.
-    #[serde(default)]
-    pub harness: Option<String>,
     /// The default profile to use for tasks which don't set their own profile.
     #[serde(default)]
     pub profile: Option<String>,
     /// The default state_key to use for tasks which don't set their own state_key.
     #[serde(default)]
     pub state_key: Option<String>,
+}
+
+/// Configuration for the harness applied to this repository.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct Harness {
+    #[serde(alias = "use")]
+    pub name: String,
 }
 
 /// Describes the specific type of output being generated.
@@ -178,9 +185,12 @@ pub struct File {
     /// What version of the standard library to use.
     #[serde(default = "default_stdlib")]
     pub stdlib: LinkConfig,
-    /// Default harness, profile etc.
+    /// Default profile, state_key etc.
     #[serde(default, alias = "default")]
     pub defaults: Defaults,
+    /// The harness configured on this repository, if any.
+    #[serde(default)]
+    pub harness: Option<Harness>,
 
     /// Task definitions, invoked with `minimal run <task name>`.
     #[serde(default)]
@@ -391,6 +401,7 @@ mod tests {
                 },
                 stdlib: default_stdlib(),
                 defaults: Default::default(),
+                harness: None,
                 tasks: [(
                     "test".to_string(),
                     Task {
