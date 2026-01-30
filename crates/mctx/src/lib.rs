@@ -291,6 +291,11 @@ impl Context {
         )
     }
 
+    /// Returns a [SpecOrigin] representing the top-level repository.
+    pub fn repo_origin(&self) -> Result<SpecOrigin, Error> {
+        Ok(SpecOrigin::from_dir(self.repo_dir()?))
+    }
+
     /// Builds & returns the graph with the given packages specified as top levels.
     pub fn graph_from_package_names<S: PackageSelection>(
         &mut self,
@@ -304,7 +309,7 @@ impl Context {
 
     /// Builds & returns a graph of all packages.
     pub fn graph_from_all_packages(&mut self) -> Result<DepGraph, Error> {
-        let leaf_layer = SpecOrigin::from_dir(self.repo_dir()?);
+        let leaf_layer = self.repo_origin()?;
 
         DepGraph::new_from_chain(&mut self.vcs, leaf_layer, self.stdlib_dir.clone())
             .map_err(|e| e.into())

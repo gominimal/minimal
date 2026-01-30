@@ -739,6 +739,15 @@ impl DepGraph {
         self.builds.iter().map(|e| BuildSpecRef(e.0))
     }
 
+    /// Returns an iterator over all build-spec references which originated from the
+    /// given layer/repository.
+    pub fn from_origin(&self, origin: &SpecOrigin) -> impl Iterator<Item = BuildSpecRef> {
+        self.builds
+            .iter()
+            .filter(move |(_bsr, b)| b.from.as_ref() == origin)
+            .map(|(bsr, _b)| BuildSpecRef(bsr))
+    }
+
     /// Returns the number of build-specs in the graph.
     pub fn len(&self) -> usize {
         self.builds.len()
