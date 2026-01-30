@@ -3,8 +3,10 @@ repo = "https://github.com/gominimal/pkgs"
 branch = "main"
 locked_commit = "b19799a533143cc540e3ab919e016185f41e5815"
 
+[harness]
+use = "test-harness"
+
 [defaults]
-harness = "test-harness"
 profile = "dev"
 state_key = "dev"
 

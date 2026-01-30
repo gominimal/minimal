@@ -388,8 +388,8 @@ impl Context {
             Some(t) => t,
             None if name == "build" => {
                 // Task 'build' requested but none defined, lets see if theres a harness we can use instead.
-                if let Some(n) = &mfile.defaults.harness {
-                    if let Some(harness) = graph.harness(n) {
+                if let Some(h_conf) = &mfile.harness {
+                    if let Some(harness) = graph.harness(&h_conf.name) {
                         let mut task = harness.build_task();
                         mfile.hydrate_task_defaults(&mut task);
                         task
