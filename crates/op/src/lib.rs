@@ -34,7 +34,7 @@ pub enum Materialized {
 }
 
 mod envs;
-pub use envs::EnvSetup;
+pub use envs::{EnvSetup, RunnableEnv};
 
 #[allow(dead_code)]
 pub mod remote_build;

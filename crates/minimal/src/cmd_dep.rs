@@ -1,10 +1,11 @@
 #![allow(unused_imports, unused_variables)]
-use crate::{Context, Error, PackagesArg};
+use crate::PackagesArg;
 use clap::ArgAction;
 use graph::{
     BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, RuntimeDep, SourceFetch, SourceInput,
     SubsetInput, Transitives,
 };
+use mctx::{Context, Error};
 use nickel_lang_core::bytecode::ast::Node;
 use nickel_lang_core::traverse::TraverseControl;
 use petgraph::Direction;
@@ -549,7 +550,7 @@ fn prune_edgeless(pgraph: &mut DiGraph<NodeData, EdgeData>) {
 pub async fn cmd_dep(args: DepArgs, ctx: &mut Context) -> Result<(), Error> {
     crate::enforce_science_mode()?;
 
-    let graph = args.packages.graph(ctx)?; // load build-decls from local and upstreams
+    let graph = ctx.graph_from_package_names(args.packages.names())?;
     let GraphData {
         pgraph,
         bsname_to_node_index,

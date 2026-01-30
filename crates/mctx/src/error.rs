@@ -16,6 +16,35 @@ pub enum Error {
     Other(anyhow::Error),
 }
 
+impl Error {
+    pub fn report_to_stderr(&self) {
+        match self {
+            Error::Graph(e) => e.report_to_stderr(),
+            Error::Plan(b) => {
+                let (graph, err) = b.as_ref();
+                match err {
+                    PlanErr::Cycles(cycles) => {
+                        eprintln!(
+                            "Planning failed: unable to progress with unresolvable dependency cycles"
+                        );
+                        eprintln!("Cycles:");
+                        for c in cycles {
+                            eprintln!(
+                                "\t{}",
+                                c.iter()
+                                    .map(|bsr| graph.get(bsr).unwrap().name.clone())
+                                    .collect::<Vec<_>>()
+                                    .join(" -> "),
+                            )
+                        }
+                    }
+                }
+            }
+            _ => eprintln!("{}", self),
+        }
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -96,6 +125,12 @@ impl From<checkouts::Error> for Error {
 impl From<graph::Error> for Error {
     fn from(value: graph::Error) -> Self {
         Error::Graph(Box::new(value))
+    }
+}
+
+impl From<super::ConfigError> for Error {
+    fn from(value: super::ConfigError) -> Self {
+        Error::Config(value)
     }
 }
 

@@ -1,0 +1,11 @@
+[defaults]
+harness = "rust"
+
+[upstream] # NOTE: This gets swapped out under test
+dir = "../fakepkgs"
+
+[tasks.task-smoketest]
+packages = ["uroot"]
+cmd = """
+bash -c "echo 'env:' && env && echo \\"pwd: $(pwd)\\""
+"""

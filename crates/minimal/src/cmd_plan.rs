@@ -1,6 +1,7 @@
-use crate::{Context, Error, PackagesArg};
-use cache::{Cache, CacheBinProvider, LocalDir, RemoteBinProvider};
+use crate::PackagesArg;
+use cache::{CacheBinProvider, RemoteBinProvider};
 use graph::{BinProvider, DepGraph, ExecPlan};
+use mctx::{Cache, Context, Error};
 
 #[derive(clap::Args)]
 pub struct PlanArgs {
@@ -9,10 +10,10 @@ pub struct PlanArgs {
 }
 
 pub async fn cmd_plan(args: PlanArgs, ctx: &mut Context) -> Result<(), Error> {
-    let graph = args.packages.graph(ctx)?;
+    let graph = ctx.graph_from_package_names(args.packages.names())?;
     let cache = ctx.local_cache();
 
-    match (ctx.no_cache, ctx.no_fetch) {
+    match (!ctx.use_local_cache(), !ctx.use_remote_cache()) {
         // no local or remote cache
         (true, true) => print_plan(&graph, &cache, ExecPlan::new(&graph)),
         // both local and remote cache
@@ -47,12 +48,12 @@ pub async fn cmd_plan(args: PlanArgs, ctx: &mut Context) -> Result<(), Error> {
             )
         }
     }
-    .map_err(|e| Error::PlanErr(graph, e))
+    .map_err(|e| Error::Plan(Box::new((graph, e))))
 }
 
 fn print_plan<BP: BinProvider>(
     graph: &DepGraph,
-    cache: &Cache<LocalDir>,
+    cache: &Cache,
     plan: ExecPlan<BP>,
 ) -> Result<(), graph::PlanErr> {
     eprintln!("✓ = Already built, ⚙️ = To be built");

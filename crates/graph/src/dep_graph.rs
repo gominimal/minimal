@@ -432,12 +432,21 @@ impl SourceProvider for checkouts::Manager {
     type Error = checkouts::Error;
 
     fn checkout_of(&mut self, upstream: &LinkConfig) -> Result<PathBuf, Self::Error> {
-        let (path, _hash) = checkouts::Manager::checkout_of(
-            self,
-            &upstream.repo,
-            checkouts::GitRef::Commit(upstream.locked_commit.clone().unwrap()),
-        )?;
-        Ok(path)
+        match upstream {
+            LinkConfig::Dir { dir } => Ok(dir.into()),
+            LinkConfig::Git {
+                repo,
+                branch: _,
+                locked_commit,
+            } => {
+                let (path, _hash) = checkouts::Manager::checkout_of(
+                    self,
+                    repo,
+                    checkouts::GitRef::Commit(locked_commit.clone().unwrap()),
+                )?;
+                Ok(path)
+            }
+        }
     }
 }
 
@@ -511,7 +520,7 @@ impl DepGraph {
                     panic!("SpecOrigin::Inline given as leaf to new_from_chain()")
                 }
                 SpecOrigin::Repo(Repo::Git { url, rev, tracking }) => sp
-                    .checkout_of(&LinkConfig {
+                    .checkout_of(&LinkConfig::Git {
                         repo: url.clone(),
                         branch: tracking.as_ref().and_then(|b| match b {
                             common::repo_spec::GitRef::Branch(b) => Some(b.clone()),
@@ -533,20 +542,32 @@ impl DepGraph {
             .map_err(Error::Decode)?;
 
             cursor = if let Some(next_upstream) = layer.upstream() {
-                if upstream.as_repo().is_some_and(
-                    |r| matches!(r, Repo::Git { url, ..} if url == &next_upstream.repo),
-                ) {
-                    return Err(Error::Fetch(format!(
-                        "layer at {} defines an upstream that points to itself",
-                        next_upstream.repo.clone(),
-                    )));
-                }
-                Some(next_upstream.as_spec_origin().ok_or_else(|| {
-                    Error::Fetch(format!(
-                        "layer {:?} defines an upstream {} without a locked commit",
-                        layer.origin, next_upstream.repo,
-                    ))
-                })?)
+                match next_upstream {
+                    LinkConfig::Git {
+                        repo,
+                        branch: _,
+                        locked_commit,
+                    } => {
+                        if upstream
+                            .as_repo()
+                            .is_some_and(|r| matches!(r, Repo::Git { url, ..} if url == repo))
+                        {
+                            return Err(Error::Fetch(format!(
+                                "layer at {} defines an upstream that points to itself",
+                                repo.clone(),
+                            )));
+                        }
+                        if locked_commit.is_none() {
+                            return Err(Error::Fetch(format!(
+                                "layer {:?} defines an upstream {} without a locked commit",
+                                layer.origin, repo,
+                            )));
+                        }
+                    }
+                    LinkConfig::Dir { .. } => {} // nothing to validate
+                };
+
+                Some(next_upstream.as_spec_origin().unwrap())
             } else {
                 None
             };
@@ -1115,7 +1136,7 @@ mod tests {
             },
         )
         .unwrap();
-        let apex_repo = LinkConfig {
+        let apex_repo = LinkConfig::Git {
             repo: "git@fakehub.com:minimal/apex.git".to_string(),
             locked_commit: Some("abc123".to_string()),
             branch: None,
@@ -1152,7 +1173,7 @@ mod tests {
             },
         )
         .unwrap();
-        let middle_repo = LinkConfig {
+        let middle_repo = LinkConfig::Git {
             repo: "git@fakehub.com:minimal/middle.git".to_string(),
             locked_commit: Some("abc123".to_string()),
             branch: None,

@@ -8,7 +8,6 @@ publish.workspace = true
 
 [dev-dependencies]
 indoc.workspace = true
-tempfile.workspace = true
 
 [dependencies]
 anyhow.workspace = true
@@ -16,6 +15,7 @@ dirs.workspace = true
 google-cloud-auth.workspace = true
 google-cloud-storage.workspace = true
 toml.workspace = true
+tempfile.workspace = true
 shlex.workspace = true
 
 tokio.workspace = true

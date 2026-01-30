@@ -3,7 +3,7 @@
 use anyhow::anyhow;
 use std::path::PathBuf;
 
-use crate::{Context, Error};
+use mctx::{Context, Error};
 
 #[derive(clap::Args)]
 pub struct MaterializeArgs {
@@ -28,8 +28,8 @@ pub async fn cmd_materialize(args: MaterializeArgs, ctx: &mut Context) -> Result
     };
 
     let graph = match output.packages.len() {
-        0 => ctx.graph_from_package_names(&["base".to_string()])?,
-        _ => ctx.graph_from_package_names(&output.packages)?,
+        0 => ctx.graph_from_package_names(["base"])?,
+        _ => ctx.graph_from_package_names(output.packages.clone())?,
     };
     let cache = ctx.local_cache();
 
@@ -50,8 +50,7 @@ pub async fn cmd_materialize(args: MaterializeArgs, ctx: &mut Context) -> Result
         graph: &graph,
         exec_base: "/invalid".into(),
     };
-    use op::Runnable;
-    op.run(&opts).await?;
 
-    Ok(())
+    use op::Runnable;
+    op.run(&opts).await.map_err(|e| Error::Other(anyhow!(e)))
 }

@@ -5,6 +5,7 @@ use std::{
 
 use super::{CheckResult, CheckVerdict};
 use crate::Error;
+use anyhow::anyhow;
 use cache::{CacheErr, DirCacheEntry, LocalDir};
 use graph::{BuildOutput, BuildSpecRef, DepGraph, Transitives};
 use object::{Object, ObjectSymbol};
@@ -51,8 +52,12 @@ impl super::GraphBasedChecker for OutputTypesValid {
                 | BuildOutput::Library { glob }
                 | BuildOutput::Data { glob } => glob,
             };
-            for path in common::match_files_for_glob(cached_build.path(), glob)?.into_iter() {
-                let data = std::fs::read(&path).map_err(anyhow::Error::from)?;
+            for path in common::match_files_for_glob(cached_build.path(), glob)
+                .map_err(|e| Error::Other(anyhow!(e)))?
+                .into_iter()
+            {
+                let data = std::fs::read(&path)
+                    .map_err(|e| Error::IO("reading output file", path.to_path_buf(), e))?;
                 match (object::File::parse(&*data), output) {
                     (Ok(_), BuildOutput::Binary { .. } | BuildOutput::Library { .. }) => {}
                     (Err(_), BuildOutput::Data { .. }) => {}
@@ -152,8 +157,12 @@ impl super::GraphBasedChecker for MissingRuntimeDeps {
                 | BuildOutput::Library { glob }
                 | BuildOutput::Data { glob } => glob,
             };
-            for path in common::match_files_for_glob(cached_build.path(), glob)?.into_iter() {
-                let data = std::fs::read(&path).map_err(anyhow::Error::from)?;
+            for path in common::match_files_for_glob(cached_build.path(), glob)
+                .map_err(|e| Error::Other(anyhow!(e)))?
+                .into_iter()
+            {
+                let data = std::fs::read(&path)
+                    .map_err(|e| Error::IO("reading output file", path.to_path_buf(), e))?;
                 if let (Ok(elf), BuildOutput::Binary { .. } | BuildOutput::Library { .. }) =
                     (object::File::parse(&*data), output)
                     && let Ok(imports) = elf.imports()
@@ -196,8 +205,9 @@ impl super::GraphBasedChecker for MissingRuntimeDeps {
             match find_lib_in_deps(needed_lib, &deps)? {
                 Some((idx, lib_path)) => {
                     // There was a library, check that all the symbols we need are present.
-                    let data = std::fs::read(deps[idx].1.path().join(&lib_path))
-                        .map_err(anyhow::Error::from)?;
+                    let data = std::fs::read(deps[idx].1.path().join(&lib_path)).map_err(|e| {
+                        Error::IO("reading library", deps[idx].1.path().join(&lib_path), e)
+                    })?;
                     match object::File::parse(&*data) {
                         Ok(elf) => {
                             let exports = elf.exports().unwrap();
@@ -216,7 +226,13 @@ impl super::GraphBasedChecker for MissingRuntimeDeps {
                                         let data = std::fs::read(
                                             deps[idx].1.path().join("usr/lib/libc.so.6"),
                                         )
-                                        .map_err(anyhow::Error::from)?;
+                                        .map_err(|e| {
+                                            Error::IO(
+                                                "reading libc",
+                                                deps[idx].1.path().join("usr/lib/libc.so.6"),
+                                                e,
+                                            )
+                                        })?;
                                         object::File::parse(&*data)
                                             .unwrap()
                                             .dynamic_symbols()
@@ -301,9 +317,10 @@ fn find_lib_in_deps(
     for (i, (_bsr, dep_files)) in deps.iter().enumerate() {
         let base = dep_files.path();
 
-        if let Some(candidate) = (common::match_files_for_glob(dep_files.path(), &glob)?)
-            .into_iter()
-            .next()
+        if let Some(candidate) = (common::match_files_for_glob(dep_files.path(), &glob)
+            .map_err(|e| Error::Other(anyhow!(e)))?)
+        .into_iter()
+        .next()
         {
             return Ok(Some((
                 i,
