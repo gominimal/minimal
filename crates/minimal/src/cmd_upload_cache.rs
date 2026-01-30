@@ -1,6 +1,7 @@
-use crate::{Context, Error, PackagesArg};
+use crate::PackagesArg;
 use common::archive;
 use graph::Transitives;
+use mctx::{Context, Error};
 use std::sync::mpsc::channel;
 use tracing::info;
 
@@ -11,13 +12,9 @@ pub struct UploadArgs {
 }
 
 pub async fn cmd_upload_cache(args: UploadArgs, ctx: &mut Context) -> Result<(), Error> {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(ctx.num_parallel_builds)
-        .build_global()
-        .unwrap();
-
-    let graph = args.packages.graph(ctx)?;
+    let graph = ctx.graph_from_package_names(args.packages.names())?;
     let cache = ctx.local_cache();
+
     let upload_bsrs: Vec<_> = Transitives::for_toplevels(&graph, graph.top_levels.to_vec(), false)
         .into_keys()
         .collect();

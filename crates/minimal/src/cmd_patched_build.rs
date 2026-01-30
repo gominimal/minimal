@@ -1,7 +1,6 @@
 use crate::{Context, Error};
 use anyhow::anyhow;
 use cache::{Cache, EntryMeta, LocalDir, MetaInner};
-use common::RemoteStorage;
 use graph::{BuildSpecRef, DepGraph, Transitives};
 use op::{Runnable, SpecBuild};
 use std::{collections::HashSet, path::PathBuf};
@@ -16,11 +15,10 @@ pub struct PatchedBuildArgs {
 pub async fn cmd_patched_build(args: PatchedBuildArgs, ctx: &mut Context) -> Result<(), Error> {
     crate::enforce_science_mode()?;
 
-    let graph = ctx.graph_from_package_names(&[args.package])?;
+    let graph = ctx.graph_from_package_names([args.package])?;
     let cache = ctx.local_cache();
-    let remote_storage = RemoteStorage::new(ctx.paths().download_cache_dir().to_path_buf(), false)
-        .await
-        .unwrap();
+
+    let remote_storage = ctx.remote_storage().await.unwrap();
 
     let bsr = graph.top_levels[0];
     let build = graph.get(&bsr).unwrap();
@@ -55,7 +53,7 @@ pub async fn cmd_patched_build(args: PatchedBuildArgs, ctx: &mut Context) -> Res
         dependencies.insert(cache_dir.path().to_path_buf());
     }
 
-    let output_base = ctx.paths().sandbox_base_dir().to_path_buf();
+    let output_base = ctx.builds_base_dir();
     std::fs::create_dir_all(&output_base).ok();
     let res = SpecBuild {
         spec: &bsr,
@@ -68,7 +66,7 @@ pub async fn cmd_patched_build(args: PatchedBuildArgs, ctx: &mut Context) -> Res
         exec_base: output_base,
     })
     .await
-    .map_err(anyhow::Error::from)?;
+    .map_err(|e| Error::Other(anyhow!("build failed: {}", e)))?;
 
     res.outputs
         .finalize(EntryMeta {

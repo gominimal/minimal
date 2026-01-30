@@ -22,31 +22,62 @@ pub enum StrOrList {
 /// Defines a link to an upper layer (repo which contains a minimal file).
 ///
 /// This is typically the `[upstream]` or `[stdlib]` section of [File], describing the upstream or stdlib to use.
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
-pub struct LinkConfig {
-    /// The URL passed to git to fetch the repository.
-    pub repo: String,
-    /// If set, the branch of the repo to track. `rev` is bumped to the HEAD of this branch on `minimal update`.
-    pub branch: Option<String>,
-    /// The pinned git commit hash to use for this link.
-    ///
-    /// TODO: Remove the `rev` alias ~feb, that was the old key.
-    #[serde(alias = "rev")]
-    pub locked_commit: Option<String>,
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
+#[serde(untagged)]
+pub enum LinkConfig {
+    Git {
+        /// The URL passed to git to fetch the repository.
+        repo: String,
+        /// If set, the branch of the repo to track. `rev` is bumped to the HEAD of this branch on `minimal update`.
+        branch: Option<String>,
+        /// The pinned git commit hash to use for this link.
+        ///
+        /// TODO: Remove the `rev` alias ~feb, that was the old key.
+        #[serde(alias = "rev")]
+        locked_commit: Option<String>,
+    },
+    Dir {
+        dir: String,
+    },
+}
+
+impl Default for LinkConfig {
+    fn default() -> Self {
+        LinkConfig::Git {
+            repo: String::default(),
+            branch: None,
+            locked_commit: None,
+        }
+    }
 }
 
 impl LinkConfig {
     pub fn as_spec_origin(&self) -> Option<common::SpecOrigin> {
-        self.locked_commit.as_ref().map(|rev| {
-            common::SpecOrigin::Repo(common::repo_spec::Repo::Git {
-                url: self.repo.clone(),
-                rev: rev.clone(),
-                tracking: self
-                    .branch
-                    .as_ref()
-                    .map(|b| common::repo_spec::GitRef::Branch(b.clone())),
-            })
-        })
+        match self {
+            LinkConfig::Git {
+                repo,
+                branch,
+                locked_commit,
+            } => locked_commit.as_ref().map(|rev| {
+                common::SpecOrigin::Repo(common::repo_spec::Repo::Git {
+                    url: repo.clone(),
+                    rev: rev.clone(),
+                    tracking: branch
+                        .as_ref()
+                        .map(|b| common::repo_spec::GitRef::Branch(b.clone())),
+                })
+            }),
+            LinkConfig::Dir { dir } => Some(common::SpecOrigin::from_dir(dir)),
+        }
+    }
+
+    fn fixup_relative<P: AsRef<Path>>(&mut self, mfile_path: P) {
+        if let (LinkConfig::Dir { dir }, Some(parent_dir)) = (self, mfile_path.as_ref().parent()) {
+            if !dir.starts_with("/") {
+                let new = parent_dir.join(&dir);
+                *dir = new.to_str().unwrap().to_string();
+            }
+        }
     }
 }
 
@@ -167,7 +198,7 @@ pub struct File {
 }
 
 pub fn default_stdlib() -> LinkConfig {
-    LinkConfig {
+    LinkConfig::Git {
         repo: "https://github.com/gominimal/std".to_string(),
         branch: None,
         locked_commit: None,
@@ -215,6 +246,8 @@ impl File {
                 let mut mfile: Self = toml::from_slice(&file_data).map_err(Error::Format)?;
                 mfile.mfile_path = Some(path.to_path_buf());
                 mfile.layout = Some(Layout::Root);
+                mfile.stdlib.fixup_relative(&path);
+                mfile.upstream.fixup_relative(&path);
                 return Ok(mfile);
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -228,6 +261,8 @@ impl File {
                 let mut mfile: Self = toml::from_slice(&file_data).map_err(Error::Format)?;
                 mfile.mfile_path = Some(path.to_path_buf());
                 mfile.layout = Some(Layout::DotMinimal);
+                mfile.stdlib.fixup_relative(&path);
+                mfile.upstream.fixup_relative(&path);
                 Ok(mfile)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::NotFound),
@@ -349,7 +384,7 @@ mod tests {
         assert_eq!(
             mf,
             File {
-                upstream: LinkConfig {
+                upstream: LinkConfig::Git {
                     repo: "https://github.com/gominimal/pkgs".to_string(),
                     branch: Some("main".to_string()),
                     locked_commit: None,

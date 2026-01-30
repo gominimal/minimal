@@ -7,6 +7,7 @@ use std::{
 use crate::{Error, Options, Runnable};
 use graph::{BuildSpecRef, TransitivesDep};
 use mfile::{EnvPatches, PatchSetting};
+use tempfile::TempDir;
 
 /// Considers the transitive deps & toplevels which are going into the a runnable environment, and constructs
 /// scaffolding as necessary.
@@ -107,15 +108,16 @@ impl<'a> Runnable for EnvSetup<'a> {
         }
 
         // Hardlink in the files which represent each dependency.
+        let (mut bin_dir_exists, mut lib64_dir_exists) = (false, false);
         for dep in self.transitives.keys() {
-            common::hardlink_dir_contents(
-                opts.cache
-                    .read_dir(&opts.graph.spec_hash(dep))
-                    .unwrap()
-                    .path(),
-                &opts.exec_base,
-            )
-            .map_err(anyhow::Error::from)?;
+            let p = opts
+                .cache
+                .read_dir(&opts.graph.spec_hash(dep))
+                .map_err(|e| Error::Other(anyhow::anyhow!("loading dependency: {}", e)))?;
+            common::hardlink_dir_contents(p.path(), &opts.exec_base)
+                .map_err(anyhow::Error::from)?;
+            bin_dir_exists |= std::fs::exists(p.path().join("bin")).unwrap();
+            lib64_dir_exists |= std::fs::exists(p.path().join("lib64")).unwrap();
         }
 
         // Iterate all file/dir patches and make sure their bind mounts exist, also check
@@ -191,9 +193,14 @@ impl<'a> Runnable for EnvSetup<'a> {
                     .devfsmount("/dev")
                     .tmpfsmount("/tmp")
                     .bindmount_rw(self.cwd.to_str().unwrap(), self.cwd.to_str().unwrap())
-                    .bindmount_rw(self.state_base_dir.to_str().unwrap(), "/state")
-                    .symlink("/usr/bin", "/bin")
-                    .symlink("/usr/lib", "/lib64");
+                    .bindmount_rw(self.state_base_dir.to_str().unwrap(), "/state");
+                if !bin_dir_exists {
+                    container.symlink("/usr/bin", "/bin");
+                }
+                if !lib64_dir_exists {
+                    container.symlink("/usr/lib", "/lib64");
+                }
+
                 if let Some(hn) = &self.hostname {
                     let etc_hostname = opts.exec_base.join("etc").join("hostname");
                     if !std::fs::exists(&etc_hostname)? {
@@ -208,6 +215,8 @@ impl<'a> Runnable for EnvSetup<'a> {
             cwd: self.cwd.to_path_buf(),
             patches: patch,
             env_vars,
+
+            temp_dirs: vec![],
         })
     }
 }
@@ -219,9 +228,18 @@ pub struct RunnableEnv {
     cwd: PathBuf,
     patches: EnvPatches,
     env_vars: HashMap<String, String>,
+
+    temp_dirs: Vec<TempDir>,
 }
 
 impl RunnableEnv {
+    /// Gives temporary directories into the ownership of the runnable env. Use this
+    /// if you created a temporary directory for `state_base_dir` and want it to be
+    /// cleaned up along with this environment.
+    pub fn associate_tempdirs<I: IntoIterator<Item = TempDir>>(&mut self, dirs: I) {
+        self.temp_dirs.extend(dirs);
+    }
+
     fn container(&self) -> Result<hakoniwa::Container, Error> {
         let mut container = self.container.clone();
 

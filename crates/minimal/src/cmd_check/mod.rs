@@ -1,13 +1,13 @@
+use crate::PackagesArg;
 use crate::cmd_check::outputs::{MissingRuntimeDeps, OutputTypesValid};
-use crate::{Context, Error, PackagesArg};
 use anyhow::anyhow;
 use cache::{Cache, CacheErr, LocalDir};
-use graph::DepGraph;
-
 use codespan_reporting::term::termcolor::{
     Color, ColorChoice, ColorSpec, StandardStream, WriteColor,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
+use graph::DepGraph;
+use mctx::{Context, Error};
 use op::{Options, Runnable, StandaloneTest};
 use regex::Regex;
 use std::cmp::Ordering;
@@ -52,7 +52,7 @@ fn package_check_futures(
     let package_dirs = match std::fs::read_dir(&packages_dir) {
         Ok(i) => i,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-        Err(e) => return Err(anyhow::Error::from(e).into()),
+        Err(e) => return Err(Error::IO("reading package dirs", packages_dir.clone(), e)),
     }
     .filter_map(|e| match e {
         Err(e) => Some(Err(e)),
@@ -65,7 +65,7 @@ fn package_check_futures(
         }
     })
     .collect::<Result<Vec<_>, _>>()
-    .map_err(anyhow::Error::from)?
+    .map_err(|e| Error::IO("listing packages", packages_dir.clone(), e))?
     .into_iter()
     // Filter based on the packages argument
     .filter_map(|pkg| {
@@ -120,7 +120,7 @@ fn profile_check_futures(
         (true, _) => vec![],
         (_, Err(e)) => {
             if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(anyhow::Error::from(e).into());
+                return Err(Error::IO("reading profile dirs", profiles_dir.clone(), e));
             };
             vec![]
         }
@@ -136,7 +136,7 @@ fn profile_check_futures(
                 }
             })
             .collect::<Result<Vec<_>, _>>()
-            .map_err(anyhow::Error::from)?
+            .map_err(|e| Error::IO("listing profiles", profiles_dir.clone(), e))?
             .into_iter()
             .collect(),
     };
@@ -187,7 +187,7 @@ fn harness_check_futures(
         (true, _) => vec![],
         (_, Err(e)) => {
             if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(anyhow::Error::from(e).into());
+                return Err(Error::IO("reading harness dirs", harnesses_dir.clone(), e));
             };
             vec![]
         }
@@ -203,7 +203,7 @@ fn harness_check_futures(
                 }
             })
             .collect::<Result<Vec<_>, _>>()
-            .map_err(anyhow::Error::from)?
+            .map_err(|e| Error::IO("listing harnesses", harnesses_dir.clone(), e))?
             .into_iter()
             .collect(),
     };
@@ -240,18 +240,17 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
     let all_graph = ctx.graph_from_all_packages();
     let upstream_dir = match ctx.minimal_file() {
         Ok(mfile) => mfile.dir_path().unwrap().to_path_buf(),
-        Err(Error::MFile(mfile::Error::NotFound)) => ctx
-            .base_dir_override
-            .clone()
-            .ok_or(mfile::Error::NotFound)?,
+        Err(Error::MFile(mfile::Error::NotFound)) => ctx.repo_dir()?,
         Err(e) => return Err(e),
     };
 
     let packages_dir = upstream_dir.join("packages");
-    let stdlib_dir = ctx.stdlib_dir_and_origin()?.0;
+    let stdlib_dir = ctx.stdlib_dir_and_origin().0;
 
-    if args.fix && packages_dir.strip_prefix(ctx.paths().vcs_dir()).is_ok() {
-        return Err(anyhow!("--fix can only be used on a local repository").into());
+    if args.fix && packages_dir.strip_prefix(ctx.vcs_dir()).is_ok() {
+        return Err(Error::Other(anyhow!(
+            "--fix can only be used on a local repository"
+        )));
     }
     let (graph_hnd, graph_err) = match all_graph {
         Err(e) => (None, Some(e)),
@@ -340,7 +339,9 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
     }
 
     match had_error {
-        true => Err(anyhow::anyhow!("One or more checkers reported a failure").into()),
+        true => Err(Error::Other(anyhow!(
+            "One or more checkers reported a failure"
+        ))),
         false => match graph_err {
             None => Ok(()),
             Some(e) => Err(e),
@@ -537,8 +538,8 @@ async fn check_package(
             Ok::<Vec<CheckResult>, String>(results)
         })
         .await
-        .map_err(anyhow::Error::from)?
-        .map_err(|e| anyhow::anyhow!(e))?
+        .map_err(|s| Error::Other(anyhow::Error::from(s)))?
+        .map_err(|e| Error::Other(anyhow!(e)))?
     };
 
     out.extend(file_based_results);
@@ -674,8 +675,11 @@ impl FileBasedChecker for ImportLineCheck {
             return Ok(result);
         }
 
-        for e in std::fs::read_dir(pkg_dir).map_err(anyhow::Error::from)? {
-            let e = e.map_err(anyhow::Error::from)?;
+        for e in std::fs::read_dir(pkg_dir)
+            .map_err(|e| Error::IO("reading nickel dir", pkg_dir.to_path_buf(), e))?
+        {
+            let e =
+                e.map_err(|e| Error::IO("enumerating nickel file", pkg_dir.to_path_buf(), e))?;
             if e.file_type().unwrap().is_dir() {
                 continue;
             }
@@ -684,9 +688,10 @@ impl FileBasedChecker for ImportLineCheck {
                 continue;
             }
 
-            let file_contents =
-                String::from_utf8(std::fs::read(e.path()).map_err(anyhow::Error::from)?)
-                    .map_err(anyhow::Error::from)?;
+            let file_contents = String::from_utf8(
+                std::fs::read(e.path()).map_err(|e2| Error::IO("reading nickel", e.path(), e2))?,
+            )
+            .map_err(|e2| Error::Other(anyhow!("decoding nickel file as utf8: {}", e2)))?;
 
             if let Some(captures) = &MINIMAL_IMPORT_REGEX.captures(&file_contents) {
                 let overall = captures.get(0).unwrap();
@@ -749,7 +754,8 @@ impl FileBasedChecker for ImportLineCheck {
                     );
                     let mut new_file_contents = file_contents.clone();
                     new_file_contents.replace_range(overall.start()..overall.end(), &fixed);
-                    std::fs::write(e.path(), new_file_contents).map_err(anyhow::Error::from)?;
+                    std::fs::write(e.path(), new_file_contents)
+                        .map_err(|e2| Error::IO("writing fixed nickel", e.path(), e2))?;
                     result.verdict = CheckVerdict::Fixed;
                 }
             }
@@ -782,8 +788,11 @@ impl FileBasedChecker for FmtCheck {
             return Ok(result);
         }
 
-        for e in std::fs::read_dir(pkg_dir).map_err(anyhow::Error::from)? {
-            let e = e.map_err(anyhow::Error::from)?;
+        for e in std::fs::read_dir(pkg_dir)
+            .map_err(|e| Error::IO("reading nickel dir", pkg_dir.to_path_buf(), e))?
+        {
+            let e =
+                e.map_err(|e| Error::IO("enumerating nickel file", pkg_dir.to_path_buf(), e))?;
             if e.file_type().unwrap().is_dir() {
                 continue;
             }
@@ -792,7 +801,8 @@ impl FileBasedChecker for FmtCheck {
                 continue;
             }
 
-            let data = std::fs::read(e.path()).map_err(anyhow::Error::from)?;
+            let data =
+                std::fs::read(e.path()).map_err(|e2| Error::IO("reading nickel", e.path(), e2))?;
             let mut out: Vec<u8> = Vec::with_capacity(2048);
 
             match nickel_lang_core::format::format(&data[..], &mut out) {
@@ -807,7 +817,8 @@ impl FileBasedChecker for FmtCheck {
                 Ok(()) => {
                     if data != out {
                         if fix {
-                            std::fs::write(e.path(), out).map_err(anyhow::Error::from)?;
+                            std::fs::write(e.path(), out)
+                                .map_err(|e2| Error::IO("writing fixed nickel", e.path(), e2))?;
                             result.verdict = CheckVerdict::Fixed;
                         } else {
                             result.verdict = CheckVerdict::Fail;
@@ -903,7 +914,8 @@ impl GraphBasedChecker for StandaloneTestCheck {
                 })
                 .await
                 .unwrap()
-                .await?;
+                .await
+                .map_err(Error::Other)?;
         }
 
         Ok(result)
@@ -936,8 +948,11 @@ impl FileBasedChecker for AdjacentImportCheck {
             return Ok(result);
         }
 
-        for e in std::fs::read_dir(pkg_dir).map_err(anyhow::Error::from)? {
-            let e = e.map_err(anyhow::Error::from)?;
+        for e in std::fs::read_dir(pkg_dir)
+            .map_err(|e| Error::IO("reading nickel dir", pkg_dir.to_path_buf(), e))?
+        {
+            let e =
+                e.map_err(|e| Error::IO("enumerating nickel file", pkg_dir.to_path_buf(), e))?;
             if e.file_type().unwrap().is_dir() {
                 continue;
             }
@@ -946,9 +961,10 @@ impl FileBasedChecker for AdjacentImportCheck {
                 continue;
             }
 
-            let file_contents =
-                String::from_utf8(std::fs::read(e.path()).map_err(anyhow::Error::from)?)
-                    .map_err(anyhow::Error::from)?;
+            let file_contents = String::from_utf8(
+                std::fs::read(e.path()).map_err(|e2| Error::IO("reading nickel", e.path(), e2))?,
+            )
+            .map_err(|e2| Error::Other(anyhow!("decoding nickel file as utf8: {}", e2)))?;
 
             for captures in ADJACENT_IMPORT_REGEX.captures_iter(&file_contents) {
                 let identifier = captures.get(1).unwrap().as_str();
