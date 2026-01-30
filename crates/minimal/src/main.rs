@@ -111,6 +111,10 @@ pub struct GlobalArgs {
     #[arg(long, default_value_t = false)]
     no_fetch: bool,
 
+    /// Do not share build status with sponge
+    #[arg(long, default_value_t = false, env = "MINIMAL_NO_TELEMETRY")]
+    no_telemetry: bool,
+
     /// Configure the number of parallel builds
     #[arg(short, long)]
     num_parallel_builds: Option<usize>,
@@ -237,14 +241,16 @@ async fn main() -> Result<(), Error> {
     // Initialize SpongeBob integration
     let mut dispatcher =
         build_events::BuildEventDispatcher::new(build_events::event_bus().subscribe());
-    match build_events_proto::SpongeBob::new(invocation_id).await {
-        Ok(sb) => {
-            dispatcher.add_subscriber(Box::new(sb));
-        }
-        Err(e) => {
-            warn!("Failed to create SpongeBob client: {}", e);
-        }
-    };
+    if !cli.global_args.no_telemetry {
+        match build_events_proto::SpongeBob::new(invocation_id).await {
+            Ok(sb) => {
+                dispatcher.add_subscriber(Box::new(sb));
+            }
+            Err(e) => {
+                warn!("Failed to create SpongeBob client: {}", e);
+            }
+        };
+    }
 
     // Add text file writer if requested
     if let Some(events_file) = &cli.global_args.build_events_file {
