@@ -13,8 +13,8 @@ use tracing_indicatif::{filter::IndicatifFilter, filter::hide_indicatif_span_fie
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use uuid::Uuid;
 
-mod cmd_build;
-use cmd_build::{BuildArgs, cmd_build};
+mod cmd_pkg;
+use cmd_pkg::{PkgArgs, cmd_pkg};
 mod cmd_check;
 use cmd_check::{CheckArgs, cmd_check};
 mod cmd_plan;
@@ -47,15 +47,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Builds package(s), making them available in the local cache.
-    Build(BuildArgs),
+    /// Runs the build task. Shorthand for `minimal run build`.
+    Build,
+    /// Runs the test task. Shorthand for `minimal run test`.
+    Test,
     /// Runs a task specified in `minimal.toml`.
     #[cfg(target_os = "linux")]
     Run(RunArgs),
-    /// Materializes an output specified in `minimal.toml`.
-    Materialize(MaterializeArgs),
     /// Refreshes local checkouts of upstream packages & the standard library.
     Update(UpdateArgs),
+    /// Materializes an output specified in `minimal.toml`.
+    Materialize(MaterializeArgs),
+    /// Builds the specified package(s) in a clean room, making them available in the local cache.
+    Pkg(PkgArgs),
 
     /// Validates and formats nickel build-spec files
     Check(CheckArgs),
@@ -92,16 +96,16 @@ struct CompletionsArgs {
 /// Shared arguments and builders across all subcommands
 #[derive(Debug, Args)]
 pub struct GlobalArgs {
-    /// Override the base directory used for operations (default: ~/.cache/minimal)
-    #[arg(long)]
-    minimal_dir: Option<PathBuf>,
-
-    /// Load the minimal standard library from the given path instead
-    #[arg(long)]
-    stdlib_dir: Option<PathBuf>,
     /// Use the given directory as the repository root, instead of searching from the current working directory.
     #[arg(long, short = 'C')]
     repo_dir: Option<PathBuf>,
+
+    /// Override the base directory used for operations (default: ~/.cache/minimal)
+    #[arg(long)]
+    minimal_dir: Option<PathBuf>,
+    /// Load the minimal standard library from the given path instead
+    #[arg(long)]
+    stdlib_dir: Option<PathBuf>,
 
     /// Ignore locally-available binary artifacts (results in rebuilds unless present in a remote cache)
     #[arg(long, default_value_t = false)]
@@ -306,7 +310,7 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
     let mut ctx = Context::new(config.build()?)?;
 
     match command {
-        Command::Build(args) => cmd_build(args, &mut ctx).await,
+        Command::Pkg(args) => cmd_pkg(args, &mut ctx).await,
         Command::Check(args) => cmd_check(args, &mut ctx).await,
         Command::Plan(args) => cmd_plan(args, &mut ctx).await,
         Command::UploadCache(args) => cmd_upload_cache(args, &mut ctx).await,
@@ -314,6 +318,24 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         Command::PatchedBuild(args) => cmd_patched_build(args, &mut ctx).await,
         #[cfg(target_os = "linux")]
         Command::Run(args) => cmd_run(args, &mut ctx).await,
+        Command::Build => {
+            cmd_run(
+                RunArgs {
+                    task_name: "build".to_string(),
+                },
+                &mut ctx,
+            )
+            .await
+        }
+        Command::Test => {
+            cmd_run(
+                RunArgs {
+                    task_name: "test".to_string(),
+                },
+                &mut ctx,
+            )
+            .await
+        }
         Command::Update(args) => cmd_update(args, &mut ctx).await,
         Command::Dep(args) => cmd_dep(args, &mut ctx).await,
         Command::Completions(_) => Ok(()),

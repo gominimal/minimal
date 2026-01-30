@@ -295,6 +295,19 @@ impl Harness {
             inherit_cwd: false,
         }
     }
+
+    /// Returns the default task with the specified name this harness provides, if any.
+    pub fn task_by_name(&self, name: &str) -> Option<mfile::Task> {
+        match name {
+            "build" => Some(self.build_task()),
+            _ => None,
+        }
+    }
+
+    /// Enumerates the default tasks this harness provides.
+    pub fn task_names(&self) -> Vec<String> {
+        vec!["build".to_string()]
+    }
 }
 
 #[cfg(test)]

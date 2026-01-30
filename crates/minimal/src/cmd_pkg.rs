@@ -4,22 +4,22 @@ use mctx::{Cache, Context, Error};
 use tracing::{info, trace};
 
 #[derive(Debug, clap::Args)]
-pub struct BuildArgs {
+pub struct PkgArgs {
     #[command(flatten)]
     packages: PackagesArg,
 }
 
-pub async fn cmd_build(args: BuildArgs, ctx: &mut Context) -> Result<(), Error> {
-    trace!("cmd_build");
+pub async fn cmd_pkg(args: PkgArgs, ctx: &mut Context) -> Result<(), Error> {
+    trace!("cmd_pkg");
     let graph = args.packages.resolve(ctx)?;
     let cache = ctx.local_cache();
 
-    cmd_build_impl(&graph, ctx, cache, false).await?;
+    pkg_build_impl(&graph, ctx, cache, false).await?;
 
     Ok(())
 }
 
-pub async fn cmd_build_impl(
+pub async fn pkg_build_impl(
     graph: &DepGraph,
     ctx: &mut Context,
     cache: Cache,
