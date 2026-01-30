@@ -3,6 +3,7 @@
 use anyhow::anyhow;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
+use graph::DepGraph;
 use mctx::{ConfigBuilder, Context, Error};
 use std::io;
 use std::path::PathBuf;
@@ -56,10 +57,11 @@ enum Command {
     /// Refreshes local checkouts of upstream packages & the standard library.
     Update(UpdateArgs),
 
-    /// Prints the build plan for the specified package(s)
-    Plan(PlanArgs),
     /// Validates and formats nickel build-spec files
     Check(CheckArgs),
+    /// Prints the build plan for the specified package(s)
+    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
+    Plan(PlanArgs),
     /// Uploads the specified packages and their transitive needs to the cache.
     #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
     UploadCache(UploadArgs),
@@ -93,18 +95,6 @@ pub struct GlobalArgs {
     /// Override the base directory used for operations (default: ~/.cache/minimal)
     #[arg(long)]
     minimal_dir: Option<PathBuf>,
-    /// Override the directory where binary artifacts are cached (default: ~/.cache/minimal/builds)
-    #[arg(long, hide = true)]
-    cache_dir: Option<PathBuf>,
-    /// Override the directory where builds are performed (default: ~/.cache/minimal/sandboxes)
-    #[arg(long, hide = true)]
-    builds_dir: Option<PathBuf>,
-    /// Override the directory where run sandboxes are created (default: ~/.cache/minimal/runs)
-    #[arg(long, hide = true)]
-    runs_dir: Option<PathBuf>,
-    /// Override the directory where downloads are cached (default: ~/.cache/minimal/downloads)
-    #[arg(long, hide = true)]
-    download_cache_dir: Option<PathBuf>,
 
     /// Load the minimal standard library from the given path instead
     #[arg(long)]
@@ -179,6 +169,22 @@ impl PackagesArg {
             }
             None => vec![],
         }
+    }
+
+    /// Returns a graph where the top-level is the packages the arguments represent.
+    ///  - Non empty: resolve to packages of the specified names.
+    ///  - Empty: resolve to all packages in the repo (i.e. not from upstream).
+    pub fn resolve(&self, ctx: &mut Context) -> Result<DepGraph, Error> {
+        if let Some(p) = &self.packages
+            && !p.is_empty()
+        {
+            return ctx.graph_from_package_names(p.clone());
+        }
+
+        // Argument is empty or unset
+        let mut graph = ctx.graph_from_all_packages()?;
+        graph.top_levels = graph.from_origin(&ctx.repo_origin()?).collect();
+        Ok(graph)
     }
 }
 

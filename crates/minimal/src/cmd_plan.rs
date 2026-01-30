@@ -10,7 +10,7 @@ pub struct PlanArgs {
 }
 
 pub async fn cmd_plan(args: PlanArgs, ctx: &mut Context) -> Result<(), Error> {
-    let graph = ctx.graph_from_package_names(args.packages.names())?;
+    let graph = args.packages.resolve(ctx)?;
     let cache = ctx.local_cache();
 
     match (!ctx.use_local_cache(), !ctx.use_remote_cache()) {

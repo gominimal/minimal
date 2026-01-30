@@ -550,7 +550,7 @@ fn prune_edgeless(pgraph: &mut DiGraph<NodeData, EdgeData>) {
 pub async fn cmd_dep(args: DepArgs, ctx: &mut Context) -> Result<(), Error> {
     crate::enforce_science_mode()?;
 
-    let graph = ctx.graph_from_package_names(args.packages.names())?;
+    let graph = args.packages.resolve(ctx)?;
     let GraphData {
         pgraph,
         bsname_to_node_index,
