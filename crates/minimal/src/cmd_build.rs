@@ -27,7 +27,7 @@ pub async fn cmd_build(args: BuildArgs, ctx: &mut Context) -> Result<(), Error> 
             graph.top_levels = graph
                 .top_levels
                 .iter()
-                .filter(|bsr| graph.get(&bsr).unwrap().from.as_repo().is_none())
+                .filter(|bsr| graph.get(bsr).unwrap().from.as_repo().is_none())
                 .copied()
                 .collect();
             graph

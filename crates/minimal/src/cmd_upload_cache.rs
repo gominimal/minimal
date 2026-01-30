@@ -12,7 +12,29 @@ pub struct UploadArgs {
 }
 
 pub async fn cmd_upload_cache(args: UploadArgs, ctx: &mut Context) -> Result<(), Error> {
-    let graph = ctx.graph_from_package_names(args.packages.names())?;
+    let graph = match args
+        .packages
+        .packages
+        .as_ref()
+        .map(|v| v.len())
+        .unwrap_or(0)
+    {
+        // Nothing was specified - build everything in the graph defined in the top-level repo.
+        0 => {
+            let mut graph = ctx.graph_from_all_packages()?;
+
+            // TODO: Don't just assume that stuff that came from a directory instead of a
+            // github repo is the top level.
+            graph.top_levels = graph
+                .top_levels
+                .iter()
+                .filter(|bsr| graph.get(bsr).unwrap().from.as_repo().is_none())
+                .copied()
+                .collect();
+            graph
+        }
+        _ => ctx.graph_from_package_names(args.packages.names())?,
+    };
     let cache = ctx.local_cache();
 
     let upload_bsrs: Vec<_> = Transitives::for_toplevels(&graph, graph.top_levels.to_vec(), false)
