@@ -386,13 +386,16 @@ impl Context {
         let mfile = self.minimal_file()?;
         let mut task = match mfile.task(name) {
             Some(t) => t,
-            None if name == "build" => {
-                // Task 'build' requested but none defined, lets see if theres a harness we can use instead.
+            None => {
+                // Task requested but none defined, lets see if the harness provides an implementation.
                 if let Some(h_conf) = &mfile.harness {
                     if let Some(harness) = graph.harness(&h_conf.name) {
-                        let mut task = harness.build_task();
-                        mfile.hydrate_task_defaults(&mut task);
-                        task
+                        if let Some(mut task) = harness.task_by_name(name) {
+                            mfile.hydrate_task_defaults(&mut task);
+                            task
+                        } else {
+                            return Ok(None);
+                        }
                     } else {
                         return Ok(None);
                     }
@@ -400,7 +403,6 @@ impl Context {
                     return Ok(None);
                 }
             }
-            _ => return Ok(None),
         };
         graph.hydrate_task(&mut task)?; // Apply profile settings
 

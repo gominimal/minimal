@@ -5,7 +5,7 @@ use tracing::trace;
 
 #[derive(Debug, clap::Args)]
 pub struct RunArgs {
-    task_name: String,
+    pub task_name: String,
 }
 
 pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {

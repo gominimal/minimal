@@ -27,12 +27,14 @@ The Minimal CLI
 Usage: minimal [OPTIONS] <COMMAND>
 
 Commands:
-  build        Builds package(s), making them available in the local cache
+  build        Runs the build task. Shorthand for `minimal run build`
+  test         Runs the test task. Shorthand for `minimal run test`
   run          Runs a task specified in `minimal.toml`
-  materialize  Materializes an output specified in `minimal.toml`
   update       Refreshes local checkouts of upstream packages & the standard library
-  plan         Prints the build plan for the specified package(s)
+  materialize  Materializes an output specified in `minimal.toml`
+  pkg          Builds the specified package(s) in a clean room, making them available in the local cache
   check        Validates and formats nickel build-spec files
+  completions  Generate shell completion script
   help         Print this message or the help of the given subcommand(s)
 
 Options:
@@ -40,22 +42,23 @@ Options:
           Override the base directory used for operations (default: ~/.cache/minimal)
       --stdlib-dir <STDLIB_DIR>
           Load the minimal standard library from the given path instead
-      --upstream-dir <UPSTREAM_DIR>
-          Load the upstream from the given path instead of using `[base]` in `minimal.toml`
+  -C, --repo-dir <REPO_DIR>
+          Use the given directory as the repository root, instead of searching from the current working directory
       --no-cache
           Ignore locally-available binary artifacts (results in rebuilds unless present in a remote cache)
       --no-fetch
           Do not fetch binary artifacts from the internet
+      --no-telemetry
+          Do not share build status with sponge [env: MINIMAL_NO_TELEMETRY=]
   -n, --num-parallel-builds <NUM_PARALLEL_BUILDS>
-          Configure the number of parallel builds [default: 6]
+          Configure the number of parallel builds
   -h, --help
           Print help
   -V, --version
           Print version
 ```
 
-You'll probably use the subcommands `build` and `plan` most of the time. Basically, if you omit `--package(s) <package1>[,<packageN>]` it will build/plan
-all packages, otherwise just the ones specified.
+You'll probably use the subcommands `build` and `pkg` most of the time.
 
 Switches for the local & remote cache:
 
@@ -63,10 +66,3 @@ Switches for the local & remote cache:
  * `--no-cache`: Rebuild everything thats needed: do not use anything that was built in an earlier invocation nor anything fetched in an earlier invocation.
 
 These args apply to planning as well.
-
-Other stuff thats less important:
-
- - `minimal new-world-update` - Updates the prebuilt cycle-breakers. Tom plans to rip this out when he replaces prebuilts.
- - `minimal check` - Runs a bunch of formatting and correctness checks on our packaging.
- - `minimal upload-cache` - Ensures all the built artifacts cached locally are present in the remote cache (GCP bucket), uploading them if not.
- - `minimal patched-build <package-name>` - Builds only the specified package, wiring dependencies into the build by package name instead of spec-hash.
