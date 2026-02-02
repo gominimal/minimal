@@ -3,6 +3,7 @@ use std::{collections::HashSet, path::PathBuf, time::Instant};
 use crate::{Error, Materialized, Options, Runnable, SubsetBuild};
 use anyhow::anyhow;
 use cache::{CacheErr, MetaInner, PendingDir};
+use common::Target;
 use graph::{BuildSpec, BuildSpecInput, BuildSpecRef, SubsetInput, Transitives};
 use tempfile::TempDir;
 use tracing::info;
@@ -209,6 +210,13 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
                 outputs: opts.cache.write_dir(&opts.graph.spec_hash(self.spec))?,
                 build_ms: 0,
             });
+        }
+        if build.target != Target::host() {
+            return Err(Error::Other(anyhow!(
+                "cannot build spec with target {} on {}",
+                build.target.as_ref(),
+                Target::host().as_ref()
+            )));
         }
 
         let (inputs, mut temp_dirs) = self.inputs(build, opts).await?;
