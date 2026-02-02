@@ -29,6 +29,24 @@ impl Target {
     pub const fn new(arch: Arch, os: OS) -> Self {
         Self { arch, os }
     }
+    /// Creates a target matching the host system.
+    pub const fn host() -> Self {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            Self {
+                arch: Arch::Amd64,
+                os: OS::Linux,
+            }
+        }
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            Self {
+                arch: Arch::Arm64,
+                os: OS::MacOS,
+            }
+        }
+    }
 
     /// Writes a description of the target to the given hasher.
     pub fn hash_to(&self, h: &mut Hasher) {
