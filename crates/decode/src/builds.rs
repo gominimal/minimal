@@ -1,10 +1,7 @@
 //! Build specification objects.
 
 use crate::{Error, ObjTy, attrs::AttrValue, eval_if_closure, read_ty};
-use common::{
-    Target,
-    target::{Arch, OS},
-};
+use common::Target;
 use nickel_lang_core::files::FileId;
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::term::{IndexMap, RichTerm, Term};
@@ -1131,7 +1128,7 @@ impl BuildDecl {
             attrs,
             prebuilt,
             build_args,
-            target: target.unwrap_or(Target::new(Arch::Amd64, OS::Linux)),
+            target: target.unwrap_or(Target::host()),
             inputs,
             runtime_deps,
             abstract_deps: needs,
@@ -1146,6 +1143,7 @@ impl BuildDecl {
 mod tests {
     use super::*;
     use crate::{Test, load::*};
+    use common::target::{Arch, OS};
     use indoc::indoc;
 
     #[test]
@@ -1326,7 +1324,7 @@ mod tests {
                 replace_on_cycle,
                 tests: None,
             } if name == "single buildspec" &&
-                target == Target::default() &&
+                target == Target::host() &&
                 cmds == vec![vec!["./build.sh"]] &&
                 replace_on_cycle.is_none() &&
                 build_args == Some([("fish".to_string(), "swiggity swooty".to_string())].into()) &&
