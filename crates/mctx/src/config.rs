@@ -114,7 +114,7 @@ pub struct Config {
     num_parallel_builds: usize,
 
     /// Path to the base of the minimal state directory, typically `~/.cache/minimal`.
-    minimal_dir: PathBuf,
+    pub(crate) minimal_dir: PathBuf,
     /// Overrides where the standard directory is loaded from.
     stdlib_dir: Option<PathBuf>,
     /// Overrides the base/project/repo directory.
@@ -152,10 +152,10 @@ impl Config {
         self.minimal_dir.join("sandboxes")
     }
     pub(crate) fn state_base_dir(&self) -> PathBuf {
-        self.minimal_dir.join("envs")
+        self.minimal_dir.join("state")
     }
-    pub(crate) fn run_base_dir(&self) -> PathBuf {
-        self.minimal_dir.join("runs")
+    pub(crate) fn task_base_dir(&self) -> PathBuf {
+        self.minimal_dir.join("tasks")
     }
     pub(crate) fn vcs_dir(&self) -> PathBuf {
         self.minimal_dir.join("vcs")
