@@ -1,4 +1,5 @@
 [target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:main"
 pre-build = [
     # protoc version in apt is too old and chokes on optional keyword in proto3 fmt
     "apt-get update && apt-get install --assume-yes wget unzip",
