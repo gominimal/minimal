@@ -143,7 +143,7 @@ impl Config {
     }
 
     pub(crate) fn cache_dir(&self) -> PathBuf {
-        self.minimal_dir.join("builds")
+        self.minimal_dir.join("built")
     }
     pub(crate) fn downloads_dir(&self) -> PathBuf {
         self.minimal_dir.join("downloads")
