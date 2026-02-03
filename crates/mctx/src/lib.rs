@@ -146,14 +146,22 @@ impl Context {
     pub fn new(config: Config) -> Result<Self, Error> {
         // Upsert dirs
         use std::fs::create_dir_all;
-        create_dir_all(config.cache_dir()).map_err(|e| Error::setup_dirs(e, config.cache_dir()))?;
+
         create_dir_all(config.downloads_dir())
             .map_err(|e| Error::setup_dirs(e, config.downloads_dir()))?;
         create_dir_all(config.builds_base_dir())
             .map_err(|e| Error::setup_dirs(e, config.builds_base_dir()))?;
 
-        // TODO: remove this end of feb
-        // envs was the old name
+        // TODO: rename-if-exist logic to migrate to new dir names, remove code end of feb 2026
+
+        if std::fs::exists(config.minimal_dir.join("builds"))
+            .map_err(|e| Error::setup_dirs(e, config.minimal_dir.join("builds")))?
+        {
+            std::fs::rename(config.minimal_dir.join("builds"), config.cache_dir())
+                .map_err(|e| Error::setup_dirs(e, config.cache_dir()))?;
+        }
+        create_dir_all(config.cache_dir()).map_err(|e| Error::setup_dirs(e, config.cache_dir()))?;
+
         if std::fs::exists(config.minimal_dir.join("envs"))
             .map_err(|e| Error::setup_dirs(e, config.minimal_dir.join("envs")))?
         {
@@ -163,7 +171,6 @@ impl Context {
         create_dir_all(config.state_base_dir())
             .map_err(|e| Error::setup_dirs(e, config.state_base_dir()))?;
 
-        // TODO: remove this end of feb
         // runs was the old name
         if std::fs::exists(config.minimal_dir.join("runs"))
             .map_err(|e| Error::setup_dirs(e, config.minimal_dir.join("runs")))?
