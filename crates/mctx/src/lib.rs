@@ -151,10 +151,28 @@ impl Context {
             .map_err(|e| Error::setup_dirs(e, config.downloads_dir()))?;
         create_dir_all(config.builds_base_dir())
             .map_err(|e| Error::setup_dirs(e, config.builds_base_dir()))?;
+
+        // TODO: remove this end of feb
+        // envs was the old name
+        if std::fs::exists(config.minimal_dir.join("envs"))
+            .map_err(|e| Error::setup_dirs(e, config.minimal_dir.join("envs")))?
+        {
+            std::fs::rename(config.minimal_dir.join("envs"), config.state_base_dir())
+                .map_err(|e| Error::setup_dirs(e, config.state_base_dir()))?;
+        }
         create_dir_all(config.state_base_dir())
             .map_err(|e| Error::setup_dirs(e, config.state_base_dir()))?;
-        create_dir_all(config.run_base_dir())
-            .map_err(|e| Error::setup_dirs(e, config.run_base_dir()))?;
+
+        // TODO: remove this end of feb
+        // runs was the old name
+        if std::fs::exists(config.minimal_dir.join("runs"))
+            .map_err(|e| Error::setup_dirs(e, config.minimal_dir.join("runs")))?
+        {
+            std::fs::rename(config.minimal_dir.join("runs"), config.task_base_dir())
+                .map_err(|e| Error::setup_dirs(e, config.task_base_dir()))?;
+        }
+        create_dir_all(config.task_base_dir())
+            .map_err(|e| Error::setup_dirs(e, config.task_base_dir()))?;
         create_dir_all(config.vcs_dir()).map_err(|e| Error::setup_dirs(e, config.vcs_dir()))?;
 
         // Initialize subsystems that are always present/used
@@ -450,7 +468,7 @@ impl Context {
         self.build_graph(&graph).await?;
 
         let transitive_deps = Transitives::for_toplevels(&graph, graph.top_levels.clone(), false);
-        let base = tempfile::tempdir_in(self.config.run_base_dir()).map_err(|e| {
+        let base = tempfile::tempdir_in(self.config.task_base_dir()).map_err(|e| {
             Error::Other(anyhow::Error::from(e).context("creating base sandbox directory"))
         })?;
 
