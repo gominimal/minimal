@@ -44,9 +44,6 @@ skip = [
     { name = "arrayvec", version = "0.5.2" },
     # nickel-lang-core -> codespan
     { name = "codespan-reporting", version = "0.12.0" },
-    # hyper-tls -> native-tls -> security-framework
-    # https://github.com/sfackler/rust-native-tls/pull/338
-    { name = "core-foundation", version = "0.9.4" },
     # # oci-spec -> derive_builder
     # https://github.com/colin-kiegel/rust-derive-builder/pull/349
     { name = "darling", version = "0.20.11" },
@@ -65,9 +62,6 @@ skip = [
     # nickel-lang-core -> malachite -> malachite-base
     # https://github.com/tweag/nickel/pull/2367
     { name = "itertools", version = "0.11.0" },
-    # reqwest -> hyper-tls -> native-tls -> security-framework
-    # https://github.com/sfackler/rust-native-tls/pull/338
-    { name = "security-framework", version = "2.11.1" },
     # nickel-lang-core -> strip-ansi-escapes
     # https://github.com/luser/strip-ansi-escapes/pull/23
     { name = "vte", version = "0.14.1" },
