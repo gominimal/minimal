@@ -97,34 +97,28 @@ fn build_decls_in_dir<P: AsRef<Path>>(
         Vec::with_capacity(128)
     };
 
-    fn visit_dirs(
-        out: &mut Vec<PathBuf>,
-        with_names: &Option<&[String]>,
-        dir: &Path,
-    ) -> Result<(), Error> {
-        if dir.is_dir() {
-            for entry in std::fs::read_dir(dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_dir() {
+    if dir.as_ref().exists() {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            let path = entry.path();
+            if meta.is_dir() {
+                let build_path = path.join("build.ncl");
+                if build_path.exists() {
                     match with_names {
                         Some(names) => {
                             if names.iter().any(|n| path.ends_with(n)) {
-                                visit_dirs(out, with_names, &path)?;
+                                out.push(build_path);
                             }
                         }
                         None => {
-                            visit_dirs(out, with_names, &path)?;
+                            out.push(build_path);
                         }
                     };
-                } else if entry.file_name().to_string_lossy().ends_with("build.ncl") {
-                    out.push(path);
                 }
             }
         }
-        Ok(())
     }
-    visit_dirs(&mut out, &with_names, dir.as_ref())?;
 
     // Detect if any requested package was missing.
     if let Some(names) = &with_names
