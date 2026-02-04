@@ -73,7 +73,7 @@ pub async fn run_task(task: &mfile::Task, graph: DepGraph, ctx: &mut Context) ->
                     Ok(line) => {
                         let mut args = Shlex::new(&line);
                         let prog = args.next().unwrap();
-                        tracing::debug!("Running build command {}", line);
+                        println!("+ {}", &line);
 
                         let mut cmd = runnable_env
                             .command(&prog, args)
