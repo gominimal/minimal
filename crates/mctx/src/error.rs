@@ -1,6 +1,7 @@
-use std::fmt;
 use std::path::PathBuf;
+use std::{env, fmt};
 
+use common::SpecOrigin;
 use graph::{DepGraph, PlanErr};
 
 /// The errors possible when driving top-level minimal APIs.
@@ -19,7 +20,6 @@ pub enum Error {
 impl Error {
     pub fn report_to_stderr(&self) {
         match self {
-            Error::Graph(e) => e.report_to_stderr(),
             Error::Plan(b) => {
                 let (graph, err) = b.as_ref();
                 match err {
@@ -38,6 +38,29 @@ impl Error {
                             )
                         }
                     }
+                }
+            }
+            Error::Graph(e) => {
+                match &**e {
+                    // Slightly better error message if the upstream is not pinned, and this
+                    // error occurred on the top-level repo.
+                    graph::Error::UpstreamNotPinned {
+                        upstream,
+                        at_layer: SpecOrigin::LocalDir { absolute, .. },
+                    } if env::current_dir()
+                        .map(|d| absolute.starts_with(d))
+                        .unwrap_or(false) =>
+                    {
+                        eprintln!("Error: upstream defined but not pinned to a commit");
+                        eprintln!();
+                        eprintln!("> minimal.toml");
+                        eprintln!("[upstream]");
+                        eprintln!("repo = \"{}\"", upstream);
+                        eprintln!("locked_commit = <pinned commit hash>\t# missing field");
+                        eprintln!();
+                        eprintln!("help: try running `minimal update`")
+                    }
+                    _ => e.report_to_stderr(),
                 }
             }
             _ => eprintln!("{}", self),
