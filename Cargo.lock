@@ -2224,6 +2224,7 @@ dependencies = [
  "res-proto",
  "serde",
  "sha2",
+ "shlex",
  "smallvec",
  "tempfile",
  "tokio",

@@ -32,6 +32,7 @@ tempfile.workspace = true
 dirs.workspace = true
 blake3.workspace = true
 serde.workspace = true
+shlex.workspace = true
 
 rayon.workspace = true
 tonic.workspace = true

@@ -32,8 +32,11 @@ pub struct Task {
 }
 
 impl Task {
-    /// returns the program this task exec's, and the args to use.
-    pub fn exec_and_args(&self) -> (String, Vec<String>) {
+    /// Returns the program this task exec's, and the args to use.
+    ///
+    /// Only the Exec and Bash variants are supported. For all other actions,
+    /// this method returns None.
+    pub fn exec_and_args(&self) -> Option<(String, Vec<String>)> {
         let maybe_make_abs = |exec: &str| -> String {
             if !(exec.starts_with("/") || exec.starts_with("./")) {
                 format!("/bin/{}", exec)
@@ -43,17 +46,20 @@ impl Task {
         };
 
         match &self.action {
-            TaskAction::Exec(StrOrList::Single(s)) => {
+            TaskAction::Exec(StrOrList::Single(s)) => Some({
                 let mut cmd = shlex::Shlex::new(s.trim());
                 let exec = cmd.next().unwrap();
                 (maybe_make_abs(&exec), cmd.collect())
-            }
-            TaskAction::Exec(StrOrList::Multiple(v)) => match v.len() {
+            }),
+            TaskAction::Exec(StrOrList::Multiple(v)) => Some(match v.len() {
                 0 => ("".to_string(), vec![]),
                 1 => (maybe_make_abs(&v[0]), vec![]),
                 _ => (maybe_make_abs(&v[0]), v[1..].to_vec()),
-            },
-            TaskAction::Bash(cmd) => ("/bin/bash".to_string(), vec!["-c".to_string(), cmd.clone()]),
+            }),
+            TaskAction::Bash(cmd) => {
+                Some(("/bin/bash".to_string(), vec!["-c".to_string(), cmd.clone()]))
+            }
+            TaskAction::CmdCmd(_) => None,
         }
     }
 }
@@ -66,6 +72,12 @@ pub enum TaskAction {
     Exec(StrOrList),
     /// Executes the given bash script.
     Bash(String),
+    /// Execute the given program & arguments to generate the list
+    /// of commands to run.
+    ///
+    /// The invoked program should return each command to run on stdout,
+    /// one invocation per line.
+    CmdCmd(Vec<String>),
 }
 
 impl Default for TaskAction {
@@ -97,10 +109,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             t.exec_and_args(),
-            (
+            Some((
                 "/bin/go".to_string(),
                 vec!["test".to_string(), "./...".to_string()]
-            )
+            ))
         );
     }
     #[test]
@@ -114,10 +126,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             t.exec_and_args(),
-            (
+            Some((
                 "/bin/go".to_string(),
                 vec!["test".to_string(), "./...".to_string()]
-            )
+            ))
         );
     }
 
@@ -132,10 +144,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             t.exec_and_args(),
-            (
+            Some((
                 "/bin/bash".to_string(),
                 vec!["-c".to_string(), "go test ./... || echo failed".to_string()]
-            )
+            ))
         );
     }
 }

@@ -1,6 +1,11 @@
+use std::{io::Write, path::PathBuf};
+
 use anyhow::anyhow;
 use graph::DepGraph;
+use hakoniwa::Output;
 use mctx::{Context, Error};
+use mfile::TaskAction;
+use shlex::Shlex;
 use tracing::trace;
 
 #[derive(Debug, clap::Args)]
@@ -35,14 +40,58 @@ pub async fn run_task(task: &mfile::Task, graph: DepGraph, ctx: &mut Context) ->
         )
         .await?;
 
-    let (command, args) = task.exec_and_args();
-    let mut cmd = runnable_env
-        .command(&command, args)
-        .map_err(|e| Error::Other(anyhow!("building command failed: {}", e)))?;
-    cmd.spawn()
-        .map_err(|e| Error::Other(anyhow!("command launch failed: {}", e)))?
-        .wait()
-        .map_err(|e| Error::Other(anyhow!("command failed: {}", e)))?;
+    if let Some((command, args)) = task.exec_and_args() {
+        let mut cmd = runnable_env
+            .command(&command, args)
+            .map_err(|e| Error::Other(anyhow!("building command failed: {}", e)))?;
+        cmd.spawn()
+            .map_err(|e| Error::Other(anyhow!("command launch failed: {}", e)))?
+            .wait()
+            .map_err(|e| Error::Other(anyhow!("command failed: {}", e)))?;
+    } else {
+        // exec_and_args() only valid for some action variants, handle the others here
+        if let TaskAction::CmdCmd(argv) = &task.action {
+            let mut meta_cmd = runnable_env
+                .command(&argv[0], &argv[1..])
+                .map_err(|e| Error::Other(anyhow!("building meta-command failed: {}", e)))?;
+
+            let Output {
+                status,
+                stderr,
+                stdout,
+            } = meta_cmd
+                .output()
+                .map_err(|e| Error::Other(anyhow!("meta-command failed: {}", e)))?;
+            std::io::stderr().write_all(&stderr).unwrap();
+            if !status.success() {
+                return Err(Error::Other(anyhow!("meta-command failed: {:?}", status)));
+            }
+
+            use std::io::BufRead;
+            for line_result in std::io::Cursor::new(stdout).lines() {
+                match line_result {
+                    Ok(line) => {
+                        let mut args = Shlex::new(&line).into_iter();
+                        let prog = args.next().unwrap();
+                        tracing::debug!("Running build command {}", line);
+
+                        let mut cmd = runnable_env
+                            .command(&prog, args)
+                            .map_err(|e| Error::Other(anyhow!("building command failed: {}", e)))?;
+                        cmd.spawn()
+                            .map_err(|e| Error::Other(anyhow!("command launch failed: {}", e)))?
+                            .wait()
+                            .map_err(|e| Error::Other(anyhow!("command failed: {}", e)))?;
+                    }
+                    Err(e) => {
+                        return Err(Error::IO("reading meta-commands", PathBuf::new(), e));
+                    }
+                }
+            }
+        } else {
+            unreachable!();
+        }
+    }
 
     Ok(())
 }
