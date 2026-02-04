@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 mod error;
 pub use error::Error;
 mod tasks;
-pub use tasks::Task;
+pub use tasks::{Task, TaskAction};
 
 pub const MFILE_NAME: &str = "minimal.toml";
 
@@ -365,6 +365,8 @@ impl File {
 
 #[cfg(test)]
 mod tests {
+    use crate::tasks::TaskAction;
+
     use super::*;
     use indoc::indoc;
     use tempfile::tempdir;
@@ -381,7 +383,7 @@ mod tests {
             state_key = "test"
             patch.dir."~/.claude" = "read-write"
             packages = ["base", "go"]
-            cmd = "go test ./..."
+            exec = "go test ./..."
 
             [outputs.test]
             type = "oci-image"
@@ -413,7 +415,7 @@ mod tests {
                             file: HashMap::new()
                         },
                         packages: vec!["base".to_string(), "go".to_string()],
-                        cmd: "go test ./...".to_string(),
+                        action: TaskAction::exec_from_str("go test ./..."),
                         inherit_cwd: false,
                     }
                 )]
@@ -511,24 +513,6 @@ mod tests {
 
         std::fs::create_dir(dir.path().join("nested")).unwrap();
         assert!(File::from_dir_recursive(dir.path().join("nested")).is_ok()); // test from `./nested`
-    }
-
-    #[test]
-    fn task_cmd_and_args() {
-        let t: Task = toml::from_str(indoc! {
-            r#"
-            env = "test"
-            cmd = "go test ./..."
-            "#
-        })
-        .unwrap();
-        assert_eq!(
-            t.cmd_and_args(),
-            (
-                "/bin/go".to_string(),
-                vec!["test".to_string(), "./...".to_string()]
-            )
-        );
     }
 
     #[test]

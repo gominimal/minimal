@@ -11,13 +11,13 @@ profile = "dev"
 state_key = "dev"
 
 [tasks.claude]
-cmd = "claude"
+exec = "claude"
 
 [tasks.test]
-cmd = "cargo test"
+exec = "cargo test"
 
 [tasks.shell]
-cmd = "bash -l"
+exec = "bash -l"
 
 [outputs.bash-img]
 type = "oci-image"
@@ -28,28 +28,28 @@ cmd = ["/usr/bin/bash", "-l"]
 [tasks.vim]
 profile = "demo"
 state_key = ""
-cmd = "vim"
+exec = "vim"
 
 [tasks.btop]
 profile = "demo"
 state_key = ""
-cmd = "btop"
+exec = "btop"
 
 [tasks.demo-shell]
 profile = "demo"
 state_key = "demo"
-cmd = "bash -l"
+exec = "bash -l"
 
 [tasks.python]
 profile = "demo"
 state_key = "demo"
-cmd = "python3"
+exec = "python3"
 
 
 [tasks.env-smoketest]
 inherit_cwd = true
-cmd = """
-bash -c "echo 'env:' && env && echo \\"pwd: $(pwd)\\""
+bash = """
+echo 'env:' && env && echo "pwd: $(pwd)"
 """
 
 [stdlib]

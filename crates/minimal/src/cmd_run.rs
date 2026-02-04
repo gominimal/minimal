@@ -35,7 +35,7 @@ pub async fn run_task(task: &mfile::Task, graph: DepGraph, ctx: &mut Context) ->
         )
         .await?;
 
-    let (command, args) = task.cmd_and_args();
+    let (command, args) = task.exec_and_args();
     let mut cmd = runnable_env
         .command(&command, args)
         .map_err(|e| Error::Other(anyhow!("building command failed: {}", e)))?;
