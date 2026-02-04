@@ -558,10 +558,10 @@ impl DepGraph {
                             )));
                         }
                         if locked_commit.is_none() {
-                            return Err(Error::Fetch(format!(
-                                "layer {:?} defines an upstream {} without a locked commit",
-                                layer.origin, repo,
-                            )));
+                            return Err(Error::UpstreamNotPinned {
+                                upstream: repo.to_string(),
+                                at_layer: layer.origin,
+                            });
                         }
                     }
                     LinkConfig::Dir { .. } => {} // nothing to validate

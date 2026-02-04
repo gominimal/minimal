@@ -29,6 +29,11 @@ pub enum Error {
     NoSuchPkg { name: String },
     /// Failed to load the source code for an upstream.
     Fetch(String),
+    /// A layer declared a git upstream, but did not lock it to a commit.
+    UpstreamNotPinned {
+        upstream: String,
+        at_layer: SpecOrigin,
+    },
 }
 
 impl Error {
@@ -61,15 +66,21 @@ impl Error {
             Error::ConflictingHarness { name } => {
                 writeln!(writer, "Error: harness '{}' already exists", name,).unwrap()
             }
+            Error::ConflictingPackage { from, .. } => {
+                writeln!(writer, "Error: package '{}' already exists", from.1,).unwrap()
+            }
             Error::NoSuchPkg { name } => {
                 writeln!(writer, "Error: package '{}' does not exist", name,).unwrap()
             }
             Error::Fetch(e) => {
                 writeln!(writer, "Error: failed to fetch upstream layer: {}", e).unwrap()
             }
-            Error::ConflictingPackage { from, .. } => {
-                writeln!(writer, "Error: package '{}' already exists", from.1,).unwrap()
-            }
+            Error::UpstreamNotPinned { upstream, at_layer } => writeln!(
+                writer,
+                "Error: the layer {:?} declares an upstream '{}' but does not pin it to a commit",
+                at_layer, upstream
+            )
+            .unwrap(),
         }
     }
 
@@ -87,6 +98,7 @@ impl From<decode::Error> for Error {
 }
 
 mod spec_hasher;
+use common::SpecOrigin;
 pub use spec_hasher::SpecHasher;
 
 pub mod dep_graph;
