@@ -71,7 +71,7 @@ pub async fn run_task(task: &mfile::Task, graph: DepGraph, ctx: &mut Context) ->
             for line_result in std::io::Cursor::new(stdout).lines() {
                 match line_result {
                     Ok(line) => {
-                        let mut args = Shlex::new(&line).into_iter();
+                        let mut args = Shlex::new(&line);
                         let prog = args.next().unwrap();
                         tracing::debug!("Running build command {}", line);
 
