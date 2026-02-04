@@ -55,4 +55,4 @@ echo 'env:' && env && echo "pwd: $(pwd)"
 [stdlib]
 repo = "https://github.com/gominimal/std"
 branch = "main"
-locked_commit = "9e0003d800446d45d645c33f1c1d4590687ef7e0"
+locked_commit = "8f5b02fbc9cfb0f0e604e06ef6b6cb565ee50eea"

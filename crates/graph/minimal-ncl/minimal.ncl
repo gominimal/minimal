@@ -256,6 +256,7 @@ let needs_schema = import "need_classes.ncl" in
 
         build_cmd | String | optional,
         build_cmds | Array (Array String) | optional,
+        build_cmds_cmd | String | optional,
     },
     harness | Dyn -> Harness | doc "Constructs a harness." =
         fun spec => spec | Harness,

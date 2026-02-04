@@ -279,6 +279,7 @@ impl Harness {
             profile: None,
             action: match (&self.build_cmds, &self.build_cmds_cmd) {
                 (Some(cmds), _) => TaskAction::exec_from_str(&cmds[0].join(" ")), // TODO: this is trash
+                (_, Some(bcc)) => TaskAction::CmdCmd(bcc.clone()),
                 _ => todo!(),
             },
             packages: self
