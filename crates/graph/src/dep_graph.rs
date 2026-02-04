@@ -806,8 +806,31 @@ impl DepGraph {
             })
     }
 
-    /// Hydrates a minimal task with configuration based on the profile it calls for, if any.
-    pub fn hydrate_task(&self, task: &mut mfile::Task) -> Result<(), Error> {
+    /// Hydrates a minimal task with configuration based on the harness and
+    /// any profile it calls for, if any.
+    pub fn hydrate_task(&self, harness: Option<&str>, task: &mut mfile::Task) -> Result<(), Error> {
+        if let Some(name) = harness {
+            let harness = self.harness(name).ok_or_else(|| Error::NoSuchHarness {
+                name: name.to_string(),
+            })?;
+            // Upsert the packages list
+            task.packages.extend(
+                harness
+                    .build_packages
+                    .iter()
+                    .chain(harness.runtime_packages.iter())
+                    .filter(|p| !task.packages.contains(p))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            );
+            // Set environment variables, but only if they are not set already
+            for (k, v) in &harness.build_env_vars {
+                if !task.vars.contains_key(k) {
+                    task.vars.insert(k.clone(), v.clone());
+                }
+            }
+        }
+
         match &task.profile {
             None => Ok(()),
             Some(s) if s.is_empty() => Ok(()),
