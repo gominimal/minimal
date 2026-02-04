@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use mfile::TaskAction;
 use nickel_lang_core::{
     eval::cache::CacheImpl,
     program::Program,
@@ -276,8 +277,8 @@ impl Harness {
         mfile::Task {
             state_key: None,
             profile: None,
-            cmd: match (&self.build_cmds, &self.build_cmds_cmd) {
-                (Some(cmds), _) => cmds[0].join(" "), // TODO: this is trash
+            action: match (&self.build_cmds, &self.build_cmds_cmd) {
+                (Some(cmds), _) => TaskAction::exec_from_str(&cmds[0].join(" ")), // TODO: this is trash
                 _ => todo!(),
             },
             packages: self
