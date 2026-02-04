@@ -19,6 +19,8 @@ pub enum Error {
     },
     /// A profile with a certain name was requested, but did not exist.
     NoSuchProfile { name: String },
+    /// A harness with a certain name was requested, but did not exist.
+    NoSuchHarness { name: String },
     /// A profile has the same name as a profile in a higher layer, but did not extend it.
     ConflictingProfile { name: String },
     /// A harness has the same name as a harness in a higher layer.
@@ -46,6 +48,9 @@ impl Error {
             .unwrap(),
             Error::NoSuchProfile { name } => {
                 writeln!(writer, "Error: profile '{}' does not exist", name,).unwrap()
+            }
+            Error::NoSuchHarness { name } => {
+                writeln!(writer, "Error: harness '{}' does not exist", name,).unwrap()
             }
             Error::ConflictingProfile { name } => writeln!(
                 writer,

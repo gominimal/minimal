@@ -429,7 +429,8 @@ impl Context {
                 }
             }
         };
-        graph.hydrate_task(&mut task)?; // Apply profile settings
+        // Apply the specifics (pkgs etc) of the harness & profile
+        graph.hydrate_task(mfile.harness.as_ref().map(|h| h.name.as_str()), &mut task)?;
 
         // TODO: Probably time to retire this top_levels concept
         graph.top_levels = task.packages.as_bsrs(&graph)?;

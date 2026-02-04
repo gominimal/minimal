@@ -314,7 +314,7 @@ impl File {
         })
     }
 
-    /// Applies default task settings to any unset task fields.
+    /// Applies a default profile and state_key to a task, if unset on the task.
     pub fn hydrate_task_defaults(&self, task: &mut Task) {
         if let Some(default_profile) = &self.defaults.profile
             && task.profile.is_none()
