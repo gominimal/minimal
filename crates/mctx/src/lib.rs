@@ -181,6 +181,7 @@ impl Context {
         create_dir_all(config.task_base_dir())
             .map_err(|e| Error::setup_dirs(e, config.task_base_dir()))?;
         create_dir_all(config.vcs_dir()).map_err(|e| Error::setup_dirs(e, config.vcs_dir()))?;
+        create_dir_all(config.index_dir()).map_err(|e| Error::setup_dirs(e, config.index_dir()))?;
 
         // Initialize subsystems that are always present/used
         let mut vcs = VcsManager::new(config.vcs_dir())?;
@@ -267,6 +268,10 @@ impl Context {
     pub fn vcs_dir(&self) -> PathBuf {
         self.config.vcs_dir()
     }
+    /// Returns the base directory where the remote index is cached.
+    pub fn index_dir(&self) -> PathBuf {
+        self.config.index_dir()
+    }
     /// Returns the path to the root of the repo.
     pub fn repo_dir(&self) -> Result<PathBuf, Error> {
         match (&self.mfile, self.config.repo_dir_override()) {
@@ -295,6 +300,7 @@ impl Context {
     pub async fn remote_cache(
         &self,
         auth: bool,
+        force_fresh: bool,
     ) -> Result<RemoteCache<GcsStorage>, RemoteError<GcsError>> {
         let backend = if auth {
             GcsStorage::builder().build().await.unwrap()
@@ -306,7 +312,16 @@ impl Context {
                 .unwrap()
         };
 
-        RemoteCache::new_with_gcs_bucket(backend, "minimal-staging-cache").await
+        RemoteCache::new_with_gcs_bucket(
+            backend,
+            "minimal-staging-cache",
+            if force_fresh {
+                None
+            } else {
+                Some(self.config.index_dir())
+            },
+        )
+        .await
     }
     pub async fn remote_storage(&self) -> Result<common::RemoteStorage, Error> {
         Ok(
@@ -346,16 +361,17 @@ impl Context {
     /// Ensures the top-level packages of the given graph are built and available locally.
     pub async fn build_graph(&mut self, graph: &DepGraph) -> Result<(), Error> {
         let cache = self.local_cache();
+        let rc = if self.config.use_remote_cache() {
+            Some(self.remote_cache(false, false).await.unwrap())
+        } else {
+            None
+        };
 
         use orchestrator::LocalBackend;
         let orchestrator = LocalBackend::new_orchestrator(
             graph.top_levels.clone(),
             self.config.builds_base_dir(),
-            if self.config.use_remote_cache() {
-                Some(self.remote_cache(false).await.unwrap())
-            } else {
-                None
-            },
+            rc.clone(),
             self.remote_storage().await?,
             self.config.num_parallel_builds(),
             graph.clone(),
@@ -371,14 +387,12 @@ impl Context {
             // Both caches
             (true, true) => {
                 let local_adapter = CacheBinProvider::new(graph, cache.clone());
-                let remote_cache = self.remote_cache(false).await.unwrap();
-                let remote_adapter = RemoteBinProvider::new(graph, &remote_cache);
+                let remote_adapter = RemoteBinProvider::new(graph, rc.as_ref().unwrap());
                 LocalBackend::run_local_build(orchestrator, (local_adapter, remote_adapter)).await
             }
             // Only remote cache
             (false, true) => {
-                let remote_cache = self.remote_cache(false).await.unwrap();
-                let remote_adapter = RemoteBinProvider::new(graph, &remote_cache);
+                let remote_adapter = RemoteBinProvider::new(graph, rc.as_ref().unwrap());
                 LocalBackend::run_local_build(orchestrator, remote_adapter).await
             }
             // Only local cache

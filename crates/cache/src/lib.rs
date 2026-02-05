@@ -18,7 +18,7 @@ pub use fs::LocalDir;
 
 #[allow(dead_code)]
 mod remote;
-pub use remote::{Error as RemoteError, RemoteCache};
+pub use remote::{Error as RemoteError, INDEX_FILENAME as REMOTE_INDEX_FILENAME, RemoteCache};
 
 pub(crate) mod entry_meta;
 pub use entry_meta::{EntryMeta, MetaInner};
