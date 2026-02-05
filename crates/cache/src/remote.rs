@@ -2,6 +2,7 @@ use crate::PendingDir;
 use crate::{Cache, LocalDir, remote_index::RemoteIndex};
 use common::{SpecHash, archive};
 use std::io::{Seek, Write};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use common::fetchers::*;
@@ -37,27 +38,30 @@ impl<BE: std::fmt::Debug> From<BE> for Error<BE> {
 
 /// A source of compiled build artifacts accessible over the network. Artifacts
 /// can be fetched by [SpecHash].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RemoteCache<B: FetchBackend> {
     backend: B,
     base: B::Url,
     index: RemoteIndex,
+    dir: Option<PathBuf>,
 
     uploaded: Vec<(SpecHash, [u8; 32])>,
 }
 
-const INDEX_FILENAME: &str = "index.shisha";
+pub const INDEX_FILENAME: &str = "index.shisha";
+const INDEX_EXPIRY_SECONDS: u64 = 5 * 60; // how long a fetch of the remote index is considered fresh for
 
 impl RemoteCache<Client> {
     pub async fn new_over_https<URL: Into<ReqwestUrl>>(
         url: URL,
+        index_dir: Option<PathBuf>,
     ) -> Result<Self, Error<ReqwestError>> {
         let backend = Client::builder()
             .user_agent("minimal/remote-cache")
             .build()?;
         let url = url.into();
 
-        Self::new(backend, url).await
+        Self::new(backend, url, index_dir).await
     }
 }
 
@@ -66,13 +70,14 @@ impl RemoteCache<Storage> {
     pub async fn new_with_gcs_bucket(
         storage: Storage,
         bucket_id: &str,
+        index_dir: Option<PathBuf>,
     ) -> Result<Self, Error<GcsError>> {
         let url = GcsUrl {
             bucket: format!("projects/_/buckets/{bucket_id}"),
             object: "".to_string(),
         };
 
-        Self::new(storage, url).await
+        Self::new(storage, url, index_dir).await
     }
 
     /// Upserts the given artifact to the GCS bucket, staging it for inclusion
@@ -115,6 +120,7 @@ impl RemoteCache<Storage> {
             backend,
             base,
             uploaded,
+            dir: _,
         } = self;
 
         index.extend(uploaded);
@@ -141,7 +147,31 @@ impl<B: FetchBackend> RemoteCache<B> {
     pub async fn new(
         backend: B,
         url: B::Url,
+        index_dir: Option<PathBuf>,
     ) -> Result<Self, Error<<B::Response as FetchResponse>::Error>> {
+        // Fast path: Use locally-cached index if its recent
+        if let Some(id) = index_dir.as_ref() {
+            let l_idx_path = id.join(INDEX_FILENAME);
+            if let Ok(stat) = std::fs::metadata(&l_idx_path)
+                && let Ok(modified) = stat.modified()
+                && let Ok(elapsed) = modified.elapsed()
+                && elapsed.as_secs() <= INDEX_EXPIRY_SECONDS
+            {
+                tracing::debug!("Re-using remote index (fetched {}s ago)", elapsed.as_secs());
+                return Ok(Self {
+                    backend,
+                    index: RemoteIndex::from_reader(
+                        &mut std::fs::File::open(&l_idx_path).map_err(Error::IO)?,
+                    )
+                    .map_err(Error::IO)?,
+                    dir: index_dir,
+                    base: url,
+                    uploaded: vec![],
+                });
+            }
+        }
+
+        let fetch_start = Instant::now();
         let index_req = backend.get(url.join(INDEX_FILENAME).unwrap())?;
 
         // TODO: Gotta be a better way to stream it into [RemoteIndex].
@@ -151,14 +181,27 @@ impl<B: FetchBackend> RemoteCache<B> {
             404 => RemoteIndex::default(),
             _ => {
                 let index_data = index_resp.error_for_status()?.bytes().await?;
-                RemoteIndex::from_reader(&mut std::io::Cursor::new(index_data))
-                    .map_err(Error::IO)?
+                let index = RemoteIndex::from_reader(&mut std::io::Cursor::new(index_data))
+                    .map_err(Error::IO)?;
+
+                if let Some(index_dir) = index_dir.as_ref() {
+                    let l_idx_path = index_dir.join(INDEX_FILENAME);
+                    index
+                        .write_to(&mut std::fs::File::create(&l_idx_path).map_err(Error::IO)?)
+                        .unwrap();
+                }
+                index
             }
         };
+        tracing::debug!(
+            "Fetched remote-index in {}ms",
+            fetch_start.elapsed().as_millis()
+        );
 
         Ok(Self {
             backend,
             index,
+            dir: index_dir,
             base: url,
             uploaded: vec![],
         })

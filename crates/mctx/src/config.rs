@@ -160,4 +160,7 @@ impl Config {
     pub(crate) fn vcs_dir(&self) -> PathBuf {
         self.minimal_dir.join("vcs")
     }
+    pub(crate) fn index_dir(&self) -> PathBuf {
+        self.minimal_dir.join("idx")
+    }
 }

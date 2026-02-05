@@ -24,6 +24,9 @@ pub async fn cmd_update(_args: UpdateArgs, ctx: &mut Context) -> Result<(), Erro
         } => Some((repo.clone(), branch.clone(), locked_commit.clone())),
     };
 
+    // best effort, yeet any cached remote index so a fresh fetch occurs
+    std::fs::remove_file(ctx.index_dir().join(cache::REMOTE_INDEX_FILENAME)).ok();
+
     let vcs = ctx.vcs_manager();
     vcs.update()
         .map_err(|e| Error::Other(anyhow::Error::from(e)))?;
