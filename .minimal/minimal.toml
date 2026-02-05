@@ -19,6 +19,9 @@ exec = "cargo test"
 [tasks.shell]
 exec = "bash -l"
 
+[tasks.startup-time]
+exec = "date"
+
 [outputs.bash-img]
 type = "oci-image"
 packages = ["bash", "coreutils", "diffutils", "findutils", "tar"]
