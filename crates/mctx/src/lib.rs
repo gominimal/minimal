@@ -243,6 +243,12 @@ impl Context {
 
 /// Low-level API
 impl Context {
+    /// Clones and reinitializes the context. Intended only
+    /// to be used after the minimal file has been mutated.
+    pub fn cloned_reinit(&self) -> Result<Self, Error> {
+        Self::new(self.config.clone())
+    }
+
     /// Returns a handle to the local cache.
     pub fn local_cache(&self) -> Cache {
         self.cache.clone()
@@ -515,6 +521,28 @@ impl Context {
         runnable_env.associate_tempdirs([base]);
 
         Ok(runnable_env)
+    }
+
+    /// Returns the list of all packages brought in through profiles and harnesses.
+    pub fn scaffolding_packages(&mut self) -> Result<Vec<BuildSpecRef>, Error> {
+        let mut out = std::collections::HashSet::new();
+        let mut graph = self.graph_from_all_packages()?;
+        let mfile = self.minimal_file()?.clone();
+        for (name, _) in mfile.tasks.iter() {
+            let res = self.task(graph, name)?.unwrap();
+            let task = res.0;
+            graph = res.1;
+
+            out.extend(task.packages);
+        }
+        if let Some(harness) = &mfile.harness {
+            let h = graph.harness(&harness.name).unwrap();
+            out.extend(h.build_packages.clone());
+            out.extend(h.runtime_packages.clone());
+        }
+
+        let v = out.into_iter().collect::<Vec<_>>();
+        v.as_bsrs(&graph)
     }
 }
 
