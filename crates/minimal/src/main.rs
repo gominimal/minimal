@@ -7,7 +7,6 @@ use graph::DepGraph;
 use mctx::{ConfigBuilder, Context, Error};
 use std::io;
 use std::path::PathBuf;
-use tracing::warn;
 use tracing_indicatif::IndicatifLayer;
 use tracing_indicatif::{filter::IndicatifFilter, filter::hide_indicatif_span_fields};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -114,10 +113,6 @@ pub struct GlobalArgs {
     /// Do not fetch binary artifacts from the internet
     #[arg(long, default_value_t = false)]
     no_fetch: bool,
-
-    /// Do not share build status with sponge
-    #[arg(long, default_value_t = false, env = "MINIMAL_NO_TELEMETRY")]
-    no_telemetry: bool,
 
     /// Configure the number of parallel builds
     #[arg(short, long)]
@@ -242,19 +237,8 @@ async fn main() -> Result<(), Error> {
     build_events::initialize_invocation_id(invocation_id.clone());
     build_events::initialize_global_event_bus();
 
-    // Initialize SpongeBob integration
     let mut dispatcher =
         build_events::BuildEventDispatcher::new(build_events::event_bus().subscribe());
-    if !cli.global_args.no_telemetry {
-        match build_events_proto::SpongeBob::new(invocation_id).await {
-            Ok(sb) => {
-                dispatcher.add_subscriber(Box::new(sb));
-            }
-            Err(e) => {
-                warn!("Failed to create SpongeBob client: {}", e);
-            }
-        };
-    }
 
     // Add text file writer if requested
     if let Some(events_file) = &cli.global_args.build_events_file {
