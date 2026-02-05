@@ -106,8 +106,17 @@ fn check_harness_name(
         return Ok(CheckResult::harness_name_skip());
     }
 
+    let tree = match program.eval_full() {
+        Ok(t) => t,
+        Err(e) => {
+            return Err(Error::Graph(Box::new(graph::Error::Decode(
+                decode::Error::Nickel(Box::new((program.files(), e))),
+            ))));
+        }
+    };
+
     // If we got this far, the nickel AST compiled fine, so lets try and pull out the harness name.
-    if let Term::Record(rd) = program.eval_full().unwrap().as_ref()
+    if let Term::Record(rd) = tree.as_ref()
         && let Ok(Some(Some(s))) = rd
             .get_value_with_ctrs(&LocIdent::new("name"))
             .map(|rt| rt.map(|t| t.term.to_nickel_string()))
