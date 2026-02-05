@@ -1,3 +1,6 @@
+use cache::{EntryMeta, MetaInner};
+use graph::Transitives;
+
 use crate::{Context, Error};
 
 #[derive(clap::Args)]
@@ -107,6 +110,54 @@ pub async fn cmd_update(_args: UpdateArgs, ctx: &mut Context) -> Result<(), Erro
         }
 
         std::fs::write(p, doc.to_string()).map_err(|e| Error::Other(anyhow::Error::from(e)))?;
+    }
+
+    // Enumerate all the reachable transitive packages and
+    // make sure we download any we are missing but are available
+    // remotely.
+    *ctx = ctx.cloned_reinit()?;
+    let graph = ctx.graph_from_all_packages()?;
+    let cache = ctx.local_cache();
+    let rc = ctx.remote_cache(false, true).await.unwrap();
+
+    let mut task_set = tokio::task::JoinSet::new();
+
+    for (bsr, _depinfo) in Transitives::for_toplevels(&graph, ctx.scaffolding_packages()?, false) {
+        let b = graph.get(&bsr).unwrap();
+        let name = b.name.clone();
+        let origin = b.from.as_ref().clone();
+        let spec_hash = graph.spec_hash(&bsr);
+        if let Err(cache::CacheErr::NotFound) = cache.read_dir(&spec_hash)
+            && rc.exists(&spec_hash)
+        {
+            let rc_clone = rc.clone(); // TODO: This is trash
+            let cache_clone = cache.clone();
+            task_set.spawn(async move {
+                rc_clone
+                    .materialize(&spec_hash, &cache_clone, &name)
+                    .await
+                    .map(|(t, d)| {
+                        (
+                            d,
+                            EntryMeta {
+                                inner: MetaInner::Spec(name),
+                                fetched: true,
+                                fetch_ms: Some(t.as_millis() as usize),
+                                origin: Some(origin),
+                                ..Default::default()
+                            },
+                        )
+                    })
+            });
+        }
+    }
+
+    // Wait for all materialization tasks to complete
+    while let Some(result) = task_set.join_next().await {
+        let (pending_dir, meta) = result
+            .unwrap()
+            .map_err(|e| Error::Other(anyhow::Error::from(e)))?;
+        pending_dir.finalize(meta).unwrap();
     }
 
     Ok(())
