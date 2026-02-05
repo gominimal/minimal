@@ -2,6 +2,10 @@ let Tys = [| 'Builder, 'Path, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Loc
 in
 let attrs_schema = import "attr_classes.ncl" in
 let needs_schema = import "need_classes.ncl" in
+let CmdSpec = std.contract.any_of [
+  String,
+  Array String,
+] in
 {
     BuildSpec | doc "A minimal build spec, defining inputs to the build as well as outputs which carry build artifacts downstream" = {
         ty | Tys = 'Builder,
@@ -15,8 +19,8 @@ let needs_schema = import "need_classes.ncl" in
 
         attrs | Attrs | optional,
 
-        cmd | String | optional,
-        cmds | Array (Array String) | optional,
+        cmd | CmdSpec | optional,
+        cmds | Array CmdSpec | optional,
         build_args | {_: String} | optional,
 
         # Do NOT set this yourself
@@ -254,9 +258,8 @@ let needs_schema = import "need_classes.ncl" in
         build_env_vars
             | {_ : String} | optional,
 
-        build_cmd | String | optional,
-        build_cmds | Array (Array String) | optional,
-        build_cmds_cmd | String | optional,
+        build_cmd | CmdSpec | optional,
+        build_cmds_cmd | CmdSpec | optional,
     },
     harness | Dyn -> Harness | doc "Constructs a harness." =
         fun spec => spec | Harness,
