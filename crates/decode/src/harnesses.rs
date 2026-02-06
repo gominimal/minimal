@@ -295,6 +295,7 @@ impl Harness {
             ),
             patch: Default::default(),
             inherit_cwd: false,
+            extra: HashMap::new(),
         }
     }
 

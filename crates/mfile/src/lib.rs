@@ -144,7 +144,7 @@ pub enum OutputKind {
 }
 
 /// An output, defined in a `[outputs.<output_name>]` section of [File].
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct Output {
     #[serde(alias = "type")]
     pub ty: OutputKind,
@@ -157,6 +157,10 @@ pub struct Output {
     pub cmd: Option<StrOrList>,
     #[serde(default, alias = "env_vars")]
     pub vars: HashMap<String, String>,
+
+    /// Any fields which are not understood by this version of minimal.
+    #[serde(flatten)]
+    extra: HashMap<String, toml::Value>,
 }
 
 /// Which directory layout this layer/repo used for minimal configuration.
@@ -177,7 +181,7 @@ pub enum Layout {
 }
 
 /// The loaded representation of the `minimal.toml` file.
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct File {
     /// The previous link in the software supply chain.
     #[serde(alias = "base")]
@@ -198,6 +202,10 @@ pub struct File {
     /// Output definitions.
     #[serde(default)]
     pub outputs: HashMap<String, Output>,
+
+    /// Any fields which are not understood by this version of minimal.
+    #[serde(flatten)]
+    extra: HashMap<String, toml::Value>,
 
     /// Where the minimal file is located on disk, if it was loaded from disk.
     #[serde(skip)]
@@ -258,6 +266,7 @@ impl File {
                 mfile.layout = Some(Layout::Root);
                 mfile.stdlib.fixup_relative(&path);
                 mfile.upstream.fixup_relative(&path);
+                mfile.warn_unknown_fields();
                 return Ok(mfile);
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -273,10 +282,46 @@ impl File {
                 mfile.layout = Some(Layout::DotMinimal);
                 mfile.stdlib.fixup_relative(&path);
                 mfile.upstream.fixup_relative(&path);
+                mfile.warn_unknown_fields();
                 Ok(mfile)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::NotFound),
             Err(e) => Err(Error::IO("minimal file", path, e)),
+        }
+    }
+    fn warn_unknown_fields(&self) {
+        let mut was_unknown_fields = false;
+        if !self.extra.is_empty() {
+            tracing::warn!(
+                "unknown fields in {}: {}",
+                MFILE_NAME,
+                self.extra.keys().cloned().collect::<Vec<_>>().join(",")
+            );
+            was_unknown_fields = true;
+        }
+        for (task_name, task) in &self.tasks {
+            if !task.extra.is_empty() {
+                tracing::warn!(
+                    "unknown fields in task {}: {}",
+                    task_name,
+                    task.extra.keys().cloned().collect::<Vec<_>>().join(",")
+                );
+                was_unknown_fields = true;
+            }
+        }
+        for (output_name, output) in &self.outputs {
+            if !output.extra.is_empty() {
+                tracing::warn!(
+                    "unknown fields in output {}: {}",
+                    output_name,
+                    output.extra.keys().cloned().collect::<Vec<_>>().join(",")
+                );
+                was_unknown_fields = true;
+            }
+        }
+
+        if was_unknown_fields {
+            tracing::warn!("help: do you need to update to a newer version of minimal?");
         }
     }
 
@@ -417,6 +462,7 @@ mod tests {
                         packages: vec!["base".to_string(), "go".to_string()],
                         action: TaskAction::exec_from_str("go test ./..."),
                         inherit_cwd: false,
+                        extra: HashMap::new(),
                     }
                 )]
                 .into(),
@@ -428,9 +474,11 @@ mod tests {
                         cmd: None,
                         entrypoint: Some(StrOrList::Single("/bin/sh".to_string())),
                         vars: HashMap::new(),
+                        extra: HashMap::new(),
                     }
                 )]
                 .into(),
+                extra: HashMap::new(),
                 mfile_path: None,
                 layout: None,
             }

@@ -2171,6 +2171,7 @@ dependencies = [
  "shlex",
  "tempfile",
  "toml",
+ "tracing",
 ]
 
 [[package]]
