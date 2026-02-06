@@ -136,9 +136,15 @@ fn build_output_hash(output: &BuildOutput, h: &mut Hasher) {
             h.write_all(b"lib").unwrap();
             h.write_all(glob.as_bytes()).unwrap();
         }
-        Data { glob } => {
+        Data {
+            glob,
+            allow_executable,
+        } => {
             h.write_all(b"data").unwrap();
             h.write_all(glob.as_bytes()).unwrap();
+            if *allow_executable {
+                h.write_all(b"-allow_exec").unwrap();
+            }
         }
         Binary { glob } => {
             h.write_all(b"bin").unwrap();

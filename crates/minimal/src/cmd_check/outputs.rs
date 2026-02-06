@@ -47,11 +47,7 @@ impl super::GraphBasedChecker for OutputTypesValid {
 
         result.verdict = CheckVerdict::Pass;
         for (name, output) in &build.outputs {
-            let glob = match output {
-                BuildOutput::Binary { glob }
-                | BuildOutput::Library { glob }
-                | BuildOutput::Data { glob } => glob,
-            };
+            let glob = output.glob();
             for path in common::match_files_for_glob(cached_build.path(), glob)
                 .map_err(|e| Error::Other(anyhow!(e)))?
                 .into_iter()
@@ -61,6 +57,13 @@ impl super::GraphBasedChecker for OutputTypesValid {
                 match (object::File::parse(&*data), output) {
                     (Ok(_), BuildOutput::Binary { .. } | BuildOutput::Library { .. }) => {}
                     (Err(_), BuildOutput::Data { .. }) => {}
+                    (
+                        Ok(_),
+                        BuildOutput::Data {
+                            allow_executable: true,
+                            ..
+                        },
+                    ) => {}
                     (Ok(_), BuildOutput::Data { .. }) => {
                         result.verdict = CheckVerdict::Fail;
                         result.err.push(format!(
@@ -152,11 +155,7 @@ impl super::GraphBasedChecker for MissingRuntimeDeps {
         let mut all_imports: HashMap<String, HashMap<(&String, PathBuf), HashSet<String>>> =
             HashMap::with_capacity(1024);
         for (name, output) in &build.outputs {
-            let glob = match output {
-                BuildOutput::Binary { glob }
-                | BuildOutput::Library { glob }
-                | BuildOutput::Data { glob } => glob,
-            };
+            let glob = output.glob();
             for path in common::match_files_for_glob(cached_build.path(), glob)
                 .map_err(|e| Error::Other(anyhow!(e)))?
                 .into_iter()

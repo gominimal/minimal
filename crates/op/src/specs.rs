@@ -248,7 +248,10 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
                 .values()
                 .map(|output| match output {
                     graph::BuildOutput::Library { glob } => glob.clone(),
-                    graph::BuildOutput::Data { glob } => glob.clone(),
+                    graph::BuildOutput::Data {
+                        glob,
+                        allow_executable: _,
+                    } => glob.clone(),
                     graph::BuildOutput::Binary { glob } => glob.clone(),
                 })
                 .collect(),

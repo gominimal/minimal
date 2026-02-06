@@ -560,7 +560,10 @@ pub enum BuildOutput {
     /// This output describes shared libraries matched with the given glob.
     Library { glob: String },
     /// This output describes data files matched with the given glob.
-    Data { glob: String },
+    Data {
+        glob: String,
+        allow_executable: bool,
+    },
     /// This output describes binaries matched with the given glob.
     Binary { glob: String },
 }
@@ -569,7 +572,10 @@ impl BuildOutput {
     pub fn glob(&self) -> &String {
         match self {
             BuildOutput::Binary { glob } => glob,
-            BuildOutput::Data { glob } => glob,
+            BuildOutput::Data {
+                glob,
+                allow_executable: _,
+            } => glob,
             BuildOutput::Library { glob } => glob,
         }
     }
@@ -582,6 +588,7 @@ impl BuildOutput {
         // The type hint ty identifies which output variant this term represents
         let ty = read_ty(&rt, program)?;
         let mut glob: Option<String> = None;
+        let mut allow_executable: Option<bool> = None;
 
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
@@ -597,6 +604,14 @@ impl BuildOutput {
                                     )?)
                                     .unwrap(),
                                 );
+                                Ok(())
+                            }
+                            "allow_executable" => {
+                                if let Some(rt) = field.value.as_ref() {
+                                    allow_executable = Some(
+                                        bool::deserialize(eval_if_closure(rt, program)?).unwrap(),
+                                    );
+                                }
                                 Ok(())
                             }
                             _ => Ok(()), // TODO: Should we error if we see an unknown field?
@@ -616,10 +631,14 @@ impl BuildOutput {
                 });
             }
         };
+        let allow_executable = allow_executable.unwrap_or(false);
 
         match ty {
             ObjTy::OutputLib => Ok(BuildOutput::Library { glob }),
-            ObjTy::OutputData => Ok(BuildOutput::Data { glob }),
+            ObjTy::OutputData => Ok(BuildOutput::Data {
+                glob,
+                allow_executable,
+            }),
             ObjTy::OutputBin => Ok(BuildOutput::Binary { glob }),
             _ => Err(Error::UnexpectedObject {
                 files: program.files(),
@@ -1526,7 +1545,8 @@ mod tests {
         assert_eq!(
             o_data,
             BuildOutput::Data {
-                glob: "/data/locale/*".to_string()
+                glob: "/data/locale/*".to_string(),
+                allow_executable: false,
             },
         );
     }
