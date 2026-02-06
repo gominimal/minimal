@@ -66,6 +66,7 @@ let CmdSpec = std.contract.any_of [
         ty | Tys = 'OutputData,
         glob
           | String,
+        allow_executable | Bool | optional,
     },
 
     RuntimeDep | doc "Possible values for a runtime dependency entry." = fun Contract =>

@@ -177,7 +177,10 @@ pub enum BuildOutput {
     /// This output describes shared libraries matched with the given glob.
     Library { glob: String },
     /// This output describes data files matched with the given glob.
-    Data { glob: String },
+    Data {
+        glob: String,
+        allow_executable: bool,
+    },
     /// This output describes binaries matched with the given glob.
     Binary { glob: String },
 }
@@ -186,7 +189,10 @@ impl BuildOutput {
     pub fn glob(&self) -> &String {
         match self {
             BuildOutput::Binary { glob } => glob,
-            BuildOutput::Data { glob } => glob,
+            BuildOutput::Data {
+                glob,
+                allow_executable: _,
+            } => glob,
             BuildOutput::Library { glob } => glob,
         }
     }
@@ -194,7 +200,13 @@ impl BuildOutput {
     fn from_decoded(bd: &builds::BuildOutput) -> Self {
         match bd.clone() {
             builds::BuildOutput::Binary { glob } => Self::Binary { glob },
-            builds::BuildOutput::Data { glob } => Self::Data { glob },
+            builds::BuildOutput::Data {
+                glob,
+                allow_executable,
+            } => Self::Data {
+                glob,
+                allow_executable,
+            },
             builds::BuildOutput::Library { glob } => Self::Library { glob },
         }
     }
