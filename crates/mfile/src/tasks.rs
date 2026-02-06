@@ -2,7 +2,7 @@ use super::{EnvPatches, StrOrList};
 use std::collections::HashMap;
 
 /// A task, defined in a `[tasks.<task_name>]` section of [File].
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct Task {
     /// Indicates that this task should share durable state with other tasks with the same key.
     #[serde(default)]
@@ -29,6 +29,10 @@ pub struct Task {
     /// of the default which is the directory containing the minimal file.
     #[serde(default)]
     pub inherit_cwd: bool,
+
+    /// Any fields which are not understood by this version of minimal.
+    #[serde(flatten)]
+    pub extra: HashMap<String, toml::Value>,
 }
 
 impl Task {
