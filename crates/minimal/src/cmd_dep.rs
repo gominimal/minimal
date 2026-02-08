@@ -1,6 +1,6 @@
 #![allow(unused_imports, unused_variables)]
 use crate::PackagesArg;
-use clap::ArgAction;
+use clap::{ArgAction, ValueEnum};
 use graph::{
     BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, RuntimeDep, SourceFetch, SourceInput,
     SubsetInput, Transitives,
@@ -16,6 +16,12 @@ use petgraph::visit::{
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+#[derive(Clone, Debug, ValueEnum)]
+enum OutputFormat {
+    Dot,
+    Mermaid,
+}
 
 /// CLI options to control what goes in the generated graph
 #[derive(Debug, clap::Args)]
@@ -39,7 +45,7 @@ pub struct DepArgs {
     )]
     source_deps: bool,
 
-    /// Whether Local (build.ncl) "input" deps are in the graph
+    /// Whether Local (build.sh) "input" deps are in the graph
     #[arg(
         long,num_args(0..=1),default_missing_value("true"),default_value("false"),action = ArgAction::Set,
     )]
@@ -88,6 +94,9 @@ pub struct DepArgs {
         long,num_args(0..=1),default_missing_value("true"),default_value("false"),action = ArgAction::Set,
     )]
     prune_edgeless: bool,
+
+    #[arg(long, default_value("dot"), value_parser = clap::value_parser!(OutputFormat))]
+    output_format: OutputFormat,
 }
 
 /// Data per node in the package petgraph DiGraph (aka "weight") that identifies
@@ -366,6 +375,7 @@ fn pgraph_copy_subset(
     }
     Ok(cpy)
 }
+
 /// Recursive function for traversing the graph and collecting (copying) nodes
 /// and edges that match the criteria given in the CLI args.  Resulting petgraph
 /// is the mutabe cpy output parameter.
@@ -546,7 +556,7 @@ fn prune_edgeless(pgraph: &mut DiGraph<NodeData, EdgeData>) {
     });
 }
 
-/// Prints graphviz DOT for the dependency graph as constrained by the CLI args to stdout.
+/// Prints graphviz DOT or Mermaid for the dependency graph as constrained by the CLI args to stdout.
 pub async fn cmd_dep(args: DepArgs, ctx: &mut Context) -> Result<(), Error> {
     crate::enforce_science_mode()?;
 
@@ -560,8 +570,91 @@ pub async fn cmd_dep(args: DepArgs, ctx: &mut Context) -> Result<(), Error> {
     if args.prune_edgeless {
         prune_edgeless(&mut cpy);
     }
+    match args.output_format {
+        OutputFormat::Dot => gen_dot(&cpy, &graph),
+        OutputFormat::Mermaid => gen_mermaid(&cpy, &graph),
+    }
+}
 
-    let pgraph = cpy;
+fn mermaid_node_id(
+    pgraph: &DiGraph<NodeData, EdgeData>,
+    graph: &DepGraph,
+    node_id: NodeIndex,
+) -> String {
+    let node_data = pgraph[node_id].clone();
+    match node_data {
+        NodeData::BuildSpec(bsr) => {
+            let name = graph
+                .get(&bsr)
+                .map(|bs| bs.name.clone())
+                .unwrap_or(String::from("<unknown!>"));
+            format!("Pkg:{name}")
+        }
+        NodeData::Source(SourceNode { url, .. }) => {
+            format!("Src:{url}")
+        }
+        NodeData::HostPath(hp) => {
+            let label = hp.to_string_lossy();
+            format!("Hostpath:{label}")
+        }
+        NodeData::Local { full_path, .. } => {
+            let label = full_path.to_string_lossy();
+            format!("Local:{label}")
+        }
+        NodeData::Need(name) => {
+            format!("Need:{name}")
+        }
+    }
+}
+
+fn gen_mermaid(pgraph: &DiGraph<NodeData, EdgeData>, graph: &DepGraph) -> Result<(), Error> {
+    println!("graph LR");
+
+    // just print edge declarations to keep compat with mermaid-ascii subsut
+    for edge_ref in pgraph.edge_references() {
+        let source_index = edge_ref.source();
+        let target_index = edge_ref.target();
+        let edge_data = edge_ref.weight();
+        let source_id = source_index.index();
+        let target_id = target_index.index();
+        let source_name = mermaid_node_id(pgraph, graph, source_index);
+        let target_name = mermaid_node_id(pgraph, graph, target_index);
+
+        match edge_data {
+            EdgeData::InputDep(InputDepEdge { outputs, .. }) => {
+                if outputs.is_empty() {
+                    println!("{source_name} -->|input| {target_name}");
+                } else {
+                    let subsets = outputs.join(",");
+                    println!("{source_name} -->|input subsets {subsets}| {target_name}");
+                }
+            }
+            EdgeData::RuntimeDep(RuntimeDepEdge { outputs, .. }) => {
+                if outputs.is_empty() {
+                    println!("{source_name} -->|runtime dep| {target_name}");
+                } else {
+                    let subsets = outputs.join(",");
+                    println!("{source_id} -->|runtime dep subsets {subsets}| {target_name}");
+                }
+            }
+            EdgeData::ReplaceOnCycle => {
+                println!("{source_name} -->|bootstrap| {target_name}");
+            }
+            EdgeData::Needs => {
+                println!("{source_name} -->|needs| {target_name}");
+            }
+            EdgeData::Provides => {
+                println!("{source_name} -->|provides| {target_name}");
+            }
+        }
+    }
+
+    println!();
+
+    Ok(())
+}
+
+fn gen_dot(pgraph: &DiGraph<NodeData, EdgeData>, graph: &DepGraph) -> Result<(), Error> {
     println!("digraph {{");
     println!("  graph [rankdir=LR];");
     println!("  node [shape=circle, style=filled, fillcolor=lightblue];");
