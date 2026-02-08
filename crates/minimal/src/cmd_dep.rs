@@ -558,8 +558,6 @@ fn prune_edgeless(pgraph: &mut DiGraph<NodeData, EdgeData>) {
 
 /// Prints graphviz DOT or Mermaid for the dependency graph as constrained by the CLI args to stdout.
 pub async fn cmd_dep(args: DepArgs, ctx: &mut Context) -> Result<(), Error> {
-    crate::enforce_science_mode()?;
-
     let graph = args.packages.resolve(ctx)?;
     let GraphData {
         pgraph,
