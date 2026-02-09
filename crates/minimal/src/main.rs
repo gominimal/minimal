@@ -46,19 +46,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Runs the build task. Shorthand for `minimal run build`.
-    Build,
-    /// Runs the test task. Shorthand for `minimal run test`.
-    Test,
     /// Runs a task specified in `minimal.toml`.
     #[cfg(target_os = "linux")]
     Run(RunArgs),
     /// Refreshes local checkouts of upstream packages & the standard library.
     Update(UpdateArgs),
+    /// Runs the build task. Shorthand for `minimal run build`.
+    Build,
+    /// Runs the test task. Shorthand for `minimal run test`.
+    Test,
     /// Materializes an output specified in `minimal.toml`.
     Materialize(MaterializeArgs),
     /// Builds the specified package(s) in a clean room, making them available in the local cache.
-    Pkg(PkgArgs),
+    #[clap(alias = "pkg")]
+    Package(PkgArgs),
 
     /// Validates and formats nickel build-spec files
     Check(CheckArgs),
@@ -293,7 +294,7 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
     let mut ctx = Context::new(config.build()?)?;
 
     match command {
-        Command::Pkg(args) => cmd_pkg(args, &mut ctx).await,
+        Command::Package(args) => cmd_pkg(args, &mut ctx).await,
         Command::Check(args) => cmd_check(args, &mut ctx).await,
         Command::Plan(args) => cmd_plan(args, &mut ctx).await,
         Command::UploadCache(args) => cmd_upload_cache(args, &mut ctx).await,
