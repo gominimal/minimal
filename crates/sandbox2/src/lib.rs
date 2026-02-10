@@ -35,7 +35,23 @@ impl Drop for Sandbox {
             drop(stderr);
         }
 
-        if !self.keep_dir {
+        if !self.keep_dir && fs::remove_dir_all(&self.base_dir).is_err() {
+            // remove_dir_all will fail if files are set as non-writeable even
+            // if theres a path to delete them. Urgh. Only golang does this.
+            //
+            // We do the same thing as `go clean -modcache` to fix the horror of their
+            // making.
+            //
+            // https://cs.opensource.google/go/go/+/refs/tags/go1.25.7:src/cmd/go/internal/modfetch/fetch.go;l=426-438
+            for entry in walkdir::WalkDir::new(&self.base_dir) {
+                if let Ok(entry) = entry
+                    && entry.file_type().is_dir()
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o777)).ok();
+                }
+            }
+            // Try again
             if let Err(e) = fs::remove_dir_all(&self.base_dir) {
                 tracing::warn!(
                     "Failed cleanup for sandbox at path {}: {}",
