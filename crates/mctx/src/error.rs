@@ -163,6 +163,7 @@ impl From<orchestrator::Error> for Error {
             orchestrator::Error::IO(e) => Self::IO("vcs", PathBuf::new(), e),
             orchestrator::Error::Other(e) => Self::Other(anyhow::anyhow!(e)),
             orchestrator::Error::Cache(e) => Self::Other(anyhow::anyhow!(e)), // TODO: better error
+            orchestrator::Error::Sandbox(e) => Self::Other(anyhow::anyhow!(e)), // TODO: better error
             orchestrator::Error::Plan(graph, e) => Self::Plan(Box::new((graph, e))),
         }
     }

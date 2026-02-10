@@ -299,20 +299,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "build-sandbox"
-version = "0.0.1"
-dependencies = [
- "build-events",
- "common",
- "globset",
- "hakoniwa",
- "nickel-lang-core",
- "serde",
- "thiserror",
- "tracing",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2423,7 +2409,6 @@ name = "op"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "build-sandbox",
  "cache",
  "common",
  "decode",
@@ -2440,6 +2425,7 @@ dependencies = [
  "oci-spec",
  "rayon",
  "res-proto",
+ "sandbox2",
  "serde_json",
  "sha2",
  "shlex",
@@ -2453,6 +2439,7 @@ dependencies = [
  "tonic",
  "tracing",
  "url",
+ "walkdir",
 ]
 
 [[package]]
@@ -2478,7 +2465,6 @@ name = "orchestrator"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "build-sandbox",
  "cache",
  "common",
  "decode",
@@ -2489,6 +2475,7 @@ dependencies = [
  "graph",
  "indoc",
  "op",
+ "sandbox2",
  "tokio",
  "tracing",
 ]
@@ -3261,6 +3248,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "sandbox2"
+version = "0.0.1"
+dependencies = [
+ "build-events",
+ "common",
+ "globset",
+ "hakoniwa",
+ "tempfile",
+ "tracing",
+ "walkdir",
 ]
 
 [[package]]

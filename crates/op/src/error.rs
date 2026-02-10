@@ -15,6 +15,8 @@ pub enum Error {
     Cache(CacheErr),
     /// An error during planning occurred.
     Plan(DepGraph, PlanErr),
+    /// An error occurred during the setup or execution of a sandbox.
+    Sandbox(sandbox2::Error),
     Other(anyhow::Error),
 }
 
@@ -48,12 +50,19 @@ impl From<serde_json::Error> for Error {
     }
 }
 
+impl From<sandbox2::Error> for Error {
+    fn from(e: sandbox2::Error) -> Self {
+        Self::Sandbox(e)
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::IO(e) => write!(f, "i/o error: {}", e),
             Error::Cache(e) => write!(f, "cache error: {}", e),
             Error::Plan(_, e) => write!(f, "plan error: {:?}", e),
+            Error::Sandbox(e) => write!(f, "sandbox error: {}", e),
             Error::Other(e) => write!(f, "other: {}", e),
         }
     }
@@ -65,6 +74,7 @@ impl std::error::Error for Error {
             Error::IO(e) => Some(e),
             Error::Cache(e) => Some(e),
             Error::Plan(_, e) => Some(e),
+            Error::Sandbox(e) => Some(e),
             _ => None,
         }
     }

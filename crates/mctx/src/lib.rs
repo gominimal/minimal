@@ -557,13 +557,13 @@ mod tests {
     fn toplevel_layer_init_and_build() {
         let state = tempdir().unwrap();
         let config = ConfigBuilder::new()
-            .state_dir(state.path().to_path_buf())
-            .repo_dir(
+            .with_state_dir(state.path().to_path_buf())
+            .with_repo_dir(
                 std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
                     .join("testdata")
                     .join("fakepkgs"),
             )
-            .stdlib_dir(
+            .with_stdlib_dir(
                 std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
                     .join("../graph/minimal-ncl"),
             )
@@ -612,13 +612,13 @@ mod tests {
     fn repo_init() {
         let state = tempdir().unwrap();
         let config = ConfigBuilder::new()
-            .state_dir(state.path().to_path_buf())
-            .repo_dir(
+            .with_state_dir(state.path().to_path_buf())
+            .with_repo_dir(
                 std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
                     .join("testdata")
                     .join("fakerepo"),
             )
-            .stdlib_dir(
+            .with_stdlib_dir(
                 std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
                     .join("../graph/minimal-ncl"),
             )
@@ -636,13 +636,13 @@ mod tests {
     fn task_env() {
         let state = tempdir().unwrap();
         let config = ConfigBuilder::new()
-            .state_dir(state.path().to_path_buf())
-            .repo_dir(
+            .with_state_dir(state.path().to_path_buf())
+            .with_repo_dir(
                 std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
                     .join("testdata")
                     .join("fakerepo"),
             )
-            .stdlib_dir(
+            .with_stdlib_dir(
                 std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
                     .join("../graph/minimal-ncl"),
             )

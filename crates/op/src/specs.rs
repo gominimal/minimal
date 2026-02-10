@@ -4,8 +4,9 @@ use crate::{Error, Materialized, Options, Runnable, SubsetBuild};
 use anyhow::anyhow;
 use cache::{CacheErr, MetaInner, PendingDir};
 use common::Target;
+use globset::GlobSet;
 use graph::{BuildSpec, BuildSpecInput, BuildSpecRef, SubsetInput, Transitives};
-use tempfile::TempDir;
+use sandbox2::config::SandboxMapped;
 use tracing::info;
 
 /// The return value of a successful build of a build-spec.
@@ -30,18 +31,17 @@ pub struct SpecBuild<'a, SF: crate::SourceFetcher> {
 }
 
 impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
-    async fn inputs(
+    async fn inputs_mapped(
         &self,
         build: &BuildSpec,
         opts: &Options<'a>,
-    ) -> Result<(Vec<build_sandbox::Input>, Vec<TempDir>), Error> {
+    ) -> Result<Vec<SandboxMapped>, Error> {
         let mut inputs = Vec::new();
-        let mut temp_dirs = Vec::new();
 
         for input in build.inputs.iter() {
             match input {
                 BuildSpecInput::Local { full_path, .. } => {
-                    inputs.push(build_sandbox::Input::File(full_path.to_path_buf()))
+                    inputs.push(SandboxMapped::File(full_path.to_path_buf()))
                 }
                 BuildSpecInput::Source(source) => {
                     let resolved_src = crate::SourceLoad {
@@ -53,27 +53,28 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                     .await?;
                     match resolved_src {
                         Materialized::Given(_) => unreachable!(),
-                        Materialized::File(path) => inputs.push(build_sandbox::Input::File(path)),
-                        Materialized::TempDir(td) => {
-                            inputs.push(build_sandbox::Input::Dir(td.path().to_path_buf()));
-                            temp_dirs.push(td);
-                        }
+                        Materialized::File(path) => inputs.push(SandboxMapped::File(path)),
+                        Materialized::TempDir(td) => inputs.push(SandboxMapped::TempDir(td)),
                     }
                 }
                 BuildSpecInput::Build(_) => {} // Handled by Transitives
                 _ => todo!("input: {:?}", input),
             }
         }
-        Ok((inputs, temp_dirs))
+        Ok(inputs)
     }
 
-    async fn dependencies(
+    async fn rootfs_mapped(
         &self,
         build: &BuildSpec,
         opts: &Options<'a>,
-    ) -> Result<(HashSet<PathBuf>, bool, bool), Error> {
+    ) -> Result<(HashSet<SandboxMapped>, bool, bool), Error> {
         if let Some(deps) = &self.override_deps {
-            return Ok((deps.clone(), true, true));
+            return Ok((
+                deps.iter().map(|p| SandboxMapped::Dir(p.clone())).collect(),
+                true,
+                true,
+            ));
         }
 
         let mut dependencies = HashSet::new();
@@ -86,7 +87,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                 // Regular build
                 None => {
                     let cache_dir = opts.cache.read_dir(&opts.graph.spec_hash(&bsr)).unwrap();
-                    dependencies.insert(cache_dir.path().to_path_buf());
+                    dependencies.insert(SandboxMapped::Dir(cache_dir.path().to_path_buf()));
                 }
                 // Subset
                 Some(outputs) => {
@@ -97,7 +98,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                     let subset_hash = opts.graph.subset_hash(&subset);
 
                     // If the subset exists use it, otherwise build it
-                    dependencies.insert(
+                    dependencies.insert(SandboxMapped::Dir(
                         match opts.cache.read_dir(&subset_hash) {
                             Ok(cache_dir) => cache_dir,
                             Err(CacheErr::NotFound) => {
@@ -121,7 +122,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                         }
                         .path()
                         .to_path_buf(),
-                    );
+                    ));
                 }
             }
 
@@ -219,60 +220,93 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
             )));
         }
 
-        let (inputs, mut temp_dirs) = self.inputs(build, opts).await?;
-        let (mut dependencies, needs_dns, need_internet) = self.dependencies(build, opts).await?;
+        let inputs = self.inputs_mapped(build, opts).await?;
+        let (mut rootfs, needs_dns, _need_internet) = self.rootfs_mapped(build, opts).await?;
+        // TODO: Plumb need_internet
 
         let synth_files = opts.cache.temp_dir()?;
         if needs_dns {
             common::synth_dns_config(synth_files.path()).map_err(anyhow::Error::from)?;
         }
-        dependencies.insert(synth_files.path().to_path_buf());
-        temp_dirs.push(synth_files);
+        rootfs.insert(SandboxMapped::TempDir(synth_files));
 
-        let config = build_sandbox::BuildConfig {
-            name: build.name.clone(),
-            dependencies,
-            inputs,
-            disable_networking: !need_internet,
-            build_args: build.build_args.clone(),
-            invocations: self
-                .invocations(build)?
+        let mut config = sandbox2::config::Config::new(&build.name)
+            .with_inputs(inputs.into_iter())
+            .with_rootfs(rootfs.into_iter());
+        if let Some(a) = &build.build_args {
+            config = config.with_build_args(a.iter());
+        }
+        let mut sandbox = config.build(&opts.exec_base).await?;
+        sandbox.keep_dir(true);
+
+        info!("Building package: {}", build.name);
+        let start = Instant::now();
+        sandbox.run(
+            self.invocations(build)?
                 .into_iter()
-                .map(|(executable, args)| build_sandbox::config::Invocation {
-                    executable: executable.into(),
+                .map(|(program, args)| sandbox2::config::Invocation {
+                    executable: program,
                     args,
+                    envs: Default::default(),
                 })
                 .collect(),
-            outputs: build
-                .outputs
-                .values()
-                .map(|output| match output {
-                    graph::BuildOutput::Library { glob } => glob.clone(),
-                    graph::BuildOutput::Data {
-                        glob,
-                        allow_executable: _,
-                    } => glob.clone(),
-                    graph::BuildOutput::Binary { glob } => glob.clone(),
-                })
-                .collect(),
-        };
+        )?;
+        let build_ms = Instant::now().duration_since(start).as_millis() as usize;
 
         let out_dir = opts
             .cache
             .write_dir(&opts.graph.spec_hash(self.spec))
             .unwrap();
-        info!("Building package: {}", build.name);
 
-        let start = Instant::now();
-        let target_id = build.name.clone();
-        build_sandbox::run_build(&config, out_dir.path(), opts.exec_base.clone(), &target_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to build {}: {}", build.name, e))?;
-        let build_ms = Instant::now().duration_since(start).as_millis() as usize;
+        // Build individual globs for each output so we can verify each one matched
+        let output_globs: Vec<(String, globset::Glob)> = build
+            .outputs
+            .iter()
+            .map(|(name, o)| {
+                globset::GlobBuilder::new(o.glob())
+                    .literal_separator(true)
+                    .empty_alternates(true)
+                    .build()
+                    .map(|g| (name.clone(), g))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::Other(anyhow!(e)))?;
 
-        for tempdir in temp_dirs.into_iter() {
-            drop(tempdir);
+        // Match the outputs into their final destination
+        sandbox.match_outputs_into(
+            GlobSet::new(output_globs.iter().map(|(_, g)| g.clone())).unwrap(),
+            out_dir.path(),
+        )?;
+
+        // Verify each glob matched at least one file
+        let mut unmatched: Vec<&str> = output_globs.iter().map(|(name, _)| name.as_str()).collect();
+        for entry in walkdir::WalkDir::new(out_dir.path()) {
+            let entry = entry
+                .map_err(|e| Error::Other(anyhow!("failed to walk output directory: {}", e)))?;
+            if entry.file_type().is_dir() {
+                continue;
+            }
+            let rel_path = entry
+                .path()
+                .strip_prefix(out_dir.path())
+                .expect("path should be under out_dir");
+            for (name, glob) in &output_globs {
+                if glob.compile_matcher().is_match(rel_path) {
+                    unmatched.retain(|n| n != name);
+                }
+            }
+            if unmatched.is_empty() {
+                break;
+            }
         }
+        if !unmatched.is_empty() {
+            return Err(Error::Other(anyhow!(
+                "output globs did not match any files: {}",
+                unmatched.join(", ")
+            )));
+        }
+
+        sandbox.keep_dir(false);
         Ok(SpecBuildResult {
             outputs: out_dir,
             build_ms,
