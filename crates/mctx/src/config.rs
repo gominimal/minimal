@@ -42,32 +42,32 @@ impl ConfigBuilder {
         Self::default()
     }
     /// Configures whether the local cache may be used or not.
-    pub fn no_cache(mut self, no_cache: bool) -> Self {
+    pub fn with_no_cache(mut self, no_cache: bool) -> Self {
         self.no_cache = Some(no_cache);
         self
     }
     /// Configures whether the remote cache may be used or not.
-    pub fn no_fetch(mut self, no_fetch: bool) -> Self {
+    pub fn with_no_fetch(mut self, no_fetch: bool) -> Self {
         self.no_fetch = Some(no_fetch);
         self
     }
     /// Configures the max number of parallel builds.
-    pub fn num_parallel_builds(mut self, num_parallel_builds: usize) -> Self {
+    pub fn with_num_parallel_builds(mut self, num_parallel_builds: usize) -> Self {
         self.num_parallel_builds = Some(num_parallel_builds);
         self
     }
     /// Overrides the base directory for system state.
-    pub fn state_dir(mut self, dir: PathBuf) -> Self {
+    pub fn with_state_dir(mut self, dir: PathBuf) -> Self {
         self.minimal_dir = Some(dir);
         self
     }
     /// Overrides loading of the standard library, getting it from the given path instead.
-    pub fn stdlib_dir(mut self, dir: PathBuf) -> Self {
+    pub fn with_stdlib_dir(mut self, dir: PathBuf) -> Self {
         self.stdlib_dir = Some(dir);
         self
     }
     /// Use the repository rooted at the given directory, instead of inferring it from the cwd.
-    pub fn repo_dir(mut self, dir: PathBuf) -> Self {
+    pub fn with_repo_dir(mut self, dir: PathBuf) -> Self {
         self.repo_dir = Some(dir);
         self
     }

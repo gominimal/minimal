@@ -19,8 +19,8 @@ google-cloud-storage.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
-build-sandbox.workspace = true
 cache.workspace = true
 common.workspace = true
 graph.workspace = true
 op.workspace = true
+sandbox2.workspace = true

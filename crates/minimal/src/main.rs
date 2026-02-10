@@ -276,19 +276,19 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
     } = cli;
 
     let mut config = ConfigBuilder::new()
-        .no_cache(global_args.no_cache)
-        .no_fetch(global_args.no_fetch);
+        .with_no_cache(global_args.no_cache)
+        .with_no_fetch(global_args.no_fetch);
     if let Some(num_parallel_builds) = global_args.num_parallel_builds {
-        config = config.num_parallel_builds(num_parallel_builds);
+        config = config.with_num_parallel_builds(num_parallel_builds);
     }
     if let Some(repo_dir) = global_args.repo_dir {
-        config = config.repo_dir(repo_dir);
+        config = config.with_repo_dir(repo_dir);
     }
     if let Some(minimal_dir) = global_args.minimal_dir {
-        config = config.state_dir(minimal_dir);
+        config = config.with_state_dir(minimal_dir);
     }
     if let Some(stdlib_dir) = global_args.stdlib_dir {
-        config = config.stdlib_dir(stdlib_dir);
+        config = config.with_stdlib_dir(stdlib_dir);
     }
 
     let mut ctx = Context::new(config.build()?)?;
