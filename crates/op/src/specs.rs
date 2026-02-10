@@ -201,6 +201,14 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
 
     async fn run<'b>(&mut self, opts: &Options<'b>) -> Result<Self::Result, Error> {
         let build = opts.graph.get(self.spec).unwrap();
+
+        let span = tracing::info_span!(
+            "build",
+            "indicatif.pb_show" = tracing::field::Empty,
+            "package" = build.name,
+        );
+        let _enter = span.enter();
+
         // Special case: prebuilts
         if build.is_pure_prebuilt() {
             return self.materialize_prebuilt(opts, build).await;
@@ -272,38 +280,58 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| Error::Other(anyhow!(e)))?;
 
-        // Match the outputs into their final destination
-        sandbox.match_outputs_into(
-            GlobSet::new(output_globs.iter().map(|(_, g)| g.clone())).unwrap(),
-            out_dir.path(),
-        )?;
+        {
+            let span = tracing::info_span!(
+                "collect_outputs",
+                "indicatif.pb_show" = tracing::field::Empty,
+                "outputs" = {
+                    let s = output_globs
+                        .iter()
+                        .map(|g| g.0.clone())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    match s.char_indices().nth(30) {
+                        Some((idx, _)) => format!("{}...", &s[..idx]),
+                        None => s.to_string(),
+                    }
+                },
+            );
+            let _enter = span.enter();
 
-        // Verify each glob matched at least one file
-        let mut unmatched: Vec<&str> = output_globs.iter().map(|(name, _)| name.as_str()).collect();
-        for entry in walkdir::WalkDir::new(out_dir.path()) {
-            let entry = entry
-                .map_err(|e| Error::Other(anyhow!("failed to walk output directory: {}", e)))?;
-            if entry.file_type().is_dir() {
-                continue;
-            }
-            let rel_path = entry
-                .path()
-                .strip_prefix(out_dir.path())
-                .expect("path should be under out_dir");
-            for (name, glob) in &output_globs {
-                if glob.compile_matcher().is_match(rel_path) {
-                    unmatched.retain(|n| n != name);
+            // Match the outputs into their final destination
+            sandbox.match_outputs_into(
+                GlobSet::new(output_globs.iter().map(|(_, g)| g.clone())).unwrap(),
+                out_dir.path(),
+            )?;
+
+            // Verify each glob matched at least one file
+            let mut unmatched: Vec<&str> =
+                output_globs.iter().map(|(name, _)| name.as_str()).collect();
+            for entry in walkdir::WalkDir::new(out_dir.path()) {
+                let entry = entry
+                    .map_err(|e| Error::Other(anyhow!("failed to walk output directory: {}", e)))?;
+                if entry.file_type().is_dir() {
+                    continue;
+                }
+                let rel_path = entry
+                    .path()
+                    .strip_prefix(out_dir.path())
+                    .expect("path should be under out_dir");
+                for (name, glob) in &output_globs {
+                    if glob.compile_matcher().is_match(rel_path) {
+                        unmatched.retain(|n| n != name);
+                    }
+                }
+                if unmatched.is_empty() {
+                    break;
                 }
             }
-            if unmatched.is_empty() {
-                break;
+            if !unmatched.is_empty() {
+                return Err(Error::Other(anyhow!(
+                    "output globs did not match any files: {}",
+                    unmatched.join(", ")
+                )));
             }
-        }
-        if !unmatched.is_empty() {
-            return Err(Error::Other(anyhow!(
-                "output globs did not match any files: {}",
-                unmatched.join(", ")
-            )));
         }
 
         sandbox.keep_dir(false);

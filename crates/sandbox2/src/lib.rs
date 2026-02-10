@@ -239,6 +239,22 @@ impl Sandbox {
         let rootfs = self.base_dir.join("rootfs");
         let container = self.container()?;
         for (i, exec) in invocations.iter().enumerate() {
+            let span = tracing::info_span!(
+                "sandbox_exec",
+                "indicatif.pb_show" = tracing::field::Empty,
+                "cmd" = {
+                    let s = if exec.args.is_empty() {
+                        exec.executable.clone()
+                    } else {
+                        format!("{} {}", exec.executable, exec.args.join(" "))
+                    };
+                    match s.char_indices().nth(30) {
+                        Some((idx, _)) => format!("{}...", &s[..idx]),
+                        None => s.to_string(),
+                    }
+                },
+            );
+            let _enter = span.enter();
             let mut program = exec.executable.clone();
 
             // Add /usr/bin/ for commands that are not absolute, and don't shadow anything in cwd
