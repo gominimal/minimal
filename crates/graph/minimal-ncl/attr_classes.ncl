@@ -1,3 +1,24 @@
+let source_provenance_gnu = {
+    category = 'GnuProject,
+    name | String,
+}
+in
+let source_provenance_github = {
+    category = 'GithubRepo,
+    owner | String,
+    repo | String,
+    # TODO: releases field does not validate for some reason.
+    releases | optional | std.contract.custom (fun label value =>
+        match {
+        'TagBased {..} => 'Ok (value),
+        _ => 'Error {
+            message = "source_provenance value had invalid/unknown category",
+        },
+        }
+        value
+    ),
+}
+in
 {
     upstream_version = {
         name = "upstream version",
@@ -42,5 +63,20 @@
         name = "needed for internet",
         desc = "A marker attribute - indicates this package should be present for any environment that needs internet access.",
         validate = {},
+    },
+    source_provenance = {
+        name = "source provenance",
+        desc = "Declares the authorative source of source code for this project.",
+        validate =
+            std.contract.custom (fun label value =>
+                match {
+                {category = 'GnuProject, ..} => std.contract.check source_provenance_gnu label value,
+                {category = 'GithubRepo, ..} => std.contract.check source_provenance_github label value,
+                    _ => 'Error {
+                        message = "source_provenance value had invalid/unknown category",
+                    },
+                }
+                value
+            ),
     },
 }

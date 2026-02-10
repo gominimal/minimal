@@ -995,16 +995,23 @@ impl BuildDecl {
                                     match attrs_rt.term.as_ref() {
                                         Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                                             attrs = Some(r.fields.iter().map(
-                                                |(ident_and_loc, field)| -> Result<(String, AttrValue), Error> {
-                                                    Ok((
-                                                        ident_and_loc.label().to_string(),
-                                                        AttrValue::from_term(
-                                                            field.value.as_ref().unwrap(),
-                                                            program,
-                                                        )?,
-                                                    ))
+                                                |(ident_and_loc, field)| -> Result<Option<(String, AttrValue)>, Error> {
+                                                    let value = AttrValue::from_term(
+                                                        field.value.as_ref().unwrap(),
+                                                        program,
+                                                    )?;
+                                                    match value {
+                                                        Some(v) => Ok(Some((
+                                                            ident_and_loc.label().to_string(),
+                                                            v,
+                                                        ))),
+                                                        None => Ok(None),
+                                                    }
                                                 },
-                                            ).collect::<Result<IndexMap<_, _>, Error>>()?);
+                                            ).collect::<Result<Vec<_>, Error>>()?
+                                            .into_iter()
+                                            .flatten()
+                                            .collect());
                                         }
                                         _ => todo!("unexpected term for attrs: {:?}", attrs_rt.term.as_ref()),
                                     };
@@ -1020,16 +1027,23 @@ impl BuildDecl {
                                     match needs_rt.term.as_ref() {
                                         Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                                             needs = Some(r.fields.iter().map(
-                                                |(ident_and_loc, field)| -> Result<(String, AttrValue), Error> {
-                                                    Ok((
-                                                        ident_and_loc.label().to_string(),
-                                                        AttrValue::from_term(
-                                                            field.value.as_ref().unwrap(),
-                                                            program,
-                                                        )?,
-                                                    ))
+                                                |(ident_and_loc, field)| -> Result<Option<(String, AttrValue)>, Error> {
+                                                    let value = AttrValue::from_term(
+                                                        field.value.as_ref().unwrap(),
+                                                        program,
+                                                    )?;
+                                                    match value {
+                                                        Some(v) => Ok(Some((
+                                                            ident_and_loc.label().to_string(),
+                                                            v,
+                                                        ))),
+                                                        None => Ok(None),
+                                                    }
                                                 },
-                                            ).collect::<Result<IndexMap<_, _>, Error>>()?);
+                                            ).collect::<Result<Vec<_>, Error>>()?
+                                            .into_iter()
+                                            .flatten()
+                                            .collect());
                                         }
                                         _ => todo!("unexpected term for needs: {:?}", needs_rt.term.as_ref()),
                                     };
