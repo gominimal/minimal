@@ -13,6 +13,7 @@ pub enum AttrValue {
     Bool(bool),
     List(Vec<AttrValue>),
     Map(IndexMap<String, AttrValue>),
+    EnumVariant(String, Box<AttrValue>),
 }
 
 impl Default for AttrValue {
@@ -25,36 +26,47 @@ impl AttrValue {
     pub(crate) fn from_term(
         rt: &RichTerm,
         program: &mut Program<CacheImpl>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Option<Self>, Error> {
         let rt = eval_if_closure(rt, program)?;
 
-        match rt.term.as_ref() {
-            Term::Str(s) => Ok(Self::String(s.to_string())),
-            Term::Bool(b) => Ok(Self::Bool(*b)),
-            Term::Enum(a) => Ok(Self::String(a.into_label())),
+        Ok(match rt.term.as_ref() {
+            Term::Str(s) => Some(Self::String(s.to_string())),
+            Term::Bool(b) => Some(Self::Bool(*b)),
+            Term::Enum(a) => Some(Self::String(a.into_label())),
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                 let mut map = IndexMap::with_capacity(6);
                 r.fields
                     .iter()
                     .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
-                        map.insert(
-                            ident_and_loc.label().to_string(),
-                            AttrValue::from_term(field.value.as_ref().unwrap(), program)?,
-                        );
+                        if let Some(value) =
+                            AttrValue::from_term(field.value.as_ref().unwrap(), program)?
+                        {
+                            map.insert(ident_and_loc.label().to_string(), value);
+                        }
                         Ok(())
                     })?;
-                Ok(Self::Map(map))
+                Some(Self::Map(map))
             }
-            Term::Array(e, _attrs) => Ok(Self::List(
+            Term::Array(e, _attrs) => Some(Self::List(
                 e.iter()
                     .map(|e| AttrValue::from_term(e, program))
-                    .collect::<Result<Vec<_>, Error>>()?,
+                    .collect::<Result<Vec<_>, Error>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            )),
+            // Optional fields which are validated by a custom contract will come
+            // across as this type - so we treat them as unset.
+            Term::CustomContract(_) => None,
+            Term::EnumVariant { tag, arg, attrs: _ } => Some(Self::EnumVariant(
+                tag.into_label(),
+                Box::new(AttrValue::from_term(arg, program)?.unwrap()),
             )),
             _ => todo!(
                 "error for unexpected attribute value type: {:?}",
                 rt.term.as_ref()
             ),
-        }
+        })
     }
 
     /// Returns the inner list, if this [AttrValue] is the list variant.
@@ -106,7 +118,7 @@ mod tests {
             });
 
         assert_eq!(
-            AttrValue::from_term(&term, &mut program).unwrap(),
+            AttrValue::from_term(&term, &mut program).unwrap().unwrap(),
             AttrValue::String("a".to_string()),
         );
     }
@@ -124,7 +136,7 @@ mod tests {
             });
 
         assert_eq!(
-            AttrValue::from_term(&term, &mut program).unwrap(),
+            AttrValue::from_term(&term, &mut program).unwrap().unwrap(),
             AttrValue::Bool(true),
         );
     }
@@ -142,7 +154,7 @@ mod tests {
             });
 
         assert_eq!(
-            AttrValue::from_term(&term, &mut program).unwrap(),
+            AttrValue::from_term(&term, &mut program).unwrap().unwrap(),
             AttrValue::String("Uwu".to_string()),
         );
     }
@@ -161,7 +173,7 @@ mod tests {
             });
 
         assert_eq!(
-            AttrValue::from_term(&term, &mut program).unwrap(),
+            AttrValue::from_term(&term, &mut program).unwrap().unwrap(),
             AttrValue::Map(IndexMap::from_iter([(
                 "key".to_string(),
                 AttrValue::String("a".to_string())
@@ -183,7 +195,7 @@ mod tests {
             });
 
         assert_eq!(
-            AttrValue::from_term(&term, &mut program).unwrap(),
+            AttrValue::from_term(&term, &mut program).unwrap().unwrap(),
             AttrValue::List(vec![
                 AttrValue::String("a".to_string()),
                 AttrValue::String("b".to_string()),

@@ -279,6 +279,11 @@ fn build_attrvalue_hash(v: &AttrValue, h: &mut Hasher) {
                 });
             }
         }
+        AttrValue::EnumVariant(name, v) => {
+            h.write_all(b"ev").unwrap();
+            h.write_all(name.as_bytes()).unwrap();
+            build_attrvalue_hash(v, h);
+        }
     }
 }
 
