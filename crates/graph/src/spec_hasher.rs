@@ -132,9 +132,12 @@ impl<'a> SpecHasher<'a> {
 fn build_output_hash(output: &BuildOutput, h: &mut Hasher) {
     use BuildOutput::*;
     match output {
-        Library { glob } => {
+        Library { glob, allow_data } => {
             h.write_all(b"lib").unwrap();
             h.write_all(glob.as_bytes()).unwrap();
+            if *allow_data {
+                h.write_all(b"-allow_data").unwrap();
+            }
         }
         Data {
             glob,

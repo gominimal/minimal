@@ -558,7 +558,7 @@ impl BuildDeclInput {
 #[allow(dead_code)]
 pub enum BuildOutput {
     /// This output describes shared libraries matched with the given glob.
-    Library { glob: String },
+    Library { glob: String, allow_data: bool },
     /// This output describes data files matched with the given glob.
     Data {
         glob: String,
@@ -576,7 +576,10 @@ impl BuildOutput {
                 glob,
                 allow_executable: _,
             } => glob,
-            BuildOutput::Library { glob } => glob,
+            BuildOutput::Library {
+                glob,
+                allow_data: _,
+            } => glob,
         }
     }
 }
@@ -589,6 +592,7 @@ impl BuildOutput {
         let ty = read_ty(&rt, program)?;
         let mut glob: Option<String> = None;
         let mut allow_executable: Option<bool> = None;
+        let mut allow_data: Option<bool> = None;
 
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
@@ -614,6 +618,14 @@ impl BuildOutput {
                                 }
                                 Ok(())
                             }
+                            "allow_data" => {
+                                if let Some(rt) = field.value.as_ref() {
+                                    allow_data = Some(
+                                        bool::deserialize(eval_if_closure(rt, program)?).unwrap(),
+                                    );
+                                }
+                                Ok(())
+                            }
                             _ => Ok(()), // TODO: Should we error if we see an unknown field?
                         }
                     })?;
@@ -632,9 +644,10 @@ impl BuildOutput {
             }
         };
         let allow_executable = allow_executable.unwrap_or(false);
+        let allow_data = allow_data.unwrap_or(false);
 
         match ty {
-            ObjTy::OutputLib => Ok(BuildOutput::Library { glob }),
+            ObjTy::OutputLib => Ok(BuildOutput::Library { glob, allow_data }),
             ObjTy::OutputData => Ok(BuildOutput::Data {
                 glob,
                 allow_executable,
@@ -1361,7 +1374,7 @@ mod tests {
                 cmds == vec![vec!["./build.sh"]] &&
                 replace_on_cycle.is_none() &&
                 build_args == Some([("fish".to_string(), "swiggity swooty".to_string())].into()) &&
-                outputs == [("something".to_string(), BuildOutput::Library{ glob: "/usr/lib/something.*.so".to_string()})].into(),
+                outputs == [("something".to_string(), BuildOutput::Library{ glob: "/usr/lib/something.*.so".to_string(), allow_data: false})].into(),
         ));
     }
 
@@ -1512,7 +1525,7 @@ mod tests {
                 "
                 let {OutputLib, OutputData, OutputBin, ..} = import \"minimal.ncl\" in
                 [
-                    { glob = \"/usr/lib/something.*.so\" } | OutputLib,
+                    { glob = \"/usr/lib/something.*.so\", allow_data = true } | OutputLib,
                     { glob = \"/bin/uwu\" } | OutputBin,
                     { glob = \"/data/locale/*\"  } | OutputData,
                 ]
@@ -1545,7 +1558,8 @@ mod tests {
         assert_eq!(
             o_lib,
             BuildOutput::Library {
-                glob: "/usr/lib/something.*.so".to_string()
+                glob: "/usr/lib/something.*.so".to_string(),
+                allow_data: true,
             },
         );
         // We expect that buildspec to have one Binary output

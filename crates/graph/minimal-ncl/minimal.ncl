@@ -56,6 +56,7 @@ let CmdSpec = std.contract.any_of [
         ty | Tys = 'OutputLib,
         glob
           | String,
+        allow_data | Bool | optional,
     },
     OutputBin | doc "An output of a build spec which represents a binary." = {
         ty | Tys = 'OutputBin,
