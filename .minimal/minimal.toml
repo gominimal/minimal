@@ -1,7 +1,7 @@
 [upstream] # Source of software & tooling
 repo = "https://github.com/gominimal/pkgs"
 branch = "main"
-locked_commit = "1878eda8ab1e2960f90e67064a6493a02e118318"
+locked_commit = "531353315cd3d1da92a118f4bbd5d61c41f159cc"
 
 [harness]
 use = "rust"
@@ -58,4 +58,4 @@ echo 'env:' && env && echo "pwd: $(pwd)"
 [stdlib]
 repo = "https://github.com/gominimal/std"
 branch = "main"
-locked_commit = "667484d385931129c29a22b1a607d38509de1269"
+locked_commit = "7721b2a7edb342569ba4cfba2710e55842556af1"
