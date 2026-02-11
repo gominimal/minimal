@@ -173,7 +173,10 @@ impl<'a> Runnable for RemoteSpecBuild<'a> {
                         .outputs
                         .values()
                         .map(|output| match output {
-                            graph::BuildOutput::Library { glob } => glob.clone(),
+                            graph::BuildOutput::Library {
+                                glob,
+                                allow_data: _,
+                            } => glob.clone(),
                             graph::BuildOutput::Data {
                                 glob,
                                 allow_executable: _,

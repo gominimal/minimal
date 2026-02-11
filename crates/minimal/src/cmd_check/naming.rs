@@ -167,9 +167,10 @@ impl super::GraphBasedChecker for OutputNaming {
                             ));
                     }
                 }
-                BuildOutput::Library { glob }
-                    if glob == "usr/lib/*" || glob == "usr/lib/**" || glob == "usr/lib/**/*" =>
-                {
+                BuildOutput::Library {
+                    glob,
+                    allow_data: _,
+                } if glob == "usr/lib/*" || glob == "usr/lib/**" || glob == "usr/lib/**/*" => {
                     if name != "libs" {
                         result.err.push(format!(
                                 "{}: library output '{}': catch-all library outputs should be named 'libs' by convention",

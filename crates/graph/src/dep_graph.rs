@@ -175,7 +175,7 @@ impl BuildSpecInput {
 #[allow(dead_code)]
 pub enum BuildOutput {
     /// This output describes shared libraries matched with the given glob.
-    Library { glob: String },
+    Library { glob: String, allow_data: bool },
     /// This output describes data files matched with the given glob.
     Data {
         glob: String,
@@ -193,7 +193,10 @@ impl BuildOutput {
                 glob,
                 allow_executable: _,
             } => glob,
-            BuildOutput::Library { glob } => glob,
+            BuildOutput::Library {
+                glob,
+                allow_data: _,
+            } => glob,
         }
     }
 
@@ -207,7 +210,7 @@ impl BuildOutput {
                 glob,
                 allow_executable,
             },
-            builds::BuildOutput::Library { glob } => Self::Library { glob },
+            builds::BuildOutput::Library { glob, allow_data } => Self::Library { glob, allow_data },
         }
     }
 }

@@ -72,6 +72,12 @@ impl super::GraphBasedChecker for OutputTypesValid {
                             path.strip_prefix(cached_build.path()).unwrap().display()
                         ));
                     }
+                    (
+                        Err(e),
+                        BuildOutput::Library {
+                            allow_data: true, ..
+                        },
+                    ) if format!("{}", e) == "Unknown file magic" => {}
                     (Err(e), BuildOutput::Binary { .. } | BuildOutput::Library { .. }) => {
                         if matches!(output, BuildOutput::Binary { .. }) && data.starts_with(b"#!") {
                             // Special case for binaries - its valid for it to be a #! executable.
