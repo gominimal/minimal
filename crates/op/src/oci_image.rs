@@ -5,7 +5,7 @@
 //! becomes a separate layer.
 
 use crate::{Error, Options, Runnable};
-use common::SpecHash;
+use common::{SpecHash, Tee};
 use flate2::{Compression, write::GzEncoder};
 use globset::{Glob, GlobSet};
 use graph::{BuildSpecRef, Transitives, TransitivesDep};
@@ -19,11 +19,33 @@ use sha2::digest::OutputSizeUser;
 #[allow(deprecated)]
 use sha2::digest::generic_array::GenericArray;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::io::Seek;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::io::{Seek, Write};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use tracing::info;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LayerMeta {
+    compressed_sha256: String,
+    uncompressed_sha256: String,
+    compressed_len: u64,
+}
+
+fn layer_cache_key(spec_hash: &SpecHash, output_names: &Option<&HashSet<String>>) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"oci-layer-v1\0");
+    hasher.update(spec_hash.as_bytes());
+    if let Some(names) = output_names {
+        let mut sorted: Vec<&String> = names.iter().collect();
+        sorted.sort();
+        for name in sorted {
+            hasher.update(b"\0");
+            hasher.update(name.as_bytes());
+        }
+    }
+    hasher.finalize()
+}
 
 /// Creates an OCI image from a set of packages.
 pub struct OciImageCreate {
@@ -55,10 +77,13 @@ impl Runnable for OciImageCreate {
             all_deps.len()
         );
 
+        let layers_dir = opts.cache.root_path().join("layers");
+        std::fs::create_dir_all(&layers_dir)?;
+
         let mut layers = Vec::new();
 
         // Create base layer with /lib64 symlink
-        layers.push(create_base_layer().await?);
+        layers.push(create_base_layer(&layers_dir).await?);
 
         // Build all layers in parallel
         let tokio_runtime = tokio::runtime::Handle::current();
@@ -69,6 +94,7 @@ impl Runnable for OciImageCreate {
                 let tokio_runtime = tokio_runtime.clone();
                 let results = results.clone();
                 let cache = opts.cache.clone();
+                let layers_dir = layers_dir.clone();
 
                 let dep_spec = opts.graph.get(bsr).unwrap();
                 let dep_hash = opts.graph.spec_hash(bsr);
@@ -78,6 +104,7 @@ impl Runnable for OciImageCreate {
                     }))
                     .unwrap()
                 });
+                let output_names = dep.outputs.clone();
 
                 info!(
                     "Creating layer for: {}",
@@ -95,6 +122,8 @@ impl Runnable for OciImageCreate {
                         &dep_hash,
                         &dep_spec.name,
                         &match_globs,
+                        output_names.as_ref(),
+                        &layers_dir,
                     ));
                     results.lock().unwrap().push(result);
                 });
@@ -278,50 +307,163 @@ impl BuiltLayer {
     }
 }
 
-async fn create_base_layer() -> anyhow::Result<BuiltLayer> {
-    let enc = GzEncoder::new(tempfile::tempfile()?, Compression::best());
-    let mut tar = tar::Builder::new(enc);
+/// Builds a layer by tar-ing + gzip-compressing, using a Tee to hash the uncompressed
+/// tar stream inline (avoiding a separate decompression pass).
+/// Returns (compressed_file, compressed_sha256, uncompressed_sha256, compressed_len).
+#[allow(deprecated)]
+fn build_layer_tee<F>(
+    write_tar: F,
+) -> anyhow::Result<(
+    std::fs::File,
+    GenericArray<u8, <Sha256 as OutputSizeUser>::OutputSize>,
+    GenericArray<u8, <Sha256 as OutputSizeUser>::OutputSize>,
+    u64,
+)>
+where
+    F: FnOnce(&mut tar::Builder<Tee<GzEncoder<std::fs::File>, Sha256>>) -> anyhow::Result<()>,
+{
+    let compressed_file = tempfile::tempfile()?;
+    let enc = GzEncoder::new(compressed_file, Compression::fast());
+    let uncompressed_hasher = Sha256::new();
+    let tee = Tee::new(enc, uncompressed_hasher);
 
-    let mut header = tar::Header::new_gnu();
-    header.set_path("lib64")?;
-    header.set_link_name("usr/lib")?;
-    header.set_entry_type(tar::EntryType::Symlink);
-    header.set_size(0);
-    header.set_cksum();
-    tar.append(&header, std::io::empty())?;
-
+    let mut tar = tar::Builder::new(tee);
+    write_tar(&mut tar)?;
     tar.finish()?;
-    let mut tar_file = tar.into_inner()?.finish()?;
 
-    // Calculate digests
-    let (sha256, compressed_len) = {
-        let mut hasher = sha2::Sha256::new();
-        tar_file.seek(std::io::SeekFrom::Start(0))?;
-        let len = std::io::copy(&mut tar_file, &mut hasher)?;
+    let tee = tar.into_inner()?;
+    let (enc, uncompressed_hasher) = tee.into_inner();
+    let uncompressed_sha256 = uncompressed_hasher.finalize();
+
+    let mut compressed_file = enc.finish()?;
+
+    // Hash the compressed data
+    let (compressed_sha256, compressed_len) = {
+        let mut hasher = Sha256::new();
+        compressed_file.seek(std::io::SeekFrom::Start(0))?;
+        let len = std::io::copy(&mut compressed_file, &mut hasher)?;
         (hasher.finalize(), len)
     };
 
-    let uncompressed_sha256 = {
-        tar_file.seek(std::io::SeekFrom::Start(0))?;
-        let dec = flate2::read::GzDecoder::new(&tar_file);
-        let mut hasher = sha2::Sha256::new();
-        let mut reader = std::io::BufReader::new(dec);
-        std::io::copy(&mut reader, &mut hasher)?;
-        hasher.finalize()
+    compressed_file.seek(std::io::SeekFrom::Start(0))?;
+    Ok((
+        compressed_file,
+        compressed_sha256,
+        uncompressed_sha256,
+        compressed_len,
+    ))
+}
+
+fn load_cached_layer(layers_dir: &Path, key_hex: &str) -> anyhow::Result<Option<BuiltLayer>> {
+    let meta_path = layers_dir.join(format!("{}.meta.json", key_hex));
+    let targz_path = layers_dir.join(format!("{}.tar.gz", key_hex));
+
+    let meta_bytes = match std::fs::read(&meta_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
     };
+    let meta: LayerMeta = serde_json::from_slice(&meta_bytes)?;
+
+    let targz = match std::fs::File::open(&targz_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+
+    let compressed_sha256 = hex_to_sha256_array(&meta.compressed_sha256)?;
+    let uncompressed_sha256 = hex_to_sha256_array(&meta.uncompressed_sha256)?;
+
+    let descriptor = DescriptorBuilder::default()
+        .media_type(MediaType::ImageLayerGzip)
+        .size(meta.compressed_len)
+        .digest(Sha256Digest::from_str(&meta.compressed_sha256)?)
+        .build()?;
+
+    Ok(Some(BuiltLayer {
+        descriptor,
+        uncompressed_sha256,
+        compressed_sha256,
+        targz,
+    }))
+}
+
+#[allow(deprecated)]
+fn hex_to_sha256_array(
+    hex: &str,
+) -> anyhow::Result<GenericArray<u8, <Sha256 as OutputSizeUser>::OutputSize>> {
+    let bytes = hex::decode(hex)?;
+    if bytes.len() != 32 {
+        anyhow::bail!("expected 32 bytes for sha256 hex, got {}", bytes.len());
+    }
+    Ok(GenericArray::clone_from_slice(&bytes))
+}
+
+fn save_layer_cache(
+    layers_dir: &Path,
+    key_hex: &str,
+    compressed_file: &mut std::fs::File,
+    meta: &LayerMeta,
+) -> anyhow::Result<()> {
+    // Write tar.gz to cache via temp file for atomicity
+    let targz_path = layers_dir.join(format!("{}.tar.gz", key_hex));
+    let tmp_targz = tempfile::NamedTempFile::new_in(layers_dir)?;
+    compressed_file.seek(std::io::SeekFrom::Start(0))?;
+    let mut tmp_writer = std::io::BufWriter::new(&tmp_targz);
+    std::io::copy(compressed_file, &mut tmp_writer)?;
+    tmp_writer.flush()?;
+    drop(tmp_writer);
+    tmp_targz.persist(&targz_path)?;
+
+    // Write metadata
+    let meta_path = layers_dir.join(format!("{}.meta.json", key_hex));
+    let tmp_meta = tempfile::NamedTempFile::new_in(layers_dir)?;
+    serde_json::to_writer(&tmp_meta, meta)?;
+    tmp_meta.persist(&meta_path)?;
+
+    compressed_file.seek(std::io::SeekFrom::Start(0))?;
+    Ok(())
+}
+
+async fn create_base_layer(layers_dir: &Path) -> anyhow::Result<BuiltLayer> {
+    let key = blake3::hash(b"oci-base-layer-v1");
+    let key_hex = key.to_hex();
+
+    if let Some(layer) = load_cached_layer(layers_dir, &key_hex)? {
+        info!("Using cached base layer");
+        return Ok(layer);
+    }
+
+    let (mut compressed_file, compressed_sha256, uncompressed_sha256, compressed_len) =
+        build_layer_tee(|tar| {
+            let mut header = tar::Header::new_gnu();
+            header.set_path("lib64")?;
+            header.set_link_name("usr/lib")?;
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            header.set_cksum();
+            tar.append(&header, std::io::empty())?;
+            Ok(())
+        })?;
+
+    let meta = LayerMeta {
+        compressed_sha256: format!("{:x}", compressed_sha256),
+        uncompressed_sha256: format!("{:x}", uncompressed_sha256),
+        compressed_len,
+    };
+    save_layer_cache(layers_dir, &key_hex, &mut compressed_file, &meta)?;
 
     let descriptor = DescriptorBuilder::default()
         .media_type(MediaType::ImageLayerGzip)
         .size(compressed_len)
-        .digest(Sha256Digest::from_str(&format!("{:x}", sha256))?)
+        .digest(Sha256Digest::from_str(&format!("{:x}", compressed_sha256))?)
         .build()?;
 
-    tar_file.seek(std::io::SeekFrom::Start(0))?;
     Ok(BuiltLayer {
         descriptor,
         uncompressed_sha256,
-        compressed_sha256: sha256,
-        targz: tar_file,
+        compressed_sha256,
+        targz: compressed_file,
     })
 }
 
@@ -330,41 +472,47 @@ async fn create_layer_from_cache(
     spec_hash: &SpecHash,
     package_name: &str,
     match_globs: &Option<globset::GlobSet>,
+    output_names: Option<&HashSet<String>>,
+    layers_dir: &Path,
 ) -> anyhow::Result<BuiltLayer> {
+    let key = layer_cache_key(spec_hash, &output_names);
+    let key_hex = key.to_hex();
+
+    if let Some(layer) = load_cached_layer(layers_dir, &key_hex)? {
+        info!(
+            "Using cached layer for {}",
+            if match_globs.is_some() {
+                format!("{} (subset)", package_name)
+            } else {
+                package_name.to_string()
+            }
+        );
+        return Ok(layer);
+    }
+
     let cache_entry = cache
         .read_dir(spec_hash)
         .map_err(|_| anyhow::anyhow!("Package {} not found in cache", package_name))?;
 
-    let cache_dir = cache_entry.path();
+    let cache_dir = cache_entry.path().to_path_buf();
 
-    // Create tar.gz backed by temporary file
-    let enc = GzEncoder::new(tempfile::tempfile()?, Compression::best());
-    let mut tar = tar::Builder::new(enc);
-    common::archive::add_dir_to_tar(&mut tar, cache_dir, ".", match_globs)?;
-    tar.finish()?;
-    let mut tar_file = tar.into_inner()?.finish()?;
+    let (mut compressed_file, compressed_sha256, uncompressed_sha256, compressed_len) =
+        build_layer_tee(|tar| {
+            common::archive::add_dir_to_tar(tar, &cache_dir, ".", match_globs)?;
+            Ok(())
+        })?;
 
-    // Calculate digests
-    let (sha256, compressed_len) = {
-        let mut hasher = sha2::Sha256::new();
-        tar_file.seek(std::io::SeekFrom::Start(0))?;
-        let len = std::io::copy(&mut tar_file, &mut hasher)?;
-        (hasher.finalize(), len)
+    let meta = LayerMeta {
+        compressed_sha256: format!("{:x}", compressed_sha256),
+        uncompressed_sha256: format!("{:x}", uncompressed_sha256),
+        compressed_len,
     };
-
-    let uncompressed_sha256 = {
-        tar_file.seek(std::io::SeekFrom::Start(0))?;
-        let dec = flate2::read::GzDecoder::new(&tar_file);
-        let mut hasher = sha2::Sha256::new();
-        let mut reader = std::io::BufReader::new(dec);
-        std::io::copy(&mut reader, &mut hasher)?;
-        hasher.finalize()
-    };
+    save_layer_cache(layers_dir, &key_hex, &mut compressed_file, &meta)?;
 
     let descriptor = DescriptorBuilder::default()
         .media_type(MediaType::ImageLayerGzip)
         .size(compressed_len)
-        .digest(Sha256Digest::from_str(&format!("{:x}", sha256))?)
+        .digest(Sha256Digest::from_str(&format!("{:x}", compressed_sha256))?)
         .build()?;
 
     info!(
@@ -377,11 +525,10 @@ async fn create_layer_from_cache(
         size::Size::from_bytes(compressed_len)
     );
 
-    tar_file.seek(std::io::SeekFrom::Start(0))?;
     Ok(BuiltLayer {
         descriptor,
         uncompressed_sha256,
-        compressed_sha256: sha256,
-        targz: tar_file,
+        compressed_sha256,
+        targz: compressed_file,
     })
 }

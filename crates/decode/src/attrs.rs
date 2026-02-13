@@ -7,7 +7,7 @@ use nickel_lang_core::{
 use crate::{Error, eval_if_closure};
 
 /// The value of an attribute.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum AttrValue {
     String(String),
     Bool(bool),

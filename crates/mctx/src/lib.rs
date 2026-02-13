@@ -12,7 +12,7 @@ mod error;
 pub use error::Error;
 mod config;
 pub use config::{Config, ConfigBuilder, ConfigError};
-use graph::{BuildSpecRef, DepGraph, Transitives};
+use graph::{BuildSpecRef, DepGraph, ExecPlan, Transitives};
 use mfile::{EnvPatches, Task};
 use op::RunnableEnv;
 
@@ -355,8 +355,28 @@ impl Context {
 
     /// Builds & returns a graph of all packages.
     pub fn graph_from_all_packages(&mut self) -> Result<DepGraph, Error> {
-        let leaf_layer = self.repo_origin()?;
+        let repo_dir = self.repo_dir()?;
 
+        // Fingerprint all .ncl dirs that feed into the graph
+        let dirs = [repo_dir.as_path(), self.stdlib_dir.as_path()];
+        if let Ok(fingerprint) = DepGraph::fingerprint(&dirs) {
+            let cache_dir = self.config.graph_cache_dir();
+            if let Some(graph) = DepGraph::load_cached(&cache_dir, &fingerprint) {
+                return Ok(graph);
+            }
+
+            // Cache miss — full Nickel load
+            let leaf_layer = self.repo_origin()?;
+            let graph = DepGraph::new_from_chain(&mut self.vcs, leaf_layer, self.stdlib_dir.clone())
+                .map_err(|e| -> Error { e.into() })?;
+
+            // Save for next time (ignore errors — caching is best-effort)
+            let _ = graph.save_cached(&cache_dir, &fingerprint);
+            return Ok(graph);
+        }
+
+        // Fingerprinting failed — fall back to uncached path
+        let leaf_layer = self.repo_origin()?;
         DepGraph::new_from_chain(&mut self.vcs, leaf_layer, self.stdlib_dir.clone())
             .map_err(|e| e.into())
     }
@@ -367,6 +387,16 @@ impl Context {
     /// Ensures the top-level packages of the given graph are built and available locally.
     pub async fn build_graph(&mut self, graph: &DepGraph) -> Result<(), Error> {
         let cache = self.local_cache();
+
+        // Fast path: skip remote client init (~200ms TLS) when everything is locally cached.
+        if self.config.use_local_cache() {
+            let local_bp = CacheBinProvider::new(graph, cache.clone());
+            let plan = ExecPlan::with_toplevels(local_bp, graph, &graph.top_levels);
+            if plan.finished() {
+                return Ok(());
+            }
+        }
+
         let rc = if self.config.use_remote_cache() {
             Some(self.remote_cache(false, false).await.unwrap())
         } else {

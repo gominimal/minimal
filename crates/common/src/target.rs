@@ -2,7 +2,7 @@ use blake3::Hasher;
 use std::io::Write;
 
 /// A supported CPU architecture.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Arch {
     #[default]
     Amd64,
@@ -10,7 +10,7 @@ pub enum Arch {
 }
 
 /// A supported OS.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OS {
     #[default]
     Linux,
@@ -18,7 +18,7 @@ pub enum OS {
 }
 
 /// The description of a system where software runs.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Target {
     arch: Arch,
     os: OS,

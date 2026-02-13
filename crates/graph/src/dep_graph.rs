@@ -26,7 +26,10 @@ type OutputMap = IndexMap<String, BuildOutput>;
 pub use decode::AttrValue;
 
 /// A reference to some other [BuildSpec] in a [DepGraph].
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, Hash, Eq, PartialEq, PartialOrd, Ord, serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct BuildSpecRef(pub(crate) generational_arena::Index);
 
 impl BuildSpecRef {
@@ -36,7 +39,7 @@ impl BuildSpecRef {
     }
 }
 /// A description of pulling source code regardless of form.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SourceFetch {
     Web {
         url: String,
@@ -67,7 +70,7 @@ impl From<builds::SourceFetch> for SourceFetch {
 }
 
 /// A description of source code thats used as an input.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SourceInput {
     pub from: SourceFetch,
     pub extract: bool,
@@ -85,7 +88,7 @@ impl From<builds::SourceInput> for SourceInput {
 }
 
 /// A dependency on some of the outputs of a build-spec.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SubsetInput {
     pub from: BuildSpecRef,
     pub outputs: SmallVec<[String; 4]>,
@@ -125,7 +128,7 @@ impl From<(BuildSpecRef, HashSet<String>)> for SubsetInput {
 /// An input to a build spec.
 ///
 /// Each entry in a build-spec's `inputs` array corresponds to one [BuildSpecInput].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub enum BuildSpecInput {
     Build(BuildSpecRef),
@@ -171,7 +174,7 @@ impl BuildSpecInput {
 }
 
 /// An output from a build.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub enum BuildOutput {
     /// This output describes shared libraries matched with the given glob.
@@ -218,7 +221,7 @@ impl BuildOutput {
 /// A runtime dependency declared on a build-spec.
 ///
 /// Each entry in a build-spec's `runtime_deps` array corresponds to one [RuntimeDep].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RuntimeDep {
     /// A direct runtime dependency on the build-spec described by the contained reference.
     Build(BuildSpecRef),
@@ -244,7 +247,7 @@ impl RuntimeDep {
 }
 
 /// A unit test defined on a build spec.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SpecTest {
     /// The test needs to run in the build sandbox, rather than standalone.
     pub build_test: bool,
@@ -272,7 +275,7 @@ impl SpecTest {
 }
 
 /// Some task or build in the dependency graph.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct BuildSpec {
     /// The human-readable name declared on the build spec.
@@ -466,7 +469,7 @@ impl SourceProvider for checkouts::Manager {
 }
 
 /// The dependency graph.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct DepGraph {
     /// All the build-specs known to this dependency graph.
@@ -486,6 +489,7 @@ pub struct DepGraph {
     /// The cache of build specs to their [SpecHash]. There is also a
     /// reverse cache of [SpecHash]'s to the build spec they correspond to.
     #[allow(clippy::type_complexity)]
+    #[serde(skip)]
     hash_cache: Arc<
         RwLock<(
             HashMap<BuildSpecRef, SpecHash>,
@@ -883,6 +887,59 @@ impl DepGraph {
     /// Returns the named harness, if it exists.
     pub fn harness(&self, name: &str) -> Option<&Harness> {
         self.harnesses.get(name)
+    }
+
+    /// Compute a fingerprint of all .ncl files under the given directories
+    /// by hashing their paths and mtimes.
+    pub fn fingerprint(dirs: &[&std::path::Path]) -> anyhow::Result<blake3::Hash> {
+        let mut hasher = blake3::Hasher::new();
+        for dir in dirs {
+            for entry in walkdir::WalkDir::new(dir)
+                .sort_by_file_name()
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "ncl"))
+            {
+                let meta = entry.metadata()?;
+                let mtime = meta.modified()?;
+                hasher.update(entry.path().to_string_lossy().as_bytes());
+                hasher.update(
+                    &mtime
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                        .to_le_bytes(),
+                );
+            }
+        }
+        Ok(hasher.finalize())
+    }
+
+    /// Try to load a cached DepGraph if the fingerprint matches.
+    pub fn load_cached(cache_path: &std::path::Path, fingerprint: &blake3::Hash) -> Option<DepGraph> {
+        let fp_path = cache_path.join("graph.fingerprint");
+        let data_path = cache_path.join("graph.bin");
+        let stored_fp = std::fs::read(&fp_path).ok()?;
+        if stored_fp != fingerprint.as_bytes() {
+            return None;
+        }
+        let data = std::fs::read(&data_path).ok()?;
+        bincode::serde::decode_from_slice(&data, bincode::config::standard())
+            .ok()
+            .map(|(graph, _)| graph)
+    }
+
+    /// Save DepGraph to cache with fingerprint.
+    pub fn save_cached(
+        &self,
+        cache_path: &std::path::Path,
+        fingerprint: &blake3::Hash,
+    ) -> anyhow::Result<()> {
+        std::fs::create_dir_all(cache_path)?;
+        let data = bincode::serde::encode_to_vec(self, bincode::config::standard())?;
+        std::fs::write(cache_path.join("graph.bin"), &data)?;
+        std::fs::write(cache_path.join("graph.fingerprint"), fingerprint.as_bytes())?;
+        Ok(())
     }
 }
 

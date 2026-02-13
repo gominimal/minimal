@@ -11,12 +11,16 @@ indoc.workspace = true
 tempfile.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 nickel-lang-core.workspace = true
 codespan-reporting.workspace = true
 blake3.workspace = true
+bincode.workspace = true
 generational-arena.workspace = true
+serde.workspace = true
 smallvec.workspace = true
 tracing.workspace = true
+walkdir.workspace = true
 
 common.workspace = true
 checkouts.workspace = true

@@ -11,7 +11,7 @@ use serde::Deserialize;
 use crate::{Error, ObjTy, eval_if_closure};
 
 /// A harness, a specific set of norms for building a codebase.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct Harness {
     /// The human-readable name declared on the harness. Unique within a repo/layer.

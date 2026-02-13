@@ -9,7 +9,7 @@ use serde::Deserialize;
 use crate::{Error, ObjTy, eval_if_closure};
 
 /// A profile, the initial configuration for an environment.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct Profile {
     /// The human-readable name declared on the profile. Unique within a repo/layer.

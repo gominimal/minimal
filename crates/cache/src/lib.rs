@@ -282,6 +282,11 @@ impl Cache<LocalDir> {
         })
     }
 
+    /// Returns the root path of the cache directory.
+    pub fn root_path(&self) -> PathBuf {
+        self.inner().fs.path().to_path_buf()
+    }
+
     /// Allocates a temporary directory in the same filesystem as the rest of the cache.
     pub fn temp_dir(&self) -> Result<tempfile::TempDir, std::io::Error> {
         let inner = self.inner();

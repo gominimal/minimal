@@ -12,9 +12,11 @@ smallvec.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
 either.workspace = true
 flate2.workspace = true
 futures.workspace = true
+hex.workspace = true
 generational-arena.workspace = true
 google-cloud-storage.workspace = true
 globset.workspace = true
@@ -22,6 +24,7 @@ walkdir.workspace = true
 hakoniwa.workspace = true
 oci-spec.workspace = true
 rayon.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 shlex.workspace = true
