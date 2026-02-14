@@ -293,11 +293,13 @@ impl Runnable for OciImageCreate {
     }
 }
 
+type Sha256Hash = GenericArray<u8, <Sha256 as OutputSizeUser>::OutputSize>;
+
 #[allow(deprecated)]
 struct BuiltLayer {
     descriptor: Descriptor,
-    uncompressed_sha256: GenericArray<u8, <Sha256 as OutputSizeUser>::OutputSize>,
-    compressed_sha256: GenericArray<u8, <Sha256 as OutputSizeUser>::OutputSize>,
+    uncompressed_sha256: Sha256Hash,
+    compressed_sha256: Sha256Hash,
     targz: std::fs::File,
 }
 
@@ -311,14 +313,7 @@ impl BuiltLayer {
 /// tar stream inline (avoiding a separate decompression pass).
 /// Returns (compressed_file, compressed_sha256, uncompressed_sha256, compressed_len).
 #[allow(deprecated)]
-fn build_layer_tee<F>(
-    write_tar: F,
-) -> anyhow::Result<(
-    std::fs::File,
-    GenericArray<u8, <Sha256 as OutputSizeUser>::OutputSize>,
-    GenericArray<u8, <Sha256 as OutputSizeUser>::OutputSize>,
-    u64,
-)>
+fn build_layer_tee<F>(write_tar: F) -> anyhow::Result<(std::fs::File, Sha256Hash, Sha256Hash, u64)>
 where
     F: FnOnce(&mut tar::Builder<Tee<GzEncoder<std::fs::File>, Sha256>>) -> anyhow::Result<()>,
 {
@@ -389,9 +384,7 @@ fn load_cached_layer(layers_dir: &Path, key_hex: &str) -> anyhow::Result<Option<
 }
 
 #[allow(deprecated)]
-fn hex_to_sha256_array(
-    hex: &str,
-) -> anyhow::Result<GenericArray<u8, <Sha256 as OutputSizeUser>::OutputSize>> {
+fn hex_to_sha256_array(hex: &str) -> anyhow::Result<Sha256Hash> {
     let bytes = hex::decode(hex)?;
     if bytes.len() != 32 {
         anyhow::bail!("expected 32 bytes for sha256 hex, got {}", bytes.len());
