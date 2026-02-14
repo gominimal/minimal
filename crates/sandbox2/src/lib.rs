@@ -155,8 +155,7 @@ impl Sandbox {
     }
     fn needs_lib_symlink(&self) -> Result<bool, Error> {
         let lib_p = self.base_dir.join("rootfs").join("lib");
-        Ok(!fs::exists(&lib_p)
-            .map_err(|e| Error::IO("checking for lib directory", lib_p, e))?)
+        Ok(!fs::exists(&lib_p).map_err(|e| Error::IO("checking for lib directory", lib_p, e))?)
     }
     fn needs_bin_symlink(&self) -> Result<bool, Error> {
         let bin_p = self.base_dir.join("rootfs").join("bin");
