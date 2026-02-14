@@ -317,10 +317,20 @@ impl Sandbox {
             }
 
             if !output.status.success() {
+                let stderr_tail = {
+                    let s = &output.stderr;
+                    let tail = if s.len() > 4096 {
+                        &s[s.len() - 4096..]
+                    } else {
+                        s
+                    };
+                    String::from_utf8_lossy(tail).into_owned()
+                };
                 return Err(Error::Execution(ExecutionError::InvocationFailed {
                     idx: i,
                     code: output.status.code,
                     reason: output.status.reason.clone(),
+                    stderr: stderr_tail,
                 }));
             }
         }
