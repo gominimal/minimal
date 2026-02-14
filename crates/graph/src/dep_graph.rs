@@ -27,8 +27,7 @@ pub use decode::AttrValue;
 
 /// A reference to some other [BuildSpec] in a [DepGraph].
 #[derive(
-    Debug, Clone, Copy, Hash, Eq, PartialEq, PartialOrd, Ord, serde::Serialize,
-    serde::Deserialize,
+    Debug, Clone, Copy, Hash, Eq, PartialEq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 pub struct BuildSpecRef(pub(crate) generational_arena::Index);
 
@@ -910,7 +909,10 @@ impl DepGraph {
     }
 
     /// Try to load a cached DepGraph if the fingerprint matches.
-    pub fn load_cached(cache_path: &std::path::Path, fingerprint: &blake3::Hash) -> Option<DepGraph> {
+    pub fn load_cached(
+        cache_path: &std::path::Path,
+        fingerprint: &blake3::Hash,
+    ) -> Option<DepGraph> {
         let fp_path = cache_path.join("graph.fingerprint");
         let data_path = cache_path.join("graph.bin");
         let stored_fp = std::fs::read(&fp_path).ok()?;

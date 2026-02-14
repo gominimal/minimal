@@ -18,7 +18,10 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
 
     let t0 = std::time::Instant::now();
     let graph = ctx.graph_from_all_packages()?;
-    debug!(phase = "graph_from_all_packages", elapsed_ms = t0.elapsed().as_millis() as u64);
+    debug!(
+        phase = "graph_from_all_packages",
+        elapsed_ms = t0.elapsed().as_millis() as u64
+    );
 
     let t0 = std::time::Instant::now();
     let (task, graph) = match ctx.task(graph, &args.task_name)? {
@@ -46,7 +49,10 @@ pub async fn run_task(task: &mfile::Task, graph: DepGraph, ctx: &mut Context) ->
             task.packages.clone(),
         )
         .await?;
-    debug!(phase = "make_env", elapsed_ms = t0.elapsed().as_millis() as u64);
+    debug!(
+        phase = "make_env",
+        elapsed_ms = t0.elapsed().as_millis() as u64
+    );
 
     if let Some((command, args)) = task.exec_and_args() {
         let mut cmd = runnable_env
