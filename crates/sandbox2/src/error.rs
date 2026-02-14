@@ -57,7 +57,11 @@ impl fmt::Display for ExecutionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvocationFailed { idx, code, reason } => {
-                write!(f, "Invocation {} failed with exit code {}: {}", idx, code, reason)
+                write!(
+                    f,
+                    "Invocation {} failed with exit code {}: {}",
+                    idx, code, reason
+                )
             }
             Self::SpawnFailed(e) => {
                 write!(f, "Invocation spawn failed: {}", e)
