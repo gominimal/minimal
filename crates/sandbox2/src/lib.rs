@@ -153,6 +153,11 @@ impl Sandbox {
         Ok(!fs::exists(&lib64_p)
             .map_err(|e| Error::IO("checking for lib64 directory", lib64_p, e))?)
     }
+    fn needs_lib_symlink(&self) -> Result<bool, Error> {
+        let lib_p = self.base_dir.join("rootfs").join("lib");
+        Ok(!fs::exists(&lib_p)
+            .map_err(|e| Error::IO("checking for lib directory", lib_p, e))?)
+    }
     fn needs_bin_symlink(&self) -> Result<bool, Error> {
         let bin_p = self.base_dir.join("rootfs").join("bin");
         Ok(!fs::exists(&bin_p).map_err(|e| Error::IO("checking for bin directory", bin_p, e))?)
@@ -230,6 +235,9 @@ impl Sandbox {
         }
         if self.needs_lib64_symlink()? {
             container.symlink("/usr/lib", "/lib64");
+        }
+        if self.needs_lib_symlink()? {
+            container.symlink("/usr/lib", "/lib");
         }
 
         if let WdSetup::Isolated = self.config.wd {
