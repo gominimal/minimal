@@ -320,6 +320,7 @@ impl Sandbox {
                 return Err(Error::Execution(ExecutionError::InvocationFailed {
                     idx: i,
                     code: output.status.code,
+                    reason: output.status.reason.clone(),
                 }));
             }
         }
