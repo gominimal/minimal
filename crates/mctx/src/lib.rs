@@ -362,13 +362,17 @@ impl Context {
         if let Ok(fingerprint) = DepGraph::fingerprint(&dirs) {
             let cache_dir = self.config.graph_cache_dir();
             if let Some(graph) = DepGraph::load_cached(&cache_dir, &fingerprint) {
+                tracing::debug!(phase = "graph_from_all_packages", cache = "hit");
                 return Ok(graph);
             }
 
             // Cache miss — full Nickel load
+            tracing::debug!(phase = "graph_from_all_packages", cache = "miss");
+            let t0 = std::time::Instant::now();
             let leaf_layer = self.repo_origin()?;
             let graph = DepGraph::new_from_chain(&mut self.vcs, leaf_layer, self.stdlib_dir.clone())
                 .map_err(|e| -> Error { e.into() })?;
+            tracing::debug!(phase = "graph_from_all_packages", nickel_eval_ms = t0.elapsed().as_millis() as u64);
 
             // Save for next time (ignore errors — caching is best-effort)
             let _ = graph.save_cached(&cache_dir, &fingerprint);
@@ -376,9 +380,13 @@ impl Context {
         }
 
         // Fingerprinting failed — fall back to uncached path
+        tracing::debug!(phase = "graph_from_all_packages", cache = "fingerprint_failed");
+        let t0 = std::time::Instant::now();
         let leaf_layer = self.repo_origin()?;
-        DepGraph::new_from_chain(&mut self.vcs, leaf_layer, self.stdlib_dir.clone())
-            .map_err(|e| e.into())
+        let graph = DepGraph::new_from_chain(&mut self.vcs, leaf_layer, self.stdlib_dir.clone())
+            .map_err(|e| -> Error { e.into() })?;
+        tracing::debug!(phase = "graph_from_all_packages", nickel_eval_ms = t0.elapsed().as_millis() as u64);
+        Ok(graph)
     }
 }
 
@@ -386,6 +394,7 @@ impl Context {
 impl Context {
     /// Ensures the top-level packages of the given graph are built and available locally.
     pub async fn build_graph(&mut self, graph: &DepGraph) -> Result<(), Error> {
+        let t0 = std::time::Instant::now();
         let cache = self.local_cache();
 
         // Fast path: skip remote client init (~200ms TLS) when everything is locally cached.
@@ -393,6 +402,7 @@ impl Context {
             let local_bp = CacheBinProvider::new(graph, cache.clone());
             let plan = ExecPlan::with_toplevels(local_bp, graph, &graph.top_levels);
             if plan.finished() {
+                tracing::debug!(phase = "build_graph", fast_path = true, elapsed_ms = t0.elapsed().as_millis() as u64);
                 return Ok(());
             }
         }
@@ -448,6 +458,7 @@ impl Context {
                 .map_err(|e| Error::Other(e.into()))?;
         }
 
+        tracing::debug!(phase = "build_graph", fast_path = false, elapsed_ms = t0.elapsed().as_millis() as u64);
         Ok(())
     }
 
@@ -523,8 +534,11 @@ impl Context {
         };
         graph.top_levels = packages.as_bsrs(&graph)?;
 
+        let t0 = std::time::Instant::now();
         self.build_graph(&graph).await?;
+        tracing::debug!(phase = "make_env/build_graph", elapsed_ms = t0.elapsed().as_millis() as u64);
 
+        let t0 = std::time::Instant::now();
         let transitive_deps = Transitives::for_toplevels(&graph, graph.top_levels.clone(), false);
         let base = tempfile::tempdir_in(self.config.task_base_dir()).map_err(|e| {
             Error::Other(anyhow::Error::from(e).context("creating base sandbox directory"))
@@ -547,6 +561,7 @@ impl Context {
         };
         use op::Runnable;
         let mut runnable_env = op.run(&opts).await.map_err(|e| Error::Other(e.into()))?;
+        tracing::debug!(phase = "make_env/env_setup", elapsed_ms = t0.elapsed().as_millis() as u64);
         runnable_env.associate_tempdirs(temp_dirs);
         runnable_env.associate_tempdirs([base]);
 

@@ -890,7 +890,7 @@ impl DepGraph {
     }
 
     /// Compute a fingerprint of all .ncl files under the given directories
-    /// by hashing their paths and mtimes.
+    /// by hashing their paths and contents.
     pub fn fingerprint(dirs: &[&std::path::Path]) -> anyhow::Result<blake3::Hash> {
         let mut hasher = blake3::Hasher::new();
         for dir in dirs {
@@ -900,16 +900,8 @@ impl DepGraph {
                 .filter_map(|e| e.ok())
                 .filter(|e| e.path().extension().is_some_and(|ext| ext == "ncl"))
             {
-                let meta = entry.metadata()?;
-                let mtime = meta.modified()?;
                 hasher.update(entry.path().to_string_lossy().as_bytes());
-                hasher.update(
-                    &mtime
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos()
-                        .to_le_bytes(),
-                );
+                hasher.update_reader(std::fs::File::open(entry.path())?)?;
             }
         }
         Ok(hasher.finalize())

@@ -6,7 +6,7 @@ use hakoniwa::Output;
 use mctx::{Context, Error};
 use mfile::TaskAction;
 use shlex::Shlex;
-use tracing::trace;
+use tracing::{debug, trace};
 
 #[derive(Debug, clap::Args)]
 pub struct RunArgs {
@@ -15,16 +15,23 @@ pub struct RunArgs {
 
 pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
     trace!("cmd_run");
+
+    let t0 = std::time::Instant::now();
     let graph = ctx.graph_from_all_packages()?;
+    debug!(phase = "graph_from_all_packages", elapsed_ms = t0.elapsed().as_millis() as u64);
+
+    let t0 = std::time::Instant::now();
     let (task, graph) = match ctx.task(graph, &args.task_name)? {
         None => return Err(Error::Other(anyhow!("no such task: {}", args.task_name))),
         Some((t, g)) => (t, g),
     };
+    debug!(phase = "task", elapsed_ms = t0.elapsed().as_millis() as u64);
 
     run_task(&task, graph, ctx).await
 }
 
 pub async fn run_task(task: &mfile::Task, graph: DepGraph, ctx: &mut Context) -> Result<(), Error> {
+    let t0 = std::time::Instant::now();
     let runnable_env = ctx
         .make_env(
             graph,
@@ -39,6 +46,7 @@ pub async fn run_task(task: &mfile::Task, graph: DepGraph, ctx: &mut Context) ->
             task.packages.clone(),
         )
         .await?;
+    debug!(phase = "make_env", elapsed_ms = t0.elapsed().as_millis() as u64);
 
     if let Some((command, args)) = task.exec_and_args() {
         let mut cmd = runnable_env

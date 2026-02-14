@@ -19,6 +19,7 @@ tempfile.workspace = true
 shlex.workspace = true
 
 tokio.workspace = true
+tracing.workspace = true
 
 cache.workspace = true
 common.workspace = true
