@@ -182,6 +182,8 @@ impl Context {
             .map_err(|e| Error::setup_dirs(e, config.task_base_dir()))?;
         create_dir_all(config.vcs_dir()).map_err(|e| Error::setup_dirs(e, config.vcs_dir()))?;
         create_dir_all(config.index_dir()).map_err(|e| Error::setup_dirs(e, config.index_dir()))?;
+        create_dir_all(config.env_cache_dir())
+            .map_err(|e| Error::setup_dirs(e, config.env_cache_dir()))?;
 
         // Initialize subsystems that are always present/used
         let mut vcs = VcsManager::new(config.vcs_dir())?;
@@ -540,9 +542,34 @@ impl Context {
 
         let t0 = std::time::Instant::now();
         let transitive_deps = Transitives::for_toplevels(&graph, graph.top_levels.clone(), false);
-        let base = tempfile::tempdir_in(self.config.task_base_dir()).map_err(|e| {
-            Error::Other(anyhow::Error::from(e).context("creating base sandbox directory"))
+
+        // Compute env cache key from sorted dep hashes → persistent exec_base dir.
+        let env_cache_key = {
+            let mut hashes: Vec<_> = transitive_deps
+                .keys()
+                .map(|dep| graph.spec_hash(dep))
+                .collect();
+            hashes.sort();
+            let mut hasher = blake3::Hasher::new();
+            for h in &hashes {
+                hasher.update(h.as_bytes());
+            }
+            hasher.finalize()
+        };
+        let env_hex = env_cache_key.to_hex();
+        let exec_base = self
+            .config
+            .env_cache_dir()
+            .join(&env_hex.as_str()[..2])
+            .join(env_hex.as_str());
+        let env_cache_hit = exec_base.join(".env-ready").exists();
+        std::fs::create_dir_all(&exec_base).map_err(|e| {
+            Error::Other(anyhow::Error::from(e).context("creating env cache directory"))
         })?;
+        tracing::debug!(
+            phase = "make_env/env_cache",
+            cache = if env_cache_hit { "hit" } else { "miss" },
+        );
 
         let mut op = op::EnvSetup {
             state_base_dir: &state_base_dir,
@@ -557,13 +584,12 @@ impl Context {
         let opts = op::Options {
             cache: self.local_cache(),
             graph: &graph,
-            exec_base: base.path().to_path_buf(),
+            exec_base: exec_base.clone(),
         };
         use op::Runnable;
         let mut runnable_env = op.run(&opts).await.map_err(|e| Error::Other(e.into()))?;
         tracing::debug!(phase = "make_env/env_setup", elapsed_ms = t0.elapsed().as_millis() as u64);
         runnable_env.associate_tempdirs(temp_dirs);
-        runnable_env.associate_tempdirs([base]);
 
         Ok(runnable_env)
     }

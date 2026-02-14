@@ -900,7 +900,9 @@ impl DepGraph {
                 .filter_map(|e| e.ok())
                 .filter(|e| e.path().extension().is_some_and(|ext| ext == "ncl"))
             {
-                hasher.update(entry.path().to_string_lossy().as_bytes());
+                // Use relative path so fingerprint is stable across VCS checkout dir names
+                let rel = entry.path().strip_prefix(dir).unwrap_or(entry.path());
+                hasher.update(rel.to_string_lossy().as_bytes());
                 hasher.update_reader(std::fs::File::open(entry.path())?)?;
             }
         }

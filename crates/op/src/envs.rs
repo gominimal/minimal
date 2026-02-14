@@ -108,17 +108,46 @@ impl<'a> Runnable for EnvSetup<'a> {
         }
 
         // Hardlink in the files which represent each dependency.
-        let (mut bin_dir_exists, mut lib64_dir_exists) = (false, false);
-        for dep in self.transitives.keys() {
-            let p = opts
-                .cache
-                .read_dir(&opts.graph.spec_hash(dep))
-                .map_err(|e| Error::Other(anyhow::anyhow!("loading dependency: {}", e)))?;
-            common::hardlink_dir_contents(p.path(), &opts.exec_base)
-                .map_err(anyhow::Error::from)?;
-            bin_dir_exists |= std::fs::exists(p.path().join("bin")).unwrap();
-            lib64_dir_exists |= std::fs::exists(p.path().join("lib64")).unwrap();
-        }
+        // Skip if a previous run already populated this exec_base (marker file present).
+        let env_ready_marker = opts.exec_base.join(".env-ready");
+        let (bin_dir_exists, lib64_dir_exists) = if env_ready_marker.exists() {
+            // Cache hit: deps already hardlinked. Check bin/lib64 from the cached tree.
+            (
+                std::fs::exists(opts.exec_base.join("bin")).unwrap_or(false),
+                std::fs::exists(opts.exec_base.join("lib64")).unwrap_or(false),
+            )
+        } else {
+            use rayon::prelude::*;
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let bin_flag = AtomicBool::new(false);
+            let lib64_flag = AtomicBool::new(false);
+
+            let dep_keys: Vec<_> = self.transitives.keys().collect();
+            dep_keys.par_iter().try_for_each(|dep| {
+                let p = opts
+                    .cache
+                    .read_dir(&opts.graph.spec_hash(dep))
+                    .map_err(|e| Error::Other(anyhow::anyhow!("loading dependency: {}", e)))?;
+                common::hardlink_dir_contents(p.path(), &opts.exec_base)
+                    .map_err(anyhow::Error::from)?;
+                if std::fs::exists(p.path().join("bin")).unwrap_or(false) {
+                    bin_flag.store(true, Ordering::Relaxed);
+                }
+                if std::fs::exists(p.path().join("lib64")).unwrap_or(false) {
+                    lib64_flag.store(true, Ordering::Relaxed);
+                }
+                Ok::<_, Error>(())
+            })?;
+
+            // Mark this exec_base as fully populated.
+            let _ = std::fs::write(&env_ready_marker, b"");
+
+            (
+                bin_flag.load(Ordering::Relaxed),
+                lib64_flag.load(Ordering::Relaxed),
+            )
+        };
 
         // Iterate all file/dir patches and make sure their bind mounts exist, also check
         // the bind target paths and make empty dirs/files as necessary.

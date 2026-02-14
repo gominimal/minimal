@@ -166,4 +166,7 @@ impl Config {
     pub(crate) fn graph_cache_dir(&self) -> PathBuf {
         self.minimal_dir.join("graph-cache")
     }
+    pub(crate) fn env_cache_dir(&self) -> PathBuf {
+        self.minimal_dir.join("env-cache")
+    }
 }

@@ -2134,6 +2134,7 @@ name = "mctx"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "blake3",
  "cache",
  "checkouts",
  "common",
