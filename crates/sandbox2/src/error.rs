@@ -49,6 +49,7 @@ pub enum ExecutionError {
         idx: usize,
         code: i32,
         reason: String,
+        stderr: String,
     },
     SpawnFailed(hakoniwa::Error),
 }
@@ -56,12 +57,21 @@ pub enum ExecutionError {
 impl fmt::Display for ExecutionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvocationFailed { idx, code, reason } => {
+            Self::InvocationFailed {
+                idx,
+                code,
+                reason,
+                stderr,
+            } => {
                 write!(
                     f,
                     "Invocation {} failed with exit code {}: {}",
                     idx, code, reason
-                )
+                )?;
+                if !stderr.is_empty() {
+                    write!(f, "\nstderr:\n{}", stderr)?;
+                }
+                Ok(())
             }
             Self::SpawnFailed(e) => {
                 write!(f, "Invocation spawn failed: {}", e)
