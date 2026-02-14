@@ -45,15 +45,19 @@ impl From<OutputError> for Error {
 
 #[derive(Debug)]
 pub enum ExecutionError {
-    InvocationFailed { idx: usize, code: i32 },
+    InvocationFailed {
+        idx: usize,
+        code: i32,
+        reason: String,
+    },
     SpawnFailed(hakoniwa::Error),
 }
 
 impl fmt::Display for ExecutionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvocationFailed { idx, code } => {
-                write!(f, "Invocation {} failed with exit code {}", idx, code)
+            Self::InvocationFailed { idx, code, reason } => {
+                write!(f, "Invocation {} failed with exit code {}: {}", idx, code, reason)
             }
             Self::SpawnFailed(e) => {
                 write!(f, "Invocation spawn failed: {}", e)
