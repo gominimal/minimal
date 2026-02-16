@@ -28,10 +28,18 @@ use cmd_patched_build::{PatchedBuildArgs, cmd_patched_build};
 mod cmd_run;
 #[cfg(target_os = "linux")]
 use cmd_run::{RunArgs, cmd_run};
+#[cfg(target_os = "linux")]
+mod cmd_shell;
+#[cfg(target_os = "linux")]
+use cmd_shell::{ShellArgs, cmd_shell};
 mod cmd_dep;
 use cmd_dep::{DepArgs, cmd_dep};
 mod cmd_update;
 use cmd_update::{UpdateArgs, cmd_update};
+mod cmd_search;
+use cmd_search::{InfoArgs, SearchArgs, cmd_info, cmd_search};
+mod cmd_init;
+use cmd_init::{AddArgs, InitArgs, RemoveArgs, cmd_add, cmd_init, cmd_remove};
 
 #[derive(Parser)]
 #[command(name = "minimal", version = env!("GIT_HASH"))]
@@ -55,6 +63,17 @@ enum Command {
     Build,
     /// Runs the test task. Shorthand for `minimal run test`.
     Test,
+
+    /// Initialize a new minimal.toml for this project
+    Init(InitArgs),
+    /// Add packages to a task in minimal.toml
+    Add(AddArgs),
+    /// Remove packages from tasks in minimal.toml
+    Remove(RemoveArgs),
+
+    /// Opens an interactive shell with packages available on PATH.
+    #[cfg(target_os = "linux")]
+    Shell(ShellArgs),
     /// Materializes an output specified in `minimal.toml`.
     Materialize(MaterializeArgs),
     /// Builds the specified package(s) in a clean room, making them available in the local cache.
@@ -77,6 +96,12 @@ enum Command {
         long_about = "Generate an image of the dependency graph using graphviz's \"dot\" program.\n\n  minimal dep --input_deps_depth=0 -p file | dot -Tpng > deps.png"
     )]
     Dep(DepArgs),
+
+    /// Search for packages by name
+    Search(SearchArgs),
+
+    /// Show detailed information about a package
+    Info(InfoArgs),
 
     /// Generate shell completion script
     #[command(
@@ -275,6 +300,14 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         global_args,
     } = cli;
 
+    // Commands that operate without a project context
+    let command = match command {
+        Command::Init(args) => return cmd_init(args),
+        Command::Add(args) => return cmd_add(args),
+        Command::Remove(args) => return cmd_remove(args),
+        other => other,
+    };
+
     let mut config = ConfigBuilder::new()
         .with_no_cache(global_args.no_cache)
         .with_no_fetch(global_args.no_fetch);
@@ -320,8 +353,13 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
             )
             .await
         }
+        #[cfg(target_os = "linux")]
+        Command::Shell(args) => cmd_shell(args, &mut ctx).await,
         Command::Update(args) => cmd_update(args, &mut ctx).await,
         Command::Dep(args) => cmd_dep(args, &mut ctx).await,
+        Command::Search(args) => cmd_search(args, &mut ctx).await,
+        Command::Info(args) => cmd_info(args, &mut ctx).await,
         Command::Completions(_) => Ok(()),
+        Command::Init(_) | Command::Add(_) | Command::Remove(_) => unreachable!(),
     }
 }

@@ -2210,6 +2210,7 @@ dependencies = [
  "reqwest",
  "res-proto",
  "serde",
+ "serde_json",
  "sha2",
  "shlex",
  "smallvec",
