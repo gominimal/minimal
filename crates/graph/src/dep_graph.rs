@@ -524,6 +524,7 @@ impl DepGraph {
         sp: &mut SP,
         leaf: SpecOrigin,
         minimal_lib_path: PathBuf,
+        for_target: Target,
     ) -> Result<Self, Error> {
         let mut layers = Vec::with_capacity(6);
 
@@ -552,6 +553,7 @@ impl DepGraph {
                 &decode::LoadOptions {
                     minimal_lib_path: minimal_lib_path.clone(),
                     from: upstream.clone(),
+                    target: for_target.clone(),
                 },
             )
             .map_err(Error::Decode)?;
@@ -1234,6 +1236,7 @@ mod tests {
             &mut sp,
             middle_repo.as_spec_origin().unwrap(),
             LoadOptions::for_test().minimal_lib_path,
+            Target::default(),
         )
         .unwrap();
 
@@ -1299,6 +1302,40 @@ mod tests {
                 )]
                 .into()
             )
+        );
+    }
+
+    #[test]
+    fn conditional_on_config() {
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+                let {BuildSpec, ..} = import \"minimal.ncl\" in
+                let {target, ..} = import \"config.ncl\" in
+
+                {
+                    name = \"build 1\",
+                    inputs = [],
+                    cmd = match {
+                      {arch = 'Amd64, ..} => \"good\",
+                      _ => \"bad\",
+                    } target,
+                } | BuildSpec
+                "
+            }
+            .to_string(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        let dp = DepGraph::new().ingest(layer).unwrap();
+        // We expect the singular buildspec to have a command 'good', because
+        // the default target (used in tests) is amd64/linux.
+        assert_eq!(
+            Some(vec![vec!["good".to_string()]]),
+            dp.builds.into_iter().map(|b| b.cmds).next()
         );
     }
 }
