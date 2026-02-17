@@ -265,4 +265,9 @@ let CmdSpec = std.contract.any_of [
     },
     harness | Dyn -> Harness | doc "Constructs a harness." =
         fun spec => spec | Harness,
+
+    Target | doc "A specific system that packages can run on." = {
+        os | [| 'Linux, 'MacOS |],
+        arch | [| 'Amd64, 'Arm64 |],
+    },
 }

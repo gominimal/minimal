@@ -5,7 +5,7 @@ use std::{collections::HashMap, fmt, path::PathBuf};
 use anyhow::anyhow;
 use cache::{CacheBinProvider, RemoteBinProvider, RemoteCache, RemoteError};
 use checkouts::{GitRef, Manager as VcsManager};
-use common::SpecOrigin;
+use common::{SpecOrigin, Target};
 use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
 
 mod error;
@@ -357,8 +357,13 @@ impl Context {
     pub fn graph_from_all_packages(&mut self) -> Result<DepGraph, Error> {
         let leaf_layer = self.repo_origin()?;
 
-        DepGraph::new_from_chain(&mut self.vcs, leaf_layer, self.stdlib_dir.clone())
-            .map_err(|e| e.into())
+        DepGraph::new_from_chain(
+            &mut self.vcs,
+            leaf_layer,
+            self.stdlib_dir.clone(),
+            Target::host(),
+        )
+        .map_err(|e| e.into())
     }
 }
 

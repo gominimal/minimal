@@ -3,7 +3,7 @@
 #![allow(clippy::result_large_err)]
 
 use crate::Error;
-use common::SpecOrigin;
+use common::{SpecOrigin, Target};
 
 use nickel_lang_core::cache::TermCacheError;
 use nickel_lang_core::identifier::LocIdent;
@@ -19,7 +19,10 @@ use std::path::{Path, PathBuf};
 pub struct LoadOptions {
     /// Where on the filesystem the minimal base library (i.e. minimal.ncl) is located.
     pub minimal_lib_path: PathBuf,
+    /// A description of where the top-level layer/repo was sourced from.
     pub from: SpecOrigin,
+    /// The target we are loading for.
+    pub target: Target,
 }
 
 impl LoadOptions {
@@ -28,7 +31,12 @@ impl LoadOptions {
             from: SpecOrigin::Inline,
             minimal_lib_path: std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
                 .join("minimal-ncl"),
+            target: Target::default(),
         }
+    }
+
+    pub fn for_target(&self) -> &Target {
+        &self.target
     }
 }
 
@@ -142,18 +150,32 @@ pub(crate) struct Loader {
     from: SpecOrigin,
     minimal_lib_path: PathBuf,
     last_id: u64,
+
+    #[allow(dead_code)]
+    generated_lib_dir: tempfile::TempDir,
 }
 
 impl Loader {
     /// Processes literal source representing a top-level collection of objects.
     pub fn new<S: Into<String>>(src: S, opts: &LoadOptions) -> Result<Self, Error> {
-        let mut program = Program::new_from_source(
-            io::Cursor::new(src.into()),
-            "toplevel",
+        let generated_lib_dir = tempfile::TempDir::new()?;
+        std::fs::write(generated_lib_dir.path().join("__injected_config__.ncl"), {
+            let mut out = Vec::with_capacity(128);
+            out.extend(b"{target = {os = ");
+            out.extend(opts.for_target().arch().as_nickel_literal());
+            out.extend(b",arch = ");
+            out.extend(opts.for_target().arch().as_nickel_literal());
+            out.extend(b"}}");
+            out
+        })?;
+
+        let mut program = Program::new_from_sources(
+            [(io::Cursor::new(src.into()), "toplevel")],
             std::io::stderr(),
             NullReporter {},
         )?;
-        program.add_import_paths([&opts.minimal_lib_path].iter());
+
+        program.add_import_paths([&opts.minimal_lib_path, generated_lib_dir.path()].iter());
 
         program
             .typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk)
@@ -167,6 +189,7 @@ impl Loader {
             from: opts.from.clone(),
             last_id: 0,
             minimal_lib_path: opts.minimal_lib_path.canonicalize()?,
+            generated_lib_dir,
         };
         out.annotate()?;
         Ok(out)
@@ -299,7 +322,7 @@ impl Loader {
 
         let result = self
             .p
-            .custom_transform(0, |_cache, rt| {
+            .custom_transform(1, |_cache, rt| {
                 rt.traverse(&mut traversal, TraverseOrder::TopDown)
             })
             .map_err(|e| Error::Other(format!("annotation: {:?}", e)));
@@ -382,6 +405,15 @@ mod tests {
     #[test]
     fn loader_empty() {
         let _sr = Loader::new("{}".to_string(), &LoadOptions::for_test()).unwrap();
+    }
+
+    #[test]
+    fn loader_injects_config() {
+        let _sr = Loader::new(
+            "{c = import \"__injected_config__.ncl\"}".to_string(),
+            &LoadOptions::for_test(),
+        )
+        .unwrap();
     }
 
     #[test]

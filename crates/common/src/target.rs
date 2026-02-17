@@ -9,12 +9,30 @@ pub enum Arch {
     Arm64,
 }
 
+impl Arch {
+    pub fn as_nickel_literal(&self) -> &[u8] {
+        match self {
+            Arch::Amd64 => b"'Amd64",
+            Arch::Arm64 => b"'Arm64",
+        }
+    }
+}
+
 /// A supported OS.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum OS {
     #[default]
     Linux,
     MacOS,
+}
+
+impl OS {
+    pub fn as_nickel_literal(&self) -> &[u8] {
+        match self {
+            OS::Linux => b"'Linux",
+            OS::MacOS => b"'MacOS",
+        }
+    }
 }
 
 /// The description of a system where software runs.
@@ -91,6 +109,13 @@ impl Target {
                 os: OS::MacOS,
             },
         ]
+    }
+
+    pub fn arch(&self) -> &Arch {
+        &self.arch
+    }
+    pub fn os(&self) -> &OS {
+        &self.os
     }
 }
 
