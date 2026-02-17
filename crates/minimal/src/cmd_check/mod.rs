@@ -616,7 +616,14 @@ impl FileBasedChecker for ParseCheck {
                 });
             }
         };
-        program.add_import_paths([stdlib_dir].iter());
+
+        let generated_lib_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            generated_lib_dir.path().join("__injected_config__.ncl"),
+            b"{target = {arch = 'Amd64, os = 'Linux}}",
+        )
+        .unwrap();
+        program.add_import_paths([stdlib_dir, generated_lib_dir.path()].iter());
 
         if let Err(e) = program.typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk) {
             return Ok(CheckResult {
@@ -641,6 +648,7 @@ impl FileBasedChecker for ParseCheck {
             });
         }
 
+        drop(generated_lib_dir);
         Ok(CheckResult {
             check: "parse",
             verdict: CheckVerdict::Pass,
