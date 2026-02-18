@@ -1,0 +1,162 @@
+//! Command to initialize a minimal file based on matching the source tree to a valid harness.
+
+use std::io::Write;
+
+use anyhow::anyhow;
+use common::{SpecOrigin, Target, repo_spec::Repo};
+use decode::Harness;
+use graph::DepGraph;
+use mctx::{Context, Error};
+
+#[derive(clap::Args)]
+pub struct InitArgs {
+    /// Skip confirmation, writing configuration based on auto-detection
+    #[arg(long, short, default_value_t = false)]
+    yes: bool,
+}
+
+const DEFAULT_PKGS: &str = "https://github.com/gominimal/pkgs";
+const DEFAULT_PKGS_BRANCH: &str = "main";
+
+pub async fn cmd_init(args: InitArgs, ctx: &mut Context) -> Result<(), Error> {
+    // Harnesses have the match rules, so we need a graph, either from the repo
+    // minimal file or some default based on the MPPR.
+    let (origin, graph) = match ctx.minimal_file() {
+        // We are in a repo where theres a minimal file, lets use that upstream.
+        // Maybe the user is re-initializing?
+        Ok(f) => (
+            f.upstream.as_spec_origin().unwrap(),
+            ctx.graph_from_all_packages()?,
+        ),
+        // Unsurprisingly, theres no minimal file yet. We need the harnesses though for
+        // auto-detection, so lets wire up a default graph.
+        Err(Error::MFile(mfile::Error::NotFound)) => {
+            let (_dir, rev) = ctx.vcs_manager().checkout_of(
+                DEFAULT_PKGS,
+                checkouts::GitRef::Branch(DEFAULT_PKGS_BRANCH.to_string()),
+            )?;
+            let (stdlib_dir, _) = ctx.vcs_manager().checkout_of(
+                mfile::default_stdlib().as_url().unwrap(),
+                checkouts::GitRef::Branch("main".to_string()),
+            )?;
+
+            (
+                SpecOrigin::Repo(common::repo_spec::Repo::Git {
+                    url: DEFAULT_PKGS.to_string(),
+                    rev: rev.clone(),
+                    tracking: Some(common::repo_spec::GitRef::Branch(
+                        DEFAULT_PKGS_BRANCH.to_string(),
+                    )),
+                }),
+                DepGraph::new_from_chain(
+                    ctx.vcs_manager(),
+                    SpecOrigin::Repo(common::repo_spec::Repo::Git {
+                        url: "https://github.com/gominimal/pkgs".to_string(),
+                        rev,
+                        tracking: Some(common::repo_spec::GitRef::Branch("main".to_string())),
+                    }),
+                    stdlib_dir,
+                    Target::host(),
+                )?,
+            )
+        }
+        Err(e) => {
+            return Err(e);
+        }
+    };
+
+    let repo_dir = ctx
+        .repo_dir()
+        .unwrap_or_else(|_| std::env::current_dir().unwrap());
+    let toml_path = ctx
+        .minimal_file()
+        .map(|f| f.file_path())
+        .iter()
+        .flatten()
+        .cloned()
+        .next()
+        .cloned()
+        .unwrap_or_else(|| repo_dir.join(mfile::MFILE_NAME));
+    for (name, harness) in graph.iter_harnesses() {
+        if let Some(matchers) = &harness.project_matchers {
+            for matcher in matchers {
+                if matcher
+                    .match_dir(&repo_dir)
+                    .map_err(|e| Error::Other(anyhow!(e)))?
+                {
+                    let content = generate_mfile(name, &origin, harness);
+
+                    // -- Confirmation prompt (unless --yes) --
+                    if !args.yes {
+                        eprintln!("\nWill create {}:\n", toml_path.display());
+                        eprintln!("---");
+                        eprint!("{}", content);
+                        eprintln!("---");
+                        eprintln!();
+                        eprint!("Continue? [Y/n] ");
+                        std::io::stderr().flush().ok();
+
+                        let mut input = String::new();
+                        std::io::stdin()
+                            .read_line(&mut input)
+                            .map_err(|e| Error::Other(anyhow::anyhow!("reading stdin: {}", e)))?;
+                        if !input.trim().eq_ignore_ascii_case("y") {
+                            eprintln!("Aborted.");
+                            return Ok(());
+                        }
+                    }
+
+                    std::fs::write(&toml_path, &content).map_err(|e| {
+                        Error::Other(anyhow::anyhow!("writing {}: {}", toml_path.display(), e))
+                    })?;
+
+                    eprintln!("Created {}", toml_path.display());
+                    eprintln!();
+                    eprintln!("Next steps:");
+                    eprintln!("  minimal update      # pin package versions");
+                    eprintln!("  minimal run shell   # enter development shell");
+                    eprintln!("  minimal build       # build the project");
+
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    eprintln!("error: Your source tree did not match a known or supported layout.");
+    Ok(())
+}
+
+fn generate_mfile(harness_name: &String, origin: &SpecOrigin, _harness: &Harness) -> String {
+    let mut content = String::new();
+    content.push_str("# Generated by `minimal init`\n\n");
+
+    // [upstream]
+    content.push_str("[upstream] # Source of software & tooling\n");
+    match &origin {
+        SpecOrigin::Repo(Repo::Git { url, rev, tracking }) => {
+            content.push_str(&format!("repo = \"{}\"\n", url));
+            if let Some(common::repo_spec::GitRef::Branch(b)) = tracking {
+                content.push_str(&format!("branch = \"{}\"\n", b));
+            }
+            content.push_str(&format!("locked_commit = \"{}\"\n", rev,));
+        }
+        SpecOrigin::LocalDir { given, .. } => {
+            content.push_str(&format!("dir = \"{}\"\n", given.to_str().unwrap()))
+        }
+        SpecOrigin::Inline => unreachable!(),
+    }
+    content.push('\n');
+
+    content.push_str("[harness]\n");
+    content.push_str(&format!("use = \"{}\"\n", harness_name));
+    content.push('\n');
+
+    content.push_str("[defaults]\n");
+    content.push_str("state_key = \"dev\"\n");
+    content.push('\n');
+    content.push_str("[tasks.shell]\n");
+    content.push_str("packages = [\"base\"]\n");
+    content.push_str("exec = \"bash -l\"\n");
+    content
+}

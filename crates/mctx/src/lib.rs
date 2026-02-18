@@ -314,7 +314,7 @@ impl Context {
     /// Returns the path to the root of the repo.
     pub fn repo_dir(&self) -> Result<PathBuf, Error> {
         match (&self.mfile, self.config.repo_dir_override()) {
-            (Some(mfile), _) => Ok(mfile.dir_path().unwrap().to_path_buf()),
+            (Some(mfile), _) => Ok(mfile.repo_path().unwrap().to_path_buf()),
             (None, Some(d)) => Ok(d.to_path_buf()),
             (None, None) => Err(Error::MFile(mfile::Error::NotFound)),
         }

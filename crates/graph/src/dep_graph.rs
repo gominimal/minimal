@@ -886,6 +886,11 @@ impl DepGraph {
     pub fn harness(&self, name: &str) -> Option<&Harness> {
         self.harnesses.get(name)
     }
+
+    /// Returns an iterator over all harnesses configured in the graph.
+    pub fn iter_harnesses(&self) -> impl Iterator<Item = (&String, &Harness)> {
+        self.harnesses.iter()
+    }
 }
 
 #[cfg(test)]
