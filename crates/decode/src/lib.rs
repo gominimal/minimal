@@ -28,7 +28,7 @@ pub use profiles::Profile;
 mod decl_tests;
 pub use decl_tests::Test;
 mod harnesses;
-pub use harnesses::Harness;
+pub use harnesses::{Harness, HarnessMatcher};
 
 /// A collection of nickel objects, defined together in a single codebase.
 #[derive(Debug)]
