@@ -32,6 +32,8 @@ mod cmd_dep;
 use cmd_dep::{DepArgs, cmd_dep};
 mod cmd_update;
 use cmd_update::{UpdateArgs, cmd_update};
+mod cmd_init;
+use cmd_init::{InitArgs, cmd_init};
 
 #[derive(Parser)]
 #[command(name = "minimal", version = env!("GIT_HASH"))]
@@ -51,6 +53,8 @@ enum Command {
     Run(RunArgs),
     /// Refreshes local checkouts of upstream packages & the standard library.
     Update(UpdateArgs),
+    /// Automatically initialize minimal configuration based on your source tree.
+    Init(InitArgs),
     /// Runs the build task. Shorthand for `minimal run build`.
     Build,
     /// Runs the test task. Shorthand for `minimal run test`.
@@ -294,6 +298,7 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
     let mut ctx = Context::new(config.build()?)?;
 
     match command {
+        Command::Init(args) => cmd_init(args, &mut ctx).await,
         Command::Package(args) => cmd_pkg(args, &mut ctx).await,
         Command::Check(args) => cmd_check(args, &mut ctx).await,
         Command::Plan(args) => cmd_plan(args, &mut ctx).await,

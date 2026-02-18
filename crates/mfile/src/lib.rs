@@ -71,6 +71,22 @@ impl LinkConfig {
         }
     }
 
+    pub fn as_url(&self) -> Option<&String> {
+        match self {
+            LinkConfig::Dir { .. } => None,
+            LinkConfig::Git { repo, .. } => Some(repo),
+        }
+    }
+    pub fn as_branch(&self) -> Option<&String> {
+        match self {
+            LinkConfig::Git {
+                branch: Some(branch),
+                ..
+            } => Some(branch),
+            _ => None,
+        }
+    }
+
     fn fixup_relative<P: AsRef<Path>>(&mut self, mfile_path: P) {
         if let (LinkConfig::Dir { dir }, Some(parent_dir)) = (self, mfile_path.as_ref().parent()) {
             if !dir.starts_with("/") {
