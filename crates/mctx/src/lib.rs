@@ -1,6 +1,11 @@
 //! Top-level API for minimal tooling.
 
-use std::{collections::HashMap, fmt, path::PathBuf, time::SystemTime};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    path::PathBuf,
+    time::SystemTime,
+};
 
 use anyhow::anyhow;
 use cache::{CacheBinProvider, RemoteBinProvider, RemoteCache, RemoteError};
@@ -25,6 +30,7 @@ pub type Cache = cache::Cache<cache::LocalDir>;
 ///
 ///  - `Vec<String>`
 ///  - `Vec<BuildSpecRef>`
+///  - `HashSet<BuildSpecRef>`
 ///  - `["literal strings"]`
 ///  - `[String]`
 pub trait PackageSelection {
@@ -67,12 +73,39 @@ impl PackageSelection for Vec<String> {
     }
 }
 
+impl PackageSelection for HashSet<String> {
+    type NameIter<'a>
+        = std::iter::Map<std::collections::hash_set::Iter<'a, String>, fn(&'a String) -> &'a str>
+    where
+        Self: 'a;
+    type RefIter<'a> = std::slice::Iter<'a, BuildSpecRef>;
+
+    fn as_names(&self) -> Option<Self::NameIter<'_>> {
+        Some(self.iter().map(|s| s.as_str()))
+    }
+}
+
 impl PackageSelection for Vec<BuildSpecRef> {
     type NameIter<'a>
         = std::iter::Map<std::slice::Iter<'a, String>, fn(&'a String) -> &'a str>
     where
         Self: 'a;
     type RefIter<'a> = std::slice::Iter<'a, BuildSpecRef>;
+
+    fn as_names(&self) -> Option<Self::NameIter<'_>> {
+        None
+    }
+    fn as_refs(&self) -> Option<Self::RefIter<'_>> {
+        Some(self.iter())
+    }
+}
+
+impl PackageSelection for HashSet<BuildSpecRef> {
+    type NameIter<'a>
+        = std::iter::Map<std::slice::Iter<'a, String>, fn(&'a String) -> &'a str>
+    where
+        Self: 'a;
+    type RefIter<'a> = std::collections::hash_set::Iter<'a, BuildSpecRef>;
 
     fn as_names(&self) -> Option<Self::NameIter<'_>> {
         None
@@ -564,8 +597,7 @@ impl Context {
             out.extend(h.runtime_packages.clone());
         }
 
-        let v = out.into_iter().collect::<Vec<_>>();
-        v.as_bsrs(&graph)
+        out.as_bsrs(&graph)
     }
 }
 
