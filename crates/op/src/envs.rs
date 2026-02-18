@@ -105,7 +105,7 @@ impl<'a> Runnable for EnvSetup<'a> {
 
                 match wiring {
                     decode::AttrValue::List(l) => l.iter().try_for_each(apply_wiring)?,
-                    decode::AttrValue::Map(_) => apply_wiring(&wiring)?,
+                    decode::AttrValue::Map(_) => apply_wiring(wiring)?,
                     _ => todo!("error for unhandled env_state_wiring AttrValue variant"),
                 }
             }
