@@ -1,6 +1,6 @@
 //! Top-level API for minimal tooling.
 
-use std::{collections::HashMap, fmt, path::PathBuf};
+use std::{collections::HashMap, fmt, path::PathBuf, time::SystemTime};
 
 use anyhow::anyhow;
 use cache::{CacheBinProvider, RemoteBinProvider, RemoteCache, RemoteError};
@@ -308,6 +308,7 @@ impl Context {
         auth: bool,
         force_fresh: bool,
     ) -> Result<RemoteCache<GcsStorage>, RemoteError<GcsError>> {
+        let start = SystemTime::now();
         let backend = if auth {
             GcsStorage::builder().build().await.unwrap()
         } else {
@@ -318,7 +319,7 @@ impl Context {
                 .unwrap()
         };
 
-        RemoteCache::new_with_gcs_bucket(
+        let res = RemoteCache::new_with_gcs_bucket(
             backend,
             "minimal-staging-cache",
             if force_fresh {
@@ -327,14 +328,17 @@ impl Context {
                 Some(self.config.index_dir())
             },
         )
-        .await
+        .await;
+        tracing::trace!("remote cache init took {:?}", start.elapsed());
+        res
     }
     pub async fn remote_storage(&self) -> Result<common::RemoteStorage, Error> {
-        Ok(
-            common::RemoteStorage::new(self.config.downloads_dir(), false)
-                .await
-                .unwrap(),
-        )
+        let start = SystemTime::now();
+        let rs = common::RemoteStorage::new(self.config.downloads_dir(), false)
+            .await
+            .unwrap();
+        tracing::trace!("remote storage init took {:?}", start.elapsed());
+        Ok(rs)
     }
 
     /// Returns a [SpecOrigin] representing the top-level repository.
@@ -357,13 +361,17 @@ impl Context {
     pub fn graph_from_all_packages(&mut self) -> Result<DepGraph, Error> {
         let leaf_layer = self.repo_origin()?;
 
-        DepGraph::new_from_chain(
+        let start = SystemTime::now();
+        let res = DepGraph::new_from_chain(
             &mut self.vcs,
             leaf_layer,
             self.stdlib_dir.clone(),
             Target::host(),
         )
-        .map_err(|e| e.into())
+        .map_err(|e| e.into());
+        tracing::trace!("graph parse/load took {:?}", start.elapsed());
+
+        res
     }
 }
 
@@ -498,9 +506,19 @@ impl Context {
         };
         graph.top_levels = packages.as_bsrs(&graph)?;
 
-        self.build_graph(&graph).await?;
-
+        let cache = self.local_cache();
         let transitive_deps = Transitives::for_toplevels(&graph, graph.top_levels.clone(), false);
+        let all_built = transitive_deps
+            .iter()
+            .all(|(bsr, _dep)| cache.read_dir(&graph.spec_hash(bsr)).is_ok());
+
+        if !all_built {
+            tracing::trace!("missing local packages, calling mctx.build_graph()");
+            self.build_graph(&graph).await?;
+        } else {
+            tracing::trace!("all packages available locally, eluding build");
+        }
+
         let base = tempfile::tempdir_in(self.config.task_base_dir()).map_err(|e| {
             Error::Other(anyhow::Error::from(e).context("creating base sandbox directory"))
         })?;
@@ -516,7 +534,7 @@ impl Context {
             hostname: state_key.map(|s| s.to_string()),
         };
         let opts = op::Options {
-            cache: self.local_cache(),
+            cache,
             graph: &graph,
             exec_base: base.path().to_path_buf(),
         };
