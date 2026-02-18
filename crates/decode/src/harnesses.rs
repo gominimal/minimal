@@ -1,14 +1,102 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, path::Path};
 
 use mfile::TaskAction;
 use nickel_lang_core::{
     eval::cache::CacheImpl,
     program::Program,
-    term::{IndexMap, RichTerm, Term},
+    term::{IndexMap, RichTerm, RuntimeContract, Term},
 };
+use regex::bytes::Regex;
 use serde::Deserialize;
 
 use crate::{Error, ObjTy, eval_if_closure};
+
+/// A set of rules that when matched, indicate that this harness is applicable to a source tree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HarnessMatcher {
+    pub file_regexes: IndexMap<String, String>,
+}
+
+impl HarnessMatcher {
+    /// Returns true if all the predicates in this matcher apply to the given source tree.
+    pub fn match_dir<P: AsRef<Path>>(&self, p: P) -> Result<bool, regex::Error> {
+        for (path, regex_str) in &self.file_regexes {
+            let f = p.as_ref().join(path);
+
+            if let Ok(data) = std::fs::read(&f) {
+                if regex_str == "*" {
+                    continue; // special case: match anything
+                }
+
+                let r = Regex::new(regex_str)?;
+                if !r.is_match(&data) {
+                    return Ok(false);
+                }
+            } else {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Deserializes a harness matcher structure from the given nickel term tree.
+    pub(crate) fn from_term(
+        rt: &RichTerm,
+        program: &mut Program<CacheImpl>,
+    ) -> Result<Self, Error> {
+        let rt = eval_if_closure(rt, program)?;
+
+        let mut file_regexes: Option<IndexMap<String, String>> = None;
+        match rt.term.as_ref() {
+            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
+                r.fields
+                    .iter()
+                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                        if let Some(rt) = field.value.as_ref() {
+                        let rt = RuntimeContract::apply_all(
+                            rt.clone(),
+                            field.pending_contracts.iter().cloned(),
+                            rt.pos,
+                        );
+
+                        match ident_and_loc.label() {
+                            "file_regexes" => {
+                                    let rt = eval_if_closure(&rt, program)?;
+                                    match rt.term.as_ref() {
+                                        Term::Record(r) | Term::RecRecord(r, _, _, _) => {
+                                            file_regexes = Some(r.fields.iter().map(
+                                                |(ident_and_loc, field)| -> Result<(String, String), Error> {
+                                                    Ok((
+                                                        ident_and_loc.label().to_string(),
+                                                        String::deserialize(eval_if_closure(
+                                                            field.value.as_ref().unwrap(),
+                                                            program,
+                                                        )?).unwrap(),
+                                                    ))
+                                                },
+                                            ).collect::<Result<IndexMap<_, _>, Error>>()?);
+                                        }
+                                        _ => todo!("unexpected term for file_regexes: {:?}", rt.term.as_ref()),
+                                    };
+
+                                Ok(())
+                            }
+                            _ => Ok(()),
+                        }
+                        } else {
+                            Ok(())
+                        }
+                    })?;
+            }
+            _ => {}
+        };
+
+        Ok(HarnessMatcher {
+            file_regexes: file_regexes.unwrap_or_default(),
+        })
+    }
+}
 
 /// A harness, a specific set of norms for building a codebase.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -32,6 +120,11 @@ pub struct Harness {
     ///
     /// Only one of `build_cmds` and `build_cmds_cmd` may be set.
     pub build_cmds_cmd: Option<Vec<String>>,
+
+    /// Harness matchers - predicates that indicate this harness is applicable to a source tree.
+    ///
+    /// For a harness to be applicable, one of the matchers in this list must have all its predicates met.
+    pub project_matchers: Option<Vec<HarnessMatcher>>,
 }
 
 impl Harness {
@@ -49,6 +142,7 @@ impl Harness {
         let mut build_env_vars: Option<IndexMap<String, String>> = None;
         let mut build_cmds: Option<Vec<Vec<String>>> = None;
         let mut build_cmds_cmd: Option<Vec<String>> = None;
+        let mut project_matchers: Option<Vec<HarnessMatcher>> = None;
 
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
@@ -208,6 +302,39 @@ impl Harness {
                                     Ok(())
                                 }
                             }
+                            "project_matchers" => {
+                                if let Some(matchers_rt) = field.value.as_ref() {
+                                    let matchers_rt =
+                                        eval_if_closure(matchers_rt, program)?;
+
+                                    match matchers_rt.term.as_ref() {
+                                        Term::Array(a, attrs) => {
+                                            project_matchers = Some(
+                                                a.iter()
+                                                    .map(|m| {
+                                                        let rt = RuntimeContract::apply_all(
+                                                            m.clone(),
+                                                            attrs.pending_contracts.iter().cloned(),
+                                                            m.pos,
+                                                        );
+
+                                                        HarnessMatcher::from_term(&eval_if_closure(
+                                                            &rt,
+                                                            program,
+                                                        )?, program)
+                                                    })
+                                                    .collect::<Result<Vec<_>, Error>>()?,
+                                            );
+                                        }
+                                        _ => todo!(
+                                            "handle runtime_packages value being non-array {:?}",
+                                            field.value
+                                        ),
+                                    }
+                                }
+
+                                Ok(())
+                            }
 
                             // TODO: `build_cmds` like `cmds` in build-specs.
                             _ => Ok(()),
@@ -269,6 +396,7 @@ impl Harness {
             build_env_vars,
             build_cmds,
             build_cmds_cmd,
+            project_matchers,
         })
     }
 
@@ -330,6 +458,12 @@ mod tests {
 
                     build_packages = [\"gcc\", \"rust\", \"binutils\"],
                     build_cmd = \"cargo build --release\",
+
+                    project_matchers = [{
+                        file_regexes = {
+                            \"Cargo.toml\" = \"*\",
+                        },
+                    }],
                 }
                 "
             }
@@ -363,8 +497,55 @@ mod tests {
                     "--release".to_string()
                 ]]),
                 build_env_vars: Default::default(),
+                project_matchers: Some(vec![HarnessMatcher {
+                    file_regexes: [("Cargo.toml".to_string(), "*".to_string())].into(),
+                }]),
                 ..Default::default()
             }
         )
+    }
+
+    #[test]
+    fn harness_matcher_match_dir_file_wildcard() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"test\"\n",
+        )
+        .unwrap();
+
+        let matcher = HarnessMatcher {
+            file_regexes: [("Cargo.toml".to_string(), "*".to_string())].into(),
+        };
+        assert!(matcher.match_dir(dir.path()).unwrap());
+    }
+    #[test]
+    fn harness_matcher_match_dir_regex() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"test\"\n",
+        )
+        .unwrap();
+
+        let matcher = HarnessMatcher {
+            file_regexes: [(
+                "Cargo.toml".to_string(),
+                "(?m).*\\[package\\].*".to_string(),
+            )]
+            .into(),
+        };
+        assert!(matcher.match_dir(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn harness_matcher_match_dir_toml_missing() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let matcher = HarnessMatcher {
+            file_regexes: [("Cargo.toml".to_string(), "*".to_string())].into(),
+        };
+        // File doesn't exist, so the predicate is skipped and match_dir returns true.
+        assert!(!matcher.match_dir(dir.path()).unwrap());
     }
 }

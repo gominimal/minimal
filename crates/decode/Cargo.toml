@@ -15,6 +15,7 @@ tempfile.workspace = true
 nickel-lang-core.workspace = true
 codespan-reporting.workspace = true
 blake3.workspace = true
+regex.workspace = true
 generational-arena.workspace = true
 smallvec.workspace = true
 

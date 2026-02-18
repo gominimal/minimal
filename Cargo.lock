@@ -783,6 +783,7 @@ dependencies = [
  "indoc",
  "mfile",
  "nickel-lang-core",
+ "regex",
  "serde",
  "shlex",
  "smallvec",
