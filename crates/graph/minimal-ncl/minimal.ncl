@@ -247,6 +247,9 @@ let CmdSpec = std.contract.any_of [
             include cmd,
         },
 
+    HarnessMatcherEntry = {
+        file_regexes | {_ : String} | optional,
+    },
 
     Harness | doc "A specific way to build a directory of source into software." = {
         ty | Tys = 'Harness,
@@ -262,6 +265,8 @@ let CmdSpec = std.contract.any_of [
 
         build_cmd | CmdSpec | optional,
         build_cmds_cmd | CmdSpec | optional,
+
+        project_matchers | Array HarnessMatcherEntry | optional,
     },
     harness | Dyn -> Harness | doc "Constructs a harness." =
         fun spec => spec | Harness,
