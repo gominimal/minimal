@@ -1,0 +1,11 @@
+[upstream]
+dir = "../fakepkgs"
+
+[harness]
+use = "fake-harness"
+build_packages = ["extra-build-pkg"]
+runtime_packages = ["extra-runtime-pkg"]
+
+[tasks.task-inherits-harness]
+exec = "exec"
+packages = ["uroot"]

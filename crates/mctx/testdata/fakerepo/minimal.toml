@@ -1,7 +1,4 @@
-[defaults]
-harness = "rust"
-
-[upstream] # NOTE: This gets swapped out under test
+[upstream]
 dir = "../fakepkgs"
 
 [tasks.task-smoketest]

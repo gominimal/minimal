@@ -31,9 +31,6 @@ pub enum LinkConfig {
         /// If set, the branch of the repo to track. `rev` is bumped to the HEAD of this branch on `minimal update`.
         branch: Option<String>,
         /// The pinned git commit hash to use for this link.
-        ///
-        /// TODO: Remove the `rev` alias ~feb, that was the old key.
-        #[serde(alias = "rev")]
         locked_commit: Option<String>,
     },
     Dir {
@@ -133,6 +130,12 @@ pub struct Defaults {
 pub struct Harness {
     #[serde(alias = "use")]
     pub name: String,
+    /// Additional build_packages needed by this repo.
+    #[serde(default)]
+    pub build_packages: Vec<String>,
+    /// Additional runtime_packages needed by this repo.
+    #[serde(default)]
+    pub runtime_packages: Vec<String>,
 }
 
 /// Describes the specific type of output being generated.
@@ -359,7 +362,10 @@ impl File {
         })
     }
 
-    /// Applies a default profile and state_key to a task, if unset on the task.
+    /// Applies additional settings to hydrate a task, namely:
+    ///  - default profile if set (and not set on the task)
+    ///  - default state_key if set (and not set on the task)
+    ///  - additional build_packages & runtime_packages set on the harness
     pub fn hydrate_task_defaults(&self, task: &mut Task) {
         if let Some(default_profile) = &self.defaults.profile
             && task.profile.is_none()
@@ -370,6 +376,17 @@ impl File {
             && task.state_key.is_none()
         {
             task.state_key = Some(default_state_key.clone());
+        }
+        if let Some(harness) = &self.harness {
+            task.packages.extend(
+                harness
+                    .build_packages
+                    .iter()
+                    .chain(harness.runtime_packages.iter())
+                    .filter(|p| !task.packages.contains(p))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            );
         }
     }
 

@@ -469,8 +469,8 @@ impl Context {
         Ok(())
     }
 
-    /// Returns the task of the given name, fully hydrated based on profiles. If none
-    /// are declared in the minimal file with that name, harnesses are considered.
+    /// Returns the task of the given name, fully hydrated based on profiles. If no task
+    /// is declared in the minimal file with the given name, harnesses are considered.
     pub fn task(
         &mut self,
         mut graph: DepGraph,
@@ -686,6 +686,45 @@ mod tests {
 
         let graph = ctx.graph_from_all_packages().unwrap();
         let (_task_smoketest, _graph) = ctx.task(graph, "task-smoketest").unwrap().unwrap();
+    }
+
+    #[test]
+    fn task_inherits_harness() {
+        let state = tempdir().unwrap();
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_repo_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("testdata")
+                    .join("fakerepo-with-harness"),
+            )
+            .with_stdlib_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("../graph/minimal-ncl"),
+            )
+            .build()
+            .unwrap();
+
+        let mut ctx = Context::new(config).unwrap();
+
+        let graph = ctx.graph_from_all_packages().unwrap();
+        let (task, _graph) = ctx.task(graph, "task-inherits-harness").unwrap().unwrap();
+
+        // println!("task = {:#?}", task);
+        // task inherited harness build_packages and runtime_packages, as well as any
+        // extras defined in the minimal file
+        assert_eq!(
+            task.packages,
+            vec![
+                "uroot".to_string(),
+                "extra-build-pkg".to_string(),
+                "extra-runtime-pkg".to_string(),
+                "harness-build-pkg".to_string(),
+                "harness-runtime-pkg".to_string(),
+            ]
+        );
+        // task inherited harness build env vars
+        assert_eq!(task.vars.get("HARNESS_VAR"), Some(&"set".to_string()));
     }
 
     #[test]
