@@ -1,7 +1,7 @@
 use nickel_lang_core::{
     eval::cache::CacheImpl,
     program::Program,
-    term::{IndexMap, RichTerm, Term},
+    term::{IndexMap, RichTerm, RuntimeContract, Term},
 };
 
 use crate::{Error, eval_if_closure};
@@ -38,10 +38,16 @@ impl AttrValue {
                 r.fields
                     .iter()
                     .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
-                        if let Some(value) =
-                            AttrValue::from_term(field.value.as_ref().unwrap(), program)?
-                        {
-                            map.insert(ident_and_loc.label().to_string(), value);
+                        if let Some(rt) = field.value.as_ref() {
+                            let rt = RuntimeContract::apply_all(
+                                rt.clone(),
+                                field.pending_contracts.iter().cloned(),
+                                rt.pos,
+                            );
+
+                            if let Some(value) = AttrValue::from_term(&rt, program)? {
+                                map.insert(ident_and_loc.label().to_string(), value);
+                            }
                         }
                         Ok(())
                     })?;
