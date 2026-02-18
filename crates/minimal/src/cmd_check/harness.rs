@@ -1,5 +1,7 @@
 use crate::Error;
+use crate::cmd_check::CheckVerdict;
 use cache::{Cache, LocalDir};
+use decode::Harness;
 use graph::DepGraph;
 use nickel_lang_core::eval::cache::CacheImpl;
 use nickel_lang_core::identifier::LocIdent;
@@ -68,12 +70,21 @@ pub(super) async fn check_harness(
 
     out.push(check_harness_name(
         harness.clone(),
-        all_graph,
+        all_graph.clone(),
         fix,
         skip_checkers.clone(),
         harnesses_dir.clone(),
         &mut program,
-        cache,
+        cache.clone(),
+    )?);
+    out.push(check_project_matcher_regexes(
+        harness.clone(),
+        all_graph.clone(),
+        fix,
+        skip_checkers.clone(),
+        harnesses_dir.clone(),
+        &mut program,
+        cache.clone(),
     )?);
     use super::FileBasedChecker;
     out.push(super::ImportLineCheck.check(
@@ -134,4 +145,53 @@ fn check_harness_name(
     Ok(CheckResult::harness_name_fail(
         "failed reading name from nickel object".to_string(),
     ))
+}
+
+fn check_project_matcher_regexes(
+    _harness: String,
+    _all_graph: Option<Arc<RwLock<DepGraph>>>,
+    _fix: bool,
+    skip_checkers: Vec<String>,
+    _harnesses_dir: PathBuf,
+    program: &mut Program<CacheImpl>,
+    _cache: Cache<LocalDir>,
+) -> Result<CheckResult, Error> {
+    if skip_checkers.contains(&"project_matchers regexes".to_string()) {
+        return Ok(CheckResult::harness_regexes_skip());
+    }
+
+    let tree = match program.eval_full() {
+        Ok(t) => t,
+        Err(e) => {
+            return Err(Error::Graph(Box::new(graph::Error::Decode(
+                decode::Error::Nickel(Box::new((program.files(), e))),
+            ))));
+        }
+    };
+
+    match Harness::from_term(&tree, program) {
+        Ok(h) => {
+            let mut out = CheckResult::harness_regexes_pass();
+            for matcher in h.project_matchers.iter().flatten() {
+                for (fname, regex_str) in &matcher.file_regexes {
+                    if regex_str == "*" {
+                        continue;
+                    }
+                    if let Err(e) = regex::bytes::Regex::new(regex_str) {
+                        out.verdict = CheckVerdict::Fail;
+                        out.err.push(format!(
+                            "invalid regex \"{}\" to match file {}: {}",
+                            regex_str, fname, e
+                        ));
+                    }
+                }
+            }
+
+            Ok(out)
+        }
+        Err(e) => Ok(CheckResult::harness_regexes_fail(format!(
+            "failed loading harness: {}",
+            e
+        ))),
+    }
 }

@@ -396,6 +396,7 @@ impl CheckResult {
             err: vec![msg],
         }
     }
+
     fn harness_name_skip() -> Self {
         CheckResult {
             check: "harness name matches dir",
@@ -403,7 +404,6 @@ impl CheckResult {
             err: vec![],
         }
     }
-
     fn harness_name_pass() -> Self {
         CheckResult {
             check: "harness name matches dir",
@@ -411,10 +411,33 @@ impl CheckResult {
             err: vec![],
         }
     }
-
     fn harness_name_fail(msg: String) -> Self {
         CheckResult {
             check: "harness name matches dir",
+            verdict: CheckVerdict::Fail,
+            err: vec![msg],
+        }
+    }
+
+    fn harness_regexes_skip() -> Self {
+        CheckResult {
+            check: "project_matchers regexes",
+            verdict: CheckVerdict::Skip,
+            err: vec![],
+        }
+    }
+
+    fn harness_regexes_pass() -> Self {
+        CheckResult {
+            check: "project_matchers regexes",
+            verdict: CheckVerdict::Pass,
+            err: vec![],
+        }
+    }
+
+    fn harness_regexes_fail(msg: String) -> Self {
+        CheckResult {
+            check: "project_matchers regexes",
             verdict: CheckVerdict::Fail,
             err: vec![msg],
         }

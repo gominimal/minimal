@@ -129,10 +129,7 @@ pub struct Harness {
 
 impl Harness {
     /// Deserializes a harness structure from the given nickel term tree.
-    pub(crate) fn from_term(
-        rt: &RichTerm,
-        program: &mut Program<CacheImpl>,
-    ) -> Result<Self, Error> {
+    pub fn from_term(rt: &RichTerm, program: &mut Program<CacheImpl>) -> Result<Self, Error> {
         let rt = eval_if_closure(rt, program)?;
 
         let mut ty: Option<ObjTy> = None;
