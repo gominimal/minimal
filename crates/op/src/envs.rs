@@ -5,6 +5,7 @@ use std::{
 };
 
 use crate::{Error, Options, Runnable};
+use decode::AttrValue;
 use graph::{BuildSpecRef, TransitivesDep};
 use mfile::{EnvPatches, PatchSetting};
 use tempfile::TempDir;
@@ -85,19 +86,28 @@ impl<'a> Runnable for EnvSetup<'a> {
                     );
                 }
             }
-            if let Some(dir) = b.attrs.get("env_state_wiring") {
-                let mapping = dir.as_map().unwrap();
-                let env_var = mapping.get("env_var").unwrap().as_string().unwrap().clone();
-                let prefix = mapping.get("prefix").unwrap().as_string().unwrap().clone();
-                let dir = self.state_base_dir.join(&prefix);
-                std::fs::create_dir_all(&dir).map_err(anyhow::Error::from)?;
-                env_vars.entry(env_var).or_insert_with(|| {
-                    PathBuf::from("/state")
-                        .join(dir.strip_prefix(self.state_base_dir).unwrap())
-                        .to_str()
-                        .unwrap()
-                        .to_string()
-                });
+            if let Some(wiring) = b.attrs.get("env_state_wiring") {
+                let mut apply_wiring = |entry: &AttrValue| -> Result<(), Error> {
+                    let entry = entry.as_map().unwrap();
+                    let env_var = entry.get("env_var").unwrap().as_string().unwrap().clone();
+                    let prefix = entry.get("prefix").unwrap().as_string().unwrap().clone();
+                    let dir = self.state_base_dir.join(&prefix);
+                    std::fs::create_dir_all(&dir).map_err(anyhow::Error::from)?;
+                    env_vars.entry(env_var).or_insert_with(|| {
+                        PathBuf::from("/state")
+                            .join(dir.strip_prefix(self.state_base_dir).unwrap())
+                            .to_str()
+                            .unwrap()
+                            .to_string()
+                    });
+                    Ok(())
+                };
+
+                match wiring {
+                    decode::AttrValue::List(l) => l.iter().try_for_each(apply_wiring)?,
+                    decode::AttrValue::Map(_) => apply_wiring(&wiring)?,
+                    _ => todo!("error for unhandled env_state_wiring AttrValue variant"),
+                }
             }
 
             needs_dns |= b.abstract_deps.get("dns").is_some();
