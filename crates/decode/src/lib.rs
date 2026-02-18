@@ -88,15 +88,23 @@ impl Layer {
 
     /// Loads all objects in the given directory following the standard directory layout.
     pub fn new<P: AsRef<Path>>(layer_dir: P, opts: &LoadOptions) -> Result<Self, Error> {
-        let upstream = match mfile::File::from_dir(layer_dir.as_ref()) {
-            Ok(mfile) => Some(mfile.upstream),
-            Err(mfile::Error::IO(_, _, e)) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(mfile::Error::NotFound) => None,
+        let (upstream, config_dir) = match mfile::File::from_dir(layer_dir.as_ref()) {
+            Ok(mfile) => (
+                Some(mfile.upstream.clone()),
+                mfile.dir_path().map(|p| p.to_path_buf()),
+            ),
+            Err(mfile::Error::IO(_, _, e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                (None, None)
+            }
+            Err(mfile::Error::NotFound) => (None, None),
             Err(mfile::Error::IO(_, _, e)) => return Err(Error::IO(e)),
             Err(e) => return Err(Error::Other(e.to_string())),
         };
 
-        let loader = load::Loader::new_with_all_pkgs(layer_dir, opts)?;
+        let loader = load::Loader::new_with_all_pkgs(
+            config_dir.unwrap_or_else(|| layer_dir.as_ref().to_path_buf()),
+            opts,
+        )?;
         Self::from_loader(loader, upstream)
     }
 
