@@ -4,7 +4,7 @@ use crate::{Error, ObjTy, attrs::AttrValue, eval_if_closure, read_ty};
 use common::Target;
 use nickel_lang_core::files::FileId;
 use nickel_lang_core::identifier::LocIdent;
-use nickel_lang_core::term::{IndexMap, RichTerm, Term};
+use nickel_lang_core::term::{IndexMap, RichTerm, RuntimeContract, Term};
 use nickel_lang_core::{eval::cache::CacheImpl, program::Program};
 use serde::Deserialize;
 use smallvec::SmallVec;
@@ -1009,16 +1009,26 @@ impl BuildDecl {
                                         Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                                             attrs = Some(r.fields.iter().map(
                                                 |(ident_and_loc, field)| -> Result<Option<(String, AttrValue)>, Error> {
-                                                    let value = AttrValue::from_term(
-                                                        field.value.as_ref().unwrap(),
-                                                        program,
-                                                    )?;
-                                                    match value {
-                                                        Some(v) => Ok(Some((
-                                                            ident_and_loc.label().to_string(),
-                                                            v,
-                                                        ))),
-                                                        None => Ok(None),
+                                                    if let Some(rt) = field.value.as_ref() {
+                                                        let rt = RuntimeContract::apply_all(
+                                                            rt.clone(),
+                                                            field.pending_contracts.iter().cloned(),
+                                                            rt.pos,
+                                                        );
+
+                                                        let value = AttrValue::from_term(
+                                                            &rt,
+                                                            program,
+                                                        )?;
+                                                        match value {
+                                                            Some(v) => Ok(Some((
+                                                                ident_and_loc.label().to_string(),
+                                                                v,
+                                                            ))),
+                                                            None => Ok(None),
+                                                        }
+                                                    } else {
+                                                        Ok(None)
                                                     }
                                                 },
                                             ).collect::<Result<Vec<_>, Error>>()?
