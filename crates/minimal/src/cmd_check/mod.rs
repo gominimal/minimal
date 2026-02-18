@@ -500,6 +500,17 @@ async fn check_package(
                 .await?,
         );
         out.push(
+            BuildScriptIsExecutable
+                .check(
+                    &skip_checkers,
+                    fix,
+                    pkg.clone(),
+                    graph.read().await,
+                    cache.clone(),
+                )
+                .await?,
+        );
+        out.push(
             StandaloneTestCheck
                 .check(
                     &skip_checkers,
@@ -986,6 +997,86 @@ impl FileBasedChecker for AdjacentImportCheck {
                         folder
                     ));
                     result.verdict = CheckVerdict::Fail;
+                }
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+pub struct BuildScriptIsExecutable;
+
+impl GraphBasedChecker for BuildScriptIsExecutable {
+    async fn check(
+        self,
+        skip_checkers: &[String],
+        _fix: bool,
+        pkg: String,
+        graph: RwLockReadGuard<'_, DepGraph>,
+        _cache: Cache<LocalDir>,
+    ) -> Result<CheckResult, Error> {
+        let mut result = CheckResult {
+            verdict: CheckVerdict::Skip,
+            check: "build scripts are executable",
+            err: vec![],
+        };
+        if skip_checkers.contains(&"build scripts are executable".to_string()) {
+            return Ok(result);
+        }
+
+        let bsr = match graph.by_name(&pkg) {
+            None => {
+                return Ok(result); // skip
+            }
+            Some(bsr) => bsr,
+        };
+        let build = graph.get(bsr).unwrap();
+        result.verdict = CheckVerdict::Pass;
+
+        let local_inputs = build
+            .inputs
+            .iter()
+            .filter_map(|i| match i {
+                graph::BuildSpecInput::Local {
+                    full_path,
+                    filename,
+                    file_hash: _,
+                } => Some((full_path.clone(), filename.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        for cmd in &build.cmds {
+            if cmd.is_empty() {
+                continue;
+            }
+            if let Some(exec) = &cmd[0].strip_prefix("./")
+                && let Some((path, name)) = local_inputs.iter().find(|(_path, name)| name == exec)
+            {
+                match std::fs::metadata(path) {
+                    Err(e) => {
+                        result.verdict = CheckVerdict::Fail;
+                        result
+                            .err
+                            .push(format!("failed stat for build script {}: {}", name, e));
+                    }
+                    Ok(s) => {
+                        use std::os::unix::fs::PermissionsExt;
+                        if s.is_dir() {
+                            result.verdict = CheckVerdict::Fail;
+                            result
+                                .err
+                                .push(format!("build script {} is a directory", name));
+                        } else if (s.permissions().mode() & 0o111) == 0 {
+                            result.verdict = CheckVerdict::Fail;
+                            result.err.push(format!(
+                                "build script {} is not executable: got mode={:#o}",
+                                name,
+                                s.permissions().mode() & 0x0fff
+                            ));
+                        }
+                    }
                 }
             }
         }
