@@ -1,7 +1,9 @@
 use crate::Error;
-use crate::cmd_check::FileBasedChecker;
+use crate::cmd_check::{CheckVerdict, FileBasedChecker};
 use cache::{Cache, LocalDir};
+use decode::Profile;
 use graph::DepGraph;
+use nickel_lang_core::error::report::report_as_str;
 use nickel_lang_core::eval::cache::CacheImpl;
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::program::Program;
@@ -67,6 +69,15 @@ pub(super) async fn check_profile(
         ))]);
     }
 
+    out.push(check_profile_parses(
+        profile.clone(),
+        all_graph.clone(),
+        fix,
+        skip_checkers.clone(),
+        profiles_dir.clone(),
+        &mut program,
+        cache.clone(),
+    )?);
     out.push(check_profile_name(
         profile.clone(),
         all_graph,
@@ -90,6 +101,59 @@ pub(super) async fn check_profile(
         &profiles_dir.join(&profile),
         &stdlib_dir,
     )?);
+    Ok(out)
+}
+
+fn check_profile_parses(
+    _profile: String,
+    _all_graph: Option<Arc<RwLock<DepGraph>>>,
+    _fix: bool,
+    skip_checkers: Vec<String>,
+    _profiles_dir: PathBuf,
+    program: &mut Program<CacheImpl>,
+    _cache: Cache<LocalDir>,
+) -> Result<CheckResult, Error> {
+    let mut out = CheckResult {
+        check: "profile parses",
+        err: vec![],
+        verdict: CheckVerdict::Pass,
+    };
+
+    if skip_checkers.contains(&"profile parses".to_string()) {
+        out.verdict = CheckVerdict::Skip;
+        return Ok(out);
+    }
+
+    let tree = match program.eval_full() {
+        Ok(t) => t,
+        Err(e) => {
+            out.verdict = CheckVerdict::Fail;
+            out.err.push(report_as_str(
+                &mut program.files(),
+                e,
+                nickel_lang_core::error::report::ColorOpt::Never,
+            ));
+            return Ok(out);
+        }
+    };
+
+    if let Err(e) = Profile::from_term(&tree, program) {
+        out.verdict = CheckVerdict::Fail;
+        match e {
+            decode::Error::Nickel(b) => {
+                let (files, e) = *b;
+                out.err.push(report_as_str(
+                    &mut files.clone(),
+                    e,
+                    nickel_lang_core::error::report::ColorOpt::Never,
+                ));
+            }
+            _ => {
+                out.err.push(format!("error when decoding profile: {}", e));
+            }
+        }
+    }
+
     Ok(out)
 }
 
