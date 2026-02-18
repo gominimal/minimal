@@ -79,21 +79,45 @@ pub struct Orchestrator<B: Backend> {
 
 impl<B: Backend> Orchestrator<B> {
     /// Executes the build.
-    pub async fn run<BP: BinProvider>(self, bp: BP) -> Result<Vec<B::Artifact>, Error> {
+    pub async fn run<BP: BinProvider>(self, bp: BP) -> (Vec<B::Artifact>, Result<(), Error>) {
         let shared = Shared {
             graph: self.graph.clone(),
             cache: self.cache.clone(),
             backend: self.backend,
         };
-        let state = State::from_plan(
+        let state = match State::from_plan(
             &shared.graph,
             ExecPlan::with_toplevels(bp, &shared.graph, &self.top_levels),
-        )?;
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                return (vec![], Err(e));
+            }
+        };
 
-        Self::run_impl(state, shared).await
+        match Self::run_impl(state, shared).await {
+            Ok(v) => (v, Ok(())),
+            Err((state_hnd, e)) => (
+                state_hnd
+                    .into_inner()
+                    .unwrap()
+                    .s
+                    .deliverables
+                    .into_iter()
+                    .filter_map(|d| match d.state {
+                        DeliverableState::Complete(a) => Some(a),
+                        _ => None,
+                    })
+                    .collect(),
+                Err(e),
+            ),
+        }
     }
 
-    async fn run_impl(state: State<B>, shared: Shared<B>) -> Result<Vec<B::Artifact>, Error> {
+    async fn run_impl(
+        state: State<B>,
+        shared: Shared<B>,
+    ) -> Result<Vec<B::Artifact>, (StateHandle<B>, Error)> {
         let state_hnd = state.into_handle();
         let shared_hnd = SharedHandle::new(shared);
 
@@ -176,7 +200,7 @@ impl<B: Backend> Orchestrator<B> {
                                 e
                             );
                             pending.abort_all();
-                            return Err(e);
+                            return Err((state_hnd, e));
                         }
                     },
                     Err(e) => {
@@ -186,7 +210,7 @@ impl<B: Backend> Orchestrator<B> {
                             tracing::error!("execution for a deliverable panicked! {}", e);
                         }
                         pending.abort_all();
-                        return Err(Error::Other(e.into()));
+                        return Err((state_hnd, Error::Other(e.into())));
                     }
                 }
             }
@@ -208,7 +232,7 @@ impl<B: Backend> Orchestrator<B> {
                             e
                         );
                         pending.abort_all();
-                        return Err(e);
+                        return Err((state_hnd, e));
                     }
                 },
                 Err(e) => {
@@ -218,7 +242,7 @@ impl<B: Backend> Orchestrator<B> {
                         tracing::error!("execution for a deliverable panicked! {}", e);
                     }
                     pending.abort_all();
-                    return Err(Error::Other(e.into()));
+                    return Err((state_hnd, Error::Other(e.into())));
                 }
             }
         }
