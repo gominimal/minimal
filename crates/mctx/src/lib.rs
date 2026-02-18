@@ -430,7 +430,7 @@ impl Context {
             cache.clone(),
         )?;
 
-        let run_result = match (
+        let (built, result) = match (
             self.config.use_local_cache(),
             self.config.use_remote_cache(),
         ) {
@@ -457,12 +457,14 @@ impl Context {
         // let build_succeeded = run_result.is_ok();
         // let error_message = run_result.as_ref().err().map(|e| e.to_string());
 
-        // Propagate error if build failed, and commit all artifacts to the local cache
-        for (pending_dir, meta) in run_result? {
+        // commit all built artifacts to the local cache
+        for (pending_dir, meta) in built {
             pending_dir
                 .finalize(meta)
                 .map_err(|e| Error::Other(e.into()))?;
         }
+        // propergate any error
+        result?;
 
         Ok(())
     }
