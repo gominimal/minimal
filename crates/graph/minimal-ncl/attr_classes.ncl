@@ -1,3 +1,8 @@
+let env_state_wiring_entry = {
+    env_var | String,
+    prefix | String,
+}
+in
 let source_provenance_gnu = {
     category = 'GnuProject,
     name | String,
@@ -53,10 +58,7 @@ in
     env_state_wiring = {
         name = "environment state directory & variable",
         desc = "Indicates the need for a state directory in an environment, and the environment variable through which it is communicated.",
-        validate = {
-            env_var | String,
-            prefix | String,
-        },
+        validate = std.contract.any_of [env_state_wiring_entry, Array env_state_wiring_entry],
     },
 
     needed_for_internet = {
