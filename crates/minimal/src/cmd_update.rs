@@ -75,9 +75,6 @@ pub async fn cmd_update(_args: UpdateArgs, ctx: &mut Context) -> Result<(), Erro
         // Update upstream
         if let Some(new_rev) = new_up_rev {
             doc["upstream"]["locked_commit"] = value(new_rev.clone());
-            if let Some(t) = doc["upstream"].as_table_like_mut() {
-                t.remove("rev"); // Old name, safe to remove ~feb
-            }
 
             println!(
                 "Upstream {}:{} updated from {} to {}",
@@ -93,9 +90,6 @@ pub async fn cmd_update(_args: UpdateArgs, ctx: &mut Context) -> Result<(), Erro
         // Update stdlib, if it was different.
         if let Some(new_rev) = new_std_rev {
             doc["stdlib"]["locked_commit"] = value(new_rev.clone());
-            if let Some(t) = doc["stdlib"].as_table_like_mut() {
-                t.remove("rev"); // Old name, safe to remove ~feb
-            }
 
             println!(
                 "Stdlib {}:{} updated from {} to {}",
