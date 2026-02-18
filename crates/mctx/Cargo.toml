@@ -18,6 +18,7 @@ toml.workspace = true
 tempfile.workspace = true
 shlex.workspace = true
 
+tracing.workspace = true
 tokio.workspace = true
 
 cache.workspace = true
