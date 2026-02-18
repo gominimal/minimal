@@ -115,7 +115,7 @@ impl EnvPatches {
 }
 
 /// Default settings applied to minimal's use in the repo and to objects in the mfile.
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct Defaults {
     /// The default profile to use for tasks which don't set their own profile.
     #[serde(default)]
@@ -123,10 +123,16 @@ pub struct Defaults {
     /// The default state_key to use for tasks which don't set their own state_key.
     #[serde(default)]
     pub state_key: Option<String>,
+
+    /// Any fields which are not understood by this version of minimal.
+    #[serde(flatten)]
+    pub extra: HashMap<String, toml::Value>,
 }
 
+impl Eq for Defaults {}
+
 /// Configuration for the harness applied to this repository.
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct Harness {
     #[serde(alias = "use")]
     pub name: String,
@@ -136,7 +142,13 @@ pub struct Harness {
     /// Additional runtime_packages needed by this repo.
     #[serde(default)]
     pub runtime_packages: Vec<String>,
+
+    /// Any fields which are not understood by this version of minimal.
+    #[serde(flatten)]
+    pub extra: HashMap<String, toml::Value>,
 }
+
+impl Eq for Harness {}
 
 /// Describes the specific type of output being generated.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -302,6 +314,30 @@ impl File {
             );
             was_unknown_fields = true;
         }
+        if !self.defaults.extra.is_empty() {
+            tracing::warn!(
+                "unknown fields in [defaults] section of {}: {}",
+                MFILE_NAME,
+                self.defaults
+                    .extra
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            was_unknown_fields = true;
+        }
+        if let Some(harness) = &self.harness
+            && !harness.extra.is_empty()
+        {
+            tracing::warn!(
+                "unknown fields in [harness] section of {}: {}",
+                MFILE_NAME,
+                harness.extra.keys().cloned().collect::<Vec<_>>().join(",")
+            );
+            was_unknown_fields = true;
+        }
+
         for (task_name, task) in &self.tasks {
             if !task.extra.is_empty() {
                 tracing::warn!(
