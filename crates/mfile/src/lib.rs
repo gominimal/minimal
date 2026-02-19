@@ -194,6 +194,13 @@ pub struct Output {
     extra: HashMap<String, toml::Value>,
 }
 
+/// Configuration for the standard library.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct Stdlib {
+    #[serde(alias = "min_version")]
+    pub minimum_version: Option<String>,
+}
+
 /// Which directory layout this layer/repo used for minimal configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Layout {
@@ -230,6 +237,9 @@ pub struct File {
     /// Output definitions.
     #[serde(default)]
     pub outputs: HashMap<String, Output>,
+    /// Configuration relevant to the standard library.
+    #[serde(default)]
+    pub stdlib: Stdlib,
 
     /// Any fields which are not understood by this version of minimal.
     #[serde(flatten)]
@@ -533,6 +543,7 @@ mod tests {
                     }
                 )]
                 .into(),
+                stdlib: Default::default(),
                 extra: HashMap::new(),
                 mfile_path: None,
                 layout: None,

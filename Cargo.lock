@@ -787,6 +787,7 @@ dependencies = [
  "serde",
  "shlex",
  "smallvec",
+ "stdlib",
  "tempfile",
  "toml",
 ]

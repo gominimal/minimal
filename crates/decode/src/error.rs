@@ -51,6 +51,12 @@ pub enum Error {
     },
     /// Some packages which were requested were not found.
     PackagesNotFound { packages: Vec<String> },
+    /// A newer version of the standard library is needed.
+    StdlibOutdated {
+        need_version: String,
+        needed_by: String,
+        current_version: String,
+    },
 }
 
 impl Error {
@@ -102,6 +108,15 @@ impl fmt::Display for Error {
             Error::PackagesNotFound { packages } => {
                 write!(f, "packages not found: {}", packages.join(","))
             }
+            Error::StdlibOutdated {
+                need_version,
+                needed_by,
+                current_version,
+            } => write!(
+                f,
+                "stdlib out of date: need={},got={},needed_by={}",
+                need_version, current_version, needed_by
+            ),
         }
     }
 }
@@ -266,6 +281,23 @@ impl Error {
                     diagnostic,
                     nickel_lang_core::error::report::ErrorFormat::Text,
                 );
+            }
+            Error::StdlibOutdated {
+                need_version,
+                needed_by,
+                current_version,
+            } => {
+                writeln!(
+                    writer,
+                    "Error: newer version of the standard library needed"
+                )
+                .unwrap();
+                writeln!(writer).unwrap();
+                writeln!(writer, "have: \"{}\"", current_version).unwrap();
+                writeln!(writer, "needed: \"{}\"", need_version).unwrap();
+                writeln!(writer, "needed by: {}", needed_by).unwrap();
+                writeln!(writer).unwrap();
+                writeln!(writer, "help: try updating minimal").unwrap();
             }
         }
     }
