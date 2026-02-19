@@ -34,6 +34,8 @@ mod cmd_update;
 use cmd_update::{UpdateArgs, cmd_update};
 mod cmd_init;
 use cmd_init::{InitArgs, cmd_init};
+mod cmd_add;
+use cmd_add::{AddArgs, cmd_add};
 
 #[derive(Parser)]
 #[command(name = "minimal", version = env!("GIT_HASH"))]
@@ -53,6 +55,8 @@ enum Command {
     Run(RunArgs),
     /// Refreshes local checkouts of upstream packages & the standard library.
     Update(UpdateArgs),
+    /// Add a new tool or dependency.
+    Add(AddArgs),
     /// Automatically initialize minimal configuration based on your source tree.
     Init(InitArgs),
     /// Runs the build task. Shorthand for `minimal run build`.
@@ -302,6 +306,7 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         Command::Package(args) => cmd_pkg(args, &mut ctx).await,
         Command::Check(args) => cmd_check(args, &mut ctx).await,
         Command::Plan(args) => cmd_plan(args, &mut ctx).await,
+        Command::Add(args) => cmd_add(args, &mut ctx).await,
         Command::UploadCache(args) => cmd_upload_cache(args, &mut ctx).await,
         Command::Materialize(args) => cmd_materialize(args, &mut ctx).await,
         Command::PatchedBuild(args) => cmd_patched_build(args, &mut ctx).await,
