@@ -245,7 +245,7 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
     };
 
     let packages_dir = upstream_dir.join("packages");
-    let stdlib_dir = ctx.stdlib_dir_and_origin().0;
+    let stdlib_dir = ctx.stdlib_dir();
 
     if args.fix && packages_dir.strip_prefix(ctx.vcs_dir()).is_ok() {
         return Err(Error::Other(anyhow!(

@@ -35,10 +35,7 @@ pub async fn cmd_init(args: InitArgs, ctx: &mut Context) -> Result<(), Error> {
                 DEFAULT_PKGS,
                 checkouts::GitRef::Branch(DEFAULT_PKGS_BRANCH.to_string()),
             )?;
-            let (stdlib_dir, _) = ctx.vcs_manager().checkout_of(
-                mfile::default_stdlib().as_url().unwrap(),
-                checkouts::GitRef::Branch("main".to_string()),
-            )?;
+            let stdlib_dir = ctx.stdlib_dir().to_path_buf();
 
             (
                 SpecOrigin::Repo(common::repo_spec::Repo::Git {
