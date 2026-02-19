@@ -89,10 +89,22 @@ impl Layer {
     /// Loads all objects in the given directory following the standard directory layout.
     pub fn new<P: AsRef<Path>>(layer_dir: P, opts: &LoadOptions) -> Result<Self, Error> {
         let (upstream, config_dir) = match mfile::File::from_dir(layer_dir.as_ref()) {
-            Ok(mfile) => (
-                Some(mfile.upstream.clone()),
-                mfile.dir_path().map(|p| p.to_path_buf()),
-            ),
+            Ok(mfile) => {
+                if let Some(min_vers) = &mfile.stdlib.minimum_version {
+                    if **min_vers > *stdlib::VERSION {
+                        return Err(Error::StdlibOutdated {
+                            need_version: min_vers.to_string(),
+                            needed_by: layer_dir.as_ref().to_str().unwrap().to_string(),
+                            current_version: stdlib::VERSION.to_string(),
+                        });
+                    }
+                }
+
+                (
+                    Some(mfile.upstream.clone()),
+                    mfile.dir_path().map(|p| p.to_path_buf()),
+                )
+            }
             Err(mfile::Error::IO(_, _, e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 (None, None)
             }

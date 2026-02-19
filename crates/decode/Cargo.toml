@@ -25,3 +25,4 @@ toml.workspace = true
 shlex.workspace = true
 common.workspace = true
 mfile.workspace = true
+stdlib.workspace = true
