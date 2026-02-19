@@ -28,3 +28,4 @@ graph.workspace = true
 mfile.workspace = true
 op.workspace = true
 orchestrator.workspace = true
+stdlib.workspace = true

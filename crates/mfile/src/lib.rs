@@ -217,9 +217,6 @@ pub struct File {
     /// The previous link in the software supply chain.
     #[serde(alias = "base")]
     pub upstream: LinkConfig,
-    /// What version of the standard library to use.
-    #[serde(default = "default_stdlib")]
-    pub stdlib: LinkConfig,
     /// Default profile, state_key etc.
     #[serde(default, alias = "default")]
     pub defaults: Defaults,
@@ -244,14 +241,6 @@ pub struct File {
     /// What layout this repo/layer is using, if loaded from disk.
     #[serde(skip)]
     layout: Option<Layout>,
-}
-
-pub fn default_stdlib() -> LinkConfig {
-    LinkConfig::Git {
-        repo: "https://github.com/gominimal/std".to_string(),
-        branch: None,
-        locked_commit: None,
-    }
 }
 
 impl File {
@@ -295,7 +284,6 @@ impl File {
                 let mut mfile: Self = toml::from_slice(&file_data).map_err(Error::Format)?;
                 mfile.mfile_path = Some(path.to_path_buf());
                 mfile.layout = Some(Layout::Root);
-                mfile.stdlib.fixup_relative(&path);
                 mfile.upstream.fixup_relative(&path);
                 mfile.warn_unknown_fields();
                 return Ok(mfile);
@@ -311,7 +299,6 @@ impl File {
                 let mut mfile: Self = toml::from_slice(&file_data).map_err(Error::Format)?;
                 mfile.mfile_path = Some(path.to_path_buf());
                 mfile.layout = Some(Layout::DotMinimal);
-                mfile.stdlib.fixup_relative(&path);
                 mfile.upstream.fixup_relative(&path);
                 mfile.warn_unknown_fields();
                 Ok(mfile)
@@ -515,7 +502,6 @@ mod tests {
                     branch: Some("main".to_string()),
                     locked_commit: None,
                 },
-                stdlib: default_stdlib(),
                 defaults: Default::default(),
                 harness: None,
                 tasks: [(

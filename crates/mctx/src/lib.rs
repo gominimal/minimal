@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::anyhow;
 use cache::{CacheBinProvider, RemoteBinProvider, RemoteCache, RemoteError};
-use checkouts::{GitRef, Manager as VcsManager};
+use checkouts::Manager as VcsManager;
 use common::{SpecOrigin, Target};
 use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
 
@@ -151,7 +151,6 @@ pub struct Context {
     config: Config,
 
     stdlib_dir: PathBuf,
-    stdlib_origin: SpecOrigin,
     mfile: Option<mfile::File>,
 
     vcs: VcsManager,
@@ -179,45 +178,22 @@ impl Context {
     pub fn new(config: Config) -> Result<Self, Error> {
         // Upsert dirs
         use std::fs::create_dir_all;
-
         create_dir_all(config.downloads_dir())
             .map_err(|e| Error::setup_dirs(e, config.downloads_dir()))?;
         create_dir_all(config.builds_base_dir())
             .map_err(|e| Error::setup_dirs(e, config.builds_base_dir()))?;
-
-        // TODO: rename-if-exist logic to migrate to new dir names, remove code end of feb 2026
-
-        if std::fs::exists(config.minimal_dir.join("builds"))
-            .map_err(|e| Error::setup_dirs(e, config.minimal_dir.join("builds")))?
-        {
-            std::fs::rename(config.minimal_dir.join("builds"), config.cache_dir())
-                .map_err(|e| Error::setup_dirs(e, config.cache_dir()))?;
-        }
         create_dir_all(config.cache_dir()).map_err(|e| Error::setup_dirs(e, config.cache_dir()))?;
-
-        if std::fs::exists(config.minimal_dir.join("envs"))
-            .map_err(|e| Error::setup_dirs(e, config.minimal_dir.join("envs")))?
-        {
-            std::fs::rename(config.minimal_dir.join("envs"), config.state_base_dir())
-                .map_err(|e| Error::setup_dirs(e, config.state_base_dir()))?;
-        }
         create_dir_all(config.state_base_dir())
             .map_err(|e| Error::setup_dirs(e, config.state_base_dir()))?;
-
-        // runs was the old name
-        if std::fs::exists(config.minimal_dir.join("runs"))
-            .map_err(|e| Error::setup_dirs(e, config.minimal_dir.join("runs")))?
-        {
-            std::fs::rename(config.minimal_dir.join("runs"), config.task_base_dir())
-                .map_err(|e| Error::setup_dirs(e, config.task_base_dir()))?;
-        }
         create_dir_all(config.task_base_dir())
             .map_err(|e| Error::setup_dirs(e, config.task_base_dir()))?;
         create_dir_all(config.vcs_dir()).map_err(|e| Error::setup_dirs(e, config.vcs_dir()))?;
         create_dir_all(config.index_dir()).map_err(|e| Error::setup_dirs(e, config.index_dir()))?;
+        create_dir_all(config.stdlib_dir())
+            .map_err(|e| Error::setup_dirs(e, config.stdlib_dir()))?;
 
         // Initialize subsystems that are always present/used
-        let mut vcs = VcsManager::new(config.vcs_dir())?;
+        let vcs = VcsManager::new(config.vcs_dir())?;
         let cache = Cache::at_dir(config.cache_dir())
             .map_err(|e| Error::Other(anyhow!("initializing local cache: {}", e)))?;
 
@@ -237,36 +213,20 @@ impl Context {
 
         // Figure out a path to the standard library. Roughly speaking this is loaded from:
         //  - Any override in the config
-        //  - The minimal file, if one was found
-        //  - The fallback `mfile::default_stdlib()`
-        let (stdlib_dir, stdlib_origin) = {
+        //  - The version embedded in the binary, stamped to disk
+        let stdlib_dir = {
             if let Some(dir) = config.stdlib_dir_override() {
-                (dir.clone(), SpecOrigin::from_dir(dir))
+                dir.clone()
             } else {
-                let stdlib_link = if let Some(mfile) = &mfile {
-                    &mfile.stdlib
-                } else {
-                    &mfile::default_stdlib()
-                };
-
-                match &stdlib_link {
-                    mfile::LinkConfig::Git { repo, .. } => {
-                        let git_ref: GitRef = stdlib_link.try_into().unwrap();
-                        let (dir, git_hash) = vcs.checkout_of(repo, git_ref.clone())?;
-                        (
-                            dir,
-                            SpecOrigin::Repo(git_ref.as_repo(repo.clone(), git_hash)),
-                        )
-                    }
-                    mfile::LinkConfig::Dir { dir } => (dir.into(), SpecOrigin::from_dir(dir)),
-                }
+                stdlib::upsert_stdlib_to_disk(config.stdlib_dir()).map_err(|e| {
+                    Error::Other(anyhow!("loading embedded standard library: {}", e))
+                })?
             }
         };
 
         Ok(Self {
             config,
             stdlib_dir,
-            stdlib_origin,
             mfile,
             vcs,
             cache,
@@ -319,9 +279,9 @@ impl Context {
             (None, None) => Err(Error::MFile(mfile::Error::NotFound)),
         }
     }
-    /// Returns a path to the standard library, as well as info about where its from.
-    pub fn stdlib_dir_and_origin(&self) -> (&PathBuf, &SpecOrigin) {
-        (&self.stdlib_dir, &self.stdlib_origin)
+    /// Returns a path to the standard library.
+    pub fn stdlib_dir(&self) -> &PathBuf {
+        &self.stdlib_dir
     }
 
     /// Returns the minimal file loaded from disk.
@@ -622,7 +582,7 @@ mod tests {
             )
             .with_stdlib_dir(
                 std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
-                    .join("../graph/minimal-ncl"),
+                    .join("../stdlib/minimal-ncl"),
             )
             .build()
             .unwrap();
@@ -677,7 +637,7 @@ mod tests {
             )
             .with_stdlib_dir(
                 std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
-                    .join("../graph/minimal-ncl"),
+                    .join("../stdlib/minimal-ncl"),
             )
             .build()
             .unwrap();
@@ -700,7 +660,7 @@ mod tests {
             )
             .with_stdlib_dir(
                 std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
-                    .join("../graph/minimal-ncl"),
+                    .join("../stdlib/minimal-ncl"),
             )
             .build()
             .unwrap();
@@ -740,7 +700,7 @@ mod tests {
             )
             .with_stdlib_dir(
                 std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
-                    .join("../graph/minimal-ncl"),
+                    .join("../stdlib/minimal-ncl"),
             )
             .build()
             .unwrap();

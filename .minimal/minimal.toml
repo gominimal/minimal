@@ -54,8 +54,3 @@ inherit_cwd = true
 bash = """
 echo 'env:' && env && echo "pwd: $(pwd)"
 """
-
-[stdlib]
-repo = "https://github.com/gominimal/std"
-branch = "main"
-locked_commit = "85aa75d38aa36a9051c548e85729a9ed2e6d54e7"

@@ -163,4 +163,7 @@ impl Config {
     pub(crate) fn index_dir(&self) -> PathBuf {
         self.minimal_dir.join("idx")
     }
+    pub(crate) fn stdlib_dir(&self) -> PathBuf {
+        self.minimal_dir.join("stdlib")
+    }
 }
