@@ -40,7 +40,10 @@ impl RemoteStorage {
         backend
             .download(ReqwestUrl::try_from(url)?, sha256)
             .await
-            .map_err(anyhow::Error::from)
+            .map_err(|e| match e {
+                either::Either::Left(e) => anyhow::Error::from(e),
+                either::Either::Right(e) => anyhow::Error::from(e),
+            })
     }
 
     #[tracing::instrument]
@@ -60,7 +63,10 @@ impl RemoteStorage {
                 sha256,
             )
             .await
-            .map_err(anyhow::Error::from)
+            .map_err(|e| match e {
+                either::Either::Left(e) => anyhow::Error::from(e),
+                either::Either::Right(e) => anyhow::Error::from(e),
+            })
     }
 
     #[tracing::instrument(skip(file))]
