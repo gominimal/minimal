@@ -59,6 +59,8 @@ enum Command {
     Add(AddArgs),
     /// Automatically initialize minimal configuration based on your source tree.
     Init(InitArgs),
+    /// Launches a development shell. Shorthand for `minimal run shell`.
+    Shell,
     /// Runs the build task. Shorthand for `minimal run build`.
     Build,
     /// Runs the test task. Shorthand for `minimal run test`.
@@ -312,6 +314,15 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         Command::PatchedBuild(args) => cmd_patched_build(args, &mut ctx).await,
         #[cfg(target_os = "linux")]
         Command::Run(args) => cmd_run(args, &mut ctx).await,
+        Command::Shell => {
+            cmd_run(
+                RunArgs {
+                    task_name: "shell".to_string(),
+                },
+                &mut ctx,
+            )
+            .await
+        }
         Command::Build => {
             cmd_run(
                 RunArgs {
