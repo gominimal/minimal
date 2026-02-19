@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     env::home_dir,
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 use crate::{Error, Options, Runnable};
@@ -41,6 +42,7 @@ impl<'a> Runnable for EnvSetup<'a> {
     type Result = RunnableEnv;
 
     async fn run<'b>(&mut self, opts: &Options<'b>) -> Result<Self::Result, Error> {
+        let start = SystemTime::now();
         let mut patch = self.patches.cloned().unwrap_or_else(EnvPatches::default);
         let mut env_vars = self
             .env_vars
@@ -118,6 +120,7 @@ impl<'a> Runnable for EnvSetup<'a> {
         }
 
         // Hardlink in the files which represent each dependency.
+        let hardlinking_start = SystemTime::now();
         let (mut bin_dir_exists, mut lib64_dir_exists) = (false, false);
         for dep in self.transitives.keys() {
             let p = opts
@@ -129,6 +132,7 @@ impl<'a> Runnable for EnvSetup<'a> {
             bin_dir_exists |= std::fs::exists(p.path().join("bin")).unwrap();
             lib64_dir_exists |= std::fs::exists(p.path().join("lib64")).unwrap();
         }
+        tracing::trace!("hardlinking took {:?}", hardlinking_start.elapsed());
 
         // Iterate all file/dir patches and make sure their bind mounts exist, also check
         // the bind target paths and make empty dirs/files as necessary.
@@ -219,6 +223,7 @@ impl<'a> Runnable for EnvSetup<'a> {
                     container.unshare(hakoniwa::Namespace::Uts);
                     container.hostname(hn);
                 }
+                tracing::trace!("task sandbox init took {:?}", start.elapsed());
                 container
             },
 
