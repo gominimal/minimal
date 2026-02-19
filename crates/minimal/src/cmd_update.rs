@@ -1,3 +1,5 @@
+use std::time::SystemTime;
+
 use cache::{EntryMeta, MetaInner};
 use graph::Transitives;
 
@@ -115,7 +117,7 @@ pub async fn cmd_update(_args: UpdateArgs, ctx: &mut Context) -> Result<(), Erro
     let rc = ctx.remote_cache(false, true).await.unwrap();
 
     let mut task_set = tokio::task::JoinSet::new();
-
+    let fetch_start = SystemTime::now();
     for (bsr, _depinfo) in Transitives::for_toplevels(&graph, ctx.scaffolding_packages()?, false) {
         let b = graph.get(&bsr).unwrap();
         let name = b.name.clone();
@@ -153,6 +155,7 @@ pub async fn cmd_update(_args: UpdateArgs, ctx: &mut Context) -> Result<(), Erro
             .map_err(|e| Error::Other(anyhow::Error::from(e)))?;
         pending_dir.finalize(meta).unwrap();
     }
+    tracing::trace!("package fetch took {:?}", fetch_start.elapsed());
 
     Ok(())
 }

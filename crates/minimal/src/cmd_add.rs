@@ -1,5 +1,7 @@
 //! Command to add packages as a dependency.
 
+use std::time::SystemTime;
+
 use anyhow::anyhow;
 use cache::{EntryMeta, MetaInner};
 use graph::Transitives;
@@ -119,6 +121,7 @@ pub async fn cmd_add(args: AddArgs, ctx: &mut Context) -> Result<(), Error> {
     let cache = ctx.local_cache();
     let rc = ctx.remote_cache(false, true).await.unwrap();
     let mut task_set = tokio::task::JoinSet::new();
+    let fetch_start = SystemTime::now();
     for (bsr, _depinfo) in Transitives::for_toplevels(&graph, graph.top_levels.clone(), false) {
         let b = graph.get(&bsr).unwrap();
         let name = b.name.clone();
@@ -157,6 +160,7 @@ pub async fn cmd_add(args: AddArgs, ctx: &mut Context) -> Result<(), Error> {
             .map_err(|e| Error::Other(anyhow::Error::from(e)))?;
         pending_dir.finalize(meta).unwrap();
     }
+    tracing::trace!("package fetch took {:?}", fetch_start.elapsed());
 
     Ok(())
 }
