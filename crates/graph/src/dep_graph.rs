@@ -7,14 +7,14 @@ use common::repo_spec::Repo;
 use common::{SpecOrigin, SubsetSpec, Target};
 use decode::builds::BuildRef;
 use decode::{Harness, Layer, Profile, builds};
-use mfile::{self, LinkConfig};
+use mfile::{self, EnvPatches, LinkConfig};
 use nickel_lang_core::term::IndexMap;
 
 use generational_arena::Arena;
 use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crate::spec_hasher::SubsetHasher;
@@ -891,6 +891,95 @@ impl DepGraph {
     pub fn iter_harnesses(&self) -> impl Iterator<Item = (&String, &Harness)> {
         self.harnesses.iter()
     }
+
+    /// Computes environment settings that need to be applied to an environment containing the
+    /// given packages.
+    ///
+    /// This returns settings derived from attributes.
+    pub fn env_config_for_packages<'a, P: AsRef<Path>, I: IntoIterator<Item = &'a BuildSpecRef>>(
+        &'a self,
+        state_base_dir: P,
+        i: I,
+    ) -> Result<SetupForPackages, std::io::Error> {
+        let mut patch = EnvPatches::default();
+        let (mut needs_dns, mut needs_internet) = (false, false);
+        let mut env_vars: HashMap<String, String> = Default::default();
+
+        use mfile::PatchSetting;
+        for dep in i.into_iter() {
+            let b = self.get(dep).unwrap();
+            if let Some(dirs) = b.attrs.get("env_dir_mappings") {
+                for mapping in dirs.as_list().unwrap() {
+                    let mapping = mapping.as_map().unwrap();
+                    patch.dir.insert(
+                        mapping.get("path").unwrap().as_string().unwrap().clone(),
+                        if *mapping.get("read_only").unwrap().as_bool().unwrap() {
+                            PatchSetting::ReadOnly
+                        } else {
+                            PatchSetting::ReadWrite
+                        },
+                    );
+                }
+            }
+            if let Some(dirs) = b.attrs.get("env_file_mappings") {
+                for mapping in dirs.as_list().unwrap() {
+                    let mapping = mapping.as_map().unwrap();
+                    patch.file.insert(
+                        mapping.get("path").unwrap().as_string().unwrap().clone(),
+                        if *mapping.get("read_only").unwrap().as_bool().unwrap() {
+                            PatchSetting::ReadOnly
+                        } else {
+                            PatchSetting::ReadWrite
+                        },
+                    );
+                }
+            }
+            if let Some(wiring) = b.attrs.get("env_state_wiring") {
+                let state_base_dir = state_base_dir.as_ref();
+                let mut apply_wiring = |entry: &AttrValue| -> Result<(), std::io::Error> {
+                    let entry = entry.as_map().unwrap();
+                    let env_var = entry.get("env_var").unwrap().as_string().unwrap().clone();
+                    let prefix = entry.get("prefix").unwrap().as_string().unwrap().clone();
+
+                    std::fs::create_dir_all(state_base_dir.join(&prefix))?;
+                    env_vars.insert(
+                        env_var,
+                        PathBuf::from("/state")
+                            .join(prefix)
+                            .to_str()
+                            .unwrap()
+                            .to_string(),
+                    );
+                    Ok(())
+                };
+
+                match wiring {
+                    decode::AttrValue::List(l) => l.iter().try_for_each(apply_wiring)?,
+                    decode::AttrValue::Map(_) => apply_wiring(wiring)?,
+                    _ => todo!("error for unhandled env_state_wiring AttrValue variant"),
+                }
+            }
+
+            needs_dns |= b.abstract_deps.get("dns").is_some();
+            needs_internet |= b.abstract_deps.get("internet").is_some();
+        }
+
+        Ok(SetupForPackages {
+            env_vars,
+            fs_mappings: patch,
+            needs_dns,
+            needs_internet,
+        })
+    }
+}
+
+/// Describes sandbox configuration that needs to be set to power present packages.
+#[derive(Debug, Clone)]
+pub struct SetupForPackages {
+    pub env_vars: HashMap<String, String>,
+    pub needs_dns: bool,
+    pub needs_internet: bool,
+    pub fs_mappings: EnvPatches,
 }
 
 #[cfg(test)]

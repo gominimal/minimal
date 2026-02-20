@@ -6,8 +6,7 @@ use std::{
 };
 
 use crate::{Error, Options, Runnable};
-use decode::AttrValue;
-use graph::{BuildSpecRef, TransitivesDep};
+use graph::{BuildSpecRef, SetupForPackages, TransitivesDep};
 use mfile::{EnvPatches, PatchSetting};
 use tempfile::TempDir;
 
@@ -43,12 +42,6 @@ impl<'a> Runnable for EnvSetup<'a> {
 
     async fn run<'b>(&mut self, opts: &Options<'b>) -> Result<Self::Result, Error> {
         let start = SystemTime::now();
-        let mut patch = self.patches.cloned().unwrap_or_else(EnvPatches::default);
-        let mut env_vars = self
-            .env_vars
-            .cloned()
-            .unwrap_or_else(|| HashMap::with_capacity(12));
-        // TODO: I think this means our env-vars take precedence, not ones from the minimalfile. Fix?
 
         // In rootfs: Create the cwd tree
         std::fs::create_dir_all(opts.exec_base.join(self.cwd)).map_err(anyhow::Error::from)?;
@@ -58,65 +51,24 @@ impl<'a> Runnable for EnvSetup<'a> {
         std::fs::create_dir_all(self.state_base_dir.join("cache")).map_err(anyhow::Error::from)?; // XDG_CACHE_HOME  ala ~/.cache
         std::fs::create_dir_all(self.state_base_dir.join("state")).map_err(anyhow::Error::from)?; // XDG_STATE_HOME  ala ~/.local/state
 
-        // Check attributes on each dependency to see if theres any additional env wiring.
-        let mut needs_dns = false;
-        for dep in self.transitives.keys() {
-            let b = opts.graph.get(dep).unwrap();
-            if let Some(dirs) = b.attrs.get("env_dir_mappings") {
-                for mapping in dirs.as_list().unwrap() {
-                    let mapping = mapping.as_map().unwrap();
-                    patch.dir.insert(
-                        mapping.get("path").unwrap().as_string().unwrap().clone(),
-                        if *mapping.get("read_only").unwrap().as_bool().unwrap() {
-                            PatchSetting::ReadOnly
-                        } else {
-                            PatchSetting::ReadWrite
-                        },
-                    );
-                }
-            }
-            if let Some(dirs) = b.attrs.get("env_file_mappings") {
-                for mapping in dirs.as_list().unwrap() {
-                    let mapping = mapping.as_map().unwrap();
-                    patch.file.insert(
-                        mapping.get("path").unwrap().as_string().unwrap().clone(),
-                        if *mapping.get("read_only").unwrap().as_bool().unwrap() {
-                            PatchSetting::ReadOnly
-                        } else {
-                            PatchSetting::ReadWrite
-                        },
-                    );
-                }
-            }
-            if let Some(wiring) = b.attrs.get("env_state_wiring") {
-                let mut apply_wiring = |entry: &AttrValue| -> Result<(), Error> {
-                    let entry = entry.as_map().unwrap();
-                    let env_var = entry.get("env_var").unwrap().as_string().unwrap().clone();
-                    let prefix = entry.get("prefix").unwrap().as_string().unwrap().clone();
-                    let dir = self.state_base_dir.join(&prefix);
-                    std::fs::create_dir_all(&dir).map_err(anyhow::Error::from)?;
-                    env_vars.entry(env_var).or_insert_with(|| {
-                        PathBuf::from("/state")
-                            .join(dir.strip_prefix(self.state_base_dir).unwrap())
-                            .to_str()
-                            .unwrap()
-                            .to_string()
-                    });
-                    Ok(())
-                };
-
-                match wiring {
-                    decode::AttrValue::List(l) => l.iter().try_for_each(apply_wiring)?,
-                    decode::AttrValue::Map(_) => apply_wiring(wiring)?,
-                    _ => todo!("error for unhandled env_state_wiring AttrValue variant"),
-                }
-            }
-
-            needs_dns |= b.abstract_deps.get("dns").is_some();
-        }
-
+        // Collect wiring needed by packages.
+        let SetupForPackages {
+            fs_mappings: mut patch,
+            needs_dns,
+            needs_internet: _,
+            mut env_vars,
+        } = opts
+            .graph
+            .env_config_for_packages(self.state_base_dir, self.transitives.keys())
+            .map_err(anyhow::Error::from)?;
         if needs_dns {
             common::synth_dns_config(&opts.exec_base).map_err(anyhow::Error::from)?;
+        }
+        if let Some(patches) = self.patches {
+            patch.union(patches);
+        }
+        if let Some(vars) = self.env_vars {
+            env_vars.extend(vars.clone());
         }
 
         // Hardlink in the files which represent each dependency.
