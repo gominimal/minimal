@@ -37,11 +37,62 @@ jobs:
         run: cargo fmt -- --check
       - name: Run Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  build-release-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install dependencies
+        run: sudo apt-get install -y musl-tools protobuf-compiler
+      - name: Add Rust target
+        run: rustup target add x86_64-unknown-linux-musl
+      - name: Configure musl linker
+        run: |
+          echo '' >> .cargo/config.toml
+          echo '[target.x86_64-unknown-linux-musl]' >> .cargo/config.toml
+          echo 'linker = "musl-gcc"' >> .cargo/config.toml
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-amd64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build static release binary
+        run: cargo build --release --package minimal --target x86_64-unknown-linux-musl
       - name: Upload binary artifact
         uses: actions/upload-artifact@v6
         with:
-          name: minimal-binary
-          path: target/debug/minimal
+          name: minimal-linux-amd64
+          path: target/x86_64-unknown-linux-musl/release/minimal
+          retention-days: 7
+
+  build-release-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-arm64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build static release binary
+        run: cross build --release --package minimal --target aarch64-unknown-linux-musl
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: minimal-linux-arm64
+          path: target/aarch64-unknown-linux-musl/release/minimal
           retention-days: 7
 
   cargo-deny:
@@ -52,18 +103,23 @@ jobs:
 
   release:
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, build-release-amd64, build-release-arm64]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: write
       id-token: write
     steps:
       - uses: actions/checkout@v6
-      - name: Download binary artifact
+      - name: Download amd64 binary
         uses: actions/download-artifact@v7
         with:
-          name: minimal-binary
-          path: .
+          name: minimal-linux-amd64
+          path: artifacts/amd64
+      - name: Download arm64 binary
+        uses: actions/download-artifact@v7
+        with:
+          name: minimal-linux-arm64
+          path: artifacts/arm64
       - name: Generate release info
         id: release_info
         run: |
@@ -71,12 +127,20 @@ jobs:
           echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
           echo "tag=release-$SHORT_SHA" >> $GITHUB_OUTPUT
           echo "name=minimal-$SHORT_SHA" >> $GITHUB_OUTPUT
+      - name: Prepare release assets
+        run: |
+          cp artifacts/amd64/minimal minimal-linux-amd64
+          cp artifacts/arm64/minimal minimal-linux-arm64
+          cp artifacts/amd64/minimal minimal
+          chmod +x minimal-linux-* minimal
       - name: Create Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${{ steps.release_info.outputs.tag }}" \
             minimal \
+            minimal-linux-amd64 \
+            minimal-linux-arm64 \
             --repo="${GITHUB_REPOSITORY}" \
             --title="${{ steps.release_info.outputs.name }}"
       - name: Authenticate to Google Cloud
