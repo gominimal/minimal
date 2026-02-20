@@ -81,7 +81,11 @@ pub struct Config {
     /// The set of files that should be mapped into the root filesystem of the sandbox.
     pub rootfs: HashSet<SandboxMapped>,
 
+    /// Synthesize DNS config.
+    pub setup_dns_config: bool,
+    /// Disable all networking.
     pub disable_networking: bool,
+
     /// The hostname to set in the environment, if any.
     pub hostname: Option<String>,
 
@@ -111,6 +115,7 @@ impl Config {
     pub fn new<S: Into<String>>(name: S) -> Self {
         Self {
             name: name.into(),
+            setup_dns_config: true,
             disable_networking: false,
             env_vars: HashMap::with_capacity(12),
             hostname: None,
@@ -188,6 +193,11 @@ impl Config {
     /// Sets whether networking is required.
     pub fn with_disable_networking(mut self, disable_networking: bool) -> Self {
         self.disable_networking = disable_networking;
+        self
+    }
+    /// Sets whether DNS should be configured.
+    pub fn with_dns(mut self, dns: bool) -> Self {
+        self.setup_dns_config = dns;
         self
     }
 
@@ -319,6 +329,15 @@ impl Config {
                     }
                 };
             }
+        }
+
+        // Make synthetic configuration
+        let sd = build_base_dir.join("synth");
+        fs::create_dir_all(&sd)
+            .map_err(|e| Error::IO("create synth config directory", sd.clone(), e))?;
+        if self.setup_dns_config {
+            common::synth_dns_config(&sd)
+                .map_err(|e| Error::IO("synthesizing DNS configuration", sd, e))?;
         }
 
         Sandbox::new(build_base_dir, self)
