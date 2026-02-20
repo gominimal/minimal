@@ -213,8 +213,6 @@ impl Container {
         EnvV: AsRef<str>,
     {
         let mut command = self.container.command(program);
-        command.stderr(hakoniwa::Stdio::MakePipe);
-        command.stdout(hakoniwa::Stdio::MakePipe);
         command.args(args);
         command.current_dir(match &sandbox.config.wd {
             WdSetup::BoundDir { path, .. } => path.to_str().unwrap().to_string(),
@@ -379,6 +377,14 @@ impl Sandbox {
             }
 
             let mut cmd = container.command(self, &program, exec.args.clone(), &exec.envs)?;
+            cmd.stderr(match exec.output {
+                config::PipeMode::Capture => hakoniwa::Stdio::MakePipe,
+                config::PipeMode::Inherit => hakoniwa::Stdio::Inherit,
+            });
+            cmd.stdout(match exec.output {
+                config::PipeMode::Capture => hakoniwa::Stdio::MakePipe,
+                config::PipeMode::Inherit => hakoniwa::Stdio::Inherit,
+            });
             tracing::debug!("Executing: {} {}", &exec.executable, exec.args.join(" "));
 
             // Exclusive section: only one hakoniwa command can be spawned
@@ -393,41 +399,40 @@ impl Sandbox {
             }
             .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
 
-            let output = child
-                .wait_with_output()
-                .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
-            if let Some(stdout) = self.stdout.as_mut() {
-                stdout
-                    .write_all(&output.stdout)
-                    .map_err(|e| Error::IO("writing stdout", Default::default(), e))?;
-                stdout
-                    .flush()
-                    .map_err(|e| Error::IO("flushing stdout", Default::default(), e))?;
-            }
-            if let Some(stderr) = self.stderr.as_mut() {
-                stderr
-                    .write_all(&output.stderr)
-                    .map_err(|e| Error::IO("writing stderr", Default::default(), e))?;
-                stderr
-                    .flush()
-                    .map_err(|e| Error::IO("flushing stderr", Default::default(), e))?;
-            }
+            let exit_status = match &exec.output {
+                config::PipeMode::Capture => {
+                    let output = child
+                        .wait_with_output()
+                        .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
+                    if let Some(stdout) = self.stdout.as_mut() {
+                        stdout
+                            .write_all(&output.stdout)
+                            .map_err(|e| Error::IO("writing stdout", Default::default(), e))?;
+                        stdout
+                            .flush()
+                            .map_err(|e| Error::IO("flushing stdout", Default::default(), e))?;
+                    }
+                    if let Some(stderr) = self.stderr.as_mut() {
+                        stderr
+                            .write_all(&output.stderr)
+                            .map_err(|e| Error::IO("writing stderr", Default::default(), e))?;
+                        stderr
+                            .flush()
+                            .map_err(|e| Error::IO("flushing stderr", Default::default(), e))?;
+                    }
+                    output.status
+                }
+                config::PipeMode::Inherit => child
+                    .wait()
+                    .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?,
+            };
 
-            if !output.status.success() {
-                let stderr_tail = {
-                    let s = &output.stderr;
-                    let tail = if s.len() > 4096 {
-                        &s[s.len() - 4096..]
-                    } else {
-                        s
-                    };
-                    String::from_utf8_lossy(tail).into_owned()
-                };
+            if !exit_status.success() {
                 return Err(Error::Execution(ExecutionError::InvocationFailed {
                     idx: i,
-                    code: output.status.code,
-                    reason: output.status.reason.clone(),
-                    stderr: stderr_tail,
+                    code: exit_status.code,
+                    reason: exit_status.reason.clone(),
+                    stderr: "<todo capture err>".to_string(),
                 }));
             }
         }

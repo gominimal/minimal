@@ -89,6 +89,14 @@ pub struct Config {
     pub env_vars: HashMap<String, String>,
 }
 
+/// Configuration for a pipe such as stderr or stdout.
+#[derive(Debug, Clone, Default)]
+pub enum PipeMode {
+    #[default]
+    Inherit,
+    Capture,
+}
+
 /// A command to be run in the sandbox.
 #[derive(Debug, Clone)]
 pub struct Invocation {
@@ -99,8 +107,13 @@ pub struct Invocation {
     ///  * `{executable}` is not a file in the cwd
     ///  * `/usr/bin/{executable}` exists
     pub executable: String,
+    /// Argv given to the invoked program.
     pub args: Vec<String>,
+    /// Environment variables set on this invocation only. This
+    /// takes precedence over any env vars set on [Config].
     pub envs: HashMap<String, String>,
+
+    pub output: PipeMode,
 }
 
 impl Config {
