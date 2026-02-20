@@ -534,7 +534,7 @@ impl Context {
         let opts = op::Options {
             cache,
             graph: &graph,
-            exec_base: base.path().to_path_buf(),
+            exec_base: self.config.task_base_dir(), // sandbox2 generates own unique path within
         };
         use op::Runnable;
         let mut runnable_env = op.run(&opts).await.map_err(|e| Error::Other(e.into()))?;
