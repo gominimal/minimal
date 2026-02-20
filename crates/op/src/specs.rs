@@ -239,7 +239,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
         rootfs.insert(SandboxMapped::TempDir(synth_files));
 
         let mut config = sandbox2::config::Config::new(&build.name)
-            .with_inputs(inputs.into_iter())
+            .with_isolated_wd(inputs.into_iter())
             .with_rootfs(rootfs.into_iter());
         if let Some(a) = &build.build_args {
             config = config.with_build_args(a.iter());

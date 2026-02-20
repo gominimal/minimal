@@ -1,7 +1,7 @@
 //! Finding & reading the `minimal.toml` file.
 
 use std::collections::HashMap;
-use std::env;
+use std::env::{self, home_dir};
 use std::path::{Component, Path, PathBuf};
 
 mod error;
@@ -127,6 +127,47 @@ impl EnvPatches {
             .extend(other.dir.iter().map(|(k, v)| (k.clone(), v.clone())));
         self.file
             .extend(other.file.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+}
+
+impl From<EnvPatches> for Vec<common::FsMapping> {
+    fn from(val: EnvPatches) -> Self {
+        let h = home_dir().unwrap();
+        let map_path = |path: String| {
+            if let Some(stripped) = path.strip_prefix("~/") {
+                h.join(stripped).to_str().unwrap().to_string()
+            } else {
+                path
+            }
+        };
+
+        val.dir
+            .into_iter()
+            .map(|(path, settings)| common::FsMapping {
+                host_path: map_path(path),
+                sandbox_path: None, // use host
+                create_if_missing: true,
+                is_file: false,
+                read_only: match settings {
+                    PatchSetting::ReadOnly => true,
+                    PatchSetting::ReadWrite => false,
+                },
+            })
+            .chain(
+                val.file
+                    .into_iter()
+                    .map(|(path, settings)| common::FsMapping {
+                        host_path: map_path(path),
+                        sandbox_path: None, // use host
+                        create_if_missing: true,
+                        is_file: true,
+                        read_only: match settings {
+                            PatchSetting::ReadOnly => true,
+                            PatchSetting::ReadWrite => false,
+                        },
+                    }),
+            )
+            .collect()
     }
 }
 

@@ -81,11 +81,11 @@ impl Sandbox {
 
         // Setup the working directory
         match &config.wd {
-            WdSetup::Isolated => {
+            WdSetup::Isolated { working_inputs } => {
                 let b = base_dir.join("build");
                 fs::create_dir_all(&b).map_err(|e| Error::IO("create build dir", b.clone(), e))?;
 
-                for i in &config.working_inputs {
+                for i in working_inputs {
                     match i {
                         config::SandboxMapped::File(p) => {
                             let dest = &b.join(p.file_name().unwrap());
@@ -114,10 +114,27 @@ impl Sandbox {
                 fs::create_dir_all(b.join("output"))
                     .map_err(|e| Error::IO("create output dir", b.clone(), e))?;
             }
-            WdSetup::BoundDir { path, read_only: _ } => {
+            WdSetup::BoundDir {
+                path,
+                fs_mappings,
+                read_only: _,
+            } => {
                 let cwd = rootfs.join(path);
                 fs::create_dir_all(&cwd)
                     .map_err(|e| Error::IO("create shadow cwd tree", cwd.clone(), e))?;
+
+                // Create bind-mount targets
+                for m in fs_mappings {
+                    let p = rootfs.join(m.path_in_sandbox());
+
+                    if m.is_file {
+                        fs::create_dir_all(p.parent().unwrap())
+                            .map_err(|e| Error::IO("create mapping parent", p, e))?;
+                    } else {
+                        fs::create_dir_all(&p)
+                            .map_err(|e| Error::IO("create mapping target", p, e))?;
+                    }
+                }
             }
         }
 
@@ -201,7 +218,7 @@ impl Container {
         command.args(args);
         command.current_dir(match &sandbox.config.wd {
             WdSetup::BoundDir { path, .. } => path.to_str().unwrap().to_string(),
-            WdSetup::Isolated => "/build".to_string(),
+            WdSetup::Isolated { .. } => "/build".to_string(),
         });
 
         command.env("XDG_CONFIG_HOME", "/state/home");
@@ -209,14 +226,14 @@ impl Container {
         command.env("XDG_CACHE_HOME", "/state/cache");
         command.env("XDG_STATE_HOME", "/state/state");
         command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
-        if let WdSetup::Isolated = sandbox.config.wd {
+        if let WdSetup::Isolated { .. } = sandbox.config.wd {
             command.env("HOME", "/state/home");
         } else if let Ok(h) = std::env::var("HOME") {
             command.env("HOME", &h);
         } else {
             command.env("HOME", "/state/home");
         };
-        if let WdSetup::Isolated = sandbox.config.wd {
+        if let WdSetup::Isolated { .. } = sandbox.config.wd {
             command.env("OUTPUT_DIR", "/build/output");
         }
 
@@ -268,19 +285,43 @@ impl Sandbox {
             container.symlink("/usr/lib", "/lib");
         }
 
+        // Mount in the working directory
         match &self.config.wd {
-            WdSetup::Isolated => {
+            WdSetup::Isolated { .. } => {
                 container.bindmount_rw(self.base_dir.join("build").to_str().unwrap(), "/build")
             }
             WdSetup::BoundDir {
                 path,
                 read_only: false,
+                fs_mappings: _,
             } => container.bindmount_rw(path.to_str().unwrap(), path.to_str().unwrap()),
             WdSetup::BoundDir {
                 path,
                 read_only: true,
+                fs_mappings: _,
             } => container.bindmount_ro(path.to_str().unwrap(), path.to_str().unwrap()),
         };
+        // Mount in any file mappings
+        if let WdSetup::BoundDir { fs_mappings, .. } = &self.config.wd {
+            for m in fs_mappings {
+                if m.is_file {
+                    container.mount(
+                        &m.host_path,
+                        &m.path_in_sandbox(),
+                        "",
+                        if m.read_only {
+                            hakoniwa::MountOptions::BIND | hakoniwa::MountOptions::RDONLY
+                        } else {
+                            hakoniwa::MountOptions::BIND
+                        },
+                    );
+                } else if m.read_only {
+                    container.bindmount_ro(&m.host_path, &m.path_in_sandbox());
+                } else {
+                    container.bindmount_rw(&m.host_path, &m.path_in_sandbox());
+                }
+            }
+        }
 
         if let Some(hn) = &self.config.hostname {
             let etc_hostname = self.base_dir.join("rootfs").join("etc").join("hostname");
@@ -302,7 +343,7 @@ impl Sandbox {
         let container = self.container()?;
         for (i, exec) in invocations.iter().enumerate() {
             let span = match &self.config.wd {
-                WdSetup::Isolated => tracing::info_span!(
+                WdSetup::Isolated { .. } => tracing::info_span!(
                     "sandbox_exec",
                     "indicatif.pb_show" = tracing::field::Empty,
                     "cmd" = {
@@ -326,7 +367,7 @@ impl Sandbox {
             if !program.starts_with("/")
                 && !fs::exists(
                     match &self.config.wd {
-                        WdSetup::Isolated => self.base_dir.join("build"),
+                        WdSetup::Isolated { .. } => self.base_dir.join("build"),
                         WdSetup::BoundDir { path, .. } => path.clone(),
                     }
                     .join(&program),

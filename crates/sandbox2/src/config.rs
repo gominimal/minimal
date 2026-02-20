@@ -44,18 +44,24 @@ impl Hash for SandboxMapped {
 }
 
 /// The different ways the working directory in the sandbox is to be setup.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug)]
 pub enum WdSetup {
     /// An empty directory `/build` is created, which is setup according to `working_inputs`.
-    #[default]
-    Isolated,
+    Isolated {
+        /// The set of files that should be mapped into the working directory of the sandbox.
+        working_inputs: Vec<SandboxMapped>,
+    },
     /// The host filesystem up to the given path is recreated with empty directories, and
     /// the given path is bind-mounted into the sandbox.
-    BoundDir { path: PathBuf, read_only: bool },
+    BoundDir {
+        path: PathBuf,
+        read_only: bool,
+        fs_mappings: Vec<common::FsMapping>,
+    },
 }
 
 /// Describes the setup of a sandbox.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Config {
     /// A human-readable name for this sandbox, such as the package being built.
     pub name: String,
@@ -74,8 +80,6 @@ pub struct Config {
     pub wd: WdSetup,
     /// The set of files that should be mapped into the root filesystem of the sandbox.
     pub rootfs: HashSet<SandboxMapped>,
-    /// The set of files that should be mapped into the working directory of the sandbox.
-    pub working_inputs: Vec<SandboxMapped>,
 
     pub disable_networking: bool,
     /// The hostname to set in the environment, if any.
@@ -104,7 +108,15 @@ impl Config {
     pub fn new<S: Into<String>>(name: S) -> Self {
         Self {
             name: name.into(),
-            ..Default::default()
+            disable_networking: false,
+            env_vars: HashMap::with_capacity(12),
+            hostname: None,
+            keep_dirs: false,
+            rootfs: HashSet::with_capacity(64),
+            state_dir: None,
+            wd: WdSetup::Isolated {
+                working_inputs: Vec::with_capacity(6),
+            },
         }
     }
 
@@ -114,13 +126,33 @@ impl Config {
         self
     }
     /// Configures the sandbox to map the given directory as the working directory.
-    pub fn with_wd<P: Into<PathBuf>>(mut self, wd: P, read_only: bool) -> Self {
+    pub fn with_wd<P: Into<PathBuf>>(
+        mut self,
+        wd: P,
+        read_only: bool,
+        fs_mappings: Vec<common::FsMapping>,
+    ) -> Self {
         self.wd = WdSetup::BoundDir {
             path: wd.into(),
             read_only,
+            fs_mappings,
         };
         self
     }
+    /// Configures the sandbox to isolate itself from the host, configuring only
+    /// the given files as contents of the isolated working directory.
+    pub fn with_isolated_wd<I: Iterator<Item = SandboxMapped>>(mut self, inputs: I) -> Self {
+        match &mut self.wd {
+            WdSetup::BoundDir { .. } => {
+                self.wd = WdSetup::Isolated {
+                    working_inputs: inputs.into_iter().collect(),
+                };
+            }
+            WdSetup::Isolated { working_inputs } => working_inputs.extend(inputs),
+        };
+        self
+    }
+
     /// Configures the hostname to use in the sandbox.
     pub fn with_hostname<S: Into<String>>(mut self, hostname: S) -> Self {
         self.hostname = Some(hostname.into());
@@ -148,17 +180,6 @@ impl Config {
     /// Adds the given [SandboxMapped] object to the root fs.
     pub fn with_add_rootfs(mut self, file: SandboxMapped) -> Self {
         self.rootfs.insert(file);
-        self
-    }
-
-    /// Extends the list of [SandboxMapped] objects which will be mapped into the working directory.
-    pub fn with_inputs<I: Iterator<Item = SandboxMapped>>(mut self, inputs: I) -> Self {
-        self.working_inputs.extend(inputs);
-        self
-    }
-    /// Adds to the list of [SandboxMapped] objects which will be mapped into the working directory.
-    pub fn with_add_input(mut self, file: SandboxMapped) -> Self {
-        self.working_inputs.push(file);
         self
     }
 
@@ -244,6 +265,53 @@ impl Config {
                 }
             }
         };
+
+        // Validate FS mappings, creating any non-existent files as we go.
+        if let WdSetup::BoundDir { fs_mappings, .. } = &self.wd {
+            for m in fs_mappings {
+                match fs::metadata(&m.host_path) {
+                    Ok(stat) => {
+                        if stat.is_dir() && m.is_file {
+                            return Err(Error::IO(
+                                "stat fs mapping",
+                                m.host_path.clone().into(),
+                                std::io::Error::new(
+                                    std::io::ErrorKind::AlreadyExists,
+                                    "directory mapped as a file",
+                                ),
+                            ));
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        if !m.create_if_missing {
+                            return Err(Error::IO("fs mapping", m.host_path.clone().into(), e));
+                        }
+
+                        // Missing and needs to be created.
+                        if m.is_file {
+                            fs::write(
+                                &m.host_path,
+                                if m.host_path.ends_with(".json") {
+                                    "{}"
+                                } else {
+                                    ""
+                                },
+                            )
+                            .map_err(|e| {
+                                Error::IO("create mapped file", m.host_path.clone().into(), e)
+                            })?;
+                        } else {
+                            fs::create_dir_all(&m.host_path).map_err(|e| {
+                                Error::IO("create mapped dir", m.host_path.clone().into(), e)
+                            })?;
+                        }
+                    }
+                    Err(e) => {
+                        return Err(Error::IO("stat fs mapping", m.host_path.clone().into(), e));
+                    }
+                };
+            }
+        }
 
         Sandbox::new(build_base_dir, self)
     }
