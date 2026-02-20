@@ -256,6 +256,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
                     executable: program,
                     args,
                     envs: Default::default(),
+                    output: sandbox2::config::PipeMode::Capture,
                 })
                 .collect(),
         )?;
