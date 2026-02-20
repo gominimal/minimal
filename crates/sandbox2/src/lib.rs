@@ -80,6 +80,7 @@ impl Sandbox {
                 config::SandboxMapped::File(_p) => todo!(),
             }
         }
+        hardlink_dir_contents(&base_dir.join("synth"), &rootfs)?;
         tracing::trace!("rootfs hardlinking took {:?}", hardlinking_start.elapsed());
 
         // Setup the working directory

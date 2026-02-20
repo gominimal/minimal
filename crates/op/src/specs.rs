@@ -229,17 +229,12 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
         }
 
         let inputs = self.inputs_mapped(build, opts).await?;
-        let (mut rootfs, needs_dns, needs_internet) = self.rootfs_mapped(build, opts).await?;
-
-        let synth_files = opts.cache.temp_dir()?;
-        if needs_dns {
-            common::synth_dns_config(synth_files.path()).map_err(anyhow::Error::from)?;
-        }
-        rootfs.insert(SandboxMapped::TempDir(synth_files));
+        let (rootfs, needs_dns, needs_internet) = self.rootfs_mapped(build, opts).await?;
 
         let mut config = sandbox2::config::Config::new(&build.name)
             .with_isolated_wd(inputs.into_iter())
             .with_rootfs(rootfs.into_iter())
+            .with_dns(needs_dns)
             .with_disable_networking(!needs_dns && !needs_internet);
         if let Some(a) = &build.build_args {
             config = config.with_build_args(a.iter());

@@ -52,9 +52,7 @@ impl<'a> Runnable for EnvSetup<'a> {
             .graph
             .env_config_for_packages(self.transitives.keys())
             .map_err(anyhow::Error::from)?;
-        if needs_dns {
-            common::synth_dns_config(&opts.exec_base).map_err(anyhow::Error::from)?;
-        }
+
         if let Some(patches) = self.patches {
             patch.union(patches); // patches set on [EnvSetup] take precedence
         }
@@ -74,6 +72,7 @@ impl<'a> Runnable for EnvSetup<'a> {
                     .map(|ce| SandboxMapped::Dir(ce.path().to_path_buf())),
             )
             .with_state_dir(self.state_base_dir)
+            .with_dns(needs_dns)
             .with_disable_networking(!needs_dns && !needs_internet)
             .with_env_vars(env_vars.into_iter());
 
