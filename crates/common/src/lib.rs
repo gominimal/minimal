@@ -365,3 +365,30 @@ pub fn command_exists(command: &str) -> Result<bool, io::Error> {
 
     Ok(false)
 }
+
+/// Describes a file or directory mapped from the host to the sandbox.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FsMapping {
+    /// The path on the host which will be mapped into the sandbox.
+    pub host_path: String,
+    /// The path within the sandbox which will point to the host path.
+    ///
+    /// If unset, the path in the sandbox is the same as the host.
+    pub sandbox_path: Option<String>,
+    /// If set, the path is read-only within the sandbox.
+    pub read_only: bool,
+
+    /// The path represents a file, not a directory.
+    pub is_file: bool,
+    /// Create the file or directory if it does not exist.
+    pub create_if_missing: bool,
+}
+
+impl FsMapping {
+    pub fn path_in_sandbox(&self) -> String {
+        match &self.sandbox_path {
+            Some(p) => p.clone(),
+            None => self.host_path.clone(),
+        }
+    }
+}
