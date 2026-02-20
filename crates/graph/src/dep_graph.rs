@@ -14,7 +14,7 @@ use generational_arena::Arena;
 use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use crate::spec_hasher::SubsetHasher;
@@ -896,14 +896,14 @@ impl DepGraph {
     /// given packages.
     ///
     /// This returns settings derived from attributes.
-    pub fn env_config_for_packages<'a, P: AsRef<Path>, I: IntoIterator<Item = &'a BuildSpecRef>>(
+    pub fn env_config_for_packages<'a, I: IntoIterator<Item = &'a BuildSpecRef>>(
         &'a self,
-        state_base_dir: P,
         i: I,
     ) -> Result<SetupForPackages, std::io::Error> {
         let mut patch = EnvPatches::default();
         let (mut needs_dns, mut needs_internet) = (false, false);
         let mut env_vars: HashMap<String, String> = Default::default();
+        let mut state_dirs = HashSet::default();
 
         use mfile::PatchSetting;
         for dep in i.into_iter() {
@@ -935,13 +935,13 @@ impl DepGraph {
                 }
             }
             if let Some(wiring) = b.attrs.get("env_state_wiring") {
-                let state_base_dir = state_base_dir.as_ref();
                 let mut apply_wiring = |entry: &AttrValue| -> Result<(), std::io::Error> {
                     let entry = entry.as_map().unwrap();
                     let env_var = entry.get("env_var").unwrap().as_string().unwrap().clone();
                     let prefix = entry.get("prefix").unwrap().as_string().unwrap().clone();
 
-                    std::fs::create_dir_all(state_base_dir.join(&prefix))?;
+                    state_dirs.insert(prefix.clone());
+
                     env_vars.insert(
                         env_var,
                         PathBuf::from("/state")
@@ -967,6 +967,7 @@ impl DepGraph {
         Ok(SetupForPackages {
             env_vars,
             fs_mappings: patch,
+            state_dirs,
             needs_dns,
             needs_internet,
         })
@@ -976,9 +977,16 @@ impl DepGraph {
 /// Describes sandbox configuration that needs to be set to power present packages.
 #[derive(Debug, Clone)]
 pub struct SetupForPackages {
+    /// Environment variables that need to be set, typically for an env_state_wiring entry.
     pub env_vars: HashMap<String, String>,
+    /// Directories that should be created in `/state`, typically from an env_state_wiring entry.
+    pub state_dirs: HashSet<String>,
+
+    /// Whether any package sets `needs.dns`.
     pub needs_dns: bool,
+    /// Whether any package sets `needs.internet`.
     pub needs_internet: bool,
+    /// The filesystem mappings accumulated from `env_file_mappings` and `env_dir_mappings` attrs.
     pub fs_mappings: EnvPatches,
 }
 
