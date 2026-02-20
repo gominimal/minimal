@@ -65,6 +65,12 @@ pub struct Config {
     /// The state directory, if any. An empty one will be created otherwise.
     pub state_dir: Option<PathBuf>,
     /// How the working directory is configured.
+    ///
+    /// The two main options are:
+    ///  * Isolated: cwd is an empty `/build` directory.
+    ///  * BoundDir: cwd is a path on the host system. Directories between `/` and the
+    ///    given path are created but empty, and the given path is bind-mounted
+    ///    into the sandbox.
     pub wd: WdSetup,
     /// The set of files that should be mapped into the root filesystem of the sandbox.
     pub rootfs: HashSet<SandboxMapped>,
@@ -82,6 +88,12 @@ pub struct Config {
 /// A command to be run in the sandbox.
 #[derive(Debug, Clone)]
 pub struct Invocation {
+    /// The program to exec.
+    ///
+    /// If executable is not an absolute path, it will be
+    /// mutated to `/usr/bin/{executable}` if:
+    ///  * `{executable}` is not a file in the cwd
+    ///  * `/usr/bin/{executable}` exists
     pub executable: String,
     pub args: Vec<String>,
     pub envs: HashMap<String, String>,
@@ -133,7 +145,7 @@ impl Config {
         self.rootfs.extend(rootfs);
         self
     }
-    /// Sets the given environment variable, all invocations will see it unless overridden.
+    /// Adds the given [SandboxMapped] object to the root fs.
     pub fn with_add_rootfs(mut self, file: SandboxMapped) -> Self {
         self.rootfs.insert(file);
         self

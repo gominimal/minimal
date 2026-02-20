@@ -3,6 +3,7 @@ use config::Config;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use tracing::Span;
 pub mod error;
 use crate::config::{Invocation, WdSetup};
 use crate::error::ExecutionError;
@@ -79,7 +80,7 @@ impl Sandbox {
         }
 
         // Setup the working directory
-        match config.wd {
+        match &config.wd {
             WdSetup::Isolated => {
                 let b = base_dir.join("build");
                 fs::create_dir_all(&b).map_err(|e| Error::IO("create build dir", b.clone(), e))?;
@@ -113,10 +114,11 @@ impl Sandbox {
                 fs::create_dir_all(b.join("output"))
                     .map_err(|e| Error::IO("create output dir", b.clone(), e))?;
             }
-            WdSetup::BoundDir {
-                path: _,
-                read_only: _,
-            } => todo!(),
+            WdSetup::BoundDir { path, read_only: _ } => {
+                let cwd = rootfs.join(path);
+                fs::create_dir_all(&cwd)
+                    .map_err(|e| Error::IO("create shadow cwd tree", cwd.clone(), e))?;
+            }
         }
 
         // Setup /state
@@ -179,22 +181,26 @@ impl AsRef<hakoniwa::Container> for Container {
 }
 
 impl Container {
-    pub fn command<I, S>(
+    pub fn command<I, IE, ArgS, EnvK, EnvV>(
         &self,
         sandbox: &Sandbox,
         program: &str,
         args: I,
+        envs: IE,
     ) -> Result<hakoniwa::Command, Error>
     where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
+        I: IntoIterator<Item = ArgS>,
+        ArgS: AsRef<str>,
+        IE: IntoIterator<Item = (EnvK, EnvV)>,
+        EnvK: AsRef<str>,
+        EnvV: AsRef<str>,
     {
         let mut command = self.container.command(program);
         command.stderr(hakoniwa::Stdio::MakePipe);
         command.stdout(hakoniwa::Stdio::MakePipe);
         command.args(args);
-        command.current_dir(match sandbox.config.wd {
-            WdSetup::BoundDir { .. } => todo!(),
+        command.current_dir(match &sandbox.config.wd {
+            WdSetup::BoundDir { path, .. } => path.to_str().unwrap().to_string(),
             WdSetup::Isolated => "/build".to_string(),
         });
 
@@ -203,15 +209,38 @@ impl Container {
         command.env("XDG_CACHE_HOME", "/state/cache");
         command.env("XDG_STATE_HOME", "/state/state");
         command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
-        command.env("HOME", "/state/home");
-        command.env("LANG", "en_US.utf8");
-        command.env("LC_ALL", "en_US.utf8");
+        if let WdSetup::Isolated = sandbox.config.wd {
+            command.env("HOME", "/state/home");
+        } else if let Ok(h) = std::env::var("HOME") {
+            command.env("HOME", &h);
+        } else {
+            command.env("HOME", "/state/home");
+        };
         if let WdSetup::Isolated = sandbox.config.wd {
             command.env("OUTPUT_DIR", "/build/output");
         }
+
+        command.env("LANG", "en_US.utf8");
+        command.env("LC_ALL", "en_US.utf8");
+        if let WdSetup::BoundDir { .. } = sandbox.config.wd {
+            //  Quality-of-life wiring for task sandboxes
+            if let Ok(term) = std::env::var("TERM") {
+                command.env("TERM", &term);
+            }
+            if let Ok(ct) = std::env::var("COLORTERM") {
+                command.env("COLORTERM", &ct);
+            }
+            if let Ok(lsc) = std::env::var("LS_COLORS") {
+                command.env("LS_COLORS", &lsc);
+            }
+        }
+
         sandbox.config.env_vars.iter().for_each(|(var, val)| {
             command.env(var, val);
         });
+        for (k, v) in envs.into_iter() {
+            command.env(k.as_ref(), v.as_ref());
+        }
 
         Ok(command)
     }
@@ -239,9 +268,19 @@ impl Sandbox {
             container.symlink("/usr/lib", "/lib");
         }
 
-        if let WdSetup::Isolated = self.config.wd {
-            container.bindmount_rw(self.base_dir.join("build").to_str().unwrap(), "/build");
-        }
+        match &self.config.wd {
+            WdSetup::Isolated => {
+                container.bindmount_rw(self.base_dir.join("build").to_str().unwrap(), "/build")
+            }
+            WdSetup::BoundDir {
+                path,
+                read_only: false,
+            } => container.bindmount_rw(path.to_str().unwrap(), path.to_str().unwrap()),
+            WdSetup::BoundDir {
+                path,
+                read_only: true,
+            } => container.bindmount_ro(path.to_str().unwrap(), path.to_str().unwrap()),
+        };
 
         if let Some(hn) = &self.config.hostname {
             let etc_hostname = self.base_dir.join("rootfs").join("etc").join("hostname");
@@ -262,33 +301,43 @@ impl Sandbox {
         let rootfs = self.base_dir.join("rootfs");
         let container = self.container()?;
         for (i, exec) in invocations.iter().enumerate() {
-            let span = tracing::info_span!(
-                "sandbox_exec",
-                "indicatif.pb_show" = tracing::field::Empty,
-                "cmd" = {
-                    let s = if exec.args.is_empty() {
-                        exec.executable.clone()
-                    } else {
-                        format!("{} {}", exec.executable, exec.args.join(" "))
-                    };
-                    match s.char_indices().nth(30) {
-                        Some((idx, _)) => format!("{}...", &s[..idx]),
-                        None => s.to_string(),
-                    }
-                },
-            );
+            let span = match &self.config.wd {
+                WdSetup::Isolated => tracing::info_span!(
+                    "sandbox_exec",
+                    "indicatif.pb_show" = tracing::field::Empty,
+                    "cmd" = {
+                        let s = if exec.args.is_empty() {
+                            exec.executable.clone()
+                        } else {
+                            format!("{} {}", exec.executable, exec.args.join(" "))
+                        };
+                        match s.char_indices().nth(30) {
+                            Some((idx, _)) => format!("{}...", &s[..idx]),
+                            None => s.to_string(),
+                        }
+                    },
+                ),
+                _ => Span::none(),
+            };
             let _enter = span.enter();
             let mut program = exec.executable.clone();
 
             // Add /usr/bin/ for commands that are not absolute, and don't shadow anything in cwd
             if !program.starts_with("/")
-                && !fs::exists(self.base_dir.join("build").join(&program)).unwrap()
+                && !fs::exists(
+                    match &self.config.wd {
+                        WdSetup::Isolated => self.base_dir.join("build"),
+                        WdSetup::BoundDir { path, .. } => path.clone(),
+                    }
+                    .join(&program),
+                )
+                .unwrap()
                 && fs::exists(rootfs.join("usr/bin").join(&program)).unwrap()
             {
                 program = format!("/usr/bin/{}", &program);
             }
 
-            let mut cmd = container.command(self, &program, exec.args.clone())?;
+            let mut cmd = container.command(self, &program, exec.args.clone(), &exec.envs)?;
             tracing::debug!("Executing: {} {}", &exec.executable, exec.args.join(" "));
 
             // Exclusive section: only one hakoniwa command can be spawned
