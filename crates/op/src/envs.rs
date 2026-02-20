@@ -76,11 +76,12 @@ impl<'a> Runnable for EnvSetup<'a> {
             .with_disable_networking(!needs_dns && !needs_internet)
             .with_env_vars(env_vars.into_iter());
 
-        let sandbox = config.build(&opts.exec_base).await?;
+        let mut sandbox = config.build(&opts.exec_base).await?;
         for want_dir in state_dirs {
             std::fs::create_dir_all(self.state_base_dir.join(want_dir))
                 .map_err(anyhow::Error::from)?;
         }
+        sandbox.keep_dir(false);
 
         Ok(RunnableEnv {
             sandbox,
