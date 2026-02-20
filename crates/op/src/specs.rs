@@ -229,8 +229,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
         }
 
         let inputs = self.inputs_mapped(build, opts).await?;
-        let (mut rootfs, needs_dns, _need_internet) = self.rootfs_mapped(build, opts).await?;
-        // TODO: Plumb need_internet
+        let (mut rootfs, needs_dns, needs_internet) = self.rootfs_mapped(build, opts).await?;
 
         let synth_files = opts.cache.temp_dir()?;
         if needs_dns {
@@ -240,7 +239,8 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
 
         let mut config = sandbox2::config::Config::new(&build.name)
             .with_isolated_wd(inputs.into_iter())
-            .with_rootfs(rootfs.into_iter());
+            .with_rootfs(rootfs.into_iter())
+            .with_disable_networking(!needs_dns && !needs_internet);
         if let Some(a) = &build.build_args {
             config = config.with_build_args(a.iter());
         }
@@ -256,7 +256,6 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
                     executable: program,
                     args,
                     envs: Default::default(),
-                    output: sandbox2::config::PipeMode::Capture,
                 })
                 .collect(),
         )?;

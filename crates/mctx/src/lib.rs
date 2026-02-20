@@ -467,8 +467,10 @@ impl Context {
     }
 
     /// Constructs an environment from which executions can be run, based on the given parameters.
+    #[allow(clippy::too_many_arguments)]
     pub async fn make_env<S: PackageSelection>(
         &mut self,
+        name: &str,
         mut graph: DepGraph,
         wd: Option<PathBuf>,
         state_key: Option<&String>,
@@ -519,6 +521,7 @@ impl Context {
         })?;
 
         let mut op = op::EnvSetup {
+            name,
             state_base_dir: &state_base_dir,
             top_levels: &graph.top_levels,
             transitives: &transitive_deps,
@@ -716,8 +719,9 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             // Build an environment based on the task
-            let env = ctx
+            let mut env = ctx
                 .make_env(
+                    "test",
                     graph,
                     None,
                     task_smoketest.state_key.as_ref(),
@@ -728,9 +732,11 @@ mod tests {
                 .await
                 .unwrap();
 
+            let container = env.container().unwrap();
+
             // Smoketest: date command should succeed, and regardless of the time the output should contain a colon.
             let output = env
-                .command("/bbin/date", [""; 0])
+                .command(&container, "/bbin/date", [""; 0])
                 .unwrap()
                 .output()
                 .unwrap();
@@ -742,7 +748,11 @@ mod tests {
             );
 
             // cwd should be the repo root
-            let output = env.command("/bbin/pwd", [""; 0]).unwrap().output().unwrap();
+            let output = env
+                .command(&container, "/bbin/pwd", [""; 0])
+                .unwrap()
+                .output()
+                .unwrap();
             assert!(output.status.success());
             assert_eq!(
                 String::from_utf8(output.stdout.clone()).unwrap(),

@@ -3,6 +3,7 @@ use config::Config;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use tracing::Span;
 pub mod error;
 use crate::config::{Invocation, WdSetup};
@@ -71,6 +72,7 @@ impl Sandbox {
         let rootfs = base_dir.join("rootfs");
         fs::create_dir_all(&rootfs)
             .map_err(|e| Error::IO("create rootfs dir", rootfs.clone(), e))?;
+        let hardlinking_start = SystemTime::now();
         for i in config.rootfs.iter() {
             match i {
                 config::SandboxMapped::Dir(p) => hardlink_dir_contents(p, &rootfs)?,
@@ -78,6 +80,7 @@ impl Sandbox {
                 config::SandboxMapped::File(_p) => todo!(),
             }
         }
+        tracing::trace!("rootfs hardlinking took {:?}", hardlinking_start.elapsed());
 
         // Setup the working directory
         match &config.wd {
@@ -85,6 +88,7 @@ impl Sandbox {
                 let b = base_dir.join("build");
                 fs::create_dir_all(&b).map_err(|e| Error::IO("create build dir", b.clone(), e))?;
 
+                let hardlinking_start = SystemTime::now();
                 for i in working_inputs {
                     match i {
                         config::SandboxMapped::File(p) => {
@@ -110,6 +114,7 @@ impl Sandbox {
                         config::SandboxMapped::TempDir(td) => hardlink_dir_contents(td.path(), &b)?,
                     }
                 }
+                tracing::trace!("input hardlinking took {:?}", hardlinking_start.elapsed());
 
                 fs::create_dir_all(b.join("output"))
                     .map_err(|e| Error::IO("create output dir", b.clone(), e))?;
@@ -187,7 +192,8 @@ impl Sandbox {
     }
 }
 
-struct Container {
+/// An initialized sandbox environment.
+pub struct Container {
     container: hakoniwa::Container,
 }
 
@@ -198,7 +204,7 @@ impl AsRef<hakoniwa::Container> for Container {
 }
 
 impl Container {
-    pub fn command<I, IE, ArgS, EnvK, EnvV>(
+    fn command_inner<I, IE, ArgS, EnvK, EnvV>(
         &self,
         sandbox: &Sandbox,
         program: &str,
@@ -263,7 +269,7 @@ impl Container {
 
 // Sandbox usage
 impl Sandbox {
-    fn container(&self) -> Result<Container, Error> {
+    pub fn new_container(&self) -> Result<Container, Error> {
         let mut container = hakoniwa::Container::new();
         container
             .rootfs(self.base_dir.join("rootfs"))
@@ -336,9 +342,44 @@ impl Sandbox {
         Ok(Container { container })
     }
 
-    pub fn run(&mut self, invocations: Vec<Invocation>) -> Result<(), Error> {
+    /// Initializes a hakoniwa command structure.
+    pub fn command<I, ArgS, IE, EnvK, EnvV>(
+        &mut self,
+        container: &Container,
+        program: &str,
+        args: I,
+        env_vars: IE,
+    ) -> Result<hakoniwa::Command, Error>
+    where
+        I: IntoIterator<Item = ArgS>,
+        ArgS: AsRef<str>,
+        IE: IntoIterator<Item = (EnvK, EnvV)>,
+        EnvK: AsRef<str>,
+        EnvV: AsRef<str>,
+    {
         let rootfs = self.base_dir.join("rootfs");
-        let container = self.container()?;
+        let mut program = program.to_string();
+
+        // Add /usr/bin/ for commands that are not absolute, and don't shadow anything in cwd
+        if !program.starts_with("/")
+            && !fs::exists(
+                match &self.config.wd {
+                    WdSetup::Isolated { .. } => self.base_dir.join("build"),
+                    WdSetup::BoundDir { path, .. } => path.clone(),
+                }
+                .join(&program),
+            )
+            .unwrap()
+            && fs::exists(rootfs.join("usr/bin").join(&program)).unwrap()
+        {
+            program = format!("/usr/bin/{}", &program);
+        }
+
+        container.command_inner(self, &program, args, env_vars)
+    }
+
+    pub fn run(&mut self, invocations: Vec<Invocation>) -> Result<(), Error> {
+        let container = self.new_container()?;
         for (i, exec) in invocations.iter().enumerate() {
             let span = match &self.config.wd {
                 WdSetup::Isolated { .. } => tracing::info_span!(
@@ -359,32 +400,10 @@ impl Sandbox {
                 _ => Span::none(),
             };
             let _enter = span.enter();
-            let mut program = exec.executable.clone();
 
-            // Add /usr/bin/ for commands that are not absolute, and don't shadow anything in cwd
-            if !program.starts_with("/")
-                && !fs::exists(
-                    match &self.config.wd {
-                        WdSetup::Isolated { .. } => self.base_dir.join("build"),
-                        WdSetup::BoundDir { path, .. } => path.clone(),
-                    }
-                    .join(&program),
-                )
-                .unwrap()
-                && fs::exists(rootfs.join("usr/bin").join(&program)).unwrap()
-            {
-                program = format!("/usr/bin/{}", &program);
-            }
-
-            let mut cmd = container.command(self, &program, exec.args.clone(), &exec.envs)?;
-            cmd.stderr(match exec.output {
-                config::PipeMode::Capture => hakoniwa::Stdio::MakePipe,
-                config::PipeMode::Inherit => hakoniwa::Stdio::Inherit,
-            });
-            cmd.stdout(match exec.output {
-                config::PipeMode::Capture => hakoniwa::Stdio::MakePipe,
-                config::PipeMode::Inherit => hakoniwa::Stdio::Inherit,
-            });
+            let mut cmd = self.command(&container, &exec.executable, &exec.args, &exec.envs)?;
+            cmd.stderr(hakoniwa::Stdio::MakePipe);
+            cmd.stdout(hakoniwa::Stdio::MakePipe);
             tracing::debug!("Executing: {} {}", &exec.executable, exec.args.join(" "));
 
             // Exclusive section: only one hakoniwa command can be spawned
@@ -399,40 +418,41 @@ impl Sandbox {
             }
             .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
 
-            let exit_status = match &exec.output {
-                config::PipeMode::Capture => {
-                    let output = child
-                        .wait_with_output()
-                        .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
-                    if let Some(stdout) = self.stdout.as_mut() {
-                        stdout
-                            .write_all(&output.stdout)
-                            .map_err(|e| Error::IO("writing stdout", Default::default(), e))?;
-                        stdout
-                            .flush()
-                            .map_err(|e| Error::IO("flushing stdout", Default::default(), e))?;
-                    }
-                    if let Some(stderr) = self.stderr.as_mut() {
-                        stderr
-                            .write_all(&output.stderr)
-                            .map_err(|e| Error::IO("writing stderr", Default::default(), e))?;
-                        stderr
-                            .flush()
-                            .map_err(|e| Error::IO("flushing stderr", Default::default(), e))?;
-                    }
-                    output.status
-                }
-                config::PipeMode::Inherit => child
-                    .wait()
-                    .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?,
-            };
+            let output = child
+                .wait_with_output()
+                .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
+            if let Some(stdout) = self.stdout.as_mut() {
+                stdout
+                    .write_all(&output.stdout)
+                    .map_err(|e| Error::IO("writing stdout", Default::default(), e))?;
+                stdout
+                    .flush()
+                    .map_err(|e| Error::IO("flushing stdout", Default::default(), e))?;
+            }
+            if let Some(stderr) = self.stderr.as_mut() {
+                stderr
+                    .write_all(&output.stderr)
+                    .map_err(|e| Error::IO("writing stderr", Default::default(), e))?;
+                stderr
+                    .flush()
+                    .map_err(|e| Error::IO("flushing stderr", Default::default(), e))?;
+            }
 
-            if !exit_status.success() {
+            if !output.status.success() {
+                let stderr_tail = {
+                    let s = &output.stderr;
+                    let tail = if s.len() > 4096 {
+                        &s[s.len() - 4096..]
+                    } else {
+                        s
+                    };
+                    String::from_utf8_lossy(tail).into_owned()
+                };
                 return Err(Error::Execution(ExecutionError::InvocationFailed {
                     idx: i,
-                    code: exit_status.code,
-                    reason: exit_status.reason.clone(),
-                    stderr: "<todo capture err>".to_string(),
+                    code: output.status.code,
+                    reason: output.status.reason.clone(),
+                    stderr: stderr_tail,
                 }));
             }
         }

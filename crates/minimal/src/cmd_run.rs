@@ -21,12 +21,18 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
         Some((t, g)) => (t, g),
     };
 
-    run_task(&task, graph, ctx).await
+    run_task(&args.task_name, &task, graph, ctx).await
 }
 
-pub async fn run_task(task: &mfile::Task, graph: DepGraph, ctx: &mut Context) -> Result<(), Error> {
-    let runnable_env = ctx
+pub async fn run_task(
+    task_name: &str,
+    task: &mfile::Task,
+    graph: DepGraph,
+    ctx: &mut Context,
+) -> Result<(), Error> {
+    let mut env = ctx
         .make_env(
+            task_name,
             graph,
             if task.inherit_cwd {
                 Some(std::env::current_dir().unwrap())
@@ -39,10 +45,13 @@ pub async fn run_task(task: &mfile::Task, graph: DepGraph, ctx: &mut Context) ->
             task.packages.clone(),
         )
         .await?;
+    let container = env
+        .container()
+        .map_err(|e| Error::Other(anyhow!("building container failed: {}", e)))?;
 
     if let Some((command, args)) = task.exec_and_args() {
-        let mut cmd = runnable_env
-            .command(&command, args)
+        let mut cmd = env
+            .command(&container, &command, args)
             .map_err(|e| Error::Other(anyhow!("building command failed: {}", e)))?;
         cmd.spawn()
             .map_err(|e| Error::Other(anyhow!("command launch failed: {}", e)))?
@@ -51,8 +60,8 @@ pub async fn run_task(task: &mfile::Task, graph: DepGraph, ctx: &mut Context) ->
     } else {
         // exec_and_args() only valid for some action variants, handle the others here
         if let TaskAction::CmdCmd(argv) = &task.action {
-            let mut meta_cmd = runnable_env
-                .command(&argv[0], &argv[1..])
+            let mut meta_cmd = env
+                .command(&container, &argv[0], &argv[1..])
                 .map_err(|e| Error::Other(anyhow!("building meta-command failed: {}", e)))?;
 
             let Output {
@@ -75,8 +84,8 @@ pub async fn run_task(task: &mfile::Task, graph: DepGraph, ctx: &mut Context) ->
                         let prog = args.next().unwrap();
                         println!("+ {}", &line);
 
-                        let mut cmd = runnable_env
-                            .command(&prog, args)
+                        let mut cmd = env
+                            .command(&container, &prog, args)
                             .map_err(|e| Error::Other(anyhow!("building command failed: {}", e)))?;
                         cmd.spawn()
                             .map_err(|e| Error::Other(anyhow!("command launch failed: {}", e)))?

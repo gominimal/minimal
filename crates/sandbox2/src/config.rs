@@ -89,14 +89,6 @@ pub struct Config {
     pub env_vars: HashMap<String, String>,
 }
 
-/// Configuration for a pipe such as stderr or stdout.
-#[derive(Debug, Clone, Default)]
-pub enum PipeMode {
-    #[default]
-    Inherit,
-    Capture,
-}
-
 /// A command to be run in the sandbox.
 #[derive(Debug, Clone)]
 pub struct Invocation {
@@ -112,8 +104,6 @@ pub struct Invocation {
     /// Environment variables set on this invocation only. This
     /// takes precedence over any env vars set on [Config].
     pub envs: HashMap<String, String>,
-
-    pub output: PipeMode,
 }
 
 impl Config {
@@ -193,6 +183,11 @@ impl Config {
     /// Adds the given [SandboxMapped] object to the root fs.
     pub fn with_add_rootfs(mut self, file: SandboxMapped) -> Self {
         self.rootfs.insert(file);
+        self
+    }
+    /// Sets whether networking is required.
+    pub fn with_disable_networking(mut self, disable_networking: bool) -> Self {
+        self.disable_networking = disable_networking;
         self
     }
 
