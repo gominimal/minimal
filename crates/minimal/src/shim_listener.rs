@@ -253,6 +253,30 @@ fn process_add(
     config: &ShimListenerConfig,
     present: &mut HashSet<BuildSpecRef>,
 ) -> String {
+    let resp = process_add_impl(package_names, ephemeral, config, present);
+    // Convert to legacy text format
+    let mut out = String::new();
+    out.push_str(&format!("STATUS {}\n", resp.status));
+    if !resp.added.is_empty() {
+        out.push_str(&format!("ADDED {}\n", resp.added.join(" ")));
+    } else if resp.status == "ok" {
+        out.push_str("ADDED\n");
+    }
+    for (key, value) in &resp.env {
+        out.push_str(&format!("ENV {}={}\n", key, value));
+    }
+    if !resp.message.is_empty() {
+        out.push_str(&format!("MSG {}\n", resp.message));
+    }
+    out
+}
+
+fn process_add_impl(
+    package_names: Vec<&str>,
+    ephemeral: bool,
+    config: &ShimListenerConfig,
+    present: &mut HashSet<BuildSpecRef>,
+) -> AddResponse {
     let graph = &config.graph;
     let cache = &config.cache;
 
@@ -261,7 +285,14 @@ fn process_add(
     for name in &package_names {
         match graph.by_name(name) {
             Some(bsr) => requested_bsrs.push(*bsr),
-            None => return format_error(&format!("unknown package: {}", name)),
+            None => {
+                return AddResponse {
+                    status: "error".into(),
+                    added: vec![],
+                    env: Default::default(),
+                    message: format!("unknown package: {}", name),
+                };
+            }
         }
     }
 
@@ -280,19 +311,21 @@ fn process_add(
         let env_result = graph.env_config_for_packages(requested_bsrs.iter());
         match env_result {
             Ok(setup) => {
-                let mut response = String::new();
-                response.push_str("STATUS ok\n");
-                response.push_str("ADDED\n");
-                for (key, value) in &setup.env_vars {
-                    response.push_str(&format!("ENV {}={}\n", key, value));
-                }
-                response.push_str(&format!(
-                    "MSG {} already present\n",
-                    package_names.join(", ")
-                ));
-                return response;
+                return AddResponse {
+                    status: "ok".into(),
+                    added: vec![],
+                    env: setup.env_vars.into_iter().collect(),
+                    message: format!("{} already present", package_names.join(", ")),
+                };
             }
-            Err(e) => return format_error(&format!("env config error: {}", e)),
+            Err(e) => {
+                return AddResponse {
+                    status: "error".into(),
+                    added: vec![],
+                    env: Default::default(),
+                    message: format!("env config error: {}", e),
+                };
+            }
         }
     }
 
@@ -306,27 +339,35 @@ fn process_add(
     }
 
     if !uncached.is_empty() {
-        // Attempt to build uncached packages
         info!(
             "shim listener: building {} uncached packages",
             uncached.len()
         );
         match build_uncached(graph, &uncached, &config.mctx_config) {
             Ok(()) => {
-                // Verify they're now cached
                 for bsr in &uncached {
                     let hash = graph.spec_hash(bsr);
                     if cache.read_dir(&hash).is_err() {
                         let name = graph.get(bsr).map(|b| b.name.as_str()).unwrap_or("unknown");
-                        return format_error(&format!(
-                            "package '{}' could not be built or fetched",
-                            name
-                        ));
+                        return AddResponse {
+                            status: "error".into(),
+                            added: vec![],
+                            env: Default::default(),
+                            message: format!(
+                                "package '{}' could not be built or fetched",
+                                name
+                            ),
+                        };
                     }
                 }
             }
             Err(e) => {
-                return format_error(&format!("build failed: {}", e));
+                return AddResponse {
+                    status: "error".into(),
+                    added: vec![],
+                    env: Default::default(),
+                    message: format!("build failed: {}", e),
+                };
             }
         }
     }
@@ -341,13 +382,23 @@ fn process_add(
             Ok(entry) => entry,
             Err(e) => {
                 let name = graph.get(bsr).map(|b| b.name.as_str()).unwrap_or("unknown");
-                return format_error(&format!("cache read failed for '{}': {}", name, e));
+                return AddResponse {
+                    status: "error".into(),
+                    added: vec![],
+                    env: Default::default(),
+                    message: format!("cache read failed for '{}': {}", name, e),
+                };
             }
         };
 
         if let Err(e) = common::hardlink_dir_contents(cache_entry.path(), rootfs) {
             let name = graph.get(bsr).map(|b| b.name.as_str()).unwrap_or("unknown");
-            return format_error(&format!("hardlink failed for '{}': {}", name, e));
+            return AddResponse {
+                status: "error".into(),
+                added: vec![],
+                env: Default::default(),
+                message: format!("hardlink failed for '{}': {}", name, e),
+            };
         }
 
         let name = graph
@@ -362,7 +413,14 @@ fn process_add(
     let env_result = graph.env_config_for_packages(new_deps.iter());
     let setup = match env_result {
         Ok(s) => s,
-        Err(e) => return format_error(&format!("env config error: {}", e)),
+        Err(e) => {
+            return AddResponse {
+                status: "error".into(),
+                added: vec![],
+                env: Default::default(),
+                message: format!("env config error: {}", e),
+            };
+        }
     };
 
     // Step 7: Create /state subdirectories
@@ -379,12 +437,6 @@ fn process_add(
     }
 
     // Step 9: Build response
-    let mut response = String::new();
-    response.push_str("STATUS ok\n");
-    response.push_str(&format!("ADDED {}\n", added_names.join(" ")));
-    for (key, value) in &setup.env_vars {
-        response.push_str(&format!("ENV {}={}\n", key, value));
-    }
     let msg = if added_names.len() == 1 {
         format!("Added {}", added_names[0])
     } else {
@@ -394,9 +446,13 @@ fn process_add(
             added_names.len().saturating_sub(package_names.len())
         )
     };
-    response.push_str(&format!("MSG {}\n", msg));
 
-    response
+    AddResponse {
+        status: "ok".into(),
+        added: added_names,
+        env: setup.env_vars.into_iter().collect(),
+        message: msg,
+    }
 }
 
 fn format_error(msg: &str) -> String {
@@ -1227,6 +1283,31 @@ exec = "bash -l"
         assert!(BASHRC_SNIPPET.contains("min()"));
         assert!(BASHRC_SNIPPET.contains("eval"));
         assert!(BASHRC_SNIPPET.contains("/usr/bin/min"));
+    }
+
+    #[test]
+    fn test_process_add_returns_structured_ok() {
+        let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
+        let (config, _state_dir, _mfile_dir) =
+            make_config(&graph, &cache, &rootfs_dir, HashSet::new());
+        let mut present = HashSet::new();
+
+        let resp = process_add_impl(vec!["zlib"], false, &config, &mut present);
+        assert_eq!(resp.status, "ok");
+        assert!(resp.added.contains(&"zlib".to_string()));
+        assert!(!resp.message.is_empty());
+    }
+
+    #[test]
+    fn test_process_add_returns_structured_error() {
+        let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
+        let (config, _state_dir, _mfile_dir) =
+            make_config(&graph, &cache, &rootfs_dir, HashSet::new());
+        let mut present = HashSet::new();
+
+        let resp = process_add_impl(vec!["nonexistent"], false, &config, &mut present);
+        assert_eq!(resp.status, "error");
+        assert!(resp.message.contains("unknown package"));
     }
 
     #[test]
