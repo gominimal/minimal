@@ -65,14 +65,11 @@ pub async fn run_task(
         .map_err(|e| Error::Other(anyhow!("creating .min directory: {}", e)))?;
 
     // Compute the initial set of packages in the rootfs (for tracking)
-    let initial_packages: std::collections::HashSet<_> = Transitives::for_toplevels(
-        &graph_for_shim,
-        graph_for_shim.top_levels.clone(),
-        false,
-    )
-    .keys()
-    .copied()
-    .collect();
+    let initial_packages: std::collections::HashSet<_> =
+        Transitives::for_toplevels(&graph_for_shim, graph_for_shim.top_levels.clone(), false)
+            .keys()
+            .copied()
+            .collect();
 
     // Get mfile path for persistence
     let mfile_path = ctx.minimal_file().ok().and_then(|f| f.file_path().cloned());

@@ -8,8 +8,8 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use graph::{BuildSpecRef, DepGraph, Transitives};
 use tracing::{debug, info, warn};
@@ -275,10 +275,7 @@ fn process_add(
                 for bsr in &uncached {
                     let hash = graph.spec_hash(bsr);
                     if cache.read_dir(&hash).is_err() {
-                        let name = graph
-                            .get(bsr)
-                            .map(|b| b.name.as_str())
-                            .unwrap_or("unknown");
+                        let name = graph.get(bsr).map(|b| b.name.as_str()).unwrap_or("unknown");
                         return format_error(&format!(
                             "package '{}' could not be built or fetched",
                             name
@@ -301,19 +298,13 @@ fn process_add(
         let cache_entry = match cache.read_dir(&hash) {
             Ok(entry) => entry,
             Err(e) => {
-                let name = graph
-                    .get(bsr)
-                    .map(|b| b.name.as_str())
-                    .unwrap_or("unknown");
+                let name = graph.get(bsr).map(|b| b.name.as_str()).unwrap_or("unknown");
                 return format_error(&format!("cache read failed for '{}': {}", name, e));
             }
         };
 
         if let Err(e) = common::hardlink_dir_contents(cache_entry.path(), rootfs) {
-            let name = graph
-                .get(bsr)
-                .map(|b| b.name.as_str())
-                .unwrap_or("unknown");
+            let name = graph.get(bsr).map(|b| b.name.as_str()).unwrap_or("unknown");
             return format_error(&format!("hardlink failed for '{}': {}", name, e));
         }
 
@@ -341,10 +332,8 @@ fn process_add(
     }
 
     // Step 8: Persist to minimal.toml if not ephemeral
-    if !ephemeral {
-        if let Some(mfile_path) = &config.mfile_path {
-            persist_packages_to_mfile(mfile_path, &config.task_name, &package_names);
-        }
+    if !ephemeral && let Some(mfile_path) = &config.mfile_path {
+        persist_packages_to_mfile(mfile_path, &config.task_name, &package_names);
     }
 
     // Step 9: Build response
@@ -422,9 +411,11 @@ fn persist_packages_to_mfile(mfile_path: &Path, task_name: &str, packages: &[&st
     let tasks = doc
         .entry("tasks")
         .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
-    let task = tasks
-        .as_table_mut()
-        .and_then(|t| t.entry(task_name).or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new())).as_table_mut());
+    let task = tasks.as_table_mut().and_then(|t| {
+        t.entry(task_name)
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_mut()
+    });
 
     if let Some(task_table) = task {
         let existing = task_table
@@ -457,7 +448,10 @@ fn persist_packages_to_mfile(mfile_path: &Path, task_name: &str, packages: &[&st
             info!("persisted packages to minimal.toml");
         }
     } else {
-        warn!("could not find or create task '{}' in minimal.toml", task_name);
+        warn!(
+            "could not find or create task '{}' in minimal.toml",
+            task_name
+        );
     }
 }
 
@@ -546,7 +540,12 @@ mod tests {
     ///
     /// Packages: zlib, expat, libffi, python (deps: zlib, expat, libffi), gcc, bash, coreutils.
     /// Each is populated in the cache with a dummy file under usr/lib/ or usr/bin/.
-    fn make_test_env() -> (DepGraph, Cache<cache::LocalDir>, tempfile::TempDir, tempfile::TempDir) {
+    fn make_test_env() -> (
+        DepGraph,
+        Cache<cache::LocalDir>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
         let cache_dir = tempfile::tempdir().unwrap();
         let cache = Cache::at_dir(cache_dir.path()).unwrap();
 
@@ -665,7 +664,10 @@ in
             )
             .unwrap();
             std::fs::write(
-                pending.path().join("usr/lib").join(format!("lib{}.so", pkg_name)),
+                pending
+                    .path()
+                    .join("usr/lib")
+                    .join(format!("lib{}.so", pkg_name)),
                 format!("fake lib for {}", pkg_name),
             )
             .unwrap();
@@ -734,7 +736,8 @@ packages = ["bash"]
     #[test]
     fn test_add_single_package() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
-        let (config, _state_dir, _mfile_dir) = make_config(&graph, &cache, &rootfs_dir, HashSet::new());
+        let (config, _state_dir, _mfile_dir) =
+            make_config(&graph, &cache, &rootfs_dir, HashSet::new());
 
         let mut present = HashSet::new();
         let response = process_add(vec!["zlib"], false, &config, &mut present);
@@ -750,10 +753,16 @@ packages = ["bash"]
     #[test]
     fn test_add_multiple_packages() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
-        let (config, _state_dir, _mfile_dir) = make_config(&graph, &cache, &rootfs_dir, HashSet::new());
+        let (config, _state_dir, _mfile_dir) =
+            make_config(&graph, &cache, &rootfs_dir, HashSet::new());
 
         let mut present = HashSet::new();
-        let response = process_add(vec!["zlib", "expat", "libffi"], false, &config, &mut present);
+        let response = process_add(
+            vec!["zlib", "expat", "libffi"],
+            false,
+            &config,
+            &mut present,
+        );
 
         assert!(response.contains("STATUS ok"), "response: {}", response);
         assert!(
@@ -774,7 +783,8 @@ packages = ["bash"]
     #[test]
     fn test_add_package_with_transitive_deps() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
-        let (config, _state_dir, _mfile_dir) = make_config(&graph, &cache, &rootfs_dir, HashSet::new());
+        let (config, _state_dir, _mfile_dir) =
+            make_config(&graph, &cache, &rootfs_dir, HashSet::new());
 
         let mut present = HashSet::new();
         // python depends on zlib, expat, libffi
@@ -782,10 +792,26 @@ packages = ["bash"]
 
         assert!(response.contains("STATUS ok"), "response: {}", response);
         // All transitive deps should be in ADDED
-        assert!(response.contains("zlib"), "zlib should be added: {}", response);
-        assert!(response.contains("expat"), "expat should be added: {}", response);
-        assert!(response.contains("libffi"), "libffi should be added: {}", response);
-        assert!(response.contains("python"), "python should be added: {}", response);
+        assert!(
+            response.contains("zlib"),
+            "zlib should be added: {}",
+            response
+        );
+        assert!(
+            response.contains("expat"),
+            "expat should be added: {}",
+            response
+        );
+        assert!(
+            response.contains("libffi"),
+            "libffi should be added: {}",
+            response
+        );
+        assert!(
+            response.contains("python"),
+            "python should be added: {}",
+            response
+        );
         // All should be hardlinked
         assert!(rootfs_dir.path().join("usr/lib/libzlib.so").exists());
         assert!(rootfs_dir.path().join("usr/lib/libexpat.so").exists());
@@ -801,7 +827,8 @@ packages = ["bash"]
         // Mark zlib as already present
         let mut initial = HashSet::new();
         initial.insert(*graph.by_name("zlib").unwrap());
-        let (config, _state_dir, _mfile_dir) = make_config(&graph, &cache, &rootfs_dir, initial.clone());
+        let (config, _state_dir, _mfile_dir) =
+            make_config(&graph, &cache, &rootfs_dir, initial.clone());
 
         let mut present = initial;
         let response = process_add(vec!["zlib"], false, &config, &mut present);
@@ -818,7 +845,8 @@ packages = ["bash"]
     #[test]
     fn test_add_unknown_package() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
-        let (config, _state_dir, _mfile_dir) = make_config(&graph, &cache, &rootfs_dir, HashSet::new());
+        let (config, _state_dir, _mfile_dir) =
+            make_config(&graph, &cache, &rootfs_dir, HashSet::new());
 
         let mut present = HashSet::new();
         let response = process_add(vec!["nonexistent_pkg"], false, &config, &mut present);
@@ -839,7 +867,8 @@ packages = ["bash"]
     #[test]
     fn test_add_ephemeral_does_not_persist() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
-        let (config, _state_dir, _mfile_dir) = make_config(&graph, &cache, &rootfs_dir, HashSet::new());
+        let (config, _state_dir, _mfile_dir) =
+            make_config(&graph, &cache, &rootfs_dir, HashSet::new());
 
         let mfile_path = config.mfile_path.clone().unwrap();
         let content_before = std::fs::read_to_string(&mfile_path).unwrap();
@@ -861,7 +890,8 @@ packages = ["bash"]
     #[test]
     fn test_add_persists_to_mfile() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
-        let (config, _state_dir, _mfile_dir) = make_config(&graph, &cache, &rootfs_dir, HashSet::new());
+        let (config, _state_dir, _mfile_dir) =
+            make_config(&graph, &cache, &rootfs_dir, HashSet::new());
 
         let mfile_path = config.mfile_path.clone().unwrap();
 
@@ -893,7 +923,8 @@ packages = ["bash"]
         let gcc_entry = cache.read_dir(&gcc_hash).unwrap();
         common::hardlink_dir_contents(gcc_entry.path(), rootfs_dir.path()).unwrap();
 
-        let (config, _state_dir, _mfile_dir) = make_config(&graph, &cache, &rootfs_dir, initial.clone());
+        let (config, _state_dir, _mfile_dir) =
+            make_config(&graph, &cache, &rootfs_dir, initial.clone());
 
         let mut present = initial;
         // bash depends on gcc, but gcc is already present
@@ -921,7 +952,8 @@ packages = ["bash"]
     #[test]
     fn test_sequential_adds_track_state() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
-        let (config, _state_dir, _mfile_dir) = make_config(&graph, &cache, &rootfs_dir, HashSet::new());
+        let (config, _state_dir, _mfile_dir) =
+            make_config(&graph, &cache, &rootfs_dir, HashSet::new());
 
         let mut present = HashSet::new();
 
@@ -968,7 +1000,8 @@ packages = ["bash"]
     #[test]
     fn test_tcp_wire_protocol() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
-        let (config, _state_dir, _mfile_dir) = make_config(&graph, &cache, &rootfs_dir, HashSet::new());
+        let (config, _state_dir, _mfile_dir) =
+            make_config(&graph, &cache, &rootfs_dir, HashSet::new());
 
         let port_file = config.port_file_path.clone();
         let handle = start(config);
@@ -1097,10 +1130,7 @@ packages = ["coreutils", "python"]
         let content = std::fs::read_to_string(&mfile_path).unwrap();
         let doc: toml_edit::DocumentMut = content.parse().unwrap();
         let arr = doc["tasks"]["shell"]["packages"].as_array().unwrap();
-        let python_count = arr
-            .iter()
-            .filter(|v| v.as_str() == Some("python"))
-            .count();
+        let python_count = arr.iter().filter(|v| v.as_str() == Some("python")).count();
         assert_eq!(python_count, 1, "python should appear exactly once");
     }
 
