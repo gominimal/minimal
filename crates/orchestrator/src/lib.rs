@@ -234,6 +234,7 @@ impl<B: Backend> Orchestrator<B> {
                             e
                         );
                         pending.abort_all();
+                        while pending.join_next().await.is_some() {}
                         return Err((state_hnd, e));
                     }
                 },
@@ -244,6 +245,7 @@ impl<B: Backend> Orchestrator<B> {
                         tracing::error!("execution for a deliverable panicked! {}", e);
                     }
                     pending.abort_all();
+                    while pending.join_next().await.is_some() {}
                     return Err((state_hnd, Error::Other(e.into())));
                 }
             }
