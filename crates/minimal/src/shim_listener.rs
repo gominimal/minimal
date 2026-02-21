@@ -119,8 +119,7 @@ pub fn start(config: ShimListenerConfig) -> ShimHandle {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
 
     // Bind before spawning so we know the address
-    let listener =
-        std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind TCP listener");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind TCP listener");
     let addr = listener.local_addr().expect("failed to get local addr");
 
     // Write port file
@@ -249,30 +248,6 @@ fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-fn process_add(
-    package_names: Vec<&str>,
-    ephemeral: bool,
-    config: &ShimListenerConfig,
-    present: &mut HashSet<BuildSpecRef>,
-) -> String {
-    let resp = process_add_impl(package_names, ephemeral, config, present);
-    // Convert to legacy text format
-    let mut out = String::new();
-    out.push_str(&format!("STATUS {}\n", resp.status));
-    if !resp.added.is_empty() {
-        out.push_str(&format!("ADDED {}\n", resp.added.join(" ")));
-    } else if resp.status == "ok" {
-        out.push_str("ADDED\n");
-    }
-    for (key, value) in &resp.env {
-        out.push_str(&format!("ENV {}={}\n", key, value));
-    }
-    if !resp.message.is_empty() {
-        out.push_str(&format!("MSG {}\n", resp.message));
-    }
-    out
-}
-
 fn process_add_impl(
     package_names: Vec<&str>,
     ephemeral: bool,
@@ -355,10 +330,7 @@ fn process_add_impl(
                             status: "error".into(),
                             added: vec![],
                             env: Default::default(),
-                            message: format!(
-                                "package '{}' could not be built or fetched",
-                                name
-                            ),
+                            message: format!("package '{}' could not be built or fetched", name),
                         };
                     }
                 }
@@ -455,10 +427,6 @@ fn process_add_impl(
         env: setup.env_vars.into_iter().collect(),
         message: msg,
     }
-}
-
-fn format_error(msg: &str) -> String {
-    format!("STATUS error\nMSG {}\n", msg)
 }
 
 /// Attempts to build uncached packages by creating a fresh Context.
@@ -635,7 +603,6 @@ mod tests {
     use cache::{Cache, EntryMeta, MetaInner};
     use decode::Layer;
     use graph::DepGraph;
-    use std::net::{TcpListener, TcpStream};
 
     /// Helper: create a DepGraph and Cache with multiple test packages.
     ///
@@ -845,7 +812,10 @@ packages = ["bash"]
         let request = if body.is_some() {
             format!(
                 "{} {} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                method, path, body_bytes.len(), body_bytes
+                method,
+                path,
+                body_bytes.len(),
+                body_bytes
             )
         } else {
             format!(
@@ -971,21 +941,31 @@ packages = ["bash"]
         handle.shutdown();
     }
 
-    // ========== Test 1: Single package add ==========
+    // ========== Test 1: Single package add (via HTTP) ==========
     #[test]
     fn test_add_single_package() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
         let (config, _state_dir, _mfile_dir) =
             make_config(&graph, &cache, &rootfs_dir, HashSet::new());
 
-        let mut present = HashSet::new();
-        let response = process_add(vec!["zlib"], false, &config, &mut present);
+        let port_file = config.port_file_path.clone();
+        let handle = start(config);
+        let port: u16 = std::fs::read_to_string(&port_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
 
-        assert!(response.contains("STATUS ok"), "response: {}", response);
-        assert!(response.contains("ADDED"), "response: {}", response);
-        assert!(response.contains("zlib"), "response: {}", response);
+        let body = r#"{"packages":["zlib"]}"#;
+        let (status, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
+        assert_eq!(status, 200);
+        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        assert_eq!(resp.status, "ok");
+        assert!(resp.added.contains(&"zlib".to_string()));
         // Verify the file was hardlinked into rootfs
         assert!(rootfs_dir.path().join("usr/lib/libzlib.so").exists());
+
+        handle.shutdown();
     }
 
     // ========== Test 2: Multiple packages at once ==========
@@ -995,27 +975,24 @@ packages = ["bash"]
         let (config, _state_dir, _mfile_dir) =
             make_config(&graph, &cache, &rootfs_dir, HashSet::new());
 
-        let mut present = HashSet::new();
-        let response = process_add(
-            vec!["zlib", "expat", "libffi"],
-            false,
-            &config,
-            &mut present,
-        );
+        let port_file = config.port_file_path.clone();
+        let handle = start(config);
+        let port: u16 = std::fs::read_to_string(&port_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
 
-        assert!(response.contains("STATUS ok"), "response: {}", response);
-        assert!(
-            rootfs_dir.path().join("usr/lib/libzlib.so").exists(),
-            "zlib should be in rootfs"
-        );
-        assert!(
-            rootfs_dir.path().join("usr/lib/libexpat.so").exists(),
-            "expat should be in rootfs"
-        );
-        assert!(
-            rootfs_dir.path().join("usr/lib/liblibffi.so").exists(),
-            "libffi should be in rootfs"
-        );
+        let body = r#"{"packages":["zlib","expat","libffi"]}"#;
+        let (status, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
+        assert_eq!(status, 200);
+        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        assert_eq!(resp.status, "ok");
+        assert!(rootfs_dir.path().join("usr/lib/libzlib.so").exists());
+        assert!(rootfs_dir.path().join("usr/lib/libexpat.so").exists());
+        assert!(rootfs_dir.path().join("usr/lib/liblibffi.so").exists());
+
+        handle.shutdown();
     }
 
     // ========== Test 3: Package with transitive dependencies ==========
@@ -1025,37 +1002,31 @@ packages = ["bash"]
         let (config, _state_dir, _mfile_dir) =
             make_config(&graph, &cache, &rootfs_dir, HashSet::new());
 
-        let mut present = HashSet::new();
-        // python depends on zlib, expat, libffi
-        let response = process_add(vec!["python"], false, &config, &mut present);
+        let port_file = config.port_file_path.clone();
+        let handle = start(config);
+        let port: u16 = std::fs::read_to_string(&port_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
 
-        assert!(response.contains("STATUS ok"), "response: {}", response);
-        // All transitive deps should be in ADDED
-        assert!(
-            response.contains("zlib"),
-            "zlib should be added: {}",
-            response
-        );
-        assert!(
-            response.contains("expat"),
-            "expat should be added: {}",
-            response
-        );
-        assert!(
-            response.contains("libffi"),
-            "libffi should be added: {}",
-            response
-        );
-        assert!(
-            response.contains("python"),
-            "python should be added: {}",
-            response
-        );
+        // python depends on zlib, expat, libffi
+        let body = r#"{"packages":["python"]}"#;
+        let (status, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
+        assert_eq!(status, 200);
+        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        assert_eq!(resp.status, "ok");
+        assert!(resp.added.contains(&"zlib".to_string()));
+        assert!(resp.added.contains(&"expat".to_string()));
+        assert!(resp.added.contains(&"libffi".to_string()));
+        assert!(resp.added.contains(&"python".to_string()));
         // All should be hardlinked
         assert!(rootfs_dir.path().join("usr/lib/libzlib.so").exists());
         assert!(rootfs_dir.path().join("usr/lib/libexpat.so").exists());
         assert!(rootfs_dir.path().join("usr/lib/liblibffi.so").exists());
         assert!(rootfs_dir.path().join("usr/bin/python").exists());
+
+        handle.shutdown();
     }
 
     // ========== Test 4: Already-present package (no-op) ==========
@@ -1063,21 +1034,26 @@ packages = ["bash"]
     fn test_add_already_present_package() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
 
-        // Mark zlib as already present
         let mut initial = HashSet::new();
         initial.insert(*graph.by_name("zlib").unwrap());
-        let (config, _state_dir, _mfile_dir) =
-            make_config(&graph, &cache, &rootfs_dir, initial.clone());
+        let (config, _state_dir, _mfile_dir) = make_config(&graph, &cache, &rootfs_dir, initial);
 
-        let mut present = initial;
-        let response = process_add(vec!["zlib"], false, &config, &mut present);
+        let port_file = config.port_file_path.clone();
+        let handle = start(config);
+        let port: u16 = std::fs::read_to_string(&port_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
 
-        assert!(response.contains("STATUS ok"), "response: {}", response);
-        assert!(
-            response.contains("already present"),
-            "should say already present: {}",
-            response
-        );
+        let body = r#"{"packages":["zlib"]}"#;
+        let (status, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
+        assert_eq!(status, 200);
+        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        assert_eq!(resp.status, "ok");
+        assert!(resp.message.contains("already present"));
+
+        handle.shutdown();
     }
 
     // ========== Test 5: Unknown package ==========
@@ -1087,19 +1063,22 @@ packages = ["bash"]
         let (config, _state_dir, _mfile_dir) =
             make_config(&graph, &cache, &rootfs_dir, HashSet::new());
 
-        let mut present = HashSet::new();
-        let response = process_add(vec!["nonexistent_pkg"], false, &config, &mut present);
+        let port_file = config.port_file_path.clone();
+        let handle = start(config);
+        let port: u16 = std::fs::read_to_string(&port_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
 
-        assert!(
-            response.contains("STATUS error"),
-            "should error for unknown: {}",
-            response
-        );
-        assert!(
-            response.contains("unknown package"),
-            "should mention unknown: {}",
-            response
-        );
+        let body = r#"{"packages":["nonexistent_pkg"]}"#;
+        let (status, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
+        assert_eq!(status, 422);
+        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        assert_eq!(resp.status, "error");
+        assert!(resp.message.contains("unknown package"));
+
+        handle.shutdown();
     }
 
     // ========== Test 6: Ephemeral flag (no minimal.toml update) ==========
@@ -1112,10 +1091,19 @@ packages = ["bash"]
         let mfile_path = config.mfile_path.clone().unwrap();
         let content_before = std::fs::read_to_string(&mfile_path).unwrap();
 
-        let mut present = HashSet::new();
-        let response = process_add(vec!["gcc"], true, &config, &mut present);
+        let port_file = config.port_file_path.clone();
+        let handle = start(config);
+        let port: u16 = std::fs::read_to_string(&port_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
 
-        assert!(response.contains("STATUS ok"), "response: {}", response);
+        let body = r#"{"packages":["gcc"],"ephemeral":true}"#;
+        let (status, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
+        assert_eq!(status, 200);
+        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        assert_eq!(resp.status, "ok");
 
         // Verify minimal.toml was NOT modified
         let content_after = std::fs::read_to_string(&mfile_path).unwrap();
@@ -1123,6 +1111,8 @@ packages = ["bash"]
             content_before, content_after,
             "minimal.toml should not be modified for ephemeral adds"
         );
+
+        handle.shutdown();
     }
 
     // ========== Test 7: Non-ephemeral persists to minimal.toml ==========
@@ -1134,10 +1124,19 @@ packages = ["bash"]
 
         let mfile_path = config.mfile_path.clone().unwrap();
 
-        let mut present = HashSet::new();
-        let response = process_add(vec!["gcc"], false, &config, &mut present);
+        let port_file = config.port_file_path.clone();
+        let handle = start(config);
+        let port: u16 = std::fs::read_to_string(&port_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
 
-        assert!(response.contains("STATUS ok"), "response: {}", response);
+        let body = r#"{"packages":["gcc"]}"#;
+        let (status, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
+        assert_eq!(status, 200);
+        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        assert_eq!(resp.status, "ok");
 
         // Verify minimal.toml was updated with gcc
         let content_after = std::fs::read_to_string(&mfile_path).unwrap();
@@ -1146,6 +1145,8 @@ packages = ["bash"]
             "minimal.toml should contain gcc: {}",
             content_after
         );
+
+        handle.shutdown();
     }
 
     // ========== Test 8: Partial overlap with already-present packages ==========
@@ -1162,29 +1163,31 @@ packages = ["bash"]
         let gcc_entry = cache.read_dir(&gcc_hash).unwrap();
         common::hardlink_dir_contents(gcc_entry.path(), rootfs_dir.path()).unwrap();
 
-        let (config, _state_dir, _mfile_dir) =
-            make_config(&graph, &cache, &rootfs_dir, initial.clone());
+        let (config, _state_dir, _mfile_dir) = make_config(&graph, &cache, &rootfs_dir, initial);
 
-        let mut present = initial;
+        let port_file = config.port_file_path.clone();
+        let handle = start(config);
+        let port: u16 = std::fs::read_to_string(&port_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
         // bash depends on gcc, but gcc is already present
-        let response = process_add(vec!["bash"], false, &config, &mut present);
+        let body = r#"{"packages":["bash"]}"#;
+        let (status, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
+        assert_eq!(status, 200);
+        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        assert_eq!(resp.status, "ok");
+        assert!(resp.added.contains(&"bash".to_string()));
+        // gcc should NOT be re-added
+        assert!(
+            !resp.added.contains(&"gcc".to_string()),
+            "gcc should not be re-added: {:?}",
+            resp.added
+        );
 
-        assert!(response.contains("STATUS ok"), "response: {}", response);
-        assert!(
-            response.contains("bash"),
-            "bash should be added: {}",
-            response
-        );
-        // gcc should NOT be in the ADDED line since it was already present
-        let added_line = response
-            .lines()
-            .find(|l| l.starts_with("ADDED"))
-            .unwrap_or("");
-        assert!(
-            !added_line.contains("gcc"),
-            "gcc should not be re-added: {}",
-            added_line
-        );
+        handle.shutdown();
     }
 
     // ========== Test 9: Sequential adds track state ==========
@@ -1194,50 +1197,46 @@ packages = ["bash"]
         let (config, _state_dir, _mfile_dir) =
             make_config(&graph, &cache, &rootfs_dir, HashSet::new());
 
-        let mut present = HashSet::new();
+        let port_file = config.port_file_path.clone();
+        let handle = start(config);
+        let port: u16 = std::fs::read_to_string(&port_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
 
         // First add: gcc
-        let response1 = process_add(vec!["gcc"], false, &config, &mut present);
-        assert!(response1.contains("STATUS ok"), "r1: {}", response1);
-        assert!(
-            response1.contains("gcc"),
-            "gcc should be added: {}",
-            response1
-        );
+        let body = r#"{"packages":["gcc"]}"#;
+        let (status, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
+        assert_eq!(status, 200);
+        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        assert_eq!(resp.status, "ok");
+        assert!(resp.added.contains(&"gcc".to_string()));
 
         // Second add: bash (depends on gcc, which is now present)
-        let response2 = process_add(vec!["bash"], false, &config, &mut present);
-        assert!(response2.contains("STATUS ok"), "r2: {}", response2);
-
-        let added_line2 = response2
-            .lines()
-            .find(|l| l.starts_with("ADDED"))
-            .unwrap_or("");
+        let body = r#"{"packages":["bash"]}"#;
+        let (_, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
+        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        assert_eq!(resp.status, "ok");
+        assert!(resp.added.contains(&"bash".to_string()));
         assert!(
-            added_line2.contains("bash"),
-            "bash should be added: {}",
-            added_line2
-        );
-        // gcc should NOT be added again
-        assert!(
-            !added_line2.contains("gcc"),
-            "gcc should not be re-added: {}",
-            added_line2
+            !resp.added.contains(&"gcc".to_string()),
+            "gcc should not be re-added"
         );
 
         // Third add: gcc again (should be no-op)
-        let response3 = process_add(vec!["gcc"], false, &config, &mut present);
-        assert!(response3.contains("STATUS ok"), "r3: {}", response3);
-        assert!(
-            response3.contains("already present"),
-            "gcc should be already present: {}",
-            response3
-        );
+        let body = r#"{"packages":["gcc"]}"#;
+        let (_, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
+        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        assert_eq!(resp.status, "ok");
+        assert!(resp.message.contains("already present"));
+
+        handle.shutdown();
     }
 
-    // ========== Test 10: Wire protocol over TCP ==========
+    // ========== Test 10: HTTP protocol over TCP ==========
     #[test]
-    fn test_tcp_wire_protocol() {
+    fn test_http_wire_protocol() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
         let (config, _state_dir, _mfile_dir) =
             make_config(&graph, &cache, &rootfs_dir, HashSet::new());
@@ -1250,50 +1249,19 @@ packages = ["bash"]
         let port: u16 = port_str.trim().parse().unwrap();
         assert!(port > 0, "port should be non-zero");
 
-        // Connect and send a request via TCP
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(b"add false zlib\n").unwrap();
-        stream.flush().unwrap();
+        let body = r#"{"packages":["zlib"]}"#;
+        let (status, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
+        assert_eq!(status, 200);
+        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        assert_eq!(resp.status, "ok");
 
-        // Read the response
-        let mut response = String::new();
-        std::io::Read::read_to_string(&mut stream, &mut response).unwrap();
-
-        assert!(
-            response.contains("STATUS ok"),
-            "wire protocol response: {}",
-            response
-        );
-        assert!(
-            response.contains("ADDED"),
-            "wire protocol response: {}",
-            response
-        );
-
-        // Verify hardlinking worked through the socket
+        // Verify hardlinking worked through the HTTP server
         assert!(
             rootfs_dir.path().join("usr/lib/libzlib.so").exists(),
             "zlib should be hardlinked into rootfs"
         );
 
         handle.shutdown();
-    }
-
-    // ========== Tests from the original set ==========
-    #[test]
-    fn test_format_error() {
-        let err = format_error("something broke");
-        assert_eq!(err, "STATUS error\nMSG something broke\n");
-    }
-
-    #[test]
-    fn test_process_request_empty() {
-        let err = format_error("empty request");
-        assert!(err.contains("STATUS error"));
-        assert!(err.contains("empty request"));
     }
 
     #[test]
@@ -1393,18 +1361,6 @@ exec = "bash -l"
 
         let content = std::fs::read_to_string(&mfile_path).unwrap();
         assert!(content.contains("python"), "content: {}", content);
-    }
-
-    #[test]
-    fn test_tcp_listener_lifecycle() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        assert!(addr.port() > 0);
-        // Connecting should work while listener is alive
-        let _stream = TcpStream::connect(addr).unwrap();
-        drop(listener);
-        // After drop, connecting should fail
-        assert!(TcpStream::connect(addr).is_err());
     }
 
     #[test]
