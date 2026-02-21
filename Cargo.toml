@@ -28,6 +28,7 @@ codegen-units = 1
 
 [workspace.dependencies]
 anyhow = "1.0.100"
+axum = { version = "0.8", features = ["json"] }
 blake3 = { version = "1", features = ["serde"] }
 bytes = "1.11.0" # keep in sync with reqwest
 bzip2 = "0.6"

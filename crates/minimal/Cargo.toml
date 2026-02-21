@@ -57,4 +57,5 @@ petgraph.workspace = true
 smallvec.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+axum.workspace = true
 hakoniwa.workspace = true
