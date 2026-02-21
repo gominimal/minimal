@@ -242,6 +242,11 @@ impl Context {
         Self::new(self.config.clone())
     }
 
+    /// Returns a clone of the configuration.
+    pub fn config(&self) -> Config {
+        self.config.clone()
+    }
+
     /// Returns a handle to the local cache.
     pub fn local_cache(&self) -> Cache {
         self.cache.clone()

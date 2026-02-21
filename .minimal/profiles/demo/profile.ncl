@@ -20,6 +20,7 @@ profile {
     "coreutils",
     # Vim
     "vim",
+    "socat",
     "btop",
   ],
 }

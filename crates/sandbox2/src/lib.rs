@@ -191,6 +191,21 @@ impl Sandbox {
     pub fn keep_dir(&mut self, keep_dir: bool) {
         self.keep_dir = keep_dir;
     }
+
+    /// Returns the base directory of this sandbox.
+    pub fn base_dir(&self) -> &Path {
+        &self.base_dir
+    }
+
+    /// Returns the state directory of this sandbox.
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    /// Returns the path to the rootfs directory of this sandbox.
+    pub fn rootfs_path(&self) -> PathBuf {
+        self.base_dir.join("rootfs")
+    }
 }
 
 /// An initialized sandbox environment.

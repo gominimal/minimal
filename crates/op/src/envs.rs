@@ -122,4 +122,14 @@ impl RunnableEnv {
             .command(container, program, args, [("", ""); 0])
             .map_err(|e| e.into())
     }
+
+    /// Returns the path to the rootfs directory of this environment's sandbox.
+    pub fn rootfs_path(&self) -> std::path::PathBuf {
+        self.sandbox.rootfs_path()
+    }
+
+    /// Returns the state directory of this environment's sandbox.
+    pub fn state_dir(&self) -> &std::path::Path {
+        self.sandbox.state_dir()
+    }
 }

@@ -1,12 +1,14 @@
 use std::{io::Write, path::PathBuf};
 
 use anyhow::anyhow;
-use graph::DepGraph;
+use graph::{DepGraph, Transitives};
 use hakoniwa::Output;
 use mctx::{Context, Error};
 use mfile::TaskAction;
 use shlex::Shlex;
 use tracing::trace;
+
+use crate::shim_listener;
 
 #[derive(Debug, clap::Args)]
 pub struct RunArgs {
@@ -30,6 +32,9 @@ pub async fn run_task(
     graph: DepGraph,
     ctx: &mut Context,
 ) -> Result<(), Error> {
+    // Clone graph before make_env consumes it - needed for the shim listener
+    let graph_for_shim = graph.clone();
+
     let mut env = ctx
         .make_env(
             task_name,
@@ -45,11 +50,53 @@ pub async fn run_task(
             task.packages.clone(),
         )
         .await?;
+
+    // Get paths from the environment for shim setup
+    let rootfs_path = env.rootfs_path();
+    let state_dir = env.state_dir().to_path_buf();
+
+    // Inject the min script and bashrc into the rootfs
+    shim_listener::inject_shim_scripts(&rootfs_path)
+        .map_err(|e| Error::Other(anyhow!("injecting shim scripts: {}", e)))?;
+
+    // Create the /state/.min/ directory (visible inside sandbox)
+    let min_dir = state_dir.join(".min");
+    std::fs::create_dir_all(&min_dir)
+        .map_err(|e| Error::Other(anyhow!("creating .min directory: {}", e)))?;
+
+    // Compute the initial set of packages in the rootfs (for tracking)
+    let initial_packages: std::collections::HashSet<_> = Transitives::for_toplevels(
+        &graph_for_shim,
+        graph_for_shim.top_levels.clone(),
+        false,
+    )
+    .keys()
+    .copied()
+    .collect();
+
+    // Get mfile path for persistence
+    let mfile_path = ctx.minimal_file().ok().and_then(|f| f.file_path().cloned());
+
+    // Start the shim listener
+    let listener_config = shim_listener::ShimListenerConfig {
+        port_file_path: min_dir.join("port"),
+        graph: graph_for_shim,
+        cache: ctx.local_cache(),
+        mctx_config: ctx.config(),
+        rootfs_path,
+        state_dir,
+        mfile_path,
+        task_name: task_name.to_string(),
+        initial_packages,
+    };
+    let shim_handle = shim_listener::start(listener_config);
+
+    // Create container and run the task command
     let container = env
         .container()
         .map_err(|e| Error::Other(anyhow!("building container failed: {}", e)))?;
 
-    if let Some((command, args)) = task.exec_and_args() {
+    let result: Result<(), Error> = if let Some((command, args)) = task.exec_and_args() {
         let mut cmd = env
             .command(&container, &command, args)
             .map_err(|e| Error::Other(anyhow!("building command failed: {}", e)))?;
@@ -57,6 +104,7 @@ pub async fn run_task(
             .map_err(|e| Error::Other(anyhow!("command launch failed: {}", e)))?
             .wait()
             .map_err(|e| Error::Other(anyhow!("command failed: {}", e)))?;
+        Ok(())
     } else {
         // exec_and_args() only valid for some action variants, handle the others here
         if let TaskAction::CmdCmd(argv) = &task.action {
@@ -97,10 +145,15 @@ pub async fn run_task(
                     }
                 }
             }
+
+            Ok(())
         } else {
             unreachable!();
         }
-    }
+    };
 
-    Ok(())
+    // Shut down the shim listener
+    shim_handle.shutdown();
+
+    result
 }

@@ -25,6 +25,8 @@ use cmd_upload_cache::{UploadArgs, cmd_upload_cache};
 mod cmd_patched_build;
 use cmd_patched_build::{PatchedBuildArgs, cmd_patched_build};
 #[cfg(target_os = "linux")]
+mod shim_listener;
+#[cfg(target_os = "linux")]
 mod cmd_run;
 #[cfg(target_os = "linux")]
 use cmd_run::{RunArgs, cmd_run};
