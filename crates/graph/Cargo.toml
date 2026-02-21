@@ -16,6 +16,7 @@ codespan-reporting.workspace = true
 blake3.workspace = true
 generational-arena.workspace = true
 smallvec.workspace = true
+serde.workspace = true
 tracing.workspace = true
 
 common.workspace = true

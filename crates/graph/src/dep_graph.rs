@@ -11,6 +11,7 @@ use mfile::{self, EnvPatches, LinkConfig};
 use nickel_lang_core::term::IndexMap;
 
 use generational_arena::Arena;
+use serde::Serialize;
 use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -36,11 +37,14 @@ impl BuildSpecRef {
     }
 }
 /// A description of pulling source code regardless of form.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum SourceFetch {
     Web {
         url: String,
         sha256: String,
+        url_pos: Option<(usize, usize)>,
+        sha256_pos: Option<(usize, usize)>,
     },
     Local {
         full_path: PathBuf,
@@ -52,7 +56,21 @@ pub enum SourceFetch {
 impl From<builds::SourceFetch> for SourceFetch {
     fn from(value: builds::SourceFetch) -> Self {
         match value {
-            builds::SourceFetch::Web { url, sha256 } => SourceFetch::Web { url, sha256 },
+            builds::SourceFetch::Web {
+                url,
+                sha256,
+                url_pos,
+                sha256_pos,
+            } => SourceFetch::Web {
+                url,
+                sha256,
+                url_pos: url_pos
+                    .and_then(|p| p.into_opt())
+                    .map(|p| (p.start.to_usize(), p.end.to_usize())),
+                sha256_pos: sha256_pos
+                    .and_then(|p| p.into_opt())
+                    .map(|p| (p.start.to_usize(), p.end.to_usize())),
+            },
             builds::SourceFetch::Local {
                 full_path,
                 filename,
@@ -67,7 +85,7 @@ impl From<builds::SourceFetch> for SourceFetch {
 }
 
 /// A description of source code thats used as an input.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
 pub struct SourceInput {
     pub from: SourceFetch,
     pub extract: bool,
@@ -171,8 +189,9 @@ impl BuildSpecInput {
 }
 
 /// An output from a build.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[allow(dead_code)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum BuildOutput {
     /// This output describes shared libraries matched with the given glob.
     Library { glob: String, allow_data: bool },

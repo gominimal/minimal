@@ -165,7 +165,12 @@ fn build_input_hash(input: &BuildSpecInput, h: &mut Hasher) {
         Source(s) => {
             h.write_all(b"src").unwrap();
             match &s.from {
-                SourceFetch::Web { url, sha256 } => {
+                SourceFetch::Web {
+                    url,
+                    sha256,
+                    url_pos: _,
+                    sha256_pos: _,
+                } => {
                     h.write_all(b"url").unwrap();
                     h.write_all(url.as_bytes()).unwrap();
                     h.write_all(sha256.as_bytes()).unwrap();
@@ -262,7 +267,7 @@ fn build_attrvalue_hash(v: &AttrValue, h: &mut Hasher) {
             h.write_all(b"b").unwrap();
             h.write_all(if *b { b"1" } else { b"0" }).unwrap();
         }
-        AttrValue::String(s) => {
+        AttrValue::String(s, _str_pos) => {
             h.write_all(b"s").unwrap();
             h.write_all(s.as_bytes()).unwrap();
         }
