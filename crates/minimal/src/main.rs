@@ -36,6 +36,8 @@ mod cmd_init;
 use cmd_init::{InitArgs, cmd_init};
 mod cmd_add;
 use cmd_add::{AddArgs, cmd_add};
+mod cmd_dump;
+use cmd_dump::{DumpArgs, cmd_dump};
 
 #[derive(Parser)]
 #[command(name = "minimal", version = env!("GIT_HASH"))]
@@ -82,6 +84,9 @@ enum Command {
     /// Executes the build for a package, using stale dependencies.
     #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
     PatchedBuild(PatchedBuildArgs),
+    /// Dumps out information about the supply chain in a machine-readable format.
+    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
+    Dump(DumpArgs),
     /// Generates Graphviz source code of the dependency graph
     #[command(
         long_about = "Generate an image of the dependency graph using graphviz's \"dot\" program.\n\n  minimal dep --input_deps_depth=0 -p file | dot -Tpng > deps.png"
@@ -343,6 +348,7 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         }
         Command::Update(args) => cmd_update(args, &mut ctx).await,
         Command::Dep(args) => cmd_dep(args, &mut ctx).await,
+        Command::Dump(args) => cmd_dump(args, &mut ctx).await,
         Command::Completions(_) => Ok(()),
     }
 }

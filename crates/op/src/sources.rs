@@ -71,7 +71,12 @@ impl<'a, SF: SourceFetcher> Runnable for SourceLoad<'a, SF> {
                 filename,
                 file_hash: _,
             } => (full_path.clone(), filename.clone()),
-            SourceFetch::Web { url, sha256 } => {
+            SourceFetch::Web {
+                url,
+                sha256,
+                url_pos: _,
+                sha256_pos: _,
+            } => {
                 let url =
                     Url::parse(url).with_context(|| format!("Failed to parse URL '{}'", url))?;
                 let filename = url

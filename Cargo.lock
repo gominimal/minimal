@@ -247,6 +247,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures",
+ "serde",
 ]
 
 [[package]]
@@ -1387,6 +1388,7 @@ dependencies = [
  "indoc",
  "mfile",
  "nickel-lang-core",
+ "serde",
  "smallvec",
  "tempfile",
  "tracing",
@@ -2214,6 +2216,7 @@ dependencies = [
  "reqwest",
  "res-proto",
  "serde",
+ "serde_json",
  "sha2",
  "shlex",
  "smallvec",

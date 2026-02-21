@@ -234,7 +234,13 @@ fn pgraph_from(graph: &graph::DepGraph) -> Result<GraphData, Error> {
                 pgraph.add_edge(node_index, inode_index, edge_data);
             }
             BuildSpecInput::Source(SourceInput {
-                from: SourceFetch::Web { url, sha256 },
+                from:
+                    SourceFetch::Web {
+                        url,
+                        sha256,
+                        url_pos: _,
+                        sha256_pos: _,
+                    },
                 extract,
                 strip_prefix,
             }) => {

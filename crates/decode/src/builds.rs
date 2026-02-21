@@ -4,6 +4,7 @@ use crate::{Error, ObjTy, attrs::AttrValue, eval_if_closure, read_ty};
 use common::Target;
 use nickel_lang_core::files::FileId;
 use nickel_lang_core::identifier::LocIdent;
+use nickel_lang_core::position::TermPos;
 use nickel_lang_core::term::{IndexMap, RichTerm, RuntimeContract, Term};
 use nickel_lang_core::{eval::cache::CacheImpl, program::Program};
 use serde::Deserialize;
@@ -142,6 +143,8 @@ pub enum SourceFetch {
     Web {
         url: String,
         sha256: String,
+        url_pos: Option<TermPos>,
+        sha256_pos: Option<TermPos>,
     },
     Local {
         full_path: PathBuf,
@@ -162,8 +165,8 @@ impl SourceInput {
     fn from_term(rt: &RichTerm, program: &mut Program<CacheImpl>) -> Result<Self, Error> {
         let mut filename: Option<(String, FileId)> = None;
 
-        let mut url: Option<String> = None;
-        let mut sha256: Option<String> = None;
+        let mut url: Option<(String, Option<TermPos>)> = None;
+        let mut sha256: Option<(String, Option<TermPos>)> = None;
 
         let mut extract: Option<bool> = None;
         let mut strip_prefix: Option<String> = None;
@@ -184,17 +187,19 @@ impl SourceInput {
                             }
                             "url" => {
                                 if let Some(rt) = field.value.as_ref() {
-                                    url = Some(
+                                    url = Some((
                                         String::deserialize(eval_if_closure(rt, program)?).unwrap(),
-                                    );
+                                        Some(rt.pos),
+                                    ));
                                 }
                                 Ok(())
                             }
                             "sha256" => {
                                 if let Some(rt) = field.value.as_ref() {
-                                    sha256 = Some(
+                                    sha256 = Some((
                                         String::deserialize(eval_if_closure(rt, program)?).unwrap(),
-                                    );
+                                        Some(rt.pos),
+                                    ));
                                 }
                                 Ok(())
                             }
@@ -250,7 +255,7 @@ impl SourceInput {
                 filename: file,
             }
         } else {
-            let url = match url {
+            let (url, url_pos) = match url {
                 Some(url) => url,
                 None => {
                     return Err(Error::MissingField {
@@ -261,7 +266,7 @@ impl SourceInput {
                     });
                 }
             };
-            let sha256 = match sha256 {
+            let (sha256, sha256_pos) = match sha256 {
                 Some(sha256) => sha256,
                 None => {
                     return Err(Error::MissingField {
@@ -273,7 +278,12 @@ impl SourceInput {
                 }
             };
 
-            SourceFetch::Web { url, sha256 }
+            SourceFetch::Web {
+                url,
+                url_pos,
+                sha256,
+                sha256_pos,
+            }
         };
 
         Ok(SourceInput {
@@ -1229,7 +1239,7 @@ mod tests {
         assert!(matches!(
             source,
             BuildDeclInput::Source( SourceInput {
-                from: SourceFetch::Web{url, sha256: sha},
+                from: SourceFetch::Web{url, sha256: sha, sha256_pos: _, url_pos: _},
                 extract: true,
                 strip_prefix: None,
             }) if url == "http://uwu.com" && sha == "abcdef",
@@ -1617,15 +1627,15 @@ mod tests {
             panic!("finish failed");
         });
 
-        assert_eq!(
-            BuildDecl::from_term(&term, &mut program, &mut ())
-                .unwrap()
-                .attrs,
-            Some(IndexMap::from_iter([(
-                "upstream_version".to_string(),
-                AttrValue::String("1.2.3".to_string())
-            )])),
-        );
+        let attrs = BuildDecl::from_term(&term, &mut program, &mut ())
+            .unwrap()
+            .attrs
+            .unwrap();
+        assert_eq!(attrs.len(), 1);
+        assert!(matches!(
+            attrs.get("upstream_version").unwrap(),
+            AttrValue::String(v, _) if v == "1.2.3"
+        ));
     }
 
     #[test]

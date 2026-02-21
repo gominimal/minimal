@@ -1,5 +1,6 @@
 use nickel_lang_core::{
     eval::cache::CacheImpl,
+    position::TermPos,
     program::Program,
     term::{IndexMap, RichTerm, RuntimeContract, Term},
 };
@@ -9,7 +10,7 @@ use crate::{Error, eval_if_closure};
 /// The value of an attribute.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum AttrValue {
-    String(String),
+    String(String, Option<TermPos>),
     Bool(bool),
     List(Vec<AttrValue>),
     Map(IndexMap<String, AttrValue>),
@@ -18,7 +19,7 @@ pub enum AttrValue {
 
 impl Default for AttrValue {
     fn default() -> Self {
-        AttrValue::String(String::new())
+        AttrValue::String(String::new(), None)
     }
 }
 
@@ -30,9 +31,9 @@ impl AttrValue {
         let rt = eval_if_closure(rt, program)?;
 
         Ok(match rt.term.as_ref() {
-            Term::Str(s) => Some(Self::String(s.to_string())),
+            Term::Str(s) => Some(Self::String(s.to_string(), Some(rt.pos))),
             Term::Bool(b) => Some(Self::Bool(*b)),
-            Term::Enum(a) => Some(Self::String(a.into_label())),
+            Term::Enum(a) => Some(Self::String(a.into_label(), Some(rt.pos))),
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                 let mut map = IndexMap::with_capacity(6);
                 r.fields
@@ -92,7 +93,7 @@ impl AttrValue {
     /// Returns the inner string, if this [AttrValue] is the string variant.
     pub fn as_string(&self) -> Option<&String> {
         match self {
-            Self::String(s) => Some(s),
+            Self::String(s, _) => Some(s),
             _ => None,
         }
     }
@@ -123,10 +124,10 @@ mod tests {
                 panic!("finish failed");
             });
 
-        assert_eq!(
-            AttrValue::from_term(&term, &mut program).unwrap().unwrap(),
-            AttrValue::String("a".to_string()),
-        );
+        assert!(matches!(
+        AttrValue::from_term(&term, &mut program).unwrap().unwrap(),
+        AttrValue::String(a, _) if a == "a",
+        ));
     }
     #[test]
     fn parse_bool() {
@@ -159,10 +160,10 @@ mod tests {
                 panic!("finish failed");
             });
 
-        assert_eq!(
-            AttrValue::from_term(&term, &mut program).unwrap().unwrap(),
-            AttrValue::String("Uwu".to_string()),
-        );
+        assert!(matches!(
+        AttrValue::from_term(&term, &mut program).unwrap().unwrap(),
+        AttrValue::String(a, _) if a == "Uwu",
+        ));
     }
 
     #[test]
@@ -178,13 +179,10 @@ mod tests {
                 panic!("finish failed");
             });
 
-        assert_eq!(
-            AttrValue::from_term(&term, &mut program).unwrap().unwrap(),
-            AttrValue::Map(IndexMap::from_iter([(
-                "key".to_string(),
-                AttrValue::String("a".to_string())
-            )])),
-        );
+        let result = AttrValue::from_term(&term, &mut program).unwrap().unwrap();
+        let map = result.as_map().unwrap();
+        assert_eq!(map.len(), 1);
+        assert!(matches!(map.get("key").unwrap(), AttrValue::String(a, _) if a == "a"));
     }
 
     #[test]
@@ -200,13 +198,11 @@ mod tests {
                 panic!("finish failed");
             });
 
-        assert_eq!(
-            AttrValue::from_term(&term, &mut program).unwrap().unwrap(),
-            AttrValue::List(vec![
-                AttrValue::String("a".to_string()),
-                AttrValue::String("b".to_string()),
-            ]),
-        );
+        let result = AttrValue::from_term(&term, &mut program).unwrap().unwrap();
+        let list = result.as_list().unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(matches!(&list[0], AttrValue::String(a, _) if a == "a"));
+        assert!(matches!(&list[1], AttrValue::String(a, _) if a == "b"));
     }
 
     #[test]
