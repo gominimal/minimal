@@ -1,19 +1,21 @@
-//! TCP listener for in-sandbox package addition (`min add`).
+//! HTTP metadata service for in-sandbox package addition (`min add`).
 //!
-//! Runs alongside the shell in a task sandbox. Accepts requests from the `/usr/bin/min`
-//! script inside the sandbox (using bash `/dev/tcp`), resolves packages via the DepGraph,
-//! hardlinks them into the rootfs, computes env vars, and returns status to the client.
+//! Runs alongside the shell in a task sandbox. Serves an HTTP/JSON API that the
+//! `/usr/bin/min` binary inside the sandbox calls, resolves packages via the DepGraph,
+//! hardlinks them into the rootfs, computes env vars, and returns structured responses.
 
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use graph::{BuildSpecRef, DepGraph, Transitives};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AddRequest {
@@ -59,16 +61,13 @@ pub struct MetaResponse {
 /// Handle to a running shim listener. Drop or call `shutdown()` to stop.
 pub struct ShimHandle {
     thread: Option<std::thread::JoinHandle<()>>,
-    shutdown: Arc<AtomicBool>,
-    addr: std::net::SocketAddr,
+    shutdown_tx: Option<tokio::sync::watch::Sender<()>>,
 }
 
 impl ShimHandle {
     /// Signals the listener to stop and waits for the thread to finish.
     pub fn shutdown(mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        // Connect briefly to unblock the accept() call
-        let _ = TcpStream::connect(self.addr);
+        self.shutdown_tx.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -77,9 +76,7 @@ impl ShimHandle {
 
 impl Drop for ShimHandle {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        // Best-effort wakeup for the accept loop
-        let _ = TcpStream::connect(self.addr);
+        self.shutdown_tx.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -108,143 +105,148 @@ pub struct ShimListenerConfig {
     pub initial_packages: HashSet<BuildSpecRef>,
 }
 
+/// Shared state for HTTP handlers.
+struct AppState {
+    config: ShimListenerConfig,
+    present: Mutex<HashSet<BuildSpecRef>>,
+}
+
 /// Starts the shim listener on a background thread.
 ///
 /// Binds to `127.0.0.1:0` (OS-assigned port), writes the port to `port_file_path`,
 /// and returns a handle that can be used to shut down the listener.
 pub fn start(config: ShimListenerConfig) -> ShimHandle {
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
 
-    // Bind before spawning so we know the address immediately
-    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind TCP listener");
+    // Bind before spawning so we know the address
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind TCP listener");
     let addr = listener.local_addr().expect("failed to get local addr");
 
-    // Write port file so the in-sandbox script can find us
+    // Write port file
     if let Some(parent) = config.port_file_path.parent() {
         std::fs::create_dir_all(parent).expect("failed to create port file directory");
     }
     std::fs::write(&config.port_file_path, addr.port().to_string())
         .expect("failed to write port file");
 
+    let port_file_path = config.port_file_path.clone();
+
+    let state = Arc::new(AppState {
+        present: Mutex::new(config.initial_packages.clone()),
+        config,
+    });
+
     let thread = std::thread::Builder::new()
         .name("shim-listener".to_string())
         .spawn(move || {
-            run_listener(config, listener, shutdown_clone);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to create tokio runtime");
+
+            rt.block_on(async move {
+                let app = build_router(state);
+                listener
+                    .set_nonblocking(true)
+                    .expect("failed to set non-blocking");
+                let tcp_listener = tokio::net::TcpListener::from_std(listener)
+                    .expect("failed to convert listener");
+
+                info!("shim listener started on {}", addr);
+
+                let mut shutdown_rx = shutdown_rx;
+                axum::serve(tcp_listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = shutdown_rx.changed().await;
+                    })
+                    .await
+                    .expect("axum server error");
+
+                // Cleanup port file
+                let _ = std::fs::remove_file(&port_file_path);
+                info!("shim listener stopped");
+            });
         })
         .expect("failed to spawn shim listener thread");
 
     ShimHandle {
         thread: Some(thread),
-        shutdown,
-        addr,
+        shutdown_tx: Some(shutdown_tx),
     }
 }
 
-fn run_listener(mut config: ShimListenerConfig, listener: TcpListener, shutdown: Arc<AtomicBool>) {
-    // Use non-blocking mode so we can periodically check the shutdown flag
-    listener
-        .set_nonblocking(true)
-        .expect("failed to set non-blocking mode");
+async fn handle_add(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AddRequest>,
+) -> (StatusCode, Json<AddResponse>) {
+    // Use spawn_blocking because process_add_impl may create a nested tokio
+    // runtime via build_uncached.
+    let resp = tokio::task::spawn_blocking(move || {
+        let package_names: Vec<&str> = req.packages.iter().map(|s| s.as_str()).collect();
+        let mut present = state.present.lock().unwrap();
+        process_add_impl(package_names, req.ephemeral, &state.config, &mut present)
+    })
+    .await
+    .unwrap();
 
-    let addr = listener.local_addr().unwrap();
-    info!("shim listener started on {}", addr);
+    let status_code = if resp.status == "ok" {
+        StatusCode::OK
+    } else {
+        StatusCode::UNPROCESSABLE_ENTITY
+    };
 
-    let mut present = std::mem::take(&mut config.initial_packages);
-
-    while !shutdown.load(Ordering::SeqCst) {
-        let (stream, _addr) = match listener.accept() {
-            Ok(conn) => conn,
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::WouldBlock {
-                    // No pending connections, sleep briefly and retry
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    continue;
-                }
-                if shutdown.load(Ordering::SeqCst) {
-                    break;
-                }
-                warn!("accept error on shim listener: {}", e);
-                continue;
-            }
-        };
-
-        if shutdown.load(Ordering::SeqCst) {
-            break;
-        }
-
-        // Set the accepted connection back to blocking for request handling
-        stream
-            .set_nonblocking(false)
-            .expect("failed to set stream blocking mode");
-
-        debug!("shim listener: accepted connection");
-        handle_connection(stream, &config, &mut present);
-    }
-
-    // Cleanup port file
-    let _ = std::fs::remove_file(&config.port_file_path);
-    info!("shim listener stopped");
+    (status_code, Json(resp))
 }
 
-fn handle_connection(
-    stream: TcpStream,
-    config: &ShimListenerConfig,
-    present: &mut HashSet<BuildSpecRef>,
-) {
-    let reader = BufReader::new(&stream);
-    let mut writer = &stream;
+async fn handle_packages(State(state): State<Arc<AppState>>) -> Json<PackagesResponse> {
+    let present = state.present.lock().unwrap();
+    let graph = &state.config.graph;
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(e) => {
-                warn!("shim listener: read error: {}", e);
-                return;
-            }
-        };
+    let packages: Vec<PackageInfo> = present
+        .iter()
+        .filter_map(|bsr| {
+            graph.get(bsr).map(|b| PackageInfo {
+                name: b.name.clone(),
+                hash: graph.spec_hash(bsr).0.to_string(),
+            })
+        })
+        .collect();
 
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-
-        debug!("shim listener: received request: {}", line);
-        let response = process_request(&line, config, present);
-        debug!("shim listener: sending response ({} bytes)", response.len());
-
-        if let Err(e) = writer.write_all(response.as_bytes()) {
-            warn!("shim listener: write error: {}", e);
-        }
-        if let Err(e) = writer.flush() {
-            warn!("shim listener: flush error: {}", e);
-        }
-        // One request per connection (matching socat behavior)
-        return;
-    }
+    Json(PackagesResponse { packages })
 }
 
-fn process_request(
-    line: &str,
-    config: &ShimListenerConfig,
-    present: &mut HashSet<BuildSpecRef>,
-) -> String {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.is_empty() {
-        return format_error("empty request");
-    }
+async fn handle_env(State(state): State<Arc<AppState>>) -> Json<EnvResponse> {
+    let present = state.present.lock().unwrap();
+    let graph = &state.config.graph;
 
-    match parts[0] {
-        "add" => {
-            if parts.len() < 3 {
-                return format_error("usage: add <ephemeral:bool> <pkg> [pkg...]");
-            }
-            let ephemeral = parts[1] == "true";
-            let package_names: Vec<&str> = parts[2..].to_vec();
-            process_add(package_names, ephemeral, config, present)
-        }
-        _ => format_error(&format!("unknown command: {}", parts[0])),
-    }
+    let env = match graph.env_config_for_packages(present.iter()) {
+        Ok(setup) => setup.env_vars.into_iter().collect(),
+        Err(_) => Default::default(),
+    };
+
+    Json(EnvResponse { env })
+}
+
+async fn handle_meta(State(state): State<Arc<AppState>>) -> Json<MetaResponse> {
+    Json(MetaResponse {
+        task_name: state.config.task_name.clone(),
+        rootfs: state.config.rootfs_path.to_string_lossy().into_owned(),
+        mfile: state
+            .config
+            .mfile_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
+    })
+}
+
+fn build_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/v1/add", post(handle_add))
+        .route("/v1/packages", get(handle_packages))
+        .route("/v1/env", get(handle_env))
+        .route("/v1/meta", get(handle_meta))
+        .with_state(state)
 }
 
 fn process_add(
@@ -633,6 +635,7 @@ mod tests {
     use cache::{Cache, EntryMeta, MetaInner};
     use decode::Layer;
     use graph::DepGraph;
+    use std::net::{TcpListener, TcpStream};
 
     /// Helper: create a DepGraph and Cache with multiple test packages.
     ///
@@ -828,6 +831,144 @@ packages = ["bash"]
             state_dir,
             mfile_dir,
         )
+    }
+
+    /// Helper: send a raw HTTP request and return the response body.
+    fn http_request(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+
+        let body_bytes = body.unwrap_or("");
+        let request = if body.is_some() {
+            format!(
+                "{} {} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                method, path, body_bytes.len(), body_bytes
+            )
+        } else {
+            format!(
+                "{} {} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                method, path
+            )
+        };
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.flush().unwrap();
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+
+        // Parse HTTP status code and body
+        let status_line = response.lines().next().unwrap_or("");
+        let status_code: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0);
+
+        let body_start = response.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+        let response_body = response[body_start..].to_string();
+
+        (status_code, response_body)
+    }
+
+    #[test]
+    fn test_http_add_single_package() {
+        let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
+        let (config, _state_dir, _mfile_dir) =
+            make_config(&graph, &cache, &rootfs_dir, HashSet::new());
+
+        let port_file = config.port_file_path.clone();
+        let handle = start(config);
+
+        let port: u16 = std::fs::read_to_string(&port_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        let body = r#"{"packages":["zlib"],"ephemeral":false}"#;
+        let (status, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
+        assert_eq!(status, 200);
+
+        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        assert_eq!(resp.status, "ok");
+        assert!(resp.added.contains(&"zlib".to_string()));
+
+        handle.shutdown();
+    }
+
+    #[test]
+    fn test_http_get_packages() {
+        let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
+        let (config, _state_dir, _mfile_dir) =
+            make_config(&graph, &cache, &rootfs_dir, HashSet::new());
+
+        let port_file = config.port_file_path.clone();
+        let handle = start(config);
+        let port: u16 = std::fs::read_to_string(&port_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        // Add a package first
+        let body = r#"{"packages":["zlib"]}"#;
+        http_request(port, "POST", "/v1/add", Some(body));
+
+        // Query packages
+        let (status, resp_body) = http_request(port, "GET", "/v1/packages", None);
+        assert_eq!(status, 200);
+
+        let resp: PackagesResponse = serde_json::from_str(&resp_body).unwrap();
+        assert!(resp.packages.iter().any(|p| p.name == "zlib"));
+
+        handle.shutdown();
+    }
+
+    #[test]
+    fn test_http_get_env() {
+        let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
+        let (config, _state_dir, _mfile_dir) =
+            make_config(&graph, &cache, &rootfs_dir, HashSet::new());
+
+        let port_file = config.port_file_path.clone();
+        let handle = start(config);
+        let port: u16 = std::fs::read_to_string(&port_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        let (status, _) = http_request(port, "GET", "/v1/env", None);
+        assert_eq!(status, 200);
+
+        handle.shutdown();
+    }
+
+    #[test]
+    fn test_http_get_meta() {
+        let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
+        let (config, _state_dir, _mfile_dir) =
+            make_config(&graph, &cache, &rootfs_dir, HashSet::new());
+
+        let port_file = config.port_file_path.clone();
+        let handle = start(config);
+        let port: u16 = std::fs::read_to_string(&port_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        let (status, resp_body) = http_request(port, "GET", "/v1/meta", None);
+        assert_eq!(status, 200);
+
+        let resp: MetaResponse = serde_json::from_str(&resp_body).unwrap();
+        assert_eq!(resp.task_name, "shell");
+
+        handle.shutdown();
     }
 
     // ========== Test 1: Single package add ==========
