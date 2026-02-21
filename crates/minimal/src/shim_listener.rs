@@ -12,7 +12,49 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use graph::{BuildSpecRef, DepGraph, Transitives};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddRequest {
+    pub packages: Vec<String>,
+    #[serde(default)]
+    pub ephemeral: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddResponse {
+    pub status: String,
+    #[serde(default)]
+    pub added: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PackageInfo {
+    pub name: String,
+    pub hash: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PackagesResponse {
+    pub packages: Vec<PackageInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EnvResponse {
+    pub env: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MetaResponse {
+    pub task_name: String,
+    pub rootfs: String,
+    pub mfile: Option<String>,
+}
 
 /// Handle to a running shim listener. Drop or call `shutdown()` to stop.
 pub struct ShimHandle {
@@ -1185,5 +1227,31 @@ exec = "bash -l"
         assert!(BASHRC_SNIPPET.contains("min()"));
         assert!(BASHRC_SNIPPET.contains("eval"));
         assert!(BASHRC_SNIPPET.contains("/usr/bin/min"));
+    }
+
+    #[test]
+    fn test_add_request_serde() {
+        let req = AddRequest {
+            packages: vec!["python".to_string(), "gcc".to_string()],
+            ephemeral: false,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: AddRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.packages, vec!["python", "gcc"]);
+        assert!(!parsed.ephemeral);
+    }
+
+    #[test]
+    fn test_add_response_serde() {
+        let resp = AddResponse {
+            status: "ok".to_string(),
+            added: vec!["python".to_string()],
+            env: std::collections::HashMap::from([("PATH".to_string(), "/usr/bin".to_string())]),
+            message: "Added python".to_string(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"status\":\"ok\""));
+        let parsed: AddResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.added, vec!["python"]);
     }
 }
