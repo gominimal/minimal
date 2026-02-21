@@ -60,7 +60,7 @@ impl<'a> Runnable for EnvSetup<'a> {
             env_vars.extend(vars.clone()); // env vars set on [EnvSetup] take precedence
         }
 
-        let config = sandbox2::config::Config::new(self.name)
+        let mut config = sandbox2::config::Config::new(self.name)
             .with_wd(self.cwd, false, patch.into())
             .with_rootfs(
                 self.transitives
@@ -75,6 +75,9 @@ impl<'a> Runnable for EnvSetup<'a> {
             .with_dns(needs_dns)
             .with_disable_networking(!needs_dns && !needs_internet)
             .with_env_vars(env_vars.into_iter());
+        if let Some(hn) = &self.hostname {
+            config = config.with_hostname(hn);
+        }
 
         let mut sandbox = config.build(&opts.exec_base).await?;
         for want_dir in state_dirs {

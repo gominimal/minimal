@@ -529,7 +529,7 @@ impl Context {
             cwd: &wd,
             patches,
             env_vars,
-            hostname: state_key.map(|s| s.to_string()),
+            hostname: Some(name.to_string()),
         };
         let opts = op::Options {
             cache,
