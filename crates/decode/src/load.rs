@@ -162,7 +162,7 @@ impl Loader {
         std::fs::write(generated_lib_dir.path().join("__injected_config__.ncl"), {
             let mut out = Vec::with_capacity(128);
             out.extend(b"{target = {os = ");
-            out.extend(opts.for_target().arch().as_nickel_literal());
+            out.extend(opts.for_target().os().as_nickel_literal());
             out.extend(b",arch = ");
             out.extend(opts.for_target().arch().as_nickel_literal());
             out.extend(b"}}");
