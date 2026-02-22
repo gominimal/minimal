@@ -9,6 +9,7 @@ members = [
     "crates/graph",
     "crates/mctx",
     "crates/mfile",
+    "crates/min-client",
     "crates/op",
     "crates/orchestrator",
     "crates/minimal",
