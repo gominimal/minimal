@@ -286,6 +286,14 @@ impl Sandbox {
         if self.needs_lib64_symlink()? {
             container.symlink("/usr/lib", "/lib64");
         }
+        // On aarch64, autotools/libtool defaults to installing libraries
+        // into lib64/. Symlink /usr/lib64 → /usr/lib so installs land in
+        // lib/ transparently (configure and libtool check for this symlink).
+        if !fs::exists(self.base_dir.join("rootfs").join("usr").join("lib64"))
+            .unwrap_or(false)
+        {
+            container.symlink("/usr/lib", "/usr/lib64");
+        }
         if self.needs_lib_symlink()? {
             container.symlink("/usr/lib", "/lib");
         }
