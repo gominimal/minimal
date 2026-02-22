@@ -104,4 +104,5 @@ op = { version = "0.0.1", path = "crates/op" }
 orchestrator = { version = "0.0.1", path = "crates/orchestrator" }
 res-proto = { version = "0.0.1", path = "crates/res-proto" }
 sandbox2 = { version = "0.0.1", path = "crates/sandbox2" }
+min-client = { version = "0.1.0", path = "crates/min-client" }
 stdlib = { version = "0.0.1", path = "crates/stdlib" }

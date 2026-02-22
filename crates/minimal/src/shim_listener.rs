@@ -1,6 +1,6 @@
-//! HTTP metadata service for in-sandbox package addition (`min add`).
+//! gRPC metadata service for in-sandbox package addition (`min add`).
 //!
-//! Runs alongside the shell in a task sandbox. Serves an HTTP/JSON API that the
+//! Runs alongside the shell in a task sandbox. Serves a gRPC API that the
 //! `/usr/bin/min` binary inside the sandbox calls, resolves packages via the DepGraph,
 //! hardlinks them into the rootfs, computes env vars, and returns structured responses.
 
@@ -9,54 +9,14 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use axum::extract::State;
-use axum::http::StatusCode;
-use axum::routing::{get, post};
-use axum::{Json, Router};
 use graph::{BuildSpecRef, DepGraph, Transitives};
-use serde::{Deserialize, Serialize};
+use min_client::min_proto::min_service_server::{MinService, MinServiceServer};
+use min_client::min_proto::{
+    AddRequest, AddResponse, GetEnvRequest, GetEnvResponse, GetMetaRequest, GetMetaResponse,
+    ListPackagesRequest, ListPackagesResponse, PackageInfo,
+};
+use tonic::{Request, Response, Status};
 use tracing::{info, warn};
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AddRequest {
-    pub packages: Vec<String>,
-    #[serde(default)]
-    pub ephemeral: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AddResponse {
-    pub status: String,
-    #[serde(default)]
-    pub added: Vec<String>,
-    #[serde(default)]
-    pub env: std::collections::HashMap<String, String>,
-    #[serde(default)]
-    pub message: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PackageInfo {
-    pub name: String,
-    pub hash: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PackagesResponse {
-    pub packages: Vec<PackageInfo>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EnvResponse {
-    pub env: std::collections::HashMap<String, String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MetaResponse {
-    pub task_name: String,
-    pub rootfs: String,
-    pub mfile: Option<String>,
-}
 
 /// Handle to a running shim listener. Drop or call `shutdown()` to stop.
 pub struct ShimHandle {
@@ -105,10 +65,78 @@ pub struct ShimListenerConfig {
     pub initial_packages: HashSet<BuildSpecRef>,
 }
 
-/// Shared state for HTTP handlers.
+/// Shared state for gRPC service handlers.
 struct AppState {
     config: ShimListenerConfig,
     present: Mutex<HashSet<BuildSpecRef>>,
+}
+
+/// gRPC service implementation wrapping shared state.
+struct MinServiceImpl {
+    state: Arc<AppState>,
+}
+
+#[tonic::async_trait]
+impl MinService for MinServiceImpl {
+    async fn add(&self, request: Request<AddRequest>) -> Result<Response<AddResponse>, Status> {
+        let req = request.into_inner();
+        let state = self.state.clone();
+        let resp = tokio::task::spawn_blocking(move || {
+            let package_names: Vec<&str> = req.packages.iter().map(|s| s.as_str()).collect();
+            let mut present = state.present.lock().unwrap();
+            process_add_impl(package_names, req.ephemeral, &state.config, &mut present)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking failed: {}", e)))?;
+        Ok(Response::new(resp))
+    }
+
+    async fn list_packages(
+        &self,
+        _request: Request<ListPackagesRequest>,
+    ) -> Result<Response<ListPackagesResponse>, Status> {
+        let present = self.state.present.lock().unwrap();
+        let graph = &self.state.config.graph;
+        let packages: Vec<PackageInfo> = present
+            .iter()
+            .filter_map(|bsr| {
+                graph.get(bsr).map(|b| PackageInfo {
+                    name: b.name.clone(),
+                    hash: graph.spec_hash(bsr).0.to_string(),
+                })
+            })
+            .collect();
+        Ok(Response::new(ListPackagesResponse { packages }))
+    }
+
+    async fn get_env(
+        &self,
+        _request: Request<GetEnvRequest>,
+    ) -> Result<Response<GetEnvResponse>, Status> {
+        let present = self.state.present.lock().unwrap();
+        let graph = &self.state.config.graph;
+        let env = match graph.env_config_for_packages(present.iter()) {
+            Ok(setup) => setup.env_vars.into_iter().collect(),
+            Err(_) => Default::default(),
+        };
+        Ok(Response::new(GetEnvResponse { env }))
+    }
+
+    async fn get_meta(
+        &self,
+        _request: Request<GetMetaRequest>,
+    ) -> Result<Response<GetMetaResponse>, Status> {
+        Ok(Response::new(GetMetaResponse {
+            task_name: self.state.config.task_name.clone(),
+            rootfs: self.state.config.rootfs_path.to_string_lossy().into_owned(),
+            mfile: self
+                .state
+                .config
+                .mfile_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+        }))
+    }
 }
 
 /// Starts the shim listener on a background thread.
@@ -118,11 +146,9 @@ struct AppState {
 pub fn start(config: ShimListenerConfig) -> ShimHandle {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
 
-    // Bind before spawning so we know the address
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind TCP listener");
     let addr = listener.local_addr().expect("failed to get local addr");
 
-    // Write port file
     if let Some(parent) = config.port_file_path.parent() {
         std::fs::create_dir_all(parent).expect("failed to create port file directory");
     }
@@ -136,33 +162,39 @@ pub fn start(config: ShimListenerConfig) -> ShimHandle {
         config,
     });
 
+    let service = MinServiceImpl {
+        state: state.clone(),
+    };
+
     let thread = std::thread::Builder::new()
         .name("shim-listener".to_string())
         .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
                 .expect("failed to create tokio runtime");
 
             rt.block_on(async move {
-                let app = build_router(state);
                 listener
                     .set_nonblocking(true)
                     .expect("failed to set non-blocking");
-                let tcp_listener = tokio::net::TcpListener::from_std(listener)
+                let incoming = tokio::net::TcpListener::from_std(listener)
                     .expect("failed to convert listener");
+                let incoming_stream =
+                    tokio_stream::wrappers::TcpListenerStream::new(incoming);
 
                 info!("shim listener started on {}", addr);
 
                 let mut shutdown_rx = shutdown_rx;
-                axum::serve(tcp_listener, app)
-                    .with_graceful_shutdown(async move {
+                tonic::transport::Server::builder()
+                    .add_service(MinServiceServer::new(service))
+                    .serve_with_incoming_shutdown(incoming_stream, async move {
                         let _ = shutdown_rx.changed().await;
                     })
                     .await
-                    .expect("axum server error");
+                    .expect("tonic server error");
 
-                // Cleanup port file
                 let _ = std::fs::remove_file(&port_file_path);
                 info!("shim listener stopped");
             });
@@ -173,79 +205,6 @@ pub fn start(config: ShimListenerConfig) -> ShimHandle {
         thread: Some(thread),
         shutdown_tx: Some(shutdown_tx),
     }
-}
-
-async fn handle_add(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<AddRequest>,
-) -> (StatusCode, Json<AddResponse>) {
-    // Use spawn_blocking because process_add_impl may create a nested tokio
-    // runtime via build_uncached.
-    let resp = tokio::task::spawn_blocking(move || {
-        let package_names: Vec<&str> = req.packages.iter().map(|s| s.as_str()).collect();
-        let mut present = state.present.lock().unwrap();
-        process_add_impl(package_names, req.ephemeral, &state.config, &mut present)
-    })
-    .await
-    .unwrap();
-
-    let status_code = if resp.status == "ok" {
-        StatusCode::OK
-    } else {
-        StatusCode::UNPROCESSABLE_ENTITY
-    };
-
-    (status_code, Json(resp))
-}
-
-async fn handle_packages(State(state): State<Arc<AppState>>) -> Json<PackagesResponse> {
-    let present = state.present.lock().unwrap();
-    let graph = &state.config.graph;
-
-    let packages: Vec<PackageInfo> = present
-        .iter()
-        .filter_map(|bsr| {
-            graph.get(bsr).map(|b| PackageInfo {
-                name: b.name.clone(),
-                hash: graph.spec_hash(bsr).0.to_string(),
-            })
-        })
-        .collect();
-
-    Json(PackagesResponse { packages })
-}
-
-async fn handle_env(State(state): State<Arc<AppState>>) -> Json<EnvResponse> {
-    let present = state.present.lock().unwrap();
-    let graph = &state.config.graph;
-
-    let env = match graph.env_config_for_packages(present.iter()) {
-        Ok(setup) => setup.env_vars.into_iter().collect(),
-        Err(_) => Default::default(),
-    };
-
-    Json(EnvResponse { env })
-}
-
-async fn handle_meta(State(state): State<Arc<AppState>>) -> Json<MetaResponse> {
-    Json(MetaResponse {
-        task_name: state.config.task_name.clone(),
-        rootfs: state.config.rootfs_path.to_string_lossy().into_owned(),
-        mfile: state
-            .config
-            .mfile_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned()),
-    })
-}
-
-fn build_router(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/v1/add", post(handle_add))
-        .route("/v1/packages", get(handle_packages))
-        .route("/v1/env", get(handle_env))
-        .route("/v1/meta", get(handle_meta))
-        .with_state(state)
 }
 
 fn process_add_impl(
@@ -613,6 +572,7 @@ mod tests {
     use cache::{Cache, EntryMeta, MetaInner};
     use decode::Layer;
     use graph::DepGraph;
+    use min_client::min_proto::min_service_client::MinServiceClient;
 
     /// Helper: create a DepGraph and Cache with multiple test packages.
     ///
@@ -810,52 +770,23 @@ packages = ["bash"]
         )
     }
 
-    /// Helper: send a raw HTTP request and return the response body.
-    fn http_request(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
-        use std::io::{Read, Write};
-        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .unwrap();
-
-        let body_bytes = body.unwrap_or("");
-        let request = if body.is_some() {
-            format!(
-                "{} {} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                method,
-                path,
-                body_bytes.len(),
-                body_bytes
-            )
-        } else {
-            format!(
-                "{} {} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-                method, path
-            )
-        };
-        stream.write_all(request.as_bytes()).unwrap();
-        stream.flush().unwrap();
-
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
-
-        // Parse HTTP status code and body
-        let status_line = response.lines().next().unwrap_or("");
-        let status_code: u16 = status_line
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or("0")
-            .parse()
-            .unwrap_or(0);
-
-        let body_start = response.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
-        let response_body = response[body_start..].to_string();
-
-        (status_code, response_body)
+    /// Helper: create a gRPC client connected to the given port.
+    /// Retries connection up to 50 times with 10ms delays to allow server startup.
+    async fn grpc_client(port: u16) -> MinServiceClient<tonic::transport::Channel> {
+        let endpoint = format!("http://127.0.0.1:{}", port);
+        for _ in 0..50 {
+            match MinServiceClient::connect(endpoint.clone()).await {
+                Ok(client) => return client,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+        MinServiceClient::connect(endpoint)
+            .await
+            .expect("failed to connect gRPC client after retries")
     }
 
-    #[test]
-    fn test_http_add_single_package() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_grpc_add_single_package() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
         let (config, _state_dir, _mfile_dir) =
             make_config(&graph, &cache, &rootfs_dir, HashSet::new());
@@ -869,19 +800,23 @@ packages = ["bash"]
             .parse()
             .unwrap();
 
-        let body = r#"{"packages":["zlib"],"ephemeral":false}"#;
-        let (status, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
-        assert_eq!(status, 200);
-
-        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        let mut client = grpc_client(port).await;
+        let resp = client
+            .add(tonic::Request::new(AddRequest {
+                packages: vec!["zlib".into()],
+                ephemeral: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
         assert_eq!(resp.status, "ok");
         assert!(resp.added.contains(&"zlib".to_string()));
 
         handle.shutdown();
     }
 
-    #[test]
-    fn test_http_get_packages() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_grpc_get_packages() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
         let (config, _state_dir, _mfile_dir) =
             make_config(&graph, &cache, &rootfs_dir, HashSet::new());
@@ -894,22 +829,30 @@ packages = ["bash"]
             .parse()
             .unwrap();
 
+        let mut client = grpc_client(port).await;
+
         // Add a package first
-        let body = r#"{"packages":["zlib"]}"#;
-        http_request(port, "POST", "/v1/add", Some(body));
+        client
+            .add(tonic::Request::new(AddRequest {
+                packages: vec!["zlib".into()],
+                ephemeral: false,
+            }))
+            .await
+            .unwrap();
 
         // Query packages
-        let (status, resp_body) = http_request(port, "GET", "/v1/packages", None);
-        assert_eq!(status, 200);
-
-        let resp: PackagesResponse = serde_json::from_str(&resp_body).unwrap();
+        let resp = client
+            .list_packages(tonic::Request::new(ListPackagesRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
         assert!(resp.packages.iter().any(|p| p.name == "zlib"));
 
         handle.shutdown();
     }
 
-    #[test]
-    fn test_http_get_env() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_grpc_get_env() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
         let (config, _state_dir, _mfile_dir) =
             make_config(&graph, &cache, &rootfs_dir, HashSet::new());
@@ -922,14 +865,18 @@ packages = ["bash"]
             .parse()
             .unwrap();
 
-        let (status, _) = http_request(port, "GET", "/v1/env", None);
-        assert_eq!(status, 200);
+        let mut client = grpc_client(port).await;
+        let _resp = client
+            .get_env(tonic::Request::new(GetEnvRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
 
         handle.shutdown();
     }
 
-    #[test]
-    fn test_http_get_meta() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_grpc_get_meta() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
         let (config, _state_dir, _mfile_dir) =
             make_config(&graph, &cache, &rootfs_dir, HashSet::new());
@@ -942,18 +889,20 @@ packages = ["bash"]
             .parse()
             .unwrap();
 
-        let (status, resp_body) = http_request(port, "GET", "/v1/meta", None);
-        assert_eq!(status, 200);
-
-        let resp: MetaResponse = serde_json::from_str(&resp_body).unwrap();
+        let mut client = grpc_client(port).await;
+        let resp = client
+            .get_meta(tonic::Request::new(GetMetaRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
         assert_eq!(resp.task_name, "shell");
 
         handle.shutdown();
     }
 
-    // ========== Test 1: Single package add (via HTTP) ==========
-    #[test]
-    fn test_add_single_package() {
+    // ========== Test 1: Single package add (via gRPC) ==========
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_add_single_package() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
         let (config, _state_dir, _mfile_dir) =
             make_config(&graph, &cache, &rootfs_dir, HashSet::new());
@@ -966,10 +915,15 @@ packages = ["bash"]
             .parse()
             .unwrap();
 
-        let body = r#"{"packages":["zlib"]}"#;
-        let (status, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
-        assert_eq!(status, 200);
-        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        let mut client = grpc_client(port).await;
+        let resp = client
+            .add(tonic::Request::new(AddRequest {
+                packages: vec!["zlib".into()],
+                ephemeral: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
         assert_eq!(resp.status, "ok");
         assert!(resp.added.contains(&"zlib".to_string()));
         // Verify the file was hardlinked into rootfs
@@ -979,8 +933,8 @@ packages = ["bash"]
     }
 
     // ========== Test 2: Multiple packages at once ==========
-    #[test]
-    fn test_add_multiple_packages() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_add_multiple_packages() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
         let (config, _state_dir, _mfile_dir) =
             make_config(&graph, &cache, &rootfs_dir, HashSet::new());
@@ -993,10 +947,15 @@ packages = ["bash"]
             .parse()
             .unwrap();
 
-        let body = r#"{"packages":["zlib","expat","libffi"]}"#;
-        let (status, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
-        assert_eq!(status, 200);
-        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        let mut client = grpc_client(port).await;
+        let resp = client
+            .add(tonic::Request::new(AddRequest {
+                packages: vec!["zlib".into(), "expat".into(), "libffi".into()],
+                ephemeral: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
         assert_eq!(resp.status, "ok");
         assert!(rootfs_dir.path().join("usr/lib/libzlib.so").exists());
         assert!(rootfs_dir.path().join("usr/lib/libexpat.so").exists());
@@ -1006,8 +965,8 @@ packages = ["bash"]
     }
 
     // ========== Test 3: Package with transitive dependencies ==========
-    #[test]
-    fn test_add_package_with_transitive_deps() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_add_package_with_transitive_deps() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
         let (config, _state_dir, _mfile_dir) =
             make_config(&graph, &cache, &rootfs_dir, HashSet::new());
@@ -1021,10 +980,15 @@ packages = ["bash"]
             .unwrap();
 
         // python depends on zlib, expat, libffi
-        let body = r#"{"packages":["python"]}"#;
-        let (status, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
-        assert_eq!(status, 200);
-        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        let mut client = grpc_client(port).await;
+        let resp = client
+            .add(tonic::Request::new(AddRequest {
+                packages: vec!["python".into()],
+                ephemeral: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
         assert_eq!(resp.status, "ok");
         assert!(resp.added.contains(&"zlib".to_string()));
         assert!(resp.added.contains(&"expat".to_string()));
@@ -1040,8 +1004,8 @@ packages = ["bash"]
     }
 
     // ========== Test 4: Already-present package (no-op) ==========
-    #[test]
-    fn test_add_already_present_package() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_add_already_present_package() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
 
         let mut initial = HashSet::new();
@@ -1056,10 +1020,15 @@ packages = ["bash"]
             .parse()
             .unwrap();
 
-        let body = r#"{"packages":["zlib"]}"#;
-        let (status, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
-        assert_eq!(status, 200);
-        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        let mut client = grpc_client(port).await;
+        let resp = client
+            .add(tonic::Request::new(AddRequest {
+                packages: vec!["zlib".into()],
+                ephemeral: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
         assert_eq!(resp.status, "ok");
         assert!(resp.message.contains("already present"));
 
@@ -1067,8 +1036,8 @@ packages = ["bash"]
     }
 
     // ========== Test 5: Unknown package ==========
-    #[test]
-    fn test_add_unknown_package() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_add_unknown_package() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
         let (config, _state_dir, _mfile_dir) =
             make_config(&graph, &cache, &rootfs_dir, HashSet::new());
@@ -1081,10 +1050,15 @@ packages = ["bash"]
             .parse()
             .unwrap();
 
-        let body = r#"{"packages":["nonexistent_pkg"]}"#;
-        let (status, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
-        assert_eq!(status, 422);
-        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        let mut client = grpc_client(port).await;
+        let resp = client
+            .add(tonic::Request::new(AddRequest {
+                packages: vec!["nonexistent_pkg".into()],
+                ephemeral: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
         assert_eq!(resp.status, "error");
         assert!(resp.message.contains("unknown package"));
 
@@ -1092,8 +1066,8 @@ packages = ["bash"]
     }
 
     // ========== Test 6: Ephemeral flag (no minimal.toml update) ==========
-    #[test]
-    fn test_add_ephemeral_does_not_persist() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_add_ephemeral_does_not_persist() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
         let (config, _state_dir, _mfile_dir) =
             make_config(&graph, &cache, &rootfs_dir, HashSet::new());
@@ -1109,10 +1083,15 @@ packages = ["bash"]
             .parse()
             .unwrap();
 
-        let body = r#"{"packages":["gcc"],"ephemeral":true}"#;
-        let (status, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
-        assert_eq!(status, 200);
-        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        let mut client = grpc_client(port).await;
+        let resp = client
+            .add(tonic::Request::new(AddRequest {
+                packages: vec!["gcc".into()],
+                ephemeral: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
         assert_eq!(resp.status, "ok");
 
         // Verify minimal.toml was NOT modified
@@ -1126,8 +1105,8 @@ packages = ["bash"]
     }
 
     // ========== Test 7: Non-ephemeral persists to minimal.toml ==========
-    #[test]
-    fn test_add_persists_to_mfile() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_add_persists_to_mfile() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
         let (config, _state_dir, _mfile_dir) =
             make_config(&graph, &cache, &rootfs_dir, HashSet::new());
@@ -1142,10 +1121,15 @@ packages = ["bash"]
             .parse()
             .unwrap();
 
-        let body = r#"{"packages":["gcc"]}"#;
-        let (status, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
-        assert_eq!(status, 200);
-        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        let mut client = grpc_client(port).await;
+        let resp = client
+            .add(tonic::Request::new(AddRequest {
+                packages: vec!["gcc".into()],
+                ephemeral: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
         assert_eq!(resp.status, "ok");
 
         // Verify minimal.toml was updated with gcc
@@ -1160,8 +1144,8 @@ packages = ["bash"]
     }
 
     // ========== Test 8: Partial overlap with already-present packages ==========
-    #[test]
-    fn test_add_partial_overlap() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_add_partial_overlap() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
 
         // gcc is already present (so bash's transitive dep on gcc is satisfied)
@@ -1184,10 +1168,15 @@ packages = ["bash"]
             .unwrap();
 
         // bash depends on gcc, but gcc is already present
-        let body = r#"{"packages":["bash"]}"#;
-        let (status, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
-        assert_eq!(status, 200);
-        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        let mut client = grpc_client(port).await;
+        let resp = client
+            .add(tonic::Request::new(AddRequest {
+                packages: vec!["bash".into()],
+                ephemeral: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
         assert_eq!(resp.status, "ok");
         assert!(resp.added.contains(&"bash".to_string()));
         // gcc should NOT be re-added
@@ -1201,8 +1190,8 @@ packages = ["bash"]
     }
 
     // ========== Test 9: Sequential adds track state ==========
-    #[test]
-    fn test_sequential_adds_track_state() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_sequential_adds_track_state() {
         let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
         let (config, _state_dir, _mfile_dir) =
             make_config(&graph, &cache, &rootfs_dir, HashSet::new());
@@ -1215,18 +1204,29 @@ packages = ["bash"]
             .parse()
             .unwrap();
 
+        let mut client = grpc_client(port).await;
+
         // First add: gcc
-        let body = r#"{"packages":["gcc"]}"#;
-        let (status, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
-        assert_eq!(status, 200);
-        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        let resp = client
+            .add(tonic::Request::new(AddRequest {
+                packages: vec!["gcc".into()],
+                ephemeral: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
         assert_eq!(resp.status, "ok");
         assert!(resp.added.contains(&"gcc".to_string()));
 
         // Second add: bash (depends on gcc, which is now present)
-        let body = r#"{"packages":["bash"]}"#;
-        let (_, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
-        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        let resp = client
+            .add(tonic::Request::new(AddRequest {
+                packages: vec!["bash".into()],
+                ephemeral: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
         assert_eq!(resp.status, "ok");
         assert!(resp.added.contains(&"bash".to_string()));
         assert!(
@@ -1235,41 +1235,16 @@ packages = ["bash"]
         );
 
         // Third add: gcc again (should be no-op)
-        let body = r#"{"packages":["gcc"]}"#;
-        let (_, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
-        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
+        let resp = client
+            .add(tonic::Request::new(AddRequest {
+                packages: vec!["gcc".into()],
+                ephemeral: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
         assert_eq!(resp.status, "ok");
         assert!(resp.message.contains("already present"));
-
-        handle.shutdown();
-    }
-
-    // ========== Test 10: HTTP protocol over TCP ==========
-    #[test]
-    fn test_http_wire_protocol() {
-        let (graph, cache, _cache_dir, rootfs_dir) = make_test_env();
-        let (config, _state_dir, _mfile_dir) =
-            make_config(&graph, &cache, &rootfs_dir, HashSet::new());
-
-        let port_file = config.port_file_path.clone();
-        let handle = start(config);
-
-        // Verify port file was written
-        let port_str = std::fs::read_to_string(&port_file).unwrap();
-        let port: u16 = port_str.trim().parse().unwrap();
-        assert!(port > 0, "port should be non-zero");
-
-        let body = r#"{"packages":["zlib"]}"#;
-        let (status, resp_body) = http_request(port, "POST", "/v1/add", Some(body));
-        assert_eq!(status, 200);
-        let resp: AddResponse = serde_json::from_str(&resp_body).unwrap();
-        assert_eq!(resp.status, "ok");
-
-        // Verify hardlinking worked through the HTTP server
-        assert!(
-            rootfs_dir.path().join("usr/lib/libzlib.so").exists(),
-            "zlib should be hardlinked into rootfs"
-        );
 
         handle.shutdown();
     }
@@ -1415,31 +1390,5 @@ exec = "bash -l"
         let resp = process_add_impl(vec!["nonexistent"], false, &config, &mut present);
         assert_eq!(resp.status, "error");
         assert!(resp.message.contains("unknown package"));
-    }
-
-    #[test]
-    fn test_add_request_serde() {
-        let req = AddRequest {
-            packages: vec!["python".to_string(), "gcc".to_string()],
-            ephemeral: false,
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        let parsed: AddRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.packages, vec!["python", "gcc"]);
-        assert!(!parsed.ephemeral);
-    }
-
-    #[test]
-    fn test_add_response_serde() {
-        let resp = AddResponse {
-            status: "ok".to_string(),
-            added: vec!["python".to_string()],
-            env: std::collections::HashMap::from([("PATH".to_string(), "/usr/bin".to_string())]),
-            message: "Added python".to_string(),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("\"status\":\"ok\""));
-        let parsed: AddResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.added, vec!["python"]);
     }
 }

@@ -46,6 +46,11 @@ reqwest.workspace = true
 
 anyhow.workspace = true
 
+min-client.workspace = true
+prost.workspace = true
+tonic-prost.workspace = true
+tokio-stream.workspace = true
+
 sha2.workspace = true
 hex.workspace = true
 toml.workspace = true
@@ -57,5 +62,4 @@ petgraph.workspace = true
 smallvec.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-axum.workspace = true
 hakoniwa.workspace = true

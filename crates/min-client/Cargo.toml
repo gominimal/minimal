@@ -4,6 +4,20 @@ version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
 
+[lib]
+name = "min_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "min-client"
+path = "src/main.rs"
+
 [dependencies]
-serde = { workspace = true }
-serde_json = { workspace = true }
+prost.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+tokio.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+tonic-prost-build.workspace = true
