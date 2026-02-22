@@ -55,8 +55,14 @@ pub async fn run_task(
     let rootfs_path = env.rootfs_path();
     let state_dir = env.state_dir().to_path_buf();
 
-    // Inject the min script and bashrc into the rootfs
-    shim_listener::inject_shim_scripts(&rootfs_path)
+    // Locate min-client binary (next to current executable)
+    let min_client_bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("min-client")))
+        .filter(|p| p.exists());
+
+    // Inject the min binary and bashrc into the rootfs
+    shim_listener::inject_shim_scripts(&rootfs_path, min_client_bin.as_deref())
         .map_err(|e| Error::Other(anyhow!("injecting shim scripts: {}", e)))?;
 
     // Create the /state/.min/ directory (visible inside sandbox)

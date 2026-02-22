@@ -570,14 +570,24 @@ pub const BASHRC_SNIPPET: &str = r#"
 min() { eval "$(/usr/bin/min "$@")"; }
 "#;
 
-/// Injects the min script and bashrc snippet into the rootfs.
-pub fn inject_shim_scripts(rootfs_path: &Path) -> Result<(), std::io::Error> {
-    // Write /usr/bin/min
+/// Injects the min binary (or fallback script) and bashrc snippet into the rootfs.
+///
+/// If `min_client_bin` is provided, copies the compiled min-client binary.
+/// Otherwise falls back to the bash script using `/dev/tcp`.
+pub fn inject_shim_scripts(
+    rootfs_path: &Path,
+    min_client_bin: Option<&Path>,
+) -> Result<(), std::io::Error> {
     let min_path = rootfs_path.join("usr/bin/min");
     if let Some(parent) = min_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&min_path, MIN_SCRIPT)?;
+
+    if let Some(bin_path) = min_client_bin {
+        std::fs::copy(bin_path, &min_path)?;
+    } else {
+        std::fs::write(&min_path, MIN_SCRIPT)?;
+    }
 
     // Make executable
     use std::os::unix::fs::PermissionsExt;
@@ -1270,7 +1280,7 @@ packages = ["bash"]
         let rootfs = tmp.path().join("rootfs");
         std::fs::create_dir_all(&rootfs).unwrap();
 
-        inject_shim_scripts(&rootfs).unwrap();
+        inject_shim_scripts(&rootfs, None).unwrap();
 
         // Check /usr/bin/min exists and is executable
         let min_path = rootfs.join("usr/bin/min");
