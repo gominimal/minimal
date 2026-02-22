@@ -83,6 +83,17 @@ impl Sandbox {
         hardlink_dir_contents(&base_dir.join("synth"), &rootfs)?;
         tracing::trace!("rootfs hardlinking took {:?}", hardlinking_start.elapsed());
 
+        // On aarch64, autotools/libtool defaults to installing libraries
+        // into lib64/. Create a usr/lib64 → lib symlink in the rootfs so
+        // configure scripts detect it and use usr/lib/ instead. Also create
+        // the same symlink in the output directory so DESTDIR installs that
+        // still target lib64/ land in lib/ transparently.
+        let usr_lib64 = rootfs.join("usr").join("lib64");
+        if !fs::exists(&usr_lib64).unwrap_or(true) {
+            std::os::unix::fs::symlink("lib", &usr_lib64)
+                .map_err(|e| Error::IO("create usr/lib64 symlink", usr_lib64, e))?;
+        }
+
         // Setup the working directory
         match &config.wd {
             WdSetup::Isolated { working_inputs } => {
@@ -117,8 +128,18 @@ impl Sandbox {
                 }
                 tracing::trace!("input hardlinking took {:?}", hardlinking_start.elapsed());
 
-                fs::create_dir_all(b.join("output"))
+                let output = b.join("output");
+                fs::create_dir_all(&output)
                     .map_err(|e| Error::IO("create output dir", b.clone(), e))?;
+
+                // Mirror the usr/lib64 → lib symlink into the output dir so
+                // that DESTDIR installs targeting lib64/ land in lib/.
+                let out_usr_lib = output.join("usr").join("lib");
+                fs::create_dir_all(&out_usr_lib)
+                    .map_err(|e| Error::IO("create output usr/lib", out_usr_lib.clone(), e))?;
+                let out_usr_lib64 = output.join("usr").join("lib64");
+                std::os::unix::fs::symlink("lib", &out_usr_lib64)
+                    .map_err(|e| Error::IO("create output usr/lib64 symlink", out_usr_lib64, e))?;
             }
             WdSetup::BoundDir {
                 path,
@@ -285,12 +306,6 @@ impl Sandbox {
         }
         if self.needs_lib64_symlink()? {
             container.symlink("/usr/lib", "/lib64");
-        }
-        // On aarch64, autotools/libtool defaults to installing libraries
-        // into lib64/. Symlink /usr/lib64 → /usr/lib so installs land in
-        // lib/ transparently (configure and libtool check for this symlink).
-        if !fs::exists(self.base_dir.join("rootfs").join("usr").join("lib64")).unwrap_or(false) {
-            container.symlink("/usr/lib", "/usr/lib64");
         }
         if self.needs_lib_symlink()? {
             container.symlink("/usr/lib", "/lib");
