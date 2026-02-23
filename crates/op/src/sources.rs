@@ -12,7 +12,7 @@ pub trait SourceFetcher: Send + Sync + std::fmt::Debug {
     /// Returns a path to the specified URL, after sha256 verification.
     ///
     /// The returned path may be cached - there's no expectation a fresh fetch is performed.
-    fn download_https(
+    fn download_web(
         &self,
         url: &str,
         sha256: &str,
@@ -30,8 +30,8 @@ pub trait SourceFetcher: Send + Sync + std::fmt::Debug {
 }
 
 impl SourceFetcher for common::RemoteStorage {
-    async fn download_https(&self, url: &str, sha256: &str) -> Result<PathBuf, anyhow::Error> {
-        self.download_https_with_verification_and_caching(url, sha256)
+    async fn download_web(&self, url: &str, sha256: &str) -> Result<PathBuf, anyhow::Error> {
+        self.download_web_with_verification_and_caching(url, sha256)
             .await
     }
 
@@ -86,10 +86,10 @@ impl<'a, SF: SourceFetcher> Runnable for SourceLoad<'a, SF> {
                     .to_string();
 
                 match url.scheme() {
-                    "https" => {
+                    "https" | "http" => {
                         let cached_path = self
                             .remote_fetcher
-                            .download_https(url.as_str(), sha256)
+                            .download_web(url.as_str(), sha256)
                             .await?;
 
                         debug!("  Downloaded and verified source from {}", url);
