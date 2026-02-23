@@ -135,6 +135,7 @@ pub enum DeliverableState<B: super::Backend> {
 pub struct Deliverable<B: super::Backend> {
     pub inner: DeliverableInner,
     pub state: DeliverableState<B>,
+    pub depended_on_by: usize,
 }
 
 /// A wrapper type for all the underlying storage within a [State] object.
@@ -172,6 +173,7 @@ impl<B: super::Backend> StateInner<B> {
         let dr = DeliverableRef(self.deliverables.insert(Deliverable {
             inner: di,
             state: DeliverableState::Pending,
+            depended_on_by: 0,
         }));
 
         if let Some(fills_key) = fills_key {
@@ -481,6 +483,27 @@ impl<B: super::Backend> State<B> {
                     }
                 }
             });
+
+        // Fill in depended_on_by.
+        for (deliverable, count) in inner
+            .deliverables
+            .iter()
+            .map(|(idx, _d)| {
+                (
+                    idx,
+                    inner.deliverables.iter().fold(0, |acc, (_idx, d)| {
+                        if let Some(deps) = d.inner.build_deps() {
+                            acc + deps.iter().filter(|d| d.0 == idx).count()
+                        } else {
+                            acc
+                        }
+                    }),
+                )
+            })
+            .collect::<Vec<_>>()
+        {
+            inner.deliverables[deliverable].depended_on_by = count;
+        }
 
         Ok(Self { s: inner })
     }

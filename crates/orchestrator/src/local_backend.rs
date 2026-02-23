@@ -44,6 +44,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                 .map(|dr| match s.get(&dr).unwrap() {
                     Deliverable {
                         inner: _,
+                        depended_on_by: _,
                         state: DeliverableState::Complete(a),
                     } => match a {
                         Either::Left((pd, _meta)) => pd.path().to_path_buf(),
