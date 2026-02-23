@@ -123,14 +123,18 @@ impl<B: Backend> Orchestrator<B> {
 
         let mut pending: JoinSet<Result<(), (DeliverableRef, Error)>> = JoinSet::new();
         while !state_hnd.done().await {
-            // Spawn tasks for all runnables
             let mut s = state_hnd.lock().await;
-            for dr in s
-                .runnable()
-                .map(|(dr, _)| dr)
-                .collect::<Vec<_>>()
-                .into_iter()
-            {
+            let mut runnables = s.runnable().map(|(dr, _)| dr).collect::<Vec<_>>();
+            // Sort runnables by the ones which unblock the largest number of tasks first.
+            runnables.sort_by(|a, b| {
+                s.get(a)
+                    .unwrap()
+                    .depended_on_by
+                    .cmp(&s.get(b).unwrap().depended_on_by)
+                    .reverse()
+            });
+            // Spawn tasks for all runnables
+            for dr in runnables.into_iter() {
                 let deliverable = s.get_mut(&dr).unwrap();
                 assert!(matches!(deliverable.state, DeliverableState::Pending));
 
