@@ -1009,6 +1009,7 @@ impl FileBasedChecker for AdjacentImportCheck {
             .map_err(|e2| Error::Other(anyhow!("decoding nickel file as utf8: {}", e2)))?;
 
             for captures in ADJACENT_IMPORT_REGEX.captures_iter(&file_contents) {
+                let end_idx = captures.get_match().end();
                 let identifier = captures.get(1).unwrap().as_str();
                 let folder = captures.get(2).unwrap().as_str();
 
@@ -1018,6 +1019,17 @@ impl FileBasedChecker for AdjacentImportCheck {
                         name.to_str().unwrap(),
                         identifier,
                         folder
+                    ));
+                    result.verdict = CheckVerdict::Fail;
+                }
+
+                if let Some((_before, after)) = file_contents.split_at_checked(end_idx)
+                    && !after.contains(identifier)
+                {
+                    result.err.push(format!(
+                        "{}: adjacent package '{}' imported but not used",
+                        name.to_str().unwrap(),
+                        identifier,
                     ));
                     result.verdict = CheckVerdict::Fail;
                 }
