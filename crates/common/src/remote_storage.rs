@@ -30,7 +30,7 @@ impl RemoteStorage {
     }
 
     #[tracing::instrument]
-    pub async fn download_https_with_verification_and_caching(
+    pub async fn download_web_with_verification_and_caching(
         &self,
         url: &str,
         sha256: &str,
