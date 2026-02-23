@@ -220,6 +220,7 @@ impl super::GraphBasedChecker for MissingRuntimeDeps {
                             let likely_glibc_stub_lib = exports.iter().any(|e| {
                                 e.name().ends_with(b"__libpthread_version_placeholder")
                                     || e.name().ends_with(b"__libdl_version_placeholder")
+                                    || e.name().ends_with(b"__librt_version_placeholder")
                             });
 
                             // Valid executable, lets check all the imported symbols are present as exports.
