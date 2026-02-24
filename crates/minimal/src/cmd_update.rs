@@ -72,8 +72,8 @@ pub async fn cmd_update(_args: UpdateArgs, ctx: &mut Context) -> Result<(), Erro
     // remotely.
     *ctx = ctx.cloned_reinit()?;
     let graph = ctx.graph_from_all_packages()?;
-    ctx.download_if_available(&graph, graph.top_levels.clone())
-        .await?;
+    let ensure_pkgs = ctx.scaffolding_packages()?;
+    ctx.download_if_available(&graph, ensure_pkgs).await?;
 
     Ok(())
 }

@@ -63,7 +63,7 @@ impl EnvChannel<'_> {
         writeln!(
             stream,
             "msg: installed {}",
-            pkgs.into_iter().map(|t| t.0).collect::<Vec<_>>().join(", ")
+            pkgs.iter().map(|t| t.0).collect::<Vec<_>>().join(", ")
         )
         .ok();
     }
