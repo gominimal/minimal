@@ -16,6 +16,7 @@ struct EnvChannel<'a> {
     graph: &'a mut DepGraph,
     ctx: &'a mut Context,
 
+    state_dir: PathBuf,
     has_packages: HashSet<BuildSpecRef>,
 }
 
@@ -45,6 +46,24 @@ impl EnvChannel<'_> {
             pkgs.iter().map(|(_n, bsr)| *bsr).collect(),
             false,
         );
+        match self.graph.env_config_for_packages(
+            transitives
+                .keys()
+                .filter(|bsr| !self.has_packages.contains(bsr)),
+        ) {
+            Ok(setup) => {
+                for want_dir in setup.state_dirs {
+                    std::fs::create_dir_all(self.state_dir.join(want_dir)).unwrap();
+                }
+                setup.env_vars.iter().for_each(|(k, v)| {
+                    writeln!(stream, "set_env:{}:{}", k, v).ok();
+                });
+            }
+            Err(e) => {
+                writeln!(stream, "error: {}", e).ok();
+                return;
+            }
+        }
         for bsr in transitives.keys() {
             if self.has_packages.insert(*bsr) {
                 if let Err(e) = common::hardlink_dir_contents(
@@ -226,6 +245,7 @@ impl<'a> Env<'a> {
                 EnvChannel {
                     ctx,
                     graph,
+                    state_dir: args.state_base_dir.clone(),
                     has_packages: args.transitives.keys().cloned().collect(),
                 },
             )
