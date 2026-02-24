@@ -1,7 +1,7 @@
 [upstream] # Source of software & tooling
 repo = "https://github.com/gominimal/pkgs"
 branch = "main"
-locked_commit = "57bf423b09e0286fc4c16b130b4f83ddb7b2c6e8"
+locked_commit = "d66366faa6e6f674e3a770385776300aa3c99fae"
 
 [harness]
 use = "rust"
@@ -18,6 +18,7 @@ exec = "cargo test"
 
 [tasks.shell]
 exec = "bash -l"
+packages = ["socat"]
 
 [tasks.startup-time]
 exec = "date"
