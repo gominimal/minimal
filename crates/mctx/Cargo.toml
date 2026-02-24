@@ -21,6 +21,9 @@ shlex.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 
+hakoniwa.workspace = true
+sandbox2.workspace = true
+
 cache.workspace = true
 common.workspace = true
 checkouts.workspace = true

@@ -231,6 +231,8 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
         let inputs = self.inputs_mapped(build, opts).await?;
         let (rootfs, needs_dns, needs_internet) = self.rootfs_mapped(build, opts).await?;
 
+        let channel = ();
+
         let mut config = sandbox2::config::Config::new(&build.name)
             .with_isolated_wd(inputs.into_iter())
             .with_rootfs(rootfs.into_iter())
@@ -239,7 +241,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
         if let Some(a) = &build.build_args {
             config = config.with_build_args(a.iter());
         }
-        let mut sandbox = config.build(&opts.exec_base).await?;
+        let mut sandbox = config.build(&opts.exec_base, channel).await?;
         sandbox.keep_dir(true);
 
         info!("Building package: {}", build.name);
