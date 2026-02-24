@@ -222,22 +222,27 @@ impl<C: Channel> Sandbox<C> {
     }
 
     fn needs_lib64_symlink(&self) -> Result<bool, Error> {
-        let lib64_p = self.base_dir.join("rootfs").join("lib64");
+        let lib64_p = self.rootfs().join("lib64");
         Ok(!fs::exists(&lib64_p)
             .map_err(|e| Error::IO("checking for lib64 directory", lib64_p, e))?)
     }
     fn needs_lib_symlink(&self) -> Result<bool, Error> {
-        let lib_p = self.base_dir.join("rootfs").join("lib");
+        let lib_p = self.rootfs().join("lib");
         Ok(!fs::exists(&lib_p).map_err(|e| Error::IO("checking for lib directory", lib_p, e))?)
     }
     fn needs_bin_symlink(&self) -> Result<bool, Error> {
-        let bin_p = self.base_dir.join("rootfs").join("bin");
+        let bin_p = self.rootfs().join("bin");
         Ok(!fs::exists(&bin_p).map_err(|e| Error::IO("checking for bin directory", bin_p, e))?)
     }
 
     /// Configures the sandbox to not delete itself when dropped.
     pub fn keep_dir(&mut self, keep_dir: bool) {
         self.keep_dir = keep_dir;
+    }
+
+    /// Path to the rootfs of the sandbox.
+    pub fn rootfs(&self) -> PathBuf {
+        self.base_dir.join("rootfs")
     }
 }
 
@@ -322,7 +327,7 @@ impl<C: Channel> Sandbox<C> {
     pub fn new_container(&self) -> Result<Container, Error> {
         let mut container = hakoniwa::Container::new();
         container
-            .rootfs(self.base_dir.join("rootfs"))
+            .rootfs(self.rootfs())
             .unwrap()
             .devfsmount("/dev")
             .tmpfsmount("/tmp")
@@ -378,7 +383,7 @@ impl<C: Channel> Sandbox<C> {
         }
 
         if let Some(hn) = &self.config.hostname {
-            let etc_hostname = self.base_dir.join("rootfs").join("etc").join("hostname");
+            let etc_hostname = self.rootfs().join("etc").join("hostname");
             if !std::fs::exists(&etc_hostname)
                 .map_err(|e| Error::IO("checking for /etc/hostname", etc_hostname.clone(), e))?
             {
@@ -407,7 +412,7 @@ impl<C: Channel> Sandbox<C> {
         EnvK: AsRef<str>,
         EnvV: AsRef<str>,
     {
-        let rootfs = self.base_dir.join("rootfs");
+        let rootfs = self.rootfs();
         let mut program = program.to_string();
 
         // Add /usr/bin/ for commands that are not absolute, and don't shadow anything in cwd

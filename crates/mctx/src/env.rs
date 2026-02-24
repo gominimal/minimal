@@ -1,6 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
+    fs::Permissions,
     io::Write,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -27,6 +29,13 @@ impl EnvChannel<'_> {
         stream: &mut std::os::unix::net::UnixStream,
         rootfs: &Path,
     ) {
+        if pkgs
+            .iter()
+            .all(|(_n, bsr)| self.graph.top_levels.contains(bsr))
+        {
+            return; // Already installed.
+        }
+
         pkgs.iter().for_each(|(_n, bsr)| {
             if !self.graph.top_levels.contains(bsr) {
                 self.graph.top_levels.push(*bsr);
@@ -81,7 +90,7 @@ impl EnvChannel<'_> {
         }
         writeln!(
             stream,
-            "msg: installed {}",
+            "msg:Installed {}",
             pkgs.iter().map(|t| t.0).collect::<Vec<_>>().join(", ")
         )
         .ok();
@@ -256,6 +265,9 @@ impl<'a> Env<'a> {
                 .map_err(anyhow::Error::from)
                 .map_err(Error::Other)?;
         }
+        install_min_script(sandbox.rootfs())
+            .map_err(|e| Error::Other(anyhow::anyhow!("installing min script: {}", e)))?;
+
         sandbox.keep_dir(false);
 
         Ok(Env {
@@ -292,3 +304,122 @@ impl<'a> Env<'a> {
             .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))
     }
 }
+
+fn install_min_script(rootfs: PathBuf) -> Result<(), std::io::Error> {
+    let usr_bin = rootfs.join("usr").join("bin");
+    std::fs::create_dir_all(&usr_bin)?;
+
+    std::fs::write(usr_bin.join("min"), MIN_SCRIPT)?;
+    std::fs::set_permissions(
+        rootfs.join("usr").join("bin").join("min"),
+        Permissions::from_mode(0o0755),
+    )?;
+
+    let etc = rootfs.join("etc");
+    std::fs::create_dir_all(&etc)?;
+
+    // Append to /etc/bashrc (or create it)
+    let bashrc = etc.join("bashrc");
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&bashrc)?
+        .write_all(MIN_BASHRC_SNIPPET.as_bytes())?;
+
+    Ok(())
+}
+
+pub const MIN_BASHRC_SNIPPET: &str = r#"
+
+# minimal: in-sandbox package addition
+min() { eval "$(/usr/bin/min "$@")"; }
+"#;
+
+const MIN_SCRIPT: &str = indoc::indoc! {
+    r#"#!/usr/bin/bash
+
+    __min_add() {
+        local prefix="$1"
+        local pkgname="$2"
+        if [[ -z "$prefix" || -z "$pkgname" ]]; then
+            echo "Usage: min_add <prefix> <pkgname>" >&2
+            return 1
+        fi
+
+        local error="false"
+        local env_pairs=()
+
+        while IFS= read -r line; do
+            local tag="${line%%:*}"
+            local rest="${line#*:}"
+            case "$tag" in
+                msg)
+                    echo "$rest"
+                    ;;
+                set_env)
+                    local varname="${rest%%:*}"
+                    local varval="${rest#*:}"
+                    declare -gx "$varname=$varval"
+                    env_pairs+=("${varname}=${varval}")
+                    ;;
+                done)
+                    break
+                    ;;
+                error)
+                    echo "error:$rest" >&2
+                    error="true"
+                    break
+                    ;;
+            esac
+        done < <(echo "${prefix}%${pkgname}" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
+
+        if [[ ${#env_pairs[@]} -gt 0 ]]; then
+            echo ""
+            echo "Run the following to apply environment variables in your current shell:"
+            echo "  export ${env_pairs[*]}"
+        fi
+
+        if [[ "$error" == "true" ]]; then
+            return 1
+        fi
+    }
+
+    min_add() {
+        local flag="$1"
+        shift
+
+        if [[ -z "$flag" || -z "$1" ]]; then
+            echo "Usage: min add --ephemeral|--build|--runtime|--tool <packages>" >&2
+            return 1
+        fi
+
+        local prefix
+        case "$flag" in
+            --ephemeral) prefix="add-ephemeral" ;;
+            --build)     prefix="add-build"     ;;
+            --runtime)   prefix="add-runtime"   ;;
+            --tool)      prefix="add-tool"      ;;
+            *)
+                echo "error: unknown flag '$flag'. Expected --ephemeral, --build, --runtime, or --tool" >&2
+                return 1
+                ;;
+        esac
+
+        __min_add "$prefix" "$@"
+    }
+
+    # If invoked directly as a script (not sourced), handle `min add <pkg>`
+    if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+        subcmd="$1"
+        shift
+        case "$subcmd" in
+            add)
+                min_add "$@"
+                ;;
+            *)
+                echo "Usage: min add --ephemeral|--build|--runtime|--tool <packages>" >&2
+                exit 1
+                ;;
+        esac
+    fi"#
+};

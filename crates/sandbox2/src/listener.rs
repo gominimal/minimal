@@ -69,11 +69,9 @@ impl<C: Channel + Send> Listener<C> {
                             Ok(line) => {
                                 tracing::trace!("listener received: {}", line);
                                 channel.handle(&mut stream2, &line, &rootfs);
-                                break;
                             }
                             Err(e) => {
                                 tracing::warn!("listener read error: {}", e);
-                                break;
                             }
                         }
                     }
