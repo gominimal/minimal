@@ -22,6 +22,7 @@ use graph::{BuildSpecRef, DepGraph, Transitives};
 use mfile::{EnvPatches, Task};
 
 use env::Env;
+use toml_edit::{Array, DocumentMut, Item, TableLike, Value};
 
 use crate::env::EnvArgs;
 
@@ -375,6 +376,8 @@ impl Context {
 /// Outcome-oriented API
 impl Context {
     /// Ensures the top-level packages of the given graph are built and available locally.
+    ///
+    /// Use [Context::download_if_available] if you want to only fetch packages.
     pub async fn build_graph(&mut self, graph: &DepGraph) -> Result<(), Error> {
         let cache = self.local_cache();
         let rc = if self.config.use_remote_cache() {
@@ -563,6 +566,170 @@ impl Context {
         }
 
         out.as_bsrs(&graph)
+    }
+
+    /// Downloads the specified packages if they are missing locally but present in the
+    /// remote cache.
+    ///
+    /// Use [Context::build_graph] instead if you want to also build packages that
+    /// aren't available for download.
+    pub async fn download_if_available<I: IntoIterator<Item = BuildSpecRef>>(
+        &mut self,
+        graph: &DepGraph,
+        pkgs: I,
+    ) -> Result<(), Error> {
+        let rc = self.remote_cache(false, true).await.unwrap();
+        let mut task_set = tokio::task::JoinSet::new();
+        let fetch_start = SystemTime::now();
+        for (bsr, _depinfo) in Transitives::for_toplevels(graph, pkgs.into_iter().collect(), false)
+        {
+            let b = graph.get(&bsr).unwrap();
+            let name = b.name.clone();
+            let origin = b.from.as_ref().clone();
+            let spec_hash = graph.spec_hash(&bsr);
+            if let Err(cache::CacheErr::NotFound) = self.cache.read_dir(&spec_hash)
+                && rc.exists(&spec_hash)
+            {
+                let rc_clone = rc.clone(); // TODO: This is trash
+                let cache_clone = self.cache.clone();
+                task_set.spawn(async move {
+                    rc_clone
+                        .materialize(&spec_hash, &cache_clone, &name)
+                        .await
+                        .map(|(t, d)| {
+                            (
+                                d,
+                                cache::EntryMeta {
+                                    inner: cache::MetaInner::Spec(name),
+                                    fetched: true,
+                                    fetch_ms: Some(t.as_millis() as usize),
+                                    origin: Some(origin),
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                });
+            }
+        }
+
+        // Wait for all materialization tasks to complete, committing each pending dir
+        // to the cache as it is finished being staged
+        while let Some(result) = task_set.join_next().await {
+            let (pending_dir, meta) = result
+                .unwrap()
+                .map_err(|e| Error::Other(anyhow::Error::from(e)))?;
+            pending_dir.finalize(meta).unwrap();
+        }
+        tracing::trace!("package fetch took {:?}", fetch_start.elapsed());
+
+        Ok(())
+    }
+
+    /// Adds the specified dependencies if they arent already present.
+    pub fn add_deps<S: PackageSelection>(
+        &mut self,
+        graph: &DepGraph,
+        deps: S,
+        mode: AddDepMode,
+    ) -> Result<(), Error> {
+        let mfile = self.minimal_file()?;
+        let mfile_path = mfile.file_path().cloned();
+
+        if mfile_path.is_none() {
+            return Err(Error::Other(anyhow!(
+                "Cannot add dependency - no minimal.toml located."
+            )));
+        }
+        let mfile_path = mfile_path.unwrap();
+
+        let toml = std::fs::read_to_string(&mfile_path)
+            .map_err(|e| Error::IO("reading minimal.toml for add", mfile_path.to_path_buf(), e))?;
+        let mut doc = toml
+            .parse::<DocumentMut>()
+            .map_err(|e| Error::Other(anyhow!("parsing minimal.toml: {}", e)))?;
+
+        let resolved: Vec<String> = deps
+            .as_bsrs(graph)?
+            .into_iter()
+            .map(|bsr| graph.get(&bsr).unwrap().name.clone())
+            .collect();
+
+        let mut did_edit = false;
+        match mode {
+            AddDepMode::BuildPackages => {
+                if let Some(h) = doc["harness"].as_table_mut() {
+                    did_edit |= upsert_toml_packages_list(h, "build_packages", &resolved);
+                    println!("Added [{}] to harness.build_packages", resolved.join(","));
+                } else {
+                    return Err(Error::Other(anyhow!(
+                        "could not find [harness] in minimal.toml: needed for update"
+                    )));
+                }
+            }
+            AddDepMode::RuntimePackages => {
+                if let Some(h) = doc["harness"].as_table_mut() {
+                    did_edit |= upsert_toml_packages_list(h, "runtime_packages", &resolved);
+                    println!("Added [{}] to harness.runtime_packages", resolved.join(","));
+                } else {
+                    return Err(Error::Other(anyhow!(
+                        "could not find [harness] in minimal.toml: needed for update"
+                    )));
+                }
+            }
+            AddDepMode::ToolPackages => {
+                if let Some(tasks) = doc.get_mut("tasks")
+                    && let Some(shell) = tasks.get_mut("shell")
+                {
+                    upsert_toml_packages_list(shell.as_table_mut().unwrap(), "packages", &resolved);
+                    println!("Added [{}] to tasks.shell.packages", resolved.join(","));
+                } else {
+                    return Err(Error::Other(anyhow!(
+                        "could not find [tasks.shell] in minimal.toml: needed for update"
+                    )));
+                }
+            }
+        }
+
+        if did_edit {
+            std::fs::write(&mfile_path, doc.to_string())
+                .map_err(|e| Error::Other(anyhow::Error::from(e)))?;
+            *self = self.cloned_reinit()?;
+        }
+        Ok(())
+    }
+}
+
+/// How to add a set of dependencies - as a build dep, a runtime dep, or a tool.
+pub enum AddDepMode {
+    /// Add the specified packages to harness.build_packages.
+    BuildPackages,
+    /// Add the specified packages to harness.runtime_packages.
+    RuntimePackages,
+    /// Add the specified packages to tasks.shell.packages.
+    ToolPackages,
+}
+
+fn upsert_toml_packages_list<T: TableLike>(t: &mut T, key: &str, upsert: &[String]) -> bool {
+    if let Some(bp) = t.get_mut(key) {
+        let mut existing: Vec<_> = bp
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i.as_str().unwrap())
+            .collect();
+
+        let mut did_edit = false;
+        upsert.iter().for_each(|p| {
+            if !existing.contains(&p.as_str()) {
+                existing.push(p);
+                did_edit = true;
+            }
+        });
+        *bp = Item::Value(Value::Array(Array::from_iter(existing)));
+        did_edit
+    } else {
+        t.insert(key, Item::Value(Value::Array(Array::from_iter(upsert))));
+        true
     }
 }
 
