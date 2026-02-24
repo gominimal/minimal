@@ -9,7 +9,7 @@ use mfile::EnvPatches;
 use sandbox2::{Container, config::SandboxMapped};
 use tempfile::TempDir;
 
-use crate::{Context, Error};
+use crate::{AddDepMode, Context, Error};
 
 #[allow(dead_code)]
 struct EnvChannel<'a> {
@@ -60,6 +60,12 @@ impl EnvChannel<'_> {
                 }
             }
         }
+        writeln!(
+            stream,
+            "msg: installed {}",
+            pkgs.into_iter().map(|t| t.0).collect::<Vec<_>>().join(", ")
+        )
+        .ok();
     }
 
     fn parse_pkgs_line<'a>(
@@ -80,23 +86,60 @@ impl sandbox2::Channel for EnvChannel<'_> {
     fn handle(&mut self, stream: &mut std::os::unix::net::UnixStream, line: &str, rootfs: &Path) {
         // handle, eg: echo 'add-ephemeral%mermaid-ascii' | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock
 
-        match line.split_once("%") {
+        let add_dep = match line.split_once("%") {
             Some(("add-ephemeral", pkgs)) => match self.parse_pkgs_line(pkgs) {
                 Err(n) => {
                     writeln!(stream, "error: no such package '{}'", n).ok();
+                    None
                 }
                 Ok(pkgs) => {
                     self.install(&pkgs, stream, rootfs);
-                    writeln!(
-                        stream,
-                        "msg: installed {}",
-                        pkgs.into_iter().map(|t| t.0).collect::<Vec<_>>().join(", ")
-                    )
-                    .ok();
+                    None
+                }
+            },
+            Some(("add-build", pkgs)) => match self.parse_pkgs_line(pkgs) {
+                Err(n) => {
+                    writeln!(stream, "error: no such package '{}'", n).ok();
+                    None
+                }
+                Ok(pkgs) => {
+                    self.install(&pkgs, stream, rootfs);
+                    Some((AddDepMode::BuildPackages, pkgs))
+                }
+            },
+            Some(("add-runtime", pkgs)) => match self.parse_pkgs_line(pkgs) {
+                Err(n) => {
+                    writeln!(stream, "error: no such package '{}'", n).ok();
+                    None
+                }
+                Ok(pkgs) => {
+                    self.install(&pkgs, stream, rootfs);
+                    Some((AddDepMode::RuntimePackages, pkgs))
+                }
+            },
+            Some(("add-tool", pkgs)) => match self.parse_pkgs_line(pkgs) {
+                Err(n) => {
+                    writeln!(stream, "error: no such package '{}'", n).ok();
+                    None
+                }
+                Ok(pkgs) => {
+                    self.install(&pkgs, stream, rootfs);
+                    Some((AddDepMode::ToolPackages, pkgs))
                 }
             },
             _ => {
                 writeln!(stream, "error: unhandled input '{}'", line).ok();
+                None
+            }
+        };
+
+        if let Some((add_mode, pkgs)) = add_dep {
+            if let Err(e) = self.ctx.add_deps(
+                self.graph,
+                pkgs.into_iter().map(|a| a.1).collect::<Vec<_>>(),
+                add_mode,
+            ) {
+                writeln!(stream, "error: {}", e).ok();
             }
         }
     }
