@@ -26,7 +26,7 @@ impl<C: Channel + Send> Listener<C> {
         channel: C,
     ) -> Result<Self, std::io::Error> {
         let socket_path = socket_path.into();
-        let channel = Box::new(channel);
+        let mut channel = Box::new(channel);
         let listener = UnixListener::bind(&socket_path)?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
@@ -36,11 +36,11 @@ impl<C: Channel + Send> Listener<C> {
         // remains valid for the lifetime of the thread because:
         //   1. `Box` provides a stable heap address across moves of `Listener`.
         //   2. `Listener::drop` joins the thread before dropping `_channel`.
-        let channel_addr = &*channel as *const C as usize;
+        let channel_addr = &mut *channel as *mut C as usize;
 
         let rootfs = rootfs.into();
         let thread = thread::spawn(move || {
-            let channel: &C = unsafe { &*(channel_addr as *const C) };
+            let channel: &mut C = unsafe { &mut *(channel_addr as *mut C) };
             Self::run(listener, channel, shutdown_clone, rootfs);
         });
 
@@ -52,7 +52,7 @@ impl<C: Channel + Send> Listener<C> {
         })
     }
 
-    fn run(listener: UnixListener, channel: &C, shutdown: Arc<AtomicBool>, rootfs: PathBuf) {
+    fn run(listener: UnixListener, channel: &mut C, shutdown: Arc<AtomicBool>, rootfs: PathBuf) {
         for stream in listener.incoming() {
             if shutdown.load(Ordering::Acquire) {
                 return;
@@ -61,17 +61,15 @@ impl<C: Channel + Send> Listener<C> {
                 Ok(stream) => {
                     let mut stream2 = stream.try_clone().unwrap();
 
-                    let reader = BufReader::new(&stream);
-                    for line in reader.lines() {
+                    if let Some(line) = BufReader::new(&stream).lines().next() {
                         if shutdown.load(Ordering::Acquire) {
                             return;
                         }
                         match line {
                             Ok(line) => {
                                 tracing::trace!("listener received: {}", line);
-                                if channel.handle(&mut stream2, &line, &rootfs) {
-                                    break;
-                                }
+                                channel.handle(&mut stream2, &line, &rootfs);
+                                break;
                             }
                             Err(e) => {
                                 tracing::warn!("listener read error: {}", e);

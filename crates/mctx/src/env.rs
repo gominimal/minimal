@@ -1,6 +1,10 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Write,
+    path::{Path, PathBuf},
+};
 
-use graph::{BuildSpecRef, DepGraph, SetupForPackages, TransitivesDep};
+use graph::{BuildSpecRef, DepGraph, SetupForPackages, Transitives, TransitivesDep};
 use mfile::EnvPatches;
 use sandbox2::{Container, config::SandboxMapped};
 use tempfile::TempDir;
@@ -9,22 +13,113 @@ use crate::{Context, Error};
 
 #[allow(dead_code)]
 struct EnvChannel<'a> {
-    graph: &'a DepGraph,
+    graph: &'a mut DepGraph,
     ctx: &'a mut Context,
+
+    has_packages: HashSet<BuildSpecRef>,
+}
+
+impl EnvChannel<'_> {
+    fn install(
+        &mut self,
+        pkgs: &Vec<(&str, BuildSpecRef)>,
+        stream: &mut std::os::unix::net::UnixStream,
+        rootfs: &Path,
+    ) {
+        pkgs.iter().for_each(|(_n, bsr)| {
+            if !self.graph.top_levels.contains(bsr) {
+                self.graph.top_levels.push(*bsr);
+            }
+        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        if let Err(e) = rt.block_on(self.ctx.build_graph(self.graph)) {
+            writeln!(stream, "error: {}", e).ok();
+            return;
+        };
+
+        let transitives = Transitives::for_toplevels(
+            self.graph,
+            pkgs.iter().map(|(_n, bsr)| *bsr).collect(),
+            false,
+        );
+        for bsr in transitives.keys() {
+            if self.has_packages.insert(*bsr) {
+                if let Err(e) = common::hardlink_dir_contents(
+                    self.ctx
+                        .cache
+                        .read_dir(&self.graph.spec_hash(bsr))
+                        .unwrap()
+                        .path(),
+                    rootfs,
+                ) {
+                    writeln!(stream, "error: {}", e).ok();
+                    return;
+                }
+            }
+        }
+    }
+
+    fn parse_pkgs_line<'a>(
+        &self,
+        comma_separated_pkgs: &'a str,
+    ) -> Result<Vec<(&'a str, BuildSpecRef)>, &'a str> {
+        comma_separated_pkgs
+            .split(",")
+            .map(|n| match self.graph.by_name(n) {
+                None => Err(n),
+                Some(bsr) => Ok((n, *bsr)),
+            })
+            .collect()
+    }
 }
 
 impl sandbox2::Channel for EnvChannel<'_> {
-    fn handle(
-        &self,
-        stream: &mut std::os::unix::net::UnixStream,
-        line: &str,
-        _rootfs: &Path,
-    ) -> bool {
-        use std::io::Write;
-        writeln!(stream, "error: unhandled input '{}'", line).unwrap();
-        // TODO: do stuff with self.graph, self.cache, self.mfile
-        false
+    fn handle(&mut self, stream: &mut std::os::unix::net::UnixStream, line: &str, rootfs: &Path) {
+        // handle, eg: echo 'add-ephemeral%mermaid-ascii' | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock
+
+        match line.split_once("%") {
+            Some(("add-ephemeral", pkgs)) => match self.parse_pkgs_line(pkgs) {
+                Err(n) => {
+                    writeln!(stream, "error: no such package '{}'", n).ok();
+                }
+                Ok(pkgs) => {
+                    self.install(&pkgs, stream, rootfs);
+                    writeln!(
+                        stream,
+                        "msg: installed {}",
+                        pkgs.into_iter().map(|t| t.0).collect::<Vec<_>>().join(", ")
+                    )
+                    .ok();
+                }
+            },
+            _ => {
+                writeln!(stream, "error: unhandled input '{}'", line).ok();
+            }
+        }
     }
+}
+
+/// The arguments used to construct a runtime environment.
+pub struct EnvArgs<'a> {
+    /// A symbolic name for the environment.
+    pub name: &'a str,
+    /// The exhaustive set of packages needed in the environment, aka transitive dependencies.
+    pub transitives: HashMap<BuildSpecRef, TransitivesDep>,
+
+    /// The path to the directory which will back /state.
+    pub state_base_dir: PathBuf,
+    /// The working directory to map.
+    pub cwd: PathBuf,
+    /// Any additional pinhole bind mounts / file mappings.
+    pub patches: Option<&'a EnvPatches>,
+
+    /// Environment variables to set.
+    pub env_vars: Option<&'a HashMap<String, String>>,
+    /// The hostname to set, if any.
+    pub hostname: Option<String>,
 }
 
 /// A successfully-configured runtime environment.
@@ -39,19 +134,13 @@ impl<'a> Env<'a> {
     /// This collects the wiring needed by packages (fs mappings, DNS, env vars),
     /// merges any caller-supplied patches and env vars, then constructs and
     /// returns the sandbox.
-    #[allow(clippy::too_many_arguments)]
     pub async fn build(
         ctx: &'a mut Context,
-        name: &str,
-        state_base_dir: &Path,
-        transitives: &HashMap<BuildSpecRef, TransitivesDep>,
-        cwd: &Path,
-        patches: Option<&EnvPatches>,
-        env_vars: Option<&HashMap<String, String>>,
-        hostname: Option<String>,
-        graph: &'a DepGraph,
-        exec_base: std::path::PathBuf,
+        graph: &'a mut DepGraph,
+        args: EnvArgs<'a>,
     ) -> Result<Self, Error> {
+        let base_dir = ctx.config.task_base_dir();
+
         let SetupForPackages {
             fs_mappings: mut patch,
             needs_dns,
@@ -59,20 +148,20 @@ impl<'a> Env<'a> {
             state_dirs,
             env_vars: mut pkg_env_vars,
         } = graph
-            .env_config_for_packages(transitives.keys())
+            .env_config_for_packages(args.transitives.keys())
             .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))?;
 
-        if let Some(p) = patches {
+        if let Some(p) = args.patches {
             patch.union(p);
         }
-        if let Some(vars) = env_vars {
+        if let Some(vars) = args.env_vars {
             pkg_env_vars.extend(vars.clone());
         }
 
-        let mut config = sandbox2::config::Config::new(name)
-            .with_wd(cwd, false, patch.into())
+        let mut config = sandbox2::config::Config::new(args.name)
+            .with_wd(args.cwd, false, patch.into())
             .with_rootfs(
-                transitives
+                args.transitives
                     .keys()
                     .map(|bsr| ctx.cache.read_dir(&graph.spec_hash(bsr)))
                     .collect::<Result<Vec<_>, _>>()
@@ -80,20 +169,27 @@ impl<'a> Env<'a> {
                     .into_iter()
                     .map(|ce| SandboxMapped::Dir(ce.path().to_path_buf())),
             )
-            .with_state_dir(state_base_dir)
+            .with_state_dir(&args.state_base_dir)
             .with_dns(needs_dns)
             .with_disable_networking(!needs_dns && !needs_internet)
             .with_env_vars(pkg_env_vars.into_iter());
-        if let Some(hn) = &hostname {
+        if let Some(hn) = &args.hostname {
             config = config.with_hostname(hn);
         }
 
         let mut sandbox = config
-            .build(&exec_base, EnvChannel { graph, ctx })
+            .build(
+                base_dir,
+                EnvChannel {
+                    ctx,
+                    graph,
+                    has_packages: args.transitives.keys().cloned().collect(),
+                },
+            )
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))?;
         for want_dir in state_dirs {
-            std::fs::create_dir_all(state_base_dir.join(want_dir))
+            std::fs::create_dir_all(args.state_base_dir.join(want_dir))
                 .map_err(anyhow::Error::from)
                 .map_err(Error::Other)?;
         }

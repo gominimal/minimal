@@ -23,6 +23,8 @@ use mfile::{EnvPatches, Task};
 
 use env::Env;
 
+use crate::env::EnvArgs;
+
 /// The local cache.
 pub type Cache = cache::Cache<cache::LocalDir>;
 
@@ -472,12 +474,12 @@ impl Context {
     #[allow(clippy::too_many_arguments)]
     pub async fn make_env<'a, S: PackageSelection>(
         &'a mut self,
-        name: &str,
+        name: &'a str,
         graph: &'a mut DepGraph,
         wd: Option<PathBuf>,
         state_key: Option<&String>,
-        patches: Option<&EnvPatches>,
-        env_vars: Option<&HashMap<String, String>>,
+        patches: Option<&'a EnvPatches>,
+        env_vars: Option<&'a HashMap<String, String>>,
         packages: S,
     ) -> Result<env::Env<'a>, Error> {
         let mfile = self.minimal_file()?;
@@ -522,19 +524,18 @@ impl Context {
             Error::Other(anyhow::Error::from(e).context("creating base sandbox directory"))
         })?;
 
-        let graph: &'a DepGraph = graph;
-
         let mut env = Env::build(
             self,
-            name,
-            &state_base_dir,
-            &transitive_deps,
-            &wd,
-            patches,
-            env_vars,
-            Some(name.to_string()),
             graph,
-            self.config.task_base_dir(), // sandbox2 generates own unique path within
+            EnvArgs {
+                name,
+                state_base_dir,
+                transitives: transitive_deps,
+                cwd: wd,
+                patches,
+                env_vars,
+                hostname: Some(name.to_string()),
+            },
         )
         .await?;
         env.associate_tempdirs(temp_dirs);
@@ -543,7 +544,7 @@ impl Context {
         Ok(env)
     }
 
-    /// Returns the list of all packages brought in through profiles and harnesses.
+    /// Returns the list of all packages brought in through tasks, profiles and harnesses.
     pub fn scaffolding_packages(&mut self) -> Result<Vec<BuildSpecRef>, Error> {
         let mut out = std::collections::HashSet::new();
         let mut graph = self.graph_from_all_packages()?;
