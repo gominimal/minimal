@@ -18,7 +18,6 @@ exec = "cargo test"
 
 [tasks.shell]
 exec = "bash -l"
-packages = ["socat"]
 
 [tasks.startup-time]
 exec = "date"
