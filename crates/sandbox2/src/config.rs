@@ -225,7 +225,11 @@ impl Config {
 
     /// Builds the sandbox using the given configuration, with temporary files and the rootfs
     /// contained within the given directory.
-    pub async fn build<P: AsRef<Path>>(self, base_dir: P) -> Result<Sandbox, Error> {
+    pub async fn build<P: AsRef<Path>, C: super::Channel>(
+        self,
+        base_dir: P,
+        channel: C,
+    ) -> Result<Sandbox<C>, Error> {
         // Make sure the parent directory exists
         fs::create_dir_all(base_dir.as_ref()).map_err(|e| {
             Error::IO(
@@ -340,6 +344,6 @@ impl Config {
                 .map_err(|e| Error::IO("synthesizing DNS configuration", sd, e))?;
         }
 
-        Sandbox::new(build_base_dir, self)
+        Sandbox::new(build_base_dir, self, channel)
     }
 }

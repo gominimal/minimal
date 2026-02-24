@@ -2,6 +2,7 @@ pub mod config;
 use config::Config;
 use std::fs;
 use std::io::Write;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tracing::Span;
@@ -11,8 +12,23 @@ use crate::error::ExecutionError;
 use common::FdSynchronizer;
 pub use error::Error;
 
+mod listener;
+
+/// Something that handles line-oriented RPCs from within the sandbox.
+pub trait Channel: Send {
+    // Return true to close the connection.
+    fn handle(&self, stream: &mut UnixStream, line: &str, rootfs: &Path) -> bool;
+}
+
+impl Channel for () {
+    fn handle(&self, stream: &mut UnixStream, _line: &str, _rootfs: &Path) -> bool {
+        writeln!(stream, "error: no handler!").unwrap();
+        true
+    }
+}
+
 #[derive(Debug)]
-pub struct Sandbox {
+pub struct Sandbox<C: Channel = ()> {
     pub(crate) base_dir: PathBuf,
     pub(crate) state_dir: PathBuf,
     pub(crate) config: Config,
@@ -20,10 +36,14 @@ pub struct Sandbox {
     keep_dir: bool,
     stdout: Option<fs::File>,
     stderr: Option<fs::File>,
+
+    listener: Option<listener::Listener<C>>,
 }
 
-impl Drop for Sandbox {
+impl<C: Channel> Drop for Sandbox<C> {
     fn drop(&mut self) {
+        drop(self.listener.take()); // drop the listener first to clean up the listening thread
+
         if let Some(stdout) = self.stdout.take() {
             if let Err(e) = stdout.sync_all() {
                 tracing::warn!("Failed fsync of stdout file: {}", e,);
@@ -66,8 +86,8 @@ impl Drop for Sandbox {
 }
 
 // Sandbox initialization
-impl Sandbox {
-    pub(crate) fn new(base_dir: PathBuf, config: Config) -> Result<Self, Error> {
+impl<C: Channel> Sandbox<C> {
+    pub(crate) fn new(base_dir: PathBuf, config: Config, channel: C) -> Result<Self, Error> {
         // Setup the rootfs
         let rootfs = base_dir.join("rootfs");
         fs::create_dir_all(&rootfs)
@@ -179,6 +199,13 @@ impl Sandbox {
         fs::create_dir_all(state_dir.join("state"))
             .map_err(|e| Error::IO("mkdir /state/state", state_dir.join("state"), e))?;
 
+        // Create /run/minenv_sock as the pipe to higher-level functions.
+        let run_dir = rootfs.join("run");
+        fs::create_dir_all(&run_dir).map_err(|e| Error::IO("mkdir /run", run_dir.clone(), e))?;
+        let sock_path = run_dir.join("minenv_sock");
+        let listener = listener::Listener::new(&sock_path, &rootfs, channel)
+            .map_err(|e| Error::IO("creating env socket", rootfs.join("minenv_sock"), e))?;
+
         let stdout = fs::File::create(base_dir.join("stdout"))
             .map_err(|e| Error::IO("creating stdout", base_dir.join("stdout"), e))?;
         let stderr = fs::File::create(base_dir.join("stderr"))
@@ -191,6 +218,7 @@ impl Sandbox {
             keep_dir: false,
             stdout: Some(stdout),
             stderr: Some(stderr),
+            listener: Some(listener),
         })
     }
 
@@ -226,14 +254,15 @@ impl AsRef<hakoniwa::Container> for Container {
 }
 
 impl Container {
-    fn command_inner<I, IE, ArgS, EnvK, EnvV>(
+    fn command_inner<C, I, IE, ArgS, EnvK, EnvV>(
         &self,
-        sandbox: &Sandbox,
+        sandbox: &Sandbox<C>,
         program: &str,
         args: I,
         envs: IE,
     ) -> Result<hakoniwa::Command, Error>
     where
+        C: Channel,
         I: IntoIterator<Item = ArgS>,
         ArgS: AsRef<str>,
         IE: IntoIterator<Item = (EnvK, EnvV)>,
@@ -290,7 +319,7 @@ impl Container {
 }
 
 // Sandbox usage
-impl Sandbox {
+impl<C: Channel> Sandbox<C> {
     pub fn new_container(&self) -> Result<Container, Error> {
         let mut container = hakoniwa::Container::new();
         container

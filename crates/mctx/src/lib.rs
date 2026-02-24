@@ -17,9 +17,11 @@ mod error;
 pub use error::Error;
 mod config;
 pub use config::{Config, ConfigBuilder, ConfigError};
+mod env;
 use graph::{BuildSpecRef, DepGraph, Transitives};
 use mfile::{EnvPatches, Task};
-use op::RunnableEnv;
+
+use env::Env;
 
 /// The local cache.
 pub type Cache = cache::Cache<cache::LocalDir>;
@@ -468,16 +470,16 @@ impl Context {
 
     /// Constructs an environment from which executions can be run, based on the given parameters.
     #[allow(clippy::too_many_arguments)]
-    pub async fn make_env<S: PackageSelection>(
-        &mut self,
+    pub async fn make_env<'a, S: PackageSelection>(
+        &'a mut self,
         name: &str,
-        mut graph: DepGraph,
+        graph: &'a mut DepGraph,
         wd: Option<PathBuf>,
         state_key: Option<&String>,
         patches: Option<&EnvPatches>,
         env_vars: Option<&HashMap<String, String>>,
         packages: S,
-    ) -> Result<RunnableEnv, Error> {
+    ) -> Result<env::Env<'a>, Error> {
         let mfile = self.minimal_file()?;
 
         let mut temp_dirs = vec![];
@@ -501,17 +503,17 @@ impl Context {
                 tmp_path
             }
         };
-        graph.top_levels = packages.as_bsrs(&graph)?;
+        graph.top_levels = packages.as_bsrs(graph)?;
 
         let cache = self.local_cache();
-        let transitive_deps = Transitives::for_toplevels(&graph, graph.top_levels.clone(), false);
+        let transitive_deps = Transitives::for_toplevels(graph, graph.top_levels.clone(), false);
         let all_built = transitive_deps
             .iter()
             .all(|(bsr, _dep)| cache.read_dir(&graph.spec_hash(bsr)).is_ok());
 
         if !all_built {
             tracing::trace!("missing local packages, calling mctx.build_graph()");
-            self.build_graph(&graph).await?;
+            self.build_graph(graph).await?;
         } else {
             tracing::trace!("all packages available locally, eluding build");
         }
@@ -520,28 +522,25 @@ impl Context {
             Error::Other(anyhow::Error::from(e).context("creating base sandbox directory"))
         })?;
 
-        let mut op = op::EnvSetup {
-            name,
-            state_base_dir: &state_base_dir,
-            top_levels: &graph.top_levels,
-            transitives: &transitive_deps,
+        let graph: &'a DepGraph = graph;
 
-            cwd: &wd,
+        let mut env = Env::build(
+            self,
+            name,
+            &state_base_dir,
+            &transitive_deps,
+            &wd,
             patches,
             env_vars,
-            hostname: Some(name.to_string()),
-        };
-        let opts = op::Options {
-            cache,
-            graph: &graph,
-            exec_base: self.config.task_base_dir(), // sandbox2 generates own unique path within
-        };
-        use op::Runnable;
-        let mut runnable_env = op.run(&opts).await.map_err(|e| Error::Other(e.into()))?;
-        runnable_env.associate_tempdirs(temp_dirs);
-        runnable_env.associate_tempdirs([base]);
+            Some(name.to_string()),
+            graph,
+            self.config.task_base_dir(), // sandbox2 generates own unique path within
+        )
+        .await?;
+        env.associate_tempdirs(temp_dirs);
+        env.associate_tempdirs([base]);
 
-        Ok(runnable_env)
+        Ok(env)
     }
 
     /// Returns the list of all packages brought in through profiles and harnesses.
@@ -711,7 +710,7 @@ mod tests {
         let mut ctx = Context::new(config).unwrap();
 
         let graph = ctx.graph_from_all_packages().unwrap();
-        let (task_smoketest, graph) = ctx.task(graph, "task-smoketest").unwrap().unwrap();
+        let (task_smoketest, mut graph) = ctx.task(graph, "task-smoketest").unwrap().unwrap();
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -722,7 +721,7 @@ mod tests {
             let mut env = ctx
                 .make_env(
                     "test",
-                    graph,
+                    &mut graph,
                     None,
                     task_smoketest.state_key.as_ref(),
                     Some(&task_smoketest.patch),

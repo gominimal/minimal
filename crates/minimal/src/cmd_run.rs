@@ -27,13 +27,13 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
 pub async fn run_task(
     task_name: &str,
     task: &mfile::Task,
-    graph: DepGraph,
+    mut graph: DepGraph,
     ctx: &mut Context,
 ) -> Result<(), Error> {
     let mut env = ctx
         .make_env(
             task_name,
-            graph,
+            &mut graph,
             if task.inherit_cwd {
                 Some(std::env::current_dir().unwrap())
             } else {
