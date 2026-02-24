@@ -510,6 +510,20 @@ impl Context {
         };
         graph.top_levels = packages.as_bsrs(graph)?;
 
+        // /usr/bin/min needs bash and socat
+        {
+            if let Some(bash) = graph.by_name("bash")
+                && !graph.top_levels.contains(bash)
+            {
+                graph.top_levels.push(*bash);
+            }
+            if let Some(socat) = graph.by_name("socat")
+                && !graph.top_levels.contains(socat)
+            {
+                graph.top_levels.push(*socat);
+            }
+        }
+
         let cache = self.local_cache();
         let transitive_deps = Transitives::for_toplevels(graph, graph.top_levels.clone(), false);
         let all_built = transitive_deps
