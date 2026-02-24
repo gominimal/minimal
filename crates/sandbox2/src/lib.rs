@@ -17,13 +17,12 @@ mod listener;
 /// Something that handles line-oriented RPCs from within the sandbox.
 pub trait Channel: Send {
     // Return true to close the connection.
-    fn handle(&self, stream: &mut UnixStream, line: &str, rootfs: &Path) -> bool;
+    fn handle(&mut self, stream: &mut UnixStream, line: &str, rootfs: &Path);
 }
 
 impl Channel for () {
-    fn handle(&self, stream: &mut UnixStream, _line: &str, _rootfs: &Path) -> bool {
-        writeln!(stream, "error: no handler!").unwrap();
-        true
+    fn handle(&mut self, stream: &mut UnixStream, _line: &str, _rootfs: &Path) {
+        writeln!(stream, "error: no handler!").ok();
     }
 }
 
