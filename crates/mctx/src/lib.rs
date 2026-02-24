@@ -680,7 +680,11 @@ impl Context {
                 if let Some(tasks) = doc.get_mut("tasks")
                     && let Some(shell) = tasks.get_mut("shell")
                 {
-                    upsert_toml_packages_list(shell.as_table_mut().unwrap(), "packages", &resolved);
+                    did_edit |= upsert_toml_packages_list(
+                        shell.as_table_mut().unwrap(),
+                        "packages",
+                        &resolved,
+                    );
                     println!("Added [{}] to tasks.shell.packages", resolved.join(","));
                 } else {
                     return Err(Error::Other(anyhow!(
