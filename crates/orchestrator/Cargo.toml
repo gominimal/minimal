@@ -2,7 +2,7 @@
 name = "orchestrator"
 version = "0.0.1"
 edition.workspace = true
-rust-version = "1.85"
+rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 publish.workspace = true
 
