@@ -1,0 +1,25 @@
+[package]
+name = "op"
+version = "0.0.1"
+edition.workspace = true
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish.workspace = true
+
+[dev-dependencies]
+indoc.workspace = true
+smallvec.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+shlex.workspace = true
+tempfile.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+build-sandbox.workspace = true
+cache.workspace = true
+common.workspace = true
+decode.workspace = true
+graph.workspace = true

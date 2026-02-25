@@ -1,0 +1,105 @@
+use crate::Error;
+use crate::{Context, PackagesArg};
+use graph::Transitives;
+
+use hakoniwa::Container;
+
+#[derive(Debug, clap::Args)]
+pub struct RunArgs {
+    #[command(flatten)]
+    packages: PackagesArg,
+
+    /// Any additional directories to bind-mount read-write.
+    #[arg(long, required = false)]
+    rw_dir: Vec<String>,
+
+    /// Environment variables to set
+    #[arg(long, required = false)]
+    env: Vec<String>,
+
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    args: Vec<String>,
+}
+
+pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
+    crate::enforce_science_mode()?;
+
+    let graph = if args.packages.packages.is_none() {
+        ctx.graph_from_package_name("base")?
+    } else {
+        args.packages.graph(ctx)?
+    };
+    let cache = ctx.local_cache();
+    // Make sure the packages are built
+    crate::cmd_build::cmd_build_impl(&graph, ctx, cache.clone(), ctx.num_parallel_builds).await?;
+
+    // Start setting up the run container
+    let base = tempfile::tempdir_in(ctx.paths().run_base_dir()).map_err(anyhow::Error::from)?;
+    for dep in Transitives::for_toplevels(&graph, graph.top_levels.clone(), false).into_iter() {
+        common::hardlink_dir_contents(
+            cache.read_dir(&graph.spec_hash(&dep)).unwrap().path(),
+            base.path(),
+        )
+        .map_err(anyhow::Error::from)?;
+    }
+
+    // Create the cwd in the rootfs, and bindmount the cwd to it
+    let cwd = std::env::current_dir().unwrap();
+    std::fs::create_dir_all(base.path().join(cwd.clone())).map_err(anyhow::Error::from)?;
+
+    let mut container = Container::new();
+    container
+        .rootfs(base.path())
+        .map_err(anyhow::Error::from)?
+        .devfsmount("/dev")
+        .tmpfsmount("/tmp")
+        .bindmount_rw(cwd.clone().to_str().unwrap(), cwd.clone().to_str().unwrap())
+        .symlink("/usr/bin", "/bin")
+        .symlink("/usr/lib", "/lib64");
+    for rw_mount in args.rw_dir {
+        std::fs::create_dir_all(base.path().join(rw_mount.clone())).map_err(anyhow::Error::from)?;
+        container.bindmount_rw(&rw_mount, &rw_mount);
+    }
+
+    let command = if args.args[0].starts_with("/") || args.args[0].starts_with("./") {
+        args.args[0].clone()
+    } else {
+        format!("/bin/{}", args.args[0])
+    };
+    let mut cmd = container.command(&command);
+
+    cmd.args(args.args.iter().skip(1));
+    cmd.current_dir(&cwd);
+    cmd.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env(
+            "HOME",
+            std::env::var("HOME").unwrap_or("/".to_string()).as_str(),
+        )
+        .env("LANG", "en_US.utf8")
+        .env("LC_ALL", "en_US.utf8");
+    if let Ok(term) = std::env::var("TERM") {
+        cmd.env("TERM", term.as_str());
+    }
+    if let Ok(ct) = std::env::var("COLORTERM") {
+        cmd.env("COLORTERM", ct.as_str());
+    }
+    if let Ok(lsc) = std::env::var("LS_COLORS") {
+        cmd.env("LS_COLORS", lsc.as_str());
+    }
+    for env in args.env {
+        let mut spl = env.split("=");
+        let (var, val) = (
+            spl.next().unwrap(),
+            spl.next()
+                .expect("expected '=' between --env var and value"),
+        );
+        cmd.env(var, val);
+    }
+
+    cmd.spawn()
+        .map_err(anyhow::Error::from)?
+        .wait()
+        .map_err(anyhow::Error::from)?;
+
+    Ok(())
+}

@@ -1,0 +1,101 @@
+[advisories]
+ignore = ["RUSTSEC-2024-0014"]
+
+[licenses]
+unused-allowed-license = "deny"
+allow = [
+    "Apache-2.0 WITH LLVM-exception",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+exceptions = [
+    # Dummy comment for formatting
+    { allow = ["LGPL-3.0-only WITH LGPL-3.0-linking-exception"], crate = "hakoniwa" },
+    { allow = ["LGPL-3.0-only"], crate = "malachite" },
+    { allow = ["LGPL-3.0-only"], crate = "malachite-base" },
+    { allow = ["LGPL-3.0-only"], crate = "malachite-float" },
+    { allow = ["LGPL-3.0-only"], crate = "malachite-nz" },
+    { allow = ["LGPL-3.0-only"], crate = "malachite-q" },
+]
+
+[licenses.private]
+ignore = true
+ignore-sources = ["https://buf.build/gen/cargo//"]
+
+[bans]
+skip = [
+    # nickel-lang-core -> pretty
+    # https://github.com/Marwes/pretty.rs/blob/bd138e503ee3f679b26c838c9f148fbdaf6d2b7c/Cargo.toml#L17
+    { name = "arrayvec", version = "0.5.2" },
+    # oci-client -> jwt
+    # https://github.com/mikkyang/rust-jwt/pull/101
+    { name = "base64", version = "0.13.1" },
+    # docker_credential
+    # https://github.com/keirlawson/docker_credential/pull/21
+    { name = "base64", version = "0.21.7" },
+    # nickel-lang-core -> codespan
+    { name = "codespan-reporting", version = "0.12.0" },
+    # hyper-tls -> native-tls -> security-framework
+    # https://github.com/sfackler/rust-native-tls/pull/338
+    { name = "core-foundation", version = "0.9.4" },
+    # # oci-spec -> derive_builder
+    # https://github.com/colin-kiegel/rust-derive-builder/pull/349
+    { name = "darling", version = "0.20.11" },
+    { name = "darling_core", version = "0.20.11" },
+    { name = "darling_macro", version = "0.20.11" },
+    { name = "darling_macro", version = "0.20.11" },
+    # google-cloud-auth -> rustls -> ring
+    # https://github.com/briansmith/ring/issues/2341
+    { name = "getrandom", version = "0.2.16" },
+    # minimal_spongebob_community_neoeinstein-tonic -> tonic
+    # due to neoeinstein using an outdated tonic
+    { name = "hashbrown", version = "0.12.3" },
+    # nickel-lang-core -> saphyr-parser -> hashlink
+    # https://github.com/djc/hashlink/pull/38
+    { name = "hashbrown", version = "0.15.5" },
+    # nickel-lang-core -> ouroboros -> ouroboros_macro
+    # https://github.com/someguynamedjosh/ouroboros/pull/127
+    { name = "heck", version = "0.4.1" },
+    # nickel-lang-core -> malachite -> malachite-base
+    # https://github.com/tweag/nickel/pull/2367
+    { name = "itertools", version = "0.11.0" },
+    # reqwest -> hyper-tls -> native-tls -> security-framework
+    # https://github.com/sfackler/rust-native-tls/pull/338
+    { name = "security-framework", version = "2.11.1" },
+    # nickel-lang-core -> strip-ansi-escapes
+    # https://github.com/luser/strip-ansi-escapes/pull/23
+    { name = "vte", version = "0.14.1" },
+
+
+    { name = "indexmap", version = "1.9.3" },
+    { name = "prost", version = "0.13.5" },
+    { name = "prost-derive", version = "0.13.5" },
+    { name = "prost-types", version = "0.13.5" },
+    { name = "rand", version = "0.8.5" },
+    { name = "rand_chacha", version = "0.3.1" },
+    { name = "rand_core", version = "0.6.4" },
+    { name = "socket2", version = "0.5.10" },
+    { name = "tonic", version = "0.12.3" },
+    { name = "tower", version = "0.4.13" },
+]
+
+skip-tree = [
+    { name = "windows-registry", version = "=0.5.3" },
+    { name = "windows-sys", version = "=0.52.0" },
+    { name = "windows-sys", version = "=0.60.2" },
+    { name = "windows-targets", version = "=0.52.6" },
+]
+
+[sources]
+allow-registry = ["registry+https://github.com/rust-lang/crates.io-index", "sparse+https://buf.build/gen/cargo/"]
+
+[sources.allow-org]
+github = ["souk4711"]
