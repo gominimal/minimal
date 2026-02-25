@@ -249,6 +249,7 @@ let CmdSpec = std.contract.any_of [
 
     HarnessMatcherEntry = {
         file_regexes | {_ : String} | optional,
+        file_predicates | {_ : String} | optional,
     },
 
     Harness | doc "A specific way to build a directory of source into software." = {

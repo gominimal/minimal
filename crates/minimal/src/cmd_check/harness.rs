@@ -86,6 +86,15 @@ pub(super) async fn check_harness(
         &mut program,
         cache.clone(),
     )?);
+    out.push(check_project_matcher_predicates(
+        harness.clone(),
+        all_graph.clone(),
+        fix,
+        skip_checkers.clone(),
+        harnesses_dir.clone(),
+        &mut program,
+        cache.clone(),
+    )?);
     use super::FileBasedChecker;
     out.push(super::ImportLineCheck.check(
         &skip_checkers,
@@ -190,6 +199,52 @@ fn check_project_matcher_regexes(
             Ok(out)
         }
         Err(e) => Ok(CheckResult::harness_regexes_fail(format!(
+            "failed loading harness: {}",
+            e
+        ))),
+    }
+}
+
+fn check_project_matcher_predicates(
+    _harness: String,
+    _all_graph: Option<Arc<RwLock<DepGraph>>>,
+    _fix: bool,
+    skip_checkers: Vec<String>,
+    _harnesses_dir: PathBuf,
+    program: &mut Program<CacheImpl>,
+    _cache: Cache<LocalDir>,
+) -> Result<CheckResult, Error> {
+    if skip_checkers.contains(&"project_matchers predicates".to_string()) {
+        return Ok(CheckResult::harness_predicates_skip());
+    }
+
+    let tree = match program.eval_full() {
+        Ok(t) => t,
+        Err(e) => {
+            return Err(Error::Graph(Box::new(graph::Error::Decode(
+                decode::Error::Nickel(Box::new((program.files(), e))),
+            ))));
+        }
+    };
+
+    match Harness::from_term(&tree, program) {
+        Ok(h) => {
+            let mut out = CheckResult::harness_predicates_pass();
+            for matcher in h.project_matchers.iter().flatten() {
+                for (fname, predicate_str) in &matcher.file_predicates {
+                    if let Err(e) = common::jq::Expression::parse(predicate_str) {
+                        out.verdict = CheckVerdict::Fail;
+                        out.err.push(format!(
+                            "invalid jq filter \"{}\" to match file {}: {:?}",
+                            predicate_str, fname, e.err
+                        ));
+                    }
+                }
+            }
+
+            Ok(out)
+        }
+        Err(e) => Ok(CheckResult::harness_predicates_fail(format!(
             "failed loading harness: {}",
             e
         ))),

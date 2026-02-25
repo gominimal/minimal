@@ -46,6 +46,7 @@ google-cloud-storage = "1.5.0"
 hakoniwa = { git = "https://github.com/souk4711/hakoniwa", branch = "main" }
 hex = "0.4"
 indoc = "^2.0"
+jaq-all = "0.1.0-beta"
 lzma-rs = "0.3"
 nickel-lang-core = { version = "0.15.3", default-features = false, features = ["format"] }
 object = { version = "0.38", default-features = false, features = ["archive", "elf", "read_core", "std"] }
@@ -102,4 +103,5 @@ op = { version = "0.0.1", path = "crates/op" }
 orchestrator = { version = "0.0.1", path = "crates/orchestrator" }
 res-proto = { version = "0.0.1", path = "crates/res-proto" }
 sandbox2 = { version = "0.0.1", path = "crates/sandbox2" }
-stdlib = { version = "0.0.1", path = "crates/stdlib" }
+
+stdlib = { version = "0.0.2", path = "crates/stdlib" }

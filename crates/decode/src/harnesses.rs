@@ -1,5 +1,7 @@
 use std::{collections::HashMap, path::Path};
 
+use common::jq::JqError;
+use either::Either;
 use mfile::TaskAction;
 use nickel_lang_core::{
     eval::cache::CacheImpl,
@@ -14,12 +16,20 @@ use crate::{Error, ObjTy, eval_if_closure};
 /// A set of rules that when matched, indicate that this harness is applicable to a source tree.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HarnessMatcher {
+    /// A list of file paths in the project and corresponding regexes, all of which must match
+    /// for this harness to be applicable.
+    ///
+    /// In lieu of a regex, the value may be the string `*` to signal the file need only exist.
     pub file_regexes: IndexMap<String, String>,
+
+    /// A list of file paths in the project and corresponding predicates in jq syntax. All predicates
+    /// must match for this harness to be applicable.
+    pub file_predicates: IndexMap<String, String>,
 }
 
 impl HarnessMatcher {
     /// Returns true if all the predicates in this matcher apply to the given source tree.
-    pub fn match_dir<P: AsRef<Path>>(&self, p: P) -> Result<bool, regex::Error> {
+    pub fn match_dir<P: AsRef<Path>>(&self, p: P) -> Result<bool, Either<regex::Error, JqError>> {
         for (path, regex_str) in &self.file_regexes {
             let f = p.as_ref().join(path);
 
@@ -28,8 +38,23 @@ impl HarnessMatcher {
                     continue; // special case: match anything
                 }
 
-                let r = Regex::new(regex_str)?;
+                let r = Regex::new(regex_str).map_err(Either::Left)?;
                 if !r.is_match(&data) {
+                    return Ok(false);
+                }
+            } else {
+                return Ok(false);
+            }
+        }
+
+        for (path, predicate_str) in &self.file_predicates {
+            let f = p.as_ref().join(path);
+            use common::jq;
+            if let Ok(data) = std::fs::read(&f) {
+                let data = jq::parse_file(&f, data).map_err(Either::Right)?;
+
+                let exp = jq::Expression::parse(predicate_str).map_err(Either::Right)?;
+                if !exp.predicate_eval(data).map_err(Either::Right)? {
                     return Ok(false);
                 }
             } else {
@@ -48,6 +73,7 @@ impl HarnessMatcher {
         let rt = eval_if_closure(rt, program)?;
 
         let mut file_regexes: Option<IndexMap<String, String>> = None;
+        let mut file_predicates: Option<IndexMap<String, String>> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                 r.fields
@@ -82,6 +108,27 @@ impl HarnessMatcher {
 
                                 Ok(())
                             }
+                            "file_predicates" => {
+                                    let rt = eval_if_closure(&rt, program)?;
+                                    match rt.term.as_ref() {
+                                        Term::Record(r) | Term::RecRecord(r, _, _, _) => {
+                                            file_predicates = Some(r.fields.iter().map(
+                                                |(ident_and_loc, field)| -> Result<(String, String), Error> {
+                                                    Ok((
+                                                        ident_and_loc.label().to_string(),
+                                                        String::deserialize(eval_if_closure(
+                                                            field.value.as_ref().unwrap(),
+                                                            program,
+                                                        )?).unwrap(),
+                                                    ))
+                                                },
+                                            ).collect::<Result<IndexMap<_, _>, Error>>()?);
+                                        }
+                                        _ => todo!("unexpected term for file_predicates: {:?}", rt.term.as_ref()),
+                                    };
+
+                                Ok(())
+                            }
                             _ => Ok(()),
                         }
                         } else {
@@ -94,6 +141,7 @@ impl HarnessMatcher {
 
         Ok(HarnessMatcher {
             file_regexes: file_regexes.unwrap_or_default(),
+            file_predicates: file_predicates.unwrap_or_default(),
         })
     }
 }
@@ -460,6 +508,10 @@ mod tests {
                         file_regexes = {
                             \"Cargo.toml\" = \"*\",
                         },
+
+                        file_predicates = {
+                            \"Cargo.toml\" = \".workspace.dependencies.dirs == '6'\",
+                        },
                     }],
                 }
                 "
@@ -496,6 +548,11 @@ mod tests {
                 build_env_vars: Default::default(),
                 project_matchers: Some(vec![HarnessMatcher {
                     file_regexes: [("Cargo.toml".to_string(), "*".to_string())].into(),
+                    file_predicates: [(
+                        "Cargo.toml".to_string(),
+                        ".workspace.dependencies.dirs == '6'".to_string()
+                    )]
+                    .into(),
                 }]),
                 ..Default::default()
             }
@@ -513,6 +570,7 @@ mod tests {
 
         let matcher = HarnessMatcher {
             file_regexes: [("Cargo.toml".to_string(), "*".to_string())].into(),
+            ..Default::default()
         };
         assert!(matcher.match_dir(dir.path()).unwrap());
     }
@@ -531,6 +589,7 @@ mod tests {
                 "(?m).*\\[package\\].*".to_string(),
             )]
             .into(),
+            ..Default::default()
         };
         assert!(matcher.match_dir(dir.path()).unwrap());
     }
@@ -541,8 +600,38 @@ mod tests {
 
         let matcher = HarnessMatcher {
             file_regexes: [("Cargo.toml".to_string(), "*".to_string())].into(),
+            ..Default::default()
         };
         // File doesn't exist, so the predicate is skipped and match_dir returns true.
+        assert!(!matcher.match_dir(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn harness_matcher_match_toml_predicate() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"test\"\n",
+        )
+        .unwrap();
+
+        let matcher = HarnessMatcher {
+            file_predicates: [(
+                "Cargo.toml".to_string(),
+                ".package.name == \"test\"".to_string(),
+            )]
+            .into(),
+            ..Default::default()
+        };
+        assert!(matcher.match_dir(dir.path()).unwrap());
+        let matcher = HarnessMatcher {
+            file_predicates: [(
+                "Cargo.toml".to_string(),
+                ".package.name == \"wrong thing\"".to_string(),
+            )]
+            .into(),
+            ..Default::default()
+        };
         assert!(!matcher.match_dir(dir.path()).unwrap());
     }
 }

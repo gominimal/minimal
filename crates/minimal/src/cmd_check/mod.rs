@@ -438,6 +438,29 @@ impl CheckResult {
             err: vec![msg],
         }
     }
+    fn harness_predicates_skip() -> Self {
+        CheckResult {
+            check: "project_matchers predicates",
+            verdict: CheckVerdict::Skip,
+            err: vec![],
+        }
+    }
+
+    fn harness_predicates_pass() -> Self {
+        CheckResult {
+            check: "project_matchers predicates",
+            verdict: CheckVerdict::Pass,
+            err: vec![],
+        }
+    }
+
+    fn harness_predicates_fail(msg: String) -> Self {
+        CheckResult {
+            check: "project_matchers predicates",
+            verdict: CheckVerdict::Fail,
+            err: vec![msg],
+        }
+    }
 }
 
 async fn check_package(
