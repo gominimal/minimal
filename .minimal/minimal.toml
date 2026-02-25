@@ -13,8 +13,13 @@ state_key = "dev"
 [tasks.claude]
 exec = "claude"
 
+[tasks.build]
+exec = "cargo build --verbose"
+inherit_cwd = true
+
 [tasks.test]
-exec = "cargo test"
+exec = "cargo test --verbose"
+inherit_cwd = true
 
 [tasks.shell]
 exec = "bash -l"
@@ -48,6 +53,18 @@ profile = "demo"
 state_key = "demo"
 exec = "python3"
 
+
+[tasks.ci]
+exec = "cargo test --verbose && cargo fmt -- --check && cargo clippy --all-targets -- -D warnings"
+inherit_cwd = true
+
+[tasks.fmt-check]
+exec = "cargo fmt -- --check"
+inherit_cwd = true
+
+[tasks.clippy]
+exec = "cargo clippy --all-targets -- -D warnings"
+inherit_cwd = true
 
 [tasks.env-smoketest]
 inherit_cwd = true
