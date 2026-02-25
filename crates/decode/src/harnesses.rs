@@ -169,10 +169,10 @@ pub struct Harness {
     /// Only one of `build_cmds` and `build_cmds_cmd` may be set.
     pub build_cmds_cmd: Option<Vec<String>>,
 
-    /// Harness matchers - predicates that indicate this harness is applicable to a source tree.
+    /// Predicates that indicate this harness is applicable to a source tree.
     ///
     /// For a harness to be applicable, one of the matchers in this list must have all its predicates met.
-    pub project_matchers: Option<Vec<HarnessMatcher>>,
+    pub matches_project_if_any: Option<Vec<HarnessMatcher>>,
 }
 
 impl Harness {
@@ -187,7 +187,7 @@ impl Harness {
         let mut build_env_vars: Option<IndexMap<String, String>> = None;
         let mut build_cmds: Option<Vec<Vec<String>>> = None;
         let mut build_cmds_cmd: Option<Vec<String>> = None;
-        let mut project_matchers: Option<Vec<HarnessMatcher>> = None;
+        let mut matches_project_if_any: Option<Vec<HarnessMatcher>> = None;
 
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
@@ -347,14 +347,14 @@ impl Harness {
                                     Ok(())
                                 }
                             }
-                            "project_matchers" => {
+                            "matches_project_if_any" => {
                                 if let Some(matchers_rt) = field.value.as_ref() {
                                     let matchers_rt =
                                         eval_if_closure(matchers_rt, program)?;
 
                                     match matchers_rt.term.as_ref() {
                                         Term::Array(a, attrs) => {
-                                            project_matchers = Some(
+                                            matches_project_if_any = Some(
                                                 a.iter()
                                                     .map(|m| {
                                                         let rt = RuntimeContract::apply_all(
@@ -441,7 +441,7 @@ impl Harness {
             build_env_vars,
             build_cmds,
             build_cmds_cmd,
-            project_matchers,
+            matches_project_if_any,
         })
     }
 
@@ -504,7 +504,7 @@ mod tests {
                     build_packages = [\"gcc\", \"rust\", \"binutils\"],
                     build_cmd = \"cargo build --release\",
 
-                    project_matchers = [{
+                    matches_project_if_any = [{
                         file_regexes = {
                             \"Cargo.toml\" = \"*\",
                         },
@@ -546,7 +546,7 @@ mod tests {
                     "--release".to_string()
                 ]]),
                 build_env_vars: Default::default(),
-                project_matchers: Some(vec![HarnessMatcher {
+                matches_project_if_any: Some(vec![HarnessMatcher {
                     file_regexes: [("Cargo.toml".to_string(), "*".to_string())].into(),
                     file_predicates: [(
                         "Cargo.toml".to_string(),

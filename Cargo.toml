@@ -104,4 +104,4 @@ orchestrator = { version = "0.0.1", path = "crates/orchestrator" }
 res-proto = { version = "0.0.1", path = "crates/res-proto" }
 sandbox2 = { version = "0.0.1", path = "crates/sandbox2" }
 
-stdlib = { version = "0.0.2", path = "crates/stdlib" }
+stdlib = { version = "0.0.3", path = "crates/stdlib" }

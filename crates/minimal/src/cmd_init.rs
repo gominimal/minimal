@@ -77,12 +77,15 @@ pub async fn cmd_init(args: InitArgs, config: Config) -> Result<(), Error> {
 
     // Try to match a harness based on project structure.
     let matched_harness = graph.iter_harnesses().find_map(|(name, harness)| {
-        harness.project_matchers.as_ref().and_then(|matchers| {
-            matchers
-                .iter()
-                .any(|m| m.match_dir(&repo_dir).unwrap_or(false))
-                .then(|| name.clone())
-        })
+        harness
+            .matches_project_if_any
+            .as_ref()
+            .and_then(|matchers| {
+                matchers
+                    .iter()
+                    .any(|m| m.match_dir(&repo_dir).unwrap_or(false))
+                    .then(|| name.clone())
+            })
     });
 
     // Fall back to the "shell" harness if no project-specific matcher hit.

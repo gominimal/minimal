@@ -181,7 +181,7 @@ fn check_project_matcher_regexes(
     match Harness::from_term(&tree, program) {
         Ok(h) => {
             let mut out = CheckResult::harness_regexes_pass();
-            for matcher in h.project_matchers.iter().flatten() {
+            for matcher in h.matches_project_if_any.iter().flatten() {
                 for (fname, regex_str) in &matcher.file_regexes {
                     if regex_str == "*" {
                         continue;
@@ -230,7 +230,7 @@ fn check_project_matcher_predicates(
     match Harness::from_term(&tree, program) {
         Ok(h) => {
             let mut out = CheckResult::harness_predicates_pass();
-            for matcher in h.project_matchers.iter().flatten() {
+            for matcher in h.matches_project_if_any.iter().flatten() {
                 for (fname, predicate_str) in &matcher.file_predicates {
                     if let Err(e) = common::jq::Expression::parse(predicate_str) {
                         out.verdict = CheckVerdict::Fail;

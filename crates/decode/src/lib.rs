@@ -778,7 +778,7 @@ mod tests {
                 build_env_vars: IndexMap::from_iter([("CC".to_string(), "gcc".to_string())]),
                 build_cmds_cmd: None,
                 build_cmds: Some(vec![vec!["uwu".to_string(), "build".to_string()]]),
-                project_matchers: None,
+                matches_project_if_any: None,
             }),
         );
     }
