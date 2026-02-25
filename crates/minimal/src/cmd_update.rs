@@ -4,7 +4,7 @@ use crate::{Context, Error};
 pub struct UpdateArgs {}
 
 pub async fn cmd_update(_args: UpdateArgs, ctx: &mut Context) -> Result<(), Error> {
-    let mfile = ctx.minimal_file()?;
+    let mfile = ctx.minimal_file();
     let mfile_path = mfile.file_path().cloned();
 
     let upstream: Option<(String, Option<String>, Option<String>)> = match mfile.upstream.as_ref() {

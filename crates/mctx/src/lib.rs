@@ -3,7 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::SystemTime,
 };
 
@@ -156,7 +156,7 @@ pub struct Context {
     config: Config,
 
     stdlib_dir: PathBuf,
-    mfile: Option<mfile::File>,
+    mfile: mfile::File,
 
     vcs: VcsManager,
     cache: Cache,
@@ -165,11 +165,7 @@ pub struct Context {
 impl fmt::Display for Context {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "mctx{{")?;
-        if let Some(p) = self
-            .mfile
-            .as_ref()
-            .and_then(|f| f.dir_path().map(|p| p.to_path_buf()))
-        {
+        if let Some(p) = self.mfile.dir_path().map(|p| p.to_path_buf()) {
             write!(f, " mfile repo at {} ", p.display())?;
         } else {
             write!(f, "{:?}", self.config)?;
@@ -179,8 +175,11 @@ impl fmt::Display for Context {
 }
 
 impl Context {
-    /// Initializes a new context using the given configuration.
-    pub fn new(config: Config) -> Result<Self, Error> {
+    /// Initializes a bunch of internals and returns them. Use [Self::new] instead.
+    ///
+    /// This separation is needed to power logic in `minimal init`, which needs
+    /// to use a bunch of this stuff without being able to initialize a full [Context].
+    pub fn sub_setup(config: &Config) -> Result<(VcsManager, Cache, PathBuf), Error> {
         // Upsert dirs
         use std::fs::create_dir_all;
         create_dir_all(config.downloads_dir())
@@ -202,20 +201,6 @@ impl Context {
         let cache = Cache::at_dir(config.cache_dir())
             .map_err(|e| Error::Other(anyhow!("initializing local cache: {}", e)))?;
 
-        // Load the minimal file. All error are terminal except not found.
-        let mfile = match config
-            .repo_dir_override()
-            .as_ref()
-            .map(|d| mfile::File::from_dir(d.clone()))
-            .unwrap_or_else(|| mfile::File::from_dir_recursive(std::env::current_dir().unwrap()))
-        {
-            Ok(mfile) => Some(mfile),
-            Err(mfile::Error::NotFound) => None,
-            Err(e) => {
-                return Err(Error::MFile(e));
-            }
-        };
-
         // Figure out a path to the standard library. Roughly speaking this is loaded from:
         //  - Any override in the config
         //  - The version embedded in the binary, stamped to disk
@@ -226,6 +211,26 @@ impl Context {
                 stdlib::upsert_stdlib_to_disk(config.stdlib_dir()).map_err(|e| {
                     Error::Other(anyhow!("loading embedded standard library: {}", e))
                 })?
+            }
+        };
+
+        Ok((vcs, cache, stdlib_dir))
+    }
+
+    /// Initializes a new context using the given configuration.
+    pub fn new(config: Config) -> Result<Self, Error> {
+        let (vcs, cache, stdlib_dir) = Self::sub_setup(&config)?;
+
+        // Load the minimal file. All error are terminal.
+        let mfile = match config
+            .repo_dir_override()
+            .as_ref()
+            .map(|d| mfile::File::from_dir(d.clone()))
+            .unwrap_or_else(|| mfile::File::from_dir_recursive(std::env::current_dir().unwrap()))
+        {
+            Ok(mfile) => mfile,
+            Err(e) => {
+                return Err(Error::MFile(e));
             }
         };
 
@@ -277,12 +282,8 @@ impl Context {
         self.config.index_dir()
     }
     /// Returns the path to the root of the repo.
-    pub fn repo_dir(&self) -> Result<PathBuf, Error> {
-        match (&self.mfile, self.config.repo_dir_override()) {
-            (Some(mfile), _) => Ok(mfile.repo_path().unwrap().to_path_buf()),
-            (None, Some(d)) => Ok(d.to_path_buf()),
-            (None, None) => Err(Error::MFile(mfile::Error::NotFound)),
-        }
+    pub fn repo_dir(&self) -> &Path {
+        self.mfile.repo_path().unwrap()
     }
     /// Returns a path to the standard library.
     pub fn stdlib_dir(&self) -> &PathBuf {
@@ -290,14 +291,8 @@ impl Context {
     }
 
     /// Returns the minimal file loaded from disk.
-    ///
-    /// Its possible for some layers to not have a minimal file (i.e. 'pkgs'), these
-    /// return `Error::MFile(mfile::Error::NotFound)`.
-    pub fn minimal_file(&self) -> Result<&mfile::File, Error> {
-        match &self.mfile {
-            Some(mfile) => Ok(mfile),
-            None => Err(Error::MFile(mfile::Error::NotFound)),
-        }
+    pub fn minimal_file(&self) -> &mfile::File {
+        &self.mfile
     }
 
     /// Builds and returns a remote cache with default configurations.
@@ -340,8 +335,8 @@ impl Context {
     }
 
     /// Returns a [SpecOrigin] representing the top-level repository.
-    pub fn repo_origin(&self) -> Result<SpecOrigin, Error> {
-        Ok(SpecOrigin::from_dir(self.repo_dir()?))
+    pub fn repo_origin(&self) -> SpecOrigin {
+        SpecOrigin::from_dir(self.repo_dir())
     }
 
     /// Builds & returns the graph with the given packages specified as top levels.
@@ -357,7 +352,7 @@ impl Context {
 
     /// Builds & returns a graph of all packages.
     pub fn graph_from_all_packages(&mut self) -> Result<DepGraph, Error> {
-        let leaf_layer = self.repo_origin()?;
+        let leaf_layer = self.repo_origin();
 
         let start = SystemTime::now();
         let res = DepGraph::new_from_chain(
@@ -443,7 +438,7 @@ impl Context {
         mut graph: DepGraph,
         name: &str,
     ) -> Result<Option<(Task, DepGraph)>, Error> {
-        let mfile = self.minimal_file()?;
+        let mfile = self.minimal_file();
         let mut task = match mfile.task(name) {
             Some(t) => t,
             None => {
@@ -485,7 +480,7 @@ impl Context {
         env_vars: Option<&'a HashMap<String, String>>,
         packages: S,
     ) -> Result<env::Env<'a>, Error> {
-        let mfile = self.minimal_file()?;
+        let mfile = self.minimal_file();
 
         let mut temp_dirs = vec![];
         let wd = if let Some(wd) = wd {
@@ -565,7 +560,7 @@ impl Context {
     pub fn scaffolding_packages(&mut self) -> Result<Vec<BuildSpecRef>, Error> {
         let mut out = std::collections::HashSet::new();
         let mut graph = self.graph_from_all_packages()?;
-        let mfile = self.minimal_file()?.clone();
+        let mfile = self.minimal_file().clone();
         for (name, _) in mfile.tasks.iter() {
             let res = self.task(graph, name)?.unwrap();
             let task = res.0;
@@ -646,7 +641,7 @@ impl Context {
         deps: S,
         mode: AddDepMode,
     ) -> Result<(), Error> {
-        let mfile = self.minimal_file()?;
+        let mfile = self.minimal_file();
         let mfile_path = mfile.file_path().cloned();
 
         if mfile_path.is_none() {

@@ -4,7 +4,7 @@ use std::io::Write;
 
 use common::{SpecOrigin, Target, repo_spec::Repo};
 use graph::DepGraph;
-use mctx::{Context, Error};
+use mctx::{Config, Context, Error};
 
 #[derive(clap::Args)]
 pub struct InitArgs {
@@ -17,24 +17,32 @@ const DEFAULT_PKGS: &str = "https://github.com/gominimal/pkgs";
 const DEFAULT_PKGS_BRANCH: &str = "main";
 const FALLBACK_HARNESS: &str = "shell";
 
-pub async fn cmd_init(args: InitArgs, ctx: &mut Context) -> Result<(), Error> {
+pub async fn cmd_init(args: InitArgs, config: Config) -> Result<(), Error> {
     // Harnesses have the match rules, so we need a graph, either from the repo
     // minimal file or some default based on the MPPR.
-    let (origin, graph) = match ctx.minimal_file() {
-        // We are in a repo where theres a minimal file, lets use that upstream.
-        // Maybe the user is re-initializing?
-        Ok(f) => (
-            f.upstream.as_ref().unwrap().as_spec_origin().unwrap(),
+    let (upstream_origin, repo_dir, toml_path, graph) = match Context::new(config.clone()) {
+        // We are in a repo where theres a minimal file, and the minimal file has an upstream.
+        // Lets use that upstream. Maybe the user is re-initializing?
+        Ok(mut ctx) if ctx.minimal_file().upstream.is_some() => (
+            ctx.minimal_file()
+                .upstream
+                .as_ref()
+                .unwrap()
+                .as_spec_origin()
+                .unwrap(),
+            ctx.repo_dir().to_path_buf(),
+            ctx.minimal_file().file_path().cloned(),
             ctx.graph_from_all_packages()?,
         ),
-        // Unsurprisingly, theres no minimal file yet. We need the harnesses though for
-        // auto-detection, so lets wire up a default graph.
-        Err(Error::MFile(mfile::Error::NotFound)) => {
-            let (_dir, rev) = ctx.vcs_manager().checkout_of(
+        // Unsurprisingly, theres no minimal file yet, or theres no upstream so theres no
+        // useful information. We need the harnesses though for auto-detection, so lets
+        // wire up a default graph.
+        Err(Error::MFile(mfile::Error::NotFound)) | Ok(_) => {
+            let (mut vcs, _cache, stdlib_dir) = Context::sub_setup(&config)?;
+            let (_dir, rev) = vcs.checkout_of(
                 DEFAULT_PKGS,
                 checkouts::GitRef::Branch(DEFAULT_PKGS_BRANCH.to_string()),
             )?;
-            let stdlib_dir = ctx.stdlib_dir().to_path_buf();
 
             (
                 SpecOrigin::Repo(common::repo_spec::Repo::Git {
@@ -44,8 +52,13 @@ pub async fn cmd_init(args: InitArgs, ctx: &mut Context) -> Result<(), Error> {
                         DEFAULT_PKGS_BRANCH.to_string(),
                     )),
                 }),
+                config
+                    .repo_dir_override()
+                    .clone()
+                    .unwrap_or_else(|| std::env::current_dir().unwrap()),
+                None,
                 DepGraph::new_from_chain(
-                    ctx.vcs_manager(),
+                    &mut vcs,
                     SpecOrigin::Repo(common::repo_spec::Repo::Git {
                         url: "https://github.com/gominimal/pkgs".to_string(),
                         rev,
@@ -60,19 +73,8 @@ pub async fn cmd_init(args: InitArgs, ctx: &mut Context) -> Result<(), Error> {
             return Err(e);
         }
     };
+    let toml_path = toml_path.unwrap_or_else(|| repo_dir.join(mfile::MFILE_NAME));
 
-    let repo_dir = ctx
-        .repo_dir()
-        .unwrap_or_else(|_| std::env::current_dir().unwrap());
-    let toml_path = ctx
-        .minimal_file()
-        .map(|f| f.file_path())
-        .iter()
-        .flatten()
-        .cloned()
-        .next()
-        .cloned()
-        .unwrap_or_else(|| repo_dir.join(mfile::MFILE_NAME));
     // Try to match a harness based on project structure.
     let matched_harness = graph.iter_harnesses().find_map(|(name, harness)| {
         harness.project_matchers.as_ref().and_then(|matchers| {
@@ -86,7 +88,7 @@ pub async fn cmd_init(args: InitArgs, ctx: &mut Context) -> Result<(), Error> {
     // Fall back to the "shell" harness if no project-specific matcher hit.
     let has_matched = matched_harness.is_some();
     let harness_name = matched_harness.unwrap_or_else(|| FALLBACK_HARNESS.to_string());
-    let content = generate_mfile(&harness_name, &origin);
+    let content = generate_mfile(&harness_name, &upstream_origin);
 
     // -- Confirmation prompt (unless --yes) --
     if !args.yes {

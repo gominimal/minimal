@@ -201,7 +201,7 @@ impl PackagesArg {
 
         // Argument is empty or unset
         let mut graph = ctx.graph_from_all_packages()?;
-        graph.top_levels = graph.from_origin(&ctx.repo_origin()?).collect();
+        graph.top_levels = graph.from_origin(&ctx.repo_origin()).collect();
         Ok(graph)
     }
 }
@@ -305,11 +305,16 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
     if let Some(stdlib_dir) = global_args.stdlib_dir {
         config = config.with_stdlib_dir(stdlib_dir);
     }
+    let config = config.build()?;
 
-    let mut ctx = Context::new(config.build()?)?;
+    // `minimal init` is typically run where there exists no `minimal.toml`, so
+    // context setup will fail.
+    if let Command::Init(args) = command {
+        return cmd_init(args, config).await;
+    }
+    let mut ctx = Context::new(config)?;
 
     match command {
-        Command::Init(args) => cmd_init(args, &mut ctx).await,
         Command::Package(args) => cmd_pkg(args, &mut ctx).await,
         Command::Check(args) => cmd_check(args, &mut ctx).await,
         Command::Plan(args) => cmd_plan(args, &mut ctx).await,
@@ -349,6 +354,8 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         Command::Update(args) => cmd_update(args, &mut ctx).await,
         Command::Dep(args) => cmd_dep(args, &mut ctx).await,
         Command::Dump(args) => cmd_dump(args, &mut ctx).await,
+        // Handled earlier
         Command::Completions(_) => Ok(()),
+        Command::Init(_) => Ok(()),
     }
 }

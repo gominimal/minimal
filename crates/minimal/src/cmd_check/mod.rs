@@ -238,11 +238,7 @@ fn harness_check_futures(
 
 pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> {
     let all_graph = ctx.graph_from_all_packages();
-    let upstream_dir = match ctx.minimal_file() {
-        Ok(mfile) => mfile.dir_path().unwrap().to_path_buf(),
-        Err(Error::MFile(mfile::Error::NotFound)) => ctx.repo_dir()?,
-        Err(e) => return Err(e),
-    };
+    let upstream_dir = ctx.minimal_file().dir_path().unwrap().to_path_buf();
 
     let packages_dir = upstream_dir.join("packages");
     let stdlib_dir = ctx.stdlib_dir();

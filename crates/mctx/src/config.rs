@@ -125,7 +125,9 @@ impl Config {
     pub(crate) fn stdlib_dir_override(&self) -> &Option<PathBuf> {
         &self.stdlib_dir
     }
-    pub(crate) fn repo_dir_override(&self) -> &Option<PathBuf> {
+
+    /// Returns the path to the repo, if overridden (i.e. via '-C' argument).
+    pub fn repo_dir_override(&self) -> &Option<PathBuf> {
         &self.repo_dir
     }
 

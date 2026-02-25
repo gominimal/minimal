@@ -16,7 +16,7 @@ pub struct MaterializeArgs {
 }
 
 pub async fn cmd_materialize(args: MaterializeArgs, ctx: &mut Context) -> Result<(), Error> {
-    let mfile = ctx.minimal_file()?;
+    let mfile = ctx.minimal_file();
     let output = match mfile.outputs.get(&args.output_name) {
         Some(t) => t.clone(),
         None => {
