@@ -24,7 +24,7 @@ pub async fn cmd_init(args: InitArgs, ctx: &mut Context) -> Result<(), Error> {
         // We are in a repo where theres a minimal file, lets use that upstream.
         // Maybe the user is re-initializing?
         Ok(f) => (
-            f.upstream.as_spec_origin().unwrap(),
+            f.upstream.as_ref().unwrap().as_spec_origin().unwrap(),
             ctx.graph_from_all_packages()?,
         ),
         // Unsurprisingly, theres no minimal file yet. We need the harnesses though for

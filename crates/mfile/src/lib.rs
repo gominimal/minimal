@@ -264,7 +264,7 @@ pub enum Layout {
 pub struct File {
     /// The previous link in the software supply chain.
     #[serde(alias = "base")]
-    pub upstream: LinkConfig,
+    pub upstream: Option<LinkConfig>,
     /// Default profile, state_key etc.
     #[serde(default, alias = "default")]
     pub defaults: Defaults,
@@ -335,7 +335,9 @@ impl File {
                 let mut mfile: Self = toml::from_slice(&file_data).map_err(Error::Format)?;
                 mfile.mfile_path = Some(path.to_path_buf());
                 mfile.layout = Some(Layout::Root);
-                mfile.upstream.fixup_relative(&path);
+                if let Some(u) = mfile.upstream.as_mut() {
+                    u.fixup_relative(&path)
+                }
                 mfile.warn_unknown_fields();
                 return Ok(mfile);
             }
@@ -350,7 +352,9 @@ impl File {
                 let mut mfile: Self = toml::from_slice(&file_data).map_err(Error::Format)?;
                 mfile.mfile_path = Some(path.to_path_buf());
                 mfile.layout = Some(Layout::DotMinimal);
-                mfile.upstream.fixup_relative(&path);
+                if let Some(u) = mfile.upstream.as_mut() {
+                    u.fixup_relative(&path)
+                }
                 mfile.warn_unknown_fields();
                 Ok(mfile)
             }
@@ -548,11 +552,11 @@ mod tests {
         assert_eq!(
             mf,
             File {
-                upstream: LinkConfig::Git {
+                upstream: Some(LinkConfig::Git {
                     repo: "https://github.com/gominimal/pkgs".to_string(),
                     branch: Some("main".to_string()),
                     locked_commit: None,
-                },
+                }),
                 defaults: Default::default(),
                 harness: None,
                 tasks: [(

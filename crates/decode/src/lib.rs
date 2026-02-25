@@ -101,7 +101,7 @@ impl Layer {
                 }
 
                 (
-                    Some(mfile.upstream.clone()),
+                    mfile.upstream.clone(),
                     mfile.dir_path().map(|p| p.to_path_buf()),
                 )
             }

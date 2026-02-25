@@ -7,13 +7,14 @@ pub async fn cmd_update(_args: UpdateArgs, ctx: &mut Context) -> Result<(), Erro
     let mfile = ctx.minimal_file()?;
     let mfile_path = mfile.file_path().cloned();
 
-    let upstream: Option<(String, Option<String>, Option<String>)> = match &mfile.upstream {
-        mfile::LinkConfig::Dir { .. } => None,
-        mfile::LinkConfig::Git {
+    let upstream: Option<(String, Option<String>, Option<String>)> = match mfile.upstream.as_ref() {
+        Some(mfile::LinkConfig::Git {
             repo,
             branch,
             locked_commit,
-        } => Some((repo.clone(), branch.clone(), locked_commit.clone())),
+        }) => Some((repo.clone(), branch.clone(), locked_commit.clone())),
+        Some(mfile::LinkConfig::Dir { .. }) => None,
+        None => None,
     };
 
     // best effort, yeet any cached remote index so a fresh fetch occurs
