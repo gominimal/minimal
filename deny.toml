@@ -23,6 +23,8 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "bzip2-1.0.6",
+    # OpenSSL 3 is meaningfully the Apache license
+    "OpenSSL",
 ]
 
 exceptions = [
