@@ -1,4 +1,4 @@
-name: ci
+name: CI
 
 on:
   push:
@@ -37,6 +37,43 @@ jobs:
         run: cargo fmt -- --check
       - name: Run Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  build-in-minimal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache Minimal binary
+        id: cache-minimal
+        uses: actions/cache@v5
+        with:
+          path: ~/.minimal
+          key: minimal-bin-${{ runner.os }}
+      - name: Install Minimal
+        if: steps.cache-minimal.outputs.cache-hit != 'true'
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://storage.googleapis.com/minimal-shim/install.sh | sh -s -- -y
+      - name: Add Minimal to PATH
+        run: echo "$HOME/.minimal/bin" >> $GITHUB_PATH
+      - name: Cache Cargo state
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/minimal/state
+          key: minimal-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: minimal-cargo-
+      - name: Cache VCS checkouts
+        id: cache-vcs
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/minimal/vcs
+          key: minimal-vcs-${{ runner.os }}
+          restore-keys: minimal-vcs-
+      - name: Enable unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Update packages
+        if: steps.cache-vcs.outputs.cache-hit != 'true'
+        run: minimal update
+      - name: Fmt, clippy, test
+        run: minimal run ci
 
   build-release-amd64:
     runs-on: ubuntu-latest

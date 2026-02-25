@@ -1,7 +1,7 @@
 [upstream] # Source of software & tooling
 repo = "https://github.com/gominimal/pkgs"
 branch = "main"
-locked_commit = "d66366faa6e6f674e3a770385776300aa3c99fae"
+locked_commit = "3d109ab29848bd35dc11517aafa96bbaeb8a4d0b"
 
 [harness]
 use = "rust"
@@ -13,8 +13,13 @@ state_key = "dev"
 [tasks.claude]
 exec = "claude"
 
+[tasks.build]
+exec = "cargo build --verbose"
+inherit_cwd = true
+
 [tasks.test]
-exec = "cargo test"
+exec = "cargo test --verbose"
+inherit_cwd = true
 
 [tasks.shell]
 exec = "bash -l"
@@ -49,6 +54,18 @@ profile = "demo"
 state_key = "demo"
 exec = "python3"
 
+
+[tasks.ci]
+exec = "cargo test --verbose && cargo fmt -- --check && cargo clippy --all-targets -- -D warnings"
+inherit_cwd = true
+
+[tasks.fmt-check]
+exec = "cargo fmt -- --check"
+inherit_cwd = true
+
+[tasks.clippy]
+exec = "cargo clippy --all-targets -- -D warnings"
+inherit_cwd = true
 
 [tasks.env-smoketest]
 inherit_cwd = true
