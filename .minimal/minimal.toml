@@ -55,8 +55,13 @@ exec = "python3"
 
 
 [tasks.ci]
-exec = "cargo test --verbose && cargo fmt -- --check && cargo clippy --all-targets -- -D warnings"
 inherit_cwd = true
+bash = """
+set -e
+cargo test --verbose
+cargo fmt -- --check
+cargo clippy --all-targets -- -D warnings
+"""
 
 [tasks.fmt-check]
 exec = "cargo fmt -- --check"
