@@ -18,6 +18,7 @@ struct EnvChannel<'a> {
     graph: &'a mut DepGraph,
     ctx: &'a mut Context,
 
+    task_name: String,
     state_dir: PathBuf,
     has_packages: HashSet<BuildSpecRef>,
 }
@@ -115,7 +116,7 @@ impl sandbox2::Channel for EnvChannel<'_> {
         // handle, eg: echo 'add-ephemeral%mermaid-ascii' | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock
 
         let add_dep = match line.split_once("%") {
-            Some(("add-ephemeral", pkgs)) => match self.parse_pkgs_line(pkgs) {
+            Some(("add-session", pkgs)) => match self.parse_pkgs_line(pkgs) {
                 Err(n) => {
                     writeln!(stream, "error: no such package '{}'", n).ok();
                     None
@@ -145,14 +146,19 @@ impl sandbox2::Channel for EnvChannel<'_> {
                     Some((AddDepMode::RuntimePackages, pkgs))
                 }
             },
-            Some(("add-tool", pkgs)) => match self.parse_pkgs_line(pkgs) {
+            Some(("add-task", pkgs)) => match self.parse_pkgs_line(pkgs) {
                 Err(n) => {
                     writeln!(stream, "error: no such package '{}'", n).ok();
                     None
                 }
                 Ok(pkgs) => {
                     self.install(&pkgs, stream, rootfs);
-                    Some((AddDepMode::ToolPackages, pkgs))
+                    Some((
+                        AddDepMode::TaskPackages {
+                            name: self.task_name.clone(),
+                        },
+                        pkgs,
+                    ))
                 }
             },
             _ => {
@@ -175,7 +181,7 @@ impl sandbox2::Channel for EnvChannel<'_> {
 
 /// The arguments used to construct a runtime environment.
 pub struct EnvArgs<'a> {
-    /// A symbolic name for the environment.
+    /// A symbolic name for the environment. For tasks, this is the task name.
     pub name: &'a str,
     /// The exhaustive set of packages needed in the environment, aka transitive dependencies.
     pub transitives: HashMap<BuildSpecRef, TransitivesDep>,
@@ -260,6 +266,7 @@ impl<'a> Env<'a> {
                 EnvChannel {
                     ctx,
                     graph,
+                    task_name: args.name.to_string(),
                     state_dir: args.state_base_dir.clone(),
                     has_packages: args.transitives.keys().cloned().collect(),
                 },
@@ -392,21 +399,28 @@ const MIN_SCRIPT: &str = indoc::indoc! {
 
     min_add() {
         local flag="$1"
-        shift
 
-        if [[ -z "$flag" || -z "$1" ]]; then
-            echo "Usage: min add --ephemeral|--build|--runtime|--tool <packages>" >&2
+        # If no flag provided, or first arg isn't a flag, default to --session
+        if [[ -z "$flag" || "$flag" != --* ]]; then
+            echo "No --flag provided, defaulting to adding package(s) for this session only"
+            flag="--session"
+        else
+            shift
+        fi
+
+        if [[ -z "$1" ]]; then
+            echo "Usage: min add [--session|--build|--runtime|--task] <packages>" >&2
             return 1
         fi
 
         local prefix
         case "$flag" in
-            --ephemeral) prefix="add-ephemeral" ;;
+            --session)   prefix="add-session"   ;;
             --build)     prefix="add-build"     ;;
             --runtime)   prefix="add-runtime"   ;;
-            --tool)      prefix="add-tool"      ;;
+            --task)      prefix="add-task"      ;;
             *)
-                echo "error: unknown flag '$flag'. Expected --ephemeral, --build, --runtime, or --tool" >&2
+                echo "error: unknown flag '$flag'. Expected --session, --build, --runtime, or --task" >&2
                 return 1
                 ;;
         esac
@@ -423,7 +437,7 @@ const MIN_SCRIPT: &str = indoc::indoc! {
                 min_add "$@"
                 ;;
             *)
-                echo "Usage: min add --ephemeral|--build|--runtime|--tool <packages>" >&2
+                echo "Usage: min add --session|--build|--runtime|--task <packages>" >&2
                 exit 1
                 ;;
         esac

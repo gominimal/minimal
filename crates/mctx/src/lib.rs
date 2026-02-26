@@ -686,19 +686,20 @@ impl Context {
                     )));
                 }
             }
-            AddDepMode::ToolPackages => {
+            AddDepMode::TaskPackages { name } => {
                 if let Some(tasks) = doc.get_mut("tasks")
-                    && let Some(shell) = tasks.get_mut("shell")
+                    && let Some(shell) = tasks.get_mut(&name)
                 {
                     did_edit |= upsert_toml_packages_list(
                         shell.as_table_mut().unwrap(),
                         "packages",
                         &resolved,
                     );
-                    println!("Added [{}] to tasks.shell.packages", resolved.join(","));
+                    println!("Added [{}] to tasks.{}.packages", resolved.join(","), name);
                 } else {
                     return Err(Error::Other(anyhow!(
-                        "could not find [tasks.shell] in minimal.toml: needed for update"
+                        "could not find [tasks.{}] in minimal.toml: needed for update",
+                        name
                     )));
                 }
             }
@@ -719,8 +720,8 @@ pub enum AddDepMode {
     BuildPackages,
     /// Add the specified packages to harness.runtime_packages.
     RuntimePackages,
-    /// Add the specified packages to tasks.shell.packages.
-    ToolPackages,
+    /// Add the specified packages to a task with a given name.
+    TaskPackages { name: String },
 }
 
 fn upsert_toml_packages_list<T: TableLike>(t: &mut T, key: &str, upsert: &[String]) -> bool {

@@ -58,7 +58,9 @@ pub async fn cmd_add(args: AddArgs, ctx: &mut Context) -> Result<(), Error> {
         } => ctx.add_deps(
             &graph,
             graph.top_levels.clone(),
-            mctx::AddDepMode::ToolPackages,
+            mctx::AddDepMode::TaskPackages {
+                name: "shell".to_string(),
+            },
         )?,
     }
 
