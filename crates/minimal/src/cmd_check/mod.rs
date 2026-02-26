@@ -237,7 +237,15 @@ fn harness_check_futures(
 }
 
 pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> {
-    let all_graph = ctx.graph_from_all_packages();
+    let mut all_graph = ctx.graph_from_all_packages();
+    if let Ok(g) = all_graph.as_mut()
+        && ctx.use_remote_cache()
+    {
+        // Download any missing packages unless --no-fetch was set.
+        ctx.download_if_available(g, g.from_origin(&ctx.repo_origin()))
+            .await?;
+    }
+
     let upstream_dir = ctx.minimal_file().dir_path().unwrap().to_path_buf();
 
     let packages_dir = upstream_dir.join("packages");

@@ -73,7 +73,7 @@ enum Command {
     #[clap(alias = "pkg")]
     Package(PkgArgs),
 
-    /// Validates and formats nickel build-spec files
+    /// Validates minimal configuration including packages, harnesses, and profiles
     Check(CheckArgs),
     /// Prints the build plan for the specified package(s)
     #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
