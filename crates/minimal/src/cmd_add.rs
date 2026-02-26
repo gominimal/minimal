@@ -8,20 +8,24 @@ pub struct AddArgs {
     pub kind: AddKind,
 
     /// Packages to add, comma-separated
-    #[arg(value_delimiter=',', num_args=0..)]
+    #[arg(required = true, value_delimiter=',', num_args=0..)]
     pub packages: Vec<String>,
 }
 
 #[derive(clap::Args, Debug)]
-#[group(required = false, multiple = false)]
+#[group(required = true, multiple = false)]
 pub struct AddKind {
     /// Add as a runtime dependency - your program needs this package anywhere it runs
     #[arg(long)]
     runtime: bool,
 
-    /// Add as a tool - made available in your development shell
-    #[arg(long, alias = "shell")]
-    tool: bool,
+    /// Add as a build dependency - your program needs this package to build
+    #[arg(long)]
+    build: bool,
+
+    /// Add to a task's package list
+    #[arg(long)]
+    task: Option<String>,
 }
 
 pub async fn cmd_add(args: AddArgs, ctx: &mut Context) -> Result<(), Error> {
@@ -29,39 +33,27 @@ pub async fn cmd_add(args: AddArgs, ctx: &mut Context) -> Result<(), Error> {
     let graph = ctx.graph_from_package_names(args.packages.clone())?;
 
     match args.kind {
-        AddKind {
-            runtime: true,
-            tool: true,
-        } => unreachable!(),
         // Build-time dependency
-        AddKind {
-            runtime: false,
-            tool: false,
-        } => ctx.add_deps(
+        AddKind { build: true, .. } => ctx.add_deps(
             &graph,
             graph.top_levels.clone(),
             mctx::AddDepMode::BuildPackages,
         )?,
         // Run-time dependency
-        AddKind {
-            runtime: true,
-            tool: false,
-        } => ctx.add_deps(
+        AddKind { runtime: true, .. } => ctx.add_deps(
             &graph,
             graph.top_levels.clone(),
             mctx::AddDepMode::RuntimePackages,
         )?,
-        // Tool
+        // Task
         AddKind {
-            runtime: false,
-            tool: true,
+            task: Some(task), ..
         } => ctx.add_deps(
             &graph,
             graph.top_levels.clone(),
-            mctx::AddDepMode::TaskPackages {
-                name: "shell".to_string(),
-            },
+            mctx::AddDepMode::TaskPackages { name: task },
         )?,
+        _ => unreachable!(),
     }
 
     ctx.download_if_available(&graph, graph.top_levels.clone())

@@ -688,13 +688,10 @@ impl Context {
             }
             AddDepMode::TaskPackages { name } => {
                 if let Some(tasks) = doc.get_mut("tasks")
-                    && let Some(shell) = tasks.get_mut(&name)
+                    && let Some(t) = tasks.get_mut(&name)
+                    && let Some(t) = t.as_table_mut()
                 {
-                    did_edit |= upsert_toml_packages_list(
-                        shell.as_table_mut().unwrap(),
-                        "packages",
-                        &resolved,
-                    );
+                    did_edit |= upsert_toml_packages_list(t, "packages", &resolved);
                     println!("Added [{}] to tasks.{}.packages", resolved.join(","), name);
                 } else {
                     return Err(Error::Other(anyhow!(
