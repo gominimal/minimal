@@ -48,8 +48,8 @@ impl Expression {
     pub fn parse(filter_str: &str) -> Result<Self, JqError> {
         match jaq_all::compile_with(
             filter_str,
-            jaq_all::jaq_std::defs(),
-            jaq_all::jaq_std::funs(),
+            jaq_all::jaq_std::defs().chain(jaq_all::json::defs()),
+            jaq_all::jaq_std::funs().chain(jaq_all::json::funs()),
             &[],
         ) {
             Ok(filter) => Ok(Expression {

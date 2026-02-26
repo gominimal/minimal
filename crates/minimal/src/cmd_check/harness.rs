@@ -240,6 +240,22 @@ fn check_project_matcher_predicates(
                         ));
                     }
                 }
+
+                for (fname, predicate_str) in matcher
+                    .build_package_matchers
+                    .values()
+                    .chain(matcher.runtime_package_matchers.values())
+                    .flatten()
+                    .flat_map(|p| p.file_predicates.iter())
+                {
+                    if let Err(e) = common::jq::Expression::parse(predicate_str) {
+                        out.verdict = CheckVerdict::Fail;
+                        out.err.push(format!(
+                            "invalid jq filter \"{}\" to match file {}: {:?}",
+                            predicate_str, fname, e.err
+                        ));
+                    }
+                }
             }
 
             Ok(out)

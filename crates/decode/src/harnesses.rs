@@ -13,9 +13,9 @@ use serde::Deserialize;
 
 use crate::{Error, ObjTy, eval_if_closure};
 
-/// A set of rules that when matched, indicate that this harness is applicable to a source tree.
+/// A predicate that when matched, indicates a package should be added when using a harness.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct HarnessMatcher {
+pub struct PackageMatcherPredicate {
     /// A list of file paths in the project and corresponding regexes, all of which must match
     /// for this harness to be applicable.
     ///
@@ -27,45 +27,13 @@ pub struct HarnessMatcher {
     pub file_predicates: IndexMap<String, String>,
 }
 
-impl HarnessMatcher {
+impl PackageMatcherPredicate {
     /// Returns true if all the predicates in this matcher apply to the given source tree.
     pub fn match_dir<P: AsRef<Path>>(&self, p: P) -> Result<bool, Either<regex::Error, JqError>> {
-        for (path, regex_str) in &self.file_regexes {
-            let f = p.as_ref().join(path);
-
-            if let Ok(data) = std::fs::read(&f) {
-                if regex_str == "*" {
-                    continue; // special case: match anything
-                }
-
-                let r = Regex::new(regex_str).map_err(Either::Left)?;
-                if !r.is_match(&data) {
-                    return Ok(false);
-                }
-            } else {
-                return Ok(false);
-            }
-        }
-
-        for (path, predicate_str) in &self.file_predicates {
-            let f = p.as_ref().join(path);
-            use common::jq;
-            if let Ok(data) = std::fs::read(&f) {
-                let data = jq::parse_file(&f, data).map_err(Either::Right)?;
-
-                let exp = jq::Expression::parse(predicate_str).map_err(Either::Right)?;
-                if !exp.predicate_eval(data).map_err(Either::Right)? {
-                    return Ok(false);
-                }
-            } else {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
+        matches(p, &self.file_regexes, &self.file_predicates)
     }
 
-    /// Deserializes a harness matcher structure from the given nickel term tree.
+    /// Deserializes a matcher structure from the given nickel term tree.
     pub(crate) fn from_term(
         rt: &RichTerm,
         program: &mut Program<CacheImpl>,
@@ -139,9 +107,168 @@ impl HarnessMatcher {
             _ => {}
         };
 
-        Ok(HarnessMatcher {
+        Ok(PackageMatcherPredicate {
             file_regexes: file_regexes.unwrap_or_default(),
             file_predicates: file_predicates.unwrap_or_default(),
+        })
+    }
+}
+
+/// Parses a nickel tree representing a map of `String` to `Vec<PackageMatcherPredicate>`.
+fn package_map_from_term(
+    rt: &RichTerm,
+    program: &mut Program<CacheImpl>,
+) -> Result<IndexMap<String, Vec<PackageMatcherPredicate>>, Error> {
+    let rt = eval_if_closure(rt, program)?;
+    match rt.term.as_ref() {
+        Term::Record(r) | Term::RecRecord(r, _, _, _) => r
+            .fields
+            .iter()
+            .map(
+                |(ident_and_loc, field)| -> Result<(String, Vec<PackageMatcherPredicate>), Error> {
+                    let a_rt = eval_if_closure(field.value.as_ref().unwrap(), program)?;
+                    let pred = match a_rt.term.as_ref() {
+                        Term::Array(a, _attrs) => a
+                            .iter()
+                            .map(|input| PackageMatcherPredicate::from_term(input, program))
+                            .collect::<Result<Vec<_>, Error>>()?,
+                        _ => todo!(
+                            "handle build_package_if_any value being non-array {:?}",
+                            field.value
+                        ),
+                    };
+
+                    Ok((ident_and_loc.label().to_string(), pred))
+                },
+            )
+            .collect::<Result<IndexMap<_, _>, Error>>(),
+        _ => todo!(
+            "unexpected term for build_package_if_any: {:?}",
+            rt.term.as_ref()
+        ),
+    }
+}
+
+/// Returns true if all the predicates in this matcher apply to the given source tree.
+fn matches<P: AsRef<Path>>(
+    p: P,
+    file_regexes: &IndexMap<String, String>,
+    file_predicates: &IndexMap<String, String>,
+) -> Result<bool, Either<regex::Error, JqError>> {
+    for (path, regex_str) in file_regexes {
+        let f = p.as_ref().join(path);
+
+        if let Ok(data) = std::fs::read(&f) {
+            if regex_str == "*" {
+                continue; // special case: match anything
+            }
+
+            let r = Regex::new(regex_str).map_err(Either::Left)?;
+            if !r.is_match(&data) {
+                return Ok(false);
+            }
+        } else {
+            return Ok(false);
+        }
+    }
+
+    for (path, predicate_str) in file_predicates {
+        let f = p.as_ref().join(path);
+        use common::jq;
+        if let Ok(data) = std::fs::read(&f) {
+            let data = jq::parse_file(&f, data).map_err(Either::Right)?;
+
+            let exp = jq::Expression::parse(predicate_str).map_err(Either::Right)?;
+            if !exp.predicate_eval(data).map_err(Either::Right)? {
+                return Ok(false);
+            }
+        } else {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+/// A set of rules that when matched, indicate that this harness is applicable to a source tree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HarnessMatcher {
+    /// A list of file paths in the project and corresponding regexes, all of which must match
+    /// for this harness to be applicable.
+    ///
+    /// In lieu of a regex, the value may be the string `*` to signal the file need only exist.
+    pub file_regexes: IndexMap<String, String>,
+
+    /// A list of file paths in the project and corresponding predicates in jq syntax. All predicates
+    /// must match for this harness to be applicable.
+    pub file_predicates: IndexMap<String, String>,
+
+    /// Predicates for when a package should be an additional build package. The package should be added
+    /// if any predicate matches.
+    pub build_package_matchers: IndexMap<String, Vec<PackageMatcherPredicate>>,
+    /// Predicates for when a package should be an additional runtime package. The package should be added
+    /// if any predicate matches.
+    pub runtime_package_matchers: IndexMap<String, Vec<PackageMatcherPredicate>>,
+}
+
+impl HarnessMatcher {
+    /// Returns true if all the predicates in this matcher apply to the given source tree.
+    pub fn match_dir<P: AsRef<Path>>(&self, p: P) -> Result<bool, Either<regex::Error, JqError>> {
+        matches(p, &self.file_regexes, &self.file_predicates)
+    }
+
+    /// Deserializes a harness matcher structure from the given nickel term tree.
+    pub(crate) fn from_term(
+        rt: &RichTerm,
+        program: &mut Program<CacheImpl>,
+    ) -> Result<Self, Error> {
+        let rt = eval_if_closure(rt, program)?;
+
+        let PackageMatcherPredicate {
+            file_regexes,
+            file_predicates,
+        } = PackageMatcherPredicate::from_term(&rt, program)?;
+
+        let mut build_package_matchers: IndexMap<String, Vec<PackageMatcherPredicate>> =
+            Default::default();
+        let mut runtime_package_matchers: IndexMap<String, Vec<PackageMatcherPredicate>> =
+            Default::default();
+        match rt.term.as_ref() {
+            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
+                r.fields
+                    .iter()
+                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                        if let Some(rt) = field.value.as_ref() {
+                            let rt = RuntimeContract::apply_all(
+                                rt.clone(),
+                                field.pending_contracts.iter().cloned(),
+                                rt.pos,
+                            );
+
+                            match ident_and_loc.label() {
+                                "build_package_if_any" => {
+                                    build_package_matchers = package_map_from_term(&rt, program)?;
+                                    Ok(())
+                                }
+                                "runtime_package_if_any" => {
+                                    runtime_package_matchers = package_map_from_term(&rt, program)?;
+                                    Ok(())
+                                }
+                                _ => Ok(()),
+                            }
+                        } else {
+                            Ok(())
+                        }
+                    })?;
+            }
+            _ => {}
+        };
+
+        Ok(HarnessMatcher {
+            file_regexes,
+            file_predicates,
+            build_package_matchers,
+            runtime_package_matchers,
         })
     }
 }
@@ -372,7 +499,7 @@ impl Harness {
                                             );
                                         }
                                         _ => todo!(
-                                            "handle runtime_packages value being non-array {:?}",
+                                            "handle matches_project_if_any value being non-array {:?}",
                                             field.value
                                         ),
                                     }
@@ -512,6 +639,12 @@ mod tests {
                         file_predicates = {
                             \"Cargo.toml\" = \".workspace.dependencies.dirs == '6'\",
                         },
+
+                        build_package_if_any.\"openssl\" = [
+                          {
+                            file_predicates.\"Cargo.toml\" = \".workspace.dependencies.reqwest.features | contains(\\\"native-tls\\\")\",
+                          }
+                        ],
                     }],
                 }
                 "
@@ -553,6 +686,19 @@ mod tests {
                         ".workspace.dependencies.dirs == '6'".to_string()
                     )]
                     .into(),
+                    build_package_matchers: [(
+                        "openssl".to_string(),
+                        vec![PackageMatcherPredicate {
+                            file_predicates: [(
+                                "Cargo.toml".to_string(),
+                                ".workspace.dependencies.reqwest.features | contains(\"native-tls\")".to_string()
+                            )]
+                            .into(),
+                            ..Default::default()
+                        }]
+                    )]
+                    .into(),
+                    runtime_package_matchers: Default::default(),
                 }]),
                 ..Default::default()
             }

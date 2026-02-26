@@ -247,9 +247,16 @@ let CmdSpec = std.contract.any_of [
             include cmd,
         },
 
+    AdditionalPackageMatcherEntry = {
+        file_regexes | {_ : String} | optional,
+        file_predicates | {_ : String} | optional,
+    },
     HarnessMatcherEntry = {
         file_regexes | {_ : String} | optional,
         file_predicates | {_ : String} | optional,
+
+        build_package_if_any | {_ : Array AdditionalPackageMatcherEntry} | optional,
+        runtime_package_if_any | {_ : Array AdditionalPackageMatcherEntry} | optional,
     },
 
     Harness | doc "A specific way to build a directory of source into software." = {
