@@ -1,7 +1,7 @@
 let { BuildSpec, .. } = import "minimal.ncl" in
 {
   name = "extra-build-pkg",
-  inputs = [],
+  build_deps = [],
   runtime_deps = [],
   outputs = {},
 } | BuildSpec

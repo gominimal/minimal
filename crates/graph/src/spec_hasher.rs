@@ -1,5 +1,5 @@
 use crate::{
-    BuildOutput, BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, RuntimeDep, SpecHash,
+    BuildDep, BuildOutput, BuildSpec, BuildSpecRef, DepGraph, RuntimeDep, SpecHash,
     dep_graph::SourceFetch,
 };
 use blake3::Hasher;
@@ -102,9 +102,9 @@ impl<'a> SpecHasher<'a> {
 
         // recurse in a well-defined order to capture referenced specs.
         let mut edges = Edges::new();
-        for (bsr, subset_info) in build.inputs.iter().filter_map(|i| match i {
-            BuildSpecInput::Build(bsr) => Some((bsr, None)),
-            BuildSpecInput::Subset(si) => Some((&si.from, Some(SubsetInfo(si.outputs.clone())))),
+        for (bsr, subset_info) in build.build_deps.iter().filter_map(|i| match i {
+            BuildDep::Build(bsr) => Some((bsr, None)),
+            BuildDep::Subset(si) => Some((&si.from, Some(SubsetInfo(si.outputs.clone())))),
             _ => None,
         }) {
             edges.push(Edge::BuildInput(self.process(bsr), subset_info));
@@ -156,8 +156,8 @@ fn build_output_hash(output: &BuildOutput, h: &mut Hasher) {
     }
 }
 
-fn build_input_hash(input: &BuildSpecInput, h: &mut Hasher) {
-    use BuildSpecInput::*;
+fn build_input_hash(input: &BuildDep, h: &mut Hasher) {
+    use BuildDep::*;
     match input {
         Build(_) | Subset(_) => {
             unreachable!();
@@ -234,7 +234,7 @@ fn build_attrs_hash(spec: &BuildSpec, h: &mut Hasher) {
     }
 
     h.write_all(b"-inputs").unwrap();
-    spec.inputs
+    spec.build_deps
         .iter()
         .filter(|i| i.as_build().is_none())
         .for_each(|i| build_input_hash(i, h));
@@ -350,7 +350,7 @@ mod tests {
                 let {BuildSpec, HostPath, Source, OutputLib, OutputBin, OutputData, ..} = import \"minimal.ncl\" in
                 {
                     name = \"single buildspec\",
-                    inputs = [
+                    build_deps = [
                         {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
                         {path = \"/\"} | HostPath,
                     ],
@@ -387,7 +387,7 @@ mod tests {
                 let {Needs, BuildSpec, ..} = import \"minimal.ncl\" in
                 {
                     name = \"single buildspec\",
-                    inputs = [],
+                    build_deps = [],
                     cmd = \"something\",
                     needs = {
                         dns = {},
@@ -417,7 +417,7 @@ mod tests {
                         let {Needs, BuildSpec, ..} = import \"minimal.ncl\" in
                         {
                             name = \"single buildspec\",
-                            inputs = [],
+                            build_deps = [],
                             cmd = \"something\",
                         } | BuildSpec"
                 }
@@ -440,18 +440,18 @@ mod tests {
                 let {BuildSpec, Source, OutputLib, OutputBin, OutputData, ..} = import \"minimal.ncl\" in
                 {
                     name = \"top\",
-                    inputs = [
+                    build_deps = [
                         {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
                         {
                             name = \"nested input\",
-                            inputs = [],
+                            build_deps = [],
                             cmd = \"\",
                         } | BuildSpec
                     ],
                     runtime_deps = [
                         {
                             name = \"nested runtime dep\",
-                            inputs = [],
+                            build_deps = [],
                             cmd = \"\",
                         } | BuildSpec
                     ],
@@ -484,14 +484,14 @@ mod tests {
 
                 let rec b1 = {
                     name = \"b1\",
-                    inputs = [
+                    build_deps = [
                         b2,
                     ],
                     cmd = \"\",
                 } | BuildSpec,
                 b2 = {
                     name = \"b2\",
-                    inputs = [
+                    build_deps = [
                         b1,
                     ],
                     cmd = \"\",
@@ -525,7 +525,7 @@ mod tests {
                 let {BuildSpec, HostPath, Source, OutputLib, OutputBin, OutputData, ..} = import \"minimal.ncl\" in
                 {
                     name = \"single buildspec\",
-                    inputs = [
+                    build_deps = [
                         {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
                         {path = \"/\"} | HostPath,
                     ],

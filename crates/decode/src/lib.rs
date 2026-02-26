@@ -460,7 +460,7 @@ mod tests {
                 let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
                 {
         			name = \"single buildspec\",
-        			inputs = [
+        			build_deps = [
                         {path = \"/\"} | HostPath,
                     ],
                     outputs = {
@@ -491,8 +491,8 @@ mod tests {
         );
         // We expect that buildspec to have one HostPath input
         assert!(matches!(
-            l.builds.iter().next().unwrap().1.inputs[0],
-            builds::BuildDeclInput::HostPath(_)
+            l.builds.iter().next().unwrap().1.build_deps[0],
+            builds::BuildDep::HostPath(_)
         ));
 
         assert_eq!(
@@ -523,17 +523,17 @@ mod tests {
 
                 let shared = {
         			name = \"sharing is caringgggg\",
-        			inputs = [],
+        			build_deps = [],
         			cmd = \"\",
         		} | BuildSpec
         		in
 
                 {
         			name = \"top build\",
-        			inputs = [
+        			build_deps = [
 						{
 		        			name = \"nested build\",
-		        			inputs = [shared],
+		        			build_deps = [shared],
 		        			cmd = \"\",
 		        		} | BuildSpec,
 		        		shared,
@@ -572,10 +572,10 @@ mod tests {
                 let {BuildSpec, ..} = import \"minimal.ncl\" in
                 {
         			name = \"top build\",
-        			inputs = [
+        			build_deps = [
 						{
 		        			name = \"nested build\",
-		        			inputs = [],
+		        			build_deps = [],
 		        			cmd = \"\",
 		        		} | BuildSpec
         			],
@@ -609,7 +609,7 @@ mod tests {
                 let {BuildSpec, OutputData, Subset, build, subsetOf, ..} = import \"minimal.ncl\" in
                 let our_runtime_dep = build {
                     name = \"runtime dep\",
-                    inputs = [],
+                    build_deps = [],
                     cmd = \"\",
                     outputs = {
                         some_data = { glob = \"usr/*\"} | OutputData,
@@ -617,7 +617,7 @@ mod tests {
                 } in
                 {
                     name = \"top build\",
-                    inputs = [our_runtime_dep],
+                    build_deps = [our_runtime_dep],
                     runtime_deps = [
                         our_runtime_dep,
                         subsetOf our_runtime_dep [\"some_data\"],
@@ -654,7 +654,7 @@ mod tests {
                 .iter()
                 .map(|b| b.1.clone())
                 .collect::<Vec<BuildDecl>>()[0]
-                .inputs[0]
+                .build_deps[0]
                 .as_build()
                 .unwrap(),
             l.builds
@@ -683,12 +683,12 @@ mod tests {
 
                 let rec b1 = {
                     name = \"build 1\",
-                    inputs = [b2],
+                    build_deps = [b2],
                     cmd = \"\",
                 } | BuildSpec,
                 b2 = {
                     name = \"build 2\",
-                    inputs = [b1],
+                    build_deps = [b1],
                     cmd = \"\",
                 } | BuildSpec,
                 in
@@ -714,7 +714,7 @@ mod tests {
                   builds = [
                     {
                         name = \"build\",
-                        inputs = [],
+                        build_deps = [],
                         cmd = \"\",
                     } | BuildSpec,
                   ],

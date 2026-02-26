@@ -2,7 +2,7 @@ let { standaloneTest, BuildSpec, OutputLib, Source, .. } = import "minimal.ncl" 
 {
   name = "uroot",
   prebuilt = true,
-  inputs = [
+  build_deps = [
     {
       file = "u-root-core-amd64.tar.zst",
       extract = true,

@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{Error, Options, Runnable};
-use graph::{BuildSpec, BuildSpecInput, BuildSpecRef, SourceInput, dep_graph::SourceFetch};
+use graph::{BuildDep, BuildSpec, BuildSpecRef, SourceInput, dep_graph::SourceFetch};
 use res_proto::{
     BuildStatus, CommandParameters, CreateBuildRequest, DownloadRequest, InjectedFiles, Invocation,
     OutputArtifact, PollBuildRequest, TarballCompression, TarballFormat, UploadMessage,
@@ -65,7 +65,7 @@ pub struct RemoteSpecBuild<'a> {
 impl<'a> RemoteSpecBuild<'a> {
     // Construct the array of layers which will form the execution environment.
     // self.deps[i] corresponds to layers[i], and any extra layers beyond the len
-    // of self.deps corresponds to Local or Source inputs.
+    // of self.deps corresponds to Local or Source build_deps.
     fn layers(&self, build: &BuildSpec) -> Vec<InjectedFiles> {
         self.deps
             .iter()
@@ -83,11 +83,11 @@ impl<'a> RemoteSpecBuild<'a> {
                 },
                 DepInner::Remote(remote) => todo!("remote dep: {:?}", remote),
             })
-            .chain(build.inputs.iter().filter_map(|i| match i {
+            .chain(build.build_deps.iter().filter_map(|i| match i {
                 // Should be represented in the deps array
-                BuildSpecInput::Build(_) | BuildSpecInput::Subset(_) => None,
+                BuildDep::Build(_) | BuildDep::Subset(_) => None,
                 // Handle local files as additional uploads
-                BuildSpecInput::Local {
+                BuildDep::Local {
                     full_path,
                     filename,
                     file_hash: _,
@@ -102,7 +102,7 @@ impl<'a> RemoteSpecBuild<'a> {
                     )),
                 }),
                 // Source entries map 1:1 to a Source proto
-                BuildSpecInput::Source(SourceInput {
+                BuildDep::Source(SourceInput {
                     extract,
                     from:
                         SourceFetch::Web {
@@ -123,13 +123,13 @@ impl<'a> RemoteSpecBuild<'a> {
                         },
                     )),
                 }),
-                BuildSpecInput::Source(SourceInput {
+                BuildDep::Source(SourceInput {
                     extract: _,
                     from: SourceFetch::Local { filename, .. },
                     strip_prefix: _,
                 }) => todo!("supporting local sources, i.e. {}", filename),
 
-                BuildSpecInput::HostPath(_) => todo!(),
+                BuildDep::HostPath(_) => todo!(),
             }))
             .collect()
     }

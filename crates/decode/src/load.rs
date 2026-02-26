@@ -451,7 +451,7 @@ mod tests {
                 {
                     toplevel = build {
                         name = \"smol ol buildspec\",
-                        inputs = [
+                        build_deps = [
                             build { name = \"swiggity swooty\" },
                         ],
                     }

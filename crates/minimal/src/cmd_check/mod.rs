@@ -1093,11 +1093,11 @@ impl GraphBasedChecker for BuildScriptIsExecutable {
         let build = graph.get(bsr).unwrap();
         result.verdict = CheckVerdict::Pass;
 
-        let local_inputs = build
-            .inputs
+        let local_build_deps = build
+            .build_deps
             .iter()
             .filter_map(|i| match i {
-                graph::BuildSpecInput::Local {
+                graph::BuildDep::Local {
                     full_path,
                     filename,
                     file_hash: _,
@@ -1111,7 +1111,8 @@ impl GraphBasedChecker for BuildScriptIsExecutable {
                 continue;
             }
             if let Some(exec) = &cmd[0].strip_prefix("./")
-                && let Some((path, name)) = local_inputs.iter().find(|(_path, name)| name == exec)
+                && let Some((path, name)) =
+                    local_build_deps.iter().find(|(_path, name)| name == exec)
             {
                 match std::fs::metadata(path) {
                     Err(e) => {

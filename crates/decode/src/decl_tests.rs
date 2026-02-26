@@ -206,7 +206,7 @@ mod tests {
                     test_deps = [
                         {
                  			name = \"single buildspec\",
-                 			inputs = [],
+                 			build_deps = [],
                             outputs = {},
                  			cmd = \"./build.sh\",
                   		} | BuildSpec

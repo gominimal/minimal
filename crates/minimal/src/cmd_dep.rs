@@ -2,8 +2,8 @@
 use crate::PackagesArg;
 use clap::{ArgAction, ValueEnum};
 use graph::{
-    BuildSpec, BuildSpecInput, BuildSpecRef, DepGraph, RuntimeDep, SourceFetch, SourceInput,
-    SubsetInput, Transitives,
+    BuildDep, BuildSpec, BuildSpecRef, DepGraph, RuntimeDep, SourceFetch, SourceInput, SubsetInput,
+    Transitives,
 };
 use mctx::{Context, Error};
 use nickel_lang_core::bytecode::ast::Node;
@@ -33,13 +33,13 @@ pub struct DepArgs {
     #[arg(short, long, alias="exclude", value_delimiter=',', num_args=0..)]
     excludes: Option<Vec<String>>,
 
-    /// Whether build spec "inputs" are in the graph (does not affect runtime deps)
+    /// Whether build spec "build_deps" are in the graph (does not affect runtime deps)
     #[arg(
         long,num_args(0..=1),default_missing_value("true"),default_value("true"),action = ArgAction::Set,
     )]
     build_spec_deps: bool,
 
-    /// Whether source code "inputs" are in the graph
+    /// Whether source code "build_deps" are in the graph
     #[arg(
         long,num_args(0..=1),default_missing_value("true"),default_value("false"),action = ArgAction::Set,
     )]
@@ -51,7 +51,7 @@ pub struct DepArgs {
     )]
     local_deps: bool,
 
-    /// Whether host path "inputs" are in the graph
+    /// Whether host path "build_deps" are in the graph
     #[arg(
         long,num_args(0..=1),default_missing_value("true"),default_value("false"),action=ArgAction::Set,
     )]
@@ -197,8 +197,8 @@ fn pgraph_from(graph: &graph::DepGraph) -> Result<GraphData, Error> {
         let (node_index, _) = add_uniq_node(&mut pgraph, &mut processed_nodes, node_data);
         bsname_to_node_index.insert(bs.name.clone(), node_index);
 
-        bs.inputs.iter().for_each(|input| match input {
-            BuildSpecInput::Build(ibsr) => {
+        bs.build_deps.iter().for_each(|input| match input {
+            BuildDep::Build(ibsr) => {
                 let (inode_index, _) = add_uniq_node(
                     &mut pgraph,
                     &mut processed_nodes,
@@ -207,7 +207,7 @@ fn pgraph_from(graph: &graph::DepGraph) -> Result<GraphData, Error> {
                 let edge_data = EdgeData::InputDep(InputDepEdge::default());
                 pgraph.add_edge(node_index, inode_index, edge_data);
             }
-            BuildSpecInput::HostPath(hp) => {
+            BuildDep::HostPath(hp) => {
                 let (inode_index, _) = add_uniq_node(
                     &mut pgraph,
                     &mut processed_nodes,
@@ -216,7 +216,7 @@ fn pgraph_from(graph: &graph::DepGraph) -> Result<GraphData, Error> {
                 let edge_data = EdgeData::InputDep(InputDepEdge::default());
                 pgraph.add_edge(node_index, inode_index, edge_data);
             }
-            BuildSpecInput::Local {
+            BuildDep::Local {
                 full_path,
                 filename,
                 file_hash,
@@ -233,7 +233,7 @@ fn pgraph_from(graph: &graph::DepGraph) -> Result<GraphData, Error> {
                 let edge_data = EdgeData::InputDep(InputDepEdge::default());
                 pgraph.add_edge(node_index, inode_index, edge_data);
             }
-            BuildSpecInput::Source(SourceInput {
+            BuildDep::Source(SourceInput {
                 from:
                     SourceFetch::Web {
                         url,
@@ -259,11 +259,11 @@ fn pgraph_from(graph: &graph::DepGraph) -> Result<GraphData, Error> {
                 });
                 pgraph.add_edge(node_index, inode_index, edge_data);
             }
-            BuildSpecInput::Source(SourceInput {
+            BuildDep::Source(SourceInput {
                 from: SourceFetch::Local { .. },
                 ..
             }) => todo!(),
-            BuildSpecInput::Subset(SubsetInput { from, outputs }) => {
+            BuildDep::Subset(SubsetInput { from, outputs }) => {
                 let (inode_index, _) = add_uniq_node(
                     &mut pgraph,
                     &mut processed_nodes,

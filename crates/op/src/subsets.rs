@@ -84,7 +84,7 @@ mod tests {
                 let {BuildSpec, Source, OutputData, ..} = import \"minimal.ncl\" in
                 {
                     name = \"fake build\",
-                    inputs = [],
+                    build_deps = [],
                     cmd = \"\",
                     outputs = {
                     a = {glob = \"a\"} | OutputData,

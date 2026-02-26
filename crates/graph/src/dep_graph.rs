@@ -142,10 +142,10 @@ impl From<(BuildSpecRef, HashSet<String>)> for SubsetInput {
 
 /// An input to a build spec.
 ///
-/// Each entry in a build-spec's `inputs` array corresponds to one [BuildSpecInput].
+/// Each entry in a build-spec's `build_deps` array corresponds to one [BuildDep].
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub enum BuildSpecInput {
+pub enum BuildDep {
     Build(BuildSpecRef),
     Source(SourceInput),
     HostPath(PathBuf),
@@ -158,21 +158,21 @@ pub enum BuildSpecInput {
 }
 
 #[allow(dead_code)]
-impl BuildSpecInput {
+impl BuildDep {
     /// Returns the underlying build-spec reference if this value was the Build variant.
     pub(crate) fn as_build(&self) -> Option<&BuildSpecRef> {
         match self {
-            BuildSpecInput::Build(bsr) => Some(bsr),
+            BuildDep::Build(bsr) => Some(bsr),
             _ => None,
         }
     }
 
-    fn from_decoded(i: &builds::BuildDeclInput, loader: &Loader) -> Result<Self, Error> {
+    fn from_decoded(i: &builds::BuildDep, loader: &Loader) -> Result<Self, Error> {
         Ok(match i {
-            builds::BuildDeclInput::Build(br) => Self::Build(loader.load(br)?),
-            builds::BuildDeclInput::Source(s) => Self::Source(s.clone().into()),
-            builds::BuildDeclInput::HostPath(p) => Self::HostPath(p.clone()),
-            builds::BuildDeclInput::Local {
+            builds::BuildDep::Build(br) => Self::Build(loader.load(br)?),
+            builds::BuildDep::Source(s) => Self::Source(s.clone().into()),
+            builds::BuildDep::HostPath(p) => Self::HostPath(p.clone()),
+            builds::BuildDep::Local {
                 full_path,
                 filename,
                 file_hash,
@@ -181,9 +181,7 @@ impl BuildSpecInput {
                 filename: filename.clone(),
                 file_hash: *file_hash,
             },
-            builds::BuildDeclInput::Subset(si) => {
-                Self::Subset(SubsetInput::from_decoded(si, loader)?)
-            }
+            builds::BuildDep::Subset(si) => Self::Subset(SubsetInput::from_decoded(si, loader)?),
         })
     }
 }
@@ -307,7 +305,7 @@ pub struct BuildSpec {
     pub build_args: Option<IndexMap<String, String>>,
 
     /// The dependencies needed to execute the build spec.
-    pub inputs: SmallVec<[BuildSpecInput; 10]>,
+    pub build_deps: SmallVec<[BuildDep; 10]>,
     /// The dependencies needed to run outputs of this build spec, as well as possibly needed
     /// during the build.
     pub runtime_deps: SmallVec<[RuntimeDep; 8]>,
@@ -337,7 +335,7 @@ impl BuildSpec {
 
     /// Returns true if the build-spec represents a rollup of runtime_deps but no substance or computation of its own.
     pub fn is_pure_collection(&self) -> bool {
-        self.inputs.is_empty()
+        self.build_deps.is_empty()
             && (self.cmds.is_empty()
                 || (self.cmds.len() == 1
                     && (self.cmds[0].is_empty() || self.cmds[0][0].is_empty())))
@@ -351,10 +349,10 @@ impl BuildSpec {
             cmds: bd.cmds.clone(),
             build_args: bd.build_args.clone(),
 
-            inputs: bd
-                .inputs
+            build_deps: bd
+                .build_deps
                 .iter()
-                .map(|i| BuildSpecInput::from_decoded(i, loader))
+                .map(|i| BuildDep::from_decoded(i, loader))
                 .collect::<Result<SmallVec<_>, _>>()?,
             runtime_deps: bd
                 .runtime_deps
@@ -639,10 +637,10 @@ impl DepGraph {
             // Subsets reference outputs by name. Validate for these new
             // build-specs that any subsets reference outputs that exist.
             for subset in b
-                .inputs
+                .build_deps
                 .iter()
                 .filter_map(|input| {
-                    if let BuildSpecInput::Subset(s) = input {
+                    if let BuildDep::Subset(s) = input {
                         Some(s)
                     } else {
                         None
@@ -803,7 +801,7 @@ impl DepGraph {
 
     /// Returns the unique set of transitive build-spec dependencies of the given toplevel.
     ///
-    /// Dependencies of a build-spec are its inputs and its runtime dependencies.
+    /// Dependencies of a build-spec are its build dependencies and its runtime dependencies.
     pub fn transitive_specs_of(&self, toplevel: &BuildSpecRef) -> Vec<BuildSpecRef> {
         let mut seen: HashMap<BuildSpecRef, ()> = HashMap::with_capacity(self.builds.len());
         let mut reachable = Vec::with_capacity(self.builds.len());
@@ -820,9 +818,9 @@ impl DepGraph {
     ) {
         let build_spec = self.get(bsr).unwrap();
 
-        use BuildSpecInput::*;
+        use BuildDep::*;
         build_spec
-            .inputs
+            .build_deps
             .iter()
             .filter_map(|input| match input {
                 Build(bsr) => Some(bsr),
@@ -1026,14 +1024,14 @@ mod tests {
 
                 let rec b1 = {
                     name = \"b1\",
-                    inputs = [
+                    build_deps = [
                         b2,
                     ],
                     cmd = \"\",
                 } | BuildSpec,
                 b2 = {
                     name = \"b2\",
-                    inputs = [
+                    build_deps = [
                         b1,
                     ],
                     cmd = \"\",
@@ -1061,7 +1059,7 @@ mod tests {
 
                 let shared = {
                     name = \"shared\",
-                    inputs = [
+                    build_deps = [
                         {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
                     ],
                     cmd = \"\",
@@ -1070,11 +1068,11 @@ mod tests {
 
                 {
                     name = \"top build\",
-                    inputs = [
+                    build_deps = [
                         shared,
                         {
                             name = \"second build\",
-                            inputs = [],
+                            build_deps = [],
                             cmd = \"\",
                         } | BuildSpec,
                     ],
@@ -1113,12 +1111,12 @@ mod tests {
 
                 let rec b1 = {
                     name = \"build 1\",
-                    inputs = [b2],
+                    build_deps = [b2],
                     cmd = \"\",
                 } | BuildSpec,
                 b2 = {
                     name = \"build 2\",
-                    inputs = [b1],
+                    build_deps = [b1],
                     cmd = \"\",
                 } | BuildSpec,
                 in
@@ -1205,7 +1203,7 @@ mod tests {
 
                 layer {
                   builds = [
-                    build{name = \"extra\", inputs = [], cmd = \"\"},
+                    build{name = \"extra\", build_deps = [], cmd = \"\"},
                   ],
                   profiles = [
                     profile {
@@ -1300,7 +1298,7 @@ mod tests {
 
             build {
                 name = \"top\",
-                inputs = [],
+                build_deps = [],
                 cmd = \"\",
             }"
             },
@@ -1337,7 +1335,7 @@ mod tests {
 
             build {
                 name = \"middle\",
-                inputs = [upstream \"top\"],
+                build_deps = [upstream \"top\"],
                 cmd = \"\",
             }"
             },
@@ -1373,7 +1371,7 @@ mod tests {
         // Make sure the middle reference to the upstream package is well formed
         let m = graph.get(graph.by_name("middle").unwrap()).unwrap();
         assert_eq!(
-            m.inputs[0].as_build().unwrap(),
+            m.build_deps[0].as_build().unwrap(),
             graph.by_name("top").unwrap()
         );
     }
@@ -1388,12 +1386,12 @@ mod tests {
                 let
                     b1 = {
                         name = \"build 1\",
-                        inputs = [],
+                        build_deps = [],
                         cmd = \"\",
                     } | BuildSpec,
                     b2 = {
                         name = \"build 2\",
-                        inputs = [],
+                        build_deps = [],
                         tests.smoketest = standaloneTest \"some_cmd\",
                         cmd = \"\",
                     } | BuildSpec,
@@ -1436,7 +1434,7 @@ mod tests {
 
                 {
                     name = \"build 1\",
-                    inputs = [],
+                    build_deps = [],
                     cmd = match {
                       {arch = 'Amd64, ..} => \"good\",
                       _ => \"bad\",

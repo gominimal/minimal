@@ -5,7 +5,7 @@ use anyhow::anyhow;
 use cache::{CacheErr, MetaInner, PendingDir};
 use common::Target;
 use globset::GlobSet;
-use graph::{BuildSpec, BuildSpecInput, BuildSpecRef, SubsetInput, Transitives};
+use graph::{BuildDep, BuildSpec, BuildSpecRef, SubsetInput, Transitives};
 use sandbox2::config::SandboxMapped;
 use tracing::info;
 
@@ -25,25 +25,25 @@ pub struct SpecBuild<'a, SF: crate::SourceFetcher> {
     /// If set, overrides the set of dependencies injected into the build.
     /// If unset, the necessary dependencies are computed automatically.
     ///
-    /// Does not override `Local` or `Source` variant inputs - those will
+    /// Does not override `Local` or `Source` variant build_deps - those will
     /// always be made present automatically.
     pub override_deps: Option<HashSet<PathBuf>>,
 }
 
 impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
-    async fn inputs_mapped(
+    async fn build_deps_mapped(
         &self,
         build: &BuildSpec,
         opts: &Options<'a>,
     ) -> Result<Vec<SandboxMapped>, Error> {
-        let mut inputs = Vec::new();
+        let mut build_deps = Vec::new();
 
-        for input in build.inputs.iter() {
+        for input in build.build_deps.iter() {
             match input {
-                BuildSpecInput::Local { full_path, .. } => {
-                    inputs.push(SandboxMapped::File(full_path.to_path_buf()))
+                BuildDep::Local { full_path, .. } => {
+                    build_deps.push(SandboxMapped::File(full_path.to_path_buf()))
                 }
-                BuildSpecInput::Source(source) => {
+                BuildDep::Source(source) => {
                     let resolved_src = crate::SourceLoad {
                         source,
                         remote_fetcher: self.remote_fetcher,
@@ -53,15 +53,15 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                     .await?;
                     match resolved_src {
                         Materialized::Given(_) => unreachable!(),
-                        Materialized::File(path) => inputs.push(SandboxMapped::File(path)),
-                        Materialized::TempDir(td) => inputs.push(SandboxMapped::TempDir(td)),
+                        Materialized::File(path) => build_deps.push(SandboxMapped::File(path)),
+                        Materialized::TempDir(td) => build_deps.push(SandboxMapped::TempDir(td)),
                     }
                 }
-                BuildSpecInput::Build(_) => {} // Handled by Transitives
+                BuildDep::Build(_) => {} // Handled by Transitives
                 _ => todo!("input: {:?}", input),
             }
         }
-        Ok(inputs)
+        Ok(build_deps)
     }
 
     async fn rootfs_mapped(
@@ -164,7 +164,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         opts: &Options<'b>,
         build: &BuildSpec,
     ) -> Result<SpecBuildResult, Error> {
-        if let BuildSpecInput::Source(source) = &build.inputs[0] {
+        if let BuildDep::Source(source) = &build.build_deps[0] {
             let start = Instant::now();
             let out_dir = opts
                 .cache
@@ -191,7 +191,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                 );
             }
         } else {
-            panic!("prebuilt input was not source: {:?}", &build.inputs[0]);
+            panic!("prebuilt input was not source: {:?}", &build.build_deps[0]);
         }
     }
 }
@@ -228,7 +228,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
             )));
         }
 
-        let inputs = self.inputs_mapped(build, opts).await?;
+        let inputs = self.build_deps_mapped(build, opts).await?;
         let (rootfs, needs_dns, needs_internet) = self.rootfs_mapped(build, opts).await?;
 
         let channel = ();

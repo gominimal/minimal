@@ -547,17 +547,17 @@ mod tests {
 
                 let no_deps_spec = {
         			name = \"no deps\",
-        			inputs = [],
+        			build_deps = [],
         			cmd = \"\",
         		} | BuildSpec
         		in
                 let rec self_ref = {
         			name = \"self ref\",
-        			inputs = [self_ref],
+        			build_deps = [self_ref],
         			cmd = \"\",
                     replace_on_cycle = {
                         name = \"breaker\",
-                        inputs = [],
+                        build_deps = [],
                         cmd = \"\",
                     } | BuildSpec,
         		} | BuildSpec
@@ -565,7 +565,7 @@ mod tests {
 
         		{
         			name = \"top\",
-        			inputs = [no_deps_spec],
+        			build_deps = [no_deps_spec],
         			runtime_deps = [self_ref],
         			cmd = \"\",
         		} | BuildSpec
@@ -681,13 +681,13 @@ mod tests {
 
                 let no_deps_spec = {
         			name = \"no deps\",
-        			inputs = [],
+        			build_deps = [],
         			cmd = \"\",
         		} | BuildSpec
         		in
         		{
         			name = \"top\",
-        			inputs = [no_deps_spec],
+        			build_deps = [no_deps_spec],
         			runtime_deps = [],
         			cmd = \"\",
         		} | BuildSpec

@@ -11,8 +11,8 @@ let CmdSpec = std.contract.any_of [
         ty | Tys = 'Builder,
         name
           | String,
-        inputs
-          | Array Input,
+        build_deps
+          | Array BuildDep,
         runtime_deps
           | Array RuntimeDep | optional,
         needs | Needs | optional,
@@ -83,7 +83,7 @@ let CmdSpec = std.contract.any_of [
             value
         ),
 
-    Input | doc "Possible inputs to a build spec." = fun Contract =>
+    BuildDep | doc "Possible types in an entry of the build_deps array." = fun Contract =>
         std.contract.custom (fun label value =>
             match {
                 {ty = 'Builder, ..} => std.contract.check BuildSpec label value,

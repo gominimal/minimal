@@ -1,4 +1,4 @@
-use crate::{BuildSpecInput, BuildSpecRef, DepGraph, SubsetInput, Transitives, transitives};
+use crate::{BuildDep, BuildSpecRef, DepGraph, SubsetInput, Transitives, transitives};
 use nickel_lang_core::term::IndexMap;
 use std::{
     collections::{HashMap, HashSet},
@@ -291,14 +291,15 @@ fn make_reachable<BP: BinProvider>(
         }
 
         // We need to build this build-spec. Bring in not only its runtime deps,
-        // but its inputs as well (so we can do da build).
+        // but its build_deps as well (so we can do da build).
         if !seen_before {
             for bsr in build
-                .inputs
+                .build_deps
                 .iter()
                 .filter_map(|i| match i {
-                    BuildSpecInput::Build(bsr)
-                    | BuildSpecInput::Subset(SubsetInput { from: bsr, .. }) => Some(bsr),
+                    BuildDep::Build(bsr) | BuildDep::Subset(SubsetInput { from: bsr, .. }) => {
+                        Some(bsr)
+                    }
                     _ => None,
                 })
                 .chain(build.runtime_deps.iter().map(|dep| dep.bsr()))
@@ -554,9 +555,9 @@ impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
             }
         };
 
-        // Search through all inputs and runtime deps.
-        for input in bs.inputs.iter() {
-            use BuildSpecInput::*;
+        // Search through all build deps and runtime deps.
+        for input in bs.build_deps.iter() {
+            use BuildDep::*;
             match input {
                 Build(bsr) | Subset(SubsetInput { from: bsr, .. }) => {
                     process(bsr, seen, &mut out);
@@ -654,8 +655,8 @@ impl<'a, BP: BinProvider> Iterator for ExecPlan<'a, BP> {
             // This build-spec is either not built at all, or built using cycle breakers.
             let cycle_breakers_allowed = info.state != BuildState::BuiltUsingBreakers;
 
-            // Something is ready to be built if all its inputs are built, and all its transitive
-            // runtime deps (and the transitive runtime deps of its inputs) are built.
+            // Something is ready to be built if all its build deps are built, and all its transitive
+            // runtime deps (and the transitive runtime deps of its build deps) are built.
             let mut deps: Vec<(Option<Dep>, transitives::Dep)> =
                 Transitives::new(self.graph, candidate, true)
                     .transitive_runtime_deps
@@ -788,7 +789,7 @@ mod tests {
     use indoc::indoc;
 
     #[test]
-    fn inputs_and_runtime_deps_reachable_when_not_built() {
+    fn build_deps_and_runtime_deps_reachable_when_not_built() {
         let layer = Layer::new_for_test(
             indoc! {
                 "
@@ -796,20 +797,20 @@ mod tests {
 
                 let no_deps_spec = {
         			name = \"no deps\",
-        			inputs = [],
+        			build_deps = [],
         			cmd = \"\",
         		} | BuildSpec
         		in
                 let no_deps_spec2 = {
         			name = \"no deps 2\",
-        			inputs = [],
+        			build_deps = [],
         			cmd = \"\",
         		} | BuildSpec
         		in
 
         		{
         			name = \"top\",
-        			inputs = [no_deps_spec],
+        			build_deps = [no_deps_spec],
         			runtime_deps = [no_deps_spec2],
         			cmd = \"\",
         		} | BuildSpec
@@ -855,17 +856,17 @@ mod tests {
 
                 let rec nested_dep = {
                     name = \"nested dep\",
-                    inputs = [],
+                    build_deps = [],
                     cmd = \"\",
                 } | BuildSpec,
                 dep = {
                     name = \"dep\",
-                    inputs = [nested_dep],
+                    build_deps = [nested_dep],
                     cmd = \"\",
                 } | BuildSpec,
                 top = {
                     name = \"top\",
-                    inputs = [dep],
+                    build_deps = [dep],
                     cmd = \"\",
                 } | BuildSpec,
                 in
@@ -929,12 +930,12 @@ mod tests {
 
                 let rec b1 = {
                     name = \"build 1\",
-                    inputs = [b2],
+                    build_deps = [b2],
                     cmd = \"\",
                 } | BuildSpec,
                 b2 = {
                     name = \"build 2\",
-                    inputs = [b1],
+                    build_deps = [b1],
                     cmd = \"\",
                 } | BuildSpec,
                 in
@@ -977,22 +978,22 @@ mod tests {
 
                 let rec self_ref = {
                     name = \"self ref\",
-                    inputs = [self_ref],
+                    build_deps = [self_ref],
                     cmd = \"\",
                     replace_on_cycle = {
                         name = \"breaker\",
-                        inputs = [breaker_dep],
+                        build_deps = [breaker_dep],
                         cmd = \"\",
                     } | BuildSpec,
                 } | BuildSpec,
                 breaker_dep = {
                     name = \"breaker dep\",
-                    inputs = [],
+                    build_deps = [],
                     cmd = \"\",
                 } | BuildSpec,
                 top = {
                     name = \"top\",
-                    inputs = [self_ref],
+                    build_deps = [self_ref],
                     cmd = \"\",
                 } | BuildSpec,
                 in
@@ -1103,17 +1104,17 @@ mod tests {
 
                 let rec nested_dep = {
                     name = \"nested dep\",
-                    inputs = [],
+                    build_deps = [],
                     cmd = \"\",
                 } | BuildSpec,
                 dep = {
                     name = \"dep\",
-                    inputs = [nested_dep],
+                    build_deps = [nested_dep],
                     cmd = \"\",
                 } | BuildSpec,
                 top = {
                     name = \"top\",
-                    inputs = [dep],
+                    build_deps = [dep],
                     cmd = \"\",
                 } | BuildSpec,
                 in
@@ -1175,24 +1176,24 @@ mod tests {
 
                 let rec nested_deeper_dep = {
                     name = \"nested deeper dep\",
-                    inputs = [],
+                    build_deps = [],
                     cmd = \"\",
                 } | BuildSpec,
                 nested_dep = {
                     name = \"nested dep\",
-                    inputs = [],
+                    build_deps = [],
                     runtime_deps = [nested_deeper_dep],
                     cmd = \"\",
                 } | BuildSpec,
                 dep = {
                     name = \"dep\",
-                    inputs = [],
+                    build_deps = [],
                     runtime_deps = [nested_dep],
                     cmd = \"\",
                 } | BuildSpec,
                 top = {
                     name = \"top\",
-                    inputs = [],
+                    build_deps = [],
                     runtime_deps = [dep],
                     cmd = \"\",
                 } | BuildSpec,
@@ -1266,11 +1267,11 @@ mod tests {
 
                 let rec self_ref = {
                     name = \"self ref\",
-                    inputs = [self_ref],
+                    build_deps = [self_ref],
                     cmd = \"\",
                     replace_on_cycle = {
                         name = \"breaker\",
-                        inputs = [],
+                        build_deps = [],
                         cmd = \"\",
                     } | BuildSpec,
                 } | BuildSpec,

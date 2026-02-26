@@ -394,12 +394,10 @@ impl SubsetInput {
     }
 }
 
-/// An input to a build spec.
-///
-/// Each entry in a build-spec's `inputs` array corresponds to one [BuildSpecInput].
+/// An entry in a build spec's `build_deps` array.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub enum BuildDeclInput {
+pub enum BuildDep {
     Build(BuildRef),
     Source(SourceInput),
     HostPath(PathBuf),
@@ -412,17 +410,17 @@ pub enum BuildDeclInput {
 }
 
 #[allow(dead_code)]
-impl BuildDeclInput {
+impl BuildDep {
     /// Returns the underlying build-spec reference if this value was the Build variant.
     pub(crate) fn as_build(&self) -> Option<&BuildRef> {
         match self {
-            BuildDeclInput::Build(bsr) => Some(bsr),
+            BuildDep::Build(bsr) => Some(bsr),
             _ => None,
         }
     }
 }
 
-impl BuildDeclInput {
+impl BuildDep {
     fn from_term<A: super::DeclAccumulator>(
         rt: &RichTerm,
         program: &mut Program<CacheImpl>,
@@ -438,12 +436,12 @@ impl BuildDeclInput {
             }
             ObjTy::Subset => Ok(Self::Subset(SubsetInput::from_term(&rt, program, acc)?)),
             ObjTy::Source => Ok(Self::Source(SourceInput::from_term(&rt, program)?)),
-            ObjTy::Path => Ok(BuildDeclInput::HostPath(
+            ObjTy::Path => Ok(BuildDep::HostPath(
                 Self::from_term_hostpath(&rt, program)?.into(),
             )),
             ObjTy::Local => {
                 let (full_path, filename, file_hash) = Self::from_term_local(&rt, program)?;
-                Ok(BuildDeclInput::Local {
+                Ok(BuildDep::Local {
                     full_path,
                     filename,
                     file_hash,
@@ -733,7 +731,7 @@ pub struct BuildDecl {
     pub attrs: Option<IndexMap<String, AttrValue>>,
     /// Marker that this build-spec is a prebuilt, meaning:
     ///  - No cmds may be defined.
-    ///  - inputs must consist of a single source input.
+    ///  - build_deps must consist of a single source input.
     pub prebuilt: bool,
 
     /// The build commands declared on the build spec.
@@ -742,7 +740,7 @@ pub struct BuildDecl {
     pub build_args: Option<IndexMap<String, String>>,
 
     /// The dependencies needed to execute the build spec.
-    pub inputs: SmallVec<[BuildDeclInput; 10]>,
+    pub build_deps: SmallVec<[BuildDep; 10]>,
     /// The dependencies needed to run outputs of this build spec, as well as possibly needed
     /// during the build.
     pub runtime_deps: SmallVec<[RuntimeDep; 8]>,
@@ -761,7 +759,7 @@ pub struct BuildDecl {
 impl BuildDecl {
     /// Returns true if the build-spec represents a rollup of runtime_deps but no substance or computation of its own.
     pub fn is_pure_collection(&self) -> bool {
-        self.inputs.is_empty()
+        self.build_deps.is_empty()
             && (self.cmds.is_empty() || (self.cmds.len() == 1 && self.cmds[0][0].is_empty()))
     }
 }
@@ -780,7 +778,7 @@ impl BuildDecl {
         let mut ty: Option<ObjTy> = None;
         let mut target: Option<Target> = None;
         let mut build_args: Option<IndexMap<String, String>> = None;
-        let mut inputs: Option<SmallVec<[BuildDeclInput; 10]>> = None;
+        let mut build_deps: Option<SmallVec<[BuildDep; 10]>> = None;
         let mut runtime_deps: Option<SmallVec<[RuntimeDep; 8]>> = None;
         let mut needs: Option<IndexMap<String, AttrValue>> = None;
         let mut outputs: Option<OutputMap> = None;
@@ -930,8 +928,8 @@ impl BuildDecl {
 
                                 Ok(())
                             }
-                            "inputs" => {
-                                let inputs_rt = field
+                            "build_deps" => {
+                                let build_deps_rt = field
                                     .value
                                     .as_ref()
                                     .map(|rt| eval_if_closure(rt, program))
@@ -939,16 +937,16 @@ impl BuildDecl {
                                         files: program.files(),
                                         obj: ObjTy::Builder,
                                         pos: rt.pos,
-                                        field: "inputs",
+                                        field: "build_deps",
                                     })??;
-                                if let Term::Array(a, _attrs) = inputs_rt.as_ref() {
-                                    inputs = Some(
+                                if let Term::Array(a, _attrs) = build_deps_rt.as_ref() {
+                                    build_deps = Some(
                                         a.iter()
-                                            .map(|input| BuildDeclInput::from_term(input, program, acc))
+                                            .map(|input| BuildDep::from_term(input, program, acc))
                                             .collect::<Result<SmallVec<_>, Error>>()?,
                                     );
                                 } else {
-                                    todo!("handle inputs value being non-array {:?}", field.value);
+                                    todo!("handle build_deps value being non-array {:?}", field.value);
                                 };
                                 Ok(())
                             }
@@ -1140,14 +1138,14 @@ impl BuildDecl {
         };
         let prebuilt = prebuilt.unwrap_or_default();
         let cmds = cmds.unwrap_or_default();
-        let inputs = match inputs {
-            Some(inputs) => inputs,
+        let build_deps = match build_deps {
+            Some(build_deps) => build_deps,
             None => {
                 return Err(Error::MissingField {
                     files: program.files(),
                     obj: ObjTy::Builder,
                     pos: rt.pos,
-                    field: "inputs",
+                    field: "build_deps",
                 });
             }
         };
@@ -1170,7 +1168,7 @@ impl BuildDecl {
 
         // Validate our magic prebuilt-marked decls
         if prebuilt {
-            if let [BuildDeclInput::Source(_)] = inputs.as_slice() {
+            if let [BuildDep::Source(_)] = build_deps.as_slice() {
                 if !cmds.is_empty() {
                     return Err(Error::Other(
                         "prebuilt decls must not declare commands to execute".to_string(),
@@ -1195,7 +1193,7 @@ impl BuildDecl {
             prebuilt,
             build_args,
             target: target.unwrap_or(Target::host()),
-            inputs,
+            build_deps,
             runtime_deps,
             abstract_deps: needs,
             outputs,
@@ -1234,11 +1232,11 @@ mod tests {
             panic!("finish failed");
         });
 
-        let source = BuildDeclInput::from_term(&term, &mut program, &mut ()).unwrap();
+        let source = BuildDep::from_term(&term, &mut program, &mut ()).unwrap();
 
         assert!(matches!(
             source,
-            BuildDeclInput::Source( SourceInput {
+            BuildDep::Source( SourceInput {
                 from: SourceFetch::Web{url, sha256: sha, sha256_pos: _, url_pos: _},
                 extract: true,
                 strip_prefix: None,
@@ -1265,11 +1263,11 @@ mod tests {
             panic!("finish failed");
         });
 
-        let source = BuildDeclInput::from_term(&term, &mut program, &mut ()).unwrap();
+        let source = BuildDep::from_term(&term, &mut program, &mut ()).unwrap();
 
         assert!(matches!(
             source,
-            BuildDeclInput::Local{ full_path, .. } if full_path.ends_with("testdata/local_input.txt"),
+            BuildDep::Local{ full_path, .. } if full_path.ends_with("testdata/local_input.txt"),
         ));
     }
 
@@ -1295,11 +1293,11 @@ mod tests {
             panic!("finish failed");
         });
 
-        let source = BuildDeclInput::from_term(&term, &mut program, &mut ()).unwrap();
+        let source = BuildDep::from_term(&term, &mut program, &mut ()).unwrap();
 
         assert!(matches!(
             source,
-            BuildDeclInput::HostPath(p) if p.to_str().unwrap() == "/bin/bash",
+            BuildDep::HostPath(p) if p.to_str().unwrap() == "/bin/bash",
         ));
     }
 
@@ -1311,7 +1309,7 @@ mod tests {
                 let {Subset, BuildSpec, OutputData, ..} = import \"minimal.ncl\" in
                 {from = {
                     name = \"speccy\",
-                    inputs = [],
+                    build_deps = [],
                     cmd = \"\",
                     outputs = {
                         abc = {glob=\"\"} | OutputData,
@@ -1333,11 +1331,11 @@ mod tests {
             panic!("finish failed");
         });
 
-        let source = BuildDeclInput::from_term(&term, &mut program, &mut ()).unwrap();
+        let source = BuildDep::from_term(&term, &mut program, &mut ()).unwrap();
 
         assert!(matches!(
             source,
-            BuildDeclInput::Subset(SubsetInput { from: BuildRef::Local { name, .. }, outputs }) if name == "speccy" && outputs.to_vec() == vec!["abc", "uwu"],
+            BuildDep::Subset(SubsetInput { from: BuildRef::Local { name, .. }, outputs }) if name == "speccy" && outputs.to_vec() == vec!["abc", "uwu"],
         ));
     }
 
@@ -1349,7 +1347,7 @@ mod tests {
                 let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
                 {
         			name = \"single buildspec\",
-        			inputs = [],
+        			build_deps = [],
                     outputs = {
                         something = { glob = \"/usr/lib/something.*.so\" } | OutputLib,
                     },
@@ -1383,7 +1381,7 @@ mod tests {
                 prebuilt: false,
                 attrs: _,
                 build_args,
-                inputs: _,
+                build_deps: _,
                 runtime_deps: _,
                 abstract_deps: _,
                 outputs,
@@ -1406,7 +1404,7 @@ mod tests {
                 let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
                 {
         			name = \"simple\",
-        			inputs = [],
+        			build_deps = [],
         			cmd = [\"bash\", \"-c\", \"echo uwu\"],
         		} | BuildSpec"
             }
@@ -1439,7 +1437,7 @@ mod tests {
                 let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
                 {
         			name = \"simple\",
-        			inputs = [],
+        			build_deps = [],
         			cmds = [
                         [\"bash\", \"-c\", \"echo uwu\"],
                         \"/bin/pip3 wheel -w dist --no-build-isolation --no-deps --no-cache-dir ./\",
@@ -1478,7 +1476,7 @@ mod tests {
                 let {standaloneTest, BuildSpec, ..} = import \"minimal.ncl\" in
                 {
         			name = \"simple\",
-        			inputs = [],
+        			build_deps = [],
                     tests.uwu = standaloneTest \"/usr/bin/yes\",
         		} | BuildSpec"
             }
@@ -1515,7 +1513,7 @@ mod tests {
                 let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
                 {
         			name = \"buildspec\",
-                    inputs = [],
+                    build_deps = [],
         			cmd = \"./build.sh\",
                     target = \"arm64/macos\",
         		} | BuildSpec"
@@ -1607,7 +1605,7 @@ mod tests {
                 let {Attrs, BuildSpec, ..} = import \"minimal.ncl\" in
                 {
         			name = \"buildspec\",
-                    inputs = [],
+                    build_deps = [],
         			cmd = \"./build.sh\",
                     attrs = {
                       upstream_version = \"1.2.3\",
@@ -1646,7 +1644,7 @@ mod tests {
                 let {Needs, BuildSpec, ..} = import \"minimal.ncl\" in
                 {
         			name = \"buildspec\",
-                    inputs = [],
+                    build_deps = [],
         			cmd = \"./build.sh\",
                     needs = {
                       dns = {},
@@ -1685,7 +1683,7 @@ mod tests {
                 let {upstream, BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
                 {
         			name = \"single buildspec\",
-        			inputs = [upstream \"upstream-pkg\"],
+        			build_deps = [upstream \"upstream-pkg\"],
         			cmd = \"./build.sh\",
         		} | BuildSpec"
             }
@@ -1708,8 +1706,8 @@ mod tests {
         });
 
         assert_eq!(
-            build.inputs[0],
-            BuildDeclInput::Build(BuildRef::Upstream {
+            build.build_deps[0],
+            BuildDep::Build(BuildRef::Upstream {
                 name: "upstream-pkg".to_string()
             })
         );

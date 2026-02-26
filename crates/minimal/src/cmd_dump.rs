@@ -1,7 +1,7 @@
 use std::{fmt::Display, io::stdout};
 
 use decode::AttrValue;
-use graph::{BuildOutput, BuildSpec, BuildSpecInput, DepGraph, RuntimeDep, SourceInput};
+use graph::{BuildDep, BuildOutput, BuildSpec, DepGraph, RuntimeDep, SourceInput};
 use mctx::{Cache, Context, Error};
 use nickel_lang_core::term::IndexMap;
 use serde::Serialize;
@@ -53,7 +53,7 @@ pub struct PkgInfo {
     is_collection: bool,
     target: String,
 
-    inputs: Vec<PkgRef>,
+    build_deps: Vec<PkgRef>,
     runtime_deps: Vec<PkgRef>,
     outputs: IndexMap<String, BuildOutput>,
 
@@ -175,8 +175,8 @@ fn build_pkg_info(g: &DepGraph, b: &BuildSpec, c: &Cache) -> Result<PkgInfo, Err
         is_prebuilt: b.is_pure_prebuilt(),
         is_collection: b.is_pure_collection(),
         target: b.target.as_ref().to_string(),
-        inputs: b
-            .inputs
+        build_deps: b
+            .build_deps
             .iter()
             .map(|i| pkg_ref_from_input(g, i, c))
             .collect::<Result<_, _>>()?,
@@ -208,12 +208,12 @@ fn pkg_ref_from_runtime_dep(g: &DepGraph, i: &RuntimeDep, _c: &Cache) -> Result<
     }
 }
 
-fn pkg_ref_from_input(g: &DepGraph, i: &BuildSpecInput, _c: &Cache) -> Result<PkgRef, Error> {
+fn pkg_ref_from_input(g: &DepGraph, i: &BuildDep, _c: &Cache) -> Result<PkgRef, Error> {
     match i {
-        BuildSpecInput::Build(b) => Ok(PkgRef::Package {
+        BuildDep::Build(b) => Ok(PkgRef::Package {
             name: g.get(b).unwrap().name.clone(),
         }),
-        BuildSpecInput::Local {
+        BuildDep::Local {
             full_path: _,
             filename,
             file_hash,
@@ -221,11 +221,11 @@ fn pkg_ref_from_input(g: &DepGraph, i: &BuildSpecInput, _c: &Cache) -> Result<Pk
             filename: filename.clone(),
             hash: format!("{}", file_hash.to_hex()),
         }),
-        BuildSpecInput::Subset(s) => Ok(PkgRef::SubsetOf {
+        BuildDep::Subset(s) => Ok(PkgRef::SubsetOf {
             package: g.get(&s.from).unwrap().name.clone(),
             outputs: s.outputs.iter().cloned().collect(),
         }),
-        BuildSpecInput::Source(s) => Ok(PkgRef::Source(s.clone())),
+        BuildDep::Source(s) => Ok(PkgRef::Source(s.clone())),
         _ => todo!("bsi variant {:?}", i),
     }
 }

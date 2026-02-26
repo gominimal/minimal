@@ -1,4 +1,4 @@
-use crate::{BuildSpecInput, BuildSpecRef, DepGraph, RuntimeDep, SubsetInput};
+use crate::{BuildDep, BuildSpecRef, DepGraph, RuntimeDep, SubsetInput};
 use std::{
     collections::{HashMap, HashSet},
     ops::Deref,
@@ -78,21 +78,21 @@ impl Transitives {
     }
 
     /// Constructs the set of transitive dependencies for the given build.
-    pub fn new(g: &DepGraph, bsr: &BuildSpecRef, include_inputs: bool) -> Self {
-        Self::new_with_seenset(&mut HashSet::with_capacity(256), g, bsr, include_inputs)
+    pub fn new(g: &DepGraph, bsr: &BuildSpecRef, include_build_deps: bool) -> Self {
+        Self::new_with_seenset(&mut HashSet::with_capacity(256), g, bsr, include_build_deps)
     }
     fn new_with_seenset(
         seen: &mut HashSet<BuildSpecRef>,
         g: &DepGraph,
         bsr: &BuildSpecRef,
-        include_inputs: bool,
+        include_build_deps: bool,
     ) -> Self {
         let build = g.get(bsr).unwrap();
 
         let mut out = Transitives {
             build: *bsr,
             transitive_runtime_deps: HashMap::with_capacity(
-                2 * (build.inputs.len() + 2 * build.runtime_deps.len()),
+                2 * (build.build_deps.len() + 2 * build.runtime_deps.len()),
             ),
         };
 
@@ -116,9 +116,9 @@ impl Transitives {
                 }
             }
         }
-        if include_inputs {
-            for dep in build.inputs.iter() {
-                use BuildSpecInput::*;
+        if include_build_deps {
+            for dep in build.build_deps.iter() {
+                use BuildDep::*;
                 match dep {
                     Build(bsr) => {
                         Self::upsert(
@@ -154,12 +154,12 @@ impl Transitives {
         }
 
         // Collect all transitive runtime_deps by recursing into the [BuildManifest] of
-        // all inputs, as well as all runtime_deps.
-        use BuildSpecInput::*;
+        // all build_deps, as well as all runtime_deps.
+        use BuildDep::*;
         build
-            .inputs
+            .build_deps
             .iter()
-            .filter_map(|input| match (input, include_inputs) {
+            .filter_map(|input| match (input, include_build_deps) {
                 (Build(bsr), true) => Some((bsr, None)),
                 (Subset(SubsetInput { from: bsr, outputs }), true) => Some((bsr, Some(outputs))),
                 (Build(_) | Subset(_), false) => None,
@@ -207,7 +207,7 @@ impl Transitives {
     pub fn for_toplevels(
         graph: &DepGraph,
         top_levels: Vec<BuildSpecRef>,
-        include_inputs: bool,
+        include_build_deps: bool,
     ) -> HashMap<BuildSpecRef, Dep> {
         let mut seenset = HashSet::with_capacity(256);
         let mut out: HashMap<BuildSpecRef, Dep> = HashMap::with_capacity(512);
@@ -215,7 +215,7 @@ impl Transitives {
             .iter()
             .flat_map(|base| {
                 seenset.clear();
-                Transitives::new_with_seenset(&mut seenset, graph, base, include_inputs)
+                Transitives::new_with_seenset(&mut seenset, graph, base, include_build_deps)
                     .transitive_runtime_deps
                     .into_iter()
                     .map(|(dep_bsr, mut info)| {
@@ -258,7 +258,7 @@ mod tests {
 
                 let runtime_dep = {
                     name = \"runtime dep\",
-                    inputs = [
+                    build_deps = [
                         {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
                     ],
                     cmd = \"\",
@@ -267,10 +267,10 @@ mod tests {
 
                 {
                     name = \"top build\",
-                    inputs = [
+                    build_deps = [
                         {
                             name = \"input\",
-                            inputs = [],
+                            build_deps = [],
                             cmd = \"\",
                         } | BuildSpec,
                     ],
@@ -317,7 +317,7 @@ mod tests {
 
                 let runtime_dep = {
                     name = \"runtime dep\",
-                    inputs = [
+                    build_deps = [
                         {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
                     ],
                     cmd = \"\",
@@ -326,10 +326,10 @@ mod tests {
 
                 {
                     name = \"top build\",
-                    inputs = [
+                    build_deps = [
                         {
                             name = \"nested input\",
-                            inputs = [],
+                            build_deps = [],
                             runtime_deps = [runtime_dep],
                             cmd = \"\",
                         } | BuildSpec,
@@ -389,7 +389,7 @@ mod tests {
 
                 let nested_dep = {
                     name = \"nested dep\",
-                    inputs = [
+                    build_deps = [
                         {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
                     ],
                     cmd = \"\",
@@ -397,7 +397,7 @@ mod tests {
                 in
                 let top_dep = {
                     name = \"top dep\",
-                    inputs = [],
+                    build_deps = [],
                     runtime_deps = [nested_dep],
                     cmd = \"\",
                 } | BuildSpec
@@ -405,7 +405,7 @@ mod tests {
 
                 {
                     name = \"top build\",
-                    inputs = [],
+                    build_deps = [],
                     runtime_deps = [top_dep],
                     cmd = \"\",
                 } | BuildSpec"
@@ -463,7 +463,7 @@ mod tests {
 
                 let runtime_dep = {
                     name = \"runtime dep\",
-                    inputs = [
+                    build_deps = [
                         {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
                     ],
                     cmd = \"\",
@@ -475,7 +475,7 @@ mod tests {
                 in
                 let collection = {
                   name = \"collection\",
-                  inputs = [],
+                  build_deps = [],
                   cmd = \"\",
                   runtime_deps = [subsetOf runtime_dep [\"a\"]],
                 } | BuildSpec
@@ -483,10 +483,10 @@ mod tests {
 
                 {
                     name = \"top build\",
-                    inputs = [
+                    build_deps = [
                         {
                             name = \"input\",
-                            inputs = [],
+                            build_deps = [],
                             cmd = \"\",
                         } | BuildSpec,
                     ],
@@ -552,7 +552,7 @@ mod tests {
 
                 let runtime_dep = {
                     name = \"runtime dep\",
-                    inputs = [
+                    build_deps = [
                         {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
                     ],
                     cmd = \"\",
@@ -565,10 +565,10 @@ mod tests {
 
                 {
                     name = \"top build\",
-                    inputs = [
+                    build_deps = [
                         {
                             name = \"input\",
-                            inputs = [],
+                            build_deps = [],
                             cmd = \"\",
                         } | BuildSpec,
                         runtime_dep,
@@ -629,7 +629,7 @@ mod tests {
 
                 let nested = build {
                     name = \"nested\",
-                    inputs = [],
+                    build_deps = [],
                     needs = {
                         internet = {},
                     } | Needs,
@@ -640,12 +640,12 @@ mod tests {
                 [
                     build {
                         name = \"top build\",
-                        inputs = [nested],
+                        build_deps = [nested],
                         cmd = \"\",
                     },
                     build {
                         name = \"internet provider\",
-                        inputs = [],
+                        build_deps = [],
                         cmd = \"\",
                         attrs.needed_for_internet = {},
                     },
