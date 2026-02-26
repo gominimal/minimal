@@ -547,6 +547,7 @@ impl Context {
                 patches,
                 env_vars,
                 hostname: Some(name.to_string()),
+                override_disable_networking: Some(false),
             },
         )
         .await?;

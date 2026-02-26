@@ -191,6 +191,9 @@ pub struct EnvArgs<'a> {
     pub env_vars: Option<&'a HashMap<String, String>>,
     /// The hostname to set, if any.
     pub hostname: Option<String>,
+
+    /// If set, enables or disables networking.
+    pub override_disable_networking: Option<bool>,
 }
 
 /// A successfully-configured runtime environment.
@@ -242,7 +245,10 @@ impl<'a> Env<'a> {
             )
             .with_state_dir(&args.state_base_dir)
             .with_dns(needs_dns)
-            .with_disable_networking(!needs_dns && !needs_internet)
+            .with_disable_networking(
+                args.override_disable_networking
+                    .unwrap_or(!needs_dns && !needs_internet),
+            )
             .with_env_vars(pkg_env_vars.into_iter());
         if let Some(hn) = &args.hostname {
             config = config.with_hostname(hn);
