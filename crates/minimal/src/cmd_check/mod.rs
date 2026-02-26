@@ -422,7 +422,6 @@ impl CheckResult {
             err: vec![],
         }
     }
-
     fn harness_regexes_pass() -> Self {
         CheckResult {
             check: "project_matchers regexes",
@@ -430,7 +429,6 @@ impl CheckResult {
             err: vec![],
         }
     }
-
     fn harness_regexes_fail(msg: String) -> Self {
         CheckResult {
             check: "project_matchers regexes",
@@ -438,6 +436,7 @@ impl CheckResult {
             err: vec![msg],
         }
     }
+
     fn harness_predicates_skip() -> Self {
         CheckResult {
             check: "project_matchers predicates",
@@ -445,7 +444,6 @@ impl CheckResult {
             err: vec![],
         }
     }
-
     fn harness_predicates_pass() -> Self {
         CheckResult {
             check: "project_matchers predicates",
@@ -453,7 +451,6 @@ impl CheckResult {
             err: vec![],
         }
     }
-
     fn harness_predicates_fail(msg: String) -> Self {
         CheckResult {
             check: "project_matchers predicates",

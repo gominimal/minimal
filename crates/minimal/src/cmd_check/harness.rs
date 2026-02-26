@@ -77,6 +77,15 @@ pub(super) async fn check_harness(
         &mut program,
         cache.clone(),
     )?);
+    out.push(check_harness_packages_valid(
+        harness.clone(),
+        all_graph.clone(),
+        fix,
+        skip_checkers.clone(),
+        harnesses_dir.clone(),
+        &mut program,
+        cache.clone(),
+    )?);
     out.push(check_project_matcher_regexes(
         harness.clone(),
         all_graph.clone(),
@@ -156,6 +165,80 @@ fn check_harness_name(
     ))
 }
 
+fn check_harness_packages_valid(
+    _harness: String,
+    all_graph: Option<Arc<RwLock<DepGraph>>>,
+    _fix: bool,
+    skip_checkers: Vec<String>,
+    _harnesses_dir: PathBuf,
+    program: &mut Program<CacheImpl>,
+    _cache: Cache<LocalDir>,
+) -> Result<CheckResult, Error> {
+    let mut out = CheckResult {
+        check: "packages valid",
+        verdict: CheckVerdict::Skip,
+        err: vec![],
+    };
+    if skip_checkers.contains(&"packages valid".to_string()) {
+        return Ok(out);
+    }
+
+    let tree = match program.eval_full() {
+        Ok(t) => t,
+        Err(e) => {
+            return Err(Error::Graph(Box::new(graph::Error::Decode(
+                decode::Error::Nickel(Box::new((program.files(), e))),
+            ))));
+        }
+    };
+
+    out.verdict = CheckVerdict::Pass;
+    match Harness::from_term(&tree, program) {
+        Ok(h) => {
+            if let Some(g) = all_graph.as_ref()
+                && let Ok(g) = g.try_read()
+            {
+                for pkg in &h.build_packages {
+                    if g.by_name(pkg).is_none() {
+                        out.verdict = CheckVerdict::Fail;
+                        out.err
+                            .push(format!("build package \"{}\" does not exist", pkg));
+                    }
+                }
+                for pkg in &h.runtime_packages {
+                    if g.by_name(pkg).is_none() {
+                        out.verdict = CheckVerdict::Fail;
+                        out.err
+                            .push(format!("runtime package \"{}\" does not exist", pkg));
+                    }
+                }
+
+                for matcher in h.matches_project_if_any.iter().flatten() {
+                    for pkg in matcher
+                        .build_package_matchers
+                        .keys()
+                        .chain(matcher.runtime_package_matchers.keys())
+                    {
+                        if g.by_name(pkg).is_none() {
+                            out.verdict = CheckVerdict::Fail;
+                            out.err.push(format!(
+                                "predicate for package \"{}\" which does not exist",
+                                pkg
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            out.verdict = CheckVerdict::Fail;
+            out.err.push(format!("failed loading harness: {}", e));
+        }
+    };
+
+    Ok(out)
+}
+
 fn check_project_matcher_regexes(
     _harness: String,
     _all_graph: Option<Arc<RwLock<DepGraph>>>,
@@ -207,7 +290,7 @@ fn check_project_matcher_regexes(
 
 fn check_project_matcher_predicates(
     _harness: String,
-    all_graph: Option<Arc<RwLock<DepGraph>>>,
+    _all_graph: Option<Arc<RwLock<DepGraph>>>,
     _fix: bool,
     skip_checkers: Vec<String>,
     _harnesses_dir: PathBuf,
@@ -254,24 +337,6 @@ fn check_project_matcher_predicates(
                             "invalid jq filter \"{}\" to match file {}: {:?}",
                             predicate_str, fname, e.err
                         ));
-                    }
-                }
-
-                if let Some(g) = all_graph.as_ref() {
-                    for pkg in matcher
-                        .build_package_matchers
-                        .keys()
-                        .chain(matcher.runtime_package_matchers.keys())
-                    {
-                        if let Ok(g) = g.try_read()
-                            && g.by_name(pkg).is_none()
-                        {
-                            out.verdict = CheckVerdict::Fail;
-                            out.err.push(format!(
-                                "predicate for package \"{}\" which does not exist",
-                                pkg
-                            ));
-                        }
                     }
                 }
             }
