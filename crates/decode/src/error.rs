@@ -297,7 +297,7 @@ impl Error {
                 writeln!(writer, "needed: \"{}\"", need_version).unwrap();
                 writeln!(writer, "needed by: {}", needed_by).unwrap();
                 writeln!(writer).unwrap();
-                writeln!(writer, "help: try updating minimal").unwrap();
+                writeln!(writer, "help: try updating your Minimal installation").unwrap();
             }
         }
     }
