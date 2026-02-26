@@ -207,7 +207,7 @@ fn check_project_matcher_regexes(
 
 fn check_project_matcher_predicates(
     _harness: String,
-    _all_graph: Option<Arc<RwLock<DepGraph>>>,
+    all_graph: Option<Arc<RwLock<DepGraph>>>,
     _fix: bool,
     skip_checkers: Vec<String>,
     _harnesses_dir: PathBuf,
@@ -254,6 +254,24 @@ fn check_project_matcher_predicates(
                             "invalid jq filter \"{}\" to match file {}: {:?}",
                             predicate_str, fname, e.err
                         ));
+                    }
+                }
+
+                if let Some(g) = all_graph.as_ref() {
+                    for pkg in matcher
+                        .build_package_matchers
+                        .keys()
+                        .chain(matcher.runtime_package_matchers.keys())
+                    {
+                        if let Ok(g) = g.try_read()
+                            && g.by_name(pkg).is_none()
+                        {
+                            out.verdict = CheckVerdict::Fail;
+                            out.err.push(format!(
+                                "predicate for package \"{}\" which does not exist",
+                                pkg
+                            ));
+                        }
                     }
                 }
             }
