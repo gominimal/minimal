@@ -318,6 +318,24 @@ pub fn synth_dns_config(p: &Path) -> Result<(), io::Error> {
     std::fs::write(p.join("etc").join("resolv.conf"), format!("{}", conf))
 }
 
+pub fn synth_user_group_config(p: &Path, username: &str) -> Result<(), io::Error> {
+    std::fs::create_dir_all(p.join("etc"))?;
+    std::fs::write(
+        p.join("etc").join("passwd"),
+        format!(
+            "root:x:0:0:root:/root:/usr/bin/bash\n{}:x:1000:1000:User,,,:/home/{}:/bin/bash",
+            username, username
+        ),
+    )?;
+    std::fs::write(
+        p.join("etc").join("group"),
+        format!(
+            "root:x:0:\nusers:x:100:{}\nnogroup:x:65534:\n{}:x:1000:\n",
+            username, username
+        ),
+    )
+}
+
 pub fn random_alphanumeric(length: usize) -> String {
     use rand::Rng;
     let mut rng = rand::rng();

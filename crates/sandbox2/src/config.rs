@@ -88,6 +88,8 @@ pub struct Config {
 
     /// The hostname to set in the environment, if any.
     pub hostname: Option<String>,
+    /// The username to set in the environment, if any. Defaults to `build`.
+    pub username: Option<String>,
 
     /// Globally/initially-set environment variables.
     pub env_vars: HashMap<String, String>,
@@ -119,6 +121,7 @@ impl Config {
             disable_networking: false,
             env_vars: HashMap::with_capacity(12),
             hostname: None,
+            username: None,
             keep_dirs: false,
             rootfs: HashSet::with_capacity(64),
             state_dir: None,
@@ -198,6 +201,11 @@ impl Config {
     /// Sets whether DNS should be configured.
     pub fn with_dns(mut self, dns: bool) -> Self {
         self.setup_dns_config = dns;
+        self
+    }
+    /// Configures the username to use in the sandbox.
+    pub fn with_username<S: Into<String>>(mut self, username: S) -> Self {
+        self.username = Some(username.into());
         self
     }
 
@@ -341,8 +349,13 @@ impl Config {
             .map_err(|e| Error::IO("create synth config directory", sd.clone(), e))?;
         if self.setup_dns_config {
             common::synth_dns_config(&sd)
-                .map_err(|e| Error::IO("synthesizing DNS configuration", sd, e))?;
+                .map_err(|e| Error::IO("synthesizing DNS configuration", sd.clone(), e))?;
         }
+        match &self.username {
+            Some(n) => common::synth_user_group_config(&sd, n),
+            None => common::synth_user_group_config(&sd, "build"),
+        }
+        .map_err(|e| Error::IO("synthesizing user/group configuration", sd, e))?;
 
         Sandbox::new(build_base_dir, self, channel)
     }

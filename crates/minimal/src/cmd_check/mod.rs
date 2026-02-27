@@ -242,7 +242,7 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
         && ctx.use_remote_cache()
     {
         // Download any missing packages unless --no-fetch was set.
-        ctx.download_if_available(&g, g.top_levels.iter().cloned())
+        ctx.download_if_available(g, g.top_levels.iter().cloned())
             .await?;
     }
 

@@ -259,6 +259,9 @@ impl<'a> Env<'a> {
         if let Some(hn) = &args.hostname {
             config = config.with_hostname(hn);
         }
+        if let Ok(username) = std::env::var("USER") {
+            config = config.with_username(username);
+        }
 
         let mut sandbox = config
             .build(
