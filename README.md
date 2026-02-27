@@ -1,8 +1,8 @@
 ## Building `minimal`
 
-For now, the minimal tool only runs on amd64 Linux.
+The "minimal" CLI tool runs on amd64 and aarch64 Linux.
 
-8 cores and at least 16 Gb of ram recommended, but it should (slowly) run on a wet piece of spaghetti.
+8 cores and at least 16 Gb of RAM is recommended to build the entire package registry but it should (slowly) run on a wet piece of spaghetti.
 
 ### Dependencies
 1. Install a fairly recent version of rust: https://rust-lang.org/tools/install/
