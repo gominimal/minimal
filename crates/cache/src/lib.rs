@@ -26,6 +26,9 @@ pub use entry_meta::{EntryMeta, MetaInner};
 #[allow(dead_code)]
 mod remote_index;
 
+mod read_tracker;
+use read_tracker::ReadTracker;
+
 /// A directory tree in the cache you can read or write.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -145,45 +148,12 @@ impl FileSystem for PendingDir {
     }
 }
 
-/// A blob in the cache you can read or write.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct FileCacheEntry<FS: FileSystem> {
-    c: Cache<FS>,
-    hash: SpecHash,
-    file: FS::File,
-}
-
-impl<FS: FileSystem> std::io::Read for FileCacheEntry<FS> {
-    // Required method
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
-        self.file.read(buf)
-    }
-    // TODO: Implement passthroughs for the provided methods
-}
-
-impl<FS: FileSystem> std::io::Seek for FileCacheEntry<FS> {
-    fn seek(&mut self, pos: std::io::SeekFrom) -> Result<u64, std::io::Error> {
-        self.file.seek(pos)
-    }
-    // TODO: Implement passthroughs for the provided methods
-}
-
-impl<FS: FileSystem> std::io::Write for FileCacheEntry<FS> {
-    fn write(&mut self, buf: &[u8]) -> Result<usize, std::io::Error> {
-        self.file.write(buf)
-    }
-    fn flush(&mut self) -> Result<(), std::io::Error> {
-        self.file.flush()
-    }
-    // TODO: Implement passthroughs for the provided methods
-}
-
 /// The implementation of [Cache].
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct CacheInner<FS: FileSystem> {
     fs: FS,
+    read_tracker: Option<Arc<Mutex<ReadTracker>>>,
 }
 
 impl<FS: FileSystem> CacheInner<FS> {
@@ -206,6 +176,13 @@ impl<FS: FileSystem> CacheInner<FS> {
                 e.into()
             }
         })
+    }
+    fn record_access(&self, hash: &SpecHash) {
+        if let Some(t) = &self.read_tracker {
+            if let Err(e) = t.as_ref().lock().unwrap().record_read(hash) {
+                tracing::warn!("Error flushing read tracker: {}", e);
+            }
+        }
     }
 }
 
@@ -260,12 +237,10 @@ impl<FS: FileSystem> Clone for Cache<FS> {
 impl Cache<LocalDir> {
     /// Constructs a local cache that uses the given directory for storage.
     pub fn at_dir<P: AsRef<Path>>(p: P) -> Result<Self, std::io::Error> {
-        let inner = CacheInner {
-            fs: LocalDir::with_base(p)?,
-        };
+        let fs = LocalDir::with_base(p)?;
 
-        for dir in &["temp", "meta"] {
-            match inner.fs.mkdir(dir) {
+        for dir in &["temp", "meta", "alog"] {
+            match fs.mkdir(dir) {
                 Ok(()) => Ok(()),
                 Err(e) => {
                     if let std::io::ErrorKind::AlreadyExists = e.kind() {
@@ -276,6 +251,31 @@ impl Cache<LocalDir> {
                 }
             }?;
         }
+
+        // Create a ReadTracker. Pick the filename based on the PID so we
+        // get some randomness as to what file we start at.
+        //
+        // Read trackers aren't _essential_ to operation, so if after 32 rounds
+        // we still cant get a lock on a file, we just give up.
+        let read_tracker = {
+            let mut attempts = 0;
+            let mut n = std::process::id() % 32;
+            loop {
+                if attempts > 32 {
+                    break None;
+                } else if let Ok(tracker) =
+                    ReadTracker::at_path(&fs.path().join("alog").join(format!("{}.v1", n)))
+                {
+                    break Some(tracker);
+                } else {
+                    attempts += 1;
+                    n += 1;
+                }
+            }
+        }
+        .map(|t| Arc::new(Mutex::new(t)));
+
+        let inner = CacheInner { fs, read_tracker };
 
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -329,9 +329,11 @@ impl<FS: FileSystem> Cache<FS> {
 
     /// Reads a directory cached as the given spec hash.
     pub fn read_dir(&self, hash: &SpecHash) -> Result<DirCacheEntry<FS>, CacheErr> {
+        let i = self.inner();
+        i.record_access(hash);
         Ok(DirCacheEntry {
             c: self.clone(),
-            tree: self.inner().dir(hash)?,
+            tree: i.dir(hash)?,
             hash: hash.clone(),
         })
     }
