@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Install protoc
-        run: sudo apt-get install -y protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: actions/cache@v5
         with:
           path: |
@@ -51,7 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Install dependencies
-        run: sudo apt-get install -y musl-tools protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
       - name: Add Rust target
         run: rustup target add x86_64-unknown-linux-musl
       - name: Configure musl linker
