@@ -196,6 +196,11 @@ impl PackagesArg {
         if let Some(p) = &self.packages
             && !p.is_empty()
         {
+            if p[0].is_empty() {
+                let mut g = ctx.graph_from_all_packages()?;
+                g.top_levels.clear();
+                return Ok(g);
+            }
             return ctx.graph_from_package_names(p.clone());
         }
 
