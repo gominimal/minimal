@@ -1,18 +1,14 @@
-use crate::PackagesArg;
-use crate::cmd_check::outputs::{MissingRuntimeDeps, OutputTypesValid};
+#![allow(clippy::result_large_err)]
+
 use anyhow::anyhow;
 use cache::{Cache, CacheErr, LocalDir};
-use codespan_reporting::term::termcolor::{
-    Color, ColorChoice, ColorSpec, StandardStream, WriteColor,
-};
 use futures::stream::{FuturesUnordered, StreamExt};
 use graph::DepGraph;
-use mctx::{Context, Error};
+use mctx::Error;
 use op::{Options, Runnable, StandaloneTest};
 use regex::Regex;
 use std::cmp::Ordering;
 use std::future::Future;
-use std::io::Write;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -23,26 +19,200 @@ mod naming;
 mod outputs;
 mod profile;
 
-#[derive(clap::Args)]
-pub struct CheckArgs {
-    /// Attempt to fix any issues
-    #[arg(short, long, default_value_t = false)]
-    fix: bool,
+use outputs::{MissingRuntimeDeps, OutputTypesValid};
 
-    #[command(flatten)]
-    packages: PackagesArg,
+#[derive(Debug, Clone)]
+pub enum CheckVerdict {
+    Fail,
+    Fixed,
+    Skip,
+    Pass,
+}
 
-    /// Checker names to skip, comma-separated
-    #[arg(short, long, alias="skip", value_delimiter=',', num_args=0..)]
-    skip_checkers: Option<Vec<String>>,
+#[derive(Debug, Clone)]
+pub struct CheckResult {
+    pub check: &'static str,
+    pub verdict: CheckVerdict,
+    pub err: Vec<String>,
+}
+
+impl CheckResult {
+    pub(crate) fn parse_failure(msg: String) -> Self {
+        CheckResult {
+            check: "parse",
+            verdict: CheckVerdict::Fail,
+            err: vec![msg],
+        }
+    }
+
+    pub(crate) fn profile_name_skip() -> Self {
+        CheckResult {
+            check: "profile name matches dir",
+            verdict: CheckVerdict::Skip,
+            err: vec![],
+        }
+    }
+
+    pub(crate) fn profile_name_pass() -> Self {
+        CheckResult {
+            check: "profile name matches dir",
+            verdict: CheckVerdict::Pass,
+            err: vec![],
+        }
+    }
+
+    pub(crate) fn profile_name_fail(msg: String) -> Self {
+        CheckResult {
+            check: "profile name matches dir",
+            verdict: CheckVerdict::Fail,
+            err: vec![msg],
+        }
+    }
+
+    pub(crate) fn harness_name_skip() -> Self {
+        CheckResult {
+            check: "harness name matches dir",
+            verdict: CheckVerdict::Skip,
+            err: vec![],
+        }
+    }
+    pub(crate) fn harness_name_pass() -> Self {
+        CheckResult {
+            check: "harness name matches dir",
+            verdict: CheckVerdict::Pass,
+            err: vec![],
+        }
+    }
+    pub(crate) fn harness_name_fail(msg: String) -> Self {
+        CheckResult {
+            check: "harness name matches dir",
+            verdict: CheckVerdict::Fail,
+            err: vec![msg],
+        }
+    }
+
+    pub(crate) fn harness_regexes_skip() -> Self {
+        CheckResult {
+            check: "project_matchers regexes",
+            verdict: CheckVerdict::Skip,
+            err: vec![],
+        }
+    }
+    pub(crate) fn harness_regexes_pass() -> Self {
+        CheckResult {
+            check: "project_matchers regexes",
+            verdict: CheckVerdict::Pass,
+            err: vec![],
+        }
+    }
+    pub(crate) fn harness_regexes_fail(msg: String) -> Self {
+        CheckResult {
+            check: "project_matchers regexes",
+            verdict: CheckVerdict::Fail,
+            err: vec![msg],
+        }
+    }
+
+    pub(crate) fn harness_predicates_skip() -> Self {
+        CheckResult {
+            check: "project_matchers predicates",
+            verdict: CheckVerdict::Skip,
+            err: vec![],
+        }
+    }
+    pub(crate) fn harness_predicates_pass() -> Self {
+        CheckResult {
+            check: "project_matchers predicates",
+            verdict: CheckVerdict::Pass,
+            err: vec![],
+        }
+    }
+    pub(crate) fn harness_predicates_fail(msg: String) -> Self {
+        CheckResult {
+            check: "project_matchers predicates",
+            verdict: CheckVerdict::Fail,
+            err: vec![msg],
+        }
+    }
 }
 
 type CheckFuture =
     std::pin::Pin<Box<dyn Future<Output = (String, Result<Vec<CheckResult>, Error>)> + Send>>;
 
+/// Runs checks over packages (and optionally profiles/harnesses) and returns the results.
+///
+/// When `package_names` is empty, all packages, profiles, and harnesses are checked.
+/// When `package_names` is non-empty, only the named packages are checked (profiles
+/// and harnesses are skipped).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_checks(
+    packages_dir: PathBuf,
+    profiles_dir: PathBuf,
+    harnesses_dir: PathBuf,
+    stdlib_dir: PathBuf,
+    package_names: &[String],
+    graph: Option<DepGraph>,
+    cache: Cache<LocalDir>,
+    fix: bool,
+    skip_checkers: &[String],
+) -> Result<Vec<(String, Vec<CheckResult>)>, Error> {
+    let graph_hnd = graph.map(|g| Arc::new(RwLock::new(g)));
+    let skip_checkers_owned = Some(skip_checkers.to_vec());
+    let check_all = package_names.is_empty() || package_names[0].is_empty();
+
+    let results = package_check_futures(
+        packages_dir,
+        package_names.to_vec(),
+        graph_hnd.clone(),
+        skip_checkers_owned.clone(),
+        stdlib_dir.clone(),
+        cache.clone(),
+        fix,
+    )?;
+
+    let profile_results = if check_all {
+        profile_check_futures(
+            profiles_dir,
+            graph_hnd.clone(),
+            skip_checkers_owned.clone(),
+            stdlib_dir.clone(),
+            cache.clone(),
+            fix,
+        )?
+    } else {
+        vec![]
+    };
+
+    let harness_results = if check_all {
+        harness_check_futures(
+            harnesses_dir,
+            graph_hnd,
+            skip_checkers_owned,
+            stdlib_dir,
+            cache,
+            fix,
+        )?
+    } else {
+        vec![]
+    };
+
+    let mut futures_unordered = results
+        .into_iter()
+        .chain(profile_results)
+        .chain(harness_results)
+        .collect::<FuturesUnordered<_>>();
+
+    let mut all_results = Vec::new();
+    while let Some((heading, result)) = futures_unordered.next().await {
+        all_results.push((heading, result?));
+    }
+
+    Ok(all_results)
+}
+
 fn package_check_futures(
     packages_dir: PathBuf,
-    packages_arg: PackagesArg,
+    package_names: Vec<String>,
     graph_hnd: Option<Arc<RwLock<DepGraph>>>,
     skip_checkers: Option<Vec<String>>,
     stdlib_dir: PathBuf,
@@ -67,11 +237,10 @@ fn package_check_futures(
     .collect::<Result<Vec<_>, _>>()
     .map_err(|e| Error::IO("listing packages", packages_dir.clone(), e))?
     .into_iter()
-    // Filter based on the packages argument
+    // Filter based on the package names
     .filter_map(|pkg| {
-        let want_pkgs = packages_arg.names();
         let pkg = pkg.to_str().unwrap().to_string();
-        if want_pkgs.is_empty() || want_pkgs.contains(&pkg) {
+        if package_names.is_empty() || package_names.contains(&pkg) {
             Some(pkg)
         } else {
             None
@@ -104,27 +273,16 @@ fn package_check_futures(
 
 fn profile_check_futures(
     profiles_dir: PathBuf,
-    packages_arg: PackagesArg,
     graph_hnd: Option<Arc<RwLock<DepGraph>>>,
     skip_checkers: Option<Vec<String>>,
     stdlib_dir: PathBuf,
     cache: Cache<LocalDir>,
     fix: bool,
 ) -> Result<Vec<CheckFuture>, Error> {
-    // Only check profiles if the check is being run over the whole layer, or the empty string
-    // was given for selecting packages
-    let dirs = match (
-        packages_arg.packages.is_some() && !packages_arg.names().iter().all(|p| p.is_empty()),
-        std::fs::read_dir(&profiles_dir),
-    ) {
-        (true, _) => vec![],
-        (_, Err(e)) => {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(Error::IO("reading profile dirs", profiles_dir.clone(), e));
-            };
-            vec![]
-        }
-        (_, Ok(dirs)) => dirs
+    let dirs: Vec<std::ffi::OsString> = match std::fs::read_dir(&profiles_dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(Error::IO("reading profile dirs", profiles_dir.clone(), e)),
+        Ok(dirs) => dirs
             .filter_map(|e| match e {
                 Err(e) => Some(Err(e)),
                 Ok(e) => {
@@ -136,9 +294,7 @@ fn profile_check_futures(
                 }
             })
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| Error::IO("listing profiles", profiles_dir.clone(), e))?
-            .into_iter()
-            .collect(),
+            .map_err(|e| Error::IO("listing profiles", profiles_dir.clone(), e))?,
     };
 
     Ok(dirs
@@ -171,27 +327,16 @@ fn profile_check_futures(
 
 fn harness_check_futures(
     harnesses_dir: PathBuf,
-    packages_arg: PackagesArg,
     graph_hnd: Option<Arc<RwLock<DepGraph>>>,
     skip_checkers: Option<Vec<String>>,
     stdlib_dir: PathBuf,
     cache: Cache<LocalDir>,
     fix: bool,
 ) -> Result<Vec<CheckFuture>, Error> {
-    // Only check harnesses if the check is being run over the whole layer, or the empty string
-    // was given for selecting packages
-    let dirs = match (
-        packages_arg.packages.is_some() && !packages_arg.names().iter().all(|p| p.is_empty()),
-        std::fs::read_dir(&harnesses_dir),
-    ) {
-        (true, _) => vec![],
-        (_, Err(e)) => {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(Error::IO("reading harness dirs", harnesses_dir.clone(), e));
-            };
-            vec![]
-        }
-        (_, Ok(dirs)) => dirs
+    let dirs: Vec<std::ffi::OsString> = match std::fs::read_dir(&harnesses_dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(Error::IO("reading harness dirs", harnesses_dir.clone(), e)),
+        Ok(dirs) => dirs
             .filter_map(|e| match e {
                 Err(e) => Some(Err(e)),
                 Ok(e) => {
@@ -203,9 +348,7 @@ fn harness_check_futures(
                 }
             })
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| Error::IO("listing harnesses", harnesses_dir.clone(), e))?
-            .into_iter()
-            .collect(),
+            .map_err(|e| Error::IO("listing harnesses", harnesses_dir.clone(), e))?,
     };
 
     Ok(dirs
@@ -234,238 +377,6 @@ fn harness_check_futures(
             })
         })
         .collect())
-}
-
-pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> {
-    let all_graph = args.packages.resolve(ctx);
-    if let Ok(g) = all_graph.as_ref()
-        && ctx.use_remote_cache()
-    {
-        // Download any missing packages unless --no-fetch was set.
-        ctx.download_if_available(g, g.top_levels.iter().cloned())
-            .await?;
-    }
-
-    let upstream_dir = ctx.minimal_file().dir_path().unwrap().to_path_buf();
-
-    let packages_dir = upstream_dir.join("packages");
-    let stdlib_dir = ctx.stdlib_dir();
-
-    if args.fix && packages_dir.strip_prefix(ctx.vcs_dir()).is_ok() {
-        return Err(Error::Other(anyhow!(
-            "--fix can only be used on a local repository"
-        )));
-    }
-    let (graph_hnd, graph_err) = match all_graph {
-        Err(e) => (None, Some(e)),
-        Ok(g) => (Some(Arc::new(RwLock::new(g))), None),
-    };
-
-    let results = package_check_futures(
-        packages_dir.clone(),
-        args.packages.clone(),
-        graph_hnd.clone(),
-        args.skip_checkers.clone(),
-        stdlib_dir.clone(),
-        ctx.local_cache(),
-        args.fix,
-    )?;
-    let profile_results = profile_check_futures(
-        upstream_dir.join("profiles"),
-        args.packages.clone(),
-        graph_hnd.clone(),
-        args.skip_checkers.clone(),
-        stdlib_dir.clone(),
-        ctx.local_cache(),
-        args.fix,
-    )?;
-    let harnesses_results = harness_check_futures(
-        upstream_dir.join("harnesses"),
-        args.packages.clone(),
-        graph_hnd.clone(),
-        args.skip_checkers.clone(),
-        stdlib_dir.clone(),
-        ctx.local_cache(),
-        args.fix,
-    )?;
-
-    let mut had_error = false;
-    let mut stdout = StandardStream::stdout(ColorChoice::Auto);
-
-    // Collect futures into FuturesUnordered for concurrent execution with incremental results
-    let mut futures_unordered = results
-        .into_iter()
-        .chain(profile_results)
-        .chain(harnesses_results)
-        .collect::<FuturesUnordered<_>>();
-
-    while let Some((heading, result)) = futures_unordered.next().await {
-        stdout.reset().unwrap();
-        let result = result?;
-        stdout.set_color(ColorSpec::new().set_fg(None)).unwrap();
-
-        writeln!(&mut stdout, "\n{}", heading).unwrap();
-        for check in result {
-            write!(&mut stdout, "{}...", check.check).unwrap();
-            match check.verdict {
-                CheckVerdict::Fail => {
-                    had_error = true;
-                    stdout
-                        .set_color(ColorSpec::new().set_fg(Some(Color::Red)))
-                        .unwrap();
-                    writeln!(&mut stdout, "Fail").unwrap();
-                }
-                CheckVerdict::Fixed => {
-                    stdout
-                        .set_color(ColorSpec::new().set_fg(Some(Color::Blue)))
-                        .unwrap();
-                    writeln!(&mut stdout, "Fixed").unwrap();
-                }
-                CheckVerdict::Skip => {
-                    stdout
-                        .set_color(ColorSpec::new().set_fg(Some(Color::Yellow)))
-                        .unwrap();
-                    writeln!(&mut stdout, "Skip").unwrap();
-                }
-                CheckVerdict::Pass => {
-                    stdout
-                        .set_color(ColorSpec::new().set_fg(Some(Color::Green)))
-                        .unwrap();
-                    writeln!(&mut stdout, "Pass").unwrap();
-                }
-            }
-            stdout.set_color(ColorSpec::new().set_fg(None)).unwrap();
-
-            for err in check.err {
-                writeln!(&mut stdout, "\t{}", err).unwrap();
-            }
-        }
-    }
-
-    match had_error {
-        true => Err(Error::Other(anyhow!(
-            "One or more checkers reported a failure"
-        ))),
-        false => match graph_err {
-            None => Ok(()),
-            Some(e) => Err(e),
-        },
-    }
-}
-
-#[derive(Debug, Clone)]
-enum CheckVerdict {
-    Fail,
-    Fixed,
-    Skip,
-    Pass,
-}
-
-#[derive(Debug, Clone)]
-struct CheckResult {
-    check: &'static str,
-    verdict: CheckVerdict,
-    err: Vec<String>,
-}
-
-impl CheckResult {
-    fn parse_failure(msg: String) -> Self {
-        CheckResult {
-            check: "parse",
-            verdict: CheckVerdict::Fail,
-            err: vec![msg],
-        }
-    }
-
-    fn profile_name_skip() -> Self {
-        CheckResult {
-            check: "profile name matches dir",
-            verdict: CheckVerdict::Skip,
-            err: vec![],
-        }
-    }
-
-    fn profile_name_pass() -> Self {
-        CheckResult {
-            check: "profile name matches dir",
-            verdict: CheckVerdict::Pass,
-            err: vec![],
-        }
-    }
-
-    fn profile_name_fail(msg: String) -> Self {
-        CheckResult {
-            check: "profile name matches dir",
-            verdict: CheckVerdict::Fail,
-            err: vec![msg],
-        }
-    }
-
-    fn harness_name_skip() -> Self {
-        CheckResult {
-            check: "harness name matches dir",
-            verdict: CheckVerdict::Skip,
-            err: vec![],
-        }
-    }
-    fn harness_name_pass() -> Self {
-        CheckResult {
-            check: "harness name matches dir",
-            verdict: CheckVerdict::Pass,
-            err: vec![],
-        }
-    }
-    fn harness_name_fail(msg: String) -> Self {
-        CheckResult {
-            check: "harness name matches dir",
-            verdict: CheckVerdict::Fail,
-            err: vec![msg],
-        }
-    }
-
-    fn harness_regexes_skip() -> Self {
-        CheckResult {
-            check: "project_matchers regexes",
-            verdict: CheckVerdict::Skip,
-            err: vec![],
-        }
-    }
-    fn harness_regexes_pass() -> Self {
-        CheckResult {
-            check: "project_matchers regexes",
-            verdict: CheckVerdict::Pass,
-            err: vec![],
-        }
-    }
-    fn harness_regexes_fail(msg: String) -> Self {
-        CheckResult {
-            check: "project_matchers regexes",
-            verdict: CheckVerdict::Fail,
-            err: vec![msg],
-        }
-    }
-
-    fn harness_predicates_skip() -> Self {
-        CheckResult {
-            check: "project_matchers predicates",
-            verdict: CheckVerdict::Skip,
-            err: vec![],
-        }
-    }
-    fn harness_predicates_pass() -> Self {
-        CheckResult {
-            check: "project_matchers predicates",
-            verdict: CheckVerdict::Pass,
-            err: vec![],
-        }
-    }
-    fn harness_predicates_fail(msg: String) -> Self {
-        CheckResult {
-            check: "project_matchers predicates",
-            verdict: CheckVerdict::Fail,
-            err: vec![msg],
-        }
-    }
 }
 
 async fn check_package(
@@ -607,7 +518,7 @@ async fn check_package(
 
 /// A checker which checks a package by looking at its files. These checkers
 /// are run serially.
-trait FileBasedChecker: Send {
+pub(crate) trait FileBasedChecker: Send {
     fn check(
         &mut self,
         skip_checkers: &[String],
@@ -620,7 +531,7 @@ trait FileBasedChecker: Send {
 
 /// A checker which checks a package by looking at its representation in the graph.
 /// These checkers are run in parallel.
-trait GraphBasedChecker {
+pub(crate) trait GraphBasedChecker {
     async fn check(
         self,
         skip_checkers: &[String],
@@ -720,7 +631,7 @@ static MINIMAL_IMPORT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
         .expect("Invalid regex pattern")
 });
 
-struct ImportLineCheck;
+pub(crate) struct ImportLineCheck;
 
 impl FileBasedChecker for ImportLineCheck {
     fn check(
@@ -834,7 +745,7 @@ impl FileBasedChecker for ImportLineCheck {
     }
 }
 
-struct FmtCheck;
+pub(crate) struct FmtCheck;
 
 impl FileBasedChecker for FmtCheck {
     fn check(
@@ -1064,7 +975,7 @@ impl FileBasedChecker for AdjacentImportCheck {
     }
 }
 
-pub struct BuildScriptIsExecutable;
+struct BuildScriptIsExecutable;
 
 impl GraphBasedChecker for BuildScriptIsExecutable {
     async fn check(

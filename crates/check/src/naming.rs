@@ -1,12 +1,12 @@
-use super::{CheckResult, CheckVerdict};
-use crate::Error;
+use crate::{CheckResult, CheckVerdict};
 use cache::{Cache, LocalDir};
 use graph::{BuildOutput, DepGraph};
+use mctx::Error;
 use tokio::sync::RwLockReadGuard;
 
-pub struct SpecNameMatchesDir;
+pub(crate) struct SpecNameMatchesDir;
 
-impl super::GraphBasedChecker for SpecNameMatchesDir {
+impl crate::GraphBasedChecker for SpecNameMatchesDir {
     async fn check(
         self,
         skip_checkers: &[String],
@@ -41,9 +41,9 @@ impl super::GraphBasedChecker for SpecNameMatchesDir {
     }
 }
 
-pub struct SpecNameValid;
+pub(crate) struct SpecNameValid;
 
-impl super::GraphBasedChecker for SpecNameValid {
+impl crate::GraphBasedChecker for SpecNameValid {
     async fn check(
         self,
         skip_checkers: &[String],
@@ -79,9 +79,9 @@ impl super::GraphBasedChecker for SpecNameValid {
     }
 }
 
-pub struct CycleBreakerNaming;
+pub(crate) struct CycleBreakerNaming;
 
-impl super::GraphBasedChecker for CycleBreakerNaming {
+impl crate::GraphBasedChecker for CycleBreakerNaming {
     async fn check(
         self,
         skip_checkers: &[String],
@@ -126,9 +126,9 @@ impl super::GraphBasedChecker for CycleBreakerNaming {
     }
 }
 
-pub struct OutputNaming;
+pub(crate) struct OutputNaming;
 
-impl super::GraphBasedChecker for OutputNaming {
+impl crate::GraphBasedChecker for OutputNaming {
     async fn check(
         self,
         skip_checkers: &[String],

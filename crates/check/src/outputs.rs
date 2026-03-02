@@ -3,17 +3,17 @@ use std::{
     path::PathBuf,
 };
 
-use super::{CheckResult, CheckVerdict};
-use crate::Error;
+use crate::{CheckResult, CheckVerdict};
 use anyhow::anyhow;
 use cache::{CacheErr, DirCacheEntry, LocalDir};
 use graph::{BuildOutput, BuildSpecRef, DepGraph, Transitives};
+use mctx::Error;
 use object::{Object, ObjectSymbol};
 use tokio::sync::RwLockReadGuard;
 
-pub struct OutputTypesValid;
+pub(crate) struct OutputTypesValid;
 
-impl super::GraphBasedChecker for OutputTypesValid {
+impl crate::GraphBasedChecker for OutputTypesValid {
     async fn check(
         self,
         skip_checkers: &[String],
@@ -104,9 +104,9 @@ impl super::GraphBasedChecker for OutputTypesValid {
     }
 }
 
-pub struct MissingRuntimeDeps;
+pub(crate) struct MissingRuntimeDeps;
 
-impl super::GraphBasedChecker for MissingRuntimeDeps {
+impl crate::GraphBasedChecker for MissingRuntimeDeps {
     async fn check(
         self,
         skip_checkers: &[String],
@@ -303,8 +303,6 @@ impl super::GraphBasedChecker for MissingRuntimeDeps {
                     result.verdict = CheckVerdict::Fail;
                 }
             }
-
-            //println!("{}: {:?}", needed_lib, outputs);
         }
 
         Ok(result)

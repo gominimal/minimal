@@ -432,6 +432,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "check"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "cache",
+ "common",
+ "decode",
+ "futures",
+ "graph",
+ "mctx",
+ "nickel-lang-core",
+ "object",
+ "op",
+ "regex",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "checkouts"
 version = "0.0.1"
 dependencies = [
@@ -2515,6 +2534,7 @@ dependencies = [
  "build-events",
  "build-events-proto",
  "cache",
+ "check",
  "checkouts",
  "clap",
  "clap_complete",

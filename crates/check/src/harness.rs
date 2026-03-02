@@ -1,8 +1,8 @@
-use crate::Error;
-use crate::cmd_check::CheckVerdict;
+use crate::CheckVerdict;
 use cache::{Cache, LocalDir};
 use decode::Harness;
 use graph::DepGraph;
+use mctx::Error;
 use nickel_lang_core::eval::cache::CacheImpl;
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::program::Program;
@@ -11,9 +11,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use super::CheckResult;
+use crate::CheckResult;
 
-pub(super) async fn check_harness(
+pub(crate) async fn check_harness(
     harness: String,
     all_graph: Option<Arc<RwLock<DepGraph>>>,
     fix: bool,
@@ -104,15 +104,15 @@ pub(super) async fn check_harness(
         &mut program,
         cache.clone(),
     )?);
-    use super::FileBasedChecker;
-    out.push(super::ImportLineCheck.check(
+    use crate::FileBasedChecker;
+    out.push(crate::ImportLineCheck.check(
         &skip_checkers,
         fix,
         &harness,
         &harnesses_dir.join(&harness),
         &stdlib_dir,
     )?);
-    out.push(super::FmtCheck.check(
+    out.push(crate::FmtCheck.check(
         &skip_checkers,
         fix,
         &harness,

@@ -1,8 +1,8 @@
-use crate::Error;
-use crate::cmd_check::{CheckVerdict, FileBasedChecker};
+use crate::{CheckResult, CheckVerdict, FileBasedChecker};
 use cache::{Cache, LocalDir};
 use decode::Profile;
 use graph::DepGraph;
+use mctx::Error;
 use nickel_lang_core::error::report::report_as_str;
 use nickel_lang_core::eval::cache::CacheImpl;
 use nickel_lang_core::identifier::LocIdent;
@@ -12,9 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use super::CheckResult;
-
-pub(super) async fn check_profile(
+pub(crate) async fn check_profile(
     profile: String,
     all_graph: Option<Arc<RwLock<DepGraph>>>,
     fix: bool,
@@ -87,14 +85,14 @@ pub(super) async fn check_profile(
         &mut program,
         cache,
     )?);
-    out.push(super::ImportLineCheck.check(
+    out.push(crate::ImportLineCheck.check(
         &skip_checkers,
         fix,
         &profile,
         &profiles_dir.join(&profile),
         &stdlib_dir,
     )?);
-    out.push(super::FmtCheck.check(
+    out.push(crate::FmtCheck.check(
         &skip_checkers,
         fix,
         &profile,
