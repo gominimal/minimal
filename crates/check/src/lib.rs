@@ -8,6 +8,7 @@ use mctx::Error;
 use op::{Options, Runnable, StandaloneTest};
 use regex::Regex;
 use std::cmp::Ordering;
+use std::fmt::Display;
 use std::future::Future;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -136,45 +137,52 @@ impl CheckResult {
     }
 }
 
+/// The specific object check results are about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckObj {
+    Package(String),
+    Harness(String),
+    Profile(String),
+}
+
+impl Display for CheckObj {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckObj::Package(n) => write!(f, "package: {}", n),
+            CheckObj::Harness(n) => write!(f, "harness: {}", n),
+            CheckObj::Profile(n) => write!(f, "profile: {}", n),
+        }
+    }
+}
+
 /// A future that resolves to a heading (e.g. "package: foo") and check results.
 pub type CheckFuture =
-    std::pin::Pin<Box<dyn Future<Output = (String, Result<Vec<CheckResult>, Error>)> + Send>>;
+    std::pin::Pin<Box<dyn Future<Output = (CheckObj, Result<Vec<CheckResult>, Error>)> + Send>>;
 
-/// Runs checks over packages (and optionally profiles/harnesses), returning a
-/// [`FuturesUnordered`] that yields results as each check completes.
+/// Runs checkers, returning a [`FuturesUnordered`] that yields results as each check completes.
 ///
-/// When `package_names` is empty, all packages, profiles, and harnesses are checked.
-/// When `package_names` is non-empty, only the named packages are checked (profiles
-/// and harnesses are skipped).
+/// If `None` is given for a `packages_dir`, `profiles_dir`, or `harnesses_dir`, the corresponding
+/// class of checkers are skipped.
 #[allow(clippy::too_many_arguments)]
 pub fn run_checks(
-    packages_dir: PathBuf,
-    profiles_dir: PathBuf,
-    harnesses_dir: PathBuf,
+    packages_dir: Option<PathBuf>,
+    profiles_dir: Option<PathBuf>,
+    harnesses_dir: Option<PathBuf>,
     stdlib_dir: PathBuf,
-    package_names: &[String],
+    filter_names: &[String],
     graph: Option<DepGraph>,
     cache: Cache<LocalDir>,
     fix: bool,
     skip_checkers: &[String],
 ) -> Result<FuturesUnordered<CheckFuture>, Error> {
     let graph_hnd = graph.map(|g| Arc::new(RwLock::new(g)));
-    let skip_checkers_owned = Some(skip_checkers.to_vec());
-    let check_all = package_names.is_empty() || package_names[0].is_empty();
+    let skip_checkers_owned = skip_checkers.to_vec();
+    let filter_names_owned = filter_names.to_vec();
 
-    let results = package_check_futures(
-        packages_dir,
-        package_names.to_vec(),
-        graph_hnd.clone(),
-        skip_checkers_owned.clone(),
-        stdlib_dir.clone(),
-        cache.clone(),
-        fix,
-    )?;
-
-    let profile_results = if check_all {
-        profile_check_futures(
-            profiles_dir,
+    let results = if let Some(packages_dir) = packages_dir {
+        package_check_futures(
+            packages_dir,
+            filter_names_owned.clone(),
             graph_hnd.clone(),
             skip_checkers_owned.clone(),
             stdlib_dir.clone(),
@@ -185,9 +193,24 @@ pub fn run_checks(
         vec![]
     };
 
-    let harness_results = if check_all {
+    let profile_results = if let Some(profiles_dir) = profiles_dir {
+        profile_check_futures(
+            profiles_dir,
+            filter_names_owned.clone(),
+            graph_hnd.clone(),
+            skip_checkers_owned.clone(),
+            stdlib_dir.clone(),
+            cache.clone(),
+            fix,
+        )?
+    } else {
+        vec![]
+    };
+
+    let harness_results = if let Some(harnesses_dir) = harnesses_dir {
         harness_check_futures(
             harnesses_dir,
+            filter_names_owned,
             graph_hnd,
             skip_checkers_owned,
             stdlib_dir,
@@ -207,9 +230,9 @@ pub fn run_checks(
 
 fn package_check_futures(
     packages_dir: PathBuf,
-    package_names: Vec<String>,
+    filter_names: Vec<String>,
     graph_hnd: Option<Arc<RwLock<DepGraph>>>,
-    skip_checkers: Option<Vec<String>>,
+    skip_checkers: Vec<String>,
     stdlib_dir: PathBuf,
     cache: Cache<LocalDir>,
     fix: bool,
@@ -232,10 +255,10 @@ fn package_check_futures(
     .collect::<Result<Vec<_>, _>>()
     .map_err(|e| Error::IO("listing packages", packages_dir.clone(), e))?
     .into_iter()
-    // Filter based on the package names
+    // Filter based on any given filter names
     .filter_map(|pkg| {
         let pkg = pkg.to_str().unwrap().to_string();
-        if package_names.is_empty() || package_names.contains(&pkg) {
+        if filter_names.is_empty() || filter_names.contains(&pkg) {
             Some(pkg)
         } else {
             None
@@ -255,12 +278,12 @@ fn package_check_futures(
                     pkg.clone(),
                     graph_hnd,
                     fix,
-                    skip_checkers.unwrap_or_default(),
+                    skip_checkers,
                     packages_dir,
                     stdlib_dir,
                     cache,
                 );
-                (format!("package: {}", pkg), result.await)
+                (CheckObj::Package(pkg), result.await)
             })
         })
         .collect::<Vec<_>>())
@@ -268,8 +291,9 @@ fn package_check_futures(
 
 fn profile_check_futures(
     profiles_dir: PathBuf,
+    filter_names: Vec<String>,
     graph_hnd: Option<Arc<RwLock<DepGraph>>>,
-    skip_checkers: Option<Vec<String>>,
+    skip_checkers: Vec<String>,
     stdlib_dir: PathBuf,
     cache: Cache<LocalDir>,
     fix: bool,
@@ -289,7 +313,18 @@ fn profile_check_futures(
                 }
             })
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| Error::IO("listing profiles", profiles_dir.clone(), e))?,
+            .map_err(|e| Error::IO("listing profiles", profiles_dir.clone(), e))?
+            .into_iter()
+            // Filter based on any given filter names
+            .filter_map(|dir| {
+                let n = dir.as_os_str().to_str().unwrap().to_string();
+                if filter_names.is_empty() || filter_names.contains(&n) {
+                    Some(dir)
+                } else {
+                    None
+                }
+            })
+            .collect(),
     };
 
     Ok(dirs
@@ -303,12 +338,12 @@ fn profile_check_futures(
 
             Box::pin(async move {
                 (
-                    format!("profile: {}", pd.to_str().unwrap(),),
+                    CheckObj::Profile(pd.to_str().unwrap().to_string()),
                     profile::check_profile(
                         pd.to_str().unwrap().to_string(),
                         graph_hnd,
                         fix,
-                        skip_checkers.unwrap_or_default(),
+                        skip_checkers.clone(),
                         profiles_dir,
                         stdlib_dir,
                         cache,
@@ -322,8 +357,9 @@ fn profile_check_futures(
 
 fn harness_check_futures(
     harnesses_dir: PathBuf,
+    filter_names: Vec<String>,
     graph_hnd: Option<Arc<RwLock<DepGraph>>>,
-    skip_checkers: Option<Vec<String>>,
+    skip_checkers: Vec<String>,
     stdlib_dir: PathBuf,
     cache: Cache<LocalDir>,
     fix: bool,
@@ -343,7 +379,18 @@ fn harness_check_futures(
                 }
             })
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| Error::IO("listing harnesses", harnesses_dir.clone(), e))?,
+            .map_err(|e| Error::IO("listing harnesses", harnesses_dir.clone(), e))?
+            .into_iter()
+            // Filter based on any given filter names
+            .filter_map(|dir| {
+                let n = dir.as_os_str().to_str().unwrap().to_string();
+                if filter_names.is_empty() || filter_names.contains(&n) {
+                    Some(dir)
+                } else {
+                    None
+                }
+            })
+            .collect(),
     };
 
     Ok(dirs
@@ -357,12 +404,12 @@ fn harness_check_futures(
 
             Box::pin(async move {
                 (
-                    format!("harness: {}", pd.to_str().unwrap(),),
+                    CheckObj::Harness(pd.to_str().unwrap().to_string()),
                     harness::check_harness(
                         pd.to_str().unwrap().to_string(),
                         graph_hnd,
                         fix,
-                        skip_checkers.unwrap_or_default(),
+                        skip_checkers.clone(),
                         harnesses_dir,
                         stdlib_dir,
                         cache,
