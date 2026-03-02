@@ -6,12 +6,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::{AddDepMode, Context, Error};
+use futures::stream::StreamExt;
 use graph::{BuildSpecRef, DepGraph, SetupForPackages, Transitives, TransitivesDep};
 use mfile::EnvPatches;
 use sandbox2::{Container, config::SandboxMapped};
 use tempfile::TempDir;
-
-use crate::{AddDepMode, Context, Error};
 
 #[allow(dead_code)]
 struct EnvChannel<'a> {
@@ -120,6 +120,18 @@ impl sandbox2::Channel for EnvChannel<'_> {
     fn handle(&mut self, stream: &mut std::os::unix::net::UnixStream, line: &str, rootfs: &Path) {
         // handle, eg: echo 'add-ephemeral%mermaid-ascii' | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock
 
+        let report_err = |e: Error, stream: &mut std::os::unix::net::UnixStream| {
+            let mut buf =
+                codespan_reporting::term::termcolor::NoColor::new(Vec::with_capacity(512));
+            e.report_to(&mut buf);
+            for line in buf.into_inner().split(|c| *c == b'\n') {
+                stream.write_all(b"msg:").ok();
+                stream.write_all(line).ok();
+                stream.write_all(b"\n").ok();
+            }
+            writeln!(stream, "error: failed to initialize minimal in codebase").ok();
+        };
+
         let add_dep = match line.split_once("%") {
             Some(("add-session", pkgs)) => match self.parse_pkgs_line(pkgs) {
                 Err(n) => {
@@ -181,6 +193,68 @@ impl sandbox2::Channel for EnvChannel<'_> {
 
                         writeln!(stream, "msg: * {}", name).ok();
                     });
+                None
+            }
+            Some(("check", _args)) => {
+                let mut check_ctx = match self.ctx.cloned_reinit() {
+                    Err(e) => return report_err(e, stream),
+                    Ok(ctx) => ctx,
+                };
+                let graph = match check_ctx.graph_from_all_packages() {
+                    Err(e) => return report_err(e, stream),
+                    Ok(g) => g,
+                };
+                let mut checks_stream = match check::run_checks(
+                    Some(
+                        check_ctx
+                            .minimal_file()
+                            .dir_path()
+                            .unwrap()
+                            .join("packages"),
+                    ),
+                    Some(
+                        check_ctx
+                            .minimal_file()
+                            .dir_path()
+                            .unwrap()
+                            .join("profiles"),
+                    ),
+                    Some(
+                        check_ctx
+                            .minimal_file()
+                            .dir_path()
+                            .unwrap()
+                            .join("harnesses"),
+                    ),
+                    check_ctx.stdlib_dir().to_path_buf(),
+                    &[],
+                    Some(graph),
+                    check_ctx.local_cache(),
+                    false,
+                    &[],
+                ) {
+                    Err(e) => return report_err(e.into(), stream),
+                    Ok(res_stream) => res_stream,
+                };
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                if let Err(e) = rt.block_on(async {
+                    while let Some((heading, result)) = checks_stream.next().await {
+                        let checks = result?;
+                        writeln!(stream, "msg:").ok();
+                        writeln!(stream, "msg:{}", heading).ok();
+                        for check in checks {
+                            writeln!(stream, "msg:{}...{}", check.check, check.verdict).ok();
+                        }
+                    }
+                    Ok::<(), check::Error>(())
+                }) {
+                    writeln!(stream, "error: {}", e).ok();
+                    return;
+                };
+
                 None
             }
             _ => {
@@ -376,45 +450,10 @@ min() { eval "$(/usr/bin/min "$@")"; }
 const MIN_SCRIPT: &str = indoc::indoc! {
     r#"#!/usr/bin/bash
 
-    min_search() {
-        local term="$1"
-        if [[ -z "$term" || -z "$term" ]]; then
-            echo "Usage: min_search <search term>" >&2
-            return 1
-        fi
-
-        local error="false"
-        while IFS= read -r line; do
-            local tag="${line%%:*}"
-            local rest="${line#*:}"
-            case "$tag" in
-                msg)
-                    echo "$rest"
-                    ;;
-                done)
-                    break
-                    ;;
-                error)
-                    echo "error:$rest" >&2
-                    error="true"
-                    break
-                    ;;
-            esac
-        done < <(echo "search%${term}" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
-
-        if [[ "$error" == "true" ]]; then
-            return 1
-        fi
-    }
-
-
-    __min_add() {
-        local prefix="$1"
-        local pkgname="$2"
-        if [[ -z "$prefix" || -z "$pkgname" ]]; then
-            echo "Usage: min_add <prefix> <pkgname>" >&2
-            return 1
-        fi
+    __min_rpc() {
+        local method="$1"
+        shift
+        local data="$@"
 
         local error="false"
         local env_pairs=()
@@ -441,7 +480,7 @@ const MIN_SCRIPT: &str = indoc::indoc! {
                     break
                     ;;
             esac
-        done < <(echo "${prefix}%${pkgname}" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
+        done < <(echo "${method}%${data}" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
 
         if [[ ${#env_pairs[@]} -gt 0 ]]; then
             echo ""
@@ -452,6 +491,28 @@ const MIN_SCRIPT: &str = indoc::indoc! {
         if [[ "$error" == "true" ]]; then
             return 1
         fi
+    }
+
+    min_search() {
+        local term="$1"
+        if [[ -z "$term" || -z "$term" ]]; then
+            echo "Usage: min_search <search term>" >&2
+            return 1
+        fi
+
+        __min_rpc "search" "$term"
+    }
+
+    __min_add() {
+        local prefix="$1"
+        shift
+        local packages="$@"
+        if [[ -z "$prefix" || -z "$packages" ]]; then
+            echo "Usage: min_add [--session|--build|--runtime|--task <taskname>] <packages>" >&2
+            return 1
+        fi
+
+        __min_rpc "$prefix" "$packages"
     }
 
     min_add() {
@@ -485,7 +546,11 @@ const MIN_SCRIPT: &str = indoc::indoc! {
         __min_add "$prefix" "$@"
     }
 
-    # If invoked directly as a script (not sourced), handle `min add <pkg>`
+    min_check() {
+        __min_rpc "check" "$@"
+    }
+
+    # If invoked directly as a script (not sourced), handle invocation
     if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         subcmd="$1"
         shift
@@ -496,8 +561,15 @@ const MIN_SCRIPT: &str = indoc::indoc! {
             search)
                 min_search "$@"
                 ;;
+            check)
+                min_check "$@"
+                ;;
             *)
-                echo "Usage: min add --session|--build|--runtime|--task <packages>" >&2
+                echo "Usage: min <subcommand>" >&2
+                echo "" >&2
+                echo "Add packages: min add [--session|--build|--runtime|--task <taskname>] <packages>" >&2
+                echo "Search for packages: min search <query>" >&2
+                echo "Check minimal configuration: min check" >&2
                 exit 1
                 ;;
         esac

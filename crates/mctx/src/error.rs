@@ -18,24 +18,28 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn report_to_stderr(&self) {
+    /// Writes a human-friendly error to the given terminal or buffer.
+    pub fn report_to(&self, writer: &mut dyn codespan_reporting::term::termcolor::WriteColor) {
         match self {
             Error::Plan(b) => {
                 let (graph, err) = b.as_ref();
                 match err {
                     PlanErr::Cycles(cycles) => {
-                        eprintln!(
+                        writeln!(
+                            writer,
                             "Planning failed: unable to progress with unresolvable dependency cycles"
-                        );
-                        eprintln!("Cycles:");
+                        ).unwrap();
+                        writeln!(writer, "Cycles:").unwrap();
                         for c in cycles {
-                            eprintln!(
+                            writeln!(
+                                writer,
                                 "\t{}",
                                 c.iter()
                                     .map(|bsr| graph.get(bsr).unwrap().name.clone())
                                     .collect::<Vec<_>>()
                                     .join(" -> "),
                             )
+                            .unwrap()
                         }
                     }
                 }
@@ -51,20 +55,29 @@ impl Error {
                         .map(|d| absolute.starts_with(d))
                         .unwrap_or(false) =>
                     {
-                        eprintln!("Error: upstream defined but not pinned to a commit");
-                        eprintln!();
-                        eprintln!("> minimal.toml");
-                        eprintln!("[upstream]");
-                        eprintln!("repo = \"{}\"", upstream);
-                        eprintln!("locked_commit = <pinned commit hash>\t# missing field");
-                        eprintln!();
-                        eprintln!("help: try running `minimal update`")
+                        writeln!(writer, "Error: upstream defined but not pinned to a commit")
+                            .unwrap();
+                        writeln!(writer).unwrap();
+                        writeln!(writer, "> minimal.toml").unwrap();
+                        writeln!(writer, "[upstream]").unwrap();
+                        writeln!(writer, "repo = \"{}\"", upstream).unwrap();
+                        writeln!(
+                            writer,
+                            "locked_commit = <pinned commit hash>\t# missing field"
+                        )
+                        .unwrap();
+                        writeln!(writer).unwrap();
+                        writeln!(writer, "help: try running `minimal update`").unwrap();
                     }
-                    _ => e.report_to_stderr(),
+                    _ => e.report_to(writer),
                 }
             }
-            _ => eprintln!("{}", self),
+            _ => writeln!(writer, "{}", self).unwrap(),
         }
+    }
+    pub fn report_to_stderr(&self) {
+        use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
+        self.report_to(&mut StandardStream::stderr(ColorChoice::Auto).lock());
     }
 }
 
@@ -165,6 +178,16 @@ impl From<orchestrator::Error> for Error {
             orchestrator::Error::Cache(e) => Self::Other(anyhow::anyhow!(e)), // TODO: better error
             orchestrator::Error::Sandbox(e) => Self::Other(anyhow::anyhow!(e)), // TODO: better error
             orchestrator::Error::Plan(graph, e) => Self::Plan(Box::new((graph, e))),
+        }
+    }
+}
+
+impl From<check::Error> for Error {
+    fn from(value: check::Error) -> Self {
+        match value {
+            check::Error::IO(s, p, e) => Self::IO(s, p, e),
+            check::Error::Other(e) => Self::Other(e),
+            check::Error::Graph(e) => Self::Graph(e),
         }
     }
 }

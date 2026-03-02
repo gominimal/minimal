@@ -578,8 +578,8 @@ impl Context {
         out.as_bsrs(&graph)
     }
 
-    /// Downloads the specified packages if they are missing locally but present in the
-    /// remote cache.
+    /// Downloads the specified packages and their dependencies, if they are missing locally
+    /// but present in the remote cache.
     ///
     /// Use [Context::build_graph] instead if you want to also build packages that
     /// aren't available for download.

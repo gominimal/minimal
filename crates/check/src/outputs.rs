@@ -3,11 +3,11 @@ use std::{
     path::PathBuf,
 };
 
+use super::Error;
 use crate::{CheckResult, CheckVerdict};
 use anyhow::anyhow;
 use cache::{CacheErr, DirCacheEntry, LocalDir};
 use graph::{BuildOutput, BuildSpecRef, DepGraph, Transitives};
-use mctx::Error;
 use object::{Object, ObjectSymbol};
 use tokio::sync::RwLockReadGuard;
 

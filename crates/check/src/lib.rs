@@ -4,10 +4,10 @@ use anyhow::anyhow;
 use cache::{Cache, CacheErr, LocalDir};
 use futures::stream::FuturesUnordered;
 use graph::DepGraph;
-use mctx::Error;
 use op::{Options, Runnable, StandaloneTest};
 use regex::Regex;
 use std::cmp::Ordering;
+use std::fmt;
 use std::fmt::Display;
 use std::future::Future;
 use std::ops::Deref;
@@ -22,12 +22,53 @@ mod profile;
 
 use outputs::{MissingRuntimeDeps, OutputTypesValid};
 
+/// The errors possible when running checkers.
+#[derive(Debug)]
+pub enum Error {
+    IO(&'static str, PathBuf, std::io::Error),
+    Graph(Box<graph::Error>),
+    Other(anyhow::Error),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::IO(ctx, path, e) => {
+                write!(f, "{} I/O error at path {}: {}", ctx, path.display(), e)
+            }
+            Error::Graph(e) => write!(f, "graph: {:?}", e),
+            Error::Other(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::IO(_, _, e) => Some(e),
+            Error::Graph(_e) => None,
+            Error::Other(_e) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum CheckVerdict {
     Fail,
     Fixed,
     Skip,
     Pass,
+}
+
+impl Display for CheckVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckVerdict::Fail => write!(f, "Fail"),
+            CheckVerdict::Fixed => write!(f, "Fixed"),
+            CheckVerdict::Skip => write!(f, "Skip"),
+            CheckVerdict::Pass => write!(f, "Pass"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

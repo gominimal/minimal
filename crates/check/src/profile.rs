@@ -1,8 +1,8 @@
+use super::Error;
 use crate::{CheckResult, CheckVerdict, FileBasedChecker};
 use cache::{Cache, LocalDir};
 use decode::Profile;
 use graph::DepGraph;
-use mctx::Error;
 use nickel_lang_core::error::report::report_as_str;
 use nickel_lang_core::eval::cache::CacheImpl;
 use nickel_lang_core::identifier::LocIdent;
