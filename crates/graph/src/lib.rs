@@ -113,11 +113,14 @@ pub use builds::{
     BuildDep, BuildOutput, BuildSpec, RuntimeDep, SourceFetch, SourceInput, SpecTest, SubsetInput,
 };
 
-mod spec_hasher;
-pub use spec_hasher::SpecHasher;
+mod env_setup;
+pub use env_setup::SetupForPackages;
 
 mod graph;
-pub use graph::{Graph, SetupForPackages};
+pub use graph::Graph;
+
+mod spec_hasher;
+pub use spec_hasher::SpecHasher;
 
 mod planner;
 pub use planner::Dep as PlannerDep;

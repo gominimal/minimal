@@ -56,7 +56,8 @@ impl EnvChannel<'_> {
             pkgs.iter().map(|(_n, bsr)| *bsr).collect(),
             false,
         );
-        match self.graph.env_config_for_packages(
+        match SetupForPackages::build(
+            self.graph,
             transitives
                 .keys()
                 .filter(|bsr| !self.has_packages.contains(bsr)),
@@ -323,8 +324,7 @@ impl<'a> Env<'a> {
             needs_internet,
             state_dirs,
             env_vars: mut pkg_env_vars,
-        } = graph
-            .env_config_for_packages(args.transitives.keys())
+        } = SetupForPackages::build(graph, args.transitives.keys())
             .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))?;
 
         if let Some(p) = args.patches {

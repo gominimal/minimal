@@ -7,13 +7,13 @@ use common::repo_spec::Repo;
 use common::{SpecOrigin, Target};
 use decode::builds::BuildRef;
 use decode::{Harness, Layer, Profile, builds};
-use mfile::{self, EnvPatches, LinkConfig};
+use mfile::{self, LinkConfig};
 use nickel_lang_core::term::IndexMap;
 
 use generational_arena::Arena;
 use smallvec::SmallVec;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -236,22 +236,6 @@ impl SourceProvider for checkouts::Manager {
             }
         }
     }
-}
-
-/// Describes sandbox configuration that needs to be set to power present packages.
-#[derive(Debug, Clone)]
-pub struct SetupForPackages {
-    /// Environment variables that need to be set, typically for an env_state_wiring entry.
-    pub env_vars: HashMap<String, String>,
-    /// Directories that should be created in `/state`, typically from an env_state_wiring entry.
-    pub state_dirs: HashSet<String>,
-
-    /// Whether any package sets `needs.dns`.
-    pub needs_dns: bool,
-    /// Whether any package sets `needs.internet`.
-    pub needs_internet: bool,
-    /// The filesystem mappings accumulated from `env_file_mappings` and `env_dir_mappings` attrs.
-    pub fs_mappings: EnvPatches,
 }
 
 /// The in-memory representation of the software supply chain: all packages, profiles, and harnesses.
@@ -679,87 +663,6 @@ impl Graph {
     /// Returns an iterator over all harnesses configured in the graph.
     pub fn iter_harnesses(&self) -> impl Iterator<Item = (&String, &Harness)> {
         self.harnesses.iter()
-    }
-
-    /// Computes environment settings that need to be applied to an environment containing the
-    /// given packages.
-    ///
-    /// This returns settings derived from attributes.
-    pub fn env_config_for_packages<'a, I: IntoIterator<Item = &'a BuildSpecRef>>(
-        &'a self,
-        i: I,
-    ) -> Result<SetupForPackages, std::io::Error> {
-        let mut patch = EnvPatches::default();
-        let (mut needs_dns, mut needs_internet) = (false, false);
-        let mut env_vars: HashMap<String, String> = Default::default();
-        let mut state_dirs = HashSet::default();
-
-        use mfile::PatchSetting;
-        for dep in i.into_iter() {
-            let b = self.get(dep).unwrap();
-            if let Some(dirs) = b.attrs.get("env_dir_mappings") {
-                for mapping in dirs.as_list().unwrap() {
-                    let mapping = mapping.as_map().unwrap();
-                    patch.dir.insert(
-                        mapping.get("path").unwrap().as_string().unwrap().clone(),
-                        if *mapping.get("read_only").unwrap().as_bool().unwrap() {
-                            PatchSetting::ReadOnly
-                        } else {
-                            PatchSetting::ReadWrite
-                        },
-                    );
-                }
-            }
-            if let Some(dirs) = b.attrs.get("env_file_mappings") {
-                for mapping in dirs.as_list().unwrap() {
-                    let mapping = mapping.as_map().unwrap();
-                    patch.file.insert(
-                        mapping.get("path").unwrap().as_string().unwrap().clone(),
-                        if *mapping.get("read_only").unwrap().as_bool().unwrap() {
-                            PatchSetting::ReadOnly
-                        } else {
-                            PatchSetting::ReadWrite
-                        },
-                    );
-                }
-            }
-            if let Some(wiring) = b.attrs.get("env_state_wiring") {
-                let mut apply_wiring = |entry: &AttrValue| -> Result<(), std::io::Error> {
-                    let entry = entry.as_map().unwrap();
-                    let env_var = entry.get("env_var").unwrap().as_string().unwrap().clone();
-                    let prefix = entry.get("prefix").unwrap().as_string().unwrap().clone();
-
-                    state_dirs.insert(prefix.clone());
-
-                    env_vars.insert(
-                        env_var,
-                        PathBuf::from("/state")
-                            .join(prefix)
-                            .to_str()
-                            .unwrap()
-                            .to_string(),
-                    );
-                    Ok(())
-                };
-
-                match wiring {
-                    decode::AttrValue::List(l) => l.iter().try_for_each(apply_wiring)?,
-                    decode::AttrValue::Map(_) => apply_wiring(wiring)?,
-                    _ => todo!("error for unhandled env_state_wiring AttrValue variant"),
-                }
-            }
-
-            needs_dns |= b.abstract_deps.get("dns").is_some();
-            needs_internet |= b.abstract_deps.get("internet").is_some();
-        }
-
-        Ok(SetupForPackages {
-            env_vars,
-            fs_mappings: patch,
-            state_dirs,
-            needs_dns,
-            needs_internet,
-        })
     }
 
     /// Returns a list of [BuildSpecRef] objects who's names matched the given search term.
