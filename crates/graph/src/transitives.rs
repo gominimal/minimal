@@ -1,4 +1,4 @@
-use crate::{BuildDep, BuildSpecRef, DepGraph, RuntimeDep, SubsetInput};
+use crate::{BuildDep, BuildSpecRef, Graph, RuntimeDep, SubsetInput};
 use std::{
     collections::{HashMap, HashSet},
     ops::Deref,
@@ -78,12 +78,12 @@ impl Transitives {
     }
 
     /// Constructs the set of transitive dependencies for the given build.
-    pub fn new(g: &DepGraph, bsr: &BuildSpecRef, include_build_deps: bool) -> Self {
+    pub fn new(g: &Graph, bsr: &BuildSpecRef, include_build_deps: bool) -> Self {
         Self::new_with_seenset(&mut HashSet::with_capacity(256), g, bsr, include_build_deps)
     }
     fn new_with_seenset(
         seen: &mut HashSet<BuildSpecRef>,
-        g: &DepGraph,
+        g: &Graph,
         bsr: &BuildSpecRef,
         include_build_deps: bool,
     ) -> Self {
@@ -169,43 +169,45 @@ impl Transitives {
                 RuntimeDep::Build(bsr) => (bsr, None),
                 RuntimeDep::Subset(SubsetInput { from: bsr, outputs }) => (bsr, Some(outputs)),
             }))
-            .for_each(|(bsr, outputs)| {
-                if !seen.contains(bsr) {
-                    seen.insert(*bsr);
-                    for (dep_bsr, info) in Transitives::new_with_seenset(seen, g, bsr, false)
-                        .transitive_runtime_deps
-                        .into_iter()
-                        .map(|(dep_bsr, mut info)| {
-                            (dep_bsr, {
-                                info.needed_by.clear();
-                                info.needed_by.push(Attribution::Inherited { from: *bsr });
-                                info
+            .for_each(
+                |(bsr, outputs): (&BuildSpecRef, Option<&smallvec::SmallVec<[String; 4]>>)| {
+                    if !seen.contains(bsr) {
+                        seen.insert(*bsr);
+                        for (dep_bsr, info) in Transitives::new_with_seenset(seen, g, bsr, false)
+                            .transitive_runtime_deps
+                            .into_iter()
+                            .map(|(dep_bsr, mut info)| {
+                                (dep_bsr, {
+                                    info.needed_by.clear();
+                                    info.needed_by.push(Attribution::Inherited { from: *bsr });
+                                    info
+                                })
                             })
-                        })
-                    {
+                        {
+                            Self::upsert(
+                                &mut out.transitive_runtime_deps,
+                                &dep_bsr,
+                                info.needed_by.into_iter(),
+                                info.outputs,
+                            );
+                        }
+                    } else {
                         Self::upsert(
                             &mut out.transitive_runtime_deps,
-                            &dep_bsr,
-                            info.needed_by.into_iter(),
-                            info.outputs,
+                            bsr,
+                            [Attribution::Ours].into_iter(),
+                            outputs.map(|v| v.deref()),
                         );
                     }
-                } else {
-                    Self::upsert(
-                        &mut out.transitive_runtime_deps,
-                        bsr,
-                        [Attribution::Ours].into_iter(),
-                        outputs.map(|v| v.deref()),
-                    );
-                }
-            });
+                },
+            );
 
         out
     }
 
     /// Returns the transitive dependencies required to materialize the given toplevels.
     pub fn for_toplevels(
-        graph: &DepGraph,
+        graph: &Graph,
         top_levels: Vec<BuildSpecRef>,
         include_build_deps: bool,
     ) -> HashMap<BuildSpecRef, Dep> {
@@ -285,7 +287,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dg = DepGraph::new().ingest(layer).unwrap();
+        let dg = Graph::new().ingest(layer).unwrap();
 
         let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], false);
         assert_eq!(
@@ -344,7 +346,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dg = DepGraph::new().ingest(layer).unwrap();
+        let dg = Graph::new().ingest(layer).unwrap();
 
         let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], true);
         assert_eq!(
@@ -417,7 +419,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dg = DepGraph::new().ingest(layer).unwrap();
+        let dg = Graph::new().ingest(layer).unwrap();
 
         let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], true);
         assert_eq!(
@@ -504,7 +506,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dg = DepGraph::new().ingest(layer).unwrap();
+        let dg = Graph::new().ingest(layer).unwrap();
 
         let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], false);
         assert_eq!(
@@ -586,7 +588,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dg = DepGraph::new().ingest(layer).unwrap();
+        let dg = Graph::new().ingest(layer).unwrap();
 
         let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], true);
         assert_eq!(
@@ -659,7 +661,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dg = DepGraph::new().ingest(layer).unwrap();
+        let dg = Graph::new().ingest(layer).unwrap();
 
         let toplevel_manifest = Transitives::new(&dg, &dg.top_levels[0], true);
         assert_eq!(

@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{Error, Options, Runnable};
-use graph::{BuildDep, BuildSpec, BuildSpecRef, SourceInput, dep_graph::SourceFetch};
+use graph::{BuildDep, BuildSpec, BuildSpecRef, SourceFetch, SourceInput};
 use res_proto::{
     BuildStatus, CommandParameters, CreateBuildRequest, DownloadRequest, InjectedFiles, Invocation,
     OutputArtifact, PollBuildRequest, TarballCompression, TarballFormat, UploadMessage,

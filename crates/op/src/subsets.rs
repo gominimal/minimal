@@ -65,7 +65,7 @@ mod tests {
     use super::*;
     use cache::{Cache, EntryMeta, MetaInner};
     use decode::Layer;
-    use graph::DepGraph;
+    use graph::Graph;
     use indoc::indoc;
     use smallvec::smallvec;
     use tempfile::TempDir;
@@ -76,7 +76,7 @@ mod tests {
         let cache = Cache::at_dir(tmp_dir.path()).unwrap();
 
         // Make a fake upstream build.
-        let dg = DepGraph::new()
+        let dg = Graph::new()
             .ingest(
                 Layer::new_for_test(
                     indoc! {

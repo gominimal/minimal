@@ -3,7 +3,7 @@
 use anyhow::anyhow;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
-use graph::DepGraph;
+use graph::Graph;
 use mctx::{ConfigBuilder, Context, Error};
 use std::io;
 use std::path::PathBuf;
@@ -192,7 +192,7 @@ impl PackagesArg {
     /// Returns a graph where the top-level is the packages the arguments represent.
     ///  - Non empty: resolve to packages of the specified names.
     ///  - Empty: resolve to all packages in the repo (i.e. not from upstream).
-    pub fn resolve(&self, ctx: &mut Context) -> Result<DepGraph, Error> {
+    pub fn resolve(&self, ctx: &mut Context) -> Result<Graph, Error> {
         if let Some(p) = &self.packages
             && !p.is_empty()
         {

@@ -4,7 +4,7 @@ use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use common::SpecHash;
 use generational_arena::{Arena, Index};
-use graph::{BinProvider, BuildSpecRef, DepGraph, ExecPlan, SubsetInput, Transitives};
+use graph::{BinProvider, BuildSpecRef, ExecPlan, Graph, SubsetInput, Transitives};
 use tokio::{
     sync::{MappedMutexGuard, Mutex, MutexGuard},
     task::AbortHandle,
@@ -65,13 +65,13 @@ impl DeliverableInner {
     }
 
     /// Pretty-prints the structure.
-    pub fn display<'a>(&'a self, g: &'a DepGraph) -> DeliverableInnerDisplay<'a> {
+    pub fn display<'a>(&'a self, g: &'a Graph) -> DeliverableInnerDisplay<'a> {
         DeliverableInnerDisplay(self, g)
     }
 }
 
 /// A wrapper which implements pretty-printing for errors and debugging.
-pub struct DeliverableInnerDisplay<'a>(&'a DeliverableInner, &'a DepGraph);
+pub struct DeliverableInnerDisplay<'a>(&'a DeliverableInner, &'a Graph);
 
 impl<'a> Display for DeliverableInnerDisplay<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -321,7 +321,7 @@ impl<B: super::Backend> Display for State<B> {
 
 impl<B: super::Backend> State<B> {
     pub fn from_plan<'a, BP: BinProvider>(
-        graph: &'a DepGraph,
+        graph: &'a Graph,
         p: ExecPlan<'a, BP>,
     ) -> Result<Self, Error> {
         let plan: Vec<_> = p
@@ -341,7 +341,7 @@ impl<B: super::Backend> State<B> {
                         .with_deps
                         .into_iter()
                         .map(|d| {
-                            use graph::planner::Dep;
+                            use graph::PlannerDep as Dep;
                             match d {
                                 Dep::Cached {
                                     bsr,
@@ -580,7 +580,7 @@ mod tests {
         });
         let layer = layer.unwrap();
 
-        let dp = DepGraph::new().ingest(layer).unwrap();
+        let dp = Graph::new().ingest(layer).unwrap();
         let planner: ExecPlan<()> = ExecPlan::new(&dp);
         let state = State::<()>::from_plan(&dp, planner).unwrap();
 
@@ -702,7 +702,7 @@ mod tests {
         });
         let layer = layer.unwrap();
 
-        let dp = DepGraph::new().ingest(layer).unwrap();
+        let dp = Graph::new().ingest(layer).unwrap();
         let planner: ExecPlan<()> = ExecPlan::new(&dp);
         let mut state = State::<()>::from_plan(&dp, planner).unwrap();
 

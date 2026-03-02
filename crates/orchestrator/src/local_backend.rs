@@ -10,7 +10,7 @@ use cache::{
 use common::SpecHash;
 use either::Either;
 use google_cloud_storage::client::Storage as GcsStorage;
-use graph::{BinProvider, BuildSpecRef, DepGraph, SubsetInput};
+use graph::{BinProvider, BuildSpecRef, Graph, SubsetInput};
 use op::{Runnable, SourceFetcher};
 use tokio::sync::Semaphore;
 use tokio::task::spawn_blocking;
@@ -225,7 +225,7 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
         remote_cache: Option<RemoteCache<GcsStorage>>,
         sf: SF,
         num_concurrent_builds: usize,
-        graph: DepGraph,
+        graph: Graph,
         cache: Cache<LocalDir>,
     ) -> Result<Orchestrator<Self>, Error> {
         Ok(Orchestrator {

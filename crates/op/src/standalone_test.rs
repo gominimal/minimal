@@ -2,7 +2,7 @@ use std::{collections::HashSet, path::PathBuf};
 
 use anyhow::anyhow;
 use cache::{CacheErr, MetaInner};
-use graph::{BuildSpec, BuildSpecRef, SubsetInput, Transitives, dep_graph::SpecTest};
+use graph::{BuildSpec, BuildSpecRef, SpecTest, SubsetInput, Transitives};
 
 use crate::{Error, Options, Runnable, SubsetBuild};
 

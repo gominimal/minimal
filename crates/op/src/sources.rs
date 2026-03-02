@@ -64,7 +64,7 @@ impl<'a, SF: SourceFetcher> Runnable for SourceLoad<'a, SF> {
         );
         let _enter = span.enter();
 
-        use graph::dep_graph::SourceFetch;
+        use graph::SourceFetch;
         let (cached_path, filename) = match &self.source.from {
             SourceFetch::Local {
                 full_path,

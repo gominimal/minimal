@@ -3,7 +3,7 @@
 use std::fmt;
 
 use cache::CacheErr;
-use graph::{DepGraph, PlanErr};
+use graph::{Graph, PlanErr};
 
 /// Error type for the orchestrator crate.
 #[derive(Debug)]
@@ -14,7 +14,7 @@ pub enum Error {
     /// An error interacting with the Cache occurred.
     Cache(CacheErr),
     /// An error during planning occurred.
-    Plan(DepGraph, PlanErr),
+    Plan(Graph, PlanErr),
     /// An error occurred during the setup or execution of a sandbox.
     Sandbox(sandbox2::Error),
     /// Other errors.

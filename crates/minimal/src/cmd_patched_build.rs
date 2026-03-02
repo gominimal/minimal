@@ -1,7 +1,7 @@
 use crate::{Context, Error};
 use anyhow::anyhow;
 use cache::{Cache, EntryMeta, LocalDir, MetaInner};
-use graph::{BuildSpecRef, DepGraph, Transitives};
+use graph::{BuildSpecRef, Graph, Transitives};
 use op::{Runnable, SpecBuild};
 use std::{collections::HashSet, path::PathBuf};
 
@@ -85,7 +85,7 @@ pub async fn cmd_patched_build(args: PatchedBuildArgs, ctx: &mut Context) -> Res
 pub async fn remote_patched_build(
     addr: String,
     spec: &BuildSpecRef,
-    graph: &DepGraph,
+    graph: &Graph,
     cache: Cache<LocalDir>,
     deps: Vec<(BuildSpecRef, Option<HashSet<String>>, PathBuf)>,
 ) -> Result<(), Error> {

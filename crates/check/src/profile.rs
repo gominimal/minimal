@@ -2,7 +2,7 @@ use super::Error;
 use crate::{CheckResult, CheckVerdict, FileBasedChecker};
 use cache::{Cache, LocalDir};
 use decode::Profile;
-use graph::DepGraph;
+use graph::Graph;
 use nickel_lang_core::error::report::report_as_str;
 use nickel_lang_core::eval::cache::CacheImpl;
 use nickel_lang_core::identifier::LocIdent;
@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 
 pub(crate) async fn check_profile(
     profile: String,
-    all_graph: Option<Arc<RwLock<DepGraph>>>,
+    all_graph: Option<Arc<RwLock<Graph>>>,
     fix: bool,
     skip_checkers: Vec<String>,
     profiles_dir: PathBuf,
@@ -104,7 +104,7 @@ pub(crate) async fn check_profile(
 
 fn check_profile_parses(
     _profile: String,
-    _all_graph: Option<Arc<RwLock<DepGraph>>>,
+    _all_graph: Option<Arc<RwLock<Graph>>>,
     _fix: bool,
     skip_checkers: Vec<String>,
     _profiles_dir: PathBuf,
@@ -157,7 +157,7 @@ fn check_profile_parses(
 
 fn check_profile_name(
     profile: String,
-    _all_graph: Option<Arc<RwLock<DepGraph>>>,
+    _all_graph: Option<Arc<RwLock<Graph>>>,
     _fix: bool,
     skip_checkers: Vec<String>,
     _profiles_dir: PathBuf,

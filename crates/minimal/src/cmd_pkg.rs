@@ -1,5 +1,5 @@
 use crate::PackagesArg;
-use graph::DepGraph;
+use graph::Graph;
 use mctx::{Cache, Context, Error};
 use tracing::{info, trace};
 
@@ -20,7 +20,7 @@ pub async fn cmd_pkg(args: PkgArgs, ctx: &mut Context) -> Result<(), Error> {
 }
 
 pub async fn pkg_build_impl(
-    graph: &DepGraph,
+    graph: &Graph,
     ctx: &mut Context,
     cache: Cache,
     quiet: bool,
@@ -38,7 +38,7 @@ pub async fn pkg_build_impl(
 }
 
 /// Display a summary of what was built and where outputs can be found
-fn display_build_summary(graph: &DepGraph, cache: &Cache, _ctx: &mut Context) {
+fn display_build_summary(graph: &Graph, cache: &Cache, _ctx: &mut Context) {
     info!("Build completed successfully!");
 
     // Show target packages and their cache locations

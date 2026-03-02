@@ -1,4 +1,4 @@
-use crate::{BuildDep, BuildSpecRef, DepGraph, SubsetInput, Transitives, transitives};
+use crate::{BuildDep, BuildSpecRef, Graph, SubsetInput, Transitives, transitives};
 use nickel_lang_core::term::IndexMap;
 use std::{
     collections::{HashMap, HashSet},
@@ -210,7 +210,7 @@ impl<BP1: BinProvider, BP2: BinProvider, BP3: BinProvider> BinProvider for (BP1,
 /// When multiple build specs are yielded in one iteration, these builds may be executed in parallel.
 #[derive(Debug)]
 pub struct ExecPlan<'a, BP: BinProvider> {
-    graph: &'a DepGraph,
+    graph: &'a Graph,
     bin_provider: BP,
 
     // the apex of the build graph - the set of build-specs we want compiled.
@@ -226,7 +226,7 @@ pub struct ExecPlan<'a, BP: BinProvider> {
 /// dependencies.
 fn make_reachable<BP: BinProvider>(
     bsr: &BuildSpecRef,
-    graph: &DepGraph,
+    graph: &Graph,
     bin_provider: &mut BP,
     builds: &mut IndexMap<BuildSpecRef, BuildInfo>,
     path: &mut Vec<BuildSpecRef>,
@@ -317,7 +317,7 @@ fn make_reachable<BP: BinProvider>(
 impl<'a> ExecPlan<'a, ()> {
     /// Initializes a new execution plan to materialize the top levels of the given dependency graph.
     #[tracing::instrument]
-    pub fn new(dep_graph: &'a DepGraph) -> Self {
+    pub fn new(dep_graph: &'a Graph) -> Self {
         ExecPlan::with_toplevels((), dep_graph, &dep_graph.top_levels)
     }
 }
@@ -326,14 +326,14 @@ impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
     /// Initializes a new execution plan to materialize the top levels of the given dependency graph,
     /// leveraging the provided bin provider to know which dependencies are already available.
     #[tracing::instrument]
-    pub fn new_with_bin_provider(dep_graph: &'a DepGraph, bin_provider: BP) -> ExecPlan<'a, BP> {
+    pub fn new_with_bin_provider(dep_graph: &'a Graph, bin_provider: BP) -> ExecPlan<'a, BP> {
         ExecPlan::with_toplevels(bin_provider, dep_graph, &dep_graph.top_levels)
     }
 
     /// Initializes a new execution plan to materialize the specified deps within the given dependency graph.
     pub fn with_toplevels(
         mut bin_provider: BP,
-        graph: &'a DepGraph,
+        graph: &'a Graph,
         toplevels: &[BuildSpecRef],
     ) -> ExecPlan<'a, BP> {
         let mut toplevels = toplevels.to_owned();
@@ -443,7 +443,7 @@ impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
         // dep isn't satisfied.
         fn check_runtime_deps_recursive(
             bsr: &BuildSpecRef,
-            graph: &DepGraph,
+            graph: &Graph,
             builds: &IndexMap<BuildSpecRef, BuildInfo>,
             seen: &mut HashMap<BuildSpecRef, ()>,
         ) -> bool {
@@ -498,7 +498,7 @@ impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
     }
 
     fn dfs_iter(
-        g: &DepGraph,
+        g: &Graph,
         cursor: &BuildSpecRef,
         path: &mut Vec<BuildSpecRef>,
         seen: &mut HashMap<BuildSpecRef, ()>,
@@ -825,7 +825,7 @@ mod tests {
         });
         let layer = layer.unwrap();
 
-        let dp = DepGraph::new().ingest(layer).unwrap();
+        let dp = Graph::new().ingest(layer).unwrap();
         let planner: ExecPlan<()> = ExecPlan::new(&dp);
 
         assert_eq!(
@@ -882,7 +882,7 @@ mod tests {
         });
         let layer = layer.unwrap();
 
-        let dp = DepGraph::new().ingest(layer).unwrap();
+        let dp = Graph::new().ingest(layer).unwrap();
         let planner: ExecPlan<()> = ExecPlan::new(&dp);
 
         // true = all builds without cycle-breakers
@@ -951,7 +951,7 @@ mod tests {
         });
         let layer = layer.unwrap();
 
-        let dp = DepGraph::new().ingest(layer).unwrap();
+        let dp = Graph::new().ingest(layer).unwrap();
         let mut cycles = ExecPlan::new(&dp)
             .find_cycles()
             .into_iter()
@@ -1009,7 +1009,7 @@ mod tests {
         });
         let layer = layer.unwrap();
 
-        let dp = DepGraph::new().ingest(layer).unwrap();
+        let dp = Graph::new().ingest(layer).unwrap();
         let plan: Vec<BuildPhase> = ExecPlan::new(&dp).collect::<Result<_, _>>().unwrap();
 
         assert_eq!(
@@ -1130,7 +1130,7 @@ mod tests {
         });
         let layer = layer.unwrap();
 
-        let dp = DepGraph::new().ingest(layer).unwrap();
+        let dp = Graph::new().ingest(layer).unwrap();
 
         let bin_provider: BinProviderFake =
             HashMap::from([(*dp.by_name("nested dep").unwrap(), ())]).into();
@@ -1210,7 +1210,7 @@ mod tests {
         });
         let layer = layer.unwrap();
 
-        let dp = DepGraph::new().ingest(layer).unwrap();
+        let dp = Graph::new().ingest(layer).unwrap();
 
         let bin_provider: BinProviderFake = HashMap::from([
             (*dp.by_name("top").unwrap(), ()),
@@ -1288,7 +1288,7 @@ mod tests {
         });
         let layer = layer.unwrap();
 
-        let dp = DepGraph::new().ingest(layer).unwrap();
+        let dp = Graph::new().ingest(layer).unwrap();
         // Pretend that the breaker is in the local cache.
         let bp: BinProviderFake = HashMap::from([(*dp.by_name("breaker").unwrap(), ())]).into();
         let plan: Vec<BuildPhase> = ExecPlan::new_with_bin_provider(&dp, bp)

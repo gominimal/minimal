@@ -1,6 +1,6 @@
 use crate::PackagesArg;
 use cache::{CacheBinProvider, RemoteBinProvider};
-use graph::{BinProvider, DepGraph, ExecPlan};
+use graph::{BinProvider, ExecPlan, Graph};
 use mctx::{Cache, Context, Error};
 
 #[derive(clap::Args)]
@@ -52,7 +52,7 @@ pub async fn cmd_plan(args: PlanArgs, ctx: &mut Context) -> Result<(), Error> {
 }
 
 fn print_plan<BP: BinProvider>(
-    graph: &DepGraph,
+    graph: &Graph,
     cache: &Cache,
     plan: ExecPlan<BP>,
 ) -> Result<(), graph::PlanErr> {

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use cache::{Cache, LocalDir};
 use common::SpecHash;
-use graph::{BinProvider, BuildSpecRef, DepGraph, ExecPlan, SubsetInput};
+use graph::{BinProvider, BuildSpecRef, ExecPlan, Graph, SubsetInput};
 use tokio::{
     sync::{RwLock, RwLockReadGuard},
     task::{JoinSet, yield_now},
@@ -35,7 +35,7 @@ pub use error::Error;
 /// passed around as needed. Namely, a [SharedHandle].
 #[derive(Debug)]
 pub struct Shared<B: Backend> {
-    pub graph: DepGraph,
+    pub graph: Graph,
     pub cache: Cache<LocalDir>,
     pub backend: B,
 }
@@ -58,7 +58,7 @@ impl<B: Backend> SharedHandle<B> {
     /// Takes a lock and returns &[DepGraph].
     ///
     /// Make sure to drop as soon as possible to release the lock.
-    pub async fn graph<'a>(&'a self) -> RwLockReadGuard<'a, DepGraph> {
+    pub async fn graph<'a>(&'a self) -> RwLockReadGuard<'a, Graph> {
         RwLockReadGuard::map(self.0.read().await, |s| &s.graph)
     }
 
@@ -73,7 +73,7 @@ impl<B: Backend> SharedHandle<B> {
 pub struct Orchestrator<B: Backend> {
     pub top_levels: Vec<BuildSpecRef>,
     pub backend: B,
-    pub graph: DepGraph,
+    pub graph: Graph,
     pub cache: Cache<LocalDir>,
 }
 

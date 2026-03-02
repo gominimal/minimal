@@ -18,7 +18,7 @@ pub use error::Error;
 mod config;
 pub use config::{Config, ConfigBuilder, ConfigError};
 mod env;
-use graph::{BuildSpecRef, DepGraph, Transitives};
+use graph::{BuildSpecRef, Graph, Transitives};
 use mfile::{EnvPatches, Task};
 
 use env::Env;
@@ -51,7 +51,7 @@ pub trait PackageSelection {
         None
     }
 
-    fn as_bsrs(&self, g: &DepGraph) -> Result<Vec<BuildSpecRef>, Error> {
+    fn as_bsrs(&self, g: &Graph) -> Result<Vec<BuildSpecRef>, Error> {
         if let Some(bsrs) = self.as_refs() {
             Ok(bsrs.copied().collect())
         } else {
@@ -343,7 +343,7 @@ impl Context {
     pub fn graph_from_package_names<S: PackageSelection>(
         &mut self,
         pkgs: S,
-    ) -> Result<DepGraph, Error> {
+    ) -> Result<Graph, Error> {
         let mut graph = self.graph_from_all_packages()?;
         graph.top_levels = pkgs.as_bsrs(&graph)?;
 
@@ -351,11 +351,11 @@ impl Context {
     }
 
     /// Builds & returns a graph of all packages.
-    pub fn graph_from_all_packages(&mut self) -> Result<DepGraph, Error> {
+    pub fn graph_from_all_packages(&mut self) -> Result<Graph, Error> {
         let leaf_layer = self.repo_origin();
 
         let start = SystemTime::now();
-        let res = DepGraph::new_from_chain(
+        let res = Graph::new_from_chain(
             &mut self.vcs,
             leaf_layer,
             self.stdlib_dir.clone(),
@@ -373,7 +373,7 @@ impl Context {
     /// Ensures the top-level packages of the given graph are built and available locally.
     ///
     /// Use [Context::download_if_available] if you want to only fetch packages.
-    pub async fn build_graph(&mut self, graph: &DepGraph) -> Result<(), Error> {
+    pub async fn build_graph(&mut self, graph: &Graph) -> Result<(), Error> {
         let cache = self.local_cache();
         let rc = if self.config.use_remote_cache() {
             Some(self.remote_cache(false, false).await.unwrap())
@@ -433,11 +433,7 @@ impl Context {
 
     /// Returns the task of the given name, fully hydrated based on profiles. If no task
     /// is declared in the minimal file with the given name, harnesses are considered.
-    pub fn task(
-        &mut self,
-        mut graph: DepGraph,
-        name: &str,
-    ) -> Result<Option<(Task, DepGraph)>, Error> {
+    pub fn task(&mut self, mut graph: Graph, name: &str) -> Result<Option<(Task, Graph)>, Error> {
         let mfile = self.minimal_file();
         let mut task = match mfile.task(name) {
             Some(t) => t,
@@ -473,7 +469,7 @@ impl Context {
     pub async fn make_env<'a, S: PackageSelection>(
         &'a mut self,
         name: &'a str,
-        graph: &'a mut DepGraph,
+        graph: &'a mut Graph,
         wd: Option<PathBuf>,
         state_key: Option<&String>,
         patches: Option<&'a EnvPatches>,
@@ -585,7 +581,7 @@ impl Context {
     /// aren't available for download.
     pub async fn download_if_available<I: IntoIterator<Item = BuildSpecRef>>(
         &mut self,
-        graph: &DepGraph,
+        graph: &Graph,
         pkgs: I,
     ) -> Result<(), Error> {
         let rc = self.remote_cache(false, true).await.unwrap();
@@ -638,7 +634,7 @@ impl Context {
     /// Adds the specified dependencies if they arent already present.
     pub fn add_deps<S: PackageSelection>(
         &mut self,
-        graph: &DepGraph,
+        graph: &Graph,
         deps: S,
         mode: AddDepMode,
     ) -> Result<(), Error> {

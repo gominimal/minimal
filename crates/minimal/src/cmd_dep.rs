@@ -2,7 +2,7 @@
 use crate::PackagesArg;
 use clap::{ArgAction, ValueEnum};
 use graph::{
-    BuildDep, BuildSpec, BuildSpecRef, DepGraph, RuntimeDep, SourceFetch, SourceInput, SubsetInput,
+    BuildDep, BuildSpec, BuildSpecRef, Graph, RuntimeDep, SourceFetch, SourceInput, SubsetInput,
     Transitives,
 };
 use mctx::{Context, Error};
@@ -187,7 +187,7 @@ fn add_uniq_node(
 /// Returns a perhaps easier to understand and work with petgraph DiGraph derived
 /// from the given [`graph::DepGraph`].  See the [`NodeData`] and [`EdgeData`] types and the
 /// petgraph API docs for how to work with them
-fn pgraph_from(graph: &graph::DepGraph) -> Result<GraphData, Error> {
+fn pgraph_from(graph: &graph::Graph) -> Result<GraphData, Error> {
     let mut pgraph: DiGraph<NodeData, EdgeData> = DiGraph::new();
     let mut processed_nodes = HashMap::new();
     let mut bsname_to_node_index = HashMap::new();
@@ -347,7 +347,7 @@ fn pgraph_from(graph: &graph::DepGraph) -> Result<GraphData, Error> {
 
 /// Creates a copy of the pgraph with only the nodes and edges as specified by the args
 fn pgraph_copy_subset(
-    graph: &DepGraph,
+    graph: &Graph,
     pgraph: &DiGraph<NodeData, EdgeData>,
     bsname_to_node_index: &HashMap<String, NodeIndex>,
     args: &DepArgs,
@@ -387,7 +387,7 @@ fn pgraph_copy_subset(
 /// is the mutabe cpy output parameter.
 #[allow(clippy::too_many_arguments)]
 fn pgraph_copy_subset_for_node(
-    graph: &DepGraph,
+    graph: &Graph,
     pgraph: &DiGraph<NodeData, EdgeData>,
     args: &DepArgs,
     node_index: NodeIndex,
@@ -582,7 +582,7 @@ pub async fn cmd_dep(args: DepArgs, ctx: &mut Context) -> Result<(), Error> {
 
 fn mermaid_node_id(
     pgraph: &DiGraph<NodeData, EdgeData>,
-    graph: &DepGraph,
+    graph: &Graph,
     node_id: NodeIndex,
 ) -> String {
     let node_data = pgraph[node_id].clone();
@@ -611,7 +611,7 @@ fn mermaid_node_id(
     }
 }
 
-fn gen_mermaid(pgraph: &DiGraph<NodeData, EdgeData>, graph: &DepGraph) -> Result<(), Error> {
+fn gen_mermaid(pgraph: &DiGraph<NodeData, EdgeData>, graph: &Graph) -> Result<(), Error> {
     println!("graph LR");
 
     // just print edge declarations to keep compat with mermaid-ascii subsut
@@ -658,7 +658,7 @@ fn gen_mermaid(pgraph: &DiGraph<NodeData, EdgeData>, graph: &DepGraph) -> Result
     Ok(())
 }
 
-fn gen_dot(pgraph: &DiGraph<NodeData, EdgeData>, graph: &DepGraph) -> Result<(), Error> {
+fn gen_dot(pgraph: &DiGraph<NodeData, EdgeData>, graph: &Graph) -> Result<(), Error> {
     println!("digraph {{");
     println!("  graph [rankdir=LR];");
     println!("  node [shape=circle, style=filled, fillcolor=lightblue];");

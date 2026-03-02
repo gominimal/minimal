@@ -363,12 +363,12 @@ impl<FS: FileSystem> Cache<FS> {
 /// An adapter that lets you use a [Cache] as a [graph::BinProvider].
 #[derive(Debug, Clone)]
 pub struct CacheBinProvider<'a> {
-    graph: &'a graph::DepGraph,
+    graph: &'a graph::Graph,
     cache: Cache<LocalDir>,
 }
 
 impl<'a> CacheBinProvider<'a> {
-    pub fn new(graph: &'a graph::DepGraph, cache: Cache<LocalDir>) -> Self {
+    pub fn new(graph: &'a graph::Graph, cache: Cache<LocalDir>) -> Self {
         Self { graph, cache }
     }
 }
@@ -382,12 +382,12 @@ impl<'a> graph::BinProvider for CacheBinProvider<'a> {
 /// An adapter that lets you use a [RemoteCache] as a [graph::BinProvider].
 #[derive(Debug, Clone)]
 pub struct RemoteBinProvider<'a, B: common::fetchers::FetchBackend> {
-    graph: &'a graph::DepGraph,
+    graph: &'a graph::Graph,
     remote: &'a RemoteCache<B>,
 }
 
 impl<'a, B: common::fetchers::FetchBackend> RemoteBinProvider<'a, B> {
-    pub fn new(graph: &'a graph::DepGraph, remote: &'a RemoteCache<B>) -> Self {
+    pub fn new(graph: &'a graph::Graph, remote: &'a RemoteCache<B>) -> Self {
         Self { graph, remote }
     }
 }

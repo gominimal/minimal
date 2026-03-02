@@ -1,6 +1,5 @@
 use crate::{
-    BuildDep, BuildOutput, BuildSpec, BuildSpecRef, DepGraph, RuntimeDep, SpecHash,
-    dep_graph::SourceFetch,
+    BuildDep, BuildOutput, BuildSpec, BuildSpecRef, Graph, RuntimeDep, SourceFetch, SpecHash,
 };
 use blake3::Hasher;
 use common::{SubsetSpec, Target, target};
@@ -26,13 +25,13 @@ enum Edge {
 
 /// Computes the [SpecHash] for a build spec.
 pub struct SpecHasher<'a> {
-    graph: &'a DepGraph,
+    graph: &'a Graph,
     specs: Vec<(BuildSpecRef, Option<Edges>)>,
     spec_idx: HashMap<BuildSpecRef, SpecIndex>,
 }
 
 impl<'a> SpecHasher<'a> {
-    pub fn hash(graph: &'a DepGraph, bsr: &'a BuildSpecRef) -> SpecHash {
+    pub fn hash(graph: &'a Graph, bsr: &'a BuildSpecRef) -> SpecHash {
         let mut sh = SpecHasher {
             graph,
             specs: Vec::with_capacity(2048),
@@ -301,7 +300,7 @@ pub struct SubsetHasher;
 impl SubsetHasher {
     /// Computs the [SpecHash] of a subset of outputs from the given [BuildSpecRef].
     pub fn hash_single<'a, S: Into<String>>(
-        graph: &'a DepGraph,
+        graph: &'a Graph,
         bsr: &'a BuildSpecRef,
         outputs: Vec<S>,
     ) -> SpecHash {
@@ -369,7 +368,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new().ingest(layer).unwrap();
+        let dp = Graph::new().ingest(layer).unwrap();
 
         // println!("{}", SpecHasher::hash(&dp, &dp.top_levels[0]).0.to_hex());
         assert_eq!(
@@ -401,7 +400,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new().ingest(layer).unwrap();
+        let dp = Graph::new().ingest(layer).unwrap();
 
         assert_eq!(
             SpecHasher::hash(&dp, &dp.top_levels[0]),
@@ -427,7 +426,7 @@ mod tests {
                 e.report_to_stderr();
                 panic!("spec parsing failed");
             });
-            let dp = DepGraph::new().ingest(layer).unwrap();
+            let dp = Graph::new().ingest(layer).unwrap();
             SpecHasher::hash(&dp, &dp.top_levels[0])
         });
     }
@@ -465,7 +464,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new().ingest(layer).unwrap();
+        let dp = Graph::new().ingest(layer).unwrap();
 
         // println!("{}", SpecHasher::hash(&dp, &dp.top_levels[0]).0.to_hex());
         assert_eq!(
@@ -507,7 +506,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new().ingest(layer).unwrap();
+        let dp = Graph::new().ingest(layer).unwrap();
 
         // println!("{}", SpecHasher::hash(&dp, &dp.top_levels[0]).0.to_hex());
         assert_eq!(
@@ -544,7 +543,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new().ingest(layer).unwrap();
+        let dp = Graph::new().ingest(layer).unwrap();
 
         // println!("{}", SpecHasher::hash(&dp, &dp.top_levels[0]).0.to_hex());
         assert_eq!(

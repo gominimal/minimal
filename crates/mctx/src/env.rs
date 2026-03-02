@@ -8,14 +8,14 @@ use std::{
 
 use crate::{AddDepMode, Context, Error};
 use futures::stream::StreamExt;
-use graph::{BuildSpecRef, DepGraph, SetupForPackages, Transitives, TransitivesDep};
+use graph::{BuildSpecRef, Graph, SetupForPackages, Transitives, TransitivesDep};
 use mfile::EnvPatches;
 use sandbox2::{Container, config::SandboxMapped};
 use tempfile::TempDir;
 
 #[allow(dead_code)]
 struct EnvChannel<'a> {
-    graph: &'a mut DepGraph,
+    graph: &'a mut Graph,
     ctx: &'a mut Context,
 
     task_name: String,
@@ -312,7 +312,7 @@ impl<'a> Env<'a> {
     /// returns the sandbox.
     pub async fn build(
         ctx: &'a mut Context,
-        graph: &'a mut DepGraph,
+        graph: &'a mut Graph,
         args: EnvArgs<'a>,
     ) -> Result<Self, Error> {
         let base_dir = ctx.config.task_base_dir();

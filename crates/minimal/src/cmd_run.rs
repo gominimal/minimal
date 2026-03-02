@@ -1,7 +1,7 @@
 use std::{io::Write, path::PathBuf};
 
 use anyhow::anyhow;
-use graph::DepGraph;
+use graph::Graph;
 use hakoniwa::Output;
 use mctx::{Context, Error};
 use mfile::TaskAction;
@@ -27,7 +27,7 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
 pub async fn run_task(
     task_name: &str,
     task: &mfile::Task,
-    mut graph: DepGraph,
+    mut graph: Graph,
     ctx: &mut Context,
 ) -> Result<(), Error> {
     let mut env = ctx

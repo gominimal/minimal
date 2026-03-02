@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use cache::{Cache, LocalDir, PendingDir};
-use graph::DepGraph;
+use graph::Graph;
 
 mod error;
 pub use error::Error;
@@ -12,7 +12,7 @@ pub use error::Error;
 /// Standard options and configuration needed for most operations.
 pub struct Options<'a> {
     pub cache: Cache<LocalDir>,
-    pub graph: &'a DepGraph,
+    pub graph: &'a Graph,
     pub exec_base: PathBuf,
 }
 

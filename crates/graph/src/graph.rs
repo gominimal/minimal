@@ -4,14 +4,13 @@
 #![allow(clippy::single_match)]
 
 use common::repo_spec::Repo;
-use common::{SpecOrigin, SubsetSpec, Target};
+use common::{SpecOrigin, Target};
 use decode::builds::BuildRef;
 use decode::{Harness, Layer, Profile, builds};
 use mfile::{self, EnvPatches, LinkConfig};
 use nickel_lang_core::term::IndexMap;
 
 use generational_arena::Arena;
-use serde::Serialize;
 use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -21,107 +20,69 @@ use std::sync::{Arc, RwLock};
 use crate::spec_hasher::SubsetHasher;
 use crate::{Error, SpecHash, SpecHasher};
 
-/// A map with ordered iteration semantics - we need this for stable spec hashes.
-type OutputMap = IndexMap<String, BuildOutput>;
+use crate::BuildSpecRef;
+use crate::builds::*;
 
-pub use decode::AttrValue;
-
-/// A reference to some other [BuildSpec] in a [DepGraph].
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, PartialOrd, Ord)]
-pub struct BuildSpecRef(pub(crate) generational_arena::Index);
-
-impl BuildSpecRef {
-    /// returns the index of the BuildSpec in the arena
-    pub fn index(&self) -> usize {
-        self.0.into_raw_parts().0
-    }
-}
-/// A description of pulling source code regardless of form.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum SourceFetch {
-    Web {
-        url: String,
-        sha256: String,
-        url_pos: Option<(usize, usize)>,
-        sha256_pos: Option<(usize, usize)>,
-    },
-    Local {
-        full_path: PathBuf,
-        filename: String,
-        file_hash: blake3::Hash,
-    },
+/// Manages loading a [Layer] into [DepGraph].
+struct Loader {
+    from: Layer,
+    origin: Arc<SpecOrigin>,
+    into_graph: RefCell<Graph>,
+    resolved: RefCell<HashMap<generational_arena::Index, BuildSpecRef>>,
 }
 
-impl From<builds::SourceFetch> for SourceFetch {
-    fn from(value: builds::SourceFetch) -> Self {
-        match value {
-            builds::SourceFetch::Web {
-                url,
-                sha256,
-                url_pos,
-                sha256_pos,
-            } => SourceFetch::Web {
-                url,
-                sha256,
-                url_pos: url_pos
-                    .and_then(|p| p.into_opt())
-                    .map(|p| (p.start.to_usize(), p.end.to_usize())),
-                sha256_pos: sha256_pos
-                    .and_then(|p| p.into_opt())
-                    .map(|p| (p.start.to_usize(), p.end.to_usize())),
-            },
-            builds::SourceFetch::Local {
-                full_path,
-                filename,
-                file_hash,
-            } => SourceFetch::Local {
-                full_path,
-                filename,
-                file_hash,
-            },
+impl Loader {
+    /// upserts the specified build ref, returning the new or already-existing BSR.
+    fn load(&self, br: &builds::BuildRef) -> Result<BuildSpecRef, Error> {
+        if let BuildRef::Upstream { name } = br {
+            return match self.into_graph.borrow().by_name(name) {
+                Some(bsr) => Ok(*bsr),
+                None => Err(Error::NoSuchPkg { name: name.clone() }),
+            };
         }
+
+        let idx = self.from.resolve(br).unwrap();
+        self.load_idx(idx)
     }
-}
 
-/// A description of source code thats used as an input.
-#[derive(Debug, Clone, serde::Serialize, PartialEq)]
-pub struct SourceInput {
-    pub from: SourceFetch,
-    pub extract: bool,
-    pub strip_prefix: Option<String>,
-}
-
-impl From<builds::SourceInput> for SourceInput {
-    fn from(value: builds::SourceInput) -> Self {
-        Self {
-            from: value.from.into(),
-            extract: value.extract,
-            strip_prefix: value.strip_prefix,
+    /// upserts the specified layer idx, returning the new or already-existing BSR.
+    fn load_idx(&self, idx: &generational_arena::Index) -> Result<BuildSpecRef, Error> {
+        // Fast path: already loaded.
+        if let Some(bsr) = self.resolved.borrow().get(idx) {
+            return Ok(*bsr);
         }
+
+        let decl = self.from.get(*idx).unwrap();
+
+        // Insert a placeholder that can be used in the short-circuit path in the case of cycles.
+        let bsr = BuildSpecRef(
+            self.into_graph
+                .borrow_mut()
+                .builds
+                .insert(BuildSpec::default()),
+        );
+        self.resolved.borrow_mut().insert(*idx, bsr);
+
+        // Decode the build-spec and write it back to the allocated position.
+        let build = BuildSpec::from_decoded(decl, self)?;
+        *self.into_graph.borrow_mut().builds.get_mut(bsr.0).unwrap() = build;
+
+        Ok(bsr)
+    }
+
+    fn load_toplevels(&mut self) -> Result<Vec<BuildSpecRef>, Error> {
+        self.from
+            .top_levels
+            .clone()
+            .iter()
+            .map(|idx| self.load_idx(idx))
+            .collect::<Result<Vec<_>, _>>()
     }
 }
 
-/// A dependency on some of the outputs of a build-spec.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SubsetInput {
-    pub from: BuildSpecRef,
-    pub outputs: SmallVec<[String; 4]>,
-}
+// === from_decoded impls (kept here because they depend on Loader) ===
 
 impl SubsetInput {
-    /// Constructs a new [SubsetInput], except using the given build instead.
-    pub fn override_build(&self, bsr: BuildSpecRef) -> Self {
-        Self {
-            from: bsr,
-            ..self.clone()
-        }
-    }
-
-    pub fn as_spec(&self, graph: &DepGraph) -> SubsetSpec {
-        SubsetSpec::new_single(&graph.spec_hash(&self.from), self.outputs.to_vec())
-    }
-
     fn from_decoded(si: &builds::SubsetInput, loader: &Loader) -> Result<Self, Error> {
         Ok(Self {
             from: loader.load(&si.from)?,
@@ -130,43 +91,7 @@ impl SubsetInput {
     }
 }
 
-impl From<(BuildSpecRef, HashSet<String>)> for SubsetInput {
-    fn from(value: (BuildSpecRef, HashSet<String>)) -> Self {
-        let (from, outputs) = value;
-        let mut outputs: SmallVec<[String; 4]> = outputs.into_iter().collect();
-        outputs.sort();
-        outputs.dedup();
-        Self { from, outputs }
-    }
-}
-
-/// An input to a build spec.
-///
-/// Each entry in a build-spec's `build_deps` array corresponds to one [BuildDep].
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub enum BuildDep {
-    Build(BuildSpecRef),
-    Source(SourceInput),
-    HostPath(PathBuf),
-    Local {
-        full_path: PathBuf,
-        filename: String,
-        file_hash: blake3::Hash,
-    },
-    Subset(SubsetInput),
-}
-
-#[allow(dead_code)]
 impl BuildDep {
-    /// Returns the underlying build-spec reference if this value was the Build variant.
-    pub(crate) fn as_build(&self) -> Option<&BuildSpecRef> {
-        match self {
-            BuildDep::Build(bsr) => Some(bsr),
-            _ => None,
-        }
-    }
-
     fn from_decoded(i: &builds::BuildDep, loader: &Loader) -> Result<Self, Error> {
         Ok(match i {
             builds::BuildDep::Build(br) => Self::Build(loader.load(br)?),
@@ -186,37 +111,7 @@ impl BuildDep {
     }
 }
 
-/// An output from a build.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[allow(dead_code)]
-#[serde(tag = "type", content = "value", rename_all = "snake_case")]
-pub enum BuildOutput {
-    /// This output describes shared libraries matched with the given glob.
-    Library { glob: String, allow_data: bool },
-    /// This output describes data files matched with the given glob.
-    Data {
-        glob: String,
-        allow_executable: bool,
-    },
-    /// This output describes binaries matched with the given glob.
-    Binary { glob: String },
-}
-
 impl BuildOutput {
-    pub fn glob(&self) -> &String {
-        match self {
-            BuildOutput::Binary { glob } => glob,
-            BuildOutput::Data {
-                glob,
-                allow_executable: _,
-            } => glob,
-            BuildOutput::Library {
-                glob,
-                allow_data: _,
-            } => glob,
-        }
-    }
-
     fn from_decoded(bd: &builds::BuildOutput) -> Self {
         match bd.clone() {
             builds::BuildOutput::Binary { glob } => Self::Binary { glob },
@@ -232,43 +127,13 @@ impl BuildOutput {
     }
 }
 
-/// A runtime dependency declared on a build-spec.
-///
-/// Each entry in a build-spec's `runtime_deps` array corresponds to one [RuntimeDep].
-#[derive(Debug, Clone, PartialEq)]
-pub enum RuntimeDep {
-    /// A direct runtime dependency on the build-spec described by the contained reference.
-    Build(BuildSpecRef),
-    /// A direct runtime dependency on a subset of the outputs of some other build-spec.
-    Subset(SubsetInput),
-}
-
 impl RuntimeDep {
-    /// Returns the build spec that the runtime dependency ultimately depends on.
-    pub fn bsr(&self) -> &BuildSpecRef {
-        match self {
-            RuntimeDep::Build(bsr) => bsr,
-            RuntimeDep::Subset(SubsetInput { from, .. }) => from,
-        }
-    }
-
     fn from_decoded(d: &builds::RuntimeDep, loader: &Loader) -> Result<Self, Error> {
         Ok(match d {
             builds::RuntimeDep::Build(br) => Self::Build(loader.load(br)?),
             builds::RuntimeDep::Subset(si) => Self::Subset(SubsetInput::from_decoded(si, loader)?),
         })
     }
-}
-
-/// A unit test defined on a build spec.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct SpecTest {
-    /// The test needs to run in the build sandbox, rather than standalone.
-    pub build_test: bool,
-    /// Additional dependencies needed for the test.
-    pub deps: Option<SmallVec<[BuildSpecRef; 6]>>,
-    /// The tests commands.
-    pub cmds: Vec<Vec<String>>,
 }
 
 impl SpecTest {
@@ -288,59 +153,7 @@ impl SpecTest {
     }
 }
 
-/// Some task or build in the dependency graph.
-#[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
-pub struct BuildSpec {
-    /// The human-readable name declared on the build spec.
-    pub name: String,
-    /// The system this build-spec is meant to run on. Defaults to amd64 Linux.
-    pub target: Target,
-    /// This spec was marked as a prebuilt - no computation, fetch the output from an archive directly.
-    pub(crate) prebuilt: bool,
-
-    /// The build commands declared on the build spec.
-    pub cmds: Vec<Vec<String>>,
-    /// Any arguments to the build command, ultimately passed as environment variables.
-    pub build_args: Option<IndexMap<String, String>>,
-
-    /// The dependencies needed to execute the build spec.
-    pub build_deps: SmallVec<[BuildDep; 10]>,
-    /// The dependencies needed to run outputs of this build spec, as well as possibly needed
-    /// during the build.
-    pub runtime_deps: SmallVec<[RuntimeDep; 8]>,
-    /// The 'needs' (abstract dependencies) defined on the build-spec.
-    pub abstract_deps: IndexMap<String, AttrValue>,
-    /// The named outputs (and match patterns) produced by executing this build spec.
-    pub outputs: OutputMap,
-
-    /// An alternative build spec to use to break cycles in resolving dependencies on this build spec.
-    pub replace_on_cycle: Option<BuildSpecRef>,
-
-    /// The attributes defined on the build-spec.
-    pub attrs: IndexMap<String, AttrValue>,
-
-    /// Any unit tests defined on the build-spec.
-    pub tests: Option<IndexMap<String, SpecTest>>,
-
-    /// Identifies the collection of build-specs where this was defined.
-    pub from: Arc<SpecOrigin>,
-}
-
 impl BuildSpec {
-    /// Returns true if the build-spec represents a fetch of files but no actual computation.
-    pub fn is_pure_prebuilt(&self) -> bool {
-        self.prebuilt
-    }
-
-    /// Returns true if the build-spec represents a rollup of runtime_deps but no substance or computation of its own.
-    pub fn is_pure_collection(&self) -> bool {
-        self.build_deps.is_empty()
-            && (self.cmds.is_empty()
-                || (self.cmds.len() == 1
-                    && (self.cmds[0].is_empty() || self.cmds[0][0].is_empty())))
-    }
-
     fn from_decoded(bd: &builds::BuildDecl, loader: &Loader) -> Result<Self, Error> {
         Ok(Self {
             name: bd.name.clone(),
@@ -395,63 +208,6 @@ impl BuildSpec {
     }
 }
 
-/// Manages loading a [Layer] into [DepGraph].
-struct Loader {
-    from: Layer,
-    origin: Arc<SpecOrigin>,
-    into_graph: RefCell<DepGraph>,
-    resolved: RefCell<HashMap<generational_arena::Index, BuildSpecRef>>,
-}
-
-impl Loader {
-    /// upserts the specified build ref, returning the new or already-existing BSR.
-    fn load(&self, br: &builds::BuildRef) -> Result<BuildSpecRef, Error> {
-        if let BuildRef::Upstream { name } = br {
-            return match self.into_graph.borrow().by_name(name) {
-                Some(bsr) => Ok(*bsr),
-                None => Err(Error::NoSuchPkg { name: name.clone() }),
-            };
-        }
-
-        let idx = self.from.resolve(br).unwrap();
-        self.load_idx(idx)
-    }
-
-    /// upserts the specified layer idx, returning the new or already-existing BSR.
-    fn load_idx(&self, idx: &generational_arena::Index) -> Result<BuildSpecRef, Error> {
-        // Fast path: already loaded.
-        if let Some(bsr) = self.resolved.borrow().get(idx) {
-            return Ok(*bsr);
-        }
-
-        let decl = self.from.get(*idx).unwrap();
-
-        // Insert a placeholder that can be used in the short-circuit path in the case of cycles.
-        let bsr = BuildSpecRef(
-            self.into_graph
-                .borrow_mut()
-                .builds
-                .insert(BuildSpec::default()),
-        );
-        self.resolved.borrow_mut().insert(*idx, bsr);
-
-        // Decode the build-spec and write it back to the allocated position.
-        let build = BuildSpec::from_decoded(decl, self)?;
-        *self.into_graph.borrow_mut().builds.get_mut(bsr.0).unwrap() = build;
-
-        Ok(bsr)
-    }
-
-    fn load_toplevels(&mut self) -> Result<Vec<BuildSpecRef>, Error> {
-        self.from
-            .top_levels
-            .clone()
-            .iter()
-            .map(|idx| self.load_idx(idx))
-            .collect::<Result<Vec<_>, _>>()
-    }
-}
-
 /// Describes something that can resolve the upstream a layer declares it chains from, into the
 /// source tree on disk it represents.
 pub trait SourceProvider {
@@ -482,10 +238,26 @@ impl SourceProvider for checkouts::Manager {
     }
 }
 
-/// The dependency graph.
+/// Describes sandbox configuration that needs to be set to power present packages.
+#[derive(Debug, Clone)]
+pub struct SetupForPackages {
+    /// Environment variables that need to be set, typically for an env_state_wiring entry.
+    pub env_vars: HashMap<String, String>,
+    /// Directories that should be created in `/state`, typically from an env_state_wiring entry.
+    pub state_dirs: HashSet<String>,
+
+    /// Whether any package sets `needs.dns`.
+    pub needs_dns: bool,
+    /// Whether any package sets `needs.internet`.
+    pub needs_internet: bool,
+    /// The filesystem mappings accumulated from `env_file_mappings` and `env_dir_mappings` attrs.
+    pub fs_mappings: EnvPatches,
+}
+
+/// The in-memory representation of the software supply chain: all packages, profiles, and harnesses.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub struct DepGraph {
+pub struct Graph {
     /// All the build-specs known to this dependency graph.
     builds: Arena<BuildSpec>,
     /// The top level build-specs (i.e. non-transitive) that were read when
@@ -511,13 +283,13 @@ pub struct DepGraph {
     >,
 }
 
-impl Default for DepGraph {
+impl Default for Graph {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl DepGraph {
+impl Graph {
     /// Constructs an empty dependency graph.
     pub fn new() -> Self {
         Self {
@@ -1058,22 +830,6 @@ fn fuzzy_match(needle: &str, haystack: &str) -> u32 {
     (char_score * length_penalty_num / 100).min(900)
 }
 
-/// Describes sandbox configuration that needs to be set to power present packages.
-#[derive(Debug, Clone)]
-pub struct SetupForPackages {
-    /// Environment variables that need to be set, typically for an env_state_wiring entry.
-    pub env_vars: HashMap<String, String>,
-    /// Directories that should be created in `/state`, typically from an env_state_wiring entry.
-    pub state_dirs: HashSet<String>,
-
-    /// Whether any package sets `needs.dns`.
-    pub needs_dns: bool,
-    /// Whether any package sets `needs.internet`.
-    pub needs_internet: bool,
-    /// The filesystem mappings accumulated from `env_file_mappings` and `env_dir_mappings` attrs.
-    pub fs_mappings: EnvPatches,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1113,7 +869,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new().ingest(layer).unwrap();
+        let dp = Graph::new().ingest(layer).unwrap();
         assert!(dp.spec_hash(dp.by_name("b1").unwrap()) != dp.spec_hash(dp.by_name("b2").unwrap()),);
     }
 
@@ -1153,7 +909,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new().ingest(layer).unwrap();
+        let dp = Graph::new().ingest(layer).unwrap();
         assert_eq!(
             dp.transitive_specs_of(&dp.top_levels[0]),
             vec![
@@ -1197,7 +953,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new().ingest(layer).unwrap();
+        let dp = Graph::new().ingest(layer).unwrap();
         // We expect two buildspecs
         assert_eq!(
             vec!["build 1".to_string(), "build 2".to_string(),],
@@ -1232,7 +988,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new().ingest(layer).unwrap();
+        let dp = Graph::new().ingest(layer).unwrap();
         assert_eq!(
             dp.profiles.get("profile 1"),
             Some(&Profile {
@@ -1247,7 +1003,7 @@ mod tests {
 
     #[test]
     fn profile_overwrites_on_conflict() {
-        let mut dp = DepGraph::new();
+        let mut dp = Graph::new();
         dp.profiles.insert(
             "prof".to_string(),
             Profile {
@@ -1329,7 +1085,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new().ingest(layer).unwrap();
+        let dp = Graph::new().ingest(layer).unwrap();
         assert_eq!(
             dp.harnesses.get("harness 1"),
             Some(&Harness {
@@ -1418,7 +1174,7 @@ mod tests {
             (apex_repo.clone(), apex),
             (middle_repo.clone(), middle),
         ]));
-        let graph = DepGraph::new_from_chain(
+        let graph = Graph::new_from_chain(
             &mut sp,
             middle_repo.as_spec_origin().unwrap(),
             LoadOptions::for_test().minimal_lib_path,
@@ -1473,7 +1229,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new().ingest(layer).unwrap();
+        let dp = Graph::new().ingest(layer).unwrap();
         let build = dp.get(dp.by_name("build 2").unwrap()).unwrap();
         assert_eq!(
             build.tests,
@@ -1525,7 +1281,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new().ingest(layer).unwrap();
+        let dp = Graph::new().ingest(layer).unwrap();
 
         // Exact match should rank highest
         let results = dp.fuzzy_name_search("libffi", 3);
@@ -1570,7 +1326,7 @@ mod tests {
             panic!("spec parsing failed");
         });
 
-        let dp = DepGraph::new().ingest(layer).unwrap();
+        let dp = Graph::new().ingest(layer).unwrap();
         // We expect the singular buildspec to have a command 'good', because
         // the default target (used in tests) is amd64/linux.
         assert_eq!(

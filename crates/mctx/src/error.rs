@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::{env, fmt};
 
 use common::SpecOrigin;
-use graph::{DepGraph, PlanErr};
+use graph::{Graph, PlanErr};
 
 /// The errors possible when driving top-level minimal APIs.
 #[derive(Debug)]
@@ -13,7 +13,7 @@ pub enum Error {
     MFile(mfile::Error),
     Graph(Box<graph::Error>),
 
-    Plan(Box<(DepGraph, PlanErr)>),
+    Plan(Box<(Graph, PlanErr)>),
     Other(anyhow::Error),
 }
 

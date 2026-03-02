@@ -3,7 +3,7 @@
 use anyhow::anyhow;
 use cache::{Cache, CacheErr, LocalDir};
 use futures::stream::FuturesUnordered;
-use graph::DepGraph;
+use graph::Graph;
 use op::{Options, Runnable, StandaloneTest};
 use regex::Regex;
 use std::cmp::Ordering;
@@ -211,7 +211,7 @@ pub fn run_checks(
     harnesses_dir: Option<PathBuf>,
     stdlib_dir: PathBuf,
     filter_names: &[String],
-    graph: Option<DepGraph>,
+    graph: Option<Graph>,
     cache: Cache<LocalDir>,
     fix: bool,
     skip_checkers: &[String],
@@ -272,7 +272,7 @@ pub fn run_checks(
 fn package_check_futures(
     packages_dir: PathBuf,
     filter_names: Vec<String>,
-    graph_hnd: Option<Arc<RwLock<DepGraph>>>,
+    graph_hnd: Option<Arc<RwLock<Graph>>>,
     skip_checkers: Vec<String>,
     stdlib_dir: PathBuf,
     cache: Cache<LocalDir>,
@@ -333,7 +333,7 @@ fn package_check_futures(
 fn profile_check_futures(
     profiles_dir: PathBuf,
     filter_names: Vec<String>,
-    graph_hnd: Option<Arc<RwLock<DepGraph>>>,
+    graph_hnd: Option<Arc<RwLock<Graph>>>,
     skip_checkers: Vec<String>,
     stdlib_dir: PathBuf,
     cache: Cache<LocalDir>,
@@ -399,7 +399,7 @@ fn profile_check_futures(
 fn harness_check_futures(
     harnesses_dir: PathBuf,
     filter_names: Vec<String>,
-    graph_hnd: Option<Arc<RwLock<DepGraph>>>,
+    graph_hnd: Option<Arc<RwLock<Graph>>>,
     skip_checkers: Vec<String>,
     stdlib_dir: PathBuf,
     cache: Cache<LocalDir>,
@@ -464,7 +464,7 @@ fn harness_check_futures(
 
 async fn check_package(
     pkg: String,
-    all_graph: Option<Arc<RwLock<DepGraph>>>,
+    all_graph: Option<Arc<RwLock<Graph>>>,
     fix: bool,
     skip_checkers: Vec<String>,
     packages_dir: PathBuf,
@@ -620,7 +620,7 @@ pub(crate) trait GraphBasedChecker {
         skip_checkers: &[String],
         fix: bool,
         pkg: String,
-        graph: RwLockReadGuard<'_, DepGraph>,
+        graph: RwLockReadGuard<'_, Graph>,
         cache: Cache<LocalDir>,
     ) -> Result<CheckResult, Error>;
 }
@@ -902,7 +902,7 @@ impl GraphBasedChecker for StandaloneTestCheck {
         skip_checkers: &[String],
         _fix: bool,
         pkg: String,
-        graph: RwLockReadGuard<'_, DepGraph>,
+        graph: RwLockReadGuard<'_, Graph>,
         cache: Cache<LocalDir>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
@@ -1066,7 +1066,7 @@ impl GraphBasedChecker for BuildScriptIsExecutable {
         skip_checkers: &[String],
         _fix: bool,
         pkg: String,
-        graph: RwLockReadGuard<'_, DepGraph>,
+        graph: RwLockReadGuard<'_, Graph>,
         _cache: Cache<LocalDir>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {

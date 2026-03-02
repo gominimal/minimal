@@ -2,7 +2,7 @@ use super::Error;
 use crate::CheckVerdict;
 use cache::{Cache, LocalDir};
 use decode::Harness;
-use graph::DepGraph;
+use graph::Graph;
 use nickel_lang_core::eval::cache::CacheImpl;
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::program::Program;
@@ -15,7 +15,7 @@ use crate::CheckResult;
 
 pub(crate) async fn check_harness(
     harness: String,
-    all_graph: Option<Arc<RwLock<DepGraph>>>,
+    all_graph: Option<Arc<RwLock<Graph>>>,
     fix: bool,
     skip_checkers: Vec<String>,
     harnesses_dir: PathBuf,
@@ -124,7 +124,7 @@ pub(crate) async fn check_harness(
 
 fn check_harness_name(
     harness: String,
-    _all_graph: Option<Arc<RwLock<DepGraph>>>,
+    _all_graph: Option<Arc<RwLock<Graph>>>,
     _fix: bool,
     skip_checkers: Vec<String>,
     _harnesses_dir: PathBuf,
@@ -167,7 +167,7 @@ fn check_harness_name(
 
 fn check_harness_packages_valid(
     _harness: String,
-    all_graph: Option<Arc<RwLock<DepGraph>>>,
+    all_graph: Option<Arc<RwLock<Graph>>>,
     _fix: bool,
     skip_checkers: Vec<String>,
     _harnesses_dir: PathBuf,
@@ -241,7 +241,7 @@ fn check_harness_packages_valid(
 
 fn check_project_matcher_regexes(
     _harness: String,
-    _all_graph: Option<Arc<RwLock<DepGraph>>>,
+    _all_graph: Option<Arc<RwLock<Graph>>>,
     _fix: bool,
     skip_checkers: Vec<String>,
     _harnesses_dir: PathBuf,
@@ -290,7 +290,7 @@ fn check_project_matcher_regexes(
 
 fn check_project_matcher_predicates(
     _harness: String,
-    _all_graph: Option<Arc<RwLock<DepGraph>>>,
+    _all_graph: Option<Arc<RwLock<Graph>>>,
     _fix: bool,
     skip_checkers: Vec<String>,
     _harnesses_dir: PathBuf,

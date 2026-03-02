@@ -1,4 +1,4 @@
-use common::SpecHash;
+use common::{SpecHash, SpecOrigin};
 
 /// An error during construction or processing of the dependency graph.
 #[allow(clippy::large_enum_variant)]
@@ -97,17 +97,30 @@ impl From<decode::Error> for Error {
     }
 }
 
-mod spec_hasher;
-use common::SpecOrigin;
-pub use spec_hasher::SpecHasher;
+/// A reference to some other [BuildSpec] in a [DepGraph].
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, PartialOrd, Ord)]
+pub struct BuildSpecRef(pub(crate) generational_arena::Index);
 
-pub mod dep_graph;
-pub use dep_graph::{
-    BuildDep, BuildOutput, BuildSpec, BuildSpecRef, DepGraph, RuntimeDep, SetupForPackages,
-    SourceFetch, SourceInput, SubsetInput,
+impl BuildSpecRef {
+    /// returns the index of the BuildSpec in the arena
+    pub fn index(&self) -> usize {
+        self.0.into_raw_parts().0
+    }
+}
+
+mod builds;
+pub use builds::{
+    BuildDep, BuildOutput, BuildSpec, RuntimeDep, SourceFetch, SourceInput, SpecTest, SubsetInput,
 };
 
-pub mod planner;
+mod spec_hasher;
+pub use spec_hasher::SpecHasher;
+
+mod graph;
+pub use graph::{Graph, SetupForPackages};
+
+mod planner;
+pub use planner::Dep as PlannerDep;
 pub use planner::{BinProvider, ExecPlan, PlanErr};
 
 mod transitives;

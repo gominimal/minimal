@@ -3,7 +3,7 @@
 use std::io::Write;
 
 use common::{SpecOrigin, Target, repo_spec::Repo};
-use graph::DepGraph;
+use graph::Graph;
 use mctx::{Config, Context, Error};
 
 #[derive(clap::Args)]
@@ -57,7 +57,7 @@ pub async fn cmd_init(args: InitArgs, config: Config) -> Result<(), Error> {
                     .clone()
                     .unwrap_or_else(|| std::env::current_dir().unwrap()),
                 None,
-                DepGraph::new_from_chain(
+                Graph::new_from_chain(
                     &mut vcs,
                     SpecOrigin::Repo(common::repo_spec::Repo::Git {
                         url: "https://github.com/gominimal/pkgs".to_string(),

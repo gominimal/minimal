@@ -1,7 +1,7 @@
 use std::{fmt::Display, io::stdout};
 
 use decode::AttrValue;
-use graph::{BuildDep, BuildOutput, BuildSpec, DepGraph, RuntimeDep, SourceInput};
+use graph::{BuildDep, BuildOutput, BuildSpec, Graph, RuntimeDep, SourceInput};
 use mctx::{Cache, Context, Error};
 use nickel_lang_core::term::IndexMap;
 use serde::Serialize;
@@ -169,7 +169,7 @@ fn fuzzy_match(exact: bool, query: &str, target: &str) -> bool {
     current.is_none()
 }
 
-fn build_pkg_info(g: &DepGraph, b: &BuildSpec, c: &Cache) -> Result<PkgInfo, Error> {
+fn build_pkg_info(g: &Graph, b: &BuildSpec, c: &Cache) -> Result<PkgInfo, Error> {
     Ok(PkgInfo {
         name: b.name.clone(),
         is_prebuilt: b.is_pure_prebuilt(),
@@ -196,7 +196,7 @@ fn build_pkg_info(g: &DepGraph, b: &BuildSpec, c: &Cache) -> Result<PkgInfo, Err
     })
 }
 
-fn pkg_ref_from_runtime_dep(g: &DepGraph, i: &RuntimeDep, _c: &Cache) -> Result<PkgRef, Error> {
+fn pkg_ref_from_runtime_dep(g: &Graph, i: &RuntimeDep, _c: &Cache) -> Result<PkgRef, Error> {
     match i {
         RuntimeDep::Build(b) => Ok(PkgRef::Package {
             name: g.get(b).unwrap().name.clone(),
@@ -208,7 +208,7 @@ fn pkg_ref_from_runtime_dep(g: &DepGraph, i: &RuntimeDep, _c: &Cache) -> Result<
     }
 }
 
-fn pkg_ref_from_input(g: &DepGraph, i: &BuildDep, _c: &Cache) -> Result<PkgRef, Error> {
+fn pkg_ref_from_input(g: &Graph, i: &BuildDep, _c: &Cache) -> Result<PkgRef, Error> {
     match i {
         BuildDep::Build(b) => Ok(PkgRef::Package {
             name: g.get(b).unwrap().name.clone(),

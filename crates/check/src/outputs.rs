@@ -7,7 +7,7 @@ use super::Error;
 use crate::{CheckResult, CheckVerdict};
 use anyhow::anyhow;
 use cache::{CacheErr, DirCacheEntry, LocalDir};
-use graph::{BuildOutput, BuildSpecRef, DepGraph, Transitives};
+use graph::{BuildOutput, BuildSpecRef, Graph, Transitives};
 use object::{Object, ObjectSymbol};
 use tokio::sync::RwLockReadGuard;
 
@@ -19,7 +19,7 @@ impl crate::GraphBasedChecker for OutputTypesValid {
         skip_checkers: &[String],
         _fix: bool,
         pkg: String,
-        graph: RwLockReadGuard<'_, DepGraph>,
+        graph: RwLockReadGuard<'_, Graph>,
         cache: cache::Cache<LocalDir>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
@@ -112,7 +112,7 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
         skip_checkers: &[String],
         _fix: bool,
         pkg: String,
-        graph: RwLockReadGuard<'_, DepGraph>,
+        graph: RwLockReadGuard<'_, Graph>,
         cache: cache::Cache<LocalDir>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
