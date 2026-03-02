@@ -4,6 +4,7 @@ use check::CheckVerdict;
 use codespan_reporting::term::termcolor::{
     Color, ColorChoice, ColorSpec, StandardStream, WriteColor,
 };
+use futures::stream::StreamExt;
 use mctx::{Context, Error};
 use std::io::Write;
 
@@ -48,7 +49,7 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
     let skip_checkers = args.skip_checkers.unwrap_or_default();
     let package_names = args.packages.names();
 
-    let results = check::run_checks(
+    let mut checks_stream = check::run_checks(
         packages_dir,
         upstream_dir.join("profiles"),
         upstream_dir.join("harnesses"),
@@ -58,13 +59,13 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
         ctx.local_cache(),
         args.fix,
         &skip_checkers,
-    )
-    .await?;
+    )?;
 
     let mut had_error = false;
     let mut stdout = StandardStream::stdout(ColorChoice::Auto);
 
-    for (heading, checks) in &results {
+    while let Some((heading, result)) = checks_stream.next().await {
+        let checks = result?;
         stdout.reset().unwrap();
         stdout.set_color(ColorSpec::new().set_fg(None)).unwrap();
 

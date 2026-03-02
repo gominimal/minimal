@@ -2,7 +2,7 @@
 
 use anyhow::anyhow;
 use cache::{Cache, CacheErr, LocalDir};
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::FuturesUnordered;
 use graph::DepGraph;
 use mctx::Error;
 use op::{Options, Runnable, StandaloneTest};
@@ -136,16 +136,18 @@ impl CheckResult {
     }
 }
 
-type CheckFuture =
+/// A future that resolves to a heading (e.g. "package: foo") and check results.
+pub type CheckFuture =
     std::pin::Pin<Box<dyn Future<Output = (String, Result<Vec<CheckResult>, Error>)> + Send>>;
 
-/// Runs checks over packages (and optionally profiles/harnesses) and returns the results.
+/// Runs checks over packages (and optionally profiles/harnesses), returning a
+/// [`FuturesUnordered`] that yields results as each check completes.
 ///
 /// When `package_names` is empty, all packages, profiles, and harnesses are checked.
 /// When `package_names` is non-empty, only the named packages are checked (profiles
 /// and harnesses are skipped).
 #[allow(clippy::too_many_arguments)]
-pub async fn run_checks(
+pub fn run_checks(
     packages_dir: PathBuf,
     profiles_dir: PathBuf,
     harnesses_dir: PathBuf,
@@ -155,7 +157,7 @@ pub async fn run_checks(
     cache: Cache<LocalDir>,
     fix: bool,
     skip_checkers: &[String],
-) -> Result<Vec<(String, Vec<CheckResult>)>, Error> {
+) -> Result<FuturesUnordered<CheckFuture>, Error> {
     let graph_hnd = graph.map(|g| Arc::new(RwLock::new(g)));
     let skip_checkers_owned = Some(skip_checkers.to_vec());
     let check_all = package_names.is_empty() || package_names[0].is_empty();
@@ -196,18 +198,11 @@ pub async fn run_checks(
         vec![]
     };
 
-    let mut futures_unordered = results
+    Ok(results
         .into_iter()
         .chain(profile_results)
         .chain(harness_results)
-        .collect::<FuturesUnordered<_>>();
-
-    let mut all_results = Vec::new();
-    while let Some((heading, result)) = futures_unordered.next().await {
-        all_results.push((heading, result?));
-    }
-
-    Ok(all_results)
+        .collect::<FuturesUnordered<_>>())
 }
 
 fn package_check_futures(
