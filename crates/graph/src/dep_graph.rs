@@ -989,6 +989,73 @@ impl DepGraph {
             needs_internet,
         })
     }
+
+    /// Returns a list of [BuildSpecRef] objects who's names matched the given search term.
+    pub fn fuzzy_name_search(&self, term: &str, num_results: usize) -> Vec<(BuildSpecRef, u32)> {
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+        struct SearchEntry {
+            score: u32,
+            bsr: BuildSpecRef,
+        }
+
+        use std::collections::BinaryHeap;
+        let mut results = BinaryHeap::with_capacity(num_results);
+
+        for (bsr, build) in self.builds.iter() {
+            let score = fuzzy_match(term, &build.name);
+            results.push(std::cmp::Reverse(SearchEntry {
+                score,
+                bsr: BuildSpecRef(bsr),
+            }));
+            if results.len() > num_results {
+                results.pop();
+            }
+        }
+
+        // Little-known fact: into_iter() of a vec followed by a collect into a vec
+        // where the memory needed is less, doesnt allocate.
+        results
+            .into_sorted_vec()
+            .into_iter()
+            .map(|std::cmp::Reverse(SearchEntry { score, bsr })| (bsr, score))
+            .collect()
+    }
+}
+
+fn fuzzy_match(needle: &str, haystack: &str) -> u32 {
+    let n = needle.trim().to_lowercase();
+    let h = haystack.trim().to_lowercase();
+
+    if n == h {
+        return 1000;
+    }
+    if h.contains(n.as_str()) {
+        return 950;
+    }
+
+    let mut h_rest = h.as_str();
+    let mut score = 0u32;
+    let mut consecutive_bonus = 0u32;
+    let mut matched = 0u32;
+
+    for ch in n.chars() {
+        if let Some(idx) = h_rest.find(ch) {
+            consecutive_bonus = if idx == 0 && matched > 0 {
+                consecutive_bonus + 1
+            } else {
+                0
+            };
+            score += 10 + consecutive_bonus;
+            h_rest = &h_rest[idx + ch.len_utf8()..];
+            matched += 1;
+        }
+    }
+
+    let n_len = n.chars().count() as u32;
+    let h_len = h.chars().count() as u32;
+    let char_score = score * 10 / (n_len * 11); // approx divide by 1.1
+    let length_penalty_num = n_len * 100 / n_len.max(h_len);
+    (char_score * length_penalty_num / 100).min(900)
 }
 
 /// Describes sandbox configuration that needs to be set to power present packages.
@@ -1422,6 +1489,60 @@ mod tests {
                 .into()
             )
         );
+    }
+
+    #[test]
+    fn fuzzy_name_search() {
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+                let {BuildSpec, ..} = import \"minimal.ncl\" in
+
+                let
+                    b1 = {
+                        name = \"libffi\",
+                        build_deps = [],
+                        cmd = \"\",
+                    } | BuildSpec,
+                    b2 = {
+                        name = \"libxml2\",
+                        build_deps = [],
+                        cmd = \"\",
+                    } | BuildSpec,
+                    b3 = {
+                        name = \"zlib\",
+                        build_deps = [],
+                        cmd = \"\",
+                    } | BuildSpec,
+                in
+                [b1, b2, b3]
+                "
+            }
+            .to_string(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        let dp = DepGraph::new().ingest(layer).unwrap();
+
+        // Exact match should rank highest
+        let results = dp.fuzzy_name_search("libffi", 3);
+        assert_eq!(results.len(), 3);
+        assert_eq!(dp.get(&results[0].0).unwrap().name, "libffi");
+
+        // Partial match: "lib" should prefer libffi/libxml2 over zlib
+        let results = dp.fuzzy_name_search("lib", 2);
+        let names: Vec<&str> = results
+            .iter()
+            .map(|r| dp.get(&r.0).unwrap().name.as_str())
+            .collect();
+        assert!(names.contains(&"libffi") || names.contains(&"libxml2"));
+
+        // Limiting num_results works
+        let results = dp.fuzzy_name_search("lib", 1);
+        assert_eq!(results.len(), 1);
     }
 
     #[test]

@@ -97,17 +97,22 @@ impl EnvChannel<'_> {
         .ok();
     }
 
-    fn parse_pkgs_line<'a>(
-        &self,
-        comma_separated_pkgs: &'a str,
-    ) -> Result<Vec<(&'a str, BuildSpecRef)>, &'a str> {
-        comma_separated_pkgs
-            .split(",")
-            .map(|n| match self.graph.by_name(n) {
-                None => Err(n),
-                Some(bsr) => Ok((n, *bsr)),
-            })
-            .collect()
+    fn parse_pkgs_line<'a>(&self, pkgs: &'a str) -> Result<Vec<(&'a str, BuildSpecRef)>, &'a str> {
+        if pkgs.contains(",") {
+            pkgs.split(",")
+                .map(|n| match self.graph.by_name(n) {
+                    None => Err(n),
+                    Some(bsr) => Ok((n, *bsr)),
+                })
+                .collect()
+        } else {
+            pkgs.split(" ")
+                .map(|n| match self.graph.by_name(n) {
+                    None => Err(n),
+                    Some(bsr) => Ok((n, *bsr)),
+                })
+                .collect()
+        }
     }
 }
 
@@ -161,6 +166,23 @@ impl sandbox2::Channel for EnvChannel<'_> {
                     ))
                 }
             },
+            Some(("search", term)) => {
+                self.graph
+                    .fuzzy_name_search(term, 8)
+                    .iter()
+                    .for_each(|(bsr, n)| {
+                        if *n < 8 {
+                            return;
+                        }
+                        let name = &self.graph.get(bsr).unwrap().name;
+                        if name.ends_with(" (prebuilt)") {
+                            return;
+                        }
+
+                        writeln!(stream, "msg: * {}", name).ok();
+                    });
+                None
+            }
             _ => {
                 writeln!(stream, "error: unhandled input '{}'", line).ok();
                 None
@@ -354,6 +376,38 @@ min() { eval "$(/usr/bin/min "$@")"; }
 const MIN_SCRIPT: &str = indoc::indoc! {
     r#"#!/usr/bin/bash
 
+    min_search() {
+        local term="$1"
+        if [[ -z "$term" || -z "$term" ]]; then
+            echo "Usage: min_search <search term>" >&2
+            return 1
+        fi
+
+        local error="false"
+        while IFS= read -r line; do
+            local tag="${line%%:*}"
+            local rest="${line#*:}"
+            case "$tag" in
+                msg)
+                    echo "$rest"
+                    ;;
+                done)
+                    break
+                    ;;
+                error)
+                    echo "error:$rest" >&2
+                    error="true"
+                    break
+                    ;;
+            esac
+        done < <(echo "search%${term}" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
+
+        if [[ "$error" == "true" ]]; then
+            return 1
+        fi
+    }
+
+
     __min_add() {
         local prefix="$1"
         local pkgname="$2"
@@ -438,6 +492,9 @@ const MIN_SCRIPT: &str = indoc::indoc! {
         case "$subcmd" in
             add)
                 min_add "$@"
+                ;;
+            search)
+                min_search "$@"
                 ;;
             *)
                 echo "Usage: min add --session|--build|--runtime|--task <packages>" >&2
