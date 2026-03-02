@@ -1,5 +1,4 @@
 #![allow(unused_imports, unused_variables)]
-use crate::PackagesArg;
 use clap::{ArgAction, ValueEnum};
 use graph::{
     BuildDep, BuildSpec, BuildSpecRef, Graph, RuntimeDep, SourceFetch, SourceInput, SubsetInput,
@@ -26,10 +25,7 @@ enum OutputFormat {
 /// CLI options to control what goes in the generated graph
 #[derive(Debug, clap::Args)]
 pub struct DepArgs {
-    #[command(flatten)]
-    packages: PackagesArg,
-
-    /// Packages left out of graph and not traversed. Overrides matching -p entries
+    /// Packages left out of graph and not traversed. Overrides matching package entries
     #[arg(short, long, alias="exclude", value_delimiter=',', num_args=0..)]
     excludes: Option<Vec<String>>,
 
@@ -97,6 +93,10 @@ pub struct DepArgs {
 
     #[arg(long, default_value("dot"), value_parser = clap::value_parser!(OutputFormat))]
     output_format: OutputFormat,
+
+    /// Packages to visualize, space separated
+    #[arg(required = false, trailing_var_arg = true, allow_hyphen_values = false, num_args=0..)]
+    pub packages: Vec<String>,
 }
 
 /// Data per node in the package petgraph DiGraph (aka "weight") that identifies
@@ -353,13 +353,14 @@ fn pgraph_copy_subset(
     args: &DepArgs,
 ) -> Result<DiGraph<NodeData, EdgeData>, Error> {
     // if the listest packages with -p reduce to just those node indices
-    let node_indices = match args.packages.packages.clone() {
-        Some(strs) if !strs.is_empty() => strs
+    let node_indices = if !args.packages.is_empty() {
+        args.packages
             .iter()
             .filter_map(|s| bsname_to_node_index.get(s))
             .copied()
-            .collect::<Vec<_>>(),
-        _ => pgraph.node_indices().collect::<Vec<_>>(),
+            .collect::<Vec<_>>()
+    } else {
+        pgraph.node_indices().collect::<Vec<_>>()
     };
 
     let mut cpy = DiGraph::new();
@@ -564,7 +565,11 @@ fn prune_edgeless(pgraph: &mut DiGraph<NodeData, EdgeData>) {
 
 /// Prints graphviz DOT or Mermaid for the dependency graph as constrained by the CLI args to stdout.
 pub async fn cmd_dep(args: DepArgs, ctx: &mut Context) -> Result<(), Error> {
-    let graph = args.packages.resolve(ctx)?;
+    let graph = if args.packages.is_empty() {
+        ctx.graph_from_all_packages()
+    } else {
+        ctx.graph_from_package_names(args.packages.clone())
+    }?;
     let GraphData {
         pgraph,
         bsname_to_node_index,

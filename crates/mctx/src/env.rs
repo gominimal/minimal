@@ -99,21 +99,12 @@ impl EnvChannel<'_> {
     }
 
     fn parse_pkgs_line<'a>(&self, pkgs: &'a str) -> Result<Vec<(&'a str, BuildSpecRef)>, &'a str> {
-        if pkgs.contains(",") {
-            pkgs.split(",")
-                .map(|n| match self.graph.by_name(n) {
-                    None => Err(n),
-                    Some(bsr) => Ok((n, *bsr)),
-                })
-                .collect()
-        } else {
-            pkgs.split(" ")
-                .map(|n| match self.graph.by_name(n) {
-                    None => Err(n),
-                    Some(bsr) => Ok((n, *bsr)),
-                })
-                .collect()
-        }
+        pkgs.split(" ")
+            .map(|n| match self.graph.by_name(n) {
+                None => Err(n),
+                Some(bsr) => Ok((n, *bsr)),
+            })
+            .collect()
     }
 }
 

@@ -3,7 +3,6 @@
 use anyhow::anyhow;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
-use graph::Graph;
 use mctx::{ConfigBuilder, Context, Error};
 use std::io;
 use std::path::PathBuf;
@@ -155,59 +154,6 @@ pub(crate) fn enforce_science_mode() -> Result<(), Error> {
         )))
     } else {
         Ok(())
-    }
-}
-
-/// Argument parser for `[--packages <package 1>[,<package N>]]`.
-#[derive(Debug, Clone, Args)]
-pub struct PackagesArg {
-    /// Package names to build, comma-separated
-    #[arg(short, long, alias="package", value_delimiter=',', num_args=0..)]
-    packages: Option<Vec<String>>,
-}
-
-impl std::fmt::Display for PackagesArg {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(packages) = &self.packages {
-            write!(f, "{}", packages.join(","))
-        } else {
-            Ok(())
-        }
-    }
-}
-
-impl PackagesArg {
-    pub fn names(&self) -> Vec<String> {
-        match &self.packages {
-            Some(packages) => {
-                let mut names = packages.clone();
-                names.sort();
-                names.dedup();
-                names
-            }
-            None => vec![],
-        }
-    }
-
-    /// Returns a graph where the top-level is the packages the arguments represent.
-    ///  - Non empty: resolve to packages of the specified names.
-    ///  - Empty: resolve to all packages in the repo (i.e. not from upstream).
-    pub fn resolve(&self, ctx: &mut Context) -> Result<Graph, Error> {
-        if let Some(p) = &self.packages
-            && !p.is_empty()
-        {
-            if p[0].is_empty() {
-                let mut g = ctx.graph_from_all_packages()?;
-                g.top_levels.clear();
-                return Ok(g);
-            }
-            return ctx.graph_from_package_names(p.clone());
-        }
-
-        // Argument is empty or unset
-        let mut graph = ctx.graph_from_all_packages()?;
-        graph.top_levels = graph.from_origin(&ctx.repo_origin()).collect();
-        Ok(graph)
     }
 }
 

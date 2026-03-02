@@ -1,16 +1,22 @@
-use crate::PackagesArg;
 use cache::{CacheBinProvider, RemoteBinProvider};
 use graph::{BinProvider, ExecPlan, Graph};
 use mctx::{Cache, Context, Error};
 
 #[derive(clap::Args)]
 pub struct PlanArgs {
-    #[command(flatten)]
-    packages: PackagesArg,
+    /// Packages to plan
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args=0..)]
+    packages: Vec<String>,
 }
 
 pub async fn cmd_plan(args: PlanArgs, ctx: &mut Context) -> Result<(), Error> {
-    let graph = args.packages.resolve(ctx)?;
+    let graph = if !args.packages.is_empty() {
+        ctx.graph_from_package_names(args.packages.clone())?
+    } else {
+        let mut g = ctx.graph_from_all_packages()?;
+        g.top_levels = g.from_origin(&ctx.repo_origin()).collect();
+        g
+    };
     let cache = ctx.local_cache();
 
     match (!ctx.use_local_cache(), !ctx.use_remote_cache()) {

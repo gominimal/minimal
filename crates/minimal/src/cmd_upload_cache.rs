@@ -1,4 +1,3 @@
-use crate::PackagesArg;
 use common::archive;
 use graph::Transitives;
 use mctx::{Context, Error};
@@ -7,12 +6,18 @@ use tracing::info;
 
 #[derive(clap::Args)]
 pub struct UploadArgs {
-    #[command(flatten)]
-    packages: PackagesArg,
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args=0..)]
+    packages: Vec<String>,
 }
 
 pub async fn cmd_upload_cache(args: UploadArgs, ctx: &mut Context) -> Result<(), Error> {
-    let graph = args.packages.resolve(ctx)?;
+    let graph = if !args.packages.is_empty() {
+        ctx.graph_from_package_names(args.packages.clone())?
+    } else {
+        let mut g = ctx.graph_from_all_packages()?;
+        g.top_levels = g.from_origin(&ctx.repo_origin()).collect();
+        g
+    };
     let cache = ctx.local_cache();
 
     let upload_bsrs: Vec<_> = Transitives::for_toplevels(&graph, graph.top_levels.to_vec(), false)

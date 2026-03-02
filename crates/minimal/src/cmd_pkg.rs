@@ -1,17 +1,23 @@
-use crate::PackagesArg;
 use graph::Graph;
 use mctx::{Cache, Context, Error};
 use tracing::{info, trace};
 
 #[derive(Debug, clap::Args)]
 pub struct PkgArgs {
-    #[command(flatten)]
-    packages: PackagesArg,
+    /// Packages to build
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args=0..)]
+    packages: Vec<String>,
 }
 
 pub async fn cmd_pkg(args: PkgArgs, ctx: &mut Context) -> Result<(), Error> {
     trace!("cmd_pkg");
-    let graph = args.packages.resolve(ctx)?;
+    let graph = if !args.packages.is_empty() {
+        ctx.graph_from_package_names(args.packages.clone())?
+    } else {
+        let mut g = ctx.graph_from_all_packages()?;
+        g.top_levels = g.from_origin(&ctx.repo_origin()).collect();
+        g
+    };
     let cache = ctx.local_cache();
 
     pkg_build_impl(&graph, ctx, cache, false).await?;

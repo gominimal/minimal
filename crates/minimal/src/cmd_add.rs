@@ -7,8 +7,8 @@ pub struct AddArgs {
     #[command(flatten)]
     pub kind: AddKind,
 
-    /// Packages to add, comma-separated
-    #[arg(required = true, value_delimiter=',', num_args=0..)]
+    /// Packages to add, space-separated
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = false, num_args=0..)]
     pub packages: Vec<String>,
 }
 
