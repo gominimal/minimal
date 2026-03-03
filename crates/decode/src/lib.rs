@@ -1,4 +1,8 @@
-//! Decodes a layer of build specs into objects.
+//! Decodes a layer in the software supply chain.
+//!
+//! Concretely, this means walking the codebase which declares the layer to enumerate
+//! packages/profiles/harnesses, then evaluating the resulting Nickel to decode them
+//! into in-memory structures.
 
 use common::SpecOrigin;
 use generational_arena::Arena;

@@ -238,6 +238,25 @@ impl SourceProvider for checkouts::Manager {
     }
 }
 
+/// Describes something that can cache a [Layer], that is, the result of parsing/eval of nickel.
+pub trait LayerCache {
+    type Error: std::fmt::Debug;
+
+    fn insert(&mut self, origin: SpecOrigin, layer: &Layer) -> Result<(), Self::Error>;
+    fn get(&mut self, origin: &SpecOrigin) -> Result<Option<Layer>, Self::Error>;
+}
+
+impl LayerCache for () {
+    type Error = ();
+
+    fn insert(&mut self, _origin: SpecOrigin, _layer: &Layer) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn get(&mut self, _origin: &SpecOrigin) -> Result<Option<Layer>, Self::Error> {
+        Ok(None)
+    }
+}
+
 /// The in-memory representation of the software supply chain: all packages, profiles, and harnesses.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -293,8 +312,9 @@ impl Graph {
     /// and resolving the files for upstream layers using the given implementation of [SourceProvider].
     ///
     /// The given leaf paramater must not be `SpecOrigin::Inline`, or this function will panic.
-    pub fn new_from_chain<SP: SourceProvider>(
+    pub fn new_from_chain<SP: SourceProvider, LC: LayerCache>(
         sp: &mut SP,
+        lc: &mut LC,
         leaf: SpecOrigin,
         minimal_lib_path: PathBuf,
         for_target: Target,
@@ -321,15 +341,28 @@ impl Graph {
                 SpecOrigin::LocalDir { absolute, .. } => absolute.clone(),
             };
 
-            let layer = Layer::new(
-                src_path,
-                &decode::LoadOptions {
-                    minimal_lib_path: minimal_lib_path.clone(),
-                    from: upstream.clone(),
-                    target: for_target.clone(),
-                },
-            )
-            .map_err(Error::Decode)?;
+            // Load the layer, either from the layer cache or by doing a full load via [Layer::new].
+            let layer = if let Some(layer) = lc
+                .get(&upstream)
+                .map_err(|e| Error::Fetch(format!("layer-cache fetch: {:?}", e)))?
+            {
+                layer
+            } else {
+                let layer = Layer::new(
+                    src_path,
+                    &decode::LoadOptions {
+                        minimal_lib_path: minimal_lib_path.clone(),
+                        from: upstream.clone(),
+                        target: for_target.clone(),
+                    },
+                )
+                .map_err(Error::Decode)?;
+
+                if let Err(e) = lc.insert(upstream.clone(), &layer) {
+                    tracing::warn!("Failed to cache layer for origin {:?}: {:?}", upstream, e);
+                }
+                layer
+            };
 
             cursor = if let Some(next_upstream) = layer.upstream() {
                 match next_upstream {
@@ -1079,6 +1112,7 @@ mod tests {
         ]));
         let graph = Graph::new_from_chain(
             &mut sp,
+            &mut (),
             middle_repo.as_spec_origin().unwrap(),
             LoadOptions::for_test().minimal_lib_path,
             Target::default(),

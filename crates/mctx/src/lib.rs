@@ -357,6 +357,7 @@ impl Context {
         let start = SystemTime::now();
         let res = Graph::new_from_chain(
             &mut self.vcs,
+            &mut (),
             leaf_layer,
             self.stdlib_dir.clone(),
             Target::host(),
