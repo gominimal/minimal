@@ -1,7 +1,7 @@
 pub mod config;
 use config::Config;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -433,7 +433,16 @@ impl<C: Channel> Sandbox<C> {
         container.command_inner(self, &program, args, env_vars)
     }
 
-    pub fn run(&mut self, invocations: Vec<Invocation>) -> Result<(), Error> {
+    pub async fn run<W1, W2>(
+        &mut self,
+        invocations: Vec<Invocation>,
+        mut stdout_writer: Option<W1>,
+        mut stderr_writer: Option<W2>,
+    ) -> Result<(), Error>
+    where
+        W1: tokio::io::AsyncWrite + Unpin + Send,
+        W2: tokio::io::AsyncWrite + Unpin + Send,
+    {
         let container = self.new_container()?;
         for (i, exec) in invocations.iter().enumerate() {
             let span = match &self.config.wd {
@@ -473,41 +482,133 @@ impl<C: Channel> Sandbox<C> {
             }
             .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
 
-            let output = child
-                .wait_with_output()
-                .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
-            if let Some(stdout) = self.stdout.as_mut() {
-                stdout
-                    .write_all(&output.stdout)
-                    .map_err(|e| Error::IO("writing stdout", Default::default(), e))?;
-                stdout
-                    .flush()
-                    .map_err(|e| Error::IO("flushing stdout", Default::default(), e))?;
-            }
-            if let Some(stderr) = self.stderr.as_mut() {
-                stderr
-                    .write_all(&output.stderr)
-                    .map_err(|e| Error::IO("writing stderr", Default::default(), e))?;
-                stderr
-                    .flush()
-                    .map_err(|e| Error::IO("flushing stderr", Default::default(), e))?;
-            }
+            // Take pipes from the child so threads can stream them into the stdout/stderr
+            // files, as well as to the caller-provided writers if applicable.
+            let child_stdout = child.stdout.take();
+            let child_stderr = child.stderr.take();
 
-            if !output.status.success() {
-                let stderr_tail = {
-                    let s = &output.stderr;
-                    let tail = if s.len() > 4096 {
-                        &s[s.len() - 4096..]
-                    } else {
-                        s
-                    };
-                    String::from_utf8_lossy(tail).into_owned()
-                };
+            // Stdout thread
+            let stdout_file = self.stdout.take();
+            let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+            let stdout_thread = std::thread::spawn(move || -> Result<Option<fs::File>, Error> {
+                let mut file = stdout_file;
+                if let Some(mut pipe) = child_stdout {
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        let n = pipe
+                            .read(&mut buf)
+                            .map_err(|e| Error::IO("reading stdout pipe", Default::default(), e))?;
+                        if n == 0 {
+                            break;
+                        }
+                        if let Some(f) = file.as_mut() {
+                            f.write_all(&buf[..n])
+                                .map_err(|e| Error::IO("writing stdout", Default::default(), e))?;
+                        }
+                        // Ignore send errors: the receiver may have been dropped
+                        // if the async writer errored, but we still drain the pipe.
+                        let _ = stdout_tx.blocking_send(buf[..n].to_vec());
+                    }
+                    if let Some(f) = file.as_mut() {
+                        f.flush()
+                            .map_err(|e| Error::IO("flushing stdout", Default::default(), e))?;
+                    }
+                }
+                Ok(file)
+            });
+
+            // Stderr thread
+            let stderr_file = self.stderr.take();
+            let (stderr_tx, mut stderr_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+            let stderr_thread =
+                std::thread::spawn(move || -> Result<(Option<fs::File>, Vec<u8>), Error> {
+                    let mut file = stderr_file;
+                    let mut tail = Vec::new();
+                    if let Some(mut pipe) = child_stderr {
+                        let mut buf = [0u8; 8192];
+                        loop {
+                            let n = pipe.read(&mut buf).map_err(|e| {
+                                Error::IO("reading stderr pipe", Default::default(), e)
+                            })?;
+                            if n == 0 {
+                                break;
+                            }
+                            if let Some(f) = file.as_mut() {
+                                f.write_all(&buf[..n]).map_err(|e| {
+                                    Error::IO("writing stderr", Default::default(), e)
+                                })?;
+                            }
+                            tail.extend_from_slice(&buf[..n]);
+                            if tail.len() > 8192 {
+                                let start = tail.len() - 4096;
+                                tail = tail[start..].to_vec();
+                            }
+                            let _ = stderr_tx.blocking_send(buf[..n].to_vec());
+                        }
+                        if let Some(f) = file.as_mut() {
+                            f.flush()
+                                .map_err(|e| Error::IO("flushing stderr", Default::default(), e))?;
+                        }
+                    }
+                    if tail.len() > 4096 {
+                        let start = tail.len() - 4096;
+                        tail = tail[start..].to_vec();
+                    }
+                    Ok((file, tail))
+                });
+
+            // Forward chunks from the channels to the optional async writers.
+            use tokio::io::AsyncWriteExt;
+            let stdout_fwd = async {
+                while let Some(chunk) = stdout_rx.recv().await {
+                    if let Some(w) = stdout_writer.as_mut() {
+                        w.write_all(&chunk).await.map_err(|e| {
+                            Error::IO("writing to stdout writer", Default::default(), e)
+                        })?;
+                    }
+                }
+                Ok::<(), Error>(())
+            };
+            let stderr_fwd = async {
+                while let Some(chunk) = stderr_rx.recv().await {
+                    if let Some(w) = stderr_writer.as_mut() {
+                        w.write_all(&chunk).await.map_err(|e| {
+                            Error::IO("writing to stderr writer", Default::default(), e)
+                        })?;
+                    }
+                }
+                Ok::<(), Error>(())
+            };
+
+            let (stdout_fwd_res, stderr_fwd_res) = tokio::join!(stdout_fwd, stderr_fwd);
+
+            // Collect results from the reader threads.
+            let stdout_file = stdout_thread
+                .join()
+                .expect("stdout reader thread panicked")?;
+            let (stderr_file, stderr_tail) = stderr_thread
+                .join()
+                .expect("stderr reader thread panicked")?;
+
+            self.stdout = stdout_file;
+            self.stderr = stderr_file;
+
+            // Propagate any async writer errors.
+            stdout_fwd_res?;
+            stderr_fwd_res?;
+
+            // The pipes are drained, so the child should have exited.
+            let status = child
+                .wait()
+                .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
+
+            if !status.success() {
+                let stderr_str = String::from_utf8_lossy(&stderr_tail).into_owned();
                 return Err(Error::Execution(ExecutionError::InvocationFailed {
                     idx: i,
-                    code: output.status.code,
-                    reason: output.status.reason.clone(),
-                    stderr: stderr_tail,
+                    code: status.code,
+                    reason: status.reason.clone(),
+                    stderr: stderr_str,
                 }));
             }
         }

@@ -71,6 +71,8 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                 override_deps: Some(dep_paths.into_iter().collect()),
                 spec: &bsr,
                 remote_fetcher: &shared.backend.sf,
+                stdout_writer: None,
+                stderr_writer: None,
             };
 
             let res = b

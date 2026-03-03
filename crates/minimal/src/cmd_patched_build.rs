@@ -1,9 +1,11 @@
 use crate::{Context, Error};
 use anyhow::anyhow;
+use common::TracingWriter;
 use graph::{BuildSpecRef, Graph, Transitives};
 use lcache::{Cache, EntryMeta, LocalDir, MetaInner};
 use op::{Runnable, SpecBuild};
-use std::{collections::HashSet, path::PathBuf};
+use std::collections::HashSet;
+use std::path::PathBuf;
 
 #[derive(Debug, clap::Args)]
 pub struct PatchedBuildArgs {
@@ -59,6 +61,8 @@ pub async fn cmd_patched_build(args: PatchedBuildArgs, ctx: &mut Context) -> Res
         spec: &bsr,
         override_deps: Some(dependencies),
         remote_fetcher: &remote_storage,
+        stdout_writer: Some(Box::new(TracingWriter::stdout())),
+        stderr_writer: Some(Box::new(TracingWriter::stderr())),
     }
     .run(&op::Options {
         cache,

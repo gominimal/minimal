@@ -10,6 +10,7 @@ publish.workspace = true
 globset.workspace = true
 tracing.workspace = true
 tempfile.workspace = true
+tokio.workspace = true
 walkdir.workspace = true
 
 common.workspace = true

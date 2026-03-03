@@ -28,6 +28,11 @@ pub struct SpecBuild<'a, SF: crate::SourceFetcher> {
     /// Does not override `Local` or `Source` variant build_deps - those will
     /// always be made present automatically.
     pub override_deps: Option<HashSet<PathBuf>>,
+
+    /// Optional async writer that receives a copy of the sandbox's stdout stream.
+    pub stdout_writer: Option<Box<dyn tokio::io::AsyncWrite + Unpin + Send + Sync>>,
+    /// Optional async writer that receives a copy of the sandbox's stderr stream.
+    pub stderr_writer: Option<Box<dyn tokio::io::AsyncWrite + Unpin + Send + Sync>>,
 }
 
 impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
@@ -246,16 +251,20 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
 
         info!("Building package: {}", build.name);
         let start = Instant::now();
-        sandbox.run(
-            self.invocations(build)?
-                .into_iter()
-                .map(|(program, args)| sandbox2::config::Invocation {
-                    executable: program,
-                    args,
-                    envs: Default::default(),
-                })
-                .collect(),
-        )?;
+        sandbox
+            .run(
+                self.invocations(build)?
+                    .into_iter()
+                    .map(|(program, args)| sandbox2::config::Invocation {
+                        executable: program,
+                        args,
+                        envs: Default::default(),
+                    })
+                    .collect(),
+                self.stdout_writer.take(),
+                self.stderr_writer.take(),
+            )
+            .await?;
         let build_ms = Instant::now().duration_since(start).as_millis() as usize;
 
         let out_dir = opts

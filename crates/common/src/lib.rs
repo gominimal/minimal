@@ -385,6 +385,91 @@ pub fn command_exists(command: &str) -> Result<bool, io::Error> {
     Ok(false)
 }
 
+/// An [`tokio::io::AsyncWrite`] implementation that emits complete lines as tracing events.
+///
+/// Stdout lines are emitted at `INFO` level, stderr lines at `WARN` level.
+/// Events are emitted with no parent span (`parent: tracing::Span::none()`) so
+/// they don't inherit noisy span context from the caller.
+pub struct TracingWriter {
+    buf: Vec<u8>,
+    is_stderr: bool,
+}
+
+impl TracingWriter {
+    /// Creates a writer that emits lines at `INFO` level.
+    pub fn stdout() -> Self {
+        Self {
+            buf: Vec::new(),
+            is_stderr: false,
+        }
+    }
+
+    /// Creates a writer that emits lines at `WARN` level.
+    pub fn stderr() -> Self {
+        Self {
+            buf: Vec::new(),
+            is_stderr: true,
+        }
+    }
+
+    fn emit_lines(&mut self) {
+        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&self.buf[..pos]);
+            if self.is_stderr {
+                tracing::warn!(parent: tracing::Span::none(), "{}", line);
+            } else {
+                tracing::info!(parent: tracing::Span::none(), "{}", line);
+            }
+            self.buf.drain(..=pos);
+        }
+    }
+
+    fn emit_remaining(&mut self) {
+        if !self.buf.is_empty() {
+            let line = String::from_utf8_lossy(&self.buf);
+            if self.is_stderr {
+                tracing::warn!(parent: tracing::Span::none(), "{}", line);
+            } else {
+                tracing::info!(parent: tracing::Span::none(), "{}", line);
+            }
+            self.buf.clear();
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for TracingWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, io::Error>> {
+        self.buf.extend_from_slice(buf);
+        self.emit_lines();
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), io::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), io::Error>> {
+        self.emit_remaining();
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for TracingWriter {
+    fn drop(&mut self) {
+        self.emit_remaining();
+    }
+}
+
 /// Describes a file or directory mapped from the host to the sandbox.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FsMapping {
