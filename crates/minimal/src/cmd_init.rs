@@ -76,8 +76,18 @@ pub async fn cmd_init(args: InitArgs, config: Config) -> Result<(), Error> {
     let toml_path = toml_path.unwrap_or_else(|| repo_dir.join(mfile::MFILE_NAME));
 
     // Apply all predicates, collecting the harness name, any additional build packages, and any additional runtime packages.
+    let harnesses = {
+        let mut h = graph.iter_harnesses().collect::<Vec<_>>();
+        // Sort harnesses so those with a higher priority are iterated first.
+        h.sort_by(|a, b| {
+            a.1.matches_project_priority
+                .cmp(&b.1.matches_project_priority)
+                .reverse()
+        });
+        h
+    };
     let matched_harness: Option<(String, Vec<String>, Vec<String>)> =
-        graph.iter_harnesses().find_map(|(name, harness)| {
+        harnesses.into_iter().find_map(|(name, harness)| {
             harness
                 .matches_project_if_any
                 .as_ref()

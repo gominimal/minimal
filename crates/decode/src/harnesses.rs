@@ -300,6 +300,9 @@ pub struct Harness {
     ///
     /// For a harness to be applicable, one of the matchers in this list must have all its predicates met.
     pub matches_project_if_any: Option<Vec<HarnessMatcher>>,
+
+    /// Priority of this harness for matching, defaults to zero.
+    pub matches_project_priority: i32,
 }
 
 impl Harness {
@@ -315,6 +318,7 @@ impl Harness {
         let mut build_cmds: Option<Vec<Vec<String>>> = None;
         let mut build_cmds_cmd: Option<Vec<String>> = None;
         let mut matches_project_if_any: Option<Vec<HarnessMatcher>> = None;
+        let mut matches_project_priority: Option<i32> = None;
 
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
@@ -507,6 +511,15 @@ impl Harness {
 
                                 Ok(())
                             }
+                            "matches_project_priority" => {
+                                if let Some(matchers_rt) = field.value.as_ref() {
+                                    let matchers_rt =
+                                        eval_if_closure(matchers_rt, program)?;
+                                    matches_project_priority = Some(i32::deserialize(matchers_rt).unwrap());
+                                }
+
+                                Ok(())
+                            }
 
                             // TODO: `build_cmds` like `cmds` in build-specs.
                             _ => Ok(()),
@@ -542,6 +555,7 @@ impl Harness {
         let build_packages = build_packages.unwrap_or_default();
         let runtime_packages = runtime_packages.unwrap_or_default();
         let build_env_vars = build_env_vars.unwrap_or_default();
+        let matches_project_priority = matches_project_priority.unwrap_or(0);
 
         match (&build_cmds, &build_cmds_cmd) {
             (Some(_), Some(_)) => {
@@ -569,6 +583,7 @@ impl Harness {
             build_cmds,
             build_cmds_cmd,
             matches_project_if_any,
+            matches_project_priority,
         })
     }
 
@@ -646,6 +661,7 @@ mod tests {
                           }
                         ],
                     }],
+                    matches_project_priority = 1,
                 }
                 "
             }
@@ -700,6 +716,7 @@ mod tests {
                     .into(),
                     runtime_package_matchers: Default::default(),
                 }]),
+                matches_project_priority: 1,
                 ..Default::default()
             }
         )

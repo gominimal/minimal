@@ -800,6 +800,7 @@ mod tests {
                 build_cmds_cmd: None,
                 build_cmds: Some(vec![vec!["uwu".to_string(), "build".to_string()]]),
                 matches_project_if_any: None,
+                matches_project_priority: 0,
             }),
         );
     }

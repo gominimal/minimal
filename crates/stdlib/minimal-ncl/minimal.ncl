@@ -275,6 +275,7 @@ let CmdSpec = std.contract.any_of [
         build_cmds_cmd | CmdSpec | optional,
 
         matches_project_if_any | Array HarnessMatcherEntry | optional,
+        matches_project_priority | Number | optional,
     },
     harness | Dyn -> Harness | doc "Constructs a harness." =
         fun spec => spec | Harness,
