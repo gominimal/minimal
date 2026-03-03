@@ -100,10 +100,7 @@ impl From<&AttrValue> for PkgAttr {
             AttrValue::Bool(b) => PkgAttr::Bool(*b),
             AttrValue::String(s, pos) => PkgAttr::String {
                 value: s.clone(),
-                pos: pos
-                    .map(|p| p.into_opt())
-                    .flatten()
-                    .map(|s| (s.start.to_usize(), s.end.to_usize())),
+                pos: pos.as_ref().map(|s| (s.start_offset, s.end_offset)),
             },
             AttrValue::List(v) => PkgAttr::List(v.iter().map(PkgAttr::from).collect()),
             AttrValue::EnumVariant(n, b) => {

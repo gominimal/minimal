@@ -4,12 +4,13 @@ use common::SpecOrigin;
 use generational_arena::Arena;
 use mfile::{EnvPatches, LinkConfig, PatchSetting};
 use nickel_lang_core::identifier::LocIdent;
+use nickel_lang_core::position::TermPos;
 use nickel_lang_core::term::{RichTerm, Term};
 use nickel_lang_core::{
     eval::{Closure, cache::CacheImpl},
     program::Program,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -29,6 +30,26 @@ mod decl_tests;
 pub use decl_tests::Test;
 mod harnesses;
 pub use harnesses::{Harness, HarnessMatcher};
+
+/// The start and end bytes where a string was defined.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StrPos {
+    pub start_offset: usize,
+    pub end_offset: usize,
+}
+
+impl TryFrom<TermPos> for StrPos {
+    type Error = ();
+    fn try_from(value: TermPos) -> Result<Self, Self::Error> {
+        match value {
+            TermPos::Inherited(_) | TermPos::None => Err(()),
+            TermPos::Original(p) => Ok(Self {
+                start_offset: p.start.to_usize(),
+                end_offset: p.end.to_usize(),
+            }),
+        }
+    }
+}
 
 /// A collection of nickel objects, defined together in a single codebase.
 #[derive(Debug)]

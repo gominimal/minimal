@@ -9,12 +9,12 @@ use nickel_lang_core::{
     term::{IndexMap, RichTerm, RuntimeContract, Term},
 };
 use regex::bytes::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{Error, ObjTy, eval_if_closure};
 
 /// A predicate that when matched, indicates a package should be added when using a harness.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageMatcherPredicate {
     /// A list of file paths in the project and corresponding regexes, all of which must match
     /// for this harness to be applicable.
@@ -191,7 +191,7 @@ fn matches<P: AsRef<Path>>(
 }
 
 /// A set of rules that when matched, indicate that this harness is applicable to a source tree.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessMatcher {
     /// A list of file paths in the project and corresponding regexes, all of which must match
     /// for this harness to be applicable.
@@ -274,7 +274,7 @@ impl HarnessMatcher {
 }
 
 /// A harness, a specific set of norms for building a codebase.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct Harness {
     /// The human-readable name declared on the harness. Unique within a repo/layer.

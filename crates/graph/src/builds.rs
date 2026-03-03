@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub use decode::AttrValue;
+pub use decode::{AttrValue, StrPos};
 
 /// A map with ordered iteration semantics - we need this for stable spec hashes.
 type OutputMap = IndexMap<String, BuildOutput>;
@@ -22,8 +22,8 @@ pub enum SourceFetch {
     Web {
         url: String,
         sha256: String,
-        url_pos: Option<(usize, usize)>,
-        sha256_pos: Option<(usize, usize)>,
+        url_pos: Option<StrPos>,
+        sha256_pos: Option<StrPos>,
     },
     Local {
         full_path: PathBuf,
@@ -43,12 +43,8 @@ impl From<builds::SourceFetch> for SourceFetch {
             } => SourceFetch::Web {
                 url,
                 sha256,
-                url_pos: url_pos
-                    .and_then(|p| p.into_opt())
-                    .map(|p| (p.start.to_usize(), p.end.to_usize())),
-                sha256_pos: sha256_pos
-                    .and_then(|p| p.into_opt())
-                    .map(|p| (p.start.to_usize(), p.end.to_usize())),
+                url_pos,
+                sha256_pos,
             },
             builds::SourceFetch::Local {
                 full_path,

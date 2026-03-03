@@ -1,16 +1,16 @@
 use nickel_lang_core::{
     eval::cache::CacheImpl,
-    position::TermPos,
     program::Program,
     term::{IndexMap, RichTerm, RuntimeContract, Term},
 };
+use serde::{Deserialize, Serialize};
 
-use crate::{Error, eval_if_closure};
+use crate::{Error, StrPos, eval_if_closure};
 
 /// The value of an attribute.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AttrValue {
-    String(String, Option<TermPos>),
+    String(String, Option<StrPos>),
     Bool(bool),
     List(Vec<AttrValue>),
     Map(IndexMap<String, AttrValue>),
@@ -31,9 +31,9 @@ impl AttrValue {
         let rt = eval_if_closure(rt, program)?;
 
         Ok(match rt.term.as_ref() {
-            Term::Str(s) => Some(Self::String(s.to_string(), Some(rt.pos))),
+            Term::Str(s) => Some(Self::String(s.to_string(), rt.pos.try_into().ok())),
             Term::Bool(b) => Some(Self::Bool(*b)),
-            Term::Enum(a) => Some(Self::String(a.into_label(), Some(rt.pos))),
+            Term::Enum(a) => Some(Self::String(a.into_label(), rt.pos.try_into().ok())),
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                 let mut map = IndexMap::with_capacity(6);
                 r.fields

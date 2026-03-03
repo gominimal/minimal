@@ -3,12 +3,12 @@ use nickel_lang_core::{
     program::Program,
     term::{RichTerm, Term},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::{Error, ObjTy, builds::BuildRef, eval_if_closure, read_ty};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Test {
     /// The test needs to run in the build sandbox, rather than standalone.
     pub build_test: bool,

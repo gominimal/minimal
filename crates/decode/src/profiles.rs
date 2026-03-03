@@ -4,12 +4,12 @@ use nickel_lang_core::{
     program::Program,
     term::{IndexMap, RichTerm, Term},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{Error, ObjTy, eval_if_closure};
 
 /// A profile, the initial configuration for an environment.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct Profile {
     /// The human-readable name declared on the profile. Unique within a repo/layer.

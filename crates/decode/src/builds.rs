@@ -1,5 +1,6 @@
 //! Build specification objects.
 
+use crate::StrPos;
 use crate::{Error, ObjTy, attrs::AttrValue, eval_if_closure, read_ty};
 use common::Target;
 use nickel_lang_core::files::FileId;
@@ -7,7 +8,7 @@ use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::position::TermPos;
 use nickel_lang_core::term::{IndexMap, RichTerm, RuntimeContract, Term};
 use nickel_lang_core::{eval::cache::CacheImpl, program::Program};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use std::path::{Path, PathBuf};
@@ -16,7 +17,7 @@ use std::path::{Path, PathBuf};
 type OutputMap = IndexMap<String, BuildOutput>;
 
 /// A reference to some other build.
-#[derive(Debug, Clone, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum BuildRef {
     /// A build within the same layer.
     Local { annotated_id: u64, name: String },
@@ -138,13 +139,13 @@ impl BuildRef {
 }
 
 /// A description of pulling source code regardless of form.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SourceFetch {
     Web {
         url: String,
         sha256: String,
-        url_pos: Option<TermPos>,
-        sha256_pos: Option<TermPos>,
+        url_pos: Option<StrPos>,
+        sha256_pos: Option<StrPos>,
     },
     Local {
         full_path: PathBuf,
@@ -154,7 +155,7 @@ pub enum SourceFetch {
 }
 
 /// A description of source code thats used as an input.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceInput {
     pub from: SourceFetch,
     pub extract: bool,
@@ -280,9 +281,9 @@ impl SourceInput {
 
             SourceFetch::Web {
                 url,
-                url_pos,
+                url_pos: url_pos.and_then(|p| p.try_into().ok()),
                 sha256,
-                sha256_pos,
+                sha256_pos: sha256_pos.and_then(|p| p.try_into().ok()),
             }
         };
 
@@ -295,7 +296,7 @@ impl SourceInput {
 }
 
 /// A dependency on some of the outputs of a build-spec.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubsetInput {
     pub from: BuildRef,
     pub outputs: SmallVec<[String; 4]>,
@@ -395,7 +396,7 @@ impl SubsetInput {
 }
 
 /// An entry in a build spec's `build_deps` array.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum BuildDep {
     Build(BuildRef),
@@ -562,7 +563,7 @@ impl BuildDep {
 }
 
 /// An output from a build.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum BuildOutput {
     /// This output describes shared libraries matched with the given glob.
@@ -674,7 +675,7 @@ impl BuildOutput {
 /// A runtime dependency declared on a build-spec.
 ///
 /// Each entry in a build-spec's `runtime_deps` array corresponds to one [RuntimeDep].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RuntimeDep {
     /// A direct runtime dependency on the build-spec described by the contained reference.
     Build(BuildRef),
@@ -720,7 +721,7 @@ impl RuntimeDep {
 }
 
 /// Some task or build in the dependency graph.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct BuildDecl {
     /// The human-readable name declared on the build decl.
