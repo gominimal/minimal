@@ -1,22 +1,6 @@
 use common::SpecHash;
-use futures::{StreamExt, io::AsyncReadExt};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-
-pub fn read_wire_kv_stream<R>(
-    reader: R,
-) -> impl futures::Stream<Item = std::io::Result<(SpecHash, IndexEntry)>>
-where
-    R: AsyncReadExt + std::marker::Unpin,
-{
-    futures::stream::try_unfold(reader, |mut reader| async move {
-        match read_wire_kv_async(&mut reader).await {
-            Ok(kv_pair) => Ok(Some((kv_pair, reader))),
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
-            Err(e) => Err(e),
-        }
-    })
-}
 
 fn read_wire_kv<R: Read>(reader: &mut R) -> std::io::Result<(SpecHash, IndexEntry)> {
     let mut buf = [0u8; 32];
@@ -24,16 +8,6 @@ fn read_wire_kv<R: Read>(reader: &mut R) -> std::io::Result<(SpecHash, IndexEntr
     let spec_hash = SpecHash::from_bytes(buf);
 
     Ok((spec_hash, IndexEntry::read_wire(reader)?))
-}
-
-async fn read_wire_kv_async<R: AsyncReadExt + std::marker::Unpin>(
-    reader: &mut R,
-) -> std::io::Result<(SpecHash, IndexEntry)> {
-    let mut buf = [0u8; 32];
-    reader.read_exact(&mut buf[..]).await?;
-    let spec_hash = SpecHash::from_bytes(buf);
-
-    Ok((spec_hash, IndexEntry::read_wire_async(reader).await?))
 }
 
 fn write_wire_kv<W: Write>(writer: &mut W, k: &SpecHash, v: &IndexEntry) -> std::io::Result<()> {
@@ -87,24 +61,6 @@ impl IndexEntry {
         Ok(Self { sha256 })
     }
 
-    pub(crate) async fn read_wire_async<R: AsyncReadExt + std::marker::Unpin>(
-        reader: &mut R,
-    ) -> std::io::Result<IndexEntry> {
-        let mut flags = [0u8; 4];
-        reader.read_exact(&mut flags[..]).await?;
-        if flags != [0u8; 4] {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Unexpected flags value: this index might be in an updated format that requires an update to minimal",
-            ));
-        }
-
-        let mut sha256 = [0u8; 32];
-        reader.read_exact(&mut sha256[..]).await?;
-
-        Ok(Self { sha256 })
-    }
-
     pub(crate) fn write_wire<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
         writer.write_all(&[0u8; 4])?;
         writer.write_all(&self.sha256[..])
@@ -134,28 +90,6 @@ impl RemoteIndex {
 
         if let Some(err) = err {
             return Err(err);
-        }
-
-        Ok(Self { idx })
-    }
-
-    /// Asynchronously loads a remote index that was previously serialized with [Self::write_to].
-    pub async fn from_reader_async<R: AsyncReadExt + std::marker::Unpin>(
-        reader: &mut R,
-    ) -> std::io::Result<Self> {
-        let stream = read_wire_kv_stream(reader);
-        futures::pin_mut!(stream);
-
-        let mut idx = BTreeMap::new();
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok((spec_hash, index_entry)) => {
-                    idx.insert(spec_hash, index_entry);
-                }
-                Err(e) => {
-                    return Err(e);
-                }
-            }
         }
 
         Ok(Self { idx })

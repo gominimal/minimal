@@ -2,7 +2,8 @@
 members = [
     "crates/build-events",
     "crates/build-events-proto",
-    "crates/cache",
+    "crates/lcache",
+    "crates/rcache",
     "crates/check",
     "crates/checkouts",
     "crates/common",
@@ -94,7 +95,8 @@ petgraph = "0.8"
 build-events = { version = "0.0.1", path = "crates/build-events" }
 build-events-proto = { version = "0.0.1", path = "crates/build-events-proto" }
 graph = { version = "0.0.1", path = "crates/graph" }
-cache = { version = "0.0.1", path = "crates/cache" }
+lcache = { version = "0.0.1", path = "crates/lcache" }
+rcache = { version = "0.0.1", path = "crates/rcache" }
 check = { version = "0.0.1", path = "crates/check" }
 checkouts = { version = "0.0.1", path = "crates/checkouts" }
 common = { version = "0.0.1", path = "crates/common" }

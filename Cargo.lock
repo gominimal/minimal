@@ -360,28 +360,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cache"
-version = "0.0.1"
-dependencies = [
- "blake3",
- "bytes",
- "common",
- "futures",
- "google-cloud-storage",
- "graph",
- "hex",
- "libc",
- "path-absolutize",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-indicatif",
-]
-
-[[package]]
 name = "caps"
 version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -436,11 +414,11 @@ name = "check"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "cache",
  "common",
  "decode",
  "futures",
  "graph",
+ "lcache",
  "nickel-lang-core",
  "object",
  "op",
@@ -2249,6 +2227,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
+name = "lcache"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "common",
+ "graph",
+ "hex",
+ "libc",
+ "path-absolutize",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "leb128fmt"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2442,7 +2436,6 @@ name = "mctx"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "cache",
  "check",
  "checkouts",
  "codespan-reporting 0.13.1",
@@ -2454,9 +2447,11 @@ dependencies = [
  "graph",
  "hakoniwa",
  "indoc",
+ "lcache",
  "mfile",
  "op",
  "orchestrator",
+ "rcache",
  "sandbox2",
  "shlex",
  "stdlib",
@@ -2535,7 +2530,6 @@ dependencies = [
  "blake3",
  "build-events",
  "build-events-proto",
- "cache",
  "check",
  "checkouts",
  "clap",
@@ -2550,6 +2544,7 @@ dependencies = [
  "graph",
  "hakoniwa",
  "hex",
+ "lcache",
  "mctx",
  "mfile",
  "nickel-lang-core",
@@ -2558,6 +2553,7 @@ dependencies = [
  "orchestrator",
  "petgraph 0.8.3",
  "rayon",
+ "rcache",
  "regex",
  "reqwest",
  "res-proto",
@@ -2781,7 +2777,6 @@ name = "op"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "cache",
  "common",
  "decode",
  "either",
@@ -2793,6 +2788,7 @@ dependencies = [
  "graph",
  "hakoniwa",
  "indoc",
+ "lcache",
  "mfile",
  "oci-spec",
  "rayon",
@@ -2837,7 +2833,6 @@ name = "orchestrator"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "cache",
  "common",
  "decode",
  "either",
@@ -2846,7 +2841,9 @@ dependencies = [
  "google-cloud-storage",
  "graph",
  "indoc",
+ "lcache",
  "op",
+ "rcache",
  "sandbox2",
  "tokio",
  "tracing",
@@ -3398,6 +3395,23 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "rcache"
+version = "0.0.1"
+dependencies = [
+ "bytes",
+ "common",
+ "google-cloud-storage",
+ "graph",
+ "hex",
+ "lcache",
+ "reqwest",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-indicatif",
 ]
 
 [[package]]

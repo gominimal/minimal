@@ -1,9 +1,9 @@
 #![allow(clippy::result_large_err)]
 
 use anyhow::anyhow;
-use cache::{Cache, CacheErr, LocalDir};
 use futures::stream::FuturesUnordered;
 use graph::Graph;
+use lcache::{Cache, CacheErr, LocalDir};
 use op::{Options, Runnable, StandaloneTest};
 use regex::Regex;
 use std::cmp::Ordering;

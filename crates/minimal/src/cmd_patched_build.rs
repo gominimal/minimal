@@ -1,7 +1,7 @@
 use crate::{Context, Error};
 use anyhow::anyhow;
-use cache::{Cache, EntryMeta, LocalDir, MetaInner};
 use graph::{BuildSpecRef, Graph, Transitives};
+use lcache::{Cache, EntryMeta, LocalDir, MetaInner};
 use op::{Runnable, SpecBuild};
 use std::{collections::HashSet, path::PathBuf};
 

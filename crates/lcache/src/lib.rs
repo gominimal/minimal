@@ -16,15 +16,8 @@ pub use fs::FSError;
 pub use fs::FileSystem;
 pub use fs::LocalDir;
 
-#[allow(dead_code)]
-mod remote;
-pub use remote::{Error as RemoteError, INDEX_FILENAME as REMOTE_INDEX_FILENAME, RemoteCache};
-
 pub(crate) mod entry_meta;
 pub use entry_meta::{EntryMeta, MetaInner};
-
-#[allow(dead_code)]
-mod remote_index;
 
 mod read_tracker;
 use read_tracker::ReadTracker;
@@ -376,25 +369,6 @@ impl<'a> CacheBinProvider<'a> {
 impl<'a> graph::BinProvider for CacheBinProvider<'a> {
     fn exists(&self, bsr: &graph::BuildSpecRef) -> bool {
         self.cache.read_dir(&self.graph.spec_hash(bsr)).is_ok()
-    }
-}
-
-/// An adapter that lets you use a [RemoteCache] as a [graph::BinProvider].
-#[derive(Debug, Clone)]
-pub struct RemoteBinProvider<'a, B: common::fetchers::FetchBackend> {
-    graph: &'a graph::Graph,
-    remote: &'a RemoteCache<B>,
-}
-
-impl<'a, B: common::fetchers::FetchBackend> RemoteBinProvider<'a, B> {
-    pub fn new(graph: &'a graph::Graph, remote: &'a RemoteCache<B>) -> Self {
-        Self { graph, remote }
-    }
-}
-
-impl<'a, B: common::fetchers::FetchBackend> graph::BinProvider for RemoteBinProvider<'a, B> {
-    fn exists(&self, bsr: &graph::BuildSpecRef) -> bool {
-        self.remote.exists(&self.graph.spec_hash(bsr))
     }
 }
 

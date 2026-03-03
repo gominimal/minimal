@@ -2,10 +2,10 @@ use std::{collections::HashSet, path::PathBuf, time::Instant};
 
 use crate::{Error, Materialized, Options, Runnable, SubsetBuild};
 use anyhow::anyhow;
-use cache::{CacheErr, MetaInner, PendingDir};
 use common::Target;
 use globset::GlobSet;
 use graph::{BuildDep, BuildSpec, BuildSpecRef, SubsetInput, Transitives};
+use lcache::{CacheErr, MetaInner, PendingDir};
 use sandbox2::config::SandboxMapped;
 use tracing::info;
 
@@ -107,7 +107,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                                     from_dir: None,
                                 };
                                 let pending_dir = sb.run(opts).await?;
-                                pending_dir.finalize(cache::EntryMeta {
+                                pending_dir.finalize(lcache::EntryMeta {
                                     inner: MetaInner::Subset(subset.as_spec(opts.graph)),
                                     fetched: false,
                                     origin: Some(build.from.as_ref().clone()),

@@ -1,6 +1,6 @@
 use crate::{Error, Materialized, Options, Runnable};
-use cache::PendingDir;
 use graph::SourceInput;
+use lcache::PendingDir;
 
 use anyhow::{Context, Result, anyhow};
 use std::future::Future;

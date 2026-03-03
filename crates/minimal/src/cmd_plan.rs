@@ -1,6 +1,7 @@
-use cache::{CacheBinProvider, RemoteBinProvider};
 use graph::{BinProvider, ExecPlan, Graph};
+use lcache::CacheBinProvider;
 use mctx::{Cache, Context, Error};
+use rcache::RemoteBinProvider;
 
 #[derive(clap::Args)]
 pub struct PlanArgs {

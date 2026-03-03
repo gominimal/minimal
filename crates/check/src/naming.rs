@@ -1,7 +1,7 @@
 use super::Error;
 use crate::{CheckResult, CheckVerdict};
-use cache::{Cache, LocalDir};
 use graph::{BuildOutput, Graph};
+use lcache::{Cache, LocalDir};
 use tokio::sync::RwLockReadGuard;
 
 pub(crate) struct SpecNameMatchesDir;

@@ -1,8 +1,8 @@
 use std::{collections::HashSet, path::PathBuf};
 
 use anyhow::anyhow;
-use cache::{CacheErr, MetaInner};
 use graph::{BuildSpec, BuildSpecRef, SpecTest, SubsetInput, Transitives};
+use lcache::{CacheErr, MetaInner};
 
 use crate::{Error, Options, Runnable, SubsetBuild};
 
@@ -65,7 +65,7 @@ impl<'a> StandaloneTest<'a> {
                                     from_dir: None,
                                 };
                                 let pending_dir = sb.run(opts).await?;
-                                pending_dir.finalize(cache::EntryMeta {
+                                pending_dir.finalize(lcache::EntryMeta {
                                     inner: MetaInner::Subset(subset.as_spec(opts.graph)),
                                     fetched: false,
                                     origin: Some(build.from.as_ref().clone()),

@@ -3,8 +3,8 @@
 
 use std::path::PathBuf;
 
-use cache::{Cache, LocalDir, PendingDir};
 use graph::Graph;
+use lcache::{Cache, LocalDir, PendingDir};
 
 mod error;
 pub use error::Error;

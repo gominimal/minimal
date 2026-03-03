@@ -2,8 +2,8 @@
 
 use std::fmt;
 
-use cache::CacheErr;
 use graph::{Graph, PlanErr};
+use lcache::CacheErr;
 
 /// Error type for the op crate.
 #[derive(Debug)]

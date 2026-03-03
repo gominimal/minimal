@@ -6,7 +6,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-cache.workspace = true
+lcache.workspace = true
 common.workspace = true
 decode.workspace = true
 futures.workspace = true

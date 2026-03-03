@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use crate::{Error, Options, Runnable};
-use cache::PendingDir;
 use graph::SubsetInput;
+use lcache::PendingDir;
 
 /// Constructs a subset, storing the resulting object in the cache.
 pub struct SubsetBuild<'a> {
@@ -63,10 +63,10 @@ impl<'a> Runnable for SubsetBuild<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cache::{Cache, EntryMeta, MetaInner};
     use decode::Layer;
     use graph::Graph;
     use indoc::indoc;
+    use lcache::{Cache, EntryMeta, MetaInner};
     use smallvec::smallvec;
     use tempfile::TempDir;
 
@@ -130,7 +130,7 @@ mod tests {
         };
         let pending_dir = futures::executor::block_on(sb.run(run_opts)).unwrap();
         pending_dir
-            .finalize(cache::EntryMeta {
+            .finalize(lcache::EntryMeta {
                 inner: MetaInner::Subset(sb.subset.as_spec(&dg)),
                 fetched: false,
                 origin: Some(

@@ -1,8 +1,8 @@
 use super::Error;
 use crate::CheckVerdict;
-use cache::{Cache, LocalDir};
 use decode::Harness;
 use graph::Graph;
+use lcache::{Cache, LocalDir};
 use nickel_lang_core::eval::cache::CacheImpl;
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::program::Program;

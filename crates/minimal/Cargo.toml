@@ -8,7 +8,8 @@ publish.workspace = true
 build-events.workspace = true
 build-events-proto = { path = "../build-events-proto" }
 graph.workspace = true
-cache.workspace = true
+lcache.workspace = true
+rcache.workspace = true
 check.workspace = true
 common.workspace = true
 checkouts.workspace = true

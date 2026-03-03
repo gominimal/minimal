@@ -334,8 +334,8 @@ impl<'a> Runnable for RemoteSpecBuild<'a> {
                 )
                 .map_err(|e| Error::Other(e.into()))?;
 
-                into_dir.finalize(cache::EntryMeta {
-                    inner: cache::MetaInner::Spec(build.name.clone()),
+                into_dir.finalize(lcache::EntryMeta {
+                    inner: lcache::MetaInner::Spec(build.name.clone()),
                     origin: Some(build.from.as_ref().clone()),
                     ..Default::default()
                 })?;

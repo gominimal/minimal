@@ -4,14 +4,13 @@ use crate::{
     Backend, Deliverable, DeliverableInner, DeliverableRef, DeliverableState, Orchestrator,
     SharedHandle, StateHandle,
 };
-use cache::{
-    Cache, CacheErr, DirCacheEntry, EntryMeta, LocalDir, MetaInner, PendingDir, RemoteCache,
-};
 use common::SpecHash;
 use either::Either;
 use google_cloud_storage::client::Storage as GcsStorage;
 use graph::{BinProvider, BuildSpecRef, Graph, SubsetInput};
+use lcache::{Cache, CacheErr, DirCacheEntry, EntryMeta, LocalDir, MetaInner, PendingDir};
 use op::{Runnable, SourceFetcher};
+use rcache::RemoteCache;
 use tokio::sync::Semaphore;
 use tokio::task::spawn_blocking;
 

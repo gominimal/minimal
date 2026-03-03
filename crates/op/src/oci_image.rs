@@ -326,7 +326,7 @@ async fn create_base_layer() -> anyhow::Result<BuiltLayer> {
 }
 
 async fn create_layer_from_cache(
-    cache: &cache::Cache<cache::LocalDir>,
+    cache: &lcache::Cache<lcache::LocalDir>,
     spec_hash: &SpecHash,
     package_name: &str,
     match_globs: &Option<globset::GlobSet>,

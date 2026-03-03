@@ -1,6 +1,6 @@
-use crate::PendingDir;
-use crate::{Cache, LocalDir, remote_index::RemoteIndex};
+use crate::remote_index::RemoteIndex;
 use common::{SpecHash, archive};
+use lcache::{Cache, LocalDir, PendingDir};
 use std::io::{Seek, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -17,7 +17,7 @@ use tracing_indicatif::style::ProgressStyle;
 pub enum Error<BE: std::fmt::Debug> {
     Backend(BE),
     IO(std::io::Error),
-    Cache(crate::CacheErr),
+    Cache(lcache::CacheErr),
     NotFound,
     ArchiveError(archive::ArchiveError),
 }
@@ -43,6 +43,8 @@ pub struct RemoteCache<B: FetchBackend> {
     backend: B,
     base: B::Url,
     index: RemoteIndex,
+
+    #[allow(dead_code)]
     dir: Option<PathBuf>,
 
     uploaded: Vec<(SpecHash, [u8; 32])>,

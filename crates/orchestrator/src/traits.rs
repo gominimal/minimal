@@ -1,6 +1,6 @@
-use cache::{DirCacheEntry, EntryMeta, LocalDir, PendingDir};
 use common::SpecHash;
 use graph::{BuildSpecRef, SubsetInput};
+use lcache::{DirCacheEntry, EntryMeta, LocalDir, PendingDir};
 
 use super::state::DeliverableRef;
 use super::{SharedHandle, StateHandle};

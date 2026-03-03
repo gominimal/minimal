@@ -35,7 +35,7 @@ tonic.workspace = true
 tracing.workspace = true
 url.workspace = true
 
-cache.workspace = true
+lcache.workspace = true
 common.workspace = true
 decode.workspace = true
 graph.workspace = true

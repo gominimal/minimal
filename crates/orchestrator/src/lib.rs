@@ -7,9 +7,9 @@
 
 use std::sync::Arc;
 
-use cache::{Cache, LocalDir};
 use common::SpecHash;
 use graph::{BinProvider, BuildSpecRef, ExecPlan, Graph, SubsetInput};
+use lcache::{Cache, LocalDir};
 use tokio::{
     sync::{RwLock, RwLockReadGuard},
     task::{JoinSet, yield_now},

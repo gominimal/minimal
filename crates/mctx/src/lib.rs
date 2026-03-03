@@ -8,10 +8,11 @@ use std::{
 };
 
 use anyhow::anyhow;
-use cache::{CacheBinProvider, RemoteBinProvider, RemoteCache, RemoteError};
 use checkouts::Manager as VcsManager;
 use common::{SpecOrigin, Target};
 use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
+use lcache::CacheBinProvider;
+use rcache::{Error as RemoteError, RemoteBinProvider, RemoteCache};
 
 mod error;
 pub use error::Error;
@@ -27,7 +28,7 @@ use toml_edit::{Array, DocumentMut, Item, TableLike, Value};
 use crate::env::EnvArgs;
 
 /// The local cache.
-pub type Cache = cache::Cache<cache::LocalDir>;
+pub type Cache = lcache::Cache<lcache::LocalDir>;
 
 /// Anything which represents a set of packages.
 ///
@@ -594,7 +595,7 @@ impl Context {
             let name = b.name.clone();
             let origin = b.from.as_ref().clone();
             let spec_hash = graph.spec_hash(&bsr);
-            if let Err(cache::CacheErr::NotFound) = self.cache.read_dir(&spec_hash)
+            if let Err(lcache::CacheErr::NotFound) = self.cache.read_dir(&spec_hash)
                 && rc.exists(&spec_hash)
             {
                 let rc_clone = rc.clone(); // TODO: This is trash
@@ -606,8 +607,8 @@ impl Context {
                         .map(|(t, d)| {
                             (
                                 d,
-                                cache::EntryMeta {
-                                    inner: cache::MetaInner::Spec(name),
+                                lcache::EntryMeta {
+                                    inner: lcache::MetaInner::Spec(name),
                                     fetched: true,
                                     fetch_ms: Some(t.as_millis() as usize),
                                     origin: Some(origin),
