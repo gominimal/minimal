@@ -196,6 +196,8 @@ impl Context {
         create_dir_all(config.index_dir()).map_err(|e| Error::setup_dirs(e, config.index_dir()))?;
         create_dir_all(config.stdlib_dir())
             .map_err(|e| Error::setup_dirs(e, config.stdlib_dir()))?;
+        create_dir_all(config.layer_cache_dir())
+            .map_err(|e| Error::setup_dirs(e, config.layer_cache_dir()))?;
 
         // Initialize subsystems that are always present/used
         let vcs = VcsManager::new(config.vcs_dir())?;
@@ -358,7 +360,7 @@ impl Context {
         let start = SystemTime::now();
         let res = Graph::new_from_chain(
             &mut self.vcs,
-            &mut (),
+            &mut graph::LayerCacheDir(self.config.layer_cache_dir()),
             leaf_layer,
             self.stdlib_dir.clone(),
             Target::host(),

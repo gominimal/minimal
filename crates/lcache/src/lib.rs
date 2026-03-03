@@ -1,4 +1,4 @@
-//! Implementations of caches storing artifacts keyed by [SpecHash].
+//! Implementations of the local cache: storing artifacts keyed by [SpecHash].
 
 use common::SpecHash;
 

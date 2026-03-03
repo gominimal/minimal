@@ -168,4 +168,7 @@ impl Config {
     pub(crate) fn stdlib_dir(&self) -> PathBuf {
         self.minimal_dir.join("stdlib")
     }
+    pub(crate) fn layer_cache_dir(&self) -> PathBuf {
+        self.minimal_dir.join("lc")
+    }
 }

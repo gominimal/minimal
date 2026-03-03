@@ -56,7 +56,7 @@ impl TryFrom<TermPos> for StrPos {
 }
 
 /// A collection of nickel objects, defined together in a single codebase.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Layer {
     upstream: Option<LinkConfig>,
     pub origin: SpecOrigin,
@@ -151,10 +151,10 @@ impl Layer {
             origin,
             upstream,
             top_levels: Vec::new(),
-            builds: Arena::with_capacity(1024),
-            read_ids: HashMap::with_capacity(1024),
+            builds: Arena::with_capacity(512),
+            read_ids: HashMap::with_capacity(512),
 
-            profiles: HashMap::with_capacity(32),
+            profiles: HashMap::with_capacity(16),
             harnesses: HashMap::with_capacity(32),
         };
 

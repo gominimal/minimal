@@ -257,6 +257,56 @@ impl LayerCache for () {
     }
 }
 
+/// A layer cache which serializes layers in the given directory.
+pub struct LayerCacheDir(pub PathBuf);
+
+impl LayerCache for LayerCacheDir {
+    type Error = ();
+
+    fn insert(&mut self, origin: SpecOrigin, layer: &Layer) -> Result<(), Self::Error> {
+        // Its only safe to cache stuff that is pinned to a hash
+        if !matches!(origin, SpecOrigin::Repo(_)) {
+            return Ok(());
+        }
+
+        let origin_bytes = serde_json::to_vec(&origin).unwrap();
+        let origin_hash = blake3::hash(&origin_bytes).to_hex();
+        let p = self.0.join(origin_hash.as_str());
+
+        if std::fs::exists(&p).unwrap_or(false) {
+            return Ok(());
+        }
+
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&p)
+            .map_err(|e| {
+                tracing::warn!("LayerCacheDir::insert failed open: {}", e);
+            })?;
+        serde_json::to_writer(f, layer).map_err(|e| {
+            tracing::warn!("LayerCacheDir::insert failed to serialize layer: {}", e);
+            std::fs::remove_file(p).ok(); // best effort
+        })?;
+
+        Ok(())
+    }
+    fn get(&mut self, origin: &SpecOrigin) -> Result<Option<Layer>, Self::Error> {
+        let origin_bytes = serde_json::to_vec(origin).unwrap();
+        let origin_hash = blake3::hash(&origin_bytes).to_hex();
+        let p = self.0.join(origin_hash.as_str());
+
+        if let Ok(f) = std::fs::File::open(p) {
+            Ok(Some(serde_json::from_reader(f).map_err(|e| {
+                tracing::warn!("LayerCacheDir::get failed to deserialize: {}", e);
+            })?))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 /// The in-memory representation of the software supply chain: all packages, profiles, and harnesses.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]

@@ -117,7 +117,7 @@ mod env_setup;
 pub use env_setup::SetupForPackages;
 
 mod graph;
-pub use graph::Graph;
+pub use graph::{Graph, LayerCacheDir};
 
 mod spec_hasher;
 pub use spec_hasher::SpecHasher;
