@@ -118,6 +118,7 @@ pub struct GlobalArgs {
     minimal_dir: Option<PathBuf>,
     /// Load the minimal standard library from the given path instead
     #[arg(long)]
+    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
     stdlib_dir: Option<PathBuf>,
 
     /// Ignore locally-available binary artifacts (results in rebuilds unless present in a remote cache)
