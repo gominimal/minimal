@@ -1,7 +1,7 @@
 [upstream] # Source of software & tooling
 repo = "https://github.com/gominimal/pkgs"
 branch = "main"
-locked_commit = "2bef4ac2742343e9d132bc7bd4f0eff58447e76d"
+locked_commit = "d39aaaa581f983d6b3ba5eaaf383485a602f37f0"
 
 [harness]
 use = "rust"
@@ -11,7 +11,7 @@ profile = "dev"
 state_key = "dev"
 
 [tasks.claude]
-exec = "claude"
+exec = "claude --dangerously-skip-permissions"
 
 [tasks.build]
 exec = "cargo build --verbose"
@@ -22,7 +22,7 @@ exec = "cargo test --verbose"
 inherit_cwd = true
 
 [tasks.shell]
-exec = "bash -l"
+exec = "bash --noprofile -l"
 
 [tasks.startup-time]
 exec = "date"
