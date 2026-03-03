@@ -1,9 +1,8 @@
 use crate::{Context, Error};
 use anyhow::anyhow;
-use common::TracingWriter;
 use graph::{BuildSpecRef, Graph, Transitives};
-use lcache::{Cache, EntryMeta, LocalDir, MetaInner};
-use op::{Runnable, SpecBuild};
+use lcache::{Cache, LocalDir};
+use op::{PatchedBuild, Runnable};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -23,7 +22,6 @@ pub async fn cmd_patched_build(args: PatchedBuildArgs, ctx: &mut Context) -> Res
     let remote_storage = ctx.remote_storage().await.unwrap();
 
     let bsr = graph.top_levels[0];
-    let build = graph.get(&bsr).unwrap();
 
     // Handle the remote-build case.
     if let Some(addr) = args.remote_addr {
@@ -40,29 +38,13 @@ pub async fn cmd_patched_build(args: PatchedBuildArgs, ctx: &mut Context) -> Res
         return remote_patched_build(addr, &bsr, &graph, cache, deps).await;
     }
 
-    // Select dependencies by name to be used in the build.
-    let mut dependencies = HashSet::new();
-    let transitives = Transitives::new(&graph, &bsr, true);
-    let build_deps: Vec<_> = transitives
-        .transitive_runtime_deps
-        .keys()
-        .to_owned()
-        .collect();
-
-    for bsr in build_deps.iter() {
-        let build = graph.get(bsr).unwrap();
-        let cache_dir = cache.unsafe_get_build_by_name(&build.name).unwrap();
-        dependencies.insert(cache_dir.path().to_path_buf());
-    }
-
     let output_base = ctx.builds_base_dir();
     std::fs::create_dir_all(&output_base).ok();
-    let res = SpecBuild {
+    let res = PatchedBuild {
         spec: &bsr,
-        override_deps: Some(dependencies),
         remote_fetcher: &remote_storage,
-        stdout_writer: Some(Box::new(TracingWriter::stdout())),
-        stderr_writer: Some(Box::new(TracingWriter::stderr())),
+        stdout_writer: Some(Box::new(common::TracingWriter::stdout())),
+        stderr_writer: Some(Box::new(common::TracingWriter::stderr())),
     }
     .run(&op::Options {
         cache,
@@ -72,15 +54,7 @@ pub async fn cmd_patched_build(args: PatchedBuildArgs, ctx: &mut Context) -> Res
     .await
     .map_err(|e| Error::Other(anyhow!("build failed: {}", e)))?;
 
-    res.outputs
-        .finalize(EntryMeta {
-            inner: MetaInner::Spec(build.name.clone()),
-            breaker_build: true,
-            build_ms: Some(res.build_ms),
-            origin: Some(build.from.as_ref().clone()),
-            ..Default::default()
-        })
-        .unwrap();
+    res.outputs.finalize(res.meta).unwrap();
     println!("Written to cache with hash {}", graph.spec_hash(&bsr).0);
 
     Ok(())

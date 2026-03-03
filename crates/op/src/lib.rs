@@ -47,5 +47,8 @@ pub use specs::{SpecBuild, SpecBuildResult};
 mod oci_image;
 pub use oci_image::OciImageCreate;
 
+mod patched;
+pub use patched::{PatchedBuild, PatchedBuildResult};
+
 mod standalone_test;
 pub use standalone_test::StandaloneTest;
