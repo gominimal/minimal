@@ -146,6 +146,23 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                 .get("internet")
                 .is_some();
         }
+
+        // We should also consider if the spec being-built needs internet, rather than just its deps.
+        needs_dns |= opts
+            .graph
+            .get(self.spec)
+            .unwrap()
+            .abstract_deps
+            .get("dns")
+            .is_some();
+        need_internet |= opts
+            .graph
+            .get(self.spec)
+            .unwrap()
+            .abstract_deps
+            .get("internet")
+            .is_some();
+
         Ok((dependencies, needs_dns, need_internet))
     }
 
