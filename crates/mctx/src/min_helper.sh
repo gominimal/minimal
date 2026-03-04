@@ -53,6 +53,16 @@ min_search() {
     __min_rpc "search" "$term"
 }
 
+min_patched_pkg() {
+    local pkg="$1"
+    if [[ -z "$pkg" || -z "$pkg" ]]; then
+        echo "Usage: min_patched_pkg <package-name>" >&2
+        return 1
+    fi
+
+    __min_rpc "patched-pkg" "$pkg"
+}
+
 __min_add() {
     local prefix="$1"
     shift
@@ -111,6 +121,9 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         search)
             min_search "$@"
             ;;
+        patched-pkg)
+            min_patched_pkg "$@"
+            ;;
         check)
             min_check "$@"
             ;;
@@ -120,6 +133,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             echo "Add packages: min add [--session|--build|--runtime|--task <taskname>] <packages>" >&2
             echo "Search for packages: min search <query>" >&2
             echo "Check minimal configuration: min check" >&2
+            echo "Try building a package (with potentially-stale dependencies): min patched-pkg <package name>" >&2
             exit 1
             ;;
     esac

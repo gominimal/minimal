@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::Permissions,
     io::Write,
-    os::unix::fs::PermissionsExt,
+    os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
 };
 
@@ -10,6 +10,7 @@ use crate::{AddDepMode, Context, Error};
 use futures::stream::StreamExt;
 use graph::{BuildSpecRef, Graph, SetupForPackages, Transitives, TransitivesDep};
 use mfile::EnvPatches;
+use op::Runnable;
 use sandbox2::{Container, config::SandboxMapped};
 use tempfile::TempDir;
 
@@ -24,10 +25,11 @@ struct EnvChannel<'a> {
 }
 
 impl EnvChannel<'_> {
+    /// Helper for installing packages into the environment.
     fn install(
         &mut self,
         pkgs: &Vec<(&str, BuildSpecRef)>,
-        stream: &mut std::os::unix::net::UnixStream,
+        stream: &mut UnixStream,
         rootfs: &Path,
     ) {
         if pkgs
@@ -106,23 +108,141 @@ impl EnvChannel<'_> {
             })
             .collect()
     }
+
+    /// Helper for writing an [Error] back to the user
+    fn write_error(e: Error, stream: &mut UnixStream) {
+        let mut buf = codespan_reporting::term::termcolor::NoColor::new(Vec::with_capacity(512));
+        e.report_to(&mut buf);
+        for line in buf.into_inner().split(|c| *c == b'\n') {
+            stream.write_all(b"msg:").ok();
+            stream.write_all(line).ok();
+            stream.write_all(b"\n").ok();
+        }
+        writeln!(stream, "error: failed to initialize minimal in codebase").ok();
+    }
+
+    /// Implementation of `min check`
+    fn run_check(&mut self, stream: &mut UnixStream, _rootfs: &Path) {
+        let mut check_ctx = match self.ctx.cloned_reinit() {
+            Err(e) => return EnvChannel::write_error(e, stream),
+            Ok(ctx) => ctx,
+        };
+        let graph = match check_ctx.graph_from_all_packages() {
+            Err(e) => return EnvChannel::write_error(e, stream),
+            Ok(g) => g,
+        };
+        let mut checks_stream = match check::run_checks(
+            Some(
+                check_ctx
+                    .minimal_file()
+                    .dir_path()
+                    .unwrap()
+                    .join("packages"),
+            ),
+            Some(
+                check_ctx
+                    .minimal_file()
+                    .dir_path()
+                    .unwrap()
+                    .join("profiles"),
+            ),
+            Some(
+                check_ctx
+                    .minimal_file()
+                    .dir_path()
+                    .unwrap()
+                    .join("harnesses"),
+            ),
+            check_ctx.stdlib_dir().to_path_buf(),
+            &[],
+            Some(graph),
+            check_ctx.local_cache(),
+            false,
+            &[],
+        ) {
+            Err(e) => return EnvChannel::write_error(e.into(), stream),
+            Ok(res_stream) => res_stream,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        if let Err(e) = rt.block_on(async {
+            while let Some((heading, result)) = checks_stream.next().await {
+                let checks = result?;
+                writeln!(stream, "msg:").ok();
+                writeln!(stream, "msg:{}", heading).ok();
+                for check in checks {
+                    writeln!(stream, "msg:{}...{}", check.check, check.verdict).ok();
+                }
+            }
+            Ok::<(), check::Error>(())
+        }) {
+            writeln!(stream, "error: {}", e).ok();
+        }
+    }
+
+    /// Implementation of `min patched-pkg <pkgname>`
+    fn run_patched_pkg(&mut self, stream: &mut UnixStream, _rootfs: &Path, pkg_name: &str) {
+        let mut build_ctx = match self.ctx.cloned_reinit() {
+            Err(e) => return EnvChannel::write_error(e, stream),
+            Ok(ctx) => ctx,
+        };
+        let graph = match build_ctx.graph_from_package_names([pkg_name]) {
+            Err(e) => return EnvChannel::write_error(e, stream),
+            Ok(g) => g,
+        };
+
+        let bsr = graph.top_levels[0];
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        if let Err(e) = rt.block_on(async {
+            let remote_storage = build_ctx
+                .remote_storage()
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            let output_base = build_ctx.builds_base_dir();
+            std::fs::create_dir_all(&output_base).ok();
+
+            let cache = build_ctx.local_cache();
+            let (stdout_writer, stderr_writer) = StreamWriter::pair(stream);
+            let res = op::PatchedBuild {
+                spec: &bsr,
+                remote_fetcher: &remote_storage,
+                stdout_writer: Some(Box::new(stdout_writer)),
+                stderr_writer: Some(Box::new(stderr_writer)),
+            }
+            .run(&op::Options {
+                cache,
+                graph: &graph,
+                exec_base: output_base,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            res.outputs
+                .finalize(res.meta)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            Ok::<(), anyhow::Error>(())
+        }) {
+            writeln!(stream, "error: {}", e).ok();
+            return;
+        };
+        writeln!(
+            stream,
+            "msg:Written to cache with hash {}",
+            graph.spec_hash(&bsr).0
+        )
+        .ok();
+    }
 }
 
 impl sandbox2::Channel for EnvChannel<'_> {
-    fn handle(&mut self, stream: &mut std::os::unix::net::UnixStream, line: &str, rootfs: &Path) {
+    fn handle(&mut self, stream: &mut UnixStream, line: &str, rootfs: &Path) {
         // handle, eg: echo 'add-ephemeral%mermaid-ascii' | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock
-
-        let report_err = |e: Error, stream: &mut std::os::unix::net::UnixStream| {
-            let mut buf =
-                codespan_reporting::term::termcolor::NoColor::new(Vec::with_capacity(512));
-            e.report_to(&mut buf);
-            for line in buf.into_inner().split(|c| *c == b'\n') {
-                stream.write_all(b"msg:").ok();
-                stream.write_all(line).ok();
-                stream.write_all(b"\n").ok();
-            }
-            writeln!(stream, "error: failed to initialize minimal in codebase").ok();
-        };
 
         let add_dep = match line.split_once("%") {
             Some(("add-session", pkgs)) => match self.parse_pkgs_line(pkgs) {
@@ -188,64 +308,12 @@ impl sandbox2::Channel for EnvChannel<'_> {
                 None
             }
             Some(("check", _args)) => {
-                let mut check_ctx = match self.ctx.cloned_reinit() {
-                    Err(e) => return report_err(e, stream),
-                    Ok(ctx) => ctx,
-                };
-                let graph = match check_ctx.graph_from_all_packages() {
-                    Err(e) => return report_err(e, stream),
-                    Ok(g) => g,
-                };
-                let mut checks_stream = match check::run_checks(
-                    Some(
-                        check_ctx
-                            .minimal_file()
-                            .dir_path()
-                            .unwrap()
-                            .join("packages"),
-                    ),
-                    Some(
-                        check_ctx
-                            .minimal_file()
-                            .dir_path()
-                            .unwrap()
-                            .join("profiles"),
-                    ),
-                    Some(
-                        check_ctx
-                            .minimal_file()
-                            .dir_path()
-                            .unwrap()
-                            .join("harnesses"),
-                    ),
-                    check_ctx.stdlib_dir().to_path_buf(),
-                    &[],
-                    Some(graph),
-                    check_ctx.local_cache(),
-                    false,
-                    &[],
-                ) {
-                    Err(e) => return report_err(e.into(), stream),
-                    Ok(res_stream) => res_stream,
-                };
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                if let Err(e) = rt.block_on(async {
-                    while let Some((heading, result)) = checks_stream.next().await {
-                        let checks = result?;
-                        writeln!(stream, "msg:").ok();
-                        writeln!(stream, "msg:{}", heading).ok();
-                        for check in checks {
-                            writeln!(stream, "msg:{}...{}", check.check, check.verdict).ok();
-                        }
-                    }
-                    Ok::<(), check::Error>(())
-                }) {
-                    writeln!(stream, "error: {}", e).ok();
-                    return;
-                };
+                self.run_check(stream, rootfs);
+
+                None
+            }
+            Some(("patched-pkg", name)) => {
+                self.run_patched_pkg(stream, rootfs, name);
 
                 None
             }
@@ -439,3 +507,63 @@ min() { eval "$(/usr/bin/min "$@")"; }
 "#;
 
 const MIN_SCRIPT: &str = include_str!("min_helper.sh");
+
+/// An [`tokio::io::AsyncWrite`] implementation that writes complete lines
+/// as `msg:` prefixed messages to a [`UnixStream`].
+///
+/// Multiple `StreamWriter` instances can share the same underlying stream
+/// via an `Arc<Mutex<_>>`, preventing interleaved writes from stdout/stderr.
+struct StreamWriter {
+    stream: std::sync::Arc<std::sync::Mutex<UnixStream>>,
+    buf: Vec<u8>,
+}
+
+impl StreamWriter {
+    fn pair(stream: &UnixStream) -> (Self, Self) {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(stream.try_clone().unwrap()));
+        (
+            Self {
+                stream: shared.clone(),
+                buf: Vec::new(),
+            },
+            Self {
+                stream: shared,
+                buf: Vec::new(),
+            },
+        )
+    }
+
+    fn emit_lines(&mut self) {
+        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&self.buf[..pos]);
+            writeln!(self.stream.lock().unwrap(), "msg:{}", line).ok();
+            self.buf.drain(..=pos);
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for StreamWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        self.buf.extend_from_slice(buf);
+        self.emit_lines();
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
