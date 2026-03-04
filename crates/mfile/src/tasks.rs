@@ -1,4 +1,4 @@
-use super::{EnvPatches, StrOrList};
+use super::{EnvPatches, EnvVarValue, StrOrList};
 use std::collections::HashMap;
 
 /// A task, defined in a `[tasks.<task_name>]` section of [File].
@@ -20,7 +20,7 @@ pub struct Task {
     pub packages: Vec<String>,
     /// Environment variables to set on the process this task launches.
     #[serde(default, alias = "env_vars")]
-    pub vars: HashMap<String, String>,
+    pub vars: HashMap<String, EnvVarValue>,
     /// Files/directories to be patched into the sandbox this task executes in.
     #[serde(default, alias = "patches")]
     pub patch: EnvPatches,
@@ -106,7 +106,6 @@ mod tests {
     fn exec_str() {
         let t: Task = toml::from_str(indoc! {
             r#"
-            env = "test"
             exec = "go test ./..."
             "#
         })
@@ -123,7 +122,6 @@ mod tests {
     fn exec_list() {
         let t: Task = toml::from_str(indoc! {
             r#"
-            env = "test"
             exec = ["go", "test", "./..."]
             "#
         })
@@ -141,7 +139,6 @@ mod tests {
     fn bash_str() {
         let t: Task = toml::from_str(indoc! {
             r#"
-            env = "test"
             bash = "go test ./... || echo failed"
             "#
         })
@@ -153,5 +150,17 @@ mod tests {
                 vec!["-c".to_string(), "go test ./... || echo failed".to_string()]
             ))
         );
+    }
+
+    #[test]
+    fn inherit_env_var() {
+        let t: Task = toml::from_str(indoc! {
+            r#"
+            env_vars.my_var = { inherit = true }
+            exec = ["go", "test", "./..."]
+            "#
+        })
+        .unwrap();
+        assert_eq!(t.vars.get("my_var"), Some(&EnvVarValue::Inherit),);
     }
 }

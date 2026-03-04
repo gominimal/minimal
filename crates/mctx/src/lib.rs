@@ -20,7 +20,7 @@ mod config;
 pub use config::{Config, ConfigBuilder, ConfigError};
 mod env;
 use graph::{BuildSpecRef, Graph, Transitives};
-use mfile::{EnvPatches, Task};
+use mfile::{EnvPatches, EnvVarValue, Task};
 
 use env::Env;
 use toml_edit::{Array, DocumentMut, Item, TableLike, Value};
@@ -477,7 +477,7 @@ impl Context {
         wd: Option<PathBuf>,
         state_key: Option<&String>,
         patches: Option<&'a EnvPatches>,
-        env_vars: Option<&'a HashMap<String, String>>,
+        env_vars: Option<&'a HashMap<String, EnvVarValue>>,
         packages: S,
     ) -> Result<env::Env<'a>, Error> {
         let mfile = self.minimal_file();
@@ -748,6 +748,7 @@ fn upsert_toml_packages_list<T: TableLike>(t: &mut T, key: &str, upsert: &[Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mfile::EnvVarValue;
     use op::{Runnable, StandaloneTest};
     use tempfile::tempdir;
 
@@ -866,7 +867,10 @@ mod tests {
             ]
         );
         // task inherited harness build env vars
-        assert_eq!(task.vars.get("HARNESS_VAR"), Some(&"set".to_string()));
+        assert_eq!(
+            task.vars.get("HARNESS_VAR"),
+            Some(&EnvVarValue::Value("set".to_string()))
+        );
     }
 
     #[test]

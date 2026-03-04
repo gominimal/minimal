@@ -821,7 +821,7 @@ mod tests {
     use super::*;
     use decode::{Layer, LoadOptions};
     use indoc::indoc;
-    use mfile::MFILE_NAME;
+    use mfile::{EnvVarValue, MFILE_NAME};
     use tempfile::TempDir;
 
     #[test]
@@ -996,7 +996,10 @@ mod tests {
                 name: "prof".to_string(),
                 from_profile: None,
                 packages: vec!["base".to_string()],
-                env_vars: IndexMap::from_iter([("CC".to_string(), "gcc".to_string())]),
+                env_vars: IndexMap::from_iter([(
+                    "CC".to_string(),
+                    EnvVarValue::Value("gcc".to_string()),
+                )]),
                 patch: Default::default(),
             },
         );
@@ -1041,7 +1044,10 @@ mod tests {
                 name: "prof".to_string(),
                 from_profile: Some("prof".to_string()),
                 packages: vec!["base".to_string(), "extra".to_string()],
-                env_vars: IndexMap::from_iter([("CC".to_string(), "clang".to_string())]),
+                env_vars: IndexMap::from_iter([(
+                    "CC".to_string(),
+                    EnvVarValue::Value("clang".to_string())
+                )]),
                 patch: Default::default(),
             })
         );

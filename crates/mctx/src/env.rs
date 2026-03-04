@@ -9,7 +9,7 @@ use std::{
 use crate::{AddDepMode, Context, Error};
 use futures::stream::StreamExt;
 use graph::{BuildSpecRef, Graph, SetupForPackages, Transitives, TransitivesDep};
-use mfile::EnvPatches;
+use mfile::{EnvPatches, EnvVarValue};
 use op::Runnable;
 use sandbox2::{Container, config::SandboxMapped};
 use tempfile::TempDir;
@@ -366,7 +366,7 @@ pub struct EnvArgs<'a> {
     pub patches: Option<&'a EnvPatches>,
 
     /// Environment variables to set.
-    pub env_vars: Option<&'a HashMap<String, String>>,
+    pub env_vars: Option<&'a HashMap<String, EnvVarValue>>,
     /// The hostname to set, if any.
     pub hostname: Option<String>,
 
@@ -406,7 +406,23 @@ impl<'a> Env<'a> {
             patch.union(p);
         }
         if let Some(vars) = args.env_vars {
-            pkg_env_vars.extend(vars.clone());
+            pkg_env_vars.extend(
+                vars.iter()
+                    .map(|(k, v)| match v {
+                        EnvVarValue::Value(v) => Ok::<_, Error>((k.clone(), v.clone())),
+                        EnvVarValue::Inherit => Ok((
+                            k.clone(),
+                            std::env::var(k).map_err(|e| {
+                                Error::Other(anyhow::anyhow!(
+                                    "inheriting environment variable '{}': {}",
+                                    k,
+                                    e
+                                ))
+                            })?,
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
         }
 
         let mut config = sandbox2::config::Config::new(args.name)

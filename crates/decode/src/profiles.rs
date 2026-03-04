@@ -1,4 +1,4 @@
-use mfile::EnvPatches;
+use mfile::{EnvPatches, EnvVarValue};
 use nickel_lang_core::{
     eval::cache::CacheImpl,
     program::Program,
@@ -21,7 +21,7 @@ pub struct Profile {
     pub packages: Vec<String>,
 
     /// The environment variables that should be applied to any environment using this profile.
-    pub env_vars: IndexMap<String, String>,
+    pub env_vars: IndexMap<String, EnvVarValue>,
 
     /// Files/directories to be patched into the sandbox this task executes in.
     pub patch: EnvPatches,
@@ -49,7 +49,7 @@ impl Profile {
         let mut name: Option<String> = None;
         let mut from_profile: Option<String> = None;
         let mut packages: Option<Vec<String>> = None;
-        let mut env_vars: Option<IndexMap<String, String>> = None;
+        let mut env_vars: Option<IndexMap<String, EnvVarValue>> = None;
         let mut patches: Option<EnvPatches> = None;
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
@@ -94,13 +94,13 @@ impl Profile {
                                     match ev_rt.term.as_ref() {
                                         Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                                             env_vars = Some(r.fields.iter().map(
-                                                |(ident_and_loc, field)| -> Result<(String, String), Error> {
+                                                |(ident_and_loc, field)| -> Result<(String, EnvVarValue), Error> {
                                                     Ok((
                                                         ident_and_loc.label().to_string(),
-                                                        String::deserialize(eval_if_closure(
+                                                        EnvVarValue::Value(String::deserialize(eval_if_closure(
                                                             field.value.as_ref().unwrap(),
                                                             program,
-                                                        )?).unwrap(),
+                                                        )?).unwrap()),
                                                     ))
                                                 },
                                             ).collect::<Result<IndexMap<_, _>, Error>>()?);

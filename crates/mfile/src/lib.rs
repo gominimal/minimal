@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 mod error;
 pub use error::Error;
 mod tasks;
+use serde::{Deserializer, Serializer};
 pub use tasks::{Task, TaskAction};
 
 pub const MFILE_NAME: &str = "minimal.toml";
@@ -92,6 +93,64 @@ impl LinkConfig {
             if !dir.starts_with("/") {
                 let new = parent_dir.join(&dir);
                 *dir = new.to_str().unwrap().to_string();
+            }
+        }
+    }
+}
+
+/// The value of a declared environment variable. Either a literal value
+/// or the symbolic variant `{ inherit = true }`, meaning to read it from the parent process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvVarValue {
+    Value(String),
+    Inherit,
+}
+
+impl<'de> serde::Deserialize<'de> for EnvVarValue {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{self, MapAccess, Visitor};
+        struct VarVisitor;
+        impl<'de> Visitor<'de> for VarVisitor {
+            type Value = EnvVarValue;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "a string or {{ inherit = true }}")
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<EnvVarValue, E> {
+                Ok(EnvVarValue::Value(v.to_owned()))
+            }
+            fn visit_string<E: de::Error>(self, v: String) -> Result<EnvVarValue, E> {
+                Ok(EnvVarValue::Value(v))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<EnvVarValue, A::Error> {
+                let key: String = map
+                    .next_key()?
+                    .ok_or_else(|| de::Error::custom("empty map"))?;
+                if key != "inherit" {
+                    return Err(de::Error::unknown_field(&key, &["inherit"]));
+                }
+                let val: bool = map.next_value()?;
+                if !val {
+                    return Err(de::Error::custom("`inherit` must be true"));
+                }
+                if map.next_key::<String>()?.is_some() {
+                    return Err(de::Error::custom("unexpected extra fields"));
+                }
+                Ok(EnvVarValue::Inherit)
+            }
+        }
+        d.deserialize_any(VarVisitor)
+    }
+}
+
+impl serde::Serialize for EnvVarValue {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            EnvVarValue::Value(v) => s.serialize_str(v),
+            EnvVarValue::Inherit => {
+                use serde::ser::SerializeMap;
+                let mut map = s.serialize_map(Some(1))?;
+                map.serialize_entry("inherit", &true)?;
+                map.end()
             }
         }
     }

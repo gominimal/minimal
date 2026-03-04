@@ -475,6 +475,7 @@ mod tests {
 
     use super::*;
     use indoc::indoc;
+    use mfile::EnvVarValue;
     use nickel_lang_core::term::IndexMap;
 
     #[test]
@@ -790,7 +791,10 @@ mod tests {
                 name: "uwu".to_string(),
                 from_profile: Some("rust".to_string()),
                 packages: vec!["gcc".to_string(), "rust".to_string()],
-                env_vars: IndexMap::from_iter([("CC".to_string(), "gcc".to_string())]),
+                env_vars: IndexMap::from_iter([(
+                    "CC".to_string(),
+                    EnvVarValue::Value("gcc".to_string())
+                )]),
                 patch: Default::default(),
             }),
         );
@@ -800,7 +804,10 @@ mod tests {
                 name: "uwu".to_string(),
                 runtime_packages: vec!["glibc".to_string()],
                 build_packages: vec!["gcc".to_string(), "rust".to_string()],
-                build_env_vars: IndexMap::from_iter([("CC".to_string(), "gcc".to_string())]),
+                build_env_vars: IndexMap::from_iter([(
+                    "CC".to_string(),
+                    EnvVarValue::Value("gcc".to_string())
+                )]),
                 build_cmds_cmd: None,
                 build_cmds: Some(vec![vec!["uwu".to_string(), "build".to_string()]]),
                 matches_project_if_any: None,
