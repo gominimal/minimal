@@ -793,6 +793,8 @@ mod tests {
             let mut t = StandaloneTest {
                 spec: graph.by_name("uroot").unwrap(),
                 test_name: "smoke",
+                stdout_writer: None,
+                stderr_writer: None,
             };
             let opts = op::Options {
                 cache: ctx.local_cache(),
@@ -801,8 +803,6 @@ mod tests {
             };
 
             assert_eq!(t.run(&opts).await.unwrap(), vec![]);
-
-            assert!(std::fs::exists(temp_dir.path().join("tmp/uwu")).unwrap());
             drop(temp_dir);
         });
     }

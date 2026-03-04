@@ -166,7 +166,7 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
             stdout.set_color(ColorSpec::new().set_fg(None)).unwrap();
 
             for err in &check.err {
-                writeln!(&mut stdout, "\t{}", err).unwrap();
+                writeln!(&mut stdout, "\t{}", err.replace("\n", "\n\t")).unwrap();
             }
         }
     }

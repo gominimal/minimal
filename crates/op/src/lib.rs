@@ -51,4 +51,4 @@ mod patched;
 pub use patched::{PatchedBuild, PatchedBuildResult};
 
 mod standalone_test;
-pub use standalone_test::StandaloneTest;
+pub use standalone_test::{StandaloneTest, StandaloneTestError};

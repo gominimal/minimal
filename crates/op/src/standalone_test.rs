@@ -1,8 +1,9 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::collections::HashSet;
 
 use anyhow::anyhow;
 use graph::{BuildSpec, BuildSpecRef, SpecTest, SubsetInput, Transitives};
 use lcache::{CacheErr, MetaInner};
+use sandbox2::config::SandboxMapped;
 
 use crate::{Error, Options, Runnable, SubsetBuild};
 
@@ -17,6 +18,10 @@ pub struct StandaloneTestError {
 pub struct StandaloneTest<'a> {
     pub spec: &'a BuildSpecRef,
     pub test_name: &'a str,
+    /// Optional async writer that receives a copy of the sandbox's stdout stream.
+    pub stdout_writer: Option<Box<dyn tokio::io::AsyncWrite + Unpin + Send + Sync>>,
+    /// Optional async writer that receives a copy of the sandbox's stderr stream.
+    pub stderr_writer: Option<Box<dyn tokio::io::AsyncWrite + Unpin + Send + Sync>>,
 }
 
 impl<'a> StandaloneTest<'a> {
@@ -25,7 +30,7 @@ impl<'a> StandaloneTest<'a> {
         build: &BuildSpec,
         test: &SpecTest,
         opts: &Options<'a>,
-    ) -> Result<(HashSet<PathBuf>, bool, bool), Error> {
+    ) -> Result<(HashSet<SandboxMapped>, bool, bool), Error> {
         let transitives = Transitives::for_toplevels(
             opts.graph,
             {
@@ -45,7 +50,7 @@ impl<'a> StandaloneTest<'a> {
                 // Regular build
                 None => {
                     let cache_dir = opts.cache.read_dir(&opts.graph.spec_hash(&bsr))?;
-                    dependencies.insert(cache_dir.path().to_path_buf());
+                    dependencies.insert(SandboxMapped::Dir(cache_dir.path().to_path_buf()));
                 }
                 // Subset
                 Some(outputs) => {
@@ -56,7 +61,7 @@ impl<'a> StandaloneTest<'a> {
                     let subset_hash = opts.graph.subset_hash(&subset);
 
                     // If the subset exists use it, otherwise build it
-                    dependencies.insert(
+                    dependencies.insert(SandboxMapped::Dir(
                         match opts.cache.read_dir(&subset_hash) {
                             Ok(cache_dir) => cache_dir,
                             Err(CacheErr::NotFound) => {
@@ -80,7 +85,7 @@ impl<'a> StandaloneTest<'a> {
                         }
                         .path()
                         .to_path_buf(),
-                    );
+                    ));
                 }
             }
 
@@ -102,7 +107,7 @@ impl<'a> StandaloneTest<'a> {
         Ok((dependencies, needs_dns, need_internet))
     }
 
-    fn invocations(&self, test: &SpecTest) -> Result<Vec<(String, Vec<String>)>, Error> {
+    fn invocations(&self, test: &SpecTest) -> Result<Vec<sandbox2::config::Invocation>, Error> {
         if test.cmds.is_empty() || test.cmds[0].is_empty() {
             return Err(Error::Other(anyhow!(
                 "cannot test spec: no test command specified"
@@ -113,7 +118,11 @@ impl<'a> StandaloneTest<'a> {
             .cmds
             .iter()
             .filter_map(|e| e.split_at_checked(1))
-            .map(|(exec, args)| (exec[0].clone(), args.to_vec()))
+            .map(|(exec, args)| sandbox2::config::Invocation {
+                executable: exec[0].clone(),
+                args: args.to_vec(),
+                envs: Default::default(),
+            })
             .collect())
     }
 }
@@ -140,71 +149,37 @@ impl<'a> Runnable for StandaloneTest<'a> {
             )));
         }
 
-        let (mut dep_paths, needs_dns, needs_internet) =
-            self.dependencies(build, test, opts).await?;
-        let synth_files = opts.cache.temp_dir()?;
-        if needs_dns {
-            common::synth_dns_config(synth_files.path()).map_err(anyhow::Error::from)?;
-        }
-        dep_paths.insert(synth_files.path().to_path_buf());
-        let needs_bin_symlink = dep_paths
-            .iter()
-            .all(|p| !std::fs::exists(p.join("bin")).unwrap());
-        let needs_lib64_symlink = dep_paths
-            .iter()
-            .all(|p| !std::fs::exists(p.join("lib64")).unwrap());
+        let (deps, needs_dns, needs_internet) = self.dependencies(build, test, opts).await?;
 
-        // Hardlink in the files which represent each dependency.
-        for dep in dep_paths {
-            common::hardlink_dir_contents(&dep, &opts.exec_base).map_err(anyhow::Error::from)?;
-        }
+        let config = sandbox2::config::Config::new("test")
+            .with_rootfs(deps.into_iter())
+            .with_dns(needs_dns)
+            .with_disable_networking(!needs_dns && !needs_internet)
+            .with_hostname("test")
+            .with_env_var("HOME", "/tmp");
+        let mut sandbox = config.build(&opts.exec_base, ()).await?;
 
-        let mut container = hakoniwa::Container::new();
-        container
-            .rootfs(&opts.exec_base)
-            .map_err(anyhow::Error::from)?
-            .devfsmount("/dev");
-        if needs_bin_symlink {
-            container.symlink("/usr/bin", "/bin");
-        }
-        if needs_lib64_symlink {
-            container.symlink("/usr/lib", "/lib64");
-        }
-
-        std::fs::create_dir_all(opts.exec_base.join("tmp"))?;
-        container.bindmount_rw(opts.exec_base.join("tmp").to_str().unwrap(), "/tmp");
-
-        std::fs::create_dir_all(opts.exec_base.join("etc"))?;
-        std::fs::write(opts.exec_base.join("etc").join("hostname"), "test\n")?;
-        container.unshare(hakoniwa::Namespace::Uts);
-        container.hostname("test");
-        if !needs_dns && !needs_internet {
-            container.unshare(hakoniwa::Namespace::Network);
-        }
-
-        let mut out = Vec::new();
-        for (program, args) in self.invocations(test)? {
-            let mut command = container.command(&program);
-            command
-                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-                .env("LANG", "en_US.utf8")
-                .env("LC_ALL", "en_US.utf8")
-                .env("HOME", "/tmp");
-            command.args(args.clone());
-            command.current_dir("/tmp");
-            command.stdin(hakoniwa::Stdio::Inherit);
-            command.stdout(hakoniwa::Stdio::Inherit);
-            command.stderr(hakoniwa::Stdio::Inherit);
-
-            let exec_result = command.status().map_err(anyhow::Error::from)?;
-            if exec_result.code != 0 {
-                out.push(StandaloneTestError {
-                    program,
-                    args,
-                    exit_code: exec_result.code,
-                });
+        let invocations = self.invocations(test)?;
+        match sandbox
+            .run(
+                invocations.clone(),
+                self.stdout_writer.take(),
+                self.stderr_writer.take(),
+            )
+            .await
+        {
+            Ok(()) => Ok(vec![]),
+            Err(sandbox2::Error::Execution(
+                sandbox2::error::ExecutionError::InvocationFailed { idx, code, .. },
+            )) => {
+                let inv = &invocations[idx];
+                Ok(vec![StandaloneTestError {
+                    program: inv.executable.clone(),
+                    args: inv.args.clone(),
+                    exit_code: code,
+                }])
             }
+            Err(e) => Err(e.into()),
         }
-        Ok(out)
     }
 }

@@ -12,8 +12,52 @@ use std::fmt::Display;
 use std::future::Future;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use tokio::sync::{RwLock, RwLockReadGuard};
+
+/// A shared buffer that implements [`tokio::io::AsyncWrite`], allowing captured
+/// output to be retrieved after the writer is consumed.
+#[derive(Clone)]
+struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+impl SharedBuf {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(Vec::new())))
+    }
+
+    fn into_string(self) -> String {
+        let buf = match Arc::try_unwrap(self.0) {
+            Ok(mutex) => mutex.into_inner().unwrap(),
+            Err(arc) => arc.lock().unwrap().clone(),
+        };
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+}
+
+impl tokio::io::AsyncWrite for SharedBuf {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
 
 mod harness;
 mod naming;
@@ -934,9 +978,13 @@ impl GraphBasedChecker for StandaloneTestCheck {
                         }
                         let temp_dir = cache.temp_dir().map_err(anyhow::Error::from)?;
 
+                        let stdout_buf = SharedBuf::new();
+                        let stderr_buf = SharedBuf::new();
                         let mut t = StandaloneTest {
                             spec: &bsr,
                             test_name: name.as_str(),
+                            stdout_writer: Some(Box::new(stdout_buf.clone())),
+                            stderr_writer: Some(Box::new(stderr_buf.clone())),
                         };
                         let opts = Options {
                             cache: cache.clone(),
@@ -957,6 +1005,14 @@ impl GraphBasedChecker for StandaloneTestCheck {
                                             e.exit_code
                                         ))
                                     });
+                                    let stdout = stdout_buf.into_string();
+                                    let stderr = stderr_buf.into_string();
+                                    if !stdout.is_empty() {
+                                        result.err.push(format!("stdout:\n{}", stdout));
+                                    }
+                                    if !stderr.is_empty() {
+                                        result.err.push(format!("stderr:\n{}", stderr));
+                                    }
                                 }
                             }
                             Err(op::Error::Cache(CacheErr::NotFound)) => {
