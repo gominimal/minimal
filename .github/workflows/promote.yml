@@ -44,7 +44,7 @@ jobs:
           for plat in "${PLATFORM_LIST[@]}"; do
             plat="$(echo "$plat" | tr -d ' ')"
             echo "Checking cli-${plat}-${SHA}.tar.zst exists..."
-            if ! gcloud storage ls "gs://minimal-shim/cli-${plat}-${SHA}.tar.zst" > /dev/null 2>&1; then
+            if ! gcloud storage ls "gs://minimal-shim/archives/cli-${plat}-${SHA}.tar.zst" > /dev/null 2>&1; then
               echo "ERROR: cli-${plat}-${SHA}.tar.zst not found in bucket"
               exit 1
             fi
@@ -53,11 +53,11 @@ jobs:
           for plat in "${PLATFORM_LIST[@]}"; do
             plat="$(echo "$plat" | tr -d ' ')"
             echo "Promoting CLI to ${SHA} for ${plat}..."
-            echo "{\"version\":\"${SHA}\"}" > "cli-${plat}-config.json"
+            echo "{\"version\":\"${SHA}\"}" > "cli-${plat}.json"
             gcloud storage cp \
               --cache-control="max-age=300" \
-              "cli-${plat}-config.json" \
-              "gs://minimal-shim/cli-${plat}-config.json"
+              "cli-${plat}.json" \
+              "gs://minimal-shim/config/cli-${plat}.json"
           done
 
           echo "CLI promoted to ${SHA} for platforms: ${PLATFORMS}"

@@ -183,10 +183,10 @@ jobs:
 
           gcloud storage cp \
             --cache-control="public, max-age=31536000, immutable" \
-            "cli-amd64-linux-${SHA}.tar.zst" gs://minimal-shim/
+            "cli-amd64-linux-${SHA}.tar.zst" gs://minimal-shim/archives/
           gcloud storage cp \
             --cache-control="public, max-age=31536000, immutable" \
-            "cli-arm64-linux-${SHA}.tar.zst" gs://minimal-shim/
+            "cli-arm64-linux-${SHA}.tar.zst" gs://minimal-shim/archives/
 
   minimal-check:
     runs-on: ubuntu-latest
