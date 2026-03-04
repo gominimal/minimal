@@ -122,7 +122,26 @@ impl EnvChannel<'_> {
     }
 
     /// Implementation of `min check`
-    fn run_check(&mut self, stream: &mut UnixStream, _rootfs: &Path) {
+    fn run_check(&mut self, stream: &mut UnixStream, _rootfs: &Path, args: &str) {
+        let mut flag_packages = false;
+        let mut flag_harnesses = false;
+        let mut flag_profiles = false;
+        let mut fix = false;
+        let mut filter_names: Vec<String> = Vec::new();
+
+        for token in args.split_whitespace() {
+            match token {
+                "--packages" => flag_packages = true,
+                "--harnesses" => flag_harnesses = true,
+                "--profiles" => flag_profiles = true,
+                "--fix" => fix = true,
+                _ => filter_names.push(token.to_string()),
+            }
+        }
+
+        // If no kind flags specified, check everything (same as cmd_check default).
+        let check_all = !flag_packages && !flag_harnesses && !flag_profiles;
+
         let mut check_ctx = match self.ctx.cloned_reinit() {
             Err(e) => return EnvChannel::write_error(e, stream),
             Ok(ctx) => ctx,
@@ -131,33 +150,30 @@ impl EnvChannel<'_> {
             Err(e) => return EnvChannel::write_error(e, stream),
             Ok(g) => g,
         };
+
+        let upstream_dir = check_ctx.minimal_file().dir_path().unwrap().to_path_buf();
+
         let mut checks_stream = match check::run_checks(
-            Some(
-                check_ctx
-                    .minimal_file()
-                    .dir_path()
-                    .unwrap()
-                    .join("packages"),
-            ),
-            Some(
-                check_ctx
-                    .minimal_file()
-                    .dir_path()
-                    .unwrap()
-                    .join("profiles"),
-            ),
-            Some(
-                check_ctx
-                    .minimal_file()
-                    .dir_path()
-                    .unwrap()
-                    .join("harnesses"),
-            ),
+            if check_all || flag_packages {
+                Some(upstream_dir.join("packages"))
+            } else {
+                None
+            },
+            if check_all || flag_profiles {
+                Some(upstream_dir.join("profiles"))
+            } else {
+                None
+            },
+            if check_all || flag_harnesses {
+                Some(upstream_dir.join("harnesses"))
+            } else {
+                None
+            },
             check_ctx.stdlib_dir().to_path_buf(),
-            &[],
+            &filter_names,
             Some(graph),
             check_ctx.local_cache(),
-            false,
+            fix,
             &[],
         ) {
             Err(e) => return EnvChannel::write_error(e.into(), stream),
@@ -307,8 +323,8 @@ impl sandbox2::Channel for EnvChannel<'_> {
                     });
                 None
             }
-            Some(("check", _args)) => {
-                self.run_check(stream, rootfs);
+            Some(("check", args)) => {
+                self.run_check(stream, rootfs, args);
 
                 None
             }
