@@ -1,0 +1,72 @@
+name: promote-cli
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Short SHA to promote (from git rev-parse --short)"
+        required: true
+        type: string
+      platforms:
+        description: "Comma-separated platform list or 'all'"
+        required: false
+        default: "amd64-linux,arm64-linux"
+        type: string
+      trigger_macos:
+        description: "Trigger minimal-vm-mac build for macOS bundle"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: "read"
+      id-token: "write"
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: "289724348228"
+          workload_identity_provider: "projects/289724348228/locations/global/workloadIdentityPools/github/providers/gominimal"
+
+      - name: Promote CLI version
+        run: |
+          SHA="${{ inputs.sha }}"
+          PLATFORMS="${{ inputs.platforms }}"
+
+          if [ "$PLATFORMS" = "all" ]; then
+            PLATFORMS="amd64-linux,arm64-linux"
+          fi
+
+          IFS=',' read -ra PLATFORM_LIST <<< "$PLATFORMS"
+          for plat in "${PLATFORM_LIST[@]}"; do
+            plat="$(echo "$plat" | tr -d ' ')"
+            echo "Checking cli-${plat}-${SHA}.tar.zst exists..."
+            if ! gcloud storage ls "gs://minimal-shim/cli-${plat}-${SHA}.tar.zst" > /dev/null 2>&1; then
+              echo "ERROR: cli-${plat}-${SHA}.tar.zst not found in bucket"
+              exit 1
+            fi
+          done
+
+          for plat in "${PLATFORM_LIST[@]}"; do
+            plat="$(echo "$plat" | tr -d ' ')"
+            echo "Promoting CLI to ${SHA} for ${plat}..."
+            echo "{\"version\":\"${SHA}\"}" > "cli-${plat}-config.json"
+            gcloud storage cp \
+              --cache-control="max-age=300" \
+              "cli-${plat}-config.json" \
+              "gs://minimal-shim/cli-${plat}-config.json"
+          done
+
+          echo "CLI promoted to ${SHA} for platforms: ${PLATFORMS}"
+
+      - name: Trigger minimal-vm-mac build
+        if: inputs.trigger_macos
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run build.yml \
+            --repo gominimal/minimal-vm-mac \
+            --field cli_sha="${{ inputs.sha }}"

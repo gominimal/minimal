@@ -156,10 +156,37 @@ jobs:
         with:
           project_id: "289724348228"
           workload_identity_provider: "projects/289724348228/locations/global/workloadIdentityPools/github/providers/gominimal"
-      - name: Update shim config
+      - name: Generate completions
         run: |
-          echo '{"version": "${{ steps.release_info.outputs.short_sha }}"}' > config.json
-          gcloud storage cp config.json gs://minimal-shim/config.json
+          chmod +x artifacts/amd64/minimal
+          mkdir -p completions/{bash,zsh,fish}
+          artifacts/amd64/minimal completions bash > completions/bash/minimal 2>/dev/null || true
+          artifacts/amd64/minimal completions zsh > completions/zsh/_minimal 2>/dev/null || true
+          artifacts/amd64/minimal completions fish > completions/fish/minimal.fish 2>/dev/null || true
+      - name: Package and upload CLI archives to GCS
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+
+          # amd64-linux
+          mkdir -p pkg-amd64/bin
+          cp artifacts/amd64/minimal pkg-amd64/bin/
+          chmod +x pkg-amd64/bin/minimal
+          cp -r completions pkg-amd64/
+          tar --zstd -cf "cli-amd64-linux-${SHA}.tar.zst" -C pkg-amd64 .
+
+          # arm64-linux (completions are text, same for both arches)
+          mkdir -p pkg-arm64/bin
+          cp artifacts/arm64/minimal pkg-arm64/bin/
+          chmod +x pkg-arm64/bin/minimal
+          cp -r completions pkg-arm64/
+          tar --zstd -cf "cli-arm64-linux-${SHA}.tar.zst" -C pkg-arm64 .
+
+          gcloud storage cp \
+            --cache-control="public, max-age=31536000, immutable" \
+            "cli-amd64-linux-${SHA}.tar.zst" gs://minimal-shim/
+          gcloud storage cp \
+            --cache-control="public, max-age=31536000, immutable" \
+            "cli-arm64-linux-${SHA}.tar.zst" gs://minimal-shim/
 
   minimal-check:
     runs-on: ubuntu-latest

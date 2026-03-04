@@ -9,7 +9,7 @@ runs:
       uses: actions/cache@v5
       with:
         path: ~/.minimal
-        key: minimal-bin-${{ runner.os }}
+        key: minimal-bin-v2-${{ runner.os }}
     - name: Install Minimal
       if: steps.cache-minimal.outputs.cache-hit != 'true'
       shell: bash
@@ -17,7 +17,10 @@ runs:
         curl --proto '=https' --tlsv1.2 -sSf https://storage.googleapis.com/minimal-shim/install.sh | sh -s -- -y
     - name: Add Minimal to PATH
       shell: bash
-      run: echo "$HOME/.minimal/bin" >> $GITHUB_PATH
+      run: |
+        # Support both old and new shim layout
+        echo "$HOME/.minimal/shim/bin" >> $GITHUB_PATH
+        echo "$HOME/.minimal/bin" >> $GITHUB_PATH
     - name: Cache Cargo state
       uses: actions/cache@v5
       with:
