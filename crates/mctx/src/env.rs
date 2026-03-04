@@ -405,7 +405,11 @@ impl<'a> Env<'a> {
                     .map(|ce| SandboxMapped::Dir(ce.path().to_path_buf())),
             )
             .with_state_dir(&args.state_base_dir)
-            .with_dns(needs_dns)
+            .with_dns(
+                args.override_disable_networking
+                    .map(|v| !v)
+                    .unwrap_or(needs_dns),
+            )
             .with_disable_networking(
                 args.override_disable_networking
                     .unwrap_or(!needs_dns && !needs_internet),
