@@ -4,19 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       sha:
-        description: "Short SHA to promote (from git rev-parse --short)"
-        required: true
+        description: "Short SHA to promote (leave empty for latest in bucket)"
+        required: false
         type: string
       platforms:
         description: "Comma-separated platform list or 'all'"
         required: false
         default: "amd64-linux,arm64-linux"
         type: string
-      trigger_macos:
-        description: "Trigger minimal-vm-mac build for macOS bundle"
-        required: false
-        default: false
-        type: boolean
 
 jobs:
   promote:
@@ -33,11 +28,27 @@ jobs:
 
       - name: Promote CLI version
         run: |
-          SHA="${{ inputs.sha }}"
-          PLATFORMS="${{ inputs.platforms }}"
+          SHA="$(echo "${{ inputs.sha }}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          PLATFORMS="$(echo "${{ inputs.platforms }}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
 
           if [ "$PLATFORMS" = "all" ]; then
             PLATFORMS="amd64-linux,arm64-linux"
+          fi
+
+          if [ -z "$SHA" ]; then
+            echo "No SHA provided, finding latest CLI archive in bucket..."
+            LATEST=$(gcloud storage ls -l "gs://minimal-shim/archives/cli-amd64-linux-*.tar.zst" \
+              | grep -v "^TOTAL:" \
+              | sort -k2 \
+              | tail -1 \
+              | awk '{print $NF}')
+            if [ -z "$LATEST" ]; then
+              echo "ERROR: No CLI archives found in bucket"
+              exit 1
+            fi
+            # Extract SHA: archives/cli-amd64-linux-<sha>.tar.zst → <sha>
+            SHA="$(basename "$LATEST" | sed 's/^cli-amd64-linux-//;s/\.tar\.zst$//')"
+            echo "Latest SHA: ${SHA}"
           fi
 
           IFS=',' read -ra PLATFORM_LIST <<< "$PLATFORMS"
@@ -61,12 +72,3 @@ jobs:
           done
 
           echo "CLI promoted to ${SHA} for platforms: ${PLATFORMS}"
-
-      - name: Trigger minimal-vm-mac build
-        if: inputs.trigger_macos
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh workflow run build.yml \
-            --repo gominimal/minimal-vm-mac \
-            --field cli_sha="${{ inputs.sha }}"
