@@ -11,7 +11,10 @@ use futures::stream::StreamExt;
 use graph::{BuildSpecRef, Graph, SetupForPackages, Transitives, TransitivesDep};
 use mfile::{EnvPatches, EnvVarValue};
 use op::Runnable;
-use sandbox2::{Container, config::SandboxMapped};
+use sandbox2::{
+    Container,
+    config::{Invocation, SandboxMapped},
+};
 use tempfile::TempDir;
 
 #[allow(dead_code)]
@@ -486,17 +489,19 @@ impl<'a> Env<'a> {
     /// Gives temporary directories into the ownership of this env. Use this
     /// if you created a temporary directory for `state_base_dir` and want it to be
     /// cleaned up along with this environment.
-    pub fn associate_tempdirs<I: IntoIterator<Item = TempDir>>(&mut self, dirs: I) {
+    pub(crate) fn associate_tempdirs<I: IntoIterator<Item = TempDir>>(&mut self, dirs: I) {
         self.temp_dirs.extend(dirs);
     }
 
-    pub fn container(&mut self) -> Result<Container, Error> {
+    #[allow(dead_code)]
+    pub(crate) fn container(&mut self) -> Result<Container, Error> {
         self.sandbox
             .new_container()
             .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))
     }
 
-    pub fn command<I, S>(
+    #[allow(dead_code)]
+    pub(crate) fn command<I, S>(
         &mut self,
         container: &Container,
         program: &str,
@@ -508,6 +513,24 @@ impl<'a> Env<'a> {
     {
         self.sandbox
             .command(container, program, args, [("", ""); 0])
+            .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))
+    }
+
+    /// Runs a sequence of invocations inside the sandbox, optionally streaming
+    /// stdout and stderr to the provided async writers.
+    pub async fn run<W1, W2>(
+        &mut self,
+        invocations: Vec<Invocation>,
+        stdout_writer: Option<W1>,
+        stderr_writer: Option<W2>,
+    ) -> Result<(), Error>
+    where
+        W1: tokio::io::AsyncWrite + Unpin + Send,
+        W2: tokio::io::AsyncWrite + Unpin + Send,
+    {
+        self.sandbox
+            .run(invocations, stdout_writer, stderr_writer)
+            .await
             .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))
     }
 }

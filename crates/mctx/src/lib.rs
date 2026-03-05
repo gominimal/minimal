@@ -21,6 +21,7 @@ pub use config::{Config, ConfigBuilder, ConfigError};
 mod env;
 use graph::{BuildSpecRef, Graph, Transitives};
 use mfile::{EnvPatches, EnvVarValue, Task};
+pub use sandbox2::config::Invocation;
 
 use env::Env;
 use toml_edit::{Array, DocumentMut, Item, TableLike, Value};

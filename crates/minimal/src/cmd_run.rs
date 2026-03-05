@@ -1,9 +1,12 @@
-use std::{io::Write, path::PathBuf};
+use std::{
+    io::BufRead,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::anyhow;
 use graph::Graph;
-use hakoniwa::Output;
-use mctx::{Context, Error};
+use mctx::{Context, Error, Invocation};
 use mfile::TaskAction;
 use shlex::Shlex;
 use tracing::trace;
@@ -45,62 +48,96 @@ pub async fn run_task(
             task.packages.clone(),
         )
         .await?;
-    let container = env
-        .container()
-        .map_err(|e| Error::Other(anyhow!("building container failed: {}", e)))?;
 
     if let Some((command, args)) = task.exec_and_args() {
-        let mut cmd = env
-            .command(&container, &command, args)
-            .map_err(|e| Error::Other(anyhow!("building command failed: {}", e)))?;
-        cmd.spawn()
-            .map_err(|e| Error::Other(anyhow!("command launch failed: {}", e)))?
-            .wait()
-            .map_err(|e| Error::Other(anyhow!("command failed: {}", e)))?;
-    } else {
-        // exec_and_args() only valid for some action variants, handle the others here
-        if let TaskAction::CmdCmd(argv) = &task.action {
-            let mut meta_cmd = env
-                .command(&container, &argv[0], &argv[1..])
-                .map_err(|e| Error::Other(anyhow!("building meta-command failed: {}", e)))?;
+        env.run(
+            vec![Invocation {
+                executable: command,
+                args,
+                envs: Default::default(),
+            }],
+            Some(tokio::io::stdout()),
+            Some(tokio::io::stderr()),
+        )
+        .await?;
+    } else if let TaskAction::CmdCmd(argv) = &task.action {
+        // Phase 1: Run the meta-command, capturing stdout so we can parse
+        // the lines it emits into commands for phase 2.
+        let (capture, buf) = CaptureWriter::new();
+        env.run(
+            vec![Invocation {
+                executable: argv[0].clone(),
+                args: argv[1..].to_vec(),
+                envs: Default::default(),
+            }],
+            Some(capture),
+            Some(tokio::io::stderr()),
+        )
+        .await?;
 
-            let Output {
-                status,
-                stderr,
-                stdout,
-            } = meta_cmd
-                .output()
-                .map_err(|e| Error::Other(anyhow!("meta-command failed: {}", e)))?;
-            std::io::stderr().write_all(&stderr).unwrap();
-            if !status.success() {
-                return Err(Error::Other(anyhow!("meta-command failed: {:?}", status)));
-            }
-
-            use std::io::BufRead;
-            for line_result in std::io::Cursor::new(stdout).lines() {
-                match line_result {
-                    Ok(line) => {
-                        let mut args = Shlex::new(&line);
-                        let prog = args.next().unwrap();
-                        println!("+ {}", &line);
-
-                        let mut cmd = env
-                            .command(&container, &prog, args)
-                            .map_err(|e| Error::Other(anyhow!("building command failed: {}", e)))?;
-                        cmd.spawn()
-                            .map_err(|e| Error::Other(anyhow!("command launch failed: {}", e)))?
-                            .wait()
-                            .map_err(|e| Error::Other(anyhow!("command failed: {}", e)))?;
-                    }
-                    Err(e) => {
-                        return Err(Error::IO("reading meta-commands", PathBuf::new(), e));
-                    }
-                }
-            }
-        } else {
-            unreachable!();
+        // Phase 2: Each line of the meta-command's stdout is a shell command.
+        let stdout = buf.lock().unwrap().clone();
+        let mut invocations = Vec::new();
+        for line_result in std::io::Cursor::new(stdout).lines() {
+            let line =
+                line_result.map_err(|e| Error::IO("reading meta-commands", PathBuf::new(), e))?;
+            let mut lexer = Shlex::new(&line);
+            let Some(prog) = lexer.next() else {
+                continue;
+            };
+            println!("+ {}", &line);
+            invocations.push(Invocation {
+                executable: prog,
+                args: lexer.collect(),
+                envs: Default::default(),
+            });
         }
+        env.run(
+            invocations,
+            Some(tokio::io::stdout()),
+            Some(tokio::io::stderr()),
+        )
+        .await?;
+    } else {
+        unreachable!();
     }
 
     Ok(())
+}
+
+/// An [`tokio::io::AsyncWrite`] adapter that captures all written bytes into a
+/// shared buffer, allowing the caller to read back the data after the writer
+/// has been consumed.
+struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+impl CaptureWriter {
+    fn new() -> (Self, Arc<Mutex<Vec<u8>>>) {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        (Self(buf.clone()), buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for CaptureWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
 }
