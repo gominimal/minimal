@@ -66,3 +66,32 @@ Switches for the local & remote cache:
  * `--no-cache`: Rebuild everything thats needed: do not use anything that was built in an earlier invocation nor anything fetched in an earlier invocation.
 
 These args apply to planning as well.
+
+## CI/CD
+
+### ci.yml — Build pipeline
+
+Runs on every push and PR to `main`. On pushes to `main`, builds static
+musl binaries for amd64 and arm64, creates a GitHub release, and uploads
+CLI archives to `gs://minimal-shim/archives/`.
+
+### promote.yml — CLI version promotion
+
+Manual `workflow_dispatch` with inputs:
+- `sha` (optional): short SHA to promote (defaults to latest archive in bucket)
+- `platforms` (optional): comma-separated list or `"amd64-linux,arm64-linux"`
+
+Verifies the archive exists in GCS, then writes per-platform config files
+under `gs://minimal-shim/config/`.
+
+### GCS permissions
+
+CI workflows authenticate via Workload Identity Federation (WIF). The WIF
+principal for this repo requires `roles/storage.objectUser` on the
+`gs://minimal-shim` bucket, which grants create, delete, get, list, and
+update on objects. This is the minimum predefined role that supports
+uploading archives and overwriting config files during promotion.
+
+```
+principal://iam.googleapis.com/projects/289724348228/locations/global/workloadIdentityPools/github/subject/repo:gominimal/minimal:ref:refs/heads/main
+```
