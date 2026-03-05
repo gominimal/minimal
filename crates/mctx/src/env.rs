@@ -493,15 +493,13 @@ impl<'a> Env<'a> {
         self.temp_dirs.extend(dirs);
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn container(&mut self) -> Result<Container, Error> {
+    pub fn container(&mut self) -> Result<Container, Error> {
         self.sandbox
             .new_container()
             .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn command<I, S>(
+    pub fn command<I, S>(
         &mut self,
         container: &Container,
         program: &str,

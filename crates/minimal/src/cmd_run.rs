@@ -50,16 +50,16 @@ pub async fn run_task(
         .await?;
 
     if let Some((command, args)) = task.exec_and_args() {
-        env.run(
-            vec![Invocation {
-                executable: command,
-                args,
-                envs: Default::default(),
-            }],
-            Some(tokio::io::stdout()),
-            Some(tokio::io::stderr()),
-        )
-        .await?;
+        let container = env
+            .container()
+            .map_err(|e| Error::Other(anyhow!("building container failed: {}", e)))?;
+        let mut cmd = env
+            .command(&container, &command, args)
+            .map_err(|e| Error::Other(anyhow!("building command failed: {}", e)))?;
+        cmd.spawn()
+            .map_err(|e| Error::Other(anyhow!("command launch failed: {}", e)))?
+            .wait()
+            .map_err(|e| Error::Other(anyhow!("command failed: {}", e)))?;
     } else if let TaskAction::CmdCmd(argv) = &task.action {
         // Phase 1: Run the meta-command, capturing stdout so we can parse
         // the lines it emits into commands for phase 2.
