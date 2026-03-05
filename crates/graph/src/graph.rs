@@ -269,10 +269,7 @@ impl LayerCache for LayerCacheDir {
             return Ok(());
         }
 
-        let origin_bytes = serde_json::to_vec(&origin).unwrap();
-        let origin_hash = blake3::hash(&origin_bytes).to_hex();
-        let p = self.0.join(origin_hash.as_str());
-
+        let p = self.0.join(origin.hash_hex().as_ref());
         if std::fs::exists(&p).unwrap_or(false) {
             return Ok(());
         }
@@ -293,9 +290,7 @@ impl LayerCache for LayerCacheDir {
         Ok(())
     }
     fn get(&mut self, origin: &SpecOrigin) -> Result<Option<Layer>, Self::Error> {
-        let origin_bytes = serde_json::to_vec(origin).unwrap();
-        let origin_hash = blake3::hash(&origin_bytes).to_hex();
-        let p = self.0.join(origin_hash.as_str());
+        let p = self.0.join(origin.hash_hex().as_ref());
 
         if let Ok(f) = std::fs::File::open(p) {
             Ok(Some(serde_json::from_reader(f).map_err(|e| {
@@ -325,6 +320,9 @@ pub struct Graph {
     /// Indexes build-specs by name.
     by_name: HashMap<String, BuildSpecRef>,
 
+    /// The series of layers which were chained together to build this graph.
+    supply_chain: Vec<SpecOrigin>,
+
     /// The cache of build specs to their [SpecHash]. There is also a
     /// reverse cache of [SpecHash]'s to the build spec they correspond to.
     #[allow(clippy::type_complexity)]
@@ -351,6 +349,7 @@ impl Graph {
             top_levels: Vec::new(),
             profiles: HashMap::with_capacity(32),
             harnesses: HashMap::with_capacity(32),
+            supply_chain: Vec::with_capacity(6),
             hash_cache: Arc::new(RwLock::new((
                 HashMap::with_capacity(4096),
                 HashMap::with_capacity(4096),
@@ -466,6 +465,7 @@ impl Graph {
 
         let mut slf = loader.into_graph.into_inner();
         slf.top_levels.extend(new_toplevels);
+        slf.supply_chain.push(loader.origin.as_ref().clone());
 
         // Iterate all the builds that were just added.
         for (bsr, b) in slf
@@ -777,6 +777,11 @@ impl Graph {
             .into_iter()
             .map(|std::cmp::Reverse(SearchEntry { score, bsr })| (bsr, score))
             .collect()
+    }
+
+    /// Returns the links in the software supply chain used to build this graph.
+    pub fn software_supply_chain(&self) -> &Vec<SpecOrigin> {
+        &self.supply_chain
     }
 }
 
@@ -1190,6 +1195,15 @@ mod tests {
             m.build_deps[0].as_build().unwrap(),
             graph.by_name("top").unwrap()
         );
+
+        // Make sure the supply chain was tracked in the correct order
+        assert_eq!(
+            graph.software_supply_chain(),
+            &vec![
+                apex_repo.as_spec_origin().unwrap(),
+                middle_repo.as_spec_origin().unwrap(),
+            ],
+        )
     }
 
     #[test]

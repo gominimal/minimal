@@ -37,6 +37,8 @@ mod cmd_add;
 use cmd_add::{AddArgs, cmd_add};
 mod cmd_dump;
 use cmd_dump::{DumpArgs, cmd_dump};
+mod cmd_status;
+use cmd_status::{StatusArgs, cmd_status};
 
 #[derive(Parser)]
 #[command(name = "minimal", version = env!("GIT_HASH"))]
@@ -60,6 +62,8 @@ enum Command {
     Add(AddArgs),
     /// Automatically initialize minimal configuration based on your source tree.
     Init(InitArgs),
+    /// Shows the status of Minimal in this codebase.
+    Status(StatusArgs),
     /// Launches a development shell. Shorthand for `minimal run shell`.
     Shell,
     /// Runs the build task. Shorthand for `minimal run build`.
@@ -306,6 +310,7 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         Command::Update(args) => cmd_update(args, &mut ctx).await,
         Command::Dep(args) => cmd_dep(args, &mut ctx).await,
         Command::Dump(args) => cmd_dump(args, &mut ctx).await,
+        Command::Status(args) => cmd_status(args, &mut ctx).await,
         // Handled earlier
         Command::Completions(_) => Ok(()),
         Command::Init(_) => Ok(()),

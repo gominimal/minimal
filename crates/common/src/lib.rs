@@ -81,6 +81,12 @@ impl SpecOrigin {
             None
         }
     }
+
+    /// Returns a hashed hex representation suitable as a cache key.
+    pub fn hash_hex(&self) -> impl AsRef<str> {
+        let origin_bytes = serde_json::to_vec(self).unwrap();
+        blake3::hash(&origin_bytes).to_hex()
+    }
 }
 
 /// Implements [Write], mirroring all writes to two underlying writers.
