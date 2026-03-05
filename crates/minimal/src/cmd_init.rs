@@ -143,7 +143,7 @@ pub async fn cmd_init(args: InitArgs, config: Config) -> Result<(), Error> {
         std::io::stdin()
             .read_line(&mut input)
             .map_err(|e| Error::Other(anyhow::anyhow!("reading stdin: {}", e)))?;
-        if !input.trim().eq_ignore_ascii_case("y") {
+        if !(input.trim().eq_ignore_ascii_case("y") || input.trim() == "") {
             eprintln!("Aborted.");
             return Ok(());
         }
