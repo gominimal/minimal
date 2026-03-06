@@ -15,8 +15,5 @@ walkdir.workspace = true
 
 common.workspace = true
 
-# Use build-events which now provides proto types
-build-events.workspace = true
-
 [target.'cfg(target_os = "linux")'.dependencies]
 hakoniwa.workspace = true

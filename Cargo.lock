@@ -294,36 +294,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "build-events"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "minimal_spongebob_community_neoeinstein-prost",
- "prost",
- "prost-reflect",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "build-events-proto"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "build-events",
- "minimal_spongebob_community_neoeinstein-prost",
- "minimal_spongebob_community_neoeinstein-tonic",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2531,8 +2501,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
- "build-events",
- "build-events-proto",
  "check",
  "checkouts",
  "clap",
@@ -2574,27 +2542,6 @@ dependencies = [
  "tracing-indicatif",
  "tracing-subscriber",
  "uuid",
-]
-
-[[package]]
-name = "minimal_spongebob_community_neoeinstein-prost"
-version = "0.5.0-20251016192339-b653b5c17f28.2"
-source = "sparse+https://buf.build/gen/cargo/"
-checksum = "4eb3987be53572f359cbd65e5c3e513d5b7984e5323095237285919cbd68bf57"
-dependencies = [
- "prost",
- "prost-types",
-]
-
-[[package]]
-name = "minimal_spongebob_community_neoeinstein-tonic"
-version = "0.5.0-20251016192339-b653b5c17f28.4"
-source = "sparse+https://buf.build/gen/cargo/"
-checksum = "966d9c82b57ce018ffdc959085867e2e4ac93378e288a6f133906c142e6229d4"
-dependencies = [
- "minimal_spongebob_community_neoeinstein-prost",
- "tonic",
- "tonic-prost",
 ]
 
 [[package]]
@@ -3215,17 +3162,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "prost-reflect"
-version = "0.16.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b89455ef41ed200cafc47c76c552ee7792370ac420497e551f16123a9135f76e"
-dependencies = [
- "logos",
- "prost",
- "prost-types",
-]
-
-[[package]]
 name = "prost-types"
 version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3732,7 +3668,6 @@ dependencies = [
 name = "sandbox2"
 version = "0.0.1"
 dependencies = [
- "build-events",
  "common",
  "globset",
  "hakoniwa",
@@ -4460,7 +4395,6 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
- "webpki-roots",
 ]
 
 [[package]]
@@ -5056,15 +4990,6 @@ name = "webpki-root-certs"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "804f18a4ac2676ffb4e8b5b5fa9ae38af06df08162314f96a68d2a363e21a8ca"
-dependencies = [
- "rustls-pki-types",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "1.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22cfaf3c063993ff62e73cb4311efde4db1efb31ab78a3e5c457939ad5cc0bed"
 dependencies = [
  "rustls-pki-types",
 ]

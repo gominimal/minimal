@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use tracing_indicatif::IndicatifLayer;
 use tracing_indicatif::{filter::IndicatifFilter, filter::hide_indicatif_span_fields};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
-use uuid::Uuid;
 
 mod cmd_pkg;
 use cmd_pkg::{PkgArgs, cmd_pkg};
@@ -201,37 +200,7 @@ async fn main() -> Result<(), Error> {
         return Ok(());
     }
 
-    // Generate invocation ID for this build
-    let invocation_id = Uuid::new_v4().to_string();
-
-    // Initialize global invocation ID and event bus
-    build_events::initialize_invocation_id(invocation_id.clone());
-    build_events::initialize_global_event_bus();
-
-    let mut dispatcher =
-        build_events::BuildEventDispatcher::new(build_events::event_bus().subscribe());
-
-    // Add text file writer if requested
-    if let Some(events_file) = &cli.global_args.build_events_file {
-        let writer = build_events::subscribers::TextFileWriter::new(events_file)
-            .map_err(|e| Error::Other(anyhow!("Failed to create events file writer: {}", e)))?;
-        dispatcher.add_subscriber(Box::new(writer));
-    }
-
-    // Spawn dispatcher in background and store the join handle
-    let dispatcher_handle = tokio::spawn(async move {
-        dispatcher.run().await;
-    });
-
     let result = run_cli(cli).await;
-
-    // Close the event bus to signal the dispatcher to shut down gracefully
-    build_events::event_bus().close();
-
-    // Wait for dispatcher to complete (which will wait for SpongeBob to log the final URL)
-    if let Err(e) = dispatcher_handle.await {
-        tracing::warn!("Dispatcher task failed: {}", e);
-    }
 
     if let Err(e) = result {
         e.report_to_stderr();
