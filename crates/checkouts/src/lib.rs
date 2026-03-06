@@ -149,7 +149,7 @@ fn create_unique_id_and_dir(base_dir: &Path, prefix: String) -> std::io::Result<
     }
 
     // If prefix exists, try adding random suffixes
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     const MAX_ATTEMPTS: u32 = 1000;
 

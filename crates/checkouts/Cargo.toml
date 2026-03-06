@@ -17,4 +17,4 @@ serde_json.workspace = true
 common.workspace = true
 mfile.workspace = true
 
-rand = "0.9"
+rand.workspace = true

@@ -54,7 +54,7 @@ nickel-lang-core = { version = "0.15.3", default-features = false, features = ["
 object = { version = "0.38", default-features = false, features = ["archive", "elf", "read_core", "std"] }
 oci-spec = "0.8.3"
 path-absolutize = "^3.1"
-rand = "0.9"
+rand = "0.10"
 rayon = "1.11"
 regex = "1" # keep in sync with nickel-lang-core
 reqwest = { version = "0.13", features = ["stream"], default-features = false } # keep in sync with google-cloud-gax

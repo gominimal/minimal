@@ -343,7 +343,7 @@ pub fn synth_user_group_config(p: &Path, username: &str) -> Result<(), io::Error
 }
 
 pub fn random_alphanumeric(length: usize) -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
 
     (0..length)
