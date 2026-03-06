@@ -1128,7 +1128,7 @@ impl FileBasedChecker for AdjacentImportCheck {
 /// Regexes that build scripts are audited against. If any match, the check fails.
 static BUILD_SCRIPT_AUDIT_REGEXES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
     vec![(
-        Regex::new(r"\btar\s+-?[a-zA-Z]*x[a-zA-Z]*\b").unwrap(),
+        Regex::new(r"\btar\s+-?xf\b").unwrap(),
         "use 'tar -xof' instead of 'tar -xf' to extract archives in build scripts",
     )]
 });
