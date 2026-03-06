@@ -52,3 +52,6 @@ pub use patched::{PatchedBuild, PatchedBuildResult};
 
 mod standalone_test;
 pub use standalone_test::{StandaloneTest, StandaloneTestError};
+
+mod task_env;
+pub use task_env::TaskEnv;

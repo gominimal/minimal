@@ -1,14 +1,6 @@
-use std::{
-    io::BufRead,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
-
 use anyhow::anyhow;
 use graph::Graph;
-use mctx::{Context, Error, Invocation};
-use mfile::TaskAction;
-use shlex::Shlex;
+use mctx::{Context, Error};
 use tracing::trace;
 
 #[derive(Debug, clap::Args)]
@@ -49,95 +41,33 @@ pub async fn run_task(
         )
         .await?;
 
-    if let Some((command, args)) = task.exec_and_args() {
+    // Resolve the invocations to run from the task definition.
+    let invocations = env.task_invocations(task).await?;
+
+    // Execute: use container/command for exec/bash (preserves inherited stdio),
+    // and env.run() for resolved CmdCmd invocations.
+    if task.exec_and_args().is_some() {
         let container = env
             .container()
             .map_err(|e| Error::Other(anyhow!("building container failed: {}", e)))?;
-        let mut cmd = env
-            .command(&container, &command, args)
-            .map_err(|e| Error::Other(anyhow!("building command failed: {}", e)))?;
-        cmd.spawn()
-            .map_err(|e| Error::Other(anyhow!("command launch failed: {}", e)))?
-            .wait()
-            .map_err(|e| Error::Other(anyhow!("command failed: {}", e)))?;
-    } else if let TaskAction::CmdCmd(argv) = &task.action {
-        // Phase 1: Run the meta-command, capturing stdout so we can parse
-        // the lines it emits into commands for phase 2.
-        let (capture, buf) = CaptureWriter::new();
-        env.run(
-            vec![Invocation {
-                executable: argv[0].clone(),
-                args: argv[1..].to_vec(),
-                envs: Default::default(),
-            }],
-            Some(capture),
-            Some(tokio::io::stderr()),
-        )
-        .await?;
-
-        // Phase 2: Each line of the meta-command's stdout is a shell command.
-        let stdout = buf.lock().unwrap().clone();
-        let mut invocations = Vec::new();
-        for line_result in std::io::Cursor::new(stdout).lines() {
-            let line =
-                line_result.map_err(|e| Error::IO("reading meta-commands", PathBuf::new(), e))?;
-            let mut lexer = Shlex::new(&line);
-            let Some(prog) = lexer.next() else {
-                continue;
-            };
-            println!("+ {}", &line);
-            invocations.push(Invocation {
-                executable: prog,
-                args: lexer.collect(),
-                envs: Default::default(),
-            });
+        for inv in invocations {
+            let mut cmd = env
+                .command(&container, &inv.executable, inv.args.iter())
+                .map_err(|e| Error::Other(anyhow!("building command failed: {}", e)))?;
+            cmd.spawn()
+                .map_err(|e| Error::Other(anyhow!("command launch failed: {}", e)))?
+                .wait()
+                .map_err(|e| Error::Other(anyhow!("command failed: {}", e)))?;
         }
+    } else {
+        trace!("Task invocation: {:?}", invocations);
         env.run(
             invocations,
             Some(tokio::io::stdout()),
             Some(tokio::io::stderr()),
         )
         .await?;
-    } else {
-        unreachable!();
     }
 
     Ok(())
-}
-
-/// An [`tokio::io::AsyncWrite`] adapter that captures all written bytes into a
-/// shared buffer, allowing the caller to read back the data after the writer
-/// has been consumed.
-struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
-
-impl CaptureWriter {
-    fn new() -> (Self, Arc<Mutex<Vec<u8>>>) {
-        let buf = Arc::new(Mutex::new(Vec::new()));
-        (Self(buf.clone()), buf)
-    }
-}
-
-impl tokio::io::AsyncWrite for CaptureWriter {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        std::task::Poll::Ready(Ok(buf.len()))
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
 }

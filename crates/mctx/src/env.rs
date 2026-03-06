@@ -493,6 +493,17 @@ impl<'a> Env<'a> {
         self.temp_dirs.extend(dirs);
     }
 
+    /// Resolves the invocations to run for the given task using [`op::TaskEnv`].
+    pub async fn task_invocations(&mut self, task: &mfile::Task) -> Result<Vec<Invocation>, Error> {
+        op::TaskEnv {
+            task,
+            sandbox: &mut self.sandbox,
+        }
+        .resolve()
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))
+    }
+
     pub fn container(&mut self) -> Result<Container, Error> {
         self.sandbox
             .new_container()
