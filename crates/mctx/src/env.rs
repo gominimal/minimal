@@ -257,6 +257,60 @@ impl EnvChannel<'_> {
         )
         .ok();
     }
+
+    /// Implementation of `min run <task>`
+    fn run_task(&mut self, stream: &mut UnixStream, _rootfs: &Path, task_name: &str) {
+        let mut build_ctx = match self.ctx.cloned_reinit() {
+            Err(e) => return EnvChannel::write_error(e, stream),
+            Ok(ctx) => ctx,
+        };
+        let graph = match build_ctx.graph_from_all_packages() {
+            Err(e) => return EnvChannel::write_error(e, stream),
+            Ok(g) => g,
+        };
+        let task = match build_ctx.task(graph, task_name) {
+            Err(e) => return EnvChannel::write_error(e, stream),
+            Ok(v) => v,
+        };
+        let (task, mut graph) = match task {
+            None => {
+                writeln!(stream, "error: no such task '{}'", task_name).ok();
+                return;
+            }
+            Some((t, g)) => (t, g),
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result: Result<(), Error> = rt.block_on(async {
+            let mut env = build_ctx
+                .make_env(
+                    task_name,
+                    &mut graph,
+                    if task.inherit_cwd {
+                        Some(std::env::current_dir().unwrap())
+                    } else {
+                        None
+                    },
+                    task.state_key.as_ref(),
+                    Some(&task.patch),
+                    Some(&task.vars),
+                    task.packages.clone(),
+                )
+                .await?;
+
+            let invocations = env.task_invocations(&task).await?;
+            let (stdout_writer, stderr_writer) = StreamWriter::pair(stream);
+            env.run(invocations, Some(stdout_writer), Some(stderr_writer))
+                .await
+        });
+
+        if let Err(e) = result {
+            EnvChannel::write_error(e, stream)
+        }
+    }
 }
 
 impl sandbox2::Channel for EnvChannel<'_> {
@@ -333,6 +387,11 @@ impl sandbox2::Channel for EnvChannel<'_> {
             }
             Some(("patched-pkg", name)) => {
                 self.run_patched_pkg(stream, rootfs, name);
+
+                None
+            }
+            Some(("run", name)) => {
+                self.run_task(stream, rootfs, name);
 
                 None
             }

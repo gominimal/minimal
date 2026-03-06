@@ -106,6 +106,10 @@ min_add() {
     __min_add "$prefix" "$@"
 }
 
+min_run() {
+    __min_rpc "run" "$@"
+}
+
 min_check() {
     __min_rpc "check" "$@"
 }
@@ -121,6 +125,15 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         search)
             min_search "$@"
             ;;
+        run)
+            min_run "$@"
+            ;;
+        build)
+            min_run build
+            ;;
+        test)
+            min_run test
+            ;;
         patched-pkg)
             min_patched_pkg "$@"
             ;;
@@ -132,6 +145,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             echo "" >&2
             echo "Add packages: min add [--session|--build|--runtime|--task <taskname>] <packages>" >&2
             echo "Search for packages: min search <query>" >&2
+            echo "Check minimal configuration: min check" >&2
+            echo "Run a task: min run <task name>" >&2
             echo "Check minimal configuration: min check" >&2
             echo "Try building a package (with potentially-stale dependencies): min patched-pkg <package name>" >&2
             exit 1
