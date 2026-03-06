@@ -1,0 +1,9 @@
+syntax = "proto3";
+package res;
+
+import "google/protobuf/empty.proto";
+import "res/create_env.proto";
+
+service RemoteExecutionService {
+  rpc CreateEnv(stream CreateEnvMessage) returns (CreateEnvResponse) {}
+}

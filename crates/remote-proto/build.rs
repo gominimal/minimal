@@ -2,19 +2,15 @@ use std::io::Result;
 fn main() -> Result<()> {
     prost_build::compile_protos(
         &[
-            "protos/injected_files.proto",
             "protos/tarball_format.proto",
-            "protos/command_parameters.proto",
-            "protos/create_build.proto",
-            "protos/poll_build.proto",
-            "protos/upload.proto",
-            "protos/remote_execution_service.proto",
+            "protos/res/create_env.proto",
+            "protos/res/remote_execution_service.proto",
         ],
-        &["protos/"],
+        &["protos/", "protos/res"],
     )?;
 
     tonic_prost_build::configure()
-        .compile_protos(&["protos/remote_execution_service.proto"], &["protos"])
+        .compile_protos(&["protos/res/remote_execution_service.proto"], &["protos"])
         .unwrap();
 
     Ok(())

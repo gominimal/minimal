@@ -33,9 +33,6 @@ pub enum Materialized {
     Given(PendingDir),
 }
 
-#[allow(dead_code)]
-pub mod remote_build;
-
 mod subsets;
 pub use subsets::SubsetBuild;
 

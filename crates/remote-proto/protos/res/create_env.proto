@@ -1,0 +1,67 @@
+syntax = "proto3";
+package res;
+
+import "tarball_format.proto";
+
+// The wire format for messages streamed to the server to create an environment.
+message CreateEnvMessage {
+    oneof msg {
+        // The initiation message of the stream. May only be sent as the first message.
+        CreateEnvRequest request = 1;
+        // A chunk of data for the stream.
+        CreateChunk chunk = 2;
+    }
+}
+
+// A request to RES to create a new environment.
+message CreateEnvRequest {
+    // A client-provided identifier for the environment.
+    string client_id = 1;
+    reserved 2 to 9;
+
+    // The streams which will be sent to create the environment.
+    repeated StreamConfig streams = 10;
+}
+
+// A chunk of streamed data for creating a new environment.
+message CreateChunk {
+    // Corresponds to an index in the [CreateEnvRequest.streams] array.
+    uint32 idx = 1;
+    reserved 2 to 4;
+
+    // Raw encoding of a chunk of stream data, where the wire format
+    // depends on the [StreamConfig.format] that was configured for the stream.
+    bytes data = 5;
+}
+
+// Defines the configuration for a stream that will be sent as part of a sequence
+// of [CreateChunk] messages.
+message StreamConfig {
+    enum StreamKind {
+        SK_UNSPECIFIED = 0;
+        // The stream is a wire encoding of the graph::Graph.
+        SK_GRAPH = 1;
+        // The stream is an encoding of the files for the cwd.
+        SK_WORKTREE = 2;
+    }
+    StreamKind kind = 1;
+    reserved 2 to 9;
+
+    enum GraphFormat {
+        GF_UNSPECIFIED = 0;
+        GF_RMP_SERDE_V1 = 1;
+    }
+    message FilesFormat {
+        TarballFormat tarball = 1;
+    }
+
+    oneof format {
+        GraphFormat graph = 10;
+        FilesFormat files = 11;
+    }
+}
+
+message CreateEnvResponse {
+    // A server-provided identifier for the environment.
+    string server_id = 1;
+}
