@@ -29,9 +29,6 @@ size.workspace = true
 tar.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
-tokio-stream.workspace = true
-tokio-util.workspace = true
-tonic.workspace = true
 tracing.workspace = true
 url.workspace = true
 

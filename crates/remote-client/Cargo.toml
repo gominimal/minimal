@@ -1,0 +1,27 @@
+[package]
+name = "remote-client"
+version = "0.0.1"
+edition.workspace = true
+rust-version = "1.87"
+license = "MIT OR Apache-2.0"
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+http-body.workspace = true
+prost.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+common.workspace = true
+graph.workspace = true
+remote-proto.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
