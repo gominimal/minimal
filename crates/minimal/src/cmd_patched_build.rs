@@ -70,7 +70,7 @@ pub async fn remote_patched_build(
     use op::remote_build::*;
 
     let client =
-        res_proto::remote_execution_service_client::RemoteExecutionServiceClient::connect(addr)
+        remote_proto::remote_execution_service_client::RemoteExecutionServiceClient::connect(addr)
             .await
             .map_err(|e| Error::Other(anyhow!(e)))?;
 

@@ -41,4 +41,4 @@ decode.workspace = true
 graph.workspace = true
 mfile.workspace = true
 sandbox2.workspace = true
-res-proto.workspace = true
+remote-proto.workspace = true

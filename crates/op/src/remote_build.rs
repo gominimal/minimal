@@ -7,7 +7,7 @@ use std::{
 
 use crate::{Error, Options, Runnable};
 use graph::{BuildDep, BuildSpec, BuildSpecRef, SourceFetch, SourceInput};
-use res_proto::{
+use remote_proto::{
     BuildStatus, CommandParameters, CreateBuildRequest, DownloadRequest, InjectedFiles, Invocation,
     OutputArtifact, PollBuildRequest, TarballCompression, TarballFormat, UploadMessage,
     UploadRequest,
@@ -73,7 +73,7 @@ impl<'a> RemoteSpecBuild<'a> {
                 DepInner::Local(_bsr, _path) => InjectedFiles {
                     unpack_to: UnpackDest::DestRootfs.into(),
                     injected_variant: Some(InjectedVariant::FilesUpload(
-                        res_proto::injected_files::FilesUpload {
+                        remote_proto::injected_files::FilesUpload {
                             upload_id: common::random_alphanumeric(8),
                             format: Some(TarballFormat {
                                 compression: TarballCompression::TarZst.into(),
@@ -94,7 +94,7 @@ impl<'a> RemoteSpecBuild<'a> {
                 } => Some(InjectedFiles {
                     unpack_to: UnpackDest::DestBuilddir.into(),
                     injected_variant: Some(InjectedVariant::InlineFile(
-                        res_proto::injected_files::InlineFile {
+                        remote_proto::injected_files::InlineFile {
                             path: filename.clone(),
                             mode: std::fs::metadata(full_path).unwrap().mode(),
                             data: std::fs::read(full_path).unwrap(),
@@ -115,7 +115,7 @@ impl<'a> RemoteSpecBuild<'a> {
                 }) => Some(InjectedFiles {
                     unpack_to: UnpackDest::DestBuilddir.into(),
                     injected_variant: Some(InjectedVariant::Source(
-                        res_proto::injected_files::Source {
+                        remote_proto::injected_files::Source {
                             url: url.clone(),
                             sha256: sha256.clone(),
                             extract: *extract,
@@ -235,8 +235,8 @@ impl<'a> Runnable for RemoteSpecBuild<'a> {
                             tokio::fs::File::from_std(file),
                         )
                         .map(|chunk| UploadMessage {
-                            msg: Some(res_proto::upload_message::Msg::Chunk(
-                                res_proto::UploadChunk {
+                            msg: Some(remote_proto::upload_message::Msg::Chunk(
+                                remote_proto::UploadChunk {
                                     data: chunk.unwrap().to_vec(),
                                 },
                             )),
@@ -245,11 +245,11 @@ impl<'a> Runnable for RemoteSpecBuild<'a> {
                         client
                             .upload(
                                 tokio_stream::once(UploadMessage {
-                                    msg: Some(res_proto::upload_message::Msg::Request(
+                                    msg: Some(remote_proto::upload_message::Msg::Request(
                                         UploadRequest {
-                                            id: Some(res_proto::upload_request::Id {
+                                            id: Some(remote_proto::upload_request::Id {
                                                 id: Some(
-                                                    res_proto::upload_request::id::Id::ClientId(
+                                                    remote_proto::upload_request::id::Id::ClientId(
                                                         client_id,
                                                     ),
                                                 ),
@@ -289,8 +289,8 @@ impl<'a> Runnable for RemoteSpecBuild<'a> {
             let status = self
                 .client
                 .poll_build(PollBuildRequest {
-                    id: Some(res_proto::poll_build_request::Id {
-                        id: Some(res_proto::poll_build_request::id::Id::ClientId(
+                    id: Some(remote_proto::poll_build_request::Id {
+                        id: Some(remote_proto::poll_build_request::id::Id::ClientId(
                             client_id.clone(),
                         )),
                     }),
@@ -302,8 +302,8 @@ impl<'a> Runnable for RemoteSpecBuild<'a> {
                 let mut output_stream = self
                     .client
                     .download(DownloadRequest {
-                        id: Some(res_proto::download_request::Id {
-                            id: Some(res_proto::download_request::id::Id::ClientId(
+                        id: Some(remote_proto::download_request::Id {
+                            id: Some(remote_proto::download_request::id::Id::ClientId(
                                 client_id.clone(),
                             )),
                         }),

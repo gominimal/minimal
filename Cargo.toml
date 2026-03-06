@@ -12,7 +12,7 @@ members = [
     "crates/op",
     "crates/orchestrator",
     "crates/minimal",
-    "crates/res-proto",
+    "crates/remote-proto",
     "crates/sandbox2",
     "crates/stdlib",
 ]
@@ -102,7 +102,7 @@ mctx = { version = "0.0.1", path = "crates/mctx" }
 mfile = { version = "0.0.1", path = "crates/mfile" }
 op = { version = "0.0.1", path = "crates/op" }
 orchestrator = { version = "0.0.1", path = "crates/orchestrator" }
-res-proto = { version = "0.0.1", path = "crates/res-proto" }
+remote-proto = { version = "0.0.1", path = "crates/remote-proto" }
 sandbox2 = { version = "0.0.1", path = "crates/sandbox2" }
 
 stdlib = { version = "0.0.6", path = "crates/stdlib" }

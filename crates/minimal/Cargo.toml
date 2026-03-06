@@ -16,7 +16,7 @@ mctx.workspace = true
 mfile.workspace = true
 op.workspace = true
 orchestrator.workspace = true
-res-proto.workspace = true
+remote-proto.workspace = true
 
 nickel-lang-core.workspace = true
 codespan-reporting.workspace = true

@@ -2526,8 +2526,8 @@ dependencies = [
  "rayon",
  "rcache",
  "regex",
+ "remote-proto",
  "reqwest",
- "res-proto",
  "serde",
  "serde_json",
  "sha2",
@@ -2742,7 +2742,7 @@ dependencies = [
  "mfile",
  "oci-spec",
  "rayon",
- "res-proto",
+ "remote-proto",
  "sandbox2",
  "serde_json",
  "sha2",
@@ -3438,6 +3438,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
+name = "remote-proto"
+version = "0.0.1"
+dependencies = [
+ "prost",
+ "prost-build",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tracing",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3477,18 +3489,6 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
-]
-
-[[package]]
-name = "res-proto"
-version = "0.0.1"
-dependencies = [
- "prost",
- "prost-build",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
- "tracing",
 ]
 
 [[package]]

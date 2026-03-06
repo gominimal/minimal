@@ -1,5 +1,5 @@
 [package]
-name = "res-proto"
+name = "remote-proto"
 version = "0.0.1"
 edition.workspace = true
 rust-version = "1.87"
