@@ -596,6 +596,17 @@ async fn check_package(
                 .await?,
         );
         out.push(
+            BuildScriptDisallowedPatterns
+                .check(
+                    &skip_checkers,
+                    fix,
+                    pkg.clone(),
+                    graph.read().await,
+                    cache.clone(),
+                )
+                .await?,
+        );
+        out.push(
             StandaloneTestCheck
                 .check(
                     &skip_checkers,
@@ -1106,6 +1117,87 @@ impl FileBasedChecker for AdjacentImportCheck {
                         identifier,
                     ));
                     result.verdict = CheckVerdict::Fail;
+                }
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+/// Regexes that build scripts are audited against. If any match, the check fails.
+static BUILD_SCRIPT_AUDIT_REGEXES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+    vec![(
+        Regex::new(r"\btar\s+-?[a-zA-Z]*x[a-zA-Z]*\b").unwrap(),
+        "use 'tar -xof' instead of 'tar -xf' to extract archives in build scripts",
+    )]
+});
+
+struct BuildScriptDisallowedPatterns;
+
+impl GraphBasedChecker for BuildScriptDisallowedPatterns {
+    async fn check(
+        self,
+        skip_checkers: &[String],
+        _fix: bool,
+        pkg: String,
+        graph: RwLockReadGuard<'_, Graph>,
+        _cache: Cache<LocalDir>,
+    ) -> Result<CheckResult, Error> {
+        let mut result = CheckResult {
+            verdict: CheckVerdict::Skip,
+            check: "build script disallowed-patterns",
+            err: vec![],
+        };
+        if skip_checkers.contains(&"build script disallowed-patterns".to_string()) {
+            return Ok(result);
+        }
+
+        let bsr = match graph.by_name(&pkg) {
+            None => return Ok(result),
+            Some(bsr) => bsr,
+        };
+        let build = graph.get(bsr).unwrap();
+        result.verdict = CheckVerdict::Pass;
+
+        // Check inline build commands.
+        for cmd in &build.cmds {
+            let cmd_str = cmd.join(" ");
+            for (regex, msg) in BUILD_SCRIPT_AUDIT_REGEXES.iter() {
+                if regex.is_match(&cmd_str) {
+                    result.verdict = CheckVerdict::Fail;
+                    result.err.push(format!("build cmd '{}': {}", cmd_str, msg));
+                }
+            }
+        }
+
+        // Check contents of local build script files.
+        for dep in &build.build_deps {
+            if let graph::BuildDep::Local {
+                full_path,
+                filename,
+                ..
+            } = dep
+            {
+                let contents = match std::fs::read_to_string(full_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        result.verdict = CheckVerdict::Fail;
+                        result
+                            .err
+                            .push(format!("failed to read build script {}: {}", filename, e));
+                        continue;
+                    }
+                };
+
+                for (regex, msg) in BUILD_SCRIPT_AUDIT_REGEXES.iter() {
+                    for m in regex.find_iter(&contents) {
+                        result.verdict = CheckVerdict::Fail;
+                        let line_num = contents[..m.start()].lines().count() + 1;
+                        result
+                            .err
+                            .push(format!("{} line {}: {}", filename, line_num, msg));
+                    }
                 }
             }
         }
