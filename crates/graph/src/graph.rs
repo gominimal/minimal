@@ -11,6 +11,7 @@ use mfile::{self, LinkConfig};
 use nickel_lang_core::term::IndexMap;
 
 use generational_arena::Arena;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -332,6 +333,59 @@ pub struct Graph {
             HashMap<SpecHash, BuildSpecRef>,
         )>,
     >,
+}
+
+/// Borrowing wire format for serialization — zero clones.
+#[derive(Serialize)]
+struct GraphWireRef<'a> {
+    builds: &'a Arena<BuildSpec>,
+    top_levels: &'a Vec<BuildSpecRef>,
+    profiles: &'a HashMap<String, Profile>,
+    harnesses: &'a HashMap<String, Harness>,
+    supply_chain: &'a Vec<SpecOrigin>,
+}
+
+/// Owning wire format for deserialization.
+/// Excludes `by_name` (rebuilt from arena) and `hash_cache` (lazily recomputed).
+#[derive(Deserialize)]
+struct GraphWire {
+    builds: Arena<BuildSpec>,
+    top_levels: Vec<BuildSpecRef>,
+    profiles: HashMap<String, Profile>,
+    harnesses: HashMap<String, Harness>,
+    supply_chain: Vec<SpecOrigin>,
+}
+
+impl Serialize for Graph {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        GraphWireRef {
+            builds: &self.builds,
+            top_levels: &self.top_levels,
+            profiles: &self.profiles,
+            harnesses: &self.harnesses,
+            supply_chain: &self.supply_chain,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Graph {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = GraphWire::deserialize(deserializer)?;
+        let mut by_name = HashMap::with_capacity(wire.builds.len());
+        for (idx, build) in wire.builds.iter() {
+            by_name.insert(build.name.clone(), BuildSpecRef(idx));
+        }
+        Ok(Graph {
+            builds: wire.builds,
+            top_levels: wire.top_levels,
+            profiles: wire.profiles,
+            harnesses: wire.harnesses,
+            by_name,
+            supply_chain: wire.supply_chain,
+            hash_cache: Default::default(),
+        })
+    }
 }
 
 impl Default for Graph {
@@ -782,6 +836,16 @@ impl Graph {
     /// Returns the links in the software supply chain used to build this graph.
     pub fn software_supply_chain(&self) -> &Vec<SpecOrigin> {
         &self.supply_chain
+    }
+
+    /// Serializes the graph to a byte vector using MessagePack.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+        rmp_serde::to_vec(self)
+    }
+
+    /// Deserializes a graph from a byte slice using MessagePack.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, rmp_serde::decode::Error> {
+        rmp_serde::from_slice(data)
     }
 }
 
@@ -1306,6 +1370,77 @@ mod tests {
         // Limiting num_results works
         let results = dp.fuzzy_name_search("lib", 1);
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn serde_roundtrip() {
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+                let {BuildSpec, Source, ..} = import \"minimal.ncl\" in
+
+                let shared = {
+                    name = \"shared\",
+                    build_deps = [
+                        {url = \"http://example.com/src.tar.gz\", sha256 = \"abc123\"} | Source,
+                    ],
+                    cmd = \"make install\",
+                } | BuildSpec
+                in
+
+                {
+                    name = \"top\",
+                    build_deps = [shared],
+                    runtime_deps = [shared],
+                    cmd = \"gcc -o main main.c\",
+                } | BuildSpec"
+            }
+            .to_string(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        let graph = Graph::new().ingest(layer).unwrap();
+
+        // Serialize and deserialize
+        let bytes = graph.to_bytes().expect("serialization failed");
+        let restored = Graph::from_bytes(&bytes).expect("deserialization failed");
+
+        // Verify by_name lookups work
+        assert!(restored.by_name("shared").is_some());
+        assert!(restored.by_name("top").is_some());
+
+        // Verify spec_hash returns identical values
+        for (bsr, build) in graph.iter() {
+            let restored_bsr = restored.by_name(&build.name).unwrap();
+            assert_eq!(
+                graph.spec_hash(&bsr),
+                restored.spec_hash(restored_bsr),
+                "spec_hash mismatch for {}",
+                build.name
+            );
+        }
+
+        // Verify top_levels match
+        assert_eq!(graph.top_levels.len(), restored.top_levels.len());
+        for (orig, rest) in graph.top_levels.iter().zip(restored.top_levels.iter()) {
+            assert_eq!(orig, rest);
+        }
+
+        // Verify cross-references resolve correctly
+        let top = restored.get(restored.by_name("top").unwrap()).unwrap();
+        assert_eq!(top.build_deps.len(), 1);
+        let shared_bsr = restored.by_name("shared").unwrap();
+        assert_eq!(top.build_deps[0].as_build().unwrap(), shared_bsr);
+        assert_eq!(top.runtime_deps[0].bsr(), shared_bsr);
+
+        // Verify supply chain preserved
+        assert_eq!(
+            graph.software_supply_chain().len(),
+            restored.software_supply_chain().len()
+        );
     }
 
     #[test]

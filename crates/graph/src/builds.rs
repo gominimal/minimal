@@ -4,7 +4,7 @@ use crate::{BuildSpecRef, Graph};
 use common::{SpecOrigin, SubsetSpec, Target};
 use decode::builds;
 use nickel_lang_core::term::IndexMap;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -16,7 +16,7 @@ pub use decode::{AttrValue, StrPos};
 type OutputMap = IndexMap<String, BuildOutput>;
 
 /// A description of pulling source code regardless of form.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SourceFetch {
     Web {
@@ -60,7 +60,7 @@ impl From<builds::SourceFetch> for SourceFetch {
 }
 
 /// A description of source code thats used as an input.
-#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SourceInput {
     pub from: SourceFetch,
     pub extract: bool,
@@ -78,7 +78,7 @@ impl From<builds::SourceInput> for SourceInput {
 }
 
 /// A dependency on some of the outputs of a build-spec.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SubsetInput {
     pub from: BuildSpecRef,
     pub outputs: SmallVec<[String; 4]>,
@@ -111,7 +111,7 @@ impl From<(BuildSpecRef, HashSet<String>)> for SubsetInput {
 /// An input to a build spec.
 ///
 /// Each entry in a build-spec's `build_deps` array corresponds to one [BuildDep].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum BuildDep {
     Build(BuildSpecRef),
@@ -137,7 +137,7 @@ impl BuildDep {
 }
 
 /// An output from a build.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(dead_code)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum BuildOutput {
@@ -171,7 +171,7 @@ impl BuildOutput {
 /// A runtime dependency declared on a build-spec.
 ///
 /// Each entry in a build-spec's `runtime_deps` array corresponds to one [RuntimeDep].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RuntimeDep {
     /// A direct runtime dependency on the build-spec described by the contained reference.
     Build(BuildSpecRef),
@@ -190,7 +190,7 @@ impl RuntimeDep {
 }
 
 /// A unit test defined on a build spec.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SpecTest {
     /// The test needs to run in the build sandbox, rather than standalone.
     pub build_test: bool,
@@ -201,7 +201,7 @@ pub struct SpecTest {
 }
 
 /// Definition of a package in the dependency graph.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct BuildSpec {
     /// The human-readable name declared on the build spec.

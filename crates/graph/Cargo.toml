@@ -12,6 +12,7 @@ tempfile.workspace = true
 
 [dependencies]
 nickel-lang-core.workspace = true
+rmp-serde.workspace = true
 codespan-reporting.workspace = true
 blake3.workspace = true
 generational-arena.workspace = true

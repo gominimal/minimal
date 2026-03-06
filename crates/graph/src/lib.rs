@@ -1,4 +1,5 @@
 use common::{SpecHash, SpecOrigin};
+use serde::{Deserialize, Serialize};
 
 /// An error during construction or processing of the dependency graph.
 #[allow(clippy::large_enum_variant)]
@@ -98,11 +99,14 @@ impl From<decode::Error> for Error {
 }
 
 /// A reference to some other [BuildSpec] in a [DepGraph].
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BuildSpecRef(pub(crate) generational_arena::Index);
 
 impl BuildSpecRef {
-    /// returns the index of the BuildSpec in the arena
+    /// Returns the index of the BuildSpec in the arena.
+    ///
+    /// This effectively erases the type and all generation-safety: do not use unless you
+    /// know what youre doing.
     pub fn index(&self) -> usize {
         self.0.into_raw_parts().0
     }
