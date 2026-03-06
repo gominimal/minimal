@@ -121,7 +121,7 @@ impl EnvChannel<'_> {
             stream.write_all(line).ok();
             stream.write_all(b"\n").ok();
         }
-        writeln!(stream, "error: failed to initialize minimal in codebase").ok();
+        writeln!(stream, "error: sandbox command failed.").ok();
     }
 
     /// Implementation of `min check`
