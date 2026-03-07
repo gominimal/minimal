@@ -279,6 +279,14 @@ impl EnvChannel<'_> {
             }
             Some((t, g)) => (t, g),
         };
+        if task.interactive {
+            writeln!(
+                stream,
+                "error: cannot run interactive tasks from within an environment"
+            )
+            .ok();
+            return;
+        }
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

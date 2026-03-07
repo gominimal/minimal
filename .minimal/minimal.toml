@@ -11,6 +11,7 @@ profile = "dev"
 state_key = "dev"
 
 [tasks.claude]
+interactive = true
 exec = "claude --dangerously-skip-permissions"
 
 [tasks.build]
@@ -22,6 +23,7 @@ exec = "cargo test --verbose"
 inherit_cwd = true
 
 [tasks.shell]
+interactive = true
 exec = "bash --noprofile -l"
 
 [tasks.startup-time]

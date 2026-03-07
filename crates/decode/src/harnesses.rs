@@ -610,6 +610,7 @@ impl Harness {
             ),
             patch: Default::default(),
             inherit_cwd: false,
+            interactive: false,
             extra: HashMap::new(),
         }
     }

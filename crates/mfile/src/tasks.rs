@@ -30,6 +30,10 @@ pub struct Task {
     #[serde(default)]
     pub inherit_cwd: bool,
 
+    /// Whether the task expects a TTY, such as TUI applications.
+    #[serde(default)]
+    pub interactive: bool,
+
     /// Any fields which are not understood by this version of minimal.
     #[serde(flatten)]
     pub extra: HashMap<String, toml::Value>,

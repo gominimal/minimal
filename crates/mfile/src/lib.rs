@@ -631,6 +631,7 @@ mod tests {
                         packages: vec!["base".to_string(), "go".to_string()],
                         action: TaskAction::exec_from_str("go test ./..."),
                         inherit_cwd: false,
+                        interactive: false,
                         extra: HashMap::new(),
                     }
                 )]
