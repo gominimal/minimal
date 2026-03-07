@@ -4,6 +4,10 @@ use tracing::{info, trace};
 
 #[derive(Debug, clap::Args)]
 pub struct PkgArgs {
+    /// Whether to log stdout/stderr during the build
+    #[arg(short, long, default_value_t = false)]
+    verbose: bool,
+
     /// Packages to build
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args=0..)]
     packages: Vec<String>,
@@ -20,7 +24,7 @@ pub async fn cmd_pkg(args: PkgArgs, ctx: &mut Context) -> Result<(), Error> {
     };
     let cache = ctx.local_cache();
 
-    pkg_build_impl(&graph, ctx, cache, false).await?;
+    pkg_build_impl(&graph, ctx, cache, false, args.verbose).await?;
 
     Ok(())
 }
@@ -30,10 +34,11 @@ pub async fn pkg_build_impl(
     ctx: &mut Context,
     cache: Cache,
     quiet: bool,
+    verbose: bool,
 ) -> Result<(), Error> {
     trace!("build_impl");
 
-    ctx.build_graph(graph).await?;
+    ctx.build_graph(graph, verbose).await?;
 
     // Display build summary
     if !quiet {

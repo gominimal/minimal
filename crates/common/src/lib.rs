@@ -399,6 +399,7 @@ pub fn command_exists(command: &str) -> Result<bool, io::Error> {
 pub struct TracingWriter {
     buf: Vec<u8>,
     is_stderr: bool,
+    target: Option<String>,
 }
 
 impl TracingWriter {
@@ -407,6 +408,7 @@ impl TracingWriter {
         Self {
             buf: Vec::new(),
             is_stderr: false,
+            target: None,
         }
     }
 
@@ -415,29 +417,37 @@ impl TracingWriter {
         Self {
             buf: Vec::new(),
             is_stderr: true,
+            target: None,
+        }
+    }
+
+    /// Sets the tracing target for emitted log lines (e.g. a package name).
+    pub fn with_target(mut self, target: impl Into<String>) -> Self {
+        self.target = Some(target.into());
+        self
+    }
+
+    fn emit_line(&self, line: &str) {
+        match (&self.target, self.is_stderr) {
+            (Some(t), true) => tracing::warn!(parent: tracing::Span::none(), "{}: {}", t, line),
+            (Some(t), false) => tracing::info!(parent: tracing::Span::none(), "{}: {}", t, line),
+            (None, true) => tracing::warn!(parent: tracing::Span::none(), "{}", line),
+            (None, false) => tracing::info!(parent: tracing::Span::none(), "{}", line),
         }
     }
 
     fn emit_lines(&mut self) {
         while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
-            let line = String::from_utf8_lossy(&self.buf[..pos]);
-            if self.is_stderr {
-                tracing::warn!(parent: tracing::Span::none(), "{}", line);
-            } else {
-                tracing::info!(parent: tracing::Span::none(), "{}", line);
-            }
+            let line = String::from_utf8_lossy(&self.buf[..pos]).into_owned();
+            self.emit_line(&line);
             self.buf.drain(..=pos);
         }
     }
 
     fn emit_remaining(&mut self) {
         if !self.buf.is_empty() {
-            let line = String::from_utf8_lossy(&self.buf);
-            if self.is_stderr {
-                tracing::warn!(parent: tracing::Span::none(), "{}", line);
-            } else {
-                tracing::info!(parent: tracing::Span::none(), "{}", line);
-            }
+            let line = String::from_utf8_lossy(&self.buf).into_owned();
+            self.emit_line(&line);
             self.buf.clear();
         }
     }

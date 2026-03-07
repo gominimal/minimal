@@ -51,7 +51,7 @@ impl EnvChannel<'_> {
             .enable_all()
             .build()
             .unwrap();
-        if let Err(e) = rt.block_on(self.ctx.build_graph(self.graph)) {
+        if let Err(e) = rt.block_on(self.ctx.build_graph(self.graph, false)) {
             writeln!(stream, "error: {}", e).ok();
             return;
         };

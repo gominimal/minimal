@@ -23,6 +23,7 @@ pub struct LocalBackend<SF: SourceFetcher + 'static> {
     pub(crate) output_base: PathBuf,
     pub(crate) remote_cache: Option<RemoteCache<GcsStorage>>,
     pub(crate) build_semaphore: Semaphore,
+    pub(crate) verbose: bool,
 }
 
 impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
@@ -67,12 +68,22 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
         let artifact = spawn_blocking(async move || {
             let shared = shared_hnd2.inner().read().await;
             let permit = shared.backend.build_semaphore.acquire().await.unwrap();
+            let verbose = shared.backend.verbose;
+            let name = shared.graph.get(&bsr).unwrap().name.clone();
             let mut b = op::SpecBuild {
                 override_deps: Some(dep_paths.into_iter().collect()),
                 spec: &bsr,
                 remote_fetcher: &shared.backend.sf,
-                stdout_writer: None,
-                stderr_writer: None,
+                stdout_writer: if verbose {
+                    Some(Box::new(common::TracingWriter::stdout().with_target(&name)))
+                } else {
+                    None
+                },
+                stderr_writer: if verbose {
+                    Some(Box::new(common::TracingWriter::stderr().with_target(&name)))
+                } else {
+                    None
+                },
             };
 
             let res = b
@@ -220,6 +231,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
 
 impl<SF: SourceFetcher> LocalBackend<SF> {
     /// Creates a new orchestrator for local builds.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_orchestrator(
         top_levels: Vec<BuildSpecRef>,
         output_base: PathBuf,
@@ -228,6 +240,7 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
         num_concurrent_builds: usize,
         graph: Graph,
         cache: Cache<LocalDir>,
+        verbose: bool,
     ) -> Result<Orchestrator<Self>, Error> {
         Ok(Orchestrator {
             top_levels,
@@ -235,6 +248,7 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
                 output_base,
                 remote_cache,
                 sf,
+                verbose,
                 build_semaphore: Semaphore::new(num_concurrent_builds),
             },
             graph,
