@@ -20,6 +20,7 @@ pub(crate) mod entry_meta;
 pub use entry_meta::{EntryMeta, MetaInner};
 
 mod read_tracker;
+pub use read_tracker::ReadSnapshot;
 use read_tracker::ReadTracker;
 
 /// A directory tree in the cache you can read or write.
@@ -275,10 +276,54 @@ impl Cache<LocalDir> {
         })
     }
 
+    /// Invalidates (deletes) a directory cache entry with the given spec hash.
+    pub fn invalidate_dir(&self, hash: &SpecHash) -> Result<(), CacheErr> {
+        let hash_hex = hash.0.to_hex();
+        // Entries on disk are at <root>/<first byte as hex>/<remaining bytes as hex>
+        let subpath: PathBuf = [&hash_hex.as_str()[0..2], &hash_hex.as_str()[2..]]
+            .iter()
+            .collect();
+
+        let p = self.inner().fs.path().join(subpath);
+        std::fs::remove_dir_all(p).map_err(CacheErr::from)
+    }
+
     /// Allocates a temporary directory in the same filesystem as the rest of the cache.
     pub fn temp_dir(&self) -> Result<tempfile::TempDir, std::io::Error> {
         let inner = self.inner();
         tempfile::tempdir_in(inner.fs.path().join("temp"))
+    }
+
+    /// Iterates all cached entries, yielding each spec hash.
+    ///
+    /// Entries are discovered lazily, one bucket directory at a time.
+    pub fn iter_entries(&self) -> impl Iterator<Item = SpecHash> {
+        let base = self.inner().fs.path().to_path_buf();
+
+        (0u8..=255).flat_map(move |prefix| {
+            let bucket_dir = base.join(format!("{:02x}", prefix));
+            let prefix_hex = format!("{:02x}", prefix);
+
+            std::fs::read_dir(&bucket_dir)
+                .into_iter()
+                .flatten()
+                .filter_map(move |entry| {
+                    let entry = entry.ok()?;
+                    if !entry.file_type().ok()?.is_dir() {
+                        return None;
+                    }
+                    let name = entry.file_name().into_string().ok()?;
+                    let full_hex = format!("{}{}", prefix_hex, name);
+                    let hash = SpecHash::from_hex(&full_hex).ok()?;
+
+                    Some(hash)
+                })
+        })
+    }
+
+    /// Returns a type that can be used to check the last time a cache entry was used.
+    pub fn atimes(&self) -> Result<ReadSnapshot, io::Error> {
+        ReadSnapshot::load_dir(&self.inner().fs.path().join("alog"))
     }
 
     /// Allocates a directory for writing into the cache as the given spec_hash when finalized.
@@ -307,17 +352,6 @@ impl<FS: FileSystem> Cache<FS> {
     fn with_inner<T>(&self, f: impl FnOnce(&CacheInner<FS>) -> T) -> T {
         let guard = self.inner.lock().unwrap();
         f(&*guard)
-    }
-
-    /// Invalidates (deletes) a directory cache entry with the given spec hash.
-    pub fn invalidate_dir(&self, hash: &SpecHash) -> Result<(), CacheErr> {
-        let hash_hex = hash.0.to_hex();
-        // Entries on disk are at <root>/<first byte as hex>/<remaining bytes as hex>
-        let subpath: PathBuf = [&hash_hex.as_str()[0..2], &hash_hex.as_str()[2..]]
-            .iter()
-            .collect();
-
-        self.inner().fs.remove_dir(subpath).map_err(CacheErr::from)
     }
 
     /// Reads a directory cached as the given spec hash.
@@ -577,6 +611,34 @@ mod tests {
         assert_eq!("good data", std::io::read_to_string(r).unwrap());
         let meta = EntryMeta::read(&cache.inner().fs, &test_key).unwrap();
         assert_eq!(meta.inner.spec_name(), Some(&"new".to_string()));
+    }
+
+    #[test]
+    fn iter_entries_lists_all() {
+        use std::io::Write;
+        let tmp_dir = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp_dir.path()).unwrap();
+
+        let keys: Vec<SpecHash> = (0..5)
+            .map(|i| SpecHash(blake3::hash(format!("key-{}", i).as_bytes())))
+            .collect();
+
+        for key in &keys {
+            let w = cache.write_dir(key).unwrap();
+            w.open_write("f").unwrap().write_all(b"x").unwrap();
+            w.finalize(EntryMeta {
+                inner: MetaInner::Spec("s".to_string()),
+                fetched: false,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+
+        let mut found: Vec<SpecHash> = cache.iter_entries().collect();
+        found.sort();
+        let mut expected = keys.clone();
+        expected.sort();
+        assert_eq!(found, expected);
     }
 
     #[test]

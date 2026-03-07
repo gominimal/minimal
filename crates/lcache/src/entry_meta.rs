@@ -1,6 +1,7 @@
 //! Metadata for cache entries.
 
 use common::{SpecHash, SpecOrigin, SubsetSpec};
+use std::fmt::Display;
 use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
@@ -20,6 +21,27 @@ impl MetaInner {
         match self {
             MetaInner::Spec(sn) => Some(sn),
             _ => None,
+        }
+    }
+}
+
+impl Display for MetaInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MetaInner::Spec(n) => write!(f, "package {}", n),
+            MetaInner::Subset(s) => write!(
+                f,
+                "subset of {} with outputs [{}]",
+                s.depends_on()
+                    .map(|h| h.0.to_hex())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                s.iter_components()
+                    .flat_map(|c| &c.1)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
         }
     }
 }

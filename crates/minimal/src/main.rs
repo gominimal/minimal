@@ -38,6 +38,8 @@ mod cmd_dump;
 use cmd_dump::{DumpArgs, cmd_dump};
 mod cmd_status;
 use cmd_status::{StatusArgs, cmd_status};
+mod cmd_cache;
+use cmd_cache::{CacheArgs, cmd_cache};
 
 #[derive(Parser)]
 #[command(name = "minimal", version = env!("GIT_HASH"))]
@@ -74,6 +76,9 @@ enum Command {
     /// Builds the specified package(s) in a clean room, making them available in the local cache.
     #[clap(alias = "pkg")]
     Package(PkgArgs),
+    /// Manipulate the local cache.
+    #[clap(subcommand)]
+    Cache(CacheArgs),
 
     /// Validates minimal configuration including packages, harnesses, and profiles
     Check(CheckArgs),
@@ -280,6 +285,7 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         Command::Dep(args) => cmd_dep(args, &mut ctx).await,
         Command::Dump(args) => cmd_dump(args, &mut ctx).await,
         Command::Status(args) => cmd_status(args, &mut ctx).await,
+        Command::Cache(args) => cmd_cache(args, &mut ctx).await,
         // Handled earlier
         Command::Completions(_) => Ok(()),
         Command::Init(_) => Ok(()),

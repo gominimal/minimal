@@ -14,13 +14,75 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Size of each record on disk: 32 bytes (SpecHash) + 8 bytes (epoch secs).
 const RECORD_SIZE: usize = 40;
 
 /// Number of recorded reads between flushes.
 const FLUSH_INTERVAL: usize = 15;
+
+/// A read-only snapshot of access records loaded from all tracker files in a directory.
+///
+/// Unlike [`ReadTracker`], this does not acquire any file locks and cannot write
+/// new entries. When the same spec hash appears in multiple files, the most
+/// recent timestamp wins.
+#[derive(Debug)]
+pub struct ReadSnapshot {
+    reads: BTreeMap<SpecHash, u64>,
+}
+
+impl ReadSnapshot {
+    /// Loads all `*.v1` tracker files in `dir`, merging their records.
+    ///
+    /// File locks are ignored — files that are currently held by a
+    /// [`ReadTracker`] are still read (their on-disk content may lag behind the
+    /// in-memory state of the owning process by up to [`FLUSH_INTERVAL`]
+    /// records).
+    pub fn load_dir(dir: &Path) -> io::Result<Self> {
+        let mut reads = BTreeMap::new();
+
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("v1") {
+                continue;
+            }
+
+            let file = match File::open(&path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+
+            let (file_reads, _) = ReadTracker::read_records(file)?;
+            for (hash, epoch_secs) in file_reads {
+                if reads.get(&hash).map(|e| *e < epoch_secs).unwrap_or(true) {
+                    reads.insert(hash, epoch_secs);
+                }
+            }
+        }
+
+        Ok(Self { reads })
+    }
+
+    /// Returns a reference to the merged read records.
+    pub fn reads(&self) -> &BTreeMap<SpecHash, u64> {
+        &self.reads
+    }
+
+    /// Returns the last access time (epoch seconds) for the given hash, if any.
+    pub fn last_read_secs(&self, hash: &SpecHash) -> Option<u64> {
+        self.reads.get(hash).copied()
+    }
+
+    /// Returns the last access time (epoch seconds) for the given hash, if any.
+    pub fn last_read(&self, hash: &SpecHash) -> Option<SystemTime> {
+        self.reads
+            .get(hash)
+            .map(|epoch_secs| UNIX_EPOCH + Duration::from_secs(*epoch_secs))
+    }
+}
 
 /// Tracks cache reads by spec hash, recording the last access time for each.
 ///
@@ -273,5 +335,65 @@ mod tests {
         // Second open on the same path should fail because the lock is held.
         let err = ReadTracker::at_path(&path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn snapshot_merges_multiple_files() {
+        let dir = TempDir::new().unwrap();
+        let alog = dir.path();
+
+        let h1 = test_hash("pkg-a");
+        let h2 = test_hash("pkg-b");
+        let h3 = test_hash("pkg-c");
+
+        // Write two separate tracker files with overlapping keys.
+        {
+            let mut t = ReadTracker::at_path(&alog.join("0.v1")).unwrap();
+            t.record_read_at(&h1, 1000).unwrap();
+            t.record_read_at(&h2, 2000).unwrap();
+        }
+        {
+            let mut t = ReadTracker::at_path(&alog.join("1.v1")).unwrap();
+            t.record_read_at(&h2, 3000).unwrap(); // newer than file 0
+            t.record_read_at(&h3, 4000).unwrap();
+        }
+
+        let snap = ReadSnapshot::load_dir(alog).unwrap();
+        assert_eq!(snap.reads().len(), 3);
+        assert_eq!(snap.last_read_secs(&h1), Some(1000));
+        assert_eq!(snap.last_read_secs(&h2), Some(3000)); // took the newer one
+        assert_eq!(snap.last_read_secs(&h3), Some(4000));
+    }
+
+    #[test]
+    fn snapshot_reads_while_tracker_holds_lock() {
+        let dir = TempDir::new().unwrap();
+        let alog = dir.path();
+
+        let h = test_hash("pkg-a");
+
+        // Tracker holds the flock; snapshot should still read the on-disk data.
+        let mut tracker = ReadTracker::at_path(&alog.join("0.v1")).unwrap();
+        tracker.record_read_at(&h, 500).unwrap();
+        tracker.flush().unwrap();
+
+        let snap = ReadSnapshot::load_dir(alog).unwrap();
+        assert_eq!(snap.last_read_secs(&h), Some(500));
+    }
+
+    #[test]
+    fn snapshot_skips_non_v1_files() {
+        let dir = TempDir::new().unwrap();
+        let alog = dir.path();
+
+        // Write a .v1 file and a non-.v1 file.
+        {
+            let mut t = ReadTracker::at_path(&alog.join("0.v1")).unwrap();
+            t.record_read_at(&test_hash("a"), 100).unwrap();
+        }
+        std::fs::write(alog.join("garbage.txt"), b"not a tracker").unwrap();
+
+        let snap = ReadSnapshot::load_dir(alog).unwrap();
+        assert_eq!(snap.reads().len(), 1);
     }
 }
