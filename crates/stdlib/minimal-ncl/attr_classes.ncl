@@ -35,6 +35,11 @@ in
         desc = "The name of this software as tracked by https://repology.org/.",
         validate = String,
     },
+    closed_source = {
+        name = "marker for closed-source software",
+        desc = "When set, the source backing this package is not publically available.",
+        validate = Bool,
+    },
 
     env_dir_mappings = {
         name = "environment directory mappings",
