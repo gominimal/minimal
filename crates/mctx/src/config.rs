@@ -96,10 +96,13 @@ fn default_parallelism() -> usize {
     let rough_threadcount = std::thread::available_parallelism().unwrap().get();
     match rough_threadcount {
         1..=3 => 1,
-        4 => 2,
-        5..=12 => rough_threadcount - 3,
-        13..=32 => rough_threadcount - 5,
-        _ => rough_threadcount - 8,
+        4..=6 => 2,
+        7..=10 => 4,
+        11..=12 => 6,
+        13..=15 => 7,
+        16..=22 => 10,
+        23..=32 => 12,
+        _ => rough_threadcount - 16,
     }
 }
 
