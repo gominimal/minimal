@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: minimal-ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: Install protoc
@@ -47,7 +47,7 @@ jobs:
         run: minimal run ci
 
   build-release-amd64:
-    runs-on: ubuntu-latest
+    runs-on: minimal-ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: Install dependencies
