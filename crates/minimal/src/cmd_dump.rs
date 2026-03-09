@@ -84,6 +84,7 @@ pub enum PkgRef {
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum PkgAttr {
     Bool(bool),
+    Number(f64),
     List(Vec<PkgAttr>),
     Map(IndexMap<String, PkgAttr>),
     EnumVariant(String, Box<PkgAttr>),
@@ -98,6 +99,7 @@ impl From<&AttrValue> for PkgAttr {
     fn from(value: &AttrValue) -> Self {
         match value {
             AttrValue::Bool(b) => PkgAttr::Bool(*b),
+            AttrValue::Number(n) => PkgAttr::Number(*n),
             AttrValue::String(s, pos) => PkgAttr::String {
                 value: s.clone(),
                 pos: pos.as_ref().map(|s| (s.start_offset, s.end_offset)),

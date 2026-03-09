@@ -8,7 +8,6 @@ publish.workspace = true
 
 [dev-dependencies]
 indoc.workspace = true
-decode.workspace = true
 
 [dependencies]
 anyhow.workspace = true
@@ -22,6 +21,7 @@ tracing.workspace = true
 lcache.workspace = true
 rcache.workspace = true
 common.workspace = true
+decode.workspace = true
 graph.workspace = true
 op.workspace = true
 sandbox2.workspace = true

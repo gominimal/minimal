@@ -144,6 +144,7 @@ impl<B: Backend> Orchestrator<B> {
                         bsr,
                         spec_hash,
                         full_build: _,
+                        cost: _,
                         dependencies,
                     } => pending.spawn(
                         OrchestratedBuild {

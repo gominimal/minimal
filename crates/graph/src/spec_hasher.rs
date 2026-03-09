@@ -270,6 +270,10 @@ fn build_attrvalue_hash(v: &AttrValue, h: &mut Hasher) {
             h.write_all(b"s").unwrap();
             h.write_all(s.as_bytes()).unwrap();
         }
+        AttrValue::Number(n) => {
+            h.write_all(b"n").unwrap();
+            h.write_all(&n.to_le_bytes()).unwrap();
+        }
 
         AttrValue::List(v) => {
             h.write_all(b"v").unwrap();

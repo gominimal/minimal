@@ -86,4 +86,10 @@ in
                 value
             ),
     },
+
+    build_cost_multiple = {
+        name = "build cost multiple",
+        desc = "Hint to build infrastructure that this build is much more intensive than the typical, by some factor.",
+        validate = Number,
+    }
 }

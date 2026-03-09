@@ -23,6 +23,7 @@ pub struct LocalBackend<SF: SourceFetcher + 'static> {
     pub(crate) output_base: PathBuf,
     pub(crate) remote_cache: Option<RemoteCache<GcsStorage>>,
     pub(crate) build_semaphore: Semaphore,
+    pub(crate) num_concurrent_builds: usize,
     pub(crate) verbose: bool,
 }
 
@@ -37,7 +38,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
         shared_hnd: &mut SharedHandle<Self>,
         state_hnd: &mut StateHandle<Self>,
     ) -> Result<Self::Artifact, Error> {
-        let (dep_paths, breaker_build) = {
+        let (dep_paths, breaker_build, cost) = {
             let s = state_hnd.lock().await;
             let dep_paths: Vec<PathBuf> = dependencies
                 .into_iter()
@@ -53,21 +54,28 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                     _ => unreachable!(),
                 })
                 .collect();
-            let breaker_build =
-                if let DeliverableInner::Build { full_build, .. } = s.get(&dr).unwrap().inner {
-                    !full_build
-                } else {
-                    unreachable!()
-                };
+            let (breaker_build, cost) = if let DeliverableInner::Build {
+                full_build, cost, ..
+            } = s.get(&dr).unwrap().inner
+            {
+                (!full_build, cost)
+            } else {
+                unreachable!()
+            };
             drop(s);
 
-            (dep_paths, breaker_build)
+            (dep_paths, breaker_build, cost)
         };
 
         let shared_hnd2 = shared_hnd.clone();
         let artifact = spawn_blocking(async move || {
             let shared = shared_hnd2.inner().read().await;
-            let permit = shared.backend.build_semaphore.acquire().await.unwrap();
+            let permit = shared
+                .backend
+                .build_semaphore
+                .acquire_many(cost.min(shared.backend.num_concurrent_builds) as u32)
+                .await
+                .unwrap();
             let verbose = shared.backend.verbose;
             let name = shared.graph.get(&bsr).unwrap().name.clone();
             let mut b = op::SpecBuild {
@@ -250,6 +258,7 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
                 sf,
                 verbose,
                 build_semaphore: Semaphore::new(num_concurrent_builds),
+                num_concurrent_builds,
             },
             graph,
             cache,

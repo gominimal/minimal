@@ -3,6 +3,7 @@
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use common::SpecHash;
+use decode::AttrValue;
 use generational_arena::{Arena, Index};
 use graph::{BinProvider, BuildSpecRef, ExecPlan, Graph, SubsetInput, Transitives};
 use tokio::{
@@ -27,6 +28,8 @@ pub enum DeliverableInner {
         spec_hash: SpecHash,
         /// True if no cycle breakers are used.
         full_build: bool,
+        /// The number of parallel build slots to take from the semaphore.
+        cost: usize,
         /// Which dependencies to be wired to the build.
         /// Subsets are represented as pointers to a [Deliverable] with
         /// a field `inner` of variant [DeliverableInner::Subset].
@@ -83,6 +86,7 @@ impl<'a> Display for DeliverableInnerDisplay<'a> {
                 spec_hash,
                 full_build,
                 dependencies: _,
+                cost: _,
             } => {
                 let build = graph.get(bsr).unwrap();
                 f.debug_struct("build")
@@ -337,6 +341,15 @@ impl<B: super::Backend> State<B> {
                     bsr: build.spec,
                     spec_hash: graph.spec_hash(&build.spec),
                     full_build: build.full_build(),
+                    cost: match graph
+                        .get(&build.spec)
+                        .unwrap()
+                        .attrs
+                        .get("build_cost_multiple")
+                    {
+                        Some(AttrValue::Number(n)) => n.floor() as usize,
+                        _ => 1,
+                    },
                     dependencies: build
                         .with_deps
                         .into_iter()
@@ -549,6 +562,7 @@ mod tests {
         			name = \"no deps\",
         			build_deps = [],
         			cmd = \"\",
+                    attrs.build_cost_multiple = 2,
         		} | BuildSpec
         		in
                 let rec self_ref = {
@@ -596,18 +610,21 @@ mod tests {
                     bsr: *dp.by_name("no deps").unwrap(),
                     spec_hash: dp.spec_hash(dp.by_name("no deps").unwrap()),
                     full_build: true,
+                    cost: 2,
                     dependencies: vec![],
                 },
                 DeliverableInner::Build {
                     bsr: *dp.by_name("breaker").unwrap(),
                     spec_hash: dp.spec_hash(dp.by_name("breaker").unwrap()),
                     full_build: true,
+                    cost: 1,
                     dependencies: vec![],
                 },
                 DeliverableInner::Build {
                     bsr: *dp.by_name("top").unwrap(),
                     spec_hash: dp.spec_hash(dp.by_name("top").unwrap()),
                     full_build: false,
+                    cost: 1,
                     dependencies: vec![
                         *state
                             .s
@@ -627,6 +644,7 @@ mod tests {
                     bsr: *dp.by_name("self ref").unwrap(),
                     spec_hash: dp.spec_hash(dp.by_name("self ref").unwrap()),
                     full_build: false,
+                    cost: 1,
                     dependencies: vec![
                         *state
                             .s
@@ -640,6 +658,7 @@ mod tests {
                     bsr: *dp.by_name("top").unwrap(),
                     spec_hash: dp.spec_hash(dp.by_name("top").unwrap()),
                     full_build: true,
+                    cost: 1,
                     dependencies: vec![
                         *state
                             .s
@@ -659,6 +678,7 @@ mod tests {
                     bsr: *dp.by_name("self ref").unwrap(),
                     spec_hash: dp.spec_hash(dp.by_name("self ref").unwrap()),
                     full_build: true,
+                    cost: 1,
                     dependencies: vec![
                         *state
                             .s

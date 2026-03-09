@@ -8,10 +8,11 @@ use serde::{Deserialize, Serialize};
 use crate::{Error, StrPos, eval_if_closure};
 
 /// The value of an attribute.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AttrValue {
     String(String, Option<StrPos>),
     Bool(bool),
+    Number(f64),
     List(Vec<AttrValue>),
     Map(IndexMap<String, AttrValue>),
     EnumVariant(String, Box<AttrValue>),
@@ -33,6 +34,7 @@ impl AttrValue {
         Ok(match rt.term.as_ref() {
             Term::Str(s) => Some(Self::String(s.to_string(), rt.pos.try_into().ok())),
             Term::Bool(b) => Some(Self::Bool(*b)),
+            Term::Num(v) => Some(Self::Number(v.try_into().unwrap())),
             Term::Enum(a) => Some(Self::String(a.into_label(), rt.pos.try_into().ok())),
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                 let mut map = IndexMap::with_capacity(6);
