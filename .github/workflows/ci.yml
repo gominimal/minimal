@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: minimal-ubuntu-latest-4x
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: Install protoc
