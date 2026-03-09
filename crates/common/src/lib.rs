@@ -512,3 +512,55 @@ impl FsMapping {
         }
     }
 }
+
+fn get_cgroup_limit_gb() -> Option<f64> {
+    // cgroup v2
+    if let Ok(content) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        let trimmed = content.trim();
+        if trimmed != "max" {
+            if let Ok(bytes) = trimmed.parse::<u64>() {
+                return Some(bytes as f64 / 1_073_741_824.0);
+            }
+        }
+    }
+
+    // cgroup v1
+    if let Ok(content) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
+        if let Ok(bytes) = content.trim().parse::<u64>() {
+            // v1 reports a huge sentinel value (near u64::MAX) when unlimited
+            if bytes < u64::MAX / 2 {
+                return Some(bytes as f64 / 1_073_741_824.0);
+            }
+        }
+    }
+
+    None
+}
+
+fn get_physical_ram_gb() -> Option<f64> {
+    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+
+    for line in content.lines() {
+        if line.starts_with("MemTotal:") {
+            let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+            return Some(kb as f64 / 1_048_576.0);
+        }
+    }
+
+    None
+}
+
+/// Returns the amount of RAM in gigabytes available on the system to this process.
+pub fn get_available_ram_gb() -> Option<u64> {
+    let cgroup = get_cgroup_limit_gb();
+    let physical = get_physical_ram_gb();
+
+    match (cgroup, physical) {
+        // Take whichever is smaller — cgroup can't exceed physical
+        (Some(c), Some(p)) => Some(c.min(p)),
+        (Some(c), None) => Some(c),
+        (None, Some(p)) => Some(p),
+        (None, None) => None,
+    }
+    .map(|v| v.floor() as u64)
+}

@@ -94,7 +94,7 @@ impl ConfigBuilder {
 
 fn default_parallelism() -> usize {
     let rough_threadcount = std::thread::available_parallelism().unwrap().get();
-    match rough_threadcount {
+    let para_by_cpu = match rough_threadcount {
         1..=3 => 1,
         4..=6 => 2,
         7..=10 => 4,
@@ -103,7 +103,18 @@ fn default_parallelism() -> usize {
         16..=22 => 10,
         23..=32 => 12,
         _ => rough_threadcount - 16,
-    }
+    };
+
+    let para_by_mem = common::get_available_ram_gb().map(|gbs| match gbs {
+        0..=6 => 1,
+        7..=12 => 2,
+        13..=19 => 3,
+        _ => gbs / 5,
+    });
+
+    para_by_mem
+        .map(|m| (m as usize).min(para_by_cpu))
+        .unwrap_or(para_by_cpu)
 }
 
 /// Configuration for a [super::Context].
