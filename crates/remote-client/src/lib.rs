@@ -147,6 +147,7 @@ where
                 msg: Some(Msg::Request(CreateEnvRequest {
                     client_id,
                     streams: stream_configs,
+                    expiry_minutes: 6 * 60,
                 })),
             }
         });
@@ -192,6 +193,8 @@ pub struct Env<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use super::*;
     use create_env_message::Msg;
     use remote_execution_service_server::{RemoteExecutionService, RemoteExecutionServiceServer};
@@ -213,6 +216,7 @@ mod tests {
             }
             Ok(tonic::Response::new(CreateEnvResponse {
                 server_id: "test".into(),
+                expires_at: Some(SystemTime::now().into()),
             }))
         }
     }
