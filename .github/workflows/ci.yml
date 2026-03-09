@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: minimal-ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: Install protoc
@@ -39,7 +39,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
   build-in-minimal:
-    runs-on: minimal-ubuntu-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-minimal
