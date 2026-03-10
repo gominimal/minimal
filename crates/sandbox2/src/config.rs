@@ -266,11 +266,7 @@ impl Config {
         let build_base_dir = {
             let mut attempt = 0u32;
             loop {
-                let dir_name = if attempt == 0 {
-                    format!("{}-{}-{}", self.name, timestamp, pid)
-                } else {
-                    format!("{}-{}-{}-{}", self.name, timestamp, pid, attempt)
-                };
+                let dir_name = format!("{}-{}-{}-{}", self.name, timestamp, attempt, pid);
 
                 let candidate_dir = base_dir.as_ref().join(dir_name);
                 match fs::create_dir(&candidate_dir) {

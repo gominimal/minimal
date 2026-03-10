@@ -291,7 +291,10 @@ impl Cache<LocalDir> {
     /// Allocates a temporary directory in the same filesystem as the rest of the cache.
     pub fn temp_dir(&self) -> Result<tempfile::TempDir, std::io::Error> {
         let inner = self.inner();
-        tempfile::tempdir_in(inner.fs.path().join("temp"))
+        tempfile::TempDir::with_suffix_in(
+            format!("-{}", std::process::id()),
+            inner.fs.path().join("temp"),
+        )
     }
 
     /// Iterates all cached entries, yielding each spec hash.
