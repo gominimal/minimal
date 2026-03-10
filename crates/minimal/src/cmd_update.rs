@@ -20,7 +20,7 @@ pub async fn cmd_update(_args: UpdateArgs, ctx: &mut Context) -> Result<(), Erro
     // best effort, yeet any cached remote index so a fresh fetch occurs
     std::fs::remove_file(ctx.index_dir().join(rcache::INDEX_FILENAME)).ok();
 
-    let vcs = ctx.vcs_manager();
+    let mut vcs = ctx.vcs_manager();
     vcs.update()
         .map_err(|e| Error::Other(anyhow::Error::from(e)))?;
 

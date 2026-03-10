@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::anyhow;
-use checkouts::Manager as VcsManager;
+use checkouts::{Manager as VcsManager, ManagerHandle as VcsManagerHandle};
 use common::{SpecOrigin, Target};
 use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
 use lcache::CacheBinProvider;
@@ -160,7 +160,7 @@ pub struct Context {
     stdlib_dir: PathBuf,
     mfile: mfile::File,
 
-    vcs: VcsManager,
+    vcs: VcsManagerHandle,
     cache: Cache,
 }
 
@@ -181,7 +181,7 @@ impl Context {
     ///
     /// This separation is needed to power logic in `minimal init`, which needs
     /// to use a bunch of this stuff without being able to initialize a full [Context].
-    pub fn sub_setup(config: &Config) -> Result<(VcsManager, Cache, PathBuf), Error> {
+    pub fn sub_setup(config: &Config) -> Result<(VcsManagerHandle, Cache, PathBuf), Error> {
         // Upsert dirs
         use std::fs::create_dir_all;
         create_dir_all(config.downloads_dir())
@@ -201,7 +201,11 @@ impl Context {
             .map_err(|e| Error::setup_dirs(e, config.layer_cache_dir()))?;
 
         // Initialize subsystems that are always present/used
-        let vcs = VcsManager::new(config.vcs_dir())?;
+        let vcs = if let Some(vcs_manager) = config.vcs_manager_override() {
+            vcs_manager
+        } else {
+            VcsManager::new_in_dir(config.vcs_dir())?
+        };
         let cache = Cache::at_dir(config.cache_dir())
             .map_err(|e| Error::Other(anyhow!("initializing local cache: {}", e)))?;
 
@@ -261,8 +265,8 @@ impl Context {
         self.cache.clone()
     }
     /// Returns the vcs manager.
-    pub fn vcs_manager(&mut self) -> &mut VcsManager {
-        &mut self.vcs
+    pub fn vcs_manager(&self) -> VcsManagerHandle {
+        self.vcs.clone()
     }
 
     /// Returns true if the context is configured to use the local cache.
@@ -371,7 +375,7 @@ impl Context {
 
         let start = SystemTime::now();
         let res = Graph::new_from_chain(
-            &mut self.vcs,
+            self.vcs_manager(),
             &mut graph::LayerCacheDir(self.config.layer_cache_dir()),
             leaf_layer,
             self.stdlib_dir.clone(),

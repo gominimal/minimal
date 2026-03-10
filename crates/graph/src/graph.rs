@@ -217,7 +217,7 @@ pub trait SourceProvider {
     fn checkout_of(&mut self, upstream: &LinkConfig) -> Result<PathBuf, Self::Error>;
 }
 
-impl SourceProvider for checkouts::Manager {
+impl SourceProvider for checkouts::ManagerHandle {
     type Error = checkouts::Error;
 
     fn checkout_of(&mut self, upstream: &LinkConfig) -> Result<PathBuf, Self::Error> {
@@ -228,7 +228,7 @@ impl SourceProvider for checkouts::Manager {
                 branch: _,
                 locked_commit,
             } => {
-                let (path, _hash) = checkouts::Manager::checkout_of(
+                let (path, _hash) = checkouts::ManagerHandle::checkout_of(
                     self,
                     repo,
                     checkouts::GitRef::Commit(locked_commit.clone().unwrap()),
@@ -416,7 +416,7 @@ impl Graph {
     ///
     /// The given leaf paramater must not be `SpecOrigin::Inline`, or this function will panic.
     pub fn new_from_chain<SP: SourceProvider, LC: LayerCache>(
-        sp: &mut SP,
+        mut sp: SP,
         lc: &mut LC,
         leaf: SpecOrigin,
         minimal_lib_path: PathBuf,
@@ -1159,7 +1159,7 @@ mod tests {
 
     struct SourceProviderFake(HashMap<LinkConfig, TempDir>);
 
-    impl SourceProvider for SourceProviderFake {
+    impl SourceProvider for &mut SourceProviderFake {
         type Error = std::io::Error;
 
         fn checkout_of(&mut self, upstream: &LinkConfig) -> Result<PathBuf, Self::Error> {

@@ -1,5 +1,7 @@
 use std::{fmt, path::PathBuf};
 
+use checkouts::ManagerHandle;
+
 /// The errors possible in configuration or building a configuration.
 #[derive(Debug)]
 pub enum ConfigError {
@@ -34,6 +36,7 @@ pub struct ConfigBuilder {
     minimal_dir: Option<PathBuf>,
     stdlib_dir: Option<PathBuf>,
     repo_dir: Option<PathBuf>,
+    vcs_manager: Option<ManagerHandle>,
 }
 
 impl ConfigBuilder {
@@ -71,6 +74,11 @@ impl ConfigBuilder {
         self.repo_dir = Some(dir);
         self
     }
+    /// Use the specified vcs manager instead of initializing one from disk.
+    pub fn with_vcs_manager(mut self, manager: ManagerHandle) -> Self {
+        self.vcs_manager = Some(manager);
+        self
+    }
 }
 
 impl ConfigBuilder {
@@ -88,6 +96,7 @@ impl ConfigBuilder {
             }),
             stdlib_dir: self.stdlib_dir,
             repo_dir: self.repo_dir,
+            vcs_manager: self.vcs_manager,
         })
     }
 }
@@ -133,11 +142,16 @@ pub struct Config {
     stdlib_dir: Option<PathBuf>,
     /// Overrides the base/project/repo directory.
     repo_dir: Option<PathBuf>,
+    /// Use the specified vcs manager instead of initializing one from disk.
+    vcs_manager: Option<ManagerHandle>,
 }
 
 impl Config {
     pub(crate) fn stdlib_dir_override(&self) -> &Option<PathBuf> {
         &self.stdlib_dir
+    }
+    pub(crate) fn vcs_manager_override(&self) -> Option<ManagerHandle> {
+        self.vcs_manager.clone()
     }
 
     /// Returns the path to the repo, if overridden (i.e. via '-C' argument).

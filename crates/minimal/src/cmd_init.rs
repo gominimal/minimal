@@ -58,7 +58,7 @@ pub async fn cmd_init(args: InitArgs, config: Config) -> Result<(), Error> {
                     .unwrap_or_else(|| std::env::current_dir().unwrap()),
                 None,
                 Graph::new_from_chain(
-                    &mut vcs,
+                    vcs,
                     &mut (),
                     SpecOrigin::Repo(common::repo_spec::Repo::Git {
                         url: "https://github.com/gominimal/pkgs".to_string(),

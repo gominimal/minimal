@@ -8,6 +8,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 use tempfile::tempdir_in;
 use tracing::trace;
@@ -183,6 +184,23 @@ fn create_unique_id_and_dir(base_dir: &Path, prefix: String) -> std::io::Result<
     ))
 }
 
+/// A handle to the manager for source-code checkouts.
+#[derive(Debug, Clone)]
+pub struct ManagerHandle(Arc<Mutex<Manager>>);
+
+impl ManagerHandle {
+    /// Updates all repos to latest - does nothing for refs which arent symbolic (i.e. commits).
+    pub fn update(&mut self) -> Result<(), Error> {
+        self.0.lock().unwrap().update()
+    }
+
+    /// Returns the path to a checkout described by the given parameters, as well as the
+    /// commit hash at the given ref.
+    pub fn checkout_of(&mut self, remote: &str, at: GitRef) -> Result<(PathBuf, String), Error> {
+        self.0.lock().unwrap().checkout_of(remote, at)
+    }
+}
+
 /// Manages source-code checkouts.
 #[derive(Debug)]
 pub struct Manager {
@@ -192,8 +210,9 @@ pub struct Manager {
 }
 
 impl Manager {
-    /// Initializes the checkouts manager in the given directory.
-    pub fn new<P: Into<PathBuf>>(base_dir: P) -> Result<Self, Error> {
+    /// Initializes the checkouts manager in the given directory, returning a
+    /// thread-safe, cloneable handle to the manager instance.
+    pub fn new_in_dir<P: Into<PathBuf>>(base_dir: P) -> Result<ManagerHandle, Error> {
         let base_dir = base_dir.into();
         let db_path = base_dir.join("git").join("db");
         fs::create_dir_all(&db_path)?;
@@ -219,7 +238,7 @@ impl Manager {
             state,
             repos,
         };
-        Ok(manager)
+        Ok(ManagerHandle(Arc::new(Mutex::new(manager))))
     }
 
     fn git_checkouts_dir(&self) -> PathBuf {
@@ -337,7 +356,7 @@ mod tests {
     fn manager() {
         let remote = "https://github.com/octocat/Spoon-Knife";
         let base_dir = tempdir().unwrap();
-        let mut manager = Manager::new(base_dir.path()).unwrap();
+        let mut manager = Manager::new_in_dir(base_dir.path()).unwrap();
 
         let (checkout, hash) = manager
             .checkout_of(remote, GitRef::Branch("main".to_string()))
@@ -356,18 +375,47 @@ mod tests {
         // Expect the README.md to exist from the checkout
         assert!(checkout.join("README.md").exists());
         // Expect runtime to be updated
-        assert!(manager.repos.contains_key("spoon-knife"));
+        assert!(
+            manager
+                .0
+                .as_ref()
+                .lock()
+                .unwrap()
+                .repos
+                .contains_key("spoon-knife")
+        );
         // Expect serialized state to be updated
         assert_eq!(
-            manager.state.git_remotes.get(remote).unwrap(),
+            manager
+                .0
+                .as_ref()
+                .lock()
+                .unwrap()
+                .state
+                .git_remotes
+                .get(remote)
+                .unwrap(),
             "spoon-knife"
         );
         assert_eq!(
-            manager.state.repos.get("spoon-knife").unwrap().remote,
+            manager
+                .0
+                .as_ref()
+                .lock()
+                .unwrap()
+                .state
+                .repos
+                .get("spoon-knife")
+                .unwrap()
+                .remote,
             remote,
         );
         assert_eq!(
             manager
+                .0
+                .as_ref()
+                .lock()
+                .unwrap()
                 .state
                 .repos
                 .get("spoon-knife")
@@ -393,7 +441,7 @@ mod tests {
             "d0dd1f61b33d64e29d8bc1372a94ef6a2fee76a9".to_string()
         );
         // Make sure even a freshly-initialized manager does the same
-        let (checkout3, hash3) = Manager::new(base_dir.path())
+        let (checkout3, hash3) = Manager::new_in_dir(base_dir.path())
             .unwrap()
             .checkout_of(remote, GitRef::Branch("main".to_string()))
             .unwrap();
