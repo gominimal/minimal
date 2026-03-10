@@ -39,7 +39,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
   build-in-minimal:
-    runs-on: ubuntu-latest
+    runs-on: minimal-ubuntu-latest-4x
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-minimal
@@ -78,7 +78,7 @@ jobs:
           retention-days: 7
 
   build-release-arm64:
-    runs-on: ubuntu-latest
+    runs-on: minimal-ubuntu-latest-4x
     steps:
       - uses: actions/checkout@v6
       - name: Install cross
@@ -104,7 +104,7 @@ jobs:
           retention-days: 7
 
   cargo-deny:
-    runs-on: ubuntu-latest
+    runs-on: minimal-ubuntu-latest-4x
     steps:
       - uses: actions/checkout@v6
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -189,7 +189,7 @@ jobs:
             "cli-arm64-linux-${SHA}.tar.zst" gs://minimal-shim/archives/
 
   minimal-check:
-    runs-on: ubuntu-latest
+    runs-on: minimal-ubuntu-latest-4x
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-minimal
