@@ -71,7 +71,7 @@ where
         let graph_stream: (StreamConfig, ChunkStream) = {
             (
                 StreamConfig {
-                    format: Some(Format::Graph(GraphFormat::GfRmpSerdeV1.into())),
+                    format: Some(Format::Graph(GraphFormat::GfJsonSerdeV1.into())),
                     kind: StreamKind::SkGraph.into(),
                 },
                 Box::pin(
@@ -188,6 +188,8 @@ where
 #[allow(dead_code)]
 pub struct Env<'a> {
     cwd: Worktree<'a>,
+
+    /// The ID of the server backing this environment.
     server_id: String,
 }
 

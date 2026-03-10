@@ -838,14 +838,14 @@ impl Graph {
         &self.supply_chain
     }
 
-    /// Serializes the graph to a byte vector using MessagePack.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
-        rmp_serde::to_vec(self)
+    /// Serializes the graph to a byte vector using JSON.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(self)
     }
 
-    /// Deserializes a graph from a byte slice using MessagePack.
-    pub fn from_bytes(data: &[u8]) -> Result<Self, rmp_serde::decode::Error> {
-        rmp_serde::from_slice(data)
+    /// Deserializes a graph from a byte slice using JSON.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(data)
     }
 }
 
@@ -1377,7 +1377,7 @@ mod tests {
         let layer = Layer::new_for_test(
             indoc! {
                 "
-                let {BuildSpec, Source, ..} = import \"minimal.ncl\" in
+                let {BuildSpec, Source, OutputBin, ..} = import \"minimal.ncl\" in
 
                 let shared = {
                     name = \"shared\",
@@ -1385,6 +1385,7 @@ mod tests {
                         {url = \"http://example.com/src.tar.gz\", sha256 = \"abc123\"} | Source,
                     ],
                     cmd = \"make install\",
+                    outputs.thing = { glob = \"usr/bin/*\" } | OutputBin,
                 } | BuildSpec
                 in
 

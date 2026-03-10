@@ -52,7 +52,7 @@ message StreamConfig {
 
   enum GraphFormat {
     GF_UNSPECIFIED = 0;
-    GF_RMP_SERDE_V1 = 1;
+    GF_JSON_SERDE_V1 = 1;
   }
   message FilesFormat {
     TarballFormat tarball = 1;
@@ -65,7 +65,7 @@ message StreamConfig {
 }
 
 message CreateEnvResponse {
-  // A server-provided identifier for the environment.
+  // The identifier for the server backing the environment.
   string server_id = 1;
   // When the environment expires and gets cleaned up.
   google.protobuf.Timestamp expires_at = 2;
