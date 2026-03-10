@@ -99,7 +99,7 @@ where
                         let file =
                             tokio::task::spawn_blocking(move || -> Result<std::fs::File, Error> {
                                 let (mut file, _hash) =
-                                    common::archive::compress_dir(&dir, Some(1))
+                                    common::archive::compress_dir(&dir, Some(-5), &None)
                                         .map_err(|e| Error::Other(e.into()))?;
                                 std::io::Seek::rewind(&mut file)
                                     .map_err(|e| Error::Other(e.into()))?;

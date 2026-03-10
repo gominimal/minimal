@@ -47,7 +47,7 @@ pub async fn cmd_upload_cache(args: UploadArgs, ctx: &mut Context) -> Result<(),
 
                         Some((
                             *bsr,
-                            archive::compress_dir(cache_dir.path(), Some(16)).unwrap(),
+                            archive::compress_dir(cache_dir.path(), Some(16), &None).unwrap(),
                         ))
                     } else {
                         info!(

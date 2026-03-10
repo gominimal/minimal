@@ -64,6 +64,7 @@ impl From<lzma_rs::error::Error> for ArchiveError {
 pub fn compress_dir<P: AsRef<Path>>(
     dir: P,
     override_level: Option<i32>,
+    match_globs: &Option<globset::GlobSet>,
 ) -> Result<(std::fs::File, [u8; 32]), std::io::Error> {
     let mut tar_file = tempfile::tempfile()?;
     let mut hasher = Sha256::new();
@@ -73,7 +74,7 @@ pub fn compress_dir<P: AsRef<Path>>(
         let mut tar_builder = tar::Builder::new(encoder);
         tar_builder.mode(tar::HeaderMode::Deterministic);
         tar_builder.follow_symlinks(false);
-        add_dir_to_tar(&mut tar_builder, dir.as_ref(), ".", &None)?;
+        add_dir_to_tar(&mut tar_builder, dir.as_ref(), ".", match_globs)?;
         tar_builder.into_inner()?.finish()?;
     }
     use std::io::Seek;
@@ -396,7 +397,7 @@ mod tests {
         std::fs::write(temp_dir.path().join("subdir/file2.txt"), b"Content 2")?;
 
         // Compress the directory
-        let (mut compressed_file, hash) = super::compress_dir(temp_dir.path(), None)?;
+        let (mut compressed_file, hash) = super::compress_dir(temp_dir.path(), None, &None)?;
 
         // Verify we got a hash
         assert_eq!(hash.len(), 32);
