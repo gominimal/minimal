@@ -70,5 +70,40 @@ pub async fn cmd_cache(args: CacheArgs, ctx: &mut Context) -> Result<(), Error> 
         }
     }
 
+    for sandbox in std::fs::read_dir(ctx.builds_base_dir())
+        .map_err(|e| Error::IO("reading sandboxes dir", ctx.builds_base_dir(), e))?
+    {
+        let entry = sandbox.map_err(|e| Error::IO("sandbox entry", ctx.builds_base_dir(), e))?;
+        cleanup_stale("sandbox", entry)?;
+    }
+    for task in std::fs::read_dir(ctx.tasks_base_dir())
+        .map_err(|e| Error::IO("reading tasks dir", ctx.tasks_base_dir(), e))?
+    {
+        let entry = task.map_err(|e| Error::IO("task entry", ctx.tasks_base_dir(), e))?;
+        cleanup_stale("task", entry)?;
+    }
+    for at in std::fs::read_dir(ctx.cache_base_dir().join("temp"))
+        .map_err(|e| Error::IO("reading artifact temp dir", ctx.tasks_base_dir(), e))?
+    {
+        let entry = at.map_err(|e| Error::IO("artifact temp entry", ctx.tasks_base_dir(), e))?;
+        cleanup_stale("tempdir", entry)?;
+    }
+
+    Ok(())
+}
+
+fn cleanup_stale(kind: &str, entry: std::fs::DirEntry) -> Result<(), Error> {
+    let name = entry.file_name();
+    let s = name.to_str().unwrap();
+    if s.contains("-")
+        && let Some(pid_str) = s.rsplit('-').next()
+        && let Ok(false) = std::fs::exists(format!("/proc/{}", pid_str))
+    {
+        // No such proc entry, therefore PID dead. Clean up directory.
+        println!("Cleaning up stale {} {}", kind, s);
+        std::fs::remove_dir_all(entry.path())
+            .map_err(|e| Error::IO("rm stale sandbox", entry.path(), e))?;
+    }
+
     Ok(())
 }

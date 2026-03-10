@@ -277,6 +277,17 @@ impl Context {
     pub fn builds_base_dir(&self) -> PathBuf {
         self.config.builds_base_dir()
     }
+    /// Returns the base directory for task sandboxes.
+    pub fn tasks_base_dir(&self) -> PathBuf {
+        self.config.task_base_dir()
+    }
+    /// Returns the base directory for the artifact/binary cache.
+    ///
+    /// DO NOT USE unless you really know what you
+    /// are doing - prefer [Context::local_cache] instead.
+    pub fn cache_base_dir(&self) -> PathBuf {
+        self.config.cache_dir()
+    }
     /// Returns the base directory where source checkouts are stored.
     pub fn vcs_dir(&self) -> PathBuf {
         self.config.vcs_dir()
