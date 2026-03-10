@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: minimal-ubuntu-latest-4x
     steps:
       - uses: actions/checkout@v6
       - name: Install protoc
@@ -47,7 +47,7 @@ jobs:
         run: minimal run ci
 
   build-release-amd64:
-    runs-on: ubuntu-latest
+    runs-on: minimal-ubuntu-latest-4x
     steps:
       - uses: actions/checkout@v6
       - name: Install dependencies
@@ -110,7 +110,7 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   release:
-    runs-on: minimal-ubuntu-latest
+    runs-on: minimal-ubuntu-latest-4x
     needs: [build, build-release-amd64, build-release-arm64]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
