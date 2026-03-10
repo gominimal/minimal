@@ -534,7 +534,11 @@ impl Context {
             tracing::trace!("all packages available locally, eluding build");
         }
 
-        let base = tempfile::tempdir_in(self.config.task_base_dir()).map_err(|e| {
+        let base = tempfile::TempDir::with_suffix_in(
+            format!("-{}", std::process::id()),
+            self.config.task_base_dir(),
+        )
+        .map_err(|e| {
             Error::Other(anyhow::Error::from(e).context("creating base sandbox directory"))
         })?;
 
