@@ -294,6 +294,7 @@ impl Container {
         };
         if let WdSetup::Isolated { .. } = sandbox.config.wd {
             command.env("OUTPUT_DIR", "/build/output");
+            command.env("GIT_TERMINAL_PROMPT", "0");
         }
 
         command.env("LANG", "en_US.utf8");
