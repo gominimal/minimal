@@ -1,15 +1,17 @@
-use std::borrow::Cow;
 use std::path::Path;
 use std::pin::Pin;
+use std::{borrow::Cow, collections::HashMap};
 
 use futures::StreamExt;
 use graph::Graph;
 use remote_execution_service_client::RemoteExecutionServiceClient as RESClient;
 use remote_proto::{res::*, *};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tonic::transport::{Channel, Error as TransportError};
 
 type ChunkStream = Pin<Box<dyn futures::Stream<Item = CreateEnvMessage> + Send>>;
 
+/// Errors that can occur when driving a remote client.
 #[derive(Debug)]
 pub enum Error {
     Transport(TransportError),
@@ -178,15 +180,76 @@ where
             .into_inner();
 
         Ok(Env {
+            client_id,
             cwd,
             server_id: tx_result.server_id,
         })
     }
+
+    pub async fn exec<'b>(
+        &mut self,
+        env: &Env<'b>,
+        args: &RemoteArgs,
+        mut stdout: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
+        mut stderr: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
+    ) -> Result<u32, Error> {
+        let mut stream = self
+            .c
+            .exec(CreateTaskRequest {
+                client_id: env.client_id.clone(),
+                args: args.args.clone(),
+                env_vars: args.env_vars.clone(),
+                packages: args.packages.clone(),
+            })
+            .await
+            .map_err(|e| Error::Other(e.into()))?
+            .into_inner();
+
+        let mut exit_code = 0;
+        while let Some(resp) = stream.next().await {
+            let resp = resp.map_err(|e| Error::Other(e.into()))?;
+            match resp.msg {
+                Some(create_task_response::Msg::Data(data)) => {
+                    match task_data::Channel::try_from(data.kind) {
+                        Ok(task_data::Channel::ChStdout) => {
+                            if let Some(w) = stdout.as_mut() {
+                                w.write_all(&data.data)
+                                    .await
+                                    .map_err(|e| Error::Other(e.into()))?;
+                            }
+                        }
+                        Ok(task_data::Channel::ChStderr) => {
+                            if let Some(w) = stderr.as_mut() {
+                                w.write_all(&data.data)
+                                    .await
+                                    .map_err(|e| Error::Other(e.into()))?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Some(create_task_response::Msg::Status(status)) => {
+                    exit_code = status.exit_code;
+                }
+                None => {}
+            }
+        }
+
+        Ok(exit_code)
+    }
+}
+
+/// The configuration describing an execution in a remote environment.
+pub struct RemoteArgs {
+    pub packages: Vec<String>,
+    pub args: Vec<String>,
+    pub env_vars: HashMap<String, String>,
 }
 
 /// An initialized remote environment.
 #[allow(dead_code)]
 pub struct Env<'a> {
+    client_id: String,
     cwd: Worktree<'a>,
 
     /// The ID of the server backing this environment.
@@ -340,5 +403,76 @@ mod tests {
 
         let extracted = std::fs::read_to_string(dst_dir.path().join("hello.txt")).unwrap();
         assert_eq!(extracted, "hello world");
+    }
+
+    struct ExecMockServer;
+
+    #[tonic::async_trait]
+    impl RemoteExecutionService for ExecMockServer {
+        async fn create_env(
+            &self,
+            _request: tonic::Request<tonic::Streaming<CreateEnvMessage>>,
+        ) -> Result<tonic::Response<CreateEnvResponse>, tonic::Status> {
+            unimplemented!()
+        }
+
+        type ExecStream =
+            tokio_stream::Iter<std::vec::IntoIter<Result<CreateTaskResponse, tonic::Status>>>;
+
+        async fn exec(
+            &self,
+            request: tonic::Request<CreateTaskRequest>,
+        ) -> Result<tonic::Response<Self::ExecStream>, tonic::Status> {
+            let req = request.into_inner();
+            assert_eq!(req.packages, vec!["base", "bash"]);
+
+            let responses = vec![
+                Ok(CreateTaskResponse {
+                    msg: Some(create_task_response::Msg::Data(TaskData {
+                        kind: task_data::Channel::ChStdout.into(),
+                        eof: false,
+                        data: b"success\n".to_vec(),
+                    })),
+                }),
+                Ok(CreateTaskResponse {
+                    msg: Some(create_task_response::Msg::Status(TaskStatus {
+                        exit_code: 0,
+                    })),
+                }),
+            ];
+
+            Ok(tonic::Response::new(tokio_stream::iter(responses)))
+        }
+    }
+
+    #[tokio::test]
+    async fn env_exec_simple() {
+        let svc = RemoteExecutionServiceServer::new(ExecMockServer);
+        let graph = Graph::new();
+        let mut client = Client::new(RESClient::new(svc), &graph);
+
+        let env = Env {
+            client_id: "test-client".into(),
+            cwd: Worktree::Ephemeral,
+            server_id: "test-server".into(),
+        };
+        let args = RemoteArgs {
+            packages: vec!["base".into(), "bash".into()],
+            args: vec![],
+            env_vars: HashMap::new(),
+        };
+
+        let mut stdout_buf = Vec::new();
+        let exit_code = client
+            .exec(&env, &args, Some(&mut stdout_buf), None)
+            .await
+            .unwrap();
+
+        assert_eq!(exit_code, 0, "expected exit code 0");
+        let output = String::from_utf8(stdout_buf).unwrap();
+        assert!(
+            output.contains("success"),
+            "expected 'success' in stdout, got: {output}"
+        );
     }
 }

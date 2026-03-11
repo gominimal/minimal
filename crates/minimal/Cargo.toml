@@ -16,6 +16,7 @@ mctx.workspace = true
 mfile.workspace = true
 op.workspace = true
 orchestrator.workspace = true
+remote-client.workspace = true
 remote-proto.workspace = true
 
 nickel-lang-core.workspace = true

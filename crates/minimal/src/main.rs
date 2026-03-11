@@ -40,6 +40,8 @@ mod cmd_status;
 use cmd_status::{StatusArgs, cmd_status};
 mod cmd_cache;
 use cmd_cache::{CacheArgs, cmd_cache};
+mod cmd_rexec;
+use cmd_rexec::{RexecArgs, cmd_rexec};
 
 #[derive(Parser)]
 #[command(name = "minimal", version = env!("GIT_HASH"))]
@@ -76,6 +78,9 @@ enum Command {
     /// Builds the specified package(s) in a clean room, making them available in the local cache.
     #[clap(alias = "pkg")]
     Package(PkgArgs),
+    /// Execute a command on a remote build server.
+    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
+    Rexec(RexecArgs),
     /// Manipulate the local cache.
     #[clap(subcommand)]
     Cache(CacheArgs),
@@ -285,6 +290,7 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         Command::Dep(args) => cmd_dep(args, &mut ctx).await,
         Command::Dump(args) => cmd_dump(args, &mut ctx).await,
         Command::Status(args) => cmd_status(args, &mut ctx).await,
+        Command::Rexec(args) => cmd_rexec(args, &mut ctx).await,
         Command::Cache(args) => cmd_cache(args, &mut ctx).await,
         // Handled earlier
         Command::Completions(_) => Ok(()),

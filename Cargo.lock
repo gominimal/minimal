@@ -2525,6 +2525,7 @@ dependencies = [
  "rayon",
  "rcache",
  "regex",
+ "remote-client",
  "remote-proto",
  "reqwest",
  "serde",
