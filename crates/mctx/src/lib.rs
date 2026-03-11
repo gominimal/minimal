@@ -250,6 +250,25 @@ impl Context {
             cache,
         })
     }
+
+    /// Constructs a new context using the lower-level primitives.
+    ///
+    /// DO NOT USE unless you know what you are doing - use [Context::new] instead.
+    pub fn new_from_parts(
+        config: Config,
+        mfile: mfile::File,
+        vcs: VcsManagerHandle,
+        cache: Cache,
+        stdlib_dir: PathBuf,
+    ) -> Self {
+        Self {
+            config,
+            stdlib_dir,
+            mfile,
+            vcs,
+            cache,
+        }
+    }
 }
 
 /// Low-level API

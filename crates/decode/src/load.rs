@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 /// Configuration for loading a layer (of Nickel files).
 ///
 /// Use `LoadOptions::for_test()` in tests.
+#[derive(Debug)]
 pub struct LoadOptions {
     /// Where on the filesystem the minimal base library (i.e. minimal.ncl) is located.
     pub minimal_lib_path: PathBuf,

@@ -421,6 +421,17 @@ impl File {
             Err(e) => Err(Error::IO("minimal file", path, e)),
         }
     }
+
+    // Creates a synthetic minimal file not backed on the filesystem.
+    //
+    // DO NOT USE unless you know what you are doing.
+    pub fn synthetic(upstream: LinkConfig) -> Self {
+        Self {
+            upstream: Some(upstream),
+            ..Default::default()
+        }
+    }
+
     fn warn_unknown_fields(&self) {
         let mut was_unknown_fields = false;
         if !self.extra.is_empty() {
