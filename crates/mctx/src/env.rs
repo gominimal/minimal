@@ -470,7 +470,7 @@ impl<'a> Env<'a> {
             state_dirs,
             env_vars: mut pkg_env_vars,
         } = SetupForPackages::build(graph, args.transitives.keys())
-            .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))?;
+            .map_err(|e| Error::IO("package setup", "".into(), e))?;
 
         if let Some(p) = args.patches {
             patch.union(p);
@@ -535,15 +535,14 @@ impl<'a> Env<'a> {
                     has_packages: args.transitives.keys().cloned().collect(),
                 },
             )
-            .await
-            .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))?;
+            .await?;
         for want_dir in state_dirs {
-            std::fs::create_dir_all(args.state_base_dir.join(want_dir))
-                .map_err(anyhow::Error::from)
-                .map_err(Error::Other)?;
+            std::fs::create_dir_all(args.state_base_dir.join(&want_dir)).map_err(|e| {
+                Error::IO("creating state dir", args.state_base_dir.join(want_dir), e)
+            })?;
         }
         install_min_script(sandbox.rootfs())
-            .map_err(|e| Error::Other(anyhow::anyhow!("installing min script: {}", e)))?;
+            .map_err(|e| Error::IO("installing min script", sandbox.rootfs(), e))?;
 
         sandbox.keep_dir(false);
 
@@ -607,7 +606,7 @@ impl<'a> Env<'a> {
         self.sandbox
             .run(invocations, stdout_writer, stderr_writer)
             .await
-            .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))
+            .map_err(Error::from)
     }
 }
 

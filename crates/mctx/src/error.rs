@@ -14,6 +14,13 @@ pub enum Error {
     Graph(Box<graph::Error>),
 
     Plan(Box<(Graph, PlanErr)>),
+    Execution {
+        idx: usize,
+        code: i32,
+        reason: String,
+        stderr: String,
+    },
+
     Other(anyhow::Error),
 }
 
@@ -112,6 +119,7 @@ impl fmt::Display for Error {
                     Ok(())
                 }
             }
+            Error::Execution { idx, code, .. } => write!(f, "invocation {} failed: {}", idx, code),
             Error::Other(e) => write!(f, "{}", e),
         }
     }
@@ -126,6 +134,7 @@ impl std::error::Error for Error {
             Error::MFile(e) => Some(e),
             Error::Graph(_e) => None,
             Error::Plan(_) => None,
+            Error::Execution { .. } => None,
             Error::Other(_e) => None,
         }
     }
@@ -188,6 +197,43 @@ impl From<check::Error> for Error {
             check::Error::IO(s, p, e) => Self::IO(s, p, e),
             check::Error::Other(e) => Self::Other(e),
             check::Error::Graph(e) => Self::Graph(e),
+        }
+    }
+}
+
+impl From<sandbox2::Error> for Error {
+    fn from(value: sandbox2::Error) -> Self {
+        match value {
+            sandbox2::Error::IO(s, p, e) => Self::IO(s, p, e),
+            sandbox2::Error::HardlinkFailed(e) => e.into(),
+            sandbox2::Error::Execution(e) => match e {
+                sandbox2::error::ExecutionError::InvocationFailed {
+                    idx,
+                    code,
+                    reason,
+                    stderr,
+                } => Self::Execution {
+                    idx,
+                    code,
+                    reason,
+                    stderr,
+                },
+                sandbox2::error::ExecutionError::SpawnFailed(e) => {
+                    Self::Other(anyhow::anyhow!("spawn failed: {}", e))
+                }
+            },
+            sandbox2::Error::Output(e) => Self::Other(e.into()),
+        }
+    }
+}
+
+impl From<common::HardlinkError> for Error {
+    fn from(value: common::HardlinkError) -> Self {
+        match value {
+            common::HardlinkError::IO(s, p, e) => Self::IO(s, p, e),
+            common::HardlinkError::HardlinkFailed(from, _to, e) => {
+                Self::IO("hardlinking failed", from, e)
+            }
         }
     }
 }
