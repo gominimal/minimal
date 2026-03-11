@@ -110,7 +110,7 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   release:
-    runs-on: minimal-ubuntu-latest
+    runs-on: ubuntu-latest
     needs: [build, build-release-amd64, build-release-arm64]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
