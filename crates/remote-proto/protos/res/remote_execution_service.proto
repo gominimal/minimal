@@ -3,7 +3,10 @@ package res;
 
 import "google/protobuf/empty.proto";
 import "res/create_env.proto";
+import "res/task.proto";
 
 service RemoteExecutionService {
   rpc CreateEnv(stream CreateEnvMessage) returns (CreateEnvResponse) {}
+
+  rpc Exec(CreateTaskRequest) returns (stream CreateTaskResponse) {}
 }

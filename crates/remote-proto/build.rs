@@ -4,6 +4,7 @@ fn main() -> Result<()> {
         &[
             "protos/tarball_format.proto",
             "protos/res/create_env.proto",
+            "protos/res/task.proto",
             "protos/res/remote_execution_service.proto",
         ],
         &["protos/", "protos/res"],

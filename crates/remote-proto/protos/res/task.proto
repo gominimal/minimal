@@ -1,0 +1,48 @@
+syntax = "proto3";
+package res;
+
+import "google/protobuf/timestamp.proto";
+import "tarball_format.proto";
+
+// A request to RES to start a new task.
+message CreateTaskRequest {
+  // The client-provided identifier for the environment.
+  string client_id = 1;
+  reserved 2 to 5;
+
+  // The top-level packages to be present in the environment.
+  repeated string packages = 6;
+  // The program arguments.
+  repeated string args = 7;
+  // Environment variables to set on the program.
+  map<string, string> env_vars = 8;
+}
+
+// The wire format for messages streamed back from the server about a task.
+message CreateTaskResponse {
+  oneof msg {
+    // The final message of the stream.
+    TaskStatus status = 1;
+    // A chunk of data output by the task.
+    TaskData data = 2;
+  }
+}
+
+message TaskStatus {
+  uint32 exit_code = 1;
+}
+
+message TaskData {
+  enum Channel {
+    CH_UNSPECIFIED = 0;
+    // Standard error.
+    CH_STDERR = 1;
+    // Stamdard out.
+    CH_STDOUT = 2;
+  }
+  Channel kind = 1;
+  bool eof = 2;
+  reserved 3, 4;
+
+  bytes data = 5;
+}

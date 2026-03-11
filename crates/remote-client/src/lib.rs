@@ -221,6 +221,15 @@ mod tests {
                 expires_at: Some(SystemTime::now().into()),
             }))
         }
+
+        type ExecStream = tokio_stream::Empty<Result<CreateTaskResponse, tonic::Status>>;
+
+        async fn exec(
+            &self,
+            _request: tonic::Request<CreateTaskRequest>,
+        ) -> Result<tonic::Response<Self::ExecStream>, tonic::Status> {
+            unimplemented!()
+        }
     }
 
     #[tokio::test]
