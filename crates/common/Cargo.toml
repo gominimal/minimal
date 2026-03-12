@@ -13,14 +13,12 @@ indoc.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-toml.workspace = true
 blake3.workspace = true
 tracing.workspace = true
 
 copy_dir.workspace = true
 globset.workspace = true
 jaq-all.workspace = true
-shlex.workspace = true
 walkdir.workspace = true
 
 bzip2.workspace = true

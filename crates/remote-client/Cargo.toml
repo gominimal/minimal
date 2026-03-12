@@ -10,14 +10,11 @@ publish.workspace = true
 bytes.workspace = true
 futures.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 
 http-body.workspace = true
-prost.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tonic.workspace = true
-tonic-prost.workspace = true
 
 common.workspace = true
 graph.workspace = true

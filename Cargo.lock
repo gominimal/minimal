@@ -594,11 +594,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "shlex",
  "tar",
  "tempfile",
  "tokio",
- "toml",
  "tracing",
  "url",
  "walkdir",
@@ -856,7 +854,6 @@ dependencies = [
  "smallvec",
  "stdlib",
  "tempfile",
- "toml",
 ]
 
 [[package]]
@@ -2206,7 +2203,6 @@ dependencies = [
  "blake3",
  "common",
  "graph",
- "hex",
  "libc",
  "path-absolutize",
  "serde",
@@ -2419,14 +2415,12 @@ dependencies = [
  "google-cloud-storage",
  "graph",
  "hakoniwa",
- "indoc",
  "lcache",
  "mfile",
  "op",
  "orchestrator",
  "rcache",
  "sandbox2",
- "shlex",
  "stdlib",
  "tempfile",
  "tokio",
@@ -2510,39 +2504,27 @@ dependencies = [
  "decode",
  "dirs",
  "futures",
- "google-cloud-auth",
- "google-cloud-storage",
  "graph",
  "hakoniwa",
- "hex",
  "lcache",
  "mctx",
  "mfile",
  "nickel-lang-core",
- "object",
  "op",
  "orchestrator",
  "petgraph 0.8.3",
  "rayon",
  "rcache",
- "regex",
  "remote-client",
  "remote-proto",
- "reqwest",
  "serde",
  "serde_json",
- "sha2",
- "shlex",
  "smallvec",
- "tempfile",
  "tokio",
- "toml",
  "toml_edit",
- "tonic",
  "tracing",
  "tracing-indicatif",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
@@ -2730,20 +2712,15 @@ dependencies = [
  "anyhow",
  "common",
  "decode",
- "either",
  "flate2",
  "futures",
- "generational-arena",
  "globset",
- "google-cloud-storage",
  "graph",
- "hakoniwa",
  "indoc",
  "lcache",
  "mfile",
  "oci-spec",
  "rayon",
- "remote-proto",
  "sandbox2",
  "serde_json",
  "sha2",
@@ -3444,15 +3421,12 @@ dependencies = [
  "futures",
  "graph",
  "http-body",
- "prost",
  "remote-proto",
  "tempfile",
  "tokio",
  "tokio-stream",
  "tokio-util",
  "tonic",
- "tonic-prost",
- "tracing",
 ]
 
 [[package]]
@@ -4010,11 +3984,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 name = "stdlib"
 version = "0.0.8"
 dependencies = [
- "anyhow",
- "dirs",
  "indoc",
- "tempfile",
- "tracing",
 ]
 
 [[package]]
@@ -4757,8 +4727,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b672338555252d43fd2240c714dc444b8c6fb0a5c5335e65a07bba7742735ddb"
 dependencies = [
  "getrandom 0.4.1",
- "js-sys",
- "wasm-bindgen",
 ]
 
 [[package]]

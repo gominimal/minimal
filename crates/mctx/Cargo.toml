@@ -16,7 +16,6 @@ google-cloud-storage.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
 tempfile.workspace = true
-shlex.workspace = true
 
 futures.workspace = true
 tracing.workspace = true
@@ -34,5 +33,3 @@ mfile.workspace = true
 op.workspace = true
 orchestrator.workspace = true
 stdlib.workspace = true
-
-indoc.workspace = true
