@@ -2,6 +2,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::{borrow::Cow, collections::HashMap};
 
+use anyhow::anyhow;
 use futures::StreamExt;
 use graph::Graph;
 use remote_execution_service_client::RemoteExecutionServiceClient as RESClient;
@@ -9,7 +10,8 @@ use remote_proto::{res::*, *};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tonic::transport::{Channel, Error as TransportError};
 
-type ChunkStream = Pin<Box<dyn futures::Stream<Item = CreateEnvMessage> + Send>>;
+type CreateEnvStream = Pin<Box<dyn futures::Stream<Item = CreateEnvMessage> + Send>>;
+type CreateBuildStream = Pin<Box<dyn futures::Stream<Item = OrchestrateBuildMessage> + Send>>;
 
 /// Errors that can occur when driving a remote client.
 #[derive(Debug)]
@@ -77,7 +79,7 @@ where
                 .await
                 .expect("graph wire serialization failed");
         });
-        let graph_stream: (StreamConfig, ChunkStream) = (
+        let graph_stream: (StreamConfig, CreateEnvStream) = (
             StreamConfig {
                 format: Some(Format::Graph(GraphFormat::GfStreamingV1.into())),
                 kind: StreamKind::SkGraph.into(),
@@ -86,7 +88,7 @@ where
                 tokio_util::io::ReaderStream::new(graph_reader)
                     .filter_map(|result| async { result.ok() })
                     .map(|bytes| CreateEnvMessage {
-                        msg: Some(Msg::Chunk(CreateChunk {
+                        msg: Some(Msg::Chunk(StreamChunk {
                             idx: 0,
                             data: bytes.to_vec(),
                         })),
@@ -94,11 +96,11 @@ where
             ),
         );
 
-        let worktree_stream: Option<(StreamConfig, ChunkStream)> = match cwd {
+        let worktree_stream: Option<(StreamConfig, CreateEnvStream)> = match cwd {
             Worktree::Ephemeral => None,
             Worktree::Dir(ref d) => {
                 let dir = d.clone().into_owned();
-                let chunk_stream: ChunkStream = Box::pin(
+                let chunk_stream: CreateEnvStream = Box::pin(
                     futures::stream::once(async move {
                         let file =
                             tokio::task::spawn_blocking(move || -> Result<std::fs::File, Error> {
@@ -117,7 +119,7 @@ where
                         tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(file))
                             .filter_map(|result| async { result.ok() })
                             .map(|bytes| CreateEnvMessage {
-                                msg: Some(Msg::Chunk(CreateChunk {
+                                msg: Some(Msg::Chunk(StreamChunk {
                                     idx: 0,
                                     data: bytes.to_vec(),
                                 })),
@@ -156,7 +158,7 @@ where
             }
         });
 
-        let streams: ChunkStream = Box::pin(
+        let streams: CreateEnvStream = Box::pin(
             futures::stream::iter(
                 vec![Some(graph_stream), worktree_stream]
                     .into_iter()
@@ -239,6 +241,78 @@ where
 
         Ok(exit_code)
     }
+
+    pub async fn build(&mut self, verbose: bool) -> Result<(), Error> {
+        use orchestrate_build_message::*;
+        let client_id = format!(
+            "{}-{}",
+            common::random_alphanumeric(8),
+            common::random_alphanumeric(8)
+        );
+
+        // Stream the graph using the async wire writer through a duplex pipe.
+        use stream_config::*;
+        let (graph_writer, graph_reader) = tokio::io::duplex(8 * 1024);
+        let graph_clone = self.g.clone();
+        tokio::spawn(async move {
+            graph::wire::AsyncGraphWriter::new(graph_writer)
+                .write_graph(&graph_clone)
+                .await
+                .expect("graph wire serialization failed");
+        });
+        let (graph_config, graph_stream): (StreamConfig, CreateBuildStream) = (
+            StreamConfig {
+                format: Some(Format::Graph(GraphFormat::GfStreamingV1.into())),
+                kind: StreamKind::SkGraph.into(),
+            },
+            Box::pin(
+                tokio_util::io::ReaderStream::new(graph_reader)
+                    .filter_map(|result| async { result.ok() })
+                    .map(|bytes| OrchestrateBuildMessage {
+                        msg: Some(Msg::Chunk(StreamChunk {
+                            idx: 0,
+                            data: bytes.to_vec(),
+                        })),
+                    }),
+            ),
+        );
+
+        let request_msg = tokio_stream::once({
+            let client_id = client_id.clone();
+            OrchestrateBuildMessage {
+                msg: Some(Msg::Request(OrchestrateBuildRequest {
+                    client_id,
+                    graph_stream: Some(graph_config),
+                    verbose,
+                })),
+            }
+        });
+        let mut rpc = self
+            .c
+            .orchestrate_build(request_msg.chain(graph_stream))
+            .await
+            .map_err(|e| Error::Other(e.into()))?
+            .into_inner();
+
+        // Read the setup status
+        let resp = match rpc.next().await {
+            Some(Ok(OrchestrateBuildResponse {
+                msg: Some(orchestrate_build_response::Msg::Resp(r)),
+            })) => Ok(r),
+            Some(Err(e)) => Err(Error::Other(e.into())),
+            _ => Err(Error::Other(
+                anyhow!("expected orchestrate_build setup status").into(),
+            )),
+        }?;
+        println!("resp: {:?}", resp);
+
+        while let Some(msg) = rpc.next().await {
+            let msg = msg.map_err(|e| Error::Other(e.into()))?;
+            println!("msg: {:?}", msg);
+        }
+
+        Ok(())
+    }
 }
 
 /// The configuration describing an execution in a remote environment.
@@ -288,11 +362,19 @@ mod tests {
         }
 
         type ExecStream = tokio_stream::Empty<Result<CreateTaskResponse, tonic::Status>>;
-
         async fn exec(
             &self,
             _request: tonic::Request<CreateTaskRequest>,
         ) -> Result<tonic::Response<Self::ExecStream>, tonic::Status> {
+            unimplemented!()
+        }
+
+        type OrchestrateBuildStream =
+            tokio_stream::Empty<Result<OrchestrateBuildResponse, tonic::Status>>;
+        async fn orchestrate_build(
+            &self,
+            _request: tonic::Request<tonic::Streaming<OrchestrateBuildMessage>>,
+        ) -> Result<tonic::Response<Self::OrchestrateBuildStream>, tonic::Status> {
             unimplemented!()
         }
     }
@@ -444,6 +526,15 @@ mod tests {
             ];
 
             Ok(tonic::Response::new(tokio_stream::iter(responses)))
+        }
+
+        type OrchestrateBuildStream =
+            tokio_stream::Empty<Result<OrchestrateBuildResponse, tonic::Status>>;
+        async fn orchestrate_build(
+            &self,
+            _request: tonic::Request<tonic::Streaming<OrchestrateBuildMessage>>,
+        ) -> Result<tonic::Response<Self::OrchestrateBuildStream>, tonic::Status> {
+            unimplemented!()
         }
     }
 

@@ -1,9 +1,6 @@
 syntax = "proto3";
 package res;
 
-import "google/protobuf/timestamp.proto";
-import "tarball_format.proto";
-
 // A request to RES to start a new task.
 message CreateTaskRequest {
   // The client-provided identifier for the environment.

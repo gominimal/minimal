@@ -3,10 +3,15 @@ package res;
 
 import "google/protobuf/empty.proto";
 import "res/create_env.proto";
+import "res/orchestrate_build.proto";
 import "res/task.proto";
 
 service RemoteExecutionService {
+  // Creates an environment with an optional worktree and optional graph.
   rpc CreateEnv(stream CreateEnvMessage) returns (CreateEnvResponse) {}
-
+  // Runs a task in an environment.
   rpc Exec(CreateTaskRequest) returns (stream CreateTaskResponse) {}
+
+  // Orchestrates a build.
+  rpc OrchestrateBuild(stream OrchestrateBuildMessage) returns (stream OrchestrateBuildResponse) {}
 }

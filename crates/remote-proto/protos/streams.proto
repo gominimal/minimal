@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+import "tarball_format.proto";
+
+// A chunk of streamed data for creating a new environment.
+message StreamChunk {
+  // Corresponds to an index in the array where streams were configured.
+  uint32 idx = 1;
+  reserved 2 to 4;
+
+  // Raw encoding of a chunk of stream data, where the wire format
+  // depends on the [StreamConfig.format] that was configured for the stream.
+  bytes data = 5;
+}
+
+// Defines the configuration for a stream that will be sent as part of a sequence
+// of [StreamChunk] messages.
+message StreamConfig {
+  enum StreamKind {
+    SK_UNSPECIFIED = 0;
+    // The stream is a wire encoding of the graph::Graph.
+    SK_GRAPH = 1;
+    // The stream is an encoding of the files for the cwd.
+    SK_WORKTREE = 2;
+  }
+  StreamKind kind = 1;
+  reserved 2 to 9;
+
+  enum GraphFormat {
+    GF_UNSPECIFIED = 0;
+    GF_STREAMING_V1 = 1;
+  }
+  message FilesFormat {
+    TarballFormat tarball = 1;
+  }
+
+  oneof format {
+    GraphFormat graph = 10;
+    FilesFormat files = 11;
+  }
+}

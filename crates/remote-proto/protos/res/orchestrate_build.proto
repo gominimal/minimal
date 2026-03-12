@@ -1,0 +1,59 @@
+syntax = "proto3";
+package res;
+
+import "streams.proto";
+
+// The wire format for messages streamed to the server to do a build.
+message OrchestrateBuildMessage {
+  oneof msg {
+    // The initiation message of the stream. May only be sent as the first message.
+    OrchestrateBuildRequest request = 1;
+    // A chunk of data for the stream.
+    StreamChunk chunk = 2;
+  }
+}
+
+// A request to RES to do a build.
+message OrchestrateBuildRequest {
+  // A client-provided identifier for the build.
+  string client_id = 1;
+  // Describes the graph stream that will follow this message with idx == 0.
+  StreamConfig graph_stream = 2;
+  // Stream back stderr/stdout for all builds.
+  bool verbose = 3;
+}
+
+message OrchestrateBuildResponse {
+  message SetupResponse {}
+  message Event {
+    enum EventKind {
+      EVT_UNSPECIFIED = 0;
+      // The build has been initiated.
+      EVT_BUILD_START = 1;
+      // The build has finished.
+      EVT_BUILD_STOP = 2;
+    }
+
+    // Typically the name of the package being built.
+    string build_id = 1;
+    // The event that occurred.
+    EventKind kind = 2;
+  }
+  message LogLine {
+    // Typically the name of the package being built.
+    string build_id = 1;
+    // Whether the line is for standard output or standard error.
+    bool stderr = 2;
+    // The Log line itself.
+    string line = 3;
+  }
+
+  oneof msg {
+    // The initial response of the RPC. May only be sent as the first message.
+    SetupResponse resp = 1;
+    // An event occurred for one of the builds in the orchestration.
+    Event event = 2;
+    // Some output is being streamed back by a build.
+    LogLine line = 3;
+  }
+}
