@@ -104,14 +104,14 @@ impl ConfigBuilder {
 fn default_parallelism() -> usize {
     let rough_threadcount = std::thread::available_parallelism().unwrap().get();
     let para_by_cpu = match rough_threadcount {
-        1..=3 => 1,
-        4..=6 => 2,
-        7..=10 => 4,
-        11..=12 => 6,
-        13..=15 => 7,
-        16..=22 => 10,
-        23..=32 => 12,
-        _ => rough_threadcount - 16,
+        0..=3 => 1,
+        4..=7 => 2,
+        8..=11 => 3,
+        12..=14 => 4,
+        15..=18 => 5,
+        19..=21 => 6,
+        22..=24 => 7,
+        _ => (rough_threadcount - 24) / 4 + 8,
     };
 
     let para_by_mem = common::get_available_ram_gb().map(|gbs| match gbs {
