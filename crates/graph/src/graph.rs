@@ -11,7 +11,6 @@ use mfile::{self, LinkConfig};
 use nickel_lang_core::term::IndexMap;
 
 use generational_arena::Arena;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -341,59 +340,6 @@ pub struct Graph {
             HashMap<SpecHash, BuildSpecRef>,
         )>,
     >,
-}
-
-/// Borrowing wire format for serialization — zero clones.
-#[derive(Serialize)]
-struct GraphWireRef<'a> {
-    builds: &'a Arena<BuildSpec>,
-    top_levels: &'a Vec<BuildSpecRef>,
-    profiles: &'a HashMap<String, Profile>,
-    harnesses: &'a HashMap<String, Harness>,
-    supply_chain: &'a Vec<SpecOrigin>,
-}
-
-/// Owning wire format for deserialization.
-/// Excludes `by_name` (rebuilt from arena) and `hash_cache` (lazily recomputed).
-#[derive(Deserialize)]
-struct GraphWire {
-    builds: Arena<BuildSpec>,
-    top_levels: Vec<BuildSpecRef>,
-    profiles: HashMap<String, Profile>,
-    harnesses: HashMap<String, Harness>,
-    supply_chain: Vec<SpecOrigin>,
-}
-
-impl Serialize for Graph {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        GraphWireRef {
-            builds: &self.builds,
-            top_levels: &self.top_levels,
-            profiles: &self.profiles,
-            harnesses: &self.harnesses,
-            supply_chain: &self.supply_chain,
-        }
-        .serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for Graph {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let wire = GraphWire::deserialize(deserializer)?;
-        let mut by_name = HashMap::with_capacity(wire.builds.len());
-        for (idx, build) in wire.builds.iter() {
-            by_name.insert(build.name.clone(), BuildSpecRef(idx));
-        }
-        Ok(Graph {
-            builds: wire.builds,
-            top_levels: wire.top_levels,
-            profiles: wire.profiles,
-            harnesses: wire.harnesses,
-            by_name,
-            supply_chain: wire.supply_chain,
-            hash_cache: Default::default(),
-        })
-    }
 }
 
 impl Default for Graph {
@@ -841,19 +787,63 @@ impl Graph {
             .collect()
     }
 
+    /// Returns an iterator over all profiles configured in the graph.
+    pub fn iter_profiles(&self) -> impl Iterator<Item = (&String, &Profile)> {
+        self.profiles.iter()
+    }
+
     /// Returns the links in the software supply chain used to build this graph.
     pub fn software_supply_chain(&self) -> &Vec<SpecOrigin> {
         &self.supply_chain
     }
 
-    /// Serializes the graph to a byte vector using JSON.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec(self)
+    /// Inserts a build spec into the arena and registers it by name.
+    /// Returns the [`BuildSpecRef`] for the inserted spec.
+    #[cfg(test)]
+    pub(crate) fn insert_build(&mut self, spec: BuildSpec) -> BuildSpecRef {
+        let name = spec.name.clone();
+        let idx = self.builds.insert(spec);
+        let bsr = BuildSpecRef(idx);
+        self.by_name.insert(name, bsr);
+        bsr
     }
 
-    /// Deserializes a graph from a byte slice using JSON.
-    pub fn from_bytes(data: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(data)
+    /// Assembles a graph from pre-built components (used by the wire reader).
+    pub(crate) fn from_parts(
+        builds: Arena<BuildSpec>,
+        top_levels: Vec<BuildSpecRef>,
+        profiles: HashMap<String, Profile>,
+        harnesses: HashMap<String, Harness>,
+        by_name: HashMap<String, BuildSpecRef>,
+        supply_chain: Vec<SpecOrigin>,
+    ) -> Self {
+        Self {
+            builds,
+            top_levels,
+            profiles,
+            harnesses,
+            by_name,
+            supply_chain,
+            hash_cache: Default::default(),
+        }
+    }
+
+    /// Serialises the graph to a byte vector using the streaming wire format.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, crate::wire::WireError> {
+        let mut buf = Vec::new();
+        crate::wire::GraphWriter::new(&mut buf).write_graph(self)?;
+        Ok(buf)
+    }
+
+    /// Deserialises a graph from a byte slice using the streaming wire format.
+    ///
+    /// If the stream contains inlined local files, a temporary directory is
+    /// created but dropped when this function returns.  Use
+    /// [`wire::GraphReader`] directly when you need to keep materialised files.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, crate::wire::WireError> {
+        let (graph, _temp_dir) =
+            crate::wire::GraphReader::new(std::io::Cursor::new(data)).read_graph()?;
+        Ok(graph)
     }
 }
 

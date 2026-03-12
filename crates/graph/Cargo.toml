@@ -8,7 +8,6 @@ publish.workspace = true
 
 [dev-dependencies]
 indoc.workspace = true
-tempfile.workspace = true
 
 [dependencies]
 nickel-lang-core.workspace = true
@@ -18,6 +17,8 @@ generational-arena.workspace = true
 smallvec.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 common.workspace = true

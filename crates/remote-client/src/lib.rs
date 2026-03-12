@@ -67,30 +67,32 @@ where
             common::random_alphanumeric(8)
         );
 
-        // Work out the streams
+        // Stream the graph using the async wire writer through a duplex pipe.
         use stream_config::*;
-        let graph_bytes = self.g.to_bytes().unwrap(); // TODO: Can we do a better job of streaming
-        let graph_stream: (StreamConfig, ChunkStream) = {
-            (
-                StreamConfig {
-                    format: Some(Format::Graph(GraphFormat::GfJsonSerdeV1.into())),
-                    kind: StreamKind::SkGraph.into(),
-                },
-                Box::pin(
-                    futures::stream::once(async move {
-                        tokio_util::io::ReaderStream::new(std::io::Cursor::new(graph_bytes))
-                            .filter_map(|result| async { result.ok() })
-                            .map(|bytes| CreateEnvMessage {
-                                msg: Some(Msg::Chunk(CreateChunk {
-                                    idx: 0,
-                                    data: bytes.to_vec(),
-                                })),
-                            })
-                    })
-                    .flatten(),
-                ),
-            )
-        };
+        let (graph_writer, graph_reader) = tokio::io::duplex(8 * 1024);
+        let graph_clone = self.g.clone();
+        tokio::spawn(async move {
+            graph::wire::AsyncGraphWriter::new(graph_writer)
+                .write_graph(&graph_clone)
+                .await
+                .expect("graph wire serialization failed");
+        });
+        let graph_stream: (StreamConfig, ChunkStream) = (
+            StreamConfig {
+                format: Some(Format::Graph(GraphFormat::GfStreamingV1.into())),
+                kind: StreamKind::SkGraph.into(),
+            },
+            Box::pin(
+                tokio_util::io::ReaderStream::new(graph_reader)
+                    .filter_map(|result| async { result.ok() })
+                    .map(|bytes| CreateEnvMessage {
+                        msg: Some(Msg::Chunk(CreateChunk {
+                            idx: 0,
+                            data: bytes.to_vec(),
+                        })),
+                    }),
+            ),
+        );
 
         let worktree_stream: Option<(StreamConfig, ChunkStream)> = match cwd {
             Worktree::Ephemeral => None,

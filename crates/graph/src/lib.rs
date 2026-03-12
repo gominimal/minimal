@@ -123,6 +123,8 @@ pub use env_setup::SetupForPackages;
 mod graph;
 pub use graph::{Graph, LayerCacheDir};
 
+pub mod wire;
+
 mod spec_hasher;
 pub use spec_hasher::SpecHasher;
 

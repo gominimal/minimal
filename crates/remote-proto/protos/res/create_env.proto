@@ -52,7 +52,7 @@ message StreamConfig {
 
   enum GraphFormat {
     GF_UNSPECIFIED = 0;
-    GF_JSON_SERDE_V1 = 1;
+    GF_STREAMING_V1 = 1;
   }
   message FilesFormat {
     TarballFormat tarball = 1;
