@@ -6,6 +6,7 @@ use crate::{
 };
 use common::SpecHash;
 use either::Either;
+use futures::channel::mpsc;
 use google_cloud_storage::client::Storage as GcsStorage;
 use graph::{BinProvider, BuildSpecRef, Graph, SubsetInput};
 use lcache::{Cache, CacheErr, DirCacheEntry, EntryMeta, LocalDir, MetaInner, PendingDir};
@@ -16,6 +17,91 @@ use tokio::task::spawn_blocking;
 
 use crate::Error;
 
+/// A single line of build output.
+#[derive(Debug, Clone)]
+pub struct BuildLogLine {
+    pub is_stderr: bool,
+    pub name: String,
+    pub line: String,
+}
+
+/// An [`tokio::io::AsyncWrite`] adapter that buffers bytes and sends complete
+/// lines as [`BuildLogLine`] items through an [`mpsc::UnboundedSender`].
+struct SinkWriter {
+    sender: mpsc::UnboundedSender<BuildLogLine>,
+    name: String,
+    is_stderr: bool,
+    buf: Vec<u8>,
+}
+
+impl SinkWriter {
+    fn new(sender: mpsc::UnboundedSender<BuildLogLine>, name: String, is_stderr: bool) -> Self {
+        Self {
+            sender,
+            name,
+            is_stderr,
+            buf: Vec::new(),
+        }
+    }
+
+    fn emit_lines(&mut self) {
+        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&self.buf[..pos]).into_owned();
+            let _ = self.sender.unbounded_send(BuildLogLine {
+                is_stderr: self.is_stderr,
+                name: self.name.clone(),
+                line,
+            });
+            self.buf.drain(..=pos);
+        }
+    }
+
+    fn emit_remaining(&mut self) {
+        if !self.buf.is_empty() {
+            let line = String::from_utf8_lossy(&self.buf).into_owned();
+            let _ = self.sender.unbounded_send(BuildLogLine {
+                is_stderr: self.is_stderr,
+                name: self.name.clone(),
+                line,
+            });
+            self.buf.clear();
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for SinkWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        self.buf.extend_from_slice(buf);
+        self.emit_lines();
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        self.emit_remaining();
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for SinkWriter {
+    fn drop(&mut self) {
+        self.emit_remaining();
+    }
+}
+
 /// A type which implements [Backend] by building everything locally.
 #[derive(Debug)]
 pub struct LocalBackend<SF: SourceFetcher + 'static> {
@@ -24,7 +110,7 @@ pub struct LocalBackend<SF: SourceFetcher + 'static> {
     pub(crate) remote_cache: Option<RemoteCache<GcsStorage>>,
     pub(crate) build_semaphore: Semaphore,
     pub(crate) num_concurrent_builds: usize,
-    pub(crate) verbose: bool,
+    pub(crate) log_sink: Option<mpsc::UnboundedSender<BuildLogLine>>,
 }
 
 impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
@@ -76,22 +162,22 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                 .acquire_many(cost.min(shared.backend.num_concurrent_builds) as u32)
                 .await
                 .unwrap();
-            let verbose = shared.backend.verbose;
+            let log_sink = shared.backend.log_sink.clone();
             let name = shared.graph.get(&bsr).unwrap().name.clone();
             let mut b = op::SpecBuild {
                 override_deps: Some(dep_paths.into_iter().collect()),
                 spec: &bsr,
                 remote_fetcher: &shared.backend.sf,
-                stdout_writer: if verbose {
-                    Some(Box::new(common::TracingWriter::stdout().with_target(&name)))
-                } else {
-                    None
-                },
-                stderr_writer: if verbose {
-                    Some(Box::new(common::TracingWriter::stderr().with_target(&name)))
-                } else {
-                    None
-                },
+                stdout_writer: log_sink.as_ref().map(
+                    |s| -> Box<dyn tokio::io::AsyncWrite + Unpin + Send + Sync> {
+                        Box::new(SinkWriter::new(s.clone(), name.clone(), false))
+                    },
+                ),
+                stderr_writer: log_sink.as_ref().map(
+                    |s| -> Box<dyn tokio::io::AsyncWrite + Unpin + Send + Sync> {
+                        Box::new(SinkWriter::new(s.clone(), name.clone(), true))
+                    },
+                ),
             };
 
             let res = b
@@ -248,7 +334,7 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
         num_concurrent_builds: usize,
         graph: Graph,
         cache: Cache<LocalDir>,
-        verbose: bool,
+        log_sink: Option<mpsc::UnboundedSender<BuildLogLine>>,
     ) -> Result<Orchestrator<Self>, Error> {
         Ok(Orchestrator {
             top_levels,
@@ -256,7 +342,7 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
                 output_base,
                 remote_cache,
                 sf,
-                verbose,
+                log_sink,
                 build_semaphore: Semaphore::new(num_concurrent_builds),
                 num_concurrent_builds,
             },

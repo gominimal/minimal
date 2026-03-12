@@ -412,7 +412,11 @@ impl Context {
     /// Ensures the top-level packages of the given graph are built and available locally.
     ///
     /// Use [Context::download_if_available] if you want to only fetch packages.
-    pub async fn build_graph(&mut self, graph: &Graph, verbose: bool) -> Result<(), Error> {
+    pub async fn build_graph(
+        &mut self,
+        graph: &Graph,
+        log_sink: Option<futures::channel::mpsc::UnboundedSender<orchestrator::BuildLogLine>>,
+    ) -> Result<(), Error> {
         let cache = self.local_cache();
         let rc = if self.config.use_remote_cache() {
             Some(self.remote_cache(false, false).await.unwrap())
@@ -429,7 +433,7 @@ impl Context {
             self.config.num_parallel_builds(),
             graph.clone(),
             cache.clone(),
-            verbose,
+            log_sink,
         )?;
 
         let (built, result) = match (
@@ -563,7 +567,7 @@ impl Context {
 
         if !all_built {
             tracing::trace!("missing local packages, calling mctx.build_graph()");
-            self.build_graph(graph, false).await?;
+            self.build_graph(graph, None).await?;
         } else {
             tracing::trace!("all packages available locally, eluding build");
         }
@@ -828,7 +832,7 @@ mod tests {
 
         rt.block_on(async {
             let graph = ctx.graph_from_package_names(["uroot"]).unwrap();
-            ctx.build_graph(&graph, false).await.unwrap();
+            ctx.build_graph(&graph, None).await.unwrap();
 
             let temp_dir = ctx.local_cache().temp_dir().unwrap();
             let mut t = StandaloneTest {

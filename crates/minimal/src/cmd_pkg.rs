@@ -1,5 +1,7 @@
+use futures::channel::mpsc;
 use graph::Graph;
 use mctx::{Cache, Context, Error};
+use orchestrator::BuildLogLine;
 use tracing::{info, trace};
 
 #[derive(Debug, clap::Args)]
@@ -24,7 +26,24 @@ pub async fn cmd_pkg(args: PkgArgs, ctx: &mut Context) -> Result<(), Error> {
     };
     let cache = ctx.local_cache();
 
-    pkg_build_impl(&graph, ctx, cache, false, args.verbose).await?;
+    let log_sink = if args.verbose {
+        let (tx, mut rx) = mpsc::unbounded::<BuildLogLine>();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            while let Some(log) = rx.next().await {
+                if log.is_stderr {
+                    tracing::warn!(target: "build", name = %log.name, "{}", log.line);
+                } else {
+                    tracing::info!(target: "build", name = %log.name, "{}", log.line);
+                }
+            }
+        });
+        Some(tx)
+    } else {
+        None
+    };
+
+    pkg_build_impl(&graph, ctx, cache, false, log_sink).await?;
 
     Ok(())
 }
@@ -34,11 +53,11 @@ pub async fn pkg_build_impl(
     ctx: &mut Context,
     cache: Cache,
     quiet: bool,
-    verbose: bool,
+    log_sink: Option<mpsc::UnboundedSender<BuildLogLine>>,
 ) -> Result<(), Error> {
     trace!("build_impl");
 
-    ctx.build_graph(graph, verbose).await?;
+    ctx.build_graph(graph, log_sink).await?;
 
     // Display build summary
     if !quiet {
