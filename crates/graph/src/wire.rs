@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use generational_arena::{Arena, Index};
@@ -173,6 +174,13 @@ struct LocalFileHeader {
     filename: String,
     file_hash: blake3::Hash,
     data_len: u64,
+    #[serde(default = "default_file_mode")]
+    file_mode: u32,
+}
+
+/// Default mode for backwards-compat with streams written before `file_mode` existed.
+fn default_file_mode() -> u32 {
+    0o644
 }
 
 #[derive(Serialize, Deserialize)]
@@ -301,11 +309,13 @@ impl<W: Write> GraphWriter<W> {
         file_hash: &blake3::Hash,
     ) -> Result<(), WireError> {
         let file_data = std::fs::read(full_path)?;
+        let file_mode = std::fs::metadata(full_path)?.permissions().mode();
 
         let header = LocalFileHeader {
             filename: filename.to_string(),
             file_hash: *file_hash,
             data_len: file_data.len() as u64,
+            file_mode,
         };
         let header_json = serde_json::to_vec(&header)?;
 
@@ -554,6 +564,10 @@ fn materialize_local_file(
     *file_counter += 1;
     let dest = subdir.join(&file_header.filename);
     std::fs::write(&dest, file_data)?;
+    std::fs::set_permissions(
+        &dest,
+        std::fs::Permissions::from_mode(file_header.file_mode),
+    )?;
 
     Ok(dest)
 }
@@ -729,11 +743,13 @@ impl<W: AsyncWrite + Unpin> AsyncGraphWriter<W> {
         file_hash: &blake3::Hash,
     ) -> Result<(), WireError> {
         let file_data = std::fs::read(full_path)?;
+        let file_mode = std::fs::metadata(full_path)?.permissions().mode();
 
         let header = LocalFileHeader {
             filename: filename.to_string(),
             file_hash: *file_hash,
             data_len: file_data.len() as u64,
+            file_mode,
         };
         let header_json = serde_json::to_vec(&header)?;
 
@@ -1559,6 +1575,78 @@ mod tests {
                 std::fs::read(fp_b).unwrap(),
                 content_2,
                 "[{label}] spec b has wrong file content"
+            );
+        }
+    }
+
+    /// File mode (permissions) should survive a roundtrip through both sync and async paths.
+    #[tokio::test]
+    async fn roundtrip_preserves_file_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let script_path = tmp.path().join("build.sh");
+        let data_path = tmp.path().join("config.txt");
+        std::fs::write(&script_path, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(&data_path, b"key=value\n").unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&data_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut graph = Graph::new();
+        let origin = Arc::new(SpecOrigin::Inline);
+        let bsr = graph.insert_build(BuildSpec {
+            name: "pkg".into(),
+            build_deps: smallvec![
+                BuildDep::Local {
+                    full_path: script_path.clone(),
+                    filename: "build.sh".into(),
+                    file_hash: blake3::hash(b"#!/bin/sh\nexit 0\n"),
+                },
+                BuildDep::Local {
+                    full_path: data_path.clone(),
+                    filename: "config.txt".into(),
+                    file_hash: blake3::hash(b"key=value\n"),
+                },
+            ],
+            from: origin,
+            ..Default::default()
+        });
+        graph.top_levels = vec![bsr];
+
+        for label in ["sync", "async"] {
+            let (restored, td) = if label == "sync" {
+                roundtrip(&graph)
+            } else {
+                async_roundtrip(&graph).await
+            };
+            assert!(td.is_some());
+
+            let spec = restored.get(restored.by_name("pkg").unwrap()).unwrap();
+
+            let BuildDep::Local {
+                full_path: fp_script,
+                ..
+            } = &spec.build_deps[0]
+            else {
+                panic!("[{label}] expected Local dep at 0");
+            };
+            let BuildDep::Local {
+                full_path: fp_data, ..
+            } = &spec.build_deps[1]
+            else {
+                panic!("[{label}] expected Local dep at 1");
+            };
+
+            let script_mode = std::fs::metadata(fp_script).unwrap().permissions().mode();
+            let data_mode = std::fs::metadata(fp_data).unwrap().permissions().mode();
+            assert_eq!(
+                script_mode & 0o7777,
+                0o755,
+                "[{label}] build.sh should be 0755"
+            );
+            assert_eq!(
+                data_mode & 0o7777,
+                0o644,
+                "[{label}] config.txt should be 0644"
             );
         }
     }

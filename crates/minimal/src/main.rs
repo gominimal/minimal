@@ -42,6 +42,8 @@ mod cmd_cache;
 use cmd_cache::{CacheArgs, cmd_cache};
 mod cmd_rexec;
 use cmd_rexec::{RexecArgs, cmd_rexec};
+mod cmd_remote_build;
+use cmd_remote_build::{RemoteBuildArgs, cmd_remote_build};
 
 #[derive(Parser)]
 #[command(name = "minimal", version = env!("CARGO_PKG_VERSION"), long_version = env!("LONG_VERSION"))]
@@ -81,6 +83,9 @@ enum Command {
     /// Execute a command on a remote build server.
     #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
     Rexec(RexecArgs),
+    /// Build packages on a remote build server.
+    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
+    RemoteBuild(RemoteBuildArgs),
     /// Manipulate the local cache.
     #[clap(subcommand)]
     Cache(CacheArgs),
@@ -291,6 +296,7 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         Command::Dump(args) => cmd_dump(args, &mut ctx).await,
         Command::Status(args) => cmd_status(args, &mut ctx).await,
         Command::Rexec(args) => cmd_rexec(args, &mut ctx).await,
+        Command::RemoteBuild(args) => cmd_remote_build(args, &mut ctx).await,
         Command::Cache(args) => cmd_cache(args, &mut ctx).await,
         // Handled earlier
         Command::Completions(_) => Ok(()),
