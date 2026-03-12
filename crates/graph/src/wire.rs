@@ -168,7 +168,7 @@ struct BuildSpecRecord {
     spec: BuildSpec,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct LocalFileHeader {
     filename: String,
     file_hash: blake3::Hash,
@@ -403,6 +403,7 @@ impl<R: Read> GraphReader<R> {
         let mut arena: Arena<BuildSpec> = Arena::with_capacity(header.build_count);
         let mut remap: HashMap<Index, BuildSpecRef> = HashMap::with_capacity(header.build_count);
         let mut temp_dir: Option<tempfile::TempDir> = None;
+        let mut file_counter: usize = 0;
 
         let mut top_levels_raw: Vec<(usize, u64)> = Vec::new();
         let mut profiles: HashMap<String, Profile> = HashMap::new();
@@ -443,7 +444,8 @@ impl<R: Read> GraphReader<R> {
                             });
                         }
 
-                        let dest_path = materialize_local_file(&fpayload, &mut temp_dir)?;
+                        let dest_path =
+                            materialize_local_file(&fpayload, &mut temp_dir, &mut file_counter)?;
 
                         if let BuildDep::Local { full_path, .. } = &mut spec.build_deps[dep_idx] {
                             *full_path = dest_path;
@@ -525,6 +527,7 @@ impl<R: Read> GraphReader<R> {
 fn materialize_local_file(
     payload: &[u8],
     temp_dir: &mut Option<tempfile::TempDir>,
+    file_counter: &mut usize,
 ) -> Result<PathBuf, WireError> {
     let mut cursor = io::Cursor::new(payload);
     let header_len = decode_varint(&mut cursor)? as usize;
@@ -543,9 +546,13 @@ fn materialize_local_file(
         });
     }
 
-    // Materialise
+    // Materialise into a unique subdirectory so files with the same name
+    // (from different specs) don't overwrite each other.
     let td = temp_dir.get_or_insert_with(|| tempfile::TempDir::new().unwrap());
-    let dest = td.path().join(&file_header.filename);
+    let subdir = td.path().join(file_counter.to_string());
+    std::fs::create_dir_all(&subdir)?;
+    *file_counter += 1;
+    let dest = subdir.join(&file_header.filename);
     std::fs::write(&dest, file_data)?;
 
     Ok(dest)
@@ -812,6 +819,7 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
         let mut arena: Arena<BuildSpec> = Arena::with_capacity(header.build_count);
         let mut remap: HashMap<Index, BuildSpecRef> = HashMap::with_capacity(header.build_count);
         let mut temp_dir: Option<tempfile::TempDir> = None;
+        let mut file_counter: usize = 0;
 
         let mut top_levels_raw: Vec<(usize, u64)> = Vec::new();
         let mut profiles: HashMap<String, Profile> = HashMap::new();
@@ -848,7 +856,8 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
                                 got: ftag,
                             });
                         }
-                        let dest_path = materialize_local_file(&fpayload, &mut temp_dir)?;
+                        let dest_path =
+                            materialize_local_file(&fpayload, &mut temp_dir, &mut file_counter)?;
                         if let BuildDep::Local { full_path, .. } = &mut spec.build_deps[dep_idx] {
                             *full_path = dest_path;
                         }
@@ -1143,6 +1152,414 @@ mod tests {
             encode_varint(value, &mut buf);
             let decoded = decode_varint(&mut io::Cursor::new(&buf)).unwrap();
             assert_eq!(value, decoded, "varint roundtrip failed for {value}");
+        }
+    }
+
+    // ── Async helpers ────────────────────────────────────────────────────────
+
+    /// Async roundtrip: async write → async read.
+    async fn async_roundtrip(graph: &Graph) -> (Graph, Option<tempfile::TempDir>) {
+        let mut buf = Vec::new();
+        AsyncGraphWriter::new(&mut buf)
+            .write_graph(graph)
+            .await
+            .unwrap();
+        AsyncGraphReader::new(io::Cursor::new(buf))
+            .read_graph()
+            .await
+            .unwrap()
+    }
+
+    /// Cross-format roundtrip: sync write → async read.
+    async fn sync_write_async_read(graph: &Graph) -> (Graph, Option<tempfile::TempDir>) {
+        let mut buf = Vec::new();
+        GraphWriter::new(&mut buf).write_graph(graph).unwrap();
+        AsyncGraphReader::new(io::Cursor::new(buf))
+            .read_graph()
+            .await
+            .unwrap()
+    }
+
+    /// Cross-format roundtrip: async write → sync read.
+    async fn async_write_sync_read(graph: &Graph) -> (Graph, Option<tempfile::TempDir>) {
+        let mut buf = Vec::new();
+        AsyncGraphWriter::new(&mut buf)
+            .write_graph(graph)
+            .await
+            .unwrap();
+        GraphReader::new(io::Cursor::new(buf)).read_graph().unwrap()
+    }
+
+    // ── Async roundtrip tests ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn async_empty_graph_roundtrip() {
+        let graph = Graph::new();
+        let (restored, td) = async_roundtrip(&graph).await;
+        assert!(td.is_none());
+        assert_eq!(restored.len(), 0);
+        assert!(restored.top_levels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn async_basic_roundtrip() {
+        let mut graph = Graph::new();
+        let origin = Arc::new(SpecOrigin::Inline);
+        let shared = graph.insert_build(BuildSpec {
+            name: "shared".into(),
+            cmds: vec![vec!["make".into()]],
+            from: origin.clone(),
+            ..Default::default()
+        });
+        let top = graph.insert_build(BuildSpec {
+            name: "top".into(),
+            build_deps: smallvec![BuildDep::Build(shared)],
+            runtime_deps: smallvec![RuntimeDep::Build(shared)],
+            from: origin.clone(),
+            ..Default::default()
+        });
+        graph.top_levels = vec![top];
+
+        let (restored, td) = async_roundtrip(&graph).await;
+        assert!(td.is_none());
+        assert_eq!(restored.len(), 2);
+
+        // Spec hashes match
+        for (_bsr, spec) in graph.iter() {
+            let r_bsr = restored.by_name(&spec.name).unwrap();
+            assert_eq!(
+                graph.spec_hash(graph.by_name(&spec.name).unwrap()),
+                restored.spec_hash(r_bsr),
+                "spec_hash mismatch for {}",
+                spec.name
+            );
+        }
+
+        // Cross-references intact
+        let top_spec = restored.get(restored.by_name("top").unwrap()).unwrap();
+        let shared_ref = restored.by_name("shared").unwrap();
+        assert_eq!(top_spec.build_deps[0].as_build().unwrap(), shared_ref);
+        assert_eq!(top_spec.runtime_deps[0].bsr(), shared_ref);
+        assert_eq!(restored.top_levels.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn async_roundtrip_with_local_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file_path = tmp.path().join("patch.diff");
+        let content = b"--- a/foo\n+++ b/foo\n";
+        std::fs::write(&file_path, content).unwrap();
+        let file_hash = blake3::hash(content);
+
+        let mut graph = Graph::new();
+        let origin = Arc::new(SpecOrigin::Inline);
+        let bsr = graph.insert_build(BuildSpec {
+            name: "pkg".into(),
+            build_deps: smallvec![BuildDep::Local {
+                full_path: file_path.clone(),
+                filename: "patch.diff".into(),
+                file_hash,
+            }],
+            from: origin,
+            ..Default::default()
+        });
+        graph.top_levels = vec![bsr];
+
+        let (restored, td) = async_roundtrip(&graph).await;
+        assert!(td.is_some(), "should have materialised files");
+
+        let spec = restored.get(restored.by_name("pkg").unwrap()).unwrap();
+        let BuildDep::Local {
+            full_path,
+            filename,
+            file_hash: h,
+        } = &spec.build_deps[0]
+        else {
+            panic!("expected Local dep");
+        };
+        assert_eq!(filename, "patch.diff");
+        assert_eq!(*h, file_hash);
+        assert_ne!(full_path, &file_path);
+        assert_eq!(std::fs::read(full_path).unwrap(), content);
+    }
+
+    /// Multiple local files on a single spec, interleaved with a Build dep.
+    /// This is the configuration most likely to surface off-by-one indexing.
+    #[tokio::test]
+    async fn async_roundtrip_multiple_local_files_interleaved() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let content_a = b"file-a-contents\n";
+        let content_b = b"file-b-is-different\n";
+        let path_a = tmp.path().join("a.txt");
+        let path_b = tmp.path().join("b.txt");
+        std::fs::write(&path_a, content_a).unwrap();
+        std::fs::write(&path_b, content_b).unwrap();
+
+        let mut graph = Graph::new();
+        let origin = Arc::new(SpecOrigin::Inline);
+
+        // Insert a build dep that sits between the two Local deps.
+        let lib = graph.insert_build(BuildSpec {
+            name: "lib".into(),
+            from: origin.clone(),
+            ..Default::default()
+        });
+
+        let pkg = graph.insert_build(BuildSpec {
+            name: "pkg".into(),
+            build_deps: smallvec![
+                BuildDep::Local {
+                    full_path: path_a.clone(),
+                    filename: "a.txt".into(),
+                    file_hash: blake3::hash(content_a),
+                },
+                BuildDep::Build(lib),
+                BuildDep::Local {
+                    full_path: path_b.clone(),
+                    filename: "b.txt".into(),
+                    file_hash: blake3::hash(content_b),
+                },
+            ],
+            from: origin,
+            ..Default::default()
+        });
+        graph.top_levels = vec![pkg];
+
+        let (restored, td) = async_roundtrip(&graph).await;
+        assert!(td.is_some());
+
+        let spec = restored.get(restored.by_name("pkg").unwrap()).unwrap();
+        assert_eq!(spec.build_deps.len(), 3);
+
+        // First dep: Local "a.txt"
+        let BuildDep::Local {
+            full_path: fp_a,
+            filename: fn_a,
+            ..
+        } = &spec.build_deps[0]
+        else {
+            panic!(
+                "expected Local dep at index 0, got {:?}",
+                spec.build_deps[0]
+            );
+        };
+        assert_eq!(fn_a, "a.txt");
+        assert_eq!(std::fs::read(fp_a).unwrap(), content_a);
+
+        // Second dep: Build ref to "lib"
+        let lib_ref = restored.by_name("lib").unwrap();
+        assert_eq!(
+            spec.build_deps[1].as_build().unwrap(),
+            lib_ref,
+            "Build dep at index 1 should reference lib"
+        );
+
+        // Third dep: Local "b.txt"
+        let BuildDep::Local {
+            full_path: fp_b,
+            filename: fn_b,
+            ..
+        } = &spec.build_deps[2]
+        else {
+            panic!(
+                "expected Local dep at index 2, got {:?}",
+                spec.build_deps[2]
+            );
+        };
+        assert_eq!(fn_b, "b.txt");
+        assert_eq!(std::fs::read(fp_b).unwrap(), content_b);
+    }
+
+    // ── Cross-format tests ───────────────────────────────────────────────────
+
+    /// Sync write → async read: ensures both sides produce/consume the same bytes.
+    #[tokio::test]
+    async fn cross_sync_write_async_read_local_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let content = b"cross-format test data\n";
+        let fpath = tmp.path().join("cross.bin");
+        std::fs::write(&fpath, content).unwrap();
+
+        let mut graph = Graph::new();
+        let origin = Arc::new(SpecOrigin::Inline);
+        let bsr = graph.insert_build(BuildSpec {
+            name: "cross".into(),
+            build_deps: smallvec![BuildDep::Local {
+                full_path: fpath.clone(),
+                filename: "cross.bin".into(),
+                file_hash: blake3::hash(content),
+            }],
+            from: origin,
+            ..Default::default()
+        });
+        graph.top_levels = vec![bsr];
+
+        let (restored, td) = sync_write_async_read(&graph).await;
+        assert!(td.is_some());
+
+        let spec = restored.get(restored.by_name("cross").unwrap()).unwrap();
+        let BuildDep::Local {
+            full_path,
+            filename,
+            ..
+        } = &spec.build_deps[0]
+        else {
+            panic!("expected Local dep");
+        };
+        assert_eq!(filename, "cross.bin");
+        assert_eq!(std::fs::read(full_path).unwrap(), content);
+    }
+
+    /// Async write → sync read: ensures the async writer output is sync-readable.
+    #[tokio::test]
+    async fn cross_async_write_sync_read_local_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let content = b"async-to-sync payload\n";
+        let fpath = tmp.path().join("a2s.dat");
+        std::fs::write(&fpath, content).unwrap();
+
+        let mut graph = Graph::new();
+        let origin = Arc::new(SpecOrigin::Inline);
+        let bsr = graph.insert_build(BuildSpec {
+            name: "a2s".into(),
+            build_deps: smallvec![BuildDep::Local {
+                full_path: fpath.clone(),
+                filename: "a2s.dat".into(),
+                file_hash: blake3::hash(content),
+            }],
+            from: origin,
+            ..Default::default()
+        });
+        graph.top_levels = vec![bsr];
+
+        let (restored, td) = async_write_sync_read(&graph).await;
+        assert!(td.is_some());
+
+        let spec = restored.get(restored.by_name("a2s").unwrap()).unwrap();
+        let BuildDep::Local {
+            full_path,
+            filename,
+            ..
+        } = &spec.build_deps[0]
+        else {
+            panic!("expected Local dep");
+        };
+        assert_eq!(filename, "a2s.dat");
+        assert_eq!(std::fs::read(full_path).unwrap(), content);
+    }
+
+    /// Both formats produce identical bytes for the same graph.
+    #[tokio::test]
+    async fn sync_and_async_produce_identical_bytes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let content = b"determinism check\n";
+        let fpath = tmp.path().join("det.txt");
+        std::fs::write(&fpath, content).unwrap();
+
+        let mut graph = Graph::new();
+        let origin = Arc::new(SpecOrigin::Inline);
+        let bsr = graph.insert_build(BuildSpec {
+            name: "det".into(),
+            build_deps: smallvec![BuildDep::Local {
+                full_path: fpath.clone(),
+                filename: "det.txt".into(),
+                file_hash: blake3::hash(content),
+            }],
+            from: origin,
+            ..Default::default()
+        });
+        graph.top_levels = vec![bsr];
+
+        let mut sync_buf = Vec::new();
+        GraphWriter::new(&mut sync_buf).write_graph(&graph).unwrap();
+
+        let mut async_buf = Vec::new();
+        AsyncGraphWriter::new(&mut async_buf)
+            .write_graph(&graph)
+            .await
+            .unwrap();
+
+        assert_eq!(sync_buf, async_buf, "sync and async writers diverge");
+    }
+
+    /// Two specs each with a local file named "patch.diff" but different content.
+    /// Without per-file subdirectories the second write would clobber the first.
+    #[tokio::test]
+    async fn duplicate_filename_across_specs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let content_1 = b"first patch\n";
+        let content_2 = b"second patch\n";
+        let p1 = tmp.path().join("patch1.diff");
+        let p2 = tmp.path().join("patch2.diff");
+        std::fs::write(&p1, content_1).unwrap();
+        std::fs::write(&p2, content_2).unwrap();
+
+        let mut graph = Graph::new();
+        let origin = Arc::new(SpecOrigin::Inline);
+
+        let a = graph.insert_build(BuildSpec {
+            name: "a".into(),
+            build_deps: smallvec![BuildDep::Local {
+                full_path: p1.clone(),
+                filename: "patch.diff".into(),
+                file_hash: blake3::hash(content_1),
+            }],
+            from: origin.clone(),
+            ..Default::default()
+        });
+        let b = graph.insert_build(BuildSpec {
+            name: "b".into(),
+            build_deps: smallvec![BuildDep::Local {
+                full_path: p2.clone(),
+                filename: "patch.diff".into(),
+                file_hash: blake3::hash(content_2),
+            }],
+            from: origin,
+            ..Default::default()
+        });
+        graph.top_levels = vec![a, b];
+
+        // Test both sync and async readers
+        for label in ["sync", "async"] {
+            let (restored, td) = if label == "sync" {
+                roundtrip(&graph)
+            } else {
+                async_roundtrip(&graph).await
+            };
+            assert!(td.is_some(), "[{label}] should have materialised files");
+
+            let spec_a = restored.get(restored.by_name("a").unwrap()).unwrap();
+            let spec_b = restored.get(restored.by_name("b").unwrap()).unwrap();
+
+            let BuildDep::Local {
+                full_path: fp_a, ..
+            } = &spec_a.build_deps[0]
+            else {
+                panic!("[{label}] expected Local dep on spec a");
+            };
+            let BuildDep::Local {
+                full_path: fp_b, ..
+            } = &spec_b.build_deps[0]
+            else {
+                panic!("[{label}] expected Local dep on spec b");
+            };
+
+            // Paths must differ
+            assert_ne!(fp_a, fp_b, "[{label}] paths should be unique");
+
+            // Content must be correct (not swapped)
+            assert_eq!(
+                std::fs::read(fp_a).unwrap(),
+                content_1,
+                "[{label}] spec a has wrong file content"
+            );
+            assert_eq!(
+                std::fs::read(fp_b).unwrap(),
+                content_2,
+                "[{label}] spec b has wrong file content"
+            );
         }
     }
 }
