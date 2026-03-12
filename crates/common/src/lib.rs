@@ -17,7 +17,7 @@ pub use target::Target;
 
 use std::{
     env, fmt,
-    io::{self, Write},
+    io::{self, ErrorKind, Write},
     path::{Path, PathBuf},
     sync::{RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
@@ -563,4 +563,34 @@ pub fn get_available_ram_gb() -> Option<u64> {
         (None, None) => None,
     }
     .map(|v| v.floor() as u64)
+}
+
+/// Recursively removes the given directory, including setting permissions as writeable where needed.
+///
+/// Same as [std::fs::remove_dir_all] except it can also handle Golang cache directories.
+pub fn remove_dir_all<P: AsRef<Path>>(dir: P) -> Result<(), std::io::Error> {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    match fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+            // remove_dir_all will fail if files are set as non-writeable even
+            // if theres a path to delete them. Urgh. Only golang does this.
+            //
+            // We do the same thing as `go clean -modcache` to fix the horror of their
+            // making.
+            //
+            // https://cs.opensource.google/go/go/+/refs/tags/go1.25.7:src/cmd/go/internal/modfetch/fetch.go;l=426-438
+            for entry in walkdir::WalkDir::new(&dir) {
+                if let Ok(entry) = entry
+                    && entry.file_type().is_dir()
+                {
+                    fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o777)).ok();
+                }
+            }
+            // Try again
+            fs::remove_dir_all(dir)
+        }
+        Err(e) => Err(e),
+    }
 }

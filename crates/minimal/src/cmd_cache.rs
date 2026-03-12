@@ -101,7 +101,7 @@ fn cleanup_stale(kind: &str, entry: std::fs::DirEntry) -> Result<(), Error> {
     {
         // No such proc entry, therefore PID dead. Clean up directory.
         println!("Cleaning up stale {} {}", kind, s);
-        std::fs::remove_dir_all(entry.path())
+        common::remove_dir_all(entry.path())
             .map_err(|e| Error::IO("rm stale sandbox", entry.path(), e))?;
     }
 

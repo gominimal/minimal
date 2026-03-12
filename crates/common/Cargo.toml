@@ -18,9 +18,10 @@ blake3.workspace = true
 tracing.workspace = true
 
 copy_dir.workspace = true
+globset.workspace = true
 jaq-all.workspace = true
 shlex.workspace = true
-globset.workspace = true
+walkdir.workspace = true
 
 bzip2.workspace = true
 either.workspace = true
