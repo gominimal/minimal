@@ -162,7 +162,7 @@ mod tests {
 
     #[test]
     fn basic() {
-        let (term, mut program, _origin) = Loader::new(
+        let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
                 let {buildTest, ..} = import \"minimal.ncl\" in
@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn with_deps() {
-        let (term, mut program, _origin) = Loader::new(
+        let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
                 let {BuildSpec, HostPath, Test, ..} = import \"minimal.ncl\" in

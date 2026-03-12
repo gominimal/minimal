@@ -149,6 +149,7 @@ fn build_decls_in_dir<P: AsRef<Path>>(
 pub(crate) struct Loader {
     p: Program<CacheImpl>,
     from: SpecOrigin,
+    for_target: Target,
     minimal_lib_path: PathBuf,
     last_id: u64,
 
@@ -188,6 +189,7 @@ impl Loader {
         let mut out = Self {
             p: program,
             from: opts.from.clone(),
+            for_target: opts.for_target().clone(),
             last_id: 0,
             minimal_lib_path: opts.minimal_lib_path.canonicalize()?,
             generated_lib_dir,
@@ -332,13 +334,18 @@ impl Loader {
     }
 
     /// Destroys the loader, returning the outputs of processing (the nickel tree, where it came from).
-    pub fn finish(self) -> Result<(RichTerm, Program<CacheImpl>, SpecOrigin), Error> {
-        let Self { mut p, from, .. } = self;
+    pub fn finish(self) -> Result<(RichTerm, Program<CacheImpl>, SpecOrigin, Target), Error> {
+        let Self {
+            mut p,
+            from,
+            for_target,
+            ..
+        } = self;
         let root_term = p
             .eval_record_spine()
             .map_err(|e| Error::Nickel(Box::new((p.files(), e))))?;
 
-        Ok((root_term, p, from))
+        Ok((root_term, p, from, for_target))
     }
 }
 

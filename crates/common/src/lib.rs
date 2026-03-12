@@ -82,10 +82,13 @@ impl SpecOrigin {
         }
     }
 
-    /// Returns a hashed hex representation suitable as a cache key.
-    pub fn hash_hex(&self) -> impl AsRef<str> {
+    /// Returns a hashed hex representation of the origin + target, suitable as a cache key.
+    pub fn hash_hex(&self, target: &Target) -> impl AsRef<str> {
         let origin_bytes = serde_json::to_vec(self).unwrap();
-        blake3::hash(&origin_bytes).to_hex()
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&origin_bytes);
+        target.hash_to(&mut hasher);
+        hasher.finalize().to_hex()
     }
 }
 

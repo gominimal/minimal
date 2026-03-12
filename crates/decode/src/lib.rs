@@ -4,7 +4,7 @@
 //! packages/profiles/harnesses, then evaluating the resulting Nickel to decode them
 //! into in-memory structures.
 
-use common::SpecOrigin;
+use common::{SpecOrigin, Target};
 use generational_arena::Arena;
 use mfile::{EnvPatches, LinkConfig, PatchSetting};
 use nickel_lang_core::identifier::LocIdent;
@@ -60,6 +60,7 @@ impl TryFrom<TermPos> for StrPos {
 pub struct Layer {
     upstream: Option<LinkConfig>,
     pub origin: SpecOrigin,
+    pub for_target: Target,
 
     pub builds: Arena<BuildDecl>,
     pub top_levels: Vec<generational_arena::Index>,
@@ -146,10 +147,11 @@ impl Layer {
     }
 
     fn from_loader(loader: load::Loader, upstream: Option<LinkConfig>) -> Result<Self, Error> {
-        let (ncl_tree, mut program, origin) = loader.finish()?;
+        let (ncl_tree, mut program, origin, for_target) = loader.finish()?;
         let mut layer = Self {
             origin,
             upstream,
+            for_target,
             top_levels: Vec::new(),
             builds: Arena::with_capacity(512),
             read_ids: HashMap::with_capacity(512),

@@ -1213,7 +1213,7 @@ mod tests {
 
     #[test]
     fn source_input() {
-        let (term, mut program, _origin) = Loader::new(
+        let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
                 let {Source, ..} = import \"minimal.ncl\" in
@@ -1250,7 +1250,7 @@ mod tests {
         let path = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
             .join("testdata/local_input.ncl");
 
-        let (term, mut program, _origin) = Loader::new(
+        let (term, mut program, _origin, _target) = Loader::new(
             format!("import \"{}\"", path.to_str().unwrap()),
             &LoadOptions::for_test(),
         )
@@ -1274,7 +1274,7 @@ mod tests {
 
     #[test]
     fn hostpath_input() {
-        let (term, mut program, _origin) = Loader::new(
+        let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
                 let {HostPath, ..} = import \"minimal.ncl\" in
@@ -1304,7 +1304,7 @@ mod tests {
 
     #[test]
     fn subset_input() {
-        let (term, mut program, _origin) = Loader::new(
+        let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
                 let {Subset, BuildSpec, OutputData, ..} = import \"minimal.ncl\" in
@@ -1342,7 +1342,7 @@ mod tests {
 
     #[test]
     fn build_simple() {
-        let (term, mut program, _origin) = Loader::new(
+        let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
                 let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
@@ -1399,7 +1399,7 @@ mod tests {
 
     #[test]
     fn build_cmd_as_array() {
-        let (term, mut program, _origin) = Loader::new(
+        let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
                 let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
@@ -1432,7 +1432,7 @@ mod tests {
     }
     #[test]
     fn build_cmds() {
-        let (term, mut program, _origin) = Loader::new(
+        let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
                 let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
@@ -1471,7 +1471,7 @@ mod tests {
     }
     #[test]
     fn build_tests() {
-        let (term, mut program, _origin) = Loader::new(
+        let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
                 let {standaloneTest, BuildSpec, ..} = import \"minimal.ncl\" in
@@ -1508,7 +1508,7 @@ mod tests {
 
     #[test]
     fn parse_target() {
-        let (term, mut program, _origin) = Loader::new(
+        let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
                 let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
@@ -1539,7 +1539,7 @@ mod tests {
 
     #[test]
     fn outputs() {
-        let (term, mut program, _origin) = Loader::new(
+        let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
                 let {OutputLib, OutputData, OutputBin, ..} = import \"minimal.ncl\" in
@@ -1600,7 +1600,7 @@ mod tests {
 
     #[test]
     fn parse_attrs() {
-        let (term, mut program, _origin) = Loader::new(
+        let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
                 let {Attrs, BuildSpec, ..} = import \"minimal.ncl\" in
@@ -1639,7 +1639,7 @@ mod tests {
 
     #[test]
     fn parse_needs() {
-        let (term, mut program, _origin) = Loader::new(
+        let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
                 let {Needs, BuildSpec, ..} = import \"minimal.ncl\" in
@@ -1678,7 +1678,7 @@ mod tests {
 
     #[test]
     fn parse_upstream() {
-        let (term, mut program, _origin) = Loader::new(
+        let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
                 let {upstream, BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in

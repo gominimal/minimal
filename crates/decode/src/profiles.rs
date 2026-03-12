@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn parse() {
-        let (term, mut program, _origin) = Loader::new(
+        let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
                 let {profile, ..} = import \"minimal.ncl\" in

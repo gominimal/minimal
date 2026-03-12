@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn parse_str() {
-        let (term, mut program, _origin) = Loader::new("\"a\"", &LoadOptions::for_test())
+        let (term, mut program, _origin, _target) = Loader::new("\"a\"", &LoadOptions::for_test())
             .unwrap_or_else(|e| {
                 e.report_to_stderr();
                 panic!("load failed");
@@ -133,7 +133,7 @@ mod tests {
     }
     #[test]
     fn parse_bool() {
-        let (term, mut program, _origin) = Loader::new("true", &LoadOptions::for_test())
+        let (term, mut program, _origin, _target) = Loader::new("true", &LoadOptions::for_test())
             .unwrap_or_else(|e| {
                 e.report_to_stderr();
                 panic!("load failed");
@@ -151,7 +151,7 @@ mod tests {
     }
     #[test]
     fn parse_enum() {
-        let (term, mut program, _origin) = Loader::new("'Uwu", &LoadOptions::for_test())
+        let (term, mut program, _origin, _target) = Loader::new("'Uwu", &LoadOptions::for_test())
             .unwrap_or_else(|e| {
                 e.report_to_stderr();
                 panic!("load failed");
@@ -170,16 +170,17 @@ mod tests {
 
     #[test]
     fn parse_record() {
-        let (term, mut program, _origin) = Loader::new("{key = \"a\"}", &LoadOptions::for_test())
-            .unwrap_or_else(|e| {
-                e.report_to_stderr();
-                panic!("load failed");
-            })
-            .finish()
-            .unwrap_or_else(|e| {
-                e.report_to_stderr();
-                panic!("finish failed");
-            });
+        let (term, mut program, _origin, _target) =
+            Loader::new("{key = \"a\"}", &LoadOptions::for_test())
+                .unwrap_or_else(|e| {
+                    e.report_to_stderr();
+                    panic!("load failed");
+                })
+                .finish()
+                .unwrap_or_else(|e| {
+                    e.report_to_stderr();
+                    panic!("finish failed");
+                });
 
         let result = AttrValue::from_term(&term, &mut program).unwrap().unwrap();
         let map = result.as_map().unwrap();
@@ -189,16 +190,17 @@ mod tests {
 
     #[test]
     fn parse_list() {
-        let (term, mut program, _origin) = Loader::new("[\"a\", \"b\"]", &LoadOptions::for_test())
-            .unwrap_or_else(|e| {
-                e.report_to_stderr();
-                panic!("load failed");
-            })
-            .finish()
-            .unwrap_or_else(|e| {
-                e.report_to_stderr();
-                panic!("finish failed");
-            });
+        let (term, mut program, _origin, _target) =
+            Loader::new("[\"a\", \"b\"]", &LoadOptions::for_test())
+                .unwrap_or_else(|e| {
+                    e.report_to_stderr();
+                    panic!("load failed");
+                })
+                .finish()
+                .unwrap_or_else(|e| {
+                    e.report_to_stderr();
+                    panic!("finish failed");
+                });
 
         let result = AttrValue::from_term(&term, &mut program).unwrap().unwrap();
         let list = result.as_list().unwrap();

@@ -244,7 +244,11 @@ pub trait LayerCache {
     type Error: std::fmt::Debug;
 
     fn insert(&mut self, origin: SpecOrigin, layer: &Layer) -> Result<(), Self::Error>;
-    fn get(&mut self, origin: &SpecOrigin) -> Result<Option<Layer>, Self::Error>;
+    fn get(
+        &mut self,
+        origin: &SpecOrigin,
+        for_target: &Target,
+    ) -> Result<Option<Layer>, Self::Error>;
 }
 
 impl LayerCache for () {
@@ -253,7 +257,11 @@ impl LayerCache for () {
     fn insert(&mut self, _origin: SpecOrigin, _layer: &Layer) -> Result<(), Self::Error> {
         Ok(())
     }
-    fn get(&mut self, _origin: &SpecOrigin) -> Result<Option<Layer>, Self::Error> {
+    fn get(
+        &mut self,
+        _origin: &SpecOrigin,
+        _for_target: &Target,
+    ) -> Result<Option<Layer>, Self::Error> {
         Ok(None)
     }
 }
@@ -270,7 +278,7 @@ impl LayerCache for LayerCacheDir {
             return Ok(());
         }
 
-        let p = self.0.join(origin.hash_hex().as_ref());
+        let p = self.0.join(origin.hash_hex(&layer.for_target).as_ref());
         if std::fs::exists(&p).unwrap_or(false) {
             return Ok(());
         }
@@ -290,8 +298,8 @@ impl LayerCache for LayerCacheDir {
 
         Ok(())
     }
-    fn get(&mut self, origin: &SpecOrigin) -> Result<Option<Layer>, Self::Error> {
-        let p = self.0.join(origin.hash_hex().as_ref());
+    fn get(&mut self, origin: &SpecOrigin, target: &Target) -> Result<Option<Layer>, Self::Error> {
+        let p = self.0.join(origin.hash_hex(target).as_ref());
 
         if let Ok(f) = std::fs::File::open(p) {
             Ok(Some(serde_json::from_reader(f).map_err(|e| {
@@ -446,7 +454,7 @@ impl Graph {
 
             // Load the layer, either from the layer cache or by doing a full load via [Layer::new].
             let layer = if let Some(layer) = lc
-                .get(&upstream)
+                .get(&upstream, &for_target)
                 .map_err(|e| Error::Fetch(format!("layer-cache fetch: {:?}", e)))?
             {
                 layer
