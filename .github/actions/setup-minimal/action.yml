@@ -10,12 +10,6 @@ runs:
         remove_android: true
         remove_dotnet: true
         remove_haskell: true
-    - name: Cache Minimal binary
-      id: cache-minimal
-      uses: actions/cache@v5
-      with:
-        path: ~/.minimal
-        key: minimal-bin-v2-${{ runner.os }}
     - name: Install Minimal
       if: steps.cache-minimal.outputs.cache-hit != 'true'
       shell: bash
