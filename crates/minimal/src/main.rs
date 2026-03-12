@@ -44,7 +44,7 @@ mod cmd_rexec;
 use cmd_rexec::{RexecArgs, cmd_rexec};
 
 #[derive(Parser)]
-#[command(name = "minimal", version = env!("GIT_HASH"))]
+#[command(name = "minimal", version = env!("CARGO_PKG_VERSION"), long_version = env!("LONG_VERSION"))]
 #[command(about = "The Minimal CLI")]
 struct Cli {
     #[command(subcommand)]
