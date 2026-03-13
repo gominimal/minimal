@@ -20,7 +20,7 @@ impl Repo {
         let url = url.into();
         let base = base.into();
 
-        if base.exists() {
+        if base.join("HEAD").exists() {
             // Double-check its the right remote
             let output = Command::new("git")
                 .args(["remote", "get-url", "origin"])
