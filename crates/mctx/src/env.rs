@@ -7,6 +7,7 @@ use std::{
 };
 
 use crate::{AddDepMode, Context, Error};
+use common::FsMapping;
 use futures::stream::StreamExt;
 use graph::{BuildSpecRef, Graph, SetupForPackages, Transitives, TransitivesDep};
 use mfile::{EnvPatches, EnvVarValue};
@@ -494,9 +495,45 @@ impl<'a> Env<'a> {
                     .collect::<Result<Vec<_>, _>>()?,
             );
         }
+        let fs_mappings: Vec<FsMapping> = patch.into();
+
+        let llm_inject_dir = ctx
+            .local_cache()
+            .temp_dir()
+            .map_err(|e| Error::Other(anyhow::anyhow!("making temp dir: {}", e)))?;
+        {
+            // Create or upsert the CLAUDE.md.
+            let claude_md = llm_inject_dir.path().join("CLAUDE.md");
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&claude_md)
+                .map_err(|e| Error::IO("open CLAUDE.md", claude_md.clone(), e))?;
+            if let Ok(data) = std::fs::read(args.cwd.join("CLAUDE.md")) {
+                f.write_all(&data)
+                    .map_err(|e| Error::IO("prefill CLAUDE.md", claude_md.clone(), e))?;
+            }
+            f.write_all(LLM_APPEND_INSTRUCTIONS.as_bytes())
+                .map_err(|e| Error::IO("write CLAUDE.md", claude_md.clone(), e))?;
+
+            // TODO: Uncomment once fixed: https://github.com/souk4711/hakoniwa/issues/136
+            // let sandbox_path = args.cwd.join("CLAUDE.md");
+            // let already_patched_by_user = fs_mappings
+            //     .iter()
+            //     .any(|m| m.host_path == sandbox_path.to_str().unwrap());
+            // if !already_patched_by_user {
+            //     fs_mappings.push(FsMapping {
+            //         host_path: claude_md.to_str().unwrap().to_string(),
+            //         is_file: true,
+            //         read_only: true,
+            //         create_if_missing: false,
+            //         sandbox_path: Some(sandbox_path.to_str().unwrap().to_string()),
+            //     });
+            // }
+        }
 
         let mut config = sandbox2::config::Config::new(args.name)
-            .with_wd(args.cwd, false, patch.into())
+            .with_wd(args.cwd, false, fs_mappings)
             .with_rootfs(
                 args.transitives
                     .keys()
@@ -541,14 +578,14 @@ impl<'a> Env<'a> {
                 Error::IO("creating state dir", args.state_base_dir.join(want_dir), e)
             })?;
         }
-        install_min_script(sandbox.rootfs())
-            .map_err(|e| Error::IO("installing min script", sandbox.rootfs(), e))?;
+        install_min_helpers(sandbox.rootfs())
+            .map_err(|e| Error::IO("installing min helpers", sandbox.rootfs(), e))?;
 
         sandbox.keep_dir(false);
 
         Ok(Env {
             sandbox,
-            temp_dirs: vec![],
+            temp_dirs: vec![llm_inject_dir],
         })
     }
 
@@ -610,7 +647,7 @@ impl<'a> Env<'a> {
     }
 }
 
-fn install_min_script(rootfs: PathBuf) -> Result<(), std::io::Error> {
+fn install_min_helpers(rootfs: PathBuf) -> Result<(), std::io::Error> {
     let usr_bin = rootfs.join("usr").join("bin");
     std::fs::create_dir_all(&usr_bin)?;
 
@@ -623,22 +660,10 @@ fn install_min_script(rootfs: PathBuf) -> Result<(), std::io::Error> {
     let etc = rootfs.join("etc");
     std::fs::create_dir_all(&etc)?;
 
-    // Append to /etc/bashrc (or create it)
-    let bashrc = etc.join("bashrc");
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&bashrc)?
-        .write_all(MIN_BASHRC_SNIPPET.as_bytes())?;
-
     Ok(())
 }
 
-pub const MIN_BASHRC_SNIPPET: &str = r#"
-
-# minimal: in-sandbox package addition
-min() { eval "$(/usr/bin/min "$@")"; }
-"#;
+const LLM_APPEND_INSTRUCTIONS: &str = include_str!("llm_append_instructions.txt");
 
 const MIN_SCRIPT: &str = include_str!("min_helper.sh");
 
