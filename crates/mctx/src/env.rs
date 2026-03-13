@@ -495,7 +495,7 @@ impl<'a> Env<'a> {
                     .collect::<Result<Vec<_>, _>>()?,
             );
         }
-        let fs_mappings: Vec<FsMapping> = patch.into();
+        let mut fs_mappings: Vec<FsMapping> = patch.into();
 
         let llm_inject_dir = ctx
             .local_cache()
@@ -516,20 +516,19 @@ impl<'a> Env<'a> {
             f.write_all(LLM_APPEND_INSTRUCTIONS.as_bytes())
                 .map_err(|e| Error::IO("write CLAUDE.md", claude_md.clone(), e))?;
 
-            // TODO: Uncomment once fixed: https://github.com/souk4711/hakoniwa/issues/136
-            // let sandbox_path = args.cwd.join("CLAUDE.md");
-            // let already_patched_by_user = fs_mappings
-            //     .iter()
-            //     .any(|m| m.host_path == sandbox_path.to_str().unwrap());
-            // if !already_patched_by_user {
-            //     fs_mappings.push(FsMapping {
-            //         host_path: claude_md.to_str().unwrap().to_string(),
-            //         is_file: true,
-            //         read_only: true,
-            //         create_if_missing: false,
-            //         sandbox_path: Some(sandbox_path.to_str().unwrap().to_string()),
-            //     });
-            // }
+            let sandbox_path = args.cwd.join("CLAUDE.md");
+            let already_patched_by_user = fs_mappings
+                .iter()
+                .any(|m| m.host_path == sandbox_path.to_str().unwrap());
+            if !already_patched_by_user {
+                fs_mappings.push(FsMapping {
+                    host_path: claude_md.to_str().unwrap().to_string(),
+                    is_file: true,
+                    read_only: true,
+                    create_if_missing: false,
+                    sandbox_path: Some(sandbox_path.to_str().unwrap().to_string()),
+                });
+            }
         }
 
         let mut config = sandbox2::config::Config::new(args.name)
