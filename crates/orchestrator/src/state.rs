@@ -588,10 +588,10 @@ mod tests {
             .to_string(),
         );
         // So we can see the actual error when parsing fails
-        layer.as_ref().err().into_iter().for_each(|e| {
+        if let Some(e) = layer.as_ref().err().into_iter().next() {
             e.report_to_stderr();
             panic!("spec parsing failed");
-        });
+        };
         let layer = layer.unwrap();
 
         let dp = Graph::new().ingest(layer).unwrap();
@@ -716,10 +716,10 @@ mod tests {
             .to_string(),
         );
         // So we can see the actual error when parsing fails
-        layer.as_ref().err().into_iter().for_each(|e| {
+        if let Some(e) = layer.as_ref().err().into_iter().next() {
             e.report_to_stderr();
             panic!("spec parsing failed");
-        });
+        };
         let layer = layer.unwrap();
 
         let dp = Graph::new().ingest(layer).unwrap();
