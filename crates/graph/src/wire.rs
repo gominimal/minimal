@@ -337,7 +337,7 @@ impl<W: Write> GraphWriter<W> {
 ///
 /// Use this to control *where* materialised local files land (e.g. to ensure
 /// they live on the same filesystem as the build cache so hard-links work).
-pub type TempDirFactory = Box<dyn Fn() -> io::Result<tempfile::TempDir>>;
+pub type TempDirFactory = Box<dyn Fn() -> io::Result<tempfile::TempDir> + Send>;
 
 /// Reads a [`Graph`] from any [`Read`] source using the streaming wire format.
 pub struct GraphReader<R: Read> {
@@ -359,7 +359,7 @@ impl<R: Read> GraphReader<R> {
     /// materialise local files.  When unset, [`tempfile::TempDir::new`] is used.
     pub fn with_tempdir_factory(
         mut self,
-        factory: impl Fn() -> io::Result<tempfile::TempDir> + 'static,
+        factory: impl Fn() -> io::Result<tempfile::TempDir> + Send + 'static,
     ) -> Self {
         self.tempdir_factory = Some(Box::new(factory));
         self
@@ -560,7 +560,7 @@ fn materialize_local_file(
     payload: &[u8],
     temp_dir: &mut Option<tempfile::TempDir>,
     file_counter: &mut usize,
-    tempdir_factory: Option<&dyn Fn() -> io::Result<tempfile::TempDir>>,
+    tempdir_factory: Option<&(dyn Fn() -> io::Result<tempfile::TempDir> + Send)>,
 ) -> Result<PathBuf, WireError> {
     let mut cursor = io::Cursor::new(payload);
     let header_len = decode_varint(&mut cursor)? as usize;
@@ -814,7 +814,7 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
     /// materialise local files.  When unset, [`tempfile::TempDir::new`] is used.
     pub fn with_tempdir_factory(
         mut self,
-        factory: impl Fn() -> io::Result<tempfile::TempDir> + 'static,
+        factory: impl Fn() -> io::Result<tempfile::TempDir> + Send + 'static,
     ) -> Self {
         self.tempdir_factory = Some(Box::new(factory));
         self
