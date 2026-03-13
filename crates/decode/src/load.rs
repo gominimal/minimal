@@ -441,10 +441,10 @@ mod tests {
         );
 
         // So we can see the actual error when the test fails
-        sr.as_ref().err().iter().for_each(|e| {
+        if let Some(e) = sr.as_ref().err().iter().next() {
             e.report_to_stderr();
             panic!();
-        });
+        }
 
         let sr = sr.unwrap();
         assert_eq!(sr.last_id, 1); // single increment for one build spec
@@ -470,10 +470,10 @@ mod tests {
         );
 
         // So we can see the actual error when the test fails
-        sr.as_ref().err().iter().for_each(|e| {
+        if let Some(e) = sr.as_ref().err().iter().next() {
             e.report_to_stderr();
             panic!();
-        });
+        }
 
         let sr = sr.unwrap();
         assert_eq!(sr.last_id, 2); // two build specs
@@ -539,10 +539,10 @@ mod tests {
 
         let sr = Loader::new_with_all_pkgs(temp_dir.path(), &LoadOptions::for_test());
         // So we can see the actual error when the test fails
-        sr.as_ref().err().iter().for_each(|e| {
+        if let Some(e) = sr.as_ref().err().iter().next() {
             e.report_to_stderr();
             panic!();
-        });
+        }
 
         let mut sr = sr.unwrap();
         assert_eq!(sr.last_id, 3); // three build specs
