@@ -283,6 +283,7 @@ impl Container {
 
         command.env("LANG", "en_US.utf8");
         command.env("LC_ALL", "en_US.utf8");
+        command.env("IS_SANDBOX", "1");
         if let WdSetup::BoundDir { .. } = sandbox.config.wd {
             //  Quality-of-life wiring for task sandboxes
             if let Ok(term) = std::env::var("TERM") {
