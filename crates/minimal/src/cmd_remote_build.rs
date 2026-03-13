@@ -15,6 +15,10 @@ pub struct RemoteBuildArgs {
     #[arg(long, default_value_t = false)]
     pub verbose: bool,
 
+    /// Commit successful builds to the cache on the remote server
+    #[arg(long, default_value_t = false)]
+    pub commit: bool,
+
     /// Packages to build
     #[arg(long, short, required = true, num_args = 1..)]
     pub packages: Vec<String>,
@@ -29,7 +33,7 @@ pub async fn cmd_remote_build(args: RemoteBuildArgs, ctx: &mut Context) -> Resul
         .map_err(|e| Error::Other(anyhow!("failed to connect to {}: {}", args.addr, e)))?;
 
     client
-        .build(args.verbose)
+        .build(args.verbose, args.commit)
         .await
         .map_err(|e| Error::Other(anyhow!("remote build failed: {:?}", e)))?;
 

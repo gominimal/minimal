@@ -193,7 +193,7 @@ where
     pub async fn exec<'b>(
         &mut self,
         env: &Env<'b>,
-        args: &RemoteArgs,
+        args: &ExecArgs,
         mut stdout: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
         mut stderr: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
     ) -> Result<u32, Error> {
@@ -242,7 +242,7 @@ where
         Ok(exit_code)
     }
 
-    pub async fn build(&mut self, verbose: bool) -> Result<(), Error> {
+    pub async fn build(&mut self, verbose: bool, commit_results: bool) -> Result<(), Error> {
         use orchestrate_build_message::*;
         let client_id = format!(
             "{}-{}",
@@ -284,6 +284,7 @@ where
                     client_id,
                     graph_stream: Some(graph_config),
                     verbose,
+                    commit: commit_results,
                 })),
             }
         });
@@ -308,6 +309,13 @@ where
 
         while let Some(msg) = rpc.next().await {
             let msg = msg.map_err(|e| Error::Other(e.into()))?;
+
+            if let Some(orchestrate_build_response::Msg::Err(e)) = msg.msg {
+                return Err(Error::Other(
+                    anyhow!("orchestration failed: {}", e.msg).into(),
+                ));
+            }
+
             println!("msg: {:?}", msg);
         }
 
@@ -316,7 +324,7 @@ where
 }
 
 /// The configuration describing an execution in a remote environment.
-pub struct RemoteArgs {
+pub struct ExecArgs {
     pub packages: Vec<String>,
     pub args: Vec<String>,
     pub env_vars: HashMap<String, String>,
@@ -549,7 +557,7 @@ mod tests {
             cwd: Worktree::Ephemeral,
             server_id: "test-server".into(),
         };
-        let args = RemoteArgs {
+        let args = ExecArgs {
             packages: vec!["base".into(), "bash".into()],
             args: vec![],
             env_vars: HashMap::new(),

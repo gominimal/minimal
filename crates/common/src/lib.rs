@@ -554,7 +554,7 @@ fn get_physical_ram_gb() -> Option<f64> {
 }
 
 /// Returns the amount of RAM in gigabytes available on the system to this process.
-pub fn get_available_ram_gb() -> Option<u64> {
+fn get_available_ram_gb() -> Option<u64> {
     let cgroup = get_cgroup_limit_gb();
     let physical = get_physical_ram_gb();
 
@@ -596,4 +596,30 @@ pub fn remove_dir_all<P: AsRef<Path>>(dir: P) -> Result<(), std::io::Error> {
         }
         Err(e) => Err(e),
     }
+}
+
+/// Returns the suggested number of parallel builds to run based on the number of cores and system memory.
+pub fn default_parallelism() -> usize {
+    let rough_threadcount = std::thread::available_parallelism().unwrap().get();
+    let para_by_cpu = match rough_threadcount {
+        0..=3 => 1,
+        4..=7 => 2,
+        8..=11 => 3,
+        12..=14 => 4,
+        15..=18 => 5,
+        19..=21 => 6,
+        22..=24 => 7,
+        _ => (rough_threadcount - 24) / 4 + 8,
+    };
+
+    let para_by_mem = get_available_ram_gb().map(|gbs| match gbs {
+        0..=6 => 1,
+        7..=12 => 2,
+        13..=19 => 3,
+        _ => gbs / 5,
+    });
+
+    para_by_mem
+        .map(|m| (m as usize).min(para_by_cpu))
+        .unwrap_or(para_by_cpu)
 }

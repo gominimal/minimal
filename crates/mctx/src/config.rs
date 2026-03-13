@@ -87,7 +87,9 @@ impl ConfigBuilder {
         Ok(Config {
             no_cache: self.no_cache.unwrap_or(false),
             no_fetch: self.no_fetch.unwrap_or(false),
-            num_parallel_builds: self.num_parallel_builds.unwrap_or_else(default_parallelism),
+            num_parallel_builds: self
+                .num_parallel_builds
+                .unwrap_or_else(common::default_parallelism),
 
             minimal_dir: self.minimal_dir.unwrap_or_else(|| {
                 dirs::cache_dir()
@@ -99,31 +101,6 @@ impl ConfigBuilder {
             vcs_manager: self.vcs_manager,
         })
     }
-}
-
-fn default_parallelism() -> usize {
-    let rough_threadcount = std::thread::available_parallelism().unwrap().get();
-    let para_by_cpu = match rough_threadcount {
-        0..=3 => 1,
-        4..=7 => 2,
-        8..=11 => 3,
-        12..=14 => 4,
-        15..=18 => 5,
-        19..=21 => 6,
-        22..=24 => 7,
-        _ => (rough_threadcount - 24) / 4 + 8,
-    };
-
-    let para_by_mem = common::get_available_ram_gb().map(|gbs| match gbs {
-        0..=6 => 1,
-        7..=12 => 2,
-        13..=19 => 3,
-        _ => gbs / 5,
-    });
-
-    para_by_mem
-        .map(|m| (m as usize).min(para_by_cpu))
-        .unwrap_or(para_by_cpu)
 }
 
 /// Configuration for a [super::Context].

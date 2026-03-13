@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use anyhow::anyhow;
 use mctx::{Context, Error};
-use remote_client::{Client, RemoteArgs, Worktree};
+use remote_client::{Client, ExecArgs, Worktree};
 use tracing::trace;
 
 #[derive(Debug, clap::Args)]
@@ -46,7 +46,7 @@ pub async fn cmd_rexec(args: RexecArgs, ctx: &mut Context) -> Result<(), Error> 
         .await
         .map_err(|e| Error::Other(anyhow!("failed to create remote environment: {:?}", e)))?;
 
-    let remote_args = RemoteArgs {
+    let remote_args = ExecArgs {
         packages: args.packages,
         args: args.args,
         env_vars: HashMap::new(),

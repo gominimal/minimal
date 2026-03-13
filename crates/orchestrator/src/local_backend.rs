@@ -19,23 +19,31 @@ use crate::Error;
 
 /// A single line of build output.
 #[derive(Debug, Clone)]
-pub struct BuildLogLine {
-    pub is_stderr: bool,
-    pub name: String,
-    pub line: String,
+pub enum BuildEvent {
+    Log {
+        is_stderr: bool,
+        name: String,
+        line: String,
+    },
+    Start {
+        name: String,
+    },
+    Stop {
+        name: String,
+    },
 }
 
 /// An [`tokio::io::AsyncWrite`] adapter that buffers bytes and sends complete
 /// lines as [`BuildLogLine`] items through an [`mpsc::UnboundedSender`].
 struct SinkWriter {
-    sender: mpsc::UnboundedSender<BuildLogLine>,
+    sender: mpsc::UnboundedSender<BuildEvent>,
     name: String,
     is_stderr: bool,
     buf: Vec<u8>,
 }
 
 impl SinkWriter {
-    fn new(sender: mpsc::UnboundedSender<BuildLogLine>, name: String, is_stderr: bool) -> Self {
+    fn new(sender: mpsc::UnboundedSender<BuildEvent>, name: String, is_stderr: bool) -> Self {
         Self {
             sender,
             name,
@@ -47,7 +55,7 @@ impl SinkWriter {
     fn emit_lines(&mut self) {
         while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
             let line = String::from_utf8_lossy(&self.buf[..pos]).into_owned();
-            let _ = self.sender.unbounded_send(BuildLogLine {
+            let _ = self.sender.unbounded_send(BuildEvent::Log {
                 is_stderr: self.is_stderr,
                 name: self.name.clone(),
                 line,
@@ -59,7 +67,7 @@ impl SinkWriter {
     fn emit_remaining(&mut self) {
         if !self.buf.is_empty() {
             let line = String::from_utf8_lossy(&self.buf).into_owned();
-            let _ = self.sender.unbounded_send(BuildLogLine {
+            let _ = self.sender.unbounded_send(BuildEvent::Log {
                 is_stderr: self.is_stderr,
                 name: self.name.clone(),
                 line,
@@ -110,7 +118,7 @@ pub struct LocalBackend<SF: SourceFetcher + 'static> {
     pub(crate) remote_cache: Option<RemoteCache<GcsStorage>>,
     pub(crate) build_semaphore: Semaphore,
     pub(crate) num_concurrent_builds: usize,
-    pub(crate) log_sink: Option<mpsc::UnboundedSender<BuildLogLine>>,
+    pub(crate) log_sink: Option<mpsc::UnboundedSender<BuildEvent>>,
 }
 
 impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
@@ -164,6 +172,10 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                 .unwrap();
             let log_sink = shared.backend.log_sink.clone();
             let name = shared.graph.get(&bsr).unwrap().name.clone();
+            log_sink.as_ref().iter().for_each(|s| {
+                s.unbounded_send(BuildEvent::Start { name: name.clone() })
+                    .ok();
+            });
             let mut b = op::SpecBuild {
                 override_deps: Some(dep_paths.into_iter().collect()),
                 spec: &bsr,
@@ -187,6 +199,10 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                     exec_base: shared.backend.output_base.clone(),
                 })
                 .await;
+            log_sink.as_ref().iter().for_each(|s| {
+                s.unbounded_send(BuildEvent::Stop { name: name.clone() })
+                    .ok();
+            });
             drop(permit);
             drop(shared);
             res
@@ -334,7 +350,7 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
         num_concurrent_builds: usize,
         graph: Graph,
         cache: Cache<LocalDir>,
-        log_sink: Option<mpsc::UnboundedSender<BuildLogLine>>,
+        log_sink: Option<mpsc::UnboundedSender<BuildEvent>>,
     ) -> Result<Orchestrator<Self>, Error> {
         Ok(Orchestrator {
             top_levels,

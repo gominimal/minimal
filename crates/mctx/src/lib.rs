@@ -415,7 +415,7 @@ impl Context {
     pub async fn build_graph(
         &mut self,
         graph: &Graph,
-        log_sink: Option<futures::channel::mpsc::UnboundedSender<orchestrator::BuildLogLine>>,
+        log_sink: Option<futures::channel::mpsc::UnboundedSender<orchestrator::BuildEvent>>,
     ) -> Result<(), Error> {
         let cache = self.local_cache();
         let rc = if self.config.use_remote_cache() {

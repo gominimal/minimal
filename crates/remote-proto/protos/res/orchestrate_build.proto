@@ -21,6 +21,8 @@ message OrchestrateBuildRequest {
   StreamConfig graph_stream = 2;
   // Stream back stderr/stdout for all builds.
   bool verbose = 3;
+  // Save the build outputs to the local cache.
+  bool commit = 4;
 }
 
 message OrchestrateBuildResponse {
@@ -47,6 +49,9 @@ message OrchestrateBuildResponse {
     // The Log line itself.
     string line = 3;
   }
+  message OrchestrationError {
+    string msg = 1;
+  }
 
   oneof msg {
     // The initial response of the RPC. May only be sent as the first message.
@@ -55,5 +60,6 @@ message OrchestrateBuildResponse {
     Event event = 2;
     // Some output is being streamed back by a build.
     LogLine line = 3;
+    OrchestrationError err = 4;
   }
 }
