@@ -333,10 +333,17 @@ impl<W: Write> GraphWriter<W> {
 
 // ── GraphReader (sync) ──────────────────────────────────────────────────────
 
+/// Factory callback that produces a [`tempfile::TempDir`].
+///
+/// Use this to control *where* materialised local files land (e.g. to ensure
+/// they live on the same filesystem as the build cache so hard-links work).
+pub type TempDirFactory = Box<dyn Fn() -> io::Result<tempfile::TempDir>>;
+
 /// Reads a [`Graph`] from any [`Read`] source using the streaming wire format.
 pub struct GraphReader<R: Read> {
     reader: R,
     hasher: blake3::Hasher,
+    tempdir_factory: Option<TempDirFactory>,
 }
 
 impl<R: Read> GraphReader<R> {
@@ -344,7 +351,18 @@ impl<R: Read> GraphReader<R> {
         Self {
             reader,
             hasher: blake3::Hasher::new(),
+            tempdir_factory: None,
         }
+    }
+
+    /// Sets a custom factory for creating the [`tempfile::TempDir`] used to
+    /// materialise local files.  When unset, [`tempfile::TempDir::new`] is used.
+    pub fn with_tempdir_factory(
+        mut self,
+        factory: impl Fn() -> io::Result<tempfile::TempDir> + 'static,
+    ) -> Self {
+        self.tempdir_factory = Some(Box::new(factory));
+        self
     }
 
     /// Reads one framed record.  For the footer record, the frame is NOT hashed.
@@ -454,8 +472,12 @@ impl<R: Read> GraphReader<R> {
                             });
                         }
 
-                        let dest_path =
-                            materialize_local_file(&fpayload, &mut temp_dir, &mut file_counter)?;
+                        let dest_path = materialize_local_file(
+                            &fpayload,
+                            &mut temp_dir,
+                            &mut file_counter,
+                            self.tempdir_factory.as_deref(),
+                        )?;
 
                         if let BuildDep::Local { full_path, .. } = &mut spec.build_deps[dep_idx] {
                             *full_path = dest_path;
@@ -538,6 +560,7 @@ fn materialize_local_file(
     payload: &[u8],
     temp_dir: &mut Option<tempfile::TempDir>,
     file_counter: &mut usize,
+    tempdir_factory: Option<&dyn Fn() -> io::Result<tempfile::TempDir>>,
 ) -> Result<PathBuf, WireError> {
     let mut cursor = io::Cursor::new(payload);
     let header_len = decode_varint(&mut cursor)? as usize;
@@ -558,7 +581,14 @@ fn materialize_local_file(
 
     // Materialise into a unique subdirectory so files with the same name
     // (from different specs) don't overwrite each other.
-    let td = temp_dir.get_or_insert_with(|| tempfile::TempDir::new().unwrap());
+    if temp_dir.is_none() {
+        let td = match tempdir_factory {
+            Some(f) => f()?,
+            None => tempfile::TempDir::new()?,
+        };
+        *temp_dir = Some(td);
+    }
+    let td = temp_dir.as_ref().unwrap();
     let subdir = td.path().join(file_counter.to_string());
     std::fs::create_dir_all(&subdir)?;
     *file_counter += 1;
@@ -768,6 +798,7 @@ impl<W: AsyncWrite + Unpin> AsyncGraphWriter<W> {
 pub struct AsyncGraphReader<W: AsyncRead + Unpin> {
     reader: W,
     hasher: blake3::Hasher,
+    tempdir_factory: Option<TempDirFactory>,
 }
 
 impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
@@ -775,7 +806,18 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
         Self {
             reader,
             hasher: blake3::Hasher::new(),
+            tempdir_factory: None,
         }
+    }
+
+    /// Sets a custom factory for creating the [`tempfile::TempDir`] used to
+    /// materialise local files.  When unset, [`tempfile::TempDir::new`] is used.
+    pub fn with_tempdir_factory(
+        mut self,
+        factory: impl Fn() -> io::Result<tempfile::TempDir> + 'static,
+    ) -> Self {
+        self.tempdir_factory = Some(Box::new(factory));
+        self
     }
 
     async fn read_record(&mut self) -> Result<(u8, Vec<u8>), WireError> {
@@ -872,8 +914,12 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
                                 got: ftag,
                             });
                         }
-                        let dest_path =
-                            materialize_local_file(&fpayload, &mut temp_dir, &mut file_counter)?;
+                        let dest_path = materialize_local_file(
+                            &fpayload,
+                            &mut temp_dir,
+                            &mut file_counter,
+                            self.tempdir_factory.as_deref(),
+                        )?;
                         if let BuildDep::Local { full_path, .. } = &mut spec.build_deps[dep_idx] {
                             *full_path = dest_path;
                         }
