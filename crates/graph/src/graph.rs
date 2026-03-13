@@ -300,10 +300,46 @@ impl LayerCache for LayerCacheDir {
     fn get(&mut self, origin: &SpecOrigin, target: &Target) -> Result<Option<Layer>, Self::Error> {
         let p = self.0.join(origin.hash_hex(target).as_ref());
 
-        if let Ok(f) = std::fs::File::open(p) {
-            Ok(Some(serde_json::from_reader(f).map_err(|e| {
+        if let Ok(f) = std::fs::File::open(&p) {
+            let layer: Layer = serde_json::from_reader(f).map_err(|e| {
                 tracing::warn!("LayerCacheDir::get failed to deserialize: {}", e);
-            })?))
+            })?;
+
+            // Local BuildDeps point to the file they represent by path, typically a VCS checkout.
+            // As a quick correctness check, spot-check a few local files to make sure the path
+            // they reference exists, and the hashes match.
+            for (lp, hash) in layer
+                .builds
+                .iter()
+                .flat_map(|(_, b)| &b.build_deps)
+                .filter_map(|d| {
+                    if let decode::builds::BuildDep::Local {
+                        full_path,
+                        file_hash,
+                        ..
+                    } = d
+                    {
+                        Some((full_path, file_hash))
+                    } else {
+                        None
+                    }
+                })
+                .take(5)
+            {
+                if !lp.exists() || hash != &blake3::hash(&std::fs::read(lp).unwrap()) {
+                    tracing::warn!(
+                        "Skipping layer-cache entry, {} not found or hash mismatch",
+                        lp.display()
+                    );
+                    if let Err(e) = std::fs::remove_file(p) {
+                        // best effort
+                        tracing::warn!("Failed to clean up layer-cache entry: {}", e);
+                    }
+                    return Ok(None);
+                }
+            }
+
+            Ok(Some(layer))
         } else {
             Ok(None)
         }
