@@ -19,6 +19,7 @@ tonic.workspace = true
 
 common.workspace = true
 graph.workspace = true
+orchestrator.workspace = true
 remote-proto.workspace = true
 
 [dev-dependencies]

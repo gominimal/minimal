@@ -4,7 +4,9 @@ use std::{borrow::Cow, collections::HashMap};
 
 use anyhow::anyhow;
 use futures::StreamExt;
+use futures::channel::mpsc;
 use graph::Graph;
+use orchestrator::BuildEvent;
 use remote_execution_service_client::RemoteExecutionServiceClient as RESClient;
 use remote_proto::{res::*, *};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -242,7 +244,12 @@ where
         Ok(exit_code)
     }
 
-    pub async fn build(&mut self, verbose: bool, commit_results: bool) -> Result<(), Error> {
+    pub async fn build(
+        &mut self,
+        verbose: bool,
+        commit_results: bool,
+        log_sink: Option<mpsc::UnboundedSender<BuildEvent>>,
+    ) -> Result<(), Error> {
         use orchestrate_build_message::*;
         let client_id = format!(
             "{}-{}",
@@ -296,27 +303,53 @@ where
             .into_inner();
 
         // Read the setup status
-        let resp = match rpc.next().await {
+        match rpc.next().await {
             Some(Ok(OrchestrateBuildResponse {
-                msg: Some(orchestrate_build_response::Msg::Resp(r)),
-            })) => Ok(r),
+                msg: Some(orchestrate_build_response::Msg::Resp(_)),
+            })) => Ok(()),
             Some(Err(e)) => Err(Error::Other(e.into())),
             _ => Err(Error::Other(
                 anyhow!("expected orchestrate_build setup status").into(),
             )),
         }?;
-        println!("resp: {:?}", resp);
 
         while let Some(msg) = rpc.next().await {
             let msg = msg.map_err(|e| Error::Other(e.into()))?;
 
-            if let Some(orchestrate_build_response::Msg::Err(e)) = msg.msg {
-                return Err(Error::Other(
-                    anyhow!("orchestration failed: {}", e.msg).into(),
-                ));
+            match msg.msg {
+                Some(orchestrate_build_response::Msg::Event(event)) => {
+                    if let Some(ref sink) = log_sink {
+                        use orchestrate_build_response::event::EventKind;
+                        let build_event = match EventKind::try_from(event.kind) {
+                            Ok(EventKind::EvtBuildStart) => Some(BuildEvent::Start {
+                                name: event.build_id,
+                            }),
+                            Ok(EventKind::EvtBuildStop) => Some(BuildEvent::Stop {
+                                name: event.build_id,
+                            }),
+                            _ => None,
+                        };
+                        if let Some(be) = build_event {
+                            let _ = sink.unbounded_send(be);
+                        }
+                    }
+                }
+                Some(orchestrate_build_response::Msg::Line(log_line)) => {
+                    if let Some(ref sink) = log_sink {
+                        let _ = sink.unbounded_send(BuildEvent::Log {
+                            is_stderr: log_line.stderr,
+                            name: log_line.build_id,
+                            line: log_line.line,
+                        });
+                    }
+                }
+                Some(orchestrate_build_response::Msg::Err(e)) => {
+                    return Err(Error::Other(
+                        anyhow!("orchestration failed: {}", e.msg).into(),
+                    ));
+                }
+                _ => {}
             }
-
-            println!("msg: {:?}", msg);
         }
 
         Ok(())

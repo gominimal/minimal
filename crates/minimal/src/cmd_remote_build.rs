@@ -33,7 +33,7 @@ pub async fn cmd_remote_build(args: RemoteBuildArgs, ctx: &mut Context) -> Resul
         .map_err(|e| Error::Other(anyhow!("failed to connect to {}: {}", args.addr, e)))?;
 
     client
-        .build(args.verbose, args.commit)
+        .build(args.verbose, args.commit, None)
         .await
         .map_err(|e| Error::Other(anyhow!("remote build failed: {:?}", e)))?;
 
