@@ -47,6 +47,7 @@ pub async fn cmd_pkg(args: PkgArgs, ctx: &mut Context) -> Result<(), Error> {
                             tracing::info!(target: "build", name = %name, "{}", line);
                         }
                     }
+                    BuildEventInner::Hydrate { .. } => {}
                 }
             }
         });

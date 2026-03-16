@@ -34,6 +34,8 @@ message OrchestrateBuildResponse {
     string name = 2;
     // Whether this is a full build or not.
     bool full_build = 3;
+    // The spec hash of the package being built.
+    string spec_hash = 4;
   }
   message LogLine {
     // Identifies the build in question.
@@ -46,6 +48,14 @@ message OrchestrateBuildResponse {
   message BuildStop {
     // Identifies the build in question.
     uint32 build_id = 1;
+  }
+  message Hydrate {
+    // Identifies the index of the operation.
+    uint32 build_id = 1;
+    // The name of the object being hydrated.
+    string name = 2;
+    // The spec hash of the artifact being hydrated.
+    string spec_hash = 3;
   }
   message OrchestrationError {
     string msg = 1;
@@ -60,7 +70,9 @@ message OrchestrateBuildResponse {
     LogLine line = 3;
     // A build was finished.
     BuildStop stop = 4;
+    // An object was hydrated from a cache.
+    Hydrate hydrate = 5;
 
-    OrchestrationError err = 5;
+    OrchestrationError err = 6;
   }
 }

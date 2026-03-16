@@ -20,8 +20,19 @@ use crate::Error;
 /// The specific event described by a [BuildEvent].
 #[derive(Debug, Clone)]
 pub enum BuildEventInner {
-    Log { is_stderr: bool, line: String },
-    Start { name: String, full_build: bool },
+    Log {
+        is_stderr: bool,
+        line: String,
+    },
+    Hydrate {
+        name: String,
+        spec_hash: String,
+    },
+    Start {
+        name: String,
+        full_build: bool,
+        spec_hash: String,
+    },
     Stop,
 }
 
@@ -130,7 +141,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
     async fn build(
         dr: DeliverableRef,
         bsr: BuildSpecRef,
-        _spec_hash: SpecHash,
+        spec_hash: SpecHash,
         dependencies: Vec<DeliverableRef>,
         shared_hnd: &mut SharedHandle<Self>,
         state_hnd: &mut StateHandle<Self>,
@@ -181,6 +192,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                     inner: BuildEventInner::Start {
                         name: name.clone(),
                         full_build: !breaker_build,
+                        spec_hash: spec_hash.0.to_hex().to_string(),
                     },
                 })
                 .ok();
@@ -240,7 +252,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
     }
 
     async fn cache_hydrate(
-        _dr: DeliverableRef,
+        dr: DeliverableRef,
         bsr: BuildSpecRef,
         spec_hash: SpecHash,
         shared_hnd: &mut SharedHandle<Self>,
@@ -261,6 +273,19 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
             let shared = shared_hnd2.inner().read().await;
             let res = if let Some(remote_cache) = shared.backend.remote_cache.as_ref() {
                 let build = shared.graph.get(&bsr).unwrap();
+
+                let log_sink = shared.backend.log_sink.clone();
+                log_sink.as_ref().iter().for_each(|s| {
+                    s.unbounded_send(BuildEvent {
+                        idx: dr.inner_idx(),
+                        inner: BuildEventInner::Hydrate {
+                            name: build.name.clone(),
+                            spec_hash: spec_hash.0.to_hex().to_string(),
+                        },
+                    })
+                    .ok();
+                });
+
                 let (fetch_time, pending_dir) = remote_cache
                     .materialize(&spec_hash, &shared.cache, build.name.as_str())
                     .await

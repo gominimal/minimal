@@ -324,6 +324,7 @@ where
                             inner: BuildEventInner::Start {
                                 name: s.name,
                                 full_build: s.full_build,
+                                spec_hash: s.spec_hash,
                             },
                         });
                     }
@@ -347,12 +348,24 @@ where
                         });
                     }
                 }
+                Some(orchestrate_build_response::Msg::Hydrate(h)) => {
+                    if let Some(ref sink) = log_sink {
+                        let _ = sink.unbounded_send(BuildEvent {
+                            idx: h.build_id as usize,
+                            inner: BuildEventInner::Hydrate {
+                                name: h.name,
+                                spec_hash: h.spec_hash,
+                            },
+                        });
+                    }
+                }
                 Some(orchestrate_build_response::Msg::Err(e)) => {
                     return Err(Error::Other(
                         anyhow!("orchestration failed: {}", e.msg).into(),
                     ));
                 }
-                _ => {}
+                Some(orchestrate_build_response::Msg::Resp(_)) => unreachable!(),
+                None => {}
             }
         }
 
