@@ -27,27 +27,25 @@ message OrchestrateBuildRequest {
 
 message OrchestrateBuildResponse {
   message SetupResponse {}
-  message Event {
-    enum EventKind {
-      EVT_UNSPECIFIED = 0;
-      // The build has been initiated.
-      EVT_BUILD_START = 1;
-      // The build has finished.
-      EVT_BUILD_STOP = 2;
-    }
-
-    // Typically the name of the package being built.
-    string build_id = 1;
-    // The event that occurred.
-    EventKind kind = 2;
+  message BuildStart {
+    // Identifies the build in question.
+    uint32 build_id = 1;
+    // The name of the build.
+    string name = 2;
+    // Whether this is a full build or not.
+    bool full_build = 3;
   }
   message LogLine {
-    // Typically the name of the package being built.
-    string build_id = 1;
+    // Identifies the build in question.
+    uint32 build_id = 1;
     // Whether the line is for standard output or standard error.
     bool stderr = 2;
     // The Log line itself.
     string line = 3;
+  }
+  message BuildStop {
+    // Identifies the build in question.
+    uint32 build_id = 1;
   }
   message OrchestrationError {
     string msg = 1;
@@ -56,10 +54,13 @@ message OrchestrateBuildResponse {
   oneof msg {
     // The initial response of the RPC. May only be sent as the first message.
     SetupResponse resp = 1;
-    // An event occurred for one of the builds in the orchestration.
-    Event event = 2;
+    // A build was started.
+    BuildStart start = 2;
     // Some output is being streamed back by a build.
     LogLine line = 3;
-    OrchestrationError err = 4;
+    // A build was finished.
+    BuildStop stop = 4;
+
+    OrchestrationError err = 5;
   }
 }

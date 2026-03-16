@@ -6,7 +6,7 @@ use anyhow::anyhow;
 use futures::StreamExt;
 use futures::channel::mpsc;
 use graph::Graph;
-use orchestrator::BuildEvent;
+use orchestrator::{BuildEvent, BuildEventInner};
 use remote_execution_service_client::RemoteExecutionServiceClient as RESClient;
 use remote_proto::{res::*, *};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -317,29 +317,33 @@ where
             let msg = msg.map_err(|e| Error::Other(e.into()))?;
 
             match msg.msg {
-                Some(orchestrate_build_response::Msg::Event(event)) => {
+                Some(orchestrate_build_response::Msg::Start(s)) => {
                     if let Some(ref sink) = log_sink {
-                        use orchestrate_build_response::event::EventKind;
-                        let build_event = match EventKind::try_from(event.kind) {
-                            Ok(EventKind::EvtBuildStart) => Some(BuildEvent::Start {
-                                name: event.build_id,
-                            }),
-                            Ok(EventKind::EvtBuildStop) => Some(BuildEvent::Stop {
-                                name: event.build_id,
-                            }),
-                            _ => None,
-                        };
-                        if let Some(be) = build_event {
-                            let _ = sink.unbounded_send(be);
-                        }
+                        let _ = sink.unbounded_send(BuildEvent {
+                            idx: s.build_id as usize,
+                            inner: BuildEventInner::Start {
+                                name: s.name,
+                                full_build: s.full_build,
+                            },
+                        });
+                    }
+                }
+                Some(orchestrate_build_response::Msg::Stop(s)) => {
+                    if let Some(ref sink) = log_sink {
+                        let _ = sink.unbounded_send(BuildEvent {
+                            idx: s.build_id as usize,
+                            inner: BuildEventInner::Stop,
+                        });
                     }
                 }
                 Some(orchestrate_build_response::Msg::Line(log_line)) => {
                     if let Some(ref sink) = log_sink {
-                        let _ = sink.unbounded_send(BuildEvent::Log {
-                            is_stderr: log_line.stderr,
-                            name: log_line.build_id,
-                            line: log_line.line,
+                        let _ = sink.unbounded_send(BuildEvent {
+                            idx: log_line.build_id as usize,
+                            inner: BuildEventInner::Log {
+                                is_stderr: log_line.stderr,
+                                line: log_line.line,
+                            },
                         });
                     }
                 }

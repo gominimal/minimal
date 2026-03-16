@@ -16,7 +16,7 @@ use tokio::{
 };
 
 mod local_backend;
-pub use local_backend::{BuildEvent, LocalBackend};
+pub use local_backend::{BuildEvent, BuildEventInner, LocalBackend};
 
 mod state;
 pub use state::{

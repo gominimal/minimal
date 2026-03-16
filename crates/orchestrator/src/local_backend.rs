@@ -17,36 +17,35 @@ use tokio::task::spawn_blocking;
 
 use crate::Error;
 
-/// A single line of build output.
+/// The specific event described by a [BuildEvent].
 #[derive(Debug, Clone)]
-pub enum BuildEvent {
-    Log {
-        is_stderr: bool,
-        name: String,
-        line: String,
-    },
-    Start {
-        name: String,
-    },
-    Stop {
-        name: String,
-    },
+pub enum BuildEventInner {
+    Log { is_stderr: bool, line: String },
+    Start { name: String, full_build: bool },
+    Stop,
+}
+
+/// Something that happens during a build run. Idx identifies the build in question.
+#[derive(Debug, Clone)]
+pub struct BuildEvent {
+    pub idx: usize,
+    pub inner: BuildEventInner,
 }
 
 /// An [`tokio::io::AsyncWrite`] adapter that buffers bytes and sends complete
 /// lines as [`BuildLogLine`] items through an [`mpsc::UnboundedSender`].
 struct SinkWriter {
     sender: mpsc::UnboundedSender<BuildEvent>,
-    name: String,
+    idx: usize,
     is_stderr: bool,
     buf: Vec<u8>,
 }
 
 impl SinkWriter {
-    fn new(sender: mpsc::UnboundedSender<BuildEvent>, name: String, is_stderr: bool) -> Self {
+    fn new(sender: mpsc::UnboundedSender<BuildEvent>, idx: usize, is_stderr: bool) -> Self {
         Self {
             sender,
-            name,
+            idx,
             is_stderr,
             buf: Vec::new(),
         }
@@ -55,10 +54,12 @@ impl SinkWriter {
     fn emit_lines(&mut self) {
         while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
             let line = String::from_utf8_lossy(&self.buf[..pos]).into_owned();
-            let _ = self.sender.unbounded_send(BuildEvent::Log {
-                is_stderr: self.is_stderr,
-                name: self.name.clone(),
-                line,
+            let _ = self.sender.unbounded_send(BuildEvent {
+                idx: self.idx,
+                inner: BuildEventInner::Log {
+                    is_stderr: self.is_stderr,
+                    line,
+                },
             });
             self.buf.drain(..=pos);
         }
@@ -67,10 +68,12 @@ impl SinkWriter {
     fn emit_remaining(&mut self) {
         if !self.buf.is_empty() {
             let line = String::from_utf8_lossy(&self.buf).into_owned();
-            let _ = self.sender.unbounded_send(BuildEvent::Log {
-                is_stderr: self.is_stderr,
-                name: self.name.clone(),
-                line,
+            let _ = self.sender.unbounded_send(BuildEvent {
+                idx: self.idx,
+                inner: BuildEventInner::Log {
+                    is_stderr: self.is_stderr,
+                    line,
+                },
             });
             self.buf.clear();
         }
@@ -173,8 +176,14 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
             let log_sink = shared.backend.log_sink.clone();
             let name = shared.graph.get(&bsr).unwrap().name.clone();
             log_sink.as_ref().iter().for_each(|s| {
-                s.unbounded_send(BuildEvent::Start { name: name.clone() })
-                    .ok();
+                s.unbounded_send(BuildEvent {
+                    idx: dr.inner_idx(),
+                    inner: BuildEventInner::Start {
+                        name: name.clone(),
+                        full_build: !breaker_build,
+                    },
+                })
+                .ok();
             });
             let mut b = op::SpecBuild {
                 override_deps: Some(dep_paths.into_iter().collect()),
@@ -182,12 +191,12 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                 remote_fetcher: &shared.backend.sf,
                 stdout_writer: log_sink.as_ref().map(
                     |s| -> Box<dyn tokio::io::AsyncWrite + Unpin + Send + Sync> {
-                        Box::new(SinkWriter::new(s.clone(), name.clone(), false))
+                        Box::new(SinkWriter::new(s.clone(), dr.inner_idx(), false))
                     },
                 ),
                 stderr_writer: log_sink.as_ref().map(
                     |s| -> Box<dyn tokio::io::AsyncWrite + Unpin + Send + Sync> {
-                        Box::new(SinkWriter::new(s.clone(), name.clone(), true))
+                        Box::new(SinkWriter::new(s.clone(), dr.inner_idx(), true))
                     },
                 ),
             };
@@ -200,8 +209,11 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                 })
                 .await;
             log_sink.as_ref().iter().for_each(|s| {
-                s.unbounded_send(BuildEvent::Stop { name: name.clone() })
-                    .ok();
+                s.unbounded_send(BuildEvent {
+                    idx: dr.inner_idx(),
+                    inner: BuildEventInner::Stop,
+                })
+                .ok();
             });
             drop(permit);
             drop(shared);
