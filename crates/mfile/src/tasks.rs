@@ -74,7 +74,7 @@ impl Task {
     /// If a command is invoked by name (i.e. not an absolute path nor a local ./), it is mapped
     /// to an absolute path out of /bin.
     ///
-    /// i.e. returns None when none is [TaskAction::CmdCmd], and a value otherwise.
+    /// i.e. returns None when action is [TaskAction::CmdCmd], and a value otherwise.
     pub fn exec_and_args(&self) -> Option<(String, Vec<String>)> {
         let maybe_make_abs = |exec: &str| -> String {
             if !(exec.starts_with("/") || exec.starts_with("./")) {

@@ -10,7 +10,7 @@ use crate::{AddDepMode, Context, Error};
 use common::FsMapping;
 use futures::stream::StreamExt;
 use graph::{BuildSpecRef, Graph, SetupForPackages, Transitives, TransitivesDep};
-use mfile::{EnvPatches, EnvVarValue, TaskAction};
+use mfile::{EnvPatches, EnvVarValue};
 use op::Runnable;
 use sandbox2::{
     Container,
@@ -260,7 +260,7 @@ impl EnvChannel<'_> {
     }
 
     /// Implementation of `min run <task>`
-    fn run_task(&mut self, stream: &mut UnixStream, _rootfs: &Path, task_name: &str) {
+    fn run_task(&mut self, stream: &mut UnixStream, _rootfs: &Path, task_name: &str, args: &str) {
         let mut build_ctx = match self.ctx.cloned_reinit() {
             Err(e) => return EnvChannel::write_error(e, stream),
             Ok(ctx) => ctx,
@@ -279,6 +279,20 @@ impl EnvChannel<'_> {
                 return;
             }
             Some((t, g)) => (t, g),
+        };
+        let parsed_args = if !task.args.is_empty() {
+            Some(match task.args.parse(args) {
+                Err(e) => {
+                    for line in format!("{}", e.render().ansi()).lines() {
+                        writeln!(stream, "msg:{}", line).ok();
+                    }
+                    writeln!(stream, "error: failed parsing arguments for task").ok();
+                    return;
+                }
+                Ok(args) => args,
+            })
+        } else {
+            None
         };
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -302,7 +316,8 @@ impl EnvChannel<'_> {
                 )
                 .await?;
 
-            let (interactive, invocations) = env.task_invocations(&task, None).await?;
+            let (interactive, invocations) =
+                env.task_invocations(&task, parsed_args.as_ref()).await?;
             if interactive {
                 return Err(Error::Other(anyhow::anyhow!(
                     "cannot run interactive tasks from within an environment"
@@ -397,8 +412,12 @@ impl sandbox2::Channel for EnvChannel<'_> {
 
                 None
             }
-            Some(("run", name)) => {
-                self.run_task(stream, rootfs, name);
+            Some(("run", args)) => {
+                let (name, rest) = match args.split_once(" ") {
+                    Some(v) => v,
+                    None => (args, ""),
+                };
+                self.run_task(stream, rootfs, name, rest);
 
                 None
             }
@@ -615,10 +634,8 @@ impl<'a> Env<'a> {
             common::ncl_eval::VarCtx::new(base)
         };
 
-        // TODO: We shouldnt keep determining whether we need to be interactive based on the action.
-        // Remove the second case once interactive has been set everywhere its needed.
         Ok((
-            task.interactive || matches!(task.action, TaskAction::Bash(_) | TaskAction::Exec(_)),
+            task.interactive,
             op::TaskEnv {
                 task: &task
                     .map_exec_strings(|s| {

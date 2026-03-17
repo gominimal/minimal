@@ -689,14 +689,14 @@ impl Context {
         mode: AddDepMode,
     ) -> Result<(), Error> {
         let mfile = self.minimal_file();
-        let mfile_path = mfile.file_path().cloned();
-
-        if mfile_path.is_none() {
-            return Err(Error::Other(anyhow!(
-                "Cannot add dependency - no minimal.toml located."
-            )));
-        }
-        let mfile_path = mfile_path.unwrap();
+        let mfile_path = match mfile.file_path() {
+            Some(p) => p.clone(),
+            None => {
+                return Err(Error::Other(anyhow!(
+                    "Cannot add dependency - no minimal.toml located."
+                )));
+            }
+        };
 
         let toml = std::fs::read_to_string(&mfile_path)
             .map_err(|e| Error::IO("reading minimal.toml for add", mfile_path.to_path_buf(), e))?;
@@ -794,6 +794,7 @@ fn upsert_toml_packages_list<T: TableLike>(t: &mut T, key: &str, upsert: &[Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indoc::indoc;
     use mfile::EnvVarValue;
     use op::{Runnable, StandaloneTest};
     use tempfile::tempdir;
@@ -996,6 +997,92 @@ mod tests {
                 output
             );
         });
+    }
+
+    #[test]
+    fn add_deps() {
+        let state = tempdir().unwrap();
+        let cwd = tempdir().unwrap();
+        let mfile_path = cwd.path().join("minimal.toml");
+        std::fs::write(
+            &mfile_path,
+            format!(
+                indoc! {
+                    "
+                    [upstream]
+                    dir = \"{}\"
+
+                    [harness]
+                    use = \"fake-harness\"
+
+                    [tasks.something]
+                    exec = \"./something\"
+                    "
+                },
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("testdata")
+                    .join("fakerepo-with-harness")
+                    .to_str()
+                    .unwrap()
+            ),
+        )
+        .unwrap();
+
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_repo_dir(cwd.path().to_path_buf())
+            .with_stdlib_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("../stdlib/minimal-ncl"),
+            )
+            .build()
+            .unwrap();
+
+        let mut ctx = Context::new(config).unwrap();
+        let graph = ctx.graph_from_all_packages().unwrap();
+
+        // Add a build package, make sure it is written back and also is now
+        // part of the packages
+        ctx.add_deps(&graph, ["uroot"], AddDepMode::BuildPackages)
+            .unwrap();
+        assert!(
+            String::from_utf8(std::fs::read(&mfile_path).unwrap())
+                .unwrap()
+                .contains("build_packages = [\"uroot\"]")
+        );
+        let (task, graph) = ctx.task(graph, "build").unwrap().unwrap();
+        assert!(task.packages.contains(&"uroot".to_string()));
+        // Add a runtime package, make sure it is written back and also is now
+        // part of the packages
+        ctx.add_deps(&graph, ["extra-runtime-pkg"], AddDepMode::RuntimePackages)
+            .unwrap();
+        assert!(
+            String::from_utf8(std::fs::read(&mfile_path).unwrap())
+                .unwrap()
+                .contains("runtime_packages = [\"extra-runtime-pkg\"]")
+        );
+        let (task, graph) = ctx.task(graph, "build").unwrap().unwrap();
+        assert!(task.packages.contains(&"extra-runtime-pkg".to_string()));
+        // Add a package to a task.
+        ctx.add_deps(
+            &graph,
+            ["uroot"],
+            AddDepMode::TaskPackages {
+                name: "something".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8(std::fs::read(&mfile_path).unwrap())
+                .unwrap()
+                .contains("[tasks.something]\nexec = \"./something\"\npackages = [\"uroot\"]")
+        );
+
+        // Make sure it errors when theres no such package
+        assert!(
+            ctx.add_deps(&graph, ["missingggggg"], AddDepMode::BuildPackages)
+                .is_err()
+        );
     }
 
     #[test]
