@@ -771,3 +771,148 @@ impl tokio::io::AsyncWrite for StreamWriter {
         std::task::Poll::Ready(Ok(()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ConfigBuilder;
+    use sandbox2::Channel;
+    use std::io::{BufRead, BufReader};
+    use tempfile::tempdir;
+
+    /// Helper: build a Context and Graph from the fakerepo test data,
+    /// matching the pattern used in lib.rs tests.
+    fn setup_ctx_and_graph() -> (TempDir, Context, Graph) {
+        let state = tempdir().unwrap();
+        let manifest_dir =
+            std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).to_path_buf();
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_repo_dir(manifest_dir.join("testdata").join("fakerepo"))
+            .with_stdlib_dir(manifest_dir.join("../stdlib/minimal-ncl"))
+            .with_no_fetch(true)
+            .build()
+            .unwrap();
+
+        let mut ctx = Context::new(config).unwrap();
+        let mut graph = ctx.graph_from_all_packages().unwrap();
+        graph.top_levels = vec![];
+        (state, ctx, graph)
+    }
+
+    /// Helper: read all available lines from a UnixStream reader.
+    fn read_lines(stream: &std::os::unix::net::UnixStream) -> Vec<String> {
+        stream
+            .set_nonblocking(true)
+            .expect("set_nonblocking failed");
+        let reader = BufReader::new(stream);
+        reader.lines().map_while(|l| l.ok()).collect()
+    }
+
+    #[test]
+    fn env_channel_errs_unknown_command() {
+        let (state_dir, mut ctx, mut graph) = setup_ctx_and_graph();
+        let mut chan = EnvChannel {
+            graph: &mut graph,
+            ctx: &mut ctx,
+            task_name: "test-task".to_string(),
+            state_dir: state_dir.path().to_path_buf(),
+            has_packages: HashSet::new(),
+        };
+
+        let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let rootfs = tempdir().unwrap();
+        chan.handle(&mut ours, "garbage-input", rootfs.path());
+        drop(ours);
+
+        let lines = read_lines(&theirs);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("error: unhandled input 'garbage-input'"),
+            "unexpected output: {:?}",
+            lines
+        );
+    }
+
+    #[test]
+    fn env_channel_search() {
+        let (state_dir, mut ctx, mut graph) = setup_ctx_and_graph();
+        let mut chan = EnvChannel {
+            graph: &mut graph,
+            ctx: &mut ctx,
+            task_name: "test-task".to_string(),
+            state_dir: state_dir.path().to_path_buf(),
+            has_packages: HashSet::new(),
+        };
+
+        let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let rootfs = tempdir().unwrap();
+        // "uroot" is a known package in the fakerepo fixture
+        chan.handle(&mut ours, "search%uroot", rootfs.path());
+        drop(ours);
+
+        let lines = read_lines(&theirs);
+        assert!(
+            lines.iter().any(|l| l.contains("uroot")),
+            "expected 'uroot' in search results, got: {:?}",
+            lines
+        );
+    }
+
+    #[test]
+    fn env_channel_add_session_errs_unknown_pkg() {
+        let (state_dir, mut ctx, mut graph) = setup_ctx_and_graph();
+        let mut chan = EnvChannel {
+            graph: &mut graph,
+            ctx: &mut ctx,
+            task_name: "test-task".to_string(),
+            state_dir: state_dir.path().to_path_buf(),
+            has_packages: HashSet::new(),
+        };
+
+        let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let rootfs = tempdir().unwrap();
+        chan.handle(&mut ours, "add-session%nonexistent-pkg-xyz", rootfs.path());
+        drop(ours);
+
+        let lines = read_lines(&theirs);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("error: no such package"),
+            "unexpected output: {:?}",
+            lines
+        );
+    }
+
+    #[test]
+    fn env_channel_add_session() {
+        let (state_dir, mut ctx, mut graph) = setup_ctx_and_graph();
+        let mut chan = EnvChannel {
+            graph: &mut graph,
+            ctx: &mut ctx,
+            task_name: "test-task".to_string(),
+            state_dir: state_dir.path().to_path_buf(),
+            has_packages: HashSet::new(),
+        };
+
+        let rootfs = tempdir().unwrap();
+        assert!(!std::fs::exists(rootfs.path().join("bin")).unwrap());
+
+        let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        chan.handle(&mut ours, "add-session%uroot", rootfs.path());
+        drop(ours);
+
+        let lines = read_lines(&theirs);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("msg:Installed uroot"),
+            "unexpected output: {:?}",
+            lines
+        );
+        assert_eq!(
+            chan.has_packages,
+            HashSet::from_iter([*chan.graph.by_name("uroot").unwrap()])
+        );
+        assert!(std::fs::exists(rootfs.path().join("bin")).unwrap());
+    }
+}
