@@ -477,6 +477,8 @@ impl Context {
 
     /// Returns the task of the given name, fully hydrated based on profiles. If no task
     /// is declared in the minimal file with the given name, harnesses are considered.
+    ///
+    /// The returned task will not have had any string interpolations applied.
     pub fn task(&mut self, mut graph: Graph, name: &str) -> Result<Option<(Task, Graph)>, Error> {
         let mfile = self.minimal_file();
         let mut task = match mfile.task(name) {
@@ -992,6 +994,74 @@ mod tests {
                     + "\n",
                 "unexpected output: {:?}",
                 output
+            );
+        });
+    }
+
+    #[test]
+    #[ignore] // Do not run in github- does not support nested namespaces
+    fn task_resolve_string_interpolation() {
+        let state = tempdir().unwrap();
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_repo_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("testdata")
+                    .join("fakerepo"),
+            )
+            .with_stdlib_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("../stdlib/minimal-ncl"),
+            )
+            .build()
+            .unwrap();
+
+        let mut ctx = Context::new(config).unwrap();
+
+        let graph = ctx.graph_from_all_packages().unwrap();
+        let (task, mut graph) = ctx.task(graph, "task-interpolation-test").unwrap().unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Build an environment based on the task
+            let mut env = ctx
+                .make_env(
+                    "test",
+                    &mut graph,
+                    None,
+                    task.state_key.as_ref(),
+                    Some(&task.patch),
+                    Some(&task.vars),
+                    task.packages.clone(),
+                )
+                .await
+                .unwrap();
+
+            let (interactive, invocations) = env
+                .task_invocations(
+                    &task,
+                    Some(&toml::Value::Table(toml::Table::from_iter([(
+                        "input".to_string(),
+                        toml::Value::String("beep".to_string()),
+                    )]))),
+                )
+                .await
+                .unwrap();
+            assert!(interactive);
+            assert_eq!(
+                invocations,
+                vec![Invocation {
+                    envs: Default::default(),
+                    executable: "/bin/sh".to_string(),
+                    args: vec![
+                        "-c".to_string(),
+                        "echo".to_string(),
+                        "val: beep".to_string()
+                    ]
+                },]
             );
         });
     }

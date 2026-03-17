@@ -88,10 +88,10 @@ impl<C: sandbox2::Channel> Runnable for TaskEnv<'_, C> {
 /// An [`tokio::io::AsyncWrite`] adapter that captures all written bytes into a
 /// shared buffer, allowing the caller to read back the data after the writer
 /// has been consumed.
-struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+pub struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
 
 impl CaptureWriter {
-    fn new() -> (Self, Arc<Mutex<Vec<u8>>>) {
+    pub fn new() -> (Self, Arc<Mutex<Vec<u8>>>) {
         let buf = Arc::new(Mutex::new(Vec::new()));
         (Self(buf.clone()), buf)
     }

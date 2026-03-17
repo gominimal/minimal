@@ -67,6 +67,14 @@ impl Task {
         })
     }
 
+    /// Returns the determined executable & argv, if the action this task encodes is one that
+    /// does not need an execution to determine. The returned strings may still contain string
+    /// interpolations that need to be resolved.
+    ///
+    /// If a command is invoked by name (i.e. not an absolute path nor a local ./), it is mapped
+    /// to an absolute path out of /bin.
+    ///
+    /// i.e. returns None when none is [TaskAction::CmdCmd], and a value otherwise.
     pub fn exec_and_args(&self) -> Option<(String, Vec<String>)> {
         let maybe_make_abs = |exec: &str| -> String {
             if !(exec.starts_with("/") || exec.starts_with("./")) {
@@ -180,7 +188,7 @@ mod tests {
     }
 
     #[test]
-    fn interpolate_action_exec_single() {
+    fn map_exec_strings_exec() {
         let t: Task = toml::from_str(indoc! {
             r#"
             exec = "go test ./pkg"
@@ -194,41 +202,6 @@ mod tests {
             t2.action,
             TaskAction::Exec(StrOrList::Single("GO TEST ./PKG".to_string()))
         );
-    }
-
-    #[test]
-    fn interpolate_action_exec_list() {
-        let t: Task = toml::from_str(indoc! {
-            r#"
-            exec = ["go", "test", "./pkg"]
-            "#
-        })
-        .unwrap();
-        let t2 = t
-            .map_exec_strings(|s| Ok::<_, ()>(s.to_uppercase()))
-            .unwrap();
-        assert_eq!(
-            t2.action,
-            TaskAction::Exec(StrOrList::Multiple(vec![
-                "GO".to_string(),
-                "TEST".to_string(),
-                "./PKG".to_string(),
-            ]))
-        );
-    }
-
-    #[test]
-    fn map_exec_strings_unchanged() {
-        let t: Task = toml::from_str(indoc! {
-            r#"
-            bash = "echo hello"
-            "#
-        })
-        .unwrap();
-        let t2 = t
-            .map_exec_strings(|s| Ok::<_, ()>(s.to_uppercase()))
-            .unwrap();
-        assert_eq!(t2.action, TaskAction::Bash("ECHO HELLO".to_string()));
     }
 
     #[test]

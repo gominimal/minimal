@@ -222,6 +222,7 @@ fn generate_mfile(
     content.push_str("state_key = \"dev\"\n");
     content.push('\n');
     content.push_str("[tasks.shell]\n");
+    content.push_str("interactive = true\n");
     content.push_str("packages = [\"base\"]\n");
     content.push_str("exec = \"bash --noprofile -l\"\n");
     content

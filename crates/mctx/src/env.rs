@@ -10,7 +10,7 @@ use crate::{AddDepMode, Context, Error};
 use common::FsMapping;
 use futures::stream::StreamExt;
 use graph::{BuildSpecRef, Graph, SetupForPackages, Transitives, TransitivesDep};
-use mfile::{EnvPatches, EnvVarValue};
+use mfile::{EnvPatches, EnvVarValue, TaskAction};
 use op::Runnable;
 use sandbox2::{
     Container,
@@ -280,14 +280,6 @@ impl EnvChannel<'_> {
             }
             Some((t, g)) => (t, g),
         };
-        if task.interactive {
-            writeln!(
-                stream,
-                "error: cannot run interactive tasks from within an environment"
-            )
-            .ok();
-            return;
-        }
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -310,7 +302,13 @@ impl EnvChannel<'_> {
                 )
                 .await?;
 
-            let invocations = env.task_invocations(&task, None).await?;
+            let (interactive, invocations) = env.task_invocations(&task, None).await?;
+            if interactive {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "cannot run interactive tasks from within an environment"
+                )));
+            }
+
             let (stdout_writer, stderr_writer) = StreamWriter::pair(stream);
             env.run(invocations, Some(stdout_writer), Some(stderr_writer))
                 .await
@@ -595,43 +593,46 @@ impl<'a> Env<'a> {
         self.temp_dirs.extend(dirs);
     }
 
-    /// Resolves the invocations to run for the given task using [`op::TaskEnv`].
+    /// Resolves the invocations to run for the given task using [`op::TaskEnv`], as well
+    /// as whether they need to be in an interactive environment or not.
     ///
-    /// If `parsed_args` is provided, all strings in the task action are evaluated
-    /// through a Nickel [`common::ncl_eval::VarCtx`] first, enabling interpolation
-    /// of task parameters (e.g. `%{name}`).
+    /// The environment is used to resolve any meta commands (i.e. `TaskAction::CmdCmd`),
+    /// and any string interpolations declared in the task are resolved.
     pub async fn task_invocations(
         &mut self,
         task: &mfile::Task,
         parsed_args: Option<&toml::Value>,
-    ) -> Result<Vec<Invocation>, Error> {
-        let interpolated;
-        let task = if let Some(args) = parsed_args {
+    ) -> Result<(bool, Vec<Invocation>), Error> {
+        let base = [("task_packages", task.packages.clone().into())].into_iter();
+        let var_ctx = if let Some(args) = parsed_args {
             let table = args
                 .as_table()
                 .ok_or_else(|| Error::Other(anyhow::anyhow!("parsed_args is not a table")))?;
-            let var_ctx =
-                common::ncl_eval::VarCtx::new(table.iter().map(|(k, v)| (k.as_str(), v.clone())));
-
-            interpolated = task
-                .map_exec_strings(|s| {
-                    var_ctx
-                        .eval_string(s)
-                        .map_err(|_| anyhow::anyhow!("nickel eval failed for string: {}", s))
-                })
-                .map_err(Error::Other)?;
-            &interpolated
+            common::ncl_eval::VarCtx::new(
+                base.chain(table.iter().map(|(k, v)| (k.as_str(), v.clone()))),
+            )
         } else {
-            task
+            common::ncl_eval::VarCtx::new(base)
         };
 
-        op::TaskEnv {
-            task,
-            sandbox: &mut self.sandbox,
-        }
-        .resolve()
-        .await
-        .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))
+        // TODO: We shouldnt keep determining whether we need to be interactive based on the action.
+        // Remove the second case once interactive has been set everywhere its needed.
+        Ok((
+            task.interactive || matches!(task.action, TaskAction::Bash(_) | TaskAction::Exec(_)),
+            op::TaskEnv {
+                task: &task
+                    .map_exec_strings(|s| {
+                        var_ctx
+                            .eval_string(s)
+                            .map_err(|_| anyhow::anyhow!("nickel eval failed for string: {}", s))
+                    })
+                    .map_err(Error::Other)?,
+                sandbox: &mut self.sandbox,
+            }
+            .resolve()
+            .await
+            .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))?,
+        ))
     }
 
     pub fn container(&mut self) -> Result<Container, Error> {

@@ -96,7 +96,7 @@ pub struct Config {
 }
 
 /// A command to be run in the sandbox.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invocation {
     /// The program to exec.
     ///

@@ -4,6 +4,7 @@ use nickel_lang_core::term::Term;
 use nickel_lang_core::{error::NullReporter, eval::cache::CacheImpl, program::Program};
 use std::io;
 
+/// Resolves string interpolations to given base values.
 pub struct VarCtx {
     base: String,
 }
@@ -30,6 +31,24 @@ impl VarCtx {
                     base.push('"');
                 }
                 toml::Value::Integer(i) => base.push_str(&i.to_string()),
+                // TODO: This is shit and also only works one level. Make a trait
+                // for serializing to nickel which is recursive and use that?
+                toml::Value::Array(v) => v.into_iter().for_each(|e| match e {
+                    toml::Value::String(s) => {
+                        base.push('"');
+                        base.push_str(&s);
+                        base.push('"');
+                    }
+                    toml::Value::Boolean(b) => {
+                        if b {
+                            base.push_str("true")
+                        } else {
+                            base.push_str("false")
+                        }
+                    }
+                    toml::Value::Float(f) => base.push_str(&f.to_string()),
+                    _ => todo!(),
+                }),
                 _ => todo!(),
             }
 

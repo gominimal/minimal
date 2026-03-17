@@ -51,4 +51,4 @@ mod standalone_test;
 pub use standalone_test::{StandaloneTest, StandaloneTestError};
 
 mod task_env;
-pub use task_env::TaskEnv;
+pub use task_env::{CaptureWriter, TaskEnv};

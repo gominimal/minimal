@@ -520,6 +520,8 @@ impl File {
 
     /// Returns the task of the given name, if one exists. Default settings for unset fields such as profile have
     /// been applied to the returned object.
+    ///
+    /// The returned task will not have had any string interpolations applied.
     pub fn task(&self, name: &str) -> Option<Task> {
         self.tasks.get(name).map(|t| {
             let mut task = t.clone();
@@ -532,6 +534,8 @@ impl File {
     ///  - default profile if set (and not set on the task)
     ///  - default state_key if set (and not set on the task)
     ///  - additional build_packages & runtime_packages set on the harness
+    ///
+    /// The returned task will not have had any string interpolations applied.
     pub fn hydrate_task_defaults(&self, task: &mut Task) {
         if let Some(default_profile) = &self.defaults.profile
             && task.profile.is_none()

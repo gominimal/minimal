@@ -63,11 +63,10 @@ pub async fn run_task(
         .await?;
 
     // Resolve the invocations to run from the task definition.
-    let invocations = env.task_invocations(task, parsed_args.as_ref()).await?;
+    let (interactive, invocations) = env.task_invocations(task, parsed_args.as_ref()).await?;
 
-    // Execute: use container/command for exec/bash (preserves inherited stdio),
-    // and env.run() for resolved CmdCmd invocations.
-    if task.exec_and_args().is_some() {
+    // Execute: use container/command for interactive (preserves inherited stdio),
+    if interactive {
         let container = env
             .container()
             .map_err(|e| Error::Other(anyhow!("building container failed: {}", e)))?;
