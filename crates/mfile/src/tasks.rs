@@ -1,4 +1,5 @@
 use super::{EnvPatches, EnvVarValue, StrOrList};
+use crate::args::TaskArgs;
 use std::collections::HashMap;
 
 /// A task, defined in a `[tasks.<task_name>]` section of [File].
@@ -34,16 +35,38 @@ pub struct Task {
     #[serde(default)]
     pub interactive: bool,
 
+    /// Typed schema of named arguments this task accepts.
+    #[serde(default)]
+    pub args: TaskArgs,
+
     /// Any fields which are not understood by this version of minimal.
     #[serde(flatten)]
     pub extra: HashMap<String, toml::Value>,
 }
 
 impl Task {
-    /// Returns the program this task exec's, and the args to use.
-    ///
-    /// Only the Exec and Bash variants are supported. For all other actions,
-    /// this method returns None.
+    /// Returns a clone of this task with all action strings mapped through `f`,
+    /// enabling interpolation of task parameters (e.g. nickel `%{name}` expansion).
+    pub fn map_exec_strings<E>(
+        &self,
+        mut f: impl FnMut(&str) -> Result<String, E>,
+    ) -> Result<Task, E> {
+        let action = match &self.action {
+            TaskAction::Exec(StrOrList::Single(s)) => TaskAction::Exec(StrOrList::Single(f(s)?)),
+            TaskAction::Exec(StrOrList::Multiple(v)) => TaskAction::Exec(StrOrList::Multiple(
+                v.iter().map(|s| f(s)).collect::<Result<Vec<_>, _>>()?,
+            )),
+            TaskAction::Bash(cmd) => TaskAction::Bash(f(cmd)?),
+            TaskAction::CmdCmd(argv) => {
+                TaskAction::CmdCmd(argv.iter().map(|s| f(s)).collect::<Result<Vec<_>, _>>()?)
+            }
+        };
+        Ok(Task {
+            action,
+            ..self.clone()
+        })
+    }
+
     pub fn exec_and_args(&self) -> Option<(String, Vec<String>)> {
         let maybe_make_abs = |exec: &str| -> String {
             if !(exec.starts_with("/") || exec.starts_with("./")) {
@@ -157,6 +180,58 @@ mod tests {
     }
 
     #[test]
+    fn interpolate_action_exec_single() {
+        let t: Task = toml::from_str(indoc! {
+            r#"
+            exec = "go test ./pkg"
+            "#
+        })
+        .unwrap();
+        let t2 = t
+            .map_exec_strings(|s| Ok::<_, ()>(s.to_uppercase()))
+            .unwrap();
+        assert_eq!(
+            t2.action,
+            TaskAction::Exec(StrOrList::Single("GO TEST ./PKG".to_string()))
+        );
+    }
+
+    #[test]
+    fn interpolate_action_exec_list() {
+        let t: Task = toml::from_str(indoc! {
+            r#"
+            exec = ["go", "test", "./pkg"]
+            "#
+        })
+        .unwrap();
+        let t2 = t
+            .map_exec_strings(|s| Ok::<_, ()>(s.to_uppercase()))
+            .unwrap();
+        assert_eq!(
+            t2.action,
+            TaskAction::Exec(StrOrList::Multiple(vec![
+                "GO".to_string(),
+                "TEST".to_string(),
+                "./PKG".to_string(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn map_exec_strings_unchanged() {
+        let t: Task = toml::from_str(indoc! {
+            r#"
+            bash = "echo hello"
+            "#
+        })
+        .unwrap();
+        let t2 = t
+            .map_exec_strings(|s| Ok::<_, ()>(s.to_uppercase()))
+            .unwrap();
+        assert_eq!(t2.action, TaskAction::Bash("ECHO HELLO".to_string()));
+    }
+
+    #[test]
     fn inherit_env_var() {
         let t: Task = toml::from_str(indoc! {
             r#"
@@ -166,5 +241,35 @@ mod tests {
         })
         .unwrap();
         assert_eq!(t.vars.get("my_var"), Some(&EnvVarValue::Inherit),);
+    }
+
+    /// Tests the interpolation path used by task_invocations when parsed_args is Some:
+    /// parse args → build VarCtx → map_exec_strings.
+    #[test]
+    fn map_exec_strings_with_parsed_args() {
+        let t: Task = toml::from_str(indoc! {
+            r#"
+            exec = "echo %{greeting} %{name}"
+            args.greeting = "string"
+            args.name = "string"
+            "#
+        })
+        .unwrap();
+
+        let parsed = t.args.parse("--greeting hello --name world").unwrap();
+        let table = parsed.as_table().unwrap();
+        let var_ctx =
+            common::ncl_eval::VarCtx::new(table.iter().map(|(k, v)| (k.as_str(), v.clone())));
+        let t2 = t
+            .map_exec_strings(|s| {
+                var_ctx
+                    .eval_string(s)
+                    .map_err(|e| format!("nickel eval failed: {:?}", e))
+            })
+            .unwrap();
+        assert_eq!(
+            t2.action,
+            TaskAction::Exec(StrOrList::Single("echo hello world".to_string()))
+        );
     }
 }

@@ -14,6 +14,7 @@ mod subsets;
 pub use subsets::SubsetSpec;
 pub mod target;
 pub use target::Target;
+pub mod ncl_eval;
 
 use std::{
     env, fmt,

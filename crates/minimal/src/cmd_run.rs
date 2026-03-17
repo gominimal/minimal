@@ -4,8 +4,12 @@ use mctx::{Context, Error};
 use tracing::trace;
 
 #[derive(Debug, clap::Args)]
+#[command(trailing_var_arg = true)]
 pub struct RunArgs {
     pub task_name: String,
+    /// Additional arguments to pass to the task, parsed according to the task's args schema.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub task_args: Vec<String>,
 }
 
 pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
@@ -16,12 +20,29 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
         Some((t, g)) => (t, g),
     };
 
-    run_task(&args.task_name, &task, graph, ctx).await
+    let parsed_args = if !task.args.is_empty() {
+        Some(
+            task.args
+                .parse_argv_named(&format!("minimal run {}", args.task_name), &args.task_args)
+                .map_err(|e| {
+                    e.print().unwrap();
+                    Error::Other(anyhow!(
+                        "task {} called with invalid arguments",
+                        args.task_name
+                    ))
+                })?,
+        )
+    } else {
+        None
+    };
+
+    run_task(&args.task_name, &task, parsed_args, graph, ctx).await
 }
 
 pub async fn run_task(
     task_name: &str,
     task: &mfile::Task,
+    parsed_args: Option<toml::Value>,
     mut graph: Graph,
     ctx: &mut Context,
 ) -> Result<(), Error> {
@@ -42,7 +63,7 @@ pub async fn run_task(
         .await?;
 
     // Resolve the invocations to run from the task definition.
-    let invocations = env.task_invocations(task).await?;
+    let invocations = env.task_invocations(task, parsed_args.as_ref()).await?;
 
     // Execute: use container/command for exec/bash (preserves inherited stdio),
     // and env.run() for resolved CmdCmd invocations.

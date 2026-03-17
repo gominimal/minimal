@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::env::{self, home_dir};
 use std::path::{Component, Path, PathBuf};
 
+mod args;
+pub use args::{ArgPrimitive, ArgSpec, TaskArg, TaskArgs};
 mod error;
 pub use error::Error;
 mod tasks;
@@ -643,6 +645,7 @@ mod tests {
                         action: TaskAction::exec_from_str("go test ./..."),
                         inherit_cwd: false,
                         interactive: false,
+                        args: Default::default(),
                         extra: HashMap::new(),
                     }
                 )]

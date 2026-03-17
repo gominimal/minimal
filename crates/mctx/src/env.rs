@@ -310,7 +310,7 @@ impl EnvChannel<'_> {
                 )
                 .await?;
 
-            let invocations = env.task_invocations(&task).await?;
+            let invocations = env.task_invocations(&task, None).await?;
             let (stdout_writer, stderr_writer) = StreamWriter::pair(stream);
             env.run(invocations, Some(stdout_writer), Some(stderr_writer))
                 .await
@@ -596,7 +596,35 @@ impl<'a> Env<'a> {
     }
 
     /// Resolves the invocations to run for the given task using [`op::TaskEnv`].
-    pub async fn task_invocations(&mut self, task: &mfile::Task) -> Result<Vec<Invocation>, Error> {
+    ///
+    /// If `parsed_args` is provided, all strings in the task action are evaluated
+    /// through a Nickel [`common::ncl_eval::VarCtx`] first, enabling interpolation
+    /// of task parameters (e.g. `%{name}`).
+    pub async fn task_invocations(
+        &mut self,
+        task: &mfile::Task,
+        parsed_args: Option<&toml::Value>,
+    ) -> Result<Vec<Invocation>, Error> {
+        let interpolated;
+        let task = if let Some(args) = parsed_args {
+            let table = args
+                .as_table()
+                .ok_or_else(|| Error::Other(anyhow::anyhow!("parsed_args is not a table")))?;
+            let var_ctx =
+                common::ncl_eval::VarCtx::new(table.iter().map(|(k, v)| (k.as_str(), v.clone())));
+
+            interpolated = task
+                .map_exec_strings(|s| {
+                    var_ctx
+                        .eval_string(s)
+                        .map_err(|_| anyhow::anyhow!("nickel eval failed for string: {}", s))
+                })
+                .map_err(Error::Other)?;
+            &interpolated
+        } else {
+            task
+        };
+
         op::TaskEnv {
             task,
             sandbox: &mut self.sandbox,

@@ -588,6 +588,7 @@ dependencies = [
  "indoc",
  "jaq-all",
  "lzma-rs",
+ "nickel-lang-core",
  "rand 0.10.0",
  "reqwest",
  "resolv-conf",
@@ -597,6 +598,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "url",
  "walkdir",
@@ -2466,6 +2468,7 @@ dependencies = [
 name = "mfile"
 version = "0.0.1"
 dependencies = [
+ "clap",
  "common",
  "indoc",
  "serde",
@@ -2523,6 +2526,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "tokio",
+ "toml",
  "toml_edit",
  "tracing",
  "tracing-indicatif",

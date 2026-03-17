@@ -268,6 +268,7 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
             cmd_run(
                 RunArgs {
                     task_name: "shell".to_string(),
+                    task_args: vec![],
                 },
                 &mut ctx,
             )
@@ -277,6 +278,7 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
             cmd_run(
                 RunArgs {
                     task_name: "build".to_string(),
+                    task_args: vec![],
                 },
                 &mut ctx,
             )
@@ -286,6 +288,7 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
             cmd_run(
                 RunArgs {
                     task_name: "test".to_string(),
+                    task_args: vec![],
                 },
                 &mut ctx,
             )

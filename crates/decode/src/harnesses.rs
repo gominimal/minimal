@@ -611,6 +611,7 @@ impl Harness {
             patch: Default::default(),
             inherit_cwd: false,
             interactive: false,
+            args: Default::default(),
             extra: HashMap::new(),
         }
     }
