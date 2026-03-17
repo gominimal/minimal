@@ -73,8 +73,10 @@ inherit_cwd = true
 exec = "cargo clippy --all-targets -- -D warnings"
 inherit_cwd = true
 
-[tasks.env-smoketest]
-inherit_cwd = true
+[tasks.arg-smoketest]
+args = {
+    input_str = "string"
+}
 bash = """
-echo 'env:' && env && echo "pwd: $(pwd)"
+echo Input was: %{input_str}
 """
