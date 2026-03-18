@@ -63,30 +63,19 @@ pub async fn run_task(
         .await?;
 
     // Resolve the invocations to run from the task definition.
-    let (interactive, invocations) = env.task_invocations(task, parsed_args.as_ref()).await?;
+    let (_interactive, invocations) = env.task_invocations(task, parsed_args.as_ref()).await?;
 
-    // Execute: use container/command for interactive (preserves inherited stdio),
-    if interactive {
-        let container = env
-            .container()
-            .map_err(|e| Error::Other(anyhow!("building container failed: {}", e)))?;
-        for inv in invocations {
-            let mut cmd = env
-                .command(&container, &inv.executable, inv.args.iter())
-                .map_err(|e| Error::Other(anyhow!("building command failed: {}", e)))?;
-            cmd.spawn()
-                .map_err(|e| Error::Other(anyhow!("command launch failed: {}", e)))?
-                .wait()
-                .map_err(|e| Error::Other(anyhow!("command failed: {}", e)))?;
-        }
-    } else {
-        trace!("Task invocation: {:?}", invocations);
-        env.run(
-            invocations,
-            Some(tokio::io::stdout()),
-            Some(tokio::io::stderr()),
-        )
-        .await?;
+    let container = env
+        .container()
+        .map_err(|e| Error::Other(anyhow!("building container failed: {}", e)))?;
+    for inv in invocations {
+        let mut cmd = env
+            .command(&container, &inv.executable, inv.args.iter())
+            .map_err(|e| Error::Other(anyhow!("building command failed: {}", e)))?;
+        cmd.spawn()
+            .map_err(|e| Error::Other(anyhow!("command launch failed: {}", e)))?
+            .wait()
+            .map_err(|e| Error::Other(anyhow!("command failed: {}", e)))?;
     }
 
     Ok(())
