@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: minimal-ubuntu-latest-4x
+    runs-on: minimal-ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: Install protoc
@@ -39,7 +39,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
   build-in-minimal:
-    runs-on: minimal-ubuntu-latest-4x
+    runs-on: minimal-ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-minimal
@@ -47,7 +47,7 @@ jobs:
         run: minimal run ci
 
   build-release-amd64:
-    runs-on: minimal-ubuntu-latest-4x
+    runs-on: minimal-ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: Install dependencies
@@ -78,7 +78,7 @@ jobs:
           retention-days: 7
 
   build-release-arm64:
-    runs-on: minimal-ubuntu-latest-4x
+    runs-on: minimal-ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: Install cross
@@ -104,13 +104,13 @@ jobs:
           retention-days: 7
 
   cargo-deny:
-    runs-on: minimal-ubuntu-latest-4x
+    runs-on: minimal-ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   release:
-    runs-on: minimal-ubuntu-latest-4x
+    runs-on: minimal-ubuntu-latest
     needs: [build, build-release-amd64, build-release-arm64]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
@@ -189,7 +189,7 @@ jobs:
             "cli-arm64-linux-${SHA}.tar.zst" gs://minimal-shim/archives/
 
   minimal-check:
-    runs-on: minimal-ubuntu-latest-4x
+    runs-on: minimal-ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-minimal
