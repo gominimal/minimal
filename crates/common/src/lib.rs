@@ -604,13 +604,13 @@ pub fn default_parallelism() -> usize {
     let rough_threadcount = std::thread::available_parallelism().unwrap().get();
     let para_by_cpu = match rough_threadcount {
         0..=3 => 1,
-        4..=7 => 2,
-        8..=11 => 3,
-        12..=14 => 4,
-        15..=18 => 5,
-        19..=21 => 6,
-        22..=24 => 7,
-        _ => (rough_threadcount - 24) / 4 + 8,
+        4..=7 => 3,
+        8..=11 => 5,
+        12..=14 => 6,
+        15..=18 => 7,
+        19..=21 => 8,
+        22..=24 => 9,
+        _ => (rough_threadcount - 24) / 3 + 9,
     };
 
     let para_by_mem = get_available_ram_gb().map(|gbs| match gbs {
