@@ -464,8 +464,29 @@ pub struct EnvArgs<'a> {
 
 /// A successfully-configured runtime environment.
 pub struct Env<'a> {
+    cwd: PathBuf,
+    claude_md_already_exists: bool,
     sandbox: sandbox2::Sandbox<EnvChannel<'a>>,
     temp_dirs: Vec<TempDir>,
+}
+
+impl<'a> Drop for Env<'a> {
+    fn drop(&mut self) {
+        // Because we bind-mount in a mutated or new CLAUDE.md file, we always leave behind
+        // such a file on the filesystem when we exit. We detect if the file is empty, and if so
+        // yeet it, to avoid polluting the users' repository.
+        if !self.claude_md_already_exists {
+            let claude_md = self.cwd.join("CLAUDE.md");
+            match std::fs::metadata(&claude_md) {
+                Err(_) => {}
+                Ok(stat) => {
+                    if stat.len() == 0 {
+                        let _ = std::fs::remove_file(claude_md);
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl<'a> Env<'a> {
@@ -514,6 +535,7 @@ impl<'a> Env<'a> {
         }
         let mut fs_mappings: Vec<FsMapping> = patch.into();
 
+        let claude_md_already_exists = args.cwd.join("CLAUDE.md").exists();
         let llm_inject_dir = ctx
             .local_cache()
             .temp_dir()
@@ -549,7 +571,7 @@ impl<'a> Env<'a> {
         }
 
         let mut config = sandbox2::config::Config::new(args.name)
-            .with_wd(args.cwd, false, fs_mappings)
+            .with_wd(args.cwd.clone(), false, fs_mappings)
             .with_rootfs(
                 args.transitives
                     .keys()
@@ -600,7 +622,9 @@ impl<'a> Env<'a> {
         sandbox.keep_dir(false);
 
         Ok(Env {
+            cwd: args.cwd,
             sandbox,
+            claude_md_already_exists: claude_md_already_exists,
             temp_dirs: vec![llm_inject_dir],
         })
     }
