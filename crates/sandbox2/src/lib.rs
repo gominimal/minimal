@@ -5,7 +5,6 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use tracing::Span;
 pub mod error;
 use crate::config::{Invocation, WdSetup};
 use crate::error::ExecutionError;
@@ -431,26 +430,6 @@ impl<C: Channel> Sandbox<C> {
     {
         let container = self.new_container()?;
         for (i, exec) in invocations.iter().enumerate() {
-            let span = match &self.config.wd {
-                WdSetup::Isolated { .. } => tracing::info_span!(
-                    "sandbox_exec",
-                    "indicatif.pb_show" = tracing::field::Empty,
-                    "cmd" = {
-                        let s = if exec.args.is_empty() {
-                            exec.executable.clone()
-                        } else {
-                            format!("{} {}", exec.executable, exec.args.join(" "))
-                        };
-                        match s.char_indices().nth(30) {
-                            Some((idx, _)) => format!("{}...", &s[..idx]),
-                            None => s.to_string(),
-                        }
-                    },
-                ),
-                _ => Span::none(),
-            };
-            let _enter = span.enter();
-
             let mut cmd = self.command(&container, &exec.executable, &exec.args, &exec.envs)?;
             cmd.stderr(hakoniwa::Stdio::MakePipe);
             cmd.stdout(hakoniwa::Stdio::MakePipe);
