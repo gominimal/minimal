@@ -33,8 +33,8 @@ anyhow = "1.0.100"
 blake3 = { version = "1", features = ["serde"] }
 bytes = "1.11.0" # keep in sync with reqwest
 bzip2 = "0.6"
-clap = { version = "4.5", features = ["derive", "env"] }
-clap_complete = { version = "4.5" }
+clap = { version = "4.6", features = ["derive", "env"] }
+clap_complete = { version = "4.6" }
 codespan-reporting = { version = "0.13", features = ["serialization"] } # Keep in sync with nickel-lang-core
 copy_dir = "0.1.3"
 dirs = "6"
@@ -42,7 +42,7 @@ either = { version = "1.15", default-features = false }
 flate2 = "1.1"
 futures = "0.3"
 generational-arena = {version = "^0.2", features = ["serde"] }
-google-cloud-gax = "1.4.0"
+google-cloud-gax = "1.8.0"
 google-cloud-auth = "1.3.0"
 google-cloud-storage = "1.5.0"
 hakoniwa = { git = "https://github.com/souk4711/hakoniwa", branch = "main" }
@@ -50,11 +50,11 @@ http-body = "1"
 hex = "0.4"
 indicatif = "0.18"
 indoc = "^2.0"
-jaq-all = "0.1.0-beta"
+jaq-all = "0.1.0-gamma"
 lzma-rs = "0.3"
-nickel-lang-core = { version = "0.15.3", default-features = false, features = ["format"] }
+nickel-lang-core = { version = "0.16.1", default-features = false, features = ["format"] }
 object = { version = "0.38", default-features = false, features = ["archive", "elf", "read_core", "std"] }
-oci-spec = "0.8.3"
+oci-spec = "0.9.0"
 path-absolutize = "^3.1"
 rand = "0.10"
 rayon = "1.11"
@@ -77,8 +77,8 @@ thiserror = "2.0"
 tokio = { version = "1.48.0", features = ["full"] }
 tokio-stream = "0.1"
 tokio-util = "0.7"
-toml = "0.9"
-toml_edit = "0.23"
+toml = "1.0"
+toml_edit = "0.25"
 tonic = "0.14.2"
 tonic-prost = "0.14.2"
 tonic-prost-build = "0.14.2"
