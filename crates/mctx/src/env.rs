@@ -239,6 +239,7 @@ impl EnvChannel<'_> {
                 cache,
                 graph: &graph,
                 exec_base: output_base,
+                ot: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -624,7 +625,7 @@ impl<'a> Env<'a> {
         Ok(Env {
             cwd: args.cwd,
             sandbox,
-            claude_md_already_exists: claude_md_already_exists,
+            claude_md_already_exists,
             temp_dirs: vec![llm_inject_dir],
         })
     }

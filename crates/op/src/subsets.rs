@@ -127,6 +127,7 @@ mod tests {
             cache: cache.clone(),
             graph: &dg,
             exec_base: "/not-exists".into(),
+            ot: None,
         };
         let pending_dir = futures::executor::block_on(sb.run(run_opts)).unwrap();
         pending_dir

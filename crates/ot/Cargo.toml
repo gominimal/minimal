@@ -1,0 +1,13 @@
+[package]
+name = "ot"
+version = "0.0.1"
+rust-version = "1.87"
+license = "MIT OR Apache-2.0"
+edition.workspace = true
+publish.workspace = true
+
+[dev-dependencies]
+indoc.workspace = true
+
+[dependencies]
+indicatif.workspace = true

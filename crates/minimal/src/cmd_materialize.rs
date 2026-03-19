@@ -49,6 +49,7 @@ pub async fn cmd_materialize(args: MaterializeArgs, ctx: &mut Context) -> Result
         cache,
         graph: &graph,
         exec_base: "/invalid".into(),
+        ot: None, // TODO: patch through from ctx
     };
 
     use op::Runnable;

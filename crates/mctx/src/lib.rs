@@ -358,6 +358,7 @@ impl Context {
             } else {
                 Some(self.config.index_dir())
             },
+            self.config.ot.clone(),
         )
         .await;
         tracing::trace!("remote cache init took {:?}", start.elapsed());
@@ -434,6 +435,7 @@ impl Context {
             graph.clone(),
             cache.clone(),
             log_sink,
+            self.config.ot.clone(),
         )?;
 
         let (built, result) = match (
@@ -848,6 +850,7 @@ mod tests {
                 cache: ctx.local_cache(),
                 exec_base: temp_dir.path().to_path_buf(),
                 graph: &graph,
+                ot: ctx.config.ot.clone(),
             };
 
             assert_eq!(t.run(&opts).await.unwrap(), vec![]);

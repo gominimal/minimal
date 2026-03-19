@@ -11,6 +11,7 @@ use google_cloud_storage::client::Storage as GcsStorage;
 use graph::{BinProvider, BuildSpecRef, Graph, SubsetInput};
 use lcache::{Cache, CacheErr, DirCacheEntry, EntryMeta, LocalDir, MetaInner, PendingDir};
 use op::{Runnable, SourceFetcher};
+use ot::OpTracker;
 use rcache::RemoteCache;
 use tokio::sync::Semaphore;
 use tokio::task::spawn_blocking;
@@ -133,6 +134,7 @@ pub struct LocalBackend<SF: SourceFetcher + 'static> {
     pub(crate) build_semaphore: Semaphore,
     pub(crate) num_concurrent_builds: usize,
     pub(crate) log_sink: Option<mpsc::UnboundedSender<BuildEvent>>,
+    pub(crate) ot: Option<OpTracker>,
 }
 
 impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
@@ -217,6 +219,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                 .run(&op::Options {
                     cache: shared.cache.clone(),
                     graph: &shared.graph,
+                    ot: shared.backend.ot.clone(),
                     exec_base: shared.backend.output_base.clone(),
                 })
                 .await;
@@ -350,6 +353,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
             .run(&op::Options {
                 cache: shared.cache.clone(),
                 graph: &shared.graph,
+                ot: shared.backend.ot.clone(),
                 exec_base: shared.backend.output_base.clone(),
             })
             .await;
@@ -388,6 +392,7 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
         graph: Graph,
         cache: Cache<LocalDir>,
         log_sink: Option<mpsc::UnboundedSender<BuildEvent>>,
+        ot: Option<OpTracker>,
     ) -> Result<Orchestrator<Self>, Error> {
         Ok(Orchestrator {
             top_levels,
@@ -398,6 +403,7 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
                 log_sink,
                 build_semaphore: Semaphore::new(num_concurrent_builds),
                 num_concurrent_builds,
+                ot,
             },
             graph,
             cache,

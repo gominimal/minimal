@@ -10,6 +10,7 @@ members = [
     "crates/mctx",
     "crates/mfile",
     "crates/op",
+    "crates/ot",
     "crates/orchestrator",
     "crates/minimal",
     "crates/remote-client",
@@ -47,6 +48,7 @@ google-cloud-storage = "1.5.0"
 hakoniwa = { git = "https://github.com/souk4711/hakoniwa", branch = "main" }
 http-body = "1"
 hex = "0.4"
+indicatif = "0.18"
 indoc = "^2.0"
 jaq-all = "0.1.0-beta"
 lzma-rs = "0.3"
@@ -81,7 +83,6 @@ tonic = "0.14.2"
 tonic-prost = "0.14.2"
 tonic-prost-build = "0.14.2"
 tracing = "0.1"
-tracing-indicatif = "0.3.14"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2.5" # keep in sync with reqwest
 uuid = { version = "1.19", features = ["v4"] }
@@ -103,6 +104,7 @@ decode = { version = "0.0.1", path = "crates/decode" }
 mctx = { version = "0.0.1", path = "crates/mctx" }
 mfile = { version = "0.0.1", path = "crates/mfile" }
 op = { version = "0.0.1", path = "crates/op" }
+ot = { version = "0.0.1", path = "crates/ot" }
 orchestrator = { version = "0.0.1", path = "crates/orchestrator" }
 remote-proto = { version = "0.0.1", path = "crates/remote-proto" }
 remote-client = { version = "0.0.1", path = "crates/remote-client" }

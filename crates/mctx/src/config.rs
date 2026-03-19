@@ -1,6 +1,7 @@
 use std::{fmt, path::PathBuf};
 
 use checkouts::ManagerHandle;
+use ot::OpTracker;
 
 /// The errors possible in configuration or building a configuration.
 #[derive(Debug)]
@@ -37,6 +38,7 @@ pub struct ConfigBuilder {
     stdlib_dir: Option<PathBuf>,
     repo_dir: Option<PathBuf>,
     vcs_manager: Option<ManagerHandle>,
+    ot: Option<OpTracker>,
 }
 
 impl ConfigBuilder {
@@ -79,6 +81,11 @@ impl ConfigBuilder {
         self.vcs_manager = Some(manager);
         self
     }
+    /// Use the specified operation tracker instead of the root.
+    pub fn with_operation_tracker(mut self, ot: OpTracker) -> Self {
+        self.ot = Some(ot);
+        self
+    }
 }
 
 impl ConfigBuilder {
@@ -99,6 +106,7 @@ impl ConfigBuilder {
             stdlib_dir: self.stdlib_dir,
             repo_dir: self.repo_dir,
             vcs_manager: self.vcs_manager,
+            ot: self.ot,
         })
     }
 }
@@ -121,6 +129,8 @@ pub struct Config {
     repo_dir: Option<PathBuf>,
     /// Use the specified vcs manager instead of initializing one from disk.
     vcs_manager: Option<ManagerHandle>,
+    /// The [OpTracker] to use instead of the root.
+    pub(crate) ot: Option<OpTracker>,
 }
 
 impl Config {

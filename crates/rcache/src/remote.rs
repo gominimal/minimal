@@ -1,6 +1,7 @@
 use crate::remote_index::RemoteIndex;
 use common::{SpecHash, archive};
 use lcache::{Cache, LocalDir, PendingDir};
+use ot::{OpTracker, Operation};
 use std::io::{Seek, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -8,9 +9,6 @@ use std::time::{Duration, Instant};
 use common::fetchers::*;
 use google_cloud_storage::{Error as GcsError, client::Storage};
 use reqwest::{Client, Error as ReqwestError};
-
-use tracing_indicatif::span_ext::IndicatifSpanExt;
-use tracing_indicatif::style::ProgressStyle;
 
 /// An error from operations with the remote cache.
 #[derive(Debug)]
@@ -47,6 +45,8 @@ pub struct RemoteCache<B: FetchBackend> {
     #[allow(dead_code)]
     dir: Option<PathBuf>,
 
+    ot: Option<OpTracker>,
+
     uploaded: Vec<(SpecHash, [u8; 32])>,
 }
 
@@ -57,13 +57,14 @@ impl RemoteCache<Client> {
     pub async fn new_over_https<URL: Into<ReqwestUrl>>(
         url: URL,
         index_dir: Option<PathBuf>,
+        ot: Option<OpTracker>,
     ) -> Result<Self, Error<ReqwestError>> {
         let backend = Client::builder()
             .user_agent("minimal/remote-cache")
             .build()?;
         let url = url.into();
 
-        Self::new(backend, url, index_dir).await
+        Self::new(backend, url, index_dir, ot).await
     }
 }
 
@@ -73,13 +74,14 @@ impl RemoteCache<Storage> {
         storage: Storage,
         bucket_id: &str,
         index_dir: Option<PathBuf>,
+        ot: Option<OpTracker>,
     ) -> Result<Self, Error<GcsError>> {
         let url = GcsUrl {
             bucket: format!("projects/_/buckets/{bucket_id}"),
             object: "".to_string(),
         };
 
-        Self::new(storage, url, index_dir).await
+        Self::new(storage, url, index_dir, ot).await
     }
 
     /// Upserts the given artifact to the GCS bucket, staging it for inclusion
@@ -123,6 +125,7 @@ impl RemoteCache<Storage> {
             base,
             uploaded,
             dir: _,
+            ot: _,
         } = self;
 
         index.extend(uploaded);
@@ -150,6 +153,7 @@ impl<B: FetchBackend> RemoteCache<B> {
         backend: B,
         url: B::Url,
         index_dir: Option<PathBuf>,
+        ot: Option<OpTracker>,
     ) -> Result<Self, Error<<B::Response as FetchResponse>::Error>> {
         // Fast path: Use locally-cached index if its recent
         if let Some(id) = index_dir.as_ref() {
@@ -169,6 +173,7 @@ impl<B: FetchBackend> RemoteCache<B> {
                     dir: index_dir,
                     base: url,
                     uploaded: vec![],
+                    ot,
                 });
             }
         }
@@ -176,14 +181,24 @@ impl<B: FetchBackend> RemoteCache<B> {
         let fetch_start = Instant::now();
         let index_req = backend.get(url.join(INDEX_FILENAME).unwrap())?;
 
-        // TODO: Gotta be a better way to stream it into [RemoteIndex].
-        let index_resp = backend.execute(index_req).await?;
+        let fetch_op = OpTracker::new_with_root(&ot).with_op(Operation::FetchIndex);
 
+        // TODO: Gotta be a better way to stream it into [RemoteIndex].
+        let mut index_resp = backend.execute(index_req).await?;
         let index = match index_resp.status_code() {
             404 => RemoteIndex::default(),
             _ => {
-                let index_data = index_resp.error_for_status()?.bytes().await?;
-                let index = RemoteIndex::from_reader(&mut std::io::Cursor::new(index_data))
+                fetch_op.set_length(index_resp.content_length().unwrap());
+
+                let mut buffer =
+                    Vec::with_capacity(index_resp.content_length().unwrap_or(1024 * 1024) as usize);
+                while let Some(chunk) = index_resp.chunk().await? {
+                    fetch_op.increment(chunk.len() as u64);
+                    buffer.extend(chunk);
+                }
+                fetch_op.set_done();
+
+                let index = RemoteIndex::from_reader(&mut std::io::Cursor::new(buffer))
                     .map_err(Error::IO)?;
 
                 if let Some(index_dir) = index_dir.as_ref() {
@@ -206,6 +221,7 @@ impl<B: FetchBackend> RemoteCache<B> {
             dir: index_dir,
             base: url,
             uploaded: vec![],
+            ot,
         })
     }
 
@@ -223,15 +239,9 @@ impl<B: FetchBackend> RemoteCache<B> {
     ) -> Result<(Duration, PendingDir), Error<<B::Response as FetchResponse>::Error>> {
         let sha256: [u8; 32] = self.index.sha256(spec_hash).ok_or(Error::NotFound)?;
 
-        let span = tracing::info_span!("materialize", "indicatif.pb_show" = tracing::field::Empty,);
-        span.pb_set_style(
-            &ProgressStyle::with_template(
-                "{prefix}Fetch: {msg:35!} [{wide_bar}]     {decimal_bytes:9!} / {decimal_total_bytes:9!}   ETA: {eta:5!}",
-            )
-            .unwrap()
-            .progress_chars("=> "),
-        );
-        span.pb_set_message(span_name);
+        let materialize_op = OpTracker::new_with_root(&self.ot).with_op(Operation::FetchPkg {
+            name: span_name.to_string(),
+        });
 
         let start = Instant::now();
         let req = self.backend.get(
@@ -242,20 +252,20 @@ impl<B: FetchBackend> RemoteCache<B> {
 
         // Fetch the remote archive into a temporary file and seek to the beginning for decoding.
         let mut resp = self.backend.execute(req).await?;
-        span.pb_set_length(resp.content_length().unwrap());
-        let span_enter = span.enter();
+        materialize_op.set_length(resp.content_length().unwrap());
 
         let mut tar_file = tempfile::tempfile().map_err(Error::IO)?;
         while let Some(chunk) = resp.chunk().await? {
-            span.pb_inc(chunk.len() as u64);
+            materialize_op.increment(chunk.len() as u64);
             tar_file.write_all(&chunk).map_err(Error::IO)?;
         }
         tar_file
             .seek(std::io::SeekFrom::Start(0))
             .map_err(Error::IO)?;
 
-        span.pb_set_style(&ProgressStyle::default_spinner());
-        span.pb_set_message(format!("Extract: {}", span_name).as_str());
+        materialize_op.set_op(Operation::Extract {
+            name: span_name.to_string(),
+        });
         let cache_hnd = cache.write_dir(spec_hash).map_err(Error::Cache)?;
         archive::extract_compressed_tar(
             tar_file,
@@ -265,8 +275,6 @@ impl<B: FetchBackend> RemoteCache<B> {
         )
         .map_err(Error::ArchiveError)?;
 
-        drop(span_enter);
-        drop(span);
         Ok((Instant::now().duration_since(start), cache_hnd))
     }
 }

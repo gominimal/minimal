@@ -24,4 +24,5 @@ common.workspace = true
 decode.workspace = true
 graph.workspace = true
 op.workspace = true
+ot.workspace = true
 sandbox2.workspace = true

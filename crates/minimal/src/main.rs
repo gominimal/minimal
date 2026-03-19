@@ -6,8 +6,6 @@ use clap_complete::Shell;
 use mctx::{ConfigBuilder, Context, Error};
 use std::io;
 use std::path::PathBuf;
-use tracing_indicatif::IndicatifLayer;
-use tracing_indicatif::{filter::IndicatifFilter, filter::hide_indicatif_span_fields};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 mod cmd_pkg;
@@ -189,10 +187,6 @@ async fn main() -> Result<(), Error> {
         std::process::exit(1);
     }
 
-    let indicatif_layer = IndicatifLayer::new()
-        .with_max_progress_bars(32, None)
-        .with_span_field_formatter(hide_indicatif_span_fields(fmt::format::DefaultFields::new()));
-
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new("info")
             .add_directive("topiary=off".parse().unwrap())
@@ -201,8 +195,7 @@ async fn main() -> Result<(), Error> {
     });
 
     tracing_subscriber::registry()
-        .with(fmt::layer().with_writer(indicatif_layer.get_stderr_writer()))
-        .with(indicatif_layer.with_filter(IndicatifFilter::new(false)))
+        .with(fmt::layer().with_writer(ot::StdoutWriter::new))
         .with(filter)
         .init();
 

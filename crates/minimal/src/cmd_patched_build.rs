@@ -31,6 +31,7 @@ pub async fn cmd_patched_build(args: PatchedBuildArgs, ctx: &mut Context) -> Res
         cache,
         graph: &graph,
         exec_base: output_base,
+        ot: None, // TODO: patch through from ctx
     })
     .await
     .map_err(|e| Error::Other(anyhow!("build failed: {}", e)))?;

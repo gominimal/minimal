@@ -14,6 +14,7 @@ pub struct Options<'a> {
     pub cache: Cache<LocalDir>,
     pub graph: &'a Graph,
     pub exec_base: PathBuf,
+    pub ot: Option<OpTracker>,
 }
 
 /// Describes an operation which is configured and ready to be executed.
@@ -34,6 +35,7 @@ pub enum Materialized {
 }
 
 mod subsets;
+use ot::OpTracker;
 pub use subsets::SubsetBuild;
 
 mod sources;

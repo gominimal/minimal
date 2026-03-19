@@ -1001,6 +1001,7 @@ impl GraphBasedChecker for StandaloneTestCheck {
                             cache: cache.clone(),
                             exec_base: temp_dir.path().to_path_buf(),
                             graph: &graph2,
+                            ot: None, // TODO: Plumb through from parent
                         };
 
                         match t.run(&opts).await {

@@ -6,6 +6,7 @@ use common::Target;
 use globset::GlobSet;
 use graph::{BuildDep, BuildSpec, BuildSpecRef, SubsetInput, Transitives};
 use lcache::{CacheErr, MetaInner, PendingDir};
+use ot::{OpTracker, Operation};
 use sandbox2::config::SandboxMapped;
 use tracing::info;
 
@@ -224,12 +225,9 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
     async fn run<'b>(&mut self, opts: &Options<'b>) -> Result<Self::Result, Error> {
         let build = opts.graph.get(self.spec).unwrap();
 
-        let span = tracing::info_span!(
-            "build",
-            "indicatif.pb_show" = tracing::field::Empty,
-            "package" = build.name,
-        );
-        let _enter = span.enter();
+        let build_op = OpTracker::new_with_root(&opts.ot).with_op(Operation::PackageBuild {
+            name: build.name.clone(),
+        });
 
         // Special case: prebuilts
         if build.is_pure_prebuilt() {
@@ -304,23 +302,6 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
             .map_err(|e| Error::Other(anyhow!(e)))?;
 
         {
-            let span = tracing::info_span!(
-                "collect_outputs",
-                "indicatif.pb_show" = tracing::field::Empty,
-                "outputs" = {
-                    let s = output_globs
-                        .iter()
-                        .map(|g| g.0.clone())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    match s.char_indices().nth(30) {
-                        Some((idx, _)) => format!("{}...", &s[..idx]),
-                        None => s.to_string(),
-                    }
-                },
-            );
-            let _enter = span.enter();
-
             // Match the outputs into their final destination
             sandbox.match_outputs_into(
                 GlobSet::new(output_globs.iter().map(|(_, g)| g.clone())).unwrap(),
@@ -358,6 +339,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
         }
 
         sandbox.keep_dir(false);
+        build_op.set_done();
         Ok(SpecBuildResult {
             outputs: out_dir,
             build_ms,
