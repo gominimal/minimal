@@ -3,6 +3,7 @@ use graph::SourceInput;
 use lcache::PendingDir;
 
 use anyhow::{Context, Result, anyhow};
+use ot::OpTracker;
 use std::future::Future;
 use std::path::PathBuf;
 use tracing::debug;
@@ -16,6 +17,7 @@ pub trait SourceFetcher: Send + Sync + std::fmt::Debug {
         &self,
         url: &str,
         sha256: &str,
+        op: &OpTracker,
     ) -> impl Future<Output = Result<PathBuf, anyhow::Error>> + Send;
 
     /// Returns a path to the specified bucket + file, after sha256 verification.
@@ -26,12 +28,18 @@ pub trait SourceFetcher: Send + Sync + std::fmt::Debug {
         bucket_id: String,
         file: &str,
         sha256: &str,
+        op: &OpTracker,
     ) -> impl Future<Output = Result<PathBuf, anyhow::Error>> + Send;
 }
 
 impl SourceFetcher for common::RemoteStorage {
-    async fn download_web(&self, url: &str, sha256: &str) -> Result<PathBuf, anyhow::Error> {
-        self.download_web_with_verification_and_caching(url, sha256)
+    async fn download_web(
+        &self,
+        url: &str,
+        sha256: &str,
+        op: &OpTracker,
+    ) -> Result<PathBuf, anyhow::Error> {
+        self.download_web_with_verification_and_caching(url, sha256, op)
             .await
     }
 
@@ -40,8 +48,9 @@ impl SourceFetcher for common::RemoteStorage {
         bucket_id: String,
         file: &str,
         sha256: &str,
+        op: &OpTracker,
     ) -> Result<PathBuf, anyhow::Error> {
-        self.download_with_verification_and_caching(bucket_id, file, sha256)
+        self.download_with_verification_and_caching(bucket_id, file, sha256, op)
             .await
     }
 }
@@ -57,14 +66,14 @@ impl<'a, SF: SourceFetcher> Runnable for SourceLoad<'a, SF> {
     type Result = Materialized;
 
     async fn run<'b>(&mut self, opts: &Options<'b>) -> Result<Self::Result, Error> {
-        let span = tracing::info_span!(
-            "source_fetch",
-            "indicatif.pb_show" = tracing::field::Empty,
-            "from" = format!("{:?}", self.source.from),
-        );
-        let _enter = span.enter();
-
         use graph::SourceFetch;
+        let op = OpTracker::new_with_root(&opts.ot).with_op(ot::Operation::FetchSource {
+            url: match &self.source.from {
+                SourceFetch::Local { filename, .. } => filename.clone(),
+                SourceFetch::Web { url, .. } => url.clone(),
+            },
+        });
+
         let (cached_path, filename) = match &self.source.from {
             SourceFetch::Local {
                 full_path,
@@ -89,7 +98,7 @@ impl<'a, SF: SourceFetcher> Runnable for SourceLoad<'a, SF> {
                     "https" | "http" => {
                         let cached_path = self
                             .remote_fetcher
-                            .download_web(url.as_str(), sha256)
+                            .download_web(url.as_str(), sha256, &op)
                             .await?;
 
                         debug!("  Downloaded and verified source from {}", url);
@@ -108,7 +117,7 @@ impl<'a, SF: SourceFetcher> Runnable for SourceLoad<'a, SF> {
 
                         let cached_path = self
                             .remote_fetcher
-                            .download_gcs(bucket_id.to_string(), file_name, sha256)
+                            .download_gcs(bucket_id.to_string(), file_name, sha256, &op)
                             .await?;
 
                         debug!(

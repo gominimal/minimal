@@ -41,6 +41,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         &self,
         build: &BuildSpec,
         opts: &Options<'a>,
+        op: &OpTracker,
     ) -> Result<Vec<SandboxMapped>, Error> {
         let mut build_deps = Vec::new();
 
@@ -55,7 +56,12 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                         remote_fetcher: self.remote_fetcher,
                         into: None,
                     }
-                    .run(opts)
+                    .run(&Options {
+                        ot: Some(op.to_owned()),
+                        cache: opts.cache.clone(),
+                        graph: opts.graph,
+                        exec_base: opts.exec_base.clone(),
+                    })
                     .await?;
                     match resolved_src {
                         Materialized::Given(_) => unreachable!(),
@@ -248,7 +254,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
             )));
         }
 
-        let inputs = self.build_deps_mapped(build, opts).await?;
+        let inputs = self.build_deps_mapped(build, opts, &build_op).await?;
         let (rootfs, needs_dns, needs_internet) = self.rootfs_mapped(build, opts).await?;
 
         let channel = ();
@@ -286,6 +292,11 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
             .cache
             .write_dir(&opts.graph.spec_hash(self.spec))
             .unwrap();
+
+        build_op.set_op(Operation::CollectOutputs {
+            name: build.name.clone(),
+            outputs: build.outputs.iter().map(|(n, _)| n.clone()).collect(),
+        });
 
         // Build individual globs for each output so we can verify each one matched
         let output_globs: Vec<(String, globset::Glob)> = build

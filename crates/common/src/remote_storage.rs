@@ -3,6 +3,7 @@ use crate::file_cache;
 use crate::file_cache::CachingDownloader;
 use anyhow::Result;
 use google_cloud_storage::client::Storage;
+use ot::OpTracker;
 
 use std::fs::File;
 use std::path::PathBuf;
@@ -34,11 +35,12 @@ impl RemoteStorage {
         &self,
         url: &str,
         sha256: &str,
+        op: &OpTracker,
     ) -> Result<PathBuf> {
         let client = reqwest::Client::new();
         let backend = (&client, &self.cache);
         backend
-            .download(ReqwestUrl::try_from(url)?, sha256)
+            .download(ReqwestUrl::try_from(url)?, sha256, op)
             .await
             .map_err(|e| match e {
                 either::Either::Left(e) => anyhow::Error::from(e),
@@ -52,6 +54,7 @@ impl RemoteStorage {
         bucket_id: String,
         file: &str,
         sha256: &str,
+        op: &OpTracker,
     ) -> Result<PathBuf> {
         let backend = (&self.client, &self.cache);
         backend
@@ -61,6 +64,7 @@ impl RemoteStorage {
                     object: file.to_string(),
                 },
                 sha256,
+                op,
             )
             .await
             .map_err(|e| match e {

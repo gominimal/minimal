@@ -589,6 +589,7 @@ dependencies = [
  "jaq-all",
  "lzma-rs",
  "nickel-lang-core",
+ "ot",
  "rand 0.10.0",
  "reqwest",
  "resolv-conf",

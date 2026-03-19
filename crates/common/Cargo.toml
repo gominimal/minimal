@@ -44,3 +44,5 @@ google-cloud-auth.workspace = true
 google-cloud-storage.workspace = true
 
 resolv-conf.workspace = true
+
+ot.workspace = true

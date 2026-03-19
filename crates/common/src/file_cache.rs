@@ -2,6 +2,7 @@ use crate::Tee;
 use crate::fetchers::{self, FetchUrl};
 
 use either::Either;
+use ot::OpTracker;
 use sha2::{Digest, Sha256};
 
 use std::fmt::{self};
@@ -135,6 +136,7 @@ impl FileCache {
         filename: &str,
         sha256: &str,
         response: &mut R,
+        op: &OpTracker,
     ) -> Result<PathBuf, Either<FileCacheError, R::Error>>
     where
         R: fetchers::FetchResponse,
@@ -146,9 +148,15 @@ impl FileCache {
             let mut f = fs::File::create(&cached_path).map_err(|e| Either::Left(e.into()))?;
             let mut w = Tee::new(&mut f, &mut hasher);
 
+            if let Some(size) = response.content_length() {
+                op.set_length(size);
+            }
             loop {
                 match response.chunk().await {
-                    Ok(Some(chunk)) => w.write_all(&chunk).unwrap(),
+                    Ok(Some(chunk)) => {
+                        op.increment(chunk.len() as u64);
+                        w.write_all(&chunk).unwrap();
+                    }
                     Ok(None) => {
                         break;
                     }
@@ -181,6 +189,7 @@ pub trait CachingDownloader<B: fetchers::FetchBackend> {
         &self,
         url: B::Url,
         sha256: &str,
+        op: &OpTracker,
     ) -> impl Future<
         Output = Result<
             PathBuf,
@@ -194,6 +203,7 @@ impl<B: fetchers::FetchBackend> CachingDownloader<B> for (&B, &FileCache) {
         &self,
         url: <B as fetchers::FetchBackend>::Url,
         sha256: &str,
+        op: &OpTracker,
     ) -> Result<
         PathBuf,
         Either<
@@ -219,6 +229,6 @@ impl<B: fetchers::FetchBackend> CachingDownloader<B> for (&B, &FileCache) {
             .await
             .map_err(Either::Right)?;
 
-        self.1.write_through(&filename, sha256, &mut r).await
+        self.1.write_through(&filename, sha256, &mut r, op).await
     }
 }

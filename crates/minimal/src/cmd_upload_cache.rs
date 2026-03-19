@@ -1,6 +1,7 @@
 use common::archive;
 use graph::Transitives;
 use mctx::{Context, Error};
+use ot::OpTracker;
 use std::sync::mpsc::channel;
 use tracing::info;
 
@@ -11,6 +12,7 @@ pub struct UploadArgs {
 }
 
 pub async fn cmd_upload_cache(args: UploadArgs, ctx: &mut Context) -> Result<(), Error> {
+    let op_root = ctx.op_tracker();
     let graph = if !args.packages.is_empty() {
         ctx.graph_from_package_names(args.packages.clone())?
     } else {
@@ -38,17 +40,15 @@ pub async fn cmd_upload_cache(args: UploadArgs, ctx: &mut Context) -> Result<(),
                     let bsh = graph.spec_hash(bsr);
                     let cache_hnd = cache.read_dir(&bsh);
                     if let Ok(cache_dir) = cache_hnd {
-                        let span = tracing::info_span!(
-                            "compress",
-                            "indicatif.pb_show" = tracing::field::Empty,
-                            "build" = build.name,
+                        let op = OpTracker::new_with_root(&op_root).with_op(
+                            ot::Operation::CompressPkg {
+                                name: build.name.clone(),
+                            },
                         );
-                        let _enter = span.enter();
 
-                        Some((
-                            *bsr,
-                            archive::compress_dir(cache_dir.path(), Some(16), &None).unwrap(),
-                        ))
+                        let out = archive::compress_dir(cache_dir.path(), Some(16), &None).unwrap();
+                        op.set_done();
+                        Some((*bsr, out))
                     } else {
                         info!(
                             "Skipping unbuilt package {} [{}]",

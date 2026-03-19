@@ -11,8 +11,11 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 #[derive(Debug, Clone)]
 pub enum Operation {
     PackageBuild { name: String },
+    CollectOutputs { name: String, outputs: Vec<String> },
     FetchPkg { name: String },
-    Extract { name: String },
+    CompressPkg { name: String },
+    ExtractPkg { name: String },
+    FetchSource { url: String },
     FetchIndex,
 }
 
@@ -51,12 +54,35 @@ impl TrackerInner {
                 new_pg.enable_steady_tick(Duration::from_millis(100));
                 self.install(new_pg);
             }
-            (Some(Operation::Extract { name }), _) => {
+            (Some(Operation::CollectOutputs { name, outputs }), _) => {
+                let new_pg = ProgressBar::hidden().with_style(
+                    ProgressStyle::with_template("{prefix}{spinner} Collect outputs for {msg}")
+                        .unwrap(),
+                );
+
+                let s = outputs.to_vec().join(" ");
+                let outputs_str = match s.char_indices().nth(30) {
+                    Some((idx, _)) => format!("{}...", &s[..idx]),
+                    None => s.to_string(),
+                };
+                new_pg.set_message(format!("{name}: {outputs_str}"));
+                new_pg.enable_steady_tick(Duration::from_millis(50));
+                self.install(new_pg);
+            }
+            (Some(Operation::ExtractPkg { name }), _) => {
                 let new_pg = ProgressBar::hidden().with_style(
                     ProgressStyle::with_template("{prefix}{spinner} Extract: {msg}").unwrap(),
                 );
                 new_pg.set_message(name.clone());
                 new_pg.enable_steady_tick(Duration::from_millis(50));
+                self.install(new_pg);
+            }
+            (Some(Operation::CompressPkg { name }), _) => {
+                let new_pg = ProgressBar::hidden().with_style(
+                    ProgressStyle::with_template("{prefix}{spinner} Compress: {msg}").unwrap(),
+                );
+                new_pg.set_message(name.clone());
+                new_pg.enable_steady_tick(Duration::from_millis(80));
                 self.install(new_pg);
             }
             (Some(Operation::FetchPkg { name }), _) => {
@@ -71,6 +97,12 @@ impl TrackerInner {
                 new_pg.set_message("");
                 self.install(new_pg);
             }
+            (Some(Operation::FetchSource { url }), _) => {
+                let new_pg = ProgressBar::hidden()
+                    .with_style(ProgressStyle::with_template("{prefix}Fetch source: {msg:35!} [{wide_bar}]     {decimal_bytes:9!} / {decimal_total_bytes:9!}   ETA: {eta:5!}").unwrap().progress_chars("=> "));
+                new_pg.set_message(url.clone());
+                self.install(new_pg);
+            }
             // No operation remains but a progress bar exists. Set it to finished and remove our reference.
             (None, Some(pg)) => {
                 pg.finish_and_clear();
@@ -82,7 +114,7 @@ impl TrackerInner {
 
     fn install(&mut self, pg: ProgressBar) {
         if self.depth > 1 {
-            pg.set_prefix(format!("{}{}", "  ".repeat((self.depth - 1) / 2), "↳ "));
+            pg.set_prefix(format!("{}{}", "  ".repeat((self.depth - 1) * 2), "↳ "));
         }
         if let Some(p) = &self.parent {
             p.install_progress(pg.clone());

@@ -12,6 +12,7 @@ use checkouts::{Manager as VcsManager, ManagerHandle as VcsManagerHandle};
 use common::{SpecOrigin, Target};
 use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
 use lcache::CacheBinProvider;
+use ot::OpTracker;
 use rcache::{Error as RemoteError, RemoteBinProvider, RemoteCache};
 
 mod error;
@@ -376,6 +377,10 @@ impl Context {
     /// Returns a [SpecOrigin] representing the top-level repository.
     pub fn repo_origin(&self) -> SpecOrigin {
         SpecOrigin::from_dir(self.repo_dir())
+    }
+    /// Returns the [OpTracker] to be used as the root for tracking long-running operations.
+    pub fn op_tracker(&self) -> Option<OpTracker> {
+        self.config.ot.clone()
     }
 
     /// Builds & returns the graph with the given packages specified as top levels.

@@ -263,7 +263,7 @@ impl<B: FetchBackend> RemoteCache<B> {
             .seek(std::io::SeekFrom::Start(0))
             .map_err(Error::IO)?;
 
-        materialize_op.set_op(Operation::Extract {
+        materialize_op.set_op(Operation::ExtractPkg {
             name: span_name.to_string(),
         });
         let cache_hnd = cache.write_dir(spec_hash).map_err(Error::Cache)?;
