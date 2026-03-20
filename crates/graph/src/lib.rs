@@ -1,3 +1,4 @@
+//! The in-memory, semantic graph of software which make up a minimal environment.
 use common::{SpecHash, SpecOrigin};
 use serde::{Deserialize, Serialize};
 

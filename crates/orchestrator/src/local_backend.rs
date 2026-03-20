@@ -21,23 +21,25 @@ use crate::Error;
 /// The specific event described by a [BuildEvent].
 #[derive(Debug, Clone)]
 pub enum BuildEventInner {
-    Log {
-        is_stderr: bool,
-        line: String,
-    },
-    Hydrate {
-        name: String,
-        spec_hash: String,
-    },
+    /// A line of text on stdout or stderr. You can identify the build by correlating
+    /// the `idx` field in the containing structure with that of an earlier
+    /// [BuildEventInner::Start] message.
+    Log { is_stderr: bool, line: String },
+    /// An indication that a package is being fetched to the local cache.
+    Hydrate { name: String, spec_hash: String },
+    /// A build of the described package has started.
     Start {
         name: String,
         full_build: bool,
         spec_hash: String,
     },
+    /// The build has finished. You can identify the build by correlating
+    /// the `idx` field in the containing structure with that of an earlier
+    /// [BuildEventInner::Start] message.
     Stop,
 }
 
-/// Something that happens during a build run. Idx identifies the build in question.
+/// Something that happens during a build run. The `idx` field identifies the build in question.
 #[derive(Debug, Clone)]
 pub struct BuildEvent {
     pub idx: usize,

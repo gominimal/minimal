@@ -1,4 +1,5 @@
-//! Tracking of long-running operations.
+//! Tracking of long-running operations, so that pretty progress bars
+//! can be printed.
 
 use std::{
     sync::{Arc, Mutex, OnceLock, Weak},

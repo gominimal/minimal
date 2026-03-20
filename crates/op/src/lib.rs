@@ -1,4 +1,4 @@
-//! Implements operations using the minimal graph, such as builds or constructing cache objects.
+//! Home for complicated operations using the minimal graph, such as builds or constructing cache objects.
 #![allow(clippy::result_large_err)]
 
 use std::path::PathBuf;

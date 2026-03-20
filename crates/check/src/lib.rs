@@ -1,3 +1,8 @@
+//! Implements `minimal check` logic - for linting Minimal configuration including
+//! `minimal.toml`, packages, profiles, and harnesses.
+//!
+//! Run checkers using [`run_checks`].
+
 #![allow(clippy::result_large_err)]
 
 use anyhow::anyhow;

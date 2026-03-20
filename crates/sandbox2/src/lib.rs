@@ -1,3 +1,15 @@
+//! The low-level sandbox implementation.
+//!
+//! Build a [`Config`] and use it to construct a [`Sandbox`].
+//!
+//! There are two main variants of sandboxes:
+//!
+//!  * those configured with [`WdSetup::Isolated`], which have no state directory, file mappings to the host system,
+//!    or mapped cwd. These are 'cleanroom' sandboxes, for hermetic builds.
+//!  * those configured with [`WdSetup::BoundDir`], which map a directory from the host for the cwd, allow additional
+//!    filesystem mappings into the sandbox, allows wiring a `/state` directory, and brings across a host of default
+//!    environment variables (like TERM) from the host. These are for task sandboxes.
+
 pub mod config;
 use config::Config;
 use std::fs;
@@ -25,6 +37,11 @@ impl Channel for () {
     }
 }
 
+/// An initialized sandbox.
+///
+/// Sandboxes can have a [`Channel`] wired to the outside world for interactive operations and mutations
+/// to the sandbox itself that originate from inside the sandbox. Pass `()` as the channel to have this
+/// be effectively disabled.
 #[derive(Debug)]
 pub struct Sandbox<C: Channel = ()> {
     pub(crate) base_dir: PathBuf,
@@ -69,6 +86,7 @@ impl<C: Channel> Drop for Sandbox<C> {
 
 // Sandbox initialization
 impl<C: Channel> Sandbox<C> {
+    /// Creates a new sandbox, containing all filesystem state within `base_dir`.
     pub(crate) fn new(base_dir: PathBuf, config: Config, channel: C) -> Result<Self, Error> {
         // Setup the rootfs
         let rootfs = base_dir.join("rootfs");
