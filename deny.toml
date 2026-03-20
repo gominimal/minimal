@@ -5,8 +5,6 @@ ignore = [
     "RUSTSEC-2023-0089",
     # DOS in time parsing, N/A
     "RUSTSEC-2026-0009",
-    # We don't enable CRL checking via X509_V_FLAG_CRL_CHECK
-    "RUSTSEC-2026-0048",
 ]
 
 [licenses]
@@ -23,8 +21,6 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "bzip2-1.0.6",
-    # OpenSSL 3 is meaningfully the Apache license
-    "OpenSSL",
 ]
 
 exceptions = [
@@ -66,13 +62,6 @@ skip = [
     # nickel-lang-core -> malachite -> malachite-base
     # https://github.com/tweag/nickel/pull/2367
     { name = "itertools", version = "0.11.0" },
-    # nickel-lang-core -> strip-ansi-escapes
-    # https://github.com/luser/strip-ansi-escapes/pull/23
-    { name = "vte", version = "0.14.1" },
-]
-
-skip-tree = [
-    { name = "windows-sys", version = "=0.60.2" },
 ]
 
 [sources.allow-org]
