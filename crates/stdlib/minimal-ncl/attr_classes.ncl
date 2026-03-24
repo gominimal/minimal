@@ -8,6 +8,11 @@ let source_provenance_gnu = {
     name | String,
 }
 in
+let source_provenance_sourceforge = {
+    category = 'Sourceforge,
+    name | String | doc "The name of the project, typically first component of the URL path.",
+}
+in
 let source_provenance_github = {
     category = 'GithubRepo,
     owner | String,
@@ -79,6 +84,7 @@ in
                 match {
                 {category = 'GnuProject, ..} => std.contract.check source_provenance_gnu label value,
                 {category = 'GithubRepo, ..} => std.contract.check source_provenance_github label value,
+                {category = 'Sourceforge, ..} => std.contract.check source_provenance_sourceforge label value,
                     _ => 'Error {
                         message = "source_provenance value had invalid/unknown category",
                     },
