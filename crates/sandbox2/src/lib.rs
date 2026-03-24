@@ -439,8 +439,28 @@ impl<C: Channel> Sandbox<C> {
     pub async fn run<W1, W2>(
         &mut self,
         invocations: Vec<Invocation>,
+        stdout_writer: Option<W1>,
+        stderr_writer: Option<W2>,
+    ) -> Result<(), Error>
+    where
+        W1: tokio::io::AsyncWrite + Unpin + Send,
+        W2: tokio::io::AsyncWrite + Unpin + Send,
+    {
+        self.run_with_cancel(
+            invocations,
+            stdout_writer,
+            stderr_writer,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+    }
+
+    pub async fn run_with_cancel<W1, W2>(
+        &mut self,
+        invocations: Vec<Invocation>,
         mut stdout_writer: Option<W1>,
         mut stderr_writer: Option<W2>,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<(), Error>
     where
         W1: tokio::io::AsyncWrite + Unpin + Send,
@@ -448,6 +468,10 @@ impl<C: Channel> Sandbox<C> {
     {
         let container = self.new_container()?;
         for (i, exec) in invocations.iter().enumerate() {
+            if cancel.is_cancelled() {
+                return Err(Error::Execution(ExecutionError::Cancelled));
+            }
+
             let mut cmd = self.command(&container, &exec.executable, &exec.args, &exec.envs)?;
             cmd.stderr(hakoniwa::Stdio::MakePipe);
             cmd.stdout(hakoniwa::Stdio::MakePipe);
@@ -563,36 +587,58 @@ impl<C: Channel> Sandbox<C> {
                 Ok::<(), Error>(())
             };
 
-            let (stdout_fwd_res, stderr_fwd_res) = tokio::join!(stdout_fwd, stderr_fwd);
+            // Race the forwarding against cancellation. When cancelled, kill the
+            // child process — this closes its pipes, which unblocks the reader
+            // threads, which drop the senders, which completes the fwd futures.
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    let _ = child.kill();
 
-            // Collect results from the reader threads.
-            let stdout_file = stdout_thread
-                .join()
-                .expect("stdout reader thread panicked")?;
-            let (stderr_file, stderr_tail) = stderr_thread
-                .join()
-                .expect("stderr reader thread panicked")?;
+                    // Recover stdout/stderr files from the reader threads.
+                    // The threads will finish promptly now that pipes are closed.
+                    if let Ok(Ok(f)) = stdout_thread.join() {
+                        self.stdout = f;
+                    }
+                    if let Ok(Ok((f, _tail))) = stderr_thread.join() {
+                        self.stderr = f;
+                    }
 
-            self.stdout = stdout_file;
-            self.stderr = stderr_file;
+                    // Reap the child process.
+                    let _ = child.wait();
+                    return Err(Error::Execution(ExecutionError::Cancelled));
+                }
+                (stdout_fwd_res, stderr_fwd_res) = async { tokio::join!(stdout_fwd, stderr_fwd) } => {
+                    // Collect results from the reader threads.
+                    let stdout_file = stdout_thread
+                        .join()
+                        .expect("stdout reader thread panicked")?;
+                    let (stderr_file, stderr_tail) = stderr_thread
+                        .join()
+                        .expect("stderr reader thread panicked")?;
 
-            // Propagate any async writer errors.
-            stdout_fwd_res?;
-            stderr_fwd_res?;
+                    self.stdout = stdout_file;
+                    self.stderr = stderr_file;
 
-            // The pipes are drained, so the child should have exited.
-            let status = child
-                .wait()
-                .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
+                    // Propagate any async writer errors.
+                    stdout_fwd_res?;
+                    stderr_fwd_res?;
 
-            if !status.success() {
-                let stderr_str = String::from_utf8_lossy(&stderr_tail).into_owned();
-                return Err(Error::Execution(ExecutionError::InvocationFailed {
-                    idx: i,
-                    code: status.code,
-                    reason: status.reason.clone(),
-                    stderr: stderr_str,
-                }));
+                    // The pipes are drained, so the child should have exited.
+                    let status = child
+                        .wait()
+                        .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
+
+                    if !status.success() {
+                        let stderr_str = String::from_utf8_lossy(&stderr_tail).into_owned();
+                        return Err(Error::Execution(ExecutionError::InvocationFailed {
+                            idx: i,
+                            code: status.code,
+                            reason: status.reason.clone(),
+                            stderr: stderr_str,
+                        }));
+                    }
+                }
             }
         }
         Ok(())

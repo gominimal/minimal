@@ -52,6 +52,7 @@ pub enum ExecutionError {
         stderr: String,
     },
     SpawnFailed(hakoniwa::Error),
+    Cancelled,
 }
 
 impl fmt::Display for ExecutionError {
@@ -76,6 +77,9 @@ impl fmt::Display for ExecutionError {
             Self::SpawnFailed(e) => {
                 write!(f, "Invocation spawn failed: {}", e)
             }
+            Self::Cancelled => {
+                write!(f, "Execution cancelled")
+            }
         }
     }
 }
@@ -85,6 +89,7 @@ impl std::error::Error for ExecutionError {
         match self {
             Self::InvocationFailed { .. } => None,
             Self::SpawnFailed(e) => Some(e),
+            Self::Cancelled => None,
         }
     }
 }

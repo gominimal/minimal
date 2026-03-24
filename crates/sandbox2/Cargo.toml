@@ -11,6 +11,7 @@ globset.workspace = true
 tracing.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 walkdir.workspace = true
 
 common.workspace = true

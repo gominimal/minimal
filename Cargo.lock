@@ -2430,6 +2430,7 @@ dependencies = [
  "stdlib",
  "tempfile",
  "tokio",
+ "tokio-util",
  "toml",
  "toml_edit",
  "tracing",
@@ -2529,6 +2530,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "tokio",
+ "tokio-util",
  "toml",
  "toml_edit",
  "tracing",
@@ -2739,6 +2741,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "url",
  "walkdir",
@@ -2781,6 +2784,7 @@ dependencies = [
  "rcache",
  "sandbox2",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -3679,6 +3683,7 @@ dependencies = [
  "hakoniwa",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "walkdir",
 ]

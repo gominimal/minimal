@@ -221,6 +221,9 @@ impl From<sandbox2::Error> for Error {
                 sandbox2::error::ExecutionError::SpawnFailed(e) => {
                     Self::Other(anyhow::anyhow!("spawn failed: {}", e))
                 }
+                sandbox2::error::ExecutionError::Cancelled => {
+                    Self::Other(anyhow::anyhow!("execution cancelled"))
+                }
             },
             sandbox2::Error::Output(e) => Self::Other(e.into()),
         }
