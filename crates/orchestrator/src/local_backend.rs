@@ -137,6 +137,7 @@ pub struct LocalBackend<SF: SourceFetcher + 'static> {
     pub(crate) num_concurrent_builds: usize,
     pub(crate) log_sink: Option<mpsc::UnboundedSender<BuildEvent>>,
     pub(crate) ot: Option<OpTracker>,
+    pub(crate) cancel: tokio_util::sync::CancellationToken,
 }
 
 impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
@@ -215,6 +216,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                         Box::new(SinkWriter::new(s.clone(), dr.inner_idx(), true))
                     },
                 ),
+                cancel: shared.backend.cancel.clone(),
             };
 
             let res = b
@@ -395,6 +397,7 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
         cache: Cache<LocalDir>,
         log_sink: Option<mpsc::UnboundedSender<BuildEvent>>,
         ot: Option<OpTracker>,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Orchestrator<Self>, Error> {
         Ok(Orchestrator {
             top_levels,
@@ -406,6 +409,7 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
                 build_semaphore: Semaphore::new(num_concurrent_builds),
                 num_concurrent_builds,
                 ot,
+                cancel,
             },
             graph,
             cache,

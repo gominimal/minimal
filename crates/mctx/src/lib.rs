@@ -423,6 +423,16 @@ impl Context {
         graph: &Graph,
         log_sink: Option<futures::channel::mpsc::UnboundedSender<orchestrator::BuildEvent>>,
     ) -> Result<(), Error> {
+        self.build_graph_with_cancel(graph, log_sink, tokio_util::sync::CancellationToken::new())
+            .await
+    }
+
+    pub async fn build_graph_with_cancel(
+        &mut self,
+        graph: &Graph,
+        log_sink: Option<futures::channel::mpsc::UnboundedSender<orchestrator::BuildEvent>>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), Error> {
         let cache = self.local_cache();
         let rc = if self.config.use_remote_cache() {
             Some(self.remote_cache(false, false).await.unwrap())
@@ -441,6 +451,7 @@ impl Context {
             cache.clone(),
             log_sink,
             self.config.ot.clone(),
+            cancel,
         )?;
 
         let (built, result) = match (

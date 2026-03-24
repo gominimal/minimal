@@ -70,7 +70,17 @@ pub async fn pkg_build_impl(
 ) -> Result<(), Error> {
     trace!("build_impl");
 
-    ctx.build_graph(graph, log_sink).await?;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel2 = cancel.clone();
+    tokio::select! {
+        result = ctx.build_graph_with_cancel(graph, log_sink, cancel) => {
+            result?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            cancel2.cancel();
+            return Err(Error::Other(anyhow::anyhow!("build cancelled")));
+        }
+    }
 
     // Display build summary
     if !quiet {

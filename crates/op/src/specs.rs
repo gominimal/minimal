@@ -34,6 +34,9 @@ pub struct SpecBuild<'a, SF: crate::SourceFetcher> {
     pub stdout_writer: Option<Box<dyn tokio::io::AsyncWrite + Unpin + Send + Sync>>,
     /// Optional async writer that receives a copy of the sandbox's stderr stream.
     pub stderr_writer: Option<Box<dyn tokio::io::AsyncWrite + Unpin + Send + Sync>>,
+
+    /// Cancellation token to stop the build.
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
@@ -273,7 +276,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
         info!("Building package: {}", build.name);
         let start = Instant::now();
         sandbox
-            .run(
+            .run_with_cancel(
                 self.invocations(build)?
                     .into_iter()
                     .map(|(program, args)| sandbox2::config::Invocation {
@@ -284,6 +287,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
                     .collect(),
                 self.stdout_writer.take(),
                 self.stderr_writer.take(),
+                self.cancel.clone(),
             )
             .await?;
         let build_ms = Instant::now().duration_since(start).as_millis() as usize;
