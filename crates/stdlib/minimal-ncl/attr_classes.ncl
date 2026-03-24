@@ -8,6 +8,11 @@ let source_provenance_gnu = {
     name | String,
 }
 in
+let source_provenance_sourceforge = {
+    category = 'Sourceforge,
+    name | String | doc "The name of the project, typically first component of the URL path.",
+}
+in
 let source_provenance_github = {
     category = 'GithubRepo,
     owner | String,
@@ -39,6 +44,11 @@ in
         name = "marker for closed-source software",
         desc = "When set, the source backing this package is not publically available.",
         validate = Bool,
+    },
+    description = {
+        name = "description",
+        desc = "A short description of the function of the software.",
+        validate = String,
     },
 
     env_dir_mappings = {
@@ -79,6 +89,7 @@ in
                 match {
                 {category = 'GnuProject, ..} => std.contract.check source_provenance_gnu label value,
                 {category = 'GithubRepo, ..} => std.contract.check source_provenance_github label value,
+                {category = 'Sourceforge, ..} => std.contract.check source_provenance_sourceforge label value,
                     _ => 'Error {
                         message = "source_provenance value had invalid/unknown category",
                     },
