@@ -45,6 +45,11 @@ in
         desc = "When set, the source backing this package is not publically available.",
         validate = Bool,
     },
+    description = {
+        name = "description",
+        desc = "A short description of the function of the software.",
+        validate = String,
+    },
 
     env_dir_mappings = {
         name = "environment directory mappings",
