@@ -194,4 +194,4 @@ jobs:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-minimal
       - name: Check
-        run: minimal check
+        run: minimal --no-fetch check
