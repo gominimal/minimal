@@ -14,3 +14,7 @@ packages = ["uroot"]
 exec = """
 /bin/sh -c echo "val: %{input}"
 """
+
+[tasks.print-date]
+packages = ["uroot"]
+exec = "/bbin/date"

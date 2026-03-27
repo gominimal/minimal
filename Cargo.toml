@@ -9,6 +9,7 @@ members = [
     "crates/graph",
     "crates/mctx",
     "crates/mfile",
+    "crates/multi",
     "crates/op",
     "crates/ot",
     "crates/orchestrator",
@@ -85,7 +86,7 @@ tonic-prost-build = "0.14.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2" # keep in sync with reqwest
-uuid = { version = "1.19", features = ["v4"] }
+uuid = { version = "1.23", features = ["v4", "serde"] }
 zstd = "0.13"
 
 globset = "0.4"
@@ -103,6 +104,7 @@ common = { version = "0.0.1", path = "crates/common" }
 decode = { version = "0.0.1", path = "crates/decode" }
 mctx = { version = "0.0.1", path = "crates/mctx" }
 mfile = { version = "0.0.1", path = "crates/mfile" }
+multi = { version = "0.0.1", path = "crates/multi" }
 op = { version = "0.0.1", path = "crates/op" }
 ot = { version = "0.0.1", path = "crates/ot" }
 orchestrator = { version = "0.0.1", path = "crates/orchestrator" }
