@@ -1,7 +1,7 @@
 use std::{fmt::Display, io::stdout};
 
 use decode::AttrValue;
-use graph::{BuildDep, BuildOutput, BuildSpec, Graph, RuntimeDep, SourceInput};
+use graph::{BuildDep, BuildOutput, BuildSpec, BuildSpecRef, Graph, RuntimeDep, SourceInput};
 use mctx::{Cache, Context, Error};
 use nickel_lang_core::term::IndexMap;
 use serde::Serialize;
@@ -49,6 +49,7 @@ impl Display for Format {
 #[derive(Debug, Clone, Serialize)]
 pub struct PkgInfo {
     name: String,
+    spec_hash: String,
     is_prebuilt: bool,
     is_collection: bool,
     target: String,
@@ -130,7 +131,7 @@ pub async fn cmd_dump(args: DumpArgs, ctx: &mut Context) -> Result<(), Error> {
                 continue;
             }
 
-            out_packages.push(build_pkg_info(&graph, b, &cache)?);
+            out_packages.push(build_pkg_info(&graph, &bsr, b, &cache)?);
         }
     }
 
@@ -168,9 +169,15 @@ fn fuzzy_match(exact: bool, query: &str, target: &str) -> bool {
     current.is_none()
 }
 
-fn build_pkg_info(g: &Graph, b: &BuildSpec, c: &Cache) -> Result<PkgInfo, Error> {
+fn build_pkg_info(
+    g: &Graph,
+    bsr: &BuildSpecRef,
+    b: &BuildSpec,
+    c: &Cache,
+) -> Result<PkgInfo, Error> {
     Ok(PkgInfo {
         name: b.name.clone(),
+        spec_hash: g.spec_hash(bsr).0.to_string(),
         is_prebuilt: b.is_pure_prebuilt(),
         is_collection: b.is_pure_collection(),
         target: b.target.as_ref().to_string(),
