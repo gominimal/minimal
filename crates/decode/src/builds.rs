@@ -911,6 +911,18 @@ impl BuildDecl {
                                         Term::Record(r) | Term::RecRecord(r, _, _, _) => {
                                             build_args = Some(r.fields.iter().map(
                                                 |(ident_and_loc, field)| -> Result<(String, String), Error> {
+                                                    if field.value.is_none() {
+                                                        // TODO: This should be a more customized error, missing
+                                                        // field with the pretty print will probably get the message
+                                                        // across, but its not super precise.
+                                                        return Err(Error::MissingField{
+                                                            field: "build_args",
+                                                            files: program.files(),
+                                                            obj: ObjTy::Builder,
+                                                            pos: ident_and_loc.pos,
+                                                        });
+                                                    }
+
                                                     Ok((
                                                         ident_and_loc.label().to_string(),
                                                         String::deserialize(eval_if_closure(
