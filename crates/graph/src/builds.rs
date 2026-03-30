@@ -252,4 +252,13 @@ impl BuildSpec {
                 || (self.cmds.len() == 1
                     && (self.cmds[0].is_empty() || self.cmds[0][0].is_empty())))
     }
+
+    /// Returns the upstream version, if set on the package.
+    pub fn upstream_version(&self) -> Option<&String> {
+        if let Some(AttrValue::String(s, _)) = self.attrs.get("upstream_version") {
+            Some(s)
+        } else {
+            None
+        }
+    }
 }
