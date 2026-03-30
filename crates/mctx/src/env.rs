@@ -390,16 +390,18 @@ impl sandbox2::Channel for EnvChannel<'_> {
                 self.graph
                     .fuzzy_name_search(term, 8)
                     .iter()
-                    .for_each(|(bsr, n)| {
-                        if *n < 8 {
-                            return;
-                        }
-                        let name = &self.graph.get(bsr).unwrap().name;
+                    .for_each(|(bsr, _)| {
+                        let b = self.graph.get(bsr).unwrap();
+                        let name = &b.name;
                         if name.ends_with(" (prebuilt)") {
                             return;
                         }
 
-                        writeln!(stream, "msg: * {}", name).ok();
+                        write!(stream, "msg: * {}", name).ok();
+                        if let Some(v) = b.upstream_version() {
+                            write!(stream, " (version {})", v).ok();
+                        }
+                        writeln!(stream).ok();
                     });
                 None
             }

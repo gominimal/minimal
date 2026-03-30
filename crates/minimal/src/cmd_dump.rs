@@ -1,5 +1,6 @@
 use std::{fmt::Display, io::stdout};
 
+use common::fuzzy_search::fuzzy_match;
 use decode::AttrValue;
 use graph::{BuildDep, BuildOutput, BuildSpec, BuildSpecRef, Graph, RuntimeDep, SourceInput};
 use mctx::{Cache, Context, Error};
@@ -125,10 +126,13 @@ pub async fn cmd_dump(args: DumpArgs, ctx: &mut Context) -> Result<(), Error> {
     if args.kind.packages {
         for bsr in graph.all() {
             let b = graph.get(&bsr).unwrap();
-            if let Some(name) = &args.name
-                && !fuzzy_match(args.exact, name, &b.name)
-            {
-                continue;
+            if let Some(name) = &args.name {
+                if args.exact && name != &b.name {
+                    continue;
+                }
+                if fuzzy_match(name, &b.name).is_none() {
+                    continue;
+                }
             }
 
             out_packages.push(build_pkg_info(&graph, &bsr, b, &cache)?);
@@ -147,26 +151,6 @@ pub async fn cmd_dump(args: DumpArgs, ctx: &mut Context) -> Result<(), Error> {
     }
 
     Ok(())
-}
-
-/// Simple subsequence fuzzy matcher: all query chars appear in order in target.
-fn fuzzy_match(exact: bool, query: &str, target: &str) -> bool {
-    if exact {
-        return query == target;
-    }
-
-    let mut query_chars = query.chars();
-    let mut current = query_chars.next();
-    for c in target.chars() {
-        if let Some(q) = current {
-            if c == q {
-                current = query_chars.next();
-            }
-        } else {
-            return true;
-        }
-    }
-    current.is_none()
 }
 
 fn build_pkg_info(

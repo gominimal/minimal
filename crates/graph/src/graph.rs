@@ -793,18 +793,39 @@ impl Graph {
     }
 
     /// Returns a list of [BuildSpecRef] objects who's names matched the given search term.
-    pub fn fuzzy_name_search(&self, term: &str, num_results: usize) -> Vec<(BuildSpecRef, u32)> {
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    pub fn fuzzy_name_search(
+        &self,
+        term: &str,
+        num_results: usize,
+    ) -> Vec<(BuildSpecRef, common::fuzzy_search::SearchMatch)> {
+        use common::fuzzy_search::{SearchMatch, fuzzy_match};
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
         struct SearchEntry {
-            score: u32,
+            score: SearchMatch,
             bsr: BuildSpecRef,
+        }
+
+        impl Ord for SearchEntry {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.score
+                    .cmp(&other.score)
+                    .then_with(|| self.bsr.cmp(&other.bsr))
+            }
+        }
+        impl PartialOrd for SearchEntry {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
         }
 
         use std::collections::BinaryHeap;
         let mut results = BinaryHeap::with_capacity(num_results);
 
         for (bsr, build) in self.builds.iter() {
-            let score = fuzzy_match(term, &build.name);
+            let Some(score) = fuzzy_match(term, &build.name) else {
+                continue;
+            };
             results.push(std::cmp::Reverse(SearchEntry {
                 score,
                 bsr: BuildSpecRef(bsr),
@@ -881,42 +902,6 @@ impl Graph {
             crate::wire::GraphReader::new(std::io::Cursor::new(data)).read_graph()?;
         Ok(graph)
     }
-}
-
-fn fuzzy_match(needle: &str, haystack: &str) -> u32 {
-    let n = needle.trim().to_lowercase();
-    let h = haystack.trim().to_lowercase();
-
-    if n == h {
-        return 1000;
-    }
-    if h.contains(n.as_str()) {
-        return 950;
-    }
-
-    let mut h_rest = h.as_str();
-    let mut score = 0u32;
-    let mut consecutive_bonus = 0u32;
-    let mut matched = 0u32;
-
-    for ch in n.chars() {
-        if let Some(idx) = h_rest.find(ch) {
-            consecutive_bonus = if idx == 0 && matched > 0 {
-                consecutive_bonus + 1
-            } else {
-                0
-            };
-            score += 10 + consecutive_bonus;
-            h_rest = &h_rest[idx + ch.len_utf8()..];
-            matched += 1;
-        }
-    }
-
-    let n_len = n.chars().count() as u32;
-    let h_len = h.chars().count() as u32;
-    let char_score = score * 10 / (n_len * 11); // approx divide by 1.1
-    let length_penalty_num = n_len * 100 / n_len.max(h_len);
-    (char_score * length_penalty_num / 100).min(900)
 }
 
 #[cfg(test)]
@@ -1354,6 +1339,8 @@ mod tests {
 
     #[test]
     fn fuzzy_name_search() {
+        use common::fuzzy_search::SearchMatch;
+
         let layer = Layer::new_for_test(
             indoc! {
                 "
@@ -1392,6 +1379,7 @@ mod tests {
         let results = dp.fuzzy_name_search("libffi", 3);
         assert_eq!(results.len(), 3);
         assert_eq!(dp.get(&results[0].0).unwrap().name, "libffi");
+        assert_eq!(results[0].1, SearchMatch::ExactMatch);
 
         // Partial match: "lib" should prefer libffi/libxml2 over zlib
         let results = dp.fuzzy_name_search("lib", 2);
@@ -1400,6 +1388,8 @@ mod tests {
             .map(|r| dp.get(&r.0).unwrap().name.as_str())
             .collect();
         assert!(names.contains(&"libffi") || names.contains(&"libxml2"));
+        // "lib" is a prefix of libffi/libxml2
+        assert!(matches!(results[0].1, SearchMatch::PrefixMatch { .. }));
 
         // Limiting num_results works
         let results = dp.fuzzy_name_search("lib", 1);
