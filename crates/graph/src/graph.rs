@@ -346,6 +346,55 @@ impl LayerCache for LayerCacheDir {
     }
 }
 
+/// Describes a match between a search term and a package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchMatch {
+    pub name: Option<common::fuzzy_search::SearchMatch>,
+    pub outputs: IndexMap<String, common::fuzzy_search::SearchMatch>,
+}
+
+impl Ord for SearchMatch {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use common::fuzzy_search::SearchMatch as FuzzyMatch;
+
+        fn is_strong(m: &FuzzyMatch) -> bool {
+            matches!(m, FuzzyMatch::ExactMatch | FuzzyMatch::PrefixMatch { .. })
+        }
+
+        // Precedence tiers (higher = better):
+        // 3: name is ExactMatch or PrefixMatch
+        // 2: best output is ExactMatch or PrefixMatch
+        // 1: name matches (ContainsMatch, Fuzzy)
+        // 0: output matches (ContainsMatch, Fuzzy)
+        fn tier(s: &SearchMatch) -> u8 {
+            if s.name.as_ref().is_some_and(is_strong) {
+                3
+            } else if s.outputs.values().any(is_strong) {
+                2
+            } else if s.name.is_some() {
+                1
+            } else {
+                0
+            }
+        }
+
+        tier(self).cmp(&tier(other)).then_with(|| match tier(self) {
+            3 | 1 => self.name.cmp(&other.name),
+            _ => self
+                .outputs
+                .values()
+                .max()
+                .cmp(&other.outputs.values().max()),
+        })
+    }
+}
+
+impl PartialOrd for SearchMatch {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// The in-memory representation of the software supply chain: all packages, profiles, and harnesses.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -797,8 +846,8 @@ impl Graph {
         &self,
         term: &str,
         num_results: usize,
-    ) -> Vec<(BuildSpecRef, common::fuzzy_search::SearchMatch)> {
-        use common::fuzzy_search::{SearchMatch, fuzzy_match};
+    ) -> Vec<(BuildSpecRef, SearchMatch)> {
+        use common::fuzzy_search::{SearchMatch as FuzzyMatch, fuzzy_match};
 
         #[derive(Debug, Clone, PartialEq, Eq)]
         struct SearchEntry {
@@ -823,11 +872,47 @@ impl Graph {
         let mut results = BinaryHeap::with_capacity(num_results);
 
         for (bsr, build) in self.builds.iter() {
-            let Some(score) = fuzzy_match(term, &build.name) else {
+            let min_output_match = FuzzyMatch::Fuzzy { score: 50 };
+
+            let name_match = fuzzy_match(term, &build.name);
+            let output_matches: IndexMap<String, FuzzyMatch> = build
+                .outputs
+                .iter()
+                .filter_map(|(name, o)| {
+                    match (name.as_str(), o) {
+                        // Filter low-signal outputs.
+                        ("bins", BuildOutput::Binary { .. }) => None,
+                        ("libs", BuildOutput::Library { .. }) => None,
+                        (_, BuildOutput::Data { .. }) => None,
+                        // Match binaries by name or usr/bin/{s}
+                        (_, BuildOutput::Binary { glob }) => {
+                            if let Some(m) = fuzzy_match(term, name.as_str())
+                                && m > min_output_match
+                            {
+                                return Some((name.to_string(), m));
+                            }
+                            if let Some(bin_name) = glob.strip_prefix("usr/bin/")
+                                && let Some(m) = fuzzy_match(term, bin_name)
+                                && m > min_output_match
+                            {
+                                return Some((name.to_string(), m));
+                            }
+
+                            None
+                        }
+                        _ => None,
+                    }
+                })
+                .collect();
+
+            if name_match.is_none() && output_matches.is_empty() {
                 continue;
             };
             results.push(std::cmp::Reverse(SearchEntry {
-                score,
+                score: SearchMatch {
+                    name: name_match,
+                    outputs: output_matches,
+                },
                 bsr: BuildSpecRef(bsr),
             }));
             if results.len() > num_results {
@@ -1339,7 +1424,7 @@ mod tests {
 
     #[test]
     fn fuzzy_name_search() {
-        use common::fuzzy_search::SearchMatch;
+        use common::fuzzy_search::SearchMatch as FuzzyMatch;
 
         let layer = Layer::new_for_test(
             indoc! {
@@ -1379,7 +1464,7 @@ mod tests {
         let results = dp.fuzzy_name_search("libffi", 3);
         assert_eq!(results.len(), 3);
         assert_eq!(dp.get(&results[0].0).unwrap().name, "libffi");
-        assert_eq!(results[0].1, SearchMatch::ExactMatch);
+        assert_eq!(results[0].1.name, Some(FuzzyMatch::ExactMatch));
 
         // Partial match: "lib" should prefer libffi/libxml2 over zlib
         let results = dp.fuzzy_name_search("lib", 2);
@@ -1389,7 +1474,10 @@ mod tests {
             .collect();
         assert!(names.contains(&"libffi") || names.contains(&"libxml2"));
         // "lib" is a prefix of libffi/libxml2
-        assert!(matches!(results[0].1, SearchMatch::PrefixMatch { .. }));
+        assert!(matches!(
+            results[0].1.name,
+            Some(FuzzyMatch::PrefixMatch { .. })
+        ));
 
         // Limiting num_results works
         let results = dp.fuzzy_name_search("lib", 1);
