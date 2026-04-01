@@ -188,3 +188,84 @@ impl crate::GraphBasedChecker for OutputNaming {
         Ok(result)
     }
 }
+
+pub(crate) struct EnumerateBins;
+
+impl crate::GraphBasedChecker for EnumerateBins {
+    async fn check(
+        self,
+        skip_checkers: &[String],
+        _fix: bool,
+        pkg: String,
+        graph: RwLockReadGuard<'_, Graph>,
+        cache: Cache<LocalDir>,
+    ) -> Result<CheckResult, Error> {
+        let mut result = CheckResult {
+            verdict: CheckVerdict::Skip,
+            check: "enumerate bins",
+            err: vec![],
+        };
+        if skip_checkers.contains(&"enumerate bins".to_string()) {
+            return Ok(result);
+        }
+
+        let bsr = match graph.by_name(&pkg) {
+            Some(b) => *b,
+            None => {
+                return Ok(result); // skip, we need the build
+            }
+        };
+        let build = graph.get(&bsr).unwrap();
+        let spec_hash = graph.spec_hash(&bsr);
+        let cached_build = if let Ok(cached_build) = cache.read_dir(&spec_hash) {
+            cached_build
+        } else {
+            return Ok(result); // skip, we need the cached build
+        };
+
+        result.verdict = CheckVerdict::Pass;
+        let bins_dir = cached_build.path().join("usr/bin");
+        if !bins_dir.exists() {
+            return Ok(result);
+        }
+
+        let mut collected_bins = std::fs::read_dir(&bins_dir)
+            .map_err(|e| Error::IO("listing bins", bins_dir.clone(), e))?
+            .map(|e| match e {
+                Err(e) => Err(e),
+                Ok(e) => Ok(e.file_name().to_str().unwrap().to_string()),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::IO("stat binary", bins_dir, e))?;
+
+        let has_bins_wildcard = build.outputs.iter().any(|o| {
+            matches!(o.1, BuildOutput::Binary { glob }
+            if glob == "usr/bin/*" || glob == "usr/bin/**" || glob == "usr/bin/**/*")
+        });
+        if !has_bins_wildcard {
+            // Not part of the problem.
+            return Ok(result);
+        }
+
+        // Retain only bins in `collected_bins` which don't have a corresponding output.
+        collected_bins.retain(|b| {
+            !build
+                .outputs
+                .iter()
+                .any(|(name, o)| b == name && matches!(o, BuildOutput::Binary { .. }))
+        });
+
+        if collected_bins.len() > 6 || collected_bins.is_empty() {
+            // We don't yell about enumerating bins if theres TONS of them.
+            return Ok(result);
+        }
+
+        // Whats left are binaries that need to be made OutputBin entries.
+        result.err.push(format!(
+            "when theres only a few binaries, they should be enumerated explicitly as their own output. Found: {}",
+            collected_bins.join(",")
+        ));
+        result.verdict = CheckVerdict::Fail;
+        Ok(result)
+    }
+}
