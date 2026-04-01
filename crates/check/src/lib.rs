@@ -568,6 +568,17 @@ async fn check_package(
                 .await?,
         );
         out.push(
+            naming::EnumerateBins
+                .check(
+                    &skip_checkers,
+                    fix,
+                    pkg.clone(),
+                    graph.read().await,
+                    cache.clone(),
+                )
+                .await?,
+        );
+        out.push(
             OutputTypesValid
                 .check(
                     &skip_checkers,
