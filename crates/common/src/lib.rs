@@ -21,27 +21,21 @@ use std::{
     env, fmt,
     io::{self, ErrorKind, Write},
     path::{Path, PathBuf},
-    sync::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+    sync::{Mutex, MutexGuard},
 };
 use tracing::warn;
 
-static HAKONIWA_SPAWN_LOCK: RwLock<()> = RwLock::new(());
+static HAKONIWA_SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 /// Global lock to synchronize the creation of files with any calls to fork(),
 /// which may in-advertently inherit them.
 pub struct FdSynchronizer;
 
 impl FdSynchronizer {
-    /// Returns a RAII guard that symbolizes that files may be written.
-    pub fn lock_writing_files() -> RwLockReadGuard<'static, ()> {
-        HAKONIWA_SPAWN_LOCK
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
     /// Returns a RAII guard that symbolizes that you may fork+exec.
-    pub fn lock_fork() -> RwLockWriteGuard<'static, ()> {
+    pub fn lock_fork() -> MutexGuard<'static, ()> {
         HAKONIWA_SPAWN_LOCK
-            .write()
+            .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }

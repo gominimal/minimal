@@ -662,8 +662,6 @@ impl Sandbox {
         let output_dir = self.base_dir.join("build").join("output");
         let dest_dir = dest_dir.as_ref();
 
-        let _l = FdSynchronizer::lock_writing_files();
-
         for entry in walkdir::WalkDir::new(&output_dir) {
             let entry =
                 entry.map_err(|e| Error::IO("walking outputs", output_dir.clone(), e.into()))?;
