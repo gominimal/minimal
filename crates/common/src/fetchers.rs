@@ -182,7 +182,10 @@ impl FetchResponse for Result<google_cloud_storage::read_object::ReadObjectRespo
         self.is_ok()
     }
     fn error_for_status(self) -> Result<Self, Self::Error> {
-        Ok(self)
+        match self {
+            Ok(_) => Ok(self),
+            Err(e) => Err(e),
+        }
     }
 
     async fn bytes(self) -> Result<Bytes, Self::Error> {

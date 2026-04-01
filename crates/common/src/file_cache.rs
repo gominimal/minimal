@@ -1,5 +1,5 @@
 use crate::Tee;
-use crate::fetchers::{self, FetchUrl};
+use crate::fetchers::{self, FetchResponse, FetchUrl};
 
 use either::Either;
 use ot::OpTracker;
@@ -227,6 +227,8 @@ impl<B: fetchers::FetchBackend> CachingDownloader<B> for (&B, &FileCache) {
             .0
             .execute(self.0.get(url).map_err(Either::Right)?)
             .await
+            .map_err(Either::Right)?
+            .error_for_status()
             .map_err(Either::Right)?;
 
         self.1.write_through(&filename, sha256, &mut r, op).await
