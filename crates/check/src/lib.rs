@@ -1133,10 +1133,20 @@ impl FileBasedChecker for AdjacentImportCheck {
 
 /// Regexes that build scripts are audited against. If any match, the check fails.
 static BUILD_SCRIPT_AUDIT_REGEXES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
-    vec![(
-        Regex::new(r"\btar\s+-?xf\b").unwrap(),
-        "use 'tar -xof' instead of 'tar -xf' to extract archives in build scripts",
-    )]
+    vec![
+        (
+            Regex::new(r"\btar\s+-?xf\b").unwrap(),
+            "use 'tar -xof' instead of 'tar -xf' to extract archives in build scripts",
+        ),
+        (
+            Regex::new(r"\bSOURCE_DATE_EPOCH\s*=\s*0").unwrap(),
+            "SOURCE_DATE_EPOCH=0 is already set by the build sandbox",
+        ),
+        (
+            Regex::new(r"\bPYTHONHASHSEED\s*=\s*0").unwrap(),
+            "PYTHONHASHSEED=0 is already set by the build sandbox",
+        ),
+    ]
 });
 
 struct BuildScriptDisallowedPatterns;

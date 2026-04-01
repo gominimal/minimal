@@ -296,6 +296,8 @@ impl Container {
         if let WdSetup::Isolated { .. } = sandbox.config.wd {
             command.env("OUTPUT_DIR", "/build/output");
             command.env("GIT_TERMINAL_PROMPT", "0");
+            command.env("SOURCE_DATE_EPOCH", "0");
+            command.env("PYTHONHASHSEED", "0");
         }
 
         command.env("LANG", "en_US.utf8");
