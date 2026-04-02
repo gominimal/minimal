@@ -18,3 +18,7 @@ exec = """
 [tasks.print-date]
 packages = ["uroot"]
 exec = "/bbin/date"
+
+[tasks.cat-stdin]
+packages = ["uroot"]
+exec = "/bbin/cat"
