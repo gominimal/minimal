@@ -167,6 +167,97 @@ mod tests {
         drop(task);
     }
 
+    /// Tests that bytes written via [`Task::send_input`] reach the child's
+    /// stdin and are echoed back through the PTY.
+    ///
+    /// Uses a `cat` task (reads stdin, writes to stdout) so the round-trip is:
+    ///   send_input → PTY master → child stdin → cat → child stdout → PTY → screen
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore] // Requires Linux namespaces.
+    async fn task_stdin_echo() {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_test_writer()
+            .try_init()
+            .ok();
+
+        use crate::mux::WinSize;
+
+        let state = TempDir::new().unwrap();
+        let mut manager = Manager::new(state.path()).unwrap();
+
+        // Set up workspace with fakerepo + fakepkgs.
+        let (_ws_uuid, ws) = manager.empty_workspace().await.unwrap();
+        let ws_dir = ws.path().await;
+        let testdata =
+            Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../mctx/testdata");
+        copy_dir_recursive(&testdata.join("fakerepo"), &ws_dir);
+        let fakepkgs_dst = ws_dir.parent().unwrap().join("fakepkgs");
+        std::fs::create_dir_all(&fakepkgs_dst).unwrap();
+        copy_dir_recursive(&testdata.join("fakepkgs"), &fakepkgs_dst);
+
+        // Create environment and start the cat-stdin task.
+        let (_env_uuid, env_handle) = manager.new_environment(ws);
+        let task_handle = env_handle
+            .new_named_task("cat-stdin".into(), None)
+            .await
+            .unwrap();
+
+        let size = WinSize {
+            rows: 24,
+            cols: 80,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        task_handle.start(size).await.unwrap();
+
+        // Send a known string to stdin. Retry briefly in case the child
+        // hasn't finished exec yet (send_input returns Closed if the task
+        // already transitioned out of Running).
+        const MARKER: &str = "hello-from-stdin-test";
+        for _ in 0..20 {
+            let task = task_handle.lock().await;
+            if task
+                .send_input(format!("{}\n", MARKER).into_bytes())
+                .is_ok()
+            {
+                break;
+            }
+            drop(task);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Poll the screen until the marker appears (or timeout).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let task = task_handle.lock().await;
+            let screen = task.screen().expect("screen should exist after start");
+            let contents = screen.lock().unwrap().screen().contents();
+            if contents.contains(MARKER) {
+                break;
+            }
+            drop(task);
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for marker on screen, last contents: {}",
+                    contents
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Send Ctrl-D (EOF) so cat exits cleanly.
+        {
+            let task = task_handle.lock().await;
+            task.send_input(vec![0x04]).unwrap();
+        }
+
+        // Wait for the task to finish.
+        tokio::time::timeout(std::time::Duration::from_secs(30), task_handle.wait())
+            .await
+            .expect("task did not finish within timeout");
+    }
+
     /// Exercises the full Task + Driver lifecycle:
     ///   Ready → start() → Running → (driver finishes) → Finished
     ///
@@ -177,7 +268,8 @@ mod tests {
         tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
             .with_test_writer()
-            .init();
+            .try_init()
+            .ok();
 
         use crate::mux::WinSize;
         use crate::tasks::TaskState;
