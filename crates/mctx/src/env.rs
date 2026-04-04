@@ -194,6 +194,9 @@ impl EnvChannel<'_> {
                 writeln!(stream, "msg:{}", heading).ok();
                 for check in checks {
                     writeln!(stream, "msg:{}...{}", check.check, check.verdict).ok();
+                    for err in check.err {
+                        writeln!(stream, "msg:\t{}", err).ok();
+                    }
                 }
             }
             Ok::<(), check::Error>(())
