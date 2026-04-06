@@ -39,10 +39,12 @@ impl<C: Channel + Send> Listener<C> {
         let channel_addr = &mut *channel as *mut C as usize;
 
         let rootfs = rootfs.into();
-        let thread = thread::spawn(move || {
-            let channel: &mut C = unsafe { &mut *(channel_addr as *mut C) };
-            Self::run(listener, channel, shutdown_clone, rootfs);
-        });
+        let thread = thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let channel: &mut C = unsafe { &mut *(channel_addr as *mut C) };
+                Self::run(listener, channel, shutdown_clone, rootfs);
+            })?;
 
         Ok(Self {
             shutdown,
