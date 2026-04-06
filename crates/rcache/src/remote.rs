@@ -98,6 +98,26 @@ impl RemoteCache<Storage> {
         if indexed_sha == Some(sha256) {
             return Ok(false); // Cached one is up to date.
         }
+        if let Ok(stat) = self
+            .backend
+            .open_object(
+                self.base.bucket.clone(),
+                self.base
+                    .join(&format!("{}.zst", hex::encode(sha256)))
+                    .unwrap()
+                    .object,
+            )
+            .send()
+            .await
+        {
+            if stat.object().size > 1024 * 1024 {
+                // Object already exists and is large enough to be real, skip the upload.
+                // We still push to the dirty-set because while this tarball may exist, its
+                // likely not wired to this spec hash.
+                self.uploaded.push((spec_hash.clone(), sha256));
+                return Ok(false);
+            }
+        }
 
         self.backend
             .write_object(
