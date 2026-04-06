@@ -576,6 +576,7 @@ pub enum BuildOutput {
     /// This output describes binaries matched with the given glob.
     Binary {
         glob: String,
+        #[serde(default)]
         allow_missing_interpreter: bool,
     },
 }
