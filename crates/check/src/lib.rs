@@ -1150,11 +1150,11 @@ static BUILD_SCRIPT_AUDIT_REGEXES: LazyLock<Vec<(Regex, &'static str)>> = LazyLo
             "use 'tar -xof' instead of 'tar -xf' to extract archives in build scripts",
         ),
         (
-            Regex::new(r"\bSOURCE_DATE_EPOCH\s*=\s*0").unwrap(),
+            Regex::new(r"(?m)^(?:[^/#\n][^\n]*)?\bSOURCE_DATE_EPOCH\s*=\s*0").unwrap(),
             "SOURCE_DATE_EPOCH=0 is already set by the build sandbox",
         ),
         (
-            Regex::new(r"\bPYTHONHASHSEED\s*=\s*0").unwrap(),
+            Regex::new(r"(?m)^(?:[^/#\n][^\n]*)?\bPYTHONHASHSEED\s*=\s*0").unwrap(),
             "PYTHONHASHSEED=0 is already set by the build sandbox",
         ),
     ]
