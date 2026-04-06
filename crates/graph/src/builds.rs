@@ -149,13 +149,19 @@ pub enum BuildOutput {
         allow_executable: bool,
     },
     /// This output describes binaries matched with the given glob.
-    Binary { glob: String },
+    Binary {
+        glob: String,
+        allow_missing_interpreter: bool,
+    },
 }
 
 impl BuildOutput {
     pub fn glob(&self) -> &String {
         match self {
-            BuildOutput::Binary { glob } => glob,
+            BuildOutput::Binary {
+                glob,
+                allow_missing_interpreter: _,
+            } => glob,
             BuildOutput::Data {
                 glob,
                 allow_executable: _,

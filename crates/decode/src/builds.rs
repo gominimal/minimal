@@ -574,13 +574,19 @@ pub enum BuildOutput {
         allow_executable: bool,
     },
     /// This output describes binaries matched with the given glob.
-    Binary { glob: String },
+    Binary {
+        glob: String,
+        allow_missing_interpreter: bool,
+    },
 }
 
 impl BuildOutput {
     pub fn glob(&self) -> &String {
         match self {
-            BuildOutput::Binary { glob } => glob,
+            BuildOutput::Binary {
+                glob,
+                allow_missing_interpreter: _,
+            } => glob,
             BuildOutput::Data {
                 glob,
                 allow_executable: _,
@@ -602,6 +608,7 @@ impl BuildOutput {
         let mut glob: Option<String> = None;
         let mut allow_executable: Option<bool> = None;
         let mut allow_data: Option<bool> = None;
+        let mut allow_missing_interpreter: Option<bool> = None;
 
         match rt.term.as_ref() {
             Term::Record(r) | Term::RecRecord(r, _, _, _) => {
@@ -635,6 +642,14 @@ impl BuildOutput {
                                 }
                                 Ok(())
                             }
+                            "allow_missing_interpreter" => {
+                                if let Some(rt) = field.value.as_ref() {
+                                    allow_missing_interpreter = Some(
+                                        bool::deserialize(eval_if_closure(rt, program)?).unwrap(),
+                                    );
+                                }
+                                Ok(())
+                            }
                             _ => Ok(()), // TODO: Should we error if we see an unknown field?
                         }
                     })?;
@@ -654,6 +669,7 @@ impl BuildOutput {
         };
         let allow_executable = allow_executable.unwrap_or(false);
         let allow_data = allow_data.unwrap_or(false);
+        let allow_missing_interpreter = allow_missing_interpreter.unwrap_or(false);
 
         match ty {
             ObjTy::OutputLib => Ok(BuildOutput::Library { glob, allow_data }),
@@ -661,7 +677,10 @@ impl BuildOutput {
                 glob,
                 allow_executable,
             }),
-            ObjTy::OutputBin => Ok(BuildOutput::Binary { glob }),
+            ObjTy::OutputBin => Ok(BuildOutput::Binary {
+                glob,
+                allow_missing_interpreter,
+            }),
             _ => Err(Error::UnexpectedObject {
                 files: program.files(),
                 got: ty,
@@ -1597,7 +1616,8 @@ mod tests {
         assert_eq!(
             o_bin,
             BuildOutput::Binary {
-                glob: "/bin/uwu".to_string()
+                glob: "/bin/uwu".to_string(),
+                allow_missing_interpreter: false,
             },
         );
         // We expect that buildspec to have one Data output

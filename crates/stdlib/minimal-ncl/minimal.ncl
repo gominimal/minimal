@@ -62,6 +62,7 @@ let CmdSpec = std.contract.any_of [
         ty | Tys = 'OutputBin,
         glob
           | String,
+        allow_missing_interpreter | Bool | optional,
     },
     OutputData | doc "An output of a build spec which represents data files that are used during execution." = {
         ty | Tys = 'OutputData,
