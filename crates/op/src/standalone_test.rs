@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use anyhow::anyhow;
 use graph::{BuildSpec, BuildSpecRef, SpecTest, SubsetInput, Transitives};
 use lcache::{CacheErr, MetaInner};
+use ot::{OpTracker, Operation};
 use sandbox2::config::SandboxMapped;
 
 use crate::{Error, Options, Runnable, SubsetBuild};
@@ -148,6 +149,9 @@ impl<'a> Runnable for StandaloneTest<'a> {
                 self.test_name
             )));
         }
+        let _test_op = OpTracker::new_with_root(&opts.ot).with_op(Operation::StandaloneTest {
+            name: self.test_name.to_string(),
+        });
 
         let (deps, needs_dns, needs_internet) = self.dependencies(build, test, opts).await?;
 

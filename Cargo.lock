@@ -413,6 +413,7 @@ dependencies = [
  "nickel-lang-core",
  "object",
  "op",
+ "ot",
  "regex",
  "tempfile",
  "tokio",

@@ -10,6 +10,7 @@ use futures::stream::FuturesUnordered;
 use graph::Graph;
 use lcache::{Cache, CacheErr, LocalDir};
 use op::{Options, Runnable, StandaloneTest};
+use ot::{OpTracker, Operation};
 use regex::Regex;
 use std::cmp::Ordering;
 use std::fmt;
@@ -264,6 +265,7 @@ pub fn run_checks(
     cache: Cache<LocalDir>,
     fix: bool,
     skip_checkers: &[String],
+    ot: Option<OpTracker>,
 ) -> Result<FuturesUnordered<CheckFuture>, Error> {
     let graph_hnd = graph.map(|g| Arc::new(RwLock::new(g)));
     let skip_checkers_owned = skip_checkers.to_vec();
@@ -278,6 +280,7 @@ pub fn run_checks(
             stdlib_dir.clone(),
             cache.clone(),
             fix,
+            ot.clone(),
         )?
     } else {
         vec![]
@@ -292,6 +295,7 @@ pub fn run_checks(
             stdlib_dir.clone(),
             cache.clone(),
             fix,
+            ot.clone(),
         )?
     } else {
         vec![]
@@ -306,6 +310,7 @@ pub fn run_checks(
             stdlib_dir,
             cache,
             fix,
+            ot,
         )?
     } else {
         vec![]
@@ -318,6 +323,7 @@ pub fn run_checks(
         .collect::<FuturesUnordered<_>>())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn package_check_futures(
     packages_dir: PathBuf,
     filter_names: Vec<String>,
@@ -326,6 +332,7 @@ fn package_check_futures(
     stdlib_dir: PathBuf,
     cache: Cache<LocalDir>,
     fix: bool,
+    ot: Option<OpTracker>,
 ) -> Result<Vec<CheckFuture>, Error> {
     let package_dirs = match std::fs::read_dir(&packages_dir) {
         Ok(i) => i,
@@ -363,6 +370,7 @@ fn package_check_futures(
             let stdlib_dir = stdlib_dir.clone();
             let cache = cache.clone();
             let packages_dir = packages_dir.clone();
+            let ot = ot.clone();
             Box::pin(async move {
                 let result = check_package(
                     pkg.clone(),
@@ -372,6 +380,7 @@ fn package_check_futures(
                     packages_dir,
                     stdlib_dir,
                     cache,
+                    ot,
                 );
                 (CheckObj::Package(pkg), result.await)
             })
@@ -379,6 +388,7 @@ fn package_check_futures(
         .collect::<Vec<_>>())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn profile_check_futures(
     profiles_dir: PathBuf,
     filter_names: Vec<String>,
@@ -387,6 +397,7 @@ fn profile_check_futures(
     stdlib_dir: PathBuf,
     cache: Cache<LocalDir>,
     fix: bool,
+    ot: Option<OpTracker>,
 ) -> Result<Vec<CheckFuture>, Error> {
     let dirs: Vec<std::ffi::OsString> = match std::fs::read_dir(&profiles_dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
@@ -425,6 +436,7 @@ fn profile_check_futures(
             let stdlib_dir = stdlib_dir.clone();
             let cache = cache.clone();
             let profiles_dir = profiles_dir.clone();
+            let ot = ot.clone();
 
             Box::pin(async move {
                 (
@@ -437,6 +449,7 @@ fn profile_check_futures(
                         profiles_dir,
                         stdlib_dir,
                         cache,
+                        ot,
                     )
                     .await,
                 )
@@ -445,6 +458,7 @@ fn profile_check_futures(
         .collect())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn harness_check_futures(
     harnesses_dir: PathBuf,
     filter_names: Vec<String>,
@@ -453,6 +467,7 @@ fn harness_check_futures(
     stdlib_dir: PathBuf,
     cache: Cache<LocalDir>,
     fix: bool,
+    ot: Option<OpTracker>,
 ) -> Result<Vec<CheckFuture>, Error> {
     let dirs: Vec<std::ffi::OsString> = match std::fs::read_dir(&harnesses_dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
@@ -491,6 +506,7 @@ fn harness_check_futures(
             let stdlib_dir = stdlib_dir.clone();
             let cache = cache.clone();
             let harnesses_dir = harnesses_dir.clone();
+            let ot = ot.clone();
 
             Box::pin(async move {
                 (
@@ -503,6 +519,7 @@ fn harness_check_futures(
                         harnesses_dir,
                         stdlib_dir,
                         cache,
+                        ot,
                     )
                     .await,
                 )
@@ -511,6 +528,7 @@ fn harness_check_futures(
         .collect())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn check_package(
     pkg: String,
     all_graph: Option<Arc<RwLock<Graph>>>,
@@ -519,7 +537,13 @@ async fn check_package(
     packages_dir: PathBuf,
     stdlib_dir: PathBuf,
     cache: Cache<LocalDir>,
+    ot: Option<OpTracker>,
 ) -> Result<Vec<CheckResult>, Error> {
+    let check_op = OpTracker::new_with_root(&ot).with_op(Operation::Check {
+        kind: ot::CheckKind::CheckPackages,
+        name: pkg.clone(),
+    });
+
     let mut out = Vec::new();
 
     if let Some(graph) = all_graph {
@@ -531,6 +555,7 @@ async fn check_package(
                     pkg.clone(),
                     graph.read().await,
                     cache.clone(),
+                    Some(check_op.clone()),
                 )
                 .await?,
         );
@@ -542,6 +567,7 @@ async fn check_package(
                     pkg.clone(),
                     graph.read().await,
                     cache.clone(),
+                    Some(check_op.clone()),
                 )
                 .await?,
         );
@@ -553,6 +579,7 @@ async fn check_package(
                     pkg.clone(),
                     graph.read().await,
                     cache.clone(),
+                    Some(check_op.clone()),
                 )
                 .await?,
         );
@@ -564,6 +591,7 @@ async fn check_package(
                     pkg.clone(),
                     graph.read().await,
                     cache.clone(),
+                    Some(check_op.clone()),
                 )
                 .await?,
         );
@@ -575,6 +603,7 @@ async fn check_package(
                     pkg.clone(),
                     graph.read().await,
                     cache.clone(),
+                    Some(check_op.clone()),
                 )
                 .await?,
         );
@@ -586,6 +615,7 @@ async fn check_package(
                     pkg.clone(),
                     graph.read().await,
                     cache.clone(),
+                    Some(check_op.clone()),
                 )
                 .await?,
         );
@@ -597,6 +627,7 @@ async fn check_package(
                     pkg.clone(),
                     graph.read().await,
                     cache.clone(),
+                    Some(check_op.clone()),
                 )
                 .await?,
         );
@@ -608,6 +639,7 @@ async fn check_package(
                     pkg.clone(),
                     graph.read().await,
                     cache.clone(),
+                    Some(check_op.clone()),
                 )
                 .await?,
         );
@@ -619,6 +651,7 @@ async fn check_package(
                     pkg.clone(),
                     graph.read().await,
                     cache.clone(),
+                    Some(check_op.clone()),
                 )
                 .await?,
         );
@@ -630,6 +663,7 @@ async fn check_package(
                     pkg.clone(),
                     graph.read().await,
                     cache.clone(),
+                    Some(check_op.clone()),
                 )
                 .await?,
         );
@@ -654,7 +688,14 @@ async fn check_package(
             for mut c in file_based.into_iter() {
                 let check_result = c
                     .as_mut()
-                    .check(&skip_checkers, fix, &pkg, &pkg_dir, &stdlib_dir)
+                    .check(
+                        &skip_checkers,
+                        fix,
+                        &pkg,
+                        &pkg_dir,
+                        &stdlib_dir,
+                        Some(check_op.clone()),
+                    )
                     .map_err(|e| format!("{:?}", e))?;
                 results.push(check_result);
             }
@@ -680,6 +721,7 @@ pub(crate) trait FileBasedChecker: Send {
         pkg: &str,
         pkg_dir: &Path,
         stdlib_dir: &Path,
+        ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error>;
 }
 
@@ -693,6 +735,7 @@ pub(crate) trait GraphBasedChecker {
         pkg: String,
         graph: RwLockReadGuard<'_, Graph>,
         cache: Cache<LocalDir>,
+        ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error>;
 }
 
@@ -707,6 +750,7 @@ impl FileBasedChecker for ParseCheck {
         _pkg: &str,
         pkg_dir: &Path,
         stdlib_dir: &Path,
+        _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
         if skip_checkers.contains(&"parse".to_string()) {
             return Ok(CheckResult {
@@ -795,6 +839,7 @@ impl FileBasedChecker for ImportLineCheck {
         _pkg: &str,
         pkg_dir: &Path,
         _stdlib_dir: &Path,
+        _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
             verdict: CheckVerdict::Pass,
@@ -909,6 +954,7 @@ impl FileBasedChecker for FmtCheck {
         _pkg: &str,
         pkg_dir: &Path,
         _stdlib_dir: &Path,
+        _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
@@ -975,6 +1021,7 @@ impl GraphBasedChecker for StandaloneTestCheck {
         pkg: String,
         graph: RwLockReadGuard<'_, Graph>,
         cache: Cache<LocalDir>,
+        ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
@@ -1017,7 +1064,7 @@ impl GraphBasedChecker for StandaloneTestCheck {
                             cache: cache.clone(),
                             exec_base: temp_dir.path().to_path_buf(),
                             graph: &graph2,
-                            ot: None, // TODO: Plumb through from parent
+                            ot: ot.clone(),
                         };
 
                         match t.run(&opts).await {
@@ -1081,6 +1128,7 @@ impl FileBasedChecker for AdjacentImportCheck {
         _pkg: &str,
         pkg_dir: &Path,
         _stdlib_dir: &Path,
+        _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
             verdict: CheckVerdict::Pass,
@@ -1170,6 +1218,7 @@ impl GraphBasedChecker for BuildScriptDisallowedPatterns {
         pkg: String,
         graph: RwLockReadGuard<'_, Graph>,
         _cache: Cache<LocalDir>,
+        _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
@@ -1243,6 +1292,7 @@ impl GraphBasedChecker for BuildScriptIsExecutable {
         pkg: String,
         graph: RwLockReadGuard<'_, Graph>,
         _cache: Cache<LocalDir>,
+        _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,

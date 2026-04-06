@@ -612,6 +612,7 @@ impl Context {
                 env_vars,
                 hostname: Some(name.to_string()),
                 override_disable_networking: Some(false),
+                ot: self.config.ot.clone(),
             },
         )
         .await?;

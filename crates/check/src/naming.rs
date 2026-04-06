@@ -2,6 +2,7 @@ use super::Error;
 use crate::{CheckResult, CheckVerdict};
 use graph::{BuildOutput, Graph};
 use lcache::{Cache, LocalDir};
+use ot::OpTracker;
 use tokio::sync::RwLockReadGuard;
 
 pub(crate) struct SpecNameMatchesDir;
@@ -14,6 +15,7 @@ impl crate::GraphBasedChecker for SpecNameMatchesDir {
         pkg: String,
         graph: RwLockReadGuard<'_, Graph>,
         _cache: Cache<LocalDir>,
+        _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
@@ -51,6 +53,7 @@ impl crate::GraphBasedChecker for SpecNameValid {
         pkg: String,
         _graph: RwLockReadGuard<'_, Graph>,
         _cache: Cache<LocalDir>,
+        _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
@@ -89,6 +92,7 @@ impl crate::GraphBasedChecker for CycleBreakerNaming {
         pkg: String,
         graph: RwLockReadGuard<'_, Graph>,
         _cache: Cache<LocalDir>,
+        _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
@@ -136,6 +140,7 @@ impl crate::GraphBasedChecker for OutputNaming {
         pkg: String,
         graph: RwLockReadGuard<'_, Graph>,
         _cache: Cache<LocalDir>,
+        _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
@@ -199,6 +204,7 @@ impl crate::GraphBasedChecker for EnumerateBins {
         pkg: String,
         graph: RwLockReadGuard<'_, Graph>,
         cache: Cache<LocalDir>,
+        _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
