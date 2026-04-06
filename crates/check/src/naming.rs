@@ -162,9 +162,10 @@ impl crate::GraphBasedChecker for OutputNaming {
         result.verdict = CheckVerdict::Pass;
         for (name, output) in &build.outputs {
             match output {
-                BuildOutput::Binary { glob }
-                    if glob == "usr/bin/*" || glob == "usr/bin/**" || glob == "usr/bin/**/*" =>
-                {
+                BuildOutput::Binary {
+                    glob,
+                    allow_missing_interpreter: _,
+                } if glob == "usr/bin/*" || glob == "usr/bin/**" || glob == "usr/bin/**/*" => {
                     if name != "bins" {
                         result.err.push(format!(
                                 "{}: binary output {}: catch-all binary outputs should be named 'bins' by convention",
@@ -245,7 +246,7 @@ impl crate::GraphBasedChecker for EnumerateBins {
             .map_err(|e| Error::IO("stat binary", bins_dir, e))?;
 
         let has_bins_wildcard = build.outputs.iter().any(|o| {
-            matches!(o.1, BuildOutput::Binary { glob }
+            matches!(o.1, BuildOutput::Binary { glob, allow_missing_interpreter: _ }
             if glob == "usr/bin/*" || glob == "usr/bin/**" || glob == "usr/bin/**/*")
         });
         if !has_bins_wildcard {

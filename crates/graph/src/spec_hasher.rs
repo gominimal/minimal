@@ -148,9 +148,15 @@ fn build_output_hash(output: &BuildOutput, h: &mut Hasher) {
                 h.write_all(b"-allow_exec").unwrap();
             }
         }
-        Binary { glob } => {
+        Binary {
+            glob,
+            allow_missing_interpreter,
+        } => {
             h.write_all(b"bin").unwrap();
             h.write_all(glob.as_bytes()).unwrap();
+            if *allow_missing_interpreter {
+                h.write_all(b"-allow_missing_interp").unwrap();
+            }
         }
     }
 }

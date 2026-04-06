@@ -114,7 +114,13 @@ impl BuildDep {
 impl BuildOutput {
     fn from_decoded(bd: &builds::BuildOutput) -> Self {
         match bd.clone() {
-            builds::BuildOutput::Binary { glob } => Self::Binary { glob },
+            builds::BuildOutput::Binary {
+                glob,
+                allow_missing_interpreter,
+            } => Self::Binary {
+                glob,
+                allow_missing_interpreter,
+            },
             builds::BuildOutput::Data {
                 glob,
                 allow_executable,
@@ -885,7 +891,7 @@ impl Graph {
                         ("libs", BuildOutput::Library { .. }) => None,
                         (_, BuildOutput::Data { .. }) => None,
                         // Match binaries by name or usr/bin/{s}
-                        (_, BuildOutput::Binary { glob }) => {
+                        (_, BuildOutput::Binary { glob, .. }) => {
                             if let Some(m) = fuzzy_match(term, name.as_str())
                                 && m > min_output_match
                             {

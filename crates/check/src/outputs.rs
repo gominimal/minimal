@@ -161,9 +161,13 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
 
         result.verdict = CheckVerdict::Pass;
 
-        // Collect the ELF imports that each file in each bin/lib output wants.
+        // Collect:
+        //  - the ELF imports that each file in each bin/lib output wants.
+        //  - the interpreter of any executable scripts
         let mut all_imports: HashMap<String, HashMap<(&String, PathBuf), HashSet<String>>> =
             HashMap::with_capacity(1024);
+        let mut script_interpreters: HashMap<PathBuf, (String, String)> =
+            HashMap::with_capacity(32);
         for (name, output) in &build.outputs {
             let glob = output.glob();
             for path in common::match_files_for_glob(cached_build.path(), glob)
@@ -207,6 +211,32 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
                             }
                         }
                     }
+                }
+
+                if let BuildOutput::Binary {
+                    glob: _,
+                    allow_missing_interpreter: false,
+                } = output
+                    && data.starts_with(b"#!")
+                    && let Some(newline_idx) = data.iter().position(|c| c == &b'\n')
+                {
+                    // NOTE: most Linux kernels (and many Unix systems) treat everything after #!
+                    // up to the first space as the interpreter, and everything after the first space
+                    // as a single argument. So we just collect everything after the shebang up to
+                    // the first space (or, newline).
+                    let interpreter = String::from_utf8(data[2..newline_idx].to_vec())
+                        .map_err(|e| Error::Other(e.into()))?
+                        .trim_start()
+                        .split(" ")
+                        .next()
+                        .unwrap()
+                        .to_string();
+                    script_interpreters.insert(
+                        path.strip_prefix(cached_build.path())
+                            .unwrap()
+                            .to_path_buf(),
+                        (name.clone(), interpreter),
+                    );
                 }
             }
         }
@@ -305,6 +335,35 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
                     ));
                     result.verdict = CheckVerdict::Fail;
                 }
+            }
+        }
+
+        // Lets also check that all binary outputs which are scripts (i.e. start with a shebang) declare a runtime
+        // dep providing the interpreter.
+        for (bin_path, (output_name, interpreter)) in script_interpreters.into_iter() {
+            let interpreter = interpreter.trim_start_matches("/");
+
+            let satisfied = deps.iter().any(|(_bsr, cache_dir)| {
+                if cache_dir.path().join(&interpreter).exists() {
+                    return true;
+                }
+                if let Some(rest) = interpreter.strip_prefix("/bin/")
+                    && cache_dir.path().join("usr/bin").join(rest).exists()
+                {
+                    return true;
+                }
+
+                false
+            });
+
+            if !satisfied {
+                result.err.push(format!(
+                    "interpreter '{}' not in runtime deps, needed by script {} (output {})",
+                    interpreter,
+                    bin_path.display(),
+                    output_name,
+                ));
+                result.verdict = CheckVerdict::Fail;
             }
         }
 
