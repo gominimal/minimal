@@ -344,10 +344,10 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
             let interpreter = interpreter.trim_start_matches("/");
 
             let satisfied = deps.iter().any(|(_bsr, cache_dir)| {
-                if cache_dir.path().join(&interpreter).exists() {
+                if cache_dir.path().join(interpreter).exists() {
                     return true;
                 }
-                if let Some(rest) = interpreter.strip_prefix("/bin/")
+                if let Some(rest) = interpreter.strip_prefix("bin/")
                     && cache_dir.path().join("usr/bin").join(rest).exists()
                 {
                     return true;
