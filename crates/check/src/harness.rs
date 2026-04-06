@@ -7,12 +7,14 @@ use nickel_lang_core::eval::cache::CacheImpl;
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::program::Program;
 use nickel_lang_core::term::Term;
+use ot::{OpTracker, Operation};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::CheckResult;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn check_harness(
     harness: String,
     all_graph: Option<Arc<RwLock<Graph>>>,
@@ -21,7 +23,12 @@ pub(crate) async fn check_harness(
     harnesses_dir: PathBuf,
     stdlib_dir: PathBuf,
     cache: Cache<LocalDir>,
+    ot: Option<OpTracker>,
 ) -> Result<Vec<CheckResult>, Error> {
+    let check_op = OpTracker::new_with_root(&ot).with_op(Operation::Check {
+        kind: ot::CheckKind::CheckHarnesses,
+        name: harness.clone(),
+    });
     let mut out = Vec::new();
 
     use nickel_lang_core::error::report::report_as_str;
@@ -111,6 +118,7 @@ pub(crate) async fn check_harness(
         &harness,
         &harnesses_dir.join(&harness),
         &stdlib_dir,
+        Some(check_op.clone()),
     )?);
     out.push(crate::FmtCheck.check(
         &skip_checkers,
@@ -118,7 +126,9 @@ pub(crate) async fn check_harness(
         &harness,
         &harnesses_dir.join(&harness),
         &stdlib_dir,
+        Some(check_op.clone()),
     )?);
+
     Ok(out)
 }
 

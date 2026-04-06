@@ -14,6 +14,7 @@ graph.workspace = true
 nickel-lang-core.workspace = true
 object.workspace = true
 op.workspace = true
+ot.workspace = true
 regex.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

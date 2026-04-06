@@ -1,11 +1,9 @@
 use anyhow::anyhow;
 use check::CheckVerdict;
-use codespan_reporting::term::termcolor::{
-    Color, ColorChoice, ColorSpec, StandardStream, WriteColor,
-};
+use codespan_reporting::term::termcolor::{Buffer, Color, ColorSpec, WriteColor};
 use futures::stream::StreamExt;
 use mctx::{Context, Error};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 #[derive(clap::Args)]
 pub struct CheckArgs {
@@ -123,17 +121,22 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
         ctx.local_cache(),
         args.fix,
         &skip_checkers,
+        None,
     )?;
 
     let mut had_error = false;
-    let mut stdout = StandardStream::stdout(ColorChoice::Auto);
+    let use_color = std::io::stdin().is_terminal();
 
     while let Some((heading, result)) = checks_stream.next().await {
         let checks = result?;
+        let mut stdout: Buffer = match use_color {
+            true => Buffer::ansi(),
+            false => Buffer::no_color(),
+        };
         stdout.reset().unwrap();
         stdout.set_color(ColorSpec::new().set_fg(None)).unwrap();
 
-        writeln!(&mut stdout, "\n{}", heading).unwrap();
+        writeln!(&mut stdout, "{}", heading).unwrap();
         for check in checks {
             write!(&mut stdout, "{}...", check.check).unwrap();
             match check.verdict {
@@ -169,6 +172,14 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
                 writeln!(&mut stdout, "\t{}", err.replace("\n", "\n\t")).unwrap();
             }
         }
+
+        stdout
+            .set_color(ColorSpec::new().set_reset(true).set_fg(None))
+            .unwrap();
+        writeln!(&mut stdout, "\n").unwrap();
+        ot::StdoutWriter::new()
+            .write_all(stdout.as_slice())
+            .unwrap();
     }
 
     match had_error {

@@ -9,6 +9,7 @@ use anyhow::anyhow;
 use graph::{BuildOutput, BuildSpecRef, Graph, Transitives};
 use lcache::{CacheErr, DirCacheEntry, LocalDir};
 use object::{Object, ObjectSymbol};
+use ot::OpTracker;
 use tokio::sync::RwLockReadGuard;
 
 pub(crate) struct OutputTypesValid;
@@ -21,6 +22,7 @@ impl crate::GraphBasedChecker for OutputTypesValid {
         pkg: String,
         graph: RwLockReadGuard<'_, Graph>,
         cache: lcache::Cache<LocalDir>,
+        _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
@@ -114,6 +116,7 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
         pkg: String,
         graph: RwLockReadGuard<'_, Graph>,
         cache: lcache::Cache<LocalDir>,
+        _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,

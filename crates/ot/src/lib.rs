@@ -2,11 +2,28 @@
 //! can be printed.
 
 use std::{
+    fmt::Display,
     sync::{Arc, Mutex, OnceLock, Weak},
     time::Duration,
 };
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+
+#[derive(Debug, Clone)]
+pub enum CheckKind {
+    CheckPackages,
+    CheckHarnesses,
+    CheckProfiles,
+}
+impl Display for CheckKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckKind::CheckPackages => f.write_str("package"),
+            CheckKind::CheckHarnesses => f.write_str("harness"),
+            CheckKind::CheckProfiles => f.write_str("profile"),
+        }
+    }
+}
 
 /// An operation being tracked.
 #[derive(Debug, Clone)]
@@ -17,6 +34,8 @@ pub enum Operation {
     CompressPkg { name: String },
     ExtractPkg { name: String },
     FetchSource { url: String },
+    Check { kind: CheckKind, name: String },
+    StandaloneTest { name: String },
     FetchIndex,
 }
 
@@ -102,6 +121,22 @@ impl TrackerInner {
                 let new_pg = ProgressBar::hidden()
                     .with_style(ProgressStyle::with_template("{prefix}Fetch source: {msg:35!} [{wide_bar}]     {decimal_bytes:9!} / {decimal_total_bytes:9!}   ETA: {eta:5!}").unwrap().progress_chars("=> "));
                 new_pg.set_message(url.clone());
+                self.install(new_pg);
+            }
+            (Some(Operation::Check { kind, name }), _) => {
+                let new_pg = ProgressBar::hidden().with_style(
+                    ProgressStyle::with_template("{prefix}{spinner} Checking: {msg}").unwrap(),
+                );
+                new_pg.set_message(format!("{} {}", kind, name));
+                new_pg.enable_steady_tick(Duration::from_millis(100));
+                self.install(new_pg);
+            }
+            (Some(Operation::StandaloneTest { name }), _) => {
+                let new_pg = ProgressBar::hidden().with_style(
+                    ProgressStyle::with_template("{prefix}{spinner} Test: {msg}").unwrap(),
+                );
+                new_pg.set_message(name.clone());
+                new_pg.enable_steady_tick(Duration::from_millis(50));
                 self.install(new_pg);
             }
             // No operation remains but a progress bar exists. Set it to finished and remove our reference.

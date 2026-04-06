@@ -12,6 +12,7 @@ use futures::stream::StreamExt;
 use graph::{BuildSpecRef, Graph, SetupForPackages, Transitives, TransitivesDep};
 use mfile::{EnvPatches, EnvVarValue};
 use op::Runnable;
+use ot::OpTracker;
 use sandbox2::{
     Container,
     config::{Invocation, SandboxMapped},
@@ -26,6 +27,8 @@ struct EnvChannel<'a> {
     task_name: String,
     state_dir: PathBuf,
     has_packages: HashSet<BuildSpecRef>,
+
+    ot: Option<OpTracker>,
 }
 
 impl EnvChannel<'_> {
@@ -179,6 +182,7 @@ impl EnvChannel<'_> {
             check_ctx.local_cache(),
             fix,
             &[],
+            self.ot.clone(),
         ) {
             Err(e) => return EnvChannel::write_error(e.into(), stream),
             Ok(res_stream) => res_stream,
@@ -242,7 +246,7 @@ impl EnvChannel<'_> {
                 cache,
                 graph: &graph,
                 exec_base: output_base,
-                ot: None,
+                ot: self.ot.clone(),
             })
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -474,6 +478,8 @@ pub struct EnvArgs<'a> {
 
     /// If set, enables or disables networking.
     pub override_disable_networking: Option<bool>,
+    /// The operation tracker to use downstream, if applicable.
+    pub ot: Option<OpTracker>,
 }
 
 /// A successfully-configured runtime environment.
@@ -622,6 +628,7 @@ impl<'a> Env<'a> {
                     task_name: args.name.to_string(),
                     state_dir: args.state_base_dir.clone(),
                     has_packages: args.transitives.keys().cloned().collect(),
+                    ot: args.ot.clone(),
                 },
             )
             .await?;
@@ -856,6 +863,7 @@ mod tests {
             task_name: "test-task".to_string(),
             state_dir: state_dir.path().to_path_buf(),
             has_packages: HashSet::new(),
+            ot: None,
         };
 
         let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -881,6 +889,7 @@ mod tests {
             task_name: "test-task".to_string(),
             state_dir: state_dir.path().to_path_buf(),
             has_packages: HashSet::new(),
+            ot: None,
         };
 
         let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -906,6 +915,7 @@ mod tests {
             task_name: "test-task".to_string(),
             state_dir: state_dir.path().to_path_buf(),
             has_packages: HashSet::new(),
+            ot: None,
         };
 
         let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -931,6 +941,7 @@ mod tests {
             task_name: "test-task".to_string(),
             state_dir: state_dir.path().to_path_buf(),
             has_packages: HashSet::new(),
+            ot: None,
         };
 
         let rootfs = tempdir().unwrap();
