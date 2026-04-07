@@ -37,6 +37,10 @@ pub struct SpecBuild<'a, SF: crate::SourceFetcher> {
 
     /// Cancellation token to stop the build.
     pub cancel: tokio_util::sync::CancellationToken,
+
+    /// CPU shares, for partitioning CPU when the system is contended. Maps roughly to
+    /// cgroups v2 cpu.weights.
+    pub cpu_weight: Option<u64>,
 }
 
 impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
@@ -269,6 +273,9 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
             .with_disable_networking(!needs_dns && !needs_internet);
         if let Some(a) = &build.build_args {
             config = config.with_build_args(a.iter());
+        }
+        if let Some(w) = self.cpu_weight {
+            config = config.with_cpu_weight(w);
         }
         let mut sandbox = config.build(&opts.exec_base, channel).await?;
         sandbox.keep_dir(true);

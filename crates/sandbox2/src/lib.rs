@@ -398,6 +398,17 @@ impl<C: Channel> Sandbox<C> {
             container.unshare(hakoniwa::Namespace::Uts);
             container.hostname(hn);
         }
+        if let Some(s) = &self.config.cpu_weight {
+            container.cgroups_resources({
+                let mut resources = hakoniwa::cgroups::Resources::default();
+                resources.cpu({
+                    let mut cpu = hakoniwa::cgroups::Cpu::default();
+                    cpu.shares(*s);
+                    cpu
+                });
+                resources
+            });
+        }
 
         Ok(Container { container })
     }

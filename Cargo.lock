@@ -1573,10 +1573,12 @@ dependencies = [
  "caps",
  "close_fds",
  "libc",
+ "libcgroups",
  "log",
  "nix",
+ "oci-spec 0.9.0",
  "postcard",
- "procfs",
+ "procfs 0.18.0",
  "serde",
  "tempfile",
  "thiserror 2.0.18",
@@ -2328,6 +2330,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 
 [[package]]
+name = "libcgroups"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff828a1e0ab31b46ebefd1e8e231b7572dec6f663d17ecee1bee42a565649672"
+dependencies = [
+ "fixedbitset",
+ "nix",
+ "oci-spec 0.9.0",
+ "pathrs",
+ "procfs 0.17.0",
+ "serde",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2353,6 +2371,12 @@ checksum = "3f50e8f47623268b5407192d26876c4d7f89d686ca130fdc53bced4814cd29f8"
 dependencies = [
  "bitflags",
 ]
+
+[[package]]
+name = "linux-raw-sys"
+version = "0.4.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d26c52dbd32dccf2d10cac7725f8eae5296885fb5703b261f7d0a0739ec807ab"
 
 [[package]]
 name = "linux-raw-sys"
@@ -2590,6 +2614,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "mfile"
 version = "0.0.1"
 dependencies = [
@@ -2779,6 +2812,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -2851,6 +2885,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "oci-spec"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8445a2631507cec628a15fdd6154b54a3ab3f20ed4fe9d73a3b8b7a4e1ba03a"
+dependencies = [
+ "const_format",
+ "derive_builder",
+ "getset",
+ "regex",
+ "serde",
+ "serde_json",
+ "strum 0.27.2",
+ "strum_macros 0.27.2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2876,7 +2927,7 @@ dependencies = [
  "indoc",
  "lcache",
  "mfile",
- "oci-spec",
+ "oci-spec 0.8.4",
  "ot",
  "rayon",
  "sandbox2",
@@ -3018,6 +3069,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07ba0ad7e047712414213ff67533e6dd477af0a4e1d14fb52343e53d30ea9397"
 dependencies = [
  "once_cell",
+]
+
+[[package]]
+name = "pathrs"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2fb2311801201fc6fd2e8a9f4841b41eee565e992fbe713731e29e367b8e3f17"
+dependencies = [
+ "bitflags",
+ "itertools 0.14.0",
+ "libc",
+ "memchr",
+ "once_cell",
+ "rustix 1.1.4",
+ "rustversion",
+ "static_assertions",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3251,6 +3320,20 @@ dependencies = [
 
 [[package]]
 name = "procfs"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc5b72d8145275d844d4b5f6d4e1eef00c8cd889edb6035c21675d1bb1f45c9f"
+dependencies = [
+ "bitflags",
+ "chrono",
+ "flate2",
+ "hex",
+ "procfs-core 0.17.0",
+ "rustix 0.38.44",
+]
+
+[[package]]
+name = "procfs"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25485360a54d6861439d60facef26de713b1e126bf015ec8f98239467a2b82f7"
@@ -3258,8 +3341,19 @@ dependencies = [
  "bitflags",
  "chrono",
  "flate2",
- "procfs-core",
- "rustix",
+ "procfs-core 0.18.0",
+ "rustix 1.1.4",
+]
+
+[[package]]
+name = "procfs-core"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "239df02d8349b06fc07398a3a1697b06418223b1c7725085e801e7c0fc6a12ec"
+dependencies = [
+ "bitflags",
+ "chrono",
+ "hex",
 ]
 
 [[package]]
@@ -3768,6 +3862,19 @@ dependencies = [
 
 [[package]]
 name = "rustix"
+version = "0.38.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdb5bc1ae2baa591800df16c9ca78619bf65c0488b41b96ccec5d11220d8c154"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys 0.4.15",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
@@ -3775,7 +3882,7 @@ dependencies = [
  "bitflags",
  "errno",
  "libc",
- "linux-raw-sys",
+ "linux-raw-sys 0.12.1",
  "windows-sys 0.61.2",
 ]
 
@@ -4368,7 +4475,7 @@ dependencies = [
  "fastrand",
  "getrandom 0.4.2",
  "once_cell",
- "rustix",
+ "rustix 1.1.4",
  "windows-sys 0.61.2",
 ]
 
@@ -5729,7 +5836,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
- "rustix",
+ "rustix 1.1.4",
 ]
 
 [[package]]

@@ -93,6 +93,10 @@ pub struct Config {
 
     /// Globally/initially-set environment variables.
     pub env_vars: HashMap<String, String>,
+
+    /// CPU shares, for partitioning CPU when the system is contended. Maps roughly to
+    /// cgroups v2 cpu.weights.
+    pub cpu_weight: Option<u64>,
 }
 
 /// A command to be run in the sandbox.
@@ -128,6 +132,7 @@ impl Config {
             wd: WdSetup::Isolated {
                 working_inputs: Vec::with_capacity(6),
             },
+            cpu_weight: None,
         }
     }
 
@@ -228,6 +233,12 @@ impl Config {
                 v.into(),
             )
         }));
+        self
+    }
+
+    /// Sets the CPU weight to the given value.
+    pub fn with_cpu_weight(mut self, weight: u64) -> Self {
+        self.cpu_weight = Some(weight);
         self
     }
 
