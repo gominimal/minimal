@@ -219,7 +219,9 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                     },
                 ),
                 cancel: shared.backend.cancel.clone(),
-                cpu_weight: Some(((60 + depended_on_by * 25) as u64).min(10000)),
+                cpu_weight: Some(
+                    ((3 * cost + 60 + depended_on_by * cost.max(1) * 25) as u64).min(10000),
+                ),
             };
 
             let res = b

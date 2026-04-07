@@ -1,6 +1,10 @@
 //! Represents the state of deliverables and activity within an orchestration.
 
-use std::{collections::HashMap, fmt::Display, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    fmt::Display,
+    sync::Arc,
+};
 
 use common::SpecHash;
 use decode::AttrValue;
@@ -504,25 +508,57 @@ impl<B: super::Backend> State<B> {
                 }
             });
 
-        // Fill in depended_on_by.
-        for (deliverable, count) in inner
+        // Fill in depended_on_by: for each deliverable, count how many other
+        // deliverables (directly or indirectly) depend on it.
+        //
+        // Build a reverse adjacency list covering all dependency edges:
+        //   Build.dependencies -> each dep, and Subset.build -> its source.
+        let mut reverse_deps: HashMap<Index, HashSet<Index>> = HashMap::new();
+        for (idx, d) in inner.deliverables.iter() {
+            match &d.inner {
+                DeliverableInner::Build { dependencies, .. } => {
+                    for dep in dependencies {
+                        reverse_deps.entry(dep.0).or_default().insert(idx);
+                    }
+                }
+                DeliverableInner::Subset { build, .. } => {
+                    reverse_deps.entry(build.0).or_default().insert(idx);
+                }
+                DeliverableInner::CacheFill { .. } => {}
+            }
+        }
+        // BFS from each deliverable through the reverse graph, counting
+        // all distinct deliverables reachable (= transitively dependent).
+        for (idx, count) in inner
             .deliverables
             .iter()
-            .map(|(idx, _d)| {
-                (
-                    idx,
-                    inner.deliverables.iter().fold(0, |acc, (_idx, d)| {
-                        if let Some(deps) = d.inner.build_deps() {
-                            acc + deps.iter().filter(|d| d.0 == idx).count()
-                        } else {
-                            acc
+            .map(|(idx, _)| {
+                let mut visited = HashSet::new();
+                let mut queue = VecDeque::new();
+                let mut count: usize = 0;
+
+                if let Some(dependents) = reverse_deps.get(&idx) {
+                    for &dep in dependents {
+                        if visited.insert(dep) {
+                            queue.push_back(dep);
                         }
-                    }),
-                )
+                    }
+                }
+                while let Some(current) = queue.pop_front() {
+                    count += 1;
+                    if let Some(dependents) = reverse_deps.get(&current) {
+                        for &dep in dependents {
+                            if visited.insert(dep) {
+                                queue.push_back(dep);
+                            }
+                        }
+                    }
+                }
+                (idx, count)
             })
             .collect::<Vec<_>>()
         {
-            inner.deliverables[deliverable].depended_on_by = count;
+            inner.deliverables[idx].depended_on_by = count;
         }
 
         Ok(Self { s: inner })
