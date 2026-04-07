@@ -399,15 +399,19 @@ impl<C: Channel> Sandbox<C> {
             container.hostname(hn);
         }
         if let Some(s) = &self.config.cpu_weight {
-            container.cgroups_resources({
-                let mut resources = hakoniwa::cgroups::Resources::default();
-                resources.cpu({
-                    let mut cpu = hakoniwa::cgroups::Cpu::default();
-                    cpu.shares(*s);
-                    cpu
+            if systemd_probably_works() {
+                container.cgroups_resources({
+                    let mut resources = hakoniwa::cgroups::Resources::default();
+                    resources.cpu({
+                        let mut cpu = hakoniwa::cgroups::Cpu::default();
+                        cpu.shares(*s);
+                        cpu
+                    });
+                    resources
                 });
-                resources
-            });
+            } else {
+                tracing::debug!("Not configuring cgroups: systemd probably not available");
+            }
         }
 
         Ok(Container { container })
@@ -735,4 +739,14 @@ impl Sandbox {
 
 fn hardlink_dir_contents(src_dir: &Path, dst_parent_dir: &Path) -> Result<(), Error> {
     common::hardlink_dir_contents(src_dir, dst_parent_dir).map_err(Error::HardlinkFailed)
+}
+
+fn systemd_probably_works() -> bool {
+    if std::env::var("DBUS_SESSION_BUS_ADDRESS").is_ok() {
+        return true;
+    }
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        return std::fs::metadata(PathBuf::from(dir).join("bus")).is_ok();
+    }
+    false
 }
