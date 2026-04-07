@@ -190,6 +190,7 @@ async fn main() -> Result<(), Error> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new("info")
             .add_directive("topiary=off".parse().unwrap())
+            .add_directive("libcgroups=off".parse().unwrap())
             .add_directive("build_events=off".parse().unwrap())
             .add_directive("build_events_proto=off".parse().unwrap())
     });

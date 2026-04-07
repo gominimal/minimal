@@ -151,7 +151,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
         shared_hnd: &mut SharedHandle<Self>,
         state_hnd: &mut StateHandle<Self>,
     ) -> Result<Self::Artifact, Error> {
-        let (dep_paths, breaker_build, cost) = {
+        let (dep_paths, breaker_build, cost, depended_on_by) = {
             let s = state_hnd.lock().await;
             let dep_paths: Vec<PathBuf> = dependencies
                 .into_iter()
@@ -167,17 +167,19 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                     _ => unreachable!(),
                 })
                 .collect();
-            let (breaker_build, cost) = if let DeliverableInner::Build {
-                full_build, cost, ..
-            } = s.get(&dr).unwrap().inner
-            {
-                (!full_build, cost)
-            } else {
-                unreachable!()
-            };
+            let d = s.get(&dr).unwrap();
+            let (breaker_build, cost, depended_on_by) =
+                if let DeliverableInner::Build {
+                    full_build, cost, ..
+                } = d.inner
+                {
+                    (!full_build, cost, d.depended_on_by)
+                } else {
+                    unreachable!()
+                };
             drop(s);
 
-            (dep_paths, breaker_build, cost)
+            (dep_paths, breaker_build, cost, depended_on_by)
         };
 
         let shared_hnd2 = shared_hnd.clone();
@@ -217,6 +219,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                     },
                 ),
                 cancel: shared.backend.cancel.clone(),
+                cpu_weight: Some(((80 + depended_on_by * 10) as u64).min(10000)),
             };
 
             let res = b

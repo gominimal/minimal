@@ -63,6 +63,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
             stdout_writer: self.stdout_writer.take(),
             stderr_writer: self.stderr_writer.take(),
             cancel: tokio_util::sync::CancellationToken::new(),
+            cpu_weight: None,
         }
         .run(opts)
         .await?;
