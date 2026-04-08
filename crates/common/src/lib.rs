@@ -601,11 +601,11 @@ pub fn default_parallelism() -> usize {
         0..=3 => 1,
         4..=7 => 3,
         8..=11 => 5,
-        12..=14 => 6,
-        15..=18 => 7,
-        19..=21 => 8,
-        22..=24 => 9,
-        _ => (rough_threadcount - 24) / 3 + 9,
+        12..=14 => 7,
+        15..=18 => 9,
+        19..=21 => 11,
+        22..=24 => 13,
+        _ => (rough_threadcount - 24) / 3 + 15,
     };
 
     let para_by_mem = get_available_ram_gb().map(|gbs| match gbs {
