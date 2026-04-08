@@ -23,6 +23,8 @@ message OrchestrateBuildRequest {
   bool verbose = 3;
   // Save the build outputs to the local cache.
   bool commit = 4;
+  // Configure the provided GCS bucket name as the remote cache.
+  optional string remote_cache_gcs_bucket = 5;
 }
 
 message OrchestrateBuildResponse {

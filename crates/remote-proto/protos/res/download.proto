@@ -1,0 +1,14 @@
+syntax = "proto3";
+package res;
+
+import "tarball_format.proto";
+
+// A request to RES to download a built package.
+message DownloadRequest {
+  bytes spec_hash = 1;
+  TarballFormat format = 2;
+}
+
+message DownloadResponse {
+    bytes chunk = 1;
+}
