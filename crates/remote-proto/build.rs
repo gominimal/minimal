@@ -6,6 +6,7 @@ fn main() -> Result<()> {
             "protos/tarball_format.proto",
             "protos/res/orchestrate_build.proto",
             "protos/res/create_env.proto",
+            "protos/res/download.proto",
             "protos/res/task.proto",
             "protos/res/remote_execution_service.proto",
         ],

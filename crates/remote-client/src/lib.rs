@@ -3,12 +3,14 @@ use std::pin::Pin;
 use std::{borrow::Cow, collections::HashMap};
 
 use anyhow::anyhow;
+use common::SpecHash;
 use futures::StreamExt;
 use futures::channel::mpsc;
 use graph::Graph;
 use orchestrator::{BuildEvent, BuildEventInner};
 use remote_execution_service_client::RemoteExecutionServiceClient as RESClient;
 use remote_proto::{res::*, *};
+use tempfile::NamedTempFile;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tonic::transport::{Channel, Error as TransportError};
 
@@ -248,6 +250,7 @@ where
         &mut self,
         verbose: bool,
         commit_results: bool,
+        remote_cache_bucket: Option<String>,
         log_sink: Option<mpsc::UnboundedSender<BuildEvent>>,
     ) -> Result<(), Error> {
         use orchestrate_build_message::*;
@@ -292,6 +295,7 @@ where
                     graph_stream: Some(graph_config),
                     verbose,
                     commit: commit_results,
+                    remote_cache_gcs_bucket: remote_cache_bucket,
                 })),
             }
         });
@@ -371,6 +375,44 @@ where
 
         Ok(())
     }
+
+    pub async fn download(
+        &mut self,
+        spec_hash: &SpecHash,
+        compression_level: i32,
+    ) -> Result<NamedTempFile, Error> {
+        let mut rpc = self
+            .c
+            .download(DownloadRequest {
+                spec_hash: spec_hash.as_bytes().to_vec(),
+                format: Some(TarballFormat {
+                    compression: compression_level,
+                }),
+            })
+            .await
+            .map_err(|e| Error::Other(e.into()))?
+            .into_inner();
+
+        let tempfile = NamedTempFile::new().map_err(|e| Error::Other(e.into()))?;
+        let mut temp_file = tokio::fs::File::from(
+            tempfile
+                .as_file()
+                .try_clone()
+                .map_err(|e| Error::Other(e.into()))?,
+        );
+        // Stream the download data and write to the temporary file
+        while let Some(download_data) = rpc.next().await {
+            let download_data = download_data.map_err(|e| Error::Other(e.into()))?;
+            tokio::io::AsyncWriteExt::write_all(&mut temp_file, &download_data.chunk)
+                .await
+                .map_err(|e| Error::Other(e.into()))?;
+        }
+        tokio::io::AsyncWriteExt::shutdown(&mut temp_file)
+            .await
+            .map_err(|e| Error::Other(e.into()))?;
+
+        Ok(tempfile)
+    }
 }
 
 /// The configuration describing an execution in a remote environment.
@@ -433,6 +475,14 @@ mod tests {
             &self,
             _request: tonic::Request<tonic::Streaming<OrchestrateBuildMessage>>,
         ) -> Result<tonic::Response<Self::OrchestrateBuildStream>, tonic::Status> {
+            unimplemented!()
+        }
+
+        type DownloadStream = tokio_stream::Empty<Result<DownloadResponse, tonic::Status>>;
+        async fn download(
+            &self,
+            _request: tonic::Request<DownloadRequest>,
+        ) -> Result<tonic::Response<Self::DownloadStream>, tonic::Status> {
             unimplemented!()
         }
     }
@@ -547,6 +597,94 @@ mod tests {
         assert_eq!(extracted, "hello world");
     }
 
+    struct DownloadMockServer {
+        chunks: Vec<Vec<u8>>,
+    }
+
+    #[tonic::async_trait]
+    impl RemoteExecutionService for DownloadMockServer {
+        async fn create_env(
+            &self,
+            _request: tonic::Request<tonic::Streaming<CreateEnvMessage>>,
+        ) -> Result<tonic::Response<CreateEnvResponse>, tonic::Status> {
+            unimplemented!()
+        }
+
+        type ExecStream = tokio_stream::Empty<Result<CreateTaskResponse, tonic::Status>>;
+        async fn exec(
+            &self,
+            _request: tonic::Request<CreateTaskRequest>,
+        ) -> Result<tonic::Response<Self::ExecStream>, tonic::Status> {
+            unimplemented!()
+        }
+
+        type OrchestrateBuildStream =
+            tokio_stream::Empty<Result<OrchestrateBuildResponse, tonic::Status>>;
+        async fn orchestrate_build(
+            &self,
+            _request: tonic::Request<tonic::Streaming<OrchestrateBuildMessage>>,
+        ) -> Result<tonic::Response<Self::OrchestrateBuildStream>, tonic::Status> {
+            unimplemented!()
+        }
+
+        type DownloadStream =
+            tokio_stream::Iter<std::vec::IntoIter<Result<DownloadResponse, tonic::Status>>>;
+        async fn download(
+            &self,
+            request: tonic::Request<DownloadRequest>,
+        ) -> Result<tonic::Response<Self::DownloadStream>, tonic::Status> {
+            let req = request.into_inner();
+            assert_eq!(req.spec_hash.len(), 32, "spec_hash must be 32 bytes");
+            assert_eq!(req.spec_hash, vec![0x11; 32]);
+            let responses: Vec<_> = self
+                .chunks
+                .iter()
+                .map(|c| Ok(DownloadResponse { chunk: c.clone() }))
+                .collect();
+            Ok(tonic::Response::new(tokio_stream::iter(responses)))
+        }
+    }
+
+    #[tokio::test]
+    async fn download_streams_tarball() {
+        // Create a temp directory with a test file and compress it into a tarball.
+        let src_dir = tempfile::tempdir().unwrap();
+        std::fs::write(src_dir.path().join("data.txt"), b"hello download").unwrap();
+        let (mut tarball, _hash) =
+            common::archive::compress_dir(src_dir.path(), Some(-5), &None).unwrap();
+        std::io::Seek::rewind(&mut tarball).unwrap();
+
+        // Read the tarball bytes and split into small chunks to simulate streaming.
+        use std::io::Read as _;
+        let mut tarball_bytes = Vec::new();
+        tarball.read_to_end(&mut tarball_bytes).unwrap();
+        let chunks: Vec<Vec<u8>> = tarball_bytes.chunks(64).map(|c| c.to_vec()).collect();
+
+        let svc = RemoteExecutionServiceServer::new(DownloadMockServer { chunks });
+        let graph = Graph::new();
+        let mut client = Client::new(RESClient::new(svc), &graph);
+
+        let spec_hash = SpecHash::from_bytes([0x11; 32]);
+        let result_file = client.download(&spec_hash, -5).await.unwrap();
+
+        // The returned NamedTempFile should contain the reassembled tarball.
+        // Rewind since the write via the cloned fd advanced the shared file offset.
+        use std::io::Seek as _;
+        let mut result_file = result_file;
+        result_file.as_file_mut().rewind().unwrap();
+
+        let dst_dir = tempfile::tempdir().unwrap();
+        common::archive::extract_compressed_tar(
+            result_file.as_file(),
+            common::archive::Compression::Zstd,
+            dst_dir.path(),
+            None,
+        )
+        .unwrap();
+        let extracted = std::fs::read_to_string(dst_dir.path().join("data.txt")).unwrap();
+        assert_eq!(extracted, "hello download");
+    }
+
     struct ExecMockServer;
 
     #[tonic::async_trait]
@@ -592,6 +730,14 @@ mod tests {
             &self,
             _request: tonic::Request<tonic::Streaming<OrchestrateBuildMessage>>,
         ) -> Result<tonic::Response<Self::OrchestrateBuildStream>, tonic::Status> {
+            unimplemented!()
+        }
+
+        type DownloadStream = tokio_stream::Empty<Result<DownloadResponse, tonic::Status>>;
+        async fn download(
+            &self,
+            _request: tonic::Request<DownloadRequest>,
+        ) -> Result<tonic::Response<Self::DownloadStream>, tonic::Status> {
             unimplemented!()
         }
     }
