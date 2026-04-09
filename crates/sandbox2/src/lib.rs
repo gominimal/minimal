@@ -399,7 +399,7 @@ impl<C: Channel> Sandbox<C> {
             container.hostname(hn);
         }
         if let Some(s) = &self.config.cpu_weight {
-            if systemd_probably_works() {
+            if systemd_probably_works() || std::env::var("MINIMAL_CGROUPS_ALWAYS").is_ok() {
                 container.cgroups_resources({
                     let mut resources = hakoniwa::cgroups::Resources::default();
                     resources.cpu({
