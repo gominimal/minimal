@@ -57,6 +57,15 @@ impl<'a, T> Client<'a, T> {
     }
 }
 
+impl<'a, T: Clone> Clone for Client<'a, T> {
+    fn clone(&self) -> Self {
+        Self {
+            c: self.c.clone(),
+            g: self.g,
+        }
+    }
+}
+
 impl<'a, T> Client<'a, T>
 where
     T: tonic::client::GrpcService<tonic::body::Body>,
