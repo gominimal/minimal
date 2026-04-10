@@ -36,6 +36,8 @@ pub struct OciImageCreate {
     pub entrypoint: Option<mfile::StrOrList>,
     pub cmd: Option<mfile::StrOrList>,
     pub vars: HashMap<String, String>,
+    /// Target architecture. Defaults to "amd64".
+    pub arch: String,
 }
 
 impl Runnable for OciImageCreate {
@@ -119,9 +121,12 @@ impl Runnable for OciImageCreate {
         let mut tb = tar::Builder::new(w);
 
         // ImageConfig - written as blob object by hash
+        let arch = &self.arch;
+        info!("OCI image architecture: {arch}");
+
         let image_config_bytes = serde_json::to_vec(
             &ImageConfigurationBuilder::default()
-                .architecture("amd64")
+                .architecture(arch.as_str())
                 .os("linux")
                 .rootfs(
                     RootFsBuilder::default()
@@ -217,7 +222,7 @@ impl Runnable for OciImageCreate {
                     .platform(
                         PlatformBuilder::default()
                             .os("linux")
-                            .architecture("amd64")
+                            .architecture(arch.as_str())
                             .build()
                             .unwrap(),
                     )
