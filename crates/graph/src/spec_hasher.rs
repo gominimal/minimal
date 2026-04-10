@@ -383,7 +383,7 @@ mod tests {
         // println!("{}", SpecHasher::hash(&dp, &dp.top_levels[0]).0.to_hex());
         assert_eq!(
             SpecHasher::hash(&dp, &dp.top_levels[0]),
-            SpecHash::from_hex("1b0191397ab3b84580087f4ff975dcdbdfc1ef73029ad4413e4deafdaa5710b4")
+            SpecHash::from_hex("ddf98033b5667083a4e3e311bd6c2b63a9bd40c8e307f20934bd88ce9510e1b4")
                 .unwrap(),
         );
     }
@@ -414,7 +414,7 @@ mod tests {
 
         assert_eq!(
             SpecHasher::hash(&dp, &dp.top_levels[0]),
-            SpecHash::from_hex("619459fa530bedc77f035ab942ef45e8e08a9f10407333a64a2e0367869fb197")
+            SpecHash::from_hex("dfd836d397a534735e55c8507a654366ee8ef803b8220a06fd13ab92eb4b1850")
                 .unwrap(),
         );
 
@@ -479,7 +479,7 @@ mod tests {
         // println!("{}", SpecHasher::hash(&dp, &dp.top_levels[0]).0.to_hex());
         assert_eq!(
             SpecHasher::hash(&dp, &dp.top_levels[0]),
-            SpecHash::from_hex("f804bd63f9f0f86e675561d73c72c3e76feaae4d874b9c5ab730def9c5d822f3")
+            SpecHash::from_hex("08bdd0ff44ac171cfde13d461473e71bf36c446f08ccc0a7e7ac49f43304db82")
                 .unwrap(),
         );
     }
@@ -521,7 +521,7 @@ mod tests {
         // println!("{}", SpecHasher::hash(&dp, &dp.top_levels[0]).0.to_hex());
         assert_eq!(
             SpecHasher::hash(&dp, &dp.top_levels[0]),
-            SpecHash::from_hex("e9bc6fb92d25f8c86d83a132d7bc5121a4571a7117554cf59169d2010a695e86")
+            SpecHash::from_hex("86349cc737dac5a7532b8271cb6a84c476dcca8238e63774a07dc4b7c96405a4")
                 .unwrap(),
         );
     }
@@ -558,7 +558,7 @@ mod tests {
         // println!("{}", SpecHasher::hash(&dp, &dp.top_levels[0]).0.to_hex());
         assert_eq!(
             SubsetHasher::hash_single(&dp, &dp.top_levels[0], vec!["uwu_tool", "something"]),
-            SpecHash::from_hex("e9a11fd6fd4f283d68b5835a577ced9a0b864e9765d753a49527aaf5736a5699")
+            SpecHash::from_hex("baca41ad137d878e3a22d09f3f1fb04de0fed042c2b5beaf060c2d0f5c023a17")
                 .unwrap(),
         );
     }
