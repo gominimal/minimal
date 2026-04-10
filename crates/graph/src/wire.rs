@@ -160,6 +160,8 @@ fn varint_bytes(value: u64) -> ([u8; 10], usize) {
 struct HeaderRecord {
     version: u32,
     build_count: usize,
+    #[serde(default)]
+    target: Option<common::Target>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -234,6 +236,7 @@ impl<W: Write> GraphWriter<W> {
         let header = HeaderRecord {
             version: STREAM_VERSION,
             build_count: graph.len(),
+            target: Some(graph.target().clone()),
         };
         self.write_record(TAG_HEADER, &serde_json::to_vec(&header)?)?;
 
@@ -427,6 +430,7 @@ impl<R: Read> GraphReader<R> {
         if header.version != STREAM_VERSION {
             return Err(WireError::UnsupportedVersion(header.version));
         }
+        let target = header.target.unwrap_or_default();
 
         let mut arena: Arena<BuildSpec> = Arena::with_capacity(header.build_count);
         let mut remap: HashMap<Index, BuildSpecRef> = HashMap::with_capacity(header.build_count);
@@ -548,6 +552,7 @@ impl<R: Read> GraphReader<R> {
                 harnesses,
                 by_name,
                 supply_chain,
+                target,
             ),
             temp_dir,
         ))
@@ -692,6 +697,7 @@ impl<W: AsyncWrite + Unpin> AsyncGraphWriter<W> {
         let header = HeaderRecord {
             version: STREAM_VERSION,
             build_count: graph.len(),
+            target: Some(graph.target().clone()),
         };
         self.write_record(TAG_HEADER, &serde_json::to_vec(&header)?)
             .await?;
@@ -873,6 +879,7 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
         if header.version != STREAM_VERSION {
             return Err(WireError::UnsupportedVersion(header.version));
         }
+        let target = header.target.unwrap_or_default();
 
         let mut arena: Arena<BuildSpec> = Arena::with_capacity(header.build_count);
         let mut remap: HashMap<Index, BuildSpecRef> = HashMap::with_capacity(header.build_count);
@@ -986,6 +993,7 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
                 harnesses,
                 by_name,
                 supply_chain,
+                target,
             ),
             temp_dir,
         ))
@@ -1150,6 +1158,7 @@ mod tests {
         let header = HeaderRecord {
             version: 99,
             build_count: 0,
+            target: None,
         };
         let payload = serde_json::to_vec(&header).unwrap();
         let mut buf = Vec::new();

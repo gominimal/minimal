@@ -422,6 +422,9 @@ pub struct Graph {
     /// The series of layers which were chained together to build this graph.
     supply_chain: Vec<SpecOrigin>,
 
+    /// The [Target] this graph was built for.
+    target: Target,
+
     /// The cache of build specs to their [SpecHash]. There is also a
     /// reverse cache of [SpecHash]'s to the build spec they correspond to.
     #[allow(clippy::type_complexity)]
@@ -440,7 +443,7 @@ impl Default for Graph {
 }
 
 impl Graph {
-    /// Constructs an empty dependency graph.
+    /// Constructs an empty dependency graph targeting the host system.
     pub fn new() -> Self {
         Self {
             builds: Arena::with_capacity(4096),
@@ -449,11 +452,17 @@ impl Graph {
             profiles: HashMap::with_capacity(32),
             harnesses: HashMap::with_capacity(32),
             supply_chain: Vec::with_capacity(6),
+            target: Target::host(),
             hash_cache: Arc::new(RwLock::new((
                 HashMap::with_capacity(4096),
                 HashMap::with_capacity(4096),
             ))),
         }
+    }
+
+    /// Returns the [Target] this graph was built for.
+    pub fn target(&self) -> &Target {
+        &self.target
     }
 
     /// Constructs a dependency graph using the given origin to load the leaf layer,
@@ -546,6 +555,7 @@ impl Graph {
         }
 
         let mut out = Self::new();
+        out.target = for_target;
         for layer in layers.into_iter().rev() {
             out = out.ingest(layer)?;
         }
@@ -964,6 +974,7 @@ impl Graph {
         harnesses: HashMap<String, Harness>,
         by_name: HashMap<String, BuildSpecRef>,
         supply_chain: Vec<SpecOrigin>,
+        target: Target,
     ) -> Self {
         Self {
             builds,
@@ -972,6 +983,7 @@ impl Graph {
             harnesses,
             by_name,
             supply_chain,
+            target,
             hash_cache: Default::default(),
         }
     }
