@@ -356,9 +356,13 @@ mod tests {
     macro_rules! arch_hash {
         ($amd64:expr, $arm64:expr) => {{
             #[cfg(target_arch = "x86_64")]
-            { $amd64 }
+            {
+                $amd64
+            }
             #[cfg(target_arch = "aarch64")]
-            { $arm64 }
+            {
+                $arm64
+            }
         }};
     }
 
