@@ -42,7 +42,6 @@ pub async fn cmd_materialize(args: MaterializeArgs, ctx: &mut Context) -> Result
             Arch::Arm64 => "arm64".to_string(),
             Arch::Amd64 => "amd64".to_string(),
         });
-
     let arch = match arch_str.as_str() {
         "arm64" | "aarch64" => Arch::Arm64,
         "amd64" | "x86_64" => Arch::Amd64,
@@ -66,7 +65,7 @@ pub async fn cmd_materialize(args: MaterializeArgs, ctx: &mut Context) -> Result
     // Make sure the packages are built for the target
     crate::cmd_pkg::pkg_build_impl(&graph, ctx, cache.clone(), false, None).await?;
 
-    // Create the OCI image — arch comes from the target we built for
+    // Create the OCI image — arch is queried from graph.target()
     let mut op = op::OciImageCreate {
         packages: output.packages,
         output_file: args.output,
@@ -74,7 +73,6 @@ pub async fn cmd_materialize(args: MaterializeArgs, ctx: &mut Context) -> Result
         entrypoint: output.entrypoint,
         cmd: output.cmd,
         vars: output.vars,
-        arch: arch_str,
     };
     let opts = op::Options {
         cache,
