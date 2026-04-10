@@ -291,6 +291,11 @@ pub struct Output {
     #[serde(default, alias = "env_vars")]
     pub vars: HashMap<String, String>,
 
+    /// Target architecture for OCI images. Defaults to "amd64".
+    /// Common values: "amd64", "arm64"
+    #[serde(default)]
+    pub arch: Option<String>,
+
     /// Any fields which are not understood by this version of minimal.
     #[serde(flatten)]
     extra: HashMap<String, toml::Value>,
@@ -662,6 +667,7 @@ mod tests {
                         cmd: None,
                         entrypoint: Some(StrOrList::Single("/bin/sh".to_string())),
                         vars: HashMap::new(),
+                        arch: None,
                         extra: HashMap::new(),
                     }
                 )]
@@ -783,5 +789,66 @@ mod tests {
                 file: HashMap::new()
             }
         );
+    }
+
+    #[test]
+    fn output_arch_defaults_to_none() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [outputs.image]
+            type = "oci-image"
+            "#
+        })
+        .unwrap();
+        assert_eq!(mf.outputs["image"].arch, None);
+    }
+
+    #[test]
+    fn output_arch_parses_arm64() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [outputs.image]
+            type = "oci-image"
+            arch = "arm64"
+            "#
+        })
+        .unwrap();
+        assert_eq!(mf.outputs["image"].arch, Some("arm64".to_string()));
+    }
+
+    #[test]
+    fn output_arch_parses_amd64() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [outputs.image]
+            type = "oci-image"
+            arch = "amd64"
+            "#
+        })
+        .unwrap();
+        assert_eq!(mf.outputs["image"].arch, Some("amd64".to_string()));
+    }
+
+    #[test]
+    fn output_with_arch_and_other_fields() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [outputs.app]
+            type = "oci-image"
+            arch = "arm64"
+            packages = ["base", "openssl"]
+            entrypoint = "/app/server"
+            vars = { PORT = "8080" }
+            "#
+        })
+        .unwrap();
+        let output = &mf.outputs["app"];
+        assert_eq!(output.arch, Some("arm64".to_string()));
+        assert_eq!(output.packages, vec!["base", "openssl"]);
+        assert_eq!(
+            output.entrypoint,
+            Some(StrOrList::Single("/app/server".to_string()))
+        );
+        assert_eq!(output.vars["PORT"], "8080");
     }
 }

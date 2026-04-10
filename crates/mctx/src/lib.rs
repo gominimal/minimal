@@ -396,6 +396,11 @@ impl Context {
 
     /// Builds & returns a graph of all packages.
     pub fn graph_from_all_packages(&mut self) -> Result<Graph, Error> {
+        self.graph_from_all_packages_with_target(Target::host())
+    }
+
+    /// Builds & returns a graph of all packages for a specific target.
+    pub fn graph_from_all_packages_with_target(&mut self, target: Target) -> Result<Graph, Error> {
         let leaf_layer = self.repo_origin();
 
         let start = SystemTime::now();
@@ -404,12 +409,23 @@ impl Context {
             &mut graph::LayerCacheDir(self.config.layer_cache_dir()),
             leaf_layer,
             self.stdlib_dir.clone(),
-            Target::host(),
+            target,
         )
         .map_err(|e| e.into());
         tracing::trace!("graph parse/load took {:?}", start.elapsed());
 
         res
+    }
+
+    /// Builds & returns the graph with the given packages for a specific target.
+    pub fn graph_from_package_names_with_target<S: PackageSelection>(
+        &mut self,
+        pkgs: S,
+        target: Target,
+    ) -> Result<Graph, Error> {
+        let mut graph = self.graph_from_all_packages_with_target(target)?;
+        graph.top_levels = pkgs.as_bsrs(&graph)?;
+        Ok(graph)
     }
 }
 
