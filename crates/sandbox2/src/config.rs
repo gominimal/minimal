@@ -358,9 +358,15 @@ impl Config {
             common::synth_dns_config(&sd)
                 .map_err(|e| Error::IO("synthesizing DNS configuration", sd.clone(), e))?;
         }
+        let root_home = match &self.wd {
+            WdSetup::Isolated { .. } => "/state/home".to_string(),
+            WdSetup::BoundDir { .. } => {
+                std::env::var("HOME").unwrap_or_else(|_| "/state/home".to_string())
+            }
+        };
         match &self.username {
-            Some(n) => common::synth_user_group_config(&sd, n),
-            None => common::synth_user_group_config(&sd, "build"),
+            Some(n) => common::synth_user_group_config(&sd, n, &root_home),
+            None => common::synth_user_group_config(&sd, "build", &root_home),
         }
         .map_err(|e| Error::IO("synthesizing user/group configuration", sd, e))?;
 
