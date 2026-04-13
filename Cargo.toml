@@ -74,7 +74,6 @@ size = "0.5"
 smallvec = {version = "1.15", features = ["serde"]}
 tar = "0.4"
 tempfile = "3.23"
-thiserror = "2.0"
 tokio = { version = "1.48", features = ["full"] }
 tokio-stream = "0.1"
 tokio-util = "0.7"
