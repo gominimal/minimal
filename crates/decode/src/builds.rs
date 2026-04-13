@@ -746,8 +746,14 @@ impl RuntimeDep {
 pub struct BuildDecl {
     /// The human-readable name declared on the build decl.
     pub name: String,
-    /// The system this build-decl is meant to run on. Defaults to amd64 Linux.
-    pub target: Target,
+    /// The system this build-decl is meant to run on.
+    ///
+    /// `None` means the build-decl did not explicitly declare a target and should
+    /// be hydrated with the target of whatever graph is being constructed from it.
+    /// This happens at the decode→graph seam in `graph::BuildSpec::from_decoded`,
+    /// which consults `Loader::for_target`. See gominimal/infra#18 for the arm64
+    /// res-server dispatch bug that motivated moving this from eager to deferred.
+    pub target: Option<Target>,
     /// Any attributes explicitly set on this build-decl.
     pub attrs: Option<IndexMap<String, AttrValue>>,
     /// Marker that this build-spec is a prebuilt, meaning:
@@ -1225,7 +1231,7 @@ impl BuildDecl {
             attrs,
             prebuilt,
             build_args,
-            target: target.unwrap_or(Target::host()),
+            target,
             build_deps,
             runtime_deps,
             abstract_deps: needs,
@@ -1421,7 +1427,7 @@ mod tests {
                 replace_on_cycle,
                 tests: None,
             } if name == "single buildspec" &&
-                target == Target::host() &&
+                target.is_none() &&
                 cmds == vec![vec!["./build.sh"]] &&
                 replace_on_cycle.is_none() &&
                 build_args == Some([("fish".to_string(), "swiggity swooty".to_string())].into()) &&
@@ -1566,7 +1572,7 @@ mod tests {
 
         let build = BuildDecl::from_term(&term, &mut program, &mut ()).unwrap();
 
-        assert_eq!(build.target, Target::new(Arch::Arm64, OS::MacOS),);
+        assert_eq!(build.target, Some(Target::new(Arch::Arm64, OS::MacOS)),);
     }
 
     #[test]
