@@ -29,6 +29,10 @@ struct Loader {
     origin: Arc<SpecOrigin>,
     into_graph: RefCell<Graph>,
     resolved: RefCell<HashMap<generational_arena::Index, BuildSpecRef>>,
+    /// The target the containing graph is being constructed for. Used to hydrate
+    /// any [`decode::builds::BuildDecl::target`] that was left `None` by the
+    /// decoder (i.e. no explicit target in the NCL).
+    for_target: Target,
 }
 
 impl Loader {
@@ -163,7 +167,14 @@ impl BuildSpec {
     fn from_decoded(bd: &builds::BuildDecl, loader: &Loader) -> Result<Self, Error> {
         Ok(Self {
             name: bd.name.clone(),
-            target: bd.target.clone(),
+            // If the NCL didn't explicitly set a target, inherit from the
+            // graph's target. This is how a graph constructed on amd64 for
+            // arm64 execution (e.g. buildbot dispatching to res-server-arm64)
+            // produces specs that match the destination host.
+            target: bd
+                .target
+                .clone()
+                .unwrap_or_else(|| loader.for_target.clone()),
             prebuilt: bd.prebuilt,
             cmds: bd.cmds.clone(),
             build_args: bd.build_args.clone(),
@@ -564,11 +575,15 @@ impl Graph {
 
     /// Loads build declarations in from the given layer.
     pub fn ingest(self, layer: Layer) -> Result<Self, Error> {
+        // Capture the target before self moves into the Loader. Set by
+        // `new_from_chain` (`out.target = for_target`) prior to ingesting layers.
+        let for_target = self.target.clone();
         let mut loader = Loader {
             origin: Arc::new(layer.origin.clone()),
             from: layer,
             into_graph: RefCell::new(self),
             resolved: RefCell::new(HashMap::with_capacity(1024)),
+            for_target,
         };
         let new_toplevels = loader.load_toplevels()?;
 
