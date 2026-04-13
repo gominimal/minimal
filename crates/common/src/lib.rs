@@ -323,13 +323,13 @@ pub fn synth_dns_config(p: &Path) -> Result<(), io::Error> {
     std::fs::write(p.join("etc").join("resolv.conf"), format!("{}", conf))
 }
 
-pub fn synth_user_group_config(p: &Path, username: &str) -> Result<(), io::Error> {
+pub fn synth_user_group_config(p: &Path, username: &str, home: &str) -> Result<(), io::Error> {
     std::fs::create_dir_all(p.join("etc"))?;
     std::fs::write(
         p.join("etc").join("passwd"),
         format!(
-            "root:x:0:0:root:/root:/usr/bin/bash\n{}:x:1000:1000:User,,,:/home/{}:/bin/bash",
-            username, username
+            "root:x:0:0:root:/root:/usr/bin/bash\n{}:x:1000:1000:User,,,:{}:/bin/bash",
+            username, home
         ),
     )?;
     std::fs::write(
@@ -618,4 +618,24 @@ pub fn default_parallelism() -> usize {
     para_by_mem
         .map(|m| (m as usize).min(para_by_cpu))
         .unwrap_or(para_by_cpu)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synth_user_group_config_sets_home_on_uid_1000() {
+        let tmp = tempfile::tempdir().unwrap();
+        synth_user_group_config(tmp.path(), "build", "/host/Users/bryan").unwrap();
+
+        let passwd = std::fs::read_to_string(tmp.path().join("etc/passwd")).unwrap();
+        // uid 1000 (the runtime uid) gets the passed-in home so user.Current()
+        // returns a path that matches the HOME env var.
+        assert!(
+            passwd.contains("build:x:1000:1000:User,,,:/host/Users/bryan:"),
+            "build line missing or wrong: {}",
+            passwd
+        );
+    }
 }
