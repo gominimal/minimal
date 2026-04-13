@@ -328,8 +328,8 @@ pub fn synth_user_group_config(p: &Path, username: &str, home: &str) -> Result<(
     std::fs::write(
         p.join("etc").join("passwd"),
         format!(
-            "root:x:0:0:root:{}:/usr/bin/bash\n{}:x:1000:1000:User,,,:{}:/bin/bash",
-            home, username, home
+            "root:x:0:0:root:/root:/usr/bin/bash\n{}:x:1000:1000:User,,,:{}:/bin/bash",
+            username, home
         ),
     )?;
     std::fs::write(
@@ -625,36 +625,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn synth_user_group_config_sets_home_on_both_passwd_entries() {
+    fn synth_user_group_config_sets_home_on_uid_1000() {
         let tmp = tempfile::tempdir().unwrap();
         synth_user_group_config(tmp.path(), "build", "/host/Users/bryan").unwrap();
 
         let passwd = std::fs::read_to_string(tmp.path().join("etc/passwd")).unwrap();
-        let lines: Vec<&str> = passwd.lines().collect();
-        assert_eq!(lines.len(), 2);
-
-        // root (uid 0) and build (uid 1000) both need a valid home — processes
-        // in sandbox2 run as uid 1000, but root is defensive for code paths that
-        // might run as either.
+        // uid 1000 (the runtime uid) gets the passed-in home so user.Current()
+        // returns a path that matches the HOME env var.
         assert!(
-            lines[0].starts_with("root:x:0:0:root:/host/Users/bryan:"),
-            "root line should have correct home: {}",
-            lines[0]
+            passwd.contains("build:x:1000:1000:User,,,:/host/Users/bryan:"),
+            "build line missing or wrong: {}",
+            passwd
         );
-        assert!(
-            lines[1].starts_with("build:x:1000:1000:User,,,:/host/Users/bryan:"),
-            "build line should have correct home: {}",
-            lines[1]
-        );
-    }
-
-    #[test]
-    fn synth_user_group_config_isolated_home() {
-        let tmp = tempfile::tempdir().unwrap();
-        synth_user_group_config(tmp.path(), "build", "/state/home").unwrap();
-
-        let passwd = std::fs::read_to_string(tmp.path().join("etc/passwd")).unwrap();
-        assert!(passwd.contains("root:x:0:0:root:/state/home:"));
-        assert!(passwd.contains("build:x:1000:1000:User,,,:/state/home:"));
     }
 }
