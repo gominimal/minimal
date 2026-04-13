@@ -323,13 +323,13 @@ pub fn synth_dns_config(p: &Path) -> Result<(), io::Error> {
     std::fs::write(p.join("etc").join("resolv.conf"), format!("{}", conf))
 }
 
-pub fn synth_user_group_config(p: &Path, username: &str, root_home: &str) -> Result<(), io::Error> {
+pub fn synth_user_group_config(p: &Path, username: &str, home: &str) -> Result<(), io::Error> {
     std::fs::create_dir_all(p.join("etc"))?;
     std::fs::write(
         p.join("etc").join("passwd"),
         format!(
-            "root:x:0:0:root:{}:/usr/bin/bash\n{}:x:1000:1000:User,,,:/home/{}:/bin/bash",
-            root_home, username, username
+            "root:x:0:0:root:{}:/usr/bin/bash\n{}:x:1000:1000:User,,,:{}:/bin/bash",
+            home, username, home
         ),
     )?;
     std::fs::write(
