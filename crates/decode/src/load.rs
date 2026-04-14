@@ -96,17 +96,12 @@ macro_rules! annotate_record {
     };
 }
 
-fn build_decls_in_dir<P: AsRef<Path>>(
-    dir: P,
-    with_names: Option<&[String]>,
-) -> Result<Vec<PathBuf>, Error> {
-    let mut out = if let Some(names) = &with_names {
-        Vec::with_capacity(names.len())
-    } else {
-        Vec::with_capacity(128)
-    };
-
-    if dir.as_ref().exists() {
+fn build_decls_in_dir<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, Error> {
+    fn walk_dir_inner<P: AsRef<Path>>(
+        out: &mut Vec<PathBuf>,
+        is_toplevel: bool,
+        dir: P,
+    ) -> Result<(), Error> {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let meta = entry.metadata()?;
@@ -114,32 +109,28 @@ fn build_decls_in_dir<P: AsRef<Path>>(
             if meta.is_dir() {
                 let build_path = path.join("build.ncl");
                 if build_path.exists() {
-                    match with_names {
-                        Some(names) => {
-                            if names.iter().any(|n| path.ends_with(n)) {
-                                out.push(build_path);
-                            }
-                        }
-                        None => {
-                            out.push(build_path);
-                        }
-                    };
+                    out.push(build_path);
+                }
+
+                // Handle partitioning, i.e. `a/abseil/build.ncl` or `ab/abseil/build.ncl`.
+                if is_toplevel
+                    && let Some(fname) = entry.file_name().to_str()
+                    && (fname.len() == 1
+                        || fname.len() == 2
+                            && fname
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                {
+                    walk_dir_inner(out, false, path)?;
                 }
             }
         }
+        Ok(())
     }
 
-    // Detect if any requested package was missing.
-    if let Some(names) = &with_names
-        && names.len() > out.len()
-    {
-        return Err(Error::PackagesNotFound {
-            packages: names
-                .iter()
-                .filter(|n| out.iter().any(|p| p.ends_with(format!("{}/build.ncl", n))))
-                .cloned()
-                .collect(),
-        });
+    let mut out = Vec::with_capacity(512);
+    if dir.as_ref().exists() {
+        walk_dir_inner(&mut out, true, dir)?;
     }
 
     Ok(out)
@@ -159,7 +150,7 @@ pub(crate) struct Loader {
 
 impl Loader {
     /// Processes literal source representing a top-level collection of objects.
-    pub fn new<S: Into<String>>(src: S, opts: &LoadOptions) -> Result<Self, Error> {
+    pub(crate) fn new<S: Into<String>>(src: S, opts: &LoadOptions) -> Result<Self, Error> {
         let generated_lib_dir = tempfile::TempDir::new()?;
         std::fs::write(generated_lib_dir.path().join("__injected_config__.ncl"), {
             let mut out = Vec::with_capacity(128);
@@ -207,7 +198,7 @@ impl Loader {
         src.push_str("let {layer, ..} = import \"minimal.ncl\" in\n");
         src.push_str("layer {\n");
         src.push_str("\tbuilds = [\n");
-        for pb in build_decls_in_dir(layer_dir.as_ref().join("packages"), None)?.into_iter() {
+        for pb in build_decls_in_dir(layer_dir.as_ref().join("packages"))?.into_iter() {
             src.push_str("\t\timport \"");
             src.push_str(pb.to_str().unwrap());
             src.push_str("\",\n");
@@ -367,7 +358,7 @@ mod tests {
             std::fs::write(pkg_dir.join("build.ncl"), "test content").unwrap();
         }
 
-        let result = build_decls_in_dir(temp_dir.path(), None).unwrap();
+        let result = build_decls_in_dir(temp_dir.path()).unwrap();
 
         assert_eq!(result.len(), 3);
         assert!(result.iter().any(|p| p.ends_with("package-a/build.ncl")));
@@ -387,27 +378,28 @@ mod tests {
         std::fs::write(pkg_dir.join("readme.md"), "# README").unwrap();
         std::fs::write(pkg_dir.join("other.ncl"), "other nickel file").unwrap();
 
-        let result = build_decls_in_dir(temp_dir.path(), None).unwrap();
+        let result = build_decls_in_dir(temp_dir.path()).unwrap();
 
         assert_eq!(result.len(), 1);
         assert!(result[0].ends_with("build.ncl"));
     }
 
     #[test]
-    fn build_decls_in_dir_filtered() {
+    fn build_decls_in_dir_partitioned() {
         let temp_dir = tempfile::tempdir().unwrap();
 
-        // Create multiple packages
-        for pkg_name in &["package-a", "package-b", "package-c"] {
+        // Create multiple package directories
+        for pkg_name in &["p/package-a", "e/effo"] {
             let pkg_dir = temp_dir.path().join(pkg_name);
-            std::fs::create_dir(&pkg_dir).unwrap();
+            std::fs::create_dir_all(&pkg_dir).unwrap();
             std::fs::write(pkg_dir.join("build.ncl"), "test content").unwrap();
         }
 
-        let result = build_decls_in_dir(temp_dir.path(), Some(&["package-b".to_string()])).unwrap();
+        let result = build_decls_in_dir(temp_dir.path()).unwrap();
 
-        assert_eq!(result.len(), 1);
-        assert!(result[0].ends_with("package-b/build.ncl"));
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().any(|p| p.ends_with("p/package-a/build.ncl")));
+        assert!(result.iter().any(|p| p.ends_with("e/effo/build.ncl")));
     }
 
     #[test]
