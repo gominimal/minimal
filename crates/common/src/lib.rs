@@ -22,24 +22,8 @@ use std::{
     hash::Hash,
     io::{self, ErrorKind, Write},
     path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard},
 };
 use tracing::warn;
-
-static HAKONIWA_SPAWN_LOCK: Mutex<()> = Mutex::new(());
-
-/// Global lock to synchronize the creation of files with any calls to fork(),
-/// which may in-advertently inherit them.
-pub struct FdSynchronizer;
-
-impl FdSynchronizer {
-    /// Returns a RAII guard that symbolizes that you may fork+exec.
-    pub fn lock_fork() -> MutexGuard<'static, ()> {
-        HAKONIWA_SPAWN_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}
 
 /// Describes where a build-spec came from.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
