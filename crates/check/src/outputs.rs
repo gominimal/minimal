@@ -133,165 +133,178 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
                 return Ok(result); // skip, we need the build
             }
         };
-        let build = graph.get(&bsr).unwrap();
-        let spec_hash = graph.spec_hash(&bsr);
-        let cached_build = if let Ok(cached_build) = cache.read_dir(&spec_hash) {
-            cached_build
-        } else {
-            return Ok(result); // skip, we need the cached build
-        };
 
-        // We also need the builds of all the runtime_deps
-        let transitives = Transitives::new(&graph, &bsr, false)
-            .transitive_runtime_deps
-            .keys()
-            .to_owned()
-            .map(|dep| Ok::<_, CacheErr>((*dep, cache.read_dir(&graph.spec_hash(dep))?)))
-            .collect::<Result<Vec<_>, _>>();
-        let deps: Vec<(BuildSpecRef, DirCacheEntry<LocalDir>)> = match transitives {
-            Ok(mut t) => {
-                // We need to consider imports from libraries in the current package as well
-                t.push((bsr, cache.read_dir(&spec_hash).unwrap()));
-                t
-            }
-            Err(_) => {
-                return Ok(result); // skip, we need the cached build of all runtime_deps
-            }
-        };
+        // Clone the graph and release the read lock so other checkers can proceed.
+        let graph = std::ops::Deref::deref(&graph).clone();
 
-        result.verdict = CheckVerdict::Pass;
+        tokio::task::spawn_blocking(move || {
+            (move || -> Result<CheckResult, Error> {
+            let build = graph.get(&bsr).unwrap();
+            let spec_hash = graph.spec_hash(&bsr);
+            let cached_build = if let Ok(cached_build) = cache.read_dir(&spec_hash) {
+                cached_build
+            } else {
+                return Ok(result); // skip, we need the cached build
+            };
 
-        // Collect:
-        //  - the ELF imports that each file in each bin/lib output wants.
-        //  - the interpreter of any executable scripts
-        let mut all_imports: HashMap<String, HashMap<(&String, PathBuf), HashSet<String>>> =
-            HashMap::with_capacity(1024);
-        let mut script_interpreters: HashMap<PathBuf, (String, String)> =
-            HashMap::with_capacity(32);
-        for (name, output) in &build.outputs {
-            let glob = output.glob();
-            for path in common::match_files_for_glob(cached_build.path(), glob)
-                .map_err(|e| Error::Other(anyhow!(e)))?
-                .into_iter()
-            {
-                let data = std::fs::read(&path)
-                    .map_err(|e| Error::IO("reading output file", path.to_path_buf(), e))?;
-                if let (Ok(elf), BuildOutput::Binary { .. } | BuildOutput::Library { .. }) =
-                    (object::File::parse(&*data), output)
-                    && let Ok(imports) = elf.imports()
+            // We also need the builds of all the runtime_deps
+            let transitives = Transitives::new(&graph, &bsr, false)
+                .transitive_runtime_deps
+                .keys()
+                .to_owned()
+                .map(|dep| Ok::<_, CacheErr>((*dep, cache.read_dir(&graph.spec_hash(dep))?)))
+                .collect::<Result<Vec<_>, _>>();
+            let deps: Vec<(BuildSpecRef, DirCacheEntry<LocalDir>)> = match transitives {
+                Ok(mut t) => {
+                    // We need to consider imports from libraries in the current package as well
+                    t.push((bsr, cache.read_dir(&spec_hash).unwrap()));
+                    t
+                }
+                Err(_) => {
+                    return Ok(result); // skip, we need the cached build of all runtime_deps
+                }
+            };
+
+            result.verdict = CheckVerdict::Pass;
+
+            // Collect:
+            //  - the ELF imports that each file in each bin/lib output wants.
+            //  - the interpreter of any executable scripts
+            let mut all_imports: HashMap<String, HashMap<(&String, PathBuf), HashSet<String>>> =
+                HashMap::with_capacity(1024);
+            let mut script_interpreters: HashMap<PathBuf, (String, String)> =
+                HashMap::with_capacity(32);
+            for (name, output) in &build.outputs {
+                let glob = output.glob();
+                for path in common::match_files_for_glob(cached_build.path(), glob)
+                    .map_err(|e| Error::Other(anyhow!(e)))?
+                    .into_iter()
                 {
-                    let path_in_build = path.strip_prefix(cached_build.path()).unwrap();
-                    for import in imports.iter() {
-                        let lib = String::from_utf8(import.library().to_vec()).unwrap();
-                        let symbol = String::from_utf8(import.name().to_vec()).unwrap();
-                        if lib.is_empty() {
-                            continue;
-                        }
-
-                        match all_imports.get_mut(&lib) {
-                            None => {
-                                all_imports.insert(
-                                    lib,
-                                    HashMap::from_iter(
-                                        [((name, path_in_build.to_path_buf()), [symbol].into())]
-                                            .into_iter(),
-                                    ),
-                                );
+                    let data = std::fs::read(&path)
+                        .map_err(|e| Error::IO("reading output file", path.to_path_buf(), e))?;
+                    if let (Ok(elf), BuildOutput::Binary { .. } | BuildOutput::Library { .. }) =
+                        (object::File::parse(&*data), output)
+                        && let Ok(imports) = elf.imports()
+                    {
+                        let path_in_build = path.strip_prefix(cached_build.path()).unwrap();
+                        for import in imports.iter() {
+                            let lib = String::from_utf8(import.library().to_vec()).unwrap();
+                            let symbol = String::from_utf8(import.name().to_vec()).unwrap();
+                            if lib.is_empty() {
+                                continue;
                             }
-                            Some(syms_by_output_files) => {
-                                let k = (name, path_in_build.to_path_buf());
-                                match syms_by_output_files.get_mut(&k) {
-                                    None => {
-                                        syms_by_output_files.insert(k, [symbol].into());
-                                    }
-                                    Some(syms) => {
-                                        syms.insert(symbol);
+
+                            match all_imports.get_mut(&lib) {
+                                None => {
+                                    all_imports.insert(
+                                        lib,
+                                        HashMap::from_iter(
+                                            [(
+                                                (name, path_in_build.to_path_buf()),
+                                                [symbol].into(),
+                                            )]
+                                            .into_iter(),
+                                        ),
+                                    );
+                                }
+                                Some(syms_by_output_files) => {
+                                    let k = (name, path_in_build.to_path_buf());
+                                    match syms_by_output_files.get_mut(&k) {
+                                        None => {
+                                            syms_by_output_files.insert(k, [symbol].into());
+                                        }
+                                        Some(syms) => {
+                                            syms.insert(symbol);
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
 
-                if let BuildOutput::Binary {
-                    glob: _,
-                    allow_missing_interpreter: false,
-                } = output
-                    && data.starts_with(b"#!")
-                    && let Some(newline_idx) = data.iter().position(|c| c == &b'\n')
-                {
-                    // NOTE: most Linux kernels (and many Unix systems) treat everything after #!
-                    // up to the first space as the interpreter, and everything after the first space
-                    // as a single argument. So we just collect everything after the shebang up to
-                    // the first space (or, newline).
-                    let interpreter = String::from_utf8(data[2..newline_idx].to_vec())
-                        .map_err(|e| Error::Other(e.into()))?
-                        .trim_start()
-                        .split(" ")
-                        .next()
-                        .unwrap()
-                        .to_string();
-                    script_interpreters.insert(
-                        path.strip_prefix(cached_build.path())
+                    if let BuildOutput::Binary {
+                        glob: _,
+                        allow_missing_interpreter: false,
+                    } = output
+                        && data.starts_with(b"#!")
+                        && let Some(newline_idx) = data.iter().position(|c| c == &b'\n')
+                    {
+                        // NOTE: most Linux kernels (and many Unix systems) treat everything after #!
+                        // up to the first space as the interpreter, and everything after the first space
+                        // as a single argument. So we just collect everything after the shebang up to
+                        // the first space (or, newline).
+                        let interpreter = String::from_utf8(data[2..newline_idx].to_vec())
+                            .map_err(|e| Error::Other(e.into()))?
+                            .trim_start()
+                            .split(" ")
+                            .next()
                             .unwrap()
-                            .to_path_buf(),
-                        (name.clone(), interpreter),
-                    );
+                            .to_string();
+                        script_interpreters.insert(
+                            path.strip_prefix(cached_build.path())
+                                .unwrap()
+                                .to_path_buf(),
+                            (name.clone(), interpreter),
+                        );
+                    }
                 }
             }
-        }
-        for (needed_lib, outputs) in &all_imports {
-            match find_lib_in_deps(needed_lib, &deps)? {
-                Some((idx, lib_path)) => {
-                    // There was a library, check that all the symbols we need are present.
-                    let data = std::fs::read(deps[idx].1.path().join(&lib_path)).map_err(|e| {
-                        Error::IO("reading library", deps[idx].1.path().join(&lib_path), e)
-                    })?;
-                    match object::File::parse(&*data) {
-                        Ok(elf) => {
-                            let exports = elf.exports().unwrap();
-                            let likely_glibc_stub_lib = exports.iter().any(|e| {
-                                e.name().ends_with(b"__libpthread_version_placeholder")
-                                    || e.name().ends_with(b"__libdl_version_placeholder")
-                                    || e.name().ends_with(b"__librt_version_placeholder")
-                            });
+            for (needed_lib, outputs) in &all_imports {
+                match find_lib_in_deps(needed_lib, &deps)? {
+                    Some((idx, lib_path)) => {
+                        // There was a library, check that all the symbols we need are present.
+                        let data =
+                            std::fs::read(deps[idx].1.path().join(&lib_path)).map_err(|e| {
+                                Error::IO("reading library", deps[idx].1.path().join(&lib_path), e)
+                            })?;
+                        match object::File::parse(&*data) {
+                            Ok(elf) => {
+                                let exports = elf.exports().unwrap();
+                                let likely_glibc_stub_lib = exports.iter().any(|e| {
+                                    e.name().ends_with(b"__libpthread_version_placeholder")
+                                        || e.name().ends_with(b"__libdl_version_placeholder")
+                                        || e.name().ends_with(b"__librt_version_placeholder")
+                                });
 
-                            // Valid executable, lets check all the imported symbols are present as exports.
-                            let avail_symbols: HashSet<String> = exports
-                                .iter()
-                                .map(|e| String::from_utf8(e.name().to_vec()).unwrap())
-                                .chain(elf.dynamic_symbols().map(|s| s.name().unwrap().to_string()))
-                                .chain(
-                                    if likely_glibc_stub_lib {
-                                        let data = std::fs::read(
-                                            deps[idx].1.path().join("usr/lib/libc.so.6"),
-                                        )
-                                        .map_err(|e| {
-                                            Error::IO(
-                                                "reading libc",
+                                // Valid executable, lets check all the imported symbols are present as exports.
+                                let avail_symbols: HashSet<String> = exports
+                                    .iter()
+                                    .map(|e| String::from_utf8(e.name().to_vec()).unwrap())
+                                    .chain(
+                                        elf.dynamic_symbols()
+                                            .map(|s| s.name().unwrap().to_string()),
+                                    )
+                                    .chain(
+                                        if likely_glibc_stub_lib {
+                                            let data = std::fs::read(
                                                 deps[idx].1.path().join("usr/lib/libc.so.6"),
-                                                e,
                                             )
-                                        })?;
-                                        object::File::parse(&*data)
-                                            .unwrap()
-                                            .dynamic_symbols()
-                                            .map(|s| s.name().unwrap().to_string())
-                                            .collect()
-                                    } else {
-                                        vec![]
-                                    }
-                                    .into_iter(),
-                                )
-                                .collect();
-                            let missing_symbols: Vec<&String> = outputs
-                                .values()
-                                .flatten()
-                                .filter(|sym| !avail_symbols.contains(*sym))
-                                .collect();
+                                            .map_err(|e| {
+                                                Error::IO(
+                                                    "reading libc",
+                                                    deps[idx].1.path().join("usr/lib/libc.so.6"),
+                                                    e,
+                                                )
+                                            })?;
+                                            object::File::parse(&*data)
+                                                .unwrap()
+                                                .dynamic_symbols()
+                                                .map(|s| s.name().unwrap().to_string())
+                                                .collect()
+                                        } else {
+                                            vec![]
+                                        }
+                                        .into_iter(),
+                                    )
+                                    .collect();
+                                let missing_symbols: Vec<&String> = outputs
+                                    .values()
+                                    .flatten()
+                                    .filter(|sym| !avail_symbols.contains(*sym))
+                                    .collect();
 
-                            if !missing_symbols.is_empty() {
-                                result.err.push(format!(
+                                if !missing_symbols.is_empty() {
+                                    result.err.push(format!(
                                         "executable dependency '{}' at {}:{} missing symbols: {}. Needed by {}",
                                         needed_lib,
                                         graph.get(&deps[idx].0).unwrap().name,
@@ -303,11 +316,11 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
                                             .collect::<Vec<_>>()
                                             .join(", ")
                                     ));
-                                result.verdict = CheckVerdict::Fail;
+                                    result.verdict = CheckVerdict::Fail;
+                                }
                             }
-                        }
-                        Err(e) => {
-                            result.err.push(format!(
+                            Err(e) => {
+                                result.err.push(format!(
                                     "executable dependency '{}' mapped to invalid executable {}:{} ({}). Needed by {}",
                                     needed_lib,
                                     graph.get(&deps[idx].0).unwrap().name,
@@ -319,55 +332,60 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
                                         .collect::<Vec<_>>()
                                         .join(", ")
                                 ));
-                            result.verdict = CheckVerdict::Fail;
+                                result.verdict = CheckVerdict::Fail;
+                            }
                         }
                     }
+                    None => {
+                        result.err.push(format!(
+                            "executable dependency '{}' not in runtime deps, needed by {}",
+                            needed_lib,
+                            outputs
+                                .keys()
+                                .map(|(_output, path)| path.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                        result.verdict = CheckVerdict::Fail;
+                    }
                 }
-                None => {
+            }
+
+            // Lets also check that all binary outputs which are scripts (i.e. start with a shebang) declare a runtime
+            // dep providing the interpreter.
+            for (bin_path, (output_name, interpreter)) in script_interpreters.into_iter() {
+                let interpreter = interpreter.trim_start_matches("/");
+
+                let satisfied = deps.iter().any(|(_bsr, cache_dir)| {
+                    if cache_dir.path().join(interpreter).exists() {
+                        return true;
+                    }
+                    if let Some(rest) = interpreter.strip_prefix("bin/")
+                        && cache_dir.path().join("usr/bin").join(rest).exists()
+                    {
+                        return true;
+                    }
+
+                    false
+                });
+
+                if !satisfied {
                     result.err.push(format!(
-                        "executable dependency '{}' not in runtime deps, needed by {}",
-                        needed_lib,
-                        outputs
-                            .keys()
-                            .map(|(_output, path)| path.display().to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                        "interpreter '{}' not in runtime deps, needed by script {} (output {})",
+                        interpreter,
+                        bin_path.display(),
+                        output_name,
                     ));
                     result.verdict = CheckVerdict::Fail;
                 }
             }
-        }
 
-        // Lets also check that all binary outputs which are scripts (i.e. start with a shebang) declare a runtime
-        // dep providing the interpreter.
-        for (bin_path, (output_name, interpreter)) in script_interpreters.into_iter() {
-            let interpreter = interpreter.trim_start_matches("/");
-
-            let satisfied = deps.iter().any(|(_bsr, cache_dir)| {
-                if cache_dir.path().join(interpreter).exists() {
-                    return true;
-                }
-                if let Some(rest) = interpreter.strip_prefix("bin/")
-                    && cache_dir.path().join("usr/bin").join(rest).exists()
-                {
-                    return true;
-                }
-
-                false
-            });
-
-            if !satisfied {
-                result.err.push(format!(
-                    "interpreter '{}' not in runtime deps, needed by script {} (output {})",
-                    interpreter,
-                    bin_path.display(),
-                    output_name,
-                ));
-                result.verdict = CheckVerdict::Fail;
-            }
-        }
-
-        Ok(result)
+            Ok(result)
+            })().map_err(|e| format!("{e}"))
+        })
+        .await
+        .map_err(|e| Error::Other(anyhow!(e)))?
+        .map_err(|e| Error::Other(anyhow!(e)))
     }
 }
 
