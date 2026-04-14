@@ -112,10 +112,10 @@ impl FileCache {
         if fs::exists(&cached_path)? {
             let computed_hash = {
                 let mut f = fs::File::open(&cached_path)?;
-                let mut hasher = Sha256::new();
+                let mut hasher = super::HashWriter(Sha256::new());
                 std::io::copy(&mut f, &mut hasher)?;
 
-                hasher.finalize()
+                hasher.0.finalize()
             };
 
             if hex::encode(computed_hash) == sha256 {
@@ -143,7 +143,7 @@ impl FileCache {
     {
         let cached_path = self.sha_dir(sha256).map_err(Either::Left)?.join(filename);
 
-        let mut hasher = Sha256::new();
+        let mut hasher = super::HashWriter(Sha256::new());
         {
             let mut f = fs::File::create(&cached_path).map_err(|e| Either::Left(e.into()))?;
             let mut w = Tee::new(&mut f, &mut hasher);
@@ -169,7 +169,7 @@ impl FileCache {
             f.sync_all().map_err(|e| Either::Left(e.into()))?;
         }
 
-        let computed_hash = hasher.finalize();
+        let computed_hash = hasher.0.finalize();
         let computed_hex = hex::encode(computed_hash);
 
         if computed_hex != sha256 {

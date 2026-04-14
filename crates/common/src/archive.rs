@@ -67,7 +67,7 @@ pub fn compress_dir<P: AsRef<Path>>(
     match_globs: &Option<globset::GlobSet>,
 ) -> Result<(std::fs::File, [u8; 32]), std::io::Error> {
     let mut tar_file = tempfile::tempfile()?;
-    let mut hasher = Sha256::new();
+    let mut hasher = super::HashWriter(Sha256::new());
     {
         let mut w = super::Tee::new(&mut tar_file, &mut hasher);
         let encoder = zstd::stream::Encoder::new(&mut w, override_level.unwrap_or(ZSTD_LEVEL))?;
@@ -80,7 +80,7 @@ pub fn compress_dir<P: AsRef<Path>>(
     use std::io::Seek;
     tar_file.seek(std::io::SeekFrom::Start(0))?;
 
-    Ok((tar_file, hasher.finalize().into()))
+    Ok((tar_file, hasher.0.finalize().into()))
 }
 
 /// Recursively adds the specified directory to the given tarball.

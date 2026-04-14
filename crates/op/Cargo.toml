@@ -13,6 +13,7 @@ smallvec.workspace = true
 [dependencies]
 anyhow.workspace = true
 flate2.workspace = true
+hex.workspace = true
 futures.workspace = true
 globset.workspace = true
 walkdir.workspace = true
