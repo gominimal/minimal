@@ -53,7 +53,7 @@ indicatif = "0.18"
 indoc = "^2.0"
 jaq-all = "0.1.0-beta"
 lzma-rs = "0.3"
-nickel-lang-core = { version = "0.15.3", default-features = false, features = ["format"] }
+nickel-lang-core = { version = "0.17.0", default-features = false, features = ["format"] }
 object = { version = "0.38", default-features = false, features = ["archive", "elf", "read_core", "std"] }
 oci-spec = "0.8.3"
 path-absolutize = "^3.1"

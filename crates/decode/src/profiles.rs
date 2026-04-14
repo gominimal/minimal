@@ -1,12 +1,12 @@
 use mfile::{EnvPatches, EnvVarValue};
 use nickel_lang_core::{
-    eval::cache::CacheImpl,
+    eval::{cache::CacheImpl, value::NickelValue},
     program::Program,
-    term::{IndexMap, RichTerm, Term},
+    term::IndexMap,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, ObjTy, eval_if_closure};
+use crate::{Error, ObjTy, eval_if_closure, record_data_from_val};
 
 /// A profile, the initial configuration for an environment.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,7 +42,7 @@ impl Profile {
     }
 
     /// Deserializes a profile structure from the given nickel term tree.
-    pub fn from_term(rt: &RichTerm, program: &mut Program<CacheImpl>) -> Result<Self, Error> {
+    pub fn from_term(rt: &NickelValue, program: &mut Program<CacheImpl>) -> Result<Self, Error> {
         let rt = eval_if_closure(rt, program)?;
 
         let mut ty: Option<ObjTy> = None;
@@ -51,118 +51,119 @@ impl Profile {
         let mut packages: Option<Vec<String>> = None;
         let mut env_vars: Option<IndexMap<String, EnvVarValue>> = None;
         let mut patches: Option<EnvPatches> = None;
-        match rt.term.as_ref() {
-            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                r.fields
-                    .iter()
-                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
-                        match ident_and_loc.label() {
-                            "ty" => {
-                                ty = Some(
-                                    ObjTy::deserialize(eval_if_closure(
-                                        field.value.as_ref().unwrap(),
-                                        program,
-                                    )?)
-                                    .unwrap(),
-                                );
-                                Ok(())
-                            }
-                            "name" => {
-                                name = Some(
-                                    String::deserialize(eval_if_closure(
-                                        field.value.as_ref().unwrap(),
-                                        program,
-                                    )?)
-                                    .unwrap(),
-                                );
-                                Ok(())
-                            }
-                            "from_profile" => {
-                                if let Some(rt) = field.value.as_ref() {
-                                from_profile = Some(
-                                    String::deserialize(eval_if_closure(rt,program,)?).unwrap(),
-                                );
-                                }
-                                Ok(())
-                            }
 
-                            "env_vars" => {
-                                if let Some(ev_rt) = field.value.as_ref() {
-                                    let ev_rt =
-                                        eval_if_closure(ev_rt, program)?;
-
-                                    match ev_rt.term.as_ref() {
-                                        Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                                            env_vars = Some(r.fields.iter().map(
-                                                |(ident_and_loc, field)| -> Result<(String, EnvVarValue), Error> {
-                                                    Ok((
-                                                        ident_and_loc.label().to_string(),
-                                                        EnvVarValue::Value(String::deserialize(eval_if_closure(
-                                                            field.value.as_ref().unwrap(),
-                                                            program,
-                                                        )?).unwrap()),
-                                                    ))
-                                                },
-                                            ).collect::<Result<IndexMap<_, _>, Error>>()?);
-                                        }
-                                        _ => todo!("unexpected term for env_vars: {:?}", ev_rt.term.as_ref()),
-                                    };
-                                }
-
-                                Ok(())
-                            }
-                            "packages" => {
-                                if let Some(packages_rt) = field.value.as_ref() {
-                                    let packages_rt =
-                                        eval_if_closure(packages_rt, program)?;
-
-                                    match packages_rt.term.as_ref() {
-                                        Term::Array(a, _attrs) => {
-                                            packages = Some(
-                                                a.iter()
-                                                    .map(|input| {
-                                                        Ok(String::deserialize(eval_if_closure(
-                                                            input,
-                                                            program,
-                                                        )?).unwrap())
-                                                    })
-                                                    .collect::<Result<Vec<_>, Error>>()?,
-                                            );
-                                        }
-                                        _ => todo!(
-                                            "handle packages value being non-array {:?}",
-                                            field.value
-                                        ),
-                                    }
-                                }
-
-                                Ok(())
-                            }
-                            "patch" | "patches" => {
-                                if let Some(patch_rt) = field.value.as_ref() {
-                                    if patches.is_some() {
-                                        todo!("error for both 'patch' and 'patches' set");
-                                    }
-                                    patches = Some(crate::patches_from_term(patch_rt, program)?);
-                                }
-                                Ok(())
-                            }
-                            _ => Ok(()),
+        if let Some(r) = record_data_from_val(&rt) {
+            r.fields
+                .iter()
+                .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                    match ident_and_loc.label() {
+                        "ty" => {
+                            ty = Some(
+                                ObjTy::deserialize(eval_if_closure(
+                                    field.value.as_ref().unwrap(),
+                                    program,
+                                )?)
+                                .unwrap(),
+                            );
+                            Ok(())
                         }
-                    })?;
-            }
-            _ => {}
-        };
+                        "name" => {
+                            name = Some(
+                                String::deserialize(eval_if_closure(
+                                    field.value.as_ref().unwrap(),
+                                    program,
+                                )?)
+                                .unwrap(),
+                            );
+                            Ok(())
+                        }
+                        "from_profile" => {
+                            if let Some(rt) = field.value.as_ref() {
+                            from_profile = Some(
+                                String::deserialize(eval_if_closure(rt,program,)?).unwrap(),
+                            );
+                            }
+                            Ok(())
+                        }
+
+                        "env_vars" => {
+                            if let Some(ev_rt) = field.value.as_ref() {
+                                let ev_rt =
+                                    eval_if_closure(ev_rt, program)?;
+
+                                if let Some(r) = record_data_from_val(&ev_rt) {
+                                    env_vars = Some(r.fields.iter().map(
+                                        |(ident_and_loc, field)| -> Result<(String, EnvVarValue), Error> {
+                                            Ok((
+                                                ident_and_loc.label().to_string(),
+                                                EnvVarValue::Value(String::deserialize(eval_if_closure(
+                                                    field.value.as_ref().unwrap(),
+                                                    program,
+                                                )?).unwrap()),
+                                            ))
+                                        },
+                                    ).collect::<Result<IndexMap<_, _>, Error>>()?);
+                                } else {
+                                    todo!("unexpected term for env_vars: {:?}", ev_rt);
+                                }
+                            }
+
+                            Ok(())
+                        }
+                        "packages" => {
+                            if let Some(packages_rt) = field.value.as_ref() {
+                                let packages_rt =
+                                    eval_if_closure(packages_rt, program)?;
+
+                                if let Some(a) = packages_rt.as_array() {
+                                    packages = Some(
+                                        a.iter()
+                                            .map(|input| {
+                                                Ok(String::deserialize(eval_if_closure(
+                                                    input,
+                                                    program,
+                                                )?).unwrap())
+                                            })
+                                            .collect::<Result<Vec<_>, Error>>()?,
+                                    );
+                                } else {
+                                    todo!(
+                                        "handle packages value being non-array {:?}",
+                                        field.value
+                                    );
+                                }
+                            }
+
+                            Ok(())
+                        }
+                        "patch" | "patches" => {
+                            if let Some(patch_rt) = field.value.as_ref() {
+                                if patches.is_some() {
+                                    todo!("error for both 'patch' and 'patches' set");
+                                }
+                                patches = Some(crate::patches_from_term(patch_rt, program)?);
+                            }
+                            Ok(())
+                        }
+                        _ => Ok(()),
+                    }
+                })?;
+        }
 
         match ty {
             Some(ObjTy::Profile) => {} // happy path
-            None => return Err(Error::MissingTy(program.files(), rt.pos)),
+            None => {
+                return Err(Error::MissingTy(
+                    program.files(),
+                    rt.pos(program.pos_table()),
+                ));
+            }
             Some(ty) => {
                 return Err(Error::UnexpectedObject {
                     files: program.files(),
                     got: ty,
                     want: ObjTy::Profile,
-                    pos: rt.pos,
+                    pos: rt.pos(program.pos_table()),
                 });
             }
         };
@@ -172,7 +173,7 @@ impl Profile {
                 return Err(Error::MissingField {
                     files: program.files(),
                     obj: ObjTy::Builder,
-                    pos: rt.pos,
+                    pos: rt.pos(program.pos_table()),
                     field: "name",
                 });
             }

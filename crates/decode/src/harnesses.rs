@@ -4,14 +4,14 @@ use common::jq::JqError;
 use either::Either;
 use mfile::{EnvVarValue, TaskAction};
 use nickel_lang_core::{
-    eval::cache::CacheImpl,
+    eval::{cache::CacheImpl, value::NickelValue},
     program::Program,
-    term::{IndexMap, RichTerm, RuntimeContract, Term},
+    term::{IndexMap, RuntimeContract},
 };
 use regex::bytes::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, ObjTy, eval_if_closure};
+use crate::{Error, ObjTy, eval_if_closure, record_data_from_val};
 
 /// A predicate that when matched, indicates a package should be added when using a harness.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,77 +35,72 @@ impl PackageMatcherPredicate {
 
     /// Deserializes a matcher structure from the given nickel term tree.
     pub(crate) fn from_term(
-        rt: &RichTerm,
+        rt: &NickelValue,
         program: &mut Program<CacheImpl>,
     ) -> Result<Self, Error> {
         let rt = eval_if_closure(rt, program)?;
 
         let mut file_regexes: Option<IndexMap<String, String>> = None;
         let mut file_predicates: Option<IndexMap<String, String>> = None;
-        match rt.term.as_ref() {
-            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                r.fields
-                    .iter()
-                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
-                        if let Some(rt) = field.value.as_ref() {
-                        let rt = RuntimeContract::apply_all(
-                            rt.clone(),
-                            field.pending_contracts.iter().cloned(),
-                            rt.pos,
-                        );
+        if let Some(r) = record_data_from_val(&rt) {
+            r.fields
+                .iter()
+                .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                    if let Some(rt) = field.value.as_ref() {
+                    let rt = RuntimeContract::apply_all(
+                        rt.clone(),
+                        field.pending_contracts.iter().cloned(),
+                        rt.pos_idx(),
+                    );
 
-                        match ident_and_loc.label() {
-                            "file_regexes" => {
-                                    let rt = eval_if_closure(&rt, program)?;
-                                    match rt.term.as_ref() {
-                                        Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                                            file_regexes = Some(r.fields.iter().map(
-                                                |(ident_and_loc, field)| -> Result<(String, String), Error> {
-                                                    Ok((
-                                                        ident_and_loc.label().to_string(),
-                                                        String::deserialize(eval_if_closure(
-                                                            field.value.as_ref().unwrap(),
-                                                            program,
-                                                        )?).unwrap(),
-                                                    ))
-                                                },
-                                            ).collect::<Result<IndexMap<_, _>, Error>>()?);
-                                        }
-                                        _ => todo!("unexpected term for file_regexes: {:?}", rt.term.as_ref()),
-                                    };
+                    match ident_and_loc.label() {
+                        "file_regexes" => {
+                                let rt = eval_if_closure(&rt, program)?;
+                                if let Some(r) = record_data_from_val(&rt) {
+                                    file_regexes = Some(r.fields.iter().map(
+                                        |(ident_and_loc, field)| -> Result<(String, String), Error> {
+                                            Ok((
+                                                ident_and_loc.label().to_string(),
+                                                String::deserialize(eval_if_closure(
+                                                    field.value.as_ref().unwrap(),
+                                                    program,
+                                                )?).unwrap(),
+                                            ))
+                                        },
+                                    ).collect::<Result<IndexMap<_, _>, Error>>()?);
+                                } else {
+                                    todo!("unexpected term for file_regexes: {:?}", rt);
+                                }
 
-                                Ok(())
-                            }
-                            "file_predicates" => {
-                                    let rt = eval_if_closure(&rt, program)?;
-                                    match rt.term.as_ref() {
-                                        Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                                            file_predicates = Some(r.fields.iter().map(
-                                                |(ident_and_loc, field)| -> Result<(String, String), Error> {
-                                                    Ok((
-                                                        ident_and_loc.label().to_string(),
-                                                        String::deserialize(eval_if_closure(
-                                                            field.value.as_ref().unwrap(),
-                                                            program,
-                                                        )?).unwrap(),
-                                                    ))
-                                                },
-                                            ).collect::<Result<IndexMap<_, _>, Error>>()?);
-                                        }
-                                        _ => todo!("unexpected term for file_predicates: {:?}", rt.term.as_ref()),
-                                    };
-
-                                Ok(())
-                            }
-                            _ => Ok(()),
-                        }
-                        } else {
                             Ok(())
                         }
-                    })?;
-            }
-            _ => {}
-        };
+                        "file_predicates" => {
+                                let rt = eval_if_closure(&rt, program)?;
+                                if let Some(r) = record_data_from_val(&rt) {
+                                    file_predicates = Some(r.fields.iter().map(
+                                        |(ident_and_loc, field)| -> Result<(String, String), Error> {
+                                            Ok((
+                                                ident_and_loc.label().to_string(),
+                                                String::deserialize(eval_if_closure(
+                                                    field.value.as_ref().unwrap(),
+                                                    program,
+                                                )?).unwrap(),
+                                            ))
+                                        },
+                                    ).collect::<Result<IndexMap<_, _>, Error>>()?);
+                                } else {
+                                    todo!("unexpected term for file_predicates: {:?}", rt);
+                                }
+
+                            Ok(())
+                        }
+                        _ => Ok(()),
+                    }
+                    } else {
+                        Ok(())
+                    }
+                })?;
+        }
 
         Ok(PackageMatcherPredicate {
             file_regexes: file_regexes.unwrap_or_default(),
@@ -116,36 +111,33 @@ impl PackageMatcherPredicate {
 
 /// Parses a nickel tree representing a map of `String` to `Vec<PackageMatcherPredicate>`.
 fn package_map_from_term(
-    rt: &RichTerm,
+    rt: &NickelValue,
     program: &mut Program<CacheImpl>,
 ) -> Result<IndexMap<String, Vec<PackageMatcherPredicate>>, Error> {
     let rt = eval_if_closure(rt, program)?;
-    match rt.term.as_ref() {
-        Term::Record(r) | Term::RecRecord(r, _, _, _) => r
-            .fields
+    if let Some(r) = record_data_from_val(&rt) {
+        r.fields
             .iter()
             .map(
                 |(ident_and_loc, field)| -> Result<(String, Vec<PackageMatcherPredicate>), Error> {
                     let a_rt = eval_if_closure(field.value.as_ref().unwrap(), program)?;
-                    let pred = match a_rt.term.as_ref() {
-                        Term::Array(a, _attrs) => a
-                            .iter()
+                    let pred = if let Some(a) = a_rt.as_array() {
+                        a.iter()
                             .map(|input| PackageMatcherPredicate::from_term(input, program))
-                            .collect::<Result<Vec<_>, Error>>()?,
-                        _ => todo!(
+                            .collect::<Result<Vec<_>, Error>>()?
+                    } else {
+                        todo!(
                             "handle build_package_if_any value being non-array {:?}",
                             field.value
-                        ),
+                        )
                     };
 
                     Ok((ident_and_loc.label().to_string(), pred))
                 },
             )
-            .collect::<Result<IndexMap<_, _>, Error>>(),
-        _ => todo!(
-            "unexpected term for build_package_if_any: {:?}",
-            rt.term.as_ref()
-        ),
+            .collect::<Result<IndexMap<_, _>, Error>>()
+    } else {
+        todo!("unexpected term for build_package_if_any: {:?}", rt)
     }
 }
 
@@ -219,7 +211,7 @@ impl HarnessMatcher {
 
     /// Deserializes a harness matcher structure from the given nickel term tree.
     pub(crate) fn from_term(
-        rt: &RichTerm,
+        rt: &NickelValue,
         program: &mut Program<CacheImpl>,
     ) -> Result<Self, Error> {
         let rt = eval_if_closure(rt, program)?;
@@ -233,36 +225,33 @@ impl HarnessMatcher {
             Default::default();
         let mut runtime_package_matchers: IndexMap<String, Vec<PackageMatcherPredicate>> =
             Default::default();
-        match rt.term.as_ref() {
-            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                r.fields
-                    .iter()
-                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
-                        if let Some(rt) = field.value.as_ref() {
-                            let rt = RuntimeContract::apply_all(
-                                rt.clone(),
-                                field.pending_contracts.iter().cloned(),
-                                rt.pos,
-                            );
+        if let Some(r) = record_data_from_val(&rt) {
+            r.fields
+                .iter()
+                .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                    if let Some(rt) = field.value.as_ref() {
+                        let rt = RuntimeContract::apply_all(
+                            rt.clone(),
+                            field.pending_contracts.iter().cloned(),
+                            rt.pos_idx(),
+                        );
 
-                            match ident_and_loc.label() {
-                                "build_package_if_any" => {
-                                    build_package_matchers = package_map_from_term(&rt, program)?;
-                                    Ok(())
-                                }
-                                "runtime_package_if_any" => {
-                                    runtime_package_matchers = package_map_from_term(&rt, program)?;
-                                    Ok(())
-                                }
-                                _ => Ok(()),
+                        match ident_and_loc.label() {
+                            "build_package_if_any" => {
+                                build_package_matchers = package_map_from_term(&rt, program)?;
+                                Ok(())
                             }
-                        } else {
-                            Ok(())
+                            "runtime_package_if_any" => {
+                                runtime_package_matchers = package_map_from_term(&rt, program)?;
+                                Ok(())
+                            }
+                            _ => Ok(()),
                         }
-                    })?;
-            }
-            _ => {}
-        };
+                    } else {
+                        Ok(())
+                    }
+                })?;
+        }
 
         Ok(HarnessMatcher {
             file_regexes,
@@ -307,7 +296,7 @@ pub struct Harness {
 
 impl Harness {
     /// Deserializes a harness structure from the given nickel term tree.
-    pub fn from_term(rt: &RichTerm, program: &mut Program<CacheImpl>) -> Result<Self, Error> {
+    pub fn from_term(rt: &NickelValue, program: &mut Program<CacheImpl>) -> Result<Self, Error> {
         let rt = eval_if_closure(rt, program)?;
 
         let mut ty: Option<ObjTy> = None;
@@ -320,224 +309,217 @@ impl Harness {
         let mut matches_project_if_any: Option<Vec<HarnessMatcher>> = None;
         let mut matches_project_priority: Option<i32> = None;
 
-        match rt.term.as_ref() {
-            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                r.fields
-                    .iter()
-                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
-                        match ident_and_loc.label() {
-                            "ty" => {
-                                ty = Some(
-                                    ObjTy::deserialize(eval_if_closure(
-                                        field.value.as_ref().unwrap(),
-                                        program,
-                                    )?)
-                                    .unwrap(),
-                                );
-                                Ok(())
-                            }
-                            "name" => {
-                                name = Some(
-                                    String::deserialize(eval_if_closure(
-                                        field.value.as_ref().unwrap(),
-                                        program,
-                                    )?)
-                                    .unwrap(),
-                                );
-                                Ok(())
-                            }
-
-                            "build_env_vars" => {
-                                if let Some(ev_rt) = field.value.as_ref() {
-                                    let ev_rt =
-                                        eval_if_closure(ev_rt, program)?;
-
-                                    match ev_rt.term.as_ref() {
-                                        Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                                            build_env_vars = Some(r.fields.iter().map(
-                                                |(ident_and_loc, field)| -> Result<(String, EnvVarValue), Error> {
-                                                    Ok((
-                                                        ident_and_loc.label().to_string(),
-                                                        EnvVarValue::Value(String::deserialize(eval_if_closure(
-                                                            field.value.as_ref().unwrap(),
-                                                            program,
-                                                        )?).unwrap()),
-                                                    ))
-                                                },
-                                            ).collect::<Result<IndexMap<_, _>, Error>>()?);
-                                        }
-                                        _ => todo!("unexpected term for build_env_vars: {:?}", ev_rt.term.as_ref()),
-                                    };
-                                }
-
-                                Ok(())
-                            }
-                            "build_packages" => {
-                                if let Some(packages_rt) = field.value.as_ref() {
-                                    let packages_rt =
-                                        eval_if_closure(packages_rt, program)?;
-
-                                    match packages_rt.term.as_ref() {
-                                        Term::Array(a, _attrs) => {
-                                            build_packages = Some(
-                                                a.iter()
-                                                    .map(|input| {
-                                                        Ok(String::deserialize(eval_if_closure(
-                                                            input,
-                                                            program,
-                                                        )?).unwrap())
-                                                    })
-                                                    .collect::<Result<Vec<_>, Error>>()?,
-                                            );
-                                        }
-                                        _ => todo!(
-                                            "handle build_packages value being non-array {:?}",
-                                            field.value
-                                        ),
-                                    }
-                                }
-
-                                Ok(())
-                            }
-                            "runtime_packages" => {
-                                if let Some(packages_rt) = field.value.as_ref() {
-                                    let packages_rt =
-                                        eval_if_closure(packages_rt, program)?;
-
-                                    match packages_rt.term.as_ref() {
-                                        Term::Array(a, _attrs) => {
-                                            runtime_packages = Some(
-                                                a.iter()
-                                                    .map(|input| {
-                                                        Ok(String::deserialize(eval_if_closure(
-                                                            input,
-                                                            program,
-                                                        )?).unwrap())
-                                                    })
-                                                    .collect::<Result<Vec<_>, Error>>()?,
-                                            );
-                                        }
-                                        _ => todo!(
-                                            "handle runtime_packages value being non-array {:?}",
-                                            field.value
-                                        ),
-                                    }
-                                }
-
-                                Ok(())
-                            }
-                            "build_cmd" => {
-                                if let Some(rt) = field.value.as_ref() {
-                                    let rt = eval_if_closure(rt, program)?;
-                                    match rt.term.as_ref() {
-                                        Term::Str(s) => {
-                                            build_cmds = Some(vec![
-                                                shlex::split(s).unwrap(),
-                                            ]);
-                                        }
-                                        Term::Array(a, _attrs) => {
-                                            build_cmds = Some(vec![
-                                                a.iter()
-                                                    .map(|rt| eval_if_closure(rt, program))
-                                                    .collect::<Result<Vec<_>, _>>()?
-                                                    .into_iter()
-                                                    .map(|rt| String::deserialize(rt).unwrap())
-                                                    .collect(),
-                                            ]);
-                                        }
-                                        _ => todo!("error for 'build_cmds' field being non-string & non-array, got {:?}", rt.term.as_ref()),
-                                    };
-                                    Ok(())
-                                } else {
-                                    Ok(())
-                                }
-                            }
-                            "build_cmds_cmd" => {
-                                if let Some(rt) = field.value.as_ref() {
-                                    let rt = eval_if_closure(rt, program)?;
-                                    match rt.term.as_ref() {
-                                        Term::Str(s) => {
-                                            build_cmds_cmd = Some(
-                                                shlex::split(s).unwrap(),
-                                            );
-                                        }
-                                        Term::Array(a, _attrs) => {
-                                            build_cmds_cmd = Some(
-                                                a.iter()
-                                                    .map(|rt| eval_if_closure(rt, program))
-                                                    .collect::<Result<Vec<_>, _>>()?
-                                                    .into_iter()
-                                                    .map(|rt| String::deserialize(rt).unwrap())
-                                                    .collect(),
-                                            );
-                                        }
-                                        _ => todo!("error for 'build_cmds_cmd' field being non-string & non-array, got {:?}", rt.term.as_ref()),
-                                    };
-                                    Ok(())
-                                } else {
-                                    Ok(())
-                                }
-                            }
-                            "matches_project_if_any" => {
-                                if let Some(matchers_rt) = field.value.as_ref() {
-                                    let matchers_rt =
-                                        eval_if_closure(matchers_rt, program)?;
-
-                                    match matchers_rt.term.as_ref() {
-                                        Term::Array(a, attrs) => {
-                                            matches_project_if_any = Some(
-                                                a.iter()
-                                                    .map(|m| {
-                                                        let rt = RuntimeContract::apply_all(
-                                                            m.clone(),
-                                                            attrs.pending_contracts.iter().cloned(),
-                                                            m.pos,
-                                                        );
-
-                                                        HarnessMatcher::from_term(&eval_if_closure(
-                                                            &rt,
-                                                            program,
-                                                        )?, program)
-                                                    })
-                                                    .collect::<Result<Vec<_>, Error>>()?,
-                                            );
-                                        }
-                                        _ => todo!(
-                                            "handle matches_project_if_any value being non-array {:?}",
-                                            field.value
-                                        ),
-                                    }
-                                }
-
-                                Ok(())
-                            }
-                            "matches_project_priority" => {
-                                if let Some(matchers_rt) = field.value.as_ref() {
-                                    let matchers_rt =
-                                        eval_if_closure(matchers_rt, program)?;
-                                    matches_project_priority = Some(i32::deserialize(matchers_rt).unwrap());
-                                }
-
-                                Ok(())
-                            }
-
-                            // TODO: `build_cmds` like `cmds` in build-specs.
-                            _ => Ok(()),
+        if let Some(r) = record_data_from_val(&rt) {
+            r.fields
+                .iter()
+                .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                    match ident_and_loc.label() {
+                        "ty" => {
+                            ty = Some(
+                                ObjTy::deserialize(eval_if_closure(
+                                    field.value.as_ref().unwrap(),
+                                    program,
+                                )?)
+                                .unwrap(),
+                            );
+                            Ok(())
                         }
-                    })?;
-            }
-            _ => {}
-        };
+                        "name" => {
+                            name = Some(
+                                String::deserialize(eval_if_closure(
+                                    field.value.as_ref().unwrap(),
+                                    program,
+                                )?)
+                                .unwrap(),
+                            );
+                            Ok(())
+                        }
+
+                        "build_env_vars" => {
+                            if let Some(ev_rt) = field.value.as_ref() {
+                                let ev_rt = eval_if_closure(ev_rt, program)?;
+
+                                if let Some(r) = record_data_from_val(&ev_rt) {
+                                    build_env_vars = Some(r.fields.iter().map(
+                                        |(ident_and_loc, field)| -> Result<(String, EnvVarValue), Error> {
+                                            Ok((
+                                                ident_and_loc.label().to_string(),
+                                                EnvVarValue::Value(String::deserialize(eval_if_closure(
+                                                    field.value.as_ref().unwrap(),
+                                                    program,
+                                                )?).unwrap()),
+                                            ))
+                                        },
+                                    ).collect::<Result<IndexMap<_, _>, Error>>()?);
+                                } else {
+                                    todo!("unexpected term for build_env_vars: {:?}", ev_rt);
+                                }
+                            }
+
+                            Ok(())
+                        }
+                        "build_packages" => {
+                            if let Some(packages_rt) = field.value.as_ref() {
+                                let packages_rt = eval_if_closure(packages_rt, program)?;
+
+                                if let Some(a) = packages_rt.as_array() {
+                                    build_packages = Some(
+                                        a.iter()
+                                            .map(|input| {
+                                                Ok(String::deserialize(eval_if_closure(
+                                                    input,
+                                                    program,
+                                                )?).unwrap())
+                                            })
+                                            .collect::<Result<Vec<_>, Error>>()?,
+                                    );
+                                } else {
+                                    todo!(
+                                        "handle build_packages value being non-array {:?}",
+                                        field.value
+                                    );
+                                }
+                            }
+
+                            Ok(())
+                        }
+                        "runtime_packages" => {
+                            if let Some(packages_rt) = field.value.as_ref() {
+                                let packages_rt = eval_if_closure(packages_rt, program)?;
+
+                                if let Some(a) = packages_rt.as_array() {
+                                    runtime_packages = Some(
+                                        a.iter()
+                                            .map(|input| {
+                                                Ok(String::deserialize(eval_if_closure(
+                                                    input,
+                                                    program,
+                                                )?).unwrap())
+                                            })
+                                            .collect::<Result<Vec<_>, Error>>()?,
+                                    );
+                                } else {
+                                    todo!(
+                                        "handle runtime_packages value being non-array {:?}",
+                                        field.value
+                                    );
+                                }
+                            }
+
+                            Ok(())
+                        }
+                        "build_cmd" => {
+                            if let Some(rt) = field.value.as_ref() {
+                                let rt = eval_if_closure(rt, program)?;
+                                if let Some(s) = rt.as_string() {
+                                    build_cmds = Some(vec![
+                                        shlex::split(s.as_ref()).unwrap(),
+                                    ]);
+                                } else if let Some(a) = rt.as_array() {
+                                    build_cmds = Some(vec![
+                                        a.iter()
+                                            .map(|rt| eval_if_closure(rt, program))
+                                            .collect::<Result<Vec<_>, _>>()?
+                                            .into_iter()
+                                            .map(|rt| String::deserialize(rt).unwrap())
+                                            .collect(),
+                                    ]);
+                                } else {
+                                    todo!("error for 'build_cmds' field being non-string & non-array, got {:?}", rt);
+                                }
+                                Ok(())
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        "build_cmds_cmd" => {
+                            if let Some(rt) = field.value.as_ref() {
+                                let rt = eval_if_closure(rt, program)?;
+                                if let Some(s) = rt.as_string() {
+                                    build_cmds_cmd = Some(
+                                        shlex::split(s.as_ref()).unwrap(),
+                                    );
+                                } else if let Some(a) = rt.as_array() {
+                                    build_cmds_cmd = Some(
+                                        a.iter()
+                                            .map(|rt| eval_if_closure(rt, program))
+                                            .collect::<Result<Vec<_>, _>>()?
+                                            .into_iter()
+                                            .map(|rt| String::deserialize(rt).unwrap())
+                                            .collect(),
+                                    );
+                                } else {
+                                    todo!("error for 'build_cmds_cmd' field being non-string & non-array, got {:?}", rt);
+                                }
+                                Ok(())
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        "matches_project_if_any" => {
+                            if let Some(matchers_rt) = field.value.as_ref() {
+                                let matchers_rt = eval_if_closure(matchers_rt, program)?;
+
+                                if let Some(a) = matchers_rt.as_array() {
+                                    matches_project_if_any = Some(
+                                        a.iter()
+                                            .map(|m| {
+                                                let pending = a.iter_pending_contracts()
+                                                    .cloned()
+                                                    .collect::<Vec<_>>();
+                                                let rt = RuntimeContract::apply_all(
+                                                    m.clone(),
+                                                    pending.into_iter(),
+                                                    m.pos_idx(),
+                                                );
+
+                                                HarnessMatcher::from_term(&eval_if_closure(
+                                                    &rt,
+                                                    program,
+                                                )?, program)
+                                            })
+                                            .collect::<Result<Vec<_>, Error>>()?,
+                                    );
+                                } else {
+                                    todo!(
+                                        "handle matches_project_if_any value being non-array {:?}",
+                                        field.value
+                                    );
+                                }
+                            }
+
+                            Ok(())
+                        }
+                        "matches_project_priority" => {
+                            if let Some(matchers_rt) = field.value.as_ref() {
+                                let matchers_rt =
+                                    eval_if_closure(matchers_rt, program)?;
+                                matches_project_priority = Some(i32::deserialize(matchers_rt).unwrap());
+                            }
+
+                            Ok(())
+                        }
+
+                        // TODO: `build_cmds` like `cmds` in build-specs.
+                        _ => Ok(()),
+                    }
+                })?;
+        }
 
         match ty {
             Some(ObjTy::Harness) => {} // happy path
-            None => return Err(Error::MissingTy(program.files(), rt.pos)),
+            None => {
+                return Err(Error::MissingTy(
+                    program.files(),
+                    rt.pos(program.pos_table()),
+                ));
+            }
             Some(ty) => {
                 return Err(Error::UnexpectedObject {
                     files: program.files(),
                     got: ty,
                     want: ObjTy::Harness,
-                    pos: rt.pos,
+                    pos: rt.pos(program.pos_table()),
                 });
             }
         };
@@ -547,7 +529,7 @@ impl Harness {
                 return Err(Error::MissingField {
                     files: program.files(),
                     obj: ObjTy::Builder,
-                    pos: rt.pos,
+                    pos: rt.pos(program.pos_table()),
                     field: "name",
                 });
             }
@@ -568,7 +550,7 @@ impl Harness {
                 return Err(Error::MissingField {
                     files: program.files(),
                     obj: ObjTy::Harness,
-                    pos: rt.pos,
+                    pos: rt.pos(program.pos_table()),
                     field: "build_cmd or build_cmds_cmd",
                 });
             }

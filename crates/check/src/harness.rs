@@ -6,7 +6,6 @@ use lcache::{Cache, LocalDir};
 use nickel_lang_core::eval::cache::CacheImpl;
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::program::Program;
-use nickel_lang_core::term::Term;
 use ot::{OpTracker, Operation};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -155,10 +154,10 @@ fn check_harness_name(
     };
 
     // If we got this far, the nickel AST compiled fine, so lets try and pull out the harness name.
-    if let Term::Record(rd) = tree.as_ref()
-        && let Ok(Some(Some(s))) = rd
+    if let Some(rd) = tree.as_record().and_then(|c| c.into_opt())
+        && let Ok(Some(s)) = rd
             .get_value_with_ctrs(&LocIdent::new("name"))
-            .map(|rt| rt.map(|t| t.term.to_nickel_string()))
+            .map(|rt| rt.and_then(|t| t.to_nickel_string()))
     {
         if s.as_str() == harness {
             return Ok(CheckResult::harness_name_pass());

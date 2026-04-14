@@ -7,9 +7,9 @@
 use common::{SpecOrigin, Target};
 use generational_arena::Arena;
 use mfile::{EnvPatches, LinkConfig, PatchSetting};
+use nickel_lang_core::eval::value::NickelValue;
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::position::TermPos;
-use nickel_lang_core::term::{RichTerm, Term};
 use nickel_lang_core::{
     eval::{Closure, cache::CacheImpl},
     program::Program,
@@ -46,8 +46,8 @@ impl TryFrom<TermPos> for StrPos {
     type Error = ();
     fn try_from(value: TermPos) -> Result<Self, Self::Error> {
         match value {
-            TermPos::Inherited(_) | TermPos::None => Err(()),
-            TermPos::Original(p) => Ok(Self {
+            TermPos::None => Err(()),
+            TermPos::Original(p) | TermPos::Inherited(p) => Ok(Self {
                 start_offset: p.start.to_usize(),
                 end_offset: p.end.to_usize(),
             }),
@@ -166,73 +166,65 @@ impl Layer {
         //  - A Layer object, containing arrays of all the objects to ingest
 
         let ncl_tree = eval_if_closure(&ncl_tree, &mut program)?;
-        layer.top_levels = match ncl_tree.term.as_ref() {
-            Term::Array(a, _attrs) => a
-                .iter()
+        layer.top_levels = if let Some(a) = ncl_tree.as_array() {
+            a.iter()
                 .map(|bs| layer.ingest_buildspec(bs, &mut program))
-                .collect::<Result<Vec<_>, Error>>()?,
-            _ => {
-                let ty = read_ty(&ncl_tree, &mut program)?;
-                match ty {
-                    ObjTy::Builder => vec![layer.ingest_buildspec(&ncl_tree, &mut program)?],
-                    ObjTy::Layer => {
-                        let record = match ncl_tree.as_ref() {
-                            Term::RecRecord(record_data, _, _, _) => record_data,
-                            Term::Record(record_data) => record_data,
-                            _ => unreachable!(), // read_ty implicitly does the same check
-                        };
+                .collect::<Result<Vec<_>, Error>>()?
+        } else {
+            let ty = read_ty(&ncl_tree, &mut program)?;
+            match ty {
+                ObjTy::Builder => vec![layer.ingest_buildspec(&ncl_tree, &mut program)?],
+                ObjTy::Layer => {
+                    let record = ncl_tree
+                        .as_record()
+                        .expect("Layer must be a record")
+                        .into_opt()
+                        .expect("Layer record must not be empty");
 
-                        if let Ok(Some(rt)) = record.get_value_with_ctrs(&LocIdent::new("profiles"))
-                        {
-                            if let Term::Array(a, _attrs) =
-                                eval_if_closure(&rt, &mut program)?.term.as_ref()
-                            {
-                                layer.profiles = HashMap::from_iter(
-                                    a.iter()
-                                        .map(|p| layer.ingest_profile(p, &mut program))
-                                        .collect::<Result<Vec<_>, Error>>()?
-                                        .into_iter()
-                                        .map(|p| (p.name.clone(), p)),
-                                );
-                            }
-                        };
-                        if let Ok(Some(rt)) =
-                            record.get_value_with_ctrs(&LocIdent::new("harnesses"))
-                        {
-                            if let Term::Array(a, _attrs) =
-                                eval_if_closure(&rt, &mut program)?.term.as_ref()
-                            {
-                                layer.harnesses = HashMap::from_iter(
-                                    a.iter()
-                                        .map(|p| layer.ingest_harness(p, &mut program))
-                                        .collect::<Result<Vec<_>, Error>>()?
-                                        .into_iter()
-                                        .map(|p| (p.name.clone(), p)),
-                                );
-                            }
-                        };
-                        if let Ok(Some(rt)) = record.get_value_with_ctrs(&LocIdent::new("builds")) {
-                            if let Term::Array(a, _attrs) =
-                                eval_if_closure(&rt, &mut program)?.term.as_ref()
-                            {
+                    if let Ok(Some(rt)) = record.get_value_with_ctrs(&LocIdent::new("profiles")) {
+                        let rt = eval_if_closure(&rt, &mut program)?;
+                        if let Some(a) = rt.as_array() {
+                            layer.profiles = HashMap::from_iter(
                                 a.iter()
-                                    .map(|bs| layer.ingest_buildspec(bs, &mut program))
+                                    .map(|p| layer.ingest_profile(p, &mut program))
                                     .collect::<Result<Vec<_>, Error>>()?
-                            } else {
-                                unreachable!(); // validation for Layer should ensure its an array
-                            }
-                        } else {
-                            vec![]
+                                    .into_iter()
+                                    .map(|p| (p.name.clone(), p)),
+                            );
                         }
+                    };
+                    if let Ok(Some(rt)) = record.get_value_with_ctrs(&LocIdent::new("harnesses")) {
+                        let rt = eval_if_closure(&rt, &mut program)?;
+                        if let Some(a) = rt.as_array() {
+                            layer.harnesses = HashMap::from_iter(
+                                a.iter()
+                                    .map(|p| layer.ingest_harness(p, &mut program))
+                                    .collect::<Result<Vec<_>, Error>>()?
+                                    .into_iter()
+                                    .map(|p| (p.name.clone(), p)),
+                            );
+                        }
+                    };
+                    if let Ok(Some(rt)) = record.get_value_with_ctrs(&LocIdent::new("builds")) {
+                        let rt = eval_if_closure(&rt, &mut program)?;
+                        if let Some(a) = rt.as_array() {
+                            a.iter()
+                                .map(|bs| layer.ingest_buildspec(bs, &mut program))
+                                .collect::<Result<Vec<_>, Error>>()?
+                        } else {
+                            unreachable!(); // validation for Layer should ensure its an array
+                        }
+                    } else {
+                        vec![]
                     }
-                    _ => {
-                        return Err(Error::UnexpectedObject {
-                            files: program.files(),
-                            got: ty,
-                            want: ObjTy::Builder,
-                            pos: ncl_tree.pos,
-                        });
-                    }
+                }
+                _ => {
+                    return Err(Error::UnexpectedObject {
+                        files: program.files(),
+                        got: ty,
+                        want: ObjTy::Builder,
+                        pos: ncl_tree.pos(program.pos_table()),
+                    });
                 }
             }
         };
@@ -242,7 +234,7 @@ impl Layer {
 
     fn ingest_buildspec(
         &mut self,
-        rt: &RichTerm,
+        rt: &NickelValue,
         program: &mut Program<CacheImpl>,
     ) -> Result<generational_arena::Index, Error> {
         let id = match builds::BuildRef::from_term(rt, program, self)? {
@@ -264,7 +256,7 @@ impl Layer {
 
     fn ingest_profile(
         &mut self,
-        rt: &RichTerm,
+        rt: &NickelValue,
         program: &mut Program<CacheImpl>,
     ) -> Result<Profile, Error> {
         Profile::from_term(rt, program)
@@ -272,7 +264,7 @@ impl Layer {
 
     fn ingest_harness(
         &mut self,
-        rt: &RichTerm,
+        rt: &NickelValue,
         program: &mut Program<CacheImpl>,
     ) -> Result<Harness, Error> {
         Harness::from_term(rt, program)
@@ -283,7 +275,7 @@ impl DeclAccumulator for Layer {
     fn maybe_decode(
         &mut self,
         spec_id: &u64,
-        rt: &RichTerm,
+        rt: &NickelValue,
         program: &mut Program<CacheImpl>,
     ) -> Result<(), Error> {
         if self.read_ids.contains_key(spec_id) {
@@ -306,7 +298,7 @@ trait DeclAccumulator {
     fn maybe_decode(
         &mut self,
         spec_id: &u64,
-        rt: &RichTerm,
+        rt: &NickelValue,
         program: &mut Program<CacheImpl>,
     ) -> Result<(), Error>;
 }
@@ -316,7 +308,7 @@ impl DeclAccumulator for () {
     fn maybe_decode(
         &mut self,
         _spec_id: &u64,
-        _rt: &RichTerm,
+        _rt: &NickelValue,
         _program: &mut Program<CacheImpl>,
     ) -> Result<(), Error> {
         Ok(())
@@ -342,34 +334,30 @@ pub enum ObjTy {
     Harness,
 }
 
-pub(crate) fn read_ty(rt: &RichTerm, program: &mut Program<CacheImpl>) -> Result<ObjTy, Error> {
-    let record = match rt.as_ref() {
-        Term::RecRecord(record_data, _, _, _) => record_data,
-        Term::Record(record_data) => record_data,
-        _ => todo!("err"),
-    };
+pub(crate) fn read_ty(val: &NickelValue, program: &mut Program<CacheImpl>) -> Result<ObjTy, Error> {
+    let record = val
+        .as_record()
+        .expect("read_ty: expected record")
+        .into_opt()
+        .expect("read_ty: expected non-empty record");
     if let Ok(Some(rt)) = record.get_value_with_ctrs(&LocIdent::new("ty")) {
         let rt = eval_if_closure(&rt, program)?;
         Ok(ObjTy::deserialize(rt).unwrap())
     } else {
-        Err(Error::MissingTy(program.files(), rt.pos))
+        Err(Error::MissingTy(
+            program.files(),
+            val.pos(program.pos_table()),
+        ))
     }
 }
 
 pub(crate) fn eval_if_closure(
-    rt: &RichTerm,
+    val: &NickelValue,
     program: &'_ mut Program<CacheImpl>,
-) -> Result<RichTerm, Error> {
-    if let Term::Closure(c) = rt.term.as_ref() {
-        program.eval_closure(c.clone().into_closure()).map_err(|e| {
-            Error::Nickel(Box::new((
-                program.files(),
-                nickel_lang_core::error::Error::EvalError(e),
-            )))
-        })
-    } else if !rt.term.is_eff_whnf() {
+) -> Result<NickelValue, Error> {
+    if !val.is_whnf() {
         program
-            .eval_closure(Closure::atomic_closure(rt.clone()))
+            .eval_closure(Closure::from(val.clone()))
             .map_err(|e| {
                 Error::Nickel(Box::new((
                     program.files(),
@@ -377,90 +365,112 @@ pub(crate) fn eval_if_closure(
                 )))
             })
     } else {
-        Ok(rt.clone())
+        Ok(val.clone())
     }
 }
 
+pub(crate) fn record_data_from_val(
+    val: &NickelValue,
+) -> Option<&nickel_lang_core::term::record::RecordData> {
+    val.as_record().and_then(|c| c.into_opt())
+}
+
+/// Returns true if the value is a record (including an empty one).
+pub(crate) fn is_record(val: &NickelValue) -> bool {
+    val.as_record().is_some()
+}
+
 pub(crate) fn patches_from_term(
-    rt: &RichTerm,
+    rt: &NickelValue,
     program: &mut Program<CacheImpl>,
 ) -> Result<EnvPatches, Error> {
     let patch_rt = eval_if_closure(rt, program)?;
 
     let mut dirs: Option<HashMap<String, PatchSetting>> = None;
     let mut files: Option<HashMap<String, PatchSetting>> = None;
-    match patch_rt.term.as_ref() {
-        Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-            r.fields
-                .iter()
-                .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
-                    match ident_and_loc.label() {
-                        "dir" | "dirs" => {
-                            let dir_rt =
-                                eval_if_closure(field.value.as_ref().unwrap(), program)?;
 
-                            match dir_rt.term.as_ref() {
-                                Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                                    if dirs.is_some() {
-                                        todo!("error for both 'dirs' and 'dir' set");
-                                    }
-                                    dirs = Some(r.fields.iter().map(
-                                        |(ident_and_loc, field)| -> Result<(String, PatchSetting), Error> {
-                                            let val = String::deserialize(eval_if_closure(
-                                                field.value.as_ref().unwrap(),
-                                                program,
-                                            )?).unwrap();
-                                            Ok((
-                                                ident_and_loc.label().to_string(),
-                                                match val.as_str() {
-                                                    "ReadOnly" | "read-only" | "ro" => PatchSetting::ReadOnly,
-                                                    "ReadWrite" | "read-write" | "rw" => PatchSetting::ReadWrite,
-                                                    _ => todo!("unexpected patch setting: {}", val),
-                                                },
-                                            ))
-                                        },
-                                    ).collect::<Result<HashMap<_, _>, Error>>()?);
-                                    Ok(())
-                                }
-                                _ => todo!("error for unexpected term for dir: {:?}", dir_rt.term.as_ref()),
-                            }
-                        },
-                        "file" | "files" => {
-                            let file_rt =
-                                eval_if_closure(field.value.as_ref().unwrap(), program)?;
+    let r = record_data_from_val(&patch_rt)
+        .unwrap_or_else(|| panic!("unexpected term for patches: {:?}", patch_rt));
 
-                            match file_rt.term.as_ref() {
-                                Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                                    if files.is_some() {
-                                        todo!("error for both 'file' and 'files' set");
-                                    }
-                                    files = Some(r.fields.iter().map(
-                                        |(ident_and_loc, field)| -> Result<(String, PatchSetting), Error> {
-                                            let val = String::deserialize(eval_if_closure(
-                                                field.value.as_ref().unwrap(),
-                                                program,
-                                            )?).unwrap();
-                                            Ok((
-                                                ident_and_loc.label().to_string(),
-                                                match val.as_str() {
-                                                    "ReadOnly" | "read-only" | "ro" => PatchSetting::ReadOnly,
-                                                    "ReadWrite" | "read-write" | "rw" => PatchSetting::ReadWrite,
-                                                    _ => todo!("unexpected patch setting: {}", val),
-                                                },
-                                            ))
-                                        },
-                                    ).collect::<Result<HashMap<_, _>, Error>>()?);
-                                    Ok(())
-                                }
-                                _ => todo!("error for unexpected term for file: {:?}", file_rt.term.as_ref()),
-                            }
-                        },
-                        _ => Ok(()),
+    r.fields
+        .iter()
+        .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+            match ident_and_loc.label() {
+                "dir" | "dirs" => {
+                    let dir_rt = eval_if_closure(field.value.as_ref().unwrap(), program)?;
+
+                    let r = record_data_from_val(&dir_rt)
+                        .unwrap_or_else(|| panic!("unexpected term for dir: {:?}", dir_rt));
+                    if dirs.is_some() {
+                        todo!("error for both 'dirs' and 'dir' set");
                     }
-                })?;
-        }
-        _ => todo!("unexpected term for patches: {:?}", patch_rt.term.as_ref()),
-    };
+                    dirs = Some(
+                        r.fields
+                            .iter()
+                            .map(
+                                |(ident_and_loc, field)| -> Result<(String, PatchSetting), Error> {
+                                    let val = String::deserialize(eval_if_closure(
+                                        field.value.as_ref().unwrap(),
+                                        program,
+                                    )?)
+                                    .unwrap();
+                                    Ok((
+                                        ident_and_loc.label().to_string(),
+                                        match val.as_str() {
+                                            "ReadOnly" | "read-only" | "ro" => {
+                                                PatchSetting::ReadOnly
+                                            }
+                                            "ReadWrite" | "read-write" | "rw" => {
+                                                PatchSetting::ReadWrite
+                                            }
+                                            _ => todo!("unexpected patch setting: {}", val),
+                                        },
+                                    ))
+                                },
+                            )
+                            .collect::<Result<HashMap<_, _>, Error>>()?,
+                    );
+                    Ok(())
+                }
+                "file" | "files" => {
+                    let file_rt = eval_if_closure(field.value.as_ref().unwrap(), program)?;
+
+                    let r = record_data_from_val(&file_rt)
+                        .unwrap_or_else(|| panic!("unexpected term for file: {:?}", file_rt));
+                    if files.is_some() {
+                        todo!("error for both 'file' and 'files' set");
+                    }
+                    files = Some(
+                        r.fields
+                            .iter()
+                            .map(
+                                |(ident_and_loc, field)| -> Result<(String, PatchSetting), Error> {
+                                    let val = String::deserialize(eval_if_closure(
+                                        field.value.as_ref().unwrap(),
+                                        program,
+                                    )?)
+                                    .unwrap();
+                                    Ok((
+                                        ident_and_loc.label().to_string(),
+                                        match val.as_str() {
+                                            "ReadOnly" | "read-only" | "ro" => {
+                                                PatchSetting::ReadOnly
+                                            }
+                                            "ReadWrite" | "read-write" | "rw" => {
+                                                PatchSetting::ReadWrite
+                                            }
+                                            _ => todo!("unexpected patch setting: {}", val),
+                                        },
+                                    ))
+                                },
+                            )
+                            .collect::<Result<HashMap<_, _>, Error>>()?,
+                    );
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        })?;
 
     Ok(EnvPatches {
         file: files.unwrap_or_default(),

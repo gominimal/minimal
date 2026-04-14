@@ -6,8 +6,9 @@ use crate::Error;
 use common::{SpecOrigin, Target};
 
 use nickel_lang_core::cache::TermCacheError;
+use nickel_lang_core::eval::value::NickelValue;
 use nickel_lang_core::identifier::LocIdent;
-use nickel_lang_core::term::{RichTerm, Term};
+use nickel_lang_core::term::Term;
 use nickel_lang_core::typ::TypeF;
 use nickel_lang_core::{error::NullReporter, eval::cache::CacheImpl, program::Program};
 use std::io;
@@ -42,55 +43,46 @@ impl LoadOptions {
 }
 
 macro_rules! annotate_record {
-    ($record:expr, $buildspec_id_ident:expr, $id:expr, $rt:expr, ($inner:expr, $files:expr, $minimal_lib_path:expr),) => {
+    ($val:expr, $buildspec_id_ident:expr, $id:expr, $orig_val:expr, ($inner:expr, $files:expr, $pos_table:expr, $minimal_lib_path:expr),) => {
         // Skip annotation for any part of the minimal library.
-        if $inner
-            .pos
-            .src_id()
-            .map(|file_id| {
-                let file_path = $files.name(file_id);
-                file_path
-                    .to_str()
-                    .map(|s| {
-                        s.starts_with($minimal_lib_path)
-                            || if let Ok(md) = std::env::var("CARGO_MANIFEST_DIR") {
-                                (s.contains("minimal-ncl/")
-                                    && s.contains("crates")
-                                    && s.starts_with(&md))
-                            } else {
-                                false
-                            }
-                    })
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false)
-        {
-            return Ok($rt);
+        if {
+            let inner_pos = $inner.pos($pos_table);
+            inner_pos
+                .src_id()
+                .map(|file_id| {
+                    let file_path = $files.name(file_id);
+                    file_path
+                        .to_str()
+                        .map(|s| {
+                            s.starts_with($minimal_lib_path)
+                                || if let Ok(md) = std::env::var("CARGO_MANIFEST_DIR") {
+                                    (s.contains("minimal-ncl/")
+                                        && s.contains("crates")
+                                        && s.starts_with(&md))
+                                } else {
+                                    false
+                                }
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        } {
+            return Ok($orig_val);
         } else {
-            match $record {
-                Term::RecRecord(mut record_data, includes, dyn_fields, deps) => {
-                    if record_data.fields.get(&$buildspec_id_ident).is_some() {
-                        return Ok($rt);
+            // In the new API, pre-evaluation records are Term::RecRecord
+            match $val {
+                Term::RecRecord(mut rec_data) => {
+                    if rec_data.record.fields.get(&$buildspec_id_ident).is_some() {
+                        return Ok($orig_val);
                     }
-                    record_data.fields.insert(
+                    rec_data.record.fields.insert(
                         LocIdent::new("__magic_buildspec_id"),
-                        RichTerm::from(Term::ForeignId($id)).into(),
+                        NickelValue::foreign_id_posless($id).into(),
                     );
                     $id += 1;
-                    Term::RecRecord(record_data, includes, dyn_fields, deps).into()
+                    NickelValue::term_posless(Term::RecRecord(rec_data))
                 }
-                Term::Record(mut record_data) => {
-                    if record_data.fields.get(&$buildspec_id_ident).is_some() {
-                        return Ok($rt);
-                    }
-                    record_data.fields.insert(
-                        LocIdent::new("__magic_buildspec_id"),
-                        RichTerm::from(Term::ForeignId($id)).into(),
-                    );
-                    $id += 1;
-                    Term::Record(record_data).into()
-                }
-                _ => unreachable!("record type was {:?}", $record),
+                _ => unreachable!("record type was {:?}", $val),
             }
         }
     };
@@ -254,70 +246,79 @@ impl Loader {
         use nickel_lang_core::traverse::{Traverse as _, TraverseOrder};
 
         let files = self.p.files();
+        let pos_table = self.p.pos_table().clone();
         let minimal_lib_path = self.minimal_lib_path.to_str().unwrap();
 
         let mut id: u64 = self.last_id;
         let buildspec_id_ident = LocIdent::new("__magic_buildspec_id");
-        let mut traversal = |rt: RichTerm| -> Result<RichTerm, TermCacheError<()>> {
-            // Explicit declaration: { ... } | BuildSpec
-            if let Term::Annotated(annotation, inner) = rt.as_ref() {
-                let is_buildspec = annotation.contracts.iter().any(|lt| {
-                    if let TypeF::Contract(c) = &lt.typ.typ {
-                        if let Term::Var(v) = c.as_ref() {
-                            v.label() == "BuildSpec"
+        let mut traversal = |val: NickelValue| -> Result<NickelValue, TermCacheError<()>> {
+            // We need to inspect the Term inside NickelValue for unevaluated AST
+            if let Some(term) = val.as_term() {
+                // Explicit declaration: { ... } | BuildSpec
+                if let Term::Annotated(ref annotation_data) = *term {
+                    let is_buildspec = annotation_data.annot.contracts.iter().any(|lt| {
+                        if let TypeF::Contract(c) = &lt.typ.typ {
+                            matches!(c.as_term(), Some(Term::Var(v)) if v.label() == "BuildSpec")
                         } else {
                             false
                         }
-                    } else {
-                        false
+                    });
+
+                    if is_buildspec {
+                        if let Some(inner_term) = annotation_data.inner.as_term() {
+                            let annotated =
+                                Term::Annotated(nickel_lang_core::term::AnnotatedData {
+                                    annot: annotation_data.annot.clone(),
+                                    inner: annotate_record!(
+                                        inner_term.clone(),
+                                        buildspec_id_ident,
+                                        id,
+                                        val,
+                                        (
+                                            &annotation_data.inner,
+                                            &files,
+                                            &pos_table,
+                                            minimal_lib_path
+                                        ),
+                                    ),
+                                });
+                            return Ok(NickelValue::term(annotated, val.pos_idx()));
+                        }
                     }
-                });
+                }
 
-                if is_buildspec {
-                    return Ok(Term::Annotated(
-                        annotation.clone(),
-                        annotate_record!(
-                            inner.term.as_ref().clone(),
-                            buildspec_id_ident,
-                            id,
-                            rt,
-                            (inner, files, minimal_lib_path),
-                        ),
-                    )
-                    .into());
+                // Function-based declaration: build { ... }
+                if let Term::App(ref app_data) = *term {
+                    let is_build_decl = matches!(
+                        app_data.head.as_term(),
+                        Some(Term::Var(v)) if v.label() == "build"
+                    );
+
+                    if is_build_decl {
+                        if let Some(arg_term) = app_data.arg.as_term() {
+                            let app = Term::App(nickel_lang_core::term::AppData {
+                                head: app_data.head.clone(),
+                                arg: annotate_record!(
+                                    arg_term.clone(),
+                                    buildspec_id_ident,
+                                    id,
+                                    val,
+                                    (&app_data.arg, &files, &pos_table, minimal_lib_path),
+                                ),
+                            });
+                            return Ok(NickelValue::term(app, val.pos_idx()));
+                        }
+                    }
                 }
             }
 
-            // Function-based declaration: build { ... }
-            if let Term::App(func, arg) = rt.as_ref() {
-                let is_build_decl = if let Term::Var(v) = func.as_ref() {
-                    v.label() == "build"
-                } else {
-                    false
-                };
-
-                if is_build_decl {
-                    return Ok(Term::App(
-                        func.clone(),
-                        annotate_record!(
-                            arg.term.as_ref().clone(),
-                            buildspec_id_ident,
-                            id,
-                            rt,
-                            (arg, files, minimal_lib_path),
-                        ),
-                    )
-                    .into());
-                }
-            }
-
-            Ok(rt)
+            Ok(val)
         };
 
         let result = self
             .p
-            .custom_transform(1, |_cache, rt| {
-                rt.traverse(&mut traversal, TraverseOrder::TopDown)
+            .custom_transform(1, |_cache, _pos_table, val| {
+                val.traverse(&mut traversal, TraverseOrder::TopDown)
             })
             .map_err(|e| Error::Other(format!("annotation: {:?}", e)));
         self.last_id = id;
@@ -325,7 +326,7 @@ impl Loader {
     }
 
     /// Destroys the loader, returning the outputs of processing (the nickel tree, where it came from).
-    pub fn finish(self) -> Result<(RichTerm, Program<CacheImpl>, SpecOrigin, Target), Error> {
+    pub fn finish(self) -> Result<(NickelValue, Program<CacheImpl>, SpecOrigin, Target), Error> {
         let Self {
             mut p,
             from,
@@ -539,32 +540,27 @@ mod tests {
         let mut sr = sr.unwrap();
         assert_eq!(sr.last_id, 3); // three build specs
 
-        if let Term::Record(rd) = sr.p.eval().unwrap().as_ref() {
+        let eval_result = sr.p.eval().unwrap();
+        if let Some(rd) = eval_result.as_record().and_then(|c| c.into_opt()) {
             // Check a field 'profiles' was an array with one object
-            assert!(matches!(
-                eval_if_closure(
-                    &rd.get_value_with_ctrs(&LocIdent::new("profiles"))
-                        .unwrap()
-                        .unwrap(),
-                    &mut sr.p,
-                )
-                .unwrap()
-                .as_ref(),
-                Term::Array(a, _attrs) if a.len() == 1,
-            ));
+            let profiles_val = eval_if_closure(
+                &rd.get_value_with_ctrs(&LocIdent::new("profiles"))
+                    .unwrap()
+                    .unwrap(),
+                &mut sr.p,
+            )
+            .unwrap();
+            assert!(profiles_val.as_array().map(|a| a.len()).unwrap_or(0) == 1,);
 
             // Check a field 'harnesses' was an array with one object
-            assert!(matches!(
-                eval_if_closure(
-                    &rd.get_value_with_ctrs(&LocIdent::new("harnesses"))
-                        .unwrap()
-                        .unwrap(),
-                    &mut sr.p,
-                )
-                .unwrap()
-                .as_ref(),
-                Term::Array(a, _attrs) if a.len() == 1,
-            ));
+            let harnesses_val = eval_if_closure(
+                &rd.get_value_with_ctrs(&LocIdent::new("harnesses"))
+                    .unwrap()
+                    .unwrap(),
+                &mut sr.p,
+            )
+            .unwrap();
+            assert!(harnesses_val.as_array().map(|a| a.len()).unwrap_or(0) == 1,);
         }
     }
 }
