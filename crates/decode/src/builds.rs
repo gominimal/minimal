@@ -3,10 +3,11 @@
 use crate::StrPos;
 use crate::{Error, ObjTy, attrs::AttrValue, eval_if_closure, read_ty};
 use common::Target;
+use nickel_lang_core::eval::value::NickelValue;
 use nickel_lang_core::files::FileId;
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::position::TermPos;
-use nickel_lang_core::term::{IndexMap, RichTerm, RuntimeContract, Term};
+use nickel_lang_core::term::{IndexMap, RuntimeContract};
 use nickel_lang_core::{eval::cache::CacheImpl, program::Program};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -59,7 +60,7 @@ impl core::hash::Hash for BuildRef {
 
 impl BuildRef {
     pub(crate) fn from_term<A: super::DeclAccumulator>(
-        rt: &RichTerm,
+        rt: &NickelValue,
         program: &mut Program<CacheImpl>,
         acc: &mut A,
     ) -> Result<Self, Error> {
@@ -69,11 +70,7 @@ impl BuildRef {
         let ty = read_ty(&rt, program)?;
         match ty {
             ObjTy::Upstream => {
-                let record = match rt.as_ref() {
-                    Term::RecRecord(record_data, _, _, _) => record_data,
-                    Term::Record(record_data) => record_data,
-                    _ => unreachable!(),
-                };
+                let record = crate::record_data_from_val(&rt).unwrap();
 
                 let name =
                     if let Ok(Some(n_rt)) = record.get_value_with_ctrs(&LocIdent::new("name")) {
@@ -82,7 +79,7 @@ impl BuildRef {
                         return Err(Error::MissingField {
                             files: program.files(),
                             obj: ObjTy::Upstream,
-                            pos: rt.pos,
+                            pos: rt.pos(program.pos_table()),
                             field: "name",
                         });
                     };
@@ -91,21 +88,23 @@ impl BuildRef {
             }
 
             ObjTy::Builder => {
-                let record = match rt.as_ref() {
-                    Term::RecRecord(record_data, _, _, _) => record_data,
-                    Term::Record(record_data) => record_data,
-                    _ => unreachable!(),
-                };
+                let record = crate::record_data_from_val(&rt).unwrap();
                 let id = if let Ok(Some(id_rt)) =
                     record.get_value_with_ctrs(&LocIdent::new("__magic_buildspec_id"))
                 {
-                    if let Term::ForeignId(id) = id_rt.as_ref() {
+                    if let Some(id) = id_rt.as_foreign_id() {
                         *id
                     } else {
-                        return Err(Error::MissingID(program.files(), rt.pos));
+                        return Err(Error::MissingID(
+                            program.files(),
+                            rt.pos(program.pos_table()),
+                        ));
                     }
                 } else {
-                    return Err(Error::MissingID(program.files(), rt.pos));
+                    return Err(Error::MissingID(
+                        program.files(),
+                        rt.pos(program.pos_table()),
+                    ));
                 };
 
                 let name =
@@ -115,7 +114,7 @@ impl BuildRef {
                         return Err(Error::MissingField {
                             files: program.files(),
                             obj: ObjTy::Builder,
-                            pos: rt.pos,
+                            pos: rt.pos(program.pos_table()),
                             field: "name",
                         });
                     };
@@ -132,7 +131,7 @@ impl BuildRef {
                 files: program.files(),
                 got: ty,
                 want: ObjTy::Builder,
-                pos: rt.pos,
+                pos: rt.pos(program.pos_table()),
             }),
         }
     }
@@ -163,7 +162,7 @@ pub struct SourceInput {
 }
 
 impl SourceInput {
-    fn from_term(rt: &RichTerm, program: &mut Program<CacheImpl>) -> Result<Self, Error> {
+    fn from_term(rt: &NickelValue, program: &mut Program<CacheImpl>) -> Result<Self, Error> {
         let mut filename: Option<(String, FileId)> = None;
 
         let mut url: Option<(String, Option<TermPos>)> = None;
@@ -171,62 +170,63 @@ impl SourceInput {
 
         let mut extract: Option<bool> = None;
         let mut strip_prefix: Option<String> = None;
-        match rt.term.as_ref() {
-            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                r.fields
-                    .iter()
-                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
-                        match ident_and_loc.label() {
-                            "file" => {
-                                if let Some(rt) = field.value.as_ref() {
-                                    filename = Some((
-                                        String::deserialize(eval_if_closure(rt, program)?).unwrap(),
-                                        field.value.as_ref().unwrap().pos.src_id().unwrap(),
-                                    ));
-                                }
-                                Ok(())
+        if let Some(r) = crate::record_data_from_val(rt) {
+            r.fields
+                .iter()
+                .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                    match ident_and_loc.label() {
+                        "file" => {
+                            if let Some(rt) = field.value.as_ref() {
+                                filename = Some((
+                                    String::deserialize(eval_if_closure(rt, program)?).unwrap(),
+                                    field
+                                        .value
+                                        .as_ref()
+                                        .unwrap()
+                                        .pos(program.pos_table())
+                                        .src_id()
+                                        .unwrap(),
+                                ));
                             }
-                            "url" => {
-                                if let Some(rt) = field.value.as_ref() {
-                                    url = Some((
-                                        String::deserialize(eval_if_closure(rt, program)?).unwrap(),
-                                        Some(rt.pos),
-                                    ));
-                                }
-                                Ok(())
-                            }
-                            "sha256" => {
-                                if let Some(rt) = field.value.as_ref() {
-                                    sha256 = Some((
-                                        String::deserialize(eval_if_closure(rt, program)?).unwrap(),
-                                        Some(rt.pos),
-                                    ));
-                                }
-                                Ok(())
-                            }
-                            "extract" => {
-                                if let Some(ext_rt) = field.value.as_ref() {
-                                    extract = Some(
-                                        bool::deserialize(eval_if_closure(ext_rt, program)?)
-                                            .unwrap(),
-                                    );
-                                }
-                                Ok(())
-                            }
-                            "strip_prefix" => {
-                                if let Some(st_rt) = field.value.as_ref() {
-                                    strip_prefix = Some(
-                                        String::deserialize(eval_if_closure(st_rt, program)?)
-                                            .unwrap(),
-                                    );
-                                }
-                                Ok(())
-                            }
-                            _ => Ok(()), // TODO: Should we error if we see an unknown field?
+                            Ok(())
                         }
-                    })?;
-            }
-            _ => {}
+                        "url" => {
+                            if let Some(rt) = field.value.as_ref() {
+                                url = Some((
+                                    String::deserialize(eval_if_closure(rt, program)?).unwrap(),
+                                    Some(rt.pos(program.pos_table())),
+                                ));
+                            }
+                            Ok(())
+                        }
+                        "sha256" => {
+                            if let Some(rt) = field.value.as_ref() {
+                                sha256 = Some((
+                                    String::deserialize(eval_if_closure(rt, program)?).unwrap(),
+                                    Some(rt.pos(program.pos_table())),
+                                ));
+                            }
+                            Ok(())
+                        }
+                        "extract" => {
+                            if let Some(ext_rt) = field.value.as_ref() {
+                                extract = Some(
+                                    bool::deserialize(eval_if_closure(ext_rt, program)?).unwrap(),
+                                );
+                            }
+                            Ok(())
+                        }
+                        "strip_prefix" => {
+                            if let Some(st_rt) = field.value.as_ref() {
+                                strip_prefix = Some(
+                                    String::deserialize(eval_if_closure(st_rt, program)?).unwrap(),
+                                );
+                            }
+                            Ok(())
+                        }
+                        _ => Ok(()), // TODO: Should we error if we see an unknown field?
+                    }
+                })?;
         }
 
         let from = if let Some((file, file_id)) = filename {
@@ -262,7 +262,7 @@ impl SourceInput {
                     return Err(Error::MissingField {
                         files: program.files(),
                         obj: ObjTy::Source,
-                        pos: rt.pos,
+                        pos: rt.pos(program.pos_table()),
                         field: "url",
                     });
                 }
@@ -273,7 +273,7 @@ impl SourceInput {
                     return Err(Error::MissingField {
                         files: program.files(),
                         obj: ObjTy::Source,
-                        pos: rt.pos,
+                        pos: rt.pos(program.pos_table()),
                         field: "sha256",
                     });
                 }
@@ -314,57 +314,56 @@ impl SubsetInput {
 
 impl SubsetInput {
     fn from_term<A: super::DeclAccumulator>(
-        rt: &RichTerm,
+        rt: &NickelValue,
         program: &mut Program<CacheImpl>,
         acc: &mut A,
     ) -> Result<Self, Error> {
         let mut from: Option<BuildRef> = None;
         let mut outputs: Option<SmallVec<[String; 4]>> = None;
-        match rt.term.as_ref() {
-            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                r.fields
-                    .iter()
-                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
-                        match ident_and_loc.label() {
-                            "from" => {
-                                from = Some(BuildRef::from_term(
-                                    field.value.as_ref().unwrap(),
-                                    program,
-                                    acc,
-                                )?);
-                                Ok(())
-                            }
-                            "outputs" => {
-                                let outputs_rt =
-                                    field.value.as_ref().map(|rt| eval_if_closure(rt, program));
-                                match outputs_rt {
-                                    None => {}
-                                    Some(outputs_rt) => match outputs_rt?.term.as_ref() {
-                                        Term::Array(a, _attrs) => {
-                                            outputs = Some(
-                                                a.iter()
-                                                    .map(|input| {
-                                                        Ok(String::deserialize(eval_if_closure(
-                                                            input, program,
-                                                        )?)
-                                                        .unwrap())
-                                                    })
-                                                    .collect::<Result<SmallVec<_>, Error>>()?,
-                                            );
-                                        }
-                                        _ => todo!(
+        if let Some(r) = crate::record_data_from_val(rt) {
+            r.fields
+                .iter()
+                .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                    match ident_and_loc.label() {
+                        "from" => {
+                            from = Some(BuildRef::from_term(
+                                field.value.as_ref().unwrap(),
+                                program,
+                                acc,
+                            )?);
+                            Ok(())
+                        }
+                        "outputs" => {
+                            let outputs_rt =
+                                field.value.as_ref().map(|rt| eval_if_closure(rt, program));
+                            match outputs_rt {
+                                None => {}
+                                Some(outputs_rt) => {
+                                    let outputs_val = outputs_rt?;
+                                    if let Some(a) = outputs_val.as_array() {
+                                        outputs = Some(
+                                            a.iter()
+                                                .map(|input| {
+                                                    Ok(String::deserialize(eval_if_closure(
+                                                        input, program,
+                                                    )?)
+                                                    .unwrap())
+                                                })
+                                                .collect::<Result<SmallVec<_>, Error>>()?,
+                                        );
+                                    } else {
+                                        todo!(
                                             "handle outputs value being non-array {:?}",
                                             field.value
-                                        ),
-                                    },
+                                        );
+                                    }
                                 }
-                                Ok(())
                             }
-                            _ => Ok(()), // TODO: Should we error if we see an unknown field?
+                            Ok(())
                         }
-                    })?;
-            }
-            _ => {}
+                        _ => Ok(()), // TODO: Should we error if we see an unknown field?
+                    }
+                })?;
         }
         let from = match from {
             Some(from) => from,
@@ -372,7 +371,7 @@ impl SubsetInput {
                 return Err(Error::MissingField {
                     files: program.files(),
                     obj: ObjTy::Subset,
-                    pos: rt.pos,
+                    pos: rt.pos(program.pos_table()),
                     field: "from",
                 });
             }
@@ -383,7 +382,7 @@ impl SubsetInput {
                 return Err(Error::MissingField {
                     files: program.files(),
                     obj: ObjTy::Subset,
-                    pos: rt.pos,
+                    pos: rt.pos(program.pos_table()),
                     field: "outputs",
                 });
             }
@@ -423,7 +422,7 @@ impl BuildDep {
 
 impl BuildDep {
     fn from_term<A: super::DeclAccumulator>(
-        rt: &RichTerm,
+        rt: &NickelValue,
         program: &mut Program<CacheImpl>,
         acc: &mut A,
     ) -> Result<Self, Error> {
@@ -458,37 +457,34 @@ impl BuildDep {
                 files: program.files(),
                 got: ty,
                 want: ObjTy::Builder,
-                pos: rt.pos,
+                pos: rt.pos(program.pos_table()),
             }),
         }
     }
 
     fn from_term_hostpath(
-        rt: &RichTerm,
+        rt: &NickelValue,
         program: &mut Program<CacheImpl>,
     ) -> Result<String, Error> {
         let mut path: Option<String> = None;
-        match rt.term.as_ref() {
-            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                r.fields
-                    .iter()
-                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
-                        match ident_and_loc.label() {
-                            "path" => {
-                                path = Some(
-                                    String::deserialize(eval_if_closure(
-                                        field.value.as_ref().unwrap(),
-                                        program,
-                                    )?)
-                                    .unwrap(),
-                                );
-                                Ok(())
-                            }
-                            _ => Ok(()), // TODO: Should we error if we see an unknown field?
+        if let Some(r) = crate::record_data_from_val(rt) {
+            r.fields
+                .iter()
+                .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                    match ident_and_loc.label() {
+                        "path" => {
+                            path = Some(
+                                String::deserialize(eval_if_closure(
+                                    field.value.as_ref().unwrap(),
+                                    program,
+                                )?)
+                                .unwrap(),
+                            );
+                            Ok(())
                         }
-                    })?;
-            }
-            _ => {}
+                        _ => Ok(()), // TODO: Should we error if we see an unknown field?
+                    }
+                })?;
         }
         let path = match path {
             Some(path) => path,
@@ -496,7 +492,7 @@ impl BuildDep {
                 return Err(Error::MissingField {
                     files: program.files(),
                     obj: ObjTy::Path,
-                    pos: rt.pos,
+                    pos: rt.pos(program.pos_table()),
                     field: "path",
                 });
             }
@@ -506,32 +502,35 @@ impl BuildDep {
     }
 
     fn from_term_local(
-        rt: &RichTerm,
+        rt: &NickelValue,
         program: &mut Program<CacheImpl>,
     ) -> Result<(PathBuf, String, blake3::Hash), Error> {
         let mut file: Option<(String, FileId)> = None;
-        match rt.term.as_ref() {
-            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                r.fields
-                    .iter()
-                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
-                        match ident_and_loc.label() {
-                            "file" => {
-                                file = Some((
-                                    String::deserialize(eval_if_closure(
-                                        field.value.as_ref().unwrap(),
-                                        program,
-                                    )?)
+        if let Some(r) = crate::record_data_from_val(rt) {
+            r.fields
+                .iter()
+                .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                    match ident_and_loc.label() {
+                        "file" => {
+                            file = Some((
+                                String::deserialize(eval_if_closure(
+                                    field.value.as_ref().unwrap(),
+                                    program,
+                                )?)
+                                .unwrap(),
+                                field
+                                    .value
+                                    .as_ref()
+                                    .unwrap()
+                                    .pos(program.pos_table())
+                                    .src_id()
                                     .unwrap(),
-                                    field.value.as_ref().unwrap().pos.src_id().unwrap(),
-                                ));
-                                Ok(())
-                            }
-                            _ => Ok(()), // TODO: Should we error if we see an unknown field?
+                            ));
+                            Ok(())
                         }
-                    })?;
-            }
-            _ => {}
+                        _ => Ok(()), // TODO: Should we error if we see an unknown field?
+                    }
+                })?;
         }
         let (file, src_id) = match file {
             Some(file) => file,
@@ -539,7 +538,7 @@ impl BuildDep {
                 return Err(Error::MissingField {
                     files: program.files(),
                     obj: ObjTy::Local,
-                    pos: rt.pos,
+                    pos: rt.pos(program.pos_table()),
                     field: "file",
                 });
             }
@@ -601,7 +600,7 @@ impl BuildOutput {
 }
 
 impl BuildOutput {
-    fn from_term(rt: &RichTerm, program: &mut Program<CacheImpl>) -> Result<Self, Error> {
+    fn from_term(rt: &NickelValue, program: &mut Program<CacheImpl>) -> Result<Self, Error> {
         let rt = eval_if_closure(rt, program)?;
 
         // The type hint ty identifies which output variant this term represents
@@ -611,51 +610,45 @@ impl BuildOutput {
         let mut allow_data: Option<bool> = None;
         let mut allow_missing_interpreter: Option<bool> = None;
 
-        match rt.term.as_ref() {
-            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                r.fields
-                    .iter()
-                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
-                        match ident_and_loc.label() {
-                            "glob" => {
-                                glob = Some(
-                                    String::deserialize(eval_if_closure(
-                                        field.value.as_ref().unwrap(),
-                                        program,
-                                    )?)
-                                    .unwrap(),
-                                );
-                                Ok(())
-                            }
-                            "allow_executable" => {
-                                if let Some(rt) = field.value.as_ref() {
-                                    allow_executable = Some(
-                                        bool::deserialize(eval_if_closure(rt, program)?).unwrap(),
-                                    );
-                                }
-                                Ok(())
-                            }
-                            "allow_data" => {
-                                if let Some(rt) = field.value.as_ref() {
-                                    allow_data = Some(
-                                        bool::deserialize(eval_if_closure(rt, program)?).unwrap(),
-                                    );
-                                }
-                                Ok(())
-                            }
-                            "allow_missing_interpreter" => {
-                                if let Some(rt) = field.value.as_ref() {
-                                    allow_missing_interpreter = Some(
-                                        bool::deserialize(eval_if_closure(rt, program)?).unwrap(),
-                                    );
-                                }
-                                Ok(())
-                            }
-                            _ => Ok(()), // TODO: Should we error if we see an unknown field?
+        if let Some(r) = crate::record_data_from_val(&rt) {
+            r.fields
+                .iter()
+                .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                    match ident_and_loc.label() {
+                        "glob" => {
+                            glob = Some(
+                                String::deserialize(eval_if_closure(
+                                    field.value.as_ref().unwrap(),
+                                    program,
+                                )?)
+                                .unwrap(),
+                            );
+                            Ok(())
                         }
-                    })?;
-            }
-            _ => {}
+                        "allow_executable" => {
+                            if let Some(rt) = field.value.as_ref() {
+                                allow_executable =
+                                    Some(bool::deserialize(eval_if_closure(rt, program)?).unwrap());
+                            }
+                            Ok(())
+                        }
+                        "allow_data" => {
+                            if let Some(rt) = field.value.as_ref() {
+                                allow_data =
+                                    Some(bool::deserialize(eval_if_closure(rt, program)?).unwrap());
+                            }
+                            Ok(())
+                        }
+                        "allow_missing_interpreter" => {
+                            if let Some(rt) = field.value.as_ref() {
+                                allow_missing_interpreter =
+                                    Some(bool::deserialize(eval_if_closure(rt, program)?).unwrap());
+                            }
+                            Ok(())
+                        }
+                        _ => Ok(()), // TODO: Should we error if we see an unknown field?
+                    }
+                })?;
         }
         let glob = match glob {
             Some(glob) => glob,
@@ -663,7 +656,7 @@ impl BuildOutput {
                 return Err(Error::MissingField {
                     files: program.files(),
                     obj: ty,
-                    pos: rt.pos,
+                    pos: rt.pos(program.pos_table()),
                     field: "glob",
                 });
             }
@@ -686,7 +679,7 @@ impl BuildOutput {
                 files: program.files(),
                 got: ty,
                 want: ObjTy::OutputLib,
-                pos: rt.pos,
+                pos: rt.pos(program.pos_table()),
             }),
         }
     }
@@ -715,7 +708,7 @@ impl RuntimeDep {
 
 impl RuntimeDep {
     fn from_term<A: super::DeclAccumulator>(
-        rt: &RichTerm,
+        rt: &NickelValue,
         program: &mut Program<CacheImpl>,
         acc: &mut A,
     ) -> Result<RuntimeDep, Error> {
@@ -734,7 +727,7 @@ impl RuntimeDep {
                 files: program.files(),
                 got: ty,
                 want: ObjTy::Builder,
-                pos: rt.pos,
+                pos: rt.pos(program.pos_table()),
             }),
         }
     }
@@ -793,7 +786,7 @@ impl BuildDecl {
 
 impl BuildDecl {
     pub(crate) fn from_term<A: super::DeclAccumulator>(
-        rt: &RichTerm,
+        rt: &NickelValue,
         program: &mut Program<CacheImpl>,
         acc: &mut A,
     ) -> Result<Self, Error> {
@@ -813,354 +806,365 @@ impl BuildDecl {
         let mut attrs: Option<IndexMap<String, AttrValue>> = None;
         let mut prebuilt: Option<bool> = None;
         let mut tests: Option<IndexMap<String, crate::Test>> = None;
-        match rt.term.as_ref() {
-            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                r.fields
-                    .iter()
-                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
-                        match ident_and_loc.label() {
-                            "ty" => {
-                                ty = Some(
-                                    ObjTy::deserialize(eval_if_closure(
-                                        field.value.as_ref().unwrap(),
-                                        program,
-                                    )?)
-                                    .unwrap(),
-                                );
-                                Ok(())
+        if let Some(r) = crate::record_data_from_val(&rt) {
+            r.fields
+                .iter()
+                .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                    match ident_and_loc.label() {
+                        "ty" => {
+                            ty = Some(
+                                ObjTy::deserialize(eval_if_closure(
+                                    field.value.as_ref().unwrap(),
+                                    program,
+                                )?)
+                                .unwrap(),
+                            );
+                            Ok(())
+                        }
+                        "name" => {
+                            name = Some(
+                                String::deserialize(eval_if_closure(
+                                    field.value.as_ref().unwrap(),
+                                    program,
+                                )?)
+                                .unwrap(),
+                            );
+                            Ok(())
+                        }
+                        "prebuilt" => {
+                            if let Some(rt) = field.value.as_ref() {
+                            prebuilt = Some(
+                                bool::deserialize(eval_if_closure(
+                                    rt,
+                                    program,
+                                )?)
+                                .unwrap(),
+                            );
                             }
-                            "name" => {
-                                name = Some(
-                                    String::deserialize(eval_if_closure(
-                                        field.value.as_ref().unwrap(),
-                                        program,
-                                    )?)
-                                    .unwrap(),
-                                );
-                                Ok(())
-                            }
-                            "prebuilt" => {
-                                if let Some(rt) = field.value.as_ref() {
-                                prebuilt = Some(
-                                    bool::deserialize(eval_if_closure(
-                                        rt,
-                                        program,
-                                    )?)
-                                    .unwrap(),
-                                );
-                                }
-                                Ok(())
-                            }
-                            "cmd" => {
-                                if let Some(rt) = field.value.as_ref() {
-                                    let rt = eval_if_closure(rt, program)?;
-                                    match rt.term.as_ref() {
-                                        Term::Str(s) => {
-                                            cmds = Some(vec![
-                                                shlex::split(s).unwrap(),
-                                            ]);
-                                        }
-                                        Term::Array(a, _attrs) => {
-                                            cmds = Some(vec![
-                                                a.iter()
-                                                    .map(|rt| eval_if_closure(rt, program))
-                                                    .collect::<Result<Vec<_>, _>>()?
-                                                    .into_iter()
-                                                    .map(|rt| String::deserialize(rt).unwrap())
-                                                    .collect(),
-                                            ]);
-                                        }
-                                        _ => todo!("error for 'cmd' field being non-string & non-array, got {:?}", rt.term.as_ref()),
-                                    };
-                                    Ok(())
-                                } else {
-                                    Ok(())
-                                }
-                            }
-                            "cmds" => {
-                                if let Some(rt) = field.value.as_ref() {
-                                    let rt = eval_if_closure(rt,program)?;
-                                    if let Term::Array(cmds_rt, _attrs) = rt.term.as_ref() {
-                                        cmds = Some(
-                                            cmds_rt.iter()
-                                                .map(|rt| {
-                                                    let rt = eval_if_closure(rt, program)?;
-                                                    if let Term::Array(a, _attrs) = rt.term.as_ref() {
-                                                        Ok::<_, Error>(a.iter()
-                                                            .map(|rt| eval_if_closure(rt, program))
-                                                            .collect::<Result<Vec<_>, _>>()?
-                                                            .into_iter()
-                                                            .map(|rt| String::deserialize(rt).unwrap())
-                                                            .collect())
-                                                    } else if let Term::Str(s) = rt.term.as_ref() {
-                                                        Ok::<_, Error>(shlex::split(s).unwrap())
-                                                    } else {
-                                                        todo!("error for 'cmds' field being non-array & non-string, got {:?}", rt.term.as_ref());
-                                                    }
-                                                })
-                                                .collect::<Result<Vec<_>, _>>()?,
-                                        );
-
-                                        Ok(())
-                                    } else {
-                                        todo!("error for 'cmds' field being non-array, got {:?}", rt.term.as_ref());
-                                    }
-                                } else {
-                                    Ok(())
-                                }
-                            }
-                            "target" => {
-                                if let Some(target_rt) = field.value.as_ref() {
-                                    let target_str =
-                                        String::deserialize(eval_if_closure(
-                                            target_rt,
-                                            program,
-                                        )?)
-                                        .unwrap();
-                                    match Target::all().iter().find(|t| t.as_ref() == target_str) {
-                                        None => Err(Error::InvalidTarget { files: program.files(), got: target_str, pos: rt.pos }),
-                                        Some(t) => {
-                                            target = Some(t.clone());
-                                            Ok(())
-                                        }
-                                    }
-                                } else {
-                                    Ok(())
-                                }
-                            }
-                            "build_args" => {
-                                if let Some(build_args_rt) = field.value.as_ref() {
-                                    let build_args_rt =
-                                        eval_if_closure(build_args_rt, program)?;
-
-                                    match build_args_rt.term.as_ref() {
-                                        Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                                            build_args = Some(r.fields.iter().map(
-                                                |(ident_and_loc, field)| -> Result<(String, String), Error> {
-                                                    if field.value.is_none() {
-                                                        // TODO: This should be a more customized error, missing
-                                                        // field with the pretty print will probably get the message
-                                                        // across, but its not super precise.
-                                                        return Err(Error::MissingField{
-                                                            field: "build_args",
-                                                            files: program.files(),
-                                                            obj: ObjTy::Builder,
-                                                            pos: ident_and_loc.pos,
-                                                        });
-                                                    }
-
-                                                    Ok((
-                                                        ident_and_loc.label().to_string(),
-                                                        String::deserialize(eval_if_closure(
-                                                            field.value.as_ref().unwrap(),
-                                                            program,
-                                                        )?)
-                                                        .unwrap(),
-                                                    ))
-                                                },
-                                            ).collect::<Result<IndexMap<_, _>, Error>>()?
-                                            );
-                                        }
-                                        _ => todo!("unexpected term for build_args"),
-                                    };
-                                }
-
-                                Ok(())
-                            }
-                            "build_deps" => {
-                                let build_deps_rt = field
-                                    .value
-                                    .as_ref()
-                                    .map(|rt| eval_if_closure(rt, program))
-                                    .ok_or_else(|| Error::MissingField {
-                                        files: program.files(),
-                                        obj: ObjTy::Builder,
-                                        pos: rt.pos,
-                                        field: "build_deps",
-                                    })??;
-                                if let Term::Array(a, _attrs) = build_deps_rt.as_ref() {
-                                    build_deps = Some(
+                            Ok(())
+                        }
+                        "cmd" => {
+                            if let Some(rt) = field.value.as_ref() {
+                                let rt = eval_if_closure(rt, program)?;
+                                if let Some(s) = rt.as_string() {
+                                    cmds = Some(vec![
+                                        shlex::split(s.as_ref()).unwrap(),
+                                    ]);
+                                } else if let Some(a) = rt.as_array() {
+                                    cmds = Some(vec![
                                         a.iter()
-                                            .map(|input| BuildDep::from_term(input, program, acc))
-                                            .collect::<Result<SmallVec<_>, Error>>()?,
-                                    );
+                                            .map(|rt| eval_if_closure(rt, program))
+                                            .collect::<Result<Vec<_>, _>>()?
+                                            .into_iter()
+                                            .map(|rt| String::deserialize(rt).unwrap())
+                                            .collect(),
+                                    ]);
                                 } else {
-                                    todo!("handle build_deps value being non-array {:?}", field.value);
-                                };
+                                    todo!("error for 'cmd' field being non-string & non-array, got {:?}", rt);
+                                }
+                                Ok(())
+                            } else {
                                 Ok(())
                             }
-                            "runtime_deps" => {
-                                let runtime_deps_rt =
-                                    field.value.as_ref().map(|rt| eval_if_closure(rt, program));
-                                match runtime_deps_rt {
-                                    None => {}
-                                    Some(runtime_deps_rt) => match runtime_deps_rt?.term.as_ref() {
-                                        Term::Array(a, _attrs) => {
-                                            runtime_deps = Some(
-                                                a.iter()
-                                                    .map(|input| {
-                                                        RuntimeDep::from_term(input, program, acc)
-                                                    })
-                                                    .collect::<Result<SmallVec<_>, Error>>()?,
-                                            );
-                                        }
-                                        _ => todo!(
+                        }
+                        "cmds" => {
+                            if let Some(rt) = field.value.as_ref() {
+                                let rt = eval_if_closure(rt,program)?;
+                                if let Some(cmds_rt) = rt.as_array() {
+                                    cmds = Some(
+                                        cmds_rt.iter()
+                                            .map(|rt| {
+                                                let rt = eval_if_closure(rt, program)?;
+                                                if let Some(a) = rt.as_array() {
+                                                    Ok::<_, Error>(a.iter()
+                                                        .map(|rt| eval_if_closure(rt, program))
+                                                        .collect::<Result<Vec<_>, _>>()?
+                                                        .into_iter()
+                                                        .map(|rt| String::deserialize(rt).unwrap())
+                                                        .collect())
+                                                } else if let Some(s) = rt.as_string() {
+                                                    Ok::<_, Error>(shlex::split(s.as_ref()).unwrap())
+                                                } else {
+                                                    todo!("error for 'cmds' field being non-array & non-string, got {:?}", rt);
+                                                }
+                                            })
+                                            .collect::<Result<Vec<_>, _>>()?,
+                                    );
+
+                                    Ok(())
+                                } else {
+                                    todo!("error for 'cmds' field being non-array, got {:?}", rt);
+                                }
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        "target" => {
+                            if let Some(target_rt) = field.value.as_ref() {
+                                let target_str =
+                                    String::deserialize(eval_if_closure(
+                                        target_rt,
+                                        program,
+                                    )?)
+                                    .unwrap();
+                                match Target::all().iter().find(|t| t.as_ref() == target_str) {
+                                    None => Err(Error::InvalidTarget { files: program.files(), got: target_str, pos: rt.pos(program.pos_table()) }),
+                                    Some(t) => {
+                                        target = Some(t.clone());
+                                        Ok(())
+                                    }
+                                }
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        "build_args" => {
+                            if let Some(build_args_rt) = field.value.as_ref() {
+                                let build_args_rt =
+                                    eval_if_closure(build_args_rt, program)?;
+
+                                if let Some(r) = crate::record_data_from_val(&build_args_rt) {
+                                    build_args = Some(r.fields.iter().map(
+                                        |(ident_and_loc, field)| -> Result<(String, String), Error> {
+                                            if field.value.is_none() {
+                                                // TODO: This should be a more customized error, missing
+                                                // field with the pretty print will probably get the message
+                                                // across, but its not super precise.
+                                                return Err(Error::MissingField{
+                                                    field: "build_args",
+                                                    files: program.files(),
+                                                    obj: ObjTy::Builder,
+                                                    pos: ident_and_loc.pos,
+                                                });
+                                            }
+
+                                            Ok((
+                                                ident_and_loc.label().to_string(),
+                                                String::deserialize(eval_if_closure(
+                                                    field.value.as_ref().unwrap(),
+                                                    program,
+                                                )?)
+                                                .unwrap(),
+                                            ))
+                                        },
+                                    ).collect::<Result<IndexMap<_, _>, Error>>()?
+                                    );
+                                } else if crate::is_record(&build_args_rt) {
+                                    build_args = Some(Default::default());
+                                } else {
+                                    todo!("unexpected term for build_args");
+                                }
+                            }
+
+                            Ok(())
+                        }
+                        "build_deps" => {
+                            let build_deps_rt = field
+                                .value
+                                .as_ref()
+                                .map(|rt| eval_if_closure(rt, program))
+                                .ok_or_else(|| Error::MissingField {
+                                    files: program.files(),
+                                    obj: ObjTy::Builder,
+                                    pos: rt.pos(program.pos_table()),
+                                    field: "build_deps",
+                                })??;
+                            if let Some(a) = build_deps_rt.as_array() {
+                                build_deps = Some(
+                                    a.iter()
+                                        .map(|input| BuildDep::from_term(input, program, acc))
+                                        .collect::<Result<SmallVec<_>, Error>>()?,
+                                );
+                            } else {
+                                todo!("handle build_deps value being non-array {:?}", field.value);
+                            };
+                            Ok(())
+                        }
+                        "runtime_deps" => {
+                            let runtime_deps_rt =
+                                field.value.as_ref().map(|rt| eval_if_closure(rt, program));
+                            match runtime_deps_rt {
+                                None => {}
+                                Some(runtime_deps_rt) => {
+                                    let runtime_deps_val = runtime_deps_rt?;
+                                    if let Some(a) = runtime_deps_val.as_array() {
+                                        runtime_deps = Some(
+                                            a.iter()
+                                                .map(|input| {
+                                                    RuntimeDep::from_term(input, program, acc)
+                                                })
+                                                .collect::<Result<SmallVec<_>, Error>>()?,
+                                        );
+                                    } else {
+                                        todo!(
                                             "handle runtime_deps value being non-array {:?}",
                                             field.value
-                                        ),
-                                    },
-                                }
-                                Ok(())
-                            }
-                            "outputs" => {
-                                let outputs_rt = field
-                                    .value
-                                    .as_ref()
-                                    .map(|rt| eval_if_closure(rt, program))
-                                    .ok_or_else(|| Error::MissingField {
-                                        files: program.files(),
-                                        obj: ObjTy::Builder,
-                                        pos: rt.pos,
-                                        field: "outputs",
-                                    })??;
-
-                                if let Term::Record(r) = outputs_rt.as_ref() {
-                                    outputs = Some(
-                                        r.iter_serializable()
-                                            .map(|entry| entry.unwrap())
-                                            .map(|(ident, val)| {
-                                                Ok((
-                                                    ident.label().to_string(),
-                                                    BuildOutput::from_term(val, program)?,
-                                                ))
-                                            })
-                                            .collect::<Result<_, Error>>()?,
-                                    );
-                                } else {
-                                    todo!("handle value being non-dict {:?}", field.value);
-                                };
-                                Ok(())
-                            }
-                            "replace_on_cycle" => {
-                                if let Some(value) = &field.value {
-                                    replace_on_cycle = Some(BuildRef::from_term(value, program, acc)?);
-                                }
-                                Ok(())
-                            }
-                            "attrs" => {
-                                if let Some(attrs_rt) = field.value.as_ref() {
-                                    let attrs_rt =
-                                        eval_if_closure(attrs_rt, program)?;
-
-                                    match attrs_rt.term.as_ref() {
-                                        Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                                            attrs = Some(r.fields.iter().map(
-                                                |(ident_and_loc, field)| -> Result<Option<(String, AttrValue)>, Error> {
-                                                    if let Some(rt) = field.value.as_ref() {
-                                                        let rt = RuntimeContract::apply_all(
-                                                            rt.clone(),
-                                                            field.pending_contracts.iter().cloned(),
-                                                            rt.pos,
-                                                        );
-
-                                                        let value = AttrValue::from_term(
-                                                            &rt,
-                                                            program,
-                                                        )?;
-                                                        match value {
-                                                            Some(v) => Ok(Some((
-                                                                ident_and_loc.label().to_string(),
-                                                                v,
-                                                            ))),
-                                                            None => Ok(None),
-                                                        }
-                                                    } else {
-                                                        Ok(None)
-                                                    }
-                                                },
-                                            ).collect::<Result<Vec<_>, Error>>()?
-                                            .into_iter()
-                                            .flatten()
-                                            .collect());
-                                        }
-                                        _ => todo!("unexpected term for attrs: {:?}", attrs_rt.term.as_ref()),
-                                    };
-                                }
-
-                                Ok(())
-                            }
-                            "needs" => {
-                                if let Some(needs_rt) = field.value.as_ref() {
-                                    let needs_rt =
-                                        eval_if_closure(needs_rt, program)?;
-
-                                    match needs_rt.term.as_ref() {
-                                        Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                                            needs = Some(r.fields.iter().map(
-                                                |(ident_and_loc, field)| -> Result<Option<(String, AttrValue)>, Error> {
-                                                    let value = AttrValue::from_term(
-                                                        field.value.as_ref().unwrap(),
-                                                        program,
-                                                    )?;
-                                                    match value {
-                                                        Some(v) => Ok(Some((
-                                                            ident_and_loc.label().to_string(),
-                                                            v,
-                                                        ))),
-                                                        None => Ok(None),
-                                                    }
-                                                },
-                                            ).collect::<Result<Vec<_>, Error>>()?
-                                            .into_iter()
-                                            .flatten()
-                                            .collect());
-                                        }
-                                        _ => todo!("unexpected term for needs: {:?}", needs_rt.term.as_ref()),
-                                    };
-                                }
-
-                                Ok(())
-                            }
-                            "tests" => {
-                                if let Some(tests_res) = field
-                                    .value
-                                    .as_ref()
-                                    .map(|rt| eval_if_closure(rt, program)) {
-                                        let tests_rt = tests_res?;
-
-                                        if let Term::Record(r) = tests_rt.as_ref() {
-                                            tests = Some(
-                                                r.iter_serializable()
-                                                    .map(|entry| entry.unwrap())
-                                                    .map(|(ident, val)| {
-                                                        Ok((
-                                                            ident.label().to_string(),
-                                                            crate::Test::from_term(val, program, acc)?,
-                                                        ))
-                                                    })
-                                                    .collect::<Result<_, Error>>()?,
-                                            );
-                                        } else {
-                                            todo!("handle value being non-dict {:?}", field.value);
-                                        };
+                                        );
                                     }
-                                Ok(())
+                                }
                             }
-                            _ => Ok(()), // TODO: Should we error if we see an unknown field?
+                            Ok(())
                         }
-                    })?;
-            }
-            _ => {}
+                        "outputs" => {
+                            let outputs_rt = field
+                                .value
+                                .as_ref()
+                                .map(|rt| eval_if_closure(rt, program))
+                                .ok_or_else(|| Error::MissingField {
+                                    files: program.files(),
+                                    obj: ObjTy::Builder,
+                                    pos: rt.pos(program.pos_table()),
+                                    field: "outputs",
+                                })??;
+
+                            if let Some(r) = crate::record_data_from_val(&outputs_rt) {
+                                outputs = Some(
+                                    r.iter_serializable()
+                                        .map(|entry| entry.unwrap())
+                                        .map(|(ident, val)| {
+                                            Ok((
+                                                ident.label().to_string(),
+                                                BuildOutput::from_term(val, program)?,
+                                            ))
+                                        })
+                                        .collect::<Result<_, Error>>()?,
+                                );
+                            } else if crate::is_record(&outputs_rt) {
+                                // Empty record - no outputs
+                                outputs = Some(Default::default());
+                            } else {
+                                todo!("handle value being non-dict {:?}", field.value);
+                            };
+                            Ok(())
+                        }
+                        "replace_on_cycle" => {
+                            if let Some(value) = &field.value {
+                                replace_on_cycle = Some(BuildRef::from_term(value, program, acc)?);
+                            }
+                            Ok(())
+                        }
+                        "attrs" => {
+                            if let Some(attrs_rt) = field.value.as_ref() {
+                                let attrs_rt =
+                                    eval_if_closure(attrs_rt, program)?;
+
+                                if let Some(r) = crate::record_data_from_val(&attrs_rt) {
+                                    attrs = Some(r.fields.iter().map(
+                                        |(ident_and_loc, field)| -> Result<Option<(String, AttrValue)>, Error> {
+                                            if let Some(rt) = field.value.as_ref() {
+                                                let rt = RuntimeContract::apply_all(
+                                                    rt.clone(),
+                                                    field.pending_contracts.iter().cloned(),
+                                                    rt.pos_idx(),
+                                                );
+
+                                                let value = AttrValue::from_term(
+                                                    &rt,
+                                                    program,
+                                                )?;
+                                                match value {
+                                                    Some(v) => Ok(Some((
+                                                        ident_and_loc.label().to_string(),
+                                                        v,
+                                                    ))),
+                                                    None => Ok(None),
+                                                }
+                                            } else {
+                                                Ok(None)
+                                            }
+                                        },
+                                    ).collect::<Result<Vec<_>, Error>>()?
+                                    .into_iter()
+                                    .flatten()
+                                    .collect());
+                                } else if crate::is_record(&attrs_rt) {
+                                    attrs = Some(Default::default());
+                                } else {
+                                    todo!("unexpected term for attrs: {:?}", attrs_rt);
+                                }
+                            }
+
+                            Ok(())
+                        }
+                        "needs" => {
+                            if let Some(needs_rt) = field.value.as_ref() {
+                                let needs_rt =
+                                    eval_if_closure(needs_rt, program)?;
+
+                                if let Some(r) = crate::record_data_from_val(&needs_rt) {
+                                    needs = Some(r.fields.iter().map(
+                                        |(ident_and_loc, field)| -> Result<Option<(String, AttrValue)>, Error> {
+                                            let value = AttrValue::from_term(
+                                                field.value.as_ref().unwrap(),
+                                                program,
+                                            )?;
+                                            match value {
+                                                Some(v) => Ok(Some((
+                                                    ident_and_loc.label().to_string(),
+                                                    v,
+                                                ))),
+                                                None => Ok(None),
+                                            }
+                                        },
+                                    ).collect::<Result<Vec<_>, Error>>()?
+                                    .into_iter()
+                                    .flatten()
+                                    .collect());
+                                } else if crate::is_record(&needs_rt) {
+                                    needs = Some(Default::default());
+                                } else {
+                                    todo!("unexpected term for needs: {:?}", needs_rt);
+                                }
+                            }
+
+                            Ok(())
+                        }
+                        "tests" => {
+                            if let Some(tests_res) = field
+                                .value
+                                .as_ref()
+                                .map(|rt| eval_if_closure(rt, program)) {
+                                    let tests_rt = tests_res?;
+
+                                    if let Some(r) = crate::record_data_from_val(&tests_rt) {
+                                        tests = Some(
+                                            r.iter_serializable()
+                                                .map(|entry| entry.unwrap())
+                                                .map(|(ident, val)| {
+                                                    Ok((
+                                                        ident.label().to_string(),
+                                                        crate::Test::from_term(val, program, acc)?,
+                                                    ))
+                                                })
+                                                .collect::<Result<_, Error>>()?,
+                                        );
+                                    } else if crate::is_record(&tests_rt) {
+                                        // Empty record - no tests
+                                        tests = Some(Default::default());
+                                    } else {
+                                        todo!("handle value being non-dict {:?}", field.value);
+                                    };
+                                }
+                            Ok(())
+                        }
+                        _ => Ok(()), // TODO: Should we error if we see an unknown field?
+                    }
+                })?;
         }
         match ty {
             Some(ObjTy::Builder) => {} // happy path
-            None => return Err(Error::MissingTy(program.files(), rt.pos)),
+            None => {
+                return Err(Error::MissingTy(
+                    program.files(),
+                    rt.pos(program.pos_table()),
+                ));
+            }
             Some(ty) => {
                 return Err(Error::UnexpectedObject {
                     files: program.files(),
                     got: ty,
                     want: ObjTy::Builder,
-                    pos: rt.pos,
+                    pos: rt.pos(program.pos_table()),
                 });
             }
         }
@@ -1170,7 +1174,7 @@ impl BuildDecl {
                 return Err(Error::MissingField {
                     files: program.files(),
                     obj: ObjTy::Builder,
-                    pos: rt.pos,
+                    pos: rt.pos(program.pos_table()),
                     field: "name",
                 });
             }
@@ -1183,7 +1187,7 @@ impl BuildDecl {
                 return Err(Error::MissingField {
                     files: program.files(),
                     obj: ObjTy::Builder,
-                    pos: rt.pos,
+                    pos: rt.pos(program.pos_table()),
                     field: "build_deps",
                 });
             }
@@ -1198,7 +1202,7 @@ impl BuildDecl {
                 return Err(Error::MissingField {
                     files: program.files(),
                     obj: ObjTy::Builder,
-                    pos: rt.pos,
+                    pos: rt.pos(program.pos_table()),
                     field: "outputs",
                 });
             }
@@ -1601,11 +1605,11 @@ mod tests {
             panic!("finish failed");
         });
 
-        let (o_lib, o_bin, o_data) = if let Term::Array(a, _) = term.as_ref() {
+        let (o_lib, o_bin, o_data) = if let Some(a) = term.as_array() {
             (
-                BuildOutput::from_term(&a[0], &mut program).unwrap(),
-                BuildOutput::from_term(&a[1], &mut program).unwrap(),
-                BuildOutput::from_term(&a[2], &mut program).unwrap(),
+                BuildOutput::from_term(a.get(0).unwrap(), &mut program).unwrap(),
+                BuildOutput::from_term(a.get(1).unwrap(), &mut program).unwrap(),
+                BuildOutput::from_term(a.get(2).unwrap(), &mut program).unwrap(),
             )
         } else {
             unreachable!()

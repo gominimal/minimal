@@ -1,6 +1,5 @@
 use nickel_lang_core::error::Error;
 use nickel_lang_core::files::Files;
-use nickel_lang_core::term::Term;
 use nickel_lang_core::{error::NullReporter, eval::cache::CacheImpl, program::Program};
 use std::io;
 
@@ -79,11 +78,10 @@ impl VarCtx {
             .compile()
             .map_err(|e| Box::new((program.files(), e)))?;
 
-        if let Term::Str(s) = program
+        let result = program
             .eval_full()
-            .map_err(|e| Box::new((program.files(), e)))?
-            .as_ref()
-        {
+            .map_err(|e| Box::new((program.files(), e)))?;
+        if let Some(s) = result.as_string() {
             Ok(s.to_string())
         } else {
             Ok("".to_string())

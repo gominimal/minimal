@@ -5,7 +5,6 @@ use graph::{
     Transitives,
 };
 use mctx::{Context, Error};
-use nickel_lang_core::bytecode::ast::Node;
 use nickel_lang_core::traverse::TraverseControl;
 use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex, NodeWeightsMut};

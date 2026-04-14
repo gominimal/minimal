@@ -1,11 +1,11 @@
 use nickel_lang_core::{
-    eval::cache::CacheImpl,
+    eval::{cache::CacheImpl, value::NickelValue},
     program::Program,
-    term::{IndexMap, RichTerm, RuntimeContract, Term},
+    term::{IndexMap, RuntimeContract},
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, StrPos, eval_if_closure};
+use crate::{Error, StrPos, eval_if_closure, record_data_from_val};
 
 /// The value of an attribute.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -26,56 +26,74 @@ impl Default for AttrValue {
 
 impl AttrValue {
     pub(crate) fn from_term(
-        rt: &RichTerm,
+        rt: &NickelValue,
         program: &mut Program<CacheImpl>,
     ) -> Result<Option<Self>, Error> {
         let rt = eval_if_closure(rt, program)?;
 
-        Ok(match rt.term.as_ref() {
-            Term::Str(s) => Some(Self::String(s.to_string(), rt.pos.try_into().ok())),
-            Term::Bool(b) => Some(Self::Bool(*b)),
-            Term::Num(v) => Some(Self::Number(v.try_into().unwrap())),
-            Term::Enum(a) => Some(Self::String(a.into_label(), rt.pos.try_into().ok())),
-            Term::Record(r) | Term::RecRecord(r, _, _, _) => {
-                let mut map = IndexMap::with_capacity(6);
-                r.fields
-                    .iter()
-                    .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
-                        if let Some(rt) = field.value.as_ref() {
-                            let rt = RuntimeContract::apply_all(
-                                rt.clone(),
-                                field.pending_contracts.iter().cloned(),
-                                rt.pos,
-                            );
+        if let Some(s) = rt.as_string() {
+            let pos = rt.pos(program.pos_table()).try_into().ok();
+            return Ok(Some(Self::String(s.to_string(), pos)));
+        }
+        if let Some(b) = rt.as_bool() {
+            return Ok(Some(Self::Bool(b)));
+        }
+        if let Some(v) = rt.as_number() {
+            return Ok(Some(Self::Number(f64::try_from(v).unwrap())));
+        }
+        if let Some(tag) = rt.as_enum_tag() {
+            return Ok(Some(Self::String(
+                tag.into_label(),
+                rt.pos(program.pos_table()).try_into().ok(),
+            )));
+        }
+        if let Some(r) = record_data_from_val(&rt) {
+            let mut map = IndexMap::with_capacity(6);
+            r.fields
+                .iter()
+                .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
+                    if let Some(val) = field.value.as_ref() {
+                        let val = RuntimeContract::apply_all(
+                            val.clone(),
+                            field.pending_contracts.iter().cloned(),
+                            val.pos_idx(),
+                        );
 
-                            if let Some(value) = AttrValue::from_term(&rt, program)? {
-                                map.insert(ident_and_loc.label().to_string(), value);
-                            }
+                        if let Some(value) = AttrValue::from_term(&val, program)? {
+                            map.insert(ident_and_loc.label().to_string(), value);
                         }
-                        Ok(())
-                    })?;
-                Some(Self::Map(map))
-            }
-            Term::Array(e, _attrs) => Some(Self::List(
-                e.iter()
+                    }
+                    Ok(())
+                })?;
+            return Ok(Some(Self::Map(map)));
+        }
+        if let Some(a) = rt.as_array() {
+            return Ok(Some(Self::List(
+                a.iter()
                     .map(|e| AttrValue::from_term(e, program))
                     .collect::<Result<Vec<_>, Error>>()?
                     .into_iter()
                     .flatten()
                     .collect(),
-            )),
-            // Optional fields which are validated by a custom contract will come
-            // across as this type - so we treat them as unset.
-            Term::CustomContract(_) => None,
-            Term::EnumVariant { tag, arg, attrs: _ } => Some(Self::EnumVariant(
-                tag.into_label(),
-                Box::new(AttrValue::from_term(arg, program)?.unwrap()),
-            )),
-            _ => todo!(
-                "error for unexpected attribute value type: {:?}",
-                rt.term.as_ref()
-            ),
-        })
+            )));
+        }
+        // Optional fields which are validated by a custom contract will come
+        // across as this type - so we treat them as unset.
+        if rt.type_of() == Some("CustomContract") {
+            return Ok(None);
+        }
+        // Empty records (Container::Empty) - treat as empty map
+        if crate::is_record(&rt) {
+            return Ok(Some(Self::Map(IndexMap::default())));
+        }
+        if let Some(ev) = rt.as_enum_variant() {
+            return Ok(Some(Self::EnumVariant(
+                ev.tag.into_label(),
+                Box::new(AttrValue::from_term(&ev.arg.clone().unwrap(), program)?.unwrap()),
+            )));
+        }
+
+        todo!("error for unexpected attribute value type: {:?}", rt)
     }
 
     /// Returns the inner list, if this [AttrValue] is the list variant.
