@@ -224,55 +224,54 @@ impl crate::GraphBasedChecker for EnumerateBins {
         };
         let build = graph.get(&bsr).unwrap();
         let spec_hash = graph.spec_hash(&bsr);
-        let cached_build = if let Ok(cached_build) = cache.read_dir(&spec_hash) {
-            cached_build
-        } else {
-            return Ok(result); // skip, we need the cached build
-        };
 
-        result.verdict = CheckVerdict::Pass;
-        let bins_dir = cached_build.path().join("usr/bin");
-        if !bins_dir.exists() {
-            return Ok(result);
-        }
+        tokio::task::block_in_place(|| {
+            let cached_build = if let Ok(cached_build) = cache.read_dir(&spec_hash) {
+                cached_build
+            } else {
+                return Ok(result); // skip, we need the cached build
+            };
 
-        let mut collected_bins = std::fs::read_dir(&bins_dir)
-            .map_err(|e| Error::IO("listing bins", bins_dir.clone(), e))?
-            .map(|e| match e {
-                Err(e) => Err(e),
-                Ok(e) => Ok(e.file_name().to_str().unwrap().to_string()),
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| Error::IO("stat binary", bins_dir, e))?;
+            result.verdict = CheckVerdict::Pass;
+            let bins_dir = cached_build.path().join("usr/bin");
+            if !bins_dir.exists() {
+                return Ok(result);
+            }
 
-        let has_bins_wildcard = build.outputs.iter().any(|o| {
-            matches!(o.1, BuildOutput::Binary { glob, allow_missing_interpreter: _ }
-            if glob == "usr/bin/*" || glob == "usr/bin/**" || glob == "usr/bin/**/*")
-        });
-        if !has_bins_wildcard {
-            // Not part of the problem.
-            return Ok(result);
-        }
+            let mut collected_bins = std::fs::read_dir(&bins_dir)
+                .map_err(|e| Error::IO("listing bins", bins_dir.clone(), e))?
+                .map(|e| match e {
+                    Err(e) => Err(e),
+                    Ok(e) => Ok(e.file_name().to_str().unwrap().to_string()),
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| Error::IO("stat binary", bins_dir, e))?;
 
-        // Retain only bins in `collected_bins` which don't have a corresponding output.
-        collected_bins.retain(|b| {
-            !build
-                .outputs
-                .iter()
-                .any(|(name, o)| b == name && matches!(o, BuildOutput::Binary { .. }))
-        });
+            let has_bins_wildcard = build.outputs.iter().any(|o| {
+                matches!(o.1, BuildOutput::Binary { glob, allow_missing_interpreter: _ }
+                if glob == "usr/bin/*" || glob == "usr/bin/**" || glob == "usr/bin/**/*")
+            });
+            if !has_bins_wildcard {
+                return Ok(result);
+            }
 
-        if collected_bins.len() > 6 || collected_bins.is_empty() {
-            // We don't yell about enumerating bins if theres TONS of them.
-            return Ok(result);
-        }
+            collected_bins.retain(|b| {
+                !build
+                    .outputs
+                    .iter()
+                    .any(|(name, o)| b == name && matches!(o, BuildOutput::Binary { .. }))
+            });
 
-        // Whats left are binaries that need to be made OutputBin entries.
-        result.err.push(format!(
-            "when theres only a few binaries, they should be enumerated explicitly as their own output. Found: {}",
-            collected_bins.join(",")
-        ));
-        result.verdict = CheckVerdict::Fail;
-        Ok(result)
+            if collected_bins.len() > 6 || collected_bins.is_empty() {
+                return Ok(result);
+            }
+
+            result.err.push(format!(
+                "when theres only a few binaries, they should be enumerated explicitly as their own output. Found: {}",
+                collected_bins.join(",")
+            ));
+            result.verdict = CheckVerdict::Fail;
+            Ok(result)
+        })
     }
 }

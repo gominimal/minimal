@@ -547,126 +547,41 @@ async fn check_package(
     let mut out = Vec::new();
 
     if let Some(graph) = all_graph {
-        out.push(
-            naming::SpecNameMatchesDir
-                .check(
-                    &skip_checkers,
-                    fix,
-                    pkg.clone(),
-                    graph.read().await,
-                    cache.clone(),
-                    Some(check_op.clone()),
-                )
-                .await?,
+        // Run all graph-based checkers concurrently. Errors are converted
+        // to String at the boundary so the results are Send.
+        macro_rules! run_checker {
+            ($checker:expr) => {
+                async {
+                    $checker
+                        .check(
+                            &skip_checkers,
+                            fix,
+                            pkg.clone(),
+                            graph.read().await,
+                            cache.clone(),
+                            Some(check_op.clone()),
+                        )
+                        .await
+                        .map_err(|e| format!("{e}"))
+                }
+            };
+        }
+
+        let (r1, r2, r3, r4, r5, r6, r7, r8, r9, r10) = tokio::join!(
+            run_checker!(naming::SpecNameMatchesDir),
+            run_checker!(naming::SpecNameValid),
+            run_checker!(naming::CycleBreakerNaming),
+            run_checker!(naming::OutputNaming),
+            run_checker!(naming::EnumerateBins),
+            run_checker!(OutputTypesValid),
+            run_checker!(MissingRuntimeDeps),
+            run_checker!(BuildScriptIsExecutable),
+            run_checker!(BuildScriptDisallowedPatterns),
+            run_checker!(StandaloneTestCheck),
         );
-        out.push(
-            naming::SpecNameValid
-                .check(
-                    &skip_checkers,
-                    fix,
-                    pkg.clone(),
-                    graph.read().await,
-                    cache.clone(),
-                    Some(check_op.clone()),
-                )
-                .await?,
-        );
-        out.push(
-            naming::CycleBreakerNaming
-                .check(
-                    &skip_checkers,
-                    fix,
-                    pkg.clone(),
-                    graph.read().await,
-                    cache.clone(),
-                    Some(check_op.clone()),
-                )
-                .await?,
-        );
-        out.push(
-            naming::OutputNaming
-                .check(
-                    &skip_checkers,
-                    fix,
-                    pkg.clone(),
-                    graph.read().await,
-                    cache.clone(),
-                    Some(check_op.clone()),
-                )
-                .await?,
-        );
-        out.push(
-            naming::EnumerateBins
-                .check(
-                    &skip_checkers,
-                    fix,
-                    pkg.clone(),
-                    graph.read().await,
-                    cache.clone(),
-                    Some(check_op.clone()),
-                )
-                .await?,
-        );
-        out.push(
-            OutputTypesValid
-                .check(
-                    &skip_checkers,
-                    fix,
-                    pkg.clone(),
-                    graph.read().await,
-                    cache.clone(),
-                    Some(check_op.clone()),
-                )
-                .await?,
-        );
-        out.push(
-            MissingRuntimeDeps
-                .check(
-                    &skip_checkers,
-                    fix,
-                    pkg.clone(),
-                    graph.read().await,
-                    cache.clone(),
-                    Some(check_op.clone()),
-                )
-                .await?,
-        );
-        out.push(
-            BuildScriptIsExecutable
-                .check(
-                    &skip_checkers,
-                    fix,
-                    pkg.clone(),
-                    graph.read().await,
-                    cache.clone(),
-                    Some(check_op.clone()),
-                )
-                .await?,
-        );
-        out.push(
-            BuildScriptDisallowedPatterns
-                .check(
-                    &skip_checkers,
-                    fix,
-                    pkg.clone(),
-                    graph.read().await,
-                    cache.clone(),
-                    Some(check_op.clone()),
-                )
-                .await?,
-        );
-        out.push(
-            StandaloneTestCheck
-                .check(
-                    &skip_checkers,
-                    fix,
-                    pkg.clone(),
-                    graph.read().await,
-                    cache.clone(),
-                    Some(check_op.clone()),
-                )
-                .await?,
-        );
+        for r in [r1, r2, r3, r4, r5, r6, r7, r8, r9, r10] {
+            out.push(r.map_err(|e| Error::Other(anyhow!(e)))?);
+        }
     }
 
     // Run file-based checkers in a separate thread as they're computation-heavy
@@ -1044,69 +959,68 @@ impl GraphBasedChecker for StandaloneTestCheck {
         if let Some(tests) = build.tests {
             let graph2 = graph.deref().clone();
             drop(graph);
-            result =
-                tokio::task::spawn_blocking(async move || -> Result<CheckResult, anyhow::Error> {
-                    for (name, test) in tests {
-                        if test.build_test {
-                            continue; // We only do standalone tests here
-                        }
-                        let temp_dir = cache.temp_dir().map_err(anyhow::Error::from)?;
+            result = tokio::task::spawn(async move {
+                let mut result = result;
+                for (name, test) in tests {
+                    if test.build_test {
+                        continue; // We only do standalone tests here
+                    }
+                    let temp_dir = cache.temp_dir().map_err(anyhow::Error::from)?;
 
-                        let stdout_buf = SharedBuf::new();
-                        let stderr_buf = SharedBuf::new();
-                        let mut t = StandaloneTest {
-                            spec: &bsr,
-                            test_name: name.as_str(),
-                            stdout_writer: Some(Box::new(stdout_buf.clone())),
-                            stderr_writer: Some(Box::new(stderr_buf.clone())),
-                        };
-                        let opts = Options {
-                            cache: cache.clone(),
-                            exec_base: temp_dir.path().to_path_buf(),
-                            graph: &graph2,
-                            ot: ot.clone(),
-                        };
+                    let stdout_buf = SharedBuf::new();
+                    let stderr_buf = SharedBuf::new();
+                    let mut t = StandaloneTest {
+                        spec: &bsr,
+                        test_name: name.as_str(),
+                        stdout_writer: Some(Box::new(stdout_buf.clone())),
+                        stderr_writer: Some(Box::new(stderr_buf.clone())),
+                    };
+                    let opts = Options {
+                        cache: cache.clone(),
+                        exec_base: temp_dir.path().to_path_buf(),
+                        graph: &graph2,
+                        ot: ot.clone(),
+                    };
 
-                        match t.run(&opts).await {
-                            Ok(errors) => {
-                                if !errors.is_empty() {
-                                    result.verdict = CheckVerdict::Fail;
-                                    errors.iter().for_each(|e| {
-                                        result.err.push(format!(
-                                            "{}: {} {} had exit code {}",
-                                            name,
-                                            e.program,
-                                            e.args.join(" "),
-                                            e.exit_code
-                                        ))
-                                    });
-                                    let stdout = stdout_buf.into_string();
-                                    let stderr = stderr_buf.into_string();
-                                    if !stdout.is_empty() {
-                                        result.err.push(format!("stdout:\n{}", stdout));
-                                    }
-                                    if !stderr.is_empty() {
-                                        result.err.push(format!("stderr:\n{}", stderr));
-                                    }
+                    match t.run(&opts).await {
+                        Ok(errors) => {
+                            if !errors.is_empty() {
+                                result.verdict = CheckVerdict::Fail;
+                                errors.iter().for_each(|e| {
+                                    result.err.push(format!(
+                                        "{}: {} {} had exit code {}",
+                                        name,
+                                        e.program,
+                                        e.args.join(" "),
+                                        e.exit_code
+                                    ))
+                                });
+                                let stdout = stdout_buf.into_string();
+                                let stderr = stderr_buf.into_string();
+                                if !stdout.is_empty() {
+                                    result.err.push(format!("stdout:\n{}", stdout));
+                                }
+                                if !stderr.is_empty() {
+                                    result.err.push(format!("stderr:\n{}", stderr));
                                 }
                             }
-                            Err(op::Error::Cache(CacheErr::NotFound)) => {
-                                result.verdict = CheckVerdict::Skip;
-                                return Ok(result);
-                            }
-                            Err(e) => {
-                                return Err(anyhow::Error::from(e)
-                                    .context(format!("running tests for spec {}", build.name))
-                                    .context(format!("failed setup for test {}", name)));
-                            }
+                        }
+                        Err(op::Error::Cache(CacheErr::NotFound)) => {
+                            result.verdict = CheckVerdict::Skip;
+                            return Ok(result);
+                        }
+                        Err(e) => {
+                            return Err(anyhow::Error::from(e)
+                                .context(format!("running tests for spec {}", build.name))
+                                .context(format!("failed setup for test {}", name)));
                         }
                     }
-                    Ok(result)
-                })
-                .await
-                .unwrap()
-                .await
-                .map_err(Error::Other)?;
+                }
+                Ok::<_, anyhow::Error>(result)
+            })
+            .await
+            .map_err(|e| Error::Other(anyhow::Error::from(e)))?
+            .map_err(Error::Other)?;
         }
 
         Ok(result)
