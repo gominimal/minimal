@@ -15,9 +15,6 @@ use oci_spec::image::{
     ImageIndexBuilder, ImageManifestBuilder, MediaType, PlatformBuilder, RootFsBuilder,
     SCHEMA_VERSION, Sha256Digest,
 };
-use sha2::digest::OutputSizeUser;
-#[allow(deprecated)]
-use sha2::digest::generic_array::GenericArray;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Seek;
@@ -170,8 +167,8 @@ impl Runnable for OciImageCreate {
         let mut th = tar::Header::new_gnu();
         th.set_mode(0o444);
         th.set_path(format!(
-            "blobs/sha256/{:x}",
-            Sha256::digest(&image_config_bytes)
+            "blobs/sha256/{}",
+            hex::encode(Sha256::digest(&image_config_bytes))
         ))?;
         th.set_size(image_config_bytes.len() as u64);
         th.set_cksum();
@@ -185,10 +182,9 @@ impl Runnable for OciImageCreate {
                     DescriptorBuilder::default()
                         .media_type(MediaType::ImageConfig)
                         .size(image_config_bytes.len() as u64)
-                        .digest(Sha256Digest::from_str(&format!(
-                            "{:x}",
-                            sha2::Sha256::digest(&image_config_bytes)
-                        ))?)
+                        .digest(Sha256Digest::from_str(&hex::encode(sha2::Sha256::digest(
+                            &image_config_bytes,
+                        )))?)
                         .build()?,
                 )
                 .layers(
@@ -202,8 +198,8 @@ impl Runnable for OciImageCreate {
         let mut th = tar::Header::new_gnu();
         th.set_mode(0o444);
         th.set_path(format!(
-            "blobs/sha256/{:x}",
-            Sha256::digest(&image_manifest_bytes)
+            "blobs/sha256/{}",
+            hex::encode(Sha256::digest(&image_manifest_bytes))
         ))?;
         th.set_size(image_manifest_bytes.len() as u64);
         th.set_cksum();
@@ -217,10 +213,9 @@ impl Runnable for OciImageCreate {
                 DescriptorBuilder::default()
                     .media_type(MediaType::ImageManifest)
                     .size(image_manifest_bytes.len() as u64)
-                    .digest(Sha256Digest::from_str(&format!(
-                        "{:x}",
-                        sha2::Sha256::digest(&image_manifest_bytes)
-                    ))?)
+                    .digest(Sha256Digest::from_str(&hex::encode(sha2::Sha256::digest(
+                        &image_manifest_bytes,
+                    )))?)
                     .platform(
                         PlatformBuilder::default()
                             .os("linux")
@@ -260,7 +255,10 @@ impl Runnable for OciImageCreate {
         for layer in layers {
             let mut th = tar::Header::new_gnu();
             th.set_mode(0o444);
-            th.set_path(format!("blobs/sha256/{:x}", layer.compressed_sha256))?;
+            th.set_path(format!(
+                "blobs/sha256/{}",
+                hex::encode(layer.compressed_sha256)
+            ))?;
             th.set_size(layer.descriptor.size());
             th.set_cksum();
             tb.append(&th, layer.targz)?;
@@ -271,17 +269,16 @@ impl Runnable for OciImageCreate {
     }
 }
 
-#[allow(deprecated)]
 struct BuiltLayer {
     descriptor: Descriptor,
-    uncompressed_sha256: GenericArray<u8, <Sha256 as OutputSizeUser>::OutputSize>,
-    compressed_sha256: GenericArray<u8, <Sha256 as OutputSizeUser>::OutputSize>,
+    uncompressed_sha256: [u8; 32],
+    compressed_sha256: [u8; 32],
     targz: std::fs::File,
 }
 
 impl BuiltLayer {
     fn uncompressed_digest(&self) -> String {
-        format!("sha256:{:x}", self.uncompressed_sha256)
+        format!("sha256:{}", hex::encode(self.uncompressed_sha256))
     }
 }
 
@@ -301,26 +298,26 @@ async fn create_base_layer() -> anyhow::Result<BuiltLayer> {
     let mut tar_file = tar.into_inner()?.finish()?;
 
     // Calculate digests
-    let (sha256, compressed_len) = {
-        let mut hasher = sha2::Sha256::new();
+    let (sha256, compressed_len): ([u8; 32], _) = {
+        let mut hasher = common::HashWriter(sha2::Sha256::new());
         tar_file.seek(std::io::SeekFrom::Start(0))?;
         let len = std::io::copy(&mut tar_file, &mut hasher)?;
-        (hasher.finalize(), len)
+        (hasher.0.finalize().into(), len)
     };
 
-    let uncompressed_sha256 = {
+    let uncompressed_sha256: [u8; 32] = {
         tar_file.seek(std::io::SeekFrom::Start(0))?;
         let dec = flate2::read::GzDecoder::new(&tar_file);
-        let mut hasher = sha2::Sha256::new();
+        let mut hasher = common::HashWriter(sha2::Sha256::new());
         let mut reader = std::io::BufReader::new(dec);
         std::io::copy(&mut reader, &mut hasher)?;
-        hasher.finalize()
+        hasher.0.finalize().into()
     };
 
     let descriptor = DescriptorBuilder::default()
         .media_type(MediaType::ImageLayerGzip)
         .size(compressed_len)
-        .digest(Sha256Digest::from_str(&format!("{:x}", sha256))?)
+        .digest(Sha256Digest::from_str(&hex::encode(sha256))?)
         .build()?;
 
     tar_file.seek(std::io::SeekFrom::Start(0))?;
@@ -352,26 +349,26 @@ async fn create_layer_from_cache(
     let mut tar_file = tar.into_inner()?.finish()?;
 
     // Calculate digests
-    let (sha256, compressed_len) = {
-        let mut hasher = sha2::Sha256::new();
+    let (sha256, compressed_len): ([u8; 32], _) = {
+        let mut hasher = common::HashWriter(sha2::Sha256::new());
         tar_file.seek(std::io::SeekFrom::Start(0))?;
         let len = std::io::copy(&mut tar_file, &mut hasher)?;
-        (hasher.finalize(), len)
+        (hasher.0.finalize().into(), len)
     };
 
-    let uncompressed_sha256 = {
+    let uncompressed_sha256: [u8; 32] = {
         tar_file.seek(std::io::SeekFrom::Start(0))?;
         let dec = flate2::read::GzDecoder::new(&tar_file);
-        let mut hasher = sha2::Sha256::new();
+        let mut hasher = common::HashWriter(sha2::Sha256::new());
         let mut reader = std::io::BufReader::new(dec);
         std::io::copy(&mut reader, &mut hasher)?;
-        hasher.finalize()
+        hasher.0.finalize().into()
     };
 
     let descriptor = DescriptorBuilder::default()
         .media_type(MediaType::ImageLayerGzip)
         .size(compressed_len)
-        .digest(Sha256Digest::from_str(&format!("{:x}", sha256))?)
+        .digest(Sha256Digest::from_str(&hex::encode(sha256))?)
         .build()?;
 
     info!(

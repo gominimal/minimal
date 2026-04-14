@@ -116,6 +116,21 @@ impl<W1: Write, W2: Write> Write for Tee<W1, W2> {
     }
 }
 
+/// Wrapper that implements [Write] for types implementing [sha2::Digest],
+/// since `digest` 0.11 no longer provides a blanket `std::io::Write` impl.
+pub struct HashWriter<D: sha2::Digest>(pub D);
+
+impl<D: sha2::Digest> Write for HashWriter<D> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        sha2::Digest::update(&mut self.0, buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// The error produced by calls to [hardlink_dir_contents].
 #[derive(Debug)]
 pub enum HardlinkError {
