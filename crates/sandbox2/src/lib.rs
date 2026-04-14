@@ -20,7 +20,6 @@ use std::time::SystemTime;
 pub mod error;
 use crate::config::{Invocation, WdSetup};
 use crate::error::ExecutionError;
-use common::FdSynchronizer;
 pub use error::Error;
 
 mod listener;
@@ -494,17 +493,9 @@ impl<C: Channel> Sandbox<C> {
             cmd.stdout(hakoniwa::Stdio::MakePipe);
             tracing::debug!("Executing: {} {}", &exec.executable, exec.args.join(" "));
 
-            // Exclusive section: only one hakoniwa command can be spawned
-            // at a time. This prevents races with a file descriptor being held
-            // by one forked process while being needed closed in another process.
-            //
-            // Waiting for spawn lets us wait till exec, at which point all such
-            // file descriptors (which have O_CLOEXEC) will have been closed.
-            let mut child = {
-                let _guard = FdSynchronizer::lock_fork();
-                cmd.spawn()
-            }
-            .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
+            let mut child = cmd
+                .spawn()
+                .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
 
             // Take pipes from the child so threads can stream them into the stdout/stderr
             // files, as well as to the caller-provided writers if applicable.
