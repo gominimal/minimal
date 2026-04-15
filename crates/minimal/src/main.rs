@@ -176,17 +176,6 @@ pub(crate) fn enforce_science_mode() -> Result<(), Error> {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let build_timestamp: u64 = env!("BUILD_TIMESTAMP")
-        .parse()
-        .expect("Invalid BUILD_TIMESTAMP");
-    let build_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(build_timestamp);
-
-    if build_time.elapsed().unwrap() > std::time::Duration::from_hours(30 * 24) {
-        eprintln!("Error: This binary has expired (built more than 30 days ago).");
-        eprintln!("Please rebuild to continue.");
-        std::process::exit(1);
-    }
-
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new("info")
             .add_directive("topiary=off".parse().unwrap())
