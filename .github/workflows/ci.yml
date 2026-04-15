@@ -76,7 +76,7 @@ jobs:
       - name: Build static release binary
         run: cargo build --release --package minimal --target x86_64-unknown-linux-musl
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: minimal-linux-amd64
           path: target/x86_64-unknown-linux-musl/release/minimal
@@ -102,7 +102,7 @@ jobs:
       - name: Build static release binary
         run: cross build --release --package minimal --target aarch64-unknown-linux-musl
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: minimal-linux-arm64
           path: target/aarch64-unknown-linux-musl/release/minimal
@@ -124,12 +124,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Download amd64 binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: minimal-linux-amd64
           path: artifacts/amd64
       - name: Download arm64 binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: minimal-linux-arm64
           path: artifacts/arm64
