@@ -1,4 +1,6 @@
 //! The in-memory, semantic graph of software which make up a minimal environment.
+use std::collections::HashSet;
+
 use common::{SpecHash, SpecOrigin};
 use serde::{Deserialize, Serialize};
 
@@ -99,7 +101,7 @@ impl From<decode::Error> for Error {
     }
 }
 
-/// A reference to some other [BuildSpec] in a [DepGraph].
+/// A reference to some other [BuildSpec] in a [Graph].
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BuildSpecRef(pub(crate) generational_arena::Index);
 
@@ -110,6 +112,65 @@ impl BuildSpecRef {
     /// know what youre doing.
     pub fn index(&self) -> usize {
         self.0.into_raw_parts().0
+    }
+}
+
+/// Something which indicates what builds are done + useable from some cache.
+pub trait BinProvider: std::fmt::Debug {
+    fn exists(&self, bsr: &BuildSpecRef) -> bool;
+}
+
+impl BinProvider for () {
+    fn exists(&self, _bsr: &BuildSpecRef) -> bool {
+        false
+    }
+}
+
+impl<BP: BinProvider + ?Sized> BinProvider for Box<BP> {
+    fn exists(&self, bsr: &BuildSpecRef) -> bool {
+        self.as_ref().exists(bsr)
+    }
+}
+
+impl<BP1: BinProvider, BP2: BinProvider> BinProvider for (BP1, BP2) {
+    fn exists(&self, bsr: &BuildSpecRef) -> bool {
+        self.0.exists(bsr) || self.1.exists(bsr)
+    }
+}
+
+impl<BP1: BinProvider, BP2: BinProvider, BP3: BinProvider> BinProvider for (BP1, BP2, BP3) {
+    fn exists(&self, bsr: &BuildSpecRef) -> bool {
+        self.0.exists(bsr) || self.1.exists(bsr) || self.2.exists(bsr)
+    }
+}
+
+/// A wrapper for types implementing [BinProvider] that pretends specific specs are never cached.
+#[derive(Debug)]
+pub struct MaskingBinProvider<BP: BinProvider> {
+    p: BP,
+    masked: HashSet<BuildSpecRef>,
+}
+
+impl<BP: BinProvider> MaskingBinProvider<BP> {
+    pub fn new<I: IntoIterator<Item = R>, R: Into<BuildSpecRef>>(provider: BP, mask: I) -> Self {
+        Self {
+            p: provider,
+            masked: mask.into_iter().map(|e| e.into()).collect(),
+        }
+    }
+
+    pub fn into_inner(self) -> BP {
+        self.p
+    }
+}
+
+impl<BP: BinProvider> BinProvider for MaskingBinProvider<BP> {
+    fn exists(&self, bsr: &BuildSpecRef) -> bool {
+        if self.masked.contains(bsr) {
+            false
+        } else {
+            self.p.exists(bsr)
+        }
     }
 }
 
@@ -131,7 +192,7 @@ pub use spec_hasher::SpecHasher;
 
 mod planner;
 pub use planner::Dep as PlannerDep;
-pub use planner::{BinProvider, ExecPlan, PlanErr};
+pub use planner::{ExecPlan, PlanErr};
 
 mod transitives;
 pub use transitives::Dep as TransitivesDep;

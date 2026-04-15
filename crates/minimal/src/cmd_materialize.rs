@@ -63,7 +63,7 @@ pub async fn cmd_materialize(args: MaterializeArgs, ctx: &mut Context) -> Result
     let cache = ctx.local_cache();
 
     // Make sure the packages are built for the target
-    crate::cmd_pkg::pkg_build_impl(&graph, ctx, cache.clone(), false, None).await?;
+    crate::cmd_pkg::pkg_build_impl(&graph, ctx, cache.clone(), false, false, None).await?;
 
     // Create the OCI image — arch is queried from graph.target()
     let mut op = op::OciImageCreate {

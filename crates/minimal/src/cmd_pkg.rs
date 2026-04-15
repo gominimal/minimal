@@ -11,6 +11,9 @@ pub struct PkgArgs {
     /// Whether to log stdout/stderr during the build
     #[arg(short, long, default_value_t = false)]
     verbose: bool,
+    /// Always build the specified packages, even if they are already available
+    #[arg(long, default_value_t = false)]
+    rebuild: bool,
 
     /// Packages to build
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args=0..)]
@@ -56,7 +59,7 @@ pub async fn cmd_pkg(args: PkgArgs, ctx: &mut Context) -> Result<(), Error> {
         None
     };
 
-    pkg_build_impl(&graph, ctx, cache, false, log_sink).await?;
+    pkg_build_impl(&graph, ctx, cache, false, args.rebuild, log_sink).await?;
 
     Ok(())
 }
@@ -66,6 +69,7 @@ pub async fn pkg_build_impl(
     ctx: &mut Context,
     cache: Cache,
     quiet: bool,
+    rebuild_top_level: bool,
     log_sink: Option<mpsc::UnboundedSender<BuildEvent>>,
 ) -> Result<(), Error> {
     trace!("build_impl");
@@ -73,7 +77,7 @@ pub async fn pkg_build_impl(
     let cancel = tokio_util::sync::CancellationToken::new();
     let cancel2 = cancel.clone();
     tokio::select! {
-        result = ctx.build_graph_with_cancel(graph, log_sink, cancel) => {
+        result = ctx.build_graph_with_cancel(graph, rebuild_top_level, log_sink, cancel) => {
             result?;
         }
         _ = tokio::signal::ctrl_c() => {
