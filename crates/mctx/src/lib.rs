@@ -20,7 +20,7 @@ pub use error::Error;
 mod config;
 pub use config::{Config, ConfigBuilder, ConfigError};
 mod env;
-use graph::{BuildSpecRef, Graph, Transitives};
+use graph::{BinProvider, BuildSpecRef, Graph, MaskingBinProvider, Transitives};
 use mfile::{EnvPatches, EnvVarValue, Task};
 pub use sandbox2::config::Invocation;
 
@@ -437,15 +437,22 @@ impl Context {
     pub async fn build_graph(
         &mut self,
         graph: &Graph,
+        rebuild_top_level: bool,
         log_sink: Option<futures::channel::mpsc::UnboundedSender<orchestrator::BuildEvent>>,
     ) -> Result<(), Error> {
-        self.build_graph_with_cancel(graph, log_sink, tokio_util::sync::CancellationToken::new())
-            .await
+        self.build_graph_with_cancel(
+            graph,
+            rebuild_top_level,
+            log_sink,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
     }
 
     pub async fn build_graph_with_cancel(
         &mut self,
         graph: &Graph,
+        rebuild_top_level: bool,
         log_sink: Option<futures::channel::mpsc::UnboundedSender<orchestrator::BuildEvent>>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<(), Error> {
@@ -470,32 +477,33 @@ impl Context {
             cancel,
         )?;
 
-        let (built, result) = match (
+        let mut bin_provider: Box<dyn BinProvider> = match (
             self.config.use_local_cache(),
             self.config.use_remote_cache(),
         ) {
             // No local or remote cache
-            (false, false) => LocalBackend::run_local_build(orchestrator, ()).await,
+            (false, false) => Box::new(()),
             // Both caches
             (true, true) => {
                 let local_adapter = CacheBinProvider::new(graph, cache.clone());
                 let remote_adapter = RemoteBinProvider::new(graph, rc.as_ref().unwrap());
-                LocalBackend::run_local_build(orchestrator, (local_adapter, remote_adapter)).await
+                Box::new((local_adapter, remote_adapter))
             }
             // Only remote cache
-            (false, true) => {
-                let remote_adapter = RemoteBinProvider::new(graph, rc.as_ref().unwrap());
-                LocalBackend::run_local_build(orchestrator, remote_adapter).await
-            }
+            (false, true) => Box::new(RemoteBinProvider::new(graph, rc.as_ref().unwrap())),
             // Only local cache
-            (true, false) => {
-                let local_adapter = CacheBinProvider::new(graph, cache.clone());
-                LocalBackend::run_local_build(orchestrator, local_adapter).await
-            }
+            (true, false) => Box::new(CacheBinProvider::new(graph, cache.clone())),
         };
+        if rebuild_top_level {
+            // Forcing a rebuild of named packages was requested. To do this, we wrap the BinProvider
+            // with one that pretends the named packages are never in any cache, resulting in a build for them.
+            bin_provider = Box::new(MaskingBinProvider::new(
+                bin_provider,
+                graph.top_levels.clone(),
+            ));
+        }
 
-        // let build_succeeded = run_result.is_ok();
-        // let error_message = run_result.as_ref().err().map(|e| e.to_string());
+        let (built, result) = LocalBackend::run_local_build(orchestrator, bin_provider).await;
 
         // commit all built artifacts to the local cache
         for (pending_dir, meta) in built {
@@ -603,7 +611,7 @@ impl Context {
 
         if !all_built {
             tracing::trace!("missing local packages, calling mctx.build_graph()");
-            self.build_graph(graph, None).await?;
+            self.build_graph(graph, false, None).await?;
         } else {
             tracing::trace!("all packages available locally, eluding build");
         }
@@ -870,7 +878,7 @@ mod tests {
 
         rt.block_on(async {
             let graph = ctx.graph_from_package_names(["uroot"]).unwrap();
-            ctx.build_graph(&graph, None).await.unwrap();
+            ctx.build_graph(&graph, false, None).await.unwrap();
 
             let temp_dir = ctx.local_cache().temp_dir().unwrap();
             let mut t = StandaloneTest {

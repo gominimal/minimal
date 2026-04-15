@@ -1,4 +1,4 @@
-use crate::{BuildDep, BuildSpecRef, Graph, SubsetInput, Transitives, transitives};
+use crate::{BinProvider, BuildDep, BuildSpecRef, Graph, SubsetInput, Transitives, transitives};
 use nickel_lang_core::term::IndexMap;
 use std::{
     collections::{HashMap, HashSet},
@@ -178,29 +178,6 @@ impl Dep {
             }
         }
         self
-    }
-}
-
-/// Types which can tell the planner what build-specs are built & available.
-pub trait BinProvider: std::fmt::Debug {
-    fn exists(&self, bsr: &BuildSpecRef) -> bool;
-}
-
-impl BinProvider for () {
-    fn exists(&self, _bsr: &BuildSpecRef) -> bool {
-        false
-    }
-}
-
-impl<BP1: BinProvider, BP2: BinProvider> BinProvider for (BP1, BP2) {
-    fn exists(&self, bsr: &BuildSpecRef) -> bool {
-        self.0.exists(bsr) || self.1.exists(bsr)
-    }
-}
-
-impl<BP1: BinProvider, BP2: BinProvider, BP3: BinProvider> BinProvider for (BP1, BP2, BP3) {
-    fn exists(&self, bsr: &BuildSpecRef) -> bool {
-        self.0.exists(bsr) || self.1.exists(bsr) || self.2.exists(bsr)
     }
 }
 
