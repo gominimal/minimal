@@ -259,6 +259,7 @@ where
         &mut self,
         verbose: bool,
         commit_results: bool,
+        rebuild_top_levels: bool,
         remote_cache_bucket: Option<String>,
         log_sink: Option<mpsc::UnboundedSender<BuildEvent>>,
     ) -> Result<(), Error> {
@@ -304,6 +305,7 @@ where
                     graph_stream: Some(graph_config),
                     verbose,
                     commit: commit_results,
+                    rebuild_top_levels,
                     remote_cache_gcs_bucket: remote_cache_bucket,
                 })),
             }
