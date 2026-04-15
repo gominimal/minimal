@@ -138,21 +138,16 @@ pub struct GlobalArgs {
     stdlib_dir: Option<PathBuf>,
 
     /// Ignore locally-available binary artifacts (results in rebuilds unless present in a remote cache)
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, global = true)]
     no_cache: bool,
 
     /// Do not fetch binary artifacts from the internet
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, global = true)]
     no_fetch: bool,
 
     /// Configure the number of parallel builds
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     num_parallel_builds: Option<usize>,
-
-    /// Write build events to a protobuf text format file
-    #[arg(long)]
-    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
-    build_events_file: Option<PathBuf>,
 }
 
 pub(crate) fn enforce_science_mode() -> Result<(), Error> {
