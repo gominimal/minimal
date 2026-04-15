@@ -19,6 +19,10 @@ pub struct RemoteBuildArgs {
     #[arg(long, default_value_t = false)]
     pub commit: bool,
 
+    /// Build all named packages, even if they are already available
+    #[arg(long, default_value_t = false)]
+    pub rebuild: bool,
+
     /// Packages to build
     #[arg(long, short, required = true, num_args = 1..)]
     pub packages: Vec<String>,
@@ -36,6 +40,7 @@ pub async fn cmd_remote_build(args: RemoteBuildArgs, ctx: &mut Context) -> Resul
         .build(
             args.verbose,
             args.commit,
+            args.rebuild,
             Some("minimal-staging-cache".to_string()),
             None,
         )

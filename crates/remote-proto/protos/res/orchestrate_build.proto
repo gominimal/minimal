@@ -25,6 +25,8 @@ message OrchestrateBuildRequest {
   bool commit = 4;
   // Configure the provided GCS bucket name as the remote cache.
   optional string remote_cache_gcs_bucket = 5;
+  // Always build the toplevels in the given graph, even if they are available.
+  bool rebuild_top_levels = 6;
 }
 
 message OrchestrateBuildResponse {
