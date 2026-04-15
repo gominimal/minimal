@@ -18,7 +18,10 @@ impl<'a, B: common::fetchers::FetchBackend> RemoteBinProvider<'a, B> {
     }
 }
 
-impl<'a, B: common::fetchers::FetchBackend> graph::BinProvider for RemoteBinProvider<'a, B> {
+impl<'a, B: common::fetchers::FetchBackend + Sync> graph::BinProvider for RemoteBinProvider<'a, B>
+where
+    B::Url: Sync + Send,
+{
     fn exists(&self, bsr: &graph::BuildSpecRef) -> bool {
         self.remote.exists(&self.graph.spec_hash(bsr))
     }
