@@ -28,7 +28,8 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-1-
       - name: Build
         run: cargo build --verbose
       - name: Run tests
@@ -37,6 +38,10 @@ jobs:
         run: cargo fmt -- --check
       - name: Run Clippy
         run: cargo clippy --all-targets -- -D warnings
+      - name: Trim cargo cache
+        run: |
+          cargo install cargo-cache --no-default-features --features ci-autoclean
+          cargo-cache
 
   build-in-minimal:
     runs-on: ubuntu-latest
