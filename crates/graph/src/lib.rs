@@ -116,7 +116,7 @@ impl BuildSpecRef {
 }
 
 /// Something which indicates what builds are done + useable from some cache.
-pub trait BinProvider: std::fmt::Debug {
+pub trait BinProvider: std::fmt::Debug + Send {
     fn exists(&self, bsr: &BuildSpecRef) -> bool;
 }
 
