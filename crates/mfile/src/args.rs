@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// The leaf scalar types an argument can have.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,20 +15,98 @@ pub enum ArgSpec {
     Scalar(ArgPrimitive),
     /// An array whose elements are the given primitive type.
     Array(ArgPrimitive),
+    /// An exhaustive enumeration of mutually-exclusive options.
+    Enum(BTreeSet<String>),
 }
 
 impl TryFrom<&str> for ArgPrimitive {
-    type Error = String;
+    type Error = ();
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         match s.to_ascii_lowercase().as_str() {
             "string" => Ok(ArgPrimitive::String),
             "number" => Ok(ArgPrimitive::Number),
             "boolean" | "bool" => Ok(ArgPrimitive::Boolean),
-            other => Err(format!(
-                "unknown type `{other}`, expected `string`, `number`, or `boolean`"
-            )),
+            _ => Err(()),
         }
     }
+}
+
+/// Parse an enum spec string of the form `[opt1, opt2, "opt 3"]` into its options.
+///
+/// Whitespace around options is trimmed. Options may optionally be quoted with
+/// double quotes, which allows commas and leading/trailing whitespace within a
+/// value. Returns an error if the input is not wrapped in `[]` or contains
+/// malformed quoting.
+fn parse_enum_spec(s: &str) -> Result<BTreeSet<String>, String> {
+    let s = s.trim();
+    let inner = s
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| format!("enum spec must be wrapped in `[]`, got `{s}`"))?;
+
+    let mut opts = BTreeSet::new();
+    let mut chars = inner.chars().peekable();
+
+    loop {
+        // Skip leading whitespace before the next option.
+        while chars.peek() == Some(&' ') || chars.peek() == Some(&'\t') {
+            chars.next();
+        }
+
+        // End of input — we're done.
+        if chars.peek().is_none() {
+            break;
+        }
+
+        let value = if chars.peek() == Some(&'"') {
+            // Quoted option: consume until the closing `"`.
+            chars.next(); // opening quote
+            let mut buf = String::new();
+            loop {
+                match chars.next() {
+                    Some('"') => break,
+                    Some(c) => buf.push(c),
+                    None => return Err("unterminated quote in enum spec".to_string()),
+                }
+            }
+            buf
+        } else {
+            // Unquoted option: consume until `,` or end.
+            let mut buf = String::new();
+            while let Some(&c) = chars.peek() {
+                if c == ',' {
+                    break;
+                }
+                buf.push(c);
+                chars.next();
+            }
+            let trimmed = buf.trim().to_string();
+            if trimmed.is_empty() {
+                return Err("empty option in enum spec".to_string());
+            }
+            trimmed
+        };
+
+        opts.insert(value);
+
+        // Skip whitespace after the value, then expect `,` or end.
+        while chars.peek() == Some(&' ') || chars.peek() == Some(&'\t') {
+            chars.next();
+        }
+        match chars.peek() {
+            Some(&',') => {
+                chars.next();
+            }
+            Some(c) => return Err(format!("unexpected character `{c}` in enum spec")),
+            None => break,
+        }
+    }
+
+    if opts.is_empty() {
+        return Err("enum spec must contain at least one option".to_string());
+    }
+
+    Ok(opts)
 }
 
 impl TryFrom<&str> for ArgSpec {
@@ -38,16 +116,26 @@ impl TryFrom<&str> for ArgSpec {
             .strip_prefix("Array ")
             .or_else(|| s.strip_prefix("array "))
         {
-            Ok(ArgSpec::Array(ArgPrimitive::try_from(rest)?))
-        } else {
-            Ok(ArgSpec::Scalar(ArgPrimitive::try_from(s)?))
+            return Ok(ArgSpec::Array(
+                ArgPrimitive::try_from(rest)
+                    .map_err(|_| format!("invalid array primitive `{rest}`"))?,
+            ));
         }
+        if let Ok(primitive) = ArgPrimitive::try_from(s) {
+            return Ok(ArgSpec::Scalar(primitive));
+        }
+
+        if s.trim().starts_with('[') {
+            return Ok(ArgSpec::Enum(parse_enum_spec(s)?));
+        }
+
+        Err(format!("unknown spec `{s}`"))
     }
 }
 
 impl<'de> serde::Deserialize<'de> for ArgSpec {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        use serde::de::{self, MapAccess, Visitor};
+        use serde::de::{self, MapAccess, SeqAccess, Visitor};
 
         struct ArgSpecVisitor;
 
@@ -57,7 +145,8 @@ impl<'de> serde::Deserialize<'de> for ArgSpec {
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                 write!(
                     f,
-                    "a type string (\"string\", \"number\", \"boolean\", \"Array string\") or {{type = \"...\"}}"
+                    "a type string (\"string\", \"number\", \"boolean\", \"Array string\"), \
+                     an array of strings, or {{type = \"...\"}}"
                 )
             }
 
@@ -67,6 +156,19 @@ impl<'de> serde::Deserialize<'de> for ArgSpec {
 
             fn visit_string<E: de::Error>(self, v: String) -> Result<ArgSpec, E> {
                 self.visit_str(&v)
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<ArgSpec, A::Error> {
+                let mut opts = BTreeSet::new();
+                while let Some(val) = seq.next_element::<String>()? {
+                    opts.insert(val);
+                }
+                if opts.is_empty() {
+                    return Err(de::Error::custom(
+                        "enum spec must contain at least one option",
+                    ));
+                }
+                Ok(ArgSpec::Enum(opts))
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<ArgSpec, A::Error> {
@@ -104,6 +206,13 @@ impl ArgSpec {
         match self {
             ArgSpec::Scalar(p) => p.to_string(),
             ArgSpec::Array(p) => format!("Array {p}"),
+            ArgSpec::Enum(opts) => format!(
+                "[{}]",
+                opts.iter()
+                    .map(|s| format!("\"{s}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         }
     }
 }
@@ -127,7 +236,7 @@ pub struct TaskArg {
 
 impl<'de> serde::Deserialize<'de> for TaskArg {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        use serde::de::{self, MapAccess, Visitor};
+        use serde::de::{self, MapAccess, SeqAccess, Visitor};
 
         struct TaskArgVisitor;
 
@@ -137,7 +246,7 @@ impl<'de> serde::Deserialize<'de> for TaskArg {
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                 write!(
                     f,
-                    "a type string, or a table with `type` (and optional `help`)"
+                    "a type string, an array of strings, or a table with `type` (and optional `help`)"
                 )
             }
 
@@ -150,6 +259,22 @@ impl<'de> serde::Deserialize<'de> for TaskArg {
 
             fn visit_string<E: de::Error>(self, v: String) -> Result<TaskArg, E> {
                 self.visit_str(&v)
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<TaskArg, A::Error> {
+                let mut opts = BTreeSet::new();
+                while let Some(val) = seq.next_element::<String>()? {
+                    opts.insert(val);
+                }
+                if opts.is_empty() {
+                    return Err(de::Error::custom(
+                        "enum spec must contain at least one option",
+                    ));
+                }
+                Ok(TaskArg {
+                    spec: ArgSpec::Enum(opts),
+                    help: None,
+                })
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<TaskArg, A::Error> {
@@ -199,6 +324,8 @@ enum ArgKind {
     Scalar(ArgPrimitive),
     /// Repeated scalar: `--tag a --tag b` → array.
     ScalarArray(ArgPrimitive),
+    /// A string from a set of options
+    Enum(BTreeSet<String>),
 }
 
 /// Parse a string value into a [toml::Value] according to the given primitive type.
@@ -272,6 +399,7 @@ impl TaskArgs {
     /// | `arg = "boolean"` | `--arg true` | `arg = true` |
     /// | `arg = "Array string"` | `--arg a --arg b` | `arg = ["a", "b"]` |
     /// | `arg = "Array number"` | `--arg 1 --arg 2` | `arg = [1, 2]` |
+    /// | `arg = "[a, b]"` | `--arg a` | `arg = a` |
     pub fn parse_argv_named<I, T>(
         &self,
         display_name: &str,
@@ -291,31 +419,26 @@ impl TaskArgs {
                 let kind = match &ta.spec {
                     ArgSpec::Scalar(p) => ArgKind::Scalar(p.clone()),
                     ArgSpec::Array(p) => ArgKind::ScalarArray(p.clone()),
+                    ArgSpec::Enum(o) => ArgKind::Enum(o.clone()),
                 };
                 (name.clone(), kind)
             })
             .collect();
 
         // Build a clap command. One flag per top-level arg name.
-        // Clap requires 'static str for arg names; leak is fine for a
-        // small, bounded set of names per task schema.
-        let leaked_names: Vec<&'static str> = arg_kinds
-            .iter()
-            .map(|(n, _)| &*Box::leak(n.clone().into_boxed_str()))
-            .collect();
-        let leaked_display: &'static str = &*Box::leak(display_name.to_string().into_boxed_str());
-        let mut cmd = Command::new(leaked_display).no_binary_name(true);
-        for (i, (_, kind)) in arg_kinds.iter().enumerate() {
-            let action = match kind {
-                ArgKind::ScalarArray(_) => ArgAction::Append,
-                _ => ArgAction::Set,
-            };
-            cmd = cmd.arg(
-                Arg::new(leaked_names[i])
-                    .long(leaked_names[i])
-                    .required(true)
-                    .action(action),
-            );
+        let mut cmd = Command::new(display_name.to_string()).no_binary_name(true);
+        for (n, kind) in arg_kinds.iter() {
+            let mut arg = Arg::new(n.clone())
+                .long(n.clone())
+                .required(true)
+                .action(match kind {
+                    ArgKind::ScalarArray(_) => ArgAction::Append,
+                    _ => ArgAction::Set,
+                });
+            if let ArgKind::Enum(opts) = kind {
+                arg = arg.value_parser(opts.iter().cloned().collect::<Vec<_>>());
+            }
+            cmd = cmd.arg(arg);
         }
 
         let matches = cmd.clone().try_get_matches_from(args)?;
@@ -325,20 +448,27 @@ impl TaskArgs {
 
         // Reconstruct a toml table from the matches.
         let mut root = toml::map::Map::new();
-        for (i, (name, kind)) in arg_kinds.iter().enumerate() {
-            let cli_name = leaked_names[i];
+        for (name, kind) in arg_kinds.iter() {
             match kind {
                 ArgKind::Scalar(p) => {
-                    if let Some(raw) = matches.get_one::<String>(cli_name) {
+                    if let Some(raw) = matches.get_one::<String>(name) {
                         root.insert(name.clone(), parse_primitive(raw, p).map_err(&val_err)?);
                     }
                 }
                 ArgKind::ScalarArray(p) => {
-                    if let Some(values) = matches.get_many::<String>(cli_name) {
+                    if let Some(values) = matches.get_many::<String>(name) {
                         let arr: Result<Vec<toml::Value>, clap::Error> = values
                             .map(|v| parse_primitive(v, p).map_err(&val_err))
                             .collect();
                         root.insert(name.clone(), toml::Value::Array(arr?));
+                    }
+                }
+                ArgKind::Enum(_) => {
+                    if let Some(raw) = matches.get_one::<String>(name) {
+                        root.insert(
+                            name.clone(),
+                            parse_primitive(raw, &ArgPrimitive::String).map_err(&val_err)?,
+                        );
                     }
                 }
             }
@@ -362,6 +492,7 @@ mod tests {
             exec = "echo"
             args.name = "string"
             args.tags = "Array number"
+            args.enum = "[a, b, c-eeee]"
             args.input = {type = "string", help = "something"}
         "#})
         .unwrap();
@@ -380,6 +511,29 @@ mod tests {
                 help: Some("something".to_string()),
             }
         );
+        assert_eq!(
+            t.args.0.get("enum").unwrap().spec,
+            ArgSpec::Enum(BTreeSet::from_iter(
+                vec!["a".to_string(), "b".to_string(), "c-eeee".to_string()].into_iter()
+            ))
+        );
+    }
+
+    #[test]
+    fn deser_enum_from_array() {
+        use crate::Task;
+
+        let t: Task = toml::from_str(indoc! {r#"
+            exec = "echo"
+            args.mode = ["debug", "release"]
+        "#})
+        .unwrap();
+        assert_eq!(
+            t.args.0.get("mode").unwrap().spec,
+            ArgSpec::Enum(BTreeSet::from(
+                ["debug".to_string(), "release".to_string(),]
+            ))
+        );
     }
 
     #[test]
@@ -392,16 +546,18 @@ mod tests {
             args.count = "number"
             args.verbose = "boolean"
             args.tags = "Array string"
+            args.enum = "[a, b]"
         "#})
         .unwrap();
 
         let result = t
             .args
-            .parse("--name hello --count 42 --verbose true --tags a --tags b")
+            .parse("--name hello --count 42 --verbose true --tags a --tags b --enum a")
             .unwrap();
         let table = result.as_table().unwrap();
         assert_eq!(table.get("name").unwrap().as_str().unwrap(), "hello");
         assert_eq!(table.get("count").unwrap().as_integer().unwrap(), 42);
+        assert_eq!(table.get("enum").unwrap().as_str().unwrap(), "a");
         assert!(table.get("verbose").unwrap().as_bool().unwrap());
         let arr = table.get("tags").unwrap().as_array().unwrap();
         assert_eq!(arr.len(), 2);
@@ -416,6 +572,7 @@ mod tests {
             exec = "echo"
             args.name = "string"
             args.flag = "boolean"
+            args.enum = "[a, b]"
         "#})
         .unwrap();
 
@@ -425,5 +582,63 @@ mod tests {
         assert!(t.args.parse("--name hello --flag true --bogus x").is_err());
         // Invalid boolean
         assert!(t.args.parse("--name hello --flag yes").is_err());
+        // Invalid enum
+        assert!(t.args.parse("--name hello --flag true --enum c").is_err());
+    }
+
+    #[test]
+    fn parse_enum_spec_basic() {
+        let opts = parse_enum_spec("[a, b, c]").unwrap();
+        assert_eq!(
+            opts,
+            BTreeSet::from(["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_enum_spec_quoted() {
+        let opts = parse_enum_spec(r#"["hello world", "foo,] bar", baz]"#).unwrap();
+        assert_eq!(
+            opts,
+            BTreeSet::from([
+                "hello world".to_string(),
+                "foo,] bar".to_string(),
+                "baz".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_enum_spec_whitespace() {
+        let opts = parse_enum_spec("[  alpha ,  beta  , gamma  ]").unwrap();
+        assert_eq!(
+            opts,
+            BTreeSet::from(["alpha".to_string(), "beta".to_string(), "gamma".to_string(),])
+        );
+    }
+
+    #[test]
+    fn parse_enum_spec_single() {
+        let opts = parse_enum_spec("[only]").unwrap();
+        assert_eq!(opts, BTreeSet::from(["only".to_string()]));
+    }
+
+    #[test]
+    fn parse_enum_spec_errors() {
+        assert!(parse_enum_spec("not brackets").is_err());
+        assert!(parse_enum_spec("[]").is_err());
+        assert!(parse_enum_spec("[a, , b]").is_err());
+        assert!(parse_enum_spec(r#"["unterminated]"#).is_err());
+    }
+
+    #[test]
+    fn argspec_try_from_enum() {
+        let spec = ArgSpec::try_from("[debug, release]").unwrap();
+        assert_eq!(
+            spec,
+            ArgSpec::Enum(BTreeSet::from(
+                ["debug".to_string(), "release".to_string(),]
+            ))
+        );
     }
 }
