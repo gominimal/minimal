@@ -1,53 +1,145 @@
-//! Typed arguments support for tasks & sideloads.
+//! Types for defining the schema of arguments of `mfile::Task` & parameters to sideloads.
+//!
+//!  * [Arg] / [ScalarArg]: A concrete argument value.
+//!  * [ArgSchema]: The type of an argument.
+//!  * [ArgSpec]: The type of an argument, combined with metadata such as help text.
+//!    [ArgSpec::parse] can be used to parse a string representing the invocation of
+//!    these arguments into their concrete values.
+//!  * [ArgsSpec]: Newtype around a map of argument names to [ArgSpec] (schema) descriptions.
+//!
+//!  A concrete set of arguments is represented using `HashMap<String, Arg>`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::{
+    collections::{BTreeSet, HashMap},
+    hash::Hash,
+};
+
+/// Deterministic hash of the value of a set of arguments.
+pub fn hash_args<H: std::hash::Hasher>(args: &HashMap<String, Arg>, state: &mut H) {
+    let keys: BTreeSet<_> = args.keys().cloned().collect();
+    for k in keys.into_iter() {
+        k.hash(state);
+        args.get(&k).unwrap().hash(state);
+    }
+}
+
+/// A scalar argument value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScalarArg {
+    String(String),
+    Number(f64),
+    Boolean(bool),
+}
+
+impl Hash for ScalarArg {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Self::String(s) => s.hash(state),
+            Self::Number(n) => n.to_le_bytes().hash(state),
+            Self::Boolean(b) => b.hash(state),
+        }
+    }
+}
+
+impl ScalarArg {
+    /// Append the nickel literal representation of this value to `buf`.
+    pub fn write_nickel(&self, buf: &mut String) {
+        match self {
+            ScalarArg::String(s) => {
+                buf.push('"');
+                buf.push_str(s);
+                buf.push('"');
+            }
+            ScalarArg::Number(f) => buf.push_str(&f.to_string()),
+            ScalarArg::Boolean(b) => buf.push_str(if *b { "true" } else { "false" }),
+        }
+    }
+}
+
+/// An argument value.
+#[derive(Debug, Clone, Hash, PartialEq)]
+pub enum Arg {
+    Scalar(ScalarArg),
+    Array(Vec<ScalarArg>),
+    Enum(String),
+}
+
+impl Arg {
+    /// Append the nickel literal representation of this value to `buf`.
+    pub fn write_nickel(&self, buf: &mut String) {
+        match self {
+            Arg::Scalar(s) => s.write_nickel(buf),
+            Arg::Enum(s) => {
+                buf.push('"');
+                buf.push_str(s);
+                buf.push('"');
+            }
+            Arg::Array(v) => {
+                buf.push('[');
+                for (i, s) in v.iter().enumerate() {
+                    if i > 0 {
+                        buf.push_str(", ");
+                    }
+                    s.write_nickel(buf);
+                }
+                buf.push(']');
+            }
+        }
+    }
+
+    /// Write a `let <ident> = <value> in\n` binding into `buf`.
+    pub fn write_nickel_binding(&self, ident: &str, buf: &mut String) {
+        buf.push_str("let ");
+        buf.push_str(ident);
+        buf.push_str(" = ");
+        self.write_nickel(buf);
+        buf.push_str(" in\n");
+    }
+}
 
 /// The leaf scalar types an argument can have.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ArgPrimitive {
+pub enum PrimitiveSpec {
     String,
     Number,
     Boolean,
 }
 
-impl std::fmt::Display for ArgPrimitive {
+impl std::fmt::Display for PrimitiveSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ArgPrimitive::String => f.write_str("string"),
-            ArgPrimitive::Number => f.write_str("number"),
-            ArgPrimitive::Boolean => f.write_str("boolean"),
+            PrimitiveSpec::String => f.write_str("string"),
+            PrimitiveSpec::Number => f.write_str("number"),
+            PrimitiveSpec::Boolean => f.write_str("boolean"),
         }
     }
 }
 
-impl TryFrom<&str> for ArgPrimitive {
+impl TryFrom<&str> for PrimitiveSpec {
     type Error = ();
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         match s.to_ascii_lowercase().as_str() {
-            "string" => Ok(ArgPrimitive::String),
-            "number" => Ok(ArgPrimitive::Number),
-            "boolean" | "bool" => Ok(ArgPrimitive::Boolean),
+            "string" => Ok(PrimitiveSpec::String),
+            "number" => Ok(PrimitiveSpec::Number),
+            "boolean" | "bool" => Ok(PrimitiveSpec::Boolean),
             _ => Err(()),
         }
     }
 }
 
-/// Parse a string value into a [toml::Value] according to the given primitive type.
-fn parse_primitive(s: &str, p: &ArgPrimitive) -> Result<toml::Value, String> {
+/// Parse a string value into a [ScalarArg] according to the given primitive type.
+fn parse_primitive(s: &str, p: &PrimitiveSpec) -> Result<ScalarArg, String> {
     match p {
-        ArgPrimitive::String => Ok(toml::Value::String(s.to_string())),
-        ArgPrimitive::Number => {
-            if let Ok(i) = s.parse::<i64>() {
-                Ok(toml::Value::Integer(i))
-            } else if let Ok(f) = s.parse::<f64>() {
-                Ok(toml::Value::Float(f))
-            } else {
-                Err(format!("expected a number, got `{s}`"))
-            }
+        PrimitiveSpec::String => Ok(ScalarArg::String(s.to_string())),
+        PrimitiveSpec::Number => {
+            let f: f64 = s
+                .parse()
+                .map_err(|_| format!("expected a number, got `{s}`"))?;
+            Ok(ScalarArg::Number(f))
         }
-        ArgPrimitive::Boolean => match s {
-            "true" => Ok(toml::Value::Boolean(true)),
-            "false" => Ok(toml::Value::Boolean(false)),
+        PrimitiveSpec::Boolean => match s {
+            "true" => Ok(ScalarArg::Boolean(true)),
+            "false" => Ok(ScalarArg::Boolean(false)),
             _ => Err(format!("expected `true` or `false`, got `{s}`")),
         },
     }
@@ -57,9 +149,9 @@ fn parse_primitive(s: &str, p: &ArgPrimitive) -> Result<toml::Value, String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArgSchema {
     /// A single scalar value: "string", "number", or "boolean".
-    Scalar(ArgPrimitive),
+    Scalar(PrimitiveSpec),
     /// An array whose elements are the given primitive type.
-    Array(ArgPrimitive),
+    Array(PrimitiveSpec),
     /// An exhaustive enumeration of mutually-exclusive options.
     Enum(BTreeSet<String>),
 }
@@ -72,11 +164,11 @@ impl TryFrom<&str> for ArgSchema {
             .or_else(|| s.strip_prefix("array "))
         {
             return Ok(ArgSchema::Array(
-                ArgPrimitive::try_from(rest)
+                PrimitiveSpec::try_from(rest)
                     .map_err(|_| format!("invalid array primitive `{rest}`"))?,
             ));
         }
-        if let Ok(primitive) = ArgPrimitive::try_from(s) {
+        if let Ok(primitive) = PrimitiveSpec::try_from(s) {
             return Ok(ArgSchema::Scalar(primitive));
         }
 
@@ -132,7 +224,7 @@ impl<'de> serde::Deserialize<'de> for ArgSchema {
                     if key == "type" {
                         type_str = Some(map.next_value()?);
                     } else {
-                        map.next_value::<toml::Value>()?; // skip unknown
+                        map.next_value::<de::IgnoredAny>()?; // skip unknown
                     }
                 }
                 let s =
@@ -308,7 +400,7 @@ impl<'de> serde::Deserialize<'de> for ArgSpec {
                         "type" => type_str = Some(map.next_value()?),
                         "help" => help = Some(map.next_value()?),
                         _ => {
-                            map.next_value::<toml::Value>()?; // skip unknown
+                            map.next_value::<de::IgnoredAny>()?; // skip unknown
                         }
                     }
                 }
@@ -339,19 +431,20 @@ impl serde::Serialize for ArgSpec {
 
 /// A set of arguments defined together.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct ArgSet(pub HashMap<String, ArgSpec>);
+pub struct ArgsSpec(pub HashMap<String, ArgSpec>);
 
-impl ArgSet {
+impl ArgsSpec {
     /// Returns true if no arguments are defined.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
     /// Parse a CLI argument string (e.g. `"--count 42 --name foo"`) according
-    /// to this schema, returning the parsed values as a [toml::Value::Table].
+    /// to this schema, returning the parsed values as a map of argument names
+    /// to [Arg] values.
     ///
     /// Shell quoting is handled via `shlex`.
-    pub fn parse(&self, args: &str) -> Result<toml::Value, clap::Error> {
+    pub fn parse(&self, args: &str) -> Result<HashMap<String, Arg>, clap::Error> {
         let argv = shlex::split(args).ok_or_else(|| {
             clap::Command::new("task").no_binary_name(true).error(
                 clap::error::ErrorKind::InvalidValue,
@@ -362,11 +455,11 @@ impl ArgSet {
     }
 
     /// Parse pre-split CLI arguments according to this schema, returning the
-    /// parsed values as a [toml::Value::Table].
+    /// parsed values as a map of argument names to [Arg] values.
     ///
     /// Equivalent to [`parse_argv_named`](Self::parse_argv_named) with a
     /// display name of `"task"`.
-    pub fn parse_argv<I, T>(&self, args: I) -> Result<toml::Value, clap::Error>
+    pub fn parse_argv<I, T>(&self, args: I) -> Result<HashMap<String, Arg>, clap::Error>
     where
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
@@ -375,7 +468,7 @@ impl ArgSet {
     }
 
     /// Parse pre-split CLI arguments according to this schema, returning the
-    /// parsed values as a [toml::Value::Table].
+    /// parsed values as a map of argument names to [Arg] values.
     ///
     /// `display_name` controls the program name shown in clap's usage/error
     /// output (e.g. `"minimal run smoketest"`).
@@ -386,34 +479,33 @@ impl ArgSet {
     ///
     /// | Schema | CLI | Result |
     /// |--------|-----|--------|
-    /// | `arg = "string"` | `--arg foo` | `arg = "foo"` |
-    /// | `arg = "number"` | `--arg 42` | `arg = 42` |
-    /// | `arg = "boolean"` | `--arg true` | `arg = true` |
-    /// | `arg = "Array string"` | `--arg a --arg b` | `arg = ["a", "b"]` |
-    /// | `arg = "Array number"` | `--arg 1 --arg 2` | `arg = [1, 2]` |
-    /// | `arg = "[a, b]"` | `--arg a` | `arg = a` |
+    /// | `arg = "string"` | `--arg foo` | `Arg::Scalar(ScalarArg::String("foo"))` |
+    /// | `arg = "number"` | `--arg 42` | `Arg::Scalar(ScalarArg::Number(42.0))` |
+    /// | `arg = "boolean"` | `--arg true` | `Arg::Scalar(ScalarArg::Boolean(true))` |
+    /// | `arg = "Array string"` | `--arg a --arg b` | `Arg::Array(vec![..])` |
+    /// | `arg = "Array number"` | `--arg 1 --arg 2` | `Arg::Array(vec![..])` |
+    /// | `arg = "[a, b]"` | `--arg a` | `Arg::Enum("a")` |
     pub fn parse_argv_named<I, T>(
         &self,
         display_name: &str,
         args: I,
-    ) -> Result<toml::Value, clap::Error>
+    ) -> Result<HashMap<String, Arg>, clap::Error>
     where
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
     {
-        use clap::{Arg, ArgAction, Command};
+        use clap::{Arg as ClapArg, ArgAction, Command};
 
         // Build a clap command. One flag per top-level arg name.
         let mut cmd = Command::new(display_name.to_string()).no_binary_name(true);
         for (n, ta) in self.0.iter() {
-            let mut arg =
-                Arg::new(n.clone())
-                    .long(n.clone())
-                    .required(true)
-                    .action(match &ta.spec {
-                        ArgSchema::Array(_) => ArgAction::Append,
-                        _ => ArgAction::Set,
-                    });
+            let mut arg = ClapArg::new(n.clone())
+                .long(n.clone())
+                .required(true)
+                .action(match &ta.spec {
+                    ArgSchema::Array(_) => ArgAction::Append,
+                    _ => ArgAction::Set,
+                });
             if let ArgSchema::Enum(opts) = &ta.spec {
                 arg = arg.value_parser(opts.iter().cloned().collect::<Vec<_>>());
             }
@@ -425,35 +517,34 @@ impl ArgSet {
         // Helper to produce a clap value-validation error.
         let val_err = |msg: String| cmd.clone().error(clap::error::ErrorKind::InvalidValue, msg);
 
-        // Reconstruct a toml table from the matches.
-        let mut root = toml::map::Map::new();
+        let mut result = HashMap::new();
         for (name, ta) in self.0.iter() {
             match &ta.spec {
                 ArgSchema::Scalar(p) => {
                     if let Some(raw) = matches.get_one::<String>(name) {
-                        root.insert(name.clone(), parse_primitive(raw, p).map_err(&val_err)?);
+                        result.insert(
+                            name.clone(),
+                            Arg::Scalar(parse_primitive(raw, p).map_err(&val_err)?),
+                        );
                     }
                 }
                 ArgSchema::Array(p) => {
                     if let Some(values) = matches.get_many::<String>(name) {
-                        let arr: Result<Vec<toml::Value>, clap::Error> = values
+                        let arr: Result<Vec<ScalarArg>, clap::Error> = values
                             .map(|v| parse_primitive(v, p).map_err(&val_err))
                             .collect();
-                        root.insert(name.clone(), toml::Value::Array(arr?));
+                        result.insert(name.clone(), Arg::Array(arr?));
                     }
                 }
                 ArgSchema::Enum(_) => {
                     if let Some(raw) = matches.get_one::<String>(name) {
-                        root.insert(
-                            name.clone(),
-                            parse_primitive(raw, &ArgPrimitive::String).map_err(&val_err)?,
-                        );
+                        result.insert(name.clone(), Arg::Enum(raw.clone()));
                     }
                 }
             }
         }
 
-        Ok(toml::Value::Table(root))
+        Ok(result)
     }
 }
 
@@ -467,7 +558,7 @@ mod tests {
     #[derive(serde::Deserialize)]
     struct ArgsOnly {
         #[serde(default)]
-        args: ArgSet,
+        args: ArgsSpec,
     }
 
     #[test]
@@ -482,16 +573,16 @@ mod tests {
         .unwrap();
         assert_eq!(
             t.args.0.get("name").unwrap().spec,
-            ArgSchema::Scalar(ArgPrimitive::String)
+            ArgSchema::Scalar(PrimitiveSpec::String)
         );
         assert_eq!(
             t.args.0.get("tags").unwrap().spec,
-            ArgSchema::Array(ArgPrimitive::Number)
+            ArgSchema::Array(PrimitiveSpec::Number)
         );
         assert_eq!(
             t.args.0.get("input").unwrap(),
             &ArgSpec {
-                spec: ArgSchema::Scalar(ArgPrimitive::String),
+                spec: ArgSchema::Scalar(PrimitiveSpec::String),
                 help: Some("something".to_string()),
             }
         );
@@ -532,14 +623,26 @@ mod tests {
             .args
             .parse("--name hello --count 42 --verbose true --tags a --tags b --enum a")
             .unwrap();
-        let table = result.as_table().unwrap();
-        assert_eq!(table.get("name").unwrap().as_str().unwrap(), "hello");
-        assert_eq!(table.get("count").unwrap().as_integer().unwrap(), 42);
-        assert_eq!(table.get("enum").unwrap().as_str().unwrap(), "a");
-        assert!(table.get("verbose").unwrap().as_bool().unwrap());
-        let arr = table.get("tags").unwrap().as_array().unwrap();
-        assert_eq!(arr.len(), 2);
-        assert_eq!(arr[0].as_str().unwrap(), "a");
+        assert_eq!(
+            result.get("name").unwrap(),
+            &Arg::Scalar(ScalarArg::String("hello".to_string()))
+        );
+        assert_eq!(
+            result.get("count").unwrap(),
+            &Arg::Scalar(ScalarArg::Number(42.0))
+        );
+        assert_eq!(result.get("enum").unwrap(), &Arg::Enum("a".to_string()));
+        assert_eq!(
+            result.get("verbose").unwrap(),
+            &Arg::Scalar(ScalarArg::Boolean(true))
+        );
+        assert_eq!(
+            result.get("tags").unwrap(),
+            &Arg::Array(vec![
+                ScalarArg::String("a".to_string()),
+                ScalarArg::String("b".to_string()),
+            ])
+        );
     }
 
     #[test]

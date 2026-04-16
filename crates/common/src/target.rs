@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 
 /// A supported CPU architecture.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Arch {
     #[default]
     Amd64,
@@ -20,7 +20,7 @@ impl Arch {
 }
 
 /// A supported OS.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OS {
     #[default]
     Linux,
@@ -37,7 +37,7 @@ impl OS {
 }
 
 /// The description of a system where software runs.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Target {
     arch: Arch,
     os: OS,

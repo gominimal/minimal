@@ -9,51 +9,11 @@ pub struct VarCtx {
 }
 
 impl VarCtx {
-    pub fn new<S: AsRef<str>, I: IntoIterator<Item = (S, toml::Value)>>(values: I) -> Self {
+    pub fn new<S: AsRef<str>, I: IntoIterator<Item = (S, args::Arg)>>(values: I) -> Self {
         let mut base = String::with_capacity(512);
         for (ident, value) in values.into_iter() {
-            base.push_str("let ");
-            base.push_str(ident.as_ref());
-            base.push_str(" = ");
-            match value {
-                toml::Value::Boolean(b) => {
-                    if b {
-                        base.push_str("true")
-                    } else {
-                        base.push_str("false")
-                    }
-                }
-                toml::Value::Float(f) => base.push_str(&f.to_string()),
-                toml::Value::String(s) => {
-                    base.push('"');
-                    base.push_str(&s);
-                    base.push('"');
-                }
-                toml::Value::Integer(i) => base.push_str(&i.to_string()),
-                // TODO: This is shit and also only works one level. Make a trait
-                // for serializing to nickel which is recursive and use that?
-                toml::Value::Array(v) => v.into_iter().for_each(|e| match e {
-                    toml::Value::String(s) => {
-                        base.push('"');
-                        base.push_str(&s);
-                        base.push('"');
-                    }
-                    toml::Value::Boolean(b) => {
-                        if b {
-                            base.push_str("true")
-                        } else {
-                            base.push_str("false")
-                        }
-                    }
-                    toml::Value::Float(f) => base.push_str(&f.to_string()),
-                    _ => todo!(),
-                }),
-                _ => todo!(),
-            }
-
-            base.push_str(" in\n");
+            value.write_nickel_binding(ident.as_ref(), &mut base);
         }
-
         Self { base }
     }
 
@@ -95,13 +55,13 @@ mod tests {
 
     #[test]
     fn empty_var_ctx() {
-        let ctx = VarCtx::new(std::iter::empty::<(&str, toml::Value)>());
+        let ctx = VarCtx::new(std::iter::empty::<(&str, args::Arg)>());
         assert_eq!(ctx.base, "");
     }
 
     #[test]
     fn passthrough_basic_strings() {
-        let ctx = VarCtx::new(std::iter::empty::<(&str, toml::Value)>());
+        let ctx = VarCtx::new(std::iter::empty::<(&str, args::Arg)>());
         assert_eq!(ctx.eval_string("hello").unwrap(), "hello");
         assert_eq!(ctx.eval_string("world").unwrap(), "world");
         assert_eq!(ctx.eval_string("hello world").unwrap(), "hello world");
@@ -109,11 +69,12 @@ mod tests {
     }
 
     #[test]
-    fn interpolation_with_vars() {
+    fn interpolation_with_vars_scalar() {
+        use args::{Arg, ScalarArg};
         let ctx = VarCtx::new(vec![
-            ("name", toml::Value::String("world".to_string())),
-            ("count", toml::Value::Integer(42)),
-            ("flag", toml::Value::Boolean(true)),
+            ("name", Arg::Scalar(ScalarArg::String("world".to_string()))),
+            ("count", Arg::Scalar(ScalarArg::Number(42.0))),
+            ("flag", Arg::Scalar(ScalarArg::Boolean(true))),
         ]);
         assert_eq!(ctx.eval_string("hello %{name}").unwrap(), "hello world");
         assert_eq!(
@@ -125,6 +86,29 @@ mod tests {
             ctx.eval_string("flag=%{std.string.from_bool flag}")
                 .unwrap(),
             "flag=true"
+        );
+    }
+
+    #[test]
+    fn interpolation_with_vars_array() {
+        use args::{Arg, ScalarArg};
+        let ctx = VarCtx::new(vec![
+            (
+                "a",
+                Arg::Array(vec![
+                    ScalarArg::String("hello".to_string()),
+                    ScalarArg::String("world".to_string()),
+                ]),
+            ),
+            (
+                "b",
+                Arg::Array(vec![ScalarArg::Boolean(true), ScalarArg::Boolean(false)]),
+            ),
+        ]);
+        assert_eq!(
+            ctx.eval_string("%{std.string.from_bool (std.array.at 1 b)}")
+                .unwrap(),
+            "false"
         );
     }
 }

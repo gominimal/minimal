@@ -1,5 +1,5 @@
 use super::{EnvPatches, EnvVarValue, StrOrList};
-use args::ArgSet;
+use args::ArgsSpec;
 use std::collections::HashMap;
 
 /// A task, defined in a `[tasks.<task_name>]` section of [File].
@@ -37,7 +37,7 @@ pub struct Task {
 
     /// Typed schema of named arguments this task accepts.
     #[serde(default)]
-    pub args: ArgSet,
+    pub args: ArgsSpec,
 
     /// Any fields which are not understood by this version of minimal.
     #[serde(flatten)]
@@ -230,9 +230,8 @@ mod tests {
         .unwrap();
 
         let parsed = t.args.parse("--greeting hello --name world").unwrap();
-        let table = parsed.as_table().unwrap();
         let var_ctx =
-            common::ncl_eval::VarCtx::new(table.iter().map(|(k, v)| (k.as_str(), v.clone())));
+            common::ncl_eval::VarCtx::new(parsed.iter().map(|(k, v)| (k.as_str(), v.clone())));
         let t2 = t
             .map_exec_strings(|s| {
                 var_ctx

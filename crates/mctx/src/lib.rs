@@ -1174,10 +1174,10 @@ mod tests {
             let (interactive, invocations) = env
                 .task_invocations(
                     &task,
-                    Some(&toml::Value::Table(toml::Table::from_iter([(
+                    Some(&std::collections::HashMap::from([(
                         "input".to_string(),
-                        toml::Value::String("beep".to_string()),
-                    )]))),
+                        args::Arg::Scalar(args::ScalarArg::String("beep".to_string())),
+                    )])),
                 )
                 .await
                 .unwrap();

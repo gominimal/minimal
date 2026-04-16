@@ -665,15 +665,21 @@ impl<'a> Env<'a> {
     pub async fn task_invocations(
         &mut self,
         task: &mfile::Task,
-        parsed_args: Option<&toml::Value>,
+        parsed_args: Option<&std::collections::HashMap<String, args::Arg>>,
     ) -> Result<(bool, Vec<Invocation>), Error> {
-        let base = [("task_packages", task.packages.clone().into())].into_iter();
+        let base = [(
+            "task_packages",
+            args::Arg::Array(
+                task.packages
+                    .iter()
+                    .map(|s| args::ScalarArg::String(s.clone()))
+                    .collect(),
+            ),
+        )]
+        .into_iter();
         let var_ctx = if let Some(args) = parsed_args {
-            let table = args
-                .as_table()
-                .ok_or_else(|| Error::Other(anyhow::anyhow!("parsed_args is not a table")))?;
             common::ncl_eval::VarCtx::new(
-                base.chain(table.iter().map(|(k, v)| (k.as_str(), v.clone()))),
+                base.chain(args.iter().map(|(k, v)| (k.as_str(), v.clone()))),
             )
         } else {
             common::ncl_eval::VarCtx::new(base)
