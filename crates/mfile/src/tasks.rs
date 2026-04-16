@@ -1,5 +1,5 @@
 use super::{EnvPatches, EnvVarValue, StrOrList};
-use crate::args::TaskArgs;
+use args::ArgSet;
 use std::collections::HashMap;
 
 /// A task, defined in a `[tasks.<task_name>]` section of [File].
@@ -37,7 +37,7 @@ pub struct Task {
 
     /// Typed schema of named arguments this task accepts.
     #[serde(default)]
-    pub args: TaskArgs,
+    pub args: ArgSet,
 
     /// Any fields which are not understood by this version of minimal.
     #[serde(flatten)]

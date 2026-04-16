@@ -1,21 +1,16 @@
 [package]
-name = "mfile"
+name = "args"
 version = "0.0.1"
 rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 edition.workspace = true
 publish.workspace = true
 
-[dev-dependencies]
-indoc.workspace = true
-tempfile.workspace = true
-
 [dependencies]
-args.workspace = true
-common.workspace = true
-
 clap.workspace = true
 serde.workspace = true
-toml.workspace = true
 shlex.workspace = true
-tracing.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+indoc.workspace = true
