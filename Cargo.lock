@@ -104,6 +104,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "args"
+version = "0.0.1"
+dependencies = [
+ "clap",
+ "indoc",
+ "serde",
+ "shlex",
+ "toml 1.1.2+spec-1.1.0",
+]
+
+[[package]]
 name = "arraydeque"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2732,6 +2743,7 @@ dependencies = [
 name = "mfile"
 version = "0.0.1"
 dependencies = [
+ "args",
  "clap",
  "common",
  "indoc",

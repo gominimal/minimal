@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/args",
     "crates/lcache",
     "crates/rcache",
     "crates/check",
@@ -94,6 +95,7 @@ walkdir = "2.5"
 petgraph = "0.8"
 
 # our crates
+args = { version = "0.0.1", path = "crates/args" }
 graph = { version = "0.0.1", path = "crates/graph" }
 lcache = { version = "0.0.1", path = "crates/lcache" }
 rcache = { version = "0.0.1", path = "crates/rcache" }
