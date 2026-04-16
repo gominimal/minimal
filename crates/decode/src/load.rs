@@ -11,6 +11,8 @@ use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::term::Term;
 use nickel_lang_core::typ::TypeF;
 use nickel_lang_core::{error::NullReporter, eval::cache::CacheImpl, program::Program};
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -21,10 +23,12 @@ use std::path::{Path, PathBuf};
 pub struct LoadOptions {
     /// Where on the filesystem the minimal base library (i.e. minimal.ncl) is located.
     pub minimal_lib_path: PathBuf,
-    /// A description of where the top-level layer/repo was sourced from.
+    /// A description of where the layer/repo was sourced from.
     pub from: SpecOrigin,
     /// The target we are loading for.
     pub target: Target,
+    /// The parameters being passed to the layer during evaluation.
+    pub params: Option<HashMap<String, args::Arg>>,
 }
 
 impl LoadOptions {
@@ -34,11 +38,45 @@ impl LoadOptions {
             minimal_lib_path: std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
                 .join("minimal-ncl"),
             target: Target::default(),
+            params: None,
         }
     }
 
+    /// Returns the [Target] this layer is evaluated for.
     pub fn for_target(&self) -> &Target {
         &self.target
+    }
+
+    /// Computes a hash that describes the inputs to layer evaluation. Layer
+    /// evaluation (i.e. eval nickel => structs) is deterministic, so an
+    /// input hash should correspond 1:1 with the result of [Loader::finish].
+    pub fn input_hash_to<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.from.hash(state);
+        self.target.hash(state);
+        if let Some(params) = &self.params {
+            state.write(b"params");
+            args::hash_args(params, state);
+        }
+    }
+
+    /// Computes a hash that describes the inputs to layer evaluation. Layer
+    /// evaluation (i.e. eval nickel => structs) is deterministic, so an
+    /// input hash should correspond 1:1 with the result of [Loader::finish].
+    pub fn input_hash(&self) -> blake3::Hash {
+        struct Blake3StdHasher(blake3::Hasher);
+
+        impl std::hash::Hasher for Blake3StdHasher {
+            fn write(&mut self, bytes: &[u8]) {
+                self.0.update(bytes);
+            }
+            fn finish(&self) -> u64 {
+                panic!("unreachable")
+            }
+        }
+
+        let mut hasher = Blake3StdHasher(blake3::Hasher::new());
+        self.input_hash_to(&mut hasher);
+        hasher.0.finalize()
     }
 }
 

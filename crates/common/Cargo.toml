@@ -32,6 +32,7 @@ lzma-rs.workspace = true
 tempfile.workspace = true
 zstd.workspace = true
 
+args.workspace = true
 nickel-lang-core.workspace = true
 toml.workspace = true
 

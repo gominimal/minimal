@@ -19,6 +19,7 @@ pub mod ncl_eval;
 
 use std::{
     env, fmt,
+    hash::Hash,
     io::{self, ErrorKind, Write},
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
@@ -77,14 +78,40 @@ impl SpecOrigin {
             None
         }
     }
+}
 
-    /// Returns a hashed hex representation of the origin + target, suitable as a cache key.
-    pub fn hash_hex(&self, target: &Target) -> impl AsRef<str> {
-        let origin_bytes = serde_json::to_vec(self).unwrap();
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&origin_bytes);
-        target.hash_to(&mut hasher);
-        hasher.finalize().to_hex()
+impl Hash for SpecOrigin {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Inline => state.write_u8(0), // type marker: 0 == Inline
+            Self::LocalDir { given, absolute } => {
+                state.write_u8(1); // type marker: 1 == LocalDir
+                state.write(given.as_os_str().as_encoded_bytes());
+                state.write_u8(b',');
+                state.write(absolute.as_os_str().as_encoded_bytes());
+            }
+            Self::Repo(r) => {
+                state.write_u8(2); // type marker: 2 == Repo
+                match r {
+                    repo_spec::Repo::Git { url, rev, tracking } => {
+                        state.write(url.as_bytes());
+                        state.write_u8(b',');
+                        state.write(rev.as_bytes());
+                        state.write_u8(b',');
+                        match tracking {
+                            Some(repo_spec::GitRef::Branch(b)) => {
+                                state.write(b.as_bytes());
+                            }
+                            Some(repo_spec::GitRef::Tag(t)) => {
+                                state.write_u8(b't');
+                                state.write(t.as_bytes());
+                            }
+                            None => {}
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -632,6 +632,7 @@ name = "common"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "args",
  "blake3",
  "bytes",
  "bzip2",
@@ -943,6 +944,7 @@ name = "decode"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "args",
  "blake3",
  "codespan-reporting",
  "common",
@@ -957,6 +959,7 @@ dependencies = [
  "smallvec",
  "stdlib",
  "tempfile",
+ "toml 1.1.2+spec-1.1.0",
 ]
 
 [[package]]
@@ -2672,6 +2675,7 @@ name = "mctx"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "args",
  "check",
  "checkouts",
  "codespan-reporting",
@@ -2805,6 +2809,7 @@ name = "minimal"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "args",
  "blake3",
  "check",
  "checkouts",
@@ -2866,6 +2871,7 @@ name = "multi"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "args",
  "checkouts",
  "common",
  "generational-arena",

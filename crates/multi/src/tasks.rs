@@ -90,7 +90,7 @@ impl TaskRuntime {
         ctx: Context,
         name: &str,
         task: &mfile::Task,
-        task_args: Option<&toml::Value>,
+        task_args: Option<&std::collections::HashMap<String, args::Arg>>,
     ) -> Result<Self, mctx::Error> {
         let mut graph = Box::new(graph);
         let mut ctx = Box::new(ctx);
@@ -164,7 +164,7 @@ impl Task {
     /// Creates a new named task, building a fresh Env from the given Context and Graph.
     pub(crate) async fn new_named(
         name: String,
-        task_args: Option<&toml::Value>,
+        task_args: Option<&std::collections::HashMap<String, args::Arg>>,
         graph: Graph,
         mut ctx: Context,
         environment: EnvironmentHandle,

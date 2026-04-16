@@ -6,7 +6,7 @@
 use common::repo_spec::Repo;
 use common::{SpecOrigin, Target};
 use decode::builds::BuildRef;
-use decode::{Harness, Layer, Profile, builds};
+use decode::{Harness, Layer, LoadOptions, Profile, builds};
 use mfile::{self, LinkConfig};
 use nickel_lang_core::term::IndexMap;
 
@@ -259,25 +259,17 @@ impl SourceProvider for checkouts::ManagerHandle {
 pub trait LayerCache {
     type Error: std::fmt::Debug;
 
-    fn insert(&mut self, origin: SpecOrigin, layer: &Layer) -> Result<(), Self::Error>;
-    fn get(
-        &mut self,
-        origin: &SpecOrigin,
-        for_target: &Target,
-    ) -> Result<Option<Layer>, Self::Error>;
+    fn insert(&mut self, lo: LoadOptions, layer: &Layer) -> Result<(), Self::Error>;
+    fn get(&mut self, lo: &LoadOptions) -> Result<Option<Layer>, Self::Error>;
 }
 
 impl LayerCache for () {
     type Error = ();
 
-    fn insert(&mut self, _origin: SpecOrigin, _layer: &Layer) -> Result<(), Self::Error> {
+    fn insert(&mut self, _lo: LoadOptions, _layer: &Layer) -> Result<(), Self::Error> {
         Ok(())
     }
-    fn get(
-        &mut self,
-        _origin: &SpecOrigin,
-        _for_target: &Target,
-    ) -> Result<Option<Layer>, Self::Error> {
+    fn get(&mut self, _lo: &LoadOptions) -> Result<Option<Layer>, Self::Error> {
         Ok(None)
     }
 }
@@ -288,13 +280,13 @@ pub struct LayerCacheDir(pub PathBuf);
 impl LayerCache for LayerCacheDir {
     type Error = ();
 
-    fn insert(&mut self, origin: SpecOrigin, layer: &Layer) -> Result<(), Self::Error> {
+    fn insert(&mut self, lo: LoadOptions, layer: &Layer) -> Result<(), Self::Error> {
         // Its only safe to cache stuff that is pinned to a hash
-        if !matches!(origin, SpecOrigin::Repo(_)) {
+        if !matches!(lo.from, SpecOrigin::Repo(_)) {
             return Ok(());
         }
 
-        let p = self.0.join(origin.hash_hex(&layer.for_target).as_ref());
+        let p = self.0.join(lo.input_hash().to_hex().as_ref());
         if std::fs::exists(&p).unwrap_or(false) {
             return Ok(());
         }
@@ -314,8 +306,8 @@ impl LayerCache for LayerCacheDir {
 
         Ok(())
     }
-    fn get(&mut self, origin: &SpecOrigin, target: &Target) -> Result<Option<Layer>, Self::Error> {
-        let p = self.0.join(origin.hash_hex(target).as_ref());
+    fn get(&mut self, lo: &LoadOptions) -> Result<Option<Layer>, Self::Error> {
+        let p = self.0.join(lo.input_hash().to_hex().as_ref());
 
         if let Ok(f) = std::fs::File::open(&p) {
             let layer: Layer = serde_json::from_reader(f).map_err(|e| {
@@ -510,23 +502,21 @@ impl Graph {
             };
 
             // Load the layer, either from the layer cache or by doing a full load via [Layer::new].
+            let load_opts = decode::LoadOptions {
+                minimal_lib_path: minimal_lib_path.clone(),
+                from: upstream.clone(),
+                target: for_target.clone(),
+                params: None,
+            };
             let layer = if let Some(layer) = lc
-                .get(&upstream, &for_target)
+                .get(&load_opts)
                 .map_err(|e| Error::Fetch(format!("layer-cache fetch: {:?}", e)))?
             {
                 layer
             } else {
-                let layer = Layer::new(
-                    src_path,
-                    &decode::LoadOptions {
-                        minimal_lib_path: minimal_lib_path.clone(),
-                        from: upstream.clone(),
-                        target: for_target.clone(),
-                    },
-                )
-                .map_err(Error::Decode)?;
+                let layer = Layer::new(src_path, &load_opts).map_err(Error::Decode)?;
 
-                if let Err(e) = lc.insert(upstream.clone(), &layer) {
+                if let Err(e) = lc.insert(load_opts, &layer) {
                     tracing::warn!("Failed to cache layer for origin {:?}: {:?}", upstream, e);
                 }
                 layer
