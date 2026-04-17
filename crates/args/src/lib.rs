@@ -7,13 +7,59 @@
 //!    these arguments into their concrete values.
 //!  * [ArgsSpec]: Newtype around a map of argument names to [ArgSpec] (schema) descriptions.
 //!  * [ArgsSet]: A concrete set of arguments, effectively a Newtype of `HashMap<String, Arg>`.
+//!
+//! ## Usage
+//!
+//! ### Loading argument schema
+//!
+//! The argument schema is typically defined in some config file. Represent the schema of
+//! arguments by having a field in your config file of type [ArgsSpec], which implements the
+//! serde traits.
+//!
+//! ```rust
+//! # use args::ArgsSpec;
+//! let schema: ArgsSpec = toml::from_str("name = \"string\"").unwrap();
+//! ```
+//!
+//! ### Hydrating arguments from a config file
+//!
+//! Use the [DiskArg] type to capture arguments specified in a config file:
+//!
+//! ```rust
+//! # use std::collections::HashMap;
+//! # use args::DiskArg;
+//! #[derive(serde::Deserialize)]
+//! struct MyConfig {
+//!   args: HashMap<String, DiskArg>,
+//! }
+//! ```
+//!
+//! You can then hydrate a map of [DiskArg]'s against an [ArgsSpec]:
+//!
+//! ```rust
+//! # use std::collections::HashMap;
+//! # use args::{DiskArg, ArgsSpec};
+//! # let args = HashMap::from_iter([("name".to_string(), DiskArg::String("a".to_string()))]);
+//! let schema: ArgsSpec = toml::from_str("name = \"string\"").unwrap();
+//! schema.from_deserialized(&args);
+//! ```
+//! ### Hydrating arguments from a command-line invocation
+//!
+//! Use [ArgsSet::parse] to parse the arguments section of a command-line invocartion:
+//!
+//! ```rust
+//! # use std::collections::HashMap;
+//! # use args::{DiskArg, ArgsSpec};
+//! let schema: ArgsSpec = toml::from_str("name = \"string\"").unwrap();
+//! schema.parse("--name hello"); // Ok(ArgsSet)
+//! ```
 
 use std::{
     collections::{BTreeSet, HashMap},
     hash::Hash,
 };
 
-/// A set of arguments.
+/// A set of arguments, already validated against a corresponding schema.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArgsSet(HashMap<String, Arg>);
 
@@ -42,6 +88,50 @@ impl From<HashMap<String, Arg>> for ArgsSet {
 impl AsRef<HashMap<String, Arg>> for ArgsSet {
     fn as_ref(&self) -> &HashMap<String, Arg> {
         &self.0
+    }
+}
+
+/// A deserialized argument value captured without schema knowledge.
+///
+/// When deserializing argument values from a configuration file (TOML, JSON, etc.),
+/// the schema is not yet available, so the concrete type cannot be validated. `DiskArg`
+/// captures the raw value as-is and can later be validated against an [`ArgsSpec`] via
+/// [`ArgsSpec::from_deserialized`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum DiskArg {
+    Boolean(bool),
+    Integer(i64),
+    Float(f64),
+    String(String),
+    Array(Vec<DiskArg>),
+}
+
+impl Hash for DiskArg {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            DiskArg::Boolean(b) => {
+                state.write_u8(0); // Type marker
+                b.hash(state);
+            }
+            DiskArg::Integer(i) => {
+                state.write_u8(1); // Type marker
+                i.hash(state);
+            }
+            DiskArg::Float(f) => {
+                state.write_u8(2); // Type marker
+                f.to_le_bytes().hash(state);
+            }
+            DiskArg::String(s) => {
+                state.write_u8(3); // Type marker
+                s.hash(state);
+            }
+            DiskArg::Array(a) => {
+                state.write_u8(4); // Type marker
+                state.write_u64(a.len() as u64);
+                a.iter().for_each(|e| e.hash(state));
+            }
+        }
     }
 }
 
@@ -492,7 +582,7 @@ impl serde::Serialize for ArgSpec {
     }
 }
 
-/// A set of arguments defined together.
+/// A set of argument schemas defined together.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ArgsSpec(pub HashMap<String, ArgSpec>);
 
@@ -502,29 +592,29 @@ impl ArgsSpec {
         self.0.is_empty()
     }
 
-    /// Hydrates the table of toml values against the argument schema, returning an [ArgsSet] if valid.
-    pub fn from_toml(&self, table: &toml::Table) -> Result<ArgsSet, String> {
-        let scalar_from_toml = |v: &toml::Value,
+    /// Hydrates a map of deserialized [`DiskArg`] values against the argument schema,
+    /// returning an [`ArgsSet`] if valid.
+    ///
+    /// This is the format-agnostic equivalent of [`from_toml`](Self::from_toml):
+    /// the caller deserializes a `HashMap<String, DiskArg>` from any serde-supported
+    /// format (TOML, JSON, YAML, …) and this method validates and converts the values.
+    pub fn from_deserialized(&self, values: &HashMap<String, DiskArg>) -> Result<ArgsSet, String> {
+        let scalar_from_disk = |v: &DiskArg,
                                 p: &PrimitiveSpec,
                                 name: &str|
          -> Result<ScalarArg, String> {
             match (v, p) {
-                (toml::Value::String(s), PrimitiveSpec::String) => Ok(ScalarArg::String(s.clone())),
-                (toml::Value::Integer(i), PrimitiveSpec::Number) => {
-                    Ok(ScalarArg::Number(*i as f64))
-                }
-                (toml::Value::Float(f), PrimitiveSpec::Number) => Ok(ScalarArg::Number(*f)),
-                (toml::Value::Boolean(b), PrimitiveSpec::Boolean) => Ok(ScalarArg::Boolean(*b)),
-                (toml::Value::Datetime(dt), PrimitiveSpec::String) => {
-                    Ok(ScalarArg::String(dt.to_string()))
-                }
-                _ => Err(format!("argument `{name}`: expected {p}, got `{v}`")),
+                (DiskArg::String(s), PrimitiveSpec::String) => Ok(ScalarArg::String(s.clone())),
+                (DiskArg::Integer(i), PrimitiveSpec::Number) => Ok(ScalarArg::Number(*i as f64)),
+                (DiskArg::Float(f), PrimitiveSpec::Number) => Ok(ScalarArg::Number(*f)),
+                (DiskArg::Boolean(b), PrimitiveSpec::Boolean) => Ok(ScalarArg::Boolean(*b)),
+                _ => Err(format!("argument `{name}`: expected {p}, got {v:?}")),
             }
         };
 
         let mut out = HashMap::with_capacity(self.0.len());
         for (name, spec) in self.0.iter() {
-            let v = match (table.get(name), &spec.default) {
+            let v = match (values.get(name), &spec.default) {
                 (None, None) => return Err(format!("missing argument {name}")),
                 (None, Some(default)) => {
                     out.insert(name.clone(), spec.spec.parse(default)?);
@@ -534,27 +624,33 @@ impl ArgsSpec {
             };
 
             let arg = match &spec.spec {
-                ArgSchema::Scalar(p) => Arg::Scalar(scalar_from_toml(v, p, name)?),
+                ArgSchema::Scalar(p) => Arg::Scalar(scalar_from_disk(v, p, name)?),
                 ArgSchema::Array(p) => {
-                    let arr = v
-                        .as_array()
-                        .ok_or_else(|| format!("argument `{name}`: expected array, got `{v}`"))?;
+                    let arr = match v {
+                        DiskArg::Array(arr) => arr,
+                        _ => return Err(format!("argument `{name}`: expected array, got {v:?}")),
+                    };
                     let items: Result<Vec<ScalarArg>, String> = arr
                         .iter()
-                        .map(|elem| scalar_from_toml(elem, p, name))
+                        .map(|elem| scalar_from_disk(elem, p, name))
                         .collect();
                     Arg::Array(items?)
                 }
                 ArgSchema::Enum(permitted) => {
-                    let s = v.as_str().ok_or_else(|| {
-                        format!("argument `{name}`: expected string for enum, got `{v}`")
-                    })?;
-                    if !permitted.contains(s) {
+                    let s = match v {
+                        DiskArg::String(s) => s,
+                        _ => {
+                            return Err(format!(
+                                "argument `{name}`: expected string for enum, got {v:?}"
+                            ));
+                        }
+                    };
+                    if !permitted.contains(s.as_str()) {
                         return Err(format!(
                             "argument `{name}`: `{s}` is not a valid enum value"
                         ));
                     }
-                    Arg::Enum(s.to_string())
+                    Arg::Enum(s.clone())
                 }
             };
             out.insert(name.clone(), arg);
@@ -932,7 +1028,32 @@ mod tests {
     }
 
     #[test]
-    fn argsspec_from_toml() {
+    fn disk_arg_deserialize() {
+        // DiskArg should capture values from TOML without schema knowledge.
+        let raw: HashMap<String, DiskArg> = toml::from_str(indoc! {r#"
+            name = "hello"
+            count = 42
+            ratio = 2.72
+            verbose = true
+            tags = ["a", "b"]
+        "#})
+        .unwrap();
+
+        assert_eq!(raw.get("name").unwrap(), &DiskArg::String("hello".into()));
+        assert_eq!(raw.get("count").unwrap(), &DiskArg::Integer(42));
+        assert_eq!(raw.get("ratio").unwrap(), &DiskArg::Float(2.72));
+        assert_eq!(raw.get("verbose").unwrap(), &DiskArg::Boolean(true));
+        assert_eq!(
+            raw.get("tags").unwrap(),
+            &DiskArg::Array(vec![
+                DiskArg::String("a".into()),
+                DiskArg::String("b".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn argsspec_from_deserialized() {
         let spec: ArgsOnly = toml::from_str(indoc! {r#"
             args.name = "string"
             args.count = "number"
@@ -945,7 +1066,7 @@ mod tests {
         .unwrap();
 
         // All explicit values provided.
-        let values: toml::Value = toml::from_str(indoc! {r#"
+        let values: HashMap<String, DiskArg> = toml::from_str(indoc! {r#"
             name = "hello"
             count = 42
             verbose = true
@@ -953,7 +1074,7 @@ mod tests {
             mode = "release"
         "#})
         .unwrap();
-        let result = spec.args.from_toml(values.as_table().unwrap()).unwrap();
+        let result = spec.args.from_deserialized(&values).unwrap();
 
         assert_eq!(
             result.as_ref().get("name").unwrap(),
@@ -978,7 +1099,7 @@ mod tests {
             result.as_ref().get("mode").unwrap(),
             &Arg::Enum("release".to_string())
         );
-        // Defaults should be filled in.
+        // Defaults filled in.
         assert_eq!(
             result.as_ref().get("default_enum").unwrap(),
             &Arg::Enum("x".to_string())
@@ -989,7 +1110,7 @@ mod tests {
         );
 
         // Float number.
-        let values: toml::Value = toml::from_str(indoc! {r#"
+        let values: HashMap<String, DiskArg> = toml::from_str(indoc! {r#"
             name = "hi"
             count = 3.15
             verbose = false
@@ -997,23 +1118,18 @@ mod tests {
             mode = "debug"
         "#})
         .unwrap();
-        let result = spec.args.from_toml(values.as_table().unwrap()).unwrap();
+        let result = spec.args.from_deserialized(&values).unwrap();
         assert_eq!(
             result.as_ref().get("count").unwrap(),
             &Arg::Scalar(ScalarArg::Number(3.15))
         );
-        assert_eq!(
-            result.as_ref().get("verbose").unwrap(),
-            &Arg::Scalar(ScalarArg::Boolean(false))
-        );
-        assert_eq!(result.as_ref().get("tags").unwrap(), &Arg::Array(vec![]));
 
         // Missing required arg is an error.
-        let values: toml::Value = toml::from_str("name = \"hi\"\n").unwrap();
-        assert!(spec.args.from_toml(values.as_table().unwrap()).is_err());
+        let values: HashMap<String, DiskArg> = toml::from_str("name = \"hi\"\n").unwrap();
+        assert!(spec.args.from_deserialized(&values).is_err());
 
         // Invalid enum value is an error.
-        let values: toml::Value = toml::from_str(indoc! {r#"
+        let values: HashMap<String, DiskArg> = toml::from_str(indoc! {r#"
             name = "hi"
             count = 1
             verbose = true
@@ -1021,10 +1137,10 @@ mod tests {
             mode = "profile"
         "#})
         .unwrap();
-        assert!(spec.args.from_toml(values.as_table().unwrap()).is_err());
+        assert!(spec.args.from_deserialized(&values).is_err());
 
         // Type mismatch (string where number expected) is an error.
-        let values: toml::Value = toml::from_str(indoc! {r#"
+        let values: HashMap<String, DiskArg> = toml::from_str(indoc! {r#"
             name = "hi"
             count = "not a number"
             verbose = true
@@ -1032,7 +1148,7 @@ mod tests {
             mode = "debug"
         "#})
         .unwrap();
-        assert!(spec.args.from_toml(values.as_table().unwrap()).is_err());
+        assert!(spec.args.from_deserialized(&values).is_err());
     }
 
     #[test]

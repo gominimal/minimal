@@ -11,6 +11,7 @@ use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::term::Term;
 use nickel_lang_core::typ::TypeF;
 use nickel_lang_core::{error::NullReporter, eval::cache::CacheImpl, program::Program};
+use std::collections::{BTreeSet, HashMap};
 use std::hash::Hash;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -27,7 +28,7 @@ pub struct LoadOptions {
     /// The target we are loading for.
     pub target: Target,
     /// The parameters being passed to the layer during evaluation.
-    pub params: Option<args::ArgsSet>,
+    pub params: Option<HashMap<String, args::DiskArg>>,
 }
 
 impl LoadOptions {
@@ -54,7 +55,11 @@ impl LoadOptions {
         self.target.hash(state);
         if let Some(params) = &self.params {
             state.write(b"params");
-            params.hash(state);
+            let keys: BTreeSet<_> = params.keys().cloned().collect();
+            for k in keys.into_iter() {
+                k.hash(state);
+                params.get(&k).unwrap().hash(state);
+            }
         }
     }
 
@@ -179,15 +184,37 @@ pub(crate) struct Loader {
 
 impl Loader {
     /// Processes literal source representing a top-level collection of objects.
-    pub(crate) fn new<S: Into<String>>(src: S, opts: &LoadOptions) -> Result<Self, Error> {
+    pub(crate) fn new<S: Into<String>>(
+        src: S,
+        args: Option<&args::ArgsSet>,
+        opts: &LoadOptions,
+    ) -> Result<Self, Error> {
         let generated_lib_dir = tempfile::TempDir::new()?;
         std::fs::write(generated_lib_dir.path().join("__injected_config__.ncl"), {
             let mut out = Vec::with_capacity(128);
-            out.extend(b"{target = {os = ");
+            out.extend(b"{\n\ttarget = {os = ");
             out.extend(opts.for_target().os().as_nickel_literal());
             out.extend(b",arch = ");
             out.extend(opts.for_target().arch().as_nickel_literal());
-            out.extend(b"}}");
+            out.extend(b"},");
+            out.extend(b"\n\targs = ");
+            match args {
+                None => out.extend(b"{}"),
+                Some(set) => {
+                    out.extend(b"{");
+                    let mut buf = String::with_capacity(64);
+                    for (name, v) in set.iter() {
+                        buf.clear();
+                        v.write_nickel(&mut buf);
+
+                        out.extend(b"\n\t\t");
+                        out.extend(format!("\"{name}\" = {buf},").as_bytes());
+                    }
+                    out.extend(b"\n\t}");
+                }
+            }
+
+            out.extend(b",\n}");
             out
         })?;
 
@@ -221,6 +248,7 @@ impl Loader {
     /// Loads all build decls in the given directory following the standard directory layout.
     pub fn new_with_all_pkgs<P: AsRef<Path>>(
         layer_dir: P,
+        args: Option<&args::ArgsSet>,
         opts: &LoadOptions,
     ) -> Result<Self, Error> {
         let mut src = String::with_capacity(2048);
@@ -275,7 +303,7 @@ impl Loader {
 
         src.push('}');
 
-        Self::new(src, opts)
+        Self::new(src, args, opts)
     }
 
     /// Walks the AST to find unique build-spec declarations, annotating them with a unique ID.
@@ -442,13 +470,23 @@ mod tests {
 
     #[test]
     fn loader_empty() {
-        let _sr = Loader::new("{}".to_string(), &LoadOptions::for_test()).unwrap();
+        let _sr = Loader::new("{}".to_string(), None, &LoadOptions::for_test()).unwrap();
     }
 
     #[test]
     fn loader_injects_config() {
+        let args = {
+            let schema: args::ArgsSpec = toml::from_str("a = \"string\"").unwrap();
+            schema
+                .from_deserialized(&HashMap::from_iter([(
+                    "a".to_string(),
+                    args::DiskArg::String("hi".to_string()),
+                )]))
+                .unwrap()
+        };
         let _sr = Loader::new(
             "{c = import \"__injected_config__.ncl\"}".to_string(),
+            Some(&args),
             &LoadOptions::for_test(),
         )
         .unwrap();
@@ -467,6 +505,7 @@ mod tests {
         		}"
             }
             .to_string(),
+            None,
             &LoadOptions::for_test(),
         );
 
@@ -496,6 +535,7 @@ mod tests {
                 }"
             }
             .to_string(),
+            None,
             &LoadOptions::for_test(),
         );
 
@@ -567,7 +607,7 @@ mod tests {
         )
         .unwrap();
 
-        let sr = Loader::new_with_all_pkgs(temp_dir.path(), &LoadOptions::for_test());
+        let sr = Loader::new_with_all_pkgs(temp_dir.path(), None, &LoadOptions::for_test());
         // So we can see the actual error when the test fails
         if let Some(e) = sr.as_ref().err().iter().next() {
             e.report_to_stderr();
