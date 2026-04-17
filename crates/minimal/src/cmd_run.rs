@@ -42,7 +42,7 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
 pub async fn run_task(
     task_name: &str,
     task: &mfile::Task,
-    parsed_args: Option<std::collections::HashMap<String, args::Arg>>,
+    parsed_args: Option<args::ArgsSet>,
     mut graph: Graph,
     ctx: &mut Context,
 ) -> Result<(), Error> {
