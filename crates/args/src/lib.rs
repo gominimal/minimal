@@ -127,6 +127,26 @@ pub enum PrimitiveSpec {
     Boolean,
 }
 
+impl PrimitiveSpec {
+    /// Parse a string value into a [ScalarArg] according to the given primitive type.
+    pub fn parse(&self, s: &str) -> Result<ScalarArg, String> {
+        match self {
+            PrimitiveSpec::String => Ok(ScalarArg::String(s.to_string())),
+            PrimitiveSpec::Number => {
+                let f: f64 = s
+                    .parse()
+                    .map_err(|_| format!("expected a number, got `{s}`"))?;
+                Ok(ScalarArg::Number(f))
+            }
+            PrimitiveSpec::Boolean => match s {
+                "true" => Ok(ScalarArg::Boolean(true)),
+                "false" => Ok(ScalarArg::Boolean(false)),
+                _ => Err(format!("expected `true` or `false`, got `{s}`")),
+            },
+        }
+    }
+}
+
 impl std::fmt::Display for PrimitiveSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -146,24 +166,6 @@ impl TryFrom<&str> for PrimitiveSpec {
             "boolean" | "bool" => Ok(PrimitiveSpec::Boolean),
             _ => Err(()),
         }
-    }
-}
-
-/// Parse a string value into a [ScalarArg] according to the given primitive type.
-fn parse_primitive(s: &str, p: &PrimitiveSpec) -> Result<ScalarArg, String> {
-    match p {
-        PrimitiveSpec::String => Ok(ScalarArg::String(s.to_string())),
-        PrimitiveSpec::Number => {
-            let f: f64 = s
-                .parse()
-                .map_err(|_| format!("expected a number, got `{s}`"))?;
-            Ok(ScalarArg::Number(f))
-        }
-        PrimitiveSpec::Boolean => match s {
-            "true" => Ok(ScalarArg::Boolean(true)),
-            "false" => Ok(ScalarArg::Boolean(false)),
-            _ => Err(format!("expected `true` or `false`, got `{s}`")),
-        },
     }
 }
 
@@ -260,6 +262,26 @@ impl<'de> serde::Deserialize<'de> for ArgSchema {
 }
 
 impl ArgSchema {
+    /// Parses the given value string into a concrete argument.
+    pub fn parse(&self, value: &str) -> Result<Arg, String> {
+        match &self {
+            ArgSchema::Scalar(p) => Ok(Arg::Scalar(p.parse(value)?)),
+            ArgSchema::Array(p) => {
+                let items = parse_bracketed_list(value)?;
+                let arr: Result<Vec<ScalarArg>, String> =
+                    items.iter().map(|v| p.parse(v)).collect();
+                Ok(Arg::Array(arr?))
+            }
+            ArgSchema::Enum(permitted) => {
+                if permitted.contains(value) {
+                    Ok(Arg::Enum(value.to_string()))
+                } else {
+                    Err(format!("`{value}` is not a valid value"))
+                }
+            }
+        }
+    }
+
     /// Returns the string form of this spec (e.g. `"Array number"`).
     pub fn as_type_string(&self) -> String {
         match self {
@@ -276,24 +298,24 @@ impl ArgSchema {
     }
 }
 
-/// Parse an enum spec string of the form `[opt1, opt2, "opt 3"]` into its options.
+/// Parse a bracketed, comma-separated list of the form `[val1, val2, "val 3"]`.
 ///
-/// Whitespace around options is trimmed. Options may optionally be quoted with
+/// Whitespace around values is trimmed. Values may optionally be quoted with
 /// double quotes, which allows commas and leading/trailing whitespace within a
 /// value. Returns an error if the input is not wrapped in `[]` or contains
 /// malformed quoting.
-fn parse_enum_schema(s: &str) -> Result<BTreeSet<String>, String> {
+fn parse_bracketed_list(s: &str) -> Result<Vec<String>, String> {
     let s = s.trim();
     let inner = s
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
-        .ok_or_else(|| format!("enum spec must be wrapped in `[]`, got `{s}`"))?;
+        .ok_or_else(|| format!("expected value wrapped in `[]`, got `{s}`"))?;
 
-    let mut opts = BTreeSet::new();
+    let mut values = Vec::new();
     let mut chars = inner.chars().peekable();
 
     loop {
-        // Skip leading whitespace before the next option.
+        // Skip leading whitespace before the next value.
         while chars.peek() == Some(&' ') || chars.peek() == Some(&'\t') {
             chars.next();
         }
@@ -304,19 +326,19 @@ fn parse_enum_schema(s: &str) -> Result<BTreeSet<String>, String> {
         }
 
         let value = if chars.peek() == Some(&'"') {
-            // Quoted option: consume until the closing `"`.
+            // Quoted value: consume until the closing `"`.
             chars.next(); // opening quote
             let mut buf = String::new();
             loop {
                 match chars.next() {
                     Some('"') => break,
                     Some(c) => buf.push(c),
-                    None => return Err("unterminated quote in enum spec".to_string()),
+                    None => return Err("unterminated quote in bracketed list".to_string()),
                 }
             }
             buf
         } else {
-            // Unquoted option: consume until `,` or end.
+            // Unquoted value: consume until `,` or end.
             let mut buf = String::new();
             while let Some(&c) = chars.peek() {
                 if c == ',' {
@@ -327,12 +349,12 @@ fn parse_enum_schema(s: &str) -> Result<BTreeSet<String>, String> {
             }
             let trimmed = buf.trim().to_string();
             if trimmed.is_empty() {
-                return Err("empty option in enum spec".to_string());
+                return Err("empty value in bracketed list".to_string());
             }
             trimmed
         };
 
-        opts.insert(value);
+        values.push(value);
 
         // Skip whitespace after the value, then expect `,` or end.
         while chars.peek() == Some(&' ') || chars.peek() == Some(&'\t') {
@@ -342,16 +364,21 @@ fn parse_enum_schema(s: &str) -> Result<BTreeSet<String>, String> {
             Some(&',') => {
                 chars.next();
             }
-            Some(c) => return Err(format!("unexpected character `{c}` in enum spec")),
+            Some(c) => return Err(format!("unexpected character `{c}` in bracketed list")),
             None => break,
         }
     }
 
-    if opts.is_empty() {
+    Ok(values)
+}
+
+/// Parse an enum spec string of the form `[opt1, opt2, "opt 3"]` into its options.
+fn parse_enum_schema(s: &str) -> Result<BTreeSet<String>, String> {
+    let values = parse_bracketed_list(s)?;
+    if values.is_empty() {
         return Err("enum spec must contain at least one option".to_string());
     }
-
-    Ok(opts)
+    Ok(values.into_iter().collect())
 }
 
 impl serde::Serialize for ArgSchema {
@@ -363,12 +390,13 @@ impl serde::Serialize for ArgSchema {
 /// A single argument definition: the type schema plus optional metadata like `help`.
 ///
 /// Deserializes from either:
-/// - A string: `"string"` → `TaskArg { spec: Scalar(String), help: None }`
-/// - A table with `type`: `{type = "string", help = "something"}` → `TaskArg { spec: .., help: Some(..) }`
+/// - A string: `"string"` → `TaskArg { spec: Scalar(String), help: None, default: None }`
+/// - A table with `type`: `{type = "string"[, help = ..][, default = ...]}` → `TaskArg { spec: .., .. }`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArgSpec {
     pub spec: ArgSchema,
     pub help: Option<String>,
+    pub default: Option<String>,
 }
 
 impl<'de> serde::Deserialize<'de> for ArgSpec {
@@ -391,6 +419,7 @@ impl<'de> serde::Deserialize<'de> for ArgSpec {
                 Ok(ArgSpec {
                     spec: ArgSchema::try_from(v).map_err(de::Error::custom)?,
                     help: None,
+                    default: None,
                 })
             }
 
@@ -411,16 +440,19 @@ impl<'de> serde::Deserialize<'de> for ArgSpec {
                 Ok(ArgSpec {
                     spec: ArgSchema::Enum(opts),
                     help: None,
+                    default: None,
                 })
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<ArgSpec, A::Error> {
                 let mut type_str: Option<String> = None;
                 let mut help: Option<String> = None;
+                let mut default: Option<String> = None;
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "type" => type_str = Some(map.next_value()?),
                         "help" => help = Some(map.next_value()?),
+                        "default" => default = Some(map.next_value()?),
                         _ => {
                             map.next_value::<de::IgnoredAny>()?; // skip unknown
                         }
@@ -429,7 +461,16 @@ impl<'de> serde::Deserialize<'de> for ArgSpec {
                 let s =
                     type_str.ok_or_else(|| de::Error::custom("expected `type` key in table"))?;
                 let spec = ArgSchema::try_from(s.as_str()).map_err(de::Error::custom)?;
-                Ok(ArgSpec { spec, help })
+                if let Some(default) = &default {
+                    // Validate default
+                    spec.parse(default).map_err(de::Error::custom)?;
+                }
+
+                Ok(ArgSpec {
+                    spec,
+                    help,
+                    default,
+                })
             }
         }
 
@@ -459,6 +500,70 @@ impl ArgsSpec {
     /// Returns true if no arguments are defined.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Hydrates the table of toml values against the argument schema, returning an [ArgsSet] if valid.
+    pub fn from_toml(&self, value: &toml::Value) -> Result<ArgsSet, String> {
+        let table = value
+            .as_table()
+            .ok_or_else(|| "expected table of toml arguments".to_string())?;
+
+        let scalar_from_toml = |v: &toml::Value,
+                                p: &PrimitiveSpec,
+                                name: &str|
+         -> Result<ScalarArg, String> {
+            match (v, p) {
+                (toml::Value::String(s), PrimitiveSpec::String) => Ok(ScalarArg::String(s.clone())),
+                (toml::Value::Integer(i), PrimitiveSpec::Number) => {
+                    Ok(ScalarArg::Number(*i as f64))
+                }
+                (toml::Value::Float(f), PrimitiveSpec::Number) => Ok(ScalarArg::Number(*f)),
+                (toml::Value::Boolean(b), PrimitiveSpec::Boolean) => Ok(ScalarArg::Boolean(*b)),
+                (toml::Value::Datetime(dt), PrimitiveSpec::String) => {
+                    Ok(ScalarArg::String(dt.to_string()))
+                }
+                _ => Err(format!("argument `{name}`: expected {p}, got `{v}`")),
+            }
+        };
+
+        let mut out = HashMap::with_capacity(self.0.len());
+        for (name, spec) in self.0.iter() {
+            let v = match (table.get(name), &spec.default) {
+                (None, None) => return Err(format!("missing argument {name}")),
+                (None, Some(default)) => {
+                    out.insert(name.clone(), spec.spec.parse(default)?);
+                    continue;
+                }
+                (Some(v), _) => v,
+            };
+
+            let arg = match &spec.spec {
+                ArgSchema::Scalar(p) => Arg::Scalar(scalar_from_toml(v, p, name)?),
+                ArgSchema::Array(p) => {
+                    let arr = v
+                        .as_array()
+                        .ok_or_else(|| format!("argument `{name}`: expected array, got `{v}`"))?;
+                    let items: Result<Vec<ScalarArg>, String> = arr
+                        .iter()
+                        .map(|elem| scalar_from_toml(elem, p, name))
+                        .collect();
+                    Arg::Array(items?)
+                }
+                ArgSchema::Enum(permitted) => {
+                    let s = v.as_str().ok_or_else(|| {
+                        format!("argument `{name}`: expected string for enum, got `{v}`")
+                    })?;
+                    if !permitted.contains(s) {
+                        return Err(format!(
+                            "argument `{name}`: `{s}` is not a valid enum value"
+                        ));
+                    }
+                    Arg::Enum(s.to_string())
+                }
+            };
+            out.insert(name.clone(), arg);
+        }
+        Ok(ArgsSet(out))
     }
 
     /// Parse a CLI argument string (e.g. `"--count 42 --name foo"`) according
@@ -523,7 +628,7 @@ impl ArgsSpec {
         for (n, ta) in self.0.iter() {
             let mut arg = ClapArg::new(n.clone())
                 .long(n.clone())
-                .required(true)
+                .required(ta.default.is_none())
                 .action(match &ta.spec {
                     ArgSchema::Array(_) => ArgAction::Append,
                     _ => ArgAction::Set,
@@ -541,20 +646,23 @@ impl ArgsSpec {
 
         let mut result = HashMap::new();
         for (name, ta) in self.0.iter() {
+            if !matches.contains_id(name)
+                && let Some(default) = &ta.default
+            {
+                result.insert(name.clone(), ta.spec.parse(default).map_err(&val_err)?);
+                continue;
+            }
+
             match &ta.spec {
                 ArgSchema::Scalar(p) => {
                     if let Some(raw) = matches.get_one::<String>(name) {
-                        result.insert(
-                            name.clone(),
-                            Arg::Scalar(parse_primitive(raw, p).map_err(&val_err)?),
-                        );
+                        result.insert(name.clone(), Arg::Scalar(p.parse(raw).map_err(&val_err)?));
                     }
                 }
                 ArgSchema::Array(p) => {
                     if let Some(values) = matches.get_many::<String>(name) {
-                        let arr: Result<Vec<ScalarArg>, clap::Error> = values
-                            .map(|v| parse_primitive(v, p).map_err(&val_err))
-                            .collect();
+                        let arr: Result<Vec<ScalarArg>, clap::Error> =
+                            values.map(|v| p.parse(v).map_err(&val_err)).collect();
                         result.insert(name.clone(), Arg::Array(arr?));
                     }
                 }
@@ -590,7 +698,7 @@ mod tests {
             args.name = "string"
             args.tags = "Array number"
             args.enum = "[a, b, c-eeee]"
-            args.input = {type = "string", help = "something"}
+            args.input = {type = "string", help = "something", default = "c"}
         "#})
         .unwrap();
         assert_eq!(
@@ -606,6 +714,7 @@ mod tests {
             &ArgSpec {
                 spec: ArgSchema::Scalar(PrimitiveSpec::String),
                 help: Some("something".to_string()),
+                default: Some("c".to_string()),
             }
         );
         assert_eq!(
@@ -638,6 +747,7 @@ mod tests {
             args.verbose = "boolean"
             args.tags = "Array string"
             args.enum = "[a, b]"
+            args.default_str = {type = "string", default = ""}
         "#})
         .unwrap();
 
@@ -667,6 +777,10 @@ mod tests {
                 ScalarArg::String("a".to_string()),
                 ScalarArg::String("b".to_string()),
             ])
+        );
+        assert_eq!(
+            result.as_ref().get("default_str").unwrap(),
+            &Arg::Scalar(ScalarArg::String("".to_string()))
         );
     }
 
@@ -732,6 +846,197 @@ mod tests {
         assert!(parse_enum_schema("[]").is_err());
         assert!(parse_enum_schema("[a, , b]").is_err());
         assert!(parse_enum_schema(r#"["unterminated]"#).is_err());
+    }
+
+    #[test]
+    fn argschema_parse() {
+        assert_eq!(
+            ArgSchema::Array(PrimitiveSpec::String)
+                .parse("[hello, world]")
+                .unwrap(),
+            Arg::Array(vec![
+                ScalarArg::String("hello".to_string()),
+                ScalarArg::String("world".to_string()),
+            ])
+        );
+
+        assert_eq!(
+            ArgSchema::Array(PrimitiveSpec::Number)
+                .parse("[1, 2.5, 3]")
+                .unwrap(),
+            Arg::Array(vec![
+                ScalarArg::Number(1.0),
+                ScalarArg::Number(2.5),
+                ScalarArg::Number(3.0),
+            ])
+        );
+        // Quoted values with commas
+        assert_eq!(
+            ArgSchema::Array(PrimitiveSpec::String)
+                .parse(r#"["hello, world", foo]"#)
+                .unwrap(),
+            Arg::Array(vec![
+                ScalarArg::String("hello, world".to_string()),
+                ScalarArg::String("foo".to_string()),
+            ])
+        );
+
+        // Empty array
+        assert_eq!(
+            ArgSchema::Array(PrimitiveSpec::Number).parse("[]").unwrap(),
+            Arg::Array(vec![])
+        );
+        // Invalid number in array
+        assert!(
+            ArgSchema::Array(PrimitiveSpec::Number)
+                .parse("[1, abc]")
+                .is_err()
+        );
+
+        // booleans
+        assert_eq!(
+            ArgSchema::Scalar(PrimitiveSpec::Boolean)
+                .parse("true")
+                .unwrap(),
+            Arg::Scalar(ScalarArg::Boolean(true)),
+        );
+        assert_eq!(
+            ArgSchema::Scalar(PrimitiveSpec::Boolean)
+                .parse("false")
+                .unwrap(),
+            Arg::Scalar(ScalarArg::Boolean(false)),
+        );
+
+        // strings
+        assert_eq!(
+            ArgSchema::Scalar(PrimitiveSpec::String)
+                .parse("true")
+                .unwrap(),
+            Arg::Scalar(ScalarArg::String("true".to_string())),
+        );
+
+        // enums
+        assert_eq!(
+            ArgSchema::Enum(["a".to_string(), "b".to_string()].into())
+                .parse("a")
+                .unwrap(),
+            Arg::Enum("a".to_string())
+        );
+        assert_eq!(
+            ArgSchema::Enum(["a".to_string(), "b".to_string()].into())
+                .parse("b")
+                .unwrap(),
+            Arg::Enum("b".to_string())
+        );
+        assert!(
+            ArgSchema::Enum(["a".to_string(), "b".to_string()].into())
+                .parse("c")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn argsspec_from_toml() {
+        let spec: ArgsOnly = toml::from_str(indoc! {r#"
+            args.name = "string"
+            args.count = "number"
+            args.verbose = "boolean"
+            args.tags = "Array string"
+            args.mode = "[debug, release]"
+            args.default_enum = {type = "[x, y]", default = "x"}
+            args.default_str = {type = "string", default = "fallback"}
+        "#})
+        .unwrap();
+
+        // All explicit values provided.
+        let values: toml::Value = toml::from_str(indoc! {r#"
+            name = "hello"
+            count = 42
+            verbose = true
+            tags = ["a", "b"]
+            mode = "release"
+        "#})
+        .unwrap();
+        let result = spec.args.from_toml(&values).unwrap();
+
+        assert_eq!(
+            result.as_ref().get("name").unwrap(),
+            &Arg::Scalar(ScalarArg::String("hello".to_string()))
+        );
+        assert_eq!(
+            result.as_ref().get("count").unwrap(),
+            &Arg::Scalar(ScalarArg::Number(42.0))
+        );
+        assert_eq!(
+            result.as_ref().get("verbose").unwrap(),
+            &Arg::Scalar(ScalarArg::Boolean(true))
+        );
+        assert_eq!(
+            result.as_ref().get("tags").unwrap(),
+            &Arg::Array(vec![
+                ScalarArg::String("a".to_string()),
+                ScalarArg::String("b".to_string()),
+            ])
+        );
+        assert_eq!(
+            result.as_ref().get("mode").unwrap(),
+            &Arg::Enum("release".to_string())
+        );
+        // Defaults should be filled in.
+        assert_eq!(
+            result.as_ref().get("default_enum").unwrap(),
+            &Arg::Enum("x".to_string())
+        );
+        assert_eq!(
+            result.as_ref().get("default_str").unwrap(),
+            &Arg::Scalar(ScalarArg::String("fallback".to_string()))
+        );
+
+        // Float number.
+        let values: toml::Value = toml::from_str(indoc! {r#"
+            name = "hi"
+            count = 3.15
+            verbose = false
+            tags = []
+            mode = "debug"
+        "#})
+        .unwrap();
+        let result = spec.args.from_toml(&values).unwrap();
+        assert_eq!(
+            result.as_ref().get("count").unwrap(),
+            &Arg::Scalar(ScalarArg::Number(3.15))
+        );
+        assert_eq!(
+            result.as_ref().get("verbose").unwrap(),
+            &Arg::Scalar(ScalarArg::Boolean(false))
+        );
+        assert_eq!(result.as_ref().get("tags").unwrap(), &Arg::Array(vec![]));
+
+        // Missing required arg is an error.
+        let values: toml::Value = toml::from_str("name = \"hi\"\n").unwrap();
+        assert!(spec.args.from_toml(&values).is_err());
+
+        // Invalid enum value is an error.
+        let values: toml::Value = toml::from_str(indoc! {r#"
+            name = "hi"
+            count = 1
+            verbose = true
+            tags = []
+            mode = "profile"
+        "#})
+        .unwrap();
+        assert!(spec.args.from_toml(&values).is_err());
+
+        // Type mismatch (string where number expected) is an error.
+        let values: toml::Value = toml::from_str(indoc! {r#"
+            name = "hi"
+            count = "not a number"
+            verbose = true
+            tags = []
+            mode = "debug"
+        "#})
+        .unwrap();
+        assert!(spec.args.from_toml(&values).is_err());
     }
 
     #[test]
