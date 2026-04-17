@@ -25,3 +25,31 @@ pub fn upsert_stdlib_to_disk<P: AsRef<Path>>(cache_dir: P) -> Result<PathBuf, Er
 
     Ok(dir)
 }
+
+fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = s.split('.').map(|p| p.parse::<u32>().ok());
+    Some((parts.next()??, parts.next()??, parts.next()??))
+}
+
+fn version_greater_than(lhs: &str, rhs: &str) -> bool {
+    match (parse_version(lhs), parse_version(rhs)) {
+        (Some(lhs), Some(rhs)) => lhs > rhs,
+        _ => true,
+    }
+}
+
+/// Returns true if the minimum version of the standard library cannot be supported.
+pub fn outdated(min_version: &str) -> bool {
+    version_greater_than(min_version, VERSION)
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn version_less_than() {
+        assert_eq!(super::version_greater_than("0.0.8", "0.0.9"), false);
+        assert_eq!(super::version_greater_than("0.0.9", "0.0.9"), false);
+        assert_eq!(super::version_greater_than("0.0.10", "0.0.9"), true);
+    }
+}
