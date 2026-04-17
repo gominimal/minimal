@@ -28,6 +28,7 @@ pub async fn cmd_init(args: InitArgs, config: Config) -> Result<(), Error> {
                 .upstream
                 .as_ref()
                 .unwrap()
+                .as_ref()
                 .as_spec_origin()
                 .unwrap(),
             ctx.repo_dir().to_path_buf(),

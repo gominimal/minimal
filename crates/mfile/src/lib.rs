@@ -98,6 +98,39 @@ impl LinkConfig {
     }
 }
 
+/// Describes the upstream, the previous link in the software supply chain.
+///
+/// The top-most link will not have an upstream, so this may not be set in all layers.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct Upstream {
+    #[serde(flatten)]
+    pub link: LinkConfig,
+
+    #[serde(default, alias = "sideload")]
+    sideloads: Vec<Sideload>,
+}
+
+impl Upstream {
+    fn fixup_relative<P: AsRef<Path>>(&mut self, mfile_path: P) {
+        self.link.fixup_relative(mfile_path);
+    }
+}
+
+impl AsRef<LinkConfig> for Upstream {
+    fn as_ref(&self) -> &LinkConfig {
+        &self.link
+    }
+}
+
+/// A sideload configured in this repo.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct Sideload {
+    #[serde(flatten)]
+    link: LinkConfig,
+    #[serde(default)]
+    params: Option<toml::Table>,
+}
+
 /// The value of a declared environment variable. Either a literal value
 /// or the symbolic variant `{ inherit = true }`, meaning to read it from the parent process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -328,7 +361,10 @@ pub enum Layout {
 pub struct File {
     /// The previous link in the software supply chain.
     #[serde(alias = "base")]
-    pub upstream: Option<LinkConfig>,
+    pub upstream: Option<Upstream>,
+    /// The schema for any parameters which configure this layer.
+    pub params: Option<args::ArgsSpec>,
+
     /// Default profile, state_key etc.
     #[serde(default, alias = "default")]
     pub defaults: Defaults,
@@ -382,6 +418,28 @@ impl File {
         }
     }
 
+    /// Helper to finish initialization of the structure after being deserialized.
+    fn init_toml(mut self, path: &PathBuf, layout: Layout) -> Result<Self, Error> {
+        self.mfile_path = Some(path.to_path_buf());
+        self.layout = Some(layout);
+        if let Some(u) = self.upstream.as_mut() {
+            u.fixup_relative(path);
+            for sideload in u.sideloads.iter_mut() {
+                sideload.link.fixup_relative(path);
+            }
+        }
+        // Parameters, if set, must declare defaults.
+        if let Some(params) = &self.params {
+            for (n, s) in params.0.iter() {
+                if s.default.is_none() {
+                    return Err(Error::MissingParamDefault(n.clone()));
+                }
+            }
+        }
+        self.warn_unknown_fields();
+        Ok(self)
+    }
+
     /// Loads the minimal file from the given directory path. The given
     /// directory must be a repository / minimalfile root.
     pub fn from_dir<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
@@ -396,14 +454,11 @@ impl File {
                     return Err(Error::ConflictingLayouts(vec![path, conflicting_path]));
                 }
 
-                let mut mfile: Self = toml::from_slice(&file_data).map_err(Error::Format)?;
-                mfile.mfile_path = Some(path.to_path_buf());
-                mfile.layout = Some(Layout::Root);
-                if let Some(u) = mfile.upstream.as_mut() {
-                    u.fixup_relative(&path)
-                }
-                mfile.warn_unknown_fields();
-                return Ok(mfile);
+                return Self::init_toml(
+                    toml::from_slice(&file_data).map_err(Error::Format)?,
+                    &path,
+                    Layout::Root,
+                );
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(Error::IO("minimal file", path, e)),
@@ -412,16 +467,11 @@ impl File {
         // Check for the minimal file at `./.minimal`.
         let path = dir.as_ref().join(".minimal").join(MFILE_NAME);
         match std::fs::read(&path) {
-            Ok(file_data) => {
-                let mut mfile: Self = toml::from_slice(&file_data).map_err(Error::Format)?;
-                mfile.mfile_path = Some(path.to_path_buf());
-                mfile.layout = Some(Layout::DotMinimal);
-                if let Some(u) = mfile.upstream.as_mut() {
-                    u.fixup_relative(&path)
-                }
-                mfile.warn_unknown_fields();
-                Ok(mfile)
-            }
+            Ok(file_data) => Self::init_toml(
+                toml::from_slice(&file_data).map_err(Error::Format)?,
+                &path,
+                Layout::DotMinimal,
+            ),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::NotFound),
             Err(e) => Err(Error::IO("minimal file", path, e)),
         }
@@ -432,7 +482,10 @@ impl File {
     // DO NOT USE unless you know what you are doing.
     pub fn synthetic(upstream: LinkConfig) -> Self {
         Self {
-            upstream: Some(upstream),
+            upstream: Some(Upstream {
+                link: upstream,
+                sideloads: vec![],
+            }),
             ..Default::default()
         }
     }
@@ -614,6 +667,10 @@ mod tests {
             repo = "https://github.com/gominimal/pkgs"
             branch = "main"
 
+            [params]
+            str = "string"
+            some_enum = {type = "[a,b]", default = "b"}
+
             [tasks.test]
             state_key = "test"
             patch.dir."~/.claude" = "read-write"
@@ -631,11 +688,32 @@ mod tests {
         assert_eq!(
             mf,
             File {
-                upstream: Some(LinkConfig::Git {
-                    repo: "https://github.com/gominimal/pkgs".to_string(),
-                    branch: Some("main".to_string()),
-                    locked_commit: None,
+                upstream: Some(Upstream {
+                    link: LinkConfig::Git {
+                        repo: "https://github.com/gominimal/pkgs".to_string(),
+                        branch: Some("main".to_string()),
+                        locked_commit: None,
+                    },
+                    sideloads: vec![]
                 }),
+                params: Some(args::ArgsSpec(HashMap::from([
+                    (
+                        "str".to_string(),
+                        args::ArgSpec {
+                            spec: args::ArgSchema::Scalar(args::PrimitiveSpec::String),
+                            help: None,
+                            default: None,
+                        }
+                    ),
+                    (
+                        "some_enum".to_string(),
+                        args::ArgSpec {
+                            spec: args::ArgSchema::Enum(["a".to_string(), "b".to_string()].into()),
+                            help: None,
+                            default: Some("b".to_string()),
+                        }
+                    ),
+                ]))),
                 defaults: Default::default(),
                 harness: None,
                 tasks: [(

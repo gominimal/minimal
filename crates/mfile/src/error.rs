@@ -10,6 +10,7 @@ pub enum Error {
     Format(toml::de::Error),
     NotFound,
     ConflictingLayouts(Vec<PathBuf>),
+    MissingParamDefault(String),
 }
 
 impl fmt::Display for Error {
@@ -29,6 +30,9 @@ impl fmt::Display for Error {
                     .collect::<Vec<_>>()
                     .join(",")
             ),
+            Error::MissingParamDefault(e) => {
+                write!(f, "invalid parameter: `{}` does not define a default", e)
+            }
         }
     }
 }
@@ -40,6 +44,7 @@ impl std::error::Error for Error {
             Error::Format(e) => Some(e),
             Error::NotFound => None,
             Error::ConflictingLayouts(_) => None,
+            Error::MissingParamDefault(_) => None,
         }
     }
 }
