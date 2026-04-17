@@ -230,8 +230,9 @@ mod tests {
         .unwrap();
 
         let parsed = t.args.parse("--greeting hello --name world").unwrap();
-        let var_ctx =
-            common::ncl_eval::VarCtx::new(parsed.iter().map(|(k, v)| (k.as_str(), v.clone())));
+        let var_ctx = common::ncl_eval::VarCtx::from_iter(
+            parsed.iter().map(|(k, v)| (k.as_str(), v.clone())),
+        );
         let t2 = t
             .map_exec_strings(|s| {
                 var_ctx

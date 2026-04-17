@@ -1174,10 +1174,13 @@ mod tests {
             let (interactive, invocations) = env
                 .task_invocations(
                     &task,
-                    Some(&std::collections::HashMap::from([(
-                        "input".to_string(),
-                        args::Arg::Scalar(args::ScalarArg::String("beep".to_string())),
-                    )])),
+                    Some(
+                        &std::collections::HashMap::from([(
+                            "input".to_string(),
+                            args::Arg::Scalar(args::ScalarArg::String("beep".to_string())),
+                        )])
+                        .into(),
+                    ),
                 )
                 .await
                 .unwrap();

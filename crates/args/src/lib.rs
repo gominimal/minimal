@@ -6,20 +6,42 @@
 //!    [ArgSpec::parse] can be used to parse a string representing the invocation of
 //!    these arguments into their concrete values.
 //!  * [ArgsSpec]: Newtype around a map of argument names to [ArgSpec] (schema) descriptions.
-//!
-//!  A concrete set of arguments is represented using `HashMap<String, Arg>`.
+//!  * [ArgsSet]: A concrete set of arguments, effectively a Newtype of `HashMap<String, Arg>`.
 
 use std::{
     collections::{BTreeSet, HashMap},
     hash::Hash,
 };
 
-/// Deterministic hash of the value of a set of arguments.
-pub fn hash_args<H: std::hash::Hasher>(args: &HashMap<String, Arg>, state: &mut H) {
-    let keys: BTreeSet<_> = args.keys().cloned().collect();
-    for k in keys.into_iter() {
-        k.hash(state);
-        args.get(&k).unwrap().hash(state);
+/// A set of arguments.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArgsSet(HashMap<String, Arg>);
+
+impl ArgsSet {
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Arg)> {
+        self.0.iter()
+    }
+}
+
+impl Hash for ArgsSet {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let keys: BTreeSet<_> = self.0.keys().cloned().collect();
+        for k in keys.into_iter() {
+            k.hash(state);
+            self.0.get(&k).unwrap().hash(state);
+        }
+    }
+}
+
+impl From<HashMap<String, Arg>> for ArgsSet {
+    fn from(value: HashMap<String, Arg>) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<HashMap<String, Arg>> for ArgsSet {
+    fn as_ref(&self) -> &HashMap<String, Arg> {
+        &self.0
     }
 }
 
@@ -444,7 +466,7 @@ impl ArgsSpec {
     /// to [Arg] values.
     ///
     /// Shell quoting is handled via `shlex`.
-    pub fn parse(&self, args: &str) -> Result<HashMap<String, Arg>, clap::Error> {
+    pub fn parse(&self, args: &str) -> Result<ArgsSet, clap::Error> {
         let argv = shlex::split(args).ok_or_else(|| {
             clap::Command::new("task").no_binary_name(true).error(
                 clap::error::ErrorKind::InvalidValue,
@@ -459,7 +481,7 @@ impl ArgsSpec {
     ///
     /// Equivalent to [`parse_argv_named`](Self::parse_argv_named) with a
     /// display name of `"task"`.
-    pub fn parse_argv<I, T>(&self, args: I) -> Result<HashMap<String, Arg>, clap::Error>
+    pub fn parse_argv<I, T>(&self, args: I) -> Result<ArgsSet, clap::Error>
     where
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
@@ -489,7 +511,7 @@ impl ArgsSpec {
         &self,
         display_name: &str,
         args: I,
-    ) -> Result<HashMap<String, Arg>, clap::Error>
+    ) -> Result<ArgsSet, clap::Error>
     where
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
@@ -544,7 +566,7 @@ impl ArgsSpec {
             }
         }
 
-        Ok(result)
+        Ok(ArgsSet(result))
     }
 }
 
@@ -624,20 +646,23 @@ mod tests {
             .parse("--name hello --count 42 --verbose true --tags a --tags b --enum a")
             .unwrap();
         assert_eq!(
-            result.get("name").unwrap(),
+            result.as_ref().get("name").unwrap(),
             &Arg::Scalar(ScalarArg::String("hello".to_string()))
         );
         assert_eq!(
-            result.get("count").unwrap(),
+            result.as_ref().get("count").unwrap(),
             &Arg::Scalar(ScalarArg::Number(42.0))
         );
-        assert_eq!(result.get("enum").unwrap(), &Arg::Enum("a".to_string()));
         assert_eq!(
-            result.get("verbose").unwrap(),
+            result.as_ref().get("enum").unwrap(),
+            &Arg::Enum("a".to_string())
+        );
+        assert_eq!(
+            result.as_ref().get("verbose").unwrap(),
             &Arg::Scalar(ScalarArg::Boolean(true))
         );
         assert_eq!(
-            result.get("tags").unwrap(),
+            result.as_ref().get("tags").unwrap(),
             &Arg::Array(vec![
                 ScalarArg::String("a".to_string()),
                 ScalarArg::String("b".to_string()),

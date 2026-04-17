@@ -9,14 +9,6 @@ pub struct VarCtx {
 }
 
 impl VarCtx {
-    pub fn new<S: AsRef<str>, I: IntoIterator<Item = (S, args::Arg)>>(values: I) -> Self {
-        let mut base = String::with_capacity(512);
-        for (ident, value) in values.into_iter() {
-            value.write_nickel_binding(ident.as_ref(), &mut base);
-        }
-        Self { base }
-    }
-
     pub fn eval_string(&self, s: &str) -> Result<String, Box<(Files, Error)>> {
         let mut source = String::with_capacity(self.base.len() + s.len() + 16);
         source.push_str(&self.base);
@@ -49,19 +41,29 @@ impl VarCtx {
     }
 }
 
+impl<S: AsRef<str>> FromIterator<(S, args::Arg)> for VarCtx {
+    fn from_iter<T: IntoIterator<Item = (S, args::Arg)>>(iter: T) -> Self {
+        let mut base = String::with_capacity(512);
+        for (ident, value) in iter.into_iter() {
+            value.write_nickel_binding(ident.as_ref(), &mut base);
+        }
+        Self { base }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn empty_var_ctx() {
-        let ctx = VarCtx::new(std::iter::empty::<(&str, args::Arg)>());
+        let ctx = VarCtx::from_iter(std::iter::empty::<(&str, args::Arg)>());
         assert_eq!(ctx.base, "");
     }
 
     #[test]
     fn passthrough_basic_strings() {
-        let ctx = VarCtx::new(std::iter::empty::<(&str, args::Arg)>());
+        let ctx = VarCtx::from_iter(std::iter::empty::<(&str, args::Arg)>());
         assert_eq!(ctx.eval_string("hello").unwrap(), "hello");
         assert_eq!(ctx.eval_string("world").unwrap(), "world");
         assert_eq!(ctx.eval_string("hello world").unwrap(), "hello world");
@@ -71,7 +73,7 @@ mod tests {
     #[test]
     fn interpolation_with_vars_scalar() {
         use args::{Arg, ScalarArg};
-        let ctx = VarCtx::new(vec![
+        let ctx = VarCtx::from_iter(vec![
             ("name", Arg::Scalar(ScalarArg::String("world".to_string()))),
             ("count", Arg::Scalar(ScalarArg::Number(42.0))),
             ("flag", Arg::Scalar(ScalarArg::Boolean(true))),
@@ -92,7 +94,7 @@ mod tests {
     #[test]
     fn interpolation_with_vars_array() {
         use args::{Arg, ScalarArg};
-        let ctx = VarCtx::new(vec![
+        let ctx = VarCtx::from_iter(vec![
             (
                 "a",
                 Arg::Array(vec![

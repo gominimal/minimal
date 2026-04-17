@@ -665,7 +665,7 @@ impl<'a> Env<'a> {
     pub async fn task_invocations(
         &mut self,
         task: &mfile::Task,
-        parsed_args: Option<&std::collections::HashMap<String, args::Arg>>,
+        parsed_args: Option<&args::ArgsSet>,
     ) -> Result<(bool, Vec<Invocation>), Error> {
         let base = [(
             "task_packages",
@@ -678,11 +678,11 @@ impl<'a> Env<'a> {
         )]
         .into_iter();
         let var_ctx = if let Some(args) = parsed_args {
-            common::ncl_eval::VarCtx::new(
+            common::ncl_eval::VarCtx::from_iter(
                 base.chain(args.iter().map(|(k, v)| (k.as_str(), v.clone()))),
             )
         } else {
-            common::ncl_eval::VarCtx::new(base)
+            common::ncl_eval::VarCtx::from_iter(base)
         };
 
         Ok((

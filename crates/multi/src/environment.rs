@@ -87,7 +87,7 @@ impl EnvironmentHandle {
     pub async fn new_named_task(
         &self,
         name: String,
-        task_args: Option<&std::collections::HashMap<String, args::Arg>>,
+        task_args: Option<&args::ArgsSet>,
     ) -> Result<TaskHandle, mctx::Error> {
         let (graph, ctx) = self.build_new().await?;
         let shared = self.0.lock().await.shared.clone();

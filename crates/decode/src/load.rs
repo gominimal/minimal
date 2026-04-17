@@ -11,7 +11,6 @@ use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::term::Term;
 use nickel_lang_core::typ::TypeF;
 use nickel_lang_core::{error::NullReporter, eval::cache::CacheImpl, program::Program};
-use std::collections::HashMap;
 use std::hash::Hash;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -28,7 +27,7 @@ pub struct LoadOptions {
     /// The target we are loading for.
     pub target: Target,
     /// The parameters being passed to the layer during evaluation.
-    pub params: Option<HashMap<String, args::Arg>>,
+    pub params: Option<args::ArgsSet>,
 }
 
 impl LoadOptions {
@@ -55,7 +54,7 @@ impl LoadOptions {
         self.target.hash(state);
         if let Some(params) = &self.params {
             state.write(b"params");
-            args::hash_args(params, state);
+            params.hash(state);
         }
     }
 
