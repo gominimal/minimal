@@ -68,14 +68,23 @@ pub async fn run_task(
     let container = env
         .container()
         .map_err(|e| Error::Other(anyhow!("building container failed: {}", e)))?;
-    for inv in invocations {
+    for (i, inv) in invocations.iter().enumerate() {
         let mut cmd = env
             .command(&container, &inv.executable, inv.args.iter())
             .map_err(|e| Error::Other(anyhow!("building command failed: {}", e)))?;
-        cmd.spawn()
+        let status = cmd
+            .spawn()
             .map_err(|e| Error::Other(anyhow!("command launch failed: {}", e)))?
             .wait()
             .map_err(|e| Error::Other(anyhow!("command failed: {}", e)))?;
+        if !status.success() {
+            return Err(Error::Execution {
+                idx: i,
+                code: status.code,
+                reason: status.reason,
+                stderr: String::new(),
+            });
+        }
     }
 
     Ok(())
