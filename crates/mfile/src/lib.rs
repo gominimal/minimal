@@ -111,8 +111,19 @@ pub struct Upstream {
 }
 
 impl Upstream {
+    pub fn from_link(link: LinkConfig) -> Self {
+        Self {
+            link,
+            sideloads: vec![],
+        }
+    }
+
     fn fixup_relative<P: AsRef<Path>>(&mut self, mfile_path: P) {
         self.link.fixup_relative(mfile_path);
+    }
+
+    pub fn sideloads(&self) -> &[Sideload] {
+        &self.sideloads
     }
 }
 
@@ -129,6 +140,16 @@ pub struct Sideload {
     link: LinkConfig,
     #[serde(default)]
     params: Option<toml::Table>,
+}
+
+impl Sideload {
+    pub fn link(&self) -> &LinkConfig {
+        &self.link
+    }
+
+    pub fn params(&self) -> Option<&toml::Table> {
+        self.params.as_ref()
+    }
 }
 
 /// The value of a declared environment variable. Either a literal value

@@ -5,6 +5,7 @@ use std::io::Write;
 use common::{SpecOrigin, Target, repo_spec::Repo};
 use graph::Graph;
 use mctx::{Config, Context, Error};
+use mfile::LinkConfig;
 
 #[derive(clap::Args)]
 pub struct InitArgs {
@@ -61,11 +62,11 @@ pub async fn cmd_init(args: InitArgs, config: Config) -> Result<(), Error> {
                 Graph::new_from_chain(
                     vcs,
                     &mut (),
-                    SpecOrigin::Repo(common::repo_spec::Repo::Git {
-                        url: "https://github.com/gominimal/pkgs".to_string(),
-                        rev,
-                        tracking: Some(common::repo_spec::GitRef::Branch("main".to_string())),
-                    }),
+                    LinkConfig::Git {
+                        repo: "https://github.com/gominimal/pkgs".to_string(),
+                        branch: Some("main".to_string()),
+                        locked_commit: Some(rev),
+                    },
                     stdlib_dir,
                     Target::host(),
                 )?,

@@ -21,7 +21,7 @@ mod config;
 pub use config::{Config, ConfigBuilder, ConfigError};
 mod env;
 use graph::{BinProvider, BuildSpecRef, Graph, MaskingBinProvider, Transitives};
-use mfile::{EnvPatches, EnvVarValue, Task};
+use mfile::{EnvPatches, EnvVarValue, LinkConfig, Task};
 pub use sandbox2::config::Invocation;
 
 pub use env::Env;
@@ -401,13 +401,13 @@ impl Context {
 
     /// Builds & returns a graph of all packages for a specific target.
     pub fn graph_from_all_packages_with_target(&mut self, target: Target) -> Result<Graph, Error> {
-        let leaf_layer = self.repo_origin();
-
         let start = SystemTime::now();
         let res = Graph::new_from_chain(
             self.vcs_manager(),
             &mut graph::LayerCacheDir(self.config.layer_cache_dir()),
-            leaf_layer,
+            LinkConfig::Dir {
+                dir: self.repo_dir().to_str().unwrap().to_string(),
+            },
             self.stdlib_dir.clone(),
             target,
         )

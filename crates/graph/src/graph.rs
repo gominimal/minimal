@@ -7,7 +7,7 @@ use common::repo_spec::Repo;
 use common::{SpecOrigin, Target};
 use decode::builds::BuildRef;
 use decode::{Harness, Layer, LoadOptions, Profile, builds};
-use mfile::{self, LinkConfig};
+use mfile::{self, LinkConfig, Upstream};
 use nickel_lang_core::term::IndexMap;
 
 use generational_arena::Arena;
@@ -355,6 +355,145 @@ impl LayerCache for LayerCacheDir {
     }
 }
 
+/// Loads layers from source with caching, and assembles them into a [Graph].
+///
+/// This struct encapsulates the infrastructure needed for chain loading: source resolution
+/// via [SourceProvider] and parsed-layer caching via [LayerCache]. The traversal logic
+/// (following upstream links, loading sideloads) is implemented as methods, making it
+/// easy to reuse `load_layer` for both upstream and sideload loading.
+pub struct ChainLoader<'lc, SP: SourceProvider, LC: LayerCache> {
+    sp: SP,
+    lc: &'lc mut LC,
+    minimal_lib_path: PathBuf,
+    for_target: Target,
+}
+
+impl<'lc, SP: SourceProvider, LC: LayerCache> ChainLoader<'lc, SP, LC> {
+    pub fn new(sp: SP, lc: &'lc mut LC, minimal_lib_path: PathBuf, for_target: Target) -> Self {
+        Self {
+            sp,
+            lc,
+            minimal_lib_path,
+            for_target,
+        }
+    }
+
+    /// Resolves a [SpecOrigin] to a filesystem path using the [SourceProvider].
+    fn resolve_source(&mut self, origin: &SpecOrigin) -> Result<PathBuf, Error> {
+        match origin {
+            SpecOrigin::Inline => {
+                unreachable!()
+            }
+            SpecOrigin::Repo(Repo::Git { url, rev, tracking }) => self
+                .sp
+                .checkout_of(&LinkConfig::Git {
+                    repo: url.clone(),
+                    branch: tracking.as_ref().and_then(|b| match b {
+                        common::repo_spec::GitRef::Branch(b) => Some(b.clone()),
+                        common::repo_spec::GitRef::Tag(_t) => None,
+                    }),
+                    locked_commit: Some(rev.clone()),
+                })
+                .map_err(|e| Error::Fetch(e.to_string())),
+            SpecOrigin::LocalDir { absolute, .. } => Ok(absolute.clone()),
+        }
+    }
+
+    /// Loads a single layer from the given origin, using the cache where possible.
+    fn load_layer(
+        &mut self,
+        upstream: &Upstream,
+        params: Option<args::ArgsSet>,
+    ) -> Result<Layer, Error> {
+        let origin = upstream.link.as_spec_origin().unwrap();
+        let src_path = self.resolve_source(&origin)?;
+        let load_opts = LoadOptions {
+            minimal_lib_path: self.minimal_lib_path.clone(),
+            from: origin.clone(),
+            target: self.for_target.clone(),
+            params,
+        };
+
+        if let Some(layer) = self
+            .lc
+            .get(&load_opts)
+            .map_err(|e| Error::Fetch(format!("layer-cache fetch: {:?}", e)))?
+        {
+            Ok(layer)
+        } else {
+            let layer = Layer::new(src_path, &load_opts).map_err(Error::Decode)?;
+            if let Err(e) = self.lc.insert(load_opts, &layer) {
+                tracing::warn!("Failed to cache layer for origin {:?}: {:?}", origin, e);
+            }
+            Ok(layer)
+        }
+    }
+
+    /// Validates a layer's upstream reference and returns the next [Upstream] to load,
+    /// or `None` if this layer is the root of the chain.
+    fn next_upstream(
+        layer: &Layer,
+        current_origin: &SpecOrigin,
+    ) -> Result<Option<Upstream>, Error> {
+        let Some(next_upstream) = layer.upstream() else {
+            return Ok(None);
+        };
+
+        match &next_upstream.link {
+            LinkConfig::Git {
+                repo,
+                branch: _,
+                locked_commit,
+            } => {
+                if current_origin
+                    .as_repo()
+                    .is_some_and(|r| matches!(r, Repo::Git { url, ..} if url == repo))
+                {
+                    return Err(Error::Fetch(format!(
+                        "layer at {} defines an upstream that points to itself",
+                        repo.clone(),
+                    )));
+                }
+                if locked_commit.is_none() {
+                    return Err(Error::UpstreamNotPinned {
+                        upstream: repo.to_string(),
+                        at_layer: layer.origin.clone(),
+                    });
+                }
+            }
+            LinkConfig::Dir { .. } => {}
+        };
+
+        Ok(Some(next_upstream.clone()))
+    }
+
+    /// Loads the full layer chain starting from a leaf, including any sideloads
+    /// declared by layers in the chain, and assembles them into a [Graph].
+    pub fn load_chain(&mut self, leaf: LinkConfig) -> Result<Graph, Error> {
+        let mut layers = Vec::with_capacity(6);
+        let mut cursor = Some(Upstream::from_link(leaf));
+
+        while let Some(upstream) = cursor.take() {
+            // Load sideloads declared by this layer. They are pushed before
+            // the declaring layer so they can depend on packages from the upstream.
+            for sideload in upstream.sideloads() {
+                layers.push(self.load_layer(&Upstream::from_link(sideload.link().clone()), None)?);
+            }
+
+            let layer = self.load_layer(&upstream, None)?;
+            cursor = Self::next_upstream(&layer, &upstream.link.as_spec_origin().unwrap())?;
+            layers.push(layer);
+        }
+
+        let mut out = Graph::new();
+        out.target = self.for_target.clone();
+        for layer in layers.into_iter().rev() {
+            out = out.ingest(layer)?;
+        }
+        Ok(out)
+    }
+}
+
 /// Describes a match between a search term and a package.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchMatch {
@@ -471,97 +610,16 @@ impl Graph {
     /// Constructs a dependency graph using the given origin to load the leaf layer,
     /// and resolving the files for upstream layers using the given implementation of [SourceProvider].
     ///
-    /// SAFETY:
-    ///   The given leaf parameter must not be `SpecOrigin::Inline`, or this function will panic.
+    /// This is a convenience wrapper around [ChainLoader]. For more control over the
+    /// loading process (e.g. loading individual layers), construct a [ChainLoader] directly.
     pub fn new_from_chain<SP: SourceProvider, LC: LayerCache>(
-        mut sp: SP,
+        sp: SP,
         lc: &mut LC,
-        leaf: SpecOrigin,
+        leaf: LinkConfig,
         minimal_lib_path: PathBuf,
         for_target: Target,
     ) -> Result<Self, Error> {
-        let mut layers = Vec::with_capacity(6);
-
-        let mut cursor = Some(leaf);
-
-        while let Some(upstream) = cursor.take() {
-            let src_path = match &upstream {
-                SpecOrigin::Inline => {
-                    panic!("SpecOrigin::Inline given as leaf to new_from_chain()")
-                }
-                SpecOrigin::Repo(Repo::Git { url, rev, tracking }) => sp
-                    .checkout_of(&LinkConfig::Git {
-                        repo: url.clone(),
-                        branch: tracking.as_ref().and_then(|b| match b {
-                            common::repo_spec::GitRef::Branch(b) => Some(b.clone()),
-                            common::repo_spec::GitRef::Tag(_t) => None,
-                        }),
-                        locked_commit: Some(rev.clone()),
-                    })
-                    .map_err(|e| Error::Fetch(e.to_string()))?,
-                SpecOrigin::LocalDir { absolute, .. } => absolute.clone(),
-            };
-
-            // Load the layer, either from the layer cache or by doing a full load via [Layer::new].
-            let load_opts = decode::LoadOptions {
-                minimal_lib_path: minimal_lib_path.clone(),
-                from: upstream.clone(),
-                target: for_target.clone(),
-                params: None,
-            };
-            let layer = if let Some(layer) = lc
-                .get(&load_opts)
-                .map_err(|e| Error::Fetch(format!("layer-cache fetch: {:?}", e)))?
-            {
-                layer
-            } else {
-                let layer = Layer::new(src_path, &load_opts).map_err(Error::Decode)?;
-
-                if let Err(e) = lc.insert(load_opts, &layer) {
-                    tracing::warn!("Failed to cache layer for origin {:?}: {:?}", upstream, e);
-                }
-                layer
-            };
-
-            cursor = if let Some(next_upstream) = layer.upstream() {
-                match next_upstream {
-                    LinkConfig::Git {
-                        repo,
-                        branch: _,
-                        locked_commit,
-                    } => {
-                        if upstream
-                            .as_repo()
-                            .is_some_and(|r| matches!(r, Repo::Git { url, ..} if url == repo))
-                        {
-                            return Err(Error::Fetch(format!(
-                                "layer at {} defines an upstream that points to itself",
-                                repo.clone(),
-                            )));
-                        }
-                        if locked_commit.is_none() {
-                            return Err(Error::UpstreamNotPinned {
-                                upstream: repo.to_string(),
-                                at_layer: layer.origin,
-                            });
-                        }
-                    }
-                    LinkConfig::Dir { .. } => {} // nothing to validate
-                };
-
-                Some(next_upstream.as_spec_origin().unwrap())
-            } else {
-                None
-            };
-            layers.push(layer);
-        }
-
-        let mut out = Self::new();
-        out.target = for_target;
-        for layer in layers.into_iter().rev() {
-            out = out.ingest(layer)?;
-        }
-        Ok(out)
+        ChainLoader::new(sp, lc, minimal_lib_path, for_target).load_chain(leaf)
     }
 
     /// Loads build declarations in from the given layer.
@@ -1366,7 +1424,7 @@ mod tests {
         let graph = Graph::new_from_chain(
             &mut sp,
             &mut (),
-            middle_repo.as_spec_origin().unwrap(),
+            middle_repo.clone(),
             LoadOptions::for_test().minimal_lib_path,
             Target::default(),
         )
@@ -1394,6 +1452,139 @@ mod tests {
             &vec![
                 apex_repo.as_spec_origin().unwrap(),
                 middle_repo.as_spec_origin().unwrap(),
+            ],
+        )
+    }
+
+    #[test]
+    fn sideload_chain() {
+        let apex = TempDir::new().unwrap();
+        std::fs::create_dir_all(apex.path().join("packages").join("top")).unwrap();
+        std::fs::write(
+            apex.path().join("packages").join("top").join("build.ncl"),
+            indoc! {
+            "
+            let {build, ..} = import \"minimal.ncl\" in
+
+            build {
+                name = \"top\",
+                build_deps = [],
+                cmd = \"\",
+            }"
+            },
+        )
+        .unwrap();
+        let apex_repo = LinkConfig::Git {
+            repo: "git@fakehub.com:minimal/apex.git".to_string(),
+            locked_commit: Some("abc123".to_string()),
+            branch: None,
+        };
+
+        let root = TempDir::new().unwrap();
+        std::fs::write(
+            root.path().join(MFILE_NAME),
+            indoc! {
+            "
+            [upstream]
+            repo = \"git@fakehub.com:minimal/apex.git\"
+            locked_commit = \"abc123\"
+
+            [[upstream.sideload]]
+            repo = \"git@fakehub.com:minimal/sideload.git\"
+            locked_commit = \"def\"
+            "
+            },
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("packages").join("root")).unwrap();
+        std::fs::write(
+            root.path().join("packages").join("root").join("build.ncl"),
+            indoc! {
+            "
+            let {build, upstream, ..} = import \"minimal.ncl\" in
+
+            build {
+                name = \"root\",
+                build_deps = [upstream \"top\"],
+                cmd = \"\",
+            }"
+            },
+        )
+        .unwrap();
+        let root_repo = LinkConfig::Git {
+            repo: "git@fakehub.com:minimal/root.git".to_string(),
+            locked_commit: Some("abc123".to_string()),
+            branch: None,
+        };
+
+        let sideload = TempDir::new().unwrap();
+        std::fs::write(
+            sideload.path().join(MFILE_NAME),
+            indoc! {
+            "
+            [upstream]
+            repo = \"git@fakehub.com:minimal/apex.git\"
+            locked_commit = \"abc123\"
+            "
+            },
+        )
+        .unwrap();
+        std::fs::create_dir_all(sideload.path().join("packages").join("sideload")).unwrap();
+        std::fs::write(
+            sideload
+                .path()
+                .join("packages")
+                .join("sideload")
+                .join("build.ncl"),
+            indoc! {
+            "
+            let {build, upstream, ..} = import \"minimal.ncl\" in
+
+            build {
+                name = \"sideload\",
+                build_deps = [upstream \"top\"],
+                cmd = \"\",
+            }"
+            },
+        )
+        .unwrap();
+        let sideload_repo = LinkConfig::Git {
+            repo: "git@fakehub.com:minimal/sideload.git".to_string(),
+            locked_commit: Some("def".to_string()),
+            branch: None,
+        };
+
+        let mut sp = SourceProviderFake(HashMap::from_iter([
+            (apex_repo.clone(), apex),
+            (root_repo.clone(), root),
+            (sideload_repo.clone(), sideload),
+        ]));
+        let graph = Graph::new_from_chain(
+            &mut sp,
+            &mut (),
+            root_repo.clone(),
+            LoadOptions::for_test().minimal_lib_path,
+            Target::default(),
+        )
+        .unwrap();
+
+        // Make sure the build from both apex, middle, & sideload is present
+        assert_eq!(
+            graph
+                .builds
+                .iter()
+                .map(|(_, b)| &b.name)
+                .collect::<Vec<_>>(),
+            vec!["top", "sideload", "root"]
+        );
+
+        // Make sure the supply chain was tracked in the correct order
+        assert_eq!(
+            graph.software_supply_chain(),
+            &vec![
+                apex_repo.as_spec_origin().unwrap(),
+                sideload_repo.as_spec_origin().unwrap(),
+                root_repo.as_spec_origin().unwrap(),
             ],
         )
     }
