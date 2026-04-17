@@ -133,16 +133,17 @@ mod tests {
 
     #[test]
     fn parse_str() {
-        let (term, mut program, _origin, _target) = Loader::new("\"a\"", &LoadOptions::for_test())
-            .unwrap_or_else(|e| {
-                e.report_to_stderr();
-                panic!("load failed");
-            })
-            .finish()
-            .unwrap_or_else(|e| {
-                e.report_to_stderr();
-                panic!("finish failed");
-            });
+        let (term, mut program, _origin, _target) =
+            Loader::new("\"a\"", None, &LoadOptions::for_test())
+                .unwrap_or_else(|e| {
+                    e.report_to_stderr();
+                    panic!("load failed");
+                })
+                .finish()
+                .unwrap_or_else(|e| {
+                    e.report_to_stderr();
+                    panic!("finish failed");
+                });
 
         assert!(matches!(
         AttrValue::from_term(&term, &mut program).unwrap().unwrap(),
@@ -151,16 +152,17 @@ mod tests {
     }
     #[test]
     fn parse_bool() {
-        let (term, mut program, _origin, _target) = Loader::new("true", &LoadOptions::for_test())
-            .unwrap_or_else(|e| {
-                e.report_to_stderr();
-                panic!("load failed");
-            })
-            .finish()
-            .unwrap_or_else(|e| {
-                e.report_to_stderr();
-                panic!("finish failed");
-            });
+        let (term, mut program, _origin, _target) =
+            Loader::new("true", None, &LoadOptions::for_test())
+                .unwrap_or_else(|e| {
+                    e.report_to_stderr();
+                    panic!("load failed");
+                })
+                .finish()
+                .unwrap_or_else(|e| {
+                    e.report_to_stderr();
+                    panic!("finish failed");
+                });
 
         assert_eq!(
             AttrValue::from_term(&term, &mut program).unwrap().unwrap(),
@@ -169,16 +171,17 @@ mod tests {
     }
     #[test]
     fn parse_enum() {
-        let (term, mut program, _origin, _target) = Loader::new("'Uwu", &LoadOptions::for_test())
-            .unwrap_or_else(|e| {
-                e.report_to_stderr();
-                panic!("load failed");
-            })
-            .finish()
-            .unwrap_or_else(|e| {
-                e.report_to_stderr();
-                panic!("finish failed");
-            });
+        let (term, mut program, _origin, _target) =
+            Loader::new("'Uwu", None, &LoadOptions::for_test())
+                .unwrap_or_else(|e| {
+                    e.report_to_stderr();
+                    panic!("load failed");
+                })
+                .finish()
+                .unwrap_or_else(|e| {
+                    e.report_to_stderr();
+                    panic!("finish failed");
+                });
 
         assert!(matches!(
         AttrValue::from_term(&term, &mut program).unwrap().unwrap(),
@@ -189,7 +192,7 @@ mod tests {
     #[test]
     fn parse_record() {
         let (term, mut program, _origin, _target) =
-            Loader::new("{key = \"a\"}", &LoadOptions::for_test())
+            Loader::new("{key = \"a\"}", None, &LoadOptions::for_test())
                 .unwrap_or_else(|e| {
                     e.report_to_stderr();
                     panic!("load failed");
@@ -209,7 +212,7 @@ mod tests {
     #[test]
     fn parse_list() {
         let (term, mut program, _origin, _target) =
-            Loader::new("[\"a\", \"b\"]", &LoadOptions::for_test())
+            Loader::new("[\"a\", \"b\"]", None, &LoadOptions::for_test())
                 .unwrap_or_else(|e| {
                     e.report_to_stderr();
                     panic!("load failed");
@@ -231,6 +234,7 @@ mod tests {
     fn unknown_attr_nickel_err() {
         let res = Loader::new(
             "let {Attrs, ..} = import \"minimal.ncl\" in {unknown_attr = \"a\"} | Attrs",
+            None,
             &LoadOptions::for_test(),
         )
         .unwrap_or_else(|e| {
@@ -247,6 +251,7 @@ mod tests {
     fn attr_wrong_schema_nickel_err() {
         let res = Loader::new(
             "let {Attrs, ..} = import \"minimal.ncl\" in {env_state_wiring = \"a\"} | Attrs",
+            None,
             &LoadOptions::for_test(),
         )
         .unwrap_or_else(|e| {

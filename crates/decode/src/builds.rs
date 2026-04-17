@@ -1263,6 +1263,7 @@ mod tests {
                 "
             }
             .to_string(),
+            None,
             &LoadOptions::for_test(),
         )
         .unwrap_or_else(|e| {
@@ -1294,6 +1295,7 @@ mod tests {
 
         let (term, mut program, _origin, _target) = Loader::new(
             format!("import \"{}\"", path.to_str().unwrap()),
+            None,
             &LoadOptions::for_test(),
         )
         .unwrap_or_else(|e| {
@@ -1324,6 +1326,7 @@ mod tests {
                 "
             }
             .to_string(),
+            None,
             &LoadOptions::for_test(),
         )
         .unwrap_or_else(|e| {
@@ -1362,6 +1365,7 @@ mod tests {
                 "
             }
             .to_string(),
+            None,
             &LoadOptions::for_test(),
         )
         .unwrap_or_else(|e| {
@@ -1401,6 +1405,7 @@ mod tests {
         		} | BuildSpec"
             }
             .to_string(),
+            None,
             &LoadOptions::for_test(),
         )
         .unwrap_or_else(|e| {
@@ -1452,6 +1457,7 @@ mod tests {
         		} | BuildSpec"
             }
             .to_string(),
+            None,
             &LoadOptions::for_test(),
         )
         .unwrap_or_else(|e| {
@@ -1487,7 +1493,7 @@ mod tests {
                     ],
         		} | BuildSpec"
             }
-            .to_string(),
+            .to_string(),None,
             &LoadOptions::for_test(),
         )
         .unwrap_or_else(|e| {
@@ -1524,6 +1530,7 @@ mod tests {
         		} | BuildSpec"
             }
             .to_string(),
+            None,
             &LoadOptions::for_test(),
         )
         .unwrap_or_else(|e| {
@@ -1562,6 +1569,7 @@ mod tests {
         		} | BuildSpec"
             }
             .to_string(),
+            None,
             &LoadOptions::for_test(),
         )
         .unwrap_or_else(|e| {
@@ -1593,6 +1601,7 @@ mod tests {
                 "
             }
             .to_string(),
+            None,
             &LoadOptions::for_test(),
         )
         .unwrap_or_else(|e| {
@@ -1657,6 +1666,7 @@ mod tests {
         		} | BuildSpec"
             }
             .to_string(),
+            None,
             &LoadOptions::for_test(),
         )
         .unwrap_or_else(|e| {
@@ -1696,6 +1706,7 @@ mod tests {
         		} | BuildSpec"
             }
             .to_string(),
+            None,
             &LoadOptions::for_test(),
         )
         .unwrap_or_else(|e| {
@@ -1732,6 +1743,7 @@ mod tests {
         		} | BuildSpec"
             }
             .to_string(),
+            None,
             &LoadOptions::for_test(),
         )
         .unwrap_or_else(|e| {

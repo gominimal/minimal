@@ -166,6 +166,7 @@ mod tests {
                 "
             }
             .to_string(),
+            None,
             &LoadOptions::for_test(),
         )
         .unwrap_or_else(|e| {
@@ -211,6 +212,7 @@ mod tests {
                 "
             }
             .to_string(),
+            None,
             &LoadOptions::for_test(),
         )
         .unwrap_or_else(|e| {

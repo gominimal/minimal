@@ -108,13 +108,13 @@ impl Layer {
 
     /// Simple builder of literal nickel for a test.
     pub fn new_for_test(s: String) -> Result<Self, Error> {
-        let l = load::Loader::new(s, &load::LoadOptions::for_test())?;
+        let l = load::Loader::new(s, None, &load::LoadOptions::for_test())?;
         Self::from_loader(l, None)
     }
 
     /// Loads all objects in the given directory following the standard directory layout.
     pub fn new<P: AsRef<Path>>(layer_dir: P, opts: &LoadOptions) -> Result<Self, Error> {
-        let (upstream, config_dir) = match mfile::File::from_dir(layer_dir.as_ref()) {
+        let (upstream, params, config_dir) = match mfile::File::from_dir(layer_dir.as_ref()) {
             Ok(mfile) => {
                 if let Some(min_vers) = &mfile.stdlib.minimum_version {
                     if **min_vers > *stdlib::VERSION {
@@ -128,19 +128,30 @@ impl Layer {
 
                 (
                     mfile.upstream.clone(),
+                    mfile.params.clone(),
                     mfile.dir_path().map(|p| p.to_path_buf()),
                 )
             }
             Err(mfile::Error::IO(_, _, e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                (None, None)
+                (None, None, None)
             }
-            Err(mfile::Error::NotFound) => (None, None),
+            Err(mfile::Error::NotFound) => (None, None, None),
             Err(mfile::Error::IO(_, _, e)) => return Err(Error::IO(e)),
             Err(e) => return Err(Error::Other(e.to_string())),
         };
 
+        let args = match params {
+            Some(schema) => Some(
+                // TODO: Make own error for bad parameters
+                schema
+                    .from_deserialized(&opts.params.clone().unwrap_or_default())
+                    .map_err(|e| Error::Other(format!("bad parameters: {e}")))?,
+            ),
+            None => None,
+        };
         let loader = load::Loader::new_with_all_pkgs(
             config_dir.unwrap_or_else(|| layer_dir.as_ref().to_path_buf()),
+            args.as_ref(),
             opts,
         )?;
         Self::from_loader(loader, upstream)
@@ -511,6 +522,7 @@ mod tests {
         		} | BuildSpec"
             }
             .to_string(),
+            None,
             &LoadOptions::for_test(),
         )
         .unwrap_or_else(|e| {
@@ -580,6 +592,7 @@ mod tests {
         		} | BuildSpec"
             }
             .to_string(),
+            None,
             &LoadOptions::for_test(),
         )
         .unwrap_or_else(|e| {
@@ -621,6 +634,7 @@ mod tests {
         		} | BuildSpec"
             }
             .to_string(),
+            None,
             &LoadOptions::for_test(),
         )
         .unwrap_or_else(|e| {
@@ -664,6 +678,7 @@ mod tests {
                 } | BuildSpec"
             }
             .to_string(),
+            None,
             &LoadOptions::for_test(),
         )
         .unwrap_or_else(|e| {

@@ -139,7 +139,7 @@ pub struct Sideload {
     #[serde(flatten)]
     link: LinkConfig,
     #[serde(default)]
-    params: Option<toml::Table>,
+    params: Option<HashMap<String, args::DiskArg>>,
 }
 
 impl Sideload {
@@ -147,7 +147,7 @@ impl Sideload {
         &self.link
     }
 
-    pub fn params(&self) -> Option<&toml::Table> {
+    pub fn params(&self) -> Option<&HashMap<String, args::DiskArg>> {
         self.params.as_ref()
     }
 }

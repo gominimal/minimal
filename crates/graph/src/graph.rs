@@ -403,7 +403,7 @@ impl<'lc, SP: SourceProvider, LC: LayerCache> ChainLoader<'lc, SP, LC> {
     fn load_layer(
         &mut self,
         upstream: &Upstream,
-        params: Option<args::ArgsSet>,
+        params: Option<HashMap<String, args::DiskArg>>,
     ) -> Result<Layer, Error> {
         let origin = upstream.link.as_spec_origin().unwrap();
         let src_path = self.resolve_source(&origin)?;
@@ -476,8 +476,11 @@ impl<'lc, SP: SourceProvider, LC: LayerCache> ChainLoader<'lc, SP, LC> {
         while let Some(upstream) = cursor.take() {
             // Load sideloads declared by this layer. They are pushed before
             // the declaring layer so they can depend on packages from the upstream.
-            for sideload in upstream.sideloads() {
-                layers.push(self.load_layer(&Upstream::from_link(sideload.link().clone()), None)?);
+            for sideload in upstream.sideloads().iter().rev() {
+                layers.push(self.load_layer(
+                    &Upstream::from_link(sideload.link().clone()),
+                    sideload.params().cloned(),
+                )?);
             }
 
             let layer = self.load_layer(&upstream, None)?;
@@ -1490,8 +1493,13 @@ mod tests {
             locked_commit = \"abc123\"
 
             [[upstream.sideload]]
-            repo = \"git@fakehub.com:minimal/sideload.git\"
+            repo = \"git@fakehub.com:minimal/sideload-noparams.git\"
             locked_commit = \"def\"
+
+            [[upstream.sideload]]
+            repo = \"git@fakehub.com:minimal/sideload-params.git\"
+            locked_commit = \"def\"
+            params.enum = \"a\"
             "
             },
         )
@@ -1517,9 +1525,9 @@ mod tests {
             branch: None,
         };
 
-        let sideload = TempDir::new().unwrap();
+        let sideload_noparams = TempDir::new().unwrap();
         std::fs::write(
-            sideload.path().join(MFILE_NAME),
+            sideload_noparams.path().join(MFILE_NAME),
             indoc! {
             "
             [upstream]
@@ -1529,27 +1537,81 @@ mod tests {
             },
         )
         .unwrap();
-        std::fs::create_dir_all(sideload.path().join("packages").join("sideload")).unwrap();
-        std::fs::write(
-            sideload
+        std::fs::create_dir_all(
+            sideload_noparams
                 .path()
                 .join("packages")
-                .join("sideload")
+                .join("sideload-noparams"),
+        )
+        .unwrap();
+        std::fs::write(
+            sideload_noparams
+                .path()
+                .join("packages")
+                .join("sideload-noparams")
                 .join("build.ncl"),
             indoc! {
             "
             let {build, upstream, ..} = import \"minimal.ncl\" in
 
             build {
-                name = \"sideload\",
+                name = \"sideload-noparams\",
                 build_deps = [upstream \"top\"],
                 cmd = \"\",
             }"
             },
         )
         .unwrap();
-        let sideload_repo = LinkConfig::Git {
-            repo: "git@fakehub.com:minimal/sideload.git".to_string(),
+        let sideload_noparams_repo = LinkConfig::Git {
+            repo: "git@fakehub.com:minimal/sideload-noparams.git".to_string(),
+            locked_commit: Some("def".to_string()),
+            branch: None,
+        };
+        let sideload_params = TempDir::new().unwrap();
+        std::fs::write(
+            sideload_params.path().join(MFILE_NAME),
+            indoc! {
+            "
+            [upstream]
+            repo = \"git@fakehub.com:minimal/apex.git\"
+            locked_commit = \"abc123\"
+
+            [params]
+            enum = {type = \"[\\\"a\\\", \\\"b\\\"]\", default =\"b\"}
+            cmd = {type = \"string\", default =\"tar\"}
+            "
+            },
+        )
+        .unwrap();
+        std::fs::create_dir_all(
+            sideload_params
+                .path()
+                .join("packages")
+                .join("sideload-params"),
+        )
+        .unwrap();
+        std::fs::write(
+            sideload_params
+                .path()
+                .join("packages")
+                .join("sideload-params")
+                .join("build.ncl"),
+            indoc! {
+            "
+            let {build, upstream, ..} = import \"minimal.ncl\" in
+            let {param, ..} = import \"config.ncl\" in
+
+            build {
+                name = \"sideload-params\",
+                build_deps = [upstream \"top\"],
+                cmd = param \"cmd\",
+                attrs.upstream_version = param \"enum\",
+            }"
+            },
+        )
+        .unwrap();
+        let sideload_params_repo = LinkConfig::Git {
+            repo: "git@fakehub.com:minimal/sideload-params.git".to_string(),
             locked_commit: Some("def".to_string()),
             branch: None,
         };
@@ -1557,7 +1619,8 @@ mod tests {
         let mut sp = SourceProviderFake(HashMap::from_iter([
             (apex_repo.clone(), apex),
             (root_repo.clone(), root),
-            (sideload_repo.clone(), sideload),
+            (sideload_noparams_repo.clone(), sideload_noparams),
+            (sideload_params_repo.clone(), sideload_params),
         ]));
         let graph = Graph::new_from_chain(
             &mut sp,
@@ -1568,14 +1631,33 @@ mod tests {
         )
         .unwrap();
 
-        // Make sure the build from both apex, middle, & sideload is present
+        // Make sure the build from both apex, middle, & sideloads are present
         assert_eq!(
             graph
                 .builds
                 .iter()
                 .map(|(_, b)| &b.name)
                 .collect::<Vec<_>>(),
-            vec!["top", "sideload", "root"]
+            vec!["top", "sideload-noparams", "sideload-params", "root"]
+        );
+
+        // Check the parameterization that set on sideload-params
+        // Param 'cmd' should have gotten default 'tar'.
+        assert_eq!(
+            graph
+                .get(graph.by_name("sideload-params").unwrap())
+                .unwrap()
+                .cmds,
+            vec![vec!["tar".to_string()]]
+        );
+        // Param 'enum' should have gotten defined value (not default) 'a'.
+        // We stuffed it into upstream_version.
+        assert_eq!(
+            graph
+                .get(graph.by_name("sideload-params").unwrap())
+                .unwrap()
+                .upstream_version(),
+            Some(&"a".to_string()),
         );
 
         // Make sure the supply chain was tracked in the correct order
@@ -1583,7 +1665,8 @@ mod tests {
             graph.software_supply_chain(),
             &vec![
                 apex_repo.as_spec_origin().unwrap(),
-                sideload_repo.as_spec_origin().unwrap(),
+                sideload_noparams_repo.as_spec_origin().unwrap(),
+                sideload_params_repo.as_spec_origin().unwrap(),
                 root_repo.as_spec_origin().unwrap(),
             ],
         )
