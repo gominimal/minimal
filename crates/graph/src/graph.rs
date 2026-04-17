@@ -471,7 +471,8 @@ impl Graph {
     /// Constructs a dependency graph using the given origin to load the leaf layer,
     /// and resolving the files for upstream layers using the given implementation of [SourceProvider].
     ///
-    /// The given leaf paramater must not be `SpecOrigin::Inline`, or this function will panic.
+    /// SAFETY:
+    ///   The given leaf parameter must not be `SpecOrigin::Inline`, or this function will panic.
     pub fn new_from_chain<SP: SourceProvider, LC: LayerCache>(
         mut sp: SP,
         lc: &mut LC,

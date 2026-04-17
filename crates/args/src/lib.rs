@@ -503,11 +503,7 @@ impl ArgsSpec {
     }
 
     /// Hydrates the table of toml values against the argument schema, returning an [ArgsSet] if valid.
-    pub fn from_toml(&self, value: &toml::Value) -> Result<ArgsSet, String> {
-        let table = value
-            .as_table()
-            .ok_or_else(|| "expected table of toml arguments".to_string())?;
-
+    pub fn from_toml(&self, table: &toml::Table) -> Result<ArgsSet, String> {
         let scalar_from_toml = |v: &toml::Value,
                                 p: &PrimitiveSpec,
                                 name: &str|
@@ -957,7 +953,7 @@ mod tests {
             mode = "release"
         "#})
         .unwrap();
-        let result = spec.args.from_toml(&values).unwrap();
+        let result = spec.args.from_toml(values.as_table().unwrap()).unwrap();
 
         assert_eq!(
             result.as_ref().get("name").unwrap(),
@@ -1001,7 +997,7 @@ mod tests {
             mode = "debug"
         "#})
         .unwrap();
-        let result = spec.args.from_toml(&values).unwrap();
+        let result = spec.args.from_toml(values.as_table().unwrap()).unwrap();
         assert_eq!(
             result.as_ref().get("count").unwrap(),
             &Arg::Scalar(ScalarArg::Number(3.15))
@@ -1014,7 +1010,7 @@ mod tests {
 
         // Missing required arg is an error.
         let values: toml::Value = toml::from_str("name = \"hi\"\n").unwrap();
-        assert!(spec.args.from_toml(&values).is_err());
+        assert!(spec.args.from_toml(values.as_table().unwrap()).is_err());
 
         // Invalid enum value is an error.
         let values: toml::Value = toml::from_str(indoc! {r#"
@@ -1025,7 +1021,7 @@ mod tests {
             mode = "profile"
         "#})
         .unwrap();
-        assert!(spec.args.from_toml(&values).is_err());
+        assert!(spec.args.from_toml(values.as_table().unwrap()).is_err());
 
         // Type mismatch (string where number expected) is an error.
         let values: toml::Value = toml::from_str(indoc! {r#"
@@ -1036,7 +1032,7 @@ mod tests {
             mode = "debug"
         "#})
         .unwrap();
-        assert!(spec.args.from_toml(&values).is_err());
+        assert!(spec.args.from_toml(values.as_table().unwrap()).is_err());
     }
 
     #[test]

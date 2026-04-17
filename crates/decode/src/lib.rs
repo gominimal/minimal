@@ -143,7 +143,7 @@ impl Layer {
             config_dir.unwrap_or_else(|| layer_dir.as_ref().to_path_buf()),
             opts,
         )?;
-        Self::from_loader(loader, upstream)
+        Self::from_loader(loader, upstream.map(|u| u.link))
     }
 
     fn from_loader(loader: load::Loader, upstream: Option<LinkConfig>) -> Result<Self, Error> {

@@ -7,15 +7,16 @@ pub async fn cmd_update(_args: UpdateArgs, ctx: &mut Context) -> Result<(), Erro
     let mfile = ctx.minimal_file();
     let mfile_path = mfile.file_path().cloned();
 
-    let upstream: Option<(String, Option<String>, Option<String>)> = match mfile.upstream.as_ref() {
-        Some(mfile::LinkConfig::Git {
-            repo,
-            branch,
-            locked_commit,
-        }) => Some((repo.clone(), branch.clone(), locked_commit.clone())),
-        Some(mfile::LinkConfig::Dir { .. }) => None,
-        None => None,
-    };
+    let upstream: Option<(String, Option<String>, Option<String>)> =
+        match mfile.upstream.as_ref().map(|u| &u.link) {
+            Some(mfile::LinkConfig::Git {
+                repo,
+                branch,
+                locked_commit,
+            }) => Some((repo.clone(), branch.clone(), locked_commit.clone())),
+            Some(mfile::LinkConfig::Dir { .. }) => None,
+            None => None,
+        };
 
     // best effort, yeet any cached remote index so a fresh fetch occurs
     std::fs::remove_file(ctx.index_dir().join(rcache::INDEX_FILENAME)).ok();
