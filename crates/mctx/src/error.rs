@@ -119,7 +119,13 @@ impl fmt::Display for Error {
                     Ok(())
                 }
             }
-            Error::Execution { idx, code, .. } => write!(f, "invocation {} failed: {}", idx, code),
+
+            Error::Execution {
+                idx, code, reason, ..
+            } if *code == 125 => write!(f, "invocation {} failed: {}", idx, reason,),
+            Error::Execution { idx, code, .. } => {
+                write!(f, "invocation {} failed: exit code {}", idx, code,)
+            }
             Error::Other(e) => write!(f, "{}", e),
         }
     }
