@@ -48,8 +48,8 @@ mod tests {
 
     #[test]
     fn version_less_than() {
-        assert_eq!(super::version_greater_than("0.0.8", "0.0.9"), false);
-        assert_eq!(super::version_greater_than("0.0.9", "0.0.9"), false);
-        assert_eq!(super::version_greater_than("0.0.10", "0.0.9"), true);
+        assert!(!super::version_greater_than("0.0.8", "0.0.9"));
+        assert!(!super::version_greater_than("0.0.9", "0.0.9"));
+        assert!(super::version_greater_than("0.0.10", "0.0.9"));
     }
 }
