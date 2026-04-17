@@ -117,7 +117,7 @@ impl Layer {
         let (upstream, params, config_dir) = match mfile::File::from_dir(layer_dir.as_ref()) {
             Ok(mfile) => {
                 if let Some(min_vers) = &mfile.stdlib.minimum_version {
-                    if **min_vers > *stdlib::VERSION {
+                    if stdlib::outdated(min_vers) {
                         return Err(Error::StdlibOutdated {
                             need_version: min_vers.to_string(),
                             needed_by: layer_dir.as_ref().to_str().unwrap().to_string(),
