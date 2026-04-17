@@ -6,7 +6,7 @@
 
 use common::{SpecOrigin, Target};
 use generational_arena::Arena;
-use mfile::{EnvPatches, LinkConfig, PatchSetting};
+use mfile::{EnvPatches, PatchSetting, Upstream};
 use nickel_lang_core::eval::value::NickelValue;
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::position::TermPos;
@@ -58,7 +58,7 @@ impl TryFrom<TermPos> for StrPos {
 /// A collection of nickel objects, defined together in a single codebase.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Layer {
-    upstream: Option<LinkConfig>,
+    upstream: Option<Upstream>,
     pub origin: SpecOrigin,
     pub for_target: Target,
 
@@ -102,7 +102,7 @@ impl Layer {
     }
 
     /// Returns the upstream layer this layer depends on, if any.
-    pub fn upstream(&self) -> Option<&LinkConfig> {
+    pub fn upstream(&self) -> Option<&Upstream> {
         self.upstream.as_ref()
     }
 
@@ -143,10 +143,10 @@ impl Layer {
             config_dir.unwrap_or_else(|| layer_dir.as_ref().to_path_buf()),
             opts,
         )?;
-        Self::from_loader(loader, upstream.map(|u| u.link))
+        Self::from_loader(loader, upstream)
     }
 
-    fn from_loader(loader: load::Loader, upstream: Option<LinkConfig>) -> Result<Self, Error> {
+    fn from_loader(loader: load::Loader, upstream: Option<Upstream>) -> Result<Self, Error> {
         let (ncl_tree, mut program, origin, for_target) = loader.finish()?;
         let mut layer = Self {
             origin,

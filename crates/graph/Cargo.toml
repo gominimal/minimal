@@ -21,6 +21,7 @@ tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+args.workspace = true
 common.workspace = true
 checkouts.workspace = true
 decode.workspace = true
