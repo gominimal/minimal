@@ -4,6 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
+    sync::Arc,
     time::SystemTime,
 };
 
@@ -25,6 +26,7 @@ use mfile::{EnvPatches, EnvVarValue, LinkConfig, Task};
 pub use sandbox2::config::Invocation;
 
 pub use env::Env;
+use tokio::sync::Semaphore;
 use toml_edit::{Array, DocumentMut, Item, TableLike, Value};
 
 use crate::env::EnvArgs;
@@ -680,6 +682,7 @@ impl Context {
         let rc = self.remote_cache(false, true).await.unwrap();
         let mut task_set = tokio::task::JoinSet::new();
         let fetch_start = SystemTime::now();
+        let semaphore = Arc::new(Semaphore::new(8));
         for (bsr, _depinfo) in Transitives::for_toplevels(graph, pkgs.into_iter().collect(), false)
         {
             let b = graph.get(&bsr).unwrap();
@@ -691,8 +694,10 @@ impl Context {
             {
                 let rc_clone = rc.clone(); // TODO: This is trash
                 let cache_clone = self.cache.clone();
+                let semaphore = semaphore.clone();
                 task_set.spawn(async move {
-                    rc_clone
+                    let sema = semaphore.acquire().await;
+                    let res = rc_clone
                         .materialize(&spec_hash, &cache_clone, &name)
                         .await
                         .map(|(t, d)| {
@@ -706,7 +711,9 @@ impl Context {
                                     ..Default::default()
                                 },
                             )
-                        })
+                        });
+                    drop(sema);
+                    res
                 });
             }
         }

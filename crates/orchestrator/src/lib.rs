@@ -11,7 +11,7 @@ use common::SpecHash;
 use graph::{BinProvider, BuildSpecRef, ExecPlan, Graph, SubsetInput};
 use lcache::{Cache, LocalDir};
 use tokio::{
-    sync::{RwLock, RwLockReadGuard},
+    sync::{RwLock, RwLockReadGuard, Semaphore},
     task::{JoinSet, yield_now},
 };
 
@@ -38,6 +38,7 @@ pub struct Shared<B: Backend> {
     pub graph: Graph,
     pub cache: Cache<LocalDir>,
     pub backend: B,
+    pub fetch_semaphore: Semaphore,
 }
 
 /// An async / task-friendly wrapper around state used everywhere.
@@ -84,6 +85,7 @@ impl<B: Backend> Orchestrator<B> {
             graph: self.graph.clone(),
             cache: self.cache.clone(),
             backend: self.backend,
+            fetch_semaphore: Semaphore::new(8),
         };
         let state = match State::from_plan(
             &shared.graph,
