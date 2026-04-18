@@ -283,6 +283,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
         let shared_hnd2 = shared_hnd.clone();
         spawn_blocking(async move || {
             let shared = shared_hnd2.inner().read().await;
+            let sema = shared.fetch_semaphore.acquire().await;
             let res = if let Some(remote_cache) = shared.backend.remote_cache.as_ref() {
                 let build = shared.graph.get(&bsr).unwrap();
 
@@ -316,6 +317,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
             } else {
                 Err(Error::Cache(CacheErr::NotFound))
             };
+            drop(sema);
             drop(shared);
             res
         })
