@@ -29,6 +29,12 @@ let source_provenance_github = {
     ),
 }
 in
+let source_provenance_website = {
+    category = 'Website,
+    homepage | String | optional | doc "The landing page of the software.",
+    downloads_page | String | optional | doc "The web page linking to the latest release or enumerating releases.",
+}
+in
 {
     upstream_version = {
         name = "upstream version",
@@ -49,6 +55,11 @@ in
         name = "description",
         desc = "A short description of the function of the software.",
         validate = String,
+    },
+    license_spdx = {
+        name = "spdx license string",
+        desc = "The SPDX name of the license the software is covered by. See: https://spdx.org/licenses",
+        validate = std.contract.any_of [String, Array String],
     },
 
     env_dir_mappings = {
@@ -90,6 +101,7 @@ in
                 {category = 'GnuProject, ..} => std.contract.check source_provenance_gnu label value,
                 {category = 'GithubRepo, ..} => std.contract.check source_provenance_github label value,
                 {category = 'Sourceforge, ..} => std.contract.check source_provenance_sourceforge label value,
+                {category = 'Website, ..} => std.contract.check source_provenance_website label value,
                     _ => 'Error {
                         message = "source_provenance value had invalid/unknown category",
                     },
