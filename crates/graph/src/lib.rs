@@ -183,7 +183,10 @@ mod env_setup;
 pub use env_setup::SetupForPackages;
 
 mod graph;
-pub use graph::{Graph, LayerCacheDir};
+pub use graph::Graph;
+
+mod loader;
+pub use loader::{ChainLoader, LayerCache, LayerCacheDir, SourceProvider};
 
 pub mod wire;
 
