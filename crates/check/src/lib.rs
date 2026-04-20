@@ -334,29 +334,18 @@ fn package_check_futures(
     fix: bool,
     ot: Option<OpTracker>,
 ) -> Result<Vec<CheckFuture>, Error> {
-    let package_dirs = match std::fs::read_dir(&packages_dir) {
+    let package_dirs = match decode::build_decls_in_dir(&packages_dir) {
         Ok(i) => i,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
         Err(e) => return Err(Error::IO("reading package dirs", packages_dir.clone(), e)),
     }
-    .filter_map(|e| match e {
-        Err(e) => Some(Err(e)),
-        Ok(e) => {
-            if !e.file_type().unwrap().is_dir() {
-                None
-            } else {
-                Some(Ok(e.file_name()))
-            }
-        }
-    })
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(|e| Error::IO("listing packages", packages_dir.clone(), e))?
     .into_iter()
     // Filter based on any given filter names
-    .filter_map(|pkg| {
-        let pkg = pkg.to_str().unwrap().to_string();
+    .filter_map(|fpath| {
+        let dir = fpath.parent().unwrap();
+        let pkg = dir.file_name().unwrap().to_str().unwrap().to_string();
         if filter_names.is_empty() || filter_names.contains(&pkg) {
-            Some(pkg)
+            Some((pkg, dir.to_path_buf()))
         } else {
             None
         }
@@ -364,20 +353,19 @@ fn package_check_futures(
 
     Ok(package_dirs
         .into_iter()
-        .map::<CheckFuture, _>(move |pkg| {
+        .map::<CheckFuture, _>(move |(pkg, dir)| {
             let graph_hnd = graph_hnd.clone();
             let skip_checkers = skip_checkers.clone();
             let stdlib_dir = stdlib_dir.clone();
             let cache = cache.clone();
-            let packages_dir = packages_dir.clone();
             let ot = ot.clone();
             Box::pin(async move {
                 let result = check_package(
                     pkg.clone(),
+                    dir,
                     graph_hnd,
                     fix,
                     skip_checkers,
-                    packages_dir,
                     stdlib_dir,
                     cache,
                     ot,
@@ -531,10 +519,10 @@ fn harness_check_futures(
 #[allow(clippy::too_many_arguments)]
 async fn check_package(
     pkg: String,
+    package_dir: PathBuf,
     all_graph: Option<Arc<RwLock<Graph>>>,
     fix: bool,
     skip_checkers: Vec<String>,
-    packages_dir: PathBuf,
     stdlib_dir: PathBuf,
     cache: Cache<LocalDir>,
     ot: Option<OpTracker>,
@@ -557,6 +545,7 @@ async fn check_package(
                             &skip_checkers,
                             fix,
                             pkg.clone(),
+                            package_dir.as_ref(),
                             graph.read().await,
                             cache.clone(),
                             Some(check_op.clone()),
@@ -588,7 +577,6 @@ async fn check_package(
     let file_based_results = {
         let skip_checkers = skip_checkers.clone();
         let pkg = pkg.clone();
-        let pkg_dir = packages_dir.join(&pkg);
         let stdlib_dir = stdlib_dir.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -607,7 +595,7 @@ async fn check_package(
                         &skip_checkers,
                         fix,
                         &pkg,
-                        &pkg_dir,
+                        &package_dir,
                         &stdlib_dir,
                         Some(check_op.clone()),
                     )
@@ -642,12 +630,14 @@ pub(crate) trait FileBasedChecker: Send {
 
 /// A checker which checks a package by looking at its representation in the graph.
 /// These checkers are run in parallel.
+#[allow(clippy::too_many_arguments)]
 pub(crate) trait GraphBasedChecker {
     async fn check(
         self,
         skip_checkers: &[String],
         fix: bool,
         pkg: String,
+        package_dir: &Path,
         graph: RwLockReadGuard<'_, Graph>,
         cache: Cache<LocalDir>,
         ot: Option<OpTracker>,
@@ -934,6 +924,7 @@ impl GraphBasedChecker for StandaloneTestCheck {
         skip_checkers: &[String],
         _fix: bool,
         pkg: String,
+        _package_dir: &Path,
         graph: RwLockReadGuard<'_, Graph>,
         cache: Cache<LocalDir>,
         ot: Option<OpTracker>,
@@ -1130,6 +1121,7 @@ impl GraphBasedChecker for BuildScriptDisallowedPatterns {
         skip_checkers: &[String],
         _fix: bool,
         pkg: String,
+        _package_dir: &Path,
         graph: RwLockReadGuard<'_, Graph>,
         _cache: Cache<LocalDir>,
         _ot: Option<OpTracker>,
@@ -1204,6 +1196,7 @@ impl GraphBasedChecker for BuildScriptIsExecutable {
         skip_checkers: &[String],
         _fix: bool,
         pkg: String,
+        _package_dir: &Path,
         graph: RwLockReadGuard<'_, Graph>,
         _cache: Cache<LocalDir>,
         _ot: Option<OpTracker>,

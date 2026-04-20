@@ -130,12 +130,16 @@ macro_rules! annotate_record {
     };
 }
 
-fn build_decls_in_dir<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, Error> {
+/// Enumerates the list of package `build.ncl` within a `packages/` directory.
+///
+/// Partitioning of the packages list by name (i.e.: `a/abseil/build.ncl`) is handled
+/// automatically.
+pub fn build_decls_in_dir<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, std::io::Error> {
     fn walk_dir_inner<P: AsRef<Path>>(
         out: &mut Vec<PathBuf>,
         is_toplevel: bool,
         dir: P,
-    ) -> Result<(), Error> {
+    ) -> Result<(), std::io::Error> {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let meta = entry.metadata()?;

@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use super::Error;
@@ -20,6 +20,7 @@ impl crate::GraphBasedChecker for OutputTypesValid {
         skip_checkers: &[String],
         _fix: bool,
         pkg: String,
+        _package_dir: &Path,
         graph: RwLockReadGuard<'_, Graph>,
         cache: lcache::Cache<LocalDir>,
         _ot: Option<OpTracker>,
@@ -114,6 +115,7 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
         skip_checkers: &[String],
         _fix: bool,
         pkg: String,
+        _package_dir: &Path,
         graph: RwLockReadGuard<'_, Graph>,
         cache: lcache::Cache<LocalDir>,
         _ot: Option<OpTracker>,
