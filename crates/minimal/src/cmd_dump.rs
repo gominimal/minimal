@@ -1,6 +1,9 @@
 use std::{fmt::Display, io::stdout};
 
+use anyhow::anyhow;
+use common::Target;
 use common::fuzzy_search::fuzzy_match;
+use common::target::{Arch, OS};
 use decode::AttrValue;
 use graph::{BuildDep, BuildOutput, BuildSpec, BuildSpecRef, Graph, RuntimeDep, SourceInput};
 use mctx::{Cache, Context, Error};
@@ -17,6 +20,15 @@ pub struct DumpArgs {
 
     #[arg(long, default_value_t = false)]
     pub exact: bool,
+
+    /// Target architecture to evaluate packages against (e.g., "amd64",
+    /// "arm64"). When a package's `build_deps` uses
+    /// `match { arch = 'Amd64 } => ..., { arch = 'Arm64 } => ... } target`
+    /// to select between per-arch source URLs, only the matching arm's
+    /// output appears in the dump. Overrides the host default so tools
+    /// downstream can aggregate both arches by running the dump twice.
+    #[arg(long)]
+    pub arch: Option<String>,
 
     pub name: Option<String>,
 }
@@ -120,7 +132,8 @@ impl From<&AttrValue> for PkgAttr {
 pub async fn cmd_dump(args: DumpArgs, ctx: &mut Context) -> Result<(), Error> {
     let mut out_packages = Vec::new();
 
-    let graph = ctx.graph_from_all_packages()?;
+    let target = resolve_target(args.arch.as_deref())?;
+    let graph = ctx.graph_from_all_packages_with_target(target)?;
     let cache = ctx.local_cache();
 
     if args.kind.packages {
@@ -217,5 +230,67 @@ fn pkg_ref_from_input(g: &Graph, i: &BuildDep, _c: &Cache) -> Result<PkgRef, Err
         }),
         BuildDep::Source(s) => Ok(PkgRef::Source(s.clone())),
         _ => todo!("bsi variant {:?}", i),
+    }
+}
+
+/// Resolve the `--arch` flag into a [`Target`], matching `cmd_materialize`'s
+/// parsing (arm64/aarch64 → Arm64, amd64/x86_64 → Amd64). When the flag is
+/// absent, defaults to [`Target::host`]. OS is always Linux — dump consumers
+/// want per-arch evaluation of the same pkgs repo, not cross-OS.
+fn resolve_target(arch: Option<&str>) -> Result<Target, Error> {
+    let Some(arch_str) = arch else {
+        return Ok(Target::host());
+    };
+    let arch = match arch_str {
+        "arm64" | "aarch64" => Arch::Arm64,
+        "amd64" | "x86_64" => Arch::Amd64,
+        other => {
+            return Err(Error::Other(anyhow!(
+                "unsupported --arch value: {other}. Use 'amd64' or 'arm64'."
+            )));
+        }
+    };
+    Ok(Target::new(arch, OS::Linux))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_target_defaults_to_host_when_arg_missing() {
+        let target = resolve_target(None).unwrap();
+        assert_eq!(target.arch(), Target::host().arch());
+        assert_eq!(target.os(), Target::host().os());
+    }
+
+    #[test]
+    fn resolve_target_parses_amd64_aliases() {
+        let target = resolve_target(Some("amd64")).unwrap();
+        assert!(matches!(target.arch(), Arch::Amd64));
+        assert!(matches!(target.os(), OS::Linux));
+
+        let target = resolve_target(Some("x86_64")).unwrap();
+        assert!(matches!(target.arch(), Arch::Amd64));
+    }
+
+    #[test]
+    fn resolve_target_parses_arm64_aliases() {
+        let target = resolve_target(Some("arm64")).unwrap();
+        assert!(matches!(target.arch(), Arch::Arm64));
+        assert!(matches!(target.os(), OS::Linux));
+
+        let target = resolve_target(Some("aarch64")).unwrap();
+        assert!(matches!(target.arch(), Arch::Arm64));
+    }
+
+    #[test]
+    fn resolve_target_rejects_unknown_arch() {
+        let err = resolve_target(Some("riscv64")).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("riscv64") && msg.contains("'amd64'") && msg.contains("'arm64'"),
+            "error should name the bad input and list valid options, got: {msg}"
+        );
     }
 }
