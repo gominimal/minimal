@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use super::Error;
 use crate::{CheckResult, CheckVerdict};
 use graph::{BuildOutput, Graph};
@@ -13,6 +15,7 @@ impl crate::GraphBasedChecker for SpecNameMatchesDir {
         skip_checkers: &[String],
         _fix: bool,
         pkg: String,
+        _package_dir: &Path,
         graph: RwLockReadGuard<'_, Graph>,
         _cache: Cache<LocalDir>,
         _ot: Option<OpTracker>,
@@ -51,6 +54,7 @@ impl crate::GraphBasedChecker for SpecNameValid {
         skip_checkers: &[String],
         _fix: bool,
         pkg: String,
+        _package_dir: &Path,
         _graph: RwLockReadGuard<'_, Graph>,
         _cache: Cache<LocalDir>,
         _ot: Option<OpTracker>,
@@ -90,6 +94,7 @@ impl crate::GraphBasedChecker for CycleBreakerNaming {
         skip_checkers: &[String],
         _fix: bool,
         pkg: String,
+        _package_dir: &Path,
         graph: RwLockReadGuard<'_, Graph>,
         _cache: Cache<LocalDir>,
         _ot: Option<OpTracker>,
@@ -138,6 +143,7 @@ impl crate::GraphBasedChecker for OutputNaming {
         skip_checkers: &[String],
         _fix: bool,
         pkg: String,
+        _package_dir: &Path,
         graph: RwLockReadGuard<'_, Graph>,
         _cache: Cache<LocalDir>,
         _ot: Option<OpTracker>,
@@ -203,6 +209,7 @@ impl crate::GraphBasedChecker for EnumerateBins {
         skip_checkers: &[String],
         _fix: bool,
         pkg: String,
+        _package_dir: &Path,
         graph: RwLockReadGuard<'_, Graph>,
         cache: Cache<LocalDir>,
         _ot: Option<OpTracker>,

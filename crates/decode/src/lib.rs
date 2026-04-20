@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 mod load;
-pub use load::LoadOptions;
+pub use load::{LoadOptions, build_decls_in_dir};
 
 mod error;
 pub use error::Error;
