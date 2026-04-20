@@ -395,7 +395,6 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
     /// Creates a new orchestrator for local builds.
     #[allow(clippy::too_many_arguments)]
     pub fn new_orchestrator(
-        top_levels: Vec<BuildSpecRef>,
         output_base: PathBuf,
         remote_cache: Option<RemoteCache<GcsStorage>>,
         sf: SF,
@@ -407,7 +406,6 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Orchestrator<Self>, Error> {
         Ok(Orchestrator {
-            top_levels,
             backend: LocalBackend::<SF> {
                 output_base,
                 remote_cache,
