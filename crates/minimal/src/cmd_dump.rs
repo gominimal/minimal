@@ -1,6 +1,5 @@
 use std::{fmt::Display, io::stdout};
 
-use anyhow::anyhow;
 use common::Target;
 use common::fuzzy_search::fuzzy_match;
 use common::target::{Arch, OS};
@@ -233,23 +232,19 @@ fn pkg_ref_from_input(g: &Graph, i: &BuildDep, _c: &Cache) -> Result<PkgRef, Err
     }
 }
 
-/// Resolve the `--arch` flag into a [`Target`], matching `cmd_materialize`'s
-/// parsing (arm64/aarch64 → Arm64, amd64/x86_64 → Amd64). When the flag is
-/// absent, defaults to [`Target::host`]. OS is always Linux — dump consumers
-/// want per-arch evaluation of the same pkgs repo, not cross-OS.
+/// Resolve the `--arch` flag into a [`Target`]. Delegates the string
+/// parsing to the shared `Arch::from_str` impl in common so the alias
+/// set (arm64/aarch64, amd64/x86_64) stays consistent with every other
+/// consumer. When the flag is absent, defaults to [`Target::host`]. OS
+/// is always Linux — dump consumers want per-arch evaluation of the
+/// same pkgs repo, not cross-OS.
 fn resolve_target(arch: Option<&str>) -> Result<Target, Error> {
     let Some(arch_str) = arch else {
         return Ok(Target::host());
     };
-    let arch = match arch_str {
-        "arm64" | "aarch64" => Arch::Arm64,
-        "amd64" | "x86_64" => Arch::Amd64,
-        other => {
-            return Err(Error::Other(anyhow!(
-                "unsupported --arch value: {other}. Use 'amd64' or 'arm64'."
-            )));
-        }
-    };
+    let arch: Arch = arch_str
+        .parse()
+        .map_err(|e: common::target::ArchParseError| Error::Other(e.into()))?;
     Ok(Target::new(arch, OS::Linux))
 }
 
@@ -265,32 +260,26 @@ mod tests {
     }
 
     #[test]
-    fn resolve_target_parses_amd64_aliases() {
+    fn resolve_target_wraps_parsed_arch_with_linux_os() {
         let target = resolve_target(Some("amd64")).unwrap();
         assert!(matches!(target.arch(), Arch::Amd64));
         assert!(matches!(target.os(), OS::Linux));
 
-        let target = resolve_target(Some("x86_64")).unwrap();
-        assert!(matches!(target.arch(), Arch::Amd64));
-    }
-
-    #[test]
-    fn resolve_target_parses_arm64_aliases() {
         let target = resolve_target(Some("arm64")).unwrap();
         assert!(matches!(target.arch(), Arch::Arm64));
         assert!(matches!(target.os(), OS::Linux));
-
-        let target = resolve_target(Some("aarch64")).unwrap();
-        assert!(matches!(target.arch(), Arch::Arm64));
     }
 
     #[test]
-    fn resolve_target_rejects_unknown_arch() {
+    fn resolve_target_propagates_arch_parse_error() {
+        // String-to-arch parsing (and its error message) lives in
+        // common::target; this test confirms cmd_dump surfaces that
+        // error to the caller rather than silently eating it.
         let err = resolve_target(Some("riscv64")).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("riscv64") && msg.contains("'amd64'") && msg.contains("'arm64'"),
-            "error should name the bad input and list valid options, got: {msg}"
+            msg.contains("riscv64"),
+            "error should name the bad input, got: {msg}"
         );
     }
 }

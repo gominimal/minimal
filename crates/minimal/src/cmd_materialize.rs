@@ -34,22 +34,14 @@ pub async fn cmd_materialize(args: MaterializeArgs, ctx: &mut Context) -> Result
         }
     };
 
-    // Resolve target architecture: CLI flag > minimal.toml > host default
-    let arch_str = args
-        .arch
-        .or(output.arch)
-        .unwrap_or_else(|| match Target::host().arch() {
-            Arch::Arm64 => "arm64".to_string(),
-            Arch::Amd64 => "amd64".to_string(),
-        });
-    let arch = match arch_str.as_str() {
-        "arm64" | "aarch64" => Arch::Arm64,
-        "amd64" | "x86_64" => Arch::Amd64,
-        other => {
-            return Err(Error::Other(anyhow!(
-                "unsupported architecture: {other}. Use 'amd64' or 'arm64'."
-            )));
-        }
+    // Resolve target architecture: CLI flag > minimal.toml > host default.
+    // String-to-arch parsing is delegated to common::target::Arch so the
+    // alias set stays consistent across every consumer.
+    let arch: Arch = match args.arch.or(output.arch) {
+        Some(s) => s.parse().map_err(|e: common::target::ArchParseError| {
+            Error::Other(anyhow!("{e}"))
+        })?,
+        None => Target::host().arch().clone(),
     };
 
     // OCI images are always Linux
