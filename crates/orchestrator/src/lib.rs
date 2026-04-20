@@ -72,7 +72,6 @@ impl<B: Backend> SharedHandle<B> {
 
 /// Manages the materialization of some built artifacts end-to-end.
 pub struct Orchestrator<B: Backend> {
-    pub top_levels: Vec<BuildSpecRef>,
     pub backend: B,
     pub graph: Graph,
     pub cache: Cache<LocalDir>,
@@ -89,7 +88,7 @@ impl<B: Backend> Orchestrator<B> {
         };
         let state = match State::from_plan(
             &shared.graph,
-            ExecPlan::with_toplevels(bp, &shared.graph, &self.top_levels),
+            ExecPlan::with_toplevels(bp, &shared.graph, &shared.graph.top_levels),
         ) {
             Ok(s) => s,
             Err(e) => {

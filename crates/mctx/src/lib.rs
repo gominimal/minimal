@@ -467,7 +467,6 @@ impl Context {
 
         use orchestrator::LocalBackend;
         let orchestrator = LocalBackend::new_orchestrator(
-            graph.top_levels.clone(),
             self.config.builds_base_dir(),
             rc.clone(),
             self.remote_storage().await?,
