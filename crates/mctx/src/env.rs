@@ -51,7 +51,7 @@ impl EnvChannel<'_> {
                 self.graph.top_levels.push(*bsr);
             }
         });
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
@@ -187,7 +187,7 @@ impl EnvChannel<'_> {
             Err(e) => return EnvChannel::write_error(e.into(), stream),
             Ok(res_stream) => res_stream,
         };
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
@@ -221,7 +221,7 @@ impl EnvChannel<'_> {
         };
 
         let bsr = graph.top_levels[0];
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
@@ -303,7 +303,7 @@ impl EnvChannel<'_> {
             None
         };
 
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
