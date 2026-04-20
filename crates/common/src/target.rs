@@ -75,6 +75,37 @@ impl OS {
     }
 }
 
+/// Error from parsing an [`OS`] out of a string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OsParseError {
+    input: String,
+}
+
+impl fmt::Display for OsParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unsupported OS: {}. Use 'linux' or 'macos'.", self.input)
+    }
+}
+
+impl std::error::Error for OsParseError {}
+
+impl FromStr for OS {
+    type Err = OsParseError;
+
+    /// Parse an OS from the short lowercase strings that appear in
+    /// `Target::as_ref()` output and that consumers (build.ncl target
+    /// expressions, CLI args) type by hand.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "linux" => Ok(OS::Linux),
+            "macos" => Ok(OS::MacOS),
+            _ => Err(OsParseError {
+                input: s.to_string(),
+            }),
+        }
+    }
+}
+
 /// The description of a system where software runs.
 #[derive(Debug, Clone, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Target {
@@ -171,6 +202,49 @@ impl AsRef<str> for Target {
     }
 }
 
+/// Error from parsing a [`Target`] out of an `<arch>/<os>` string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetParseError {
+    /// The string didn't match the required `<arch>/<os>` shape.
+    Shape(String),
+    /// The arch segment didn't parse.
+    Arch(ArchParseError),
+    /// The OS segment didn't parse.
+    Os(OsParseError),
+}
+
+impl fmt::Display for TargetParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TargetParseError::Shape(s) => write!(
+                f,
+                "target {s:?} is not in the expected <arch>/<os> form (e.g. 'amd64/linux')"
+            ),
+            TargetParseError::Arch(e) => write!(f, "target: {e}"),
+            TargetParseError::Os(e) => write!(f, "target: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for TargetParseError {}
+
+impl FromStr for Target {
+    type Err = TargetParseError;
+
+    /// Parse a [`Target`] from the `<arch>/<os>` string produced by
+    /// [`Target::as_ref`] — round-trips with that impl. Arch and OS
+    /// parsing delegate to [`Arch::from_str`] / [`OS::from_str`] so the
+    /// accepted alias set stays consistent across every consumer.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (arch_str, os_str) = s
+            .split_once('/')
+            .ok_or_else(|| TargetParseError::Shape(s.to_string()))?;
+        let arch = arch_str.parse::<Arch>().map_err(TargetParseError::Arch)?;
+        let os = os_str.parse::<OS>().map_err(TargetParseError::Os)?;
+        Ok(Target::new(arch, os))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,5 +283,48 @@ mod tests {
     #[test]
     fn arch_rejects_empty_string() {
         assert!("".parse::<Arch>().is_err());
+    }
+
+    #[test]
+    fn os_parses_both_variants() {
+        assert_eq!("linux".parse::<OS>().unwrap(), OS::Linux);
+        assert_eq!("macos".parse::<OS>().unwrap(), OS::MacOS);
+    }
+
+    #[test]
+    fn os_rejects_unknown() {
+        let err = "freebsd".parse::<OS>().unwrap_err();
+        assert!(format!("{err}").contains("freebsd"));
+    }
+
+    #[test]
+    fn target_roundtrips_with_as_ref() {
+        // Every representation in Target::all() must parse back to the
+        // same value — keeps as_ref and from_str in lockstep.
+        for expected in Target::all() {
+            let s: &str = expected.as_ref();
+            let parsed: Target = s.parse().expect("every Target::all() must parse");
+            assert_eq!(&parsed, expected, "roundtrip failed for {s}");
+        }
+    }
+
+    #[test]
+    fn target_rejects_missing_separator() {
+        let err = "amd64linux".parse::<Target>().unwrap_err();
+        assert!(matches!(err, TargetParseError::Shape(_)));
+    }
+
+    #[test]
+    fn target_propagates_arch_error() {
+        let err = "riscv64/linux".parse::<Target>().unwrap_err();
+        assert!(matches!(err, TargetParseError::Arch(_)));
+        assert!(format!("{err}").contains("riscv64"));
+    }
+
+    #[test]
+    fn target_propagates_os_error() {
+        let err = "amd64/freebsd".parse::<Target>().unwrap_err();
+        assert!(matches!(err, TargetParseError::Os(_)));
+        assert!(format!("{err}").contains("freebsd"));
     }
 }

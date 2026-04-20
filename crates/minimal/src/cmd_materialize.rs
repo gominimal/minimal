@@ -38,9 +38,9 @@ pub async fn cmd_materialize(args: MaterializeArgs, ctx: &mut Context) -> Result
     // String-to-arch parsing is delegated to common::target::Arch so the
     // alias set stays consistent across every consumer.
     let arch: Arch = match args.arch.or(output.arch) {
-        Some(s) => s.parse().map_err(|e: common::target::ArchParseError| {
-            Error::Other(anyhow!("{e}"))
-        })?,
+        Some(s) => s
+            .parse()
+            .map_err(|e: common::target::ArchParseError| Error::Other(anyhow!("{e}")))?,
         None => Target::host().arch().clone(),
     };
 

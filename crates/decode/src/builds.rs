@@ -907,12 +907,12 @@ impl BuildDecl {
                                         program,
                                     )?)
                                     .unwrap();
-                                match Target::all().iter().find(|t| t.as_ref() == target_str) {
-                                    None => Err(Error::InvalidTarget { files: program.files(), got: target_str, pos: rt.pos(program.pos_table()) }),
-                                    Some(t) => {
-                                        target = Some(t.clone());
+                                match target_str.parse::<Target>() {
+                                    Ok(t) => {
+                                        target = Some(t);
                                         Ok(())
                                     }
+                                    Err(_) => Err(Error::InvalidTarget { files: program.files(), got: target_str, pos: rt.pos(program.pos_table()) }),
                                 }
                             } else {
                                 Ok(())
