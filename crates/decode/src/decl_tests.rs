@@ -5,7 +5,10 @@ use nickel_lang_core::{
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use crate::{Error, ObjTy, builds::BuildRef, eval_if_closure, read_ty, record_data_from_val};
+use crate::{
+    Error, ObjTy, builds::BuildRef, cmds_from_cmd_term, cmds_from_cmds_term, eval_if_closure,
+    read_ty, record_data_from_val,
+};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Test {
@@ -38,7 +41,8 @@ impl Test {
                         |(ident_and_loc, field)| -> Result<(), Error> {
                             match ident_and_loc.label() {
                                 "class" => {
-                                    let rt = eval_if_closure(field.value.as_ref().unwrap(), program)?;
+                                    let rt =
+                                        eval_if_closure(field.value.as_ref().unwrap(), program)?;
                                     if let Some(tag) = rt.as_enum_tag() {
                                         is_build_test = tag.label() == "Build";
                                     } else {
@@ -48,59 +52,15 @@ impl Test {
                                 }
                                 "cmd" => {
                                     if let Some(rt) = field.value.as_ref() {
-                                        let rt = eval_if_closure(rt, program)?;
-                                        if let Some(s) = rt.as_string() {
-                                            cmds = Some(vec![
-                                                shlex::split(s.as_ref()).unwrap(),
-                                            ]);
-                                        } else if let Some(a) = rt.as_array() {
-                                            cmds = Some(vec![
-                                                a.iter()
-                                                    .map(|rt| eval_if_closure(rt, program))
-                                                    .collect::<Result<Vec<_>, _>>()?
-                                                    .into_iter()
-                                                    .map(|rt| String::deserialize(rt).unwrap())
-                                                    .collect(),
-                                            ]);
-                                        } else {
-                                            todo!("error for 'cmd' field being non-string & non-array, got {:?}", rt);
-                                        }
-                                        Ok(())
-                                    } else {
-                                        Ok(())
-                                    }
+                                        cmds = Some(cmds_from_cmd_term(rt, program)?);
+                                    };
+                                    Ok(())
                                 }
                                 "cmds" => {
                                     if let Some(rt) = field.value.as_ref() {
-                                        let rt = eval_if_closure(rt,program)?;
-                                        if let Some(cmds_a) = rt.as_array() {
-                                            cmds = Some(
-                                                cmds_a.iter()
-                                                    .map(|rt| {
-                                                        let rt = eval_if_closure(rt, program)?;
-                                                        if let Some(a) = rt.as_array() {
-                                                            Ok::<_, Error>(a.iter()
-                                                                .map(|rt| eval_if_closure(rt, program))
-                                                                .collect::<Result<Vec<_>, _>>()?
-                                                                .into_iter()
-                                                                .map(|rt| String::deserialize(rt).unwrap())
-                                                                .collect())
-                                                        } else if let Some(s) = rt.as_string() {
-                                                            Ok::<_, Error>(shlex::split(s.as_ref()).unwrap())
-                                                        } else {
-                                                            todo!("error for 'cmds' field being non-array & non-string, got {:?}", rt);
-                                                        }
-                                                    })
-                                                    .collect::<Result<Vec<_>, _>>()?,
-                                            );
-
-                                            Ok(())
-                                        } else {
-                                            todo!("error for 'cmds' field being non-array, got {:?}", rt);
-                                        }
-                                    } else {
-                                        Ok(())
-                                    }
+                                        cmds = Some(cmds_from_cmds_term(rt, program)?);
+                                    };
+                                    Ok(())
                                 }
                                 "test_deps" => {
                                     let test_deps_rt =

@@ -11,7 +11,10 @@ use nickel_lang_core::{
 use regex::bytes::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, ObjTy, eval_if_closure, record_data_from_val};
+use crate::{
+    Error, ObjTy, cmds_from_cmd_term, env_vars_from_term, eval_if_closure,
+    packages_array_from_term, record_data_from_val,
+};
 
 /// A predicate that when matched, indicates a package should be added when using a harness.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,17 +343,7 @@ impl Harness {
                                 let ev_rt = eval_if_closure(ev_rt, program)?;
 
                                 if let Some(r) = record_data_from_val(&ev_rt) {
-                                    build_env_vars = Some(r.fields.iter().map(
-                                        |(ident_and_loc, field)| -> Result<(String, EnvVarValue), Error> {
-                                            Ok((
-                                                ident_and_loc.label().to_string(),
-                                                EnvVarValue::Value(String::deserialize(eval_if_closure(
-                                                    field.value.as_ref().unwrap(),
-                                                    program,
-                                                )?).unwrap()),
-                                            ))
-                                        },
-                                    ).collect::<Result<IndexMap<_, _>, Error>>()?);
+                                    build_env_vars = Some(env_vars_from_term(r, program)?);
                                 } else {
                                     todo!("unexpected term for build_env_vars: {:?}", ev_rt);
                                 }
@@ -360,77 +353,21 @@ impl Harness {
                         }
                         "build_packages" => {
                             if let Some(packages_rt) = field.value.as_ref() {
-                                let packages_rt = eval_if_closure(packages_rt, program)?;
-
-                                if let Some(a) = packages_rt.as_array() {
-                                    build_packages = Some(
-                                        a.iter()
-                                            .map(|input| {
-                                                Ok(String::deserialize(eval_if_closure(
-                                                    input,
-                                                    program,
-                                                )?).unwrap())
-                                            })
-                                            .collect::<Result<Vec<_>, Error>>()?,
-                                    );
-                                } else {
-                                    todo!(
-                                        "handle build_packages value being non-array {:?}",
-                                        field.value
-                                    );
-                                }
+                                build_packages = Some(packages_array_from_term(packages_rt, program)?);
                             }
-
                             Ok(())
                         }
                         "runtime_packages" => {
                             if let Some(packages_rt) = field.value.as_ref() {
-                                let packages_rt = eval_if_closure(packages_rt, program)?;
-
-                                if let Some(a) = packages_rt.as_array() {
-                                    runtime_packages = Some(
-                                        a.iter()
-                                            .map(|input| {
-                                                Ok(String::deserialize(eval_if_closure(
-                                                    input,
-                                                    program,
-                                                )?).unwrap())
-                                            })
-                                            .collect::<Result<Vec<_>, Error>>()?,
-                                    );
-                                } else {
-                                    todo!(
-                                        "handle runtime_packages value being non-array {:?}",
-                                        field.value
-                                    );
-                                }
+                                runtime_packages = Some(packages_array_from_term(packages_rt, program)?);
                             }
-
                             Ok(())
                         }
                         "build_cmd" => {
                             if let Some(rt) = field.value.as_ref() {
-                                let rt = eval_if_closure(rt, program)?;
-                                if let Some(s) = rt.as_string() {
-                                    build_cmds = Some(vec![
-                                        shlex::split(s.as_ref()).unwrap(),
-                                    ]);
-                                } else if let Some(a) = rt.as_array() {
-                                    build_cmds = Some(vec![
-                                        a.iter()
-                                            .map(|rt| eval_if_closure(rt, program))
-                                            .collect::<Result<Vec<_>, _>>()?
-                                            .into_iter()
-                                            .map(|rt| String::deserialize(rt).unwrap())
-                                            .collect(),
-                                    ]);
-                                } else {
-                                    todo!("error for 'build_cmds' field being non-string & non-array, got {:?}", rt);
-                                }
-                                Ok(())
-                            } else {
-                                Ok(())
-                            }
+                                build_cmds = Some(cmds_from_cmd_term(rt, program)?);
+                            };
+                            Ok(())
                         }
                         "build_cmds_cmd" => {
                             if let Some(rt) = field.value.as_ref() {
@@ -629,6 +566,7 @@ mod tests {
 
                     build_packages = [\"gcc\", \"rust\", \"binutils\"],
                     build_cmd = \"cargo build --release\",
+                    build_env_vars.CC = \"gcc\",
 
                     matches_project_if_any = [{
                         file_regexes = {
@@ -678,7 +616,10 @@ mod tests {
                     "build".to_string(),
                     "--release".to_string()
                 ]]),
-                build_env_vars: Default::default(),
+                build_env_vars: IndexMap::from_iter([(
+                    "CC".to_string(),
+                    EnvVarValue::Value("gcc".to_string())
+                )]),
                 matches_project_if_any: Some(vec![HarnessMatcher {
                     file_regexes: [("Cargo.toml".to_string(), "*".to_string())].into(),
                     file_predicates: [(

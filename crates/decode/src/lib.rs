@@ -6,10 +6,11 @@
 
 use common::{SpecOrigin, Target};
 use generational_arena::Arena;
-use mfile::{EnvPatches, PatchSetting, Upstream};
-use nickel_lang_core::eval::value::NickelValue;
+use mfile::{EnvPatches, EnvVarValue, PatchSetting, Upstream};
+use nickel_lang_core::eval::value::{NickelValue, RecordData};
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::position::TermPos;
+use nickel_lang_core::term::IndexMap;
 use nickel_lang_core::{
     eval::{Closure, cache::CacheImpl},
     program::Program,
@@ -487,6 +488,102 @@ pub(crate) fn patches_from_term(
         file: files.unwrap_or_default(),
         dir: dirs.unwrap_or_default(),
     })
+}
+
+pub(crate) fn env_vars_from_term(
+    r: &RecordData,
+    program: &mut Program<CacheImpl>,
+) -> Result<IndexMap<String, EnvVarValue>, Error> {
+    r.fields
+        .iter()
+        .map(
+            |(ident_and_loc, field)| -> Result<(String, EnvVarValue), Error> {
+                Ok((
+                    ident_and_loc.label().to_string(),
+                    EnvVarValue::Value(
+                        String::deserialize(eval_if_closure(
+                            field.value.as_ref().unwrap(),
+                            program,
+                        )?)
+                        .unwrap(),
+                    ),
+                ))
+            },
+        )
+        .collect::<Result<IndexMap<_, _>, Error>>()
+}
+
+pub(crate) fn packages_array_from_term(
+    rt: &NickelValue,
+    program: &mut Program<CacheImpl>,
+) -> Result<Vec<String>, Error> {
+    let packages_rt = eval_if_closure(rt, program)?;
+
+    if let Some(a) = packages_rt.as_array() {
+        a.iter()
+            .map(|input| Ok(String::deserialize(eval_if_closure(input, program)?).unwrap()))
+            .collect::<Result<Vec<_>, Error>>()
+    } else {
+        todo!("handle packages value being non-array {:?}", packages_rt);
+    }
+}
+
+pub(crate) fn cmds_from_cmd_term(
+    rt: &NickelValue,
+    program: &mut Program<CacheImpl>,
+) -> Result<Vec<Vec<String>>, Error> {
+    let rt = eval_if_closure(rt, program)?;
+    if let Some(s) = rt.as_string() {
+        Ok(vec![shlex::split(s.as_ref()).unwrap()])
+    } else if let Some(a) = rt.as_array() {
+        Ok(vec![
+            a.iter()
+                .map(|rt| eval_if_closure(rt, program))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|rt| String::deserialize(rt).unwrap())
+                .collect(),
+        ])
+    } else {
+        todo!(
+            "error for 'cmd' field being non-string & non-array, got {:?}",
+            rt
+        );
+    }
+}
+
+pub(crate) fn cmds_from_cmds_term(
+    rt: &NickelValue,
+    program: &mut Program<CacheImpl>,
+) -> Result<Vec<Vec<String>>, Error> {
+    let rt = eval_if_closure(rt, program)?;
+    if let Some(cmds_rt) = rt.as_array() {
+        Ok(cmds_rt
+            .iter()
+            .map(|rt| {
+                let rt = eval_if_closure(rt, program)?;
+                if let Some(a) = rt.as_array() {
+                    Ok::<_, Error>(
+                        a.iter()
+                            .map(|rt| eval_if_closure(rt, program))
+                            .collect::<Result<Vec<_>, _>>()?
+                            .into_iter()
+                            .map(|rt| String::deserialize(rt).unwrap())
+                            .collect(),
+                    )
+                } else if let Some(s) = rt.as_string() {
+                    Ok::<_, Error>(shlex::split(s.as_ref()).unwrap())
+                } else {
+                    todo!(
+                        "error for 'cmds' field being non-array & non-string, got {:?}",
+                        rt
+                    );
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?)
+    } else {
+        todo!("error for 'cmds' field being non-array, got {:?}", rt);
+    }
 }
 
 #[cfg(test)]
