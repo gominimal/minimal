@@ -1,9 +1,11 @@
 use anyhow::anyhow;
-use check::CheckVerdict;
+use check::{CheckCtx, CheckVerdict};
 use codespan_reporting::term::termcolor::{Buffer, Color, ColorSpec, WriteColor};
 use futures::stream::StreamExt;
 use mctx::{Context, Error};
 use std::io::{IsTerminal, Write};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 #[derive(clap::Args)]
 pub struct CheckArgs {
@@ -97,7 +99,15 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
         Ok(g) => (Some(g), None),
     };
 
-    let skip_checkers = args.skip_checkers.unwrap_or_default();
+    let check_ctx = CheckCtx {
+        graph: graph.map(|g| Arc::new(RwLock::new(g))),
+        filter_names: args.filter_names.clone(),
+        skip_checkers: args.skip_checkers.unwrap_or_default(),
+        stdlib_dir: ctx.stdlib_dir().to_path_buf(),
+        cache: ctx.local_cache(),
+        fix: args.fix,
+        ot: None,
+    };
 
     let mut checks_stream = check::run_checks(
         if args.kind.check_packages() {
@@ -115,13 +125,7 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
         } else {
             None
         },
-        ctx.stdlib_dir().to_path_buf(),
-        &args.filter_names,
-        graph,
-        ctx.local_cache(),
-        args.fix,
-        &skip_checkers,
-        None,
+        check_ctx,
     )?;
 
     let mut had_error = false;

@@ -1,9 +1,8 @@
 use std::path::Path;
 
 use super::Error;
-use crate::{CheckResult, CheckVerdict};
+use crate::{CheckCtx, CheckResult, CheckVerdict};
 use graph::{BuildOutput, Graph};
-use lcache::{Cache, LocalDir};
 use ot::OpTracker;
 use tokio::sync::RwLockReadGuard;
 
@@ -12,12 +11,10 @@ pub(crate) struct SpecNameMatchesDir;
 impl crate::GraphBasedChecker for SpecNameMatchesDir {
     async fn check(
         self,
-        skip_checkers: &[String],
-        _fix: bool,
+        ctx: &CheckCtx,
         pkg: String,
         _package_dir: &Path,
         graph: RwLockReadGuard<'_, Graph>,
-        _cache: Cache<LocalDir>,
         _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
@@ -25,7 +22,10 @@ impl crate::GraphBasedChecker for SpecNameMatchesDir {
             check: "spec name matches dir",
             err: vec![],
         };
-        if skip_checkers.contains(&"spec name matches dir".to_string()) {
+        if ctx
+            .skip_checkers
+            .contains(&"spec name matches dir".to_string())
+        {
             return Ok(result);
         }
 
@@ -51,12 +51,10 @@ pub(crate) struct SpecNameValid;
 impl crate::GraphBasedChecker for SpecNameValid {
     async fn check(
         self,
-        skip_checkers: &[String],
-        _fix: bool,
+        ctx: &CheckCtx,
         pkg: String,
         _package_dir: &Path,
         _graph: RwLockReadGuard<'_, Graph>,
-        _cache: Cache<LocalDir>,
         _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
@@ -64,7 +62,7 @@ impl crate::GraphBasedChecker for SpecNameValid {
             check: "spec name valid",
             err: vec![],
         };
-        if skip_checkers.contains(&"spec name valid".to_string()) {
+        if ctx.skip_checkers.contains(&"spec name valid".to_string()) {
             return Ok(result);
         }
 
@@ -91,12 +89,10 @@ pub(crate) struct CycleBreakerNaming;
 impl crate::GraphBasedChecker for CycleBreakerNaming {
     async fn check(
         self,
-        skip_checkers: &[String],
-        _fix: bool,
+        ctx: &CheckCtx,
         pkg: String,
         _package_dir: &Path,
         graph: RwLockReadGuard<'_, Graph>,
-        _cache: Cache<LocalDir>,
         _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
@@ -104,7 +100,10 @@ impl crate::GraphBasedChecker for CycleBreakerNaming {
             check: "cycle breaker naming",
             err: vec![],
         };
-        if skip_checkers.contains(&"cycle breaker naming".to_string()) {
+        if ctx
+            .skip_checkers
+            .contains(&"cycle breaker naming".to_string())
+        {
             return Ok(result);
         }
 
@@ -140,12 +139,10 @@ pub(crate) struct OutputNaming;
 impl crate::GraphBasedChecker for OutputNaming {
     async fn check(
         self,
-        skip_checkers: &[String],
-        _fix: bool,
+        ctx: &CheckCtx,
         pkg: String,
         _package_dir: &Path,
         graph: RwLockReadGuard<'_, Graph>,
-        _cache: Cache<LocalDir>,
         _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
@@ -153,7 +150,7 @@ impl crate::GraphBasedChecker for OutputNaming {
             check: "output naming",
             err: vec![],
         };
-        if skip_checkers.contains(&"output naming".to_string()) {
+        if ctx.skip_checkers.contains(&"output naming".to_string()) {
             return Ok(result);
         }
 
@@ -206,20 +203,19 @@ pub(crate) struct EnumerateBins;
 impl crate::GraphBasedChecker for EnumerateBins {
     async fn check(
         self,
-        skip_checkers: &[String],
-        _fix: bool,
+        ctx: &CheckCtx,
         pkg: String,
         _package_dir: &Path,
         graph: RwLockReadGuard<'_, Graph>,
-        cache: Cache<LocalDir>,
         _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
+        let cache = ctx.cache.clone();
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
             check: "enumerate bins",
             err: vec![],
         };
-        if skip_checkers.contains(&"enumerate bins".to_string()) {
+        if ctx.skip_checkers.contains(&"enumerate bins".to_string()) {
             return Ok(result);
         }
 
