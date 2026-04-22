@@ -103,8 +103,7 @@ impl Runnable for OciImageCreate {
                 .into_inner()
                 .unwrap()
                 .into_iter()
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter(),
+                .collect::<Result<Vec<_>, _>>()?,
         );
 
         // Required reading: https://github.com/opencontainers/image-spec/blob/main/spec.md

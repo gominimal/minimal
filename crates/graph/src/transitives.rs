@@ -358,7 +358,7 @@ mod tests {
             .transitive_runtime_deps
             .into_iter()
             .collect::<Vec<_>>();
-        deps.sort_by(|(a, _), (b, _)| a.cmp(b));
+        deps.sort_by_key(|(a, _)| *a);
         assert_eq!(
             deps,
             vec![
@@ -431,7 +431,7 @@ mod tests {
             .transitive_runtime_deps
             .into_iter()
             .collect::<Vec<_>>();
-        deps.sort_by(|(a, _), (b, _)| a.cmp(b));
+        deps.sort_by_key(|(a, _)| *a);
 
         assert_eq!(
             deps,
@@ -518,7 +518,7 @@ mod tests {
             .transitive_runtime_deps
             .into_iter()
             .collect::<Vec<_>>();
-        result.sort_by(|a, b| a.0.cmp(&b.0));
+        result.sort_by_key(|a| a.0);
         assert_eq!(
             result,
             vec![
@@ -600,7 +600,7 @@ mod tests {
             .transitive_runtime_deps
             .into_iter()
             .collect::<Vec<_>>();
-        result.sort_by(|a, b| a.0.cmp(&b.0));
+        result.sort_by_key(|a| a.0);
         assert_eq!(
             result,
             vec![

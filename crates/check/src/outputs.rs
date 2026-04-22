@@ -208,8 +208,7 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
                                             [(
                                                 (name, path_in_build.to_path_buf()),
                                                 [symbol].into(),
-                                            )]
-                                            .into_iter(),
+                                            )],
                                         ),
                                     );
                                 }
@@ -299,8 +298,7 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
                                                 .collect()
                                         } else {
                                             vec![]
-                                        }
-                                        .into_iter(),
+                                        },
                                     )
                                     .collect();
                                 let missing_symbols: Vec<&String> = outputs

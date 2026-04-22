@@ -168,24 +168,24 @@ impl crate::GraphBasedChecker for OutputNaming {
                 BuildOutput::Binary {
                     glob,
                     allow_missing_interpreter: _,
-                } if glob == "usr/bin/*" || glob == "usr/bin/**" || glob == "usr/bin/**/*" => {
-                    if name != "bins" {
-                        result.err.push(format!(
+                } if (glob == "usr/bin/*" || glob == "usr/bin/**" || glob == "usr/bin/**/*")
+                    && name != "bins" =>
+                {
+                    result.err.push(format!(
                                 "{}: binary output {}: catch-all binary outputs should be named 'bins' by convention",
                                 pkg, name
                             ));
-                    }
                 }
                 BuildOutput::Library {
                     glob,
                     allow_data: _,
-                } if glob == "usr/lib/*" || glob == "usr/lib/**" || glob == "usr/lib/**/*" => {
-                    if name != "libs" {
-                        result.err.push(format!(
+                } if (glob == "usr/lib/*" || glob == "usr/lib/**" || glob == "usr/lib/**/*")
+                    && name != "libs" =>
+                {
+                    result.err.push(format!(
                                 "{}: library output '{}': catch-all library outputs should be named 'libs' by convention",
                                 pkg, name
                             ));
-                    }
                 }
                 _ => {}
             }
