@@ -70,7 +70,13 @@ impl<C: Channel + Send> Listener<C> {
                         match line {
                             Ok(line) => {
                                 tracing::trace!("listener received: {}", line);
-                                channel.handle(&mut stream2, &line, &rootfs);
+                                if let Err(panic) =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        channel.handle(&mut stream2, &line, &rootfs)
+                                    }))
+                                {
+                                    tracing::error!("channel handler panicked: {:?}", panic);
+                                };
                             }
                             Err(e) => {
                                 tracing::warn!("listener read error: {}", e);
