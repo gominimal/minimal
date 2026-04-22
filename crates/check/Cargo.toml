@@ -6,15 +6,17 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-lcache.workspace = true
-common.workspace = true
-decode.workspace = true
+path-absolutize.workspace = true
 futures.workspace = true
-graph.workspace = true
 nickel-lang-core.workspace = true
 object.workspace = true
-op.workspace = true
-ot.workspace = true
 regex.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+
+common.workspace = true
+decode.workspace = true
+graph.workspace = true
+lcache.workspace = true
+op.workspace = true
+ot.workspace = true
