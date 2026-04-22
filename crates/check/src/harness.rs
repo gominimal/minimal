@@ -1,30 +1,18 @@
 use super::Error;
-use crate::CheckVerdict;
+use crate::{CheckCtx, CheckResult, CheckVerdict};
 use decode::Harness;
-use graph::Graph;
-use lcache::{Cache, LocalDir};
 use nickel_lang_core::eval::cache::CacheImpl;
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::program::Program;
 use ot::{OpTracker, Operation};
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 
-use crate::CheckResult;
-
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn check_harness(
     harness: String,
-    all_graph: Option<Arc<RwLock<Graph>>>,
-    fix: bool,
-    skip_checkers: Vec<String>,
+    ctx: &CheckCtx,
     harnesses_dir: PathBuf,
-    stdlib_dir: PathBuf,
-    cache: Cache<LocalDir>,
-    ot: Option<OpTracker>,
 ) -> Result<Vec<CheckResult>, Error> {
-    let check_op = OpTracker::new_with_root(&ot).with_op(Operation::Check {
+    let check_op = OpTracker::new_with_root(&ctx.ot).with_op(Operation::Check {
         kind: ot::CheckKind::CheckHarnesses,
         name: harness.clone(),
     });
@@ -57,7 +45,7 @@ pub(crate) async fn check_harness(
             ))]);
         }
     };
-    program.add_import_paths([stdlib_dir.clone()].iter());
+    program.add_import_paths([ctx.stdlib_dir.clone()].iter());
 
     if let Err(e) = program.typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk) {
         return Ok(vec![CheckResult::parse_failure(report_as_str(
@@ -74,57 +62,21 @@ pub(crate) async fn check_harness(
         ))]);
     }
 
-    out.push(check_harness_name(
-        harness.clone(),
-        all_graph.clone(),
-        fix,
-        skip_checkers.clone(),
-        harnesses_dir.clone(),
-        &mut program,
-        cache.clone(),
-    )?);
-    out.push(check_harness_packages_valid(
-        harness.clone(),
-        all_graph.clone(),
-        fix,
-        skip_checkers.clone(),
-        harnesses_dir.clone(),
-        &mut program,
-        cache.clone(),
-    )?);
-    out.push(check_project_matcher_regexes(
-        harness.clone(),
-        all_graph.clone(),
-        fix,
-        skip_checkers.clone(),
-        harnesses_dir.clone(),
-        &mut program,
-        cache.clone(),
-    )?);
-    out.push(check_project_matcher_predicates(
-        harness.clone(),
-        all_graph.clone(),
-        fix,
-        skip_checkers.clone(),
-        harnesses_dir.clone(),
-        &mut program,
-        cache.clone(),
-    )?);
+    out.push(check_harness_name(harness.clone(), ctx, &mut program)?);
+    out.push(check_harness_packages_valid(ctx, &mut program)?);
+    out.push(check_project_matcher_regexes(ctx, &mut program)?);
+    out.push(check_project_matcher_predicates(ctx, &mut program)?);
     use crate::FileBasedChecker;
     out.push(crate::ImportLineCheck.check(
-        &skip_checkers,
-        fix,
+        ctx,
         &harness,
         &harnesses_dir.join(&harness),
-        &stdlib_dir,
         Some(check_op.clone()),
     )?);
     out.push(crate::FmtCheck.check(
-        &skip_checkers,
-        fix,
+        ctx,
         &harness,
         &harnesses_dir.join(&harness),
-        &stdlib_dir,
         Some(check_op.clone()),
     )?);
 
@@ -133,14 +85,13 @@ pub(crate) async fn check_harness(
 
 fn check_harness_name(
     harness: String,
-    _all_graph: Option<Arc<RwLock<Graph>>>,
-    _fix: bool,
-    skip_checkers: Vec<String>,
-    _harnesses_dir: PathBuf,
+    ctx: &CheckCtx,
     program: &mut Program<CacheImpl>,
-    _cache: Cache<LocalDir>,
 ) -> Result<CheckResult, Error> {
-    if skip_checkers.contains(&"harness name matches dir".to_string()) {
+    if ctx
+        .skip_checkers
+        .contains(&"harness name matches dir".to_string())
+    {
         return Ok(CheckResult::harness_name_skip());
     }
 
@@ -175,20 +126,15 @@ fn check_harness_name(
 }
 
 fn check_harness_packages_valid(
-    _harness: String,
-    all_graph: Option<Arc<RwLock<Graph>>>,
-    _fix: bool,
-    skip_checkers: Vec<String>,
-    _harnesses_dir: PathBuf,
+    ctx: &CheckCtx,
     program: &mut Program<CacheImpl>,
-    _cache: Cache<LocalDir>,
 ) -> Result<CheckResult, Error> {
     let mut out = CheckResult {
         check: "packages valid",
         verdict: CheckVerdict::Skip,
         err: vec![],
     };
-    if skip_checkers.contains(&"packages valid".to_string()) {
+    if ctx.skip_checkers.contains(&"packages valid".to_string()) {
         return Ok(out);
     }
 
@@ -204,7 +150,7 @@ fn check_harness_packages_valid(
     out.verdict = CheckVerdict::Pass;
     match Harness::from_term(&tree, program) {
         Ok(h) => {
-            if let Some(g) = all_graph.as_ref()
+            if let Some(g) = ctx.graph.as_ref()
                 && let Ok(g) = g.try_read()
             {
                 for pkg in &h.build_packages {
@@ -249,15 +195,13 @@ fn check_harness_packages_valid(
 }
 
 fn check_project_matcher_regexes(
-    _harness: String,
-    _all_graph: Option<Arc<RwLock<Graph>>>,
-    _fix: bool,
-    skip_checkers: Vec<String>,
-    _harnesses_dir: PathBuf,
+    ctx: &CheckCtx,
     program: &mut Program<CacheImpl>,
-    _cache: Cache<LocalDir>,
 ) -> Result<CheckResult, Error> {
-    if skip_checkers.contains(&"project_matchers regexes".to_string()) {
+    if ctx
+        .skip_checkers
+        .contains(&"project_matchers regexes".to_string())
+    {
         return Ok(CheckResult::harness_regexes_skip());
     }
 
@@ -298,15 +242,13 @@ fn check_project_matcher_regexes(
 }
 
 fn check_project_matcher_predicates(
-    _harness: String,
-    _all_graph: Option<Arc<RwLock<Graph>>>,
-    _fix: bool,
-    skip_checkers: Vec<String>,
-    _harnesses_dir: PathBuf,
+    ctx: &CheckCtx,
     program: &mut Program<CacheImpl>,
-    _cache: Cache<LocalDir>,
 ) -> Result<CheckResult, Error> {
-    if skip_checkers.contains(&"project_matchers predicates".to_string()) {
+    if ctx
+        .skip_checkers
+        .contains(&"project_matchers predicates".to_string())
+    {
         return Ok(CheckResult::harness_predicates_skip());
     }
 

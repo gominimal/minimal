@@ -1,29 +1,19 @@
 use super::Error;
-use crate::{CheckResult, CheckVerdict, FileBasedChecker};
+use crate::{CheckCtx, CheckResult, CheckVerdict, FileBasedChecker};
 use decode::Profile;
-use graph::Graph;
-use lcache::{Cache, LocalDir};
 use nickel_lang_core::error::report::report_as_str;
 use nickel_lang_core::eval::cache::CacheImpl;
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::program::Program;
 use ot::{OpTracker, Operation};
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn check_profile(
     profile: String,
-    all_graph: Option<Arc<RwLock<Graph>>>,
-    fix: bool,
-    skip_checkers: Vec<String>,
+    ctx: &CheckCtx,
     profiles_dir: PathBuf,
-    stdlib_dir: PathBuf,
-    cache: Cache<LocalDir>,
-    ot: Option<OpTracker>,
 ) -> Result<Vec<CheckResult>, Error> {
-    let check_op = OpTracker::new_with_root(&ot).with_op(Operation::Check {
+    let check_op = OpTracker::new_with_root(&ctx.ot).with_op(Operation::Check {
         kind: ot::CheckKind::CheckProfiles,
         name: profile.clone(),
     });
@@ -56,7 +46,7 @@ pub(crate) async fn check_profile(
             ))]);
         }
     };
-    program.add_import_paths([stdlib_dir.clone()].iter());
+    program.add_import_paths([ctx.stdlib_dir.clone()].iter());
 
     if let Err(e) = program.typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk) {
         return Ok(vec![CheckResult::parse_failure(report_as_str(
@@ -73,38 +63,18 @@ pub(crate) async fn check_profile(
         ))]);
     }
 
-    out.push(check_profile_parses(
-        profile.clone(),
-        all_graph.clone(),
-        fix,
-        skip_checkers.clone(),
-        profiles_dir.clone(),
-        &mut program,
-        cache.clone(),
-    )?);
-    out.push(check_profile_name(
-        profile.clone(),
-        all_graph,
-        fix,
-        skip_checkers.clone(),
-        profiles_dir.clone(),
-        &mut program,
-        cache,
-    )?);
+    out.push(check_profile_parses(ctx, &mut program)?);
+    out.push(check_profile_name(profile.clone(), ctx, &mut program)?);
     out.push(crate::ImportLineCheck.check(
-        &skip_checkers,
-        fix,
+        ctx,
         &profile,
         &profiles_dir.join(&profile),
-        &stdlib_dir,
         Some(check_op.clone()),
     )?);
     out.push(crate::FmtCheck.check(
-        &skip_checkers,
-        fix,
+        ctx,
         &profile,
         &profiles_dir.join(&profile),
-        &stdlib_dir,
         Some(check_op.clone()),
     )?);
 
@@ -112,13 +82,8 @@ pub(crate) async fn check_profile(
 }
 
 fn check_profile_parses(
-    _profile: String,
-    _all_graph: Option<Arc<RwLock<Graph>>>,
-    _fix: bool,
-    skip_checkers: Vec<String>,
-    _profiles_dir: PathBuf,
+    ctx: &CheckCtx,
     program: &mut Program<CacheImpl>,
-    _cache: Cache<LocalDir>,
 ) -> Result<CheckResult, Error> {
     let mut out = CheckResult {
         check: "profile parses",
@@ -126,7 +91,7 @@ fn check_profile_parses(
         verdict: CheckVerdict::Pass,
     };
 
-    if skip_checkers.contains(&"profile parses".to_string()) {
+    if ctx.skip_checkers.contains(&"profile parses".to_string()) {
         out.verdict = CheckVerdict::Skip;
         return Ok(out);
     }
@@ -166,14 +131,13 @@ fn check_profile_parses(
 
 fn check_profile_name(
     profile: String,
-    _all_graph: Option<Arc<RwLock<Graph>>>,
-    _fix: bool,
-    skip_checkers: Vec<String>,
-    _profiles_dir: PathBuf,
+    ctx: &CheckCtx,
     program: &mut Program<CacheImpl>,
-    _cache: Cache<LocalDir>,
 ) -> Result<CheckResult, Error> {
-    if skip_checkers.contains(&"profile name matches dir".to_string()) {
+    if ctx
+        .skip_checkers
+        .contains(&"profile name matches dir".to_string())
+    {
         return Ok(CheckResult::profile_name_skip());
     }
 

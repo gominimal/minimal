@@ -4,7 +4,7 @@ use std::{
 };
 
 use super::Error;
-use crate::{CheckResult, CheckVerdict};
+use crate::{CheckCtx, CheckResult, CheckVerdict};
 use anyhow::anyhow;
 use graph::{BuildOutput, BuildSpecRef, Graph, Transitives};
 use lcache::{CacheErr, DirCacheEntry, LocalDir};
@@ -17,20 +17,22 @@ pub(crate) struct OutputTypesValid;
 impl crate::GraphBasedChecker for OutputTypesValid {
     async fn check(
         self,
-        skip_checkers: &[String],
-        _fix: bool,
+        ctx: &CheckCtx,
         pkg: String,
         _package_dir: &Path,
         graph: RwLockReadGuard<'_, Graph>,
-        cache: lcache::Cache<LocalDir>,
         _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
+        let cache = ctx.cache.clone();
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
             check: "output types valid",
             err: vec![],
         };
-        if skip_checkers.contains(&"output types valid".to_string()) {
+        if ctx
+            .skip_checkers
+            .contains(&"output types valid".to_string())
+        {
             return Ok(result);
         }
 
@@ -112,20 +114,22 @@ pub(crate) struct MissingRuntimeDeps;
 impl crate::GraphBasedChecker for MissingRuntimeDeps {
     async fn check(
         self,
-        skip_checkers: &[String],
-        _fix: bool,
+        ctx: &CheckCtx,
         pkg: String,
         _package_dir: &Path,
         graph: RwLockReadGuard<'_, Graph>,
-        cache: lcache::Cache<LocalDir>,
         _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
+        let cache = ctx.cache.clone();
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
             check: "missing runtime_deps",
             err: vec![],
         };
-        if skip_checkers.contains(&"missing runtime_deps".to_string()) {
+        if ctx
+            .skip_checkers
+            .contains(&"missing runtime_deps".to_string())
+        {
             return Ok(result);
         }
 

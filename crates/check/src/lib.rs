@@ -250,68 +250,43 @@ impl Display for CheckObj {
 pub type CheckFuture =
     std::pin::Pin<Box<dyn Future<Output = (CheckObj, Result<Vec<CheckResult>, Error>)> + Send>>;
 
+/// Parameters that remain constant across all checkers within a single
+/// [`run_checks`] invocation.
+#[derive(Clone)]
+pub struct CheckCtx {
+    pub graph: Option<Arc<RwLock<Graph>>>,
+    pub filter_names: Vec<String>,
+    pub skip_checkers: Vec<String>,
+    pub stdlib_dir: PathBuf,
+    pub cache: Cache<LocalDir>,
+    pub fix: bool,
+    pub ot: Option<OpTracker>,
+}
+
 /// Runs checkers, returning a [`FuturesUnordered`] that yields results as each check completes.
 ///
 /// If `None` is given for a `packages_dir`, `profiles_dir`, or `harnesses_dir`, the corresponding
 /// class of checkers are skipped.
-#[allow(clippy::too_many_arguments)]
 pub fn run_checks(
     packages_dir: Option<PathBuf>,
     profiles_dir: Option<PathBuf>,
     harnesses_dir: Option<PathBuf>,
-    stdlib_dir: PathBuf,
-    filter_names: &[String],
-    graph: Option<Graph>,
-    cache: Cache<LocalDir>,
-    fix: bool,
-    skip_checkers: &[String],
-    ot: Option<OpTracker>,
+    ctx: CheckCtx,
 ) -> Result<FuturesUnordered<CheckFuture>, Error> {
-    let graph_hnd = graph.map(|g| Arc::new(RwLock::new(g)));
-    let skip_checkers_owned = skip_checkers.to_vec();
-    let filter_names_owned = filter_names.to_vec();
-
     let results = if let Some(packages_dir) = packages_dir {
-        package_check_futures(
-            packages_dir,
-            filter_names_owned.clone(),
-            graph_hnd.clone(),
-            skip_checkers_owned.clone(),
-            stdlib_dir.clone(),
-            cache.clone(),
-            fix,
-            ot.clone(),
-        )?
+        package_check_futures(packages_dir, ctx.clone())?
     } else {
         vec![]
     };
 
     let profile_results = if let Some(profiles_dir) = profiles_dir {
-        profile_check_futures(
-            profiles_dir,
-            filter_names_owned.clone(),
-            graph_hnd.clone(),
-            skip_checkers_owned.clone(),
-            stdlib_dir.clone(),
-            cache.clone(),
-            fix,
-            ot.clone(),
-        )?
+        profile_check_futures(profiles_dir, ctx.clone())?
     } else {
         vec![]
     };
 
     let harness_results = if let Some(harnesses_dir) = harnesses_dir {
-        harness_check_futures(
-            harnesses_dir,
-            filter_names_owned,
-            graph_hnd,
-            skip_checkers_owned,
-            stdlib_dir,
-            cache,
-            fix,
-            ot,
-        )?
+        harness_check_futures(harnesses_dir, ctx)?
     } else {
         vec![]
     };
@@ -323,18 +298,8 @@ pub fn run_checks(
         .collect::<FuturesUnordered<_>>())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn package_check_futures(
-    packages_dir: PathBuf,
-    filter_names: Vec<String>,
-    graph_hnd: Option<Arc<RwLock<Graph>>>,
-    skip_checkers: Vec<String>,
-    stdlib_dir: PathBuf,
-    cache: Cache<LocalDir>,
-    fix: bool,
-    ot: Option<OpTracker>,
-) -> Result<Vec<CheckFuture>, Error> {
-    let package_dirs = match decode::build_decls_in_dir(&packages_dir) {
+fn package_check_futures(packages_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<CheckFuture>, Error> {
+    let package_dirs: Vec<_> = match decode::build_decls_in_dir(&packages_dir) {
         Ok(i) => i,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
         Err(e) => return Err(Error::IO("reading package dirs", packages_dir.clone(), e)),
@@ -344,49 +309,27 @@ fn package_check_futures(
     .filter_map(|fpath| {
         let dir = fpath.parent().unwrap();
         let pkg = dir.file_name().unwrap().to_str().unwrap().to_string();
-        if filter_names.is_empty() || filter_names.contains(&pkg) {
+        if ctx.filter_names.is_empty() || ctx.filter_names.contains(&pkg) {
             Some((pkg, dir.to_path_buf()))
         } else {
             None
         }
-    });
+    })
+    .collect();
 
     Ok(package_dirs
         .into_iter()
         .map::<CheckFuture, _>(move |(pkg, dir)| {
-            let graph_hnd = graph_hnd.clone();
-            let skip_checkers = skip_checkers.clone();
-            let stdlib_dir = stdlib_dir.clone();
-            let cache = cache.clone();
-            let ot = ot.clone();
+            let ctx = ctx.clone();
             Box::pin(async move {
-                let result = check_package(
-                    pkg.clone(),
-                    dir,
-                    graph_hnd,
-                    fix,
-                    skip_checkers,
-                    stdlib_dir,
-                    cache,
-                    ot,
-                );
+                let result = check_package(pkg.clone(), dir, ctx);
                 (CheckObj::Package(pkg), result.await)
             })
         })
         .collect::<Vec<_>>())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn profile_check_futures(
-    profiles_dir: PathBuf,
-    filter_names: Vec<String>,
-    graph_hnd: Option<Arc<RwLock<Graph>>>,
-    skip_checkers: Vec<String>,
-    stdlib_dir: PathBuf,
-    cache: Cache<LocalDir>,
-    fix: bool,
-    ot: Option<OpTracker>,
-) -> Result<Vec<CheckFuture>, Error> {
+fn profile_check_futures(profiles_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<CheckFuture>, Error> {
     let dirs: Vec<std::ffi::OsString> = match std::fs::read_dir(&profiles_dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
         Err(e) => return Err(Error::IO("reading profile dirs", profiles_dir.clone(), e)),
@@ -407,7 +350,7 @@ fn profile_check_futures(
             // Filter based on any given filter names
             .filter_map(|dir| {
                 let n = dir.as_os_str().to_str().unwrap().to_string();
-                if filter_names.is_empty() || filter_names.contains(&n) {
+                if ctx.filter_names.is_empty() || ctx.filter_names.contains(&n) {
                     Some(dir)
                 } else {
                     None
@@ -419,44 +362,21 @@ fn profile_check_futures(
     Ok(dirs
         .into_iter()
         .map::<CheckFuture, _>(move |pd| {
-            let graph_hnd = graph_hnd.clone();
-            let skip_checkers = skip_checkers.clone();
-            let stdlib_dir = stdlib_dir.clone();
-            let cache = cache.clone();
+            let ctx = ctx.clone();
             let profiles_dir = profiles_dir.clone();
-            let ot = ot.clone();
 
             Box::pin(async move {
                 (
                     CheckObj::Profile(pd.to_str().unwrap().to_string()),
-                    profile::check_profile(
-                        pd.to_str().unwrap().to_string(),
-                        graph_hnd,
-                        fix,
-                        skip_checkers.clone(),
-                        profiles_dir,
-                        stdlib_dir,
-                        cache,
-                        ot,
-                    )
-                    .await,
+                    profile::check_profile(pd.to_str().unwrap().to_string(), &ctx, profiles_dir)
+                        .await,
                 )
             })
         })
         .collect())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn harness_check_futures(
-    harnesses_dir: PathBuf,
-    filter_names: Vec<String>,
-    graph_hnd: Option<Arc<RwLock<Graph>>>,
-    skip_checkers: Vec<String>,
-    stdlib_dir: PathBuf,
-    cache: Cache<LocalDir>,
-    fix: bool,
-    ot: Option<OpTracker>,
-) -> Result<Vec<CheckFuture>, Error> {
+fn harness_check_futures(harnesses_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<CheckFuture>, Error> {
     let dirs: Vec<std::ffi::OsString> = match std::fs::read_dir(&harnesses_dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
         Err(e) => return Err(Error::IO("reading harness dirs", harnesses_dir.clone(), e)),
@@ -477,7 +397,7 @@ fn harness_check_futures(
             // Filter based on any given filter names
             .filter_map(|dir| {
                 let n = dir.as_os_str().to_str().unwrap().to_string();
-                if filter_names.is_empty() || filter_names.contains(&n) {
+                if ctx.filter_names.is_empty() || ctx.filter_names.contains(&n) {
                     Some(dir)
                 } else {
                     None
@@ -489,52 +409,34 @@ fn harness_check_futures(
     Ok(dirs
         .into_iter()
         .map::<CheckFuture, _>(move |pd| {
-            let graph_hnd = graph_hnd.clone();
-            let skip_checkers = skip_checkers.clone();
-            let stdlib_dir = stdlib_dir.clone();
-            let cache = cache.clone();
+            let ctx = ctx.clone();
             let harnesses_dir = harnesses_dir.clone();
-            let ot = ot.clone();
 
             Box::pin(async move {
                 (
                     CheckObj::Harness(pd.to_str().unwrap().to_string()),
-                    harness::check_harness(
-                        pd.to_str().unwrap().to_string(),
-                        graph_hnd,
-                        fix,
-                        skip_checkers.clone(),
-                        harnesses_dir,
-                        stdlib_dir,
-                        cache,
-                        ot,
-                    )
-                    .await,
+                    harness::check_harness(pd.to_str().unwrap().to_string(), &ctx, harnesses_dir)
+                        .await,
                 )
             })
         })
         .collect())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn check_package(
     pkg: String,
     package_dir: PathBuf,
-    all_graph: Option<Arc<RwLock<Graph>>>,
-    fix: bool,
-    skip_checkers: Vec<String>,
-    stdlib_dir: PathBuf,
-    cache: Cache<LocalDir>,
-    ot: Option<OpTracker>,
+    ctx: CheckCtx,
 ) -> Result<Vec<CheckResult>, Error> {
-    let check_op = OpTracker::new_with_root(&ot).with_op(Operation::Check {
+    let check_op = OpTracker::new_with_root(&ctx.ot).with_op(Operation::Check {
         kind: ot::CheckKind::CheckPackages,
         name: pkg.clone(),
     });
 
     let mut out = Vec::new();
 
-    if let Some(graph) = all_graph {
+    if let Some(ref graph) = ctx.graph {
+        let graph = graph.clone();
         // Run all graph-based checkers concurrently. Errors are converted
         // to String at the boundary so the results are Send.
         macro_rules! run_checker {
@@ -542,12 +444,10 @@ async fn check_package(
                 async {
                     $checker
                         .check(
-                            &skip_checkers,
-                            fix,
+                            &ctx,
                             pkg.clone(),
                             package_dir.as_ref(),
                             graph.read().await,
-                            cache.clone(),
                             Some(check_op.clone()),
                         )
                         .await
@@ -575,9 +475,8 @@ async fn check_package(
 
     // Run file-based checkers in a separate thread as they're computation-heavy
     let file_based_results = {
-        let skip_checkers = skip_checkers.clone();
+        let ctx = ctx.clone();
         let pkg = pkg.clone();
-        let stdlib_dir = stdlib_dir.clone();
 
         tokio::task::spawn_blocking(move || {
             let file_based: Vec<Box<dyn FileBasedChecker>> = vec![
@@ -591,14 +490,7 @@ async fn check_package(
             for mut c in file_based.into_iter() {
                 let check_result = c
                     .as_mut()
-                    .check(
-                        &skip_checkers,
-                        fix,
-                        &pkg,
-                        &package_dir,
-                        &stdlib_dir,
-                        Some(check_op.clone()),
-                    )
+                    .check(&ctx, &pkg, &package_dir, Some(check_op.clone()))
                     .map_err(|e| format!("{:?}", e))?;
                 results.push(check_result);
             }
@@ -619,27 +511,22 @@ async fn check_package(
 pub(crate) trait FileBasedChecker: Send {
     fn check(
         &mut self,
-        skip_checkers: &[String],
-        fix: bool,
+        ctx: &CheckCtx,
         pkg: &str,
         pkg_dir: &Path,
-        stdlib_dir: &Path,
         ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error>;
 }
 
 /// A checker which checks a package by looking at its representation in the graph.
 /// These checkers are run in parallel.
-#[allow(clippy::too_many_arguments)]
 pub(crate) trait GraphBasedChecker {
     async fn check(
         self,
-        skip_checkers: &[String],
-        fix: bool,
+        ctx: &CheckCtx,
         pkg: String,
         package_dir: &Path,
         graph: RwLockReadGuard<'_, Graph>,
-        cache: Cache<LocalDir>,
         ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error>;
 }
@@ -650,14 +537,12 @@ struct ParseCheck;
 impl FileBasedChecker for ParseCheck {
     fn check(
         &mut self,
-        skip_checkers: &[String],
-        _fix: bool,
+        ctx: &CheckCtx,
         _pkg: &str,
         pkg_dir: &Path,
-        stdlib_dir: &Path,
         _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
-        if skip_checkers.contains(&"parse".to_string()) {
+        if ctx.skip_checkers.contains(&"parse".to_string()) {
             return Ok(CheckResult {
                 check: "parse",
                 verdict: CheckVerdict::Skip,
@@ -695,7 +580,7 @@ impl FileBasedChecker for ParseCheck {
             b"{target = {arch = 'Amd64, os = 'Linux}}",
         )
         .unwrap();
-        program.add_import_paths([stdlib_dir, generated_lib_dir.path()].iter());
+        program.add_import_paths([ctx.stdlib_dir.as_path(), generated_lib_dir.path()].iter());
 
         if let Err(e) = program.typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk) {
             return Ok(CheckResult {
@@ -739,19 +624,18 @@ pub(crate) struct ImportLineCheck;
 impl FileBasedChecker for ImportLineCheck {
     fn check(
         &mut self,
-        skip_checkers: &[String],
-        fix: bool,
+        ctx: &CheckCtx,
         _pkg: &str,
         pkg_dir: &Path,
-        _stdlib_dir: &Path,
         _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
+        let fix = ctx.fix;
         let mut result = CheckResult {
             verdict: CheckVerdict::Pass,
             check: "import line",
             err: vec![],
         };
-        if skip_checkers.contains(&"import line".to_string()) {
+        if ctx.skip_checkers.contains(&"import line".to_string()) {
             result.verdict = CheckVerdict::Skip;
             return Ok(result);
         }
@@ -854,19 +738,18 @@ pub(crate) struct FmtCheck;
 impl FileBasedChecker for FmtCheck {
     fn check(
         &mut self,
-        skip_checkers: &[String],
-        fix: bool,
+        ctx: &CheckCtx,
         _pkg: &str,
         pkg_dir: &Path,
-        _stdlib_dir: &Path,
         _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
+        let fix = ctx.fix;
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
             check: "fmt",
             err: vec![],
         };
-        if skip_checkers.contains(&"fmt".to_string()) {
+        if ctx.skip_checkers.contains(&"fmt".to_string()) {
             return Ok(result);
         }
 
@@ -921,20 +804,19 @@ struct StandaloneTestCheck;
 impl GraphBasedChecker for StandaloneTestCheck {
     async fn check(
         self,
-        skip_checkers: &[String],
-        _fix: bool,
+        ctx: &CheckCtx,
         pkg: String,
         _package_dir: &Path,
         graph: RwLockReadGuard<'_, Graph>,
-        cache: Cache<LocalDir>,
         ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
+        let cache = ctx.cache.clone();
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
             check: "standalone tests",
             err: vec![],
         };
-        if skip_checkers.contains(&"standalone tests".to_string()) {
+        if ctx.skip_checkers.contains(&"standalone tests".to_string()) {
             return Ok(result);
         }
 
@@ -1028,11 +910,9 @@ struct AdjacentImportCheck;
 impl FileBasedChecker for AdjacentImportCheck {
     fn check(
         &mut self,
-        skip_checkers: &[String],
-        _fix: bool,
+        ctx: &CheckCtx,
         _pkg: &str,
         pkg_dir: &Path,
-        _stdlib_dir: &Path,
         _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
@@ -1040,7 +920,7 @@ impl FileBasedChecker for AdjacentImportCheck {
             check: "adjacent import",
             err: vec![],
         };
-        if skip_checkers.contains(&"adjacent import".to_string()) {
+        if ctx.skip_checkers.contains(&"adjacent import".to_string()) {
             result.verdict = CheckVerdict::Skip;
             return Ok(result);
         }
@@ -1118,12 +998,10 @@ struct BuildScriptDisallowedPatterns;
 impl GraphBasedChecker for BuildScriptDisallowedPatterns {
     async fn check(
         self,
-        skip_checkers: &[String],
-        _fix: bool,
+        ctx: &CheckCtx,
         pkg: String,
         _package_dir: &Path,
         graph: RwLockReadGuard<'_, Graph>,
-        _cache: Cache<LocalDir>,
         _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
@@ -1131,7 +1009,10 @@ impl GraphBasedChecker for BuildScriptDisallowedPatterns {
             check: "build script disallowed-patterns",
             err: vec![],
         };
-        if skip_checkers.contains(&"build script disallowed-patterns".to_string()) {
+        if ctx
+            .skip_checkers
+            .contains(&"build script disallowed-patterns".to_string())
+        {
             return Ok(result);
         }
 
@@ -1193,12 +1074,10 @@ struct BuildScriptIsExecutable;
 impl GraphBasedChecker for BuildScriptIsExecutable {
     async fn check(
         self,
-        skip_checkers: &[String],
-        _fix: bool,
+        ctx: &CheckCtx,
         pkg: String,
         _package_dir: &Path,
         graph: RwLockReadGuard<'_, Graph>,
-        _cache: Cache<LocalDir>,
         _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
@@ -1206,7 +1085,10 @@ impl GraphBasedChecker for BuildScriptIsExecutable {
             check: "build scripts are executable",
             err: vec![],
         };
-        if skip_checkers.contains(&"build scripts are executable".to_string()) {
+        if ctx
+            .skip_checkers
+            .contains(&"build scripts are executable".to_string())
+        {
             return Ok(result);
         }
 
