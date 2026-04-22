@@ -254,12 +254,13 @@ pub type CheckFuture =
 /// [`run_checks`] invocation.
 #[derive(Clone)]
 pub struct CheckCtx {
-    pub graph: Option<Arc<RwLock<Graph>>>,
     pub filter_names: Vec<String>,
     pub skip_checkers: Vec<String>,
+    pub fix: bool,
+
+    pub graph: Option<Arc<RwLock<Graph>>>,
     pub stdlib_dir: PathBuf,
     pub cache: Cache<LocalDir>,
-    pub fix: bool,
     pub ot: Option<OpTracker>,
 }
 
@@ -482,7 +483,7 @@ async fn check_package(
             let file_based: Vec<Box<dyn FileBasedChecker>> = vec![
                 Box::new(ParseCheck),
                 Box::new(ImportLineCheck),
-                Box::new(AdjacentImportCheck),
+                Box::new(ImportsCheck),
                 Box::new(FmtCheck),
             ];
 
@@ -905,9 +906,12 @@ static ADJACENT_IMPORT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
         .expect("Invalid regex pattern")
 });
 
-struct AdjacentImportCheck;
+static ALL_IMPORT_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"\s+import\s+"([^"]+)""#).expect("Invalid regex pattern"));
 
-impl FileBasedChecker for AdjacentImportCheck {
+struct ImportsCheck;
+
+impl FileBasedChecker for ImportsCheck {
     fn check(
         &mut self,
         ctx: &CheckCtx,
@@ -917,10 +921,10 @@ impl FileBasedChecker for AdjacentImportCheck {
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
             verdict: CheckVerdict::Pass,
-            check: "adjacent import",
+            check: "imports",
             err: vec![],
         };
-        if ctx.skip_checkers.contains(&"adjacent import".to_string()) {
+        if ctx.skip_checkers.contains(&"imports".to_string()) {
             result.verdict = CheckVerdict::Skip;
             return Ok(result);
         }
@@ -965,6 +969,25 @@ impl FileBasedChecker for AdjacentImportCheck {
                         "{}: adjacent package '{}' imported but not used",
                         name.to_str().unwrap(),
                         identifier,
+                    ));
+                    result.verdict = CheckVerdict::Fail;
+                }
+            }
+
+            use path_absolutize::Absolutize;
+            let must_base_path = pkg_dir.parent().unwrap_or(pkg_dir);
+            for captures in ALL_IMPORT_REGEX.captures_iter(&file_contents) {
+                let import_path = captures.get(1).unwrap().as_str();
+                let joined_path = pkg_dir.join(import_path);
+                let resolved_path = joined_path
+                    .absolutize()
+                    .map_err(|e| Error::Other(e.into()))?;
+
+                if !resolved_path.starts_with(must_base_path) {
+                    result.err.push(format!(
+                        "import \"{}\": escapes base directory ({})",
+                        import_path,
+                        resolved_path.display(),
                     ));
                     result.verdict = CheckVerdict::Fail;
                 }

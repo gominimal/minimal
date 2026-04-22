@@ -461,6 +461,7 @@ dependencies = [
  "object 0.39.0",
  "op",
  "ot",
+ "path-absolutize",
  "regex",
  "tempfile",
  "tokio",

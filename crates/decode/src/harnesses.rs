@@ -469,7 +469,7 @@ impl Harness {
                                                     .collect::<Vec<_>>();
                                                 let rt = RuntimeContract::apply_all(
                                                     m.clone(),
-                                                    pending.into_iter(),
+                                                    pending,
                                                     m.pos_idx(),
                                                 );
 
