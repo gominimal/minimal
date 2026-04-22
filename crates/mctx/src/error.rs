@@ -97,7 +97,21 @@ impl fmt::Display for Error {
             }
             Error::Format(e) => write!(f, "invalid TOML: {}", e),
             Error::MFile(e) => write!(f, "{}: {}", mfile::MFILE_NAME, e),
-            Error::Graph(e) => write!(f, "graph: {:?}", e),
+            Error::Graph(e) => {
+                // Render the codespan diagnostic (source location + caret)
+                // into a buffer. NEVER use `{:?}` here — graph::Error's
+                // Decode(Nickel(..)) variant carries a
+                // codespan_reporting::files::Files index with every loaded
+                // source file's contents embedded, so Debug-dumping it
+                // floods the output with the ~5k-line Nickel stdlib plus
+                // every other file in the chain. `report_to` uses the same
+                // codespan facility to emit the human-readable diagnostic
+                // without the embedded source tree.
+                use codespan_reporting::term::termcolor::NoColor;
+                let mut buf: Vec<u8> = Vec::new();
+                e.report_to(&mut NoColor::new(&mut buf));
+                write!(f, "graph: {}", String::from_utf8_lossy(&buf).trim_end())
+            }
             Error::Plan(e) => {
                 let (graph, PlanErr::Cycles(c)) = e.as_ref();
                 {
