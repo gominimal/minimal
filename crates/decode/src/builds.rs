@@ -1,7 +1,7 @@
 //! Build specification objects.
 
-use crate::StrPos;
 use crate::{Error, ObjTy, attrs::AttrValue, eval_if_closure, read_ty};
+use crate::{StrPos, cmds_from_cmd_term, cmds_from_cmds_term};
 use common::Target;
 use nickel_lang_core::eval::value::NickelValue;
 use nickel_lang_core::files::FileId;
@@ -845,59 +845,15 @@ impl BuildDecl {
                         }
                         "cmd" => {
                             if let Some(rt) = field.value.as_ref() {
-                                let rt = eval_if_closure(rt, program)?;
-                                if let Some(s) = rt.as_string() {
-                                    cmds = Some(vec![
-                                        shlex::split(s.as_ref()).unwrap(),
-                                    ]);
-                                } else if let Some(a) = rt.as_array() {
-                                    cmds = Some(vec![
-                                        a.iter()
-                                            .map(|rt| eval_if_closure(rt, program))
-                                            .collect::<Result<Vec<_>, _>>()?
-                                            .into_iter()
-                                            .map(|rt| String::deserialize(rt).unwrap())
-                                            .collect(),
-                                    ]);
-                                } else {
-                                    todo!("error for 'cmd' field being non-string & non-array, got {:?}", rt);
-                                }
-                                Ok(())
-                            } else {
-                                Ok(())
-                            }
+                                cmds = Some(cmds_from_cmd_term(rt, program)?);
+                            };
+                            Ok(())
                         }
                         "cmds" => {
                             if let Some(rt) = field.value.as_ref() {
-                                let rt = eval_if_closure(rt,program)?;
-                                if let Some(cmds_rt) = rt.as_array() {
-                                    cmds = Some(
-                                        cmds_rt.iter()
-                                            .map(|rt| {
-                                                let rt = eval_if_closure(rt, program)?;
-                                                if let Some(a) = rt.as_array() {
-                                                    Ok::<_, Error>(a.iter()
-                                                        .map(|rt| eval_if_closure(rt, program))
-                                                        .collect::<Result<Vec<_>, _>>()?
-                                                        .into_iter()
-                                                        .map(|rt| String::deserialize(rt).unwrap())
-                                                        .collect())
-                                                } else if let Some(s) = rt.as_string() {
-                                                    Ok::<_, Error>(shlex::split(s.as_ref()).unwrap())
-                                                } else {
-                                                    todo!("error for 'cmds' field being non-array & non-string, got {:?}", rt);
-                                                }
-                                            })
-                                            .collect::<Result<Vec<_>, _>>()?,
-                                    );
-
-                                    Ok(())
-                                } else {
-                                    todo!("error for 'cmds' field being non-array, got {:?}", rt);
-                                }
-                            } else {
-                                Ok(())
-                            }
+                                cmds = Some(cmds_from_cmds_term(rt, program)?);
+                            };
+                            Ok(())
                         }
                         "target" => {
                             if let Some(target_rt) = field.value.as_ref() {

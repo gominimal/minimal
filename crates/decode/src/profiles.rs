@@ -6,7 +6,10 @@ use nickel_lang_core::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, ObjTy, eval_if_closure, record_data_from_val};
+use crate::{
+    Error, ObjTy, env_vars_from_term, eval_if_closure, packages_array_from_term,
+    record_data_from_val,
+};
 
 /// A profile, the initial configuration for an environment.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,30 +82,19 @@ impl Profile {
                         }
                         "from_profile" => {
                             if let Some(rt) = field.value.as_ref() {
-                            from_profile = Some(
-                                String::deserialize(eval_if_closure(rt,program,)?).unwrap(),
-                            );
+                                from_profile = Some(
+                                    String::deserialize(eval_if_closure(rt, program)?).unwrap(),
+                                );
                             }
                             Ok(())
                         }
 
                         "env_vars" => {
                             if let Some(ev_rt) = field.value.as_ref() {
-                                let ev_rt =
-                                    eval_if_closure(ev_rt, program)?;
+                                let ev_rt = eval_if_closure(ev_rt, program)?;
 
                                 if let Some(r) = record_data_from_val(&ev_rt) {
-                                    env_vars = Some(r.fields.iter().map(
-                                        |(ident_and_loc, field)| -> Result<(String, EnvVarValue), Error> {
-                                            Ok((
-                                                ident_and_loc.label().to_string(),
-                                                EnvVarValue::Value(String::deserialize(eval_if_closure(
-                                                    field.value.as_ref().unwrap(),
-                                                    program,
-                                                )?).unwrap()),
-                                            ))
-                                        },
-                                    ).collect::<Result<IndexMap<_, _>, Error>>()?);
+                                    env_vars = Some(env_vars_from_term(r, program)?);
                                 } else {
                                     todo!("unexpected term for env_vars: {:?}", ev_rt);
                                 }
@@ -112,28 +104,8 @@ impl Profile {
                         }
                         "packages" => {
                             if let Some(packages_rt) = field.value.as_ref() {
-                                let packages_rt =
-                                    eval_if_closure(packages_rt, program)?;
-
-                                if let Some(a) = packages_rt.as_array() {
-                                    packages = Some(
-                                        a.iter()
-                                            .map(|input| {
-                                                Ok(String::deserialize(eval_if_closure(
-                                                    input,
-                                                    program,
-                                                )?).unwrap())
-                                            })
-                                            .collect::<Result<Vec<_>, Error>>()?,
-                                    );
-                                } else {
-                                    todo!(
-                                        "handle packages value being non-array {:?}",
-                                        field.value
-                                    );
-                                }
+                                packages = Some(packages_array_from_term(packages_rt, program)?);
                             }
-
                             Ok(())
                         }
                         "patch" | "patches" => {
@@ -207,6 +179,7 @@ mod tests {
                 profile {
                     name = \"uwu\",
                     packages = [\"gcc\", \"rust\"],
+                    env_vars.something = \"some value\",
 
                     patch.file.\"~/uwu.json\" = \"ro\",
                 }
@@ -234,7 +207,10 @@ mod tests {
                 name: "uwu".to_string(),
                 from_profile: None,
                 packages: vec!["gcc".to_string(), "rust".to_string()],
-                env_vars: Default::default(),
+                env_vars: IndexMap::from_iter([(
+                    "something".to_string(),
+                    EnvVarValue::Value("some value".to_string())
+                )]),
                 patch: EnvPatches {
                     file: [("~/uwu.json".to_string(), PatchSetting::ReadOnly)].into(),
                     ..Default::default()
