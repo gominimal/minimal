@@ -607,6 +607,11 @@ impl File {
         })
     }
 
+    /// Iterates the tasks defined in the minimal file.
+    pub fn iter_tasks(&self) -> impl Iterator<Item = (&String, &Task)> {
+        self.tasks.iter()
+    }
+
     /// Applies additional settings to hydrate a task, namely:
     ///  - default profile if set (and not set on the task)
     ///  - default state_key if set (and not set on the task)

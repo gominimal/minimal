@@ -4,6 +4,7 @@ use codespan_reporting::term::termcolor::{
 };
 use common::SpecOrigin;
 use dirs::home_dir;
+use graph::Graph;
 use std::io::Write;
 use std::path::Path;
 
@@ -23,7 +24,32 @@ pub async fn cmd_status(_args: StatusArgs, ctx: &mut Context) -> Result<(), Erro
 
     let graph = ctx.graph_from_all_packages()?;
     print_supply_chain(graph.software_supply_chain(), &mut writer)?;
+    print_tasks(ctx, &graph, &mut writer)?;
 
+    Ok(())
+}
+
+fn print_tasks(ctx: &mut Context, graph: &Graph, writer: &mut dyn WriteColor) -> Result<(), Error> {
+    writer.set_color(ColorSpec::new().set_fg(None)).unwrap();
+    writeln!(writer).unwrap();
+    writeln!(writer, "Tasks:").unwrap();
+
+    for (name, source) in ctx.iter_tasks(graph).into_iter() {
+        writer
+            .set_color(ColorSpec::new().set_fg(None).set_bold(true))
+            .unwrap();
+
+        write!(writer, "  ").unwrap();
+        write!(writer, "{name}").unwrap();
+        writer.set_color(ColorSpec::new().set_fg(None)).unwrap();
+        match source {
+            mctx::TaskSource::MFile => {}
+            mctx::TaskSource::Harness(harness_name) => {
+                write!(writer, " (provided by {harness_name} harness)").unwrap()
+            }
+        }
+        writeln!(writer).unwrap();
+    }
     Ok(())
 }
 
