@@ -155,6 +155,13 @@ impl<const N: usize> PackageSelection for [String; N] {
     }
 }
 
+/// Describes where a task came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskSource {
+    MFile,
+    Harness(String),
+}
+
 /// A top-level context for operations in a minimal-configured repo.
 #[derive(Debug)]
 pub struct Context {
@@ -516,6 +523,29 @@ impl Context {
         result?;
 
         Ok(())
+    }
+
+    pub fn iter_tasks(&self, graph: &Graph) -> Vec<(String, TaskSource)> {
+        let mut out: Vec<_> = self
+            .mfile
+            .iter_tasks()
+            .map(|(name, _t)| (name.clone(), TaskSource::MFile))
+            .collect();
+
+        if let Some(h_conf) = &self.mfile.harness
+            && let Some(harness) = graph.harness(&h_conf.name)
+        {
+            out.extend(harness.task_names().into_iter().filter_map(|name| {
+                if self.mfile.task(&name).is_some() {
+                    // Already capture by iter_tasks() above
+                    None
+                } else {
+                    Some((name.to_string(), TaskSource::Harness(h_conf.name.clone())))
+                }
+            }));
+        }
+
+        out
     }
 
     /// Returns the task of the given name, fully hydrated based on profiles. If no task
