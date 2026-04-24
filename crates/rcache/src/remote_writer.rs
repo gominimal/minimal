@@ -11,7 +11,9 @@ use crate::remote::Error;
 use crate::remote_index::RemoteIndex;
 use common::SpecHash;
 use common::fetchers::{FetchUrl, GcsUrl};
-use google_cloud_storage::{Error as GcsError, client::Storage};
+use google_cloud_storage::Error as GcsError;
+use google_cloud_storage::client::Storage;
+use google_cloud_storage::stub::{DefaultStorage, Storage as StubStorage};
 use ot::OpTracker;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -49,9 +51,15 @@ const NOT_FOUND: u16 = 404;
 /// Not `Clone` on purpose — cloning the pending list and committing twice
 /// would either redo work or upload divergent state. Construct one writer
 /// per upload session and consume it via [Self::finish_uploads].
+///
+/// Generic over the GCS backend stub so tests can inject a mock via
+/// [`google_cloud_storage::client::Storage::from_stub`] and exercise the
+/// CAS retry loop end-to-end through the public API. Production code
+/// uses the default ([`DefaultStorage`]) and never names the type
+/// parameter.
 #[derive(Debug)]
-pub struct RemoteCacheWriter {
-    backend: Storage,
+pub struct RemoteCacheWriter<S: StubStorage + 'static = DefaultStorage> {
+    backend: Storage<S>,
     base: GcsUrl,
 
     /// The index as it was when we last fetched it from GCS. Used both as the
@@ -72,7 +80,7 @@ pub struct RemoteCacheWriter {
     ot: Option<OpTracker>,
 }
 
-impl RemoteCacheWriter {
+impl RemoteCacheWriter<DefaultStorage> {
     /// Initialize a writer against the given GCS bucket. Always fetches the
     /// current index fresh from GCS — there's no local-cache fast path,
     /// because the recorded generation must match the actual cloud state
@@ -97,12 +105,15 @@ impl RemoteCacheWriter {
             ot,
         ))
     }
+}
 
+impl<S: StubStorage + 'static> RemoteCacheWriter<S> {
     /// Construct directly from already-fetched index + generation. Used by
     /// [`crate::RemoteCache::into_writer`] to avoid a redundant fetch when
-    /// converting a freshly-loaded reader into a writer.
+    /// converting a freshly-loaded reader into a writer, and by tests to
+    /// inject a mock backend via [`Storage::from_stub`].
     pub(crate) fn from_parts(
-        backend: Storage,
+        backend: Storage<S>,
         base: GcsUrl,
         fetched_index: RemoteIndex,
         fetched_generation: i64,
@@ -302,8 +313,8 @@ fn merge_for_commit(fetched: &RemoteIndex, pending: &[(SpecHash, [u8; 32])]) -> 
 /// Shared between [`RemoteCacheWriter::new`] and
 /// [`crate::RemoteCache::into_writer`] (the latter calls this only when
 /// the reader was loaded from local cache and lacks a recorded generation).
-pub(crate) async fn fetch_gcs_index(
-    backend: &Storage,
+pub(crate) async fn fetch_gcs_index<S: StubStorage + 'static>(
+    backend: &Storage<S>,
     base: &GcsUrl,
 ) -> Result<(RemoteIndex, i64), Error<GcsError>> {
     let url = base.join(INDEX_FILENAME).unwrap();
@@ -345,62 +356,193 @@ fn jitter_ms(backoff_ms: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use google_cloud_storage as gcs;
+    use google_cloud_storage::Result as GcsResult;
+    use google_cloud_storage::http::HeaderMap;
+    use google_cloud_storage::model::{Object, ReadObjectRequest};
+    use google_cloud_storage::model_ext::{
+        ObjectHighlights, OpenObjectRequest, WriteObjectRequest,
+    };
+    use google_cloud_storage::object_descriptor::ObjectDescriptor;
+    use google_cloud_storage::read_object::ReadObjectResponse;
+    use google_cloud_storage::request_options::RequestOptions;
+    use google_cloud_storage::streaming_source::{BytesSource, Payload, Seek, StreamingSource};
+    use mockall::Sequence;
 
-    // Tests cover only the retry policy table because that's the contract
-    // for behavior under contention (which status codes retry, the bound,
-    // the backoff schedule). Higher-level behavior of the writer is tested
-    // through the buildbot integration against real GCS, since the
-    // remaining new logic in this module is small enough that mock
-    // infrastructure to test it would be disproportionate.
-
-    #[test]
-    fn retry_412_uses_exponential_backoff_capped_at_64x() {
-        // First retry waits 2x INITIAL, doubling each attempt up to
-        // 2^6 * INITIAL = 128_000ms (which exceeds the 300s
-        // Cache-Control max-age on the index file).
-        assert_eq!(
-            decide_retry_after_failure(Some(PRECONDITION_FAILED), 0),
-            RetryAfterFailure::Retry { backoff_ms: 4_000 }
-        );
-        assert_eq!(
-            decide_retry_after_failure(Some(PRECONDITION_FAILED), 1),
-            RetryAfterFailure::Retry { backoff_ms: 8_000 }
-        );
-        assert_eq!(
-            decide_retry_after_failure(Some(PRECONDITION_FAILED), 5),
-            RetryAfterFailure::Retry {
-                backoff_ms: 128_000
-            }
-        );
-        assert_eq!(
-            decide_retry_after_failure(Some(PRECONDITION_FAILED), 7),
-            RetryAfterFailure::Retry {
-                backoff_ms: 128_000
-            }
-        );
+    // The mock backend implements the GCS stub trait so we can wrap it in a
+    // real `Storage<MockStorage>` client via `Storage::from_stub`. The writer
+    // is generic over the stub type, so the tests construct
+    // `RemoteCacheWriter<MockStorage>` and exercise `finish_uploads` through
+    // its public API. Asserting on `if_generation_match` in the recorded
+    // requests is how we prove the writer used the right generation on each
+    // retry — the actual contract under contention.
+    mockall::mock! {
+        #[derive(Debug)]
+        Storage {}
+        impl gcs::stub::Storage for Storage {
+            async fn read_object(
+                &self,
+                _req: ReadObjectRequest,
+                _options: RequestOptions,
+            ) -> GcsResult<ReadObjectResponse>;
+            async fn write_object_buffered<P: StreamingSource + Send + Sync + 'static>(
+                &self,
+                _payload: P,
+                _req: WriteObjectRequest,
+                _options: RequestOptions,
+            ) -> GcsResult<Object>;
+            async fn write_object_unbuffered<P: StreamingSource + Seek + Send + Sync + 'static>(
+                &self,
+                _payload: P,
+                _req: WriteObjectRequest,
+                _options: RequestOptions,
+            ) -> GcsResult<Object>;
+            async fn open_object(
+                &self,
+                _request: OpenObjectRequest,
+                _options: RequestOptions,
+            ) -> GcsResult<(ObjectDescriptor, Vec<ReadObjectResponse>)>;
+        }
     }
 
-    #[test]
-    fn retry_412_gives_up_at_max() {
-        assert_eq!(
-            decide_retry_after_failure(Some(PRECONDITION_FAILED), MAX_INDEX_WRITE_RETRIES),
-            RetryAfterFailure::GiveUp
-        );
+    fn test_base() -> GcsUrl {
+        GcsUrl {
+            bucket: "projects/_/buckets/test".to_string(),
+            object: "".to_string(),
+        }
     }
 
-    #[test]
-    fn non_precondition_failures_do_not_retry() {
-        // The contention signal is 412 specifically. Other HTTP errors
-        // (server errors, auth failures, missing buckets) and transport
-        // errors that surface no status code are not retried, since
-        // retrying wouldn't fix any of them and would only delay
-        // surfacing the real problem to the caller.
-        for status in [Some(500u16), Some(404), Some(403), None] {
-            assert_eq!(
-                decide_retry_after_failure(status, 0),
-                RetryAfterFailure::GiveUp,
-                "status {status:?} should not retry"
-            );
+    fn writer_from_mock(
+        mock: MockStorage,
+        fetched_index: RemoteIndex,
+        fetched_generation: i64,
+    ) -> RemoteCacheWriter<MockStorage> {
+        let storage = gcs::client::Storage::from_stub(mock);
+        RemoteCacheWriter::from_parts(
+            storage,
+            test_base(),
+            fetched_index,
+            fetched_generation,
+            None,
+        )
+    }
+
+    /// Serialize a RemoteIndex to bytes and return as a ReadObjectResponse
+    /// with the given generation, the way GCS would return it on a fetch.
+    fn read_response_for(index: &RemoteIndex, generation: i64) -> ReadObjectResponse {
+        let mut bytes = Vec::with_capacity(2048);
+        index.write_to(&mut bytes).unwrap();
+        let mut highlights = ObjectHighlights::default();
+        highlights.generation = generation;
+        highlights.size = bytes.len() as i64;
+        ReadObjectResponse::from_source(highlights, bytes::Bytes::from(bytes))
+    }
+
+    fn http_412_error() -> gcs::Error {
+        gcs::Error::http(412, HeaderMap::new(), bytes::Bytes::new())
+    }
+
+    fn http_500_error() -> gcs::Error {
+        gcs::Error::http(500, HeaderMap::new(), bytes::Bytes::new())
+    }
+
+    /// Single attempt with no contention writes once and is done.
+    /// Verifies the writer issues exactly one write with the observed
+    /// generation as the precondition, and returns Ok.
+    #[tokio::test(start_paused = true)]
+    async fn finish_uploads_no_contention_writes_once() {
+        let mut mock = MockStorage::new();
+        mock.expect_write_object_buffered()
+            .times(1)
+            .withf(|_p: &Payload<BytesSource>, req, _| req.spec.if_generation_match == Some(42))
+            .return_once(|_p: Payload<BytesSource>, _, _| Ok(Object::default()));
+
+        let writer = writer_from_mock(mock, RemoteIndex::default(), 42);
+        writer.finish_uploads().await.expect("expected Ok");
+    }
+
+    /// 412 on first attempt should refetch the index and retry the write
+    /// with the refetched generation. Verifies both the call ordering and
+    /// that the second write uses the new generation.
+    #[tokio::test(start_paused = true)]
+    async fn finish_uploads_retries_on_412_then_succeeds() {
+        let mut mock = MockStorage::new();
+        let mut seq = Sequence::new();
+
+        // First write: contention signal.
+        mock.expect_write_object_buffered()
+            .times(1)
+            .in_sequence(&mut seq)
+            .withf(|_p: &Payload<BytesSource>, req, _| req.spec.if_generation_match == Some(50))
+            .return_once(|_p: Payload<BytesSource>, _, _| Err(http_412_error()));
+
+        // Refetch returns the new state at generation 100.
+        mock.expect_read_object()
+            .times(1)
+            .in_sequence(&mut seq)
+            .return_once(|_, _| Ok(read_response_for(&RemoteIndex::default(), 100)));
+
+        // Second write uses the refetched generation, succeeds.
+        mock.expect_write_object_buffered()
+            .times(1)
+            .in_sequence(&mut seq)
+            .withf(|_p: &Payload<BytesSource>, req, _| req.spec.if_generation_match == Some(100))
+            .return_once(|_p: Payload<BytesSource>, _, _| Ok(Object::default()));
+
+        let writer = writer_from_mock(mock, RemoteIndex::default(), 50);
+        writer
+            .finish_uploads()
+            .await
+            .expect("expected Ok after retry");
+    }
+
+    /// 412 forever exhausts the retry budget and surfaces the underlying
+    /// error rather than looping indefinitely. The writer makes
+    /// `MAX_INDEX_WRITE_RETRIES + 1` write attempts (initial + retries),
+    /// each interleaved with a refetch except the first.
+    #[tokio::test(start_paused = true)]
+    async fn finish_uploads_exhausts_retries_and_surfaces_error() {
+        let mut mock = MockStorage::new();
+
+        // Every write returns 412.
+        mock.expect_write_object_buffered()
+            .times((MAX_INDEX_WRITE_RETRIES + 1) as usize)
+            .returning(|_p: Payload<BytesSource>, _, _| Err(http_412_error()));
+
+        // Each retry refetches (`MAX_INDEX_WRITE_RETRIES` times, since the
+        // initial attempt skips the refetch).
+        mock.expect_read_object()
+            .times(MAX_INDEX_WRITE_RETRIES as usize)
+            .returning(|_, _| Ok(read_response_for(&RemoteIndex::default(), 0)));
+
+        let writer = writer_from_mock(mock, RemoteIndex::default(), 0);
+        let err = writer
+            .finish_uploads()
+            .await
+            .expect_err("expected error after retry exhaustion");
+        match err {
+            Error::Backend(e) => assert_eq!(e.http_status_code(), Some(412)),
+            other => panic!("expected Backend(412), got {other:?}"),
+        }
+    }
+
+    /// Non-412 errors are not retried. They surface to the caller after a
+    /// single write attempt.
+    #[tokio::test(start_paused = true)]
+    async fn finish_uploads_does_not_retry_on_non_412() {
+        let mut mock = MockStorage::new();
+        mock.expect_write_object_buffered()
+            .times(1)
+            .return_once(|_p: Payload<BytesSource>, _, _| Err(http_500_error()));
+
+        let writer = writer_from_mock(mock, RemoteIndex::default(), 1);
+        let err = writer
+            .finish_uploads()
+            .await
+            .expect_err("expected immediate error");
+        match err {
+            Error::Backend(e) => assert_eq!(e.http_status_code(), Some(500)),
+            other => panic!("expected Backend(500), got {other:?}"),
         }
     }
 }
