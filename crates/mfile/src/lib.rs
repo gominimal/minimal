@@ -747,6 +747,7 @@ mod tests {
                     Task {
                         state_key: Some("test".to_string()),
                         profile: None,
+                        description: None,
                         vars: HashMap::new(),
                         patch: EnvPatches {
                             dir: [("~/.claude".to_string(), PatchSetting::ReadWrite)].into(),
