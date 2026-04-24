@@ -15,6 +15,9 @@ pub struct Task {
     /// What to do when the task runs.
     #[serde(flatten)]
     pub action: TaskAction,
+    /// A description to show in `minimal status`.
+    #[serde(default)]
+    pub description: Option<String>,
 
     /// Additional packages to be present in the sandbox this task executes in.
     #[serde(default)]

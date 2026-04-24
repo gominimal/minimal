@@ -59,6 +59,8 @@ use std::{
     hash::Hash,
 };
 
+use clap::builder::StyledStr;
+
 /// A set of arguments, already validated against a corresponding schema.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArgsSet(HashMap<String, Arg>);
@@ -713,24 +715,7 @@ impl ArgsSpec {
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
     {
-        use clap::{Arg as ClapArg, ArgAction, Command};
-
-        // Build a clap command. One flag per top-level arg name.
-        let mut cmd = Command::new(display_name.to_string()).no_binary_name(true);
-        for (n, ta) in self.0.iter() {
-            let mut arg = ClapArg::new(n.clone())
-                .long(n.clone())
-                .required(ta.default.is_none())
-                .action(match &ta.spec {
-                    ArgSchema::Array(_) => ArgAction::Append,
-                    _ => ArgAction::Set,
-                });
-            if let ArgSchema::Enum(opts) = &ta.spec {
-                arg = arg.value_parser(opts.iter().cloned().collect::<Vec<_>>());
-            }
-            cmd = cmd.arg(arg);
-        }
-
+        let cmd = self.as_clap_cmd(display_name)?;
         let matches = cmd.clone().try_get_matches_from(args)?;
 
         // Helper to produce a clap value-validation error.
@@ -767,6 +752,32 @@ impl ArgsSpec {
         }
 
         Ok(ArgsSet(result))
+    }
+
+    /// Returns the usage string describing the arguments as a command invocation.
+    pub fn cmd_usage(&self, display_name: &str) -> Result<StyledStr, clap::Error> {
+        Ok(self.as_clap_cmd(display_name)?.render_usage())
+    }
+
+    fn as_clap_cmd(&self, display_name: &str) -> Result<clap::Command, clap::Error> {
+        use clap::{Arg as ClapArg, ArgAction, Command};
+
+        // Build a clap command. One flag per top-level arg name.
+        let mut cmd = Command::new(display_name.to_string()).no_binary_name(true);
+        for (n, ta) in self.0.iter() {
+            let mut arg = ClapArg::new(n.clone())
+                .long(n.clone())
+                .required(ta.default.is_none())
+                .action(match &ta.spec {
+                    ArgSchema::Array(_) => ArgAction::Append,
+                    _ => ArgAction::Set,
+                });
+            if let ArgSchema::Enum(opts) = &ta.spec {
+                arg = arg.value_parser(opts.iter().cloned().collect::<Vec<_>>());
+            }
+            cmd = cmd.arg(arg);
+        }
+        Ok(cmd)
     }
 }
 

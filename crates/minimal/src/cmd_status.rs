@@ -24,31 +24,60 @@ pub async fn cmd_status(_args: StatusArgs, ctx: &mut Context) -> Result<(), Erro
 
     let graph = ctx.graph_from_all_packages()?;
     print_supply_chain(graph.software_supply_chain(), &mut writer)?;
-    print_tasks(ctx, &graph, &mut writer)?;
+    print_tasks(ctx, graph, &mut writer)?;
 
     Ok(())
 }
 
-fn print_tasks(ctx: &mut Context, graph: &Graph, writer: &mut dyn WriteColor) -> Result<(), Error> {
+fn print_tasks(
+    ctx: &mut Context,
+    mut graph: Graph,
+    writer: &mut dyn WriteColor,
+) -> Result<(), Error> {
     writer.set_color(ColorSpec::new().set_fg(None)).unwrap();
     writeln!(writer).unwrap();
     writeln!(writer, "Tasks:").unwrap();
 
-    for (name, source) in ctx.iter_tasks(graph).into_iter() {
+    let mut tasks: Vec<_> = ctx.iter_tasks(&graph).into_iter().collect();
+    tasks.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (name, source) in tasks {
+        writer
+            .set_color(ColorSpec::new().set_fg(Some(Color::Blue)).set_bold(true))
+            .unwrap();
+        write!(writer, "  * ").unwrap();
+
         writer
             .set_color(ColorSpec::new().set_fg(None).set_bold(true))
             .unwrap();
 
-        write!(writer, "  ").unwrap();
-        write!(writer, "{name}").unwrap();
-        writer.set_color(ColorSpec::new().set_fg(None)).unwrap();
-        match source {
-            mctx::TaskSource::MFile => {}
-            mctx::TaskSource::Harness(harness_name) => {
-                write!(writer, " (provided by {harness_name} harness)").unwrap()
+        if let Ok(Some(r)) = ctx.task(graph.clone(), &name) {
+            graph = r.1;
+            let task = r.0;
+            if !task.args.is_empty() {
+                let usage = task.args.cmd_usage(&name).unwrap().to_string();
+                let usage = usage
+                    .strip_prefix("Usage: ")
+                    .unwrap_or(&usage)
+                    .trim_end()
+                    .to_string()
+                    .replace("\n", "\n    ");
+                writeln!(writer, "{}", usage).unwrap();
+            } else {
+                writeln!(writer, "{}", &name).unwrap();
+            }
+
+            writer.set_color(ColorSpec::new().set_fg(None)).unwrap();
+            if let Some(description) = &task.description {
+                writeln!(writer, "    {description}").unwrap();
+            }
+            match source {
+                mctx::TaskSource::MFile => {}
+                mctx::TaskSource::Harness(harness_name) => {
+                    writeln!(writer, "    (provided by {harness_name} harness)").unwrap()
+                }
             }
         }
-        writeln!(writer).unwrap();
     }
     Ok(())
 }

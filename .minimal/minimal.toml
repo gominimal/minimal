@@ -15,6 +15,7 @@ interactive = true
 exec = "claude --dangerously-skip-permissions"
 
 [tasks.build]
+description = "Builds the minimal CLI"
 exec = "cargo build --verbose"
 inherit_cwd = true
 
