@@ -36,6 +36,8 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-1-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-1-
+      - name: Check Cargo.lock is up-to-date
+        run: cargo fetch --locked
       - name: Build
         run: cargo build --verbose
       - name: Run tests
