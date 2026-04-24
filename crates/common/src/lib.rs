@@ -111,6 +111,11 @@ impl<W1: Write, W2: Write> Tee<W1, W2> {
     pub fn new(writer1: W1, writer2: W2) -> Self {
         Tee { writer1, writer2 }
     }
+
+    /// Deconstructs the [Tee], returning the two internal writers.
+    pub fn into_inner(self) -> (W1, W2) {
+        (self.writer1, self.writer2)
+    }
 }
 
 impl<W1: Write, W2: Write> Write for Tee<W1, W2> {

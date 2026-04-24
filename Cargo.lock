@@ -3903,6 +3903,7 @@ dependencies = [
  "mockall",
  "ot",
  "reqwest",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
  "tracing",
