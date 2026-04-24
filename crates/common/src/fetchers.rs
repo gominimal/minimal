@@ -54,6 +54,14 @@ pub trait FetchResponse: std::fmt::Debug + Sized {
     fn bytes(self) -> impl Future<Output = Result<Bytes, Self::Error>> + Send;
 
     fn chunk(&mut self) -> impl Future<Output = Result<Option<Bytes>, Self::Error>>;
+
+    /// Returns the underlying object's GCS generation, if the backend exposes
+    /// one. Backends without versioned-object semantics (e.g. plain HTTPS)
+    /// return `None` via the default impl. Used by writers to do
+    /// compare-and-swap on subsequent writes.
+    fn generation(&self) -> Option<i64> {
+        None
+    }
 }
 
 impl FetchResponse for Response {
@@ -223,6 +231,12 @@ impl FetchResponse for Result<google_cloud_storage::read_object::ReadObjectRespo
     fn content_length(&self) -> Option<u64> {
         match self {
             Ok(s) => Some(s.object().size as u64),
+            Err(_) => None,
+        }
+    }
+    fn generation(&self) -> Option<i64> {
+        match self {
+            Ok(s) => Some(s.object().generation),
             Err(_) => None,
         }
     }

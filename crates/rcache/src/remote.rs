@@ -10,6 +10,13 @@ use common::fetchers::*;
 use google_cloud_storage::{Error as GcsError, client::Storage};
 use reqwest::{Client, Error as ReqwestError};
 
+// Writers live in `remote_writer.rs`. This module is read-only.
+//
+// Historical note: `upload`/`finish_uploads` used to live here on `RemoteCache<Storage>`,
+// but did an unsynchronized read-modify-write on the index file, which lost entries when
+// two writers raced. The bifurcation forces writers down a path that fetches the index
+// generation up-front and writes with `if_generation_match` for compare-and-swap semantics.
+
 /// An error from operations with the remote cache.
 #[derive(Debug)]
 pub enum Error<BE: std::fmt::Debug> {
@@ -35,7 +42,8 @@ impl<BE: std::fmt::Debug> From<BE> for Error<BE> {
 }
 
 /// A source of compiled build artifacts accessible over the network. Artifacts
-/// can be fetched by [SpecHash].
+/// can be fetched by [SpecHash]. Read-only — for writes, see
+/// [crate::RemoteCacheWriter].
 #[derive(Debug, Clone)]
 pub struct RemoteCache<B: FetchBackend> {
     backend: B,
@@ -47,7 +55,12 @@ pub struct RemoteCache<B: FetchBackend> {
 
     ot: Option<OpTracker>,
 
-    uploaded: Vec<(SpecHash, [u8; 32])>,
+    /// The GCS object generation of the index when it was fresh-fetched
+    /// from the backend. `None` for non-GCS backends and for the
+    /// local-cache load path (where we never asked GCS what generation
+    /// we have). Used by [`Self::into_writer`] to skip a refetch when
+    /// transitioning to a writer.
+    gcs_generation: Option<i64>,
 }
 
 pub const INDEX_FILENAME: &str = "index.shisha";
@@ -84,86 +97,26 @@ impl RemoteCache<Storage> {
         Self::new(storage, url, index_dir, ot).await
     }
 
-    /// Upserts the given artifact to the GCS bucket, staging it for inclusion
-    /// in the index. Returns false if the given artifact is already in the index.
-    ///
-    /// Call [RemoteCache::finish_uploads] when all your uploads are done to finish the index.
-    pub async fn upload(
-        &mut self,
-        spec_hash: &SpecHash,
-        artifact: (std::fs::File, [u8; 32]),
-    ) -> Result<bool, Error<GcsError>> {
-        let (tar_file, sha256) = artifact;
-        let indexed_sha = self.index.sha256(spec_hash);
-        if indexed_sha == Some(sha256) {
-            return Ok(false); // Cached one is up to date.
-        }
-        if let Ok(stat) = self
-            .backend
-            .open_object(
-                self.base.bucket.clone(),
-                self.base
-                    .join(&format!("{}.zst", hex::encode(sha256)))
-                    .unwrap()
-                    .object,
-            )
-            .send()
-            .await
-        {
-            if stat.object().size > 1024 * 1024 {
-                // Object already exists and is large enough to be real, skip the upload.
-                // We still push to the dirty-set because while this tarball may exist, its
-                // likely not wired to this spec hash.
-                self.uploaded.push((spec_hash.clone(), sha256));
-                return Ok(false);
-            }
-        }
-
-        self.backend
-            .write_object(
-                self.base.bucket.clone(),
-                self.base
-                    .join(&format!("{}.zst", hex::encode(sha256)))
-                    .unwrap()
-                    .object,
-                tokio::fs::File::from_std(tar_file),
-            )
-            .set_cache_control("public, max-age=7200")
-            .send_buffered()
-            .await?;
-
-        self.uploaded.push((spec_hash.clone(), sha256));
-        Ok(true)
-    }
-
-    /// Pushes a new index to the GCS bucket, complete with all the previous entries
-    /// as well as any new entries which were added using [RemoteCache::upload].
-    pub async fn finish_uploads(self) -> Result<(), Error<GcsError>> {
-        let Self {
-            mut index,
-            backend,
-            base,
-            uploaded,
-            dir: _,
-            ot: _,
-        } = self;
-
-        index.extend(uploaded);
-
-        let mut data = Vec::with_capacity(2048);
-        index.write_to(&mut data).map_err(Error::IO)?;
-
-        let bytes_data = bytes::Bytes::copy_from_slice(&data);
-        backend
-            .write_object(
-                base.bucket.clone(),
-                base.join(INDEX_FILENAME).unwrap().object,
-                bytes_data,
-            )
-            .set_cache_control("public, max-age=300")
-            .send_buffered()
-            .await?;
-        Ok(())
+    /// Convert this reader into a writer, reusing the already-fetched index
+    /// and generation when possible. If the reader was loaded from the local
+    /// cache fast path (and therefore has no recorded generation), the index
+    /// is refetched from GCS so the writer's compare-and-swap commit has an
+    /// authoritative generation to match against.
+    pub async fn into_writer(
+        self,
+        ot: Option<OpTracker>,
+    ) -> Result<crate::RemoteCacheWriter, Error<GcsError>> {
+        let (index, generation) = match self.gcs_generation {
+            Some(g) => (self.index, g),
+            None => crate::remote_writer::fetch_gcs_index(&self.backend, &self.base).await?,
+        };
+        Ok(crate::RemoteCacheWriter::from_parts(
+            self.backend,
+            self.base,
+            index,
+            generation,
+            ot,
+        ))
     }
 }
 
@@ -192,8 +145,10 @@ impl<B: FetchBackend> RemoteCache<B> {
                     .map_err(Error::IO)?,
                     dir: index_dir,
                     base: url,
-                    uploaded: vec![],
                     ot,
+                    // Loading from local cache means we never asked GCS for
+                    // the current generation. into_writer must refetch.
+                    gcs_generation: None,
                 });
             }
         }
@@ -205,6 +160,10 @@ impl<B: FetchBackend> RemoteCache<B> {
 
         // TODO: Gotta be a better way to stream it into [RemoteIndex].
         let mut index_resp = backend.execute(index_req).await?;
+        // Capture the GCS generation, if the backend exposes one. Reads
+        // need to do this before consuming chunks because the response
+        // metadata may not survive the body read in some impls.
+        let gcs_generation = index_resp.generation();
         let index = match index_resp.status_code() {
             404 => RemoteIndex::default(),
             _ => {
@@ -240,8 +199,8 @@ impl<B: FetchBackend> RemoteCache<B> {
             index,
             dir: index_dir,
             base: url,
-            uploaded: vec![],
             ot,
+            gcs_generation,
         })
     }
 
