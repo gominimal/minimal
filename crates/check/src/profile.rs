@@ -86,7 +86,7 @@ fn check_profile_parses(
     program: &mut Program<CacheImpl>,
 ) -> Result<CheckResult, Error> {
     let mut out = CheckResult {
-        check: "profile parses",
+        check: "profile parses".into(),
         err: vec![],
         verdict: CheckVerdict::Pass,
     };

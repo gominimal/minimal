@@ -6,6 +6,7 @@ import "res/create_env.proto";
 import "res/download.proto";
 import "res/orchestrate_build.proto";
 import "res/task.proto";
+import "res/check.proto";
 
 service RemoteExecutionService {
   // Creates an environment with an optional worktree and optional graph.
@@ -18,4 +19,7 @@ service RemoteExecutionService {
 
   // Downloads a build.
   rpc Download(DownloadRequest) returns (stream DownloadResponse) {}
+
+  // Runs checkers against a repository.
+  rpc Check(stream CheckMessage) returns (stream CheckResponse) {}
 }

@@ -26,7 +26,7 @@ impl crate::GraphBasedChecker for OutputTypesValid {
         let cache = ctx.cache.clone();
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
-            check: "output types valid",
+            check: "output types valid".into(),
             err: vec![],
         };
         if ctx
@@ -123,7 +123,7 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
         let cache = ctx.cache.clone();
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
-            check: "missing runtime_deps",
+            check: "missing runtime_deps".into(),
             err: vec![],
         };
         if ctx
