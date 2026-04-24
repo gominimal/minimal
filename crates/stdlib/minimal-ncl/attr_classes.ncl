@@ -51,6 +51,19 @@ in
         desc = "When set, the source backing this package is not publically available.",
         validate = Bool,
     },
+    binary_from = {
+        name = "binary from",
+        desc = "Indicates binaries in the package were fetched from the given URL instead of built from source.",
+        validate = std.contract.custom (fun _label value =>
+            if std.typeof value != 'String then
+                'Error { message = "URLs must be a string" }
+            else if std.string.is_match m%%"^(?:https?|ftp|git)://[A-Za-z0-9.-]+(?::[0-9]+)?(?:/[^\s]*)?$"%% value then
+                'Ok value
+            else
+                'Error { message = "expected URL string" }
+        ),
+    },
+
     description = {
         name = "description",
         desc = "A short description of the function of the software.",

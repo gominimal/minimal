@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn attr_wrong_schema_nickel_err() {
         let res = Loader::new(
-            "let {Attrs, ..} = import \"minimal.ncl\" in {env_state_wiring = \"a\"} | Attrs",
+            "let {Attrs, ..} = import \"minimal.ncl\" in {binary_from = \"blueberry://example.com/bersh.exe\"} | Attrs",
             None,
             &LoadOptions::for_test(),
         )
@@ -262,5 +262,21 @@ mod tests {
 
         assert!(res.is_err());
         assert!(matches!(res, Err(Error::Nickel(_))));
+    }
+
+    #[test]
+    fn attr_binary_from_ok() {
+        let res = Loader::new(
+            "let {Attrs, ..} = import \"minimal.ncl\" in {binary_from = \"https://example.com/bersh.exe\"} | Attrs",
+            None,
+            &LoadOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("load failed");
+        })
+        .finish();
+
+        assert!(res.is_ok());
     }
 }
