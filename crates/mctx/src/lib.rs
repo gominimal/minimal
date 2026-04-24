@@ -14,7 +14,7 @@ use common::{SpecOrigin, Target};
 use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
 use lcache::CacheBinProvider;
 use ot::OpTracker;
-use rcache::{Error as RemoteError, RemoteBinProvider, RemoteCache};
+use rcache::{Error as RemoteError, RemoteBinProvider, RemoteCache, RemoteCacheWriter};
 
 mod error;
 pub use error::Error;
@@ -372,6 +372,19 @@ impl Context {
         )
         .await;
         tracing::trace!("remote cache init took {:?}", start.elapsed());
+        res
+    }
+
+    /// Builds a writer for the shared cache. Always uses authenticated GCS
+    /// access and always fetches the index fresh (no local-cache fast path) —
+    /// the writer's compare-and-swap on commit requires the GCS generation
+    /// it observed, which a stale local index can't provide.
+    pub async fn remote_cache_writer(&self) -> Result<RemoteCacheWriter, RemoteError<GcsError>> {
+        let start = SystemTime::now();
+        let backend = GcsStorage::builder().build().await.unwrap();
+        let res =
+            RemoteCacheWriter::new(backend, "minimal-staging-cache", self.config.ot.clone()).await;
+        tracing::trace!("remote cache writer init took {:?}", start.elapsed());
         res
     }
     pub async fn remote_storage(&self) -> Result<common::RemoteStorage, Error> {

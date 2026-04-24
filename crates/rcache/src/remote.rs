@@ -10,6 +10,13 @@ use common::fetchers::*;
 use google_cloud_storage::{Error as GcsError, client::Storage};
 use reqwest::{Client, Error as ReqwestError};
 
+// Writers live in `remote_writer.rs`. This module is read-only.
+//
+// Historical note: `upload`/`finish_uploads` used to live here on `RemoteCache<Storage>`,
+// but did an unsynchronized read-modify-write on the index file, which lost entries when
+// two writers raced. The bifurcation forces writers down a path that fetches the index
+// generation up-front and writes with `if_generation_match` for compare-and-swap semantics.
+
 /// An error from operations with the remote cache.
 #[derive(Debug)]
 pub enum Error<BE: std::fmt::Debug> {
@@ -35,7 +42,8 @@ impl<BE: std::fmt::Debug> From<BE> for Error<BE> {
 }
 
 /// A source of compiled build artifacts accessible over the network. Artifacts
-/// can be fetched by [SpecHash].
+/// can be fetched by [SpecHash]. Read-only — for writes, see
+/// [crate::RemoteCacheWriter].
 #[derive(Debug, Clone)]
 pub struct RemoteCache<B: FetchBackend> {
     backend: B,
@@ -46,8 +54,6 @@ pub struct RemoteCache<B: FetchBackend> {
     dir: Option<PathBuf>,
 
     ot: Option<OpTracker>,
-
-    uploaded: Vec<(SpecHash, [u8; 32])>,
 }
 
 pub const INDEX_FILENAME: &str = "index.shisha";
@@ -83,88 +89,6 @@ impl RemoteCache<Storage> {
 
         Self::new(storage, url, index_dir, ot).await
     }
-
-    /// Upserts the given artifact to the GCS bucket, staging it for inclusion
-    /// in the index. Returns false if the given artifact is already in the index.
-    ///
-    /// Call [RemoteCache::finish_uploads] when all your uploads are done to finish the index.
-    pub async fn upload(
-        &mut self,
-        spec_hash: &SpecHash,
-        artifact: (std::fs::File, [u8; 32]),
-    ) -> Result<bool, Error<GcsError>> {
-        let (tar_file, sha256) = artifact;
-        let indexed_sha = self.index.sha256(spec_hash);
-        if indexed_sha == Some(sha256) {
-            return Ok(false); // Cached one is up to date.
-        }
-        if let Ok(stat) = self
-            .backend
-            .open_object(
-                self.base.bucket.clone(),
-                self.base
-                    .join(&format!("{}.zst", hex::encode(sha256)))
-                    .unwrap()
-                    .object,
-            )
-            .send()
-            .await
-        {
-            if stat.object().size > 1024 * 1024 {
-                // Object already exists and is large enough to be real, skip the upload.
-                // We still push to the dirty-set because while this tarball may exist, its
-                // likely not wired to this spec hash.
-                self.uploaded.push((spec_hash.clone(), sha256));
-                return Ok(false);
-            }
-        }
-
-        self.backend
-            .write_object(
-                self.base.bucket.clone(),
-                self.base
-                    .join(&format!("{}.zst", hex::encode(sha256)))
-                    .unwrap()
-                    .object,
-                tokio::fs::File::from_std(tar_file),
-            )
-            .set_cache_control("public, max-age=7200")
-            .send_buffered()
-            .await?;
-
-        self.uploaded.push((spec_hash.clone(), sha256));
-        Ok(true)
-    }
-
-    /// Pushes a new index to the GCS bucket, complete with all the previous entries
-    /// as well as any new entries which were added using [RemoteCache::upload].
-    pub async fn finish_uploads(self) -> Result<(), Error<GcsError>> {
-        let Self {
-            mut index,
-            backend,
-            base,
-            uploaded,
-            dir: _,
-            ot: _,
-        } = self;
-
-        index.extend(uploaded);
-
-        let mut data = Vec::with_capacity(2048);
-        index.write_to(&mut data).map_err(Error::IO)?;
-
-        let bytes_data = bytes::Bytes::copy_from_slice(&data);
-        backend
-            .write_object(
-                base.bucket.clone(),
-                base.join(INDEX_FILENAME).unwrap().object,
-                bytes_data,
-            )
-            .set_cache_control("public, max-age=300")
-            .send_buffered()
-            .await?;
-        Ok(())
-    }
 }
 
 impl<B: FetchBackend> RemoteCache<B> {
@@ -192,7 +116,6 @@ impl<B: FetchBackend> RemoteCache<B> {
                     .map_err(Error::IO)?,
                     dir: index_dir,
                     base: url,
-                    uploaded: vec![],
                     ot,
                 });
             }
@@ -240,7 +163,6 @@ impl<B: FetchBackend> RemoteCache<B> {
             index,
             dir: index_dir,
             base: url,
-            uploaded: vec![],
             ot,
         })
     }
