@@ -1,0 +1,82 @@
+syntax = "proto3";
+package res;
+
+import "streams.proto";
+
+// The wire format for messages streamed to the server to run checks.
+message CheckMessage {
+  oneof msg {
+    // The initiation message of the stream. May only be sent as the first message.
+    CheckRequest request = 1;
+    // A chunk of data for the files stream.
+    bytes chunk = 2;
+  }
+}
+
+// A request to RES to run some checks.
+message CheckRequest {
+  // A client-provided identifier for the build.
+  string client_id = 1;
+  // Describes the stream of the repository that will follow this message with idx == 0.
+  StreamConfig files_stream = 2;
+
+  // Corresponds to CheckCtx::filter_names.
+  repeated string filter_names = 3;
+  // Corresponds to CheckCtx::skip_checkers.
+  repeated string skip_checkers = 4;
+  // Run checks over packages.
+  bool packages = 5;
+  // Run checks over profiles.
+  bool profiles = 6;
+  // Run checks over harnesses.
+  bool harnesses = 7;
+
+  // Configure the provided GCS bucket name as the remote cache.
+  optional string remote_cache_gcs_bucket = 8;
+}
+
+// Something that was checked.
+message CheckObject {
+  oneof msg {
+    string package = 1;
+    string profile = 2;
+    string harness = 3;
+  }
+}
+
+// Something that was checked.
+message CheckResult {
+    string check = 1;
+    enum CheckVerdict {
+      CV_UNSPECIFIED = 0;
+      // The check failed.
+      CV_FAIL = 1;
+      // The check fixed itself. We include this value for parity with CheckVerdict, but it should
+      // never happen on the wire.
+      CV_FIXED = 2;
+      // The check was skipped.
+      CV_SKIP = 3;
+      // The check passed.
+      CV_PASS = 4;
+    }
+    CheckVerdict verdict = 2;
+    repeated string errors = 3;
+}
+
+// A packet of information streamed back from RES while running some checks.
+message CheckResponse {
+    message Error {
+      string msg = 1;
+    }
+    message Check {
+      // Identifies what was checked.
+      CheckObject obj = 1;
+      // Results from running checks against the object.
+      repeated CheckResult results = 2;
+    }
+
+    oneof msg {
+        Error error = 1;
+        Check check = 2;
+    }
+}

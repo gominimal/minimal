@@ -8,6 +8,7 @@ fn main() -> Result<()> {
             "protos/res/create_env.proto",
             "protos/res/download.proto",
             "protos/res/task.proto",
+            "protos/res/check.proto",
             "protos/res/remote_execution_service.proto",
         ],
         &["protos/", "protos/res"],

@@ -130,7 +130,7 @@ fn check_harness_packages_valid(
     program: &mut Program<CacheImpl>,
 ) -> Result<CheckResult, Error> {
     let mut out = CheckResult {
-        check: "packages valid",
+        check: "packages valid".into(),
         verdict: CheckVerdict::Skip,
         err: vec![],
     };

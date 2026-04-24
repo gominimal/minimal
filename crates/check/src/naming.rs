@@ -19,7 +19,7 @@ impl crate::GraphBasedChecker for SpecNameMatchesDir {
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
-            check: "spec name matches dir",
+            check: "spec name matches dir".into(),
             err: vec![],
         };
         if ctx
@@ -59,7 +59,7 @@ impl crate::GraphBasedChecker for SpecNameValid {
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
-            check: "spec name valid",
+            check: "spec name valid".into(),
             err: vec![],
         };
         if ctx.skip_checkers.contains(&"spec name valid".to_string()) {
@@ -97,7 +97,7 @@ impl crate::GraphBasedChecker for CycleBreakerNaming {
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
-            check: "cycle breaker naming",
+            check: "cycle breaker naming".into(),
             err: vec![],
         };
         if ctx
@@ -147,7 +147,7 @@ impl crate::GraphBasedChecker for OutputNaming {
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
-            check: "output naming",
+            check: "output naming".into(),
             err: vec![],
         };
         if ctx.skip_checkers.contains(&"output naming".to_string()) {
@@ -212,7 +212,7 @@ impl crate::GraphBasedChecker for EnumerateBins {
         let cache = ctx.cache.clone();
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
-            check: "enumerate bins",
+            check: "enumerate bins".into(),
             err: vec![],
         };
         if ctx.skip_checkers.contains(&"enumerate bins".to_string()) {

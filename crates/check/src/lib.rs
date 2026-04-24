@@ -12,6 +12,7 @@ use lcache::{Cache, CacheErr, LocalDir};
 use op::{Options, Runnable, StandaloneTest};
 use ot::{OpTracker, Operation};
 use regex::Regex;
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt;
 use std::fmt::Display;
@@ -123,7 +124,7 @@ impl Display for CheckVerdict {
 
 #[derive(Debug, Clone)]
 pub struct CheckResult {
-    pub check: &'static str,
+    pub check: Cow<'static, str>,
     pub verdict: CheckVerdict,
     pub err: Vec<String>,
 }
@@ -131,7 +132,7 @@ pub struct CheckResult {
 impl CheckResult {
     pub(crate) fn parse_failure(msg: String) -> Self {
         CheckResult {
-            check: "parse",
+            check: "parse".into(),
             verdict: CheckVerdict::Fail,
             err: vec![msg],
         }
@@ -139,7 +140,7 @@ impl CheckResult {
 
     pub(crate) fn profile_name_skip() -> Self {
         CheckResult {
-            check: "profile name matches dir",
+            check: "profile name matches dir".into(),
             verdict: CheckVerdict::Skip,
             err: vec![],
         }
@@ -147,7 +148,7 @@ impl CheckResult {
 
     pub(crate) fn profile_name_pass() -> Self {
         CheckResult {
-            check: "profile name matches dir",
+            check: "profile name matches dir".into(),
             verdict: CheckVerdict::Pass,
             err: vec![],
         }
@@ -155,7 +156,7 @@ impl CheckResult {
 
     pub(crate) fn profile_name_fail(msg: String) -> Self {
         CheckResult {
-            check: "profile name matches dir",
+            check: "profile name matches dir".into(),
             verdict: CheckVerdict::Fail,
             err: vec![msg],
         }
@@ -163,21 +164,21 @@ impl CheckResult {
 
     pub(crate) fn harness_name_skip() -> Self {
         CheckResult {
-            check: "harness name matches dir",
+            check: "harness name matches dir".into(),
             verdict: CheckVerdict::Skip,
             err: vec![],
         }
     }
     pub(crate) fn harness_name_pass() -> Self {
         CheckResult {
-            check: "harness name matches dir",
+            check: "harness name matches dir".into(),
             verdict: CheckVerdict::Pass,
             err: vec![],
         }
     }
     pub(crate) fn harness_name_fail(msg: String) -> Self {
         CheckResult {
-            check: "harness name matches dir",
+            check: "harness name matches dir".into(),
             verdict: CheckVerdict::Fail,
             err: vec![msg],
         }
@@ -185,21 +186,21 @@ impl CheckResult {
 
     pub(crate) fn harness_regexes_skip() -> Self {
         CheckResult {
-            check: "project_matchers regexes",
+            check: "project_matchers regexes".into(),
             verdict: CheckVerdict::Skip,
             err: vec![],
         }
     }
     pub(crate) fn harness_regexes_pass() -> Self {
         CheckResult {
-            check: "project_matchers regexes",
+            check: "project_matchers regexes".into(),
             verdict: CheckVerdict::Pass,
             err: vec![],
         }
     }
     pub(crate) fn harness_regexes_fail(msg: String) -> Self {
         CheckResult {
-            check: "project_matchers regexes",
+            check: "project_matchers regexes".into(),
             verdict: CheckVerdict::Fail,
             err: vec![msg],
         }
@@ -207,21 +208,21 @@ impl CheckResult {
 
     pub(crate) fn harness_predicates_skip() -> Self {
         CheckResult {
-            check: "project_matchers predicates",
+            check: "project_matchers predicates".into(),
             verdict: CheckVerdict::Skip,
             err: vec![],
         }
     }
     pub(crate) fn harness_predicates_pass() -> Self {
         CheckResult {
-            check: "project_matchers predicates",
+            check: "project_matchers predicates".into(),
             verdict: CheckVerdict::Pass,
             err: vec![],
         }
     }
     pub(crate) fn harness_predicates_fail(msg: String) -> Self {
         CheckResult {
-            check: "project_matchers predicates",
+            check: "project_matchers predicates".into(),
             verdict: CheckVerdict::Fail,
             err: vec![msg],
         }
@@ -545,7 +546,7 @@ impl FileBasedChecker for ParseCheck {
     ) -> Result<CheckResult, Error> {
         if ctx.skip_checkers.contains(&"parse".to_string()) {
             return Ok(CheckResult {
-                check: "parse",
+                check: "parse".into(),
                 verdict: CheckVerdict::Skip,
                 err: vec![],
             });
@@ -568,7 +569,7 @@ impl FileBasedChecker for ParseCheck {
             Ok(p) => p,
             Err(e) => {
                 return Ok(CheckResult {
-                    check: "parse",
+                    check: "parse".into(),
                     verdict: CheckVerdict::Fail,
                     err: vec![format!("{}", e)],
                 });
@@ -585,7 +586,7 @@ impl FileBasedChecker for ParseCheck {
 
         if let Err(e) = program.typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk) {
             return Ok(CheckResult {
-                check: "parse",
+                check: "parse".into(),
                 verdict: CheckVerdict::Fail,
                 err: vec![report_as_str(
                     &mut program.files(),
@@ -596,7 +597,7 @@ impl FileBasedChecker for ParseCheck {
         }
         if let Err(e) = program.compile() {
             return Ok(CheckResult {
-                check: "parse",
+                check: "parse".into(),
                 verdict: CheckVerdict::Fail,
                 err: vec![report_as_str(
                     &mut program.files(),
@@ -608,7 +609,7 @@ impl FileBasedChecker for ParseCheck {
 
         drop(generated_lib_dir);
         Ok(CheckResult {
-            check: "parse",
+            check: "parse".into(),
             verdict: CheckVerdict::Pass,
             err: vec![],
         })
@@ -633,7 +634,7 @@ impl FileBasedChecker for ImportLineCheck {
         let fix = ctx.fix;
         let mut result = CheckResult {
             verdict: CheckVerdict::Pass,
-            check: "import line",
+            check: "import line".into(),
             err: vec![],
         };
         if ctx.skip_checkers.contains(&"import line".to_string()) {
@@ -747,7 +748,7 @@ impl FileBasedChecker for FmtCheck {
         let fix = ctx.fix;
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
-            check: "fmt",
+            check: "fmt".into(),
             err: vec![],
         };
         if ctx.skip_checkers.contains(&"fmt".to_string()) {
@@ -814,7 +815,7 @@ impl GraphBasedChecker for StandaloneTestCheck {
         let cache = ctx.cache.clone();
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
-            check: "standalone tests",
+            check: "standalone tests".into(),
             err: vec![],
         };
         if ctx.skip_checkers.contains(&"standalone tests".to_string()) {
@@ -921,7 +922,7 @@ impl FileBasedChecker for ImportsCheck {
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
             verdict: CheckVerdict::Pass,
-            check: "imports",
+            check: "imports".into(),
             err: vec![],
         };
         if ctx.skip_checkers.contains(&"imports".to_string()) {
@@ -1029,7 +1030,7 @@ impl GraphBasedChecker for BuildScriptDisallowedPatterns {
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
-            check: "build script disallowed-patterns",
+            check: "build script disallowed-patterns".into(),
             err: vec![],
         };
         if ctx
@@ -1105,7 +1106,7 @@ impl GraphBasedChecker for BuildScriptIsExecutable {
     ) -> Result<CheckResult, Error> {
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
-            check: "build scripts are executable",
+            check: "build scripts are executable".into(),
             err: vec![],
         };
         if ctx

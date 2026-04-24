@@ -16,6 +16,7 @@ use tonic::transport::{Channel, Error as TransportError};
 
 type CreateEnvStream = Pin<Box<dyn futures::Stream<Item = CreateEnvMessage> + Send>>;
 type CreateBuildStream = Pin<Box<dyn futures::Stream<Item = OrchestrateBuildMessage> + Send>>;
+type CheckStream = Pin<Box<dyn futures::Stream<Item = CheckMessage> + Send>>;
 
 /// Errors that can occur when driving a remote client.
 #[derive(Debug)]
@@ -424,6 +425,159 @@ where
 
         Ok(tempfile)
     }
+
+    pub async fn check(
+        &mut self,
+        dir: &Path,
+        args: &CheckArgs,
+    ) -> Result<
+        mpsc::UnboundedReceiver<(check::CheckObj, Result<Vec<check::CheckResult>, Error>)>,
+        Error,
+    > {
+        use check_message::Msg;
+        let client_id = format!(
+            "{}-{}",
+            common::random_alphanumeric(8),
+            common::random_alphanumeric(8)
+        );
+
+        // Build a tarball of the directory to stream as file chunks.
+        use stream_config::*;
+        let dir = dir.to_path_buf();
+        let file = tokio::task::spawn_blocking(move || -> Result<std::fs::File, Error> {
+            let (mut file, _hash) = common::archive::compress_dir(&dir, Some(-5), &None)
+                .map_err(|e| Error::Other(e.into()))?;
+            std::io::Seek::rewind(&mut file).map_err(|e| Error::Other(e.into()))?;
+            Ok(file)
+        })
+        .await
+        .map_err(|e| Error::Other(e.into()))
+        .and_then(|r| r)?;
+
+        let chunk_stream: CheckStream = Box::pin(
+            tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(file))
+                .filter_map(|result| async { result.ok() })
+                .map(|bytes| CheckMessage {
+                    msg: Some(Msg::Chunk(bytes.to_vec())),
+                }),
+        );
+
+        let request_msg = tokio_stream::once(CheckMessage {
+            msg: Some(Msg::Request(CheckRequest {
+                client_id,
+                files_stream: Some(StreamConfig {
+                    format: Some(Format::Files(FilesFormat {
+                        tarball: Some(TarballFormat {
+                            compression: TarballCompression::TarZst.into(),
+                        }),
+                    })),
+                    kind: StreamKind::SkWorktree.into(),
+                }),
+                filter_names: args.filter_names.clone(),
+                skip_checkers: args.skip_checkers.clone(),
+                packages: args.packages,
+                profiles: args.profiles,
+                harnesses: args.harnesses,
+                remote_cache_gcs_bucket: args.remote_cache_gcs_bucket.clone(),
+            })),
+        });
+
+        let mut rpc = self
+            .c
+            .check(request_msg.chain(chunk_stream))
+            .await
+            .map_err(|e| Error::Other(e.into()))?
+            .into_inner();
+
+        let (tx, rx) = mpsc::unbounded();
+        tokio::spawn(async move {
+            while let Some(msg) = rpc.next().await {
+                let msg = match msg {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let _ = tx.unbounded_send((
+                            check::CheckObj::Package(String::new()),
+                            Err(Error::Other(e.into())),
+                        ));
+                        break;
+                    }
+                };
+                match msg.msg {
+                    Some(check_response::Msg::Error(e)) => {
+                        let _ = tx.unbounded_send((
+                            check::CheckObj::Package(String::new()),
+                            Err(Error::Other(anyhow!("check failed: {}", e.msg).into())),
+                        ));
+                        break;
+                    }
+                    Some(check_response::Msg::Check(c)) => {
+                        let obj = match c.obj.and_then(|o| o.msg) {
+                            Some(check_object::Msg::Package(n)) => check::CheckObj::Package(n),
+                            Some(check_object::Msg::Profile(n)) => check::CheckObj::Profile(n),
+                            Some(check_object::Msg::Harness(n)) => check::CheckObj::Harness(n),
+                            None => {
+                                let _ = tx.unbounded_send((
+                                    check::CheckObj::Package(String::new()),
+                                    Err(Error::Other(
+                                        anyhow!("check response missing object").into(),
+                                    )),
+                                ));
+                                break;
+                            }
+                        };
+                        let check_results: Result<Vec<_>, Error> = c
+                            .results
+                            .into_iter()
+                            .map(|r| -> Result<check::CheckResult, Error> {
+                                let verdict = match check_result::CheckVerdict::try_from(r.verdict)
+                                {
+                                    Ok(check_result::CheckVerdict::CvFail) => {
+                                        check::CheckVerdict::Fail
+                                    }
+                                    Ok(check_result::CheckVerdict::CvFixed) => {
+                                        check::CheckVerdict::Fixed
+                                    }
+                                    Ok(check_result::CheckVerdict::CvSkip) => {
+                                        check::CheckVerdict::Skip
+                                    }
+                                    Ok(check_result::CheckVerdict::CvPass) => {
+                                        check::CheckVerdict::Pass
+                                    }
+                                    Ok(check_result::CheckVerdict::CvUnspecified) | Err(_) => {
+                                        return Err(Error::Other(
+                                            anyhow!("invalid check verdict value {}", r.verdict)
+                                                .into(),
+                                        ));
+                                    }
+                                };
+                                Ok(check::CheckResult {
+                                    check: r.check.into(),
+                                    verdict,
+                                    err: r.errors,
+                                })
+                            })
+                            .collect();
+                        if tx.unbounded_send((obj, check_results)).is_err() {
+                            break;
+                        }
+                    }
+                    None => {}
+                }
+            }
+        });
+
+        Ok(rx)
+    }
+}
+
+/// Arguments for a remote check invocation.
+pub struct CheckArgs {
+    pub filter_names: Vec<String>,
+    pub skip_checkers: Vec<String>,
+    pub packages: bool,
+    pub profiles: bool,
+    pub harnesses: bool,
+    pub remote_cache_gcs_bucket: Option<String>,
 }
 
 /// The configuration describing an execution in a remote environment.
@@ -494,6 +648,14 @@ mod tests {
             &self,
             _request: tonic::Request<DownloadRequest>,
         ) -> Result<tonic::Response<Self::DownloadStream>, tonic::Status> {
+            unimplemented!()
+        }
+
+        type CheckStream = tokio_stream::Empty<Result<CheckResponse, tonic::Status>>;
+        async fn check(
+            &self,
+            _request: tonic::Request<tonic::Streaming<CheckMessage>>,
+        ) -> Result<tonic::Response<Self::CheckStream>, tonic::Status> {
             unimplemented!()
         }
     }
@@ -654,6 +816,14 @@ mod tests {
                 .collect();
             Ok(tonic::Response::new(tokio_stream::iter(responses)))
         }
+
+        type CheckStream = tokio_stream::Empty<Result<CheckResponse, tonic::Status>>;
+        async fn check(
+            &self,
+            _request: tonic::Request<tonic::Streaming<CheckMessage>>,
+        ) -> Result<tonic::Response<Self::CheckStream>, tonic::Status> {
+            unimplemented!()
+        }
     }
 
     #[tokio::test]
@@ -751,6 +921,14 @@ mod tests {
         ) -> Result<tonic::Response<Self::DownloadStream>, tonic::Status> {
             unimplemented!()
         }
+
+        type CheckStream = tokio_stream::Empty<Result<CheckResponse, tonic::Status>>;
+        async fn check(
+            &self,
+            _request: tonic::Request<tonic::Streaming<CheckMessage>>,
+        ) -> Result<tonic::Response<Self::CheckStream>, tonic::Status> {
+            unimplemented!()
+        }
     }
 
     #[tokio::test]
@@ -782,5 +960,142 @@ mod tests {
             output.contains("success"),
             "expected 'success' in stdout, got: {output}"
         );
+    }
+
+    struct CheckMockServer;
+
+    #[tonic::async_trait]
+    impl RemoteExecutionService for CheckMockServer {
+        async fn create_env(
+            &self,
+            _request: tonic::Request<tonic::Streaming<CreateEnvMessage>>,
+        ) -> Result<tonic::Response<CreateEnvResponse>, tonic::Status> {
+            unimplemented!()
+        }
+
+        type ExecStream = tokio_stream::Empty<Result<CreateTaskResponse, tonic::Status>>;
+        async fn exec(
+            &self,
+            _request: tonic::Request<CreateTaskRequest>,
+        ) -> Result<tonic::Response<Self::ExecStream>, tonic::Status> {
+            unimplemented!()
+        }
+
+        type OrchestrateBuildStream =
+            tokio_stream::Empty<Result<OrchestrateBuildResponse, tonic::Status>>;
+        async fn orchestrate_build(
+            &self,
+            _request: tonic::Request<tonic::Streaming<OrchestrateBuildMessage>>,
+        ) -> Result<tonic::Response<Self::OrchestrateBuildStream>, tonic::Status> {
+            unimplemented!()
+        }
+
+        type DownloadStream = tokio_stream::Empty<Result<DownloadResponse, tonic::Status>>;
+        async fn download(
+            &self,
+            _request: tonic::Request<DownloadRequest>,
+        ) -> Result<tonic::Response<Self::DownloadStream>, tonic::Status> {
+            unimplemented!()
+        }
+
+        type CheckStream =
+            tokio_stream::Iter<std::vec::IntoIter<Result<CheckResponse, tonic::Status>>>;
+        async fn check(
+            &self,
+            request: tonic::Request<tonic::Streaming<CheckMessage>>,
+        ) -> Result<tonic::Response<Self::CheckStream>, tonic::Status> {
+            use check_message::Msg;
+            let mut stream = request.into_inner();
+
+            // First message should be the request.
+            let first = stream.next().await.unwrap().unwrap();
+            let Msg::Request(req) = first.msg.unwrap() else {
+                panic!("expected CheckRequest as first message");
+            };
+            assert!(!req.client_id.is_empty());
+            assert!(req.packages);
+
+            // Collect file chunks and unpack the tarball.
+            let mut file_data = Vec::new();
+            while let Some(msg) = stream.next().await {
+                let msg = msg.unwrap();
+                let Msg::Chunk(data) = msg.msg.unwrap() else {
+                    panic!("expected Chunk message");
+                };
+                file_data.extend_from_slice(&data);
+            }
+
+            let dst_dir = tempfile::tempdir().unwrap();
+            common::archive::extract_compressed_tar(
+                std::io::Cursor::new(&file_data),
+                common::archive::Compression::Zstd,
+                dst_dir.path(),
+                None,
+            )
+            .unwrap();
+
+            // Verify the streamed file arrived intact.
+            let content = std::fs::read_to_string(dst_dir.path().join("test.txt")).unwrap();
+            assert_eq!(content, "check me");
+
+            // Send back fake check results.
+            let responses = vec![Ok(CheckResponse {
+                msg: Some(check_response::Msg::Check(check_response::Check {
+                    obj: Some(CheckObject {
+                        msg: Some(check_object::Msg::Package("test-pkg".into())),
+                    }),
+                    results: vec![
+                        remote_proto::res::CheckResult {
+                            check: "parse".into(),
+                            verdict: check_result::CheckVerdict::CvPass.into(),
+                            errors: vec![],
+                        },
+                        remote_proto::res::CheckResult {
+                            check: "fmt".into(),
+                            verdict: check_result::CheckVerdict::CvFail.into(),
+                            errors: vec!["bad formatting".into()],
+                        },
+                    ],
+                })),
+            })];
+
+            Ok(tonic::Response::new(tokio_stream::iter(responses)))
+        }
+    }
+
+    #[tokio::test]
+    async fn check_streams_and_returns_results() {
+        // Create a temp directory with a test file.
+        let src_dir = tempfile::tempdir().unwrap();
+        std::fs::write(src_dir.path().join("test.txt"), b"check me").unwrap();
+
+        let svc = RemoteExecutionServiceServer::new(CheckMockServer);
+        let graph = Graph::new();
+        let mut client = Client::new(RESClient::new(svc), &graph);
+
+        let args = CheckArgs {
+            filter_names: vec![],
+            skip_checkers: vec![],
+            packages: true,
+            profiles: false,
+            harnesses: false,
+            remote_cache_gcs_bucket: None,
+        };
+
+        let mut rx = client.check(src_dir.path(), &args).await.unwrap();
+
+        // First (and only) streamed result.
+        let (obj, checks) = rx.next().await.expect("expected a check result");
+        let checks = checks.unwrap();
+        assert_eq!(obj, check::CheckObj::Package("test-pkg".into()));
+        assert_eq!(checks.len(), 2);
+        assert!(matches!(checks[0].verdict, check::CheckVerdict::Pass));
+        assert_eq!(checks[0].check.as_ref(), "parse");
+        assert!(matches!(checks[1].verdict, check::CheckVerdict::Fail));
+        assert_eq!(checks[1].check.as_ref(), "fmt");
+        assert_eq!(checks[1].err, vec!["bad formatting"]);
+
+        // Stream should be exhausted.
+        assert!(rx.next().await.is_none());
     }
 }

@@ -18,6 +18,7 @@ tokio-stream.workspace = true
 tokio-util.workspace = true
 tonic.workspace = true
 
+check.workspace = true
 common.workspace = true
 graph.workspace = true
 orchestrator.workspace = true
