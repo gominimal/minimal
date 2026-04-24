@@ -54,6 +54,13 @@ pub struct RemoteCache<B: FetchBackend> {
     dir: Option<PathBuf>,
 
     ot: Option<OpTracker>,
+
+    /// The GCS object generation of the index when it was fresh-fetched
+    /// from the backend. `None` for non-GCS backends and for the
+    /// local-cache load path (where we never asked GCS what generation
+    /// we have). Used by [`Self::into_writer`] to skip a refetch when
+    /// transitioning to a writer.
+    gcs_generation: Option<i64>,
 }
 
 pub const INDEX_FILENAME: &str = "index.shisha";
@@ -89,6 +96,28 @@ impl RemoteCache<Storage> {
 
         Self::new(storage, url, index_dir, ot).await
     }
+
+    /// Convert this reader into a writer, reusing the already-fetched index
+    /// and generation when possible. If the reader was loaded from the local
+    /// cache fast path (and therefore has no recorded generation), the index
+    /// is refetched from GCS so the writer's compare-and-swap commit has an
+    /// authoritative generation to match against.
+    pub async fn into_writer(
+        self,
+        ot: Option<OpTracker>,
+    ) -> Result<crate::RemoteCacheWriter, Error<GcsError>> {
+        let (index, generation) = match self.gcs_generation {
+            Some(g) => (self.index, g),
+            None => crate::remote_writer::fetch_gcs_index(&self.backend, &self.base).await?,
+        };
+        Ok(crate::RemoteCacheWriter::from_parts(
+            self.backend,
+            self.base,
+            index,
+            generation,
+            ot,
+        ))
+    }
 }
 
 impl<B: FetchBackend> RemoteCache<B> {
@@ -117,6 +146,9 @@ impl<B: FetchBackend> RemoteCache<B> {
                     dir: index_dir,
                     base: url,
                     ot,
+                    // Loading from local cache means we never asked GCS for
+                    // the current generation. into_writer must refetch.
+                    gcs_generation: None,
                 });
             }
         }
@@ -128,6 +160,10 @@ impl<B: FetchBackend> RemoteCache<B> {
 
         // TODO: Gotta be a better way to stream it into [RemoteIndex].
         let mut index_resp = backend.execute(index_req).await?;
+        // Capture the GCS generation, if the backend exposes one. Reads
+        // need to do this before consuming chunks because the response
+        // metadata may not survive the body read in some impls.
+        let gcs_generation = index_resp.generation();
         let index = match index_resp.status_code() {
             404 => RemoteIndex::default(),
             _ => {
@@ -164,6 +200,7 @@ impl<B: FetchBackend> RemoteCache<B> {
             dir: index_dir,
             base: url,
             ot,
+            gcs_generation,
         })
     }
 

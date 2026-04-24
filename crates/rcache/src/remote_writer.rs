@@ -18,13 +18,16 @@ use tokio::time::sleep;
 
 /// Maximum retries on `if_generation_match` contention before giving up.
 /// With the backoff schedule below, 8 retries cap total contention-wait at
-/// ~25s (200+400+800+1600+3200+6400+6400+6400 ms). After that, the
-/// underlying GCS error is bubbled up and the run fails. Total writes
-/// attempted is `MAX_INDEX_WRITE_RETRIES + 1` (the initial attempt).
+/// ~508s (4+8+16+32+64+128+128+128 s). After that, the underlying GCS
+/// error is bubbled up and the run fails. Total writes attempted is
+/// `MAX_INDEX_WRITE_RETRIES + 1` (the initial attempt).
 const MAX_INDEX_WRITE_RETRIES: u32 = 8;
 
 /// Initial backoff between retries; doubled each attempt up to a cap.
-const INITIAL_RETRY_BACKOFF_MS: u64 = 100;
+/// Set to span the index file's `Cache-Control: max-age=300` window so
+/// retries can wait out any HTTP cache layer that might serve a stale
+/// generation back during refetch.
+const INITIAL_RETRY_BACKOFF_MS: u64 = 2000;
 
 /// HTTP status returned by GCS when an `if_generation_match` precondition
 /// fails (i.e. the object's generation has changed since we read it).
@@ -84,16 +87,35 @@ impl RemoteCacheWriter {
             object: "".to_string(),
         };
 
-        let (fetched_index, fetched_generation) = fetch_index(&storage, &base).await?;
+        let (fetched_index, fetched_generation) = fetch_gcs_index(&storage, &base).await?;
 
-        Ok(Self {
-            backend: storage,
+        Ok(Self::from_parts(
+            storage,
+            base,
+            fetched_index,
+            fetched_generation,
+            ot,
+        ))
+    }
+
+    /// Construct directly from already-fetched index + generation. Used by
+    /// [`crate::RemoteCache::into_writer`] to avoid a redundant fetch when
+    /// converting a freshly-loaded reader into a writer.
+    pub(crate) fn from_parts(
+        backend: Storage,
+        base: GcsUrl,
+        fetched_index: RemoteIndex,
+        fetched_generation: i64,
+        ot: Option<OpTracker>,
+    ) -> Self {
+        Self {
+            backend,
             base,
             fetched_index,
             fetched_generation,
             pending: Vec::new(),
             ot,
-        })
+        }
     }
 
     /// Upserts the given artifact to the GCS bucket, staging it for inclusion
@@ -220,7 +242,7 @@ impl RemoteCacheWriter {
                     );
                     sleep(Duration::from_millis(backoff_ms + jitter)).await;
 
-                    let (new_index, new_gen) = fetch_index(&backend, &base).await?;
+                    let (new_index, new_gen) = fetch_gcs_index(&backend, &base).await?;
                     fetched_index = new_index;
                     fetched_generation = new_gen;
                 }
@@ -276,7 +298,11 @@ fn merge_for_commit(fetched: &RemoteIndex, pending: &[(SpecHash, [u8; 32])]) -> 
 /// GCS generation it was loaded from. Returns `(default, 0)` if the index
 /// doesn't exist yet — `0` doubles as the "create-if-not-exists" precondition
 /// value for subsequent `if_generation_match` writes.
-async fn fetch_index(
+///
+/// Shared between [`RemoteCacheWriter::new`] and
+/// [`crate::RemoteCache::into_writer`] (the latter calls this only when
+/// the reader was loaded from local cache and lacks a recorded generation).
+pub(crate) async fn fetch_gcs_index(
     backend: &Storage,
     base: &GcsUrl,
 ) -> Result<(RemoteIndex, i64), Error<GcsError>> {
@@ -334,7 +360,7 @@ mod tests {
     fn retry_412_first_attempt_uses_2x_initial_backoff() {
         assert_eq!(
             decide_retry_after_failure(Some(PRECONDITION_FAILED), 0),
-            RetryAfterFailure::Retry { backoff_ms: 200 }
+            RetryAfterFailure::Retry { backoff_ms: 4_000 }
         );
     }
 
@@ -342,20 +368,27 @@ mod tests {
     fn retry_412_second_attempt_uses_4x_initial_backoff() {
         assert_eq!(
             decide_retry_after_failure(Some(PRECONDITION_FAILED), 1),
-            RetryAfterFailure::Retry { backoff_ms: 400 }
+            RetryAfterFailure::Retry { backoff_ms: 8_000 }
         );
     }
 
     #[test]
     fn retry_412_backoff_caps_at_64x() {
-        // Cap kicks in at attempt index 5 → 2^6 * INITIAL = 6400ms; further attempts stay there
+        // Cap kicks in at attempt index 5 → 2^6 * INITIAL = 128_000ms.
+        // Further attempts stay there. The cap exceeds the 300s
+        // Cache-Control max-age on the index file, so a single capped
+        // backoff can wait out HTTP cache staleness.
         assert_eq!(
             decide_retry_after_failure(Some(PRECONDITION_FAILED), 5),
-            RetryAfterFailure::Retry { backoff_ms: 6400 }
+            RetryAfterFailure::Retry {
+                backoff_ms: 128_000
+            }
         );
         assert_eq!(
             decide_retry_after_failure(Some(PRECONDITION_FAILED), 7),
-            RetryAfterFailure::Retry { backoff_ms: 6400 }
+            RetryAfterFailure::Retry {
+                backoff_ms: 128_000
+            }
         );
     }
 
