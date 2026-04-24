@@ -2,6 +2,7 @@ use crate::remote_index::RemoteIndex;
 use common::{SpecHash, archive};
 use lcache::{Cache, LocalDir, PendingDir};
 use ot::{OpTracker, Operation};
+use sha2::Digest;
 use std::io::{Seek, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -20,11 +21,18 @@ use reqwest::{Client, Error as ReqwestError};
 /// An error from operations with the remote cache.
 #[derive(Debug)]
 pub enum Error<BE: std::fmt::Debug> {
+    /// An error occurred with the fetcher backend.
     Backend(BE),
+    /// An I/O error occurred.
     IO(std::io::Error),
+    /// An error occurred interacting with the local cache.
     Cache(lcache::CacheErr),
+    /// A remote object was not found.
     NotFound,
+    /// An error occurred unpacking an archive.
     ArchiveError(archive::ArchiveError),
+    /// The sha256 hash that was requested differed from what was written/downloaded.
+    HashMismatch { want: String, got: String },
 }
 
 impl<BE: std::fmt::Debug> std::fmt::Display for Error<BE> {
@@ -233,15 +241,26 @@ impl<B: FetchBackend> RemoteCache<B> {
         let mut resp = self.backend.execute(req).await?;
         materialize_op.set_length(resp.content_length().unwrap());
 
-        let mut tar_file = tempfile::tempfile().map_err(Error::IO)?;
+        let mut w = common::Tee::new(
+            tempfile::tempfile().map_err(Error::IO)?,
+            common::HashWriter(sha2::Sha256::new()),
+        );
         while let Some(chunk) = resp.chunk().await? {
             materialize_op.increment(chunk.len() as u64);
-            tar_file.write_all(&chunk).map_err(Error::IO)?;
+            w.write_all(&chunk).map_err(Error::IO)?;
         }
+        let (mut tar_file, hasher) = w.into_inner();
+        let got_sha256 = hasher.0.finalize();
+        if got_sha256 != sha256 {
+            return Err(Error::HashMismatch {
+                want: hex::encode(sha256),
+                got: hex::encode(got_sha256),
+            });
+        }
+
         tar_file
             .seek(std::io::SeekFrom::Start(0))
             .map_err(Error::IO)?;
-
         materialize_op.set_op(Operation::ExtractPkg {
             name: span_name.to_string(),
         });
@@ -255,5 +274,119 @@ impl<B: FetchBackend> RemoteCache<B> {
         .map_err(Error::ArchiveError)?;
 
         Ok((Instant::now().duration_since(start), cache_hnd))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[derive(Debug, Clone)]
+    struct MockUrl(String);
+
+    impl FetchUrl for MockUrl {
+        type JoinError = ();
+        fn join(&self, input: &str) -> Result<Self, ()> {
+            Ok(MockUrl(format!("{}/{}", self.0, input)))
+        }
+        fn filename(&self) -> String {
+            self.0.rsplit('/').next().unwrap_or(&self.0).to_string()
+        }
+    }
+
+    #[derive(Debug)]
+    struct MockResponse {
+        data: Vec<u8>,
+        consumed: bool,
+    }
+
+    impl FetchResponse for MockResponse {
+        type Error = std::io::Error;
+
+        fn error_for_status(self) -> Result<Self, Self::Error> {
+            Ok(self)
+        }
+        fn is_success(&self) -> bool {
+            true
+        }
+        fn status_code(&self) -> usize {
+            200
+        }
+        fn content_length(&self) -> Option<u64> {
+            Some(self.data.len() as u64)
+        }
+        async fn bytes(self) -> Result<Bytes, Self::Error> {
+            Ok(Bytes::from(self.data))
+        }
+        async fn chunk(&mut self) -> Result<Option<Bytes>, Self::Error> {
+            if self.consumed {
+                return Ok(None);
+            }
+            self.consumed = true;
+            Ok(Some(Bytes::from(self.data.clone())))
+        }
+    }
+
+    #[derive(Debug)]
+    struct MockBackend {
+        responses: std::collections::HashMap<String, Vec<u8>>,
+    }
+
+    impl FetchBackend for MockBackend {
+        type Url = MockUrl;
+        type Request = MockUrl;
+        type Response = MockResponse;
+
+        fn get(&self, url: MockUrl) -> Result<MockUrl, std::io::Error> {
+            Ok(url)
+        }
+        async fn execute(&self, req: MockUrl) -> Result<MockResponse, std::io::Error> {
+            let data = self.responses.get(&req.0).cloned().unwrap_or_default();
+            Ok(MockResponse {
+                data,
+                consumed: false,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn materialize_fails_if_hash_mismatch() {
+        let spec_hash = SpecHash::from_bytes([0xAA; 32]);
+        let claimed_sha256: [u8; 32] = [0xBB; 32];
+
+        // Build an index that maps spec_hash -> claimed_sha256.
+        let mut index = RemoteIndex::default();
+        index.extend(std::iter::once((spec_hash.clone(), claimed_sha256)));
+        let mut index_bytes = Vec::new();
+        index.write_to(&mut index_bytes).unwrap();
+
+        // The archive payload — its real sha256 won't match claimed_sha256.
+        let wrong_content = b"definitely not the right content";
+
+        let mut responses = std::collections::HashMap::new();
+        responses.insert(format!("mock://cache/{}", INDEX_FILENAME), index_bytes);
+        responses.insert(
+            format!("mock://cache/{}.zst", hex::encode(claimed_sha256)),
+            wrong_content.to_vec(),
+        );
+
+        let rc = RemoteCache::new(
+            MockBackend { responses },
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = lcache::Cache::at_dir(tmp.path()).unwrap();
+
+        let result = rc.materialize(&spec_hash, &cache, "test-pkg").await;
+        assert!(
+            matches!(result, Err(Error::HashMismatch { .. })),
+            "expected HashMismatch, got: {result:?}",
+        );
     }
 }

@@ -234,3 +234,83 @@ impl<B: fetchers::FetchBackend> CachingDownloader<B> for (&B, &FileCache) {
         self.1.write_through(&filename, sha256, &mut r, op).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    /// A fake [FetchResponse] that yields data from a pre-loaded buffer.
+    #[derive(Debug)]
+    struct FakeResponse {
+        data: Option<Bytes>,
+    }
+
+    impl FakeResponse {
+        fn new(data: &[u8]) -> Self {
+            Self {
+                data: Some(Bytes::copy_from_slice(data)),
+            }
+        }
+    }
+
+    impl fetchers::FetchResponse for FakeResponse {
+        type Error = std::convert::Infallible;
+
+        fn error_for_status(self) -> Result<Self, Self::Error> {
+            Ok(self)
+        }
+        fn is_success(&self) -> bool {
+            true
+        }
+        fn status_code(&self) -> usize {
+            200
+        }
+        fn content_length(&self) -> Option<u64> {
+            self.data.as_ref().map(|d| d.len() as u64)
+        }
+        async fn bytes(self) -> Result<Bytes, Self::Error> {
+            Ok(self.data.unwrap_or_default())
+        }
+        async fn chunk(&mut self) -> Result<Option<Bytes>, Self::Error> {
+            Ok(self.data.take())
+        }
+    }
+
+    #[tokio::test]
+    async fn write_through_hash_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = FileCache::new(tmp.path().to_path_buf()).unwrap();
+        let op = OpTracker::new_with_root(&None);
+
+        let content = b"hello world";
+        let wrong_sha = "0000000000000000000000000000000000000000000000000000000000000000";
+
+        let mut resp = FakeResponse::new(content);
+        let result = cache
+            .write_through("test.txt", wrong_sha, &mut resp, &op)
+            .await;
+
+        let err = result.unwrap_err().unwrap_left();
+        match err {
+            FileCacheError::HashMismatch { want, got } => {
+                assert_eq!(want, wrong_sha);
+                // Verify the 'got' hash is the real sha256 of "hello world".
+                let expected = {
+                    let mut h = sha2::Sha256::new();
+                    sha2::Digest::update(&mut h, content);
+                    hex::encode(h.finalize())
+                };
+                assert_eq!(got, expected);
+            }
+            other => panic!("expected HashMismatch, got: {other}"),
+        }
+
+        // The mismatched file should have been cleaned up.
+        let cached = cache.sha_dir(wrong_sha).unwrap().join("test.txt");
+        assert!(
+            !cached.exists(),
+            "file should be removed after hash mismatch"
+        );
+    }
+}
