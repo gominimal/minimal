@@ -538,7 +538,13 @@ impl FsMapping {
     pub fn path_in_sandbox(&self) -> String {
         match &self.sandbox_path {
             Some(p) => p.clone(),
-            None => self.host_path.clone(),
+            None => match std::env::var("MINIMAL_INTERNAL_PATCH_STRIP") {
+                Err(_) => self.host_path.clone(),
+                Ok(prefix) => match self.host_path.strip_prefix(&prefix) {
+                    Some(stripped) => stripped.to_string(),
+                    None => self.host_path.clone(),
+                },
+            },
         }
     }
 }
