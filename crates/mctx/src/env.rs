@@ -46,32 +46,46 @@ impl EnvChannel<'_> {
             return; // Already installed.
         }
 
+        let mut new_graph = self.graph.clone();
         pkgs.iter().for_each(|(_n, bsr)| {
-            if !self.graph.top_levels.contains(bsr) {
-                self.graph.top_levels.push(*bsr);
+            if !new_graph.top_levels.contains(bsr) {
+                new_graph.top_levels.push(*bsr);
             }
         });
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
-        if let Err(e) = rt.block_on(self.ctx.build_graph(self.graph, false, None)) {
+        if let Err(e) = rt.block_on(self.ctx.build_graph(&new_graph, false, None)) {
             writeln!(stream, "error: {}", e).ok();
             return;
         };
 
         let transitives = Transitives::for_toplevels(
-            self.graph,
+            &new_graph,
             pkgs.iter().map(|(_n, bsr)| *bsr).collect(),
             false,
         );
         match SetupForPackages::build(
-            self.graph,
+            &new_graph,
             transitives
                 .keys()
                 .filter(|bsr| !self.has_packages.contains(bsr)),
         ) {
             Ok(setup) => {
+                if !setup.fs_mappings.dir.is_empty() || !setup.fs_mappings.file.is_empty() {
+                    writeln!(stream, "msg:Error: A package needed for this install requires files from your host to be patched in,").ok();
+                    writeln!(
+                        stream,
+                        "msg:which cannot be performed within an existing session."
+                    )
+                    .ok();
+                    writeln!(stream, "msg:").ok();
+                    writeln!(stream, "msg:Exit the session, add the package yourself, and then restart your session to work around this.").ok();
+                    writeln!(stream, "error: Failed installation.").ok();
+                    return;
+                }
+
                 for want_dir in setup.state_dirs {
                     std::fs::create_dir_all(self.state_dir.join(want_dir)).unwrap();
                 }
@@ -89,7 +103,7 @@ impl EnvChannel<'_> {
                 if let Err(e) = common::hardlink_dir_contents(
                     self.ctx
                         .cache
-                        .read_dir(&self.graph.spec_hash(bsr))
+                        .read_dir(&new_graph.spec_hash(bsr))
                         .unwrap()
                         .path(),
                     rootfs,
@@ -105,6 +119,7 @@ impl EnvChannel<'_> {
             pkgs.iter().map(|t| t.0).collect::<Vec<_>>().join(", ")
         )
         .ok();
+        *self.graph = new_graph;
     }
 
     fn parse_pkgs_line<'a>(&self, pkgs: &'a str) -> Result<Vec<(&'a str, BuildSpecRef)>, &'a str> {
