@@ -499,29 +499,90 @@ pub struct EnvArgs<'a> {
     pub ot: Option<OpTracker>,
 }
 
+/// Tracks a CLAUDE.md that was patched with sandbox instructions, so we can
+/// write back user changes and strip the injected content on teardown.
+struct ClaudeMdPatch {
+    /// The original file content (empty if the file didn't exist or was empty).
+    original_content: Vec<u8>,
+    /// Whether CLAUDE.md existed on disk before we patched it.
+    already_existed: bool,
+    /// Path to the temp file that is bind-mounted into the sandbox.
+    temp_path: PathBuf,
+    /// Path to the real CLAUDE.md in the project directory.
+    real_path: PathBuf,
+}
+
+impl ClaudeMdPatch {
+    /// Sets up the patched CLAUDE.md: reads the original, appends the sandbox
+    /// instructions, writes to a temp file, and returns the patch + an FsMapping.
+    fn setup(cwd: &Path, inject_dir: &Path) -> Result<(Self, FsMapping), Error> {
+        let real_path = cwd.join("CLAUDE.md");
+        let already_existed = real_path.exists();
+        let original_content = std::fs::read(&real_path).unwrap_or_default();
+
+        let temp_path = inject_dir.join("CLAUDE.md");
+        let mut f = std::fs::File::create(&temp_path)
+            .map_err(|e| Error::IO("create CLAUDE.md", temp_path.clone(), e))?;
+        f.write_all(&original_content)
+            .map_err(|e| Error::IO("prefill CLAUDE.md", temp_path.clone(), e))?;
+        f.write_all(LLM_APPEND_INSTRUCTIONS.as_bytes())
+            .map_err(|e| Error::IO("write CLAUDE.md", temp_path.clone(), e))?;
+
+        let mapping = FsMapping {
+            host_path: temp_path.to_str().unwrap().to_string(),
+            is_file: true,
+            read_only: false,
+            create_if_missing: false,
+            sandbox_path: Some(real_path.to_str().unwrap().to_string()),
+        };
+
+        Ok((
+            ClaudeMdPatch {
+                original_content,
+                already_existed,
+                temp_path,
+                real_path,
+            },
+            mapping,
+        ))
+    }
+
+    /// Strips the injected instructions from the (potentially modified) temp file
+    /// and writes back any user changes to the real path.
+    fn teardown(&self) {
+        let content = match std::fs::read(&self.temp_path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let content = match std::str::from_utf8(&content) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        let cleaned = content.replace(LLM_APPEND_INSTRUCTIONS, "");
+        let cleaned_bytes = cleaned.as_bytes();
+
+        if cleaned_bytes.is_empty() && !self.already_existed {
+            // File didn't exist before — don't leave an empty one behind.
+            let _ = std::fs::remove_file(&self.real_path);
+        } else if cleaned_bytes != self.original_content {
+            // User made changes — write them back.
+            let _ = std::fs::write(&self.real_path, cleaned_bytes);
+        }
+    }
+}
+
 /// A successfully-configured runtime environment.
 pub struct Env<'a> {
-    cwd: PathBuf,
-    claude_md_already_exists: bool,
+    claude_md_patch: Option<ClaudeMdPatch>,
     sandbox: sandbox2::Sandbox<EnvChannel<'a>>,
     temp_dirs: Vec<TempDir>,
 }
 
 impl<'a> Drop for Env<'a> {
     fn drop(&mut self) {
-        // Because we bind-mount in a mutated or new CLAUDE.md file, we always leave behind
-        // such a file on the filesystem when we exit. We detect if the file is empty, and if so
-        // yeet it, to avoid polluting the users' repository.
-        if !self.claude_md_already_exists {
-            let claude_md = self.cwd.join("CLAUDE.md");
-            match std::fs::metadata(&claude_md) {
-                Err(_) => {}
-                Ok(stat) => {
-                    if stat.len() == 0 {
-                        let _ = std::fs::remove_file(claude_md);
-                    }
-                }
-            }
+        if let Some(patch) = &self.claude_md_patch {
+            patch.teardown();
         }
     }
 }
@@ -572,40 +633,23 @@ impl<'a> Env<'a> {
         }
         let mut fs_mappings: Vec<FsMapping> = patch.into();
 
-        let claude_md_already_exists = args.cwd.join("CLAUDE.md").exists();
         let llm_inject_dir = ctx
             .local_cache()
             .temp_dir()
             .map_err(|e| Error::Other(anyhow::anyhow!("making temp dir: {}", e)))?;
-        {
-            // Create or upsert the CLAUDE.md.
-            let claude_md = llm_inject_dir.path().join("CLAUDE.md");
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&claude_md)
-                .map_err(|e| Error::IO("open CLAUDE.md", claude_md.clone(), e))?;
-            if let Ok(data) = std::fs::read(args.cwd.join("CLAUDE.md")) {
-                f.write_all(&data)
-                    .map_err(|e| Error::IO("prefill CLAUDE.md", claude_md.clone(), e))?;
-            }
-            f.write_all(LLM_APPEND_INSTRUCTIONS.as_bytes())
-                .map_err(|e| Error::IO("write CLAUDE.md", claude_md.clone(), e))?;
-
-            let sandbox_path = args.cwd.join("CLAUDE.md");
+        let claude_md_patch = {
+            let claude_md_path = args.cwd.join("CLAUDE.md");
             let already_patched_by_user = fs_mappings
                 .iter()
-                .any(|m| m.host_path == sandbox_path.to_str().unwrap());
-            if !already_patched_by_user {
-                fs_mappings.push(FsMapping {
-                    host_path: claude_md.to_str().unwrap().to_string(),
-                    is_file: true,
-                    read_only: true,
-                    create_if_missing: false,
-                    sandbox_path: Some(sandbox_path.to_str().unwrap().to_string()),
-                });
+                .any(|m| m.host_path == claude_md_path.to_str().unwrap());
+            if already_patched_by_user {
+                None
+            } else {
+                let (patch, mapping) = ClaudeMdPatch::setup(&args.cwd, llm_inject_dir.path())?;
+                fs_mappings.push(mapping);
+                Some(patch)
             }
-        }
+        };
 
         let mut config = sandbox2::config::Config::new(args.name)
             .with_wd(args.cwd.clone(), false, fs_mappings)
@@ -660,9 +704,8 @@ impl<'a> Env<'a> {
         sandbox.keep_dir(false);
 
         Ok(Env {
-            cwd: args.cwd,
+            claude_md_patch,
             sandbox,
-            claude_md_already_exists,
             temp_dirs: vec![llm_inject_dir],
         })
     }
