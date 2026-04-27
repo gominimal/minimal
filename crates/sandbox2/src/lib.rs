@@ -161,17 +161,22 @@ impl<C: Channel> Sandbox<C> {
                     .map_err(|e| Error::IO("create output usr/lib64 symlink", out_usr_lib64, e))?;
             }
             WdSetup::BoundDir {
-                path,
+                path: _,
                 fs_mappings,
                 read_only: _,
             } => {
-                let cwd = rootfs.join(path);
-                fs::create_dir_all(&cwd)
-                    .map_err(|e| Error::IO("create shadow cwd tree", cwd.clone(), e))?;
+                let rootfs_cwd = rootfs.join(config.wd.bound_dir_sandbox_cwd());
+                fs::create_dir_all(&rootfs_cwd)
+                    .map_err(|e| Error::IO("create shadow cwd tree", rootfs_cwd, e))?;
 
                 // Create bind-mount targets
                 for m in fs_mappings {
-                    let p = rootfs.join(m.path_in_sandbox());
+                    let sp = m.path_in_sandbox();
+                    let sp = match sp.strip_prefix("/") {
+                        Some(stripped) => stripped,
+                        None => &sp,
+                    };
+                    let p = rootfs.join(sp);
 
                     if m.is_file {
                         fs::create_dir_all(p.parent().unwrap())
@@ -276,7 +281,10 @@ impl Container {
         let mut command = self.container.command(program);
         command.args(args);
         command.current_dir(match &sandbox.config.wd {
-            WdSetup::BoundDir { path, .. } => path.to_str().unwrap().to_string(),
+            WdSetup::BoundDir { .. } => format!(
+                "/{}",
+                sandbox.config.wd.bound_dir_sandbox_cwd().to_str().unwrap()
+            ),
             WdSetup::Isolated { .. } => "/build".to_string(),
         });
 
@@ -357,12 +365,26 @@ impl<C: Channel> Sandbox<C> {
                 path,
                 read_only: false,
                 fs_mappings: _,
-            } => container.bindmount_rw(path.to_str().unwrap(), path.to_str().unwrap()),
+            } => container.bindmount_rw(
+                path.to_str().unwrap(),
+                format!(
+                    "/{}",
+                    self.config.wd.bound_dir_sandbox_cwd().to_str().unwrap()
+                )
+                .as_str(),
+            ),
             WdSetup::BoundDir {
                 path,
                 read_only: true,
                 fs_mappings: _,
-            } => container.bindmount_ro(path.to_str().unwrap(), path.to_str().unwrap()),
+            } => container.bindmount_ro(
+                path.to_str().unwrap(),
+                format!(
+                    "/{}",
+                    self.config.wd.bound_dir_sandbox_cwd().to_str().unwrap()
+                )
+                .as_str(),
+            ),
         };
         // Mount in any file mappings
         if let WdSetup::BoundDir { fs_mappings, .. } = &self.config.wd {

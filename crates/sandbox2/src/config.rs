@@ -60,6 +60,30 @@ pub enum WdSetup {
     },
 }
 
+impl WdSetup {
+    /// Returns the path within the sandbox of the cwd. The returned path
+    /// is always relative.
+    ///
+    /// SAFETY:
+    ///  * This function will panic if the variant is not `BoundDir`.
+    pub(crate) fn bound_dir_sandbox_cwd(&self) -> &Path {
+        let p = match self {
+            Self::BoundDir { path, .. } => match std::env::var("MINIMAL_INTERNAL_PATCH_STRIP") {
+                Err(_) => path,
+                Ok(prefix) => match path.strip_prefix(&prefix) {
+                    Err(_) => path,
+                    Ok(stripped) => stripped,
+                },
+            },
+            _ => panic!("sandbox_cwd called for non bound-dir variant {:?}", self),
+        };
+        if p.is_absolute() {
+            return p.strip_prefix("/").unwrap();
+        }
+        p
+    }
+}
+
 /// Describes the setup of a sandbox.
 #[derive(Debug)]
 pub struct Config {
