@@ -6,6 +6,7 @@ use std::{
 use super::Error;
 use crate::{CheckCtx, CheckResult, CheckVerdict};
 use anyhow::anyhow;
+use common::target::Arch;
 use graph::{BuildOutput, BuildSpecRef, Graph, Transitives};
 use lcache::{CacheErr, DirCacheEntry, LocalDir};
 use object::{Object, ObjectSymbol};
@@ -60,7 +61,22 @@ impl crate::GraphBasedChecker for OutputTypesValid {
                 let data = std::fs::read(&path)
                     .map_err(|e| Error::IO("reading output file", path.to_path_buf(), e))?;
                 match (object::File::parse(&*data), output) {
-                    (Ok(_), BuildOutput::Binary { .. } | BuildOutput::Library { .. }) => {}
+                    (Ok(f), BuildOutput::Binary { .. } | BuildOutput::Library { .. }) => {
+                        match (f.architecture(), graph.target().arch()) {
+                            (object::Architecture::Aarch64, Arch::Arm64) => {}
+                            (object::Architecture::X86_64, Arch::Amd64) => {}
+                            (elf_arch, graph_arch) => {
+                                result.verdict = CheckVerdict::Fail;
+                                result.err.push(format!(
+                                    "output \"{}\": {} has an ELF arch of {:?}, expected {:?}",
+                                    name,
+                                    path.strip_prefix(cached_build.path()).unwrap().display(),
+                                    elf_arch,
+                                    graph_arch,
+                                ));
+                            }
+                        };
+                    }
                     (Err(_), BuildOutput::Data { .. }) => {}
                     (
                         Ok(_),
