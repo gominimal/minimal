@@ -27,6 +27,10 @@ impl std::error::Error for ConfigError {
     }
 }
 
+/// Default GCS bucket name used when the caller does not configure one
+/// via [ConfigBuilder::with_remote_cache_bucket].
+pub const DEFAULT_REMOTE_CACHE_BUCKET: &str = "minimal-staging-cache";
+
 /// Builder for [Config].
 #[derive(Debug, Default, Clone)]
 pub struct ConfigBuilder {
@@ -39,6 +43,7 @@ pub struct ConfigBuilder {
     repo_dir: Option<PathBuf>,
     vcs_manager: Option<ManagerHandle>,
     ot: Option<OpTracker>,
+    remote_cache_bucket: Option<String>,
 }
 
 impl ConfigBuilder {
@@ -86,6 +91,12 @@ impl ConfigBuilder {
         self.ot = Some(ot);
         self
     }
+    /// Override the GCS bucket name used by the remote cache reader and
+    /// writer. Defaults to [DEFAULT_REMOTE_CACHE_BUCKET] when unset.
+    pub fn with_remote_cache_bucket(mut self, bucket: String) -> Self {
+        self.remote_cache_bucket = Some(bucket);
+        self
+    }
 }
 
 impl ConfigBuilder {
@@ -107,6 +118,9 @@ impl ConfigBuilder {
             repo_dir: self.repo_dir,
             vcs_manager: self.vcs_manager,
             ot: self.ot,
+            remote_cache_bucket: self
+                .remote_cache_bucket
+                .unwrap_or_else(|| DEFAULT_REMOTE_CACHE_BUCKET.to_string()),
         })
     }
 }
@@ -131,6 +145,10 @@ pub struct Config {
     vcs_manager: Option<ManagerHandle>,
     /// The [OpTracker] to use instead of the root.
     pub(crate) ot: Option<OpTracker>,
+    /// GCS bucket name for the remote cache reader/writer. Always set —
+    /// defaults to [DEFAULT_REMOTE_CACHE_BUCKET] when the builder did
+    /// not specify one.
+    remote_cache_bucket: String,
 }
 
 impl Config {
@@ -157,6 +175,10 @@ impl Config {
     /// Returns the maximum number of parallel builds that may take place at once.
     pub fn num_parallel_builds(&self) -> usize {
         self.num_parallel_builds
+    }
+    /// Returns the GCS bucket name for the remote cache.
+    pub fn remote_cache_bucket(&self) -> &str {
+        &self.remote_cache_bucket
     }
 
     pub(crate) fn cache_dir(&self) -> PathBuf {
