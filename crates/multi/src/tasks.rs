@@ -45,6 +45,7 @@ pub struct Subscription {
 // ---------------------------------------------------------------------------
 
 /// Lifecycle state of a [`Task`].
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum TaskState {
     /// Configured but not yet started.
     #[allow(private_interfaces)]
