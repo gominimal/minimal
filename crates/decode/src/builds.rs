@@ -1724,4 +1724,56 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn parse_subset_of_upstream() {
+        let (term, mut program, _origin, _target) = Loader::new(
+            indoc! {
+                "
+                let {subsetOf, upstream, BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
+                {
+        			name = \"single buildspec\",
+        			build_deps = [subsetOf (upstream \"upstream-pkg\") [\"libgcc\"]],
+        			runtime_deps = [subsetOf (upstream \"upstream-pkg\") [\"libgcc\"]],
+        			cmd = \"./build.sh\",
+        		} | BuildSpec"
+            }
+            .to_string(),
+            None,
+            &LoadOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("load failed");
+        })
+        .finish()
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("finish failed");
+        });
+
+        let build = BuildDecl::from_term(&term, &mut program, &mut ()).unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("from_term failed");
+        });
+
+        assert_eq!(
+            build.build_deps[0],
+            BuildDep::Subset(SubsetInput {
+                from: BuildRef::Upstream {
+                    name: "upstream-pkg".to_string()
+                },
+                outputs: vec!["libgcc".to_string()].into()
+            })
+        );
+        assert_eq!(
+            build.runtime_deps[0],
+            RuntimeDep::Subset(SubsetInput {
+                from: BuildRef::Upstream {
+                    name: "upstream-pkg".to_string()
+                },
+                outputs: vec!["libgcc".to_string()].into()
+            })
+        );
+    }
 }

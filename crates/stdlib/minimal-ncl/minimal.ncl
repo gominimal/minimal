@@ -128,14 +128,25 @@ let CmdSpec = std.contract.any_of [
           | String,
     },
 
+    Subsettable | doc "Possible types which can be subsetted." = fun Contract =>
+        std.contract.custom (fun label value =>
+            match {
+                {ty = 'Builder, ..} => std.contract.check BuildSpec label value,
+                {ty = 'Upstream, ..} => std.contract.check UpstreamPkg label value,
+                _ => 'Error {
+                    message = "Expected Input type",
+                },
+            }
+            value
+        ),
     Subset | doc "A dependency on a subset of the outputs from another build spec." = {
         ty | Tys = 'Subset,
         from
-          | BuildSpec,
+          | Subsettable,
         outputs
           | Array String,
     },
-    subsetOf | BuildSpec -> Array String -> Subset | doc "Constructs a subset of the outputs of a build, for use as an input or runtime_dep." =
+    subsetOf | Dyn -> Array String -> Subset | doc "Constructs a subset of the outputs of a build, for use as an input or runtime_dep." =
       fun spec outputs =>
         {from = spec, include outputs}  | Subset,
 
