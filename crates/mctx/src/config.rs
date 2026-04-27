@@ -7,6 +7,9 @@ use ot::OpTracker;
 #[derive(Debug)]
 pub enum ConfigError {
     IO(&'static str, PathBuf, std::io::Error),
+    /// Configured remote cache bucket name is empty or whitespace-only.
+    /// Carries the offending value for diagnostics.
+    InvalidRemoteCacheBucket(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -14,6 +17,9 @@ impl fmt::Display for ConfigError {
         match self {
             ConfigError::IO(ctx, path, e) => {
                 write!(f, "{} I/O error at path {}: {}", ctx, path.display(), e)
+            }
+            ConfigError::InvalidRemoteCacheBucket(bucket) => {
+                write!(f, "invalid remote cache bucket: {:?}", bucket)
             }
         }
     }
@@ -23,9 +29,14 @@ impl std::error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ConfigError::IO(_, _, e) => Some(e),
+            ConfigError::InvalidRemoteCacheBucket(_) => None,
         }
     }
 }
+
+/// Default GCS bucket name used when the caller does not configure one
+/// via [ConfigBuilder::with_remote_cache_bucket].
+pub const DEFAULT_REMOTE_CACHE_BUCKET: &str = "minimal-staging-cache";
 
 /// Builder for [Config].
 #[derive(Debug, Default, Clone)]
@@ -39,6 +50,7 @@ pub struct ConfigBuilder {
     repo_dir: Option<PathBuf>,
     vcs_manager: Option<ManagerHandle>,
     ot: Option<OpTracker>,
+    remote_cache_bucket: Option<String>,
 }
 
 impl ConfigBuilder {
@@ -86,11 +98,24 @@ impl ConfigBuilder {
         self.ot = Some(ot);
         self
     }
+    /// Override the GCS bucket name used by the remote cache reader and
+    /// writer. Defaults to [DEFAULT_REMOTE_CACHE_BUCKET] when unset.
+    pub fn with_remote_cache_bucket(mut self, bucket: String) -> Self {
+        self.remote_cache_bucket = Some(bucket);
+        self
+    }
 }
 
 impl ConfigBuilder {
     /// Constructs a config object using the given builder.
     pub fn build(self) -> Result<Config, ConfigError> {
+        let remote_cache_bucket = self
+            .remote_cache_bucket
+            .unwrap_or_else(|| DEFAULT_REMOTE_CACHE_BUCKET.to_string());
+        if remote_cache_bucket.trim().is_empty() {
+            return Err(ConfigError::InvalidRemoteCacheBucket(remote_cache_bucket));
+        }
+
         Ok(Config {
             no_cache: self.no_cache.unwrap_or(false),
             no_fetch: self.no_fetch.unwrap_or(false),
@@ -107,6 +132,7 @@ impl ConfigBuilder {
             repo_dir: self.repo_dir,
             vcs_manager: self.vcs_manager,
             ot: self.ot,
+            remote_cache_bucket,
         })
     }
 }
@@ -131,6 +157,10 @@ pub struct Config {
     vcs_manager: Option<ManagerHandle>,
     /// The [OpTracker] to use instead of the root.
     pub(crate) ot: Option<OpTracker>,
+    /// GCS bucket name for the remote cache reader/writer. Always set —
+    /// defaults to [DEFAULT_REMOTE_CACHE_BUCKET] when the builder did
+    /// not specify one.
+    remote_cache_bucket: String,
 }
 
 impl Config {
@@ -157,6 +187,10 @@ impl Config {
     /// Returns the maximum number of parallel builds that may take place at once.
     pub fn num_parallel_builds(&self) -> usize {
         self.num_parallel_builds
+    }
+    /// Returns the GCS bucket name for the remote cache.
+    pub fn remote_cache_bucket(&self) -> &str {
+        &self.remote_cache_bucket
     }
 
     pub(crate) fn cache_dir(&self) -> PathBuf {
@@ -185,5 +219,43 @@ impl Config {
     }
     pub(crate) fn layer_cache_dir(&self) -> PathBuf {
         self.minimal_dir.join("lc")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_cache_bucket_defaults_when_unset() {
+        let cfg = ConfigBuilder::new().build().unwrap();
+        assert_eq!(cfg.remote_cache_bucket(), DEFAULT_REMOTE_CACHE_BUCKET);
+    }
+
+    #[test]
+    fn remote_cache_bucket_honors_override() {
+        let cfg = ConfigBuilder::new()
+            .with_remote_cache_bucket("my-bucket".into())
+            .build()
+            .unwrap();
+        assert_eq!(cfg.remote_cache_bucket(), "my-bucket");
+    }
+
+    #[test]
+    fn remote_cache_bucket_rejects_empty() {
+        let err = ConfigBuilder::new()
+            .with_remote_cache_bucket(String::new())
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidRemoteCacheBucket(_)));
+    }
+
+    #[test]
+    fn remote_cache_bucket_rejects_whitespace_only() {
+        let err = ConfigBuilder::new()
+            .with_remote_cache_bucket("   \t\n".into())
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidRemoteCacheBucket(_)));
     }
 }

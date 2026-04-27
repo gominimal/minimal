@@ -19,7 +19,7 @@ use rcache::{Error as RemoteError, RemoteBinProvider, RemoteCache, RemoteCacheWr
 mod error;
 pub use error::Error;
 mod config;
-pub use config::{Config, ConfigBuilder, ConfigError};
+pub use config::{Config, ConfigBuilder, ConfigError, DEFAULT_REMOTE_CACHE_BUCKET};
 mod env;
 use graph::{BinProvider, BuildSpecRef, Graph, MaskingBinProvider, Transitives};
 use mfile::{EnvPatches, EnvVarValue, LinkConfig, Task};
@@ -362,7 +362,7 @@ impl Context {
 
         let res = RemoteCache::new_with_gcs_bucket(
             backend,
-            "minimal-staging-cache",
+            self.config.remote_cache_bucket(),
             if force_fresh {
                 None
             } else {
@@ -382,8 +382,12 @@ impl Context {
     pub async fn remote_cache_writer(&self) -> Result<RemoteCacheWriter, RemoteError<GcsError>> {
         let start = SystemTime::now();
         let backend = GcsStorage::builder().build().await.unwrap();
-        let res =
-            RemoteCacheWriter::new(backend, "minimal-staging-cache", self.config.ot.clone()).await;
+        let res = RemoteCacheWriter::new(
+            backend,
+            self.config.remote_cache_bucket(),
+            self.config.ot.clone(),
+        )
+        .await;
         tracing::trace!("remote cache writer init took {:?}", start.elapsed());
         res
     }
