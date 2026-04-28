@@ -191,15 +191,15 @@ impl EnvChannel<'_> {
             } else {
                 None
             },
-            check::CheckCtx {
-                graph: Some(std::sync::Arc::new(tokio::sync::RwLock::new(graph))),
+            check::CheckCtx::new(
                 filter_names,
-                skip_checkers: vec![],
-                stdlib_dir: check_ctx.stdlib_dir().to_path_buf(),
-                cache: check_ctx.local_cache(),
+                vec![],
                 fix,
-                ot: self.ot.clone(),
-            },
+                Some(std::sync::Arc::new(tokio::sync::RwLock::new(graph))),
+                check_ctx.stdlib_dir().to_path_buf(),
+                check_ctx.local_cache(),
+                self.ot.clone(),
+            ),
         ) {
             Err(e) => return EnvChannel::write_error(e.into(), stream),
             Ok(res_stream) => res_stream,

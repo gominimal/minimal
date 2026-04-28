@@ -20,7 +20,7 @@ use std::future::Future;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
-use tokio::sync::{RwLock, RwLockReadGuard};
+use tokio::sync::{RwLock, RwLockReadGuard, Semaphore};
 
 /// A shared buffer that implements [`tokio::io::AsyncWrite`], allowing captured
 /// output to be retrieved after the writer is consumed.
@@ -251,6 +251,30 @@ impl Display for CheckObj {
 pub type CheckFuture =
     std::pin::Pin<Box<dyn Future<Output = (CheckObj, Result<Vec<CheckResult>, Error>)> + Send>>;
 
+/// Shared, single-flighted cache for expensive computations during checks.
+#[derive(Clone)]
+pub struct CheckCache {
+    /// Cache for [`common::match_files_for_glob`] results, keyed by `(dir, glob)`.
+    glob_cache: moka::sync::Cache<(PathBuf, String), Arc<Vec<PathBuf>>>,
+}
+
+impl CheckCache {
+    fn new() -> Self {
+        Self {
+            glob_cache: moka::sync::Cache::new(1024),
+        }
+    }
+
+    /// Single-flighted, cached wrapper around [`common::match_files_for_glob`].
+    pub fn match_files_for_glob(&self, dir: &Path, glob: &str) -> Result<Arc<Vec<PathBuf>>, Error> {
+        self.glob_cache
+            .try_get_with((dir.to_path_buf(), glob.to_string()), || {
+                common::match_files_for_glob(dir, glob).map(Arc::new)
+            })
+            .map_err(|e| Error::Other(anyhow!("{e}")))
+    }
+}
+
 /// Parameters that remain constant across all checkers within a single
 /// [`run_checks`] invocation.
 #[derive(Clone)]
@@ -263,6 +287,34 @@ pub struct CheckCtx {
     pub stdlib_dir: PathBuf,
     pub cache: Cache<LocalDir>,
     pub ot: Option<OpTracker>,
+
+    /// Limits the number of concurrent package/harness/profile checks.
+    semaphore: Arc<Semaphore>,
+    pub check_cache: Arc<CheckCache>,
+}
+
+impl CheckCtx {
+    pub fn new(
+        filter_names: Vec<String>,
+        skip_checkers: Vec<String>,
+        fix: bool,
+        graph: Option<Arc<RwLock<Graph>>>,
+        stdlib_dir: PathBuf,
+        cache: Cache<LocalDir>,
+        ot: Option<OpTracker>,
+    ) -> Self {
+        Self {
+            filter_names,
+            skip_checkers,
+            fix,
+            graph,
+            stdlib_dir,
+            cache,
+            ot,
+            semaphore: Arc::new(Semaphore::new(16)),
+            check_cache: Arc::new(CheckCache::new()),
+        }
+    }
 }
 
 /// Runs checkers, returning a [`FuturesUnordered`] that yields results as each check completes.
@@ -324,6 +376,7 @@ fn package_check_futures(packages_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<Che
         .map::<CheckFuture, _>(move |(pkg, dir)| {
             let ctx = ctx.clone();
             Box::pin(async move {
+                let _permit = ctx.semaphore.clone().acquire_owned().await.unwrap();
                 let result = check_package(pkg.clone(), dir, ctx);
                 (CheckObj::Package(pkg), result.await)
             })
@@ -368,6 +421,7 @@ fn profile_check_futures(profiles_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<Che
             let profiles_dir = profiles_dir.clone();
 
             Box::pin(async move {
+                let _permit = ctx.semaphore.acquire().await.unwrap();
                 (
                     CheckObj::Profile(pd.to_str().unwrap().to_string()),
                     profile::check_profile(pd.to_str().unwrap().to_string(), &ctx, profiles_dir)
@@ -415,6 +469,7 @@ fn harness_check_futures(harnesses_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<Ch
             let harnesses_dir = harnesses_dir.clone();
 
             Box::pin(async move {
+                let _permit = ctx.semaphore.acquire().await.unwrap();
                 (
                     CheckObj::Harness(pd.to_str().unwrap().to_string()),
                     harness::check_harness(pd.to_str().unwrap().to_string(), &ctx, harnesses_dir)
@@ -548,6 +603,14 @@ impl FileBasedChecker for ParseCheck {
             return Ok(CheckResult {
                 check: "parse".into(),
                 verdict: CheckVerdict::Skip,
+                err: vec![],
+            });
+        }
+        // Fast path: if the graph was constructed, everything must have parsed and typechecked.
+        if ctx.graph.is_some() {
+            return Ok(CheckResult {
+                check: "parse".into(),
+                verdict: CheckVerdict::Pass,
                 err: vec![],
             });
         }

@@ -4,7 +4,7 @@ use std::{
 };
 
 use super::Error;
-use crate::{CheckCtx, CheckResult, CheckVerdict};
+use crate::{CheckCache, CheckCtx, CheckResult, CheckVerdict};
 use anyhow::anyhow;
 use common::target::Arch;
 use graph::{BuildOutput, BuildSpecRef, Graph, Transitives};
@@ -54,11 +54,12 @@ impl crate::GraphBasedChecker for OutputTypesValid {
         result.verdict = CheckVerdict::Pass;
         for (name, output) in &build.outputs {
             let glob = output.glob();
-            for path in common::match_files_for_glob(cached_build.path(), glob)
-                .map_err(|e| Error::Other(anyhow!(e)))?
-                .into_iter()
+            for path in ctx
+                .check_cache
+                .match_files_for_glob(cached_build.path(), glob)?
+                .iter()
             {
-                let data = std::fs::read(&path)
+                let data = std::fs::read(path)
                     .map_err(|e| Error::IO("reading output file", path.to_path_buf(), e))?;
                 match (object::File::parse(&*data), output) {
                     (Ok(f), BuildOutput::Binary { .. } | BuildOutput::Library { .. }) => {
@@ -136,6 +137,7 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
         graph: RwLockReadGuard<'_, Graph>,
         _ot: Option<OpTracker>,
     ) -> Result<CheckResult, Error> {
+        let check_cache = ctx.check_cache.clone();
         let cache = ctx.cache.clone();
         let mut result = CheckResult {
             verdict: CheckVerdict::Skip,
@@ -198,11 +200,8 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
                 HashMap::with_capacity(32);
             for (name, output) in &build.outputs {
                 let glob = output.glob();
-                for path in common::match_files_for_glob(cached_build.path(), glob)
-                    .map_err(|e| Error::Other(anyhow!(e)))?
-                    .into_iter()
-                {
-                    let data = std::fs::read(&path)
+                for path in check_cache.match_files_for_glob(cached_build.path(), glob)?.iter() {
+                    let data = std::fs::read(path)
                         .map_err(|e| Error::IO("reading output file", path.to_path_buf(), e))?;
                     if let (Ok(elf), BuildOutput::Binary { .. } | BuildOutput::Library { .. }) =
                         (object::File::parse(&*data), output)
@@ -271,7 +270,7 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
                 }
             }
             for (needed_lib, outputs) in &all_imports {
-                match find_lib_in_deps(needed_lib, &deps)? {
+                match find_lib_in_deps(&check_cache, needed_lib, &deps)? {
                     Some((idx, lib_path)) => {
                         // There was a library, check that all the symbols we need are present.
                         let data =
@@ -410,7 +409,8 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
 }
 
 fn find_lib_in_deps(
-    lib: &String,
+    check_cache: &CheckCache,
+    lib: &str,
     deps: &[(BuildSpecRef, DirCacheEntry<LocalDir>)],
 ) -> Result<Option<(usize, PathBuf)>, Error> {
     let glob = if lib.starts_with("/") {
@@ -422,10 +422,9 @@ fn find_lib_in_deps(
     for (i, (_bsr, dep_files)) in deps.iter().enumerate() {
         let base = dep_files.path();
 
-        if let Some(candidate) = (common::match_files_for_glob(dep_files.path(), &glob)
-            .map_err(|e| Error::Other(anyhow!(e)))?)
-        .into_iter()
-        .next()
+        if let Some(candidate) = check_cache
+            .match_files_for_glob(dep_files.path(), &glob)?
+            .first()
         {
             return Ok(Some((
                 i,
