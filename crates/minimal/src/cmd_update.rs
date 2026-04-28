@@ -39,9 +39,35 @@ pub async fn cmd_update(_args: UpdateArgs, ctx: &mut Context) -> Result<(), Erro
         None
     };
 
+    // Update all the sideloads, if present
+    let sideload_updates = if let Some(sideloads) = mfile.upstream.as_ref().map(|u| u.sideloads()) {
+        sideloads
+            .iter()
+            .map(|s| match s.link() {
+                mfile::LinkConfig::Git {
+                    repo,
+                    branch: Some(branch),
+                    locked_commit,
+                } => {
+                    let new_git_ref = vcs
+                        .checkout_of(repo, checkouts::GitRef::Branch(branch.clone()))?
+                        .1;
+                    if Some(&new_git_ref) != locked_commit.as_ref() {
+                        Ok(Some(new_git_ref))
+                    } else {
+                        Ok(None)
+                    }
+                }
+                _ => Ok(None),
+            })
+            .collect::<Result<Vec<_>, Error>>()?
+    } else {
+        vec![]
+    };
+
     // If theres a minimal file on disk, and theres at least one new rev, write the revs to the minimal file.
     if let Some(p) = mfile_path
-        && new_up_rev.is_some()
+        && (new_up_rev.is_some() || sideload_updates.iter().any(|u| u.is_some()))
     {
         use toml_edit::{DocumentMut, value};
         let toml = std::fs::read_to_string(&p)
@@ -64,6 +90,24 @@ pub async fn cmd_update(_args: UpdateArgs, ctx: &mut Context) -> Result<(), Erro
                 },
                 new_rev
             )
+        }
+
+        // Update sideloads
+        for (i, rev) in sideload_updates.into_iter().enumerate() {
+            if let Some(new_rev) = rev {
+                println!(
+                    "Sideload {}:{} updated from {} to {}",
+                    doc["upstream"]["sideload"][i]["repo"].as_str().unwrap(),
+                    doc["upstream"]["sideload"][i]["branch"].as_str().unwrap(),
+                    doc["upstream"]["sideload"][i]
+                        .get("locked_commit")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("<unpinned>"),
+                    new_rev
+                );
+
+                doc["upstream"]["sideload"][i]["locked_commit"] = value(new_rev.clone());
+            }
         }
 
         std::fs::write(p, doc.to_string()).map_err(|e| Error::Other(anyhow::Error::from(e)))?;
