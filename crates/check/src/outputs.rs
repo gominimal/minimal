@@ -9,7 +9,7 @@ use anyhow::anyhow;
 use common::target::Arch;
 use graph::{BuildOutput, BuildSpecRef, Graph, Transitives};
 use lcache::{CacheErr, DirCacheEntry, LocalDir};
-use object::{Object, ObjectSymbol};
+use object::Object;
 use ot::OpTracker;
 use tokio::sync::RwLockReadGuard;
 
@@ -273,49 +273,8 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
                 match find_lib_in_deps(&check_cache, needed_lib, &deps)? {
                     Some((idx, lib_path)) => {
                         // There was a library, check that all the symbols we need are present.
-                        let data =
-                            std::fs::read(deps[idx].1.path().join(&lib_path)).map_err(|e| {
-                                Error::IO("reading library", deps[idx].1.path().join(&lib_path), e)
-                            })?;
-                        match object::File::parse(&*data) {
-                            Ok(elf) => {
-                                let exports = elf.exports().unwrap();
-                                let likely_glibc_stub_lib = exports.iter().any(|e| {
-                                    e.name().ends_with(b"__libpthread_version_placeholder")
-                                        || e.name().ends_with(b"__libdl_version_placeholder")
-                                        || e.name().ends_with(b"__librt_version_placeholder")
-                                });
-
-                                // Valid executable, lets check all the imported symbols are present as exports.
-                                let avail_symbols: HashSet<String> = exports
-                                    .iter()
-                                    .map(|e| String::from_utf8(e.name().to_vec()).unwrap())
-                                    .chain(
-                                        elf.dynamic_symbols()
-                                            .map(|s| s.name().unwrap().to_string()),
-                                    )
-                                    .chain(
-                                        if likely_glibc_stub_lib {
-                                            let data = std::fs::read(
-                                                deps[idx].1.path().join("usr/lib/libc.so.6"),
-                                            )
-                                            .map_err(|e| {
-                                                Error::IO(
-                                                    "reading libc",
-                                                    deps[idx].1.path().join("usr/lib/libc.so.6"),
-                                                    e,
-                                                )
-                                            })?;
-                                            object::File::parse(&*data)
-                                                .unwrap()
-                                                .dynamic_symbols()
-                                                .map(|s| s.name().unwrap().to_string())
-                                                .collect()
-                                        } else {
-                                            vec![]
-                                        },
-                                    )
-                                    .collect();
+                        match check_cache.lib_symbols(deps[idx].0, deps[idx].1.path(), &lib_path) {
+                            Ok(avail_symbols) => {
                                 let missing_symbols: Vec<&String> = outputs
                                     .values()
                                     .flatten()

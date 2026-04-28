@@ -7,13 +7,15 @@
 
 use anyhow::anyhow;
 use futures::stream::FuturesUnordered;
-use graph::Graph;
+use graph::{BuildSpecRef, Graph};
 use lcache::{Cache, CacheErr, LocalDir};
+use object::{Object, ObjectSymbol};
 use op::{Options, Runnable, StandaloneTest};
 use ot::{OpTracker, Operation};
 use regex::Regex;
 use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::fmt;
 use std::fmt::Display;
 use std::future::Future;
@@ -256,12 +258,15 @@ pub type CheckFuture =
 pub struct CheckCache {
     /// Cache for [`common::match_files_for_glob`] results, keyed by `(dir, glob)`.
     glob_cache: moka::sync::Cache<(PathBuf, String), Arc<Vec<PathBuf>>>,
+    /// Cache for library symbol sets, keyed by `(BuildSpecRef, lib_path)`.
+    symbols_cache: moka::sync::Cache<(BuildSpecRef, PathBuf), Arc<HashSet<String>>>,
 }
 
 impl CheckCache {
     fn new() -> Self {
         Self {
-            glob_cache: moka::sync::Cache::new(1024),
+            glob_cache: moka::sync::Cache::new(1536),
+            symbols_cache: moka::sync::Cache::new(96),
         }
     }
 
@@ -272,6 +277,51 @@ impl CheckCache {
                 common::match_files_for_glob(dir, glob).map(Arc::new)
             })
             .map_err(|e| Error::Other(anyhow!("{e}")))
+    }
+
+    /// Single-flighted, cached lookup of the exported/dynamic symbols in a library.
+    pub fn lib_symbols(
+        &self,
+        bsr: BuildSpecRef,
+        dep_path: &Path,
+        lib_path: &Path,
+    ) -> Result<Arc<HashSet<String>>, Arc<anyhow::Error>> {
+        self.symbols_cache.try_get_with(
+            (bsr, lib_path.to_path_buf()),
+            || -> Result<Arc<HashSet<String>>, anyhow::Error> {
+                let full_path = dep_path.join(lib_path);
+                let data = std::fs::read(&full_path)
+                    .map_err(|e| anyhow!("reading library {}: {e}", full_path.display()))?;
+                let elf = object::File::parse(&*data)
+                    .map_err(|e| anyhow!("parsing {}: {e}", full_path.display()))?;
+
+                let exports = elf.exports().unwrap();
+                let likely_glibc_stub_lib = exports.iter().any(|e| {
+                    e.name().ends_with(b"__libpthread_version_placeholder")
+                        || e.name().ends_with(b"__libdl_version_placeholder")
+                        || e.name().ends_with(b"__librt_version_placeholder")
+                });
+
+                let mut symbols: HashSet<String> = exports
+                    .iter()
+                    .map(|e| String::from_utf8(e.name().to_vec()).unwrap())
+                    .chain(elf.dynamic_symbols().map(|s| s.name().unwrap().to_string()))
+                    .collect();
+
+                if likely_glibc_stub_lib {
+                    let libc_path = dep_path.join("usr/lib/libc.so.6");
+                    let data = std::fs::read(&libc_path)
+                        .map_err(|e| anyhow!("reading libc {}: {e}", libc_path.display()))?;
+                    let libc = object::File::parse(&*data).unwrap();
+                    symbols.extend(
+                        libc.dynamic_symbols()
+                            .map(|s| s.name().unwrap().to_string()),
+                    );
+                }
+
+                Ok(Arc::new(symbols))
+            },
+        )
     }
 }
 
@@ -311,7 +361,7 @@ impl CheckCtx {
             stdlib_dir,
             cache,
             ot,
-            semaphore: Arc::new(Semaphore::new(16)),
+            semaphore: Arc::new(Semaphore::new(20)),
             check_cache: Arc::new(CheckCache::new()),
         }
     }
