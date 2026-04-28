@@ -89,6 +89,7 @@ url = "2" # keep in sync with reqwest
 uuid = { version = "1.23", features = ["v4", "serde"] }
 zstd = "0.13"
 
+moka = { version = "0.12", default-features = false, features = ["sync"] }
 globset = "0.4"
 walkdir = "2.5"
 

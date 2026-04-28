@@ -99,15 +99,15 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
         Ok(g) => (Some(g), None),
     };
 
-    let check_ctx = CheckCtx {
-        graph: graph.map(|g| Arc::new(RwLock::new(g))),
-        filter_names: args.filter_names.clone(),
-        skip_checkers: args.skip_checkers.unwrap_or_default(),
-        stdlib_dir: ctx.stdlib_dir().to_path_buf(),
-        cache: ctx.local_cache(),
-        fix: args.fix,
-        ot: None,
-    };
+    let check_ctx = CheckCtx::new(
+        args.filter_names.clone(),
+        args.skip_checkers.unwrap_or_default(),
+        args.fix,
+        graph.map(|g| Arc::new(RwLock::new(g))),
+        ctx.stdlib_dir().to_path_buf(),
+        ctx.local_cache(),
+        None,
+    );
 
     let mut checks_stream = check::run_checks(
         if args.kind.check_packages() {

@@ -13,6 +13,7 @@ object.workspace = true
 regex.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+moka.workspace = true
 
 common.workspace = true
 decode.workspace = true
