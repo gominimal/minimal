@@ -137,6 +137,24 @@ impl ConfigBuilder {
     }
 }
 
+impl Config {
+    /// Converts this config back into a builder, preserving all values.
+    /// Useful for layering overrides on top of an existing configuration.
+    pub fn into_builder(self) -> ConfigBuilder {
+        ConfigBuilder {
+            no_cache: Some(self.no_cache),
+            no_fetch: Some(self.no_fetch),
+            num_parallel_builds: Some(self.num_parallel_builds),
+            minimal_dir: Some(self.minimal_dir),
+            stdlib_dir: self.stdlib_dir,
+            repo_dir: self.repo_dir,
+            vcs_manager: self.vcs_manager,
+            ot: self.ot,
+            remote_cache_bucket: Some(self.remote_cache_bucket),
+        }
+    }
+}
+
 /// Configuration for a [super::Context].
 #[derive(Debug, Clone)]
 pub struct Config {

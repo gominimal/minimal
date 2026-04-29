@@ -329,9 +329,16 @@ impl Context {
     pub fn index_dir(&self) -> PathBuf {
         self.config.index_dir()
     }
+    /// Returns the directory where compiled layers are cached.
+    pub fn layer_cache_dir(&self) -> PathBuf {
+        self.config.layer_cache_dir()
+    }
+
     /// Returns the path to the root of the repo.
     pub fn repo_dir(&self) -> &Path {
-        self.mfile.repo_path().unwrap()
+        self.mfile
+            .repo_path()
+            .unwrap_or_else(|| self.config.repo_dir_override().as_ref().unwrap())
     }
     /// Returns a path to the standard library.
     pub fn stdlib_dir(&self) -> &PathBuf {
@@ -618,7 +625,7 @@ impl Context {
         let wd = if let Some(wd) = wd {
             wd
         } else {
-            mfile.repo_path().unwrap().to_path_buf()
+            self.repo_dir().to_path_buf()
         };
         let state_base_dir = match state_key {
             Some(name) if !name.is_empty() => {
