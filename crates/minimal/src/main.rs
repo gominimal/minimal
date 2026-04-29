@@ -23,7 +23,7 @@ use cmd_patched_build::{PatchedBuildArgs, cmd_patched_build};
 #[cfg(target_os = "linux")]
 mod cmd_run;
 #[cfg(target_os = "linux")]
-use cmd_run::{RunArgs, cmd_run};
+use cmd_run::{RunArgs, cmd_run, cmd_run_by_spec};
 mod cmd_dep;
 use cmd_dep::{DepArgs, cmd_dep};
 mod cmd_update;
@@ -56,7 +56,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Runs a task specified in `minimal.toml`.
+    /// Runs a task, such as one specified in `minimal.toml`.
     #[cfg(target_os = "linux")]
     Run(RunArgs),
     /// Refreshes local checkouts of upstream packages & the standard library.
@@ -186,13 +186,6 @@ async fn main() -> Result<(), Error> {
 
     let cli = Cli::parse();
 
-    if let Command::Completions(CompletionsArgs { shell }) = &cli.command {
-        let mut cmd = Cli::command();
-        let name = cmd.get_name().to_string();
-        clap_complete::generate(*shell, &mut cmd, name, &mut io::stdout());
-        return Ok(());
-    }
-
     let result = run_cli(cli).await;
 
     if let Err(e) = result {
@@ -225,10 +218,25 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
     }
     let config = config.build()?;
 
-    // `minimal init` is typically run where there exists no `minimal.toml`, so
-    // context setup will fail.
-    if let Command::Init(args) = command {
-        return cmd_init(args, config).await;
+    // Commands that don't need a minimal.toml / full Context.
+    match command {
+        Command::Completions(CompletionsArgs { shell }) => {
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, name, &mut io::stdout());
+            return Ok(());
+        }
+        Command::Init(args) => return cmd_init(args, config).await,
+        #[cfg(target_os = "linux")]
+        Command::Run(RunArgs {
+            variant:
+                cmd_run::RunVariant::BySpec {
+                    upstream,
+                    task_spec,
+                },
+            task_args,
+        }) => return cmd_run_by_spec(upstream, task_spec, task_args, config).await,
+        _ => {}
     }
     let mut ctx = Context::new(config)?;
 
@@ -245,7 +253,9 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         Command::Shell => {
             cmd_run(
                 RunArgs {
-                    task_name: "shell".to_string(),
+                    variant: cmd_run::RunVariant::ByName {
+                        task_name: "shell".to_string(),
+                    },
                     task_args: vec![],
                 },
                 &mut ctx,
@@ -255,7 +265,9 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         Command::Build => {
             cmd_run(
                 RunArgs {
-                    task_name: "build".to_string(),
+                    variant: cmd_run::RunVariant::ByName {
+                        task_name: "build".to_string(),
+                    },
                     task_args: vec![],
                 },
                 &mut ctx,
@@ -265,7 +277,9 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         Command::Test => {
             cmd_run(
                 RunArgs {
-                    task_name: "test".to_string(),
+                    variant: cmd_run::RunVariant::ByName {
+                        task_name: "test".to_string(),
+                    },
                     task_args: vec![],
                 },
                 &mut ctx,
@@ -279,8 +293,7 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         Command::Rexec(args) => cmd_rexec(args, &mut ctx).await,
         Command::RemoteBuild(args) => cmd_remote_build(args, &mut ctx).await,
         Command::Cache(args) => cmd_cache(args, &mut ctx).await,
-        // Handled earlier
-        Command::Completions(_) => Ok(()),
-        Command::Init(_) => Ok(()),
+        // Handled before Context::new
+        Command::Completions(_) | Command::Init(_) => unreachable!(),
     }
 }
