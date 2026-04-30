@@ -30,10 +30,32 @@ jobs:
               "text": "*Promotion approval required:* `${{ github.repository }}`\nWorkflow: `${{ github.workflow }}`\nRequested by: ${{ github.actor }}\nApprove: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             }
 
-  promote:
+  approval:
     needs: notify-pending
     runs-on: ubuntu-latest
-    environment: production
+    permissions:
+      issues: write
+    timeout-minutes: 1440
+    steps:
+      - name: Wait for manual approval
+        uses: trstringer/manual-approval@74d99dff7380e3e4b122d4ededcbca2b6ce59367 # v1.12.0
+        with:
+          secret: ${{ secrets.GITHUB_TOKEN }}
+          approvers: bryan-minimal,evanspearman,jessie-minimal,jtnkminimal,Max-minimal,mitodrummer,msample,norrietaylor,twitchyliquid64
+          minimum-approvals: 1
+          issue-title: "Promotion approval required: ${{ github.workflow }} run ${{ github.run_number }}"
+          issue-body: |
+            **Repo:** `${{ github.repository }}`
+            **Workflow:** `${{ github.workflow }}`
+            **Requested by:** @${{ github.actor }}
+            **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Comment **`approved`** to proceed or **`denied`** to cancel.
+          exclude-workflow-initiator-as-approver: true
+
+  promote:
+    needs: approval
+    runs-on: ubuntu-latest
     permissions:
       contents: "read"
       id-token: "write"
