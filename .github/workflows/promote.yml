@@ -39,7 +39,9 @@ jobs:
           REPO: ${{ github.repository }}
           WORKFLOW: ${{ github.workflow }}
           RUN_NUMBER: ${{ github.run_number }}
-          ACTOR: ${{ github.actor }}
+          # triggering_actor (NOT actor) — actor is frozen on rerun, so a rerun
+          # by a different user would still let the original initiator self-approve.
+          ACTOR: ${{ github.triggering_actor }}
           SERVER_URL: ${{ github.server_url }}
           RUN_ID: ${{ github.run_id }}
           SHA_INPUT: ${{ inputs.sha }}
@@ -80,7 +82,7 @@ jobs:
           webhook-type: incoming-webhook
           payload: |
             {
-              "text": "*Promotion approval required:* `${{ github.repository }}`\nRequested by: ${{ github.actor }}\nApprove here: ${{ steps.issue.outputs.url }}\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+              "text": "*Promotion approval required:* `${{ github.repository }}`\nRequested by: ${{ github.triggering_actor }}\nApprove here: ${{ steps.issue.outputs.url }}\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             }
 
       - name: Wait for approver decision
@@ -88,7 +90,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
           REPO: ${{ github.repository }}
-          INITIATOR: ${{ github.actor }}
+          # triggering_actor reflects the user who triggered THIS run (incl. reruns),
+          # so rerunning the workflow as a different user correctly excludes them.
+          INITIATOR: ${{ github.triggering_actor }}
           POLL_INTERVAL: "30"
         run: |
           set -euo pipefail
@@ -156,9 +160,14 @@ jobs:
       - name: Promote CLI version
         env:
           DRY_RUN: ${{ inputs.dry_run }}
+          # Pass dispatch inputs via env (NOT inline ${{ inputs.* }} in `run:`)
+          # to avoid shell template injection — see GitHub's hardening guide.
+          INPUT_SHA: ${{ inputs.sha }}
+          INPUT_PLATFORMS: ${{ inputs.platforms }}
         run: |
-          SHA="$(echo "${{ inputs.sha }}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-          PLATFORMS="$(echo "${{ inputs.platforms }}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          # Trim leading/trailing whitespace; users often paste SHAs with stray spaces.
+          SHA="$(printf '%s' "$INPUT_SHA" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          PLATFORMS="$(printf '%s' "$INPUT_PLATFORMS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
 
           if [ "$PLATFORMS" = "all" ]; then
             PLATFORMS="amd64-linux,arm64-linux"
