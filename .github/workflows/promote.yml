@@ -14,8 +14,24 @@ on:
         type: string
 
 jobs:
-  promote:
+  notify-pending:
     runs-on: ubuntu-latest
+    steps:
+      - name: Notify Slack — approval required
+        continue-on-error: true
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "*Promotion approval required:* `${{ github.repository }}`\nWorkflow: `${{ github.workflow }}`\nRequested by: ${{ github.actor }}\nApprove: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+
+  promote:
+    needs: notify-pending
+    runs-on: ubuntu-latest
+    environment: production
     permissions:
       contents: "read"
       id-token: "write"
