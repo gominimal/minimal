@@ -1,4 +1,7 @@
-use std::{fmt, path::PathBuf};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+};
 
 use checkouts::ManagerHandle;
 use ot::OpTracker;
@@ -74,18 +77,18 @@ impl ConfigBuilder {
         self
     }
     /// Overrides the base directory for system state.
-    pub fn with_state_dir(mut self, dir: PathBuf) -> Self {
-        self.minimal_dir = Some(dir);
+    pub fn with_state_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.minimal_dir = Some(dir.into());
         self
     }
     /// Overrides loading of the standard library, getting it from the given path instead.
-    pub fn with_stdlib_dir(mut self, dir: PathBuf) -> Self {
-        self.stdlib_dir = Some(dir);
+    pub fn with_stdlib_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.stdlib_dir = Some(dir.into());
         self
     }
     /// Use the repository rooted at the given directory, instead of inferring it from the cwd.
-    pub fn with_repo_dir(mut self, dir: PathBuf) -> Self {
-        self.repo_dir = Some(dir);
+    pub fn with_repo_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.repo_dir = Some(dir.into());
         self
     }
     /// Use the specified vcs manager instead of initializing one from disk.
@@ -182,16 +185,16 @@ pub struct Config {
 }
 
 impl Config {
-    pub(crate) fn stdlib_dir_override(&self) -> &Option<PathBuf> {
-        &self.stdlib_dir
+    pub(crate) fn stdlib_dir_override(&self) -> Option<&Path> {
+        self.stdlib_dir.as_deref()
     }
     pub(crate) fn vcs_manager_override(&self) -> Option<ManagerHandle> {
         self.vcs_manager.clone()
     }
 
     /// Returns the path to the repo, if overridden (i.e. via '-C' argument).
-    pub fn repo_dir_override(&self) -> &Option<PathBuf> {
-        &self.repo_dir
+    pub fn repo_dir_override(&self) -> Option<&Path> {
+        self.repo_dir.as_deref()
     }
 
     /// Returns true if objects should be used from the local cache instead of fetched/rebuilt.

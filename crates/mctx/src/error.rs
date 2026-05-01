@@ -260,3 +260,9 @@ impl From<common::HardlinkError> for Error {
         }
     }
 }
+
+impl From<mfile::Error> for Error {
+    fn from(value: mfile::Error) -> Self {
+        Self::MFile(value)
+    }
+}

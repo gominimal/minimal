@@ -25,6 +25,9 @@ use graph::{BinProvider, BuildSpecRef, Graph, MaskingBinProvider, Transitives};
 use mfile::{EnvPatches, EnvVarValue, LinkConfig, Task};
 pub use sandbox2::config::Invocation;
 
+mod mfile_search_strategy;
+pub use mfile_search_strategy::MFileSearchStrategy;
+
 pub use env::Env;
 use tokio::sync::Semaphore;
 use toml_edit::{Array, DocumentMut, Item, TableLike, Value};
@@ -224,7 +227,7 @@ impl Context {
         //  - The version embedded in the binary, stamped to disk
         let stdlib_dir = {
             if let Some(dir) = config.stdlib_dir_override() {
-                dir.clone()
+                dir.to_path_buf()
             } else {
                 stdlib::upsert_stdlib_to_disk(config.stdlib_dir()).map_err(|e| {
                     Error::Other(anyhow!("loading embedded standard library: {}", e))
@@ -237,21 +240,20 @@ impl Context {
 
     /// Initializes a new context using the given configuration.
     pub fn new(config: Config) -> Result<Self, Error> {
-        let (vcs, cache, stdlib_dir) = Self::sub_setup(&config)?;
-
-        // Load the minimal file. All error are terminal.
-        let mfile = match config
-            .repo_dir_override()
-            .as_ref()
-            .map(|d| mfile::File::from_dir(d.clone()))
-            .unwrap_or_else(|| mfile::File::from_dir_recursive(std::env::current_dir().unwrap()))
-        {
-            Ok(mfile) => mfile,
-            Err(e) => {
-                return Err(Error::MFile(e));
+        let strategy = {
+            match config.repo_dir_override() {
+                Some(path) => MFileSearchStrategy::Override(path.to_path_buf()),
+                _ => MFileSearchStrategy::CurrentDirRecursive,
             }
         };
+        Self::new_with_strategy(config, strategy)
+    }
 
+    /// Initializes a new context using the given configuration and `strategy` for finding the mfile
+    /// This is useful when a given command needs to override the behaviour for finding the mfile
+    pub fn new_with_strategy(config: Config, strategy: MFileSearchStrategy) -> Result<Self, Error> {
+        let (vcs, cache, stdlib_dir) = Self::sub_setup(&config)?;
+        let mfile = strategy.find_mfile()?;
         Ok(Self {
             config,
             stdlib_dir,
