@@ -12,9 +12,142 @@ on:
         required: false
         default: "amd64-linux,arm64-linux"
         type: string
+      dry_run:
+        description: "Dry run — open issue + wait for approval but skip the GCS write"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  # Single source of truth for the gate's approver allowlist.
+  # Comma-separated, no spaces (the polling step splits on `,`).
+  APPROVERS: bryan-minimal,evanspearman,jessie-minimal,jtnkminimal,Max-minimal,mitodrummer,msample,norrietaylor,twitchyliquid64
 
 jobs:
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    # 6h matches the GitHub-hosted runner hard limit. A higher value is
+    # misleading — `ubuntu-latest` jobs are killed at 6h regardless.
+    timeout-minutes: 360
+    outputs:
+      issue_url: ${{ steps.issue.outputs.url }}
+    steps:
+      - name: Open approval issue
+        id: issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          WORKFLOW: ${{ github.workflow }}
+          RUN_NUMBER: ${{ github.run_number }}
+          # triggering_actor (NOT actor) — actor is frozen on rerun, so a rerun
+          # by a different user would still let the original initiator self-approve.
+          ACTOR: ${{ github.triggering_actor }}
+          SERVER_URL: ${{ github.server_url }}
+          RUN_ID: ${{ github.run_id }}
+          SHA_INPUT: ${{ inputs.sha }}
+          PLATFORMS_INPUT: ${{ inputs.platforms }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          BODY="**Repo:** \`${REPO}\`
+          **Workflow:** \`${WORKFLOW}\`
+          **Requested by:** @${ACTOR}
+          **Run:** ${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}
+          **SHA input:** \`${SHA_INPUT:-<latest>}\`
+          **Platforms:** \`${PLATFORMS_INPUT}\`
+          **Dry run:** \`${DRY_RUN}\`
+
+          Comment **\`approved\`** to proceed or **\`denied\`** to cancel.
+          Closing this issue without an approval comment counts as denial.
+
+          Approver list (initiator excluded at runtime):
+          ${APPROVERS//,/, }"
+
+          URL=$(gh issue create \
+            --repo "$REPO" \
+            --title "Promotion approval required: ${WORKFLOW} run ${RUN_NUMBER}" \
+            --label "promotion-approval" \
+            --body "$BODY")
+          NUM="${URL##*/}"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "number=$NUM" >> "$GITHUB_OUTPUT"
+          echo "Opened approval issue: $URL"
+
+      - name: Notify Slack — approval required
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: slackapi/slack-github-action@485a9d42d3a73031f12ec201c457e2162c45d02d # v2.0.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "*Promotion approval required:* `${{ github.repository }}`\nRequested by: ${{ github.triggering_actor }}\nApprove here: ${{ steps.issue.outputs.url }}\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+
+      - name: Wait for approver decision
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          REPO: ${{ github.repository }}
+          # triggering_actor reflects the user who triggered THIS run (incl. reruns),
+          # so rerunning the workflow as a different user correctly excludes them.
+          INITIATOR: ${{ github.triggering_actor }}
+          POLL_INTERVAL: "30"
+        run: |
+          set -euo pipefail
+
+          INITIATOR_LC=$(printf '%s' "$INITIATOR" | tr '[:upper:]' '[:lower:]')
+          ALLOWED_JSON=$(printf '%s' "$APPROVERS" | tr ',' '\n' \
+            | tr '[:upper:]' '[:lower:]' \
+            | grep -vx "$INITIATOR_LC" \
+            | jq -R . | jq -s .)
+
+          echo "Polling issue #${ISSUE_NUMBER}. Allowed approvers (initiator ${INITIATOR} excluded):"
+          echo "$ALLOWED_JSON" | jq -r '.[]'
+
+          while true; do
+            STATE=$(gh api "repos/${REPO}/issues/${ISSUE_NUMBER}" --jq '.state')
+
+            DECISION=$(gh api --paginate "repos/${REPO}/issues/${ISSUE_NUMBER}/comments?per_page=100" \
+              | jq -s 'add // []' \
+              | jq -c --argjson allowed "$ALLOWED_JSON" '
+                  map(select(.user.login | ascii_downcase as $u | $allowed | index($u)))
+                  | sort_by(.created_at)
+                  | map(
+                      (.body | ascii_downcase | gsub("[[:space:]]"; "")) as $b
+                      | if   ($b | test("^(approved|approve|lgtm)$"))      then {decision: "approved", user: .user.login}
+                        elif ($b | test("^(denied|deny|reject|rejected)$")) then {decision: "denied",   user: .user.login}
+                        else empty end
+                    )
+                  | first // empty')
+
+            if [ -n "$DECISION" ] && [ "$DECISION" != "null" ]; then
+              DEC=$(echo "$DECISION" | jq -r '.decision')
+              USR=$(echo "$DECISION" | jq -r '.user')
+              if [ "$DEC" = "approved" ]; then
+                echo "Approved by @${USR}."
+                gh issue close "$ISSUE_NUMBER" --repo "$REPO" --comment "Approved by @${USR}. Proceeding." || true
+                exit 0
+              else
+                echo "Denied by @${USR}."
+                gh issue close "$ISSUE_NUMBER" --repo "$REPO" --comment "Denied by @${USR}. Cancelling promotion." || true
+                exit 1
+              fi
+            fi
+
+            if [ "$STATE" = "closed" ]; then
+              echo "Issue closed without an approval comment — treating as denial."
+              exit 1
+            fi
+
+            sleep "$POLL_INTERVAL"
+          done
+
   promote:
+    needs: gate
     runs-on: ubuntu-latest
     permissions:
       contents: "read"
@@ -27,9 +160,16 @@ jobs:
           workload_identity_provider: "projects/289724348228/locations/global/workloadIdentityPools/github/providers/gominimal"
 
       - name: Promote CLI version
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          # Pass dispatch inputs via env (NOT inline ${{ inputs.* }} in `run:`)
+          # to avoid shell template injection — see GitHub's hardening guide.
+          INPUT_SHA: ${{ inputs.sha }}
+          INPUT_PLATFORMS: ${{ inputs.platforms }}
         run: |
-          SHA="$(echo "${{ inputs.sha }}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-          PLATFORMS="$(echo "${{ inputs.platforms }}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          # Trim leading/trailing whitespace; users often paste SHAs with stray spaces.
+          SHA="$(printf '%s' "$INPUT_SHA" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          PLATFORMS="$(printf '%s' "$INPUT_PLATFORMS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
 
           if [ "$PLATFORMS" = "all" ]; then
             PLATFORMS="amd64-linux,arm64-linux"
@@ -65,10 +205,20 @@ jobs:
             plat="$(echo "$plat" | tr -d ' ')"
             echo "Promoting CLI to ${SHA} for ${plat}..."
             echo "{\"version\":\"${SHA}\"}" > "cli-${plat}.json"
-            gcloud storage cp \
-              --cache-control="max-age=300" \
-              "cli-${plat}.json" \
-              "gs://minimal-shim/config/cli-${plat}.json"
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "[dry-run] would: gcloud storage cp --cache-control=max-age=300 cli-${plat}.json gs://minimal-shim/config/cli-${plat}.json"
+              echo "[dry-run] config payload:"
+              cat "cli-${plat}.json"
+            else
+              gcloud storage cp \
+                --cache-control="max-age=300" \
+                "cli-${plat}.json" \
+                "gs://minimal-shim/config/cli-${plat}.json"
+            fi
           done
 
-          echo "CLI promoted to ${SHA} for platforms: ${PLATFORMS}"
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "[dry-run] CLI would have been promoted to ${SHA} for platforms: ${PLATFORMS}"
+          else
+            echo "CLI promoted to ${SHA} for platforms: ${PLATFORMS}"
+          fi
