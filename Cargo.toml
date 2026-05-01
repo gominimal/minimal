@@ -114,4 +114,4 @@ remote-proto = { version = "0.0.1", path = "crates/remote-proto" }
 remote-client = { version = "0.0.1", path = "crates/remote-client" }
 sandbox2 = { version = "0.0.1", path = "crates/sandbox2" }
 
-stdlib = { version = "0.0.13", path = "crates/stdlib" }
+stdlib = { version = "0.0.14", path = "crates/stdlib" }

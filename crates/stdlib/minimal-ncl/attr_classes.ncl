@@ -35,6 +35,15 @@ let source_provenance_website = {
     downloads_page | String | optional | doc "The web page linking to the latest release or enumerating releases.",
 }
 in
+let PURL = std.contract.custom (fun _label value =>
+    if std.typeof value != 'String then
+        'Error { message = "PURLs must be a string" }
+    else if std.string.is_match m%%"^pkg:(alpm|apk|bitbucket|cargo|cpan|docker|deb|gem|generic|github|golang|huggingface|npm|oci|pypi|rpm|vscode|yocto)/([^@]*)@(?:[^\s]*)$"%% value then
+        'Ok value
+    else
+        'Error { message = "expected PURL string" }
+)
+in
 {
     upstream_version = {
         name = "upstream version",
@@ -73,6 +82,16 @@ in
         name = "spdx license string",
         desc = "The SPDX name of the license the software is covered by. See: https://spdx.org/licenses",
         validate = std.contract.any_of [String, Array String],
+    },
+    upstream_purl = {
+        name = "PURL(s) of the packaged software",
+        desc = "The Package URL describing upstream.",
+        validate = std.contract.any_of [PURL, Array PURL],
+    },
+    peer_purl = {
+        name = "PURL(s) of the software in other package managers",
+        desc = "Package URL(s) of the software within other package managers.",
+        validate = std.contract.any_of [PURL, Array PURL],
     },
 
     env_dir_mappings = {
