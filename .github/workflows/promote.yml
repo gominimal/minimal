@@ -28,7 +28,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       issues: write
-    timeout-minutes: 1440
+    # 6h matches the GitHub-hosted runner hard limit. A higher value is
+    # misleading — `ubuntu-latest` jobs are killed at 6h regardless.
+    timeout-minutes: 360
     outputs:
       issue_url: ${{ steps.issue.outputs.url }}
     steps:
