@@ -38,7 +38,7 @@ in
 let PURL = std.contract.custom (fun _label value =>
     if std.typeof value != 'String then
         'Error { message = "PURLs must be a string" }
-    else if std.string.is_match m%%"^pkg:(alpm|apk|bitbucket|cargo|cpan|docker|deb|gem|generic|github|golang|huggingface|npm|oci|pypi|rpm|vscode|yocto)/([^@]*)@(?:[^\s]*)$"%% value then
+    else if std.string.is_match m%%"^pkg:(alpm|apk|bitbucket|cargo|cpan|docker|deb|gem|generic|github|golang|huggingface|npm|oci|pypi|rpm|vscode|yocto)/[^\s/@]+(?:/[^\s/@]+)*(?:@[^\s?#]+)?(?:\?[^\s#]*)?(?:#[^\s]*)?$"%% value then
         'Ok value
     else
         'Error { message = "expected PURL string" }
