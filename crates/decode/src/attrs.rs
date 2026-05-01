@@ -279,4 +279,20 @@ mod tests {
 
         assert!(res.is_ok());
     }
+
+    #[test]
+    fn attr_upstream_purl_ok() {
+        let res = Loader::new(
+            "let {Attrs, ..} = import \"minimal.ncl\" in {upstream_purl = \"pkg:npm/foobar@12.3.1?arch=i386&distro=jessie\"} | Attrs",
+            None,
+            &LoadOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("load failed");
+        })
+        .finish();
+
+        assert!(res.is_ok());
+    }
 }
