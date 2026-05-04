@@ -1,7 +1,9 @@
 //! Command to initialize a minimal file based on matching the source tree to a valid harness.
 
 use std::io::Write;
+use std::path::PathBuf;
 
+use anyhow::anyhow;
 use common::{SpecOrigin, Target, repo_spec::Repo};
 use graph::Graph;
 use mctx::{Config, Context, Error};
@@ -19,63 +21,77 @@ const DEFAULT_PKGS_BRANCH: &str = "main";
 const FALLBACK_HARNESS: &str = "shell";
 
 pub async fn cmd_init(args: InitArgs, config: Config) -> Result<(), Error> {
+    let mfile_strategy = match config.repo_dir_override() {
+        Some(path) => mctx::MFileSearchStrategy::Override(path.to_path_buf()),
+        _ => mctx::MFileSearchStrategy::CurrentDirOnly,
+    };
     // Harnesses have the match rules, so we need a graph, either from the repo
     // minimal file or some default based on the MPPR.
-    let (upstream_origin, repo_dir, toml_path, graph) = match Context::new(config.clone()) {
-        // We are in a repo where theres a minimal file, and the minimal file has an upstream.
-        // Lets use that upstream. Maybe the user is re-initializing?
-        Ok(mut ctx) if ctx.minimal_file().upstream.is_some() => (
-            ctx.minimal_file()
-                .upstream
-                .as_ref()
-                .unwrap()
-                .as_ref()
-                .as_spec_origin()
-                .unwrap(),
-            ctx.repo_dir().to_path_buf(),
-            ctx.minimal_file().file_path().cloned(),
-            ctx.graph_from_all_packages()?,
-        ),
-        // Unsurprisingly, theres no minimal file yet, or theres no upstream so theres no
-        // useful information. We need the harnesses though for auto-detection, so lets
-        // wire up a default graph.
-        Err(Error::MFile(mfile::Error::NotFound)) | Ok(_) => {
-            let (mut vcs, _cache, stdlib_dir) = Context::sub_setup(&config)?;
-            let (_dir, rev) = vcs.checkout_of(
-                DEFAULT_PKGS,
-                checkouts::GitRef::Branch(DEFAULT_PKGS_BRANCH.to_string()),
-            )?;
+    let (upstream_origin, repo_dir, toml_path, graph) =
+        match Context::new_with_strategy(config.clone(), mfile_strategy) {
+            // We are in a repo where theres a minimal file, and the minimal file has an upstream.
+            // Lets use that upstream. Maybe the user is re-initializing?
+            Ok(mut ctx) if ctx.minimal_file().upstream.is_some() => {
+                let upstream = ctx.minimal_file().upstream.clone().unwrap();
+                let origin = upstream.as_ref().as_spec_origin().ok_or_else(|| {
+                    Error::Other(anyhow!(
+                        "Could not use upstream{} as a spec origin",
+                        ctx.minimal_file()
+                            .file_path()
+                            .map(|p| format!(" from minimal file at {}", p.to_string_lossy()))
+                            .unwrap_or("".into())
+                    ))
+                })?;
+                (
+                    origin,
+                    ctx.repo_dir().to_path_buf(),
+                    ctx.minimal_file().file_path().cloned(),
+                    ctx.graph_from_all_packages()?,
+                )
+            }
+            // Unsurprisingly, theres no minimal file yet, or theres no upstream so theres no
+            // useful information. We need the harnesses though for auto-detection, so lets
+            // wire up a default graph.
+            Err(Error::MFile(mfile::Error::NotFound)) | Ok(_) => {
+                let (mut vcs, _cache, stdlib_dir) = Context::sub_setup(&config)?;
+                let (_dir, rev) = vcs.checkout_of(
+                    DEFAULT_PKGS,
+                    checkouts::GitRef::Branch(DEFAULT_PKGS_BRANCH.to_string()),
+                )?;
 
-            (
-                SpecOrigin::Repo(common::repo_spec::Repo::Git {
-                    url: DEFAULT_PKGS.to_string(),
-                    rev: rev.clone(),
-                    tracking: Some(common::repo_spec::GitRef::Branch(
-                        DEFAULT_PKGS_BRANCH.to_string(),
-                    )),
-                }),
-                config
-                    .repo_dir_override()
-                    .clone()
-                    .unwrap_or_else(|| std::env::current_dir().unwrap()),
-                None,
-                Graph::new_from_chain(
-                    vcs,
-                    &mut (),
-                    LinkConfig::Git {
-                        repo: "https://github.com/gominimal/pkgs".to_string(),
-                        branch: Some("main".to_string()),
-                        locked_commit: Some(rev),
-                    },
-                    stdlib_dir,
-                    Target::host(),
-                )?,
-            )
-        }
-        Err(e) => {
-            return Err(e);
-        }
-    };
+                let repo_dir = match config.repo_dir_override() {
+                    Some(path) => path.to_path_buf(),
+                    _ => std::env::current_dir()
+                        .map_err(|e| Error::IO("Getting current directory", PathBuf::new(), e))?,
+                };
+
+                (
+                    SpecOrigin::Repo(common::repo_spec::Repo::Git {
+                        url: DEFAULT_PKGS.to_string(),
+                        rev: rev.clone(),
+                        tracking: Some(common::repo_spec::GitRef::Branch(
+                            DEFAULT_PKGS_BRANCH.to_string(),
+                        )),
+                    }),
+                    repo_dir,
+                    None,
+                    Graph::new_from_chain(
+                        vcs,
+                        &mut (),
+                        LinkConfig::Git {
+                            repo: DEFAULT_PKGS.to_string(),
+                            branch: Some(DEFAULT_PKGS_BRANCH.to_string()),
+                            locked_commit: Some(rev),
+                        },
+                        stdlib_dir,
+                        Target::host(),
+                    )?,
+                )
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        };
     let toml_path = toml_path.unwrap_or_else(|| repo_dir.join(mfile::MFILE_NAME));
 
     // Apply all predicates, collecting the harness name, any additional build packages, and any additional runtime packages.

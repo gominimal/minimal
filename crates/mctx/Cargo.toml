@@ -39,3 +39,4 @@ stdlib.workspace = true
 
 [dev-dependencies]
 indoc.workspace = true
+serial_test.workspace = true
