@@ -172,10 +172,10 @@ impl<FS: FileSystem> CacheInner<FS> {
         })
     }
     fn record_access(&self, hash: &SpecHash) {
-        if let Some(t) = &self.read_tracker {
-            if let Err(e) = t.as_ref().lock().unwrap().record_read(hash) {
-                tracing::warn!("Error flushing read tracker: {}", e);
-            }
+        if let Some(t) = &self.read_tracker
+            && let Err(e) = t.as_ref().lock().unwrap().record_read(hash)
+        {
+            tracing::warn!("Error flushing read tracker: {}", e);
         }
     }
 }

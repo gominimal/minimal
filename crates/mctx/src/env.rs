@@ -99,18 +99,18 @@ impl EnvChannel<'_> {
             }
         }
         for bsr in transitives.keys() {
-            if self.has_packages.insert(*bsr) {
-                if let Err(e) = common::hardlink_dir_contents(
+            if self.has_packages.insert(*bsr)
+                && let Err(e) = common::hardlink_dir_contents(
                     self.ctx
                         .cache
                         .read_dir(&new_graph.spec_hash(bsr))
                         .unwrap()
                         .path(),
                     rootfs,
-                ) {
-                    writeln!(stream, "error: {}", e).ok();
-                    return;
-                }
+                )
+            {
+                writeln!(stream, "error: {}", e).ok();
+                return;
             }
         }
         writeln!(
@@ -462,14 +462,14 @@ impl sandbox2::Channel for EnvChannel<'_> {
             }
         };
 
-        if let Some((add_mode, pkgs)) = add_dep {
-            if let Err(e) = self.ctx.add_deps(
+        if let Some((add_mode, pkgs)) = add_dep
+            && let Err(e) = self.ctx.add_deps(
                 self.graph,
                 pkgs.into_iter().map(|a| a.1).collect::<Vec<_>>(),
                 add_mode,
-            ) {
-                writeln!(stream, "error: {}", e).ok();
-            }
+            )
+        {
+            writeln!(stream, "error: {}", e).ok();
         }
     }
 }

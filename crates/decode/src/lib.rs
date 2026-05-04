@@ -117,14 +117,14 @@ impl Layer {
     pub fn new<P: AsRef<Path>>(layer_dir: P, opts: &LoadOptions) -> Result<Self, Error> {
         let (upstream, params, config_dir) = match mfile::File::from_dir(layer_dir.as_ref()) {
             Ok(mfile) => {
-                if let Some(min_vers) = &mfile.stdlib.minimum_version {
-                    if stdlib::outdated(min_vers) {
-                        return Err(Error::StdlibOutdated {
-                            need_version: min_vers.to_string(),
-                            needed_by: layer_dir.as_ref().to_str().unwrap().to_string(),
-                            current_version: stdlib::VERSION.to_string(),
-                        });
-                    }
+                if let Some(min_vers) = &mfile.stdlib.minimum_version
+                    && stdlib::outdated(min_vers)
+                {
+                    return Err(Error::StdlibOutdated {
+                        need_version: min_vers.to_string(),
+                        needed_by: layer_dir.as_ref().to_str().unwrap().to_string(),
+                        current_version: stdlib::VERSION.to_string(),
+                    });
                 }
 
                 (

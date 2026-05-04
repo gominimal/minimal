@@ -257,13 +257,13 @@ fn make_reachable<BP: BinProvider>(
         );
         if path.contains(bsr) {
             // We've found a cycle! eagerly bring in cycle breaker if there is one.
-            if let Some(cycle_breaker) = build.replace_on_cycle {
-                if !builds.contains_key(&cycle_breaker) {
-                    path.push(*bsr);
-                    let result = make_reachable(&cycle_breaker, graph, bin_provider, builds, path);
-                    path.pop();
-                    result?;
-                }
+            if let Some(cycle_breaker) = build.replace_on_cycle
+                && !builds.contains_key(&cycle_breaker)
+            {
+                path.push(*bsr);
+                let result = make_reachable(&cycle_breaker, graph, bin_provider, builds, path);
+                path.pop();
+                result?;
             }
         }
 
@@ -388,14 +388,11 @@ impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
                     });
                 }
 
-                if cycle_breakers_allowed {
-                    if let Some(cycle_breaker) = info.cycle_breaker.as_ref() {
-                        // NOTE: For a cycle breaker that wasn't reached in make_reachable,
-                        // there may not be an entry in self.builds - so we can't just consult that.
-                        if let Some(res) = self.dep_candidate(cycle_breaker, cycle_breakers_allowed)
-                        {
-                            return Some(res.with_breaker_for(Some(*dependency)));
-                        }
+                if cycle_breakers_allowed && let Some(cycle_breaker) = info.cycle_breaker.as_ref() {
+                    // NOTE: For a cycle breaker that wasn't reached in make_reachable,
+                    // there may not be an entry in self.builds - so we can't just consult that.
+                    if let Some(res) = self.dep_candidate(cycle_breaker, cycle_breakers_allowed) {
+                        return Some(res.with_breaker_for(Some(*dependency)));
                     }
                 }
                 None
@@ -719,24 +716,24 @@ impl<'a, BP: BinProvider> Iterator for ExecPlan<'a, BP> {
             for path in &cycles {
                 let (first, last) = (path.first().unwrap(), path.last().unwrap());
                 for cycle in &[first, last] {
-                    if let Some(cycle_breaker) = self.graph.get(cycle).unwrap().replace_on_cycle {
-                        if !self.builds.contains_key(&cycle_breaker) {
-                            let mut path = Vec::new();
-                            // We found a new cycle breaker we haven't brought into the fray yet.
-                            make_reachable(
-                                &cycle_breaker,
-                                self.graph,
-                                &mut self.bin_provider,
-                                &mut self.builds,
-                                &mut path,
-                            )
-                            .unwrap();
-                            // self.builds
-                            //     .get_mut(&cycle_breaker)
-                            //     .unwrap()
-                            //     .cycle_breaker_of = Some(**cycle);
-                            added_cycle_breaker = true;
-                        }
+                    if let Some(cycle_breaker) = self.graph.get(cycle).unwrap().replace_on_cycle
+                        && !self.builds.contains_key(&cycle_breaker)
+                    {
+                        let mut path = Vec::new();
+                        // We found a new cycle breaker we haven't brought into the fray yet.
+                        make_reachable(
+                            &cycle_breaker,
+                            self.graph,
+                            &mut self.bin_provider,
+                            &mut self.builds,
+                            &mut path,
+                        )
+                        .unwrap();
+                        // self.builds
+                        //     .get_mut(&cycle_breaker)
+                        //     .unwrap()
+                        //     .cycle_breaker_of = Some(**cycle);
+                        added_cycle_breaker = true;
                     }
                 }
             }
