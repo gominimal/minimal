@@ -226,15 +226,15 @@ fn build_attrs_hash(spec: &BuildSpec, h: &mut Hasher) {
     for cmd in &spec.cmds {
         cmd.iter().for_each(|e| h.write_all(e.as_bytes()).unwrap());
     }
-    if let Some(build_args) = &spec.build_args {
-        if !build_args.is_empty() {
-            h.write_all(b"-build args").unwrap();
-            for (name, value) in build_args.iter() {
-                h.write_all(b"k").unwrap();
-                h.write_all(name.as_bytes()).unwrap();
-                h.write_all(b"v").unwrap();
-                h.write_all(value.as_bytes()).unwrap();
-            }
+    if let Some(build_args) = &spec.build_args
+        && !build_args.is_empty()
+    {
+        h.write_all(b"-build args").unwrap();
+        for (name, value) in build_args.iter() {
+            h.write_all(b"k").unwrap();
+            h.write_all(name.as_bytes()).unwrap();
+            h.write_all(b"v").unwrap();
+            h.write_all(value.as_bytes()).unwrap();
         }
     }
 

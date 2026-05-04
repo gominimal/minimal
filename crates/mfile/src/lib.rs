@@ -89,11 +89,11 @@ impl LinkConfig {
     }
 
     fn fixup_relative<P: AsRef<Path>>(&mut self, mfile_path: P) {
-        if let (LinkConfig::Dir { dir }, Some(parent_dir)) = (self, mfile_path.as_ref().parent()) {
-            if !dir.starts_with("/") {
-                let new = parent_dir.join(&dir);
-                *dir = new.to_str().unwrap().to_string();
-            }
+        if let (LinkConfig::Dir { dir }, Some(parent_dir)) = (self, mfile_path.as_ref().parent())
+            && !dir.starts_with("/")
+        {
+            let new = parent_dir.join(&dir);
+            *dir = new.to_str().unwrap().to_string();
         }
     }
 }

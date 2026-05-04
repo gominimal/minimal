@@ -157,14 +157,13 @@ impl<S: StubStorage + 'static> RemoteCacheWriter<S> {
             )
             .send()
             .await
+            && stat.object().size > 1024 * 1024
         {
-            if stat.object().size > 1024 * 1024 {
-                // Object already exists and is large enough to be real, skip the upload.
-                // We still push to the pending-set because while this tarball may exist,
-                // its likely not wired to this spec hash.
-                self.pending.push((spec_hash.clone(), sha256));
-                return Ok(false);
-            }
+            // Object already exists and is large enough to be real, skip the upload.
+            // We still push to the pending-set because while this tarball may exist,
+            // its likely not wired to this spec hash.
+            self.pending.push((spec_hash.clone(), sha256));
+            return Ok(false);
         }
 
         self.backend

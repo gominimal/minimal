@@ -71,14 +71,14 @@ impl<C: Channel> Drop for Sandbox<C> {
             drop(stderr);
         }
 
-        if !self.keep_dir {
-            if let Err(e) = common::remove_dir_all(&self.base_dir) {
-                tracing::warn!(
-                    "Failed cleanup for sandbox at path {}: {}",
-                    self.base_dir.display(),
-                    e,
-                );
-            }
+        if !self.keep_dir
+            && let Err(e) = common::remove_dir_all(&self.base_dir)
+        {
+            tracing::warn!(
+                "Failed cleanup for sandbox at path {}: {}",
+                self.base_dir.display(),
+                e,
+            );
         }
     }
 }

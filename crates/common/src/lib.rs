@@ -553,20 +553,20 @@ fn get_cgroup_limit_gb() -> Option<f64> {
     // cgroup v2
     if let Ok(content) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
         let trimmed = content.trim();
-        if trimmed != "max" {
-            if let Ok(bytes) = trimmed.parse::<u64>() {
-                return Some(bytes as f64 / 1_073_741_824.0);
-            }
+        if trimmed != "max"
+            && let Ok(bytes) = trimmed.parse::<u64>()
+        {
+            return Some(bytes as f64 / 1_073_741_824.0);
         }
     }
 
     // cgroup v1
-    if let Ok(content) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
-        if let Ok(bytes) = content.trim().parse::<u64>() {
-            // v1 reports a huge sentinel value (near u64::MAX) when unlimited
-            if bytes < u64::MAX / 2 {
-                return Some(bytes as f64 / 1_073_741_824.0);
-            }
+    if let Ok(content) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        && let Ok(bytes) = content.trim().parse::<u64>()
+    {
+        // v1 reports a huge sentinel value (near u64::MAX) when unlimited
+        if bytes < u64::MAX / 2 {
+            return Some(bytes as f64 / 1_073_741_824.0);
         }
     }
 

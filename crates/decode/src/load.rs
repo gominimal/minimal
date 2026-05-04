@@ -333,26 +333,18 @@ impl Loader {
                         }
                     });
 
-                    if is_buildspec {
-                        if let Some(inner_term) = annotation_data.inner.as_term() {
-                            let annotated =
-                                Term::Annotated(nickel_lang_core::term::AnnotatedData {
-                                    annot: annotation_data.annot.clone(),
-                                    inner: annotate_record!(
-                                        inner_term.clone(),
-                                        buildspec_id_ident,
-                                        id,
-                                        val,
-                                        (
-                                            &annotation_data.inner,
-                                            &files,
-                                            &pos_table,
-                                            minimal_lib_path
-                                        ),
-                                    ),
-                                });
-                            return Ok(NickelValue::term(annotated, val.pos_idx()));
-                        }
+                    if is_buildspec && let Some(inner_term) = annotation_data.inner.as_term() {
+                        let annotated = Term::Annotated(nickel_lang_core::term::AnnotatedData {
+                            annot: annotation_data.annot.clone(),
+                            inner: annotate_record!(
+                                inner_term.clone(),
+                                buildspec_id_ident,
+                                id,
+                                val,
+                                (&annotation_data.inner, &files, &pos_table, minimal_lib_path),
+                            ),
+                        });
+                        return Ok(NickelValue::term(annotated, val.pos_idx()));
                     }
                 }
 
@@ -363,20 +355,18 @@ impl Loader {
                         Some(Term::Var(v)) if v.label() == "build"
                     );
 
-                    if is_build_decl {
-                        if let Some(arg_term) = app_data.arg.as_term() {
-                            let app = Term::App(nickel_lang_core::term::AppData {
-                                head: app_data.head.clone(),
-                                arg: annotate_record!(
-                                    arg_term.clone(),
-                                    buildspec_id_ident,
-                                    id,
-                                    val,
-                                    (&app_data.arg, &files, &pos_table, minimal_lib_path),
-                                ),
-                            });
-                            return Ok(NickelValue::term(app, val.pos_idx()));
-                        }
+                    if is_build_decl && let Some(arg_term) = app_data.arg.as_term() {
+                        let app = Term::App(nickel_lang_core::term::AppData {
+                            head: app_data.head.clone(),
+                            arg: annotate_record!(
+                                arg_term.clone(),
+                                buildspec_id_ident,
+                                id,
+                                val,
+                                (&app_data.arg, &files, &pos_table, minimal_lib_path),
+                            ),
+                        });
+                        return Ok(NickelValue::term(app, val.pos_idx()));
                     }
                 }
             }
