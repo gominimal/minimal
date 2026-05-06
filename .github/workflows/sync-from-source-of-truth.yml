@@ -1,0 +1,80 @@
+# .github/workflows/sync-from-source-of-truth.yml
+# Provenance: sourced from gominimal/min-aw.
+# Repo-specific bits stripped for installation by scripts/quick-setup.sh.
+# Managed by gominimal/min-aw. Edit upstream; do not modify locally.
+#
+# Syncs all workflows/ sources from gominimal/min-aw including:
+#   docs-patrol.md, test-coverage-detector.md, dependency-review.md,
+#   trivial-dep-bump.md, not-gating-audit.md, route.md, worker-fix.md
+# New workflow sources are picked up automatically by sync-workflows.sh.
+
+name: Sync workflows from source of truth
+
+on:
+  schedule:
+    # Weekly on Monday at 00:00 UTC
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Source ref to sync workflows from. Must be a pinned tag or SHA — do not use main.'
+        required: false
+        default: 'REPLACE_WITH_PINNED_TAG_OR_SHA'
+        type: string
+
+jobs:
+  sync-workflows:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+
+      - name: Set source ref
+        id: source
+        run: |
+          # Use input from workflow_dispatch if provided; scheduled runs use the
+          # schedule default. Fail loudly if the placeholder was not replaced.
+          SOURCE_REF="${{ github.event.inputs.source_ref || 'REPLACE_WITH_PINNED_TAG_OR_SHA' }}"
+          if [[ "${SOURCE_REF}" == "REPLACE_WITH_PINNED_TAG_OR_SHA" ]]; then
+            echo "ERROR: source_ref default must be replaced with a pinned tag or SHA before use." >&2
+            exit 1
+          fi
+          echo "ref=${SOURCE_REF}" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch sync-workflows.sh from source of truth
+        run: |
+          SOURCE_REF="${{ steps.source.outputs.ref }}"
+          SYNC_SCRIPT_URL="https://raw.githubusercontent.com/gominimal/min-aw/${SOURCE_REF}/scripts/sync-workflows.sh"
+
+          curl -fsSL "${SYNC_SCRIPT_URL}" -o sync-workflows.sh
+
+          # Checksum verification (optional but recommended for supply-chain hardening).
+          # Set the SYNC_SCRIPT_SHA256 repository variable to the expected sha256 hash
+          # of sync-workflows.sh at the pinned ref. If the variable is unset the step
+          # logs a warning and proceeds for back-compat; if set and mismatched it exits.
+          EXPECTED_SHA="${{ vars.SYNC_SCRIPT_SHA256 }}"
+          if [[ -n "${EXPECTED_SHA}" ]]; then
+            ACTUAL_SHA="$(sha256sum sync-workflows.sh | awk '{print $1}')"
+            if [[ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]]; then
+              echo "ERROR: sync-workflows.sh checksum mismatch." >&2
+              echo "  expected: ${EXPECTED_SHA}" >&2
+              echo "  actual:   ${ACTUAL_SHA}" >&2
+              exit 1
+            fi
+            echo "Checksum verified: ${ACTUAL_SHA}"
+          else
+            echo "WARN: SYNC_SCRIPT_SHA256 repository variable is not set. Skipping checksum verification." >&2
+            echo "Set the variable to the sha256 of sync-workflows.sh at the pinned ref to enable verification."
+          fi
+
+          chmod +x sync-workflows.sh
+
+      - name: Run sync-workflows.sh
+        run: |
+          SOURCE_REF="${{ steps.source.outputs.ref }}"
+          ./sync-workflows.sh --source-ref "${SOURCE_REF}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
