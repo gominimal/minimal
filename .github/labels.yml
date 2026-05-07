@@ -1,0 +1,66 @@
+# .github/labels.yml
+# Provenance: sourced from norrietaylor/minimal-vm-mac (PoC fork, MIT).
+# Repo-specific bits stripped for installation by scripts/quick-setup.sh.
+# Managed by gominimal/min-aw. Edit upstream; do not modify locally.
+
+# Agent labels - used by chore workflows to tag issues and PRs they own
+- name: "agent:doc-drift"
+  color: "0075ca"
+  description: "Opened or updated by the doc-drift agent"
+
+- name: "agent:coverage"
+  color: "e4e669"
+  description: "Opened or updated by the coverage agent"
+
+- name: "agent:dep-drift"
+  color: "d73a4a"
+  description: "Opened or updated by the dep-drift agent"
+
+- name: "agent:auto-merge"
+  color: "0e8a16"
+  description: "Marks a PR eligible for agent-assisted auto-merge"
+
+- name: "agent:api-drift"
+  color: "fbca04"
+  description: "Opened or updated by the api-surface-drift agent"
+
+- name: "agent:not-gating-audit"
+  color: "c5def5"
+  description: "Opened or updated by the not-gating-audit agent"
+
+- name: "worker-tuning"
+  color: "e99695"
+  description: "Tuning issue for the chore-issue worker (Phase E1 R4.4 negative-case escalation). Note: not in the agent:* taxonomy because it's a meta-label about worker behavior, not a chore-output category. The agent: prefix is reserved for chore-output labels (agent:doc-drift, agent:coverage, agent:dep-drift, agent:auto-merge, agent:not-gating-audit, agent:api-drift)."
+
+# Standard triage labels
+- name: "bug"
+  color: "d73a4a"
+  description: "Something is not working"
+
+- name: "feature"
+  color: "a2eeef"
+  description: "New feature or enhancement request"
+
+- name: "chore"
+  color: "e4e669"
+  description: "Maintenance task or internal improvement"
+
+- name: "feedback"
+  color: "cfd3d7"
+  description: "General feedback from users or stakeholders"
+
+- name: "good first issue"
+  color: "7057ff"
+  description: "Good for newcomers"
+
+- name: "help wanted"
+  color: "008672"
+  description: "Extra attention is needed"
+
+- name: "wontfix"
+  color: "ffffff"
+  description: "This will not be worked on"
+
+- name: "duplicate"
+  color: "cfd3d7"
+  description: "This issue or pull request already exists"
