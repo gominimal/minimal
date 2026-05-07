@@ -1,0 +1,130 @@
+# .github/workflows/worker-fix.yml
+# Provenance: sourced from gominimal/min-aw.
+# Thin caller for the worker-fix chore-issue worker. References the canonical
+# worker-fix.md source at a pinned source_ref; do not inline worker logic here.
+# Managed by gominimal/min-aw. Edit upstream; do not modify locally.
+
+name: Worker fix
+
+on:
+  schedule:
+    # Daily 12:00 UTC. Internal trigger only. No comment-triggered path.
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Source ref (full 40-char commit SHA only — tags rejected for immutability) for worker-fix.md. Optional; falls back to vars.WORKER_SOURCE_REF if unset.'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  worker-fix:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Preflight App config
+        id: app_config
+        env:
+          APP_ID: ${{ vars.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+        run: |
+          # Graceful no-op when the gominimal-aw-bot App has not been configured yet.
+          # Avoids opaque create-github-app-token errors during initial repo setup
+          # (App registration is documented in docs/rollout/01-org-secrets.md).
+          if [[ -z "${APP_ID}" || -z "${APP_PRIVATE_KEY}" ]]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "worker-fix: APP_ID or APP_PRIVATE_KEY not set; no-op."
+            echo "Configure the gominimal-aw-bot App per docs/rollout/01-org-secrets.md."
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Mint App token
+        if: steps.app_config.outputs.available == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          # owner with no repositories: requests a token scoped to every repo
+          # gominimal-aw-bot is installed on under gominimal. The worker needs
+          # write on the running repo (push branches, open PRs) and read on
+          # the source-of-truth (raw fetch of worker-fix.md). Both fall under
+          # the App's installation set; an unscoped owner token is the
+          # minimum that covers both without hard-coding a repo list that
+          # would couple this template to the source-of-truth repo's name.
+          owner: gominimal
+
+      - name: Set source ref
+        if: steps.app_config.outputs.available == 'true'
+        id: source
+        env:
+          DISPATCH_REF: ${{ github.event.inputs.source_ref }}
+          REPO_VAR_REF: ${{ vars.WORKER_SOURCE_REF }}
+        run: |
+          # Source-ref resolution order:
+          # 1. workflow_dispatch input (operator override for testing)
+          # 2. vars.WORKER_SOURCE_REF repo variable (operator-pinned default for cron)
+          # If neither is set, log a clear noop and exit 0 so cron runs do not
+          # fail loudly while the operator is still configuring the repo variable.
+          SOURCE_REF="${DISPATCH_REF:-${REPO_VAR_REF}}"
+          if [[ -z "${SOURCE_REF}" ]]; then
+            echo "worker-fix: neither workflow_dispatch input nor vars.WORKER_SOURCE_REF set; no-op."
+            echo "Set the WORKER_SOURCE_REF repository variable to a full 40-char commit SHA. Tags are rejected for immutability."
+            echo "ref=" >> "$GITHUB_OUTPUT"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Phase E1 spec R2.1 immutability requirement, hardened per CodeRabbit
+          # finding on min-aw#85: this caller wrapper fetches+executes remote
+          # content (workflows/worker-fix.md) using a write-capable App token,
+          # so source_ref must be a full 40-character commit SHA. Tags are
+          # rejected because they're mutable — a tag could be moved to a
+          # malicious commit between the operator's review and the cron run.
+          # SHA-pinning ensures the bytes executed are exactly the bytes
+          # reviewed at install time.
+          #
+          # Operator workflow: pin a SHA via `vars.WORKER_SOURCE_REF`; bump it
+          # by editing that variable when a new release is reviewed. The
+          # WORKFLOW_TRIGGER_TOKEN-equivalent secret rotation cadence is the
+          # forcing function for re-pinning.
+          if [[ ! "${SOURCE_REF}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: source_ref must be a full 40-char commit SHA." >&2
+            echo "Got: '${SOURCE_REF}'. Tags and branch names are not accepted because" >&2
+            echo "this caller wrapper fetches+executes remote content using a write-capable" >&2
+            echo "App token. SHA-pinning is the only ref form that guarantees immutability." >&2
+            exit 1
+          fi
+          echo "ref=${SOURCE_REF}" >> "$GITHUB_OUTPUT"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout target repo
+        if: steps.app_config.outputs.available == 'true' && steps.source.outputs.ready == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # The minted App token lets the worker push branches and open PRs.
+          # The default GITHUB_TOKEN is insufficient because workflow files
+          # created with it cannot trigger further workflow runs (GitHub
+          # restriction). The App is installed per docs/rollout/11-worker-tokens.md.
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Fetch worker-fix.md from source of truth
+        if: steps.app_config.outputs.available == 'true' && steps.source.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          SOURCE_REF="${{ steps.source.outputs.ref }}"
+          # Source repo is private; the App token grants read access on it.
+          curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://raw.githubusercontent.com/gominimal/min-aw/${SOURCE_REF}/workflows/worker-fix.md" \
+            -o worker-fix.md
+
+      - name: Run worker-fix
+        if: steps.app_config.outputs.available == 'true' && steps.source.outputs.ready == 'true'
+        run: gh aw run worker-fix.md
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
