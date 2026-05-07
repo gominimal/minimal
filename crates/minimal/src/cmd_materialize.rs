@@ -3,6 +3,9 @@
 use anyhow::anyhow;
 use common::Target;
 use common::target::{Arch, OS};
+use graph::Transitives;
+use mfile::{OutputKind, StrOrList};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use mctx::{Context, Error};
@@ -13,8 +16,7 @@ pub struct MaterializeArgs {
     #[arg(short, long)]
     output: PathBuf,
 
-    /// Target architecture for OCI images (e.g., "amd64", "arm64").
-    /// Overrides the `arch` field in minimal.toml and the host default.
+    /// Override the architecture used when building the output
     #[arg(long)]
     arch: Option<String>,
 
@@ -37,7 +39,7 @@ pub async fn cmd_materialize(args: MaterializeArgs, ctx: &mut Context) -> Result
     // Resolve target architecture: CLI flag > minimal.toml > host default.
     // String-to-arch parsing is delegated to common::target::Arch so the
     // alias set stays consistent across every consumer.
-    let arch: Arch = match args.arch.or(output.arch) {
+    let arch: Arch = match args.arch.clone().or(output.arch) {
         Some(s) => s
             .parse()
             .map_err(|e: common::target::ArchParseError| Error::Other(anyhow!("{e}")))?,
@@ -52,22 +54,38 @@ pub async fn cmd_materialize(args: MaterializeArgs, ctx: &mut Context) -> Result
         0 => ctx.graph_from_package_names_with_target(["base"], target)?,
         _ => ctx.graph_from_package_names_with_target(output.packages.clone(), target)?,
     };
-    let cache = ctx.local_cache();
 
-    // Make sure the packages are built for the target
-    crate::cmd_pkg::pkg_build_impl(&graph, ctx, cache.clone(), false, false, None).await?;
+    crate::cmd_pkg::pkg_build_impl(&graph, ctx, ctx.local_cache(), true, false, None).await?;
 
-    // Create the OCI image — arch is queried from graph.target()
+    match output.kind {
+        OutputKind::OciImage {
+            entrypoint,
+            cmd,
+            vars,
+        } => materialize_oci_image(&args, ctx, graph, output.packages, entrypoint, cmd, vars).await,
+        OutputKind::RawFile { path } => materialize_raw_file(&args, ctx, graph, path).await,
+    }
+}
+
+async fn materialize_oci_image(
+    args: &MaterializeArgs,
+    ctx: &mut Context,
+    graph: graph::Graph,
+    packages: Vec<String>,
+    entrypoint: Option<StrOrList>,
+    cmd: Option<StrOrList>,
+    vars: HashMap<String, String>,
+) -> Result<(), Error> {
     let mut op = op::OciImageCreate {
-        packages: output.packages,
-        output_file: args.output,
+        packages,
+        output_file: args.output.clone(),
         name: Some(args.output_name.clone()),
-        entrypoint: output.entrypoint,
-        cmd: output.cmd,
-        vars: output.vars,
+        entrypoint,
+        cmd,
+        vars,
     };
     let opts = op::Options {
-        cache,
+        cache: ctx.local_cache(),
         graph: &graph,
         exec_base: "/invalid".into(),
         ot: ctx.op_tracker(),
@@ -75,4 +93,37 @@ pub async fn cmd_materialize(args: MaterializeArgs, ctx: &mut Context) -> Result
 
     use op::Runnable;
     op.run(&opts).await.map_err(|e| Error::Other(anyhow!(e)))
+}
+
+async fn materialize_raw_file(
+    args: &MaterializeArgs,
+    ctx: &mut Context,
+    graph: graph::Graph,
+    path: String,
+) -> Result<(), Error> {
+    let rel_path = if let Some(stripped) = path.strip_prefix("/") {
+        stripped.to_string()
+    } else {
+        path.clone()
+    };
+
+    let cache = ctx.local_cache();
+    let transitives = Transitives::for_toplevels(&graph, graph.top_levels.clone(), false);
+
+    for dir in transitives
+        .keys()
+        .map(|bsr| cache.read_dir(&graph.spec_hash(bsr)))
+    {
+        let dir = dir.map_err(|e| Error::Other(anyhow!(e)))?;
+        let p = dir.path().join(&rel_path);
+        if p.exists() {
+            std::fs::copy(&p, &args.output).map_err(|e| Error::IO("copying output file", p, e))?;
+            return Ok(());
+        }
+    }
+
+    Err(Error::Other(anyhow!(
+        "raw-file output {:?} was not found in the built package set",
+        path
+    )))
 }
