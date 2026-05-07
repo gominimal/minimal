@@ -1,4 +1,4 @@
-let Tys = [| 'Builder, 'Path, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Subset, 'Profile, 'Layer, 'Upstream, 'Test, 'Harness |]
+let Tys = [| 'Builder, 'Path, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Subset, 'Profile, 'Layer, 'Upstream, 'Test, 'Stack |]
 in
 let attrs_schema = import "attr_classes.ncl" in
 let needs_schema = import "need_classes.ncl" in
@@ -226,7 +226,7 @@ let CmdSpec = std.contract.any_of [
 
         builds | Array BuildSpec,
         profiles | Array Profile,
-        harnesses | Array Harness,
+        stacks | Array Stack,
     },
     layer | Dyn -> Layer | doc "Constructs a layer." =
         fun spec => spec | Layer,
@@ -263,7 +263,7 @@ let CmdSpec = std.contract.any_of [
         file_regexes | {_ : String} | optional,
         file_predicates | {_ : String} | optional,
     },
-    HarnessMatcherEntry = {
+    StackMatcherEntry = {
         file_regexes | {_ : String} | optional,
         file_predicates | {_ : String} | optional,
 
@@ -271,8 +271,8 @@ let CmdSpec = std.contract.any_of [
         runtime_package_if_any | {_ : Array AdditionalPackageMatcherEntry} | optional,
     },
 
-    Harness | doc "A specific way to build a directory of source into software." = {
-        ty | Tys = 'Harness,
+    Stack | doc "A specific way to build a directory of source into software." = {
+        ty | Tys = 'Stack,
         name
             | String,
 
@@ -286,11 +286,14 @@ let CmdSpec = std.contract.any_of [
         build_cmd | CmdSpec | optional,
         build_cmds_cmd | CmdSpec | optional,
 
-        matches_project_if_any | Array HarnessMatcherEntry | optional,
+        matches_project_if_any | Array StackMatcherEntry | optional,
         matches_project_priority | Number | optional,
     },
-    harness | Dyn -> Harness | doc "Constructs a harness." =
-        fun spec => spec | Harness,
+    # TODO: Remove after May 2026.
+    harness | Dyn -> Stack | doc "Constructs a stack." =
+        fun spec => spec | Stack,
+    stack | Dyn -> Stack | doc "Constructs a stack." =
+        fun spec => spec | Stack,
 
     Target | doc "A specific system that packages can run on." = {
         os | [| 'Linux, 'MacOS |],

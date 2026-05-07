@@ -79,6 +79,7 @@ impl LoadOptions {
         }
 
         let mut hasher = Blake3StdHasher(blake3::Hasher::new());
+        hasher.0.update(&[crate::FORMAT_VERSION]);
         self.input_hash_to(&mut hasher);
         hasher.0.finalize()
     }
@@ -285,6 +286,8 @@ impl Loader {
                 src.push_str("\t],\n");
             }
         }
+        src.push_str("\tstacks = [\n");
+        // TODO: Remove after May 2026 (harnesses kept for compatibility).
         match std::fs::read_dir(layer_dir.as_ref().join("harnesses")) {
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::NotFound {
@@ -292,7 +295,6 @@ impl Loader {
                 }
             }
             Ok(d) => {
-                src.push_str("\tharnesses = [\n");
                 for e in d {
                     let e = e?;
                     if e.file_type()?.is_dir() {
@@ -301,9 +303,26 @@ impl Loader {
                         src.push_str("/harness.ncl\",\n");
                     }
                 }
-                src.push_str("\t],\n");
             }
         }
+        match std::fs::read_dir(layer_dir.as_ref().join("stacks")) {
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(e.into());
+                }
+            }
+            Ok(d) => {
+                for e in d {
+                    let e = e?;
+                    if e.file_type()?.is_dir() {
+                        src.push_str("  import \"");
+                        src.push_str(e.path().to_str().unwrap());
+                        src.push_str("/stack.ncl\",\n");
+                    }
+                }
+            }
+        }
+        src.push_str("\t],\n");
 
         src.push('}');
 
@@ -623,15 +642,15 @@ mod tests {
             .unwrap();
             assert!(profiles_val.as_array().map(|a| a.len()).unwrap_or(0) == 1,);
 
-            // Check a field 'harnesses' was an array with one object
-            let harnesses_val = eval_if_closure(
-                &rd.get_value_with_ctrs(&LocIdent::new("harnesses"))
+            // Check a field 'stacks' was an array with one object
+            let stacks_val = eval_if_closure(
+                &rd.get_value_with_ctrs(&LocIdent::new("stacks"))
                     .unwrap()
                     .unwrap(),
                 &mut sr.p,
             )
             .unwrap();
-            assert!(harnesses_val.as_array().map(|a| a.len()).unwrap_or(0) == 1,);
+            assert!(stacks_val.as_array().map(|a| a.len()).unwrap_or(0) == 1,);
         }
     }
 }

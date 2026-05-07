@@ -2,10 +2,10 @@
 dir = "../fakepkgs"
 
 [harness]
-use = "fake-harness"
+use = "fake-stack"
 build_packages = ["extra-build-pkg"]
 runtime_packages = ["extra-runtime-pkg"]
 
-[tasks.task-inherits-harness]
+[tasks.task-inherits-stack]
 exec = "exec"
 packages = ["uroot"]

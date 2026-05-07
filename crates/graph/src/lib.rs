@@ -23,12 +23,12 @@ pub enum Error {
     },
     /// A profile with a certain name was requested, but did not exist.
     NoSuchProfile { name: String },
-    /// A harness with a certain name was requested, but did not exist.
-    NoSuchHarness { name: String },
+    /// A stack with a certain name was requested, but did not exist.
+    NoSuchStack { name: String },
     /// A profile has the same name as a profile in a higher layer, but did not extend it.
     ConflictingProfile { name: String },
-    /// A harness has the same name as a harness in a higher layer.
-    ConflictingHarness { name: String },
+    /// A stack has the same name as a stack in a higher layer.
+    ConflictingStack { name: String },
     /// A package with a certain name was requested, but not found in the graph.
     NoSuchPkg { name: String },
     /// Failed to load the source code for an upstream.
@@ -58,8 +58,8 @@ impl Error {
             Error::NoSuchProfile { name } => {
                 writeln!(writer, "Error: profile '{}' does not exist", name,).unwrap()
             }
-            Error::NoSuchHarness { name } => {
-                writeln!(writer, "Error: harness '{}' does not exist", name,).unwrap()
+            Error::NoSuchStack { name } => {
+                writeln!(writer, "Error: stack '{}' does not exist", name,).unwrap()
             }
             Error::ConflictingProfile { name } => writeln!(
                 writer,
@@ -67,8 +67,8 @@ impl Error {
                 name,
             )
             .unwrap(),
-            Error::ConflictingHarness { name } => {
-                writeln!(writer, "Error: harness '{}' already exists", name,).unwrap()
+            Error::ConflictingStack { name } => {
+                writeln!(writer, "Error: stack '{}' already exists", name,).unwrap()
             }
             Error::ConflictingPackage { from, .. } => {
                 writeln!(writer, "Error: package '{}' already exists", from.1,).unwrap()

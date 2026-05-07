@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! Header → BuildSpec* (each optionally followed by LocalFileData records)
-//!        → TopLevels → Profile* → Harness* → SupplyChain → Footer
+//!        → TopLevels → Profile* → Stack* → SupplyChain → Footer
 //! ```
 
 use std::collections::HashMap;
@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BuildDep, BuildSpec, BuildSpecRef, Graph, RuntimeDep, SubsetInput};
 use common::SpecOrigin;
-use decode::{Harness, Profile};
+use decode::{Profile, Stack};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -33,7 +33,7 @@ const TAG_BUILD_SPEC: u8 = 0x02;
 const TAG_LOCAL_FILE_DATA: u8 = 0x03;
 const TAG_TOP_LEVELS: u8 = 0x04;
 const TAG_PROFILE: u8 = 0x05;
-const TAG_HARNESS: u8 = 0x06;
+const TAG_STACK: u8 = 0x06;
 const TAG_SUPPLY_CHAIN: u8 = 0x07;
 const TAG_FOOTER: u8 = 0xFF;
 
@@ -192,9 +192,9 @@ struct ProfileRecord {
 }
 
 #[derive(Serialize, Deserialize)]
-struct HarnessRecord {
+struct StackRecord {
     name: String,
-    harness: Harness,
+    stack: Stack,
 }
 
 // ── GraphWriter (sync) ──────────────────────────────────────────────────────
@@ -280,13 +280,13 @@ impl<W: Write> GraphWriter<W> {
             self.write_record(TAG_PROFILE, &serde_json::to_vec(&record)?)?;
         }
 
-        // ── Harnesses ──
-        for (name, harness) in graph.iter_harnesses() {
-            let record = HarnessRecord {
+        // ── Stacks ──
+        for (name, stack) in graph.iter_stacks() {
+            let record = StackRecord {
                 name: name.clone(),
-                harness: harness.clone(),
+                stack: stack.clone(),
             };
-            self.write_record(TAG_HARNESS, &serde_json::to_vec(&record)?)?;
+            self.write_record(TAG_STACK, &serde_json::to_vec(&record)?)?;
         }
 
         // ── SupplyChain ──
@@ -439,7 +439,7 @@ impl<R: Read> GraphReader<R> {
 
         let mut top_levels_raw: Vec<(usize, u64)> = Vec::new();
         let mut profiles: HashMap<String, Profile> = HashMap::new();
-        let mut harnesses: HashMap<String, Harness> = HashMap::new();
+        let mut stacks: HashMap<String, Stack> = HashMap::new();
         let mut supply_chain: Vec<SpecOrigin> = Vec::new();
 
         // ── Body ──
@@ -501,9 +501,9 @@ impl<R: Read> GraphReader<R> {
                     profiles.insert(record.name, record.profile);
                 }
 
-                TAG_HARNESS => {
-                    let record: HarnessRecord = serde_json::from_slice(&payload)?;
-                    harnesses.insert(record.name, record.harness);
+                TAG_STACK => {
+                    let record: StackRecord = serde_json::from_slice(&payload)?;
+                    stacks.insert(record.name, record.stack);
                 }
 
                 TAG_SUPPLY_CHAIN => {
@@ -549,7 +549,7 @@ impl<R: Read> GraphReader<R> {
                 arena,
                 top_levels,
                 profiles,
-                harnesses,
+                stacks,
                 by_name,
                 supply_chain,
                 target,
@@ -745,13 +745,13 @@ impl<W: AsyncWrite + Unpin> AsyncGraphWriter<W> {
                 .await?;
         }
 
-        // Harnesses
-        for (name, harness) in graph.iter_harnesses() {
-            let record = HarnessRecord {
+        // Stacks
+        for (name, stack) in graph.iter_stacks() {
+            let record = StackRecord {
                 name: name.clone(),
-                harness: harness.clone(),
+                stack: stack.clone(),
             };
-            self.write_record(TAG_HARNESS, &serde_json::to_vec(&record)?)
+            self.write_record(TAG_STACK, &serde_json::to_vec(&record)?)
                 .await?;
         }
 
@@ -888,7 +888,7 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
 
         let mut top_levels_raw: Vec<(usize, u64)> = Vec::new();
         let mut profiles: HashMap<String, Profile> = HashMap::new();
-        let mut harnesses: HashMap<String, Harness> = HashMap::new();
+        let mut stacks: HashMap<String, Stack> = HashMap::new();
         let mut supply_chain: Vec<SpecOrigin> = Vec::new();
 
         loop {
@@ -945,9 +945,9 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
                     profiles.insert(record.name, record.profile);
                 }
 
-                TAG_HARNESS => {
-                    let record: HarnessRecord = serde_json::from_slice(&payload)?;
-                    harnesses.insert(record.name, record.harness);
+                TAG_STACK => {
+                    let record: StackRecord = serde_json::from_slice(&payload)?;
+                    stacks.insert(record.name, record.stack);
                 }
 
                 TAG_SUPPLY_CHAIN => {
@@ -990,7 +990,7 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
                 arena,
                 top_levels,
                 profiles,
-                harnesses,
+                stacks,
                 by_name,
                 supply_chain,
                 target,

@@ -65,10 +65,12 @@ pub async fn cmd_update(_args: UpdateArgs, ctx: &mut Context) -> Result<(), Erro
         vec![]
     };
 
-    // If theres a minimal file on disk, and theres at least one new rev, write the revs to the minimal file.
-    if let Some(p) = mfile_path
-        && (new_up_rev.is_some() || sideload_updates.iter().any(|u| u.is_some()))
-    {
+    // If theres a minimal file on disk, and:
+    //  - theres at least one new rev, or
+    //  - we need to migrate the 'harness' name to 'stack'
+    //
+    // write the revs to the minimal file.
+    if let Some(p) = mfile_path {
         use toml_edit::{DocumentMut, value};
         let toml = std::fs::read_to_string(&p)
             .map_err(|e| Error::IO("reading minimal.toml for update", p.to_path_buf(), e))?;
@@ -76,41 +78,50 @@ pub async fn cmd_update(_args: UpdateArgs, ctx: &mut Context) -> Result<(), Erro
             .parse::<DocumentMut>()
             .map_err(|e| Error::Other(anyhow::Error::from(e)))?;
 
-        // Update upstream
-        if let Some(new_rev) = new_up_rev {
-            doc["upstream"]["locked_commit"] = value(new_rev.clone());
-
-            println!(
-                "Upstream {}:{} updated from {} to {}",
-                upstream.as_ref().unwrap().0,
-                upstream.as_ref().unwrap().1.as_ref().unwrap(),
-                match upstream.as_ref().unwrap().2.clone() {
-                    Some(r) => r,
-                    None => "<unpinned>".to_string(),
-                },
-                new_rev
-            )
+        let mut did_upgrade_fmt = false;
+        if let Some(t) = doc.remove("harness") {
+            println!("Renamed `[harness]` to its new name `[stack]`");
+            doc.insert("stack", t);
+            did_upgrade_fmt = true;
         }
 
-        // Update sideloads
-        for (i, rev) in sideload_updates.into_iter().enumerate() {
-            if let Some(new_rev) = rev {
+        if new_up_rev.is_some() || sideload_updates.iter().any(|u| u.is_some()) || did_upgrade_fmt {
+            // Update upstream
+            if let Some(new_rev) = new_up_rev {
+                doc["upstream"]["locked_commit"] = value(new_rev.clone());
+
                 println!(
-                    "Sideload {}:{} updated from {} to {}",
-                    doc["upstream"]["sideload"][i]["repo"].as_str().unwrap(),
-                    doc["upstream"]["sideload"][i]["branch"].as_str().unwrap(),
-                    doc["upstream"]["sideload"][i]
-                        .get("locked_commit")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("<unpinned>"),
+                    "Upstream {}:{} updated from {} to {}",
+                    upstream.as_ref().unwrap().0,
+                    upstream.as_ref().unwrap().1.as_ref().unwrap(),
+                    match upstream.as_ref().unwrap().2.clone() {
+                        Some(r) => r,
+                        None => "<unpinned>".to_string(),
+                    },
                     new_rev
-                );
-
-                doc["upstream"]["sideload"][i]["locked_commit"] = value(new_rev.clone());
+                )
             }
-        }
 
-        std::fs::write(p, doc.to_string()).map_err(|e| Error::Other(anyhow::Error::from(e)))?;
+            // Update sideloads
+            for (i, rev) in sideload_updates.into_iter().enumerate() {
+                if let Some(new_rev) = rev {
+                    println!(
+                        "Sideload {}:{} updated from {} to {}",
+                        doc["upstream"]["sideload"][i]["repo"].as_str().unwrap(),
+                        doc["upstream"]["sideload"][i]["branch"].as_str().unwrap(),
+                        doc["upstream"]["sideload"][i]
+                            .get("locked_commit")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("<unpinned>"),
+                        new_rev
+                    );
+
+                    doc["upstream"]["sideload"][i]["locked_commit"] = value(new_rev.clone());
+                }
+            }
+
+            std::fs::write(p, doc.to_string()).map_err(|e| Error::Other(anyhow::Error::from(e)))?;
+        }
     }
 
     // Enumerate all the reachable transitive packages and

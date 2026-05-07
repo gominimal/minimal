@@ -8,7 +8,7 @@
 #![allow(clippy::single_match)]
 
 use common::{SpecOrigin, Target};
-use decode::{Harness, Profile};
+use decode::{Profile, Stack};
 use nickel_lang_core::term::IndexMap;
 
 use generational_arena::Arena;
@@ -69,7 +69,7 @@ impl PartialOrd for SearchMatch {
     }
 }
 
-/// The in-memory representation of the software supply chain: all packages, profiles, and harnesses.
+/// The in-memory representation of the software supply chain: all packages, profiles, and stacks.
 ///
 /// Fields are crate-visible so `loader.rs` can mutate them during ingest. External
 /// callers should go through the accessor methods below.
@@ -84,8 +84,8 @@ pub struct Graph {
 
     /// Profiles (custom packages, env vars etc) by name.
     pub(crate) profiles: HashMap<String, Profile>,
-    /// Harnesses (a way to build a directory of software) by name.
-    pub(crate) harnesses: HashMap<String, Harness>,
+    /// Stacks (a way to build a directory of software) by name.
+    pub(crate) stacks: HashMap<String, Stack>,
 
     /// Indexes build-specs by name.
     pub(crate) by_name: HashMap<String, BuildSpecRef>,
@@ -121,7 +121,7 @@ impl Graph {
             by_name: HashMap::with_capacity(2048),
             top_levels: Vec::new(),
             profiles: HashMap::with_capacity(32),
-            harnesses: HashMap::with_capacity(32),
+            stacks: HashMap::with_capacity(32),
             supply_chain: Vec::with_capacity(6),
             target: Target::host(),
             hash_cache: Arc::new(RwLock::new((
@@ -241,25 +241,25 @@ impl Graph {
             })
     }
 
-    /// Hydrates a minimal task with configuration based on the harness and
+    /// Hydrates a minimal task with configuration based on the stack and
     /// any profile it calls for, if any.
-    pub fn hydrate_task(&self, harness: Option<&str>, task: &mut mfile::Task) -> Result<(), Error> {
-        if let Some(name) = harness {
-            let harness = self.harness(name).ok_or_else(|| Error::NoSuchHarness {
+    pub fn hydrate_task(&self, stack: Option<&str>, task: &mut mfile::Task) -> Result<(), Error> {
+        if let Some(name) = stack {
+            let stack = self.stack(name).ok_or_else(|| Error::NoSuchStack {
                 name: name.to_string(),
             })?;
             // Upsert the packages list
             task.packages.extend(
-                harness
+                stack
                     .build_packages
                     .iter()
-                    .chain(harness.runtime_packages.iter())
+                    .chain(stack.runtime_packages.iter())
                     .filter(|p| !task.packages.contains(p))
                     .cloned()
                     .collect::<Vec<_>>(),
             );
             // Set environment variables, but only if they are not set already
-            for (k, v) in &harness.build_env_vars {
+            for (k, v) in &stack.build_env_vars {
                 if !task.vars.contains_key(k) {
                     task.vars.insert(k.clone(), v.clone());
                 }
@@ -300,14 +300,14 @@ impl Graph {
         }
     }
 
-    /// Returns the named harness, if it exists.
-    pub fn harness(&self, name: &str) -> Option<&Harness> {
-        self.harnesses.get(name)
+    /// Returns the named stack, if it exists.
+    pub fn stack(&self, name: &str) -> Option<&Stack> {
+        self.stacks.get(name)
     }
 
-    /// Returns an iterator over all harnesses configured in the graph.
-    pub fn iter_harnesses(&self) -> impl Iterator<Item = (&String, &Harness)> {
-        self.harnesses.iter()
+    /// Returns an iterator over all stacks configured in the graph.
+    pub fn iter_stacks(&self) -> impl Iterator<Item = (&String, &Stack)> {
+        self.stacks.iter()
     }
 
     /// Returns a list of [BuildSpecRef] objects who's names matched the given search term.
@@ -424,7 +424,7 @@ impl Graph {
         builds: Arena<BuildSpec>,
         top_levels: Vec<BuildSpecRef>,
         profiles: HashMap<String, Profile>,
-        harnesses: HashMap<String, Harness>,
+        stacks: HashMap<String, Stack>,
         by_name: HashMap<String, BuildSpecRef>,
         supply_chain: Vec<SpecOrigin>,
         target: Target,
@@ -433,7 +433,7 @@ impl Graph {
             builds,
             top_levels,
             profiles,
-            harnesses,
+            stacks,
             by_name,
             supply_chain,
             target,

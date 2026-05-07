@@ -12,14 +12,14 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 #[derive(Debug, Clone)]
 pub enum CheckKind {
     CheckPackages,
-    CheckHarnesses,
+    CheckStacks,
     CheckProfiles,
 }
 impl Display for CheckKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CheckKind::CheckPackages => f.write_str("package"),
-            CheckKind::CheckHarnesses => f.write_str("harness"),
+            CheckKind::CheckStacks => f.write_str("stack"),
             CheckKind::CheckProfiles => f.write_str("profile"),
         }
     }

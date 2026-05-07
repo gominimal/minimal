@@ -146,7 +146,7 @@ impl EnvChannel<'_> {
     /// Implementation of `min check`
     fn run_check(&mut self, stream: &mut UnixStream, _rootfs: &Path, args: &str) {
         let mut flag_packages = false;
-        let mut flag_harnesses = false;
+        let mut flag_stacks = false;
         let mut flag_profiles = false;
         let mut fix = false;
         let mut filter_names: Vec<String> = Vec::new();
@@ -154,7 +154,7 @@ impl EnvChannel<'_> {
         for token in args.split_whitespace() {
             match token {
                 "--packages" => flag_packages = true,
-                "--harnesses" => flag_harnesses = true,
+                "--stacks" => flag_stacks = true,
                 "--profiles" => flag_profiles = true,
                 "--fix" => fix = true,
                 _ => filter_names.push(token.to_string()),
@@ -162,7 +162,7 @@ impl EnvChannel<'_> {
         }
 
         // If no kind flags specified, check everything (same as cmd_check default).
-        let check_all = !flag_packages && !flag_harnesses && !flag_profiles;
+        let check_all = !flag_packages && !flag_stacks && !flag_profiles;
 
         let mut check_ctx = match self.ctx.cloned_reinit() {
             Err(e) => return EnvChannel::write_error(e, stream),
@@ -186,8 +186,8 @@ impl EnvChannel<'_> {
             } else {
                 None
             },
-            if check_all || flag_harnesses {
-                Some(upstream_dir.join("harnesses"))
+            if check_all || flag_stacks {
+                Some(upstream_dir.join("stacks"))
             } else {
                 None
             },

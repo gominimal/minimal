@@ -88,7 +88,7 @@ enum Command {
     #[clap(subcommand)]
     Cache(CacheArgs),
 
-    /// Validates minimal configuration including packages, harnesses, and profiles
+    /// Validates minimal configuration including packages, stacks, and profiles
     Check(CheckArgs),
     /// Prints the build plan for the specified package(s)
     #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]

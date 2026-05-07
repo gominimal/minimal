@@ -21,6 +21,7 @@ pub use error::Error;
 mod config;
 pub use config::{Config, ConfigBuilder, ConfigError, DEFAULT_REMOTE_CACHE_BUCKET};
 mod env;
+use graph::Error as GraphError;
 use graph::{BinProvider, BuildSpecRef, Graph, MaskingBinProvider, Transitives};
 use mfile::{EnvPatches, EnvVarValue, LinkConfig, Task};
 pub use sandbox2::config::Invocation;
@@ -162,7 +163,7 @@ impl<const N: usize> PackageSelection for [String; N] {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskSource {
     MFile,
-    Harness(String),
+    Stack(String),
 }
 
 /// A top-level context for operations in a minimal-configured repo.
@@ -558,15 +559,15 @@ impl Context {
             .map(|(name, _t)| (name.clone(), TaskSource::MFile))
             .collect();
 
-        if let Some(h_conf) = &self.mfile.harness
-            && let Some(harness) = graph.harness(&h_conf.name)
+        if let Some(h_conf) = &self.mfile.stack
+            && let Some(stack) = graph.stack(&h_conf.name)
         {
-            out.extend(harness.task_names().into_iter().filter_map(|name| {
+            out.extend(stack.task_names().into_iter().filter_map(|name| {
                 if self.mfile.task(&name).is_some() {
                     // Already capture by iter_tasks() above
                     None
                 } else {
-                    Some((name.to_string(), TaskSource::Harness(h_conf.name.clone())))
+                    Some((name.to_string(), TaskSource::Stack(h_conf.name.clone())))
                 }
             }));
         }
@@ -575,7 +576,7 @@ impl Context {
     }
 
     /// Returns the task of the given name, fully hydrated based on profiles. If no task
-    /// is declared in the minimal file with the given name, harnesses are considered.
+    /// is declared in the minimal file with the given name, stack are considered.
     ///
     /// The returned task will not have had any string interpolations applied.
     pub fn task(&mut self, mut graph: Graph, name: &str) -> Result<Option<(Task, Graph)>, Error> {
@@ -583,10 +584,10 @@ impl Context {
         let mut task = match mfile.task(name) {
             Some(t) => t,
             None => {
-                // Task requested but none defined, lets see if the harness provides an implementation.
-                if let Some(h_conf) = &mfile.harness {
-                    if let Some(harness) = graph.harness(&h_conf.name) {
-                        if let Some(mut task) = harness.task_by_name(name) {
+                // Task requested but none defined, lets see if the stack provides an implementation.
+                if let Some(h_conf) = &mfile.stack {
+                    if let Some(stack) = graph.stack(&h_conf.name) {
+                        if let Some(mut task) = stack.task_by_name(name) {
                             mfile.hydrate_task_defaults(&mut task);
                             task
                         } else {
@@ -600,8 +601,8 @@ impl Context {
                 }
             }
         };
-        // Apply the specifics (pkgs etc) of the harness & profile
-        graph.hydrate_task(mfile.harness.as_ref().map(|h| h.name.as_str()), &mut task)?;
+        // Apply the specifics (pkgs etc) of the stack & profile
+        graph.hydrate_task(mfile.stack.as_ref().map(|h| h.name.as_str()), &mut task)?;
 
         // TODO: Probably time to retire this top_levels concept
         graph.top_levels = task.packages.as_bsrs(&graph)?;
@@ -703,7 +704,7 @@ impl Context {
         Ok(env)
     }
 
-    /// Returns the list of all packages brought in through tasks, profiles and harnesses.
+    /// Returns the list of all packages brought in through tasks, profiles and stacks.
     pub fn scaffolding_packages(&mut self) -> Result<Vec<BuildSpecRef>, Error> {
         let mut out = std::collections::HashSet::new();
         let mut graph = self.graph_from_all_packages()?;
@@ -715,8 +716,12 @@ impl Context {
 
             out.extend(task.packages);
         }
-        if let Some(harness) = &mfile.harness {
-            let h = graph.harness(&harness.name).unwrap();
+        if let Some(stack) = &mfile.stack {
+            let h = graph.stack(&stack.name).ok_or_else(|| {
+                Error::Graph(Box::new(GraphError::NoSuchStack {
+                    name: stack.name.clone(),
+                }))
+            })?;
             out.extend(h.build_packages.clone());
             out.extend(h.runtime_packages.clone());
         }
@@ -818,22 +823,22 @@ impl Context {
         let mut did_edit = false;
         match mode {
             AddDepMode::BuildPackages => {
-                if let Some(h) = doc["harness"].as_table_mut() {
+                if let Some(h) = doc["stack"].as_table_mut() {
                     did_edit |= upsert_toml_packages_list(h, "build_packages", &resolved);
-                    println!("Added [{}] to harness.build_packages", resolved.join(","));
+                    println!("Added [{}] to stack.build_packages", resolved.join(","));
                 } else {
                     return Err(Error::Other(anyhow!(
-                        "could not find [harness] in minimal.toml: needed for update"
+                        "could not find [stack] in minimal.toml: needed for update"
                     )));
                 }
             }
             AddDepMode::RuntimePackages => {
-                if let Some(h) = doc["harness"].as_table_mut() {
+                if let Some(h) = doc["stack"].as_table_mut() {
                     did_edit |= upsert_toml_packages_list(h, "runtime_packages", &resolved);
-                    println!("Added [{}] to harness.runtime_packages", resolved.join(","));
+                    println!("Added [{}] to stack.runtime_packages", resolved.join(","));
                 } else {
                     return Err(Error::Other(anyhow!(
-                        "could not find [harness] in minimal.toml: needed for update"
+                        "could not find [stack] in minimal.toml: needed for update"
                     )));
                 }
             }
@@ -864,9 +869,9 @@ impl Context {
 
 /// How to add a set of dependencies - as a build dep, a runtime dep, or a tool.
 pub enum AddDepMode {
-    /// Add the specified packages to harness.build_packages.
+    /// Add the specified packages to stack.build_packages.
     BuildPackages,
-    /// Add the specified packages to harness.runtime_packages.
+    /// Add the specified packages to stack.runtime_packages.
     RuntimePackages,
     /// Add the specified packages to a task with a given name.
     TaskPackages { name: String },
@@ -985,14 +990,14 @@ mod tests {
     }
 
     #[test]
-    fn task_inherits_harness() {
+    fn task_inherits_stack() {
         let state = tempdir().unwrap();
         let config = ConfigBuilder::new()
             .with_state_dir(state.path().to_path_buf())
             .with_repo_dir(
                 std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
                     .join("testdata")
-                    .join("fakerepo-with-harness"),
+                    .join("fakerepo-with-stack"),
             )
             .with_stdlib_dir(
                 std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
@@ -1004,10 +1009,10 @@ mod tests {
         let mut ctx = Context::new(config).unwrap();
 
         let graph = ctx.graph_from_all_packages().unwrap();
-        let (task, _graph) = ctx.task(graph, "task-inherits-harness").unwrap().unwrap();
+        let (task, _graph) = ctx.task(graph, "task-inherits-stack").unwrap().unwrap();
 
         // println!("task = {:#?}", task);
-        // task inherited harness build_packages and runtime_packages, as well as any
+        // task inherited stack build_packages and runtime_packages, as well as any
         // extras defined in the minimal file
         assert_eq!(
             task.packages,
@@ -1015,13 +1020,13 @@ mod tests {
                 "uroot".to_string(),
                 "extra-build-pkg".to_string(),
                 "extra-runtime-pkg".to_string(),
-                "harness-build-pkg".to_string(),
-                "harness-runtime-pkg".to_string(),
+                "stack-build-pkg".to_string(),
+                "stack-runtime-pkg".to_string(),
             ]
         );
-        // task inherited harness build env vars
+        // task inherited stack build env vars
         assert_eq!(
-            task.vars.get("HARNESS_VAR"),
+            task.vars.get("STACK_VAR"),
             Some(&EnvVarValue::Value("set".to_string()))
         );
     }
@@ -1118,8 +1123,8 @@ mod tests {
                     [upstream]
                     dir = \"{}\"
 
-                    [harness]
-                    use = \"fake-harness\"
+                    [stack]
+                    use = \"fake-stack\"
 
                     [tasks.something]
                     exec = \"./something\"
@@ -1127,7 +1132,7 @@ mod tests {
                 },
                 std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
                     .join("testdata")
-                    .join("fakerepo-with-harness")
+                    .join("fakerepo-with-stack")
                     .to_str()
                     .unwrap()
             ),

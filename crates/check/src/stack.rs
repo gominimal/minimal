@@ -1,40 +1,58 @@
 use super::Error;
 use crate::{CheckCtx, CheckResult, CheckVerdict};
-use decode::Harness;
+use decode::Stack;
 use nickel_lang_core::eval::cache::CacheImpl;
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::program::Program;
 use ot::{OpTracker, Operation};
 use std::path::PathBuf;
 
-pub(crate) async fn check_harness(
-    harness: String,
+pub(crate) async fn check_stack(
+    stack: String,
     ctx: &CheckCtx,
-    harnesses_dir: PathBuf,
+    stacks_dir: PathBuf,
 ) -> Result<Vec<CheckResult>, Error> {
     let check_op = OpTracker::new_with_root(&ctx.ot).with_op(Operation::Check {
-        kind: ot::CheckKind::CheckHarnesses,
-        name: harness.clone(),
+        kind: ot::CheckKind::CheckStacks,
+        name: stack.clone(),
     });
     let mut out = Vec::new();
 
     use nickel_lang_core::error::report::report_as_str;
     use nickel_lang_core::{error::NullReporter, eval::cache::CacheImpl, program::Program};
 
-    let program_res = Program::new_from_source(
-        std::io::Cursor::new(format!(
-            "import \"{}\"",
-            harnesses_dir
-                .join(&harness)
-                .join("harness.ncl")
-                .as_os_str()
-                .to_str()
-                .unwrap()
-        )),
-        "toplevel",
-        std::io::stderr(),
-        NullReporter {},
-    );
+    // TODO: Transitioning from 'harness' => 'stack', remove after May 2026
+    let program_res = if stacks_dir.join(&stack).join("harness.ncl").exists() {
+        Program::new_from_source(
+            std::io::Cursor::new(format!(
+                "import \"{}\"",
+                stacks_dir
+                    .join(&stack)
+                    .join("harness.ncl")
+                    .as_os_str()
+                    .to_str()
+                    .unwrap()
+            )),
+            "toplevel",
+            std::io::stderr(),
+            NullReporter {},
+        )
+    } else {
+        Program::new_from_source(
+            std::io::Cursor::new(format!(
+                "import \"{}\"",
+                stacks_dir
+                    .join(&stack)
+                    .join("stack.ncl")
+                    .as_os_str()
+                    .to_str()
+                    .unwrap()
+            )),
+            "toplevel",
+            std::io::stderr(),
+            NullReporter {},
+        )
+    };
 
     let mut program: Program<CacheImpl> = match program_res {
         Ok(p) => p,
@@ -62,37 +80,37 @@ pub(crate) async fn check_harness(
         ))]);
     }
 
-    out.push(check_harness_name(harness.clone(), ctx, &mut program)?);
-    out.push(check_harness_packages_valid(ctx, &mut program)?);
+    out.push(check_stack_name(stack.clone(), ctx, &mut program)?);
+    out.push(check_stack_packages_valid(ctx, &mut program)?);
     out.push(check_project_matcher_regexes(ctx, &mut program)?);
     out.push(check_project_matcher_predicates(ctx, &mut program)?);
     use crate::FileBasedChecker;
     out.push(crate::ImportLineCheck.check(
         ctx,
-        &harness,
-        &harnesses_dir.join(&harness),
+        &stack,
+        &stacks_dir.join(&stack),
         Some(check_op.clone()),
     )?);
     out.push(crate::FmtCheck.check(
         ctx,
-        &harness,
-        &harnesses_dir.join(&harness),
+        &stack,
+        &stacks_dir.join(&stack),
         Some(check_op.clone()),
     )?);
 
     Ok(out)
 }
 
-fn check_harness_name(
-    harness: String,
+fn check_stack_name(
+    stack: String,
     ctx: &CheckCtx,
     program: &mut Program<CacheImpl>,
 ) -> Result<CheckResult, Error> {
     if ctx
         .skip_checkers
-        .contains(&"harness name matches dir".to_string())
+        .contains(&"stack name matches dir".to_string())
     {
-        return Ok(CheckResult::harness_name_skip());
+        return Ok(CheckResult::stack_name_skip());
     }
 
     let tree = match program.eval_full() {
@@ -110,22 +128,22 @@ fn check_harness_name(
             .get_value_with_ctrs(&LocIdent::new("name"))
             .map(|rt| rt.and_then(|t| t.to_nickel_string()))
     {
-        if s.as_str() == harness {
-            return Ok(CheckResult::harness_name_pass());
+        if s.as_str() == stack {
+            return Ok(CheckResult::stack_name_pass());
         } else {
-            return Ok(CheckResult::harness_name_fail(format!(
-                "harness defined in {}/harness.ncl has name {}",
-                harness,
+            return Ok(CheckResult::stack_name_fail(format!(
+                "stack defined in {}/stack.ncl has name {}",
+                stack,
                 s.as_str()
             )));
         }
     }
-    Ok(CheckResult::harness_name_fail(
+    Ok(CheckResult::stack_name_fail(
         "failed reading name from nickel object".to_string(),
     ))
 }
 
-fn check_harness_packages_valid(
+fn check_stack_packages_valid(
     ctx: &CheckCtx,
     program: &mut Program<CacheImpl>,
 ) -> Result<CheckResult, Error> {
@@ -148,7 +166,7 @@ fn check_harness_packages_valid(
     };
 
     out.verdict = CheckVerdict::Pass;
-    match Harness::from_term(&tree, program) {
+    match Stack::from_term(&tree, program) {
         Ok(h) => {
             if let Some(g) = ctx.graph.as_ref()
                 && let Ok(g) = g.try_read()
@@ -187,7 +205,7 @@ fn check_harness_packages_valid(
         }
         Err(e) => {
             out.verdict = CheckVerdict::Fail;
-            out.err.push(format!("failed loading harness: {}", e));
+            out.err.push(format!("failed loading stack: {}", e));
         }
     };
 
@@ -202,7 +220,7 @@ fn check_project_matcher_regexes(
         .skip_checkers
         .contains(&"project_matchers regexes".to_string())
     {
-        return Ok(CheckResult::harness_regexes_skip());
+        return Ok(CheckResult::stack_regexes_skip());
     }
 
     let tree = match program.eval_full() {
@@ -214,9 +232,9 @@ fn check_project_matcher_regexes(
         }
     };
 
-    match Harness::from_term(&tree, program) {
+    match Stack::from_term(&tree, program) {
         Ok(h) => {
-            let mut out = CheckResult::harness_regexes_pass();
+            let mut out = CheckResult::stack_regexes_pass();
             for matcher in h.matches_project_if_any.iter().flatten() {
                 for (fname, regex_str) in &matcher.file_regexes {
                     if regex_str == "*" {
@@ -234,8 +252,8 @@ fn check_project_matcher_regexes(
 
             Ok(out)
         }
-        Err(e) => Ok(CheckResult::harness_regexes_fail(format!(
-            "failed loading harness: {}",
+        Err(e) => Ok(CheckResult::stack_regexes_fail(format!(
+            "failed loading stack: {}",
             e
         ))),
     }
@@ -249,7 +267,7 @@ fn check_project_matcher_predicates(
         .skip_checkers
         .contains(&"project_matchers predicates".to_string())
     {
-        return Ok(CheckResult::harness_predicates_skip());
+        return Ok(CheckResult::stack_predicates_skip());
     }
 
     let tree = match program.eval_full() {
@@ -261,9 +279,9 @@ fn check_project_matcher_predicates(
         }
     };
 
-    match Harness::from_term(&tree, program) {
+    match Stack::from_term(&tree, program) {
         Ok(h) => {
-            let mut out = CheckResult::harness_predicates_pass();
+            let mut out = CheckResult::stack_predicates_pass();
             for matcher in h.matches_project_if_any.iter().flatten() {
                 for (fname, predicate_str) in &matcher.file_predicates {
                     if let Err(e) = common::jq::Expression::parse(predicate_str) {
@@ -294,8 +312,8 @@ fn check_project_matcher_predicates(
 
             Ok(out)
         }
-        Err(e) => Ok(CheckResult::harness_predicates_fail(format!(
-            "failed loading harness: {}",
+        Err(e) => Ok(CheckResult::stack_predicates_fail(format!(
+            "failed loading stack: {}",
             e
         ))),
     }
