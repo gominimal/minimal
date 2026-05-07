@@ -20,6 +20,14 @@
   color: "0e8a16"
   description: "Marks a PR eligible for agent-assisted auto-merge"
 
+- name: "agent:api-drift"
+  color: "fbca04"
+  description: "Opened or updated by the api-surface-drift agent"
+
+- name: "agent:not-gating-audit"
+  color: "c5def5"
+  description: "Opened or updated by the not-gating-audit agent"
+
 - name: "worker-tuning"
   color: "e99695"
   description: "Tuning issue for the chore-issue worker (Phase E1 R4.4 negative-case escalation). Note: not in the agent:* taxonomy because it's a meta-label about worker behavior, not a chore-output category. The agent: prefix is reserved for chore-output labels (agent:doc-drift, agent:coverage, agent:dep-drift, agent:auto-merge, agent:not-gating-audit, agent:api-drift)."

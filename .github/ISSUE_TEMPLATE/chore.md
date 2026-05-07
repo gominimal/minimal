@@ -33,5 +33,7 @@ If this chore was opened by an agent, it will carry one of:
 - `agent:doc-drift`
 - `agent:coverage`
 - `agent:dep-drift`
+- `agent:api-drift`
+- `agent:not-gating-audit`
 
 See `AGENTS.md` for the full agent contract.

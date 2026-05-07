@@ -22,7 +22,7 @@ on:
         # Default is substituted by quick-setup.sh at install time. Operator
         # bumps it via PR or by re-running quick-setup with a newer
         # --source-ref. Manual dispatch can override per-run.
-        default: 'v0.2.4'
+        default: 'v0.2.5'
         type: string
 
 jobs:
@@ -75,28 +75,23 @@ jobs:
         run: |
           # Resolution order:
           # 1. workflow_dispatch input (operator override per-run)
-          # 2. workflow_call default (v0.2.4, substituted by quick-setup
+          # 2. workflow_call default (v0.2.5, substituted by quick-setup
           #    at install time, bumped via PR thereafter)
-          SOURCE_REF="${{ github.event.inputs.source_ref || 'v0.2.4' }}"
+          SOURCE_REF="${{ github.event.inputs.source_ref || 'v0.2.5' }}"
 
-          # Fail loudly if quick-setup didn't substitute the token (i.e. the
-          # template was committed unsubstituted). Catches install-time
-          # regressions where the operator runs the script with a broken
-          # token-substitution path.
-          if [[ "${SOURCE_REF}" == "v0.2.4" ]]; then
-            echo "ERROR: source_ref default still holds the unsubstituted token." >&2
-            echo "Re-run scripts/quick-setup.sh from the source-of-truth repo to fix." >&2
-            exit 1
-          fi
-
-          # Immutability: source_ref must be a pinned tag (vN.N.N pattern) or
-          # full 40-char SHA. Branch names (main, master, dev) are rejected
-          # because they're mutable and the workflow fetches+executes remote
-          # content using them as a ref.
+          # Immutability + substitution-check in one regex pair. source_ref
+          # must be a pinned tag (vN.N.N pattern) or full 40-char SHA. Branch
+          # names (main, master, dev) and the unsubstituted 'v0.2.5'
+          # token both fail this check. A separate unsubstituted-token guard
+          # used to live above, but quick-setup.sh substitutes 'v0.2.5'
+          # globally including inside that guard's literal — which made the
+          # guard self-rejecting post-substitution. Dropped; the regex below
+          # catches the same condition correctly.
           if [[ ! "${SOURCE_REF}" =~ ^[0-9a-f]{40}$ ]] && \
              [[ ! "${SOURCE_REF}" =~ ^v?[0-9]+(\.[0-9]+){1,2}([.-][0-9A-Za-z._-]+)?$ ]]; then
             echo "ERROR: source_ref must be a pinned tag (e.g. v1.2.3) or full 40-char SHA." >&2
-            echo "Got: '${SOURCE_REF}'. Branch names are not accepted." >&2
+            echo "Got: '${SOURCE_REF}'. Branch names and the unsubstituted 'v0.2.5' token are not accepted." >&2
+            echo "If you see the literal token, re-run scripts/quick-setup.sh from gominimal/min-aw at a pinned ref." >&2
             exit 1
           fi
 
