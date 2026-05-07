@@ -16,17 +16,17 @@ use crate::{
     packages_array_from_term, record_data_from_val,
 };
 
-/// A predicate that when matched, indicates a package should be added when using a harness.
+/// A predicate that when matched, indicates a package should be added when using a stack.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageMatcherPredicate {
     /// A list of file paths in the project and corresponding regexes, all of which must match
-    /// for this harness to be applicable.
+    /// for this stack to be applicable.
     ///
     /// In lieu of a regex, the value may be the string `*` to signal the file need only exist.
     pub file_regexes: IndexMap<String, String>,
 
     /// A list of file paths in the project and corresponding predicates in jq syntax. All predicates
-    /// must match for this harness to be applicable.
+    /// must match for this stack to be applicable.
     pub file_predicates: IndexMap<String, String>,
 }
 
@@ -185,17 +185,17 @@ fn matches<P: AsRef<Path>>(
     Ok(true)
 }
 
-/// A set of rules that when matched, indicate that this harness is applicable to a source tree.
+/// A set of rules that when matched, indicate that this stack is applicable to a source tree.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HarnessMatcher {
+pub struct StackMatcher {
     /// A list of file paths in the project and corresponding regexes, all of which must match
-    /// for this harness to be applicable.
+    /// for this stack to be applicable.
     ///
     /// In lieu of a regex, the value may be the string `*` to signal the file need only exist.
     pub file_regexes: IndexMap<String, String>,
 
     /// A list of file paths in the project and corresponding predicates in jq syntax. All predicates
-    /// must match for this harness to be applicable.
+    /// must match for this stack to be applicable.
     pub file_predicates: IndexMap<String, String>,
 
     /// Predicates for when a package should be an additional build package. The package should be added
@@ -206,13 +206,13 @@ pub struct HarnessMatcher {
     pub runtime_package_matchers: IndexMap<String, Vec<PackageMatcherPredicate>>,
 }
 
-impl HarnessMatcher {
+impl StackMatcher {
     /// Returns true if all the predicates in this matcher apply to the given source tree.
     pub fn match_dir<P: AsRef<Path>>(&self, p: P) -> Result<bool, Either<regex::Error, JqError>> {
         matches(p, &self.file_regexes, &self.file_predicates)
     }
 
-    /// Deserializes a harness matcher structure from the given nickel term tree.
+    /// Deserializes a stack matcher structure from the given nickel term tree.
     pub(crate) fn from_term(
         rt: &NickelValue,
         program: &mut Program<CacheImpl>,
@@ -256,7 +256,7 @@ impl HarnessMatcher {
                 })?;
         }
 
-        Ok(HarnessMatcher {
+        Ok(StackMatcher {
             file_regexes,
             file_predicates,
             build_package_matchers,
@@ -265,40 +265,40 @@ impl HarnessMatcher {
     }
 }
 
-/// A harness, a specific set of norms for building a codebase.
+/// A stack, a specific set of norms for building a codebase.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(dead_code)]
-pub struct Harness {
-    /// The human-readable name declared on the harness. Unique within a repo/layer.
+pub struct Stack {
+    /// The human-readable name declared on the stack. Unique within a repo/layer.
     pub name: String,
 
     /// The names of build-specs/packages that are needed to execute a build.
     pub build_packages: Vec<String>,
-    /// The names of build-specs/packages that are needed by anything built with this harness.
+    /// The names of build-specs/packages that are needed by anything built with this stack.
     pub runtime_packages: Vec<String>,
-    /// The environment variables that should be applied to any execution within this harness.
+    /// The environment variables that should be applied to any execution within this stack.
     pub build_env_vars: IndexMap<String, EnvVarValue>,
 
-    /// Static commands to build software using this harness.
+    /// Static commands to build software using this stack.
     ///
     /// Only one of `build_cmds` and `build_cmds_cmd` may be set.
     pub build_cmds: Option<Vec<Vec<String>>>,
-    /// The command to generate the build commands to build software using this harness.
+    /// The command to generate the build commands to build software using this stack.
     ///
     /// Only one of `build_cmds` and `build_cmds_cmd` may be set.
     pub build_cmds_cmd: Option<Vec<String>>,
 
-    /// Predicates that indicate this harness is applicable to a source tree.
+    /// Predicates that indicate this stack is applicable to a source tree.
     ///
-    /// For a harness to be applicable, one of the matchers in this list must have all its predicates met.
-    pub matches_project_if_any: Option<Vec<HarnessMatcher>>,
+    /// For a stack to be applicable, one of the matchers in this list must have all its predicates met.
+    pub matches_project_if_any: Option<Vec<StackMatcher>>,
 
-    /// Priority of this harness for matching, defaults to zero.
+    /// Priority of this stack for matching, defaults to zero.
     pub matches_project_priority: i32,
 }
 
-impl Harness {
-    /// Deserializes a harness structure from the given nickel term tree.
+impl Stack {
+    /// Deserializes a stack structure from the given nickel term tree.
     pub fn from_term(rt: &NickelValue, program: &mut Program<CacheImpl>) -> Result<Self, Error> {
         let rt = eval_if_closure(rt, program)?;
 
@@ -309,7 +309,7 @@ impl Harness {
         let mut build_env_vars: Option<IndexMap<String, EnvVarValue>> = None;
         let mut build_cmds: Option<Vec<Vec<String>>> = None;
         let mut build_cmds_cmd: Option<Vec<String>> = None;
-        let mut matches_project_if_any: Option<Vec<HarnessMatcher>> = None;
+        let mut matches_project_if_any: Option<Vec<StackMatcher>> = None;
         let mut matches_project_priority: Option<i32> = None;
 
         if let Some(r) = record_data_from_val(&rt) {
@@ -410,7 +410,7 @@ impl Harness {
                                                     m.pos_idx(),
                                                 );
 
-                                                HarnessMatcher::from_term(&eval_if_closure(
+                                                StackMatcher::from_term(&eval_if_closure(
                                                     &rt,
                                                     program,
                                                 )?, program)
@@ -444,7 +444,7 @@ impl Harness {
         }
 
         match ty {
-            Some(ObjTy::Harness) => {} // happy path
+            Some(ObjTy::Stack) => {} // happy path
             None => {
                 return Err(Error::MissingTy(
                     program.files(),
@@ -455,7 +455,7 @@ impl Harness {
                 return Err(Error::UnexpectedObject {
                     files: program.files(),
                     got: ty,
-                    want: ObjTy::Harness,
+                    want: ObjTy::Stack,
                     pos: rt.pos(program.pos_table()),
                 });
             }
@@ -479,14 +479,14 @@ impl Harness {
         match (&build_cmds, &build_cmds_cmd) {
             (Some(_), Some(_)) => {
                 return Err(Error::Other(format!(
-                    "harness {}: only one of build_cmd or build_cmds_cmd may be set",
+                    "stack {}: only one of build_cmd or build_cmds_cmd may be set",
                     name
                 )));
             }
             (None, None) => {
                 return Err(Error::MissingField {
                     files: program.files(),
-                    obj: ObjTy::Harness,
+                    obj: ObjTy::Stack,
                     pos: rt.pos(program.pos_table()),
                     field: "build_cmd or build_cmds_cmd",
                 });
@@ -506,7 +506,7 @@ impl Harness {
         })
     }
 
-    /// Synthesizes a task representing the build using this harness.
+    /// Synthesizes a task representing the build using this stack.
     pub fn build_task(&self) -> mfile::Task {
         mfile::Task {
             state_key: None,
@@ -536,7 +536,7 @@ impl Harness {
         }
     }
 
-    /// Returns the default task with the specified name this harness provides, if any.
+    /// Returns the default task with the specified name this stack provides, if any.
     pub fn task_by_name(&self, name: &str) -> Option<mfile::Task> {
         match name {
             "build" => Some(self.build_task()),
@@ -544,7 +544,7 @@ impl Harness {
         }
     }
 
-    /// Enumerates the default tasks this harness provides.
+    /// Enumerates the default tasks this stack provides.
     pub fn task_names(&self) -> Vec<String> {
         vec!["build".to_string()]
     }
@@ -557,7 +557,7 @@ mod tests {
     use indoc::indoc;
 
     #[test]
-    fn parse() {
+    fn parse_harness_syntax() {
         let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
@@ -601,11 +601,11 @@ mod tests {
             panic!("finish failed");
         });
 
-        let p = Harness::from_term(&term, &mut program).unwrap();
+        let p = Stack::from_term(&term, &mut program).unwrap();
 
         assert_eq!(
             p,
-            Harness {
+            Stack {
                 name: "rust".to_string(),
                 build_packages: vec![
                     "gcc".to_string(),
@@ -621,7 +621,7 @@ mod tests {
                     "CC".to_string(),
                     EnvVarValue::Value("gcc".to_string())
                 )]),
-                matches_project_if_any: Some(vec![HarnessMatcher {
+                matches_project_if_any: Some(vec![StackMatcher {
                     file_regexes: [("Cargo.toml".to_string(), "*".to_string())].into(),
                     file_predicates: [(
                         "Cargo.toml".to_string(),
@@ -649,7 +649,99 @@ mod tests {
     }
 
     #[test]
-    fn harness_matcher_match_dir_file_wildcard() {
+    fn parse() {
+        let (term, mut program, _origin, _target) = Loader::new(
+            indoc! {
+                "
+                let {stack, ..} = import \"minimal.ncl\" in
+                stack {
+                    name = \"rust\",
+
+                    build_packages = [\"gcc\", \"rust\", \"binutils\"],
+                    build_cmd = \"cargo build --release\",
+                    build_env_vars.CC = \"gcc\",
+
+                    matches_project_if_any = [{
+                        file_regexes = {
+                            \"Cargo.toml\" = \"*\",
+                        },
+
+                        file_predicates = {
+                            \"Cargo.toml\" = \".workspace.dependencies.dirs == '6'\",
+                        },
+
+                        build_package_if_any.\"openssl\" = [
+                          {
+                            file_predicates.\"Cargo.toml\" = \".workspace.dependencies.reqwest.features | contains(\\\"native-tls\\\")\",
+                          }
+                        ],
+                    }],
+                    matches_project_priority = 1,
+                }
+                "
+            }
+            .to_string(),None,
+            &LoadOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("load failed");
+        })
+        .finish()
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("finish failed");
+        });
+
+        let p = Stack::from_term(&term, &mut program).unwrap();
+
+        assert_eq!(
+            p,
+            Stack {
+                name: "rust".to_string(),
+                build_packages: vec![
+                    "gcc".to_string(),
+                    "rust".to_string(),
+                    "binutils".to_string()
+                ],
+                build_cmds: Some(vec![vec![
+                    "cargo".to_string(),
+                    "build".to_string(),
+                    "--release".to_string()
+                ]]),
+                build_env_vars: IndexMap::from_iter([(
+                    "CC".to_string(),
+                    EnvVarValue::Value("gcc".to_string())
+                )]),
+                matches_project_if_any: Some(vec![StackMatcher {
+                    file_regexes: [("Cargo.toml".to_string(), "*".to_string())].into(),
+                    file_predicates: [(
+                        "Cargo.toml".to_string(),
+                        ".workspace.dependencies.dirs == '6'".to_string()
+                    )]
+                    .into(),
+                    build_package_matchers: [(
+                        "openssl".to_string(),
+                        vec![PackageMatcherPredicate {
+                            file_predicates: [(
+                                "Cargo.toml".to_string(),
+                                ".workspace.dependencies.reqwest.features | contains(\"native-tls\")".to_string()
+                            )]
+                            .into(),
+                            ..Default::default()
+                        }]
+                    )]
+                    .into(),
+                    runtime_package_matchers: Default::default(),
+                }]),
+                matches_project_priority: 1,
+                ..Default::default()
+            }
+        )
+    }
+
+    #[test]
+    fn stack_matcher_match_dir_file_wildcard() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("Cargo.toml"),
@@ -657,14 +749,14 @@ mod tests {
         )
         .unwrap();
 
-        let matcher = HarnessMatcher {
+        let matcher = StackMatcher {
             file_regexes: [("Cargo.toml".to_string(), "*".to_string())].into(),
             ..Default::default()
         };
         assert!(matcher.match_dir(dir.path()).unwrap());
     }
     #[test]
-    fn harness_matcher_match_dir_regex() {
+    fn stack_matcher_match_dir_regex() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("Cargo.toml"),
@@ -672,7 +764,7 @@ mod tests {
         )
         .unwrap();
 
-        let matcher = HarnessMatcher {
+        let matcher = StackMatcher {
             file_regexes: [(
                 "Cargo.toml".to_string(),
                 "(?m).*\\[package\\].*".to_string(),
@@ -684,10 +776,10 @@ mod tests {
     }
 
     #[test]
-    fn harness_matcher_match_dir_toml_missing() {
+    fn stack_matcher_match_dir_toml_missing() {
         let dir = tempfile::tempdir().unwrap();
 
-        let matcher = HarnessMatcher {
+        let matcher = StackMatcher {
             file_regexes: [("Cargo.toml".to_string(), "*".to_string())].into(),
             ..Default::default()
         };
@@ -696,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn harness_matcher_match_toml_predicate() {
+    fn stack_matcher_match_toml_predicate() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("Cargo.toml"),
@@ -704,7 +796,7 @@ mod tests {
         )
         .unwrap();
 
-        let matcher = HarnessMatcher {
+        let matcher = StackMatcher {
             file_predicates: [(
                 "Cargo.toml".to_string(),
                 ".package.name == \"test\"".to_string(),
@@ -713,7 +805,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matcher.match_dir(dir.path()).unwrap());
-        let matcher = HarnessMatcher {
+        let matcher = StackMatcher {
             file_predicates: [(
                 "Cargo.toml".to_string(),
                 ".package.name == \"wrong thing\"".to_string(),

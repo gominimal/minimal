@@ -18,14 +18,14 @@ pub struct InitArgs {
 
 const DEFAULT_PKGS: &str = "https://github.com/gominimal/pkgs";
 const DEFAULT_PKGS_BRANCH: &str = "main";
-const FALLBACK_HARNESS: &str = "shell";
+const FALLBACK_STACK: &str = "shell";
 
 pub async fn cmd_init(args: InitArgs, config: Config) -> Result<(), Error> {
     let mfile_strategy = match config.repo_dir_override() {
         Some(path) => mctx::MFileSearchStrategy::Override(path.to_path_buf()),
         _ => mctx::MFileSearchStrategy::CurrentDirOnly,
     };
-    // Harnesses have the match rules, so we need a graph, either from the repo
+    // Stacks have the match rules, so we need a graph, either from the repo
     // minimal file or some default based on the MPPR.
     let (upstream_origin, repo_dir, toml_path, graph) =
         match Context::new_with_strategy(config.clone(), mfile_strategy) {
@@ -50,7 +50,7 @@ pub async fn cmd_init(args: InitArgs, config: Config) -> Result<(), Error> {
                 )
             }
             // Unsurprisingly, theres no minimal file yet, or theres no upstream so theres no
-            // useful information. We need the harnesses though for auto-detection, so lets
+            // useful information. We need the stacks though for auto-detection, so lets
             // wire up a default graph.
             Err(Error::MFile(mfile::Error::NotFound)) | Ok(_) => {
                 let (mut vcs, _cache, stdlib_dir) = Context::sub_setup(&config)?;
@@ -94,10 +94,10 @@ pub async fn cmd_init(args: InitArgs, config: Config) -> Result<(), Error> {
         };
     let toml_path = toml_path.unwrap_or_else(|| repo_dir.join(mfile::MFILE_NAME));
 
-    // Apply all predicates, collecting the harness name, any additional build packages, and any additional runtime packages.
-    let harnesses = {
-        let mut h = graph.iter_harnesses().collect::<Vec<_>>();
-        // Sort harnesses so those with a higher priority are iterated first.
+    // Apply all predicates, collecting the stacks name, any additional build packages, and any additional runtime packages.
+    let stacks = {
+        let mut h = graph.iter_stacks().collect::<Vec<_>>();
+        // Sort stacks so those with a higher priority are iterated first.
         h.sort_by(|a, b| {
             a.1.matches_project_priority
                 .cmp(&b.1.matches_project_priority)
@@ -105,47 +105,44 @@ pub async fn cmd_init(args: InitArgs, config: Config) -> Result<(), Error> {
         });
         h
     };
-    let matched_harness: Option<(String, Vec<String>, Vec<String>)> =
-        harnesses.into_iter().find_map(|(name, harness)| {
-            harness
-                .matches_project_if_any
-                .as_ref()
-                .and_then(|matchers| {
-                    matchers
-                        .iter()
-                        .find(|m| m.match_dir(&repo_dir).unwrap_or(false))
-                        .map(|harness| {
-                            (
-                                name.clone(),
-                                harness
-                                    .build_package_matchers
-                                    .iter()
-                                    .filter_map(|(pkg, if_any)| {
-                                        if_any
-                                            .iter()
-                                            .any(|c| c.match_dir(&repo_dir).unwrap_or(false))
-                                            .then_some(pkg)
-                                    })
-                                    .cloned()
-                                    .collect::<Vec<_>>(),
-                                harness
-                                    .runtime_package_matchers
-                                    .iter()
-                                    .filter_map(|(pkg, if_any)| {
-                                        if_any
-                                            .iter()
-                                            .any(|c| c.match_dir(&repo_dir).unwrap_or(false))
-                                            .then_some(pkg)
-                                    })
-                                    .cloned()
-                                    .collect::<Vec<_>>(),
-                            )
-                        })
-                })
+    let matched_stack: Option<(String, Vec<String>, Vec<String>)> =
+        stacks.into_iter().find_map(|(name, stack)| {
+            stack.matches_project_if_any.as_ref().and_then(|matchers| {
+                matchers
+                    .iter()
+                    .find(|m| m.match_dir(&repo_dir).unwrap_or(false))
+                    .map(|stack| {
+                        (
+                            name.clone(),
+                            stack
+                                .build_package_matchers
+                                .iter()
+                                .filter_map(|(pkg, if_any)| {
+                                    if_any
+                                        .iter()
+                                        .any(|c| c.match_dir(&repo_dir).unwrap_or(false))
+                                        .then_some(pkg)
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                            stack
+                                .runtime_package_matchers
+                                .iter()
+                                .filter_map(|(pkg, if_any)| {
+                                    if_any
+                                        .iter()
+                                        .any(|c| c.match_dir(&repo_dir).unwrap_or(false))
+                                        .then_some(pkg)
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+            })
         });
 
-    let has_matched = matched_harness.is_some();
-    let content = generate_mfile(matched_harness, &upstream_origin);
+    let has_matched = matched_stack.is_some();
+    let content = generate_mfile(matched_stack, &upstream_origin);
 
     // -- Confirmation prompt (unless --yes) --
     if !args.yes {
@@ -183,13 +180,13 @@ pub async fn cmd_init(args: InitArgs, config: Config) -> Result<(), Error> {
 }
 
 fn generate_mfile(
-    matched_harness: Option<(String, Vec<String>, Vec<String>)>,
+    matched_stack: Option<(String, Vec<String>, Vec<String>)>,
     origin: &SpecOrigin,
 ) -> String {
-    // Fall back to the "shell" harness if no project-specific matcher hit.
-    let (harness_name, build_packages, runtime_packages) = matched_harness
+    // Fall back to the "shell" stack if no project-specific matcher hit.
+    let (stack_name, build_packages, runtime_packages) = matched_stack
         .map(|h| (h.0, h.1, h.2))
-        .unwrap_or_else(|| (FALLBACK_HARNESS.to_string(), vec![], vec![]));
+        .unwrap_or_else(|| (FALLBACK_STACK.to_string(), vec![], vec![]));
 
     let mut content = String::new();
     content.push_str("# Generated by `minimal init`\n\n");
@@ -211,8 +208,8 @@ fn generate_mfile(
     }
     content.push('\n');
 
-    content.push_str("[harness]\n");
-    content.push_str(&format!("use = \"{}\"\n", harness_name));
+    content.push_str("[stack]\n");
+    content.push_str(&format!("use = \"{}\"\n", stack_name));
     if !build_packages.is_empty() {
         content.push_str(&format!(
             "build_packages = [{}]\n",

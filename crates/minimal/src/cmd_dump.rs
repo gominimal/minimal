@@ -39,9 +39,9 @@ pub struct DumpKind {
     #[arg(short, long)]
     packages: bool,
 
-    /// Dump the harnesses
+    /// Dump the stacks
     #[arg(long)]
-    harnesses: bool,
+    stacks: bool,
 }
 
 #[derive(Debug, Default, Clone, clap::ValueEnum)]
@@ -155,7 +155,7 @@ pub async fn cmd_dump(args: DumpArgs, ctx: &mut Context) -> Result<(), Error> {
     match args.kind {
         DumpKind {
             packages: true,
-            harnesses: false,
+            stacks: false,
         } => {
             serde_json::to_writer_pretty(&w, &out_packages).unwrap();
         }

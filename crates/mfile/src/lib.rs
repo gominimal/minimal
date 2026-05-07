@@ -301,9 +301,9 @@ pub struct Defaults {
 
 impl Eq for Defaults {}
 
-/// Configuration for the harness applied to this repository.
+/// Configuration for the stack applied to this repository.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-pub struct Harness {
+pub struct Stack {
     #[serde(alias = "use")]
     pub name: String,
     /// Additional build_packages needed by this repo.
@@ -318,7 +318,7 @@ pub struct Harness {
     pub extra: HashMap<String, toml::Value>,
 }
 
-impl Eq for Harness {}
+impl Eq for Stack {}
 
 /// Describes the specific type of output being generated.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -367,13 +367,13 @@ pub enum Layout {
     ///
     /// If present, the packages directory is at ./packages.
     /// If present, the profiles directory is at ./profiles.
-    /// If present, the harnesses directory is at ./harnesses.
+    /// If present, the stacks directory is at ./stacks.
     Root,
     /// The 'full' layout. The minimal file is located at `./.minimal/{MFILE_NAME}`.
     ///
     /// If present, the packages directory is at ./.minimal/packages.
     /// If present, the profiles directory is at ./.minimal/profiles.
-    /// If present, the harnesses directory is at ./.minimal/harnesses.
+    /// If present, the stacks directory is at ./.minimal/stacks.
     DotMinimal,
 }
 
@@ -389,9 +389,9 @@ pub struct File {
     /// Default profile, state_key etc.
     #[serde(default, alias = "default")]
     pub defaults: Defaults,
-    /// The harness configured on this repository, if any.
-    #[serde(default)]
-    pub harness: Option<Harness>,
+    /// The stack configured on this repository, if any.
+    #[serde(default, alias = "harness")]
+    pub stack: Option<Stack>,
 
     /// Task definitions, invoked with `minimal run <task name>`.
     #[serde(default)]
@@ -534,13 +534,13 @@ impl File {
             );
             was_unknown_fields = true;
         }
-        if let Some(harness) = &self.harness
-            && !harness.extra.is_empty()
+        if let Some(stack) = &self.stack
+            && !stack.extra.is_empty()
         {
             tracing::warn!(
-                "unknown fields in [harness] section of {}: {}",
+                "unknown fields in [stack] section of {}: {}",
                 MFILE_NAME,
-                harness.extra.keys().cloned().collect::<Vec<_>>().join(",")
+                stack.extra.keys().cloned().collect::<Vec<_>>().join(",")
             );
             was_unknown_fields = true;
         }
@@ -615,7 +615,7 @@ impl File {
     /// Applies additional settings to hydrate a task, namely:
     ///  - default profile if set (and not set on the task)
     ///  - default state_key if set (and not set on the task)
-    ///  - additional build_packages & runtime_packages set on the harness
+    ///  - additional build_packages & runtime_packages set on the stack
     ///
     /// The returned task will not have had any string interpolations applied.
     pub fn hydrate_task_defaults(&self, task: &mut Task) {
@@ -629,12 +629,12 @@ impl File {
         {
             task.state_key = Some(default_state_key.clone());
         }
-        if let Some(harness) = &self.harness {
+        if let Some(stack) = &self.stack {
             task.packages.extend(
-                harness
+                stack
                     .build_packages
                     .iter()
-                    .chain(harness.runtime_packages.iter())
+                    .chain(stack.runtime_packages.iter())
                     .filter(|p| !task.packages.contains(p))
                     .cloned()
                     .collect::<Vec<_>>(),
@@ -741,7 +741,7 @@ mod tests {
                     ),
                 ]))),
                 defaults: Default::default(),
-                harness: None,
+                stack: None,
                 tasks: [(
                     "test".to_string(),
                     Task {

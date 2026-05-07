@@ -68,10 +68,10 @@ impl tokio::io::AsyncWrite for SharedBuf {
     }
 }
 
-mod harness;
 mod naming;
 mod outputs;
 mod profile;
+mod stack;
 
 use outputs::{MissingRuntimeDeps, OutputTypesValid};
 
@@ -164,43 +164,43 @@ impl CheckResult {
         }
     }
 
-    pub(crate) fn harness_name_skip() -> Self {
+    pub(crate) fn stack_name_skip() -> Self {
         CheckResult {
-            check: "harness name matches dir".into(),
+            check: "stack name matches dir".into(),
             verdict: CheckVerdict::Skip,
             err: vec![],
         }
     }
-    pub(crate) fn harness_name_pass() -> Self {
+    pub(crate) fn stack_name_pass() -> Self {
         CheckResult {
-            check: "harness name matches dir".into(),
+            check: "stack name matches dir".into(),
             verdict: CheckVerdict::Pass,
             err: vec![],
         }
     }
-    pub(crate) fn harness_name_fail(msg: String) -> Self {
+    pub(crate) fn stack_name_fail(msg: String) -> Self {
         CheckResult {
-            check: "harness name matches dir".into(),
+            check: "stack name matches dir".into(),
             verdict: CheckVerdict::Fail,
             err: vec![msg],
         }
     }
 
-    pub(crate) fn harness_regexes_skip() -> Self {
+    pub(crate) fn stack_regexes_skip() -> Self {
         CheckResult {
             check: "project_matchers regexes".into(),
             verdict: CheckVerdict::Skip,
             err: vec![],
         }
     }
-    pub(crate) fn harness_regexes_pass() -> Self {
+    pub(crate) fn stack_regexes_pass() -> Self {
         CheckResult {
             check: "project_matchers regexes".into(),
             verdict: CheckVerdict::Pass,
             err: vec![],
         }
     }
-    pub(crate) fn harness_regexes_fail(msg: String) -> Self {
+    pub(crate) fn stack_regexes_fail(msg: String) -> Self {
         CheckResult {
             check: "project_matchers regexes".into(),
             verdict: CheckVerdict::Fail,
@@ -208,21 +208,21 @@ impl CheckResult {
         }
     }
 
-    pub(crate) fn harness_predicates_skip() -> Self {
+    pub(crate) fn stack_predicates_skip() -> Self {
         CheckResult {
             check: "project_matchers predicates".into(),
             verdict: CheckVerdict::Skip,
             err: vec![],
         }
     }
-    pub(crate) fn harness_predicates_pass() -> Self {
+    pub(crate) fn stack_predicates_pass() -> Self {
         CheckResult {
             check: "project_matchers predicates".into(),
             verdict: CheckVerdict::Pass,
             err: vec![],
         }
     }
-    pub(crate) fn harness_predicates_fail(msg: String) -> Self {
+    pub(crate) fn stack_predicates_fail(msg: String) -> Self {
         CheckResult {
             check: "project_matchers predicates".into(),
             verdict: CheckVerdict::Fail,
@@ -235,7 +235,7 @@ impl CheckResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckObj {
     Package(String),
-    Harness(String),
+    Stack(String),
     Profile(String),
 }
 
@@ -243,7 +243,7 @@ impl Display for CheckObj {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CheckObj::Package(n) => write!(f, "package: {}", n),
-            CheckObj::Harness(n) => write!(f, "harness: {}", n),
+            CheckObj::Stack(n) => write!(f, "stack: {}", n),
             CheckObj::Profile(n) => write!(f, "profile: {}", n),
         }
     }
@@ -369,12 +369,12 @@ impl CheckCtx {
 
 /// Runs checkers, returning a [`FuturesUnordered`] that yields results as each check completes.
 ///
-/// If `None` is given for a `packages_dir`, `profiles_dir`, or `harnesses_dir`, the corresponding
+/// If `None` is given for a `packages_dir`, `profiles_dir`, or `stacks_dir`, the corresponding
 /// class of checkers are skipped.
 pub fn run_checks(
     packages_dir: Option<PathBuf>,
     profiles_dir: Option<PathBuf>,
-    harnesses_dir: Option<PathBuf>,
+    stacks_dir: Option<PathBuf>,
     ctx: CheckCtx,
 ) -> Result<FuturesUnordered<CheckFuture>, Error> {
     let results = if let Some(packages_dir) = packages_dir {
@@ -389,8 +389,8 @@ pub fn run_checks(
         vec![]
     };
 
-    let harness_results = if let Some(harnesses_dir) = harnesses_dir {
-        harness_check_futures(harnesses_dir, ctx)?
+    let stack_results = if let Some(stacks_dir) = stacks_dir {
+        stack_check_futures(stacks_dir, ctx)?
     } else {
         vec![]
     };
@@ -398,7 +398,7 @@ pub fn run_checks(
     Ok(results
         .into_iter()
         .chain(profile_results)
-        .chain(harness_results)
+        .chain(stack_results)
         .collect::<FuturesUnordered<_>>())
 }
 
@@ -482,10 +482,10 @@ fn profile_check_futures(profiles_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<Che
         .collect())
 }
 
-fn harness_check_futures(harnesses_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<CheckFuture>, Error> {
-    let dirs: Vec<std::ffi::OsString> = match std::fs::read_dir(&harnesses_dir) {
+fn stack_check_futures(stacks_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<CheckFuture>, Error> {
+    let dirs: Vec<std::ffi::OsString> = match std::fs::read_dir(&stacks_dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-        Err(e) => return Err(Error::IO("reading harness dirs", harnesses_dir.clone(), e)),
+        Err(e) => return Err(Error::IO("reading stack dirs", stacks_dir.clone(), e)),
         Ok(dirs) => dirs
             .filter_map(|e| match e {
                 Err(e) => Some(Err(e)),
@@ -498,7 +498,7 @@ fn harness_check_futures(harnesses_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<Ch
                 }
             })
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| Error::IO("listing harnesses", harnesses_dir.clone(), e))?
+            .map_err(|e| Error::IO("listing stack", stacks_dir.clone(), e))?
             .into_iter()
             // Filter based on any given filter names
             .filter_map(|dir| {
@@ -516,14 +516,13 @@ fn harness_check_futures(harnesses_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<Ch
         .into_iter()
         .map::<CheckFuture, _>(move |pd| {
             let ctx = ctx.clone();
-            let harnesses_dir = harnesses_dir.clone();
+            let stacks_dir = stacks_dir.clone();
 
             Box::pin(async move {
                 let _permit = ctx.semaphore.acquire().await.unwrap();
                 (
-                    CheckObj::Harness(pd.to_str().unwrap().to_string()),
-                    harness::check_harness(pd.to_str().unwrap().to_string(), &ctx, harnesses_dir)
-                        .await,
+                    CheckObj::Stack(pd.to_str().unwrap().to_string()),
+                    stack::check_stack(pd.to_str().unwrap().to_string(), &ctx, stacks_dir).await,
                 )
             })
         })

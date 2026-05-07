@@ -315,6 +315,7 @@ impl LayerCache for LayerCacheDir {
         if let Ok(f) = std::fs::File::open(&p) {
             let layer: Layer = serde_json::from_reader(f).map_err(|e| {
                 tracing::warn!("LayerCacheDir::get failed to deserialize: {}", e);
+                std::fs::remove_file(&p).ok(); // best effort, delete broken file
             })?;
 
             // Local BuildDeps point to the file they represent by path, typically a VCS checkout.
@@ -621,25 +622,25 @@ impl Graph {
                 slf.profiles.insert(name, profile);
             }
         }
-        // Load harnesses
-        for (name, harness) in loader.from.harnesses {
+        // Load stacks
+        for (name, stack) in loader.from.stacks {
             // Verify all packages exist
-            for pkg in &harness.build_packages {
+            for pkg in &stack.build_packages {
                 if slf.by_name(pkg).is_none() {
                     return Err(Error::NoSuchPkg { name: pkg.clone() });
                 }
             }
-            for pkg in &harness.runtime_packages {
+            for pkg in &stack.runtime_packages {
                 if slf.by_name(pkg).is_none() {
                     return Err(Error::NoSuchPkg { name: pkg.clone() });
                 }
             }
 
-            if slf.harnesses.contains_key(&name) {
-                // Its illegal to shadow a harness of the same name from upstream.
-                return Err(Error::ConflictingHarness { name });
+            if slf.stacks.contains_key(&name) {
+                // Its illegal to shadow a stack of the same name from upstream.
+                return Err(Error::ConflictingStack { name });
             }
-            slf.harnesses.insert(name, harness);
+            slf.stacks.insert(name, stack);
         }
 
         Ok(slf)
@@ -832,17 +833,17 @@ mod tests {
     }
 
     #[test]
-    fn ingest_harness() {
+    fn ingest_stack() {
         let layer = Layer::new_for_test(
             indoc! {
                 "
-                let {layer, harness, ..} = import \"minimal.ncl\" in
+                let {layer, stack, ..} = import \"minimal.ncl\" in
 
                 layer {
                   builds = [],
-                  harnesses = [
-                    harness {
-                      name = \"harness 1\",
+                  stacks = [
+                    stack {
+                      name = \"stack 1\",
                       build_cmd = \"beep boop\",
                     }
                   ],
@@ -858,9 +859,9 @@ mod tests {
 
         let dp = Graph::new().ingest(layer).unwrap();
         assert_eq!(
-            dp.harnesses.get("harness 1"),
-            Some(&decode::Harness {
-                name: "harness 1".to_string(),
+            dp.stacks.get("stack 1"),
+            Some(&decode::Stack {
+                name: "stack 1".to_string(),
                 build_cmds: Some(vec![vec!["beep".to_string(), "boop".to_string()]]),
                 ..Default::default()
             })

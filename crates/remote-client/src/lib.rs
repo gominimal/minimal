@@ -514,7 +514,7 @@ where
                         let obj = match c.obj.and_then(|o| o.msg) {
                             Some(check_object::Msg::Package(n)) => check::CheckObj::Package(n),
                             Some(check_object::Msg::Profile(n)) => check::CheckObj::Profile(n),
-                            Some(check_object::Msg::Harness(n)) => check::CheckObj::Harness(n),
+                            Some(check_object::Msg::Harness(n)) => check::CheckObj::Stack(n),
                             None => {
                                 let _ = tx.unbounded_send((
                                     check::CheckObj::Package(String::new()),

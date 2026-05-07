@@ -12,14 +12,14 @@ use std::path::Path;
 pub struct StatusArgs {}
 
 pub async fn cmd_status(_args: StatusArgs, ctx: &mut Context) -> Result<(), Error> {
-    let harness = ctx.minimal_file().harness.as_ref().map(|h| h.name.clone());
+    let stack = ctx.minimal_file().stack.as_ref().map(|h| h.name.clone());
 
     let s = StandardStream::stdout(ColorChoice::Auto);
     let mut writer = s.lock();
 
     writer.set_color(ColorSpec::new().set_fg(None)).unwrap();
-    if let Some(harness) = harness {
-        writeln!(writer, "Using harness {}", harness).unwrap();
+    if let Some(stack) = stack {
+        writeln!(writer, "Using stack {}", stack).unwrap();
     }
 
     let graph = ctx.graph_from_all_packages()?;
@@ -73,8 +73,8 @@ fn print_tasks(
             }
             match source {
                 mctx::TaskSource::MFile => {}
-                mctx::TaskSource::Harness(harness_name) => {
-                    writeln!(writer, "    (provided by {harness_name} harness)").unwrap()
+                mctx::TaskSource::Stack(stack_name) => {
+                    writeln!(writer, "    (provided by {stack_name} stack)").unwrap()
                 }
             }
         }

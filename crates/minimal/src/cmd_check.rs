@@ -32,9 +32,9 @@ pub struct CheckKind {
     #[arg(long)]
     packages: bool,
 
-    /// Check harnesses defined in the codebase
+    /// Check stacks defined in the codebase
     #[arg(long)]
-    harnesses: bool,
+    stacks: bool,
 
     /// Check profiles defined in the codebase
     #[arg(long)]
@@ -45,8 +45,8 @@ impl CheckKind {
     fn check_packages(&self) -> bool {
         self == &CheckKind::default() || self.packages
     }
-    fn check_harnesses(&self) -> bool {
-        self == &CheckKind::default() || self.harnesses
+    fn check_stacks(&self) -> bool {
+        self == &CheckKind::default() || self.stacks
     }
     fn check_profiles(&self) -> bool {
         self == &CheckKind::default() || self.profiles
@@ -120,8 +120,13 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
         } else {
             None
         },
-        if args.kind.check_harnesses() {
-            Some(upstream_dir.join("harnesses"))
+        if args.kind.check_stacks() {
+            // TODO: Remove after May 2026.
+            if upstream_dir.join("harnesses").exists() {
+                Some(upstream_dir.join("harnesses"))
+            } else {
+                Some(upstream_dir.join("stacks"))
+            }
         } else {
             None
         },

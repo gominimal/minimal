@@ -1,7 +1,7 @@
 //! Decodes a layer in the software supply chain.
 //!
 //! Concretely, this means walking the codebase which declares the layer to enumerate
-//! packages/profiles/harnesses, then evaluating the resulting Nickel to decode them
+//! packages/profiles/stacks, then evaluating the resulting Nickel to decode them
 //! into in-memory structures.
 
 use common::{SpecOrigin, Target};
@@ -33,8 +33,14 @@ mod profiles;
 pub use profiles::Profile;
 mod decl_tests;
 pub use decl_tests::Test;
-mod harnesses;
-pub use harnesses::{Harness, HarnessMatcher};
+mod stacks;
+pub use stacks::{Stack, StackMatcher};
+
+// Increment for any big change to the format of build specs / stacks, so that hash
+// keys get invalidated.
+//
+// Version 1: Switch from harnesses/ to stacks/.
+const FORMAT_VERSION: u8 = 1;
 
 /// The start and end bytes where a string was defined.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -67,7 +73,7 @@ pub struct Layer {
     pub top_levels: Vec<generational_arena::Index>,
 
     pub profiles: HashMap<String, Profile>,
-    pub harnesses: HashMap<String, Harness>,
+    pub stacks: HashMap<String, Stack>,
 
     read_ids: HashMap<u64, generational_arena::Index>,
 }
@@ -169,7 +175,7 @@ impl Layer {
             read_ids: HashMap::with_capacity(512),
 
             profiles: HashMap::with_capacity(16),
-            harnesses: HashMap::with_capacity(32),
+            stacks: HashMap::with_capacity(32),
         };
 
         // The top-level of the nickel tree can either evaluate to:
@@ -205,12 +211,12 @@ impl Layer {
                             );
                         }
                     };
-                    if let Ok(Some(rt)) = record.get_value_with_ctrs(&LocIdent::new("harnesses")) {
+                    if let Ok(Some(rt)) = record.get_value_with_ctrs(&LocIdent::new("stacks")) {
                         let rt = eval_if_closure(&rt, &mut program)?;
                         if let Some(a) = rt.as_array() {
-                            layer.harnesses = HashMap::from_iter(
+                            layer.stacks = HashMap::from_iter(
                                 a.iter()
-                                    .map(|p| layer.ingest_harness(p, &mut program))
+                                    .map(|p| layer.ingest_stack(p, &mut program))
                                     .collect::<Result<Vec<_>, Error>>()?
                                     .into_iter()
                                     .map(|p| (p.name.clone(), p)),
@@ -274,12 +280,12 @@ impl Layer {
         Profile::from_term(rt, program)
     }
 
-    fn ingest_harness(
+    fn ingest_stack(
         &mut self,
         rt: &NickelValue,
         program: &mut Program<CacheImpl>,
-    ) -> Result<Harness, Error> {
-        Harness::from_term(rt, program)
+    ) -> Result<Stack, Error> {
+        Stack::from_term(rt, program)
     }
 }
 
@@ -343,7 +349,7 @@ pub enum ObjTy {
     Layer,
     Upstream,
     Test,
-    Harness,
+    Stack,
 }
 
 pub(crate) fn read_ty(val: &NickelValue, program: &mut Program<CacheImpl>) -> Result<ObjTy, Error> {
@@ -858,7 +864,7 @@ mod tests {
         let layer = Layer::new_for_test(
             indoc! {
                 "
-                let {layer, harness, profile, BuildSpec, ..} = import \"minimal.ncl\" in
+                let {layer, stack, profile, BuildSpec, ..} = import \"minimal.ncl\" in
 
                 layer {
                   builds = [
@@ -880,8 +886,8 @@ mod tests {
                     }
                   ],
 
-                  harnesses = [
-                    harness {
+                  stacks = [
+                    stack {
                         name = \"uwu\",
                         runtime_packages = [\"glibc\"],
                         build_packages = [\"gcc\", \"rust\"],
@@ -923,8 +929,8 @@ mod tests {
             }),
         );
         assert_eq!(
-            layer.harnesses.get("uwu"),
-            Some(&Harness {
+            layer.stacks.get("uwu"),
+            Some(&Stack {
                 name: "uwu".to_string(),
                 runtime_packages: vec!["glibc".to_string()],
                 build_packages: vec!["gcc".to_string(), "rust".to_string()],
