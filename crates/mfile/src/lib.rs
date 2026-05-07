@@ -320,28 +320,77 @@ pub struct Stack {
 
 impl Eq for Stack {}
 
-/// Describes the specific type of output being generated.
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+/// Describes the specific type of output being generated, along with any
+/// fields which are only meaningful for that output type.
+///
+/// Serialized with an internal `type` tag (e.g. `type = "oci-image"`), so
+/// fields like `entrypoint`/`cmd`/`vars` can only be set on the `OciImage`
+/// variant — setting them with any other `type` is a deserialization error.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "kebab-case")]
 pub enum OutputKind {
-    #[default]
-    #[serde(alias = "oci-image")]
-    OciImage,
+    /// An output representing a container image.
+    OciImage {
+        #[serde(default)]
+        entrypoint: Option<StrOrList>,
+        #[serde(default)]
+        cmd: Option<StrOrList>,
+        #[serde(default, alias = "env_vars")]
+        vars: HashMap<String, String>,
+    },
+
+    /// An output representing a file extracted from some packages.
+    RawFile { path: String },
+}
+
+impl Default for OutputKind {
+    fn default() -> Self {
+        OutputKind::OciImage {
+            entrypoint: None,
+            cmd: None,
+            vars: HashMap::new(),
+        }
+    }
+}
+
+/// Flat intermediate used to deserialize [Output]. Combining
+/// `#[serde(flatten)]` on a tagged enum with a `#[serde(flatten)]` catch-all
+/// `extra` map causes serde to duplicate variant fields into both
+/// destinations, so we deserialize into a flat struct and then validate &
+/// route fields into the proper [OutputKind] variant in [TryFrom].
+#[derive(serde::Deserialize)]
+struct OutputRaw {
+    #[serde(rename = "type")]
+    ty: Option<String>,
+
+    #[serde(default)]
+    packages: Vec<String>,
+    #[serde(default)]
+    arch: Option<String>,
+
+    #[serde(default)]
+    entrypoint: Option<StrOrList>,
+    #[serde(default)]
+    cmd: Option<StrOrList>,
+    #[serde(default, alias = "env_vars")]
+    vars: HashMap<String, String>,
+
+    #[serde(default)]
+    path: String,
+
+    #[serde(flatten)]
+    extra: HashMap<String, toml::Value>,
 }
 
 /// An output, defined in a `[outputs.<output_name>]` section of [File].
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(try_from = "OutputRaw")]
 pub struct Output {
-    #[serde(alias = "type")]
-    pub ty: OutputKind,
-    #[serde(default)]
-    pub packages: Vec<String>,
+    #[serde(flatten)]
+    pub kind: OutputKind,
 
     #[serde(default)]
-    pub entrypoint: Option<StrOrList>,
-    #[serde(default)]
-    pub cmd: Option<StrOrList>,
-    #[serde(default, alias = "env_vars")]
-    pub vars: HashMap<String, String>,
+    pub packages: Vec<String>,
 
     /// Target architecture for OCI images. Defaults to "amd64".
     /// Common values: "amd64", "arm64"
@@ -351,6 +400,61 @@ pub struct Output {
     /// Any fields which are not understood by this version of minimal.
     #[serde(flatten)]
     extra: HashMap<String, toml::Value>,
+}
+
+impl TryFrom<OutputRaw> for Output {
+    type Error = String;
+
+    fn try_from(raw: OutputRaw) -> Result<Self, Self::Error> {
+        let ty = raw.ty.as_deref().unwrap_or("oci-image");
+        let kind = match ty {
+            "oci-image" => {
+                for (field, set) in [("path", !raw.path.is_empty())] {
+                    if set {
+                        return Err(format!(
+                            "field `{field}` is not valid for outputs with type = \"oci-image\""
+                        ));
+                    }
+                }
+
+                OutputKind::OciImage {
+                    entrypoint: raw.entrypoint,
+                    cmd: raw.cmd,
+                    vars: raw.vars,
+                }
+            }
+            "raw-file" => {
+                for (field, set) in [
+                    ("entrypoint", raw.entrypoint.is_some()),
+                    ("cmd", raw.cmd.is_some()),
+                    ("vars", !raw.vars.is_empty()),
+                ] {
+                    if set {
+                        return Err(format!(
+                            "field `{field}` is not valid for outputs with type = \"raw-file\""
+                        ));
+                    }
+                }
+                let path = if raw.path.is_empty() {
+                    Err("field `path` is required for outputs with type = \"raw-file\"".to_string())
+                } else {
+                    Ok(raw.path)
+                }?;
+                OutputKind::RawFile { path }
+            }
+            other => {
+                return Err(format!(
+                    "unknown output type {other:?}, expected \"oci-image\" or \"raw-file\""
+                ));
+            }
+        };
+        Ok(Output {
+            kind,
+            packages: raw.packages,
+            arch: raw.arch,
+            extra: raw.extra,
+        })
+    }
 }
 
 /// Configuration for the standard library.
@@ -765,11 +869,12 @@ mod tests {
                 outputs: [(
                     "test".to_string(),
                     Output {
-                        ty: OutputKind::OciImage,
+                        kind: OutputKind::OciImage {
+                            entrypoint: Some(StrOrList::Single("/bin/sh".to_string())),
+                            cmd: None,
+                            vars: HashMap::new(),
+                        },
                         packages: vec!["bash".to_string(), "go".to_string()],
-                        cmd: None,
-                        entrypoint: Some(StrOrList::Single("/bin/sh".to_string())),
-                        vars: HashMap::new(),
                         arch: None,
                         extra: HashMap::new(),
                     }
@@ -948,10 +1053,76 @@ mod tests {
         let output = &mf.outputs["app"];
         assert_eq!(output.arch, Some("arm64".to_string()));
         assert_eq!(output.packages, vec!["base", "openssl"]);
+        let OutputKind::OciImage {
+            entrypoint, vars, ..
+        } = &output.kind
+        else {
+            panic!("expected OciImage, got {:?}", output.kind);
+        };
         assert_eq!(
-            output.entrypoint,
-            Some(StrOrList::Single("/app/server".to_string()))
+            entrypoint,
+            &Some(StrOrList::Single("/app/server".to_string()))
         );
-        assert_eq!(output.vars["PORT"], "8080");
+        assert_eq!(vars["PORT"], "8080");
+    }
+
+    #[test]
+    fn output_raw_file() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [outputs.bash-bin]
+            type = "raw-file"
+            arch = "amd64"
+            path = "/usr/bin/bash"
+            "#
+        })
+        .unwrap();
+        assert_eq!(mf.outputs["bash-bin"].arch, Some("amd64".to_string()));
+        assert_eq!(
+            mf.outputs["bash-bin"].kind,
+            OutputKind::RawFile {
+                path: "/usr/bin/bash".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn raw_file_must_configure_path() {
+        let toml_str = "[outputs.f]\ntype = \"raw-file\"\n".to_string();
+        let err = toml::from_str::<File>(&toml_str).expect_err("expected error");
+        assert!(
+            err.to_string()
+                .contains("field `path` is required for outputs with type = \"raw-file\""),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn raw_file_rejects_oci_image_fields() {
+        for field in ["entrypoint = \"/x\"", "cmd = \"/x\"", "vars.X = \"y\""] {
+            let toml_str = format!("[outputs.f]\ntype = \"raw-file\"\n{field}\n",);
+            let err = toml::from_str::<File>(&toml_str)
+                .expect_err(&format!("expected error for `{field}` on raw-file"));
+            assert!(
+                err.to_string()
+                    .contains("not valid for outputs with type = \"raw-file\""),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_output_type_is_rejected() {
+        let err = toml::from_str::<File>(indoc! {
+            r#"
+            [outputs.f]
+            type = "weird"
+            "#
+        })
+        .expect_err("expected error for unknown output type");
+        assert!(
+            err.to_string().contains("unknown output type"),
+            "unexpected error: {err}"
+        );
     }
 }
