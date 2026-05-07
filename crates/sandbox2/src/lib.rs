@@ -12,8 +12,9 @@
 
 pub mod config;
 use config::Config;
-use std::fs;
+use std::fs::{self, Permissions};
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -204,11 +205,13 @@ impl<C: Channel> Sandbox<C> {
             .map_err(|e| Error::IO("mkdir /state/state", state_dir.join("state"), e))?;
 
         // Create /run/minenv_sock as the pipe to higher-level functions.
-        let run_dir = rootfs.join("run");
+        let run_dir = base_dir.join("run");
         fs::create_dir_all(&run_dir).map_err(|e| Error::IO("mkdir /run", run_dir.clone(), e))?;
+        fs::set_permissions(&run_dir, Permissions::from_mode(0o700))
+            .map_err(|e| Error::IO("set perms /run", run_dir.clone(), e))?;
         let sock_path = run_dir.join("minenv_sock");
         let listener = listener::Listener::new(&sock_path, &rootfs, channel)
-            .map_err(|e| Error::IO("creating env socket", rootfs.join("minenv_sock"), e))?;
+            .map_err(|e| Error::IO("creating env socket", sock_path, e))?;
 
         let stdout = fs::File::create(base_dir.join("stdout"))
             .map_err(|e| Error::IO("creating stdout", base_dir.join("stdout"), e))?;
@@ -292,6 +295,7 @@ impl Container {
         command.env("XDG_DATA_HOME", "/state/data");
         command.env("XDG_CACHE_HOME", "/state/cache");
         command.env("XDG_STATE_HOME", "/state/state");
+        command.env("XDG_RUNTIME_DIR", "/run");
         command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
         if let WdSetup::Isolated { .. } = sandbox.config.wd {
             command.env("HOME", "/state/home");
@@ -344,6 +348,7 @@ impl<C: Channel> Sandbox<C> {
             .devfsmount("/dev")
             .tmpfsmount("/tmp")
             .bindmount_rw(self.state_dir.to_str().unwrap(), "/state")
+            .bindmount_rw(self.base_dir.join("run").to_str().unwrap(), "/run")
             .unshare(hakoniwa::Namespace::Cgroup);
 
         if self.needs_bin_symlink()? {
