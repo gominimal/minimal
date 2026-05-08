@@ -19,6 +19,9 @@ pub enum FileCacheError {
     BadSha,
     /// The sha256 hash that was requested differed from what was written/downloaded.
     HashMismatch { want: String, got: String },
+    /// The cache is in offline mode and the requested entry is not present.
+    /// Caller asked for a file we'd need to download, but `--no-fetch` is set.
+    OfflineCacheMiss { sha256: String, filename: String },
     /// Something unexpected.
     Internal(String),
 }
@@ -37,6 +40,11 @@ impl fmt::Display for FileCacheError {
             FileCacheError::HashMismatch { want, got } => {
                 write!(f, "HashMismatch: want={}, got={}", want, got)
             }
+            FileCacheError::OfflineCacheMiss { sha256, filename } => write!(
+                f,
+                "offline cache miss for {filename} ({sha256}) — \
+                 --no-fetch is set; pre-populate the cache or remove the flag"
+            ),
             FileCacheError::Internal(e) => write!(f, "internal: {}", e),
         }
     }
@@ -55,11 +63,22 @@ impl std::error::Error for FileCacheError {
 #[derive(Debug, Clone)]
 pub struct FileCache {
     base_dir: PathBuf,
+    /// When true, [CachingDownloader] returns [FileCacheError::OfflineCacheMiss] on cache
+    /// miss instead of attempting a network download. Set to mirror the value of
+    /// [`mctx::Config::use_remote_cache`] (i.e. `--no-fetch`).
+    offline: bool,
 }
 
 impl FileCache {
     /// Creates a new file cache rooted at the given directory.
     pub fn new(dir: PathBuf) -> Result<Self, FileCacheError> {
+        Self::new_with_offline(dir, false)
+    }
+
+    /// Creates a new file cache rooted at the given directory, optionally in offline
+    /// mode. In offline mode, any cache miss surfaces as an error rather than a silent
+    /// network fetch.
+    pub fn new_with_offline(dir: PathBuf, offline: bool) -> Result<Self, FileCacheError> {
         match fs::create_dir_all(&dir) {
             Ok(_) => {}
             Err(e) => {
@@ -69,7 +88,15 @@ impl FileCache {
             }
         };
 
-        Ok(Self { base_dir: dir })
+        Ok(Self {
+            base_dir: dir,
+            offline,
+        })
+    }
+
+    /// Returns whether this cache rejects network fetches on cache miss.
+    pub fn is_offline(&self) -> bool {
+        self.offline
     }
 
     fn sha_dir(&self, sha256: &str) -> Result<PathBuf, FileCacheError> {
@@ -220,6 +247,15 @@ impl<B: fetchers::FetchBackend> CachingDownloader<B> for (&B, &FileCache) {
             .map_err(Either::Left)?
         {
             return Ok(p);
+        }
+
+        // Cache miss: in offline mode this is a hard error (caller asked for
+        // a file we'd need network to fetch). Otherwise fall through to fetch.
+        if self.1.offline {
+            return Err(Either::Left(FileCacheError::OfflineCacheMiss {
+                sha256: sha256.to_string(),
+                filename: filename.to_string(),
+            }));
         }
 
         // Otherwise download

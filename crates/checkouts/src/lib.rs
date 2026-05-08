@@ -207,12 +207,28 @@ pub struct Manager {
     base_dir: PathBuf,
     state: ManagerState,
     repos: HashMap<String, Repo>,
+    /// When true, [Manager::checkout_of] / [Manager::update] return
+    /// [Error::OfflineCacheMiss] for any remote that would require a clone or fetch
+    /// rather than performing the network operation. Mirrors the value of
+    /// [`mctx::Config::use_remote_cache`] (i.e. `--no-fetch`).
+    offline: bool,
 }
 
 impl Manager {
     /// Initializes the checkouts manager in the given directory, returning a
     /// thread-safe, cloneable handle to the manager instance.
     pub fn new_in_dir<P: Into<PathBuf>>(base_dir: P) -> Result<ManagerHandle, Error> {
+        Self::new_in_dir_with_offline(base_dir, false)
+    }
+
+    /// Same as [Self::new_in_dir], but with an `offline` flag. When `offline=true`,
+    /// any operation that would require a clone or fetch (new remote, or refresh of
+    /// a known remote) surfaces as [Error::OfflineCacheMiss] rather than performing
+    /// the network operation.
+    pub fn new_in_dir_with_offline<P: Into<PathBuf>>(
+        base_dir: P,
+        offline: bool,
+    ) -> Result<ManagerHandle, Error> {
         let base_dir = base_dir.into();
         let db_path = base_dir.join("git").join("db");
         fs::create_dir_all(&db_path)?;
@@ -237,6 +253,7 @@ impl Manager {
             base_dir,
             state,
             repos,
+            offline,
         };
         Ok(ManagerHandle(Arc::new(Mutex::new(manager))))
     }
@@ -249,7 +266,16 @@ impl Manager {
     }
 
     /// Updates all repos to latest - does nothing for refs which arent symbolic (i.e. commits).
+    /// In offline mode, returns [Error::OfflineCacheMiss] for the first remote we'd
+    /// have to fetch.
     pub fn update(&mut self) -> Result<(), Error> {
+        if self.offline {
+            // In offline mode, `update` is a no-op for known remotes: we have
+            // no way to refresh, but the caller's intent is "use what's there",
+            // so returning Ok is more useful than erroring on every refresh.
+            // (`checkout_of` still errors when an UNKNOWN remote is requested.)
+            return Ok(());
+        }
         let checkouts_dir = self.git_checkouts_dir();
         for (_remote, id) in self.state.git_remotes.iter_mut() {
             let repo = self.repos.get_mut(id).unwrap();
@@ -290,7 +316,14 @@ impl Manager {
                 let checkout_dir = tempdir_in(self.git_checkouts_dir()).unwrap().keep();
                 let relative_dir = checkout_dir.strip_prefix(self.git_checkouts_dir()).unwrap();
                 let repo = self.repos.get_mut(id).unwrap();
-                repo.fetch()?;
+                // Offline: skip the fetch and try the worktree checkout against
+                // what's already in the bare repo. If the requested ref isn't
+                // there, `new_worktree` will surface a git error from below
+                // — which is the right outcome (caller gets to know the ref
+                // wasn't pre-populated).
+                if !self.offline {
+                    repo.fetch()?;
+                }
                 let checkout = repo.new_worktree(checkout_dir.clone(), at.clone())?;
                 let git_hash = checkout.rev.clone();
 
@@ -305,6 +338,13 @@ impl Manager {
             }
             // New remote, need to create
             None => {
+                if self.offline {
+                    // Offline: cannot clone an unknown remote. Surface as cache miss
+                    // so the caller sees a clean error (not a git "could not connect").
+                    return Err(Error::OfflineCacheMiss {
+                        remote: remote.to_string(),
+                    });
+                }
                 // Make id/directory for bare repository
                 let prefix = match remote.to_lowercase().rsplit_once("/") {
                     None => "checkout".to_string(),
