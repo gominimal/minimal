@@ -22,7 +22,7 @@ on:
         # Default is substituted by quick-setup.sh at install time. Operator
         # bumps it via PR or by re-running quick-setup with a newer
         # --source-ref. Manual dispatch can override per-run.
-        default: 'v0.2.8'
+        default: 'v0.3.1'
         type: string
 
 jobs:
@@ -77,7 +77,7 @@ jobs:
           # 1. workflow_dispatch input (operator override per-run)
           # 2. workflow_dispatch input default (substituted by quick-setup
           #    at install time, bumped via PR thereafter)
-          SOURCE_REF="${{ github.event.inputs.source_ref || 'v0.2.8' }}"
+          SOURCE_REF="${{ github.event.inputs.source_ref || 'v0.3.1' }}"
 
           # Immutability + substitution-check in one regex pair. source_ref
           # must be a pinned tag (vN.N.N pattern) or full 40-char SHA. Branch
@@ -138,7 +138,7 @@ jobs:
           # exits 128 with `empty ident name` unless we configure it here.
           # Use the canonical github-actions[bot] noreply form including the
           # numeric user-id prefix so GitHub attributes the commit to the bot
-          # account in UI/API. Patched in from gominimal/min-aw v0.2.7;
+          # account in UI/API. Patched in from gominimal/min-aw v0.3.1;
           # subsequent sync runs (or a re-install via quick-setup at that
           # version or later) will carry the same step in the wrapper template.
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
