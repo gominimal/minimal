@@ -266,15 +266,22 @@ impl Manager {
     }
 
     /// Updates all repos to latest - does nothing for refs which arent symbolic (i.e. commits).
-    /// In offline mode, returns [Error::OfflineCacheMiss] for the first remote we'd
-    /// have to fetch.
+    /// In offline mode, returns [Error::OfflineCacheMiss] — `update` is fundamentally
+    /// a network operation, and silently lameducking it would mask hard-to-debug bugs
+    /// for callers like `minimal update` that explicitly want fresh state.
     pub fn update(&mut self) -> Result<(), Error> {
         if self.offline {
-            // In offline mode, `update` is a no-op for known remotes: we have
-            // no way to refresh, but the caller's intent is "use what's there",
-            // so returning Ok is more useful than erroring on every refresh.
-            // (`checkout_of` still errors when an UNKNOWN remote is requested.)
-            return Ok(());
+            // Pick the first known remote for the error message; if there are
+            // no known remotes there's nothing to update, so a synthetic
+            // placeholder is clearer than a misleading Ok.
+            let remote = self
+                .state
+                .git_remotes
+                .keys()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| "<no remotes>".to_string());
+            return Err(Error::OfflineCacheMiss { remote });
         }
         let checkouts_dir = self.git_checkouts_dir();
         for (_remote, id) in self.state.git_remotes.iter_mut() {
@@ -511,16 +518,18 @@ mod tests {
         }
     }
 
-    /// In offline mode, `update()` is a no-op (returns Ok without touching
-    /// the network). The caller's intent is "use what's there"; refresh-of-
-    /// known-remote is non-destructive to skip.
+    /// In offline mode, `update()` returns OfflineCacheMiss rather than
+    /// silently no-op'ing. Callers like `minimal update` ask explicitly for
+    /// fresh state, so noop-ing would mask hard-to-debug bugs (per review
+    /// from @twitchyliquid64).
     #[test]
-    fn offline_update_is_noop() {
+    fn offline_update_errors() {
         let base_dir = tempdir().unwrap();
         let mut manager = Manager::new_in_dir_with_offline(base_dir.path(), true).unwrap();
-        manager
-            .update()
-            .expect("offline update should succeed as no-op");
+        match manager.update() {
+            Err(Error::OfflineCacheMiss { .. }) => {}
+            other => panic!("expected OfflineCacheMiss, got: {:?}", other),
+        }
     }
 
     /// Default (online) Manager keeps its existing behavior — `offline` is

@@ -415,7 +415,7 @@ impl Context {
             self.config.is_offline(),
         )
         .await
-        .unwrap();
+        .map_err(|e| Error::Other(anyhow!("initializing remote storage: {}", e)))?;
         tracing::trace!("remote storage init took {:?}", start.elapsed());
         Ok(rs)
     }
