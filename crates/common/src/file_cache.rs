@@ -65,7 +65,7 @@ pub struct FileCache {
     base_dir: PathBuf,
     /// When true, [CachingDownloader] returns [FileCacheError::OfflineCacheMiss] on cache
     /// miss instead of attempting a network download. Set to mirror the value of
-    /// [`mctx::Config::use_remote_cache`] (i.e. `--no-fetch`).
+    /// `mctx::Config::is_offline` (i.e. `--offline`).
     offline: bool,
 }
 
@@ -348,5 +348,157 @@ mod tests {
             !cached.exists(),
             "file should be removed after hash mismatch"
         );
+    }
+
+    /// A fake URL whose filename is whatever the test sets.
+    #[derive(Debug, Clone)]
+    struct FakeUrl {
+        filename: String,
+    }
+    impl fetchers::FetchUrl for FakeUrl {
+        type JoinError = std::convert::Infallible;
+        fn join(&self, _input: &str) -> Result<Self, Self::JoinError> {
+            Ok(self.clone())
+        }
+        fn filename(&self) -> String {
+            self.filename.clone()
+        }
+    }
+
+    /// A FetchBackend that panics on `get` / `execute`. Used by offline-mode
+    /// tests to assert the network path is never reached.
+    #[derive(Debug)]
+    struct PanickingBackend;
+    #[derive(Debug)]
+    struct PanickingRequest;
+    impl fetchers::FetchBackend for PanickingBackend {
+        type Url = FakeUrl;
+        type Request = PanickingRequest;
+        type Response = FakeResponse;
+
+        fn get(
+            &self,
+            _url: Self::Url,
+        ) -> Result<Self::Request, <Self::Response as fetchers::FetchResponse>::Error> {
+            panic!("PanickingBackend::get must not be called in offline mode");
+        }
+        async fn execute(
+            &self,
+            _req: Self::Request,
+        ) -> Result<Self::Response, <Self::Response as fetchers::FetchResponse>::Error> {
+            panic!("PanickingBackend::execute must not be called in offline mode");
+        }
+    }
+
+    /// In offline mode, a cache miss must surface as OfflineCacheMiss without
+    /// touching the network. The PanickingBackend asserts the network path is
+    /// never invoked.
+    #[tokio::test]
+    async fn offline_cache_miss_errors_without_fetching() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = FileCache::new_with_offline(tmp.path().to_path_buf(), true).unwrap();
+        let op = OpTracker::new_with_root(&None);
+        let backend = PanickingBackend;
+
+        let url = FakeUrl {
+            filename: "missing.txt".into(),
+        };
+        let unknown_sha = "abc1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab";
+
+        let result = (&backend, &cache).download(url, unknown_sha, &op).await;
+        let err = result.unwrap_err().unwrap_left();
+        match err {
+            FileCacheError::OfflineCacheMiss { sha256, filename } => {
+                assert_eq!(sha256, unknown_sha);
+                assert_eq!(filename, "missing.txt");
+            }
+            other => panic!("expected OfflineCacheMiss, got: {other}"),
+        }
+    }
+
+    /// Offline mode is transparent on cache HIT — the backend stays uncalled
+    /// and the cached path comes back unchanged.
+    #[tokio::test]
+    async fn offline_cache_hit_returns_path_without_fetching() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = FileCache::new_with_offline(tmp.path().to_path_buf(), true).unwrap();
+        let op = OpTracker::new_with_root(&None);
+        let backend = PanickingBackend;
+
+        // Pre-populate the cache with bytes whose sha matches what we'll request.
+        let content = b"cached content";
+        let sha = {
+            let mut h = sha2::Sha256::new();
+            sha2::Digest::update(&mut h, content);
+            hex::encode(h.finalize())
+        };
+        let cached_path = cache.sha_dir(&sha).unwrap().join("cached.txt");
+        std::fs::write(&cached_path, content).unwrap();
+
+        let url = FakeUrl {
+            filename: "cached.txt".into(),
+        };
+        let path = (&backend, &cache)
+            .download(url, &sha, &op)
+            .await
+            .expect("cache hit should succeed in offline mode");
+        assert_eq!(path, cached_path);
+    }
+
+    /// Sanity check: with the default (online) cache, a cache-miss request
+    /// invokes the backend rather than returning OfflineCacheMiss. Existing
+    /// callers that don't opt into offline mode see no behavior change.
+    #[tokio::test]
+    async fn online_cache_miss_invokes_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = FileCache::new(tmp.path().to_path_buf()).unwrap();
+        assert!(!cache.is_offline());
+        let op = OpTracker::new_with_root(&None);
+
+        // Backend that succeeds with known bytes; we want to confirm the
+        // download flow falls through to write_through (i.e. the OFFLINE
+        // path is NOT taken).
+        let content = b"online content";
+        let sha = {
+            let mut h = sha2::Sha256::new();
+            sha2::Digest::update(&mut h, content);
+            hex::encode(h.finalize())
+        };
+
+        #[derive(Debug)]
+        struct StubBackend(Vec<u8>);
+        #[derive(Debug)]
+        struct StubReq;
+        impl fetchers::FetchBackend for StubBackend {
+            type Url = FakeUrl;
+            type Request = StubReq;
+            type Response = FakeResponse;
+            fn get(
+                &self,
+                _url: Self::Url,
+            ) -> Result<Self::Request, <Self::Response as fetchers::FetchResponse>::Error>
+            {
+                Ok(StubReq)
+            }
+            async fn execute(
+                &self,
+                _req: Self::Request,
+            ) -> Result<Self::Response, <Self::Response as fetchers::FetchResponse>::Error>
+            {
+                Ok(FakeResponse::new(&self.0))
+            }
+        }
+        let backend = StubBackend(content.to_vec());
+
+        let url = FakeUrl {
+            filename: "online.txt".into(),
+        };
+        let path = (&backend, &cache)
+            .download(url, &sha, &op)
+            .await
+            .expect("online cache miss should fetch + verify");
+        // Bytes were materialized to the expected path.
+        assert!(path.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), content);
     }
 }

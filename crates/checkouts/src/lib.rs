@@ -210,7 +210,7 @@ pub struct Manager {
     /// When true, [Manager::checkout_of] / [Manager::update] return
     /// [Error::OfflineCacheMiss] for any remote that would require a clone or fetch
     /// rather than performing the network operation. Mirrors the value of
-    /// [`mctx::Config::use_remote_cache`] (i.e. `--no-fetch`).
+    /// `mctx::Config::is_offline` (i.e. `--offline`).
     offline: bool,
 }
 
@@ -490,6 +490,46 @@ mod tests {
             hash3,
             "d0dd1f61b33d64e29d8bc1372a94ef6a2fee76a9".to_string()
         );
+    }
+
+    /// In offline mode, asking for an unknown remote must surface as
+    /// OfflineCacheMiss without attempting any git operation.
+    #[test]
+    fn offline_unknown_remote_errors() {
+        let base_dir = tempdir().unwrap();
+        let mut manager = Manager::new_in_dir_with_offline(base_dir.path(), true).unwrap();
+
+        let result = manager.checkout_of(
+            "https://example.invalid/never-cloned",
+            GitRef::Branch("main".to_string()),
+        );
+        match result {
+            Err(Error::OfflineCacheMiss { remote }) => {
+                assert_eq!(remote, "https://example.invalid/never-cloned");
+            }
+            other => panic!("expected OfflineCacheMiss, got: {:?}", other),
+        }
+    }
+
+    /// In offline mode, `update()` is a no-op (returns Ok without touching
+    /// the network). The caller's intent is "use what's there"; refresh-of-
+    /// known-remote is non-destructive to skip.
+    #[test]
+    fn offline_update_is_noop() {
+        let base_dir = tempdir().unwrap();
+        let mut manager = Manager::new_in_dir_with_offline(base_dir.path(), true).unwrap();
+        manager
+            .update()
+            .expect("offline update should succeed as no-op");
+    }
+
+    /// Default (online) Manager keeps its existing behavior — `offline` is
+    /// false unless explicitly requested.
+    #[test]
+    fn default_manager_is_online() {
+        let base_dir = tempdir().unwrap();
+        let manager = Manager::new_in_dir(base_dir.path()).unwrap();
+        assert!(!manager.0.lock().unwrap().offline);
     }
 
     #[test]

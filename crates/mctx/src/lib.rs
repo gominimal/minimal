@@ -218,10 +218,10 @@ impl Context {
         let vcs = if let Some(vcs_manager) = config.vcs_manager_override() {
             vcs_manager
         } else {
-            // `--no-fetch` flips the VcsManager into offline mode: any clone or fetch
+            // `--offline` flips the VcsManager into offline mode: any clone or fetch
             // surfaces as Error::OfflineCacheMiss instead of attempting the network
             // operation. Pre-populate `vcs_dir()` for the workflow that needs this.
-            VcsManager::new_in_dir_with_offline(config.vcs_dir(), !config.use_remote_cache())?
+            VcsManager::new_in_dir_with_offline(config.vcs_dir(), config.is_offline())?
         };
         let cache = Cache::at_dir(config.cache_dir())
             .map_err(|e| Error::Other(anyhow!("initializing local cache: {}", e)))?;
@@ -406,13 +406,13 @@ impl Context {
     }
     pub async fn remote_storage(&self) -> Result<common::RemoteStorage, Error> {
         let start = SystemTime::now();
-        // `--no-fetch` flips the underlying FileCache into offline mode so any
+        // `--offline` flips the underlying FileCache into offline mode so any
         // source-URL cache miss surfaces as FileCacheError::OfflineCacheMiss
         // rather than a silent network fetch.
         let rs = common::RemoteStorage::new_with_offline(
             self.config.downloads_dir(),
             false,
-            !self.config.use_remote_cache(),
+            self.config.is_offline(),
         )
         .await
         .unwrap();

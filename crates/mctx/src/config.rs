@@ -46,6 +46,7 @@ pub const DEFAULT_REMOTE_CACHE_BUCKET: &str = "minimal-staging-cache";
 pub struct ConfigBuilder {
     no_cache: Option<bool>,
     no_fetch: Option<bool>,
+    offline: Option<bool>,
     num_parallel_builds: Option<usize>,
 
     minimal_dir: Option<PathBuf>,
@@ -69,6 +70,14 @@ impl ConfigBuilder {
     /// Configures whether the remote cache may be used or not.
     pub fn with_no_fetch(mut self, no_fetch: bool) -> Self {
         self.no_fetch = Some(no_fetch);
+        self
+    }
+    /// Configures whether minimal runs in offline mode. When set, any source
+    /// or VCS cache miss surfaces as a clear error rather than a silent
+    /// network call. Implies [Self::with_no_fetch] for the remote-artifact
+    /// cache layer (you can't reach the artifact cache when offline).
+    pub fn with_offline(mut self, offline: bool) -> Self {
+        self.offline = Some(offline);
         self
     }
     /// Configures the max number of parallel builds.
@@ -122,6 +131,7 @@ impl ConfigBuilder {
         Ok(Config {
             no_cache: self.no_cache.unwrap_or(false),
             no_fetch: self.no_fetch.unwrap_or(false),
+            offline: self.offline.unwrap_or(false),
             num_parallel_builds: self
                 .num_parallel_builds
                 .unwrap_or_else(common::default_parallelism),
@@ -147,6 +157,7 @@ impl Config {
         ConfigBuilder {
             no_cache: Some(self.no_cache),
             no_fetch: Some(self.no_fetch),
+            offline: Some(self.offline),
             num_parallel_builds: Some(self.num_parallel_builds),
             minimal_dir: Some(self.minimal_dir),
             stdlib_dir: self.stdlib_dir,
@@ -165,6 +176,9 @@ pub struct Config {
     no_cache: bool,
     /// Do not fetch any needed-but-available-remote entries from the remote cache.
     no_fetch: bool,
+    /// Run in offline mode: error on source / VCS cache miss instead of attempting
+    /// any network call. Implies the artifact-cache-skip half of [Self::no_fetch].
+    offline: bool,
     /// Maximum number of concurrent builds.
     num_parallel_builds: usize,
 
@@ -202,8 +216,15 @@ impl Config {
         !self.no_cache
     }
     /// Returns true if objects should be downloaded from the remote cache instead of built.
+    /// False when either [Self::no_fetch] or [Self::offline] is set (offline implies we
+    /// can't reach the remote cache anyway).
     pub fn use_remote_cache(&self) -> bool {
-        !self.no_fetch
+        !self.no_fetch && !self.offline
+    }
+    /// Returns true if minimal is running in offline mode. When true, source-tarball
+    /// and VCS cache misses surface as errors rather than silent network fetches.
+    pub fn is_offline(&self) -> bool {
+        self.offline
     }
     /// Returns the maximum number of parallel builds that may take place at once.
     pub fn num_parallel_builds(&self) -> usize {
