@@ -75,22 +75,22 @@ jobs:
         run: |
           # Resolution order:
           # 1. workflow_dispatch input (operator override per-run)
-          # 2. workflow_call default (v0.2.5, substituted by quick-setup
+          # 2. workflow_dispatch input default (substituted by quick-setup
           #    at install time, bumped via PR thereafter)
           SOURCE_REF="${{ github.event.inputs.source_ref || 'v0.2.8' }}"
 
           # Immutability + substitution-check in one regex pair. source_ref
           # must be a pinned tag (vN.N.N pattern) or full 40-char SHA. Branch
-          # names (main, master, dev) and the unsubstituted 'v0.2.5'
-          # token both fail this check. A separate unsubstituted-token guard
-          # used to live above, but quick-setup.sh substitutes 'v0.2.5'
+          # names (main, master, dev) and an unsubstituted default token
+          # both fail this check. A separate unsubstituted-token guard
+          # used to live above, but quick-setup.sh substitutes the default
           # globally including inside that guard's literal — which made the
           # guard self-rejecting post-substitution. Dropped; the regex below
           # catches the same condition correctly.
           if [[ ! "${SOURCE_REF}" =~ ^[0-9a-f]{40}$ ]] && \
              [[ ! "${SOURCE_REF}" =~ ^v?[0-9]+(\.[0-9]+){1,2}([.-][0-9A-Za-z._-]+)?$ ]]; then
             echo "ERROR: source_ref must be a pinned tag (e.g. v1.2.3) or full 40-char SHA." >&2
-            echo "Got: '${SOURCE_REF}'. Branch names and the unsubstituted 'v0.2.5' token are not accepted." >&2
+            echo "Got: '${SOURCE_REF}'. Branch names and unsubstituted default tokens are not accepted." >&2
             echo "If you see the literal token, re-run scripts/quick-setup.sh from gominimal/min-aw at a pinned ref." >&2
             exit 1
           fi
@@ -139,8 +139,8 @@ jobs:
           # Use the canonical github-actions[bot] noreply form including the
           # numeric user-id prefix so GitHub attributes the commit to the bot
           # account in UI/API. Patched in from gominimal/min-aw v0.2.7;
-          # subsequent sync runs (or a re-install via quick-setup at v0.2.7+)
-          # will carry the same step in the wrapper template.
+          # subsequent sync runs (or a re-install via quick-setup at that
+          # version or later) will carry the same step in the wrapper template.
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
 
