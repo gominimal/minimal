@@ -57,7 +57,7 @@ impl fmt::Display for Error {
             Error::OfflineCacheMiss { remote } => write!(
                 f,
                 "offline cache miss for git remote {remote} — \
-                 --no-fetch is set; pre-populate the vcs/ cache or remove the flag"
+                 --offline is set; pre-populate the vcs/ cache or remove the flag"
             ),
         }
     }

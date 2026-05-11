@@ -43,7 +43,7 @@ impl fmt::Display for FileCacheError {
             FileCacheError::OfflineCacheMiss { sha256, filename } => write!(
                 f,
                 "offline cache miss for {filename} ({sha256}) — \
-                 --no-fetch is set; pre-populate the cache or remove the flag"
+                 --offline is set; pre-populate the cache or remove the flag"
             ),
             FileCacheError::Internal(e) => write!(f, "internal: {}", e),
         }

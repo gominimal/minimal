@@ -184,7 +184,7 @@ impl From<checkouts::Error> for Error {
                 Self::Other(anyhow::anyhow!("vcs: failed parsing state file: {}", e))
             }
             checkouts::Error::OfflineCacheMiss { remote } => Self::Other(anyhow::anyhow!(
-                "vcs: offline cache miss for remote {} — --no-fetch is set; pre-populate \
+                "vcs: offline cache miss for remote {} — --offline is set; pre-populate \
                  the vcs/ cache or remove the flag",
                 remote
             )),
