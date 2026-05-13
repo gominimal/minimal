@@ -4289,6 +4289,7 @@ dependencies = [
  "common",
  "globset",
  "hakoniwa",
+ "nix",
  "tempfile",
  "tokio",
  "tokio-util",

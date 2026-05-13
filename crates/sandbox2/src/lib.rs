@@ -338,8 +338,44 @@ impl Container {
     }
 }
 
+/// Options for [`Sandbox::bind_mount`].
+#[derive(Debug, Default, Clone, Copy)]
+struct BindOpts {
+    read_only: bool,
+    recursive: bool,
+}
+
 // Sandbox usage
 impl<C: Channel> Sandbox<C> {
+    fn bind_mount(
+        path: &Path,
+        container_path: &str,
+        opts: BindOpts,
+        container: &mut hakoniwa::Container,
+    ) -> Result<(), Error> {
+        let mut flags = hakoniwa::MountOptions::BIND
+            | hakoniwa::MountOptions::NOSUID
+            | locked_mount_flags(path);
+        if opts.recursive {
+            flags |= hakoniwa::MountOptions::REC;
+        }
+        if opts.read_only {
+            flags |= hakoniwa::MountOptions::RDONLY;
+        }
+        container.mount(
+            path.to_str().ok_or_else(|| {
+                Error::Execution(ExecutionError::MountError {
+                    msg: "Unable to convert path to unicode string",
+                    path: path.to_path_buf(),
+                })
+            })?,
+            container_path,
+            "",
+            flags,
+        );
+        Ok(())
+    }
+
     pub fn new_container(&self) -> Result<Container, Error> {
         let mut container = hakoniwa::Container::new();
         container
@@ -347,9 +383,14 @@ impl<C: Channel> Sandbox<C> {
             .unwrap()
             .devfsmount("/dev")
             .tmpfsmount("/tmp")
-            .bindmount_rw(self.state_dir.to_str().unwrap(), "/state")
-            .bindmount_rw(self.base_dir.join("run").to_str().unwrap(), "/run")
             .unshare(hakoniwa::Namespace::Cgroup);
+
+        let rec = BindOpts {
+            recursive: true,
+            read_only: false,
+        };
+        Self::bind_mount(&self.state_dir, "/state", rec, &mut container)?;
+        Self::bind_mount(&self.base_dir.join("run"), "/run", rec, &mut container)?;
 
         if self.needs_bin_symlink()? {
             container.symlink("/usr/bin", "/bin");
@@ -364,52 +405,35 @@ impl<C: Channel> Sandbox<C> {
         // Mount in the working directory
         match &self.config.wd {
             WdSetup::Isolated { .. } => {
-                container.bindmount_rw(self.base_dir.join("build").to_str().unwrap(), "/build")
+                Self::bind_mount(&self.base_dir.join("build"), "/build", rec, &mut container)?;
             }
             WdSetup::BoundDir {
-                path,
-                read_only: false,
-                fs_mappings: _,
-            } => container.bindmount_rw(
-                path.to_str().unwrap(),
-                format!(
+                path, read_only, ..
+            } => {
+                let container_path = format!(
                     "/{}",
                     self.config.wd.bound_dir_sandbox_cwd().to_str().unwrap()
-                )
-                .as_str(),
-            ),
-            WdSetup::BoundDir {
-                path,
-                read_only: true,
-                fs_mappings: _,
-            } => container.bindmount_ro(
-                path.to_str().unwrap(),
-                format!(
-                    "/{}",
-                    self.config.wd.bound_dir_sandbox_cwd().to_str().unwrap()
-                )
-                .as_str(),
-            ),
-        };
+                );
+                let opts = BindOpts {
+                    recursive: true,
+                    read_only: *read_only,
+                };
+                Self::bind_mount(path, &container_path, opts, &mut container)?;
+            }
+        }
         // Mount in any file mappings
         if let WdSetup::BoundDir { fs_mappings, .. } = &self.config.wd {
             for m in fs_mappings {
-                if m.is_file {
-                    container.mount(
-                        &m.host_path,
-                        &m.path_in_sandbox(),
-                        "",
-                        if m.read_only {
-                            hakoniwa::MountOptions::BIND | hakoniwa::MountOptions::RDONLY
-                        } else {
-                            hakoniwa::MountOptions::BIND
-                        },
-                    );
-                } else if m.read_only {
-                    container.bindmount_ro(&m.host_path, &m.path_in_sandbox());
-                } else {
-                    container.bindmount_rw(&m.host_path, &m.path_in_sandbox());
-                }
+                let opts = BindOpts {
+                    recursive: !m.is_file,
+                    read_only: m.read_only,
+                };
+                Self::bind_mount(
+                    Path::new(&m.host_path),
+                    &m.path_in_sandbox(),
+                    opts,
+                    &mut container,
+                )?;
             }
         }
 
@@ -767,4 +791,68 @@ fn systemd_probably_works() -> bool {
         return std::fs::metadata(PathBuf::from(dir).join("bus")).is_ok();
     }
     false
+}
+
+/// Returns the kernel-locked mount flags for the mount containing `path`.
+///
+/// In a user namespace, remounting a bind mount requires preserving all
+/// flags that the kernel has locked (CL_UNPRIVILEGED). If the remount
+/// omits a locked flag the kernel returns EPERM. By proactively reading
+/// these flags and including them in the mount options we hand to
+/// hakoniwa, the remount succeeds even in nested sandboxes—without
+/// resorting to MountFallback (which can silently drop requested
+/// restrictions like RDONLY).
+fn locked_mount_flags(path: &Path) -> hakoniwa::MountOptions {
+    use nix::sys::statfs::statfs;
+    use nix::sys::statvfs::FsFlags;
+
+    let stat = match statfs(path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                "statfs({}) failed: {e}, not adding locked mount flags",
+                path.to_string_lossy()
+            );
+            return hakoniwa::MountOptions::empty();
+        }
+    };
+
+    let flags = stat.flags();
+    let mut opts = hakoniwa::MountOptions::empty();
+    if flags.contains(FsFlags::ST_RDONLY) {
+        opts |= hakoniwa::MountOptions::RDONLY;
+    }
+    if flags.contains(FsFlags::ST_NOSUID) {
+        opts |= hakoniwa::MountOptions::NOSUID;
+    }
+    if flags.contains(FsFlags::ST_NODEV) {
+        opts |= hakoniwa::MountOptions::NODEV;
+    }
+    if flags.contains(FsFlags::ST_NOEXEC) {
+        opts |= hakoniwa::MountOptions::NOEXEC;
+    }
+    opts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // /proc is mounted with nosuid,nodev on essentially every Linux distro;
+    // if either stops showing up we've broken the FsFlags → MountOptions
+    // mapping and a nested sandbox would silently lose those locked flags
+    // again. NOEXEC is also common but skipped here since it's not
+    // universal.
+    #[test]
+    fn locked_mount_flags_reads_proc_flags() {
+        let opts = locked_mount_flags(Path::new("/proc"));
+        assert!(opts.contains(hakoniwa::MountOptions::NOSUID));
+        assert!(opts.contains(hakoniwa::MountOptions::NODEV));
+    }
+
+    #[test]
+    fn locked_mount_flags_empty_on_statfs_failure() {
+        let opts = locked_mount_flags(Path::new("/nonexistent-path-for-statfs-test"));
+        assert!(opts.is_empty());
+    }
 }

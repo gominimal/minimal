@@ -52,6 +52,10 @@ pub enum ExecutionError {
         stderr: String,
     },
     SpawnFailed(hakoniwa::Error),
+    MountError {
+        msg: &'static str,
+        path: PathBuf,
+    },
     Cancelled,
 }
 
@@ -77,6 +81,9 @@ impl fmt::Display for ExecutionError {
             Self::SpawnFailed(e) => {
                 write!(f, "Invocation spawn failed: {}", e)
             }
+            Self::MountError { msg, path } => {
+                write!(f, "Failed to mount {}: {}", path.display(), msg)
+            }
             Self::Cancelled => {
                 write!(f, "Execution cancelled")
             }
@@ -89,6 +96,7 @@ impl std::error::Error for ExecutionError {
         match self {
             Self::InvocationFailed { .. } => None,
             Self::SpawnFailed(e) => Some(e),
+            Self::MountError { .. } => None,
             Self::Cancelled => None,
         }
     }

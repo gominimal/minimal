@@ -18,3 +18,4 @@ common.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 hakoniwa.workspace = true
+nix.workspace = true

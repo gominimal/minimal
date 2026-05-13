@@ -244,6 +244,9 @@ impl From<sandbox2::Error> for Error {
                 sandbox2::error::ExecutionError::Cancelled => {
                     Self::Other(anyhow::anyhow!("execution cancelled"))
                 }
+                sandbox2::error::ExecutionError::MountError { .. } => {
+                    Self::Other(anyhow::anyhow!(e.to_string()))
+                }
             },
             sandbox2::Error::Output(e) => Self::Other(e.into()),
         }
