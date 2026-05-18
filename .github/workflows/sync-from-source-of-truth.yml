@@ -33,7 +33,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Checkout target repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Preflight App config
         id: app_config
@@ -57,7 +57,7 @@ jobs:
       - name: Mint App token (read on source-of-truth)
         if: steps.app_config.outputs.available == 'true'
         id: app-token
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
