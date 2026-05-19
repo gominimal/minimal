@@ -383,7 +383,8 @@ impl<C: Channel> Sandbox<C> {
             .unwrap()
             .devfsmount("/dev")
             .tmpfsmount("/tmp")
-            .unshare(hakoniwa::Namespace::Cgroup);
+            .unshare(hakoniwa::Namespace::Cgroup)
+            .runctl(hakoniwa::Runctl::IgnoreCgroupSetupFailed);
 
         let rec = BindOpts {
             recursive: true,
@@ -448,20 +449,18 @@ impl<C: Channel> Sandbox<C> {
             container.unshare(hakoniwa::Namespace::Uts);
             container.hostname(hn);
         }
-        if let Some(s) = &self.config.cpu_weight {
-            if systemd_probably_works() || std::env::var("MINIMAL_CGROUPS_ALWAYS").is_ok() {
-                container.cgroups_resources({
-                    let mut resources = hakoniwa::cgroups::Resources::default();
-                    resources.cpu({
-                        let mut cpu = hakoniwa::cgroups::Cpu::default();
-                        cpu.shares(*s);
-                        cpu
-                    });
-                    resources
+        if let Some(s) = &self.config.cpu_weight
+            && booted_with_systemd()
+        {
+            container.cgroups_resources({
+                let mut resources = hakoniwa::cgroups::Resources::default();
+                resources.cpu({
+                    let mut cpu = hakoniwa::cgroups::Cpu::default();
+                    cpu.shares(*s);
+                    cpu
                 });
-            } else {
-                tracing::debug!("Not configuring cgroups: systemd probably not available");
-            }
+                resources
+            });
         }
 
         Ok(Container { container })
@@ -779,18 +778,16 @@ impl Sandbox {
     }
 }
 
-fn hardlink_dir_contents(src_dir: &Path, dst_parent_dir: &Path) -> Result<(), Error> {
-    common::hardlink_dir_contents(src_dir, dst_parent_dir).map_err(Error::HardlinkFailed)
+// Matches the logic in the libcgroups crate. If we do not conditionally
+// set cpu resources, the underlying code in libcgroups will panic :(
+fn booted_with_systemd() -> bool {
+    std::fs::symlink_metadata("/run/systemd/system")
+        .map(|p| p.is_dir())
+        .unwrap_or_default()
 }
 
-fn systemd_probably_works() -> bool {
-    if std::env::var("DBUS_SESSION_BUS_ADDRESS").is_ok() {
-        return true;
-    }
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return std::fs::metadata(PathBuf::from(dir).join("bus")).is_ok();
-    }
-    false
+fn hardlink_dir_contents(src_dir: &Path, dst_parent_dir: &Path) -> Result<(), Error> {
+    common::hardlink_dir_contents(src_dir, dst_parent_dir).map_err(Error::HardlinkFailed)
 }
 
 /// Returns the kernel-locked mount flags for the mount containing `path`.
