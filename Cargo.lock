@@ -110,7 +110,7 @@ dependencies = [
  "clap",
  "indoc",
  "serde",
- "shlex",
+ "shlex 2.0.1",
  "toml 1.1.2+spec-1.1.0",
 ]
 
@@ -415,7 +415,7 @@ dependencies = [
  "find-msvc-tools",
  "jobserver",
  "libc",
- "shlex",
+ "shlex 1.3.0",
 ]
 
 [[package]]
@@ -966,7 +966,7 @@ dependencies = [
  "nickel-lang-core",
  "regex",
  "serde",
- "shlex",
+ "shlex 2.0.1",
  "smallvec",
  "stdlib",
  "tempfile",
@@ -1137,7 +1137,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1672,7 +1672,7 @@ dependencies = [
  "libc",
  "libcgroups",
  "log",
- "nix",
+ "nix 0.29.0",
  "oci-spec",
  "postcard",
  "procfs 0.18.0",
@@ -2271,7 +2271,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2500,7 +2500,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff828a1e0ab31b46ebefd1e8e231b7572dec6f663d17ecee1bee42a565649672"
 dependencies = [
  "fixedbitset",
- "nix",
+ "nix 0.29.0",
  "oci-spec",
  "pathrs",
  "procfs 0.17.0",
@@ -2795,7 +2795,7 @@ dependencies = [
  "common",
  "indoc",
  "serde",
- "shlex",
+ "shlex 2.0.1",
  "tempfile",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
@@ -3083,6 +3083,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3193,7 +3205,7 @@ dependencies = [
  "sandbox2",
  "serde_json",
  "sha2 0.11.0",
- "shlex",
+ "shlex 2.0.1",
  "size",
  "smallvec",
  "tar",
@@ -4172,7 +4184,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4230,7 +4242,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4288,7 +4300,7 @@ dependencies = [
  "common",
  "globset",
  "hakoniwa",
- "nix",
+ "nix 0.31.3",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -4589,6 +4601,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
+name = "shlex"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
 name = "signal-hook-registry"
 version = "1.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4826,9 +4844,9 @@ checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 
 [[package]]
 name = "tar"
-version = "0.4.45"
+version = "0.4.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22692a6476a21fa75fdfc11d452fda482af402c008cdbaf3476414e122040973"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
 dependencies = [
  "filetime",
  "libc",
@@ -4845,7 +4863,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5845,7 +5863,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
