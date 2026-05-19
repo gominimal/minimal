@@ -47,7 +47,8 @@ generational-arena = {version = "0.2", features = ["serde"] }
 google-cloud-gax = "1.10"
 google-cloud-auth = "1.3"
 google-cloud-storage = "1.5"
-hakoniwa = { version = "1.6", features = ["cgroups"] }
+# Revert back to crates.io dep once new version is released.
+hakoniwa = { git = "https://github.com/souk4711/hakoniwa.git", rev = "8de107ed506b870d0ab4bf3291271d2168003f1b", features = ["cgroups"] }
 http-body = "1"
 hex = "0.4"
 indicatif = "0.18"

@@ -1663,9 +1663,8 @@ dependencies = [
 
 [[package]]
 name = "hakoniwa"
-version = "1.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6361cf8f90dcee65a22616a3eaf289942b536dca4102310b17b60ec7ff23c82"
+version = "1.7.0"
+source = "git+https://github.com/souk4711/hakoniwa.git?rev=8de107ed506b870d0ab4bf3291271d2168003f1b#8de107ed506b870d0ab4bf3291271d2168003f1b"
 dependencies = [
  "bitflags",
  "caps",
