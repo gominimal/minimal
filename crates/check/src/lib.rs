@@ -371,6 +371,7 @@ impl CheckCtx {
 ///
 /// If `None` is given for a `packages_dir`, `profiles_dir`, or `stacks_dir`, the corresponding
 /// class of checkers are skipped.
+#[tracing::instrument(skip_all, err)]
 pub fn run_checks(
     packages_dir: Option<PathBuf>,
     profiles_dir: Option<PathBuf>,
@@ -402,6 +403,7 @@ pub fn run_checks(
         .collect::<FuturesUnordered<_>>())
 }
 
+#[tracing::instrument(skip_all, err)]
 fn package_check_futures(packages_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<CheckFuture>, Error> {
     let package_dirs: Vec<_> = match decode::build_decls_in_dir(&packages_dir) {
         Ok(i) => i,
@@ -434,6 +436,7 @@ fn package_check_futures(packages_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<Che
         .collect::<Vec<_>>())
 }
 
+#[tracing::instrument(skip_all, err)]
 fn profile_check_futures(profiles_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<CheckFuture>, Error> {
     let dirs: Vec<std::ffi::OsString> = match std::fs::read_dir(&profiles_dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
@@ -482,6 +485,7 @@ fn profile_check_futures(profiles_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<Che
         .collect())
 }
 
+#[tracing::instrument(skip_all, err)]
 fn stack_check_futures(stacks_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<CheckFuture>, Error> {
     let dirs: Vec<std::ffi::OsString> = match std::fs::read_dir(&stacks_dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
@@ -529,6 +533,7 @@ fn stack_check_futures(stacks_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<CheckFu
         .collect())
 }
 
+#[tracing::instrument(skip_all, fields(pkg = %pkg), err)]
 async fn check_package(
     pkg: String,
     package_dir: PathBuf,
@@ -583,8 +588,10 @@ async fn check_package(
     let file_based_results = {
         let ctx = ctx.clone();
         let pkg = pkg.clone();
+        let span = tracing::Span::current();
 
         tokio::task::spawn_blocking(move || {
+            let _enter = span.enter();
             let file_based: Vec<Box<dyn FileBasedChecker>> = vec![
                 Box::new(ParseCheck),
                 Box::new(ImportLineCheck),

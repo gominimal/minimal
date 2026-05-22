@@ -467,6 +467,7 @@ dependencies = [
  "regex",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4056,6 +4057,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tonic",
+ "tracing",
 ]
 
 [[package]]

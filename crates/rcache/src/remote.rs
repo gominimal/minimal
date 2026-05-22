@@ -75,6 +75,7 @@ pub const INDEX_FILENAME: &str = "index.shisha";
 const INDEX_EXPIRY_SECONDS: u64 = 5 * 60; // how long a fetch of the remote index is considered fresh for
 
 impl RemoteCache<Client> {
+    #[tracing::instrument(skip_all, err)]
     pub async fn new_over_https<URL: Into<ReqwestUrl>>(
         url: URL,
         index_dir: Option<PathBuf>,
@@ -91,6 +92,7 @@ impl RemoteCache<Client> {
 
 impl RemoteCache<Storage> {
     /// Instantiates a new remote cache using the given GCS client + bucket.
+    #[tracing::instrument(skip_all, fields(bucket_id = %bucket_id), err)]
     pub async fn new_with_gcs_bucket(
         storage: Storage,
         bucket_id: &str,
@@ -110,6 +112,7 @@ impl RemoteCache<Storage> {
     /// cache fast path (and therefore has no recorded generation), the index
     /// is refetched from GCS so the writer's compare-and-swap commit has an
     /// authoritative generation to match against.
+    #[tracing::instrument(skip_all, err)]
     pub async fn into_writer(
         self,
         ot: Option<OpTracker>,
@@ -218,6 +221,7 @@ impl<B: FetchBackend> RemoteCache<B> {
     }
 
     /// Download the given spec hash into the local cache.
+    #[tracing::instrument(skip_all, fields(span_name = %span_name), err)]
     pub async fn materialize(
         &self,
         spec_hash: &SpecHash,

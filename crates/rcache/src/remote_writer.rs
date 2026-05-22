@@ -136,6 +136,7 @@ impl<S: StubStorage + 'static> RemoteCacheWriter<S> {
     /// The artifact blob upload is content-addressed, so concurrent uploads
     /// of the same blob bytes are safe (last-writer-wins on identical content).
     /// The index update is deferred to [Self::finish_uploads].
+    #[tracing::instrument(skip_all, err)]
     pub async fn upload(
         &mut self,
         spec_hash: &SpecHash,
@@ -195,6 +196,7 @@ impl<S: StubStorage + 'static> RemoteCacheWriter<S> {
     ///
     /// Bounded by [MAX_INDEX_WRITE_RETRIES] attempts with exponential backoff
     /// + jitter; after exhaustion the underlying GCS error is returned.
+    #[tracing::instrument(skip_all, err)]
     pub async fn finish_uploads(self) -> Result<(), Error<GcsError>> {
         let Self {
             backend,

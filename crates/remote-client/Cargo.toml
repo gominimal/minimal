@@ -17,6 +17,7 @@ http-body.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tonic.workspace = true
+tracing.workspace = true
 
 check.workspace = true
 common.workspace = true
