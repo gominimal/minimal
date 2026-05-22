@@ -97,7 +97,9 @@ impl<C: Channel> Sandbox<C> {
             match i {
                 config::SandboxMapped::Dir(p) => hardlink_dir_contents(p, &rootfs)?,
                 config::SandboxMapped::TempDir(td) => hardlink_dir_contents(td.path(), &rootfs)?,
-                config::SandboxMapped::File(_p) => todo!(),
+                config::SandboxMapped::File(p) | config::SandboxMapped::FileCopy(p) => {
+                    return Err(Error::MappedFile(p.clone()));
+                }
             }
         }
         hardlink_dir_contents(&base_dir.join("synth"), &rootfs)?;
@@ -141,6 +143,11 @@ impl<C: Channel> Sandbox<C> {
                                 }
                             }
                             .map_err(|e| Error::IO("hardlinking input file", dest.clone(), e))?;
+                        }
+                        config::SandboxMapped::FileCopy(p) => {
+                            let dest = b.join(p.file_name().unwrap());
+                            fs::copy(p, &dest)
+                                .map_err(|e| Error::IO("copying input file", dest, e))?;
                         }
                         config::SandboxMapped::Dir(p) => hardlink_dir_contents(p, &b)?,
                         config::SandboxMapped::TempDir(td) => hardlink_dir_contents(td.path(), &b)?,

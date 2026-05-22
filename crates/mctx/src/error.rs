@@ -249,6 +249,10 @@ impl From<sandbox2::Error> for Error {
                 }
             },
             sandbox2::Error::Output(e) => Self::Other(e.into()),
+            sandbox2::Error::MappedFile(p) => Self::Other(anyhow::anyhow!(
+                "internal: file {} mapped to rootfs",
+                p.display()
+            )),
         }
     }
 }
