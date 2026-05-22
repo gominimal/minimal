@@ -5,6 +5,3 @@ rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 edition.workspace = true
 publish.workspace = true
-
-[dev-dependencies]
-indoc.workspace = true
