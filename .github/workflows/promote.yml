@@ -242,11 +242,24 @@ jobs:
           # Export resolved SHA for the docs-rebuild dispatch step below.
           echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
 
+      # Mint a short-lived token scoped to gominimal/docs via the
+      # gominimal-aw-bot GitHub App (org standard — App tokens over PATs, see
+      # gominimal/min-aw ADR-0002). The default GITHUB_TOKEN cannot dispatch
+      # other repos; this token carries the App's contents:write permission
+      # narrowed to the docs repo only.
+      - name: Mint docs-repo token (gominimal-aw-bot)
+        id: docs-token
+        if: ${{ inputs.dry_run != true }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.AW_BOT_APP_ID }}
+          private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
+          owner: gominimal
+          repositories: docs
+
       - name: Trigger docs rebuild
         env:
-          # minimal-aw-bot PAT with repo-dispatch (contents: write) on
-          # gominimal/docs. The default GITHUB_TOKEN cannot dispatch other repos.
-          GH_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ steps.docs-token.outputs.token }}
           DRY_RUN: ${{ inputs.dry_run }}
           SHA: ${{ steps.promote.outputs.sha }}
         run: |
