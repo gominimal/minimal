@@ -10,6 +10,9 @@ pub enum SandboxMapped {
     File(PathBuf),
     Dir(PathBuf),
     TempDir(tempfile::TempDir),
+    /// Special case of [`SandboxMapped::File`] where the path is
+    /// copied-in + permissions applied, rather than hardlinked.
+    FileCopy(PathBuf),
 }
 
 impl PartialEq for SandboxMapped {
@@ -18,6 +21,7 @@ impl PartialEq for SandboxMapped {
             (Self::File(f1), Self::File(f2)) => f1.eq(f2),
             (Self::Dir(d1), Self::Dir(d2)) => d1.eq(d2),
             (Self::TempDir(d1), Self::TempDir(d2)) => d1.path().eq(d2.path()),
+            (Self::FileCopy(f1), Self::FileCopy(f2)) => f1.eq(f2),
             _ => false,
         }
     }
@@ -38,6 +42,10 @@ impl Hash for SandboxMapped {
             Self::TempDir(p) => {
                 "t".hash(state);
                 p.path().hash(state);
+            }
+            Self::FileCopy(p) => {
+                "fc".hash(state);
+                p.hash(state);
             }
         }
     }

@@ -6,6 +6,7 @@ pub enum Error {
     Output(OutputError),
     IO(&'static str, PathBuf, std::io::Error),
     HardlinkFailed(common::HardlinkError),
+    MappedFile(PathBuf),
 }
 
 impl fmt::Display for Error {
@@ -16,6 +17,13 @@ impl fmt::Display for Error {
             Self::HardlinkFailed(e) => e.fmt(f),
             Self::IO(op, path, err) => {
                 write!(f, "{}: I/O error on path {}: {}", op, path.display(), err)
+            }
+            Self::MappedFile(path) => {
+                write!(
+                    f,
+                    "Mapped files in rootfs are not supported: {}",
+                    path.display()
+                )
             }
         }
     }
@@ -28,6 +36,7 @@ impl std::error::Error for Error {
             Self::Output(e) => e.source(),
             Self::HardlinkFailed(e) => e.source(),
             Self::IO(_, _, err) => Some(err),
+            Self::MappedFile(_) => None,
         }
     }
 }
