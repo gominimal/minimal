@@ -57,7 +57,7 @@ jaq-all = "0.1.0"
 lzma-rs = "0.3"
 
 # Revert back to crates.io dep once 0.18 is released.
-nickel-lang-core = { git = "https://github.com/nickel-lang/nickel.git", rev = "3a399233dcb5b5e8610a1245eeb171c29787a903", default-features = false, features = ["format"] }
+nickel-lang-core = { git = "https://github.com/nickel-lang/nickel.git", rev = "5bf193c843bdd5fe87aac288d1b1e32a945c2f29", default-features = false, features = ["format"] }
 
 nix = { version = "0.31", features = ["fs"] }
 object = { version = "0.39", default-features = false, features = ["archive", "elf", "read_core", "std"] }

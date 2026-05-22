@@ -665,36 +665,60 @@ impl FileBasedChecker for ParseCheck {
         }
 
         use nickel_lang_core::error::report::report_as_str;
+        use nickel_lang_core::eval::value::{NickelValue, RecordData};
+        use nickel_lang_core::identifier::{Ident, LocIdent};
+        use nickel_lang_core::program::{BuilderError, ProgramBuilder};
         use nickel_lang_core::{error::NullReporter, eval::cache::CacheImpl, program::Program};
 
-        let program_res = Program::new_from_source(
-            std::io::Cursor::new(format!(
-                "import \"{}\"",
-                pkg_dir.join("build.ncl").as_os_str().to_str().unwrap()
-            )),
-            "toplevel",
-            std::io::stderr(),
-            NullReporter {},
-        );
+        let target_val = NickelValue::record_posless(RecordData::with_field_values([
+            (
+                LocIdent::new("os"),
+                NickelValue::enum_tag_posless(LocIdent::new("Linux")),
+            ),
+            (
+                LocIdent::new("arch"),
+                NickelValue::enum_tag_posless(LocIdent::new("Amd64")),
+            ),
+        ]));
+        let injected = NickelValue::record_posless(RecordData::with_field_values([
+            (LocIdent::new("target"), target_val),
+            (
+                LocIdent::new("args"),
+                NickelValue::record_posless(RecordData::default()),
+            ),
+        ]));
+
+        let program_res: Result<Program<CacheImpl>, _> = ProgramBuilder::new()
+            .add_source(
+                std::io::Cursor::new(format!(
+                    "import \"{}\"",
+                    pkg_dir.join("build.ncl").as_os_str().to_str().unwrap()
+                )),
+                "toplevel",
+            )
+            .add_import_paths([ctx.stdlib_dir.as_path()].iter())
+            .extend_initial_env(vec![(Ident::new("__minimal_injected_config"), injected)])
+            .with_reporter(NullReporter {})
+            .with_trace(std::io::stderr())
+            .build();
 
         let mut program: Program<CacheImpl> = match program_res {
             Ok(p) => p,
             Err(e) => {
+                let msg = match e {
+                    BuilderError::NoInputs => unreachable!(),
+                    BuilderError::Io { path, error } => match path {
+                        Some(p) => format!("{}: {}", p.display(), error),
+                        None => format!("{}", error),
+                    },
+                };
                 return Ok(CheckResult {
                     check: "parse".into(),
                     verdict: CheckVerdict::Fail,
-                    err: vec![format!("{}", e)],
+                    err: vec![msg],
                 });
             }
         };
-
-        let generated_lib_dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            generated_lib_dir.path().join("__injected_config__.ncl"),
-            b"{target = {arch = 'Amd64, os = 'Linux}}",
-        )
-        .unwrap();
-        program.add_import_paths([ctx.stdlib_dir.as_path(), generated_lib_dir.path()].iter());
 
         if let Err(e) = program.typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk) {
             return Ok(CheckResult {
@@ -719,7 +743,6 @@ impl FileBasedChecker for ParseCheck {
             });
         }
 
-        drop(generated_lib_dir);
         Ok(CheckResult {
             check: "parse".into(),
             verdict: CheckVerdict::Pass,

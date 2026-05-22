@@ -1,27 +1,32 @@
 use nickel_lang_core::error::Error;
+use nickel_lang_core::eval::value::NickelValue;
 use nickel_lang_core::files::Files;
-use nickel_lang_core::{error::NullReporter, eval::cache::CacheImpl, program::Program};
-use std::io;
+use nickel_lang_core::identifier::Ident;
+use nickel_lang_core::{
+    error::NullReporter,
+    eval::cache::CacheImpl,
+    program::{Program, ProgramBuilder},
+};
 
 /// Resolves string interpolations to given base values.
 pub struct VarCtx {
-    base: String,
+    vars: Vec<(Ident, NickelValue)>,
 }
 
 impl VarCtx {
     pub fn eval_string(&self, s: &str) -> Result<String, Box<(Files, Error)>> {
-        let mut source = String::with_capacity(self.base.len() + s.len() + 16);
-        source.push_str(&self.base);
-        source.push_str("\nm%\"");
+        let mut source = String::with_capacity(s.len() + 6);
+        source.push_str("m%\"");
         source.push_str(s);
         source.push_str("\"%");
 
-        let mut program: Program<CacheImpl> = Program::new_from_sources(
-            [(io::Cursor::new(source), "toplevel")],
-            std::io::stderr(),
-            NullReporter {},
-        )
-        .unwrap();
+        let mut program: Program<CacheImpl> = ProgramBuilder::new()
+            .add_source_string(source, "toplevel")
+            .extend_initial_env(self.vars.clone())
+            .with_reporter(NullReporter {})
+            .with_trace(std::io::stderr())
+            .build()
+            .unwrap();
 
         program
             .typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk)
@@ -43,11 +48,11 @@ impl VarCtx {
 
 impl<S: AsRef<str>> FromIterator<(S, args::Arg)> for VarCtx {
     fn from_iter<T: IntoIterator<Item = (S, args::Arg)>>(iter: T) -> Self {
-        let mut base = String::with_capacity(512);
-        for (ident, value) in iter.into_iter() {
-            value.write_nickel_binding(ident.as_ref(), &mut base);
-        }
-        Self { base }
+        let vars = iter
+            .into_iter()
+            .map(|(ident, value)| (Ident::new(ident.as_ref()), value.to_nickel()))
+            .collect();
+        Self { vars }
     }
 }
 
@@ -58,7 +63,7 @@ mod tests {
     #[test]
     fn empty_var_ctx() {
         let ctx = VarCtx::from_iter(std::iter::empty::<(&str, args::Arg)>());
-        assert_eq!(ctx.base, "");
+        assert!(ctx.vars.is_empty());
     }
 
     #[test]
