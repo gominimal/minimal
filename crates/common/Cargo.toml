@@ -6,9 +6,6 @@ license = "MIT OR Apache-2.0"
 edition.workspace = true
 publish.workspace = true
 
-[dev-dependencies]
-indoc.workspace = true
-
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
@@ -34,7 +31,6 @@ zstd.workspace = true
 
 args.workspace = true
 nickel-lang-core.workspace = true
-toml.workspace = true
 
 bytes.workspace = true
 reqwest.workspace = true

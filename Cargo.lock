@@ -646,7 +646,6 @@ dependencies = [
  "google-cloud-auth",
  "google-cloud-storage",
  "hex",
- "indoc",
  "jaq-all",
  "lzma-rs",
  "nickel-lang-core",
@@ -660,7 +659,6 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
- "toml 1.1.2+spec-1.1.0",
  "tracing",
  "url",
  "walkdir",
@@ -2791,7 +2789,6 @@ name = "mfile"
 version = "0.0.1"
 dependencies = [
  "args",
- "clap",
  "common",
  "indoc",
  "serde",
@@ -2876,13 +2873,11 @@ dependencies = [
  "rayon",
  "rcache",
  "remote-client",
- "remote-proto",
  "serde",
  "serde_json",
  "smallvec",
  "tokio",
  "tokio-util",
- "toml 1.1.2+spec-1.1.0",
  "toml_edit 0.25.11+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
@@ -2963,7 +2958,6 @@ dependencies = [
  "generational-arena",
  "graph",
  "hakoniwa",
- "indoc",
  "libc",
  "mctx",
  "mfile",
@@ -2971,7 +2965,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
- "toml 1.1.2+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -3263,7 +3256,6 @@ name = "ot"
 version = "0.0.1"
 dependencies = [
  "indicatif",
- "indoc",
 ]
 
 [[package]]
@@ -4075,7 +4067,6 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
- "tracing",
 ]
 
 [[package]]
@@ -4698,9 +4689,6 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "stdlib"
 version = "0.0.15"
-dependencies = [
- "indoc",
-]
 
 [[package]]
 name = "streaming-iterator"
