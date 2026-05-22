@@ -13,6 +13,7 @@ use remote_proto::{res::*, *};
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tonic::transport::{Channel, Error as TransportError};
+use tracing::Instrument;
 
 type CreateEnvStream = Pin<Box<dyn futures::Stream<Item = CreateEnvMessage> + Send>>;
 type CreateBuildStream = Pin<Box<dyn futures::Stream<Item = OrchestrateBuildMessage> + Send>>;
@@ -75,6 +76,7 @@ where
     <T::ResponseBody as http_body::Body>::Error:
         Into<Box<dyn std::error::Error + Send + Sync>> + Send,
 {
+    #[tracing::instrument(skip_all)]
     pub async fn make_env<'b>(&mut self, cwd: Worktree<'b>) -> Result<Env<'b>, Error> {
         use create_env_message::*;
         let client_id = format!(
@@ -87,12 +89,15 @@ where
         use stream_config::*;
         let (graph_writer, graph_reader) = tokio::io::duplex(8 * 1024);
         let graph_clone = self.g.clone();
-        tokio::spawn(async move {
-            graph::wire::AsyncGraphWriter::new(graph_writer)
-                .write_graph(&graph_clone)
-                .await
-                .expect("graph wire serialization failed");
-        });
+        tokio::spawn(
+            async move {
+                graph::wire::AsyncGraphWriter::new(graph_writer)
+                    .write_graph(&graph_clone)
+                    .await
+                    .expect("graph wire serialization failed");
+            }
+            .instrument(tracing::Span::current()),
+        );
         let graph_stream: (StreamConfig, CreateEnvStream) = (
             StreamConfig {
                 format: Some(Format::Graph(GraphFormat::GfStreamingV1.into())),
@@ -204,6 +209,7 @@ where
         })
     }
 
+    #[tracing::instrument(skip_all)]
     pub async fn exec<'b>(
         &mut self,
         env: &Env<'b>,
@@ -275,12 +281,15 @@ where
         use stream_config::*;
         let (graph_writer, graph_reader) = tokio::io::duplex(8 * 1024);
         let graph_clone = self.g.clone();
-        tokio::spawn(async move {
-            graph::wire::AsyncGraphWriter::new(graph_writer)
-                .write_graph(&graph_clone)
-                .await
-                .expect("graph wire serialization failed");
-        });
+        tokio::spawn(
+            async move {
+                graph::wire::AsyncGraphWriter::new(graph_writer)
+                    .write_graph(&graph_clone)
+                    .await
+                    .expect("graph wire serialization failed");
+            }
+            .instrument(tracing::Span::current()),
+        );
         let (graph_config, graph_stream): (StreamConfig, CreateBuildStream) = (
             StreamConfig {
                 format: Some(Format::Graph(GraphFormat::GfStreamingV1.into())),
@@ -490,81 +499,88 @@ where
             .into_inner();
 
         let (tx, rx) = mpsc::unbounded();
-        tokio::spawn(async move {
-            while let Some(msg) = rpc.next().await {
-                let msg = match msg {
-                    Ok(m) => m,
-                    Err(e) => {
-                        let _ = tx.unbounded_send((
-                            check::CheckObj::Package(String::new()),
-                            Err(Error::Other(e.into())),
-                        ));
-                        break;
-                    }
-                };
-                match msg.msg {
-                    Some(check_response::Msg::Error(e)) => {
-                        let _ = tx.unbounded_send((
-                            check::CheckObj::Package(String::new()),
-                            Err(Error::Other(anyhow!("check failed: {}", e.msg).into())),
-                        ));
-                        break;
-                    }
-                    Some(check_response::Msg::Check(c)) => {
-                        let obj = match c.obj.and_then(|o| o.msg) {
-                            Some(check_object::Msg::Package(n)) => check::CheckObj::Package(n),
-                            Some(check_object::Msg::Profile(n)) => check::CheckObj::Profile(n),
-                            Some(check_object::Msg::Harness(n)) => check::CheckObj::Stack(n),
-                            None => {
-                                let _ = tx.unbounded_send((
-                                    check::CheckObj::Package(String::new()),
-                                    Err(Error::Other(
-                                        anyhow!("check response missing object").into(),
-                                    )),
-                                ));
-                                break;
-                            }
-                        };
-                        let check_results: Result<Vec<_>, Error> = c
-                            .results
-                            .into_iter()
-                            .map(|r| -> Result<check::CheckResult, Error> {
-                                let verdict = match check_result::CheckVerdict::try_from(r.verdict)
-                                {
-                                    Ok(check_result::CheckVerdict::CvFail) => {
-                                        check::CheckVerdict::Fail
-                                    }
-                                    Ok(check_result::CheckVerdict::CvFixed) => {
-                                        check::CheckVerdict::Fixed
-                                    }
-                                    Ok(check_result::CheckVerdict::CvSkip) => {
-                                        check::CheckVerdict::Skip
-                                    }
-                                    Ok(check_result::CheckVerdict::CvPass) => {
-                                        check::CheckVerdict::Pass
-                                    }
-                                    Ok(check_result::CheckVerdict::CvUnspecified) | Err(_) => {
-                                        return Err(Error::Other(
-                                            anyhow!("invalid check verdict value {}", r.verdict)
-                                                .into(),
-                                        ));
-                                    }
-                                };
-                                Ok(check::CheckResult {
-                                    check: r.check.into(),
-                                    verdict,
-                                    err: r.errors,
-                                })
-                            })
-                            .collect();
-                        if tx.unbounded_send((obj, check_results)).is_err() {
+        tokio::spawn(
+            async move {
+                while let Some(msg) = rpc.next().await {
+                    let msg = match msg {
+                        Ok(m) => m,
+                        Err(e) => {
+                            let _ = tx.unbounded_send((
+                                check::CheckObj::Package(String::new()),
+                                Err(Error::Other(e.into())),
+                            ));
                             break;
                         }
+                    };
+                    match msg.msg {
+                        Some(check_response::Msg::Error(e)) => {
+                            let _ = tx.unbounded_send((
+                                check::CheckObj::Package(String::new()),
+                                Err(Error::Other(anyhow!("check failed: {}", e.msg).into())),
+                            ));
+                            break;
+                        }
+                        Some(check_response::Msg::Check(c)) => {
+                            let obj = match c.obj.and_then(|o| o.msg) {
+                                Some(check_object::Msg::Package(n)) => check::CheckObj::Package(n),
+                                Some(check_object::Msg::Profile(n)) => check::CheckObj::Profile(n),
+                                Some(check_object::Msg::Harness(n)) => check::CheckObj::Stack(n),
+                                None => {
+                                    let _ = tx.unbounded_send((
+                                        check::CheckObj::Package(String::new()),
+                                        Err(Error::Other(
+                                            anyhow!("check response missing object").into(),
+                                        )),
+                                    ));
+                                    break;
+                                }
+                            };
+                            let check_results: Result<Vec<_>, Error> = c
+                                .results
+                                .into_iter()
+                                .map(|r| -> Result<check::CheckResult, Error> {
+                                    let verdict =
+                                        match check_result::CheckVerdict::try_from(r.verdict) {
+                                            Ok(check_result::CheckVerdict::CvFail) => {
+                                                check::CheckVerdict::Fail
+                                            }
+                                            Ok(check_result::CheckVerdict::CvFixed) => {
+                                                check::CheckVerdict::Fixed
+                                            }
+                                            Ok(check_result::CheckVerdict::CvSkip) => {
+                                                check::CheckVerdict::Skip
+                                            }
+                                            Ok(check_result::CheckVerdict::CvPass) => {
+                                                check::CheckVerdict::Pass
+                                            }
+                                            Ok(check_result::CheckVerdict::CvUnspecified)
+                                            | Err(_) => {
+                                                return Err(Error::Other(
+                                                    anyhow!(
+                                                        "invalid check verdict value {}",
+                                                        r.verdict
+                                                    )
+                                                    .into(),
+                                                ));
+                                            }
+                                        };
+                                    Ok(check::CheckResult {
+                                        check: r.check.into(),
+                                        verdict,
+                                        err: r.errors,
+                                    })
+                                })
+                                .collect();
+                            if tx.unbounded_send((obj, check_results)).is_err() {
+                                break;
+                            }
+                        }
+                        None => {}
                     }
-                    None => {}
                 }
             }
-        });
+            .instrument(tracing::Span::current()),
+        );
 
         Ok(rx)
     }
