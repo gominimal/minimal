@@ -160,6 +160,7 @@ jobs:
           workload_identity_provider: "projects/289724348228/locations/global/workloadIdentityPools/github/providers/gominimal"
 
       - name: Promote CLI version
+        id: promote
         env:
           DRY_RUN: ${{ inputs.dry_run }}
           # Pass dispatch inputs via env (NOT inline ${{ inputs.* }} in `run:`)
@@ -221,4 +222,40 @@ jobs:
             echo "[dry-run] CLI would have been promoted to ${SHA} for platforms: ${PLATFORMS}"
           else
             echo "CLI promoted to ${SHA} for platforms: ${PLATFORMS}"
+          fi
+
+          # Pin reference docs to the promoted SHA so docs.minimal.dev/reference
+          # tracks the promoted CLI version rather than docs-repo main. The docs
+          # build reads this pointer to decide which minimal SHA to fetch
+          # docs/reference/*.md from.
+          echo "{\"version\":\"${SHA}\"}" > docs.json
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "[dry-run] would: gcloud storage cp --cache-control=max-age=300 docs.json gs://minimal-shim/config/docs.json"
+          else
+            gcloud storage cp \
+              --cache-control="max-age=300" \
+              docs.json \
+              gs://minimal-shim/config/docs.json
+            echo "Reference docs pinned to ${SHA}"
+          fi
+
+          # Export resolved SHA for the docs-rebuild dispatch step below.
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger docs rebuild
+        env:
+          # minimal-aw-bot PAT with repo-dispatch (contents: write) on
+          # gominimal/docs. The default GITHUB_TOKEN cannot dispatch other repos.
+          GH_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          SHA: ${{ steps.promote.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "[dry-run] would dispatch reference-docs-promoted to gominimal/docs for ${SHA}"
+          else
+            gh api repos/gominimal/docs/dispatches \
+              -f event_type=reference-docs-promoted \
+              -F "client_payload[sha]=${SHA}"
+            echo "Dispatched reference-docs-promoted to gominimal/docs for ${SHA}"
           fi
