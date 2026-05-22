@@ -19,51 +19,45 @@ pub(crate) async fn check_stack(
     let mut out = Vec::new();
 
     use nickel_lang_core::error::report::report_as_str;
+    use nickel_lang_core::program::{BuilderError, ProgramBuilder};
     use nickel_lang_core::{error::NullReporter, eval::cache::CacheImpl, program::Program};
 
     // TODO: Transitioning from 'harness' => 'stack', remove after May 2026
-    let program_res = if stacks_dir.join(&stack).join("harness.ncl").exists() {
-        Program::new_from_source(
-            std::io::Cursor::new(format!(
-                "import \"{}\"",
-                stacks_dir
-                    .join(&stack)
-                    .join("harness.ncl")
-                    .as_os_str()
-                    .to_str()
-                    .unwrap()
-            )),
-            "toplevel",
-            std::io::stderr(),
-            NullReporter {},
-        )
+    let entry_file = if stacks_dir.join(&stack).join("harness.ncl").exists() {
+        stacks_dir.join(&stack).join("harness.ncl")
     } else {
-        Program::new_from_source(
+        stacks_dir.join(&stack).join("stack.ncl")
+    };
+
+    let program_res: Result<Program<CacheImpl>, _> = ProgramBuilder::new()
+        .add_source(
             std::io::Cursor::new(format!(
                 "import \"{}\"",
-                stacks_dir
-                    .join(&stack)
-                    .join("stack.ncl")
-                    .as_os_str()
-                    .to_str()
-                    .unwrap()
+                entry_file.as_os_str().to_str().unwrap()
             )),
             "toplevel",
-            std::io::stderr(),
-            NullReporter {},
         )
-    };
+        .add_import_paths([ctx.stdlib_dir.clone()].iter())
+        .with_reporter(NullReporter {})
+        .with_trace(std::io::stderr())
+        .build();
 
     let mut program: Program<CacheImpl> = match program_res {
         Ok(p) => p,
         Err(e) => {
+            let msg = match e {
+                BuilderError::NoInputs => unreachable!(),
+                BuilderError::Io { path, error } => match path {
+                    Some(p) => format!("{}: {}", p.display(), error),
+                    None => format!("{}", error),
+                },
+            };
             return Ok(vec![CheckResult::parse_failure(format!(
                 "loading failed: {}",
-                e
+                msg
             ))]);
         }
     };
-    program.add_import_paths([ctx.stdlib_dir.clone()].iter());
 
     if let Err(e) = program.typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk) {
         return Ok(vec![CheckResult::parse_failure(report_as_str(

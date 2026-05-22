@@ -109,6 +109,7 @@ version = "0.0.1"
 dependencies = [
  "clap",
  "indoc",
+ "nickel-lang-core",
  "serde",
  "shlex 2.0.1",
  "toml 1.1.2+spec-1.1.0",
@@ -2993,7 +2994,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 [[package]]
 name = "nickel-lang-core"
 version = "0.17.0"
-source = "git+https://github.com/nickel-lang/nickel.git?rev=3a399233dcb5b5e8610a1245eeb171c29787a903#3a399233dcb5b5e8610a1245eeb171c29787a903"
+source = "git+https://github.com/nickel-lang/nickel.git?rev=5bf193c843bdd5fe87aac288d1b1e32a945c2f29#5bf193c843bdd5fe87aac288d1b1e32a945c2f29"
 dependencies = [
  "base64",
  "bumpalo",
@@ -3038,7 +3039,7 @@ dependencies = [
 [[package]]
 name = "nickel-lang-parser"
 version = "0.2.0"
-source = "git+https://github.com/nickel-lang/nickel.git?rev=3a399233dcb5b5e8610a1245eeb171c29787a903#3a399233dcb5b5e8610a1245eeb171c29787a903"
+source = "git+https://github.com/nickel-lang/nickel.git?rev=5bf193c843bdd5fe87aac288d1b1e32a945c2f29#5bf193c843bdd5fe87aac288d1b1e32a945c2f29"
 dependencies = [
  "bumpalo",
  "codespan",
@@ -3063,7 +3064,7 @@ dependencies = [
 [[package]]
 name = "nickel-lang-vector"
 version = "0.1.0"
-source = "git+https://github.com/nickel-lang/nickel.git?rev=3a399233dcb5b5e8610a1245eeb171c29787a903#3a399233dcb5b5e8610a1245eeb171c29787a903"
+source = "git+https://github.com/nickel-lang/nickel.git?rev=5bf193c843bdd5fe87aac288d1b1e32a945c2f29#5bf193c843bdd5fe87aac288d1b1e32a945c2f29"
 dependencies = [
  "imbl-sized-chunks",
  "serde",

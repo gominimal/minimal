@@ -6,14 +6,18 @@ use crate::Error;
 use common::{SpecOrigin, Target};
 
 use nickel_lang_core::cache::TermCacheError;
-use nickel_lang_core::eval::value::NickelValue;
-use nickel_lang_core::identifier::LocIdent;
+use nickel_lang_core::eval::value::{NickelValue, RecordData};
+use nickel_lang_core::identifier::{Ident, LocIdent};
+use nickel_lang_core::program::BuilderError;
 use nickel_lang_core::term::Term;
 use nickel_lang_core::typ::TypeF;
-use nickel_lang_core::{error::NullReporter, eval::cache::CacheImpl, program::Program};
+use nickel_lang_core::{
+    error::NullReporter,
+    eval::cache::CacheImpl,
+    program::{Program, ProgramBuilder},
+};
 use std::collections::{BTreeSet, HashMap};
 use std::hash::Hash;
-use std::io;
 use std::path::{Path, PathBuf};
 
 /// Configuration for loading a layer (of Nickel files).
@@ -182,9 +186,34 @@ pub(crate) struct Loader {
     for_target: Target,
     minimal_lib_path: PathBuf,
     last_id: u64,
+}
 
-    #[allow(dead_code)]
-    generated_lib_dir: tempfile::TempDir,
+/// Name of the initial-env variable that exposes the target & layer parameters
+/// to nickel code (see `config.ncl` in the stdlib).
+pub(crate) const INJECTED_CONFIG_VAR: &str = "__minimal_injected_config";
+
+fn build_injected_config(target: &Target, args: Option<&args::ArgsSet>) -> NickelValue {
+    let target_val = NickelValue::record_posless(RecordData::with_field_values([
+        (
+            LocIdent::new("os"),
+            NickelValue::enum_tag_posless(LocIdent::new(target.os().as_nickel_str())),
+        ),
+        (
+            LocIdent::new("arch"),
+            NickelValue::enum_tag_posless(LocIdent::new(target.arch().as_nickel_str())),
+        ),
+    ]));
+    let args_val = match args {
+        None => NickelValue::record_posless(RecordData::default()),
+        Some(set) => NickelValue::record_posless(RecordData::with_field_values(
+            set.iter()
+                .map(|(name, v)| (LocIdent::new(name), v.to_nickel())),
+        )),
+    };
+    NickelValue::record_posless(RecordData::with_field_values([
+        (LocIdent::new("target"), target_val),
+        (LocIdent::new("args"), args_val),
+    ]))
 }
 
 impl Loader {
@@ -194,42 +223,19 @@ impl Loader {
         args: Option<&args::ArgsSet>,
         opts: &LoadOptions,
     ) -> Result<Self, Error> {
-        let generated_lib_dir = tempfile::TempDir::new()?;
-        std::fs::write(generated_lib_dir.path().join("__injected_config__.ncl"), {
-            let mut out = Vec::with_capacity(128);
-            out.extend(b"{\n\ttarget = {os = ");
-            out.extend(opts.for_target().os().as_nickel_literal());
-            out.extend(b",arch = ");
-            out.extend(opts.for_target().arch().as_nickel_literal());
-            out.extend(b"},");
-            out.extend(b"\n\targs = ");
-            match args {
-                None => out.extend(b"{}"),
-                Some(set) => {
-                    out.extend(b"{");
-                    let mut buf = String::with_capacity(64);
-                    for (name, v) in set.iter() {
-                        buf.clear();
-                        v.write_nickel(&mut buf);
+        let injected = build_injected_config(opts.for_target(), args);
 
-                        out.extend(b"\n\t\t");
-                        out.extend(format!("\"{name}\" = {buf},").as_bytes());
-                    }
-                    out.extend(b"\n\t}");
-                }
-            }
-
-            out.extend(b",\n}");
-            out
-        })?;
-
-        let mut program = Program::new_from_sources(
-            [(io::Cursor::new(src.into()), "toplevel")],
-            std::io::stderr(),
-            NullReporter {},
-        )?;
-
-        program.add_import_paths([&opts.minimal_lib_path, generated_lib_dir.path()].iter());
+        let mut program: Program<CacheImpl> = ProgramBuilder::new()
+            .add_source(std::io::Cursor::new(src.into()), "toplevel")
+            .add_import_paths([&opts.minimal_lib_path].iter())
+            .extend_initial_env(vec![(Ident::new(INJECTED_CONFIG_VAR), injected)])
+            .with_reporter(NullReporter {})
+            .with_trace(std::io::stderr())
+            .build()
+            .map_err(|e| match e {
+                BuilderError::NoInputs => unreachable!(),
+                BuilderError::Io { path: _, error } => Error::IO(error),
+            })?;
 
         program
             .typecheck(nickel_lang_core::typecheck::TypecheckMode::Walk)
@@ -244,7 +250,6 @@ impl Loader {
             for_target: opts.for_target().clone(),
             last_id: 0,
             minimal_lib_path: opts.minimal_lib_path.canonicalize()?,
-            generated_lib_dir,
         };
         out.annotate()?;
         Ok(out)
@@ -498,7 +503,7 @@ mod tests {
                 .unwrap()
         };
         let _sr = Loader::new(
-            "{c = import \"__injected_config__.ncl\"}".to_string(),
+            "{c = __minimal_injected_config}".to_string(),
             Some(&args),
             &LoadOptions::for_test(),
         )
