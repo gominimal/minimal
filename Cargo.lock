@@ -465,7 +465,6 @@ dependencies = [
  "ot",
  "path-absolutize",
  "regex",
- "tempfile",
  "tokio",
  "tracing",
 ]
@@ -2863,7 +2862,6 @@ dependencies = [
  "dirs",
  "futures",
  "graph",
- "hakoniwa",
  "lcache",
  "mctx",
  "mfile",
