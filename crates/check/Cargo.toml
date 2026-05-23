@@ -11,7 +11,6 @@ futures.workspace = true
 nickel-lang-core.workspace = true
 object.workspace = true
 regex.workspace = true
-tempfile.workspace = true
 tokio.workspace = true
 moka.workspace = true
 
