@@ -1,0 +1,20 @@
+[package]
+name = "minimald"
+version = "0.0.1"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap.workspace = true
+clap_complete.workspace = true
+dirs.workspace = true
+futures.workspace = true
+
+russh.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+ot.workspace = true

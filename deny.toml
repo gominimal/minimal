@@ -7,6 +7,8 @@ ignore = [
     "RUSTSEC-2026-0009",
     # Deprecation notice of paste crate
     "RUSTSEC-2024-0436",
+    # RSA crate timing side-channel, not accessible when using ed25519 host keys
+    "RUSTSEC-2023-0071",
 ]
 
 [licenses]
