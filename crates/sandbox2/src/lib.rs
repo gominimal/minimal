@@ -591,35 +591,50 @@ impl<C: Channel> Sandbox<C> {
             let child_stdout = child.stdout.take();
             let child_stderr = child.stderr.take();
 
-            // Stdout thread
+            // Stdout thread — like stderr, capture a rolling tail of the
+            // last ~4 KiB so the caller can include it in InvocationFailed
+            // when a build script swallows its stderr (mesa's pip install
+            // 2>/dev/null pattern) but emits the real diagnostic to stdout.
             let stdout_file = self.stdout.take();
             let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
-            let stdout_thread = std::thread::spawn(move || -> Result<Option<fs::File>, Error> {
-                let mut file = stdout_file;
-                if let Some(mut pipe) = child_stdout {
-                    let mut buf = [0u8; 8192];
-                    loop {
-                        let n = pipe
-                            .read(&mut buf)
-                            .map_err(|e| Error::IO("reading stdout pipe", Default::default(), e))?;
-                        if n == 0 {
-                            break;
+            let stdout_thread =
+                std::thread::spawn(move || -> Result<(Option<fs::File>, Vec<u8>), Error> {
+                    let mut file = stdout_file;
+                    let mut tail = Vec::new();
+                    if let Some(mut pipe) = child_stdout {
+                        let mut buf = [0u8; 8192];
+                        loop {
+                            let n = pipe.read(&mut buf).map_err(|e| {
+                                Error::IO("reading stdout pipe", Default::default(), e)
+                            })?;
+                            if n == 0 {
+                                break;
+                            }
+                            if let Some(f) = file.as_mut() {
+                                f.write_all(&buf[..n]).map_err(|e| {
+                                    Error::IO("writing stdout", Default::default(), e)
+                                })?;
+                            }
+                            tail.extend_from_slice(&buf[..n]);
+                            if tail.len() > 8192 {
+                                let start = tail.len() - 4096;
+                                tail = tail[start..].to_vec();
+                            }
+                            // Ignore send errors: the receiver may have been dropped
+                            // if the async writer errored, but we still drain the pipe.
+                            let _ = stdout_tx.blocking_send(buf[..n].to_vec());
                         }
                         if let Some(f) = file.as_mut() {
-                            f.write_all(&buf[..n])
-                                .map_err(|e| Error::IO("writing stdout", Default::default(), e))?;
+                            f.flush()
+                                .map_err(|e| Error::IO("flushing stdout", Default::default(), e))?;
                         }
-                        // Ignore send errors: the receiver may have been dropped
-                        // if the async writer errored, but we still drain the pipe.
-                        let _ = stdout_tx.blocking_send(buf[..n].to_vec());
                     }
-                    if let Some(f) = file.as_mut() {
-                        f.flush()
-                            .map_err(|e| Error::IO("flushing stdout", Default::default(), e))?;
+                    if tail.len() > 4096 {
+                        let start = tail.len() - 4096;
+                        tail = tail[start..].to_vec();
                     }
-                }
-                Ok(file)
-            });
+                    Ok((file, tail))
+                });
 
             // Stderr thread
             let stderr_file = self.stderr.take();
@@ -694,7 +709,7 @@ impl<C: Channel> Sandbox<C> {
 
                     // Recover stdout/stderr files from the reader threads.
                     // The threads will finish promptly now that pipes are closed.
-                    if let Ok(Ok(f)) = stdout_thread.join() {
+                    if let Ok(Ok((f, _tail))) = stdout_thread.join() {
                         self.stdout = f;
                     }
                     if let Ok(Ok((f, _tail))) = stderr_thread.join() {
@@ -707,7 +722,7 @@ impl<C: Channel> Sandbox<C> {
                 }
                 (stdout_fwd_res, stderr_fwd_res) = async { tokio::join!(stdout_fwd, stderr_fwd) } => {
                     // Collect results from the reader threads.
-                    let stdout_file = stdout_thread
+                    let (stdout_file, stdout_tail) = stdout_thread
                         .join()
                         .expect("stdout reader thread panicked")?;
                     let (stderr_file, stderr_tail) = stderr_thread
@@ -728,11 +743,13 @@ impl<C: Channel> Sandbox<C> {
 
                     if !status.success() {
                         let stderr_str = String::from_utf8_lossy(&stderr_tail).into_owned();
+                        let stdout_str = String::from_utf8_lossy(&stdout_tail).into_owned();
                         return Err(Error::Execution(ExecutionError::InvocationFailed {
                             idx: i,
                             code: status.code,
                             reason: status.reason.clone(),
                             stderr: stderr_str,
+                            stdout: stdout_str,
                         }));
                     }
                 }

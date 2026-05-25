@@ -50,6 +50,10 @@ pub enum ExecutionError {
         code: i32,
         reason: String,
         stderr: String,
+        /// Last ~4 KiB of stdout. Captured alongside stderr so build
+        /// scripts that swallow their stderr (e.g. `pip install foo
+        /// 2>/dev/null || true`) still leave a diagnostic trail.
+        stdout: String,
     },
     SpawnFailed(hakoniwa::Error),
     Cancelled,
@@ -63,6 +67,7 @@ impl fmt::Display for ExecutionError {
                 code,
                 reason,
                 stderr,
+                stdout,
             } => {
                 write!(
                     f,
@@ -71,6 +76,9 @@ impl fmt::Display for ExecutionError {
                 )?;
                 if !stderr.is_empty() {
                     write!(f, "\nstderr:\n{}", stderr)?;
+                }
+                if !stdout.is_empty() {
+                    write!(f, "\nstdout:\n{}", stdout)?;
                 }
                 Ok(())
             }
