@@ -400,6 +400,68 @@ impl<C: Channel> Sandbox<C> {
         Self::bind_mount(&self.state_dir, "/state", rec, &mut container)?;
         Self::bind_mount(&self.base_dir.join("run"), "/run", rec, &mut container)?;
 
+        // MINIMAL_INTERNAL_CS_BUILD: undocumented bundle of behaviors
+        // needed for running minimal as a library inside a GCP
+        // Confidential Space workload. Not for general callers; we
+        // expose it as a private "I am the trusted CS builder" flag so
+        // it can't accidentally enable non-hermetic behavior in normal
+        // `minimal package <pkg>` invocations.
+        //
+        // What the bundle does:
+        //
+        // 1. Bind-mount the outer /proc into the sandbox + enable
+        //    Runctl::MountFallback. CS workload containers get OCI
+        //    MaskedPaths (containerd's default — tmpfs over
+        //    /proc/{kcore,scsi,keys,...}). The Linux kernel's
+        //    anti-unmask guard then refuses any nested procfsmount
+        //    over a masked parent, so hakoniwa's implicit
+        //    `Container::new()::procfsmount("/proc")` returns EPERM.
+        //    Workaround: bind the outer (already-masked) /proc instead
+        //    of trying to mount a fresh procfs. The MountFallback
+        //    runctl is required for the same reason — hakoniwa emits
+        //    a mandatory MS_REMOUNT after every bind, which also
+        //    fails on the masked /proc until we let it retry with the
+        //    source mount's existing flags.
+        //
+        //    Caveat (noted by @twitchyliquid64 on the PR): MountFallback
+        //    is a container-global runctl, not per-mount. It applies
+        //    to every bind in the sandbox — a sandbox that wanted to
+        //    assert e.g. NOEXEC on a target may silently end up with
+        //    the source's existing flags instead. Acceptable inside
+        //    the CS attested boundary where outer isolation handles
+        //    the actual security property; the inner hakoniwa is for
+        //    build-script reproducibility, not isolation. Filed
+        //    upstream to see if hakoniwa would accept a per-mount
+        //    runctl that would let us scope this to /proc only.
+        //
+        // 2. Symlink the hermetic-builder's ecosystem cache paths.
+        //    hermetic-builder-rs stages caches at
+        //    <state>/cs-mirror/{cargo-vendor,npm-cache,...}/. The
+        //    state dir is bind-mounted at /state, so the caches are
+        //    already accessible there. Pkg build.shs in the
+        //    minimalmertic pkg set reference /cargo-vendor,
+        //    /npm-cache, etc. as hardcoded paths (per the
+        //    if-d-cargo-vendor offline-cache idiom); these symlinks
+        //    bridge the two without requiring every build.sh to know
+        //    about /state/cs-mirror/. Dangling symlinks (when a given
+        //    cache wasn't staged for the current pkg) are safe —
+        //    `[ -d /<name> ]` returns false through a dangling
+        //    symlink, so the build.sh's online-fallback branch is
+        //    taken correctly.
+        //
+        // Inert when the env var is unset; default `minimal package`
+        // invocations see no behavior change.
+        if std::env::var("MINIMAL_INTERNAL_CS_BUILD").as_deref() == Ok("1") {
+            container.bindmount_rw("/proc", "/proc");
+            container.runctl(hakoniwa::Runctl::MountFallback);
+            container.symlink("/state/cs-mirror/cargo-vendor", "/cargo-vendor");
+            container.symlink("/state/cs-mirror/npm-cache", "/npm-cache");
+            container.symlink("/state/cs-mirror/pnpm-store", "/pnpm-store");
+            container.symlink("/state/cs-mirror/bun-cache", "/bun-cache");
+            container.symlink("/state/cs-mirror/pip-wheels", "/pip-wheels");
+            container.symlink("/state/cs-mirror/rust-stage0", "/rust-stage0");
+        }
+
         if self.needs_bin_symlink()? {
             container.symlink("/usr/bin", "/bin");
         }
@@ -559,35 +621,50 @@ impl<C: Channel> Sandbox<C> {
             let child_stdout = child.stdout.take();
             let child_stderr = child.stderr.take();
 
-            // Stdout thread
+            // Stdout thread — like stderr, capture a rolling tail of the
+            // last ~4 KiB so the caller can include it in InvocationFailed
+            // when a build script swallows its stderr (mesa's pip install
+            // 2>/dev/null pattern) but emits the real diagnostic to stdout.
             let stdout_file = self.stdout.take();
             let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
-            let stdout_thread = std::thread::spawn(move || -> Result<Option<fs::File>, Error> {
-                let mut file = stdout_file;
-                if let Some(mut pipe) = child_stdout {
-                    let mut buf = [0u8; 8192];
-                    loop {
-                        let n = pipe
-                            .read(&mut buf)
-                            .map_err(|e| Error::IO("reading stdout pipe", Default::default(), e))?;
-                        if n == 0 {
-                            break;
+            let stdout_thread =
+                std::thread::spawn(move || -> Result<(Option<fs::File>, Vec<u8>), Error> {
+                    let mut file = stdout_file;
+                    let mut tail = Vec::new();
+                    if let Some(mut pipe) = child_stdout {
+                        let mut buf = [0u8; 8192];
+                        loop {
+                            let n = pipe.read(&mut buf).map_err(|e| {
+                                Error::IO("reading stdout pipe", Default::default(), e)
+                            })?;
+                            if n == 0 {
+                                break;
+                            }
+                            if let Some(f) = file.as_mut() {
+                                f.write_all(&buf[..n]).map_err(|e| {
+                                    Error::IO("writing stdout", Default::default(), e)
+                                })?;
+                            }
+                            tail.extend_from_slice(&buf[..n]);
+                            if tail.len() > 8192 {
+                                let start = tail.len() - 4096;
+                                tail = tail[start..].to_vec();
+                            }
+                            // Ignore send errors: the receiver may have been dropped
+                            // if the async writer errored, but we still drain the pipe.
+                            let _ = stdout_tx.blocking_send(buf[..n].to_vec());
                         }
                         if let Some(f) = file.as_mut() {
-                            f.write_all(&buf[..n])
-                                .map_err(|e| Error::IO("writing stdout", Default::default(), e))?;
+                            f.flush()
+                                .map_err(|e| Error::IO("flushing stdout", Default::default(), e))?;
                         }
-                        // Ignore send errors: the receiver may have been dropped
-                        // if the async writer errored, but we still drain the pipe.
-                        let _ = stdout_tx.blocking_send(buf[..n].to_vec());
                     }
-                    if let Some(f) = file.as_mut() {
-                        f.flush()
-                            .map_err(|e| Error::IO("flushing stdout", Default::default(), e))?;
+                    if tail.len() > 4096 {
+                        let start = tail.len() - 4096;
+                        tail = tail[start..].to_vec();
                     }
-                }
-                Ok(file)
-            });
+                    Ok((file, tail))
+                });
 
             // Stderr thread
             let stderr_file = self.stderr.take();
@@ -662,7 +739,7 @@ impl<C: Channel> Sandbox<C> {
 
                     // Recover stdout/stderr files from the reader threads.
                     // The threads will finish promptly now that pipes are closed.
-                    if let Ok(Ok(f)) = stdout_thread.join() {
+                    if let Ok(Ok((f, _tail))) = stdout_thread.join() {
                         self.stdout = f;
                     }
                     if let Ok(Ok((f, _tail))) = stderr_thread.join() {
@@ -675,7 +752,7 @@ impl<C: Channel> Sandbox<C> {
                 }
                 (stdout_fwd_res, stderr_fwd_res) = async { tokio::join!(stdout_fwd, stderr_fwd) } => {
                     // Collect results from the reader threads.
-                    let stdout_file = stdout_thread
+                    let (stdout_file, stdout_tail) = stdout_thread
                         .join()
                         .expect("stdout reader thread panicked")?;
                     let (stderr_file, stderr_tail) = stderr_thread
@@ -696,11 +773,13 @@ impl<C: Channel> Sandbox<C> {
 
                     if !status.success() {
                         let stderr_str = String::from_utf8_lossy(&stderr_tail).into_owned();
+                        let stdout_str = String::from_utf8_lossy(&stdout_tail).into_owned();
                         return Err(Error::Execution(ExecutionError::InvocationFailed {
                             idx: i,
                             code: status.code,
                             reason: status.reason.clone(),
                             stderr: stderr_str,
+                            stdout: stdout_str,
                         }));
                     }
                 }
