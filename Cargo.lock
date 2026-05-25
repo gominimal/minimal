@@ -5415,6 +5415,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sessions"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "toml 1.1.2+spec-1.1.0",
+]
+
+[[package]]
 name = "sha-1"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

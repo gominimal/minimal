@@ -20,6 +20,7 @@ members = [
     "crates/remote-client",
     "crates/remote-proto",
     "crates/sandbox2",
+    "crates/sessions",
     "crates/stdlib",
 ]
 resolver = "3"
