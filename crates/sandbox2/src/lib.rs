@@ -351,6 +351,68 @@ impl<C: Channel> Sandbox<C> {
             .bindmount_rw(self.base_dir.join("run").to_str().unwrap(), "/run")
             .unshare(hakoniwa::Namespace::Cgroup);
 
+        // MINIMAL_INTERNAL_CS_BUILD: undocumented bundle of behaviors
+        // needed for running minimal as a library inside a GCP
+        // Confidential Space workload. Not for general callers; we
+        // expose it as a private "I am the trusted CS builder" flag so
+        // it can't accidentally enable non-hermetic behavior in normal
+        // `minimal package <pkg>` invocations.
+        //
+        // What the bundle does:
+        //
+        // 1. Bind-mount the outer /proc into the sandbox + enable
+        //    Runctl::MountFallback. CS workload containers get OCI
+        //    MaskedPaths (containerd's default — tmpfs over
+        //    /proc/{kcore,scsi,keys,...}). The Linux kernel's
+        //    anti-unmask guard then refuses any nested procfsmount
+        //    over a masked parent, so hakoniwa's implicit
+        //    `Container::new()::procfsmount("/proc")` returns EPERM.
+        //    Workaround: bind the outer (already-masked) /proc instead
+        //    of trying to mount a fresh procfs. The MountFallback
+        //    runctl is required for the same reason — hakoniwa emits
+        //    a mandatory MS_REMOUNT after every bind, which also
+        //    fails on the masked /proc until we let it retry with the
+        //    source mount's existing flags.
+        //
+        //    Caveat (noted by @twitchyliquid64 on the PR): MountFallback
+        //    is a container-global runctl, not per-mount. It applies
+        //    to every bind in the sandbox — a sandbox that wanted to
+        //    assert e.g. NOEXEC on a target may silently end up with
+        //    the source's existing flags instead. Acceptable inside
+        //    the CS attested boundary where outer isolation handles
+        //    the actual security property; the inner hakoniwa is for
+        //    build-script reproducibility, not isolation. Filed
+        //    upstream to see if hakoniwa would accept a per-mount
+        //    runctl that would let us scope this to /proc only.
+        //
+        // 2. Symlink the hermetic-builder's ecosystem cache paths.
+        //    hermetic-builder-rs stages caches at
+        //    <state>/cs-mirror/{cargo-vendor,npm-cache,...}/. The
+        //    state dir is bind-mounted at /state, so the caches are
+        //    already accessible there. Pkg build.shs in the
+        //    minimalmertic pkg set reference /cargo-vendor,
+        //    /npm-cache, etc. as hardcoded paths (per the
+        //    if-d-cargo-vendor offline-cache idiom); these symlinks
+        //    bridge the two without requiring every build.sh to know
+        //    about /state/cs-mirror/. Dangling symlinks (when a given
+        //    cache wasn't staged for the current pkg) are safe —
+        //    `[ -d /<name> ]` returns false through a dangling
+        //    symlink, so the build.sh's online-fallback branch is
+        //    taken correctly.
+        //
+        // Inert when the env var is unset; default `minimal package`
+        // invocations see no behavior change.
+        if std::env::var("MINIMAL_INTERNAL_CS_BUILD").as_deref() == Ok("1") {
+            container.bindmount_rw("/proc", "/proc");
+            container.runctl(hakoniwa::Runctl::MountFallback);
+            container.symlink("/state/cs-mirror/cargo-vendor", "/cargo-vendor");
+            container.symlink("/state/cs-mirror/npm-cache", "/npm-cache");
+            container.symlink("/state/cs-mirror/pnpm-store", "/pnpm-store");
+            container.symlink("/state/cs-mirror/bun-cache", "/bun-cache");
+            container.symlink("/state/cs-mirror/pip-wheels", "/pip-wheels");
+            container.symlink("/state/cs-mirror/rust-stage0", "/rust-stage0");
+        }
+
         if self.needs_bin_symlink()? {
             container.symlink("/usr/bin", "/bin");
         }
