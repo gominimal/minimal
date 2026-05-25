@@ -103,6 +103,30 @@ impl<C: Channel> Sandbox<C> {
             }
         }
         hardlink_dir_contents(&base_dir.join("synth"), &rootfs)?;
+
+        // MINIMAL_INTERNAL_CS_BUILD bundle: when the env var is "1"
+        // AND the convention path exists on host, hardlink that
+        // directory's contents into the sandbox rootfs root. This is
+        // the same mechanism the public `extra_rootfs` field used to
+        // provide; it now happens behind the (undocumented) CS flag
+        // with a hardcoded convention path, so there's no new public
+        // API surface.
+        //
+        // Convention: minimalmertic's hermetic-builder-rs stages its
+        // CS-only cache bundle (cargo-vendor, npm-cache, pnpm-store,
+        // bun-cache, pip-wheels, rust-stage0, goproxy) at
+        // /root/.cache/minimal/cs-mirror/. Inside the sandbox these
+        // appear at /cargo-vendor, /goproxy, etc. — top-level paths
+        // matching the existing pkg-build.sh offline-cache idiom.
+        //
+        // Inert when env var unset or the convention path doesn't
+        // exist (tests, dev environments, non-CS callers).
+        if std::env::var("MINIMAL_INTERNAL_CS_BUILD").as_deref() == Ok("1") {
+            let cs_mirror = Path::new("/root/.cache/minimal/cs-mirror");
+            if cs_mirror.exists() {
+                hardlink_dir_contents(cs_mirror, &rootfs)?;
+            }
+        }
         tracing::trace!("rootfs hardlinking took {:?}", hardlinking_start.elapsed());
 
         // On aarch64, autotools/libtool defaults to installing libraries
@@ -434,32 +458,32 @@ impl<C: Channel> Sandbox<C> {
         //    upstream to see if hakoniwa would accept a per-mount
         //    runctl that would let us scope this to /proc only.
         //
-        // 2. Symlink the hermetic-builder's ecosystem cache paths.
-        //    hermetic-builder-rs stages caches at
-        //    <state>/cs-mirror/{cargo-vendor,npm-cache,...}/. The
-        //    state dir is bind-mounted at /state, so the caches are
-        //    already accessible there. Pkg build.shs in the
-        //    minimalmertic pkg set reference /cargo-vendor,
-        //    /npm-cache, etc. as hardcoded paths (per the
-        //    if-d-cargo-vendor offline-cache idiom); these symlinks
-        //    bridge the two without requiring every build.sh to know
-        //    about /state/cs-mirror/. Dangling symlinks (when a given
-        //    cache wasn't staged for the current pkg) are safe —
-        //    `[ -d /<name> ]` returns false through a dangling
-        //    symlink, so the build.sh's online-fallback branch is
-        //    taken correctly.
+        // 2. (Cache delivery for hermetic-builder's ecosystem caches —
+        //    cargo-vendor, npm-cache, pnpm-store, bun-cache,
+        //    pip-wheels, rust-stage0, goproxy — happens in Sandbox::new
+        //    via hardlink_dir_contents from the convention path
+        //    /root/.cache/minimal/cs-mirror/. Earlier iteration of
+        //    this PR used /state/cs-mirror-pointing symlinks here,
+        //    but /state inside each sandbox is per-build state, not
+        //    shared with the orchestrator's outer state_dir, so the
+        //    symlinks pointed at unreachable paths. The hardlink
+        //    mechanism (matching the old extra_rootfs behavior) does
+        //    the right thing without expanding public API surface.)
         //
         // Inert when the env var is unset; default `minimal package`
         // invocations see no behavior change.
         if std::env::var("MINIMAL_INTERNAL_CS_BUILD").as_deref() == Ok("1") {
             container.bindmount_rw("/proc", "/proc");
             container.runctl(hakoniwa::Runctl::MountFallback);
-            container.symlink("/state/cs-mirror/cargo-vendor", "/cargo-vendor");
-            container.symlink("/state/cs-mirror/npm-cache", "/npm-cache");
-            container.symlink("/state/cs-mirror/pnpm-store", "/pnpm-store");
-            container.symlink("/state/cs-mirror/bun-cache", "/bun-cache");
-            container.symlink("/state/cs-mirror/pip-wheels", "/pip-wheels");
-            container.symlink("/state/cs-mirror/rust-stage0", "/rust-stage0");
+            // Cache delivery (cargo-vendor, npm-cache, ...) is handled
+            // by the hardlink_dir_contents call in Sandbox::new — see
+            // lib.rs near line ~105. Earlier iteration of this PR
+            // used /state/<...>-pointing symlinks here, but /state
+            // inside each sandbox is per-build state (created via
+            // base_dir.join("state") in Sandbox::new), not shared with
+            // the orchestrator's outer state_dir, so the symlinks
+            // pointed at unreachable paths. The hardlink mechanism
+            // replaces them.
         }
 
         if self.needs_bin_symlink()? {
