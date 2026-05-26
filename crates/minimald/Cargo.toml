@@ -8,12 +8,9 @@ publish.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 dirs.workspace = true
-futures.workspace = true
-
 russh.workspace = true
 serde.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

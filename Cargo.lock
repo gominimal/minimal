@@ -3337,12 +3337,8 @@ version = "0.0.1"
 dependencies = [
  "clap",
  "clap_complete",
- "dirs",
- "futures",
  "ot",
  "tokio",
- "tokio-util",
- "tracing",
  "tracing-subscriber",
 ]
 
@@ -3353,12 +3349,10 @@ dependencies = [
  "clap",
  "clap_complete",
  "dirs",
- "futures",
  "ot",
  "russh",
  "serde",
  "tokio",
- "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
