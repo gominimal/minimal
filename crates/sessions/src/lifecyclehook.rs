@@ -6,8 +6,8 @@
 //! [`LifecycleHook::builder`] or deserialize them from configuration; both paths
 //! enforce the same invariant.
 
+use crate::paths::ConfigRelPath;
 use core::fmt;
-use std::path::PathBuf;
 
 /// Errors produced when constructing a [`LifecycleHook`].
 #[non_exhaustive]
@@ -39,6 +39,11 @@ impl std::error::Error for Error {}
 /// Either the script body provided directly ([`Inline`](Self::Inline)) or a
 /// path to a script file on disk ([`External`](Self::External)).
 ///
+/// External scripts are [`ConfigRelPath`]s — anchored to the directory of the
+/// `minimal.toml` they were decoded from. Absolute paths are rejected at
+/// deserialization. To run an arbitrary host path, the executor binds the
+/// `ConfigRelPath` against the known config directory.
+///
 /// Serialized with adjacent tagging — the wire form is a table with `type` and
 /// `value` keys:
 ///
@@ -51,8 +56,8 @@ impl std::error::Error for Error {}
 pub enum HookScript {
     /// Script body stored inline.
     Inline(String),
-    /// Path to a script file on disk.
-    External(PathBuf),
+    /// Path to a script file on disk, relative to the config directory.
+    External(ConfigRelPath),
 }
 
 /// A set of scripts to run at lifecycle transition points of a host resource.
@@ -257,9 +262,10 @@ mod tests {
         "#;
         let hook: LifecycleHook = toml::from_str(src).unwrap();
         assert!(matches!(hook.on_activate(), Some(HookScript::Inline(s)) if s == "echo activated"));
-        assert!(
-            matches!(hook.on_destroy(), Some(HookScript::External(p)) if p == &PathBuf::from("./teardown.sh"))
-        );
+        assert!(matches!(
+            hook.on_destroy(),
+            Some(HookScript::External(p)) if p.as_str() == "./teardown.sh"
+        ));
         assert!(matches!(hook.on_failure(), Some(HookScript::Inline(s)) if s == "echo failed"));
     }
 
@@ -287,7 +293,9 @@ mod tests {
     fn serde_round_trip_through_toml() {
         let original = LifecycleHook::builder()
             .with_on_activate(HookScript::Inline("echo hi".into()))
-            .with_on_failure(HookScript::External(PathBuf::from("./fail.sh")))
+            .with_on_failure(HookScript::External(
+                ConfigRelPath::try_new("./fail.sh").unwrap(),
+            ))
             .build()
             .unwrap();
 
@@ -295,10 +303,23 @@ mod tests {
         let parsed: LifecycleHook = toml::from_str(&serialized).unwrap();
 
         assert!(matches!(parsed.on_activate(), Some(HookScript::Inline(s)) if s == "echo hi"));
-        assert!(
-            matches!(parsed.on_failure(), Some(HookScript::External(p)) if p == &PathBuf::from("./fail.sh"))
-        );
+        assert!(matches!(
+            parsed.on_failure(),
+            Some(HookScript::External(p)) if p.as_str() == "./fail.sh"
+        ));
         assert!(parsed.on_destroy().is_none());
+    }
+
+    #[test]
+    fn external_rejects_absolute_path_at_deserialize() {
+        let src = r#"
+            on_activate = { type = "external", value = "/etc/hook.sh" }
+        "#;
+        let err = toml::from_str::<LifecycleHook>(src).unwrap_err();
+        assert!(
+            err.to_string().contains("relative"),
+            "expected realm error, got: {err}",
+        );
     }
 
     #[test]

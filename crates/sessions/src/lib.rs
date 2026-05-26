@@ -3,3 +3,6 @@
 
 pub mod lifecyclehook;
 pub mod loadout;
+pub mod patches;
+pub mod paths;
+pub mod vars;
