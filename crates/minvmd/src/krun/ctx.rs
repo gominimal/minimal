@@ -87,26 +87,23 @@ impl Context {
         argv_ptrs.push(ptr::null()); // NULL-terminate per C convention
 
         // Bind envp storage and its pointer-vector at the same scope as the
-        // FFI call so both outlive the unsafe block. `envp_cstrs` is `None`
-        // when the caller wants to inherit the host env (libkrun docs: pass
-        // NULL); `envp_ptrs` is a sentinel single-NULL Vec in that case to
-        // keep the type uniform.
+        // FFI call so both outlive the unsafe block. `envp_cstrs == None`
+        // means "inherit host env" per libkrun docs (pass NULL); a `Some`
+        // (including `Some(&[])`) gets a properly NULL-terminated array.
         let envp_cstrs: Option<Vec<CString>> = match envp {
             Some(entries) => Some(cstrings_from_strs(entries, "envp")?),
             None => None,
         };
-        let mut envp_ptrs: Vec<*const c_char> = match &envp_cstrs {
-            Some(cstrs) => cstrs.iter().map(|c| c.as_ptr()).collect(),
-            None => Vec::new(),
-        };
-        if envp_cstrs.is_some() {
-            envp_ptrs.push(ptr::null());
-        }
-        let envp_ptr: *const *const c_char = if envp_cstrs.is_some() {
-            envp_ptrs.as_ptr()
-        } else {
-            ptr::null()
-        };
+        let (envp_ptrs, envp_ptr): (Vec<*const c_char>, *const *const c_char) =
+            match envp_cstrs.as_ref() {
+                Some(cstrs) => {
+                    let mut ptrs: Vec<*const c_char> = cstrs.iter().map(|c| c.as_ptr()).collect();
+                    ptrs.push(ptr::null());
+                    let p = ptrs.as_ptr();
+                    (ptrs, p)
+                }
+                None => (Vec::new(), ptr::null()),
+            };
 
         // SAFETY:
         //  - `exec_cstr` is a CString owned by this stack frame; its pointer
@@ -225,10 +222,12 @@ impl Context {
         // further wrapper calls referring to this id are valid.
         let ret = unsafe { raw::krun_start_enter(ctx_id) };
         match VmError::check_backend("krun_start_enter", ret) {
-            Ok(_) => VmError::Backend {
-                op: "krun_start_enter",
-                code: 0,
-            },
+            // libkrun's docs guarantee start_enter only returns on error
+            // (success path: VMM calls exit() with the guest workload's
+            // exit code). A non-negative return is therefore a protocol
+            // violation; surface it as a distinct variant rather than
+            // pretending it was "errno 0".
+            Ok(ret) => VmError::StartEnterReturnedUnexpectedly { ret },
             Err(e) => e,
         }
     }

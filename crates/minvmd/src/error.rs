@@ -24,6 +24,12 @@ pub enum VmError {
     /// A caller-supplied string (e.g. an env var or argv entry) contained a
     /// NUL byte and cannot be passed across the C FFI boundary.
     NulInString { what: &'static str, value: String },
+
+    /// `krun_start_enter` returned a non-negative value. libkrun's docs state
+    /// the function only returns on error (on success it `exit()`s the host
+    /// process with the guest workload's exit code), so a non-negative
+    /// return is a protocol violation. `ret` is the raw libkrun return.
+    StartEnterReturnedUnexpectedly { ret: i32 },
 }
 
 impl fmt::Display for VmError {
@@ -43,6 +49,12 @@ impl fmt::Display for VmError {
                 write!(
                     f,
                     "{what} contains a NUL byte and cannot cross the FFI boundary: {value:?}"
+                )
+            }
+            Self::StartEnterReturnedUnexpectedly { ret } => {
+                write!(
+                    f,
+                    "krun_start_enter returned {ret} but libkrun's docs say it only returns on error"
                 )
             }
         }
@@ -100,6 +112,14 @@ mod tests {
         let s = format!("{err}");
         assert!(s.contains("krun_set_vm_config"), "display: {s}");
         assert!(s.contains("12"), "display: {s}");
+    }
+
+    #[test]
+    fn display_start_enter_returned_unexpectedly() {
+        let err = VmError::StartEnterReturnedUnexpectedly { ret: 0 };
+        let s = format!("{err}");
+        assert!(s.contains("krun_start_enter"), "display: {s}");
+        assert!(s.contains("only returns on error"), "display: {s}");
     }
 
     #[test]
