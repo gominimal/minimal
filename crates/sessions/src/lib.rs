@@ -12,6 +12,7 @@ pub mod lifecyclehook;
 pub mod loadout;
 pub mod patches;
 pub mod paths;
+pub mod policy;
 pub mod store;
 pub mod vars;
 

@@ -1,28 +1,16 @@
-//! Patches: descriptions of files brought into a session, the provenance of
-//! each patch, and the policy controlling which non-user patches are honored.
+//! Patches: descriptions of files brought into a session and the policy
+//! controlling which non-user patches are honored.
 //!
-//! # Sources of patches
+//! # Sources
 //!
-//! Patches enter the session from three distinct origins (see [`PatchOrigin`]):
+//! Patches can be declared by three kinds of source — a user [`Loadout`],
+//! a project's `minimal.toml`, and individual package specs — and each
+//! source contributes its patches to the session. The primitives here
+//! are origin-free: provenance is known to the session-construction
+//! layer that combines the three sources, and that layer is where the
+//! [`PatchPolicy`] gate applies (see [`PatchPolicy`] for the rules).
 //!
-//! - **User** — the user's personal config. Implicit trust: only [`PatchPolicy::ignore`]
-//!   applies; `allow` and `deny` are bypassed (the user *is* the policy).
-//! - **Project** — the shared `minimal.toml` in the project. Subject to the
-//!   full policy (`allow`, `deny`, `ignore`) — a project config can't
-//!   silently read from your `~/.ssh`.
-//! - **Package** — declared by an installed package's spec. Subject to the
-//!   full policy. Carries the package name so prompts/errors can attribute
-//!   the request.
-//!
-//! # Wire form vs domain form
-//!
-//! TOML files describe patches without origin information — the *loader*
-//! attaches the origin based on which file the declaration came from. The
-//! split is reflected in the types:
-//!
-//! - [`PatchDecl`] / [`PatchDecls`] — wire form. Deserialized from TOML.
-//! - [`Patch`] / [`Patches`] — domain form. Built from a [`PatchDecls`] plus
-//!   a [`PatchOrigin`] via [`PatchDecls::promote`].
+//! [`Loadout`]: crate::loadout::Loadout
 //!
 //! # The `FileSet` primitive
 //!
@@ -109,32 +97,6 @@ impl std::error::Error for Error {
 }
 
 // =====================================================================
-// PatchOrigin
-// =====================================================================
-
-/// Where a patch came from. Determines how [`PatchPolicy`] applies:
-///
-/// | Origin    | `allow` / `deny` | `ignore` |
-/// |-----------|------------------|----------|
-/// | `User`    | bypassed         | applies  |
-/// | `Project` | applies          | applies  |
-/// | `Package` | applies          | applies  |
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum PatchOrigin {
-    /// From the user's personal config.
-    User,
-    /// From the shared project config (`minimal.toml`).
-    Project,
-    /// Declared by an installed package's spec.
-    Package {
-        /// Name (or identifier) of the package that declared the patch.
-        /// Used in permission prompts and error messages.
-        package: String,
-    },
-}
-
-// =====================================================================
 // FileSet
 // =====================================================================
 
@@ -213,6 +175,38 @@ impl FileSet {
             patterns: Vec::new(),
             compiled: Vec::new(),
         }
+    }
+
+    /// Set the base directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::EmptyBase`] if `base`'s underlying path is empty.
+    pub fn try_with_base(self, base: HostPath) -> Result<Self, Error> {
+        if base.as_str().is_empty() {
+            return Err(Error::EmptyBase);
+        }
+        Ok(Self {
+            base: Some(base),
+            ..self
+        })
+    }
+
+    /// Append a single pattern.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidGlob`] if the pattern fails to parse.
+    pub fn try_with_pattern(self, pattern: impl Into<String>) -> Result<Self, Error> {
+        let pattern = pattern.into();
+        let glob = globset::Glob::new(&pattern).map_err(|source| Error::InvalidGlob {
+            pattern: pattern.clone(),
+            source,
+        })?;
+        let mut new = self;
+        new.patterns.push(pattern);
+        new.compiled.push(glob);
+        Ok(new)
     }
 
     /// The base directory for relative patterns, if set.
@@ -360,128 +354,38 @@ impl<'de> serde::Deserialize<'de> for PatchDest {
 }
 
 // =====================================================================
-// PatchDecl / PatchDecls — wire form
+// Patch / Patches
 // =====================================================================
 
-/// A patch as declared in a config file, **before** origin is attached.
-///
-/// This is the form that comes out of deserializing TOML — the file itself
-/// doesn't say where it came from, so origin is supplied by the loader via
-/// [`Self::promote`] (or in bulk via [`PatchDecls::promote`]).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct PatchDecl {
-    source: FileSet,
-    dest: PatchDest,
-}
-
-impl PatchDecl {
-    /// Construct a declaration without origin.
-    #[must_use]
-    pub fn new(source: FileSet, dest: PatchDest) -> Self {
-        Self { source, dest }
-    }
-
-    /// The source fileset.
-    #[must_use]
-    pub fn source(&self) -> &FileSet {
-        &self.source
-    }
-
-    /// The destination path.
-    #[must_use]
-    pub fn dest(&self) -> &PatchDest {
-        &self.dest
-    }
-
-    /// Attach an origin and produce a fully-typed [`Patch`].
-    #[must_use]
-    pub fn promote(self, origin: PatchOrigin) -> Patch {
-        Patch {
-            source: self.source,
-            dest: self.dest,
-            origin,
-        }
-    }
-}
-
-/// An ordered collection of [`PatchDecl`] entries — the wire form of a
-/// `patches = [...]` array.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-#[serde(transparent)]
-pub struct PatchDecls(Vec<PatchDecl>);
-
-impl PatchDecls {
-    /// Construct from a vector of declarations.
-    #[must_use]
-    pub fn new(decls: Vec<PatchDecl>) -> Self {
-        Self(decls)
-    }
-
-    /// Returns `true` if there are no declarations.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    /// Number of declarations.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Iterate over the declarations.
-    pub fn iter(&self) -> std::slice::Iter<'_, PatchDecl> {
-        self.0.iter()
-    }
-
-    /// Promote every declaration to a [`Patch`] with the given origin.
-    #[must_use]
-    pub fn promote(self, origin: &PatchOrigin) -> Patches {
-        Patches(
-            self.0
-                .into_iter()
-                .map(|d| d.promote(origin.clone()))
-                .collect(),
-        )
-    }
-}
-
-impl<'a> IntoIterator for &'a PatchDecls {
-    type Item = &'a PatchDecl;
-    type IntoIter = std::slice::Iter<'a, PatchDecl>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
-    }
-}
-
-// =====================================================================
-// Patch / Patches — domain form
-// =====================================================================
-
-/// A single patch entry with its origin attached.
+/// A single patch: a source fileset and the destination it should land
+/// at inside the sandbox.
 ///
 /// For single-file sources, `dest` is the destination file path. For
 /// multi-file sources (lists, globs, directory copies), `dest` is the
-/// destination *directory*. Enforcing this invariant requires expanded paths
-/// and is the apply layer's responsibility.
+/// destination *directory*. Enforcing this invariant requires expanded
+/// paths and is the apply layer's responsibility.
 ///
-/// Construct via [`Patch::new`] or by promoting a [`PatchDecl`] with
-/// [`PatchDecl::promote`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// Patches carry no provenance: which source declared a patch is known
+/// to the session-construction layer that combines a [`Loadout`], a
+/// project config, and package specs.
+///
+/// [`Loadout`]: crate::loadout::Loadout
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Patch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
     source: FileSet,
     dest: PatchDest,
-    origin: PatchOrigin,
 }
 
 impl Patch {
     /// Construct a new patch.
     #[must_use]
-    pub fn new(source: FileSet, dest: PatchDest, origin: PatchOrigin) -> Self {
+    pub fn new(source: FileSet, dest: PatchDest) -> Self {
         Self {
             source,
             dest,
-            origin,
+            description: None,
         }
     }
 
@@ -491,32 +395,44 @@ impl Patch {
         &self.source
     }
 
-    /// The destination path.
+    /// The destination path inside the sandbox.
     #[must_use]
     pub fn dest(&self) -> &PatchDest {
         &self.dest
     }
-
-    /// Where the patch came from.
-    #[must_use]
-    pub fn origin(&self) -> &PatchOrigin {
-        &self.origin
-    }
 }
 
-/// An ordered collection of [`Patch`] entries.
-///
-/// Not directly deserializable — patches require an origin, which the wire
-/// format doesn't carry. Build from a [`PatchDecls`] via
-/// [`PatchDecls::promote`].
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+/// An ordered collection of [`Patch`] entries — the wire form of a
+/// `patches = [...]` array.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
 pub struct Patches(Vec<Patch>);
 
 impl Patches {
+    /// Construct an empty collection. Useful as the start of a builder
+    /// chain.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
     /// Construct from a vector of patches.
     #[must_use]
     pub fn new(patches: Vec<Patch>) -> Self {
         Self(patches)
+    }
+
+    /// Append a patch and return the modified collection (builder style).
+    #[must_use]
+    pub fn with_patch(self, patch: Patch) -> Self {
+        let mut new = self;
+        new.0.push(patch);
+        new
+    }
+
+    /// Append a patch in place.
+    pub fn push(&mut self, patch: Patch) {
+        self.0.push(patch);
     }
 
     /// Returns `true` if there are no patches.
@@ -542,6 +458,12 @@ impl Patches {
     }
 }
 
+impl FromIterator<Patch> for Patches {
+    fn from_iter<I: IntoIterator<Item = Patch>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
 impl<'a> IntoIterator for &'a Patches {
     type Item = &'a Patch;
     type IntoIter = std::slice::Iter<'a, Patch>;
@@ -556,19 +478,21 @@ impl<'a> IntoIterator for &'a Patches {
 
 /// Policy gating which patches are honored.
 ///
-/// Applied to patches based on their [`PatchOrigin`]:
+/// Applied at the session-construction layer based on a patch's source:
 ///
-/// - **User-origin patches**: only [`ignore`](Self::ignore) applies.
-///   `allow` and `deny` are bypassed — the user is the policy for their own
-///   declarations.
+/// - **User-origin patches** (from a [`Loadout`]): only
+///   [`ignore`](Self::ignore) applies. `allow` and `deny` are bypassed —
+///   the user is the policy for their own declarations.
 /// - **Project- and Package-origin patches**: all three fields apply.
-///   A patch is honored iff its destination matches `allow`, does not match
-///   `deny`, and does not match `ignore`. Patches matching only `ignore`
-///   are silently dropped; matching `deny` is an error/prompt; matching
-///   neither `allow` nor `ignore` triggers a permission prompt.
+///   A patch is honored iff its destination matches `allow`, does not
+///   match `deny`, and does not match `ignore`. Patches matching only
+///   `ignore` are silently dropped; matching `deny` is an error/prompt;
+///   matching neither `allow` nor `ignore` triggers a permission prompt.
 ///
 /// Precedence within the policy: `ignore` first (silent), then `deny`
 /// (reject), then `allow` (permit). Anything else prompts.
+///
+/// [`Loadout`]: crate::loadout::Loadout
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PatchPolicy {
     #[serde(default, skip_serializing_if = "FileSet::is_empty")]
@@ -580,32 +504,87 @@ pub struct PatchPolicy {
 }
 
 impl PatchPolicy {
-    /// Construct a policy from its three filesets.
+    /// Construct an empty policy. Build it up with [`Self::with_allow`],
+    /// [`Self::with_deny`], and [`Self::with_ignore`] (or their
+    /// pattern-accepting `try_with_*` variants).
     #[must_use]
-    pub fn new(allow: FileSet, deny: FileSet, ignore: FileSet) -> Self {
-        Self {
-            allow,
-            deny,
-            ignore,
-        }
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Replace the `allow` set.
+    #[must_use]
+    pub fn with_allow(self, allow: FileSet) -> Self {
+        Self { allow, ..self }
+    }
+
+    /// Replace the `deny` set.
+    #[must_use]
+    pub fn with_deny(self, deny: FileSet) -> Self {
+        Self { deny, ..self }
+    }
+
+    /// Replace the `ignore` set.
+    #[must_use]
+    pub fn with_ignore(self, ignore: FileSet) -> Self {
+        Self { ignore, ..self }
+    }
+
+    /// Replace the `allow` set, constructing it from raw patterns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidGlob`] if any pattern fails to parse.
+    pub fn try_with_allow<I, S>(self, patterns: I) -> Result<Self, Error>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Ok(self.with_allow(FileSet::try_new(None, patterns)?))
+    }
+
+    /// Replace the `deny` set, constructing it from raw patterns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidGlob`] if any pattern fails to parse.
+    pub fn try_with_deny<I, S>(self, patterns: I) -> Result<Self, Error>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Ok(self.with_deny(FileSet::try_new(None, patterns)?))
+    }
+
+    /// Replace the `ignore` set, constructing it from raw patterns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidGlob`] if any pattern fails to parse.
+    pub fn try_with_ignore<I, S>(self, patterns: I) -> Result<Self, Error>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Ok(self.with_ignore(FileSet::try_new(None, patterns)?))
     }
 
     /// Paths non-user patches **may** target. Does not apply to
-    /// [`PatchOrigin::User`].
+    /// user-origin patches.
     #[must_use]
     pub fn allow(&self) -> &FileSet {
         &self.allow
     }
 
     /// Paths non-user patches **must not** target. Does not apply to
-    /// [`PatchOrigin::User`].
+    /// user-origin patches.
     #[must_use]
     pub fn deny(&self) -> &FileSet {
         &self.deny
     }
 
-    /// Paths to silently drop without prompting. **Applies to every origin
-    /// including [`PatchOrigin::User`].**
+    /// Paths to silently drop without prompting. **Applies to every
+    /// origin, user-origin included.**
     #[must_use]
     pub fn ignore(&self) -> &FileSet {
         &self.ignore
@@ -702,77 +681,40 @@ mod tests {
     }
 
     #[test]
-    fn patchdest_accepts_absolute_and_home_paths() {
-        assert!(PatchDest::try_new("/etc/foo").is_ok());
-        assert!(PatchDest::try_new("~/.gitconfig").is_ok());
-    }
-
-    #[test]
-    fn patchdest_classifies_absolute_into_sandbox_abs_variant() {
-        let dest = PatchDest::try_new("/etc/foo").unwrap();
-        assert!(dest.as_sandbox_path().is_absolute());
+    fn patchdest_classifies_absolute_and_home_paths() {
+        let abs = PatchDest::try_new("/etc/foo").unwrap();
+        assert!(abs.as_sandbox_path().is_absolute());
         // Tilde-prefixed paths classify as Rel — apply layer expands them.
         let home = PatchDest::try_new("~/.gitconfig").unwrap();
         assert!(!home.as_sandbox_path().is_absolute());
     }
 
     #[test]
-    fn patchdecl_deserialize_rejects_bad_dest() {
-        let err = toml::from_str::<Wrap<PatchDecl>>(r#"x = { dest = "foo/../bar", source = "a" }"#)
+    fn patch_deserialize_rejects_bad_dest() {
+        let err = toml::from_str::<Wrap<Patch>>(r#"x = { dest = "foo/../bar", source = "a" }"#)
             .unwrap_err();
         assert!(err.to_string().contains(".."), "got: {err}");
     }
 
-    // ---- PatchDecl / PatchDecls / promote ----
+    // ---- Patch / Patches ----
 
     #[test]
-    fn patchdecl_with_string_source() {
-        let d: PatchDecl = parse(r#"x = { dest = "/etc/foo.conf", source = "./foo.conf" }"#);
-        assert_eq!(d.dest().as_sandbox_path().as_str(), "/etc/foo.conf");
-        assert_eq!(d.source().raw_patterns(), &["./foo.conf"]);
+    fn patch_with_string_source() {
+        let p: Patch = parse(r#"x = { dest = "/etc/foo.conf", source = "./foo.conf" }"#);
+        assert_eq!(p.dest().as_sandbox_path().as_str(), "/etc/foo.conf");
+        assert_eq!(p.source().raw_patterns(), &["./foo.conf"]);
     }
 
     #[test]
-    fn patchdecls_deserialize_from_array() {
+    fn patches_deserialize_from_array() {
         let src = r#"
             x = [
                 { dest = "/a", source = "a" },
                 { dest = "/b", source = ["b1", "b2"] },
             ]
         "#;
-        let ds: PatchDecls = parse(src);
-        assert_eq!(ds.len(), 2);
-    }
-
-    #[test]
-    fn promote_attaches_origin_to_every_patch() {
-        let src = r#"
-            x = [
-                { dest = "/a", source = "a" },
-                { dest = "/b", source = "b" },
-            ]
-        "#;
-        let decls: PatchDecls = parse(src);
-        let patches = decls.promote(&PatchOrigin::Project);
-        assert_eq!(patches.len(), 2);
-        for p in &patches {
-            assert_eq!(p.origin(), &PatchOrigin::Project);
-        }
-    }
-
-    #[test]
-    fn promote_with_package_origin_preserves_package_name() {
-        let decl = PatchDecl::new(
-            FileSet::try_new(None, ["a"]).unwrap(),
-            PatchDest::try_new("/a").unwrap(),
-        );
-        let patch = decl.promote(PatchOrigin::Package {
-            package: "git".into(),
-        });
-        match patch.origin() {
-            PatchOrigin::Package { package } => assert_eq!(package, "git"),
-            other => panic!("expected Package origin, got {other:?}"),
-        }
+        let ps: Patches = parse(src);
+        assert_eq!(ps.len(), 2);
     }
 
     // ---- PatchPolicy ----
@@ -796,5 +738,97 @@ mod tests {
         assert!(policy.allow().is_empty());
         assert!(policy.deny().is_empty());
         assert!(policy.ignore().is_empty());
+    }
+
+    #[test]
+    fn patch_policy_builder_methods() {
+        let p = PatchPolicy::empty()
+            .try_with_allow(["~/.config/**"])
+            .unwrap()
+            .try_with_deny(["~/.ssh/**", "**/*.pem"])
+            .unwrap()
+            .try_with_ignore(["**/.DS_Store"])
+            .unwrap();
+        assert_eq!(p.allow().raw_patterns(), &["~/.config/**"]);
+        assert_eq!(p.deny().raw_patterns(), &["~/.ssh/**", "**/*.pem"]);
+        assert_eq!(p.ignore().raw_patterns(), &["**/.DS_Store"]);
+    }
+
+    #[test]
+    fn patch_policy_try_with_allow_propagates_invalid_glob() {
+        let err = PatchPolicy::empty().try_with_allow(["[bad"]).unwrap_err();
+        assert!(matches!(err, Error::InvalidGlob { .. }), "got: {err:?}");
+    }
+
+    // ---- FileSet builders ----
+
+    #[test]
+    fn fileset_try_with_base_and_pattern_chain() {
+        let fs = FileSet::empty()
+            .try_with_base(HostPath::new("./themes"))
+            .unwrap()
+            .try_with_pattern("**/*")
+            .unwrap()
+            .try_with_pattern("**/*.toml")
+            .unwrap();
+        assert_eq!(fs.base().map(HostPath::as_str), Some("./themes"));
+        assert_eq!(fs.raw_patterns(), &["**/*", "**/*.toml"]);
+    }
+
+    #[test]
+    fn fileset_try_with_base_rejects_empty() {
+        let err = FileSet::empty()
+            .try_with_base(HostPath::new(""))
+            .unwrap_err();
+        assert!(matches!(err, Error::EmptyBase), "got: {err:?}");
+    }
+
+    #[test]
+    fn fileset_try_with_pattern_propagates_invalid_glob() {
+        let err = FileSet::empty().try_with_pattern("[bad").unwrap_err();
+        assert!(matches!(err, Error::InvalidGlob { .. }), "got: {err:?}");
+    }
+
+    // ---- Patches builders ----
+
+    #[test]
+    fn patches_builder_surfaces_compose() {
+        let make = |s: &str| {
+            Patch::new(
+                FileSet::try_new(None, [s]).unwrap(),
+                PatchDest::try_new(format!("/{s}")).unwrap(),
+            )
+        };
+
+        // collect / with_patch / push all feed the same internal Vec.
+        let collected: Patches = ["a", "b"].into_iter().map(make).collect();
+        let mut built = Patches::empty().with_patch(make("a"));
+        built.push(make("b"));
+        assert_eq!(collected, built);
+        assert_eq!(collected.len(), 2);
+    }
+
+    #[test]
+    fn patches_extend_appends_other_collection() {
+        let make = |s: &str| {
+            Patch::new(
+                FileSet::try_new(None, [s]).unwrap(),
+                PatchDest::try_new(format!("/{s}")).unwrap(),
+            )
+        };
+        let mut ps: Patches = ["a", "b"].into_iter().map(make).collect();
+        let extra: Patches = ["c", "d"].into_iter().map(make).collect();
+        ps.extend(extra);
+        let dests: Vec<_> = ps
+            .iter()
+            .map(|p| p.dest().as_sandbox_path().as_str().to_owned())
+            .collect();
+        assert_eq!(dests, ["/a", "/b", "/c", "/d"]);
+    }
+
+    #[test]
+    fn fileset_accepts_absolute_base() {
+        let fs = FileSet::try_new(Some(HostPath::new("/etc/xdg")), ["**/*.conf"]).unwrap();
+        assert_eq!(fs.base().map(HostPath::as_str), Some("/etc/xdg"));
     }
 }

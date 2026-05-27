@@ -6,7 +6,8 @@
 //! [`LifecycleHook::builder`] or deserialize them from configuration; both paths
 //! enforce the same invariant.
 
-use crate::paths::ConfigRelPath;
+use crate::paths::{self, ConfigRelPath};
+use camino::Utf8PathBuf;
 use core::fmt;
 
 /// Errors produced when constructing a [`LifecycleHook`].
@@ -60,6 +61,24 @@ pub enum HookScript {
     External(ConfigRelPath),
 }
 
+impl HookScript {
+    /// Construct an [`Inline`](Self::Inline) script.
+    #[must_use]
+    pub fn inline(s: impl Into<String>) -> Self {
+        Self::Inline(s.into())
+    }
+
+    /// Construct an [`External`](Self::External) script.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`paths::Error::IsAbsolute`] if `p` is an absolute path;
+    /// external script paths are anchored to the config directory.
+    pub fn try_external(p: impl Into<Utf8PathBuf>) -> Result<Self, paths::Error> {
+        Ok(Self::External(ConfigRelPath::try_new(p)?))
+    }
+}
+
 /// A set of scripts to run at lifecycle transition points of a host resource.
 ///
 /// At least one of `on_activate`, `on_destroy`, or `on_failure` must be set.
@@ -105,11 +124,8 @@ pub enum HookScript {
 /// ```
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "LifecycleHookBuilder", into = "LifecycleHookBuilder")]
-#[expect(
-    clippy::struct_field_names,
-    reason = "field prefixes mirror lifecycle event names"
-)]
 pub struct LifecycleHook {
+    description: Option<String>,
     on_activate: Option<HookScript>,
     on_destroy: Option<HookScript>,
     on_failure: Option<HookScript>,
@@ -119,7 +135,7 @@ impl LifecycleHook {
     /// Returns a fresh [`LifecycleHookBuilder`].
     #[must_use]
     pub fn builder() -> LifecycleHookBuilder {
-        LifecycleHookBuilder::new()
+        LifecycleHookBuilder::default()
     }
 
     /// The script to run on activation, if any.
@@ -153,11 +169,9 @@ impl TryFrom<LifecycleHookBuilder> for LifecycleHook {
 /// Doubles as the on-the-wire deserialization shape for `LifecycleHook` — every
 /// field is optional, and validation runs at [`build`](Self::build) time.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-#[expect(
-    clippy::struct_field_names,
-    reason = "field prefixes mirror lifecycle event names"
-)]
 pub struct LifecycleHookBuilder {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     on_activate: Option<HookScript>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -167,14 +181,6 @@ pub struct LifecycleHookBuilder {
 }
 
 impl LifecycleHookBuilder {
-    /// Creates a new builder with all fields unset.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            ..Default::default()
-        }
-    }
-
     /// Sets the script to run on activation.
     #[must_use]
     pub fn with_on_activate(self, on_activate: HookScript) -> Self {
@@ -213,6 +219,7 @@ impl LifecycleHookBuilder {
             return Err(Error::EmptyLifecycleHook);
         }
         Ok(LifecycleHook {
+            description: self.description,
             on_activate: self.on_activate,
             on_destroy: self.on_destroy,
             on_failure: self.on_failure,
@@ -223,6 +230,7 @@ impl LifecycleHookBuilder {
 impl From<LifecycleHook> for LifecycleHookBuilder {
     fn from(value: LifecycleHook) -> Self {
         Self {
+            description: value.description,
             on_activate: value.on_activate,
             on_destroy: value.on_destroy,
             on_failure: value.on_failure,
@@ -308,6 +316,35 @@ mod tests {
             Some(HookScript::External(p)) if p.as_str() == "./fail.sh"
         ));
         assert!(parsed.on_destroy().is_none());
+    }
+
+    #[test]
+    fn hook_script_try_external_helper() {
+        let s = HookScript::try_external("./run.sh").unwrap();
+        assert!(matches!(s, HookScript::External(ref p) if p.as_str() == "./run.sh"));
+    }
+
+    #[test]
+    fn hook_script_try_external_rejects_absolute() {
+        let err = HookScript::try_external("/abs").unwrap_err();
+        assert!(matches!(err, paths::Error::IsAbsolute(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn hook_script_external_round_trips_through_toml_in_isolation() {
+        // Pin the External wire form independent of the full LifecycleHook
+        // round-trip — if the ConfigRelPath serde shape changes underneath
+        // us, this test fires first.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Wrap {
+            hook: HookScript,
+        }
+        let original = Wrap {
+            hook: HookScript::try_external("./run.sh").unwrap(),
+        };
+        let s = toml::to_string(&original).unwrap();
+        let parsed: Wrap = toml::from_str(&s).unwrap();
+        assert!(matches!(parsed.hook, HookScript::External(ref p) if p.as_str() == "./run.sh"),);
     }
 
     #[test]
