@@ -3421,6 +3421,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "minvmd"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "clap_complete",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
