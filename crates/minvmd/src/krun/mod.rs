@@ -14,7 +14,8 @@
 //! This module is macOS-only. On Linux, `minvmd` ships only the runtime stub
 //! and never links libkrun.
 
-pub mod ctx;
-pub mod raw;
+mod ctx;
+mod raw;
 
 pub use ctx::Context;
+pub use raw::{KRUN_KERNEL_FORMAT_IMAGE_BZ2, KRUN_KERNEL_FORMAT_IMAGE_GZ};

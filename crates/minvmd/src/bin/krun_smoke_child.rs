@@ -36,8 +36,7 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 fn run_macos() {
-    use minvmd::krun::Context;
-    use minvmd::krun::raw::{KRUN_KERNEL_FORMAT_IMAGE_BZ2, KRUN_KERNEL_FORMAT_IMAGE_GZ};
+    use minvmd::krun::{Context, KRUN_KERNEL_FORMAT_IMAGE_BZ2, KRUN_KERNEL_FORMAT_IMAGE_GZ};
 
     eprintln!("STAGE: create_ctx");
     let mut ctx = Context::create().expect("krun_create_ctx must succeed");
