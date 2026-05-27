@@ -17,6 +17,7 @@ members = [
     "crates/minimal",
     "crates/minimal2",
     "crates/minimald",
+    "crates/minvmd",
     "crates/remote-client",
     "crates/remote-proto",
     "crates/sandbox2",

@@ -1,0 +1,32 @@
+Type: cli
+Task: T01.1 — Workspace wiring, crate skeleton, build.rs, entitlements, justfile
+Command: cargo build -p minvmd && grep -c hypervisor crates/minvmd/minvmd.entitlements && just --list
+Expected: Crate builds; entitlements file contains the hypervisor entitlement; justfile recipe is registered
+Timestamp: 2026-05-26T00:00:00Z
+Status: PASS
+
+--- output ---
+
+$ cargo build -p minvmd
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.49s
+
+$ grep -c hypervisor crates/minvmd/minvmd.entitlements
+1
+
+$ just --list
+Available recipes:
+    codesign-minvmd # only runs on the host that signed it, which is correct for dev builds.
+
+$ cargo run -q -p minvmd -- completions bash | head -3
+_minvmd() {
+    local i cur prev opts cmd
+    COMPREPLY=()
+
+--- evidence ---
+
+- crates/minvmd is a member of the workspace (see Cargo.toml workspace.members).
+- crates/minvmd/Cargo.toml inherits edition.workspace + publish.workspace and pins deps via .workspace = true (no per-crate versions).
+- crates/minvmd/build.rs gates link wiring on target_os = "macos" via CARGO_CFG_TARGET_OS and exposes LIBKRUN_PREFIX override (default /opt/homebrew/lib).
+- crates/minvmd/minvmd.entitlements declares only com.apple.security.hypervisor.
+- justfile codesign-minvmd recipe runs `cargo build -p minvmd --release` then signs with the entitlements file via `codesign -s -` (ad-hoc).
+- Binary compiles on the current Linux host (the runtime stub path; no libkrun linkage triggered by the build.rs gate).

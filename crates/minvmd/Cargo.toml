@@ -1,0 +1,12 @@
+[package]
+name = "minvmd"
+version = "0.0.1"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
