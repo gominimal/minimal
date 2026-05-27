@@ -207,12 +207,28 @@ pub struct Manager {
     base_dir: PathBuf,
     state: ManagerState,
     repos: HashMap<String, Repo>,
+    /// When true, [Manager::checkout_of] / [Manager::update] return
+    /// [Error::OfflineCacheMiss] for any remote that would require a clone or fetch
+    /// rather than performing the network operation. Mirrors the value of
+    /// `mctx::Config::is_offline` (i.e. `--offline`).
+    offline: bool,
 }
 
 impl Manager {
     /// Initializes the checkouts manager in the given directory, returning a
     /// thread-safe, cloneable handle to the manager instance.
     pub fn new_in_dir<P: Into<PathBuf>>(base_dir: P) -> Result<ManagerHandle, Error> {
+        Self::new_in_dir_with_offline(base_dir, false)
+    }
+
+    /// Same as [Self::new_in_dir], but with an `offline` flag. When `offline=true`,
+    /// any operation that would require a clone or fetch (new remote, or refresh of
+    /// a known remote) surfaces as [Error::OfflineCacheMiss] rather than performing
+    /// the network operation.
+    pub fn new_in_dir_with_offline<P: Into<PathBuf>>(
+        base_dir: P,
+        offline: bool,
+    ) -> Result<ManagerHandle, Error> {
         let base_dir = base_dir.into();
         let db_path = base_dir.join("git").join("db");
         fs::create_dir_all(&db_path)?;
@@ -237,6 +253,7 @@ impl Manager {
             base_dir,
             state,
             repos,
+            offline,
         };
         Ok(ManagerHandle(Arc::new(Mutex::new(manager))))
     }
@@ -249,7 +266,23 @@ impl Manager {
     }
 
     /// Updates all repos to latest - does nothing for refs which arent symbolic (i.e. commits).
+    /// In offline mode, returns [Error::OfflineCacheMiss] — `update` is fundamentally
+    /// a network operation, and silently lameducking it would mask hard-to-debug bugs
+    /// for callers like `minimal update` that explicitly want fresh state.
     pub fn update(&mut self) -> Result<(), Error> {
+        if self.offline {
+            // Pick the first known remote for the error message; if there are
+            // no known remotes there's nothing to update, so a synthetic
+            // placeholder is clearer than a misleading Ok.
+            let remote = self
+                .state
+                .git_remotes
+                .keys()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| "<no remotes>".to_string());
+            return Err(Error::OfflineCacheMiss { remote });
+        }
         let checkouts_dir = self.git_checkouts_dir();
         for (_remote, id) in self.state.git_remotes.iter_mut() {
             let repo = self.repos.get_mut(id).unwrap();
@@ -290,7 +323,14 @@ impl Manager {
                 let checkout_dir = tempdir_in(self.git_checkouts_dir()).unwrap().keep();
                 let relative_dir = checkout_dir.strip_prefix(self.git_checkouts_dir()).unwrap();
                 let repo = self.repos.get_mut(id).unwrap();
-                repo.fetch()?;
+                // Offline: skip the fetch and try the worktree checkout against
+                // what's already in the bare repo. If the requested ref isn't
+                // there, `new_worktree` will surface a git error from below
+                // — which is the right outcome (caller gets to know the ref
+                // wasn't pre-populated).
+                if !self.offline {
+                    repo.fetch()?;
+                }
                 let checkout = repo.new_worktree(checkout_dir.clone(), at.clone())?;
                 let git_hash = checkout.rev.clone();
 
@@ -305,6 +345,13 @@ impl Manager {
             }
             // New remote, need to create
             None => {
+                if self.offline {
+                    // Offline: cannot clone an unknown remote. Surface as cache miss
+                    // so the caller sees a clean error (not a git "could not connect").
+                    return Err(Error::OfflineCacheMiss {
+                        remote: remote.to_string(),
+                    });
+                }
                 // Make id/directory for bare repository
                 let prefix = match remote.to_lowercase().rsplit_once("/") {
                     None => "checkout".to_string(),
@@ -450,6 +497,48 @@ mod tests {
             hash3,
             "d0dd1f61b33d64e29d8bc1372a94ef6a2fee76a9".to_string()
         );
+    }
+
+    /// In offline mode, asking for an unknown remote must surface as
+    /// OfflineCacheMiss without attempting any git operation.
+    #[test]
+    fn offline_unknown_remote_errors() {
+        let base_dir = tempdir().unwrap();
+        let mut manager = Manager::new_in_dir_with_offline(base_dir.path(), true).unwrap();
+
+        let result = manager.checkout_of(
+            "https://example.invalid/never-cloned",
+            GitRef::Branch("main".to_string()),
+        );
+        match result {
+            Err(Error::OfflineCacheMiss { remote }) => {
+                assert_eq!(remote, "https://example.invalid/never-cloned");
+            }
+            other => panic!("expected OfflineCacheMiss, got: {:?}", other),
+        }
+    }
+
+    /// In offline mode, `update()` returns OfflineCacheMiss rather than
+    /// silently no-op'ing. Callers like `minimal update` ask explicitly for
+    /// fresh state, so noop-ing would mask hard-to-debug bugs (per review
+    /// from @twitchyliquid64).
+    #[test]
+    fn offline_update_errors() {
+        let base_dir = tempdir().unwrap();
+        let mut manager = Manager::new_in_dir_with_offline(base_dir.path(), true).unwrap();
+        match manager.update() {
+            Err(Error::OfflineCacheMiss { .. }) => {}
+            other => panic!("expected OfflineCacheMiss, got: {:?}", other),
+        }
+    }
+
+    /// Default (online) Manager keeps its existing behavior — `offline` is
+    /// false unless explicitly requested.
+    #[test]
+    fn default_manager_is_online() {
+        let base_dir = tempdir().unwrap();
+        let manager = Manager::new_in_dir(base_dir.path()).unwrap();
+        assert!(!manager.0.lock().unwrap().offline);
     }
 
     #[test]
