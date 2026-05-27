@@ -63,6 +63,9 @@ impl fmt::Display for VmError {
 
 impl std::error::Error for VmError {}
 
+// Translating libkrun return codes is macOS-only (libkrun is not linked on
+// Linux); gating prevents a dead-code error in the Linux lib build.
+#[cfg(target_os = "macos")]
 impl VmError {
     /// Translate a libkrun return code into a `Result`. libkrun returns zero
     /// (or a positive id) on success and a negative errno on failure; we
@@ -84,12 +87,14 @@ impl VmError {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn backend_check_passes_through_success() {
         assert_eq!(VmError::check_backend("op", 0).unwrap(), 0);
         assert_eq!(VmError::check_backend("op", 7).unwrap(), 7);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn backend_check_translates_negative_to_typed_error() {
         let err = VmError::check_backend("krun_create_ctx", -22).unwrap_err();
