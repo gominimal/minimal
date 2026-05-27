@@ -1,0 +1,75 @@
+Type: file
+Task: T01.2 — libkrun FFI bindings (raw.rs) + safe wrappers (ctx.rs) + VmError
+Command: grep -E '<libkrun fns>' crates/minvmd/src/krun/raw.rs && grep -c '// SAFETY:' crates/minvmd/src/krun/raw.rs && grep -E 'VmError::Backend' crates/minvmd/src/error.rs
+Expected: raw.rs declares required FFI symbols, every unsafe block has SAFETY comment, VmError::Backend variant exists
+Timestamp: 2026-05-26T00:00:00Z
+Status: PASS
+
+--- required FFI symbols in raw.rs ---
+
+T01 surface (smoke test):
+    pub fn krun_create_ctx() -> i32;
+    pub fn krun_free_ctx(ctx_id: u32) -> i32;
+    pub fn krun_set_vm_config(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -> i32;
+    pub fn krun_set_exec(...) -> i32;
+    pub fn krun_start_enter(ctx_id: u32) -> i32;
+
+T02 surface (pulled forward per task description):
+    pub fn krun_set_root(ctx_id: u32, root_path: *const c_char) -> i32;
+    pub fn krun_set_kernel(...) -> i32;
+    pub fn krun_add_vsock_port(ctx_id: u32, port: u32, c_filepath: *const c_char) -> i32;
+    pub fn krun_set_console_output(ctx_id: u32, c_filepath: *const c_char) -> i32;
+
+Plus kernel-format constants:
+    KRUN_KERNEL_FORMAT_{RAW, ELF, PE_GZ, IMAGE_BZ2, IMAGE_GZ}
+
+--- SAFETY discipline ---
+
+raw.rs: 1 block-level `// SAFETY:` comment on the single
+        `unsafe extern "C" { ... }` block, covering all 9 fn declarations.
+        Per-fn doc comments document each function's C contract individually.
+
+ctx.rs: 9 unsafe blocks, 9 `// SAFETY:` comments — one per call site —
+        each naming the specific invariants the wrapper enforces (CString
+        ownership, NUL-termination, ctx_id provenance, pointer lifetime).
+
+--- VmError ---
+
+src/error.rs:
+    pub enum VmError {
+        Backend { op: &'static str, code: i32 },
+        NulInPath { what: &'static str, path: PathBuf },
+        NulInString { what: &'static str, value: String },
+    }
+
+    impl VmError {
+        pub(crate) fn check_backend(op: &'static str, ret: i32) -> Result<i32, VmError> {
+            if ret < 0 {
+                Err(VmError::Backend { op, code: ret.unsigned_abs() as i32 })
+            } else {
+                Ok(ret)
+            }
+        }
+    }
+
+Errno magnitude is preserved (negative → positive code) per spec lesson
+"error fidelity". Verified by `backend_check_translates_negative_to_typed_error`.
+
+--- unit-test results ---
+
+$ rtk proxy cargo test -p minvmd
+running 8 tests
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+The 8 tests split across two modules:
+  src/error.rs::tests           (4 tests) — VmError variants + check_backend semantics
+  src/krun/ctx.rs::tests        (4 tests) — NUL validation paths into CString
+
+--- platform coverage ---
+
+Build verified on aarch64-unknown-linux-gnu (this worktree's host). On Linux
+the `krun` module is `#[cfg(target_os = "macos")]`-gated out, so no libkrun
+linkage is attempted and the existing Linux-only CI stays green (R1.1). The
+macOS link path lands via the T01.1 build.rs (already merged) the moment a
+Mac runner is available — T01.3 (gated `MINVMD_E2E=1` smoke test) is the
+end-to-end gate.
