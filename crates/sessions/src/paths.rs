@@ -746,6 +746,167 @@ impl<'de, R: Realm> serde::Deserialize<'de> for EitherPath<R> {
     }
 }
 
+// =====================================================================
+// CwdResolvable + CwdRelative
+// =====================================================================
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::Host {}
+    impl Sealed for super::Daemon {}
+}
+
+/// Marker trait for realms where relative paths can be resolved against
+/// the process current working directory.
+///
+/// Sealed — only [`Host`] and [`Daemon`] qualify. The [`Sandbox`] realm
+/// has no meaningful cwd: the host process's cwd is not a path inside
+/// the sandbox rootfs, and resolving against it would silently produce a
+/// nonsense path. Crossing into the sandbox requires a [`Translator`].
+pub trait CwdResolvable: Realm + sealed::Sealed {}
+
+impl CwdResolvable for Host {}
+impl CwdResolvable for Daemon {}
+
+/// Errors produced when resolving a [`CwdRelative`] against the
+/// process current working directory.
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum CwdResolveError {
+    /// `std::env::current_dir` failed.
+    Cwd(std::io::Error),
+    /// The cwd is not valid UTF-8.
+    NonUtf8Cwd(std::path::PathBuf),
+    /// The cwd is somehow not absolute (an OS-level invariant violation).
+    CwdNotAbsolute(Utf8PathBuf),
+}
+
+impl fmt::Display for CwdResolveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cwd(_) => f.write_str("failed to read the current working directory"),
+            Self::NonUtf8Cwd(p) => write!(
+                f,
+                "current working directory `{}` is not valid UTF-8",
+                p.display(),
+            ),
+            Self::CwdNotAbsolute(p) => {
+                write!(f, "current working directory `{p}` is not absolute")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CwdResolveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Cwd(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// A CLI-supplied path: absolute is taken as-is, relative is captured
+/// for later resolution against the process current working directory.
+///
+/// Designed for direct use in clap derive contexts:
+///
+/// ```ignore
+/// #[derive(clap::Parser)]
+/// struct Args {
+///     #[arg(long)]
+///     minimal_dir: Option<sessions::paths::CwdRelative<sessions::paths::Daemon>>,
+/// }
+/// ```
+///
+/// [`FromStr`] does not touch the filesystem — call [`Self::resolve`]
+/// when you're ready to commit to a base. Typical pattern: parse args,
+/// then resolve once at CLI entry. This way the cwd is read at a single
+/// well-defined point instead of as a side effect of `clap::parse`.
+///
+/// `R: CwdResolvable` rules out [`Sandbox`] at compile time —
+/// `CwdRelative<Sandbox>` is not spellable:
+///
+/// ```compile_fail
+/// use sessions::paths::{CwdRelative, Sandbox};
+/// let _: CwdRelative<Sandbox>;
+/// ```
+pub struct CwdRelative<R: CwdResolvable>(EitherPath<R>);
+
+impl<R: CwdResolvable> CwdRelative<R> {
+    /// The path as supplied by the user, before resolution.
+    #[must_use]
+    pub fn as_either(&self) -> &EitherPath<R> {
+        &self.0
+    }
+
+    /// `true` if the wrapped path was absolute (i.e. [`Self::resolve`]
+    /// will not consult the cwd).
+    #[must_use]
+    pub fn is_absolute(&self) -> bool {
+        self.0.is_absolute()
+    }
+
+    /// Resolve to an [`AbsPath<R>`]: absolute as-is, relative joined
+    /// against the current working directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CwdResolveError`] if `getcwd` fails, returns a
+    /// non-UTF-8 path, or somehow returns a non-absolute path.
+    pub fn resolve(&self) -> Result<AbsPath<R>, CwdResolveError> {
+        match &self.0 {
+            EitherPath::Abs(p) => Ok(p.clone()),
+            EitherPath::Rel(r) => {
+                let cwd = std::env::current_dir().map_err(CwdResolveError::Cwd)?;
+                let cwd = Utf8PathBuf::from_path_buf(cwd).map_err(CwdResolveError::NonUtf8Cwd)?;
+                let cwd_abs = AbsPath::<R>::try_new(cwd.clone())
+                    .map_err(|_| CwdResolveError::CwdNotAbsolute(cwd))?;
+                Ok(cwd_abs.join(r))
+            }
+        }
+    }
+}
+
+impl<R: CwdResolvable> FromStr for CwdRelative<R> {
+    type Err = core::convert::Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(EitherPath::new(s)))
+    }
+}
+
+impl<R: CwdResolvable> Clone for CwdRelative<R> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<R: CwdResolvable> PartialEq for CwdRelative<R> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<R: CwdResolvable> Eq for CwdRelative<R> {}
+
+impl<R: CwdResolvable> std::hash::Hash for CwdRelative<R> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl<R: CwdResolvable> fmt::Debug for CwdRelative<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CwdRelative<{}>({})", R::NAME, self.0.as_utf8_path())
+    }
+}
+
+impl<R: CwdResolvable> fmt::Display for CwdRelative<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
 /// Translates absolute paths from one realm into another.
 ///
 /// Crossing realms is fallible by default: a host path may not have a
@@ -1066,5 +1227,65 @@ mod tests {
         assert_eq!(p.extension(), Some("txt"));
         let parts: Vec<_> = p.components().map(|c| c.as_str().to_owned()).collect();
         assert_eq!(parts, ["/", "a", "b", "c.txt"]);
+    }
+
+    // ---- CwdRelative ----
+    //
+    // Sandbox-realm rejection is enforced at compile time by `CwdResolvable`'s
+    // sealed-trait bound; see the `compile_fail` doctest on the type itself.
+
+    #[test]
+    fn cwd_relative_from_str_is_infallible_and_routes_to_either() {
+        let abs: CwdRelative<Host> = "/etc/minimal".parse().unwrap();
+        let rel: CwdRelative<Host> = "config/foo".parse().unwrap();
+        assert!(abs.is_absolute());
+        assert!(!rel.is_absolute());
+        assert!(matches!(abs.as_either(), EitherPath::Abs(_)));
+        assert!(matches!(rel.as_either(), EitherPath::Rel(_)));
+    }
+
+    #[test]
+    fn cwd_relative_resolve_passes_absolute_through_unchanged() {
+        let cli: CwdRelative<Host> = "/etc/minimal".parse().unwrap();
+        let resolved = cli
+            .resolve()
+            .expect("resolve does not consult cwd for abs paths");
+        assert_eq!(resolved.as_str(), "/etc/minimal");
+    }
+
+    #[test]
+    fn cwd_relative_resolve_joins_relative_to_process_cwd() {
+        let cli: CwdRelative<Host> = "config/foo".parse().unwrap();
+        let resolved = cli.resolve().expect("test process cwd is well-defined");
+
+        let cwd_std = std::env::current_dir().unwrap();
+        let cwd_utf8 = Utf8PathBuf::from_path_buf(cwd_std).unwrap();
+        let expected = HostAbsPath::try_new(cwd_utf8)
+            .unwrap()
+            .join(&HostRelPath::try_new("config/foo").unwrap());
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn cwd_relative_clone_and_equality() {
+        let a: CwdRelative<Daemon> = "/var/lib/x".parse().unwrap();
+        let b = a.clone();
+        assert_eq!(a, b);
+
+        let c: CwdRelative<Daemon> = "/var/lib/y".parse().unwrap();
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn cwd_relative_works_for_host_and_daemon_realms() {
+        // Compile-time check that both realms satisfy CwdResolvable.
+        let _: CwdRelative<Host> = "/h".parse().unwrap();
+        let _: CwdRelative<Daemon> = "/d".parse().unwrap();
+    }
+
+    #[test]
+    fn cwd_relative_debug_includes_realm_tag() {
+        let p: CwdRelative<Host> = "/x".parse().unwrap();
+        assert_eq!(format!("{p:?}"), "CwdRelative<host>(/x)");
     }
 }
