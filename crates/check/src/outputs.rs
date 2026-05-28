@@ -466,7 +466,13 @@ mod tests {
         let graph = Arc::new(RwLock::new(Graph::new()));
         let guard = graph.read().await;
         let result = MissingRuntimeDeps
-            .check(&ctx, "nonexistent-package".to_string(), &tmpdir, guard, None)
+            .check(
+                &ctx,
+                "nonexistent-package".to_string(),
+                &tmpdir,
+                guard,
+                None,
+            )
             .await
             .expect("check should not error");
 
