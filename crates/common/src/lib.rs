@@ -8,6 +8,9 @@ pub mod jq;
 mod remote_storage;
 pub use remote_storage::RemoteStorage;
 
+#[cfg(target_os = "linux")]
+pub mod renameat2;
+
 pub mod repo_spec;
 mod spec_hash;
 pub use spec_hash::SpecHash;

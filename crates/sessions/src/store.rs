@@ -110,10 +110,25 @@ impl DiskLoader {
     }
 
     /// Writes the in-memory index back to disk.
+    ///
+    /// The write is staged into a sibling temp file and then atomically
+    /// renamed into place, so a crash mid-write can never leave a partially
+    /// serialized `index.json` behind.
     fn flush(&self) -> Result<(), std::io::Error> {
-        let index_file = self.minimal_dir.as_utf8_path().join("sessions/index.json");
-        let file = std::fs::File::create(index_file)?;
-        serde_json::to_writer(file, &self.index)?;
+        let sessions_dir = self.minimal_dir.as_utf8_path().join("sessions");
+        let index_file = sessions_dir.join("index.json");
+        let tmp_file = sessions_dir.join("index.json.tmp");
+
+        let file = std::fs::File::create(&tmp_file)?;
+        serde_json::to_writer(&file, &self.index)?;
+        file.sync_all()?;
+        drop(file);
+
+        #[cfg(target_os = "linux")]
+        common::renameat2::renameat2_cwd(tmp_file.as_std_path(), index_file.as_std_path(), 0)?;
+        #[cfg(not(target_os = "linux"))]
+        std::fs::rename(&tmp_file, &index_file)?;
+
         Ok(())
     }
 }

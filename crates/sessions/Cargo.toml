@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+common.workspace = true
 globset.workspace = true
 camino.workspace = true
 serde.workspace = true
