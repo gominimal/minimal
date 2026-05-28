@@ -962,4 +962,77 @@ mod tests {
         let opts = locked_mount_flags(Path::new("/nonexistent-path-for-statfs-test"));
         assert!(opts.is_empty());
     }
+
+    /// Prepare a sandbox base directory that `Sandbox::new` can be called with.
+    ///
+    /// `Sandbox::new` expects a `synth/` subdirectory inside `base_dir` (it
+    /// hardlinks its contents into the rootfs).  `Config::build` normally
+    /// creates this; for unit tests that call `Sandbox::new` directly we have
+    /// to create it ourselves.
+    ///
+    /// We also create `synth/usr/` so that after hardlinking, `rootfs/usr/`
+    /// exists — `Sandbox::new` tries to create a `rootfs/usr/lib64 → lib`
+    /// symlink and requires the parent directory to be present.
+    fn make_sandbox_base() -> tempfile::TempDir {
+        let td = tempfile::TempDir::new().expect("TempDir::new");
+        let synth = td.path().join("synth");
+        fs::create_dir(&synth).expect("create synth dir");
+        fs::create_dir(synth.join("usr")).expect("create synth/usr dir");
+        td
+    }
+
+    /// `Sandbox::new` with an `Isolated` config (no rootfs, no working inputs)
+    /// must succeed and produce the expected directory layout.
+    #[test]
+    fn sandbox_new_isolated_empty_creates_dirs() {
+        let base = make_sandbox_base();
+        let config = config::Config::new("test-isolated");
+        let sandbox = Sandbox::new(base.path().to_path_buf(), config, ())
+            .expect("Sandbox::new with empty Isolated config should succeed");
+
+        assert!(sandbox.rootfs().is_dir(), "rootfs must exist");
+        assert!(base.path().join("build").is_dir(), "build dir must exist");
+        assert!(base.path().join("state").is_dir(), "state dir must exist");
+        assert!(
+            base.path().join("state").join("home").is_dir(),
+            "state/home must exist"
+        );
+    }
+
+    /// `Sandbox::new` with a `BoundDir` config creates the shadow cwd tree
+    /// inside the rootfs without erroring.
+    #[test]
+    fn sandbox_new_bound_dir_creates_rootfs() {
+        let cwd = tempfile::TempDir::new().expect("TempDir for cwd");
+        let base = make_sandbox_base();
+        let config = config::Config::new("test-bound").with_wd(cwd.path(), false, vec![]);
+        let sandbox = Sandbox::new(base.path().to_path_buf(), config, ())
+            .expect("Sandbox::new with BoundDir should succeed");
+
+        assert!(sandbox.rootfs().is_dir(), "rootfs must exist");
+        // The shadow of the host cwd is created under the rootfs.
+        // cwd.path() is absolute (e.g. /tmp/…); strip the leading "/" to get
+        // the relative path inside rootfs.
+        let rel = cwd.path().strip_prefix("/").unwrap();
+        assert!(
+            sandbox.rootfs().join(rel).is_dir(),
+            "shadow cwd tree must be created inside rootfs"
+        );
+    }
+
+    /// When `MINIMAL_INTERNAL_CS_BUILD=1` is set but the convention mirror
+    /// path does not exist, `Sandbox::new` must still succeed (the branch is
+    /// documented to be inert when the path is absent).
+    #[test]
+    fn sandbox_new_cs_build_env_inert_when_mirror_absent() {
+        let base = make_sandbox_base();
+        let config = config::Config::new("test-cs");
+        // SAFETY: single-threaded test; no other thread reads this variable concurrently.
+        unsafe { std::env::set_var("MINIMAL_INTERNAL_CS_BUILD", "1") };
+        let result = Sandbox::new(base.path().to_path_buf(), config, ());
+        // Always restore the variable, even on failure.
+        unsafe { std::env::remove_var("MINIMAL_INTERNAL_CS_BUILD") };
+        let sandbox = result.expect("Sandbox::new must succeed even with CS env var set");
+        assert!(sandbox.rootfs().is_dir(), "rootfs must exist");
+    }
 }
