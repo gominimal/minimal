@@ -6,11 +6,14 @@ use std::{
     collections::BTreeMap,
     sync::{Arc, LazyLock},
 };
-use tokio::{net::UnixStream, spawn, sync::Mutex};
+use tokio::{
+    net::UnixStream,
+    sync::{Mutex, MutexGuard},
+};
 
 use crate::{
     ChannelConfig, RequestedPty,
-    rpc::{self, OneshotSshRpc},
+    rpc::{self},
     server::ServerStateHandle,
 };
 
@@ -150,7 +153,7 @@ impl Connection {
         c.pending_config_mut()
     }
 
-    fn take(&mut self, id: ChannelId) -> Option<(RuChannel<Msg>, ChannelConfig)> {
+    pub fn take(&mut self, id: ChannelId) -> Option<(RuChannel<Msg>, ChannelConfig)> {
         let c = self.channels.get_mut(&id)?;
         if c.closed {
             tracing::warn!("Client tried to take an already-closed channel {id}");
@@ -173,6 +176,12 @@ impl Connection {
 /// A thread-safe handle to the connection.
 #[derive(Clone)]
 pub struct ConnectionHandle(Arc<Mutex<Connection>>);
+
+impl ConnectionHandle {
+    pub fn lock(&self) -> impl Future<Output = MutexGuard<'_, Connection>> {
+        self.0.lock()
+    }
+}
 
 /// An error when handling the SSH connection.
 #[derive(Debug)]
@@ -217,7 +226,7 @@ impl russh::server::Handler for ConnectionHandler {
     type Error = ConnectionError;
 
     async fn auth_none(&mut self, user: &str) -> Result<russh::server::Auth, Self::Error> {
-        let mut s = self.0.0.lock().await;
+        let mut s = self.0.lock().await;
         if s.auth == Auth::Local {
             s.ssh_username = Some(user.to_string());
             Ok(russh::server::Auth::Accept)
@@ -231,7 +240,7 @@ impl russh::server::Handler for ConnectionHandler {
         c: RuChannel<Msg>,
         _: &mut Session,
     ) -> Result<bool, Self::Error> {
-        let mut s = self.0.0.lock().await;
+        let mut s = self.0.lock().await;
         if s.auth != Auth::Local {
             return Ok(false); // indicate failure
         }
@@ -251,7 +260,7 @@ impl russh::server::Handler for ConnectionHandler {
     ) -> Result<(), Self::Error> {
         protocol_trace!("Got env_request on channel {id}: {var_name}={var_value}");
 
-        match self.0.0.lock().await.pending_config_mut(id) {
+        match self.0.lock().await.pending_config_mut(id) {
             Some(p) => {
                 session.channel_success(id)?;
                 p.env_vars
@@ -278,7 +287,7 @@ impl russh::server::Handler for ConnectionHandler {
             modes,
         );
 
-        match self.0.0.lock().await.pending_config_mut(id) {
+        match self.0.lock().await.pending_config_mut(id) {
             Some(p) => {
                 session.channel_success(id)?;
                 p.pty = Some(RequestedPty {
@@ -325,36 +334,13 @@ impl russh::server::Handler for ConnectionHandler {
     ) -> Result<(), Self::Error> {
         protocol_trace!("Got subsystem_request on channel {id}: subsystem={name}");
 
-        match name {
-            rpc::GetVersion::NAME => {
-                let c_hnd = match self.0.0.lock().await.take(id) {
-                    None => {
-                        session.channel_failure(id)?;
-                        return Ok(());
-                    }
-                    Some((channel, _p)) => channel,
-                };
-                session.channel_success(id)?;
-
-                spawn(async move {
-                    rpc::GetVersion
-                        .handle(c_hnd, |_req| {
-                            Ok(rpc::GetVersionResponse {
-                                version: env!("CARGO_PKG_VERSION").to_string(),
-                                long_version: env!("LONG_VERSION").to_string(),
-                                stdlib_version: stdlib::VERSION.to_string(),
-                            })
-                        })
-                        .await
-                });
-
-                Ok(())
-            }
-            _ => {
-                session.channel_failure(id)?;
-                Ok(())
-            }
+        if name.starts_with(rpc::RPC_SUBSYSTEM_PREFIX) {
+            rpc::handle_ssh_rpc(self.0.clone(), name, id, session).await?;
+        } else {
+            session.channel_failure(id)?;
         }
+
+        Ok(())
     }
 
     async fn channel_close(&mut self, id: ChannelId, _: &mut Session) -> Result<(), Self::Error> {
