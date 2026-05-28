@@ -8,10 +8,13 @@ publish.workspace = true
 common.workspace = true
 globset.workspace = true
 camino.workspace = true
+nutype.workspace = true
 paths.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 uuid.workspace = true
+walkdir.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

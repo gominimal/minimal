@@ -43,15 +43,38 @@
 
 use std::collections::BTreeMap;
 
+use nutype::nutype;
+
 use crate::lifecyclehook::LifecycleHook;
 use crate::patches::{Patch, Patches};
 use crate::vars::{LenientVarEntry, StrictVarName, VarName, VarValue};
 
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+/// A loadout's identifier — trimmed, non-empty, and free of path
+/// separators and NUL bytes.
+///
+/// Names appear in user-facing contexts (selection menus, error
+/// messages) and may be used as filesystem-key fragments by the loader,
+/// so they're constrained at construction time rather than at point of
+/// use.
+#[nutype(
+    sanitize(trim),
+    validate(not_empty, predicate = |s: &str| !s.contains(['/', '\\', '\0'])),
+    derive(
+        Clone, Debug, Display, AsRef, PartialEq, Eq, Hash, PartialOrd, Ord,
+        Serialize, Deserialize,
+    ),
+)]
+pub struct LoadoutName(String);
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Loadout {
+    /// Identifier — user-facing, used in selection and error messages.
+    name: LoadoutName,
+    /// Free-form description, shown alongside the name in user-facing
+    /// contexts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     description: Option<String>,
-    // Packages to be installed
+    /// Packages to bring into the session.
     // TODO: Newtype for `Package`?
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     packages: Vec<String>,
@@ -71,22 +94,51 @@ pub struct Loadout {
 }
 
 impl Loadout {
-    /// Construct an empty loadout. Build it up via the additive
-    /// `with_*` methods:
+    /// Construct a loadout with a pre-validated name. Build it up via
+    /// the additive `with_*` methods:
     ///
     /// ```
-    /// use sessions::loadout::Loadout;
+    /// use sessions::loadout::{Loadout, LoadoutName};
     /// use sessions::vars::{StrictVarName, VarValue};
     ///
-    /// let l = Loadout::empty()
+    /// let l = Loadout::new(LoadoutName::try_new("dev").unwrap())
     ///     .with_package("helix")
     ///     .with_var(StrictVarName::try_new("EDITOR").unwrap(), VarValue::specified("hx"));
     /// assert_eq!(l.packages(), &["helix"]);
     /// assert_eq!(l.vars().len(), 1);
     /// ```
     #[must_use]
-    pub fn empty() -> Self {
-        Self::default()
+    pub fn new(name: LoadoutName) -> Self {
+        Self {
+            name,
+            description: None,
+            packages: Vec::new(),
+            vars: BTreeMap::new(),
+            vars_lenient: Vec::new(),
+            patches: Patches::empty(),
+            lifecycle_hooks: Vec::new(),
+        }
+    }
+
+    /// Set a free-form description.
+    #[must_use]
+    pub fn with_description(self, description: impl Into<String>) -> Self {
+        Self {
+            description: Some(description.into()),
+            ..self
+        }
+    }
+
+    /// The loadout's identifier.
+    #[must_use]
+    pub fn name(&self) -> &LoadoutName {
+        &self.name
+    }
+
+    /// The loadout's free-form description, if any.
+    #[must_use]
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
     }
 
     /// Append a package dependency.
@@ -186,6 +238,51 @@ impl Loadout {
     }
 }
 
+impl crate::composable::Composable for Loadout {
+    /// Materialize the loadout as a [`Contribution`](crate::composable::Contribution),
+    /// tagging every primitive with [`Source::UserLoadout`].
+    ///
+    /// Inherited / default-bearing var values are resolved via `env`
+    /// at this point.
+    ///
+    /// [`Source::UserLoadout`]: crate::composable::Source::UserLoadout
+    fn contribute(
+        self,
+        env: crate::composable::EnvLookup<'_>,
+    ) -> Result<crate::composable::Contribution, crate::composable::Error> {
+        use crate::composable::{
+            Contribution, ProvenancedHook, ProvenancedPackage, ProvenancedPatch, ProvenancedVar,
+            Source,
+        };
+        use crate::vars::ResolvedVar;
+
+        let source = Source::UserLoadout {
+            name: self.name.into_inner(),
+        };
+        let mut c = Contribution::new();
+
+        for (name, value) in self.vars {
+            let resolved = ResolvedVar::resolve_with(name.into_inner(), value, env)?;
+            c.push_var(ProvenancedVar::new(resolved, source.clone()));
+        }
+        for entry in self.vars_lenient {
+            let (name, value) = entry.into_parts();
+            let resolved = ResolvedVar::resolve_with(name.into_inner(), value, env)?;
+            c.push_var(ProvenancedVar::new(resolved, source.clone()));
+        }
+        for patch in self.patches {
+            c.push_patch(ProvenancedPatch::new(patch, source.clone()));
+        }
+        for pkg in self.packages {
+            c.push_package(ProvenancedPackage::new(pkg, source.clone()));
+        }
+        for hook in self.lifecycle_hooks {
+            c.push_hook(ProvenancedHook::new(hook, source.clone()));
+        }
+        Ok(c)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +293,8 @@ mod tests {
     #[test]
     fn all_vars_yields_strict_then_lenient() {
         let src = r#"
+            name = "dev"
+
             [vars]
             EDITOR = "vim"
             LANG = { inherit = true, default = "C" }
@@ -227,6 +326,8 @@ mod tests {
     #[test]
     fn all_vars_distinguishes_strict_from_lenient() {
         let src = r#"
+            name = "dev"
+
             [vars]
             EDITOR = "vim"
 
@@ -241,8 +342,27 @@ mod tests {
     }
 
     #[test]
+    fn loadout_name_rejects_empty_and_path_chars() {
+        assert!(LoadoutName::try_new("").is_err());
+        assert!(LoadoutName::try_new("   ").is_err()); // trimmed → empty
+        assert!(LoadoutName::try_new("a/b").is_err());
+        assert!(LoadoutName::try_new("a\\b").is_err());
+        assert!(LoadoutName::try_new("a\0b").is_err());
+        let n = LoadoutName::try_new("  dev  ").unwrap();
+        assert_eq!(n.as_ref(), "dev");
+    }
+
+    #[test]
+    fn name_and_description_accessors_round_trip_through_builder() {
+        let l = Loadout::new(LoadoutName::try_new("dev").unwrap())
+            .with_description("primary dev session");
+        assert_eq!(l.name().as_ref(), "dev");
+        assert_eq!(l.description(), Some("primary dev session"));
+    }
+
+    #[test]
     fn default_loadout_is_empty() {
-        let l = Loadout::default();
+        let l = Loadout::new(LoadoutName::try_new("Test").unwrap());
         assert!(l.packages().is_empty());
         assert_eq!(l.all_vars().count(), 0);
         assert!(l.patches().is_empty());
@@ -252,6 +372,8 @@ mod tests {
     #[test]
     fn lenient_var_entry_round_trips_through_toml() {
         let src = r#"
+            name = "dev"
+
             [[vars_lenient]]
             name = "weird-thing"
             value = "x"
@@ -272,11 +394,11 @@ mod tests {
             .build()
             .unwrap();
         let patch = Patch::new(
-            FileSet::try_new(None, ["a"]).unwrap(),
-            PatchDest::try_new("/a").unwrap(),
+            FileSet::try_new("a").unwrap(),
+            PatchDest::try_new("a").unwrap(),
         );
 
-        let l = Loadout::empty()
+        let l = Loadout::new(LoadoutName::try_new("Test").unwrap())
             .with_package("helix")
             .with_package("zellij")
             .with_var(
@@ -299,7 +421,7 @@ mod tests {
     #[test]
     fn with_var_replaces_existing_strict_entry() {
         let name = StrictVarName::try_new("EDITOR").unwrap();
-        let l = Loadout::empty()
+        let l = Loadout::new(LoadoutName::try_new("Test").unwrap())
             .with_var(name.clone(), VarValue::specified("hx"))
             .with_var(name.clone(), VarValue::specified("vim"));
         assert_eq!(l.vars().len(), 1);
@@ -311,12 +433,14 @@ mod tests {
         // Exercise every field at once: packages, both strict and lenient
         // vars, patches with multiple source shapes, and a lifecycle hook.
         let src = r#"
-            packages = ["helix", "zellij"]
+            name        = "dev"
+            description = "Editor + terminal multiplexer"
+            packages    = ["helix", "zellij"]
 
             patches = [
-                { dest = "/etc/foo", source = "./foo" },
-                { dest = "/etc/bar", source = ["b1", "b2"] },
-                { dest = "/themes/", source = { base = "./themes", patterns = ["**/*.toml"] } },
+                { dest = "etc/foo", source = "./foo" },
+                { dest = "etc/bar", source = ["b1", "b2"] },
+                { dest = "themes/", source = "./themes/**/*.toml" },
             ]
 
             [vars]
@@ -334,8 +458,12 @@ mod tests {
         let serialized = toml::to_string(&original).unwrap();
         let parsed: Loadout = toml::from_str(&serialized).unwrap();
 
+        assert_eq!(parsed.name().as_ref(), "dev");
+        assert_eq!(parsed.description(), Some("Editor + terminal multiplexer"));
         assert_eq!(parsed.packages(), &["helix", "zellij"]);
-        assert_eq!(parsed.patches().len(), 3);
+        // Row 2 (`source = ["b1", "b2"]`) fans out into two patches, so the
+        // three rows yield four Patch entries.
+        assert_eq!(parsed.patches().len(), 4);
         assert_eq!(parsed.vars().len(), 2);
         assert_eq!(parsed.vars_lenient().len(), 1);
         assert_eq!(parsed.lifecycle_hooks().len(), 1);

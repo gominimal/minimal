@@ -118,24 +118,15 @@ pub type ConfigRelPath = RelPath<ConfigRelative>;
 
 /// Errors produced when constructing a path.
 #[non_exhaustive]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
     /// An [`AbsPath`] was constructed from a non-absolute input.
+    #[error("expected an absolute path, got: {0}")]
     NotAbsolute(Utf8PathBuf),
     /// A [`RelPath`] was constructed from an absolute input.
+    #[error("expected a relative path, got: {0}")]
     IsAbsolute(Utf8PathBuf),
 }
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotAbsolute(p) => write!(f, "expected an absolute path, got: {p}"),
-            Self::IsAbsolute(p) => write!(f, "expected a relative path, got: {p}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 #[doc(hidden)]
 pub const fn _validate_subdir(s: &str) {
@@ -196,6 +187,34 @@ impl<R: Realm> AbsPath<R> {
             })
         } else {
             Err(Error::NotAbsolute(inner))
+        }
+    }
+
+    /// Construct an [`AbsPath`] without verifying that `p` is
+    /// absolute.
+    ///
+    /// Use only when the caller has already proven absoluteness by
+    /// other means (e.g. the path came from `walkdir::WalkDir::new`
+    /// rooted at an absolute path). A `debug_assert!` catches misuse
+    /// in development builds; release builds skip the check.
+    pub fn new_unchecked(p: impl Into<Utf8PathBuf>) -> Self {
+        let p = p.into();
+        debug_assert!(p.is_absolute());
+        Self {
+            inner: p,
+            _realm: PhantomData,
+        }
+    }
+
+    /// Returns the root path (`/`), assuming a POSIX-like system.
+    ///
+    /// This is a convenience for places that need a known-absolute
+    /// root in the [`Realm`] of the caller. Not appropriate on
+    /// Windows, where the root concept differs.
+    pub fn root() -> Self {
+        Self {
+            inner: Utf8PathBuf::from("/"),
+            _realm: PhantomData,
         }
     }
 
@@ -412,6 +431,22 @@ impl<R: Realm> RelPath<R> {
                 inner,
                 _realm: PhantomData,
             })
+        }
+    }
+
+    /// Construct a [`RelPath`] without verifying that `p` is
+    /// relative.
+    ///
+    /// Use only when the caller has already proven relativity by other
+    /// means (e.g. the path was produced by `strip_prefix` against a
+    /// known absolute root). A `debug_assert!` catches misuse in
+    /// development builds; release builds skip the check.
+    pub fn new_unchecked(p: impl Into<Utf8PathBuf>) -> Self {
+        let p = p.into();
+        debug_assert!(p.is_relative());
+        Self {
+            inner: p,
+            _realm: PhantomData,
         }
     }
 
@@ -842,39 +877,17 @@ impl CwdResolvable for Daemon {}
 /// Errors produced when resolving a [`CwdRelative`] against the
 /// process current working directory.
 #[non_exhaustive]
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum CwdResolveError {
     /// `std::env::current_dir` failed.
-    Cwd(std::io::Error),
+    #[error("failed to read the current working directory")]
+    Cwd(#[source] std::io::Error),
     /// The cwd is not valid UTF-8.
+    #[error("current working directory `{}` is not valid UTF-8", .0.display())]
     NonUtf8Cwd(std::path::PathBuf),
     /// The cwd is somehow not absolute (an OS-level invariant violation).
+    #[error("current working directory `{0}` is not absolute")]
     CwdNotAbsolute(Utf8PathBuf),
-}
-
-impl fmt::Display for CwdResolveError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Cwd(_) => f.write_str("failed to read the current working directory"),
-            Self::NonUtf8Cwd(p) => write!(
-                f,
-                "current working directory `{}` is not valid UTF-8",
-                p.display(),
-            ),
-            Self::CwdNotAbsolute(p) => {
-                write!(f, "current working directory `{p}` is not absolute")
-            }
-        }
-    }
-}
-
-impl std::error::Error for CwdResolveError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Cwd(e) => Some(e),
-            _ => None,
-        }
-    }
 }
 
 /// A CLI-supplied path: absolute is taken as-is, relative is captured

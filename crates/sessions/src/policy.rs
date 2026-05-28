@@ -82,6 +82,16 @@ impl UserPolicy {
     pub fn patches(&self) -> &PatchPolicy {
         &self.patches
     }
+
+    /// Consume the policy and return the underlying narrow policies.
+    ///
+    /// Used by the resolution loop, which moves each narrow policy
+    /// into the corresponding per-domain resolver and rebuilds a
+    /// `UserPolicy` from the (possibly updated) results.
+    #[must_use]
+    pub fn into_parts(self) -> (VarsPolicy, PatchPolicy) {
+        (self.vars, self.patches)
+    }
 }
 
 fn vars_policy_is_default(p: &VarsPolicy) -> bool {
@@ -119,8 +129,20 @@ mod tests {
         let p: UserPolicy = toml::from_str(src).unwrap();
         assert_eq!(p.vars().allow().raw_patterns(), &["MY_APP_*"]);
         assert_eq!(p.vars().deny().raw_patterns(), &["AWS_*"]);
-        assert_eq!(p.patches().allow().raw_patterns(), &["~/.config/**"]);
-        assert_eq!(p.patches().deny().raw_patterns(), &["~/.ssh/**"]);
+        let allow: Vec<&str> = p
+            .patches()
+            .allow()
+            .iter()
+            .map(crate::patches::FileSet::pattern)
+            .collect();
+        let deny: Vec<&str> = p
+            .patches()
+            .deny()
+            .iter()
+            .map(crate::patches::FileSet::pattern)
+            .collect();
+        assert_eq!(allow, ["~/.config/**"]);
+        assert_eq!(deny, ["~/.ssh/**"]);
     }
 
     #[test]
