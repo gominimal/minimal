@@ -807,6 +807,7 @@ dependencies = [
  "google-cloud-storage",
  "hex",
  "jaq-all",
+ "libc",
  "lzma-rs",
  "nickel-lang-core",
  "ot",
@@ -5436,6 +5437,7 @@ name = "sessions"
 version = "0.0.1"
 dependencies = [
  "camino",
+ "common",
  "globset",
  "serde",
  "serde_json",

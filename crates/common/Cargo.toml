@@ -43,3 +43,6 @@ google-cloud-storage.workspace = true
 resolv-conf.workspace = true
 
 ot.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
