@@ -16,6 +16,9 @@ walkdir.workspace = true
 
 common.workspace = true
 
+[dev-dependencies]
+serial_test.workspace = true
+
 [target.'cfg(target_os = "linux")'.dependencies]
 hakoniwa.workspace = true
 nix.workspace = true

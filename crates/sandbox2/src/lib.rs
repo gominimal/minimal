@@ -944,6 +944,7 @@ fn locked_mount_flags(path: &Path) -> hakoniwa::MountOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     // /proc is mounted with nosuid,nodev on essentially every Linux distro;
     // if either stops showing up we've broken the FsFlags → MountOptions
@@ -1013,7 +1014,10 @@ mod tests {
         // The shadow of the host cwd is created under the rootfs.
         // cwd.path() is absolute (e.g. /tmp/…); strip the leading "/" to get
         // the relative path inside rootfs.
-        let rel = cwd.path().strip_prefix("/").unwrap();
+        let rel = cwd
+            .path()
+            .strip_prefix("/")
+            .expect("TempDir path is absolute");
         assert!(
             sandbox.rootfs().join(rel).is_dir(),
             "shadow cwd tree must be created inside rootfs"
@@ -1024,15 +1028,27 @@ mod tests {
     /// path does not exist, `Sandbox::new` must still succeed (the branch is
     /// documented to be inert when the path is absent).
     #[test]
+    #[serial]
     fn sandbox_new_cs_build_env_inert_when_mirror_absent() {
+        /// RAII guard that restores an env var to absent on drop, even on panic.
+        struct RemoveEnvOnDrop(&'static str);
+        impl Drop for RemoveEnvOnDrop {
+            fn drop(&mut self) {
+                // SAFETY: `remove_var` is unsafe (Rust ≥1.81); the `#[serial]`
+                // attribute on the enclosing test serializes all `#[serial]`
+                // tests, so no other test can observe this mutation concurrently.
+                unsafe { std::env::remove_var(self.0) }
+            }
+        }
+
         let base = make_sandbox_base();
         let config = config::Config::new("test-cs");
-        // SAFETY: single-threaded test; no other thread reads this variable concurrently.
+        // SAFETY: `set_var` is unsafe (Rust ≥1.81); serialized via `#[serial]`
+        // so no other test mutates MINIMAL_INTERNAL_CS_BUILD concurrently.
         unsafe { std::env::set_var("MINIMAL_INTERNAL_CS_BUILD", "1") };
-        let result = Sandbox::new(base.path().to_path_buf(), config, ());
-        // Always restore the variable, even on failure.
-        unsafe { std::env::remove_var("MINIMAL_INTERNAL_CS_BUILD") };
-        let sandbox = result.expect("Sandbox::new must succeed even with CS env var set");
+        let _guard = RemoveEnvOnDrop("MINIMAL_INTERNAL_CS_BUILD");
+        let sandbox = Sandbox::new(base.path().to_path_buf(), config, ())
+            .expect("Sandbox::new must succeed even with CS env var set");
         assert!(sandbox.rootfs().is_dir(), "rootfs must exist");
     }
 }
