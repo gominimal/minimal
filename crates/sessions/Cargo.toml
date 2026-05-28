@@ -8,8 +8,11 @@ publish.workspace = true
 globset.workspace = true
 camino.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 toml.workspace = true
 
 [lints.clippy]

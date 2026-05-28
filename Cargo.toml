@@ -98,7 +98,7 @@ tonic-prost-build = "0.14.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2" # keep in sync with reqwest
-uuid = { version = "1.23", features = ["v4", "serde"] }
+uuid = { version = "1.23", features = ["v4", "v7", "serde"] }
 zstd = "0.13"
 
 moka = { version = "0.12", default-features = false, features = ["sync"] }
@@ -125,5 +125,6 @@ orchestrator = { version = "0.0.1", path = "crates/orchestrator" }
 remote-proto = { version = "0.0.1", path = "crates/remote-proto" }
 remote-client = { version = "0.0.1", path = "crates/remote-client" }
 sandbox2 = { version = "0.0.1", path = "crates/sandbox2" }
+sessions = { version = "0.0.1", path = "crates/sessions" }
 
 stdlib = { version = "0.0.15", path = "crates/stdlib" }

@@ -9,11 +9,11 @@ clap.workspace = true
 clap_complete.workspace = true
 constcat.workspace = true
 dirs.workspace = true
-futures.workspace = true
-
 russh.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+futures.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
