@@ -453,7 +453,7 @@ mod tests {
             result.verdict
         );
 
-        std::fs::remove_dir_all(&tmpdir).ok();
+        std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
     }
 
     /// When the package name is not present in the graph, the checker must
@@ -482,6 +482,6 @@ mod tests {
             result.verdict
         );
 
-        std::fs::remove_dir_all(&tmpdir).ok();
+        std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
     }
 }
