@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use crate::session::{Session, SessionHandle};
 use sessions::{
     paths::DaemonAbsPath,
-    store::{DiskLoader, Loader, SessionObject},
+    store::{DiskLoader, Loader, SessionKey, SessionObject},
 };
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -48,6 +48,7 @@ enum ManagerMessage {
     List(Responder<Vec<SessionInfo>>),
     GetRecord(SessionKeyPredicate, Responder<Option<sessions::Record>>),
     GetSession(SessionKeyPredicate, Responder<Option<SessionHandle>>),
+    CreateSession(sessions::Record, Responder<Uuid>),
 }
 
 /// Manages session instances, and session state on disk.
@@ -155,6 +156,14 @@ impl<L: Loader> Manager<L> {
                 })
                 .await;
             }
+            // Creates a session using the given record.
+            ManagerMessage::CreateSession(record, r) => {
+                r.handle(async {
+                    let k = self.store.create(record)?;
+                    Ok(*k.uuid())
+                })
+                .await;
+            }
         }
     }
 }
@@ -180,6 +189,17 @@ impl ManagerHandle {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(ManagerMessage::GetRecord(pred, send)).await;
+        recv.await.expect("corresponding sessions manager is dead")
+    }
+
+    /// Creates a session based on the given record.
+    pub async fn create_session(&self, record: sessions::Record) -> Result<Uuid, ResponseError> {
+        let (send, recv) = Responder::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .0
+            .send(ManagerMessage::CreateSession(record, send))
+            .await;
         recv.await.expect("corresponding sessions manager is dead")
     }
 
