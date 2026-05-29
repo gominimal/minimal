@@ -752,3 +752,190 @@ fn gen_dot(pgraph: &DiGraph<NodeData, EdgeData>, graph: &Graph) -> Result<(), Er
     println!("}}");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use decode::Layer;
+    use graph::Graph;
+
+    /// `Layer::new_for_test` reads `CARGO_MANIFEST_DIR` at runtime to locate
+    /// `minimal-ncl/minimal.ncl`.  When running tests from the `minimal` crate
+    /// that directory does not exist there, so we redirect the env var to the
+    /// `decode` crate which ships the canonical copy.  All helpers call this
+    /// before invoking `new_for_test`, so the value is always consistent.
+    fn point_to_decode_minimal_ncl() {
+        let decode_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../decode")
+            .canonicalize()
+            .expect("decode crate dir must exist");
+        // SAFETY: All tests in this module set the same canonical path, so there
+        // is no data race between concurrent test threads.
+        unsafe {
+            std::env::set_var("CARGO_MANIFEST_DIR", decode_dir);
+        }
+    }
+
+    // Builds a graph where 'a' has a single build dep on 'b'.
+    fn graph_a_build_dep_b() -> Graph {
+        point_to_decode_minimal_ncl();
+        let nickel = concat!(
+            "let {BuildSpec, ..} = import \"minimal.ncl\" in\n",
+            "let b = { name = \"b\", build_deps = [], cmd = \"\" } | BuildSpec in\n",
+            "{ name = \"a\", build_deps = [b], cmd = \"\" } | BuildSpec",
+        )
+        .to_string();
+        Graph::new()
+            .ingest(Layer::new_for_test(nickel).unwrap())
+            .unwrap()
+    }
+
+    // Builds a three-node chain: a → b → c (all build deps).
+    fn graph_chain_a_b_c() -> Graph {
+        point_to_decode_minimal_ncl();
+        let nickel = concat!(
+            "let {BuildSpec, ..} = import \"minimal.ncl\" in\n",
+            "let c = { name = \"c\", build_deps = [], cmd = \"\" } | BuildSpec in\n",
+            "let b = { name = \"b\", build_deps = [c], cmd = \"\" } | BuildSpec in\n",
+            "{ name = \"a\", build_deps = [b], cmd = \"\" } | BuildSpec",
+        )
+        .to_string();
+        Graph::new()
+            .ingest(Layer::new_for_test(nickel).unwrap())
+            .unwrap()
+    }
+
+    // Builds a graph where 'a' has a runtime dep on 'b'.
+    fn graph_a_runtime_dep_b() -> Graph {
+        point_to_decode_minimal_ncl();
+        let nickel = concat!(
+            "let {BuildSpec, ..} = import \"minimal.ncl\" in\n",
+            "let b = { name = \"b\", build_deps = [], cmd = \"\" } | BuildSpec in\n",
+            "{ name = \"a\", build_deps = [], runtime_deps = [b], cmd = \"\" } | BuildSpec",
+        )
+        .to_string();
+        Graph::new()
+            .ingest(Layer::new_for_test(nickel).unwrap())
+            .unwrap()
+    }
+
+    fn node_names(cpy: &DiGraph<NodeData, EdgeData>, graph: &Graph) -> Vec<String> {
+        let mut names: Vec<String> = cpy
+            .node_weights()
+            .filter_map(|nd| {
+                if let NodeData::BuildSpec(bsr) = nd {
+                    graph.get(bsr).map(|bs| bs.name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn subset_from(
+        graph: &Graph,
+        root: &str,
+        build_spec_deps: bool,
+        input_deps_depth: i32,
+        runtime_deps_depth: i32,
+        excludes: Option<Vec<String>>,
+    ) -> DiGraph<NodeData, EdgeData> {
+        let args = DepArgs {
+            excludes,
+            build_spec_deps,
+            source_deps: false,
+            local_deps: false,
+            hostpath_deps: false,
+            needs: false,
+            provides: false,
+            bootstrap: false,
+            subtrees_only: false,
+            input_deps_depth,
+            runtime_deps_depth,
+            prune_edgeless: false,
+            output_format: OutputFormat::Dot,
+            packages: vec![root.to_string()],
+        };
+        let gd = pgraph_from(graph).unwrap();
+        pgraph_copy_subset(graph, &gd.pgraph, &gd.bsname_to_node_index, &args).unwrap()
+    }
+
+    #[test]
+    fn build_spec_dep_followed_when_enabled() {
+        let graph = graph_a_build_dep_b();
+        let cpy = subset_from(&graph, "a", true, -1, -1, None);
+        assert_eq!(
+            node_names(&cpy, &graph),
+            vec!["a", "b"],
+            "with build_spec_deps=true, transitive build dep 'b' must appear"
+        );
+    }
+
+    #[test]
+    fn build_spec_dep_omitted_when_disabled() {
+        let graph = graph_a_build_dep_b();
+        let cpy = subset_from(&graph, "a", false, -1, -1, None);
+        assert_eq!(
+            node_names(&cpy, &graph),
+            vec!["a"],
+            "with build_spec_deps=false, 'b' must not appear in the subgraph"
+        );
+    }
+
+    #[test]
+    fn input_deps_depth_zero_stops_at_root() {
+        let graph = graph_a_build_dep_b();
+        let cpy = subset_from(&graph, "a", true, 0, -1, None);
+        assert_eq!(
+            node_names(&cpy, &graph),
+            vec!["a"],
+            "input_deps_depth=0 must prevent following any input dep edges"
+        );
+    }
+
+    #[test]
+    fn input_deps_depth_one_stops_after_one_hop() {
+        let graph = graph_chain_a_b_c();
+        let cpy = subset_from(&graph, "a", true, 1, -1, None);
+        assert_eq!(
+            node_names(&cpy, &graph),
+            vec!["a", "b"],
+            "input_deps_depth=1 must include one hop (b) but not two hops (c)"
+        );
+    }
+
+    #[test]
+    fn excludes_stops_traversal_through_excluded_node() {
+        let graph = graph_chain_a_b_c();
+        let cpy = subset_from(&graph, "a", true, -1, -1, Some(vec!["b".to_string()]));
+        assert_eq!(
+            node_names(&cpy, &graph),
+            vec!["a"],
+            "excluding 'b' must prevent 'b' and its transitive dep 'c' from appearing"
+        );
+    }
+
+    #[test]
+    fn runtime_dep_followed_by_default() {
+        let graph = graph_a_runtime_dep_b();
+        let cpy = subset_from(&graph, "a", true, -1, -1, None);
+        assert_eq!(
+            node_names(&cpy, &graph),
+            vec!["a", "b"],
+            "runtime dep 'b' must appear when runtime_deps_depth=-1"
+        );
+    }
+
+    #[test]
+    fn runtime_dep_omitted_at_depth_zero() {
+        let graph = graph_a_runtime_dep_b();
+        let cpy = subset_from(&graph, "a", true, -1, 0, None);
+        assert_eq!(
+            node_names(&cpy, &graph),
+            vec!["a"],
+            "runtime_deps_depth=0 must prevent following any runtime dep edges"
+        );
+    }
+}
