@@ -225,7 +225,15 @@ impl fmt::Display for ConnectionError {
     }
 }
 
-impl std::error::Error for ConnectionError {}
+impl std::error::Error for ConnectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ConnectionError::Protocol(e) => Some(e),
+            ConnectionError::Json(e) => Some(e),
+            ConnectionError::SetupAfterInitiation => None,
+        }
+    }
+}
 
 /// A [`russh::server::Handler`] for a [`Connection`].
 ///

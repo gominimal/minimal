@@ -70,21 +70,10 @@ pub trait Loader {
 }
 
 /// The concrete key used to identify sessions from [`DiskLoader`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DiskSessionKey {
     session_uuid: Uuid,
     dir_key: String,
-}
-
-impl PartialOrd for DiskSessionKey {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for DiskSessionKey {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.session_uuid.cmp(&other.session_uuid)
-    }
 }
 
 impl SessionKey for DiskSessionKey {

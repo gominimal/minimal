@@ -117,7 +117,9 @@ impl<L: Loader> Manager<L> {
                             Some(h) => h.clone(),
                             None => {
                                 // Not running, start it!
-                                Session::run(self.store.get(&k).unwrap()).await.unwrap()
+                                let h = Session::run(self.store.get(&k).unwrap()).await.unwrap();
+                                self.running.insert(k, h.clone());
+                                h
                             }
                         };
                         r.send(Some(session_handle))

@@ -36,6 +36,15 @@ pub fn renameat2<P: AsRef<Path>>(
     let oldpath_c = path_to_cstring(oldpath.as_ref())?;
     let newpath_c = path_to_cstring(newpath.as_ref())?;
 
+    // SAFETY: `oldpath_c` and `newpath_c` are owned `CString`s that remain live
+    // for the duration of the call, so their `.as_ptr()` values are valid,
+    // NUL-terminated C strings. `olddirfd` and `newdirfd` are either real file
+    // descriptors supplied by the caller or `AT_FDCWD`, both of which the
+    // kernel accepts. `flags` is a `u32` bitmask of the `RENAME_*` constants
+    // documented in `renameat2(2)`; unknown bits are rejected by the kernel
+    // with `EINVAL` rather than causing UB. The syscall returns `-1` on error
+    // (with errno set) or a non-negative value on success, which we inspect
+    // immediately below.
     let ret = unsafe {
         libc::syscall(
             SYS_RENAMEAT2,
@@ -77,10 +86,14 @@ mod tests {
         let old = tmp.path().join("old");
         let new = tmp.path().join("new");
 
-        fs::write(&old, "test").unwrap();
+        fs::write(&old, "source").unwrap();
+        fs::write(&new, "destination").unwrap();
 
-        renameat2_cwd(&old, &new, RENAME_NOREPLACE).unwrap();
-        assert!(new.exists());
+        let err = renameat2_cwd(&old, &new, RENAME_NOREPLACE).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EEXIST));
+
+        assert_eq!(fs::read_to_string(&new).unwrap(), "destination");
+        assert_eq!(fs::read_to_string(&old).unwrap(), "source");
     }
 
     #[test]
