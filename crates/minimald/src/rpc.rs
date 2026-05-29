@@ -126,6 +126,7 @@ impl ListSessions {
                     sessions: mngr
                         .list()
                         .await
+                        .map_err(|e| ConnectionError::Internal(e.to_string()))?
                         .into_iter()
                         .map(|i| ListSessionsEntry {
                             id: i.id,
@@ -181,7 +182,8 @@ impl GetSessionRecord {
                             GetSessionRecordRequest::Id(id) => SessionKeyPredicate::Id(id),
                             GetSessionRecordRequest::Name(name) => SessionKeyPredicate::Name(name),
                         })
-                        .await,
+                        .await
+                        .map_err(|e| ConnectionError::Internal(e.to_string()))?,
                 })
             })
             .await;

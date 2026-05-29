@@ -190,6 +190,8 @@ impl ConnectionHandle {
 pub enum ConnectionError {
     /// A protocol error.
     Protocol(russh::Error),
+    /// An internal error.
+    Internal(String),
 
     /// Failed to (de)serialize a JSON-encoded RPC message.
     Json(serde_json::Error),
@@ -216,6 +218,7 @@ impl fmt::Display for ConnectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConnectionError::Protocol(e) => write!(f, "Protocol error: {}", e),
+            ConnectionError::Internal(e) => write!(f, "Internal error: {}", e),
             ConnectionError::Json(e) => write!(f, "Serialization error: {}", e),
             ConnectionError::SetupAfterInitiation => write!(
                 f,
@@ -230,6 +233,7 @@ impl std::error::Error for ConnectionError {
         match self {
             ConnectionError::Protocol(e) => Some(e),
             ConnectionError::Json(e) => Some(e),
+            ConnectionError::Internal(_) => None,
             ConnectionError::SetupAfterInitiation => None,
         }
     }

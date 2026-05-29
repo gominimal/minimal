@@ -137,6 +137,36 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+#[doc(hidden)]
+pub const fn _validate_subdir(s: &str) {
+    let bytes = s.as_bytes();
+    assert!(!bytes.is_empty(), "`sub_path` component must not be empty");
+    let mut i = 0;
+    while i < bytes.len() {
+        assert!(
+            bytes[i] != b'/',
+            "`sub_path` component must not contain `/`"
+        );
+        i += 1;
+    }
+    assert!(
+        !(bytes.len() == 2 && bytes[0] == b'.' && bytes[1] == b'.'),
+        "`sub_path` component must not be `..`"
+    );
+}
+
+/// Joins a literal representing a sub-component onto the end of a path. Will
+/// emit a compile-time error if the component is not valid, for instance if
+/// it contains multiple components, is absolute, or attempts directory traversal.
+#[macro_export]
+macro_rules! sub_path {
+    ($base:expr, $dir:literal) => {{
+        #[allow(clippy::used_underscore_items)]
+        const _: () = $crate::paths::_validate_subdir($dir);
+        ($base).sub_path_unchecked($dir)
+    }};
+}
+
 /// An *absolute* UTF-8 path in realm `R`.
 ///
 /// Invariant: `inner.is_absolute()` is always true. Construction goes through
@@ -194,23 +224,12 @@ impl<R: Realm> AbsPath<R> {
         }
     }
 
-    /// Joins a given name *in the same realm*, producing a new
+    /// Joins a single sub-component *in the same realm*, producing a new
     /// [`AbsPath<R>`].
     ///
-    /// We intentionally take a &'static str to make it difficult
-    /// to call this method with anything but a single dir/file.
-    ///
-    /// # Panics
-    ///
-    /// This method will panic if the directory name includes
-    /// nested directories, or attempts to traverse.
-    pub fn sub_path(&self, dir: &'static str) -> AbsPath<R> {
-        assert!(
-            !dir.contains(std::path::MAIN_SEPARATOR_STR),
-            ".subdir(\"{dir}\") contains path separators"
-        );
-        assert!(dir != "..", ".subdir(\"..\") attempts path traversal");
-
+    /// Trusts the caller; prefer the [`sub_path!`] macro at literal call
+    /// sites so the constraint is enforced at compile time.
+    pub fn sub_path_unchecked(&self, dir: &str) -> AbsPath<R> {
         AbsPath {
             inner: self.inner.join(dir),
             _realm: PhantomData,
@@ -412,6 +431,18 @@ impl<R: Realm> RelPath<R> {
     pub fn join(&self, other: &RelPath<R>) -> RelPath<R> {
         RelPath {
             inner: self.inner.join(&other.inner),
+            _realm: PhantomData,
+        }
+    }
+
+    /// Joins a single sub-component *in the same realm*, producing a new
+    /// [`RelPath<R>`].
+    ///
+    /// Trusts the caller; prefer the [`sub_path!`] macro at literal call
+    /// sites so the constraint is enforced at compile time.
+    pub fn sub_path_unchecked(&self, dir: &str) -> RelPath<R> {
+        RelPath {
+            inner: self.inner.join(dir),
             _realm: PhantomData,
         }
     }
@@ -1327,5 +1358,22 @@ mod tests {
     fn cwd_relative_debug_includes_realm_tag() {
         let p: CwdRelative<Host> = "/x".parse().unwrap();
         assert_eq!(format!("{p:?}"), "CwdRelative<host>(/x)");
+    }
+
+    #[test]
+    fn sub_path_abs() {
+        let p = HostAbsPath::try_new("/silly").unwrap();
+        assert_eq!(
+            sub_path!(p, "goose"),
+            HostAbsPath::try_new("/silly/goose").unwrap()
+        );
+    }
+    #[test]
+    fn sub_path_rel() {
+        let p = HostRelPath::try_new("silly").unwrap();
+        assert_eq!(
+            sub_path!(p, "moose"),
+            HostRelPath::try_new("silly/moose").unwrap()
+        );
     }
 }

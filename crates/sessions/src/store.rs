@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use uuid::Uuid;
 
-use crate::Record;
 use crate::paths::{DaemonAbsPath, DaemonRelPath};
+use crate::{Record, sub_path};
 
 /// Describes the session object yielded by [`Loader`].
 pub trait SessionObject: Sized + Send + 'static + std::fmt::Debug {
@@ -73,7 +73,7 @@ pub trait Loader {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DiskSessionKey {
     session_uuid: Uuid,
-    dir_key: String,
+    dir_key: DaemonRelPath,
 }
 
 impl SessionKey for DiskSessionKey {
@@ -100,10 +100,9 @@ impl SessionObject for DiskSession {
         &self.key
     }
     fn workspace_path(&self) -> DaemonAbsPath {
-        self.minimal_state_dir
-            .sub_path("sessions")
-            .join(&DaemonRelPath::try_new(&self.key.dir_key).unwrap())
-            .sub_path("tree")
+        let base = sub_path!(self.minimal_state_dir, "sessions")
+            .join(&DaemonRelPath::try_new(&self.key.dir_key).unwrap());
+        sub_path!(base, "tree")
     }
 }
 
@@ -196,14 +195,14 @@ impl Loader for DiskLoader {
 
         Ok(DiskSessionKey {
             session_uuid: uuid,
-            dir_key: short,
+            dir_key: DaemonRelPath::try_new(short).unwrap(),
         })
     }
 
     fn list(&self) -> impl Iterator<Item = Self::Key> {
         self.index.iter().map(|(short, id)| Self::Key {
             session_uuid: *id,
-            dir_key: short.clone(),
+            dir_key: DaemonRelPath::try_new(short).unwrap(),
         })
     }
 
@@ -213,7 +212,7 @@ impl Loader for DiskLoader {
             .iter()
             .find(|(_short, iter_id)| *iter_id == id)
             .map(|(short, id)| Self::Key {
-                dir_key: short.clone(),
+                dir_key: DaemonRelPath::try_new(short).unwrap(),
                 session_uuid: *id,
             }))
     }
@@ -231,7 +230,7 @@ impl Loader for DiskLoader {
 
     fn get(&self, key: &Self::Key) -> Result<Self::Object, std::io::Error> {
         assert!(
-            self.index.contains_key(&key.dir_key),
+            self.index.contains_key(key.dir_key.as_str()),
             "key {:?} not present in index — Keys are only handed out for sessions that exist",
             key.dir_key,
         );
