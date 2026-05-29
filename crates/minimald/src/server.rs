@@ -1,3 +1,4 @@
+use ::sessions::paths::DaemonAbsPath;
 use russh::keys::key::safe_rng;
 use russh::keys::{PrivateKey, ssh_key::Error as KeyError};
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
 use crate::connection::Connection;
+use crate::sessions;
 
 /// The ed25519 host private key for the SSH server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,8 +31,8 @@ pub enum HostKey {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub host_key: HostKey,
-    pub minimal_state_dir: PathBuf,
-    pub minimal_cache_dir: PathBuf,
+    pub minimal_state_dir: DaemonAbsPath,
+    pub minimal_cache_dir: DaemonAbsPath,
 }
 
 impl Config {
@@ -70,17 +72,20 @@ impl Config {
 #[derive(Debug)]
 pub struct ServerState {
     config: Config,
+    sessions: sessions::ManagerHandle,
 
     /// Memoized SSH host key, after first successful load.
     host_key: Option<PrivateKey>,
 }
 
 impl ServerState {
-    pub fn new(config: Config) -> Self {
-        Self {
+    pub async fn new(config: Config) -> Result<Self, std::io::Error> {
+        let minimal_state_dir = config.minimal_state_dir.clone();
+        Ok(Self {
             config,
+            sessions: sessions::Manager::init(minimal_state_dir).await?,
             host_key: None,
-        }
+        })
     }
 }
 
@@ -89,6 +94,11 @@ impl ServerState {
 pub struct ServerStateHandle(Arc<Mutex<ServerState>>);
 
 impl ServerStateHandle {
+    /// Constructs a fresh handle wrapping a newly-initialized [`ServerState`].
+    pub(crate) async fn new(config: Config) -> Result<Self, std::io::Error> {
+        Ok(Self(Arc::new(Mutex::new(ServerState::new(config).await?))))
+    }
+
     pub async fn host_key(&self) -> Result<PrivateKey, KeyError> {
         let mut s = self.0.lock().await;
         if let Some(hk) = &s.host_key {
@@ -103,6 +113,11 @@ impl ServerStateHandle {
             Err(e) => Err(e),
         }
     }
+
+    /// Returns a handle to the sessions manager.
+    pub async fn sessions_manager(&self) -> sessions::ManagerHandle {
+        self.0.lock().await.sessions.clone()
+    }
 }
 
 /// A listening minimald server.
@@ -115,7 +130,7 @@ pub struct Server {
 impl Server {
     /// Launches minimald, listening for connections on the given UDS socket.
     pub async fn run_on_uds(config: Config, listener: UnixListener) -> Result<(), std::io::Error> {
-        let state = ServerStateHandle(Arc::new(Mutex::new(ServerState::new(config))));
+        let state = ServerStateHandle::new(config).await?;
         Server { state, listener }.run().await
     }
 

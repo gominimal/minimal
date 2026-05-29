@@ -4,6 +4,7 @@ use russh::{
 };
 use std::{
     collections::BTreeMap,
+    fmt,
     sync::{Arc, LazyLock},
 };
 use tokio::{
@@ -211,6 +212,21 @@ impl From<serde_json::Error> for ConnectionError {
     }
 }
 
+impl fmt::Display for ConnectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectionError::Protocol(e) => write!(f, "Protocol error: {}", e),
+            ConnectionError::Json(e) => write!(f, "Serialization error: {}", e),
+            ConnectionError::SetupAfterInitiation => write!(
+                f,
+                "Protocol error: Attempted channel configuration after initialization",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConnectionError {}
+
 /// A [`russh::server::Handler`] for a [`Connection`].
 ///
 /// IMPORTANT: Handler methods must be fast to avoid blocking the
@@ -335,7 +351,9 @@ impl russh::server::Handler for ConnectionHandler {
         protocol_trace!("Got subsystem_request on channel {id}: subsystem={name}");
 
         if name.starts_with(rpc::RPC_SUBSYSTEM_PREFIX) {
-            rpc::handle_ssh_rpc(self.0.clone(), name, id, session).await?;
+            let c = self.0.clone();
+            let s = c.0.lock().await.serv.clone();
+            rpc::handle_ssh_rpc(s, c, name, id, session).await?;
         } else {
             session.channel_failure(id)?;
         }

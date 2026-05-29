@@ -1,8 +1,10 @@
 //! The minimal daemon, an SSH server which hosts sessions and
 //! task/sandbox executions within them.
 
+use camino::Utf8PathBuf;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
+use sessions::paths::{DaemonAbsPath, DaemonRelPath};
 use std::path::PathBuf;
 use tokio::net::UnixListener;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -23,36 +25,57 @@ struct Cli {
 impl Cli {
     /// Returns the path to the minimal-dir (base directory for state)
     /// based on command-line arguments.
-    pub fn minimal_state_dir(&self) -> PathBuf {
-        self.global_args.minimal_dir.clone().unwrap_or_else(|| {
-            dirs::state_dir()
-                .unwrap_or_else(|| PathBuf::from("~/.local/state"))
-                .join("minimal")
-        })
+    pub fn minimal_state_dir(&self) -> DaemonAbsPath {
+        match &self.global_args.minimal_dir {
+            Some(d) => {
+                if d.is_absolute() {
+                    DaemonAbsPath::try_new(d.clone()).unwrap()
+                } else {
+                    DaemonAbsPath::from_cwd()
+                        .unwrap()
+                        .join(&DaemonRelPath::try_new(d).unwrap())
+                }
+            }
+            None => DaemonAbsPath::try_new(
+                Utf8PathBuf::from_path_buf(
+                    dirs::state_dir()
+                        .unwrap_or_else(|| PathBuf::from("~/.local/state"))
+                        .join("minimal"),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        }
     }
 
     /// Returns the path to base directory for caching
     /// based on command-line arguments.
-    pub fn minimal_cache_dir(&self) -> PathBuf {
-        dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from("~/.local/cache"))
-            .join("minimal")
+    pub fn minimal_cache_dir(&self) -> DaemonAbsPath {
+        DaemonAbsPath::try_new(
+            Utf8PathBuf::from_path_buf(
+                dirs::cache_dir()
+                    .unwrap_or_else(|| PathBuf::from("~/.local/cache"))
+                    .join("minimal"),
+            )
+            .unwrap(),
+        )
+        .unwrap()
     }
 
     /// Returns the path to the directory containing sockets/info about this daemon for clients.
-    pub fn client_instance_dir(&self) -> PathBuf {
+    pub fn client_instance_dir(&self) -> DaemonAbsPath {
         let instance_num = match &self.command {
             Command::Run(ListenArgs { instance_num }) => *instance_num,
             _ => 0,
         };
         self.minimal_state_dir()
-            .join("providers")
-            .join(format!("local-{instance_num}"))
+            .sub_path("providers")
+            .join(&DaemonRelPath::try_new(format!("local-{instance_num}")).unwrap())
     }
 
     /// Returns the path to the UDS socket we should listen on.
-    pub fn listen_on(&self) -> PathBuf {
-        self.client_instance_dir().join("ssh.sock")
+    pub fn listen_on(&self) -> DaemonAbsPath {
+        self.client_instance_dir().sub_path("ssh.sock")
     }
 }
 
@@ -80,11 +103,11 @@ struct CompletionsArgs {
 pub struct GlobalArgs {
     /// Override the state directory used for operations (default: $XDG_STATE_DIR/minimal)
     #[arg(long)]
-    minimal_dir: Option<PathBuf>,
+    minimal_dir: Option<Utf8PathBuf>,
     /// Load the minimal standard library from the given path instead
     #[arg(long)]
     #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
-    stdlib_dir: Option<PathBuf>,
+    stdlib_dir: Option<Utf8PathBuf>,
 
     /// Configure the number of parallel builds
     #[arg(short, long, global = true)]
@@ -156,10 +179,10 @@ async fn main() -> Result<(), MainError> {
     }
     let listener =
         UnixListener::bind(cli.listen_on()).map_err(|e| MainError::IO(e, "listening to socket"))?;
-    tracing::info!("Started listening on {}", cli.listen_on().display());
+    tracing::info!("Started listening on {}", cli.listen_on());
     tracing::info!(
         "Run the following to debug the socket:\n\nssh -o ProxyCommand='socat - UNIX-CONNECT:{}' \\\n\t-o 'StrictHostKeyChecking=no' -o 'UserKnownHostsFile=/dev/null' \\\n\tlocal",
-        cli.listen_on().display()
+        cli.listen_on()
     );
 
     // TODO: When we have a daemonize command, daemonize here.
@@ -167,7 +190,11 @@ async fn main() -> Result<(), MainError> {
     // Setup the server.
     let config = Config {
         host_key: HostKey::OnDisk {
-            path: cli.client_instance_dir().join("ssh_host_ed25519_key"),
+            path: cli
+                .client_instance_dir()
+                .sub_path("ssh_host_ed25519_key")
+                .as_utf8_path()
+                .into(),
             create_if_missing: true,
         },
         minimal_state_dir: cli.minimal_state_dir(),

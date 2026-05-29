@@ -194,6 +194,29 @@ impl<R: Realm> AbsPath<R> {
         }
     }
 
+    /// Joins a given name *in the same realm*, producing a new
+    /// [`AbsPath<R>`].
+    ///
+    /// We intentionally take a &'static str to make it difficult
+    /// to call this method with anything but a single dir/file.
+    ///
+    /// # Panics
+    ///
+    /// This method will panic if the directory name includes
+    /// nested directories, or attempts to traverse.
+    pub fn sub_path(&self, dir: &'static str) -> AbsPath<R> {
+        assert!(
+            !dir.contains(std::path::MAIN_SEPARATOR_STR),
+            ".subdir(\"{dir}\") contains path separators"
+        );
+        assert!(dir != "..", ".subdir(\"..\") attempts path traversal");
+
+        AbsPath {
+            inner: self.inner.join(dir),
+            _realm: PhantomData,
+        }
+    }
+
     /// Returns the parent directory, if any.
     #[must_use]
     pub fn parent(&self) -> Option<AbsPath<R>> {
@@ -234,6 +257,23 @@ impl<R: Realm> AbsPath<R> {
     /// Iterator over the path's components.
     pub fn components(&self) -> Utf8Components<'_> {
         self.inner.components()
+    }
+
+    /// Returns an absolute path representing the current
+    /// working directory in the current realm.
+    ///
+    /// # Errors
+    ///
+    ///  * The current directory is not accessible
+    ///  * The current directory contains utf8 characters.
+    pub fn from_cwd() -> Result<Self, std::io::Error> {
+        let Ok(cwd) = Utf8PathBuf::from_path_buf(std::env::current_dir()?) else {
+            return Err(std::io::Error::other("cwd contains not-utf8 characters"));
+        };
+        Ok(Self {
+            inner: cwd,
+            _realm: PhantomData,
+        })
     }
 }
 

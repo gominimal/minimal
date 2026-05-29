@@ -5,17 +5,20 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use crate::Record;
-use crate::paths::DaemonPath;
+use crate::paths::{DaemonAbsPath, DaemonRelPath};
 
 /// Describes the session object yielded by [`Loader`].
-pub trait SessionObject<K: SessionKey>: std::fmt::Debug {
+pub trait SessionObject: Sized + Send + 'static + std::fmt::Debug {
+    type Key: SessionKey;
+
     fn record(&self) -> &Record;
-    fn key(&self) -> &K;
+    fn key(&self) -> &Self::Key;
+    fn workspace_path(&self) -> DaemonAbsPath;
 }
 
 /// Describes the primary key a [`Loader`] uses to reference
 /// sessions.
-pub trait SessionKey: Sized + std::fmt::Debug + Clone {
+pub trait SessionKey: Sized + Send + 'static + std::fmt::Debug + Clone + Eq + Ord {
     /// Returns the UUID of the session.
     fn uuid(&self) -> &Uuid;
 }
@@ -23,7 +26,7 @@ pub trait SessionKey: Sized + std::fmt::Debug + Clone {
 /// A type which can load sessions.
 pub trait Loader {
     type Key: SessionKey;
-    type Object: SessionObject<Self::Key>;
+    type Object: SessionObject<Key = Self::Key>;
 
     /// Lists all sessions known to this loader, by key.
     fn list(&self) -> impl Iterator<Item = Self::Key>;
@@ -35,6 +38,24 @@ pub trait Loader {
     /// Returns an I/O error if the backing record cannot be read or
     /// deserialized.
     fn get(&self, key: &Self::Key) -> Result<Self::Object, std::io::Error>;
+
+    /// Returns a lookup key corresponding to the given session ID, if
+    /// a session with that ID is known.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the backing record cannot be read or
+    /// deserialized.
+    fn find_by_uuid(&self, id: &Uuid) -> Result<Option<Self::Key>, std::io::Error>;
+
+    /// Returns a lookup key corresponding to the given session name, if
+    /// a session with that name is known.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the backing record cannot be read or
+    /// deserialized.
+    fn find_by_name<S: AsRef<str>>(&self, name: S) -> Result<Option<Self::Key>, std::io::Error>;
 
     /// Creates a session using the given record.
     ///
@@ -49,10 +70,21 @@ pub trait Loader {
 }
 
 /// The concrete key used to identify sessions from [`DiskLoader`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiskSessionKey {
     session_uuid: Uuid,
     dir_key: String,
+}
+
+impl PartialOrd for DiskSessionKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for DiskSessionKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.session_uuid.cmp(&other.session_uuid)
+    }
 }
 
 impl SessionKey for DiskSessionKey {
@@ -65,15 +97,24 @@ impl SessionKey for DiskSessionKey {
 #[derive(Debug)]
 pub struct DiskSession {
     key: DiskSessionKey,
+    minimal_state_dir: DaemonAbsPath,
     record: Record,
 }
 
-impl SessionObject<DiskSessionKey> for DiskSession {
+impl SessionObject for DiskSession {
+    type Key = DiskSessionKey;
+
     fn record(&self) -> &Record {
         &self.record
     }
     fn key(&self) -> &DiskSessionKey {
         &self.key
+    }
+    fn workspace_path(&self) -> DaemonAbsPath {
+        self.minimal_state_dir
+            .sub_path("sessions")
+            .join(&DaemonRelPath::try_new(&self.key.dir_key).unwrap())
+            .sub_path("tree")
     }
 }
 
@@ -85,7 +126,7 @@ impl SessionObject<DiskSessionKey> for DiskSession {
 ///
 /// ./<short-dir-name>/record.json is the session record.
 pub struct DiskLoader {
-    minimal_dir: DaemonPath,
+    minimal_dir: DaemonAbsPath,
     index: BTreeMap<String, Uuid>,
 }
 
@@ -97,7 +138,7 @@ impl DiskLoader {
     ///
     /// Returns an I/O error if the sessions directory cannot be created or
     /// the existing `index.json` cannot be read.
-    pub fn new(minimal_dir: DaemonPath) -> Result<Self, std::io::Error> {
+    pub fn new(minimal_dir: DaemonAbsPath) -> Result<Self, std::io::Error> {
         std::fs::create_dir_all(minimal_dir.as_utf8_path().join("sessions"))?;
         let index_file = minimal_dir.as_utf8_path().join("sessions/index.json");
         let index = if std::fs::exists(&index_file)? {
@@ -169,12 +210,36 @@ impl Loader for DiskLoader {
             dir_key: short,
         })
     }
+
     fn list(&self) -> impl Iterator<Item = Self::Key> {
         self.index.iter().map(|(short, id)| Self::Key {
             session_uuid: *id,
             dir_key: short.clone(),
         })
     }
+
+    fn find_by_uuid(&self, id: &Uuid) -> Result<Option<Self::Key>, std::io::Error> {
+        Ok(self
+            .index
+            .iter()
+            .find(|(_short, iter_id)| *iter_id == id)
+            .map(|(short, id)| Self::Key {
+                dir_key: short.clone(),
+                session_uuid: *id,
+            }))
+    }
+    fn find_by_name<S: AsRef<str>>(&self, name: S) -> Result<Option<Self::Key>, std::io::Error> {
+        for k in self.list() {
+            let record = self.get(&k)?;
+            if let Some(stored_name) = &record.record().name
+                && stored_name == name.as_ref()
+            {
+                return Ok(Some(k));
+            }
+        }
+        Ok(None)
+    }
+
     fn get(&self, key: &Self::Key) -> Result<Self::Object, std::io::Error> {
         assert!(
             self.index.contains_key(&key.dir_key),
@@ -189,6 +254,7 @@ impl Loader for DiskLoader {
             .join("record.json");
         let record: Record = serde_json::from_reader(std::fs::File::open(record_file)?)?;
         Ok(DiskSession {
+            minimal_state_dir: self.minimal_dir.clone(),
             key: key.clone(),
             record,
         })
@@ -202,8 +268,8 @@ mod tests {
     use std::collections::BTreeSet;
     use tempfile::TempDir;
 
-    fn loader_dir(tmp: &TempDir) -> DaemonPath {
-        DaemonPath::new(tmp.path().to_str().expect("tempdir path is utf8"))
+    fn loader_dir(tmp: &TempDir) -> DaemonAbsPath {
+        DaemonAbsPath::try_new(tmp.path().to_str().unwrap()).unwrap()
     }
 
     fn sample_record() -> Record {
@@ -233,6 +299,17 @@ mod tests {
         assert_eq!(got.record().username, input.username);
         assert_eq!(got.record().project_path, input.project_path);
         assert_eq!(got.record().attrs, input.attrs);
+
+        // Check find_by_uuid as well.
+        assert_eq!(
+            loader.find_by_uuid(&got.record.id).unwrap().as_ref(),
+            Some(&key)
+        );
+        // Check find_by_name as well.
+        assert_eq!(
+            loader.find_by_name(got.record.name.unwrap()).unwrap(),
+            Some(key)
+        );
     }
 
     #[test]
