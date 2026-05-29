@@ -22,13 +22,32 @@ pub enum SessionKeyPredicate {
     Name(String),
 }
 
+/// Transport / internal error when communicating with the sessions actor.
+pub type ResponseError = std::io::Error;
+
+/// Encapsulates the return channel for messages back from the actor.
+struct Responder<T>(oneshot::Sender<Result<T, ResponseError>>);
+
+impl<T> Responder<T> {
+    /// Constructs both ends of the return channel.
+    pub fn channel() -> (Self, oneshot::Receiver<Result<T, ResponseError>>) {
+        let (send, recv) = oneshot::channel();
+        (Self(send), recv)
+    }
+
+    /// Awaits the provided future, transmitting its result to the caller.
+    pub async fn handle<F>(self, fut: F)
+    where
+        F: Future<Output = Result<T, ResponseError>>,
+    {
+        let _ = self.0.send(fut.await);
+    }
+}
+
 enum ManagerMessage {
-    List(oneshot::Sender<Vec<SessionInfo>>),
-    GetRecord(
-        SessionKeyPredicate,
-        oneshot::Sender<Option<sessions::Record>>,
-    ),
-    GetSession(SessionKeyPredicate, oneshot::Sender<Option<SessionHandle>>),
+    List(Responder<Vec<SessionInfo>>),
+    GetRecord(SessionKeyPredicate, Responder<Option<sessions::Record>>),
+    GetSession(SessionKeyPredicate, Responder<Option<SessionHandle>>),
 }
 
 /// Manages session instances, and session state on disk.
@@ -60,6 +79,13 @@ impl Manager {
 }
 
 impl<L: Loader> Manager<L> {
+    fn key_for(&self, pred: &SessionKeyPredicate) -> Result<Option<L::Key>, std::io::Error> {
+        match pred {
+            SessionKeyPredicate::Id(id) => self.store.find_by_uuid(id),
+            SessionKeyPredicate::Name(name) => self.store.find_by_name(name),
+        }
+    }
+
     /// The async task which handles interactions with the
     /// manager.
     async fn mainloop(mut self) {
@@ -73,58 +99,61 @@ impl<L: Loader> Manager<L> {
         match msg {
             // Lists all sessions.
             ManagerMessage::List(r) => {
-                let _ = r.send(
+                r.handle(async {
                     self.store
                         .list()
                         .map(|k| {
-                            let s = self.store.get(&k).unwrap();
+                            let s = self.store.get(&k)?;
                             let r = s.record();
-                            SessionInfo {
+                            Ok::<_, ResponseError>(SessionInfo {
                                 id: r.id,
                                 name: r.name.clone(),
-                            }
+                            })
                         })
-                        .collect(),
-                );
+                        .collect::<Result<_, _>>()
+                })
+                .await;
             }
             // Gets the record for a specific session.
             ManagerMessage::GetRecord(pred, r) => {
-                let _ = r.send(match pred {
-                    SessionKeyPredicate::Id(id) => self
-                        .store
-                        .find_by_uuid(&id)
-                        .unwrap()
-                        .map(|k| self.store.get(&k).unwrap().record().clone()),
-                    SessionKeyPredicate::Name(name) => self
-                        .store
-                        .find_by_name(&name)
-                        .unwrap()
-                        .map(|k| self.store.get(&k).unwrap().record().clone()),
-                });
+                r.handle(async {
+                    Ok::<_, ResponseError>(match pred {
+                        SessionKeyPredicate::Id(id) => self
+                            .store
+                            .find_by_uuid(&id)?
+                            .map(|k| self.store.get(&k).unwrap().record().clone()),
+                        SessionKeyPredicate::Name(name) => self
+                            .store
+                            .find_by_name(&name)?
+                            .map(|k| self.store.get(&k).unwrap().record().clone()),
+                    })
+                })
+                .await;
             }
             // Gets the session actor corresponding to the predicate.
             //
             // If the session is known but not running, it is started.
             ManagerMessage::GetSession(pred, r) => {
-                let k = match pred {
-                    SessionKeyPredicate::Id(id) => self.store.find_by_uuid(&id).unwrap(),
-                    SessionKeyPredicate::Name(name) => self.store.find_by_name(&name).unwrap(),
-                };
-                let _ = match k {
-                    None => r.send(None),
-                    Some(k) => {
-                        let session_handle = match self.running.get(&k) {
-                            Some(h) => h.clone(),
-                            None => {
-                                // Not running, start it!
-                                let h = Session::run(self.store.get(&k).unwrap()).await.unwrap();
-                                self.running.insert(k, h.clone());
-                                h
-                            }
-                        };
-                        r.send(Some(session_handle))
+                r.handle(async {
+                    match self.key_for(&pred)? {
+                        None => Ok(None),
+                        Some(k) => {
+                            let session_handle = match self.running.get(&k) {
+                                Some(h) => h.clone(),
+                                None => {
+                                    // Not running, start it!
+                                    let h = Session::run(self.store.get(&k)?)
+                                        .await
+                                        .expect("TODO handle error");
+                                    self.running.insert(k, h.clone());
+                                    h
+                                }
+                            };
+                            Ok(Some(session_handle))
+                        }
                     }
-                };
+                })
+                .await;
             }
         }
     }
@@ -136,24 +165,30 @@ pub struct ManagerHandle(mpsc::Sender<ManagerMessage>);
 
 impl ManagerHandle {
     /// Lists the sessions known to this (minimald) instance.
-    pub async fn list(&self) -> Vec<SessionInfo> {
-        let (send, recv) = oneshot::channel();
+    pub async fn list(&self) -> Result<Vec<SessionInfo>, ResponseError> {
+        let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(ManagerMessage::List(send)).await;
         recv.await.expect("corresponding sessions manager is dead")
     }
 
     /// Gets the session record which corresponds to the given predicate.
-    pub async fn get_record(&self, pred: SessionKeyPredicate) -> Option<sessions::Record> {
-        let (send, recv) = oneshot::channel();
+    pub async fn get_record(
+        &self,
+        pred: SessionKeyPredicate,
+    ) -> Result<Option<sessions::Record>, ResponseError> {
+        let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(ManagerMessage::GetRecord(pred, send)).await;
         recv.await.expect("corresponding sessions manager is dead")
     }
 
     /// Gets a handle to the session corresponding with the given predicate.
-    pub async fn get_session(&self, pred: SessionKeyPredicate) -> Option<SessionHandle> {
-        let (send, recv) = oneshot::channel();
+    pub async fn get_session(
+        &self,
+        pred: SessionKeyPredicate,
+    ) -> Result<Option<SessionHandle>, ResponseError> {
+        let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(ManagerMessage::GetSession(pred, send)).await;
         recv.await.expect("corresponding sessions manager is dead")

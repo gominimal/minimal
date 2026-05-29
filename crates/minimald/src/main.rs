@@ -4,8 +4,10 @@
 use camino::Utf8PathBuf;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
-use sessions::paths::{DaemonAbsPath, DaemonRelPath};
-use std::path::PathBuf;
+use sessions::{
+    paths::{CwdRelative, Daemon, DaemonAbsPath, DaemonRelPath},
+    sub_path,
+};
 use tokio::net::UnixListener;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -27,19 +29,11 @@ impl Cli {
     /// based on command-line arguments.
     pub fn minimal_state_dir(&self) -> DaemonAbsPath {
         match &self.global_args.minimal_dir {
-            Some(d) => {
-                if d.is_absolute() {
-                    DaemonAbsPath::try_new(d.clone()).unwrap()
-                } else {
-                    DaemonAbsPath::from_cwd()
-                        .unwrap()
-                        .join(&DaemonRelPath::try_new(d).unwrap())
-                }
-            }
+            Some(p) => p.resolve().unwrap(),
             None => DaemonAbsPath::try_new(
                 Utf8PathBuf::from_path_buf(
                     dirs::state_dir()
-                        .unwrap_or_else(|| PathBuf::from("~/.local/state"))
+                        .unwrap_or_else(|| dirs::home_dir().unwrap().join(".local/state"))
                         .join("minimal"),
                 )
                 .unwrap(),
@@ -54,7 +48,7 @@ impl Cli {
         DaemonAbsPath::try_new(
             Utf8PathBuf::from_path_buf(
                 dirs::cache_dir()
-                    .unwrap_or_else(|| PathBuf::from("~/.local/cache"))
+                    .unwrap_or_else(|| dirs::home_dir().unwrap().join(".local/cache"))
                     .join("minimal"),
             )
             .unwrap(),
@@ -68,14 +62,13 @@ impl Cli {
             Command::Run(ListenArgs { instance_num }) => *instance_num,
             _ => 0,
         };
-        self.minimal_state_dir()
-            .sub_path("providers")
+        sub_path!(self.minimal_state_dir(), "providers")
             .join(&DaemonRelPath::try_new(format!("local-{instance_num}")).unwrap())
     }
 
     /// Returns the path to the UDS socket we should listen on.
     pub fn listen_on(&self) -> DaemonAbsPath {
-        self.client_instance_dir().sub_path("ssh.sock")
+        sub_path!(self.client_instance_dir(), "ssh.sock")
     }
 }
 
@@ -103,11 +96,11 @@ struct CompletionsArgs {
 pub struct GlobalArgs {
     /// Override the state directory used for operations (default: $XDG_STATE_DIR/minimal)
     #[arg(long)]
-    minimal_dir: Option<Utf8PathBuf>,
+    minimal_dir: Option<CwdRelative<Daemon>>,
     /// Load the minimal standard library from the given path instead
     #[arg(long)]
     #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
-    stdlib_dir: Option<Utf8PathBuf>,
+    stdlib_dir: Option<CwdRelative<Daemon>>,
 
     /// Configure the number of parallel builds
     #[arg(short, long, global = true)]
@@ -190,9 +183,7 @@ async fn main() -> Result<(), MainError> {
     // Setup the server.
     let config = Config {
         host_key: HostKey::OnDisk {
-            path: cli
-                .client_instance_dir()
-                .sub_path("ssh_host_ed25519_key")
+            path: sub_path!(cli.client_instance_dir(), "ssh_host_ed25519_key")
                 .as_utf8_path()
                 .into(),
             create_if_missing: true,
