@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/minvmd",
     "crates/args",
     "crates/lcache",
     "crates/rcache",
