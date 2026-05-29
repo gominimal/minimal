@@ -169,6 +169,6 @@ flowchart TD
 | minvmd | VM provider — hosts VMs; each VM runs a minimald and minvmd proxies its socket to the host. |
 | minhosted | Hosted provider — hosts sessions on an externally managed backend. |
 | mincloud | Cloud provider — hosts sessions on a cloud backend. |
+| Minimal | Client process; discovers providers via sockets, starts a default/config provider when none exist. |
 
 > Note: `minhosted` and `mincloud` are placeholders. They could be specialized into neocloud or hyperscaler-specific backends (e.g. a per-provider daemon for a specific neocloud, or AWS/GCP/Azure).
-| Minimal | Client process; discovers providers via sockets, starts a default/config provider when none exist. |
