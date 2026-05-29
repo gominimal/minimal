@@ -45,3 +45,6 @@ toml_edit.workspace = true
 petgraph.workspace = true
 smallvec.workspace = true
 
+[dev-dependencies]
+serial_test.workspace = true
+

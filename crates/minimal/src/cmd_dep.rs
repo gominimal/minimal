@@ -758,6 +758,7 @@ mod tests {
     use super::*;
     use decode::Layer;
     use graph::Graph;
+    use serial_test::serial;
 
     /// `Layer::new_for_test` reads `CARGO_MANIFEST_DIR` at runtime to locate
     /// `minimal-ncl/minimal.ncl`.  When running tests from the `minimal` crate
@@ -769,8 +770,9 @@ mod tests {
             .join("../decode")
             .canonicalize()
             .expect("decode crate dir must exist");
-        // SAFETY: All tests in this module set the same canonical path, so there
-        // is no data race between concurrent test threads.
+        // SAFETY: Tests that call this helper are annotated with #[serial]
+        // (via serial_test), which ensures only one such test runs at a time
+        // and prevents concurrent environment mutation.
         unsafe {
             std::env::set_var("CARGO_MANIFEST_DIR", decode_dir);
         }
@@ -862,6 +864,7 @@ mod tests {
         pgraph_copy_subset(graph, &gd.pgraph, &gd.bsname_to_node_index, &args).unwrap()
     }
 
+    #[serial]
     #[test]
     fn build_spec_dep_followed_when_enabled() {
         let graph = graph_a_build_dep_b();
@@ -873,6 +876,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn build_spec_dep_omitted_when_disabled() {
         let graph = graph_a_build_dep_b();
@@ -884,6 +888,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn input_deps_depth_zero_stops_at_root() {
         let graph = graph_a_build_dep_b();
@@ -895,6 +900,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn input_deps_depth_one_stops_after_one_hop() {
         let graph = graph_chain_a_b_c();
@@ -906,6 +912,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn excludes_stops_traversal_through_excluded_node() {
         let graph = graph_chain_a_b_c();
@@ -917,6 +924,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn runtime_dep_followed_by_default() {
         let graph = graph_a_runtime_dep_b();
@@ -928,6 +936,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn runtime_dep_omitted_at_depth_zero() {
         let graph = graph_a_runtime_dep_b();
