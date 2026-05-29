@@ -19,6 +19,7 @@ pub mod vars;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
     /// Unique ID describing this session.
+    #[serde(default = "Uuid::nil")]
     pub id: Uuid,
     /// The name a user assigned to this session, if
     /// one was specifically assigned.

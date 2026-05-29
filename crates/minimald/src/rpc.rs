@@ -99,7 +99,7 @@ impl GetVersion {
 pub struct ListSessions;
 
 /// An entry in the ListSessions response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ListSessionsEntry {
     pub id: Uuid,
     pub name: Option<String>,
@@ -193,6 +193,46 @@ impl GetSessionRecord {
     }
 }
 
+/// An RPC to create a new session based on the given record.
+pub struct CreateSession;
+
+/// The request for a [`CreateSession`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSessionRequest {
+    pub record: sessions::Record,
+}
+
+/// The response for a [`CreateSession`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSessionResponse {
+    pub id: Uuid,
+}
+
+impl OneshotSshRpc for CreateSession {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "CreateSession");
+    type Request<'a> = CreateSessionRequest;
+    type Response = CreateSessionResponse;
+}
+
+impl CreateSession {
+    pub async fn handle(self, s: ServerStateHandle, c: RuChannel<Msg>) {
+        let res = self
+            .handle_channel(c, async |req| {
+                let mngr = s.sessions_manager().await;
+                Ok(CreateSessionResponse {
+                    id: mngr
+                        .create_session(req.record)
+                        .await
+                        .map_err(|e| ConnectionError::Internal(e.to_string()))?,
+                })
+            })
+            .await;
+        if let Err(e) = res {
+            tracing::warn!("RPC handler for {} failed: {}", Self::NAME, e);
+        }
+    }
+}
+
 /// Handles an RPC going over an SSH subsystem channel.
 ///
 /// This method takes ownership of the ssh channel, including
@@ -211,7 +251,7 @@ pub async fn handle_ssh_rpc(
 ) -> Result<(), ConnectionError> {
     // Take the channel from connection state if its a known RPC.
     let channel = match name {
-        GetVersion::NAME | ListSessions::NAME | GetSessionRecord::NAME => {
+        GetVersion::NAME | ListSessions::NAME | GetSessionRecord::NAME | CreateSession::NAME => {
             let mut conn_lock = c.lock().await;
             let c_hnd = match conn_lock.take(id) {
                 None => {
@@ -239,6 +279,7 @@ pub async fn handle_ssh_rpc(
         GetVersion::NAME => spawn(GetVersion.handle(channel)),
         ListSessions::NAME => spawn(ListSessions.handle(s, channel)),
         GetSessionRecord::NAME => spawn(GetSessionRecord.handle(s, channel)),
+        CreateSession::NAME => spawn(CreateSession.handle(s, channel)),
         _ => unreachable!(),
     };
 
@@ -247,6 +288,8 @@ pub async fn handle_ssh_rpc(
 
 #[cfg(test)]
 mod tests {
+    use sessions::paths::HostAbsPath;
+
     use super::*;
     use crate::test_harness::TestServer;
 
@@ -311,5 +354,47 @@ mod tests {
             let resp = client.call::<GetVersion>(&()).await;
             assert_eq!(resp.version, env!("CARGO_PKG_VERSION"));
         }
+    }
+
+    #[tokio::test]
+    async fn create_session_shows_in_get_and_list() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let create_session = client
+            .call::<CreateSession>(&CreateSessionRequest {
+                record: sessions::Record {
+                    id: Uuid::nil(),
+                    name: Some("my session".to_string()),
+                    username: None,
+                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
+                    attrs: Default::default(),
+                },
+            })
+            .await;
+
+        assert!(create_session.id != Uuid::nil());
+
+        let get_session = client
+            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(create_session.id))
+            .await;
+        assert_eq!(get_session.record.as_ref().unwrap().id, create_session.id);
+        assert_eq!(
+            get_session.record.as_ref().unwrap().name,
+            Some("my session".to_string())
+        );
+        assert_eq!(
+            get_session.record.as_ref().unwrap().project_path,
+            HostAbsPath::try_new("/uwu").unwrap()
+        );
+
+        let list_sessions = client.call::<ListSessions>(&()).await;
+        assert_eq!(
+            list_sessions.sessions,
+            vec![ListSessionsEntry {
+                id: create_session.id,
+                name: Some("my session".to_string()),
+            }]
+        );
     }
 }

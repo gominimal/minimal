@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::paths::{DaemonAbsPath, DaemonRelPath};
@@ -106,6 +107,21 @@ impl SessionObject for DiskSession {
     }
 }
 
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct Index {
+    short_to_uuid: BTreeMap<String, Uuid>,
+    name_to_uuid: BTreeMap<String, Uuid>,
+}
+
+impl Index {
+    pub fn insert(&mut self, short: String, uuid: Uuid, name: Option<String>) {
+        self.short_to_uuid.insert(short, uuid);
+        if let Some(name) = name {
+            self.name_to_uuid.insert(name, uuid);
+        }
+    }
+}
+
 /// A loader of session state based on <minimal-state-dir>/sessions.
 ///
 /// ./index.json maps short directory names to session UUIDs. Typically
@@ -115,7 +131,7 @@ impl SessionObject for DiskSession {
 /// ./<short-dir-name>/record.json is the session record.
 pub struct DiskLoader {
     minimal_dir: DaemonAbsPath,
-    index: BTreeMap<String, Uuid>,
+    index: Index,
 }
 
 impl DiskLoader {
@@ -132,7 +148,7 @@ impl DiskLoader {
         let index = if std::fs::exists(&index_file)? {
             serde_json::from_reader(std::fs::File::open(index_file)?)?
         } else {
-            BTreeMap::new()
+            Index::default()
         };
 
         Ok(Self { minimal_dir, index })
@@ -167,6 +183,15 @@ impl Loader for DiskLoader {
     type Object = DiskSession;
 
     fn create(&mut self, mut record: Record) -> Result<Self::Key, std::io::Error> {
+        if let Some(name) = &record.name
+            && self.index.name_to_uuid.contains_key(name)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("a session with name `{name}` already exists"),
+            ));
+        }
+
         let uuid = Uuid::now_v7();
         record.id = uuid;
 
@@ -175,7 +200,7 @@ impl Loader for DiskLoader {
         // We got unlucky and the short name collided, 20 bits of entropy
         // so rare but very possible. Increment the short name past
         // any collisions in this case.
-        while self.index.contains_key(&short) {
+        while self.index.short_to_uuid.contains_key(&short) {
             let n = u32::from_str_radix(&short, 16)
                 .expect("short dir name is always 5 hex chars from a UUID suffix");
             short = format!("{:05x}", n.wrapping_add(1));
@@ -190,7 +215,7 @@ impl Loader for DiskLoader {
         let record_file = session_dir.join("record.json");
         serde_json::to_writer(std::fs::File::create(record_file)?, &record)?;
 
-        self.index.insert(short.clone(), uuid);
+        self.index.insert(short.clone(), uuid, record.name);
         self.flush()?;
 
         Ok(DiskSessionKey {
@@ -200,15 +225,19 @@ impl Loader for DiskLoader {
     }
 
     fn list(&self) -> impl Iterator<Item = Self::Key> {
-        self.index.iter().map(|(short, id)| Self::Key {
-            session_uuid: *id,
-            dir_key: DaemonRelPath::try_new(short).unwrap(),
-        })
+        self.index
+            .short_to_uuid
+            .iter()
+            .map(|(short, id)| Self::Key {
+                session_uuid: *id,
+                dir_key: DaemonRelPath::try_new(short).unwrap(),
+            })
     }
 
     fn find_by_uuid(&self, id: &Uuid) -> Result<Option<Self::Key>, std::io::Error> {
         Ok(self
             .index
+            .short_to_uuid
             .iter()
             .find(|(_short, iter_id)| *iter_id == id)
             .map(|(short, id)| Self::Key {
@@ -217,20 +246,15 @@ impl Loader for DiskLoader {
             }))
     }
     fn find_by_name<S: AsRef<str>>(&self, name: S) -> Result<Option<Self::Key>, std::io::Error> {
-        for k in self.list() {
-            let record = self.get(&k)?;
-            if let Some(stored_name) = &record.record().name
-                && stored_name == name.as_ref()
-            {
-                return Ok(Some(k));
-            }
+        match self.index.name_to_uuid.get(name.as_ref()) {
+            Some(uuid) => self.find_by_uuid(uuid),
+            None => Ok(None),
         }
-        Ok(None)
     }
 
     fn get(&self, key: &Self::Key) -> Result<Self::Object, std::io::Error> {
         assert!(
-            self.index.contains_key(key.dir_key.as_str()),
+            self.index.short_to_uuid.contains_key(key.dir_key.as_str()),
             "key {:?} not present in index — Keys are only handed out for sessions that exist",
             key.dir_key,
         );
@@ -253,7 +277,7 @@ impl Loader for DiskLoader {
 mod tests {
     use super::*;
     use crate::paths::HostAbsPath;
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, io::ErrorKind};
     use tempfile::TempDir;
 
     fn loader_dir(tmp: &TempDir) -> DaemonAbsPath {
@@ -315,12 +339,33 @@ mod tests {
     }
 
     #[test]
+    fn create_errors_on_non_unique_name() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        loader.create(sample_record()).unwrap();
+        assert_eq!(
+            loader.create(sample_record()).err().map(|e| e.kind()),
+            Some(ErrorKind::AlreadyExists)
+        );
+    }
+
+    #[test]
     fn list_yields_a_key_for_every_created_session() {
         let tmp = TempDir::new().unwrap();
         let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
 
         let created: BTreeSet<Uuid> = (0..5)
-            .map(|_| *loader.create(sample_record()).unwrap().uuid())
+            .map(|i| {
+                *loader
+                    .create({
+                        let mut record = sample_record();
+                        record.name = Some(format!("session-{i}"));
+                        record
+                    })
+                    .unwrap()
+                    .uuid()
+            })
             .collect();
         let listed: BTreeSet<Uuid> = loader.list().map(|k| *k.uuid()).collect();
 
