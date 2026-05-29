@@ -36,6 +36,7 @@ codegen-units = 1
 
 [workspace.dependencies]
 anyhow = "1.0"
+async-trait = "0.1"
 blake3 = { version = "1", features = ["serde"] }
 bytes = "1.11" # keep in sync with reqwest
 bzip2 = "0.6"

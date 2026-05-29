@@ -3392,10 +3392,14 @@ name = "minvmd"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "camino",
  "clap",
  "dirs",
+ "nix 0.31.3",
  "serde",
  "serial_test",
+ "sessions",
  "tempfile",
  "tokio",
  "toml 1.1.2+spec-1.1.0",

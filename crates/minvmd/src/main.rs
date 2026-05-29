@@ -8,8 +8,15 @@
 mod config;
 #[cfg(any(target_os = "macos", test))]
 mod error;
+#[cfg(any(target_os = "macos", test))]
+mod image;
 #[cfg(target_os = "macos")]
 mod launchd;
+// lifecycle's surface (KrunkitRunner seam, up/down/status) has no production
+// caller until the CLI dispatch is wired, so it is dead on the plain bin build.
+#[cfg(any(target_os = "macos", test))]
+#[allow(dead_code)]
+mod lifecycle;
 
 #[cfg(test)]
 mod test_support;

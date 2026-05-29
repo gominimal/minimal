@@ -10,9 +10,15 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace             = true
+async-trait.workspace        = true
+camino.workspace             = true
 clap.workspace               = true
 dirs.workspace               = true
+# Workspace `nix` is `features = ["fs"]`; minvmd's lifecycle SIGTERM/reap path
+# needs `signal` + `process` on top (Cargo unions these with the workspace set).
+nix                          = { workspace = true, features = ["signal", "process"] }
 serde.workspace              = true
+sessions                     = { path = "../sessions" }
 toml.workspace               = true
 tokio.workspace              = true
 tracing.workspace            = true
