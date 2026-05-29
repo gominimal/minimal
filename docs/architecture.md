@@ -77,5 +77,5 @@ or if it exists in the remote cache, we download it.
 
 ### Cache Inspection
 - Cache entries are content-addressed by Blake3 hash of complete build spec
-- Use `find ~/.cache/built -name "*pattern*"` to locate specific builds
+- Use `find ~/.cache/minimal/built -name "*pattern*"` to locate specific builds
 - Each cache entry contains the complete build output directory tree
