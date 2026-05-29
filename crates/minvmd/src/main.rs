@@ -4,8 +4,18 @@
 
 // The broker is macOS-only, but the modules are gated to `macos` *or* `test` so
 // the unit tests still compile and run on Linux CI.
+// broker ships serve() — the UDS↔vsock byte-pump. No production caller is
+// wired into the dispatch yet, so the surface is dead on the plain bin build.
+#[cfg(any(target_os = "macos", test))]
+#[allow(dead_code)]
+mod broker;
 #[cfg(any(target_os = "macos", test))]
 mod config;
+// debug_shell's connect path is reached only via the macOS dispatch, so on the
+// Linux (cfg(test)) build it has no caller.
+#[cfg(any(target_os = "macos", test))]
+#[allow(dead_code)]
+mod debug_shell;
 #[cfg(any(target_os = "macos", test))]
 mod error;
 #[cfg(any(target_os = "macos", test))]
@@ -17,6 +27,8 @@ mod launchd;
 #[cfg(any(target_os = "macos", test))]
 #[allow(dead_code)]
 mod lifecycle;
+#[cfg(any(target_os = "macos", test))]
+mod uds;
 
 #[cfg(test)]
 mod test_support;

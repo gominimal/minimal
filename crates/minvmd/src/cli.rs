@@ -3,7 +3,7 @@
 use clap::{Parser, Subcommand};
 
 use crate::error::UserFacing;
-use crate::{config, image};
+use crate::{config, debug_shell, image};
 
 #[derive(Parser)]
 #[command(name = "minvmd", about = "macOS VM host broker for minimald")]
@@ -43,8 +43,9 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Status => Err(anyhow::Error::from(UserFacing::new(
             "not yet implemented: minvmd status",
         ))),
-        Command::DebugShell => Err(anyhow::Error::from(UserFacing::new(
-            "not yet implemented: minvmd debug-shell",
-        ))),
+        Command::DebugShell => {
+            let socket_path = debug_shell::debug_shell_socket_path()?;
+            debug_shell::connect_debug_shell(socket_path.as_utf8_path().as_std_path()).await
+        }
     }
 }
