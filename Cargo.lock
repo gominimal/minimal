@@ -3362,6 +3362,7 @@ dependencies = [
 name = "minimald"
 version = "0.0.1"
 dependencies = [
+ "camino",
  "clap",
  "clap_complete",
  "constcat",
@@ -3371,11 +3372,14 @@ dependencies = [
  "russh",
  "serde",
  "serde_json",
+ "sessions",
  "stdlib",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

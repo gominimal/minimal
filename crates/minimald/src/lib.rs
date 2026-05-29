@@ -3,6 +3,10 @@ use std::collections::BTreeMap;
 pub mod connection;
 pub mod rpc;
 pub mod server;
+mod session;
+mod sessions;
+#[cfg(test)]
+mod test_harness;
 
 /// Represents the parameters of a requested PTY.
 #[derive(Debug, Clone)]

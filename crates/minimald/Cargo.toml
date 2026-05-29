@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+camino.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 constcat.workspace = true
@@ -12,6 +13,7 @@ dirs.workspace = true
 russh.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
 
 futures.workspace = true
 tokio.workspace = true
@@ -20,4 +22,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 ot.workspace = true
+sessions.workspace = true
 stdlib.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
