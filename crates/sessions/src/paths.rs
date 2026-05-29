@@ -265,7 +265,7 @@ impl<R: Realm> AbsPath<R> {
     /// # Errors
     ///
     ///  * The current directory is not accessible
-    ///  * The current directory contains utf8 characters.
+    ///  * The current directory contains non-UTF8 characters.
     pub fn from_cwd() -> Result<Self, std::io::Error> {
         let Ok(cwd) = Utf8PathBuf::from_path_buf(std::env::current_dir()?) else {
             return Err(std::io::Error::other("cwd contains not-utf8 characters"));
