@@ -1,1 +1,4 @@
 target/
+
+# Serena MCP working-tree state (spectacles quick-setup).
+.serena/

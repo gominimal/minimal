@@ -1,0 +1,157 @@
+name: sdd-validate
+
+# Thin wrapper for the sdd-validate agent.
+#
+# The agent itself is the reusable workflow
+# .github/workflows/sdd-validate.lock.yml (compiled from sdd-validate.md, which
+# declares on: workflow_call). This wrapper carries the real event triggers and
+# passes the triggering entity to the agent through the aw_context input. A
+# consumer repository installs this wrapper unchanged.
+#
+# sdd-validate has no comment-command trigger, so this wrapper performs no
+# repository-permission gate: the gh-aw command:/slash_command trigger is not
+# used here. The triggers are a pull request opened or synchronized and a
+# tracking issue gaining the sdd:ready label.
+#
+# No needs-human-removal resume is wired here. When sdd-validate escalates a
+# Blocker on a pull request, the hand-off is resumed by a fresh
+# pull_request: synchronize — the human's fix commit — not by an unlabeled
+# event: clearing needs-human without a code change would only re-run the same
+# gate set against the unchanged diff and re-post the same Blocker. A Blocker
+# at the triage boundary is advisory (validation gates neither a merge nor
+# /approve), so it needs no agent re-run. The wrapper therefore subscribes to
+# no unlabeled event. See the "Triggers this agent handles" section of
+# .github/workflows/sdd-validate.md.
+
+on:
+  # A pull request was opened or updated: the spec, architecture, or
+  # implementation boundary. synchronize also resumes a PR-boundary needs-human
+  # hand-off, since the human's fix commit fires it.
+  pull_request:
+    types: [opened, synchronize]
+  # A tracking issue gained sdd:ready: the non-pull-request triage boundary.
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  # Resolve which situation triggered the wrapper and build the aw_context the
+  # reusable workflow consumes. A non-match leaves should_run = false so the
+  # agent job is skipped.
+  #
+  # The job-level if: gate skips the route job entirely on issues label events
+  # whose label this wrapper does not route (fixes issue #119 — the
+  # sdd:in-progress/sdd:dispatched label mutations a /dispatch performs on a
+  # tracker no longer spawn a route-job runner on this wrapper). The route
+  # step routes an `issues` event only on `labeled` `sdd:ready`; every other
+  # label add is skipped here without a runner. pull_request events pass
+  # through unchanged.
+  route:
+    if: |
+      github.event_name != 'issues'
+      || (
+        github.event.action == 'labeled'
+        && github.event.label.name == 'sdd:ready'
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+      aw_context: ${{ steps.decide.outputs.aw_context }}
+    steps:
+      - name: Decide whether to run and build aw_context
+        id: decide
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const event = context.eventName;
+            const payload = context.payload;
+            let run = false;
+            let ctx = {};
+
+            // A pull request was opened or synchronized. Every such event is
+            // validated; the agent resolves the boundary from the changed
+            // files. A draft pull request is still validated: validation is
+            // advisory and never blocks.
+            if (event === 'pull_request') {
+              const action = payload.action;
+              if (action === 'opened' || action === 'synchronize') {
+                run = true;
+                ctx = {
+                  item_type: 'pull_request',
+                  item_number: payload.pull_request.number,
+                };
+              }
+            }
+
+            // A tracking issue gained sdd:ready: the triage boundary. This
+            // agent has no needs-human-removal resume, so an unlabeled event
+            // is not routed (see the header comment).
+            //
+            // sdd:ready is also applied by sdd-triage phase C to every
+            // unblocked task sub-issue, so the labelled item may be a task,
+            // not a tracking issue. The triage boundary is the tracking
+            // issue only: filter the event by the absence of a parent issue.
+            // A tracking issue has no parent; a Unit and a task each have
+            // one (their parent in the feature tree). The REST issue object
+            // exposes `parent_issue_url` for the sub-issues feature; a
+            // non-empty value means the labelled item is nested under
+            // another issue and is therefore not a tracking issue.
+            if (event === 'issues') {
+              const action = payload.action;
+              const label = payload.label && payload.label.name;
+              if (action === 'labeled' && label === 'sdd:ready') {
+                let parentUrl = '';
+                try {
+                  const { data } = await github.rest.issues.get({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: payload.issue.number,
+                  });
+                  parentUrl = data.parent_issue_url || '';
+                } catch (err) {
+                  core.info('Could not fetch issue #'
+                    + payload.issue.number + ': ' + err.message);
+                }
+                if (parentUrl) {
+                  core.info('Issue #' + payload.issue.number
+                    + ' has a parent (' + parentUrl
+                    + '); not a tracking issue, ignoring.');
+                } else {
+                  run = true;
+                  ctx = {
+                    item_type: 'issue',
+                    item_number: payload.issue.number,
+                  };
+                }
+              }
+            }
+
+            core.setOutput('should_run', run ? 'true' : 'false');
+            core.setOutput('aw_context', run ? JSON.stringify(ctx) : '');
+
+  sdd-validate:
+    needs: route
+    if: needs.route.outputs.should_run == 'true'
+    uses: norrietaylor/spectacles/.github/workflows/sdd-validate.lock.yml@main
+    with:
+      aw_context: ${{ needs.route.outputs.aw_context }}
+    # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
+    # to a reusable workflow in a different owner than the caller.
+    secrets:
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+    # Ceiling for the called reusable workflow. Must cover the union of every
+    # nested job's permissions: the gh-aw conclusion and safe_outputs jobs
+    # need write scopes, and activation needs actions: read. sdd-validate
+    # opens no pull request, so contents stays read.
+    permissions:
+      actions: read
+      contents: read
+      discussions: write
+      issues: write
+      pull-requests: write

@@ -1,0 +1,231 @@
+name: sdd-triage
+
+# Thin wrapper for the sdd-triage agent.
+#
+# The agent itself is the reusable workflow
+# .github/workflows/sdd-triage.lock.yml (compiled from sdd-triage.md, which
+# declares on: workflow_call). This wrapper carries the real event triggers,
+# gates the comment commands to authors with repository write access, and
+# passes the triggering entity to the agent through the aw_context input. A
+# consumer repository installs this wrapper unchanged.
+#
+# The gh-aw command:/slash_command trigger (with its roles: gate) is not used
+# here: that trigger is gh-aw frontmatter and only takes effect when gh aw
+# compiles a workflow. This wrapper is a hand-written GitHub Actions workflow,
+# not a gh-aw source file, so gh aw never processes it. The gating is therefore
+# done explicitly below with a real repository-permission check.
+
+on:
+  # A tracking issue gained the sdd:triage label (phase A), or the needs-human
+  # label was cleared (resume).
+  issues:
+    types: [labeled, unlabeled]
+  # A /triage, /approve, or /revise comment on an issue or pull request.
+  issue_comment:
+    types: [created]
+  # An architecture pull request was closed; the agent runs phase B only when
+  # it was merged and the head branch follows the arch/<slug> convention.
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+
+jobs:
+  # Resolve which situation triggered the wrapper and build the aw_context the
+  # reusable workflow consumes. A non-match leaves should_run = false so the
+  # agent job is skipped.
+  #
+  # The job-level if: gate skips the route job entirely on issue_comment
+  # events whose body does not start with one of the commands this wrapper
+  # owns, and on issues label events whose label this wrapper does not route
+  # (fixes issue #119 — a /dispatch or /execute comment, or the
+  # sdd:in-progress/sdd:dispatched label mutations a /dispatch performs on a
+  # tracker, no longer spawn a route-job runner on this wrapper). The route
+  # step routes an `issues` event only on `labeled` `sdd:triage` or
+  # `unlabeled` `needs-human`; every other label add/remove is skipped here
+  # without a runner.
+  route:
+    if: |
+      (github.event_name != 'issue_comment' && github.event_name != 'issues')
+      || (
+        github.event_name == 'issue_comment'
+        && (
+          startsWith(github.event.comment.body, '/triage')
+          || startsWith(github.event.comment.body, '/approve')
+          || startsWith(github.event.comment.body, '/revise')
+        )
+      )
+      || (
+        github.event_name == 'issues'
+        && (
+          (
+            github.event.action == 'labeled'
+            && github.event.label.name == 'sdd:triage'
+          )
+          || (
+            github.event.action == 'unlabeled'
+            && github.event.label.name == 'needs-human'
+          )
+        )
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+      aw_context: ${{ steps.decide.outputs.aw_context }}
+    steps:
+      - name: Decide whether to run and build aw_context
+        id: decide
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const event = context.eventName;
+            const payload = context.payload;
+            let run = false;
+            let ctx = {};
+
+            // A tracking issue gained sdd:triage (phase A), or needs-human was
+            // cleared (resume).
+            if (event === 'issues') {
+              const action = payload.action;
+              const label = payload.label && payload.label.name;
+              if (action === 'labeled' && label === 'sdd:triage') {
+                run = true;
+              } else if (action === 'unlabeled' && label === 'needs-human') {
+                run = true;
+              }
+              if (run) {
+                ctx = { item_type: 'issue', item_number: payload.issue.number };
+              }
+            }
+
+            // A /triage, /approve, or /revise comment from an author with repo
+            // write access. The gate is the actor's real repository
+            // permission, not author_association: author_association reports
+            // the relationship to the thread (OWNER/MEMBER/COLLABORATOR),
+            // which is not the same as push access. A MEMBER of the org need
+            // not have write on this repo, and a COLLABORATOR may be
+            // read-only. The collaborators/{user}/permission API returns the
+            // actual permission level; only write, maintain, or admin may run
+            // a command.
+            if (event === 'issue_comment' && payload.action === 'created') {
+              const body = (payload.comment.body || '').trim();
+              const firstWord = body.split(/\s+/)[0];
+              const isCommand = firstWord === '/triage'
+                || firstWord === '/approve' || firstWord === '/revise';
+              if (isCommand) {
+                const actor = payload.comment.user.login;
+                let permission = 'none';
+                try {
+                  const resp = await github.rest.repos
+                    .getCollaboratorPermissionLevel({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      username: actor,
+                    });
+                  // role_name is the precise role (write/maintain/triage/...)
+                  // when present; permission is the legacy bucket
+                  // (admin/write/read/none) that collapses maintain into
+                  // write and triage into read.
+                  permission = resp.data.role_name || resp.data.permission;
+                } catch (err) {
+                  core.info(
+                    'Could not resolve repo permission for ' + actor
+                    + ': ' + err.message);
+                }
+                const canWrite = permission === 'write'
+                  || permission === 'maintain' || permission === 'admin';
+                if (canWrite) {
+                  // Fast-path carve-out (ADR 0012): /approve on a tracking
+                  // issue carrying sdd:fastpath (or sdd:fastpath-review,
+                  // when the human typed /approve before the stub spec PR
+                  // merged) is handled by the sdd-spec wrapper's
+                  // fastpath-approve job (it dispatches sdd-execute-{tier}
+                  // directly, or noops with a guidance comment when the
+                  // stub PR is still open). This wrapper skips /approve in
+                  // both cases so the two wrappers do not both fire on the
+                  // same comment.
+                  const isPr = !!payload.issue.pull_request;
+                  let skipFastpath = false;
+                  if (firstWord === '/approve' && !isPr) {
+                    try {
+                      const { data } = await github.rest.issues.get({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        issue_number: payload.issue.number,
+                      });
+                      const labels = (data.labels || []).map(
+                        (l) => l.name || l);
+                      if (labels.includes('sdd:fastpath')
+                          || labels.includes('sdd:fastpath-review')) {
+                        skipFastpath = true;
+                        core.info('/approve on a fast-path tracking'
+                          + ' issue; sdd-spec wrapper will handle it.');
+                      }
+                    } catch (err) {
+                      core.info('Could not fetch issue #'
+                        + payload.issue.number + ': ' + err.message);
+                    }
+                  }
+                  if (!skipFastpath) {
+                    run = true;
+                    ctx = {
+                      item_type: isPr ? 'pull_request' : 'issue',
+                      item_number: payload.issue.number,
+                      comment_id: payload.comment.id,
+                    };
+                  }
+                } else {
+                  core.info(
+                    'Command from an author without write access ('
+                    + permission + '); ignoring.');
+                }
+              }
+            }
+
+            // A merged architecture pull request. Scoped to architecture PRs
+            // only: the head branch must follow the arch/<slug> convention. A
+            // merged non-architecture PR is not this agent's concern and is
+            // left to no-op.
+            if (event === 'pull_request' && payload.action === 'closed') {
+              const merged = payload.pull_request.merged === true;
+              const headRef = payload.pull_request.head
+                && payload.pull_request.head.ref || '';
+              const isArchBranch = headRef.startsWith('arch/');
+              if (merged && isArchBranch) {
+                run = true;
+                ctx = {
+                  item_type: 'pull_request',
+                  item_number: payload.pull_request.number,
+                };
+              } else if (merged) {
+                core.info('Merged PR is not an arch branch; ignoring.');
+              }
+            }
+
+            core.setOutput('should_run', run ? 'true' : 'false');
+            core.setOutput('aw_context', run ? JSON.stringify(ctx) : '');
+
+  sdd-triage:
+    needs: route
+    if: needs.route.outputs.should_run == 'true'
+    uses: norrietaylor/spectacles/.github/workflows/sdd-triage.lock.yml@main
+    with:
+      aw_context: ${{ needs.route.outputs.aw_context }}
+    # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
+    # to a reusable workflow in a different owner than the caller.
+    secrets:
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+      DISTILLERY_OAUTH_TOKEN: ${{ secrets.DISTILLERY_OAUTH_TOKEN }}
+    # Ceiling for the called reusable workflow. Must cover the union of every
+    # nested job's permissions: the gh-aw conclusion and safe_outputs jobs
+    # need write scopes, and activation needs actions: read.
+    permissions:
+      actions: read
+      contents: write
+      discussions: write
+      issues: write
+      pull-requests: write

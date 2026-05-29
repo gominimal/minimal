@@ -1,0 +1,190 @@
+name: sdd-triage-dedupe-tasks
+
+# Closes a duplicate phase-C task sub-issue under the same Unit.
+#
+# sdd-triage phase C decomposes each Unit sub-issue into one implementation
+# task sub-issue per single-session unit of work. The agent emits one
+# `create-issue` safe-output per task, with `parent` set to the Unit, and the
+# "each task single-session sized" rule is enforced only in prose. An
+# acceptance run (issue #62) showed the agent emitting two `create_issue`
+# payloads with identical titles and identical bodies under the same Unit:
+# the prompt rule does not prevent a duplicate emission, and the gh-aw
+# safe-output handler does not collapse identical sibling `create_issue`
+# calls. A prompt rule cannot be relied on; this is the deterministic
+# backstop in the spirit of ADR 0006 and ADR 0007.
+#
+# On every issue opened in the consumer repository, this workflow checks
+# whether the new issue is a phase-C task sub-issue, finds its parent Unit,
+# enumerates that Unit's sub-issues, and — if an earlier-numbered sibling
+# carries the same title — closes the new issue as a duplicate with a
+# comment naming the original. Lower issue number always wins, so two
+# near-simultaneous duplicate runs converge on the same survivor.
+#
+# Scoped narrowly. A non-task issue (no structured `## Task` block) is
+# ignored. An issue without a parent is ignored. An issue whose parent has
+# only one sub-issue with that title is ignored.
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  dedupe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Close a duplicate phase-C task sub-issue
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const { owner, repo } = context.repo;
+
+            // A phase-C task sub-issue carries the structured `## Task`
+            // block documented in .github/workflows/sdd-triage.md step 6.
+            // Filter on that block so a regular hand-filed issue, a Unit
+            // sub-issue, or the spec/architecture sub-issues do not match.
+            const body = issue.body || '';
+            const looksLikeTask = /^##\s+Task\b/m.test(body)
+              && /\brepo:\s/i.test(body)
+              && /\bproof artifacts:\s*$/im.test(body);
+            if (!looksLikeTask) {
+              core.info(
+                'Issue #' + issue.number + ' is not a phase-C task; '
+                + 'skipping.');
+              return;
+            }
+
+            // Resolve the parent Unit. The sub-issues preview API exposes a
+            // direct parent lookup; an issue without a parent is not a
+            // sub-issue and is left alone. Retry briefly to absorb API
+            // replication lag — the parent link is created in the same
+            // safe-output as the issue itself.
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+            let parent = 0;
+            for (let attempt = 0; attempt < 5 && !parent; attempt++) {
+              if (attempt) { await sleep(3000); }
+              try {
+                const resp = await github.request(
+                  'GET /repos/{owner}/{repo}/issues/{issue_number}/parent',
+                  { owner, repo, issue_number: issue.number });
+                if (resp.data && resp.data.number) {
+                  parent = resp.data.number;
+                }
+              } catch (err) {
+                core.info(
+                  'No parent resolvable for #' + issue.number + ' yet: '
+                  + err.message);
+              }
+            }
+            if (!parent) {
+              core.info(
+                'Issue #' + issue.number + ' has no parent; skipping.');
+              return;
+            }
+
+            // List the parent Unit's sub-issues. The original of any
+            // duplicate pair is the sibling with the lower issue number,
+            // which exists in the listing before the duplicate. Two
+            // near-simultaneous duplicate runs both see the lower-numbered
+            // sibling and both pick the same survivor.
+            //
+            // The listing can race the create-issue calls in the same
+            // safe-output job: B's run may list children of the Unit
+            // before A is visible. Retry the listing until either an
+            // earlier-numbered same-title sibling is present, or the
+            // retry budget is exhausted. A's own listing safely returns
+            // no earlier sibling (the `< issue.number` filter keeps A
+            // from matching itself), so the retry only changes B's view.
+            const titleKey = (issue.title || '').trim().toLowerCase();
+            const isSameTitleEarlierTask = (s) =>
+              (s.title || '').trim().toLowerCase() === titleKey
+              && s.number < issue.number;
+            let siblings = [];
+            let original;
+            for (let attempt = 0; attempt < 5; attempt++) {
+              if (attempt) { await sleep(3000); }
+              try {
+                siblings = await github.paginate(
+                  'GET /repos/{owner}/{repo}/issues/{issue_number}/sub_issues',
+                  { owner, repo, issue_number: parent, per_page: 100 });
+              } catch (err) {
+                core.info(
+                  'Could not list sub-issues of Unit #' + parent + ' on '
+                  + 'attempt ' + (attempt + 1) + ': ' + err.message);
+                continue;
+              }
+              original = siblings
+                .filter(isSameTitleEarlierTask)
+                .sort((a, b) => a.number - b.number)[0];
+              if (original) { break; }
+            }
+
+            // The matched sibling must itself be a phase-C task. A
+            // collision against a hand-filed issue with the same title
+            // (no `## Task` block) would otherwise close this run's
+            // legitimate task. Fetch the sibling's full body and re-check.
+            if (original) {
+              try {
+                const full = await github.rest.issues.get({
+                  owner, repo, issue_number: original.number,
+                });
+                const sbody = (full.data && full.data.body) || '';
+                const siblingIsTask = /^##\s+Task\b/m.test(sbody)
+                  && /\brepo:\s/i.test(sbody)
+                  && /\bproof artifacts:\s*$/im.test(sbody);
+                if (!siblingIsTask) {
+                  core.info(
+                    'Earlier sibling #' + original.number
+                    + ' carries the same title but no `## Task` block; '
+                    + 'not closing #' + issue.number + ' against it.');
+                  original = undefined;
+                }
+              } catch (err) {
+                core.info(
+                  'Could not read body of sibling #' + original.number
+                  + '; conservatively not closing #' + issue.number + ': '
+                  + err.message);
+                original = undefined;
+              }
+            }
+
+            if (!original) {
+              core.info(
+                'No earlier sibling of #' + issue.number + ' under Unit #'
+                + parent + ' matches; not a duplicate.');
+              return;
+            }
+
+            // The duplicate may already have moved on (closed by a prior
+            // run, or labelled by phase C's lifecycle step). Idempotent:
+            // close only when still open.
+            if (issue.state !== 'open') {
+              core.info(
+                'Issue #' + issue.number + ' already closed; nothing to do.');
+              return;
+            }
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: issue.number,
+              body:
+                'Closing as a duplicate of #' + original.number + '. Phase C '
+                + 'emitted two `create-issue` safe-outputs with the same '
+                + 'title under Unit #' + parent + '; the lower-numbered '
+                + 'sibling is kept (ADR 0008; backstop pattern in ADR 0006).',
+            });
+            await github.rest.issues.update({
+              owner,
+              repo,
+              issue_number: issue.number,
+              state: 'closed',
+              state_reason: 'not_planned',
+            });
+            core.info(
+              'Closed #' + issue.number + ' as a duplicate of #'
+              + original.number + ' under Unit #' + parent + '.');

@@ -1,0 +1,250 @@
+name: sdd-triage-promote-ready
+
+# Promotes a phase-C task sub-issue to `sdd:ready` when its last blocker
+# closes.
+#
+# ADR 0009 (`fix/63`, PR #72) attaches `sdd:ready` at task-creation time on
+# tasks born **without** a `blocked by` dependency. A task born **with** a
+# `blocked by` dependency is intentionally created without `sdd:ready` and
+# stays that way until something promotes it. Nothing in the current
+# pipeline does that: `sdd-triage` phase C runs once per `/approve` and
+# does not re-fire on a task close, and `sdd-execute`'s eligibility check
+# skips a task without `sdd:ready`. The result is a stalled cascade where
+# the work is structurally ready but the label is missing.
+#
+# This wrapper closes that gap. On every issue close in the consumer
+# repository:
+#
+# 1. Identify the closed issue as a phase-C task by its structured
+#    `## Task` block.
+# 2. Find every other open task in the same repo that references the
+#    closed task on a `blocked by #<N>` line (one GitHub code search,
+#    not a tree walk).
+# 3. For each match, parse its full `depends on:` list, fetch each
+#    referenced issue, and apply `sdd:ready` only when every blocker is
+#    now closed.
+#
+# Search is the right primitive because dependencies cross Unit
+# boundaries: a task in Unit 2 may depend on a task in Unit 1, and the
+# closed task's parent Unit alone is not enough to find all promotable
+# siblings (issue #78's "Unit's sub-issues" wording is conservative;
+# this implementation broadens to the search-driven set, which
+# subsumes it).
+#
+# Idempotent: a task that already carries `sdd:ready` is skipped. Two
+# concurrent runs that resolve the same task converge on the same
+# label state (GitHub's `add_labels` is a set-union).
+#
+# Backstop pattern of ADR 0006 (deterministic workflow does the
+# per-item work the agent has no event to react to). Companion to
+# `sdd-pr-sanitize`, `sdd-triage-dedupe-tasks`. ADR 0013 records the
+# full reasoning.
+
+on:
+  issues:
+    types: [closed]
+
+permissions:
+  contents: read
+  # `issues: write` is required to apply the `sdd:ready` label on a
+  # promoted task. Reading the closed issue's body, walking the search
+  # results, and reading each blocker's state need only `issues: read`;
+  # the write scope is solely for `addLabels` below.
+  issues: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Promote tasks whose last blocker just closed
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const closed = context.payload.issue;
+            const { owner, repo } = context.repo;
+
+            // Only phase-C task sub-issues are interesting. A non-task
+            // close (a Unit, a tracker, a hand-filed issue) cannot
+            // unblock anything in this model because dependencies are
+            // expressed only between tasks.
+            const closedBody = closed.body || '';
+            const looksLikeTask =
+              /^##\s+Task\b/m.test(closedBody)
+              && /\brepo:\s/i.test(closedBody)
+              && /\bproof artifacts:\s*$/im.test(closedBody);
+            if (!looksLikeTask) {
+              core.info(
+                'Closed issue #' + closed.number
+                + ' is not a phase-C task; nothing to promote.');
+              return;
+            }
+
+            // Find every open issue in this repo that references the
+            // closed task on a `blocked by #<N>` line. One code-search
+            // call covers the cross-Unit case without walking every
+            // task in the tree.
+            //
+            // The search index can lag the close event by a few
+            // seconds. Retry briefly to absorb that lag — the same
+            // pattern sdd-pr-sanitize and sdd-triage-dedupe-tasks use
+            // for sub-issue API replication.
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+            const phrase = '"blocked by #' + closed.number + '"';
+            const query =
+              'repo:' + owner + '/' + repo
+              + ' is:issue is:open ' + phrase;
+            let candidates = [];
+            for (let attempt = 0; attempt < 5; attempt++) {
+              if (attempt) { await sleep(3000); }
+              try {
+                const resp = await github.paginate(
+                  github.rest.search.issuesAndPullRequests,
+                  { q: query, per_page: 100 });
+                candidates = resp.filter((it) => !it.pull_request);
+                if (candidates.length) { break; }
+              } catch (err) {
+                core.info(
+                  'Code search failed on attempt ' + (attempt + 1)
+                  + ': ' + err.message);
+              }
+            }
+            if (!candidates.length) {
+              core.info(
+                'No open issues reference `blocked by #' + closed.number
+                + '`; nothing to promote.');
+              return;
+            }
+
+            core.info(
+              'Found ' + candidates.length + ' candidate(s) referencing '
+              + '`blocked by #' + closed.number + '`.');
+
+            // Per-candidate promotion. Each step is conservative: any
+            // failure to verify a blocker is treated as "still blocked",
+            // not as "ready". Promoting too eagerly would let
+            // sdd-execute pick a task whose dependencies are still
+            // open, which is a worse failure than this backstop being a
+            // no-op for one run (the next blocker close will retry).
+            for (const cand of candidates) {
+              // Re-read the candidate; the search payload omits labels
+              // and the body may have been edited since indexing.
+              let full;
+              try {
+                full = await github.rest.issues.get({
+                  owner, repo, issue_number: cand.number,
+                });
+              } catch (err) {
+                core.info(
+                  'Could not read #' + cand.number + '; skipping: '
+                  + err.message);
+                continue;
+              }
+              if (full.data.state !== 'open') {
+                core.info(
+                  '#' + cand.number + ' is no longer open; skipping.');
+                continue;
+              }
+
+              // Idempotent: skip a task that already carries
+              // `sdd:ready`. A re-fire after a no-op close, or two
+              // concurrent runs racing the same task, both reach this
+              // branch and exit without writing.
+              const labels = (full.data.labels || []).map(
+                (l) => (typeof l === 'string' ? l : l.name));
+              if (labels.indexOf('sdd:ready') !== -1) {
+                core.info(
+                  '#' + cand.number + ' already carries `sdd:ready`; '
+                  + 'skipping.');
+                continue;
+              }
+
+              // The candidate must itself be a phase-C task. A
+              // hand-filed issue that happens to mention "blocked by
+              // #<N>" in prose is not promotable.
+              const cbody = full.data.body || '';
+              const candIsTask =
+                /^##\s+Task\b/m.test(cbody)
+                && /\brepo:\s/i.test(cbody)
+                && /\bproof artifacts:\s*$/im.test(cbody);
+              if (!candIsTask) {
+                core.info(
+                  '#' + cand.number + ' is not a phase-C task '
+                  + '(no `## Task` block); skipping.');
+                continue;
+              }
+
+              // Parse the candidate's full `depends on:` block. The
+              // structured form (sdd-triage step 6) lists every
+              // dependency as `blocked by #<task>` on its own line
+              // under a `depends on:` header. Pulling the references
+              // from the full body — not just the search-matched line
+              // — is what makes the "every blocker closed" check
+              // correct in the multi-blocker case.
+              const blockerNums = [
+                ...new Set(
+                  [...cbody.matchAll(/\bblocked by #(\d+)\b/g)].map(
+                    (m) => parseInt(m[1], 10))),
+              ];
+              if (!blockerNums.length) {
+                core.info(
+                  '#' + cand.number + ' has no parsable `blocked by` '
+                  + 'references; skipping.');
+                continue;
+              }
+
+              // Verify every blocker is closed. A cross-repo blocker
+              // (`blocked by owner/repo#<N>`) is not produced by
+              // sdd-triage today (cross-repo task routing is a
+              // documented future extension), but if one appears it
+              // will not match this regex and the task is left
+              // unpromoted — conservative, and correct under the
+              // current model.
+              let allClosed = true;
+              for (const b of blockerNums) {
+                try {
+                  const got = await github.rest.issues.get({
+                    owner, repo, issue_number: b,
+                  });
+                  // `pull_request` field present => the referenced
+                  // number is a PR, not a task issue. Treat as a
+                  // non-blocker (closed PR is closed; open PR can't
+                  // block a task in this model anyway).
+                  if (got.data.pull_request) { continue; }
+                  if (got.data.state !== 'closed') {
+                    allClosed = false;
+                    break;
+                  }
+                } catch (err) {
+                  core.info(
+                    'Could not read blocker #' + b + ' for #'
+                    + cand.number + '; conservatively leaving '
+                    + 'unpromoted: ' + err.message);
+                  allClosed = false;
+                  break;
+                }
+              }
+
+              if (!allClosed) {
+                core.info(
+                  '#' + cand.number + ' still has open blocker(s); '
+                  + 'skipping.');
+                continue;
+              }
+
+              // Promote. `add_labels` is a set-union: applying
+              // `sdd:ready` to a task that has somehow gained it in
+              // the brief window since the labels read is a no-op.
+              try {
+                await github.rest.issues.addLabels({
+                  owner, repo, issue_number: cand.number,
+                  labels: ['sdd:ready'],
+                });
+                core.info(
+                  'Promoted #' + cand.number + ' to `sdd:ready` '
+                  + '(last blocker #' + closed.number + ' closed).');
+              } catch (err) {
+                core.warning(
+                  'Could not apply `sdd:ready` to #' + cand.number
+                  + ': ' + err.message);
+              }
+            }

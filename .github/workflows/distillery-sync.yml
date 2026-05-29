@@ -1,0 +1,44 @@
+name: distillery-sync
+
+# Thin wrapper for the distillery-sync agent.
+#
+# The agent itself is the reusable workflow
+# .github/workflows/distillery-sync.lock.yml in the spectacles repository,
+# compiled from distillery-sync.md (which declares on: workflow_call). This
+# wrapper carries the real triggers — a daily schedule and manual dispatch —
+# and calls the hosted reusable workflow by pinned ref. A consumer repository
+# installs this wrapper unchanged; scripts/quick-setup.sh rewrites the @ref
+# when --ref is supplied.
+#
+# distillery-sync had no wrapper before the uses: distribution model (ADR
+# 0004): it was a standalone scheduled workflow whose compiled lock the
+# installer copied directly. Under the uses: model every agent — scheduled or
+# event-driven — is a hosted reusable workflow, so distillery-sync gains a
+# wrapper that owns its schedule, exactly as the sdd-* wrappers own their
+# event triggers.
+
+on:
+  # Daily, off the top of the hour to avoid GitHub scheduler congestion.
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  distillery-sync:
+    uses: norrietaylor/spectacles/.github/workflows/distillery-sync.lock.yml@main
+    # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
+    # to a reusable workflow in a different owner than the caller.
+    secrets:
+      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+      DISTILLERY_OAUTH_TOKEN: ${{ secrets.DISTILLERY_OAUTH_TOKEN }}
+    # Ceiling for the called reusable workflow. Must cover the union of every
+    # nested job's permissions: the gh-aw conclusion and safe_outputs jobs
+    # need issues: write, and activation needs actions: read.
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: read

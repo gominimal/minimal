@@ -1,0 +1,491 @@
+name: sdd-monitor
+
+# Tier 1 of the sdd-monitor design (issue #148): detect "armed but idle"
+# tracking issues and post one `/dispatch` to unstick them.
+#
+# Why a plain utility workflow, not a gh-aw agent:
+# Tier 1 is purely mechanical — list workflow runs, list pull requests, walk
+# sub-issue trees, check labels, post a comment. There is no judgement call
+# in this loop, so an LLM in the loop only adds cost, latency, and a new
+# failure mode (model output drift). The same backstop pattern is already
+# used by sdd-pr-sanitize and sdd-triage-promote-ready (ADR 0006: a
+# deterministic workflow does the per-item work the agent has no event to
+# react to).
+#
+# Tier 2 (healing: merging UNSTABLE PRs, resetting orphaned tasks, advancing
+# sdd:review to sdd:done) and Tier 3 (escalating unrecoverable stalls to
+# needs-human) are out of scope for this PR. They are tracked as follow-ups
+# on issue #148.
+#
+# Idempotency model:
+#
+# 1. Disabled by default. The first check reads the SDD_MONITOR repo
+#    variable. The workflow only acts when SDD_MONITOR == '1'. A consumer
+#    that has not opted in pays no GitHub Actions cost beyond the no-op run.
+#
+# 2. In-flight gate. If any sdd-execute-{haiku,sonnet,opus} run is
+#    in_progress or queued anywhere in the repo, the pass exits without
+#    dispatching. This is conservative: a run targeting a different tracker
+#    still blocks all monitor dispatches for this pass. The conservatism is
+#    deliberate — correlating a workflow_run back to its tracking issue
+#    requires walking task -> Unit -> tracker per run (the run's input
+#    aw_context only names the task), and the cron backstop fires every
+#    ~10 min so a missed nudge is at most one cycle delayed. The safety
+#    case (do not stack /dispatch comments and trigger the cancellation
+#    storm described in issue #148) dominates.
+#
+# 3. Debounce. For each candidate tracker, the most recent comment whose
+#    body begins with `/dispatch` (any author, monitor-issued or
+#    operator-issued) within SDD_MONITOR_DEBOUNCE_MIN minutes (default 5)
+#    suppresses a new dispatch. This caps the rate at one dispatch per
+#    tracker per window regardless of how often the workflow fires
+#    (workflow_run completion + pull_request close + cron all converge on
+#    the same comment-history check).
+#
+# 4. Single comment per action. The audit line and the `/dispatch`
+#    directive are combined into one comment body so the dispatch
+#    wrapper's token-strict `/dispatch` match (it accepts the literal
+#    `/dispatch` followed by whitespace) still fires while operators see
+#    a one-line `sdd-monitor:` audit on the same comment.
+#
+# Triggers:
+#
+# - workflow_run completed on sdd-execute-{haiku,sonnet,opus}: react to a
+#   run finishing (success, failure, or cancellation) so a tracker that
+#   just lost its last in-flight run gets nudged immediately.
+# - pull_request closed: a merged or closed sdd/ implementation PR is the
+#   moment a task closes and the next layer could be armed.
+# - schedule */10: backstop for events lost to webhook drops or runner
+#   outages.
+
+on:
+  workflow_run:
+    workflows:
+      - sdd-execute-haiku
+      - sdd-execute-sonnet
+      - sdd-execute-opus
+    types: [completed]
+  pull_request:
+    types: [closed]
+  schedule:
+    # Every ten minutes is the backstop for missed webhook events. Tier 1
+    # is itself cheap (a handful of list calls per active tracker), so a
+    # higher cadence would be safe — ten minutes is chosen to match the
+    # debounce window order of magnitude and the typical sdd-execute run
+    # duration so most cron firings find at least one tracker actionable.
+    - cron: '*/10 * * * *'
+
+permissions:
+  contents: read
+  # actions: read is required to list sdd-execute-* workflow runs filtered
+  # by status so the in-flight gate can decide whether to dispatch.
+  actions: read
+  # pull-requests: read lists open sdd/ implementation PRs, which the
+  # armed-but-idle check excludes from candidate trackers.
+  pull-requests: read
+  # issues: read covers walking the sub-issue tree, reading labels, and
+  # listing existing comments. The /dispatch comment itself is posted with
+  # an App installation token (minted in the job below) so the dispatch
+  # wrapper's App-author carve-out admits it past the human-permission
+  # check — the default GITHUB_TOKEN's github-actions[bot] is not a
+  # repository collaborator and would be rejected.
+  issues: read
+
+jobs:
+  monitor:
+    # Top-level enable gate. A consumer that has not set SDD_MONITOR=1
+    # skips the whole job, including the App token mint, so a repo that
+    # has not opted in pays no further cost and does not need APP_ID +
+    # APP_PRIVATE_KEY configured for the monitor specifically. The
+    # second clause filters pull_request events to sdd/ branches;
+    # workflow_run and schedule events have no head ref to gate on at
+    # this level.
+    if: >-
+      vars.SDD_MONITOR == '1'
+      && (github.event_name != 'pull_request'
+        || startsWith(github.event.pull_request.head.ref, 'sdd/'))
+    # Serialize monitor passes for this repo. The three triggers
+    # (workflow_run, pull_request closed, schedule */10) can fire in
+    # close succession; without a concurrency group two passes can both
+    # clear the in-flight and debounce checks before either posts and
+    # then double-post `/dispatch` for the same tracker. cancel-in-
+    # progress is false because a running pass is cheap and worth
+    # finishing — the queued pass picks up any state change the running
+    # one missed.
+    concurrency:
+      group: sdd-monitor-${{ github.repository }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      # Mint the App installation token. The /dispatch comment posted below
+      # must be authored by the configured App so the dispatch wrapper's
+      # App-author carve-out admits it past the human-permission gate; the
+      # default GITHUB_TOKEN's github-actions[bot] is not a collaborator on
+      # the consumer repository. The same APP_ID + APP_PRIVATE_KEY pair
+      # already drives the cascade fan-out in sdd-dispatch (ADR 0014).
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+      - name: Nudge armed-but-idle trackers
+        uses: actions/github-script@v9
+        env:
+          SDD_MONITOR_DEBOUNCE_MIN: ${{ vars.SDD_MONITOR_DEBOUNCE_MIN }}
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+        with:
+          github-token: ${{ env.APP_TOKEN }}
+          script: |
+            // The job-level if: gate already ensured SDD_MONITOR == '1';
+            // if execution reaches this script the monitor is enabled.
+
+            const { owner, repo } = context.repo;
+            // Default to 5 minutes; treat a missing, empty, or
+            // non-numeric SDD_MONITOR_DEBOUNCE_MIN as "use the default".
+            // parseInt('', 10) and parseInt('abc', 10) both return NaN,
+            // and Math.max(1, NaN) is NaN — without this guard a typo
+            // in the repo var silently disables the debounce gate
+            // (every `ageMs < NaN` is false).
+            const parsedDebounce = parseInt(
+              process.env.SDD_MONITOR_DEBOUNCE_MIN || '', 10);
+            const debounceMin =
+              Number.isFinite(parsedDebounce) && parsedDebounce > 0
+                ? parsedDebounce
+                : 5;
+            const debounceMs = debounceMin * 60 * 1000;
+
+            // In-flight gate. If any sdd-execute-* run is in_progress or
+            // queued in this repo, exit without dispatching. The dispatch
+            // wrapper's per-task-per-tier concurrency group will cancel an
+            // in-flight cell when a new /dispatch fans out onto the same
+            // task, so even a single stacked /dispatch can kill productive
+            // work. The conservative repo-wide gate is the simplest way
+            // to make Tier 1 storm-proof; the cron backstop reruns every
+            // ten minutes so a missed window is recovered on the next
+            // pass.
+            const variantNames = [
+              'sdd-execute-haiku',
+              'sdd-execute-sonnet',
+              'sdd-execute-opus',
+            ];
+            for (const status of ['in_progress', 'queued']) {
+              for (const wf of variantNames) {
+                let runs = [];
+                try {
+                  runs = await github.paginate(
+                    github.rest.actions.listWorkflowRunsForRepo,
+                    { owner, repo, status, per_page: 50 });
+                } catch (err) {
+                  core.info(
+                    'Could not list ' + status + ' runs: ' + err.message
+                    + '; treating as in-flight to stay safe.');
+                  return;
+                }
+                const hit = runs.find((r) => r.name === wf);
+                if (hit) {
+                  core.info(
+                    'In-flight gate: ' + wf + ' run #' + hit.id + ' is '
+                    + status + '; deferring monitor pass.');
+                  return;
+                }
+              }
+            }
+
+            // Candidate trackers: open issues carrying sdd:dispatched, not
+            // carrying needs-human or sdd:done. The search index can lag a
+            // label change by a few seconds; one pass picks up the lag on
+            // the next firing, so no retry loop is needed here.
+            const trackerQuery =
+              'repo:' + owner + '/' + repo
+              + ' is:issue is:open label:sdd:dispatched'
+              + ' -label:needs-human -label:sdd:done';
+            let trackers = [];
+            try {
+              const resp = await github.paginate(
+                github.rest.search.issuesAndPullRequests,
+                { q: trackerQuery, per_page: 100 });
+              trackers = resp.filter((it) => !it.pull_request);
+            } catch (err) {
+              core.info(
+                'Tracker search failed: ' + err.message + '; nothing to do.');
+              return;
+            }
+            if (!trackers.length) {
+              core.info('No active sdd:dispatched trackers; nothing to do.');
+              return;
+            }
+
+            core.info(
+              'Evaluating ' + trackers.length + ' active tracker(s).');
+
+            // Per-tracker armed-but-idle check.
+            for (const tracker of trackers) {
+              const trackerNum = tracker.number;
+
+              // Debounce against the most recent /dispatch comment on
+              // this tracker, regardless of author. A monitor-issued
+              // dispatch and an operator-issued dispatch both occupy
+              // the same rate-limit slot. The check walks comments from
+              // newest to oldest and stops at the first /dispatch hit.
+              let comments = [];
+              try {
+                comments = await github.paginate(
+                  github.rest.issues.listComments,
+                  { owner, repo, issue_number: trackerNum, per_page: 100 });
+              } catch (err) {
+                core.info(
+                  '#' + trackerNum + ': could not list comments ('
+                  + err.message + '); skipping.');
+                continue;
+              }
+              const now = Date.now();
+              let recentDispatch = null;
+              for (let i = comments.length - 1; i >= 0; i--) {
+                const c = comments[i];
+                const body = (c.body || '').trimStart();
+                const isDispatch =
+                  body === '/dispatch'
+                  || body.startsWith('/dispatch ')
+                  || body.startsWith('/dispatch\n')
+                  || body.startsWith('/dispatch\r\n')
+                  || body.startsWith('/dispatch\t');
+                if (isDispatch) {
+                  recentDispatch = c;
+                  break;
+                }
+              }
+              if (recentDispatch) {
+                const ageMs = now - Date.parse(recentDispatch.created_at);
+                if (ageMs < debounceMs) {
+                  core.info(
+                    '#' + trackerNum + ': last /dispatch was '
+                    + Math.round(ageMs / 1000) + 's ago '
+                    + '(< ' + debounceMin + 'm debounce); skipping.');
+                  continue;
+                }
+              }
+
+              // Open sdd/ implementation PR check. An open PR for any task
+              // under this tracker means a layer is in flight via the PR
+              // side of the cascade; do not nudge. The dispatch wrapper
+              // re-fires on PR close, so this case will be re-evaluated
+              // then.
+              let openPrs = [];
+              try {
+                openPrs = await github.paginate(
+                  github.rest.pulls.list,
+                  { owner, repo, state: 'open', per_page: 100 });
+              } catch (err) {
+                core.info(
+                  '#' + trackerNum + ': could not list open PRs ('
+                  + err.message + '); skipping.');
+                continue;
+              }
+              const sddPrs = openPrs.filter(
+                (p) => (p.head && p.head.ref || '').startsWith('sdd/'));
+              let prInFlight = false;
+              let walkFailed = false;
+              for (const pr of sddPrs) {
+                // The sdd/ branch carries the task issue number as the
+                // first numeric segment after the prefix (ADR 0006). Map
+                // the task back to its tracker by walking two parent
+                // hops; if any open sdd/ PR rolls up to this tracker the
+                // layer is in flight.
+                const m = (pr.head.ref || '').match(/^sdd\/(\d+)-/);
+                if (!m) { continue; }
+                const taskNum = parseInt(m[1], 10);
+                // Fail closed: if the upward walk cannot be completed
+                // (a seed or GraphQL lookup error, the exact failure #133
+                // describes), we cannot prove this PR is unrelated to the
+                // tracker. Treat the unresolved walk as "assume in flight"
+                // and skip the nudge for this tracker only — never nudge a
+                // tracker we could not rule out as in flight.
+                let trackerOfTask;
+                try {
+                  trackerOfTask =
+                    await walkToTracker(github, owner, repo, taskNum);
+                } catch (err) {
+                  core.info(
+                    '#' + trackerNum + ': parent walk for PR task #'
+                    + taskNum + ' failed (' + err.message
+                    + '); assuming in flight and skipping.');
+                  walkFailed = true;
+                  break;
+                }
+                if (trackerOfTask === trackerNum) {
+                  prInFlight = true;
+                  break;
+                }
+              }
+              if (walkFailed) { continue; }
+              if (prInFlight) {
+                core.info(
+                  '#' + trackerNum + ': an open sdd/ PR rolls up to this '
+                  + 'tracker; not armed-but-idle.');
+                continue;
+              }
+
+              // Walk the sub-issue tree: tracker -> Unit -> task. Find
+              // open task sub-issues whose every `blocked by #<N>`
+              // dependency is closed. Tier 1 only needs the count; the
+              // dispatch wrapper recomputes the ready set authoritatively
+              // when it picks up our /dispatch comment.
+              let readyCount = 0;
+              let units = [];
+              try {
+                units = await github.paginate(
+                  'GET /repos/{owner}/{repo}/issues/{issue_number}/sub_issues',
+                  { owner, repo, issue_number: trackerNum, per_page: 100 });
+              } catch (err) {
+                core.info(
+                  '#' + trackerNum + ': could not list Unit sub-issues ('
+                  + err.message + '); skipping.');
+                continue;
+              }
+              for (const unit of units) {
+                let tasks = [];
+                try {
+                  tasks = await github.paginate(
+                    'GET /repos/{owner}/{repo}/issues/{issue_number}/sub_issues',
+                    { owner, repo, issue_number: unit.number, per_page: 100 });
+                } catch (err) {
+                  core.info(
+                    '#' + trackerNum + ': could not list tasks under Unit #'
+                    + unit.number + ' (' + err.message + '); skipping unit.');
+                  continue;
+                }
+                for (const task of tasks) {
+                  if (task.state !== 'open') { continue; }
+                  const body = task.body || '';
+                  const blockerNums = [
+                    ...new Set(
+                      [...body.matchAll(/\bblocked by #(\d+)\b/g)].map(
+                        (m) => parseInt(m[1], 10))),
+                  ];
+                  let allClosed = true;
+                  for (const b of blockerNums) {
+                    try {
+                      const got = await github.rest.issues.get({
+                        owner, repo, issue_number: b,
+                      });
+                      if (got.data.pull_request) { continue; }
+                      if (got.data.state !== 'closed') {
+                        allClosed = false;
+                        break;
+                      }
+                    } catch (err) {
+                      core.info(
+                        '#' + trackerNum + ': could not read blocker #' + b
+                        + ' for task #' + task.number
+                        + ' (' + err.message
+                        + '); treating as still blocked.');
+                      allClosed = false;
+                      break;
+                    }
+                  }
+                  if (allClosed) { readyCount += 1; }
+                }
+              }
+
+              if (readyCount === 0) {
+                core.info(
+                  '#' + trackerNum + ': no ready open tasks; not '
+                  + 'armed-but-idle.');
+                continue;
+              }
+
+              // Dispatch. The body's first token is `/dispatch` so the
+              // dispatch wrapper's command match fires; the audit prefix
+              // sits on a following line so operators see the action in
+              // the timeline. The combined comment is one writeable
+              // event, which keeps the timeline cleaner than a two-step
+              // (audit then dispatch) sequence.
+              const auditBody =
+                '/dispatch\n\n'
+                + 'sdd-monitor: armed-but-idle on #' + trackerNum
+                + ' with ' + readyCount + ' task'
+                + (readyCount === 1 ? '' : 's')
+                + ' ready; dispatching.';
+              try {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: trackerNum, body: auditBody,
+                });
+                core.info(
+                  '#' + trackerNum + ': posted monitor /dispatch ('
+                  + readyCount + ' ready task'
+                  + (readyCount === 1 ? '' : 's') + ').');
+              } catch (err) {
+                core.warning(
+                  '#' + trackerNum + ': failed to post /dispatch: '
+                  + err.message);
+              }
+            }
+
+            // walkToTracker: walk a task sub-issue up to its tracking
+            // issue (task -> Unit -> tracker, two hops per ADR 0005).
+            // Returns the tracker issue number, or 0 if the walk does not
+            // resolve to a two-hop root.
+            //
+            // The parent link is read via GraphQL `Issue.parent`, NOT via
+            // the REST `parent_issue_url` field. REST does not populate
+            // the child->parent pointer for native sub-issues reliably:
+            // the field comes back empty on the close webhook and on an
+            // immediate REST re-fetch (issue #133, the cascade-stall
+            // repro on this issue). sdd-dispatch's own route job switched
+            // to GraphQL for exactly this reason; the monitor mirrors it
+            // so the in-flight PR-rollup guard does not silently misfire.
+            //
+            // Fail-closed contract: parentNumberViaGraphql and walkToTracker
+            // distinguish a *resolved* walk (returns a number, or 0 when the
+            // walk legitimately reaches the top of the tree short of two
+            // hops) from an *unresolved* walk caused by a lookup error
+            // (rethrows). A swallowed error that collapsed to "no parent"
+            // would make an open sdd/ PR look unrelated to its tracker, the
+            // in-flight guard would clear, and the monitor would nudge a
+            // tracker whose layer is actually in flight — the cancellation
+            // storm issue #148 exists to prevent. The caller treats a thrown
+            // walk as "assume in flight" and skips the nudge for that
+            // tracker only.
+            async function parentNumberViaGraphql(nodeId) {
+              if (!nodeId) { return null; }
+              const result = await github.graphql(
+                'query($id: ID!) {' +
+                '  node(id: $id) {' +
+                '    ... on Issue { parent { id number } }' +
+                '  }' +
+                '}',
+                { id: nodeId });
+              const parent = result && result.node && result.node.parent;
+              return parent || null;
+            }
+
+            async function walkToTracker(ghCli, ownerArg, repoArg, taskNum) {
+              // Seed the GraphQL walk from the task issue's node id. A seed
+              // or parent lookup error rethrows so the caller fails closed;
+              // it must not be confused with a fully-walked tree that has no
+              // parent. Wrap callers in try/catch and treat a throw as
+              // "assume in flight" for that tracker.
+              const { data } = await ghCli.rest.issues.get({
+                owner: ownerArg, repo: repoArg, issue_number: taskNum,
+              });
+              let nodeId = data.node_id;
+              let parent = null;
+              let walked = 0;
+              while (nodeId && walked < 2) {
+                const next = await parentNumberViaGraphql(nodeId);
+                if (!next) { break; }
+                parent = next;
+                nodeId = next.id;
+                walked += 1;
+              }
+              // A task closure is exactly two hops below a tracking issue.
+              // A shorter walk means the seed was a Unit or the tracker
+              // itself, not a task — not a tracker match for this guard.
+              if (parent && walked === 2) {
+                return parent.number;
+              }
+              return 0;
+            }

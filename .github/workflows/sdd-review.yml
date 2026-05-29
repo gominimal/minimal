@@ -1,0 +1,100 @@
+name: sdd-review
+
+# Thin wrapper for the sdd-review agent.
+#
+# The agent itself is the reusable workflow
+# .github/workflows/sdd-review.lock.yml (compiled from sdd-review.md, which
+# declares on: workflow_call). This wrapper carries the real event triggers and
+# passes the triggering pull request to the agent through the aw_context input.
+# A consumer repository installs this wrapper unchanged.
+#
+# sdd-review has no comment-command trigger, so this wrapper performs no
+# repository-permission gate: the gh-aw command:/slash_command trigger is not
+# used here. The only trigger is an implementation pull request opened or
+# synchronized.
+#
+# The pull_request event is gated to pull requests whose head branch carries
+# the sdd-execute implementation branch prefix sdd/. sdd-execute opens
+# implementation PRs on sdd/<task-id>-<slug> branches (see the branch
+# conventions in shared/repo-conventions.md), so this prefix gate keeps the
+# review agent scoped to implementation PRs and off spec/ and arch/ PRs.
+#
+# A PR-boundary needs-human resume needs no separate trigger here. When
+# sdd-review escalates a CRITICAL or HIGH finding, the hand-off is resumed by a
+# fresh pull_request: synchronize, which is the event the human's fix commit
+# naturally fires. Clearing needs-human on a PR without a code change would
+# re-run the same review against the unchanged diff and re-post the same
+# findings; resuming on synchronize ties re-review to an actual fix. The agent
+# treats a needs-human-labelled PR as off-limits and emits noop until a real
+# fix commit arrives.
+
+on:
+  # An implementation pull request was opened or updated. synchronize also
+  # resumes a needs-human hand-off, since the human's fix commit fires it.
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  # Resolve whether the triggering pull request is an implementation PR and
+  # build the aw_context the reusable workflow consumes. A pull request whose
+  # head branch does not carry the sdd/ implementation prefix leaves
+  # should_run = false so the agent job is skipped.
+  route:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+      aw_context: ${{ steps.decide.outputs.aw_context }}
+    steps:
+      - name: Decide whether to run and build aw_context
+        id: decide
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const payload = context.payload;
+            let run = false;
+            let ctx = {};
+
+            // An implementation pull request was opened or synchronized. The
+            // review runs only when the head branch carries the sdd-execute
+            // implementation branch prefix sdd/, which scopes the agent to
+            // implementation PRs. A draft pull request is still reviewed:
+            // review is advisory and never blocks.
+            const action = payload.action;
+            if (action === 'opened' || action === 'synchronize') {
+              const headRef = payload.pull_request.head.ref || '';
+              if (headRef.startsWith('sdd/')) {
+                run = true;
+                ctx = {
+                  item_type: 'pull_request',
+                  item_number: payload.pull_request.number,
+                };
+              }
+            }
+
+            core.setOutput('should_run', run ? 'true' : 'false');
+            core.setOutput('aw_context', run ? JSON.stringify(ctx) : '');
+
+  sdd-review:
+    needs: route
+    if: needs.route.outputs.should_run == 'true'
+    uses: norrietaylor/spectacles/.github/workflows/sdd-review.lock.yml@main
+    with:
+      aw_context: ${{ needs.route.outputs.aw_context }}
+    # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
+    # to a reusable workflow in a different owner than the caller.
+    secrets:
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+    # Ceiling for the called reusable workflow. Must cover the union of every
+    # nested job's permissions: the gh-aw conclusion and safe_outputs jobs
+    # need issues and pull-requests write, and activation needs actions: read.
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: write

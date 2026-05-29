@@ -1,0 +1,228 @@
+name: sdd-pr-sanitize
+
+# Corrects the issue references in a spec or architecture pull request body,
+# and makes the deliverable link visible on the sub-issue side.
+# Three deterministic corrections, on every spec/* and arch/* pull request:
+#
+# 1. The feature tracking issue must stay open as the lifecycle anchor, so a
+#    spec or architecture pull request must never close it. The agents are told
+#    never to write a closing keyword for the feature, but across three
+#    acceptance runs the agent slipped `Closes`/`Fixes`/`Resolves #<feature>`
+#    into the body anyway. This workflow rewrites every closing keyword that
+#    precedes an issue reference to `Refs`, which GitHub does not treat as a
+#    closing keyword — except the keyword on the deliverable sub-issue (2). A
+#    prompt rule cannot be relied on; this is the deterministic backstop.
+#
+# 2. A spec pull request delivers the spec sub-issue; an architecture pull
+#    request delivers the architecture sub-issue. The agent creates that
+#    sub-issue and the pull request in one run and cannot know the sub-issue
+#    number when it writes the body, so the pull request cannot itself carry
+#    the link. This workflow runs after both exist: it resolves the deliverable
+#    sub-issue under the feature and adds `Closes #<sub-issue>` to the body, so
+#    merging the pull request closes the sub-issue — the way an implementation
+#    pull request's `Closes #<task>` already closes its task.
+#
+# 3. When the sanitizer PATCHes the pull-request body to add `Closes #<sub>`
+#    after the App-authenticated creation, GitHub suppresses the
+#    `cross-referenced` event it would normally emit on the sub-issue, and at
+#    merge time it attributes the close to the merger rather than the pull
+#    request. The closing link exists in the data model (the pull request's
+#    `closingIssuesReferences` returns the sub-issue), but neither of the two
+#    timeline events that normally make the deliverable link visible in the UI
+#    fires (issue #69). This workflow posts one `Delivered by #<pr>.` comment
+#    on the sub-issue, which both produces a visible `commented` event and
+#    causes GitHub to emit the missing `cross-referenced` event from the
+#    `#<pr>` reference in the comment body.
+#
+# All three corrections are owned by ADR 0006; the sub-issue closing model is
+# ADR 0005. Implementation pull requests on sdd/* branches are not touched:
+# their `Closes #<task>` is already correct, and GitHub already emits the
+# normal cross-reference and "closed via #<pr>" events because the closing
+# keyword was present at pull-request creation, not added by a later PATCH.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened]
+
+permissions:
+  contents: read
+  # `issues: write` is required to post the `Delivered by #<pr>.` comment on
+  # the deliverable sub-issue. Reading the sub-issue and its comments to
+  # resolve it and to enforce idempotency only needs `issues: read`; the
+  # write scope is solely for the comment add (3) below.
+  issues: write
+  pull-requests: write
+
+jobs:
+  sanitize:
+    # Only spec and architecture pull requests are corrected here. An sdd/*
+    # implementation pull request is left alone.
+    if: >-
+      startsWith(github.event.pull_request.head.ref, 'spec/') ||
+      startsWith(github.event.pull_request.head.ref, 'arch/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Correct the issue references in the pull request body
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            const headRef = pr.head.ref || '';
+            // A spec/* pull request delivers the `spec:`-titled sub-issue; an
+            // arch/* pull request delivers the `architecture:`-titled one.
+            const deliverablePrefix =
+              headRef.startsWith('spec/') ? 'spec:' : 'architecture:';
+
+            // Resolve the deliverable sub-issue. It is a sub-issue of the
+            // feature tracking issue, which the body references as `#N`. For
+            // each same-repo issue number in the body, check whether it has a
+            // sub-issue whose title marks it the deliverable; the first match
+            // wins. The sub-issue is created moments before the pull request
+            // (it gets the lower number), so on `opened` it already exists —
+            // retry briefly only to absorb API replication lag.
+            const body0 = pr.body || '';
+            const candidates = [
+              ...new Set(
+                [...body0.matchAll(/(?<![\w/])#(\d+)\b/g)].map(
+                  (m) => parseInt(m[1], 10))),
+            ];
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+            let deliverable = 0;
+            for (let attempt = 0; attempt < 5 && !deliverable; attempt++) {
+              if (attempt) { await sleep(3000); }
+              for (const feature of candidates) {
+                let subs;
+                try {
+                  subs = await github.paginate(
+                    'GET /repos/{owner}/{repo}/issues/{issue_number}/sub_issues',
+                    { owner, repo, issue_number: feature, per_page: 100 });
+                } catch (err) {
+                  core.info(
+                    'No sub-issues readable for #' + feature + ': '
+                    + err.message);
+                  continue;
+                }
+                const hit = subs.find((s) =>
+                  (s.title || '').trim().toLowerCase()
+                    .startsWith(deliverablePrefix));
+                if (hit) { deliverable = hit.number; break; }
+              }
+            }
+
+            // Rewrite every closing keyword that precedes an issue reference
+            // to `Refs`, except the keyword on the deliverable sub-issue.
+            // GitHub auto-closes an issue named after close/fix/resolve (with
+            // an optional s/d/ed) in a merged pull request body; only the
+            // keyword is rewritten, the issue number itself is kept. The
+            // exemption is scoped to a same-repo reference: a cross-repo
+            // `owner/repo#N` is never the deliverable, even when N collides
+            // with the deliverable's number. The rewrite runs whether or not
+            // the deliverable resolved, so the feature is always protected
+            // from auto-close.
+            const currentRepo = (owner + '/' + repo).toLowerCase();
+            let body = body0.replace(
+              /\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b(\s+(?:[\w.-]+\/[\w.-]+)?#(\d+))/gi,
+              (m, _kw, ref, num) => {
+                if (!deliverable || parseInt(num, 10) !== deliverable) {
+                  return 'Refs' + ref;
+                }
+                const scoped = ref.match(/([\w.-]+\/[\w.-]+)#/);
+                const sameRepo =
+                  !scoped || scoped[1].toLowerCase() === currentRepo;
+                return sameRepo ? m : 'Refs' + ref;
+              });
+
+            // Add `Closes #<deliverable>` so merging the pull request closes
+            // the deliverable sub-issue (ADR 0005). Idempotent: skip when the
+            // body already closes it — but only a **bare**, line-anchored
+            // `Closes #N` counts. GitHub does not honor a closing keyword
+            // inside an inline-code span, so a backtick-wrapped mention such as
+            // `` `Closes #162` `` (which agents write in their hand-off prose)
+            // must NOT satisfy this guard, or the real bare line is never
+            // appended and the sub-issue stays open on merge (issue #136). The
+            // line anchor matches exactly the bare line appended below.
+            if (deliverable) {
+              const hasClose = new RegExp(
+                '(^|\\n)[ \\t]*closes?\\s+#' + deliverable + '\\b', 'i')
+                .test(body);
+              if (!hasClose) {
+                body = body.replace(/\s*$/, '')
+                  + '\n\nCloses #' + deliverable + '\n';
+              }
+            }
+
+            // Make the deliverable link visible on the sub-issue side. The
+            // `Closes` keyword that the PR body update below adds closes the
+            // sub-issue on merge, but GitHub does not emit the
+            // `cross-referenced` event it would have emitted had the
+            // keyword been present at pull-request creation: a PATCH from
+            // an App identity suppresses it, and at merge time the close
+            // is attributed to the merger rather than the pull request
+            // (issue #69). Posting one comment on the sub-issue both adds
+            // a visible `commented` event and makes GitHub emit the
+            // missing `cross-referenced` event from the `#<pr>` reference.
+            //
+            // Order of operations: this comment write runs **before** the
+            // PR-body update below. If the comment fails (rate limit,
+            // permission, 5xx), the body update never runs either, so a
+            // failed run leaves zero visible state to diverge from. On a
+            // re-fire (`edited`/`reopened`) the comment write is
+            // idempotent (paginate + marker-startsWith check) so it does
+            // not re-post.
+            if (deliverable) {
+              const marker = 'Delivered by #' + pr.number + '.';
+              let comments;
+              try {
+                comments = await github.paginate(
+                  github.rest.issues.listComments,
+                  { owner, repo, issue_number: deliverable, per_page: 100 });
+              } catch (err) {
+                comments = [];
+                core.info(
+                  'Could not list comments on #' + deliverable + ': '
+                  + err.message + '; will attempt to post.');
+              }
+              const already = comments.some((c) =>
+                (c.body || '').trimStart().startsWith(marker));
+              if (already) {
+                core.info(
+                  'Sub-issue #' + deliverable
+                  + ' already has a `Delivered by` comment for PR #'
+                  + pr.number + '; skipping.');
+              } else {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: deliverable,
+                  body: marker,
+                });
+                core.info(
+                  'Posted `Delivered by #' + pr.number + '.` on sub-issue #'
+                  + deliverable + '.');
+              }
+            }
+
+            if (body !== body0) {
+              await github.rest.pulls.update({
+                owner,
+                repo,
+                pull_number: pr.number,
+                body,
+              });
+              core.info('Corrected issue references in PR #' + pr.number);
+            } else if (deliverable) {
+              core.info('Pull request body already correct.');
+            }
+
+            // With the deliverable sub-issue unresolved, no `Closes` reference
+            // was added, so the spec or architecture sub-issue would never
+            // close on merge. Fail the run so the anomaly is visible rather
+            // than silently swallowed.
+            if (!deliverable) {
+              core.setFailed(
+                'Deliverable sub-issue for PR #' + pr.number
+                + ' could not be resolved; no `Closes` reference was added. '
+                + 'The spec or architecture sub-issue will not close on merge '
+                + 'until this is fixed.');
+            }

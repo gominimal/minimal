@@ -1,0 +1,712 @@
+name: sdd-spec
+
+# Thin wrapper for the sdd-spec agent.
+#
+# The agent itself is the reusable workflow .github/workflows/sdd-spec.lock.yml
+# (compiled from sdd-spec.md, which declares on: workflow_call). This wrapper
+# carries the real event triggers, gates the comment commands to authors with
+# repository write access, and passes the triggering entity to the agent
+# through the aw_context input. A consumer repository installs this wrapper
+# unchanged.
+#
+# The gh-aw command:/slash_command trigger (with its roles: gate) is not used
+# here: that trigger is gh-aw frontmatter and only takes effect when gh aw
+# compiles a workflow. This wrapper is a hand-written GitHub Actions workflow,
+# not a gh-aw source file, so gh aw never processes it. The gating is therefore
+# done explicitly below with a real repository-permission check.
+
+on:
+  # A tracking issue gained the sdd:spec label (also fired by the
+  # feature/bug issue templates), or the needs-human label was cleared.
+  issues:
+    types: [labeled, unlabeled]
+  # A /spec or /revise comment on an issue or pull request.
+  issue_comment:
+    types: [created]
+  # A spec pull request was closed; the agent advances the lifecycle only
+  # when it was merged.
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+
+jobs:
+  # Resolve which situation triggered the wrapper and build the aw_context the
+  # reusable workflow consumes. A non-match leaves should_run = false so the
+  # agent job is skipped.
+  #
+  # The job-level if: gate skips the route job entirely on issue_comment
+  # events whose body does not start with one of the commands this wrapper
+  # owns, and on issues label events whose label this wrapper does not route
+  # (fixes issue #119 — a /dispatch or /execute comment, or the
+  # sdd:in-progress/sdd:dispatched label mutations a /dispatch performs on a
+  # tracker, no longer spawn a route-job runner on this wrapper). The route
+  # step routes an `issues` event only on `labeled` `sdd:spec`/`sdd:fastpath`
+  # or `unlabeled` `needs-human`; every other label add/remove is skipped
+  # here without a runner.
+  route:
+    if: |
+      (github.event_name != 'issue_comment' && github.event_name != 'issues')
+      || (
+        github.event_name == 'issue_comment'
+        && (
+          startsWith(github.event.comment.body, '/spec')
+          || startsWith(github.event.comment.body, '/revise')
+          || startsWith(github.event.comment.body, '/fastpath')
+          || startsWith(github.event.comment.body, '/approve')
+        )
+      )
+      || (
+        github.event_name == 'issues'
+        && (
+          (
+            github.event.action == 'labeled'
+            && (
+              github.event.label.name == 'sdd:spec'
+              || github.event.label.name == 'sdd:fastpath'
+            )
+          )
+          || (
+            github.event.action == 'unlabeled'
+            && github.event.label.name == 'needs-human'
+          )
+        )
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+      aw_context: ${{ steps.decide.outputs.aw_context }}
+      fastpath_approve: ${{ steps.decide.outputs.fastpath_approve }}
+      fastpath_tracking: ${{ steps.decide.outputs.fastpath_tracking }}
+    steps:
+      - name: Decide whether to run and build aw_context
+        id: decide
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const event = context.eventName;
+            const payload = context.payload;
+            let run = false;
+            let ctx = {};
+
+            // A tracking issue gained sdd:spec or sdd:fastpath, or
+            // needs-human was cleared on a tracking issue. All three
+            // situations are tracking-issue-scoped: a tracking issue has no
+            // parent (it is the lifecycle anchor), and a task sub-issue has
+            // a parent (its Unit). The `sdd:spec` label and the
+            // `needs-human` label are both shared with sub-issues —
+            // `sdd:spec` is set by the feature/bug templates on the tracking
+            // issue but a human can label any issue, and `needs-human` is
+            // applied by every SDD agent on whatever item it is operating
+            // on. `sdd:fastpath` is applied here by the wrapper on a
+            // `/fastpath` from a write-access author (see the
+            // issue_comment branch below) and travels with the tracking
+            // issue. Filter out any unlabeled event whose item has a parent
+            // so a task sub-issue's `needs-human` removal never re-runs
+            // this agent. The labeled-event path is left unfiltered for
+            // sdd:spec because the feature/bug templates apply `sdd:spec`
+            // on creation, before a parent link can exist; if a sub-issue
+            // is hand-labelled `sdd:spec` the agent itself bails. The
+            // check reads `parent_issue_url` from the standard REST issue
+            // payload — the same field `wrappers/sdd-validate.yml` uses
+            // for the same kind of filter, kept symmetric to keep the two
+            // routing layers in step. A non-empty `parent_issue_url`
+            // means the item is nested under another issue (i.e. a
+            // sub-issue, not a tracking issue).
+            if (event === 'issues') {
+              const action = payload.action;
+              const label = payload.label && payload.label.name;
+              if (action === 'labeled'
+                  && (label === 'sdd:spec' || label === 'sdd:fastpath')) {
+                run = true;
+                // A manually-applied `sdd:fastpath` on a sub-issue must
+                // not route into sdd-spec. The feature/bug templates
+                // apply `sdd:spec` on tracking-issue creation before a
+                // parent link can exist, so that label is left
+                // unfiltered; but `sdd:fastpath` is human-curation only
+                // and may land on a sub-issue by mistake. Filter on the
+                // same `parent_issue_url` check the `needs-human`
+                // unlabeled branch below uses, so only tracking issues
+                // proceed.
+                if (label === 'sdd:fastpath') {
+                  let parentUrl = '';
+                  try {
+                    const { data } = await github.rest.issues.get({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: payload.issue.number,
+                    });
+                    parentUrl = data.parent_issue_url || '';
+                  } catch (err) {
+                    // A transient error falls through to "proceed" so a
+                    // real tracking-issue label gain is never silently
+                    // swallowed; the agent's own situation guards are
+                    // the second line of defence.
+                    core.info(
+                      'Could not fetch issue #' + payload.issue.number
+                      + ': ' + err.message);
+                  }
+                  if (parentUrl) {
+                    core.info('Issue #' + payload.issue.number
+                      + ' has a parent (' + parentUrl
+                      + '); sdd:fastpath on a sub-issue is ignored.');
+                    run = false;
+                  }
+                }
+              } else if (action === 'unlabeled' && label === 'needs-human') {
+                run = true;
+                let parentUrl = '';
+                try {
+                  const { data } = await github.rest.issues.get({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: payload.issue.number,
+                  });
+                  parentUrl = data.parent_issue_url || '';
+                } catch (err) {
+                  // Transient errors fall through to "proceed" so a real
+                  // tracking-issue resume is never silently swallowed. The
+                  // agent's situation-6 noop precondition is the second
+                  // line of defence.
+                  core.info(
+                    'Could not fetch issue #' + payload.issue.number + ': '
+                    + err.message);
+                }
+                if (parentUrl) {
+                  core.info('Issue #' + payload.issue.number
+                    + ' has a parent (' + parentUrl
+                    + '); sdd-spec only acts on tracking issues. Skipping.');
+                  run = false;
+                }
+              }
+              if (run) {
+                ctx = { item_type: 'issue', item_number: payload.issue.number };
+              }
+            }
+
+            // A /spec, /fastpath, /approve, or /revise comment from an
+            // author with repo write access. The gate is the actor's real
+            // repository permission, not author_association:
+            // author_association reports the relationship to the thread
+            // (OWNER/MEMBER/COLLABORATOR), which is not the same as push
+            // access. A MEMBER of the org need not have write on this
+            // repo, and a COLLABORATOR may be read-only. The
+            // collaborators/{user}/permission API returns the actual
+            // permission level; only write, maintain, or admin may run a
+            // command. `/fastpath` is the fast-path confirmation command
+            // from ADR 0012; it is valid only on a tracking issue (not a
+            // pull request) and is ignored on a PR comment. `/approve` on
+            // a tracking issue carrying `sdd:fastpath` routes to the
+            // deterministic fastpath-approve job below; `/approve` on a
+            // full-path tracking issue is left to sdd-triage's wrapper.
+            if (event === 'issue_comment' && payload.action === 'created') {
+              const body = (payload.comment.body || '').trim();
+              const firstWord = body.split(/\s+/)[0];
+              const isPr = !!payload.issue.pull_request;
+              const isFastpath = firstWord === '/fastpath' && !isPr;
+              const isApprove = firstWord === '/approve' && !isPr;
+              if (firstWord === '/fastpath' && isPr) {
+                core.info('/fastpath on a pull request; ignoring.');
+              } else if (isApprove) {
+                // Detect fastpath approval. Only act on /approve when the
+                // tracking issue carries sdd:fastpath; otherwise leave it
+                // to sdd-triage. Confirm write access first.
+                const actor = payload.comment.user.login;
+                let permission = 'none';
+                try {
+                  const resp = await github.rest.repos
+                    .getCollaboratorPermissionLevel({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      username: actor,
+                    });
+                  permission = resp.data.role_name || resp.data.permission;
+                } catch (err) {
+                  core.info(
+                    'Could not resolve repo permission for ' + actor
+                    + ': ' + err.message);
+                }
+                const canWrite = permission === 'write'
+                  || permission === 'maintain' || permission === 'admin';
+                if (canWrite) {
+                  let isFastpathTracking = false;
+                  try {
+                    const { data } = await github.rest.issues.get({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: payload.issue.number,
+                    });
+                    const labels = (data.labels || []).map(
+                      (l) => l.name || l);
+                    // Accept /approve on either sdd:fastpath (the
+                    // documented post-stub-merge state, per ADR 0012) or
+                    // sdd:fastpath-review (a human typed /approve before
+                    // the stub PR merged). The fastpath-approve job
+                    // below detects fastpath-review and posts a
+                    // guidance comment instead of dispatching, so this
+                    // carve-out only owns routing — not dispatch policy.
+                    // Kept symmetric with wrappers/sdd-triage.yml's
+                    // skipFastpath check.
+                    isFastpathTracking = labels.includes('sdd:fastpath')
+                      || labels.includes('sdd:fastpath-review');
+                  } catch (err) {
+                    core.info('Could not fetch issue #'
+                      + payload.issue.number + ': ' + err.message);
+                  }
+                  if (isFastpathTracking) {
+                    core.setOutput('fastpath_approve', 'true');
+                    core.setOutput('fastpath_tracking',
+                      String(payload.issue.number));
+                    // Suppress the sdd-spec agent invocation: the
+                    // fastpath-approve job below handles this trigger.
+                  } else {
+                    core.info('/approve on a non-fast-path tracking issue;'
+                      + ' sdd-triage will handle it.');
+                  }
+                } else {
+                  core.info(
+                    '/approve from an author without write access ('
+                    + permission + '); ignoring.');
+                }
+              } else if (firstWord === '/spec'
+                  || firstWord === '/revise'
+                  || isFastpath) {
+                const actor = payload.comment.user.login;
+                let permission = 'none';
+                try {
+                  const resp = await github.rest.repos
+                    .getCollaboratorPermissionLevel({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      username: actor,
+                    });
+                  // role_name is the precise role (write/maintain/triage/...)
+                  // when present; permission is the legacy bucket
+                  // (admin/write/read/none) that collapses maintain into
+                  // write and triage into read.
+                  permission = resp.data.role_name || resp.data.permission;
+                } catch (err) {
+                  core.info(
+                    'Could not resolve repo permission for ' + actor
+                    + ': ' + err.message);
+                }
+                const canWrite = permission === 'write'
+                  || permission === 'maintain' || permission === 'admin';
+                if (canWrite) {
+                  run = true;
+                  ctx = {
+                    item_type: isPr ? 'pull_request' : 'issue',
+                    item_number: payload.issue.number,
+                    comment_id: payload.comment.id,
+                  };
+                  if (isFastpath) {
+                    ctx.command = 'fastpath';
+                  }
+                } else {
+                  core.info(
+                    'Command from an author without write access ('
+                    + permission + '); ignoring.');
+                }
+              }
+            }
+
+            // A merged spec pull request. Scoped to spec PRs only: the head
+            // branch must follow the spec/<slug> convention. A merged
+            // non-spec PR is not this agent's concern and is left to no-op.
+            if (event === 'pull_request' && payload.action === 'closed') {
+              const merged = payload.pull_request.merged === true;
+              const headRef = payload.pull_request.head
+                && payload.pull_request.head.ref || '';
+              const isSpecBranch = headRef.startsWith('spec/');
+              if (merged && isSpecBranch) {
+                run = true;
+                ctx = {
+                  item_type: 'pull_request',
+                  item_number: payload.pull_request.number,
+                };
+              } else if (merged) {
+                core.info('Merged PR is not a spec branch; ignoring.');
+              }
+            }
+
+            core.setOutput('should_run', run ? 'true' : 'false');
+            core.setOutput('aw_context', run ? JSON.stringify(ctx) : '');
+
+  # Fast-path /approve handler (ADR 0012).
+  #
+  # On /approve on a tracking issue carrying sdd:fastpath, the route job
+  # sets fastpath_approve=true. This job runs the deterministic dispatch:
+  # find the latest execution-plan comment on the tracking issue (matched
+  # by the `[sdd-spec:fastpath-plan]` plain-text marker), parse its
+  # `model:*` tier, mint an App token, call workflow_dispatch on the
+  # matching sdd-execute-{tier}.yml with `entry: 'fastpath'`, and move
+  # the tracking issue's lifecycle from `sdd:fastpath` to
+  # `sdd:in-progress`. The wrapper handles this entirely; the sdd-spec
+  # agent .md source is not invoked on this path.
+  #
+  # This follows the deterministic-in-wrapper pattern from #81 (ADR
+  # 0011): there is no natural-language judgement on this code path —
+  # walk a comment, parse a tier, call REST.
+  fastpath-approve:
+    needs: route
+    if: needs.route.outputs.fastpath_approve == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+      - name: Find plan comment and dispatch sdd-execute-{tier}
+        uses: actions/github-script@v9
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          TRACKING: ${{ needs.route.outputs.fastpath_tracking }}
+        with:
+          github-token: ${{ env.APP_TOKEN }}
+          script: |
+            const tracking = parseInt(process.env.TRACKING, 10);
+            const sentinel = '[sdd-spec:fastpath-plan]';
+
+            // Before dispatching, confirm the tracking issue is in
+            // `sdd:fastpath` (the documented `/approve` state, per ADR
+            // 0012). If it is still in `sdd:fastpath-review` the stub
+            // spec PR has not merged yet; post a guidance comment
+            // pointing at the merge gate and stop. This lets the
+            // route-job carve-out accept either state symmetrically
+            // (kept consistent with sdd-triage's skipFastpath check)
+            // while keeping dispatch policy here.
+            try {
+              const { data: issueData } = await github.rest.issues.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: tracking,
+              });
+              const issueLabels = (issueData.labels || []).map(
+                (l) => l.name || l);
+              if (issueLabels.includes('sdd:fastpath-review')
+                  && !issueLabels.includes('sdd:fastpath')) {
+                core.info('/approve on #' + tracking
+                  + ' while sdd:fastpath-review is present; the stub'
+                  + ' spec PR has not merged. Posting guidance and'
+                  + ' exiting without dispatch.');
+                try {
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: tracking,
+                    body: 'Fast-path `/approve` is gated on the stub'
+                      + ' spec PR merging. Merge the open stub spec'
+                      + ' pull request first; the tracking issue'
+                      + ' returns to `sdd:fastpath` and then `/approve`'
+                      + ' dispatches the implementation.',
+                  });
+                } catch (e) {
+                  core.info('Could not post guidance comment: '
+                    + e.message);
+                }
+                return;
+              }
+            } catch (err) {
+              // A transient fetch error falls through to the dispatch
+              // path; the agent's lifecycle move below is idempotent
+              // and the worst case is a duplicate run on the right
+              // state.
+              core.info('Could not pre-check labels on #' + tracking
+                + ': ' + err.message);
+            }
+
+            // List comments on the tracking issue and find the latest plan
+            // comment by the sentinel marker. `/revise` between the plan
+            // post and `/approve` posts a new plan comment and hides the
+            // prior one; the latest one is the active plan.
+            let planComment = null;
+            let page = 1;
+            for (;;) {
+              const { data } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: tracking,
+                per_page: 100,
+                page,
+              });
+              for (const c of data) {
+                if ((c.body || '').includes(sentinel)) {
+                  if (!planComment
+                      || (new Date(c.created_at))
+                        > (new Date(planComment.created_at))) {
+                    planComment = c;
+                  }
+                }
+              }
+              if (data.length < 100) {
+                break;
+              }
+              page += 1;
+            }
+            if (!planComment) {
+              core.setFailed('No execution plan comment found on tracking'
+                + ' issue #' + tracking + '. Expected a comment carrying'
+                + ' the `' + sentinel + '` sentinel posted by sdd-spec on'
+                + ' /fastpath. /approve cannot dispatch without a plan.');
+              try {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: tracking,
+                  body: 'Fast-path `/approve` could not find an execution'
+                    + ' plan comment on this tracking issue. Re-run'
+                    + ' `/fastpath` to regenerate the stub spec and plan,'
+                    + ' or comment `/spec` to switch to the full pipeline.',
+                });
+              } catch (e) {
+                core.info('Could not post failure comment: ' + e.message);
+              }
+              return;
+            }
+
+            // Parse the `model:*` tier from the plan body. Accept either
+            // `model: haiku` or `model:haiku` and case-insensitive tier
+            // names; reject anything else with a comment.
+            const tierMatch = (planComment.body || '').match(
+              /model\s*:\s*(haiku|sonnet|opus)\b/i);
+            if (!tierMatch) {
+              core.setFailed('Execution plan comment on #' + tracking
+                + ' is missing a `model:{haiku,sonnet,opus}` tier.');
+              try {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: tracking,
+                  body: 'Fast-path `/approve` could not parse a `model:`'
+                    + ' tier from the execution plan comment. Comment'
+                    + ' `/revise <note>` to re-post the plan with a'
+                    + ' `model: haiku|sonnet|opus` line.',
+                });
+              } catch (e) {
+                core.info('Could not post failure comment: ' + e.message);
+              }
+              return;
+            }
+            const tier = tierMatch[1].toLowerCase();
+
+            // Dispatch sdd-execute-{tier} with the fast-path entry context.
+            // Dispatch *before* moving the lifecycle label so that a
+            // dispatch failure leaves the tracking issue in
+            // `sdd:fastpath` (where the human can simply retype
+            // `/approve`) instead of stranded in `sdd:in-progress` with
+            // no execute run. The sdd-execute fast-path entry bypasses
+            // the route-job tier gate via `fastpathEntry`, so it does
+            // not depend on the lifecycle label being moved first.
+            const workflow = 'sdd-execute-' + tier + '.yml';
+            const awContext = JSON.stringify({
+              trigger: 'command',
+              entry: 'fastpath',
+              item_type: 'issue',
+              item_number: tracking,
+              plan_comment_id: planComment.id,
+              tier: tier,
+            });
+            // Resolve the dispatch ref. `context.ref` is set on
+            // issue_comment events (the branch the workflow file was
+            // loaded from — the default branch by GitHub's rule). When
+            // it is somehow absent, fall back to the repository's
+            // default branch from the REST API, not a hardcoded "main":
+            // the `workflow_dispatch` event payload does not include
+            // `repository.default_branch`, and hardcoding `main`
+            // dispatches to a non-existent ref on repos whose default
+            // branch differs.
+            let dispatchRef = context.ref;
+            if (!dispatchRef) {
+              try {
+                const { data: repoData } = await github.rest.repos.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                });
+                dispatchRef = 'refs/heads/' + repoData.default_branch;
+              } catch (err) {
+                core.setFailed('Could not resolve default branch for '
+                  + 'workflow_dispatch ref: ' + err.message);
+                return;
+              }
+            }
+            try {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: workflow,
+                ref: dispatchRef,
+                inputs: { aw_context: awContext },
+              });
+              core.info('Dispatched ' + workflow + ' for fast-path tracking'
+                + ' issue #' + tracking);
+            } catch (err) {
+              core.setFailed('Failed to dispatch ' + workflow
+                + ' for fast-path #' + tracking + ': ' + err.message);
+              return;
+            }
+
+            // Dispatch succeeded; now move the lifecycle from
+            // sdd:fastpath (or sdd:fastpath-review, if the early-state
+            // pre-check above did not catch the case) to
+            // sdd:in-progress on the tracking issue. The remove and
+            // add are idempotent.
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: tracking,
+                name: 'sdd:fastpath',
+              });
+            } catch (err) {
+              core.info('Could not remove sdd:fastpath from #' + tracking
+                + ': ' + err.message);
+            }
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: tracking,
+                labels: ['sdd:in-progress'],
+              });
+            } catch (err) {
+              core.info('Could not add sdd:in-progress to #' + tracking
+                + ': ' + err.message);
+            }
+
+  sdd-spec:
+    needs: route
+    if: needs.route.outputs.should_run == 'true'
+    uses: norrietaylor/spectacles/.github/workflows/sdd-spec.lock.yml@main
+    with:
+      aw_context: ${{ needs.route.outputs.aw_context }}
+    # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
+    # to a reusable workflow in a different owner than the caller.
+    secrets:
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+      DISTILLERY_OAUTH_TOKEN: ${{ secrets.DISTILLERY_OAUTH_TOKEN }}
+    # Ceiling for the called reusable workflow. Must cover the union of every
+    # nested job's permissions: the gh-aw conclusion and safe_outputs jobs
+    # need write scopes, and activation needs actions: read.
+    permissions:
+      actions: read
+      contents: write
+      discussions: write
+      issues: write
+      pull-requests: write
+
+  # Agent-failure hand-off (fixes #122, #123).
+  #
+  # When the sdd-spec reusable workflow fails before producing safe-outputs
+  # (e.g. the "Execute GitHub Copilot CLI" step crashes, or any other infra
+  # failure the gh-aw conclusion job does not classify), the agent has posted
+  # nothing: no comment, no needs-human. The failure is invisible to the
+  # reporter and the work stalls with no auto-retry (#122, #123). This job
+  # makes that failure visible and recoverable by minting the App token (same
+  # pattern as fastpath-approve above) and posting a hand-off comment plus
+  # the `needs-human` label on the tracking issue. Clearing `needs-human`
+  # re-fires the agent (situation 6 in sdd-spec.md), so the human-driven
+  # resume stands in for the missing auto-retry.
+  #
+  # Gated on failure() and should_run so it never runs when the agent was
+  # skipped (route decided not to run) or succeeded. The aw_context JSON the
+  # route job built carries the routed item; needs-human is applied only to
+  # an issue item (the tracking issue), which is the lifecycle anchor the
+  # agent re-fires on. A pull-request item (a /revise on a spec PR, or a
+  # merged spec PR) gets a visibility comment so the failure is still
+  # surfaced, but not needs-human: that label re-fires the agent only from
+  # the tracking issue, which is not reliably derivable from a PR here.
+  failure-handoff:
+    needs: [route, sdd-spec]
+    if: failure() && needs.route.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+      - name: Post failure hand-off to tracking issue
+        uses: actions/github-script@v9
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          AW_CONTEXT: ${{ needs.route.outputs.aw_context }}
+        with:
+          github-token: ${{ env.APP_TOKEN }}
+          script: |
+            let ctx = {};
+            try {
+              ctx = JSON.parse(process.env.AW_CONTEXT || '{}');
+            } catch (err) {
+              core.setFailed('Could not parse aw_context: ' + err.message);
+              return;
+            }
+            const itemType = ctx.item_type;
+            const itemNumber = ctx.item_number;
+            if (!itemNumber) {
+              core.info('No item_number in aw_context; nothing to hand off.');
+              return;
+            }
+            const runUrl = process.env.GITHUB_SERVER_URL + '/'
+              + context.repo.owner + '/' + context.repo.repo
+              + '/actions/runs/' + context.runId;
+            // A pull-request item is a /revise on a spec PR or a merged spec
+            // PR. Apply needs-human only to an issue (the tracking issue):
+            // its removal re-fires the agent (situation 6). On a PR, post a
+            // visibility comment only so the failure is no longer silent.
+            const isIssue = itemType === 'issue';
+            const body = isIssue
+              ? 'The `sdd-spec` agent run failed before it could post a '
+                + 'spec, a comment, or any lifecycle update — the failure '
+                + 'was not classified by the conclusion job (e.g. the '
+                + 'agent step itself crashed). Applying `needs-human` so '
+                + 'this is visible and recoverable. A human should '
+                + 'investigate the failed run and, once ready, clear the '
+                + '`needs-human` label to re-run the spec agent on this '
+                + 'tracking issue. Failed run: ' + runUrl
+              : 'The `sdd-spec` agent run failed before it could post a '
+                + 'comment or any lifecycle update. A human should '
+                + 'investigate the failed run and re-run the agent. '
+                + 'Failed run: ' + runUrl;
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: itemNumber,
+                body,
+              });
+            } catch (err) {
+              core.setFailed('Could not post failure comment on #'
+                + itemNumber + ': ' + err.message);
+              return;
+            }
+            if (isIssue) {
+              try {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: itemNumber,
+                  labels: ['needs-human'],
+                });
+              } catch (err) {
+                core.setFailed('Could not apply needs-human to #'
+                  + itemNumber + ': ' + err.message);
+              }
+            }
