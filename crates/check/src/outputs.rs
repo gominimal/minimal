@@ -394,3 +394,119 @@ fn find_lib_in_deps(
 
     Ok(None)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CheckCtx, CheckVerdict, GraphBasedChecker};
+    use lcache::Cache;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    /// A minimal RAII temp-directory that does not require the `tempfile` crate.
+    struct TmpDir(PathBuf);
+
+    impl TmpDir {
+        fn new(label: &str) -> Self {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "check-test-{}-{}-{}",
+                label,
+                std::process::id(),
+                ns,
+            ));
+            std::fs::create_dir_all(&path).expect("create tmp dir");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Returns a `CheckCtx` with a fresh cache and an empty `Graph` wrapped in an
+    /// `Arc<RwLock<>>`, plus the lock guard needed by `GraphBasedChecker::check`.
+    async fn make_ctx_with_graph(
+        cache_root: &Path,
+        skip_checkers: Vec<String>,
+    ) -> (
+        CheckCtx,
+        Arc<RwLock<Graph>>,
+        tokio::sync::RwLockReadGuard<'static, Graph>,
+    ) {
+        // Leak the Arc so we can return a 'static guard.  The memory is reclaimed
+        // when the process exits (tests are short-lived).
+        let graph_arc: Arc<RwLock<Graph>> = Arc::new(RwLock::new(Graph::new()));
+        // SAFETY: the Arc is never dropped (intentional for test scaffolding); the
+        // RwLock is valid for the process lifetime, so the returned guard is sound.
+        let static_arc: &'static RwLock<Graph> = unsafe { &*Arc::as_ptr(&graph_arc) };
+        let guard = static_arc.read().await;
+
+        let cache = Cache::at_dir(cache_root).expect("cache init");
+        let ctx = CheckCtx::new(
+            vec![],
+            skip_checkers,
+            false,
+            None,
+            PathBuf::from("/dev/null"),
+            cache,
+            None,
+        );
+        (ctx, graph_arc, guard)
+    }
+
+    /// When `"missing runtime_deps"` is listed in `skip_checkers`, the checker must
+    /// return `Skip` immediately without inspecting the graph or cache.
+    #[tokio::test]
+    async fn skip_checkers_bypasses_runtime_deps_check() {
+        let tmp = TmpDir::new("skip-checkers");
+        let (ctx, _arc, guard) =
+            make_ctx_with_graph(tmp.path(), vec!["missing runtime_deps".to_string()]).await;
+
+        let result = MissingRuntimeDeps
+            .check(&ctx, "any-pkg".into(), Path::new("/dev/null"), guard, None)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(result.verdict, CheckVerdict::Skip),
+            "expected Skip when checker is disabled, got {:?}",
+            result.verdict
+        );
+    }
+
+    /// A package name that is not registered in the graph must yield `Skip`.
+    /// The checker cannot inspect a build it has no knowledge of.
+    #[tokio::test]
+    async fn unknown_package_name_returns_skip() {
+        let tmp = TmpDir::new("unknown-pkg");
+        let (ctx, _arc, guard) = make_ctx_with_graph(tmp.path(), vec![]).await;
+
+        let result = MissingRuntimeDeps
+            .check(
+                &ctx,
+                "no-such-package".into(),
+                Path::new("/dev/null"),
+                guard,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(result.verdict, CheckVerdict::Skip),
+            "expected Skip for unknown package, got {:?}",
+            result.verdict
+        );
+    }
+}
