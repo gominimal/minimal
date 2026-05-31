@@ -26,6 +26,8 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
+use uuid::Uuid;
+
 use crate::connection::Connection;
 use crate::rpc::OneshotSshRpc;
 use crate::server::{Config, HostKey, ServerStateHandle};
@@ -133,6 +135,23 @@ impl TestClient {
         let mut response_buf = Vec::with_capacity(1024);
         stream.read_to_end(&mut response_buf).await.unwrap();
         serde_json::from_slice(&response_buf).expect("response deserializes")
+    }
+
+    /// Opens an SFTP session attached to the given minimald session.
+    ///
+    /// Sets `MINIMAL_SESSION_ID` on the channel (the env-var contract the
+    /// server uses to scope the SFTP subsystem to a session), then requests
+    /// the `sftp` subsystem and hands the channel stream to the SFTP client.
+    pub(crate) async fn open_sftp(&mut self, session_id: Uuid) -> russh_sftp::client::SftpSession {
+        let channel = self.handle.channel_open_session().await.unwrap();
+        channel
+            .set_env(true, "MINIMAL_SESSION_ID", session_id.to_string())
+            .await
+            .unwrap();
+        channel.request_subsystem(true, "sftp").await.unwrap();
+        russh_sftp::client::SftpSession::new(channel.into_stream())
+            .await
+            .unwrap()
     }
 }
 
