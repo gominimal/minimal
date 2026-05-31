@@ -5,6 +5,7 @@ pub mod rpc;
 pub mod server;
 mod session;
 mod sessions;
+mod sftp;
 #[cfg(test)]
 mod test_harness;
 

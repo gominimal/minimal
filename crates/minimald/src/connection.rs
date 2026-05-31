@@ -16,6 +16,7 @@ use crate::{
     ChannelConfig, RequestedPty,
     rpc::{self},
     server::ServerStateHandle,
+    sftp,
 };
 
 static PROTOCOL_TRACE_ENABLED: LazyLock<bool> =
@@ -366,6 +367,10 @@ impl russh::server::Handler for ConnectionHandler {
             let c = self.0.clone();
             let s = c.0.lock().await.serv.clone();
             rpc::handle_ssh_rpc(s, c, name, id, session).await?;
+        } else if name == sftp::SUBSYSTEM_NAME {
+            let c = self.0.clone();
+            let s = c.0.lock().await.serv.clone();
+            sftp::handle_sftp_subsystem(s, c, id, session).await?;
         } else {
             session.channel_failure(id)?;
         }
