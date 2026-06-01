@@ -944,6 +944,7 @@ fn locked_mount_flags(path: &Path) -> hakoniwa::MountOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use config::{Config, SandboxMapped};
 
     // /proc is mounted with nosuid,nodev on essentially every Linux distro;
     // if either stops showing up we've broken the FsFlags → MountOptions
@@ -961,5 +962,77 @@ mod tests {
     fn locked_mount_flags_empty_on_statfs_failure() {
         let opts = locked_mount_flags(Path::new("/nonexistent-path-for-statfs-test"));
         assert!(opts.is_empty());
+    }
+
+    /// Creates a tempdir with the `synth/usr/` structure required by
+    /// `Sandbox::new`. The `synth/` dir is hardlinked into the rootfs;
+    /// `usr/` must be present so the subsequent `usr/lib64 → lib` symlink
+    /// step can succeed.
+    fn make_base_with_synth() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        fs::create_dir_all(base.join("synth").join("usr")).unwrap();
+        (tmp, base)
+    }
+
+    /// `Sandbox::new` must reject a `SandboxMapped::File` entry in `config.rootfs`
+    /// with `Error::MappedFile`. Files cannot be hardlinked at the rootfs level —
+    /// only directories are valid rootfs entries.
+    #[test]
+    fn sandbox_new_rejects_mapped_file_in_rootfs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        // A file path that need not exist — the error is returned before it is accessed.
+        let phantom = base.join("phantom.txt");
+        let config = Config::new("test-reject-file").with_add_rootfs(SandboxMapped::File(phantom));
+        let result = Sandbox::new(base, config, ());
+        assert!(
+            matches!(result, Err(Error::MappedFile(_))),
+            "expected MappedFile error, got {result:?}"
+        );
+    }
+
+    /// When no explicit `state_dir` is configured, `Sandbox::new` derives it
+    /// as `base_dir/state`. The caller relies on this to bind-mount `/state`
+    /// into the container at the correct host path.
+    #[test]
+    fn sandbox_new_derives_state_dir_from_base() {
+        let (_tmp, base) = make_base_with_synth();
+        let config = Config::new("test-state-default");
+        let sandbox = Sandbox::new(base.clone(), config, ()).unwrap();
+        assert_eq!(
+            sandbox.state_dir,
+            base.join("state"),
+            "state_dir should default to base_dir/state"
+        );
+    }
+
+    /// When an explicit `state_dir` is supplied via `Config::with_state_dir`,
+    /// `Sandbox::new` must store that path verbatim so the container bind-mounts
+    /// the caller's chosen directory rather than an auto-generated one.
+    #[test]
+    fn sandbox_new_honours_explicit_state_dir() {
+        let (_tmp, base) = make_base_with_synth();
+        let state_tmp = tempfile::TempDir::new().unwrap();
+        let state_path = state_tmp.path().to_path_buf();
+        let config = Config::new("test-state-explicit").with_state_dir(state_path.clone());
+        let sandbox = Sandbox::new(base, config, ()).unwrap();
+        assert_eq!(
+            sandbox.state_dir, state_path,
+            "state_dir should match the path supplied via with_state_dir"
+        );
+    }
+
+    /// After a successful `Sandbox::new`, the minenv Unix socket must be connectable.
+    /// This exercises the channel listener thread: if the thread failed to bind or
+    /// is not running, the connect call would fail.
+    #[test]
+    fn sandbox_new_minenv_socket_is_connectable() {
+        use std::os::unix::net::UnixStream;
+        let (_tmp, base) = make_base_with_synth();
+        let config = Config::new("test-socket");
+        let sandbox = Sandbox::new(base, config, ()).unwrap();
+        let sock = sandbox.base_dir.join("run").join("minenv_sock");
+        UnixStream::connect(&sock).expect("minenv_sock should be connectable after Sandbox::new");
     }
 }
