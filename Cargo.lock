@@ -3358,6 +3358,7 @@ dependencies = [
  "remote-client",
  "serde",
  "serde_json",
+ "serial_test",
  "smallvec",
  "tokio",
  "tokio-util",
