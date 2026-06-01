@@ -21,12 +21,11 @@ use std::sync::Arc;
 
 use camino::Utf8PathBuf;
 use russh::keys::ssh_key;
+use sessions::SessionId;
 use sessions::paths::DaemonAbsPath;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-
-use uuid::Uuid;
 
 use crate::connection::Connection;
 use crate::rpc::OneshotSshRpc;
@@ -142,7 +141,10 @@ impl TestClient {
     /// Sets `MINIMAL_SESSION_ID` on the channel (the env-var contract the
     /// server uses to scope the SFTP subsystem to a session), then requests
     /// the `sftp` subsystem and hands the channel stream to the SFTP client.
-    pub(crate) async fn open_sftp(&mut self, session_id: Uuid) -> russh_sftp::client::SftpSession {
+    pub(crate) async fn open_sftp(
+        &mut self,
+        session_id: SessionId,
+    ) -> russh_sftp::client::SftpSession {
         let channel = self.handle.channel_open_session().await.unwrap();
         channel
             .set_env(true, "MINIMAL_SESSION_ID", session_id.to_string())

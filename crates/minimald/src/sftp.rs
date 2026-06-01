@@ -20,11 +20,11 @@ use russh::server::Session;
 use russh_sftp::protocol::{
     Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode,
 };
+use sessions::SessionId;
 use sessions::paths::DaemonAbsPath;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::task::spawn;
-use uuid::Uuid;
 
 use crate::connection::{ConnectionError, ConnectionHandle};
 use crate::server::ServerStateHandle;
@@ -428,7 +428,7 @@ pub(crate) async fn handle_sftp_subsystem(
         session.channel_failure(id)?;
         return Ok(());
     };
-    let Ok(session_uuid) = Uuid::parse_str(session_id_str) else {
+    let Ok(session_id) = SessionId::parse_str(session_id_str) else {
         tracing::warn!(
             value = %session_id_str,
             "sftp subsystem rejected on channel {id}: {MINIMAL_SESSION_ID_ENV} is not a uuid",
@@ -438,18 +438,15 @@ pub(crate) async fn handle_sftp_subsystem(
     };
 
     let mngr = s.sessions_manager().await;
-    let session_handle = match mngr
-        .get_session(SessionKeyPredicate::Id(session_uuid))
-        .await
-    {
+    let session_handle = match mngr.get_session(SessionKeyPredicate::Id(session_id)).await {
         Ok(Some(h)) => h,
         Ok(None) => {
-            tracing::warn!(%session_uuid, "sftp subsystem rejected: unknown session");
+            tracing::warn!(%session_id, "sftp subsystem rejected: unknown session");
             session.channel_failure(id)?;
             return Ok(());
         }
         Err(e) => {
-            tracing::warn!(%session_uuid, error = %e, "sftp subsystem rejected: lookup failed");
+            tracing::warn!(%session_id, error = %e, "sftp subsystem rejected: lookup failed");
             session.channel_failure(id)?;
             return Ok(());
         }
@@ -469,9 +466,9 @@ pub(crate) async fn handle_sftp_subsystem(
 mod tests {
     use russh_sftp::client::error::Error as SftpClientError;
     use russh_sftp::protocol::{OpenFlags, StatusCode};
+    use sessions::SessionId;
     use sessions::paths::HostAbsPath;
     use tokio::io::AsyncWriteExt;
-    use uuid::Uuid;
 
     use crate::rpc::{CreateSession, CreateSessionRequest};
     use crate::test_harness::TestServer;
@@ -479,11 +476,11 @@ mod tests {
     /// Creates a fresh session through the public CreateSession RPC and
     /// returns its uuid, mirroring how a real client would set things up
     /// before opening an SFTP channel.
-    async fn fresh_session(client: &mut crate::test_harness::TestClient) -> Uuid {
+    async fn fresh_session(client: &mut crate::test_harness::TestClient) -> SessionId {
         client
             .call::<CreateSession>(&CreateSessionRequest {
                 record: sessions::Record {
-                    id: Uuid::nil(),
+                    id: SessionId::nil(),
                     name: Some("sftp-test".to_string()),
                     username: None,
                     project_path: HostAbsPath::try_new("/tmp").unwrap(),

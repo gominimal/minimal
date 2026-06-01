@@ -3,9 +3,9 @@ use russh::{
     server::{Msg, Session},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sessions::SessionId;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::spawn;
-use uuid::Uuid;
 
 use crate::{
     connection::{ConnectionError, ConnectionHandle},
@@ -101,7 +101,7 @@ pub struct ListSessions;
 /// An entry in the ListSessions response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ListSessionsEntry {
-    pub id: Uuid,
+    pub id: SessionId,
     pub name: Option<String>,
 }
 
@@ -155,7 +155,7 @@ pub struct GetSessionRecord;
 #[serde(rename_all = "snake_case")]
 pub enum GetSessionRecordRequest {
     Name(String),
-    Id(Uuid),
+    Id(SessionId),
 }
 
 /// The response for a [`GetSessionRecord`] RPC.
@@ -205,7 +205,7 @@ pub struct CreateSessionRequest {
 /// The response for a [`CreateSession`] RPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSessionResponse {
-    pub id: Uuid,
+    pub id: SessionId,
 }
 
 impl OneshotSshRpc for CreateSession {
@@ -337,7 +337,7 @@ mod tests {
         let mut client = server.connect().await;
 
         let resp = client
-            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(Uuid::nil()))
+            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(SessionId::nil()))
             .await;
 
         assert!(resp.record.is_none());
@@ -364,7 +364,7 @@ mod tests {
         let create_session = client
             .call::<CreateSession>(&CreateSessionRequest {
                 record: sessions::Record {
-                    id: Uuid::nil(),
+                    id: SessionId::nil(),
                     name: Some("my session".to_string()),
                     username: None,
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
@@ -373,7 +373,7 @@ mod tests {
             })
             .await;
 
-        assert!(create_session.id != Uuid::nil());
+        assert!(create_session.id != SessionId::nil());
 
         let get_session = client
             .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(create_session.id))
