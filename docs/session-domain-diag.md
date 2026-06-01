@@ -14,7 +14,6 @@ classDiagram
 
     class Socket {
         <<connection>>
-        +path: $HOME/.minimal/local/[pid].sock
     }
 
     class Provider {
@@ -51,10 +50,10 @@ classDiagram
         <<workload>>
     }
 
-    Minimal "1" --> "*" Socket : discovers via local dir
+    Minimal "1" --> "*" Socket : discovers
     Socket "1" --> "1" Provider : connects to
     Minimal "1" ..> "*" Provider : connects to many
-    Provider "1" --> "1" Socket : creates [pid].sock
+    Provider "1" --> "1" Socket : creates
 
     Provider <|.. Minimald : implements
     Provider <|.. MinVMD : implements
@@ -72,9 +71,9 @@ classDiagram
 
 ```mermaid
 flowchart LR
-    M["Minimal<br/>(client process)"] -. "scans ~/.minimal/local/" .-> DIR[("~/.minimal/local/")]
-    P1["minimald (pid 4001)"] -- "creates" --> SK1["4001.sock"]
-    P2["minvmd (pid 4002)"] -- "creates" --> SK2["4002.sock"]
+    M["Minimal<br/>(client process)"] -. "discovers" .-> DIR[("local provider sockets")]
+    P1["minimald (pid 4001)"] -- "creates" --> SK1["socket"]
+    P2["minvmd (pid 4002)"] -- "creates" --> SK2["socket"]
     SK1 --> DIR
     SK2 --> DIR
     M -- "connects" --> SK1
@@ -84,7 +83,7 @@ flowchart LR
     P2 -- "hosts" --> guest
     P2 -. "proxies guest socket" .-> MD
     subgraph guest["VM (guest)"]
-        MD["minimald (in VM)<br/>~/.minimal/local/&lt;pid&gt;.sock"] --> E3["Session"]
+        MD["minimald (in VM)"] --> E3["Session"]
     end
 ```
 
@@ -94,9 +93,9 @@ macOS has no native `minimald` (it is a Linux provider), so `Minimal` **cannot t
 
 ```mermaid
 flowchart LR
-    M["Minimal<br/>(host, macOS)"] -. "scans ~/.minimal/local/" .-> DIR[("~/.minimal/local/")]
-    P1["minvmd (pid 5001)"] -- "creates" --> SK1["5001.sock"]
-    P2["minvmd (pid 5002)"] -- "creates" --> SK2["5002.sock"]
+    M["Minimal<br/>(host, macOS)"] -. "discovers" .-> DIR[("local provider sockets")]
+    P1["minvmd (pid 5001)"] -- "creates" --> SK1["socket"]
+    P2["minvmd (pid 5002)"] -- "creates" --> SK2["socket"]
     SK1 --> DIR
     SK2 --> DIR
     M -- "connects" --> SK1
@@ -119,7 +118,7 @@ flowchart LR
 
 ## VM socket proxying
 
-- The in-VM `minimald` creates its own `~/.minimal/local/<pid>.sock` inside the guest.
+- The in-VM `minimald` creates its own socket inside the guest.
 - `minvmd` **proxies/forwards** that guest socket back to the host, so host `Minimal` talks to the in-VM `minimald` through `minvmd`.
 - `Minimal` connects to `minvmd`'s host socket; `minvmd` relays traffic across the VM boundary to each VM's `minimald`.
 
@@ -132,22 +131,21 @@ flowchart LR
 
 ## Socket lifecycle
 
-- **Providers own the socket lifecycle**: create `~/.minimal/local/<pid>.sock` on start, remove it on shutdown.
-- One socket per provider process; PID namespaces the socket file.
-- `Minimal` discovers providers by scanning `~/.minimal/local/` and connecting to each `<pid>.sock`.
-- `Minimal` must **detect dead providers**: a `<pid>.sock` may be stale (provider crashed without cleanup). Connect-and-prune or liveness-check on discovery.
+- **Providers own the socket lifecycle**: create their socket on start, remove it on shutdown.
+- One socket per provider process.
+- `Minimal` discovers providers and connects to each socket.
 
 ## Startup / bootstrap
 
 ```mermaid
 flowchart TD
-    START([Minimal starts]) --> SCAN["scan ~/.minimal/local/"]
+    START([Minimal starts]) --> SCAN["discover providers"]
     SCAN --> Q{live sockets found?}
-    Q -- yes --> CONN["connect to each live <pid>.sock"]
+    Q -- yes --> CONN["connect to each live socket"]
     Q -- no --> HASCFG{config present?}
     HASCFG -- yes --> ALL["start ALL providers in config<br/>(config overrides defaults)"]
     HASCFG -- no --> DEF["start system default provider<br/>(e.g. minimald on Linux)"]
-    ALL --> MKSOCK["each provider creates <pid>.sock"]
+    ALL --> MKSOCK["each provider creates its socket"]
     DEF --> MKSOCK
     MKSOCK --> CONN
     CONN --> READY([ready])
@@ -156,8 +154,7 @@ flowchart TD
 **Bootstrap rules:**
 - No config → start the single system-default provider for the OS.
 - Config present → start **all** providers listed; config fully overrides defaults.
-- A spawned provider creates its `<pid>.sock`, then `Minimal` connects.
-- Stale `<pid>.sock` files (dead provider) are skipped/pruned during the scan.
+- A spawned provider creates its socket, then `Minimal` connects.
 
 ## Glossary
 
