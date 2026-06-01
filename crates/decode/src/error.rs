@@ -308,3 +308,96 @@ impl Error {
         self.report_to(&mut StandardStream::stderr(ColorChoice::Auto).lock());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codespan_reporting::term::termcolor::Buffer;
+
+    fn capture(err: &Error) -> String {
+        let mut buf = Buffer::no_color();
+        err.report_to(&mut buf);
+        String::from_utf8(buf.into_inner()).unwrap()
+    }
+
+    #[test]
+    fn io_error_contains_prefix() {
+        let e = Error::IO(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "file missing",
+        ));
+        let out = capture(&e);
+        assert!(
+            out.contains("IO Error:"),
+            "expected 'IO Error:' in: {out:?}"
+        );
+        assert!(out.contains("file missing"), "expected message in: {out:?}");
+    }
+
+    #[test]
+    fn other_error_contains_message() {
+        let e = Error::Other("something went wrong".into());
+        let out = capture(&e);
+        assert!(out.contains("Error:"), "expected 'Error:' in: {out:?}");
+        assert!(
+            out.contains("something went wrong"),
+            "expected message in: {out:?}"
+        );
+    }
+
+    #[test]
+    fn packages_not_found_lists_package_names() {
+        let e = Error::PackagesNotFound {
+            packages: vec!["foo".into(), "bar".into()],
+        };
+        let out = capture(&e);
+        assert!(
+            out.contains("packages not found"),
+            "expected phrase in: {out:?}"
+        );
+        assert!(out.contains("foo"), "expected 'foo' in: {out:?}");
+        assert!(out.contains("bar"), "expected 'bar' in: {out:?}");
+    }
+
+    #[test]
+    fn stdlib_outdated_contains_versions() {
+        let e = Error::StdlibOutdated {
+            need_version: "2.0.0".into(),
+            needed_by: "some-pkg".into(),
+            current_version: "1.0.0".into(),
+        };
+        let out = capture(&e);
+        assert!(
+            out.contains("newer version of the standard library needed"),
+            "expected headline in: {out:?}"
+        );
+        assert!(out.contains("2.0.0"), "expected needed version in: {out:?}");
+        assert!(
+            out.contains("1.0.0"),
+            "expected current version in: {out:?}"
+        );
+        assert!(out.contains("some-pkg"), "expected needed_by in: {out:?}");
+    }
+
+    #[test]
+    fn missing_ty_contains_error_message() {
+        let e = Error::MissingTy(Files::default(), TermPos::None);
+        let out = capture(&e);
+        assert!(
+            out.contains("record was not given a type"),
+            "expected message in: {out:?}"
+        );
+    }
+
+    #[test]
+    fn missing_field_contains_field_name() {
+        let e = Error::MissingField {
+            files: Files::default(),
+            obj: ObjTy::Builder,
+            pos: TermPos::None,
+            field: "my_field",
+        };
+        let out = capture(&e);
+        assert!(out.contains("my_field"), "expected field name in: {out:?}");
+    }
+}
