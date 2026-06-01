@@ -3,12 +3,26 @@ name: CI
 on:
   push:
     branches: ["main"]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
   pull_request:
     branches: ["main"]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+
+# Cancel an in-progress run when a newer commit is pushed to the same ref.
+# main is excluded so release/promote on main never get cancelled mid-flight.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: write
@@ -61,6 +75,7 @@ jobs:
 
   build-release-amd64:
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v6
       - name: Install dependencies
@@ -81,6 +96,7 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-amd64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-amd64-cargo-release-
       - name: Build static release binary
         run: cargo build --release --package minimal --target x86_64-unknown-linux-musl
       - name: Upload binary artifact
@@ -92,6 +108,7 @@ jobs:
 
   build-release-arm64:
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v6
       - name: Install cross
@@ -107,6 +124,7 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-arm64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-arm64-cargo-release-
       - name: Build static release binary
         run: cross build --release --package minimal --target aarch64-unknown-linux-musl
       - name: Upload binary artifact
