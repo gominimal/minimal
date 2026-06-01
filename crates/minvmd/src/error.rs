@@ -5,6 +5,7 @@
 //! source magnitude survives any wrap-and-rethrow.
 
 use std::fmt;
+use std::io;
 use std::path::PathBuf;
 
 /// Errors produced by `minvmd`'s VM layer.
@@ -13,9 +14,9 @@ use std::path::PathBuf;
 pub enum VmError {
     /// A libkrun FFI call returned a negative errno. `op` names the libkrun
     /// function so the caller can attribute the failure without parsing
-    /// strings; `code` is the absolute errno magnitude (libkrun returns
-    /// negative errnos; we strip the sign before surfacing).
-    Backend { op: &'static str, code: i32 },
+    /// strings; `source` carries the errno as an [`io::Error`] (libkrun
+    /// returns negative errnos; the sign is stripped when constructing it).
+    Backend { op: &'static str, source: io::Error },
 
     /// A caller-supplied path contained a NUL byte and cannot be passed across
     /// the C FFI boundary. `what` identifies the parameter for diagnostics.
@@ -35,8 +36,8 @@ pub enum VmError {
 impl fmt::Display for VmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Backend { op, code } => {
-                write!(f, "libkrun {op} returned errno {code}")
+            Self::Backend { op, source } => {
+                write!(f, "libkrun {op} failed: {source}")
             }
             Self::NulInPath { what, path } => {
                 write!(
@@ -61,24 +62,13 @@ impl fmt::Display for VmError {
     }
 }
 
-impl std::error::Error for VmError {}
-
-// Translating libkrun return codes is macOS-only (libkrun is not linked on
-// Linux); gating prevents a dead-code error in the Linux lib build.
-#[cfg(target_os = "macos")]
-impl VmError {
-    /// Translate a libkrun return code into a `Result`. libkrun returns zero
-    /// (or a positive id) on success and a negative errno on failure; we
-    /// preserve the magnitude as a positive `code`.
-    #[inline]
-    pub(crate) fn check_backend(op: &'static str, ret: i32) -> Result<i32, VmError> {
-        if ret < 0 {
-            Err(VmError::Backend {
-                op,
-                code: ret.unsigned_abs() as i32,
-            })
-        } else {
-            Ok(ret)
+impl std::error::Error for VmError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Backend { source, .. } => Some(source),
+            Self::NulInPath { .. }
+            | Self::NulInString { .. }
+            | Self::StartEnterReturnedUnexpectedly { .. } => None,
         }
     }
 }
@@ -87,35 +77,32 @@ impl VmError {
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn backend_check_passes_through_success() {
-        assert_eq!(VmError::check_backend("op", 0).unwrap(), 0);
-        assert_eq!(VmError::check_backend("op", 7).unwrap(), 7);
+    fn backend_preserves_errno_in_source() {
+        let err = VmError::Backend {
+            op: "krun_create_ctx",
+            source: io::Error::from_raw_os_error(22),
+        };
+        let VmError::Backend { source, .. } = &err else {
+            panic!("expected Backend, got {err:?}");
+        };
+        assert_eq!(
+            source.raw_os_error(),
+            Some(22),
+            "errno magnitude must be preserved"
+        );
+        // `source()` exposes the io::Error so the chain is traversable.
+        assert!(std::error::Error::source(&err).is_some());
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn backend_check_translates_negative_to_typed_error() {
-        let err = VmError::check_backend("krun_create_ctx", -22).unwrap_err();
-        match err {
-            VmError::Backend { op, code } => {
-                assert_eq!(op, "krun_create_ctx");
-                assert_eq!(code, 22, "errno magnitude must be preserved");
-            }
-            other => panic!("expected Backend, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn display_includes_op_and_code() {
+    fn display_includes_op_and_errno() {
         let err = VmError::Backend {
             op: "krun_set_vm_config",
-            code: 12,
+            source: io::Error::from_raw_os_error(12),
         };
         let s = format!("{err}");
         assert!(s.contains("krun_set_vm_config"), "display: {s}");
-        assert!(s.contains("12"), "display: {s}");
     }
 
     #[test]

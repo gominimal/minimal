@@ -3427,6 +3427,7 @@ dependencies = [
  "anyhow",
  "clap",
  "clap_complete",
+ "libc",
  "tracing",
  "tracing-subscriber",
 ]

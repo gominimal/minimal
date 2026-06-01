@@ -9,6 +9,9 @@
 //! requirement here so it travels with the symbols themselves.
 
 use std::ffi::c_char;
+use std::io;
+
+use crate::error::VmError;
 
 // Kernel format constants from libkrun.h, used by `krun_set_kernel`. We only
 // model the formats minvmd actually targets:
@@ -97,4 +100,59 @@ unsafe extern "C" {
     /// Redirect the implicit console output to a host file. Used by the
     /// supervisor to capture early-boot kernel output for diagnostics.
     pub fn krun_set_console_output(ctx_id: u32, c_filepath: *const c_char) -> i32;
+}
+
+/// Translate a libkrun return code into a `Result`.
+///
+/// libkrun returns zero (or a positive id) on success and a negative errno on
+/// failure. The errno magnitude is preserved by negating into an [`io::Error`]
+/// via [`io::Error::from_raw_os_error`]; the pathological `i32::MIN` (no
+/// representable negation) falls back to `EOVERFLOW`.
+///
+/// Lives next to the FFI declarations it guards rather than on `VmError`, so
+/// the negative-errno convention stays with the bindings that produce it.
+pub(crate) fn check_backend(op: &'static str, ret: i32) -> Result<i32, VmError> {
+    if ret < 0 {
+        let errno = ret.checked_neg().unwrap_or(libc::EOVERFLOW);
+        Err(VmError::Backend {
+            op,
+            source: io::Error::from_raw_os_error(errno),
+        })
+    } else {
+        Ok(ret)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_backend_passes_through_success() {
+        assert_eq!(check_backend("op", 0).unwrap(), 0);
+        assert_eq!(check_backend("op", 7).unwrap(), 7);
+    }
+
+    #[test]
+    fn check_backend_translates_negative_to_typed_error() {
+        let err = check_backend("krun_create_ctx", -22).unwrap_err();
+        let VmError::Backend { op, source } = err else {
+            panic!("expected Backend, got {err:?}");
+        };
+        assert_eq!(op, "krun_create_ctx");
+        assert_eq!(
+            source.raw_os_error(),
+            Some(22),
+            "errno magnitude must be preserved"
+        );
+    }
+
+    #[test]
+    fn check_backend_handles_i32_min() {
+        let err = check_backend("op", i32::MIN).unwrap_err();
+        let VmError::Backend { source, .. } = err else {
+            panic!("expected Backend");
+        };
+        assert_eq!(source.raw_os_error(), Some(libc::EOVERFLOW));
+    }
 }

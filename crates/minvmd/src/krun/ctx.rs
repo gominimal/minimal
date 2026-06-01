@@ -34,7 +34,7 @@ impl Context {
         // non-negative ctx_id (owned by the caller until krun_free_ctx) or a
         // negative errno. No pointer or lifetime invariants apply.
         let ret = unsafe { raw::krun_create_ctx() };
-        let id = VmError::check_backend("krun_create_ctx", ret)?;
+        let id = raw::check_backend("krun_create_ctx", ret)?;
         Ok(Self { ctx_id: id as u32 })
     }
 
@@ -52,7 +52,7 @@ impl Context {
         // SAFETY: all arguments are passed by value; ctx_id refers to a
         // context owned by `self` and not yet freed. No pointer invariants.
         let ret = unsafe { raw::krun_set_vm_config(self.ctx_id, num_vcpus, ram_mib) };
-        VmError::check_backend("krun_set_vm_config", ret)?;
+        raw::check_backend("krun_set_vm_config", ret)?;
         Ok(())
     }
 
@@ -64,7 +64,7 @@ impl Context {
         // is valid (NUL-terminated, non-null) until the call returns. The
         // ctx_id is owned by `self`.
         let ret = unsafe { raw::krun_set_root(self.ctx_id, cstr.as_ptr()) };
-        VmError::check_backend("krun_set_root", ret)?;
+        raw::check_backend("krun_set_root", ret)?;
         drop(cstr);
         Ok(())
     }
@@ -90,10 +90,9 @@ impl Context {
         // FFI call so both outlive the unsafe block. `envp_cstrs == None`
         // means "inherit host env" per libkrun docs (pass NULL); a `Some`
         // (including `Some(&[])`) gets a properly NULL-terminated array.
-        let envp_cstrs: Option<Vec<CString>> = match envp {
-            Some(entries) => Some(cstrings_from_strs(entries, "envp")?),
-            None => None,
-        };
+        let envp_cstrs: Option<Vec<CString>> = envp
+            .map(|entries| cstrings_from_strs(entries, "envp"))
+            .transpose()?;
         let (envp_ptrs, envp_ptr): (Vec<*const c_char>, *const *const c_char) =
             match envp_cstrs.as_ref() {
                 Some(cstrs) => {
@@ -131,7 +130,7 @@ impl Context {
         drop(argv_cstrs);
         drop(envp_ptrs);
         drop(envp_cstrs);
-        VmError::check_backend("krun_set_exec", ret)?;
+        raw::check_backend("krun_set_exec", ret)?;
         Ok(())
     }
 
@@ -145,14 +144,12 @@ impl Context {
         cmdline: Option<&str>,
     ) -> Result<(), VmError> {
         let kernel_cstr = cstring_from_path(kernel_path.as_ref(), "kernel")?;
-        let initramfs_cstr = match initramfs {
-            Some(p) => Some(cstring_from_path(p.as_ref(), "initramfs")?),
-            None => None,
-        };
-        let cmdline_cstr = match cmdline {
-            Some(s) => Some(cstring_from_str(s, "cmdline")?),
-            None => None,
-        };
+        let initramfs_cstr = initramfs
+            .map(|p| cstring_from_path(p.as_ref(), "initramfs"))
+            .transpose()?;
+        let cmdline_cstr = cmdline
+            .map(|s| cstring_from_str(s, "cmdline"))
+            .transpose()?;
 
         let initramfs_ptr = initramfs_cstr.as_ref().map_or(ptr::null(), |c| c.as_ptr());
         let cmdline_ptr = cmdline_cstr.as_ref().map_or(ptr::null(), |c| c.as_ptr());
@@ -173,7 +170,7 @@ impl Context {
         drop(kernel_cstr);
         drop(initramfs_cstr);
         drop(cmdline_cstr);
-        VmError::check_backend("krun_set_kernel", ret)?;
+        raw::check_backend("krun_set_kernel", ret)?;
         Ok(())
     }
 
@@ -189,7 +186,7 @@ impl Context {
         // `port` passed by value; `ctx_id` owned by `self`.
         let ret = unsafe { raw::krun_add_vsock_port(self.ctx_id, port, cstr.as_ptr()) };
         drop(cstr);
-        VmError::check_backend("krun_add_vsock_port", ret)?;
+        raw::check_backend("krun_add_vsock_port", ret)?;
         Ok(())
     }
 
@@ -200,7 +197,7 @@ impl Context {
         // `ctx_id` owned by `self`.
         let ret = unsafe { raw::krun_set_console_output(self.ctx_id, cstr.as_ptr()) };
         drop(cstr);
-        VmError::check_backend("krun_set_console_output", ret)?;
+        raw::check_backend("krun_set_console_output", ret)?;
         Ok(())
     }
 
@@ -221,7 +218,7 @@ impl Context {
         // docs, krun_start_enter takes ownership of the configuration. No
         // further wrapper calls referring to this id are valid.
         let ret = unsafe { raw::krun_start_enter(ctx_id) };
-        match VmError::check_backend("krun_start_enter", ret) {
+        match raw::check_backend("krun_start_enter", ret) {
             // libkrun's docs guarantee start_enter only returns on error
             // (success path: VMM calls exit() with the guest workload's
             // exit code). A non-negative return is therefore a protocol

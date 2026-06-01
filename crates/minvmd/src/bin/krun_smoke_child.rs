@@ -21,35 +21,31 @@
 //!
 //! Linux is a no-op stub (exit 0); the integration test is `target_os = macos`.
 
-fn main() {
+fn main() -> Result<(), minvmd::VmError> {
+    #[cfg(target_os = "macos")]
+    return run_macos();
+
     #[cfg(not(target_os = "macos"))]
     {
         eprintln!("krun_smoke_child: macOS-only; nothing to do on this platform");
-        std::process::exit(0);
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        run_macos();
+        Ok(())
     }
 }
 
 #[cfg(target_os = "macos")]
-fn run_macos() {
+fn run_macos() -> Result<(), minvmd::VmError> {
     use minvmd::krun::{Context, KRUN_KERNEL_FORMAT_IMAGE_BZ2, KRUN_KERNEL_FORMAT_IMAGE_GZ};
 
     eprintln!("STAGE: create_ctx");
-    let mut ctx = Context::create().expect("krun_create_ctx must succeed");
+    let mut ctx = Context::create()?;
     eprintln!("STAGE: create_ctx ok ctx_id={}", ctx.id());
 
     eprintln!("STAGE: set_vm_config");
-    ctx.set_vm_config(1, 512)
-        .expect("krun_set_vm_config 1 vcpu / 512 MiB must succeed");
+    ctx.set_vm_config(1, 512)?;
     eprintln!("STAGE: set_vm_config ok");
 
     eprintln!("STAGE: set_exec");
-    ctx.set_exec("/bin/true", &[] as &[&str], None::<&[&str]>)
-        .expect("krun_set_exec /bin/true must succeed");
+    ctx.set_exec("/bin/true", &[] as &[&str], None::<&[&str]>)?;
     eprintln!("STAGE: set_exec ok");
 
     let kernel = std::env::var("MINVMD_KERNEL_PATH").ok();
@@ -61,11 +57,11 @@ fn run_macos() {
              start_enter requires a configured kernel + rootfs)"
         );
         drop(ctx); // RAII free_ctx
-        std::process::exit(0);
+        return Ok(());
     };
 
     eprintln!("STAGE: set_root path={rootfs}");
-    ctx.set_root(&rootfs).expect("krun_set_root must succeed");
+    ctx.set_root(&rootfs)?;
     eprintln!("STAGE: set_root ok");
 
     // Per-arch kernel format: the virtio-linux package ships `Image.gz` on
@@ -76,13 +72,7 @@ fn run_macos() {
         KRUN_KERNEL_FORMAT_IMAGE_BZ2
     };
     eprintln!("STAGE: set_kernel path={kernel} format={format}");
-    ctx.set_kernel(
-        &kernel,
-        format,
-        None::<&std::path::Path>,
-        None, // cmdline
-    )
-    .expect("krun_set_kernel must succeed");
+    ctx.set_kernel(&kernel, format, None::<&std::path::Path>, None)?;
     eprintln!("STAGE: set_kernel ok");
 
     eprintln!("STAGE: start_enter");
