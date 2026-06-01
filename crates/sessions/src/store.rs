@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::paths::{DaemonAbsPath, DaemonRelPath};
-use crate::{Record, sub_path};
+use crate::{Record, SessionId, sub_path};
 
 /// Describes the session object yielded by [`Loader`].
 pub trait SessionObject: Sized + Send + 'static + std::fmt::Debug {
@@ -20,8 +20,8 @@ pub trait SessionObject: Sized + Send + 'static + std::fmt::Debug {
 /// Describes the primary key a [`Loader`] uses to reference
 /// sessions.
 pub trait SessionKey: Sized + Send + 'static + std::fmt::Debug + Clone + Eq + Ord {
-    /// Returns the UUID of the session.
-    fn uuid(&self) -> &Uuid;
+    /// Returns the ID of the session.
+    fn id(&self) -> &SessionId;
 }
 
 /// A type which can load sessions.
@@ -30,7 +30,7 @@ pub trait Loader {
     type Object: SessionObject<Key = Self::Key>;
 
     /// Lists all sessions known to this loader, by key.
-    fn list(&self) -> impl Iterator<Item = Self::Key>;
+    fn keys(&self) -> impl Iterator<Item = Self::Key>;
 
     /// Gets a session.
     ///
@@ -47,7 +47,7 @@ pub trait Loader {
     ///
     /// Returns an I/O error if the backing record cannot be read or
     /// deserialized.
-    fn find_by_uuid(&self, id: &Uuid) -> Result<Option<Self::Key>, std::io::Error>;
+    fn find_by_id(&self, id: &SessionId) -> Result<Option<Self::Key>, std::io::Error>;
 
     /// Returns a lookup key corresponding to the given session name, if
     /// a session with that name is known.
@@ -73,13 +73,13 @@ pub trait Loader {
 /// The concrete key used to identify sessions from [`DiskLoader`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DiskSessionKey {
-    session_uuid: Uuid,
+    session_id: SessionId,
     dir_key: DaemonRelPath,
 }
 
 impl SessionKey for DiskSessionKey {
-    fn uuid(&self) -> &Uuid {
-        &self.session_uuid
+    fn id(&self) -> &SessionId {
+        &self.session_id
     }
 }
 
@@ -109,16 +109,39 @@ impl SessionObject for DiskSession {
 
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct Index {
-    short_to_uuid: BTreeMap<String, Uuid>,
-    name_to_uuid: BTreeMap<String, Uuid>,
+    short_to_id: BTreeMap<String, SessionId>,
+    name_to_id: BTreeMap<String, SessionId>,
 }
 
 impl Index {
-    pub fn insert(&mut self, short: String, uuid: Uuid, name: Option<String>) {
-        self.short_to_uuid.insert(short, uuid);
+    pub fn insert(&mut self, short: String, id: SessionId, name: Option<String>) {
+        self.short_to_id.insert(short, id);
         if let Some(name) = name {
-            self.name_to_uuid.insert(name, uuid);
+            self.name_to_id.insert(name, id);
         }
+    }
+
+    /// Iterates over all (shortname, session id) pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &SessionId)> {
+        self.short_to_id.iter()
+    }
+
+    /// Returns the session ID corresponding to the given session name, if known.
+    pub fn find_by_name<S: AsRef<str>>(&self, name: S) -> Option<&SessionId> {
+        self.name_to_id.get(name.as_ref())
+    }
+
+    /// Returns the session ID corresponding to the given short name, if known.
+    pub fn find_by_short<S: AsRef<str>>(&self, name: S) -> Option<&SessionId> {
+        self.short_to_id.get(name.as_ref())
+    }
+
+    /// Returns the short corresponding to the given session ID, if known.
+    pub fn short_by_id(&self, id: &SessionId) -> Option<&String> {
+        self.short_to_id
+            .iter()
+            .find(|(_short, iter_id)| *iter_id == id)
+            .map(|(short, _)| short)
     }
 }
 
@@ -131,6 +154,8 @@ impl Index {
 /// ./<short-dir-name>/record.json is the session record.
 pub struct DiskLoader {
     minimal_dir: DaemonAbsPath,
+    /// Keeps track of a mapping from shortname to UUID, as well as name to UUID.
+    /// Always kept up to date.
     index: Index,
 }
 
@@ -184,7 +209,7 @@ impl Loader for DiskLoader {
 
     fn create(&mut self, mut record: Record) -> Result<Self::Key, std::io::Error> {
         if let Some(name) = &record.name
-            && self.index.name_to_uuid.contains_key(name)
+            && self.index.name_to_id.contains_key(name)
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
@@ -193,14 +218,14 @@ impl Loader for DiskLoader {
         }
 
         let uuid = Uuid::now_v7();
-        record.id = uuid;
+        record.id = SessionId(uuid);
 
         let uuid_str = uuid.simple().to_string();
         let mut short = uuid_str[uuid_str.len() - 5..].to_string();
         // We got unlucky and the short name collided, 20 bits of entropy
         // so rare but very possible. Increment the short name past
         // any collisions in this case.
-        while self.index.short_to_uuid.contains_key(&short) {
+        while self.index.find_by_short(&short).is_some() {
             let n = u32::from_str_radix(&short, 16)
                 .expect("short dir name is always 5 hex chars from a UUID suffix");
             short = format!("{:05x}", n.wrapping_add(1));
@@ -215,46 +240,39 @@ impl Loader for DiskLoader {
         let record_file = session_dir.join("record.json");
         serde_json::to_writer(std::fs::File::create(record_file)?, &record)?;
 
-        self.index.insert(short.clone(), uuid, record.name);
+        self.index
+            .insert(short.clone(), SessionId(uuid), record.name);
         self.flush()?;
 
         Ok(DiskSessionKey {
-            session_uuid: uuid,
+            session_id: SessionId(uuid),
             dir_key: DaemonRelPath::try_new(short).unwrap(),
         })
     }
 
-    fn list(&self) -> impl Iterator<Item = Self::Key> {
-        self.index
-            .short_to_uuid
-            .iter()
-            .map(|(short, id)| Self::Key {
-                session_uuid: *id,
-                dir_key: DaemonRelPath::try_new(short).unwrap(),
-            })
+    fn keys(&self) -> impl Iterator<Item = Self::Key> {
+        self.index.iter().map(|(short, id)| Self::Key {
+            session_id: *id,
+            dir_key: DaemonRelPath::try_new(short).unwrap(),
+        })
     }
 
-    fn find_by_uuid(&self, id: &Uuid) -> Result<Option<Self::Key>, std::io::Error> {
-        Ok(self
-            .index
-            .short_to_uuid
-            .iter()
-            .find(|(_short, iter_id)| *iter_id == id)
-            .map(|(short, id)| Self::Key {
-                dir_key: DaemonRelPath::try_new(short).unwrap(),
-                session_uuid: *id,
-            }))
+    fn find_by_id(&self, id: &SessionId) -> Result<Option<Self::Key>, std::io::Error> {
+        Ok(self.index.short_by_id(id).map(|short| Self::Key {
+            dir_key: DaemonRelPath::try_new(short).unwrap(),
+            session_id: *id,
+        }))
     }
     fn find_by_name<S: AsRef<str>>(&self, name: S) -> Result<Option<Self::Key>, std::io::Error> {
-        match self.index.name_to_uuid.get(name.as_ref()) {
-            Some(uuid) => self.find_by_uuid(uuid),
+        match self.index.find_by_name(name) {
+            Some(uuid) => self.find_by_id(uuid),
             None => Ok(None),
         }
     }
 
     fn get(&self, key: &Self::Key) -> Result<Self::Object, std::io::Error> {
         assert!(
-            self.index.short_to_uuid.contains_key(key.dir_key.as_str()),
+            self.index.find_by_short(&key.dir_key).is_some(),
             "key {:?} not present in index — Keys are only handed out for sessions that exist",
             key.dir_key,
         );
@@ -286,7 +304,7 @@ mod tests {
 
     fn sample_record() -> Record {
         Record {
-            id: Uuid::nil(),
+            id: SessionId::nil(),
             name: Some("my-session".to_string()),
             username: Some("alice".to_string()),
             project_path: HostAbsPath::try_new("/home/alice/proj").unwrap(),
@@ -312,9 +330,9 @@ mod tests {
         assert_eq!(got.record().project_path, input.project_path);
         assert_eq!(got.record().attrs, input.attrs);
 
-        // Check find_by_uuid as well.
+        // Check find_by_id as well.
         assert_eq!(
-            loader.find_by_uuid(&got.record.id).unwrap().as_ref(),
+            loader.find_by_id(&got.record.id).unwrap().as_ref(),
             Some(&key)
         );
         // Check find_by_name as well.
@@ -330,12 +348,12 @@ mod tests {
         let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
 
         let mut input = sample_record();
-        input.id = Uuid::nil();
+        input.id = SessionId::nil();
         let key = loader.create(input).unwrap();
 
-        assert_ne!(key.uuid(), &Uuid::nil(), "create must overwrite caller id");
+        assert_ne!(key.id().0, Uuid::nil(), "create must overwrite caller id");
         let stored = loader.get(&key).unwrap();
-        assert_eq!(&stored.record().id, key.uuid());
+        assert_eq!(&stored.record().id, key.id());
     }
 
     #[test]
@@ -355,7 +373,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
 
-        let created: BTreeSet<Uuid> = (0..5)
+        let created: BTreeSet<SessionId> = (0..5)
             .map(|i| {
                 *loader
                     .create({
@@ -364,10 +382,10 @@ mod tests {
                         record
                     })
                     .unwrap()
-                    .uuid()
+                    .id()
             })
             .collect();
-        let listed: BTreeSet<Uuid> = loader.list().map(|k| *k.uuid()).collect();
+        let listed: BTreeSet<SessionId> = loader.keys().map(|k| *k.id()).collect();
 
         assert_eq!(listed, created);
     }
@@ -382,11 +400,11 @@ mod tests {
 
         let reloaded = DiskLoader::new(loader_dir(&tmp)).unwrap();
         let key = reloaded
-            .list()
-            .find(|k| k.uuid() == original.uuid())
+            .keys()
+            .find(|k| k.id() == original.id())
             .expect("previously-created session should be visible after reinit");
         let stored = reloaded.get(&key).unwrap();
-        assert_eq!(&stored.record().id, original.uuid());
+        assert_eq!(&stored.record().id, original.id());
         assert_eq!(stored.record().name.as_deref(), Some("my-session"));
     }
 }

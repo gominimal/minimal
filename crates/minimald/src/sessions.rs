@@ -2,23 +2,23 @@ use std::collections::BTreeMap;
 
 use crate::session::{Session, SessionHandle};
 use sessions::{
+    SessionId,
     paths::DaemonAbsPath,
     store::{DiskLoader, Loader, SessionKey, SessionObject},
 };
 use tokio::sync::{mpsc, oneshot};
-use uuid::Uuid;
 
 /// A short summary of the metadata of a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionInfo {
-    pub id: Uuid,
+    pub id: SessionId,
     pub name: Option<String>,
 }
 
 /// A key you can use to identify a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionKeyPredicate {
-    Id(Uuid),
+    Id(SessionId),
     Name(String),
 }
 
@@ -48,7 +48,7 @@ enum ManagerMessage {
     List(Responder<Vec<SessionInfo>>),
     GetRecord(SessionKeyPredicate, Responder<Option<sessions::Record>>),
     GetSession(SessionKeyPredicate, Responder<Option<SessionHandle>>),
-    CreateSession(sessions::Record, Responder<Uuid>),
+    CreateSession(sessions::Record, Responder<SessionId>),
 }
 
 /// Manages session instances, and session state on disk.
@@ -82,7 +82,7 @@ impl Manager {
 impl<L: Loader> Manager<L> {
     fn key_for(&self, pred: &SessionKeyPredicate) -> Result<Option<L::Key>, std::io::Error> {
         match pred {
-            SessionKeyPredicate::Id(id) => self.store.find_by_uuid(id),
+            SessionKeyPredicate::Id(id) => self.store.find_by_id(id),
             SessionKeyPredicate::Name(name) => self.store.find_by_name(name),
         }
     }
@@ -102,7 +102,7 @@ impl<L: Loader> Manager<L> {
             ManagerMessage::List(r) => {
                 r.handle(async {
                     self.store
-                        .list()
+                        .keys()
                         .map(|k| {
                             let s = self.store.get(&k)?;
                             let r = s.record();
@@ -121,7 +121,7 @@ impl<L: Loader> Manager<L> {
                     Ok::<_, ResponseError>(match pred {
                         SessionKeyPredicate::Id(id) => self
                             .store
-                            .find_by_uuid(&id)?
+                            .find_by_id(&id)?
                             .map(|k| self.store.get(&k).unwrap().record().clone()),
                         SessionKeyPredicate::Name(name) => self
                             .store
@@ -160,7 +160,7 @@ impl<L: Loader> Manager<L> {
             ManagerMessage::CreateSession(record, r) => {
                 r.handle(async {
                     let k = self.store.create(record)?;
-                    Ok(*k.uuid())
+                    Ok(*k.id())
                 })
                 .await;
             }
@@ -193,7 +193,10 @@ impl ManagerHandle {
     }
 
     /// Creates a session based on the given record.
-    pub async fn create_session(&self, record: sessions::Record) -> Result<Uuid, ResponseError> {
+    pub async fn create_session(
+        &self,
+        record: sessions::Record,
+    ) -> Result<SessionId, ResponseError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
