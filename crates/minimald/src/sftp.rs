@@ -15,13 +15,13 @@ use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 
 use path_absolutize::Absolutize;
+use paths::DaemonAbsPath;
 use russh::ChannelId;
 use russh::server::Session;
 use russh_sftp::protocol::{
     Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode,
 };
 use sessions::SessionId;
-use sessions::paths::DaemonAbsPath;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::task::spawn;
@@ -464,10 +464,10 @@ pub(crate) async fn handle_sftp_subsystem(
 
 #[cfg(test)]
 mod tests {
+    use paths::HostAbsPath;
     use russh_sftp::client::error::Error as SftpClientError;
     use russh_sftp::protocol::{OpenFlags, StatusCode};
     use sessions::SessionId;
-    use sessions::paths::HostAbsPath;
     use tokio::io::AsyncWriteExt;
 
     use crate::rpc::{CreateSession, CreateSessionRequest};

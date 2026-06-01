@@ -25,6 +25,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 ot.workspace = true
+paths.workspace = true
 sessions.workspace = true
 stdlib.workspace = true
 

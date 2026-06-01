@@ -20,9 +20,9 @@
 use std::sync::Arc;
 
 use camino::Utf8PathBuf;
+use paths::DaemonAbsPath;
 use russh::keys::ssh_key;
 use sessions::SessionId;
-use sessions::paths::DaemonAbsPath;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;

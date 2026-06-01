@@ -1,4 +1,4 @@
-use ::sessions::paths::DaemonAbsPath;
+use ::paths::DaemonAbsPath;
 use russh::keys::key::safe_rng;
 use russh::keys::{PrivateKey, ssh_key::Error as KeyError};
 use serde::{Deserialize, Serialize};

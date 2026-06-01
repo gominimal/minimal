@@ -14,6 +14,7 @@ members = [
     "crates/op",
     "crates/ot",
     "crates/orchestrator",
+    "crates/paths",
     "crates/minimal",
     "crates/minimal2",
     "crates/minimald",
@@ -124,6 +125,7 @@ multi = { version = "0.0.1", path = "crates/multi" }
 op = { version = "0.0.1", path = "crates/op" }
 ot = { version = "0.0.1", path = "crates/ot" }
 orchestrator = { version = "0.0.1", path = "crates/orchestrator" }
+paths = { version = "0.0.1", path = "crates/paths" }
 remote-proto = { version = "0.0.1", path = "crates/remote-proto" }
 remote-client = { version = "0.0.1", path = "crates/remote-client" }
 sandbox2 = { version = "0.0.1", path = "crates/sandbox2" }

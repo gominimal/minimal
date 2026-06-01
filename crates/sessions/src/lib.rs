@@ -7,12 +7,11 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::paths::HostAbsPath;
+use paths::HostAbsPath;
 
 pub mod lifecyclehook;
 pub mod loadout;
 pub mod patches;
-pub mod paths;
 pub mod policy;
 pub mod store;
 pub mod vars;

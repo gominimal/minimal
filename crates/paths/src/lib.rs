@@ -6,7 +6,7 @@
 //! to pass a host path to code that expects a sandbox-internal path, and the
 //! type checker will not stop you.
 //!
-//! This module encodes the filesystem a path belongs to as a *phantom type
+//! This crate encodes the filesystem a path belongs to as a *phantom type
 //! parameter*, splits absolute and relative paths into distinct types, and
 //! requires crossing realms to go through an explicit [`Translator`].
 //!
@@ -26,7 +26,7 @@
 //! # Example
 //!
 //! ```
-//! use sessions::paths::{AbsPath, Host, RelPath};
+//! use paths::{AbsPath, Host, RelPath};
 //!
 //! let base: AbsPath<Host> = AbsPath::try_new("/etc/minimal").unwrap();
 //! let rel: RelPath<Host> = RelPath::try_new("hooks/cleanup.sh").unwrap();
@@ -162,7 +162,7 @@ pub const fn _validate_subdir(s: &str) {
 macro_rules! sub_path {
     ($base:expr, $dir:literal) => {{
         #[allow(clippy::used_underscore_items)]
-        const _: () = $crate::paths::_validate_subdir($dir);
+        const _: () = $crate::_validate_subdir($dir);
         ($base).sub_path_unchecked($dir)
     }};
 }
@@ -608,7 +608,7 @@ impl<'de, R: Realm> serde::Deserialize<'de> for RelPath<R> {
 /// tag is needed — every UTF-8 path is unambiguously one or the other.
 ///
 /// ```
-/// use sessions::paths::HostPath;
+/// use paths::HostPath;
 ///
 /// let abs: HostPath = toml::from_str::<Wrap>(r#"x = "/etc/minimal""#).unwrap().x;
 /// let rel: HostPath = toml::from_str::<Wrap>(r#"x = "etc/minimal""#).unwrap().x;
@@ -886,7 +886,7 @@ impl std::error::Error for CwdResolveError {
 /// #[derive(clap::Parser)]
 /// struct Args {
 ///     #[arg(long)]
-///     minimal_dir: Option<sessions::paths::CwdRelative<sessions::paths::Daemon>>,
+///     minimal_dir: Option<paths::CwdRelative<paths::Daemon>>,
 /// }
 /// ```
 ///
@@ -899,7 +899,7 @@ impl std::error::Error for CwdResolveError {
 /// `CwdRelative<Sandbox>` is not spellable:
 ///
 /// ```compile_fail
-/// use sessions::paths::{CwdRelative, Sandbox};
+/// use paths::{CwdRelative, Sandbox};
 /// let _: CwdRelative<Sandbox>;
 /// ```
 pub struct CwdRelative<R: CwdResolvable>(EitherPath<R>);
