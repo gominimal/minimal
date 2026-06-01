@@ -288,7 +288,7 @@ pub async fn handle_ssh_rpc(
 
 #[cfg(test)]
 mod tests {
-    use sessions::paths::HostAbsPath;
+    use paths::HostAbsPath;
 
     use super::*;
     use crate::test_harness::TestServer;

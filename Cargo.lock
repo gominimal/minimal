@@ -3395,6 +3395,7 @@ dependencies = [
  "futures",
  "ot",
  "path-absolutize",
+ "paths",
  "russh",
  "russh-sftp",
  "serde",
@@ -3989,6 +3990,15 @@ dependencies = [
  "static_assertions",
  "tempfile",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "paths"
+version = "0.0.1"
+dependencies = [
+ "camino",
+ "serde",
+ "toml 1.1.2+spec-1.1.0",
 ]
 
 [[package]]
@@ -5498,6 +5508,7 @@ dependencies = [
  "camino",
  "common",
  "globset",
+ "paths",
  "serde",
  "serde_json",
  "tempfile",

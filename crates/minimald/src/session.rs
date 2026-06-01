@@ -1,4 +1,5 @@
-use sessions::{paths::DaemonAbsPath, store::SessionObject};
+use paths::DaemonAbsPath;
+use sessions::store::SessionObject;
 use tokio::sync::{mpsc, oneshot};
 
 enum SessionMessage {

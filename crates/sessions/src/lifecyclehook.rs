@@ -6,9 +6,9 @@
 //! [`LifecycleHook::builder`] or deserialize them from configuration; both paths
 //! enforce the same invariant.
 
-use crate::paths::{self, ConfigRelPath};
 use camino::Utf8PathBuf;
 use core::fmt;
+use paths::ConfigRelPath;
 
 /// Errors produced when constructing a [`LifecycleHook`].
 #[non_exhaustive]

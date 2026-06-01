@@ -4,10 +4,7 @@
 use camino::Utf8PathBuf;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
-use sessions::{
-    paths::{CwdRelative, Daemon, DaemonAbsPath, DaemonRelPath},
-    sub_path,
-};
+use paths::{CwdRelative, Daemon, DaemonAbsPath, DaemonRelPath, sub_path};
 use tokio::net::UnixListener;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 

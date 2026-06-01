@@ -5,8 +5,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::paths::{DaemonAbsPath, DaemonRelPath};
-use crate::{Record, SessionId, sub_path};
+use paths::{DaemonAbsPath, DaemonRelPath, sub_path};
+
+use crate::{Record, SessionId};
 
 /// Describes the session object yielded by [`Loader`].
 pub trait SessionObject: Sized + Send + 'static + std::fmt::Debug {
@@ -294,7 +295,7 @@ impl Loader for DiskLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::paths::HostAbsPath;
+    use paths::HostAbsPath;
     use std::{collections::BTreeSet, io::ErrorKind};
     use tempfile::TempDir;
 

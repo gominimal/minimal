@@ -49,9 +49,9 @@
 //! ignore = ["**/.DS_Store", "**/*.bak", "**/*.swp"]
 //! ```
 
-use crate::paths::{HostPath, SandboxPath};
 use camino::{Utf8Component, Utf8PathBuf};
 use core::fmt;
+use paths::{HostPath, SandboxPath};
 
 /// Errors produced when constructing patch types.
 #[non_exhaustive]
@@ -308,7 +308,7 @@ impl<'de> serde::Deserialize<'de> for FileSet {
 /// Wraps a [`SandboxPath`], so the realm tag is preserved through to the
 /// apply layer. No `AsRef<std::path::Path>` is provided on purpose: a
 /// destination path cannot be passed to host I/O without going through a
-/// [`crate::paths::Translator`] first.
+/// [`paths::Translator`] first.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PatchDest(SandboxPath);
 

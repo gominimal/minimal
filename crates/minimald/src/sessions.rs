@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
 use crate::session::{Session, SessionHandle};
+use paths::DaemonAbsPath;
 use sessions::{
     SessionId,
-    paths::DaemonAbsPath,
     store::{DiskLoader, Loader, SessionKey, SessionObject},
 };
 use tokio::sync::{mpsc, oneshot};
