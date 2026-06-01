@@ -23,7 +23,7 @@ are also configured as a build, runtime, or task dependency in `minimal.toml`.
 
 ### `search <TERM>`
 
-Searches-for and lists packages related to the search term.
+Searches for and lists packages related to the search term.
 
 ### `check [<OPTIONS>] [FILTER_NAMES...]`
 

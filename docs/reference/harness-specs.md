@@ -93,7 +93,7 @@ harness {
   name = "rust",
 
   build_packages = ["gcc", "rust", "binutils", "pkgconf"],
-  build_cmd = "cargo build --release", # [!code focus]
+  build_cmds = [["cargo", "build", "--release"]], # [!code focus]
   # ...
 }
 ```
@@ -139,6 +139,6 @@ Each matcher has the following fields, all optional:
  * `build_package_if_any` - A map of package names to a list of `PackageMatcher` objects. The
    additional package will be wired as a build package if any object in the list matches.
  * `runtime_package_if_any` - A map of package names to a list of `PackageMatcher` objects. The
-   additional package will be wired as a build package if any object in the list matches.
+   additional package will be wired as a runtime package if any object in the list matches.
  
 The `PackageMatcher` object has both `file_regexes` and `file_predicates` fields, with identical semantics.

@@ -9,7 +9,7 @@ The `minimal.toml` file defines the configuration for Minimal in a codebase.
 This file must be present at the base of the repository (i.e. `./minimal.toml`), or
 in a `.minimal` directory at the base of the repository.
 
-Unless [`-C`](/reference/cli#opt-c) is specified, the [Minimal CLI](/reference/cli) searches the directory tree backwards from
+Unless [`-C`](/reference/cli#global-flags) is specified, the [Minimal CLI](/reference/cli) searches the directory tree backwards from
 the current directory till a `minimal.toml` file is found. This behavior allows minimal to be invoked in project directories.
 
 ## Example

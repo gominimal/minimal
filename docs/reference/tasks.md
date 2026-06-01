@@ -5,7 +5,7 @@ description: Full task schema reference — packages, exec/bash commands, state_
 # Tasks
 
 Tasks are defined in a [`minimal.toml`](/reference/minimal-dot-toml) file, and describe
-a runtime environment + command invocations to be executed using [`minimal run <taskname>`](/reference/cli#minimal-run)
+a runtime environment + command invocations to be executed using [`minimal run <taskname>`](/reference/cli#run)
 
 ## Tasks schema
 
@@ -145,7 +145,7 @@ mappings.
 
 If a mapped file or directory does not exist on the host, an empty file or directory is created.
 
-Mapped paths must be absolute or start with `~`, in which case the tilda is expanded to the users'
+Mapped paths must be absolute or start with `~`, in which case the tilde is expanded to the user's
 home directory.
 
 ### `inherit_cwd` - Use parent working directory instead of repository root
