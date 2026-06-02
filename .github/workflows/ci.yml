@@ -89,9 +89,14 @@ jobs:
         with:
           components: clippy
       - name: Ensure libkrun is installed
+        # libkrun is not in homebrew-core; it ships from the slp/krun tap
+        # (github.com/slp/homebrew-krun). The fully-qualified name auto-taps.
+        env:
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+          HOMEBREW_NO_REQUIRE_TAP_TRUST: "1"
         run: |
           if [ ! -f /opt/homebrew/lib/libkrun.dylib ]; then
-            brew install libkrun
+            brew install slp/krun/libkrun
           fi
           ls -l /opt/homebrew/lib/libkrun*.dylib
       - name: Clippy (minvmd)
