@@ -77,3 +77,23 @@ jobs:
         # wrappers. Skips krun_start_enter (no kernel/rootfs), so it needs no
         # codesigned hypervisor entitlement.
         run: MINVMD_E2E=1 cargo test -p minvmd --test krun_smoke -- --include-ignored
+
+      - name: Release shared apple/container builder state
+        # The self-hosted runner (jks-Mac-mini) is shared with
+        # gominimal/minimal-vm-mac's apple/container nightly matrix. libkrun and
+        # apple/container both drive Virtualization.framework; leaving the
+        # apple/container BuildKit builder VM running after this job has been
+        # observed to wedge it with stale runc-native snapshot mounts, after
+        # which the next tenant's `container build` RUN steps fail with
+        # "operation not permitted" (gominimal/minimal-vm-mac#25). Tear the
+        # builder + system down so the next workload starts clean — its own
+        # setup re-starts the service. Best-effort; runs even when tests fail
+        # and never fails this job. Subcommand/flag spelling varies across
+        # apple/container versions, so each call is guarded.
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          command -v container >/dev/null 2>&1 || exit 0
+          container builder delete --force </dev/null 2>/dev/null \
+            || container builder delete </dev/null 2>/dev/null || true
+          container system stop </dev/null 2>/dev/null || true
