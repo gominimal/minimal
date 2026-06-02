@@ -52,11 +52,6 @@ jobs:
         with:
           # Don't leave git credentials on the persistent self-hosted runner.
           persist-credentials: false
-          # Warm builds: keep the persistent runner's target/ between runs
-          # instead of wiping it (default clean: true) and cold-rebuilding
-          # minvmd's whole dependency tree every time. cargo's fingerprinting
-          # keeps this correct across branches.
-          clean: false
       - name: Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
