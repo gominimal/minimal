@@ -49,9 +49,11 @@ pub struct ConfigBuilder {
     offline: Option<bool>,
     num_parallel_builds: Option<usize>,
 
-    minimal_dir: Option<PathBuf>,
+    minimal_state_dir: Option<PathBuf>,
+    minimal_cache_dir: Option<PathBuf>,
     stdlib_dir: Option<PathBuf>,
     repo_dir: Option<PathBuf>,
+
     vcs_manager: Option<ManagerHandle>,
     ot: Option<OpTracker>,
     remote_cache_bucket: Option<String>,
@@ -95,9 +97,14 @@ impl ConfigBuilder {
         self.num_parallel_builds = Some(num_parallel_builds);
         self
     }
-    /// Overrides the base directory for system state.
+    /// Overrides the base directory for minimal state.
     pub fn with_state_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.minimal_dir = Some(dir.into());
+        self.minimal_state_dir = Some(dir.into());
+        self
+    }
+    /// Overrides the base directory for minimal cache.
+    pub fn with_cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.minimal_cache_dir = Some(dir.into());
         self
     }
     /// Overrides loading of the standard library, getting it from the given path instead.
@@ -146,7 +153,26 @@ impl ConfigBuilder {
                 .num_parallel_builds
                 .unwrap_or_else(common::default_parallelism),
 
-            minimal_dir: self.minimal_dir.unwrap_or_else(|| {
+            // TODO: Update default to
+            //
+            // dirs::state_dir()
+            //  .unwrap_or_else(|| dirs::home_dir().unwrap().join(".local/state"))
+            //  .join("minimal")
+            //
+            // Once Minimal One is the primary surface.
+            minimal_state_dir: self.minimal_state_dir.unwrap_or_else(|| {
+                dirs::cache_dir()
+                    .unwrap_or_else(|| PathBuf::from("~/.cache"))
+                    .join("minimal")
+            }),
+            // TODO: Update default to
+            //
+            // dirs::cache_dir()
+            //  .unwrap_or_else(|| dirs::home_dir().unwrap().join(".local/cache"))
+            //  .join("minimal")
+            //
+            // Once Minimal One is the primary surface.
+            minimal_cache_dir: self.minimal_cache_dir.unwrap_or_else(|| {
                 dirs::cache_dir()
                     .unwrap_or_else(|| PathBuf::from("~/.cache"))
                     .join("minimal")
@@ -169,7 +195,8 @@ impl Config {
             no_fetch: Some(self.no_fetch),
             offline: Some(self.offline),
             num_parallel_builds: Some(self.num_parallel_builds),
-            minimal_dir: Some(self.minimal_dir),
+            minimal_state_dir: Some(self.minimal_state_dir),
+            minimal_cache_dir: Some(self.minimal_cache_dir),
             stdlib_dir: self.stdlib_dir,
             repo_dir: self.repo_dir,
             vcs_manager: self.vcs_manager,
@@ -192,12 +219,15 @@ pub struct Config {
     /// Maximum number of concurrent builds.
     num_parallel_builds: usize,
 
-    /// Path to the base of the minimal state directory, typically `~/.cache/minimal`.
-    pub(crate) minimal_dir: PathBuf,
-    /// Overrides where the standard directory is loaded from.
+    /// Path to the base of the minimal state directory, typically `$XDG_STATE_DIR/minimal`.
+    pub(crate) minimal_state_dir: PathBuf,
+    /// Path to the base of the minimal cache directory, typically `$XDG_CACHE_DIR/minimal`.
+    pub(crate) minimal_cache_dir: PathBuf,
+    /// Overrides where the standard library is loaded from.
     stdlib_dir: Option<PathBuf>,
     /// Overrides the base/project/repo directory.
     repo_dir: Option<PathBuf>,
+
     /// Use the specified vcs manager instead of initializing one from disk.
     vcs_manager: Option<ManagerHandle>,
     /// The [OpTracker] to use instead of the root.
@@ -248,32 +278,32 @@ impl Config {
         &self.remote_cache_bucket
     }
 
-    pub(crate) fn cache_dir(&self) -> PathBuf {
-        self.minimal_dir.join("built")
+    pub(crate) fn built_cache_dir(&self) -> PathBuf {
+        self.minimal_cache_dir.join("built")
     }
     pub(crate) fn downloads_dir(&self) -> PathBuf {
-        self.minimal_dir.join("downloads")
+        self.minimal_cache_dir.join("downloads")
     }
     pub(crate) fn builds_base_dir(&self) -> PathBuf {
-        self.minimal_dir.join("sandboxes")
+        self.minimal_state_dir.join("sandboxes")
     }
     pub(crate) fn state_base_dir(&self) -> PathBuf {
-        self.minimal_dir.join("state")
+        self.minimal_state_dir.join("state")
     }
     pub(crate) fn task_base_dir(&self) -> PathBuf {
-        self.minimal_dir.join("tasks")
+        self.minimal_state_dir.join("tasks")
     }
     pub(crate) fn vcs_dir(&self) -> PathBuf {
-        self.minimal_dir.join("vcs")
+        self.minimal_cache_dir.join("vcs")
     }
     pub(crate) fn index_dir(&self) -> PathBuf {
-        self.minimal_dir.join("idx")
+        self.minimal_cache_dir.join("idx")
     }
     pub(crate) fn stdlib_dir(&self) -> PathBuf {
-        self.minimal_dir.join("stdlib")
+        self.minimal_cache_dir.join("stdlib")
     }
     pub(crate) fn layer_cache_dir(&self) -> PathBuf {
-        self.minimal_dir.join("lc")
+        self.minimal_cache_dir.join("lc")
     }
 }
 

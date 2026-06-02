@@ -202,7 +202,8 @@ impl Context {
             .map_err(|e| Error::setup_dirs(e, config.downloads_dir()))?;
         create_dir_all(config.builds_base_dir())
             .map_err(|e| Error::setup_dirs(e, config.builds_base_dir()))?;
-        create_dir_all(config.cache_dir()).map_err(|e| Error::setup_dirs(e, config.cache_dir()))?;
+        create_dir_all(config.built_cache_dir())
+            .map_err(|e| Error::setup_dirs(e, config.built_cache_dir()))?;
         create_dir_all(config.state_base_dir())
             .map_err(|e| Error::setup_dirs(e, config.state_base_dir()))?;
         create_dir_all(config.task_base_dir())
@@ -223,7 +224,7 @@ impl Context {
             // operation. Pre-populate `vcs_dir()` for the workflow that needs this.
             VcsManager::new_in_dir_with_offline(config.vcs_dir(), config.is_offline())?
         };
-        let cache = Cache::at_dir(config.cache_dir())
+        let cache = Cache::at_dir(config.built_cache_dir())
             .map_err(|e| Error::Other(anyhow!("initializing local cache: {}", e)))?;
 
         // Figure out a path to the standard library. Roughly speaking this is loaded from:
@@ -325,7 +326,7 @@ impl Context {
     /// DO NOT USE unless you really know what you
     /// are doing - prefer [Context::local_cache] instead.
     pub fn cache_base_dir(&self) -> PathBuf {
-        self.config.cache_dir()
+        self.config.built_cache_dir()
     }
     /// Returns the base directory where source checkouts are stored.
     pub fn vcs_dir(&self) -> PathBuf {
@@ -351,7 +352,11 @@ impl Context {
         &self.stdlib_dir
     }
 
-    /// Returns the minimal file loaded from disk.
+    /// Returns the minimal file configuring this context.
+    ///
+    /// This usually maps to a `minimal.toml` read from disk,
+    /// but not always. Methods like [`mfile::File::repo_path`]
+    /// return None if not read from disk.
     pub fn minimal_file(&self) -> &mfile::File {
         &self.mfile
     }

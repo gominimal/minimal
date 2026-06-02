@@ -1001,6 +1001,7 @@ mod tests {
     #[test]
     fn env_channel_add_session() {
         let (state_dir, mut ctx, mut graph) = setup_ctx_and_graph();
+        let rootfs = ctx.cache.temp_dir().unwrap();
         let mut chan = EnvChannel {
             graph: &mut graph,
             ctx: &mut ctx,
@@ -1010,7 +1011,6 @@ mod tests {
             ot: None,
         };
 
-        let rootfs = tempdir().unwrap();
         assert!(!std::fs::exists(rootfs.path().join("bin")).unwrap());
 
         let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
