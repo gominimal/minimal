@@ -56,15 +56,16 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: Ensure libkrun is installed
-        # libkrun is not in homebrew-core; it ships from the slp/krun tap
-        # (github.com/slp/homebrew-krun). The fully-qualified name auto-taps.
-        env:
-          HOMEBREW_NO_INSTALL_CLEANUP: "1"
-          HOMEBREW_NO_REQUIRE_TAP_TRUST: "1"
+      - name: Verify libkrun is available
+        # libkrun must be preprovisioned on the runner (it ships from the
+        # third-party slp/krun tap, github.com/slp/homebrew-krun). CI does not
+        # install it: auto-installing a third-party tap on a persistent runner
+        # is a supply-chain risk and would require bypassing Homebrew's tap
+        # trust. Provisioning is part of runner setup: `brew install slp/krun/libkrun`.
         run: |
           if [ ! -f /opt/homebrew/lib/libkrun.dylib ]; then
-            brew install slp/krun/libkrun
+            echo "::error::libkrun.dylib not found under /opt/homebrew/lib. Provision the runner with: brew install slp/krun/libkrun" >&2
+            exit 1
           fi
           ls -l /opt/homebrew/lib/libkrun*.dylib
       - name: Clippy (minvmd)
