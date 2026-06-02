@@ -73,6 +73,37 @@ jobs:
       - name: Fmt, clippy, test
         run: minimal run ci
 
+  build-macos:
+    # Self-hosted Apple Silicon runner (org runner `jks-Mac-mini`). Required
+    # because `minvmd` links libkrun (`#[link(name = "krun")]`) and only
+    # compiles on macOS — the Linux CI builds it as a stub. This is real
+    # hardware, so the hypervisor-backed FFI smoke can run; GitHub-hosted
+    # macOS VMs cannot. Scoped to `minvmd`, the only macOS-gated crate; widen
+    # to `--workspace` once the rest of the tree is confirmed mac-buildable.
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Ensure libkrun is installed
+        run: |
+          if [ ! -f /opt/homebrew/lib/libkrun.dylib ]; then
+            brew install libkrun
+          fi
+          ls -l /opt/homebrew/lib/libkrun*.dylib
+      - name: Clippy (minvmd)
+        run: cargo clippy -p minvmd --all-targets -- -D warnings
+      - name: Test (minvmd)
+        run: cargo test -p minvmd
+      - name: FFI smoke against real libkrun (no VM boot)
+        # Exercises create_ctx -> set_vm_config -> set_exec through the safe
+        # wrappers. Skips krun_start_enter (no kernel/rootfs), so it needs no
+        # codesigned hypervisor entitlement.
+        run: MINVMD_E2E=1 cargo test -p minvmd --test krun_smoke -- --include-ignored
+
   build-release-amd64:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
