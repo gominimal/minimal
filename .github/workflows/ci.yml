@@ -80,10 +80,24 @@ jobs:
     # hardware, so the hypervisor-backed FFI smoke can run; GitHub-hosted
     # macOS VMs cannot. Scoped to `minvmd`, the only macOS-gated crate; widen
     # to `--workspace` once the rest of the tree is confirmed mac-buildable.
+    #
+    # Gated on the RUN_MACOS_CI repo variable, which defaults to enabled (runs
+    # when unset). `timeout-minutes` counts time queued waiting for a runner,
+    # so set the repo variable RUN_MACOS_CI=false to skip this job while the
+    # self-hosted runner is offline and avoid stalling CI.
+    if: ${{ vars.RUN_MACOS_CI != 'false' }}
     runs-on: [self-hosted, macOS, ARM64]
+    # Least privilege: this job only checks out and builds. Narrow the token
+    # from the workflow-level `contents: write`, especially on a persistent
+    # self-hosted runner.
+    permissions:
+      contents: read
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Don't leave git credentials on the persistent self-hosted runner.
+          persist-credentials: false
       - name: Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
