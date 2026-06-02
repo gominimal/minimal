@@ -220,6 +220,12 @@ impl<B: FetchBackend> RemoteCache<B> {
         self.index.exists(spec_hash)
     }
 
+    /// Returns the sha256 of the cached artifact for the given spec hash, or
+    /// `None` if it isn't in the index.
+    pub fn sha256(&self, spec_hash: &SpecHash) -> Option<[u8; 32]> {
+        self.index.sha256(spec_hash)
+    }
+
     /// Download the given spec hash into the local cache.
     #[tracing::instrument(skip_all, fields(span_name = %span_name), err)]
     pub async fn materialize(
@@ -392,5 +398,33 @@ mod tests {
             matches!(result, Err(Error::HashMismatch { .. })),
             "expected HashMismatch, got: {result:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn sha256_returns_indexed_hash_or_none() {
+        let spec_hash = SpecHash::from_bytes([0xAA; 32]);
+        let sha256: [u8; 32] = [0xCD; 32];
+
+        // Index maps spec_hash -> sha256.
+        let mut index = RemoteIndex::default();
+        index.extend(std::iter::once((spec_hash.clone(), sha256)));
+        let mut index_bytes = Vec::new();
+        index.write_to(&mut index_bytes).unwrap();
+
+        let mut responses = std::collections::HashMap::new();
+        responses.insert(format!("mock://cache/{}", INDEX_FILENAME), index_bytes);
+
+        let rc = RemoteCache::new(
+            MockBackend { responses },
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Present spec hash -> its indexed sha256; absent -> None.
+        assert_eq!(rc.sha256(&spec_hash), Some(sha256));
+        assert_eq!(rc.sha256(&SpecHash::from_bytes([0x11; 32])), None);
     }
 }
