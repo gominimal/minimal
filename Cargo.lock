@@ -3373,12 +3373,8 @@ version = "0.0.1"
 dependencies = [
  "clap",
  "clap_complete",
- "dirs",
- "futures",
  "ot",
  "tokio",
- "tokio-util",
- "tracing",
  "tracing-subscriber",
 ]
 
@@ -3392,7 +3388,6 @@ dependencies = [
  "clap_complete",
  "constcat",
  "dirs",
- "futures",
  "ot",
  "path-absolutize",
  "paths",
@@ -3404,7 +3399,6 @@ dependencies = [
  "stdlib",
  "tempfile",
  "tokio",
- "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",
