@@ -26,16 +26,13 @@ use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::task::spawn;
 
+use crate::MINIMAL_SESSION_ID_ENV;
 use crate::connection::{ConnectionError, ConnectionHandle};
 use crate::server::ServerStateHandle;
 use crate::sessions::SessionKeyPredicate;
 
 /// The SSH subsystem name used to negotiate an SFTP channel.
 pub const SUBSYSTEM_NAME: &str = "sftp";
-
-/// Env var that the client must set (via `env_request`) before the SFTP
-/// subsystem request, naming which session the SFTP channel attaches to.
-const MINIMAL_SESSION_ID_ENV: &str = "MINIMAL_SESSION_ID";
 
 /// Cap on how many directory entries are returned per `readdir` call.
 /// SFTP clients call `readdir` repeatedly until they see `SSH_FX_EOF`, so

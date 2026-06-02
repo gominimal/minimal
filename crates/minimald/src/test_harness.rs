@@ -155,7 +155,96 @@ impl TestClient {
             .await
             .unwrap()
     }
+
+    /// Opens a fresh session channel, applies `env` and optionally a PTY,
+    /// fires an `exec` request for `command`, writes `stdin`, then drains
+    /// the channel to completion.
+    ///
+    /// `Ok(ExecOutcome)` when the server accepted the exec request — the
+    /// process ran (with whatever exit code or signal). `Err(ExecRejected)`
+    /// when the server returned `SSH_MSG_CHANNEL_FAILURE`, i.e. the request
+    /// was refused before a process ever started.
+    pub(crate) async fn exec(
+        &mut self,
+        env: &[(&str, &str)],
+        request_pty: bool,
+        command: &str,
+        stdin: &[u8],
+    ) -> Result<ExecOutcome, ExecRejected> {
+        use russh::ChannelMsg;
+
+        let mut channel = self.handle.channel_open_session().await.unwrap();
+        for (name, value) in env {
+            channel.set_env(true, *name, *value).await.unwrap();
+        }
+        if request_pty {
+            // Any plausible pty params will do; the server only cares
+            // that *some* pty was negotiated.
+            channel
+                .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                .await
+                .unwrap();
+        }
+        channel.exec(true, command).await.unwrap();
+        if !stdin.is_empty() {
+            channel.data_bytes(stdin.to_vec()).await.unwrap();
+        }
+        // Close write half so `cat`-style commands see EOF and exit.
+        channel.eof().await.unwrap();
+
+        // Replies arrive in request order on a single channel: one per
+        // set_env, optionally one for request_pty, then one for exec.
+        // env/pty requests on a fresh channel can't fail, so any
+        // CHANNEL_FAILURE we see is necessarily the exec request's.
+        let expected_replies_before_exec = env.len() + usize::from(request_pty);
+        let mut seen_request_reply = 0usize;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut exit_status = None;
+
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Success => seen_request_reply += 1,
+                ChannelMsg::Failure => {
+                    assert!(
+                        seen_request_reply >= expected_replies_before_exec,
+                        "unexpected CHANNEL_FAILURE before exec request reply \
+                         (saw {seen_request_reply}, expected at least \
+                         {expected_replies_before_exec})",
+                    );
+                    return Err(ExecRejected);
+                }
+                ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+                ChannelMsg::ExtendedData { data, ext: 1 } => stderr.extend_from_slice(&data),
+                ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
+                _ => {}
+            }
+        }
+
+        Ok(ExecOutcome {
+            stdout,
+            stderr,
+            exit_status,
+        })
+    }
 }
+
+/// Result of a successful SSH `exec` request — the server accepted the
+/// request, the process ran (possibly aborted), and the channel closed
+/// cleanly.
+#[derive(Debug)]
+pub(crate) struct ExecOutcome {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    /// `Some` when the server reported a numeric exit code; `None` when
+    /// the channel closed without one (e.g. signal-terminated).
+    pub exit_status: Option<u32>,
+}
+
+/// Marker for an exec request the server refused at the request layer
+/// via `SSH_MSG_CHANNEL_FAILURE`, before any process was spawned.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ExecRejected;
 
 struct TestClientHandler;
 

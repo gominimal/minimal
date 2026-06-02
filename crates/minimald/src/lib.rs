@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 pub mod connection;
+mod exec;
 pub mod rpc;
 pub mod server;
 mod session;
@@ -8,6 +9,10 @@ mod sessions;
 mod sftp;
 #[cfg(test)]
 mod test_harness;
+
+/// Env var that the client must set (via `env_request`) before the SFTP
+/// subsystem request, naming which session the SFTP channel attaches to.
+const MINIMAL_SESSION_ID_ENV: &str = "MINIMAL_SESSION_ID";
 
 /// Represents the parameters of a requested PTY.
 #[derive(Debug, Clone)]
