@@ -13,7 +13,7 @@ use tokio::{
 };
 
 use crate::{
-    ChannelConfig, RequestedPty,
+    ChannelConfig, RequestedPty, exec,
     rpc::{self},
     server::ServerStateHandle,
     sftp,
@@ -176,7 +176,7 @@ impl Connection {
 }
 
 /// A thread-safe handle to the connection.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ConnectionHandle(Arc<Mutex<Connection>>);
 
 impl ConnectionHandle {
@@ -341,8 +341,9 @@ impl russh::server::Handler for ConnectionHandler {
             "Got exec_request on channel {id}: {:?}",
             String::from_utf8(data.to_vec())
         );
-        session.channel_failure(id)?; // TODO: handle exec request
-        Ok(())
+        let c = self.0.clone();
+        let s = c.0.lock().await.serv.clone();
+        exec::handle_exec(data, s, c, id, session).await
     }
 
     async fn shell_request(
