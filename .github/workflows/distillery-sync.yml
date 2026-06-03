@@ -44,6 +44,10 @@ jobs:
     # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
     # to a reusable workflow in a different owner than the caller.
     secrets:
+      # The agent's safe-outputs mint an App token (github-app:) to upsert the
+      # persistent status issue, so the wrapper must pass the App private key —
+      # the same mapping every sdd-* wrapper carries.
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
       COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
       DISTILLERY_OAUTH_TOKEN: ${{ secrets.DISTILLERY_OAUTH_TOKEN }}
     # Ceiling for the called reusable workflow. Must cover the union of every
