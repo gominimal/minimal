@@ -518,6 +518,120 @@ mod tests {
         }
     }
 
+    /// Helper: initialise a local git repo with one commit on `branch` and
+    /// return (TempDir, commit-hash).  The TempDir must be kept alive for the
+    /// duration of the test so the path stays valid.
+    fn make_local_repo(branch: &str) -> (tempfile::TempDir, String) {
+        use std::process::Command;
+        let src = tempfile::tempdir().unwrap();
+        // Init with an explicit branch name so the test is git-version agnostic.
+        let init = Command::new("git")
+            .args(["init", "-b", branch, src.path().to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "git init failed");
+
+        for (k, v) in [("user.email", "test@example.com"), ("user.name", "Test")] {
+            Command::new("git")
+                .args(["config", k, v])
+                .current_dir(src.path())
+                .output()
+                .unwrap();
+        }
+
+        std::fs::write(src.path().join("hello.txt"), b"hello").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(src.path())
+            .output()
+            .unwrap();
+        let commit = Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(src.path())
+            .output()
+            .unwrap();
+        assert!(commit.status.success(), "git commit failed");
+
+        let rev_out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(src.path())
+            .output()
+            .unwrap();
+        let hash = String::from_utf8_lossy(&rev_out.stdout).trim().to_string();
+        (src, hash)
+    }
+
+    /// checkout_of with a previously-unseen local repo URL returns a valid
+    /// directory containing the committed file and the correct rev SHA.
+    #[test]
+    fn checkout_of_new_remote_returns_valid_path_and_rev() {
+        let (src, expected_hash) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+
+        let base = tempfile::tempdir().unwrap();
+        let mut handle = Manager::new_in_dir(base.path()).unwrap();
+
+        let (checkout_path, rev) = handle
+            .checkout_of(&remote, GitRef::Branch("main".to_string()))
+            .unwrap();
+
+        assert!(checkout_path.exists(), "checkout directory must exist");
+        assert!(
+            checkout_path.join("hello.txt").exists(),
+            "checked-out file must be present"
+        );
+        assert_eq!(rev, expected_hash, "returned rev must match HEAD");
+    }
+
+    /// A second checkout_of call for the same ref returns the cached path and
+    /// rev without creating a new worktree.
+    #[test]
+    fn checkout_of_same_branch_twice_uses_cache() {
+        let (src, _) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+
+        let base = tempfile::tempdir().unwrap();
+        let mut handle = Manager::new_in_dir(base.path()).unwrap();
+
+        let (path1, hash1) = handle
+            .checkout_of(&remote, GitRef::Branch("main".to_string()))
+            .unwrap();
+        let (path2, hash2) = handle
+            .checkout_of(&remote, GitRef::Branch("main".to_string()))
+            .unwrap();
+
+        assert_eq!(path1, path2, "second call must return the cached path");
+        assert_eq!(hash1, hash2, "both calls must return the same rev");
+    }
+
+    /// When a commit hash matching an existing branch checkout is requested,
+    /// checkout_of returns the same worktree instead of creating a second one.
+    #[test]
+    fn checkout_of_commit_ref_reuses_branch_worktree() {
+        let (src, hash) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+
+        let base = tempfile::tempdir().unwrap();
+        let mut handle = Manager::new_in_dir(base.path()).unwrap();
+
+        // First: checkout via branch.
+        let (branch_path, branch_rev) = handle
+            .checkout_of(&remote, GitRef::Branch("main".to_string()))
+            .unwrap();
+        assert_eq!(branch_rev, hash);
+
+        // Second: request the exact commit — must reuse the existing worktree.
+        let (commit_path, commit_rev) = handle
+            .checkout_of(&remote, GitRef::Commit(hash.clone()))
+            .unwrap();
+
+        assert_eq!(
+            branch_path, commit_path,
+            "commit ref must reuse the branch worktree"
+        );
+        assert_eq!(commit_rev, hash);
+    }
+
     /// In offline mode, `update()` returns OfflineCacheMiss rather than
     /// silently no-op'ing. Callers like `minimal update` ask explicitly for
     /// fresh state, so noop-ing would mask hard-to-debug bugs (per review
