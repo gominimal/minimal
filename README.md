@@ -83,7 +83,7 @@ CLI archives to `gs://minimal-shim/archives/`.
 
 Manual `workflow_dispatch` with inputs:
 - `sha` (optional): short SHA to promote (defaults to latest archive in bucket)
-- `platforms` (optional): comma-separated list or `"amd64-linux,arm64-linux"`
+- `platforms` (optional): comma-separated list or `"all"` (default: `"amd64-linux,arm64-linux"`)
 - `dry_run` (optional, boolean, default `false`): when `true`, opens the approval issue and logs what would be written but skips the actual GCS config write
 
 Verifies the archive exists in GCS, then writes per-platform config files
