@@ -258,6 +258,45 @@ fn global_progress() -> MultiProgress {
     MP.get_or_init(MultiProgress::new).clone()
 }
 
+use std::io;
+
+/// A writer to stdout which coordinates with printing progress bars.
+pub struct StdoutWriter(MultiProgress);
+
+impl Default for StdoutWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StdoutWriter {
+    pub fn new() -> Self {
+        StdoutWriter(global_progress())
+    }
+}
+
+impl io::Write for StdoutWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.suspend(|| io::stdout().write(buf))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.suspend(|| io::stdout().flush())
+    }
+
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        self.0.suspend(|| io::stdout().write_vectored(bufs))
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.0.suspend(|| io::stdout().write_all(buf))
+    }
+
+    fn write_fmt(&mut self, fmt: std::fmt::Arguments<'_>) -> io::Result<()> {
+        self.0.suspend(|| io::stdout().write_fmt(fmt))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,44 +440,5 @@ mod tests {
         let parent_depth = parent.depth();
         let child = parent.new_child();
         assert_eq!(child.depth(), parent_depth + 1);
-    }
-}
-
-use std::io;
-
-/// A writer to stdout which coordinates with printing progress bars.
-pub struct StdoutWriter(MultiProgress);
-
-impl Default for StdoutWriter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl StdoutWriter {
-    pub fn new() -> Self {
-        StdoutWriter(global_progress())
-    }
-}
-
-impl io::Write for StdoutWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.suspend(|| io::stdout().write(buf))
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.0.suspend(|| io::stdout().flush())
-    }
-
-    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
-        self.0.suspend(|| io::stdout().write_vectored(bufs))
-    }
-
-    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.0.suspend(|| io::stdout().write_all(buf))
-    }
-
-    fn write_fmt(&mut self, fmt: std::fmt::Arguments<'_>) -> io::Result<()> {
-        self.0.suspend(|| io::stdout().write_fmt(fmt))
     }
 }
