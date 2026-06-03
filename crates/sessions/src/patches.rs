@@ -19,12 +19,21 @@
 //! wire form is always a bare string; lists of patterns live one level
 //! up (at the patches array or in policy fields).
 //!
-//! Path expansion (`~`, `$VAR`) and canonicalization are **not** performed
-//! by this module — `FileSet` stores patterns as written. Callers must
-//! resolve them at config-load time before using them for policy checks,
-//! since comparing unresolved paths is a path-traversal hazard.
-//! This is necessary because which `$VAR` can be used are subject to
-//! a separate policy.
+//! Path expansion is split by responsibility:
+//!
+//! - **`FileSet` itself** stores patterns as written. No expansion at
+//!   construction or matching time.
+//! - **The session resolver** ([`composable::Composer::resolve`](crate::composable::Composer::resolve))
+//!   expands leading `~` in patch *source* patterns and in
+//!   [`PatchPolicy`] patterns at the start of resolution, against
+//!   `dirs::home_dir` (or a `Composer::with_home(...)` override).
+//!   Patterns retain their `~` form in returned policies for
+//!   round-trippability.
+//! - **[`PatchDest`] needs no expansion.** Every destination is
+//!   implicitly relative to the sandbox user's home directory; `~`
+//!   and absolute paths are rejected at construction.
+//! - **The apply layer** is responsible for `$VAR` expansion and
+//!   canonicalization across the board.
 //!
 //! # Example user config
 //!
@@ -276,20 +285,26 @@ impl<'de> serde::Deserialize<'de> for FileSet {
 // PatchDest
 // =====================================================================
 
-/// A validated patch destination — a path inside the *sandbox*, where the
-/// patch's content will land.
+/// A validated patch destination, **relative to the sandbox user's
+/// home directory**.
+///
+/// Every patch lands somewhere under `$HOME` inside the sandbox. A
+/// future revision may introduce a separate type for non-home-rooted
+/// destinations; until then, `PatchDest` represents only the
+/// home-relative case.
 ///
 /// Rejected at construction:
 /// - empty paths,
+/// - absolute paths (would escape the home anchor),
 /// - paths containing `..` components (path-traversal protection — the
 ///   apply layer also canonicalizes, but rejecting at the config layer
 ///   gives a config-line-number error and prevents the value from ever
 ///   existing in memory).
 ///
-/// Wraps a [`SandboxPath`], so the realm tag is preserved through to the
-/// apply layer. No `AsRef<std::path::Path>` is provided on purpose: a
-/// destination path cannot be passed to host I/O without going through a
-/// [`paths::Translator`] first.
+/// Wraps a [`SandboxRelPath`], so the realm tag is preserved through to
+/// the apply layer. No `AsRef<std::path::Path>` is provided on purpose:
+/// a destination path cannot be passed to host I/O without going through
+/// a [`paths::Translator`] first.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PatchDest(SandboxRelPath);
 
@@ -316,7 +331,7 @@ impl PatchDest {
         ))
     }
 
-    /// Borrow the underlying sandbox path.
+    /// Borrow the underlying sandbox-home-relative path.
     pub fn as_sandbox_path(&self) -> &SandboxRelPath {
         &self.0
     }
@@ -339,8 +354,9 @@ impl<'de> serde::Deserialize<'de> for PatchDest {
 // Patch / Patches
 // =====================================================================
 
-/// A single patch: a source fileset and the destination it should land
-/// at inside the sandbox.
+/// A single patch: a source fileset on the host and the destination
+/// inside the sandbox (relative to the sandbox user's home directory)
+/// where its content should land.
 ///
 /// For single-file sources, `dest` is the destination file path. For
 /// multi-file sources (lists, globs, directory copies), `dest` is the
@@ -534,6 +550,29 @@ impl IntoIterator for Patches {
 /// Precedence: `ignore` first (silent), then `deny` (reject), then
 /// `allow` (permit). Anything else prompts.
 ///
+/// # `~` expansion
+///
+/// Policy patterns may start with `~`. The session resolver expands
+/// them against `dirs::home_dir` (or a `Composer::with_home(...)`
+/// override) at the start of `resolve_patches`, and again after any
+/// [`PolicyHooks`](crate::composable::PolicyHooks) callback returns
+/// an updated policy. Patterns retain their `~` form in the policy
+/// returned from
+/// [`Composer::resolve`](crate::composable::Composer::resolve), so
+/// the policy round-trips losslessly across save / load.
+///
+/// When any `~`-prefixed pattern is in scope, home is resolved once
+/// up-front. Both failure modes — no home available, or a non-UTF-8
+/// home path — surface as
+/// [`ResolveError::HomeUnresolved`](crate::composable::ResolveError::HomeUnresolved)
+/// carrying a
+/// [`HomeResolutionFailure`](crate::composable::HomeResolutionFailure)
+/// to distinguish them. They are **not** silently dropped.
+///
+/// **Fast path:** a policy whose patterns contain no `~` does not
+/// invoke the home lookup at all. This means a `~`-free policy
+/// resolves cleanly even when `dirs::home_dir` returns `None`.
+///
 /// [`Loadout`]: crate::loadout::Loadout
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PatchPolicy {
@@ -716,7 +755,8 @@ where
 }
 
 /// A single patch's resolved endpoints: where the file lives on the
-/// host, and where it lands inside the sandbox.
+/// host, and where it lands inside the sandbox (relative to the
+/// sandbox user's home directory).
 ///
 /// The field is `host_path` (not `source`) so it doesn't collide with
 /// [`Provenanced::source`](crate::composable::Provenanced::source) when
@@ -741,7 +781,8 @@ impl ResolvedPatch {
         &self.host_path
     }
 
-    /// The sandbox-relative destination the file is copied to.
+    /// The destination the file is copied to, relative to the sandbox
+    /// user's home directory.
     pub fn destination(&self) -> &SandboxRelPath {
         &self.destination
     }
