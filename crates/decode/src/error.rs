@@ -400,4 +400,67 @@ mod tests {
         let out = capture(&e);
         assert!(out.contains("my_field"), "expected field name in: {out:?}");
     }
+
+    #[test]
+    fn missing_id_contains_error_message() {
+        let e = Error::MissingID(Files::default(), TermPos::None);
+        let out = capture(&e);
+        assert!(
+            out.contains("record was not declared a build spec"),
+            "expected message in: {out:?}"
+        );
+    }
+
+    #[test]
+    fn unexpected_object_contains_type_names() {
+        let e = Error::UnexpectedObject {
+            files: Files::default(),
+            got: ObjTy::Source,
+            want: ObjTy::Builder,
+            pos: TermPos::None,
+        };
+        let out = capture(&e);
+        assert!(
+            out.contains("unexpected record"),
+            "expected 'unexpected record' in: {out:?}"
+        );
+        assert!(out.contains("Source"), "expected 'Source' in: {out:?}");
+        assert!(out.contains("Builder"), "expected 'Builder' in: {out:?}");
+    }
+
+    #[test]
+    fn no_such_output_contains_output_name() {
+        let e = Error::NoSuchOutput {
+            files: Files::default(),
+            pos: TermPos::None,
+            output: "my_output".into(),
+        };
+        let out = capture(&e);
+        assert!(
+            out.contains("my_output"),
+            "expected output name in: {out:?}"
+        );
+        assert!(
+            out.contains("no such output"),
+            "expected 'no such output' in: {out:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_target_contains_target_string() {
+        let e = Error::InvalidTarget {
+            files: Files::default(),
+            pos: TermPos::None,
+            got: "bad-target".into(),
+        };
+        let out = capture(&e);
+        assert!(
+            out.contains("bad-target"),
+            "expected target string in: {out:?}"
+        );
+        assert!(
+            out.contains("not a valid target"),
+            "expected 'not a valid target' in: {out:?}"
+        );
+    }
 }
