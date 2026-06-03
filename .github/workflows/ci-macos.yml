@@ -1,0 +1,79 @@
+name: CI (macOS)
+
+# Split from ci.yml so it can be PATH-SCOPED: the single self-hosted Apple
+# Silicon runner (`jks-Mac-mini`) is a shared bottleneck, so only run it when
+# the macOS-relevant surface changes. Most PRs touch no minvmd code and skip
+# this workflow entirely, keeping the runner free.
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "crates/minvmd/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ci-macos.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "crates/minvmd/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ci-macos.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Cancel a superseded run so the single runner isn't backed up by stale commits.
+concurrency:
+  group: ci-macos-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Least privilege: this workflow only checks out and builds.
+permissions:
+  contents: read
+
+jobs:
+  build-macos:
+    # Self-hosted Apple Silicon runner. minvmd links libkrun
+    # (`#[link(name = "krun")]`) and only compiles on macOS — the Linux CI
+    # builds it as a stub. Real hardware, so the hypervisor-backed FFI smoke
+    # runs here; GitHub-hosted macOS VMs can't. Scoped to minvmd, the only
+    # macOS-gated crate; widen to --workspace once the tree is mac-buildable.
+    #
+    # Gated on the RUN_MACOS_CI repo variable (defaults to enabled when unset).
+    # `timeout-minutes` counts time queued for a runner, so set
+    # RUN_MACOS_CI=false to skip while the runner is offline.
+    if: ${{ vars.RUN_MACOS_CI != 'false' }}
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Don't leave git credentials on the persistent self-hosted runner.
+          persist-credentials: false
+      - name: Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Verify libkrun is available
+        # libkrun must be preprovisioned on the runner (it ships from the
+        # third-party slp/krun tap, github.com/slp/homebrew-krun). CI does not
+        # install it: auto-installing a third-party tap on a persistent runner
+        # is a supply-chain risk and would require bypassing Homebrew's tap
+        # trust. Provisioning is part of runner setup: `brew install slp/krun/libkrun`.
+        run: |
+          if [ ! -f /opt/homebrew/lib/libkrun.dylib ]; then
+            echo "::error::libkrun.dylib not found under /opt/homebrew/lib. Provision the runner with: brew install slp/krun/libkrun" >&2
+            exit 1
+          fi
+          ls -l /opt/homebrew/lib/libkrun*.dylib
+      - name: Clippy (minvmd)
+        run: cargo clippy -p minvmd --all-targets -- -D warnings
+      - name: Test (minvmd)
+        run: cargo test -p minvmd
+      - name: FFI smoke against real libkrun (no VM boot)
+        # Exercises create_ctx -> set_vm_config -> set_exec through the safe
+        # wrappers. Skips krun_start_enter (no kernel/rootfs), so it needs no
+        # codesigned hypervisor entitlement.
+        run: MINVMD_E2E=1 cargo test -p minvmd --test krun_smoke -- --include-ignored
