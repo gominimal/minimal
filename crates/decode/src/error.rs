@@ -424,6 +424,8 @@ mod tests {
             out.contains("unexpected record"),
             "expected 'unexpected record' in: {out:?}"
         );
+        assert!(out.contains("Source"), "expected 'Source' in: {out:?}");
+        assert!(out.contains("Builder"), "expected 'Builder' in: {out:?}");
     }
 
     #[test]
