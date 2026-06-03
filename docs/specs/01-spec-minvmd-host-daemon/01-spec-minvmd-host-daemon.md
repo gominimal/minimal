@@ -21,10 +21,13 @@ the VM so the `minimal` CLI can talk to `minimald` transparently.
 The crate already exists in the workspace at `crates/minvmd/` with FFI
 bindings (`src/krun/raw.rs`), safe wrappers (`src/krun/ctx.rs`), typed
 errors (`src/error.rs`), a build script for libkrun linking, macOS
-entitlements, and a CLI skeleton. This spec covers the remaining work
-to make the daemon functional end-to-end: VM boot with a real kernel and
-rootfs, the UDS↔vsock bridge, and the lifecycle daemon (auto-spawn,
-status, stop).
+entitlements, and a CLI skeleton. Unit 1's requirements (R1.2, R1.3)
+are acceptance criteria for the existing scaffolding — they validate
+that the code already landed meets the spec's safety and error-handling
+standards; they are not new-from-scratch deliverables. This spec covers
+the remaining work to make the daemon functional end-to-end: VM boot
+with a real kernel and rootfs, the UDS↔vsock bridge, and the lifecycle
+daemon (auto-spawn, status, stop).
 
 Networking is explicitly deferred to #160. The crate compiles to a
 no-op stub on Linux so the existing Linux-only CI stays green.
@@ -147,7 +150,7 @@ guest-side init.
   `MINVMD_ROOTFS_PATH`; staging is performed by
   `scripts/fetch-alpine.sh`. (translated from plan: step R2.2)
 - **R2.3**: `minvmd boot` (parent) shall configure the libkrun context
-  via the safe wrappers, then `exec`-spawn a hidden
+  via the safe wrappers, then fork-exec a hidden
   `minvmd __krun-vmm` child that calls `krun_start_enter`. The parent
   shall write a `vmm.pid` file and surface child-exit codes via signal
   handling. (translated from plan: step R2.3)
@@ -196,10 +199,10 @@ permissions), guest-side vsock stub
   to a guest process listening on vsock `VSOCK_PORT`.
   (translated from plan: step R3.1)
 - **R3.2**: The host UDS path shall be
-  `$XDG_RUNTIME_DIR/minimal/minimald.sock` (fallback
-  `~/.minimal/local/minimald.sock`). `minvmd` shall create the parent
-  directory (mode 0700) before boot and verify the bound socket is
-  owner-only (0600). (translated from plan: step R3.2)
+  `$XDG_RUNTIME_DIR/minimal/minimald.sock`; if `XDG_RUNTIME_DIR` is
+  unset the fallback is `~/.minimal/local/minimald.sock`. `minvmd`
+  shall create the parent directory with mode 0700 if absent and verify
+  the bound socket is owner-only (0600). (translated from plan: step R3.2)
 - **R3.3**: libkrun shall multiplex multiple concurrent host
   connections, each bridged to an independent vsock connection to
   `VSOCK_PORT`; `minvmd` carries no per-connection state.
@@ -245,7 +248,8 @@ auto-spawns it; subsequent calls reuse; `minvmd status` introspects;
 
 - **R4.1**: State and PID files shall live under
   `$XDG_STATE_HOME/minimal/minvmd/` (default
-  `~/.local/state/minimal/minvmd/`): `state.toml` (lifecycle enum +
+  `~/.local/state/minimal/minvmd/`): `state.toml` (lifecycle enum:
+  `NotProvisioned | Stopped | Starting | Running | Stopping`, plus
   `vmm_pid` + `started_at`), `vmm.pid`, `lifecycle.lock`. `state.toml`
   writes shall be atomic (tmp + rename + fsync).
   (translated from plan: step R4.1)
@@ -353,6 +357,18 @@ hold under this model.
   no `println!`/`eprintln!` outside the CLI surface (use `tracing`);
   structured fields not interpolated strings; typed error enums in
   library code, `anyhow::Result` only at CLI boundaries.
+- Commit messages follow Conventional Commits (`docs/commit-conventions.md`):
+  imperative mood, lower-case description, no trailing period. Type is
+  the dominant change (`feat`, `fix`, `docs`, etc.); scope is the
+  affected crate name in parentheses (e.g. `feat(minvmd): ...`). One
+  logical change per commit.
+- Rust coding standards from `docs/rust-coding-standards.md`: functional
+  over imperative (iterator chains, combinators on Option/Result);
+  cheapest reference that works (`&str` over `&String`, `&Path` over
+  `&PathBuf`); make illegal states unrepresentable; newtypes for domain
+  values; `#[must_use]` on Result-shaped returns; `#[non_exhaustive]` on
+  public enums/structs that may grow; private by default, widen to
+  `pub(crate)` before `pub`.
 - Naming: `minvmd` (matches `minimald`).
 - Platform gates: `#[cfg(target_os = "macos")]` for all libkrun-touching
   code; a stub Linux entry that `bail!`s.
@@ -407,8 +423,9 @@ hold under this model.
 - Single-use auth token between parent `minvmd run` and child
   `minvmd __krun-vmm`: written to state dir mode 0600, verified by
   child, deleted on first read.
-- Image provenance is deferred — v0.1 reads kernel + rootfs from
-  caller-supplied paths.
+- v0.1 trusts caller-supplied kernel and rootfs paths without integrity
+  verification; provenance and integrity checking are deferred to a
+  future version.
 
 ## Verification
 
