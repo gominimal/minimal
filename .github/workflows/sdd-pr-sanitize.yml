@@ -1,0 +1,68 @@
+name: sdd-pr-sanitize
+
+# Corrects the issue references in a spec or architecture pull request body,
+# and makes the deliverable link visible on the sub-issue side.
+# Three deterministic corrections, on every spec/* and arch/* pull request:
+#
+# 1. The feature tracking issue must stay open as the lifecycle anchor, so a
+#    spec or architecture pull request must never close it. The agents are told
+#    never to write a closing keyword for the feature, but across three
+#    acceptance runs the agent slipped `Closes`/`Fixes`/`Resolves #<feature>`
+#    into the body anyway. This workflow rewrites every closing keyword that
+#    precedes an issue reference to `Refs`, which GitHub does not treat as a
+#    closing keyword — except the keyword on the deliverable sub-issue (2). A
+#    prompt rule cannot be relied on; this is the deterministic backstop.
+#
+# 2. A spec pull request delivers the spec sub-issue; an architecture pull
+#    request delivers the architecture sub-issue. The agent creates that
+#    sub-issue and the pull request in one run and cannot know the sub-issue
+#    number when it writes the body, so the pull request cannot itself carry
+#    the link. This workflow runs after both exist: it resolves the deliverable
+#    sub-issue under the feature and adds `Closes #<sub-issue>` to the body, so
+#    merging the pull request closes the sub-issue — the way an implementation
+#    pull request's `Closes #<task>` already closes its task.
+#
+# 3. When the sanitizer PATCHes the pull-request body to add `Closes #<sub>`
+#    after the App-authenticated creation, GitHub suppresses the
+#    `cross-referenced` event it would normally emit on the sub-issue, and at
+#    merge time it attributes the close to the merger rather than the pull
+#    request. The closing link exists in the data model (the pull request's
+#    `closingIssuesReferences` returns the sub-issue), but neither of the two
+#    timeline events that normally make the deliverable link visible in the UI
+#    fires (issue #69). This workflow posts one `Delivered by #<pr>.` comment
+#    on the sub-issue, which both produces a visible `commented` event and
+#    causes GitHub to emit the missing `cross-referenced` event from the
+#    `#<pr>` reference in the comment body.
+#
+# All three corrections are owned by ADR 0006; the sub-issue closing model is
+# ADR 0005. Implementation pull requests on sdd/* branches are not touched:
+# their `Closes #<task>` is already correct, and GitHub already emits the
+# normal cross-reference and "closed via #<pr>" events because the closing
+# keyword was present at pull-request creation, not added by a later PATCH.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened]
+
+permissions:
+  contents: read
+  # `issues: write` is required to post the `Delivered by #<pr>.` comment on
+  # the deliverable sub-issue. Reading the sub-issue and its comments to
+  # resolve it and to enforce idempotency only needs `issues: read`; the
+  # write scope is solely for the comment add (3) below.
+  issues: write
+  pull-requests: write
+
+jobs:
+  sanitize:
+    # Only spec and architecture pull requests are corrected here. An sdd/*
+    # implementation pull request is left alone.
+    if: >-
+      startsWith(github.event.pull_request.head.ref, 'spec/') ||
+      startsWith(github.event.pull_request.head.ref, 'arch/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Correct the issue references in the pull request body
+        uses: norrietaylor/spectacles/.github/actions/sdd-pr-sanitize@v0.1.0
+        with:
+          github-token: ${{ github.token }}

@@ -1,0 +1,106 @@
+name: sdd-triage
+
+# Thin wrapper for the sdd-triage agent.
+#
+# The agent itself is the reusable workflow
+# .github/workflows/sdd-triage.lock.yml (compiled from sdd-triage.md, which
+# declares on: workflow_call). This wrapper carries the real event triggers,
+# gates the comment commands to authors with repository write access, and
+# passes the triggering entity to the agent through the aw_context input. A
+# consumer repository installs this wrapper unchanged.
+#
+# The gh-aw command:/slash_command trigger (with its roles: gate) is not used
+# here: that trigger is gh-aw frontmatter and only takes effect when gh aw
+# compiles a workflow. This wrapper is a hand-written GitHub Actions workflow,
+# not a gh-aw source file, so gh aw never processes it. The gating is therefore
+# done explicitly below with a real repository-permission check.
+
+on:
+  # A tracking issue gained the sdd:triage label (phase A), or the needs-human
+  # label was cleared (resume).
+  issues:
+    types: [labeled, unlabeled]
+  # A /triage, /approve, or /revise comment on an issue or pull request.
+  issue_comment:
+    types: [created]
+  # An architecture pull request was closed; the agent runs phase B only when
+  # it was merged and the head branch follows the arch/<slug> convention.
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+
+jobs:
+  # Resolve which situation triggered the wrapper and build the aw_context the
+  # reusable workflow consumes. A non-match leaves should_run = false so the
+  # agent job is skipped.
+  #
+  # The job-level if: gate skips the route job entirely on issue_comment
+  # events whose body does not start with one of the commands this wrapper
+  # owns, and on issues label events whose label this wrapper does not route
+  # (fixes issue #119 — a /dispatch or /execute comment, or the
+  # sdd:in-progress/sdd:dispatched label mutations a /dispatch performs on a
+  # tracker, no longer spawn a route-job runner on this wrapper). The route
+  # step routes an `issues` event only on `labeled` `sdd:triage` or
+  # `unlabeled` `needs-human`; every other label add/remove is skipped here
+  # without a runner.
+  route:
+    if: |
+      (github.event_name != 'issue_comment' && github.event_name != 'issues')
+      || (
+        github.event_name == 'issue_comment'
+        && (
+          startsWith(github.event.comment.body, '/triage')
+          || startsWith(github.event.comment.body, '/approve')
+          || startsWith(github.event.comment.body, '/revise')
+        )
+      )
+      || (
+        github.event_name == 'issues'
+        && (
+          (
+            github.event.action == 'labeled'
+            && github.event.label.name == 'sdd:triage'
+          )
+          || (
+            github.event.action == 'unlabeled'
+            && github.event.label.name == 'needs-human'
+          )
+        )
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+      aw_context: ${{ steps.decide.outputs.aw_context }}
+    steps:
+      - name: Decide whether to run and build aw_context
+        id: decide
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-triage@v0.1.0
+        with:
+          github-token: ${{ github.token }}
+
+  sdd-triage:
+    needs: route
+    if: needs.route.outputs.should_run == 'true'
+    uses: norrietaylor/spectacles/.github/workflows/sdd-triage.lock.yml@v0.1.0
+    with:
+      aw_context: ${{ needs.route.outputs.aw_context }}
+    # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
+    # to a reusable workflow in a different owner than the caller.
+    secrets:
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+      DISTILLERY_OAUTH_TOKEN: ${{ secrets.DISTILLERY_OAUTH_TOKEN }}
+    # Ceiling for the called reusable workflow. Must cover the union of every
+    # nested job's permissions: the gh-aw conclusion and safe_outputs jobs
+    # need write scopes, and activation needs actions: read.
+    permissions:
+      actions: read
+      contents: write
+      discussions: write
+      issues: write
+      pull-requests: write
