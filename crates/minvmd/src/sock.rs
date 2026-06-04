@@ -61,6 +61,29 @@ pub fn prepare_socket_dir(socket_path: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Remove a stale socket left by a previous run.
+///
+/// `krun_add_vsock_port2(listen=true)` binds the host UDS and fails with
+/// `EEXIST` if the path already exists — common on a persistent runner where
+/// the socket file outlives the process. Remove a pre-existing *socket* at
+/// `socket_path`; refuse to touch any other file type so an unrelated path is
+/// never clobbered. A missing path is a no-op.
+pub fn remove_stale_socket(socket_path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt as _;
+    match std::fs::symlink_metadata(socket_path) {
+        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(socket_path),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{} exists and is not a socket; refusing to remove",
+                socket_path.display(),
+            ),
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Verify that the socket file at `socket_path` has owner-only permissions
 /// (0600).
 ///
@@ -159,5 +182,31 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let err = verify_socket_permissions(&path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn remove_stale_socket_missing_is_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        remove_stale_socket(&tmp.path().join("absent.sock")).unwrap();
+    }
+
+    #[test]
+    fn remove_stale_socket_unlinks_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("live.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(path.exists());
+        remove_stale_socket(&path).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn remove_stale_socket_refuses_non_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("regular");
+        std::fs::File::create(&path).unwrap();
+        let err = remove_stale_socket(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(path.exists(), "non-socket must be left in place");
     }
 }

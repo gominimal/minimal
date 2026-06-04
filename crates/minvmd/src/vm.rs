@@ -57,6 +57,10 @@ impl VmConfig {
             .map_err(|source| crate::error::VmError::Io { source })?;
         crate::sock::prepare_socket_dir(&uds_path)
             .map_err(|source| crate::error::VmError::Io { source })?;
+        // Drop a stale socket from a prior run; libkrun's listen-bind fails
+        // EEXIST otherwise (e.g. on a persistent runner).
+        crate::sock::remove_stale_socket(&uds_path)
+            .map_err(|source| crate::error::VmError::Io { source })?;
         ctx.add_vsock_port2(crate::sock::VSOCK_BRIDGE_PORT, &uds_path, true)?;
         Ok(())
     }
