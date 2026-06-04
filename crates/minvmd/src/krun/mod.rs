@@ -18,4 +18,4 @@ mod ctx;
 mod raw;
 
 pub use ctx::Context;
-pub use raw::{KRUN_KERNEL_FORMAT_BZIMAGE, KRUN_KERNEL_FORMAT_IMAGE_GZ};
+pub use raw::{KRUN_KERNEL_FORMAT_ELF, KRUN_KERNEL_FORMAT_IMAGE_GZ};
