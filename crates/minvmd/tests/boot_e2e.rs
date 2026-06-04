@@ -16,11 +16,13 @@
 
 #![cfg(target_os = "macos")]
 
+use serial_test::serial;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 #[test]
+#[serial]
 #[ignore = "gated MINVMD_E2E=1; requires Mac with libkrun, kernel, and rootfs"]
 fn boot_e2e_ready_marker_round_trip() {
     if std::env::var("MINVMD_E2E").as_deref() != Ok("1") {
