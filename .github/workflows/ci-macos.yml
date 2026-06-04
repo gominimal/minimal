@@ -95,12 +95,14 @@ jobs:
         # A setup failure fails the job — it is not hidden behind the non-gating
         # test below.
         run: scripts/build-rootfs.sh
-      - name: Build and codesign minvmd
-        # boot_e2e spawns the minvmd binary, which needs the hypervisor
-        # entitlement (R1.4). A build/codesign failure fails the job.
-        run: |
-          cargo build -p minvmd --bin minvmd
-          codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
+      - name: Build boot E2E + minvmd (no run)
+        # Build the test harness + minvmd bin, then codesign, then run the test
+        # BINARY DIRECTLY (below). Invoking `cargo test` again after signing
+        # relinks (and unsigns) target/debug/minvmd, so krun_start_enter fails
+        # with EINVAL. A direct-binary run never touches the signature.
+        run: cargo test -p minvmd --test boot_e2e --no-run
+      - name: Codesign minvmd (hypervisor entitlement, R1.4)
+        run: codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
       - name: Boot E2E (READY round-trip)
         # NON-GATING only on the test itself, pending first-green on the runner
         # (the virtio-linux kernel config is validated by this boot). Setup/
@@ -108,11 +110,13 @@ jobs:
         # regressions outside the known-pending boot.
         continue-on-error: true
         run: |
+          testbin="$(ls -1t target/debug/deps/boot_e2e-* | grep -v '\.d$' | head -1)"
+          test -x "$testbin" || { echo "::error::boot_e2e test binary not found"; exit 1; }
           MINVMD_E2E=1 \
           MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz" \
           MINVMD_ROOTFS_PATH="$(scripts/build-rootfs.sh --print-path)" \
           MINVMD_BOOT_LOG="$RUNNER_TEMP/boot.log" \
-            cargo test -p minvmd --test boot_e2e -- --include-ignored --nocapture
+            "$testbin" --include-ignored --nocapture
       - name: Upload guest boot console log
         # Capture hvc0 output for diagnosing a stuck/failed boot (e.g. a missing
         # virtio driver in the kernel). Always runs so a red boot is debuggable.
