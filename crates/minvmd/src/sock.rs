@@ -31,10 +31,10 @@ pub const VSOCK_BRIDGE_PORT: u32 = 2222;
 /// Returns an error when `XDG_RUNTIME_DIR` is absent/empty and the home
 /// directory cannot be determined (e.g. `HOME` unset and no passwd entry).
 pub fn resolve_uds_path() -> io::Result<PathBuf> {
-    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-        if !runtime.is_empty() {
-            return Ok(PathBuf::from(runtime).join("minimal/minimald.sock"));
-        }
+    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR")
+        && !runtime.is_empty()
+    {
+        return Ok(PathBuf::from(runtime).join("minimal/minimald.sock"));
     }
     dirs::home_dir()
         .ok_or_else(|| {
