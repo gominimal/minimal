@@ -35,9 +35,12 @@ fn boot_e2e_ready_marker_round_trip() {
         );
     }
 
+    let state_dir = tempfile::TempDir::new().expect("creating isolated state dir");
+
     let exe = env!("CARGO_BIN_EXE_minvmd");
     let mut child = Command::new(exe)
         .args(["boot", "--foreground"])
+        .env("XDG_STATE_HOME", state_dir.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()

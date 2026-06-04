@@ -75,8 +75,8 @@ fn run_macos(foreground: bool) -> Result<()> {
 
     // Write vmm.pid to the state directory (R2.3).
     let state_dir = StateDir::new(StateDir::default_path()).context("opening state dir")?;
-    std::fs::write(state_dir.vmm_pid_path(), format!("{child_pid}\n"))
-        .context("writing vmm.pid")?;
+    let vmm_pid_path = state_dir.vmm_pid_path();
+    std::fs::write(&vmm_pid_path, format!("{child_pid}\n")).context("writing vmm.pid")?;
 
     // Wait for the READY marker from the guest (R2.4): up to 5 s.
     const READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -111,10 +111,16 @@ fn run_macos(foreground: bool) -> Result<()> {
         }
         Ok(Err(e)) => {
             let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&vmm_pid_path);
+            let _ = std::fs::remove_file(&marker_sock_path);
             bail!("boot failed: {e}");
         }
         Err(_timeout) => {
             let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&vmm_pid_path);
+            let _ = std::fs::remove_file(&marker_sock_path);
             bail!("boot timed out waiting for READY marker after 5 s");
         }
     }
