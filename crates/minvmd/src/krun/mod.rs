@@ -9,7 +9,7 @@
 //!   `// SAFETY:` comment naming the specific invariants the wrapper enforces
 //!   (NUL-termination, pointer lifetimes, range bounds, ownership transfer).
 //!   Wrappers translate negative-errno returns into [`crate::error::VmError`]
-//!   via [`crate::error::VmError::check_backend`].
+//!   via [`crate::krun::raw::check_backend`].
 //!
 //! This module is macOS-only. On Linux, `minvmd` ships only the runtime stub
 //! and never links libkrun.
