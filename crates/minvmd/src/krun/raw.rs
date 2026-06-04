@@ -13,17 +13,17 @@ use std::io;
 
 use crate::error::VmError;
 
-// Kernel format constants from libkrun.h, used by `krun_set_kernel`. We only
-// model the formats minvmd actually targets:
-// - aarch64 `virtio-linux` ships `Image.gz` → `KRUN_KERNEL_FORMAT_IMAGE_GZ`
-// - x86_64  `virtio-linux` ships `bzImage`  → `KRUN_KERNEL_FORMAT_ELF`
-//
-// Note: `IMAGE_BZ2` (=3) is for bzip2-compressed blobs, not the Linux bzImage
-// container format. bzImage is loaded as ELF by libkrun.
-//
-// libkrun.h also defines RAW=0, PE_GZ=2, IMAGE_BZ2=3, IMAGE_ZSTD=5 — added
-// as needed.
+// Kernel format constants from libkrun.h, used by `krun_set_kernel`. Full enum:
+// RAW=0, ELF=1, PE_GZ=2, IMAGE_BZ2=3, IMAGE_GZ=4, IMAGE_ZSTD=5. minvmd targets:
+// - aarch64 `virtio-linux` ships `Image.gz` → `KRUN_KERNEL_FORMAT_PE_GZ`. The
+//   aarch64 loader implements only RAW and PE_GZ; PE_GZ scans for the gzip
+//   magic and decompresses. `IMAGE_GZ` (=4) is x86_64-only and returns
+//   `KernelFormatUnsupported` on aarch64.
+// - x86_64  `virtio-linux` ships `bzImage`  → `KRUN_KERNEL_FORMAT_ELF`. libkrun
+//   loads bzImage as ELF; `IMAGE_BZ2` (=3) is bzip2 blobs, not the bzImage
+//   container format.
 pub const KRUN_KERNEL_FORMAT_ELF: u32 = 1;
+pub const KRUN_KERNEL_FORMAT_PE_GZ: u32 = 2;
 pub const KRUN_KERNEL_FORMAT_IMAGE_GZ: u32 = 4;
 
 // SAFETY: every function in this block is an `extern "C"` declaration that

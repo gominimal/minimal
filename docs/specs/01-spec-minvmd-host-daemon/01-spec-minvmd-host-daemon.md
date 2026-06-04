@@ -130,8 +130,10 @@ with no rootfs work.
 ### Unit 2: VM bring-up with virtio-linux kernel + Alpine rootfs
 
 **Purpose:** Actual Linux boot. `minvmd boot` brings up an Alpine VM
-that reaches userspace and writes a "READY" marker to vsock from a
-guest-side init.
+that reaches userspace and writes a "READY" marker to vsock from its
+guest workload. libkrun's built-in init (`/init.krun`) runs as PID 1,
+mounts `/proc`, `/sys`, `/dev`, and execs the workload set via
+`krun_set_exec` — so the rootfs needs no init system (no OpenRC).
 
 **Depends on:** Unit 1
 
@@ -144,20 +146,39 @@ guest-side init.
 - **R2.1**: The kernel artifact shall be the `vmlinuz` output of the
   `virtio-linux` minimal package; on aarch64 the artifact is `Image.gz`,
   on x86_64 `bzImage`. Path resolution shall happen at runtime via a
-  `MINVMD_KERNEL_PATH` env var. (translated from plan: step R2.1)
+  `MINVMD_KERNEL_PATH` env var. The kernel shall be loaded directly — no EFI
+  firmware, no disk image — via `krun_set_kernel` with the arch-appropriate
+  libkrun format: `KRUN_KERNEL_FORMAT_PE_GZ` for the aarch64 `Image.gz` (the
+  aarch64 loader implements only `RAW` and `PE_GZ`; `IMAGE_GZ` is x86_64-only
+  and returns `KernelFormatUnsupported` on aarch64) and `KRUN_KERNEL_FORMAT_ELF`
+  for the x86_64 `bzImage`. The `virtio-linux` kernel shall be built with
+  virtio-MMIO (not PCI), `VIRTIO_FS`/`FUSE`, `VIRTIO_VSOCKETS`, and
+  `VIRTIO_CONSOLE`/HVC all `=y` (the default cmdline carries `nomodule`).
+  (translated from plan: step R2.1)
 - **R2.2**: The rootfs shall be an Alpine minirootfs (version-pinned,
-  sha256-verified). For v0.1 the path is supplied via
-  `MINVMD_ROOTFS_PATH`; staging is performed by
-  `scripts/fetch-alpine.sh`. (translated from plan: step R2.2)
+  sha256-verified). For v0.1 the path is supplied via `MINVMD_ROOTFS_PATH`;
+  `scripts/fetch-alpine.sh` stages the base and `scripts/build-rootfs.sh`
+  overlays the guest workload (`/sbin/minvmd-stub-init`) plus its runtime
+  closure (socat and the sha256-pinned `readline` + `libncursesw` apks it
+  dynamically links). The result is a directory consumed by `krun_set_root` as
+  virtio-fs — no disk image. (translated from plan: step R2.2)
 - **R2.3**: `minvmd boot` (parent) shall configure the libkrun context
   via the safe wrappers, then fork-exec a hidden
-  `minvmd __krun-vmm` child that calls `krun_start_enter`. The parent
-  shall write a `vmm.pid` file and surface child-exit codes via signal
+  `minvmd __krun-vmm` child that calls `krun_start_enter`. The child shall set
+  the guest workload via `krun_set_exec` (default `/sbin/minvmd-stub-init`,
+  overridable by `MINVMD_EXEC`) with an explicit minimal envp, leave the kernel
+  cmdline unset (libkrun's default supplies `console=hvc0 rootfstype=virtiofs
+  rw` and injects `init=/init.krun`), and configure 2 vCPU / 1024 MiB. The
+  parent shall write a `vmm.pid` file and surface child-exit codes via signal
   handling. (translated from plan: step R2.3)
-- **R2.4**: Boot shall complete to a guest-side marker (writes `READY\n`
-  on a designated vsock port) within 5 s on a warm laptop; the parent
-  shall block on this marker before reporting boot success.
-  (translated from plan: step R2.4)
+- **R2.4**: Boot shall complete to a guest-side marker within 5 s on a warm
+  laptop; the parent shall block on this marker before reporting boot success.
+  The marker is **guest-initiated**: the host registers the marker port (7350)
+  with the plain `krun_add_vsock_port` (≡ `krun_add_vsock_port2(.., listen =
+  false)`) and listens on the host UDS; the guest workload connects to
+  AF_VSOCK CID 2 (host) port 7350 and writes `READY\n`, which libkrun bridges
+  to the host. This is the opposite direction from the R3 `ssh.sock` bridge
+  (`listen = true`, host-initiated). (translated from plan: step R2.4)
 - **R2.5**: No network device shall be added to the libkrun config in
   v0.1; gvproxy/TSI integration is owned by #160.
   (translated from plan: step R2.5)
@@ -320,7 +341,8 @@ guest workload's exit code. This forces a parent/child split:
 minvmd run                       (parent — supervisor)
   └── minvmd __krun-vmm          (hidden child — calls krun_start_enter)
        └── libkrun + Alpine VM   (the actual VM)
-            └── minimald (pid-1) (in-VM, via krun_set_exec)
+            └── /init.krun (pid-1, libkrun-supplied)
+                 └── minimald   (guest workload, via krun_set_exec)
 ```
 
 Parent owns: `state.toml`, `lifecycle.lock`, and lifecycle supervision.

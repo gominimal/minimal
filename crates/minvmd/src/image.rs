@@ -9,13 +9,16 @@ use crate::error::VmError;
 
 /// Arch-appropriate libkrun kernel format constant.
 ///
-/// - `aarch64`: `virtio-linux` ships `Image.gz` → `KRUN_KERNEL_FORMAT_IMAGE_GZ`
-/// - `x86_64`:  `virtio-linux` ships `bzImage`  → `KRUN_KERNEL_FORMAT_ELF`
+/// - `aarch64`: `virtio-linux` ships `Image.gz` → `KRUN_KERNEL_FORMAT_PE_GZ`.
+///   The aarch64 loader implements only RAW and PE_GZ; PE_GZ decompresses the
+///   gzipped image. `IMAGE_GZ` is x86_64-only and returns
+///   `KernelFormatUnsupported` on aarch64.
+/// - `x86_64`:  `virtio-linux` ships `bzImage`  → `KRUN_KERNEL_FORMAT_ELF`.
 #[cfg(target_os = "macos")]
 pub fn kernel_format() -> u32 {
     #[cfg(target_arch = "aarch64")]
     {
-        crate::krun::KRUN_KERNEL_FORMAT_IMAGE_GZ
+        crate::krun::KRUN_KERNEL_FORMAT_PE_GZ
     }
     #[cfg(target_arch = "x86_64")]
     {
@@ -122,15 +125,13 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn kernel_format_is_valid() {
+    fn kernel_format_matches_arch() {
         let fmt = kernel_format();
-        let valid = [
-            crate::krun::KRUN_KERNEL_FORMAT_ELF,
-            crate::krun::KRUN_KERNEL_FORMAT_IMAGE_GZ,
-        ];
-        assert!(
-            valid.contains(&fmt),
-            "unexpected kernel format constant {fmt}"
-        );
+        // aarch64 must use PE_GZ for Image.gz — IMAGE_GZ (=4) is x86_64-only and
+        // returns KernelFormatUnsupported on the aarch64 libkrun loader.
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(fmt, crate::krun::KRUN_KERNEL_FORMAT_PE_GZ);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(fmt, crate::krun::KRUN_KERNEL_FORMAT_ELF);
     }
 }
