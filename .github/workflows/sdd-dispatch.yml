@@ -75,7 +75,7 @@ jobs:
     steps:
       - name: Decide whether to run, and find the tracking issue
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-dispatch@v0.1.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-dispatch@v0.1.1
         with:
           app-id: ${{ vars.APP_ID }}
           github-token: ${{ github.token }}
@@ -108,7 +108,7 @@ jobs:
     steps:
       - name: Compute ready set and precondition state
         id: compute
-        uses: norrietaylor/spectacles/.github/actions/sdd-dispatch-compute@v0.1.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-dispatch-compute@v0.1.1
         with:
           tracking-issue: ${{ needs.route.outputs.tracking_issue }}
           trigger-kind: ${{ needs.route.outputs.trigger_kind }}
@@ -189,7 +189,7 @@ jobs:
               core.setFailed('Failed to post /execute on task #' + task
                 + ': ' + err.message);
             }
-      - name: Apply sdd:ready hint to dispatched task #${{ matrix.task }}
+      - name: Claim dispatched task #${{ matrix.task }} as sdd:in-progress
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           APP_TOKEN: ${{ steps.app.outputs.token }}
@@ -198,17 +198,48 @@ jobs:
           github-token: ${{ env.APP_TOKEN }}
           script: |
             const task = parseInt(process.env.TASK, 10);
+            // Claim the task deterministically at dispatch time: mark it
+            // sdd:in-progress and drop sdd:ready, mirroring the
+            // tracking-issue move in the lifecycle job. Done here (not in
+            // the agent run) so a dispatched-but-not-yet-booted task is
+            // visibly in flight, never indistinguishable from an
+            // un-dispatched sdd:ready task (#200). The write uses the App
+            // token; #143's trigger guard makes execute ignore issues
+            // label events (except `unlabeled needs-human`), so this does
+            // not re-fire or cancel the execute run.
+            // Add sdd:in-progress first; only drop sdd:ready once the task is
+            // confirmed in-progress, so an unexpected add failure (403/5xx)
+            // never leaves the task with neither label. A 422 means the label
+            // is already present (idempotent); any other status is fatal.
+            let inProgressPresent = false;
             try {
               await github.rest.issues.addLabels({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: task,
-                labels: ['sdd:ready'],
+                labels: ['sdd:in-progress'],
               });
+              inProgressPresent = true;
             } catch (err) {
-              // A 422 here means the label is already present; ignore.
-              core.info('Could not add sdd:ready to #' + task + ': '
-                + err.message);
+              if (err.status === 422) {
+                inProgressPresent = true;
+              } else {
+                throw err;
+              }
+            }
+            if (inProgressPresent) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: task,
+                  name: 'sdd:ready',
+                });
+              } catch (err) {
+                // A 404 here means sdd:ready was not present; ignore.
+                core.info('Could not remove sdd:ready from #' + task + ': '
+                  + err.message);
+              }
             }
 
   # Manage the tracking issue's lifecycle and sdd:dispatched labels. On the
@@ -298,8 +329,9 @@ jobs:
                   labels: ['sdd:dispatched'],
                 });
               } catch (err) {
-                core.info('Could not add sdd:dispatched to #' + tracking
+                core.setFailed('Could not add sdd:dispatched to #' + tracking
                   + ': ' + err.message);
+                throw err;
               }
             }
 

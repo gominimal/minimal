@@ -65,6 +65,15 @@ on:
   # directly.
   pull_request:
     types: [unlabeled, closed]
+  # A check suite that completed on a pull request this agent opened. A
+  # failure conclusion on an `sdd/` branch is treated as an implicit
+  # /revise (issue #203): a required CI check failed and merge is BLOCKED,
+  # so the build is handed back to sdd-execute to fix on the same branch,
+  # mirroring the CHANGES_REQUESTED path. A success/neutral suite does not
+  # trigger a revise. The route step bounds the retries and escalates with
+  # needs-human after the cap.
+  check_suite:
+    types: [completed]
 
 permissions:
   contents: read
@@ -132,7 +141,8 @@ jobs:
   # without an API call).
   route:
     if: |
-      (github.event_name != 'issue_comment' && github.event_name != 'issues')
+      (github.event_name != 'issue_comment' && github.event_name != 'issues'
+        && github.event_name != 'check_suite')
       || (
         github.event_name == 'issue_comment'
         && (
@@ -148,6 +158,17 @@ jobs:
         && github.event.action == 'unlabeled'
         && github.event.label.name == 'needs-human'
       )
+      || (
+        github.event_name == 'check_suite'
+        && github.event.action == 'completed'
+        && startsWith(github.event.check_suite.head_branch, 'sdd/')
+        && (
+          github.event.check_suite.conclusion == 'failure'
+          || github.event.check_suite.conclusion == 'timed_out'
+          || github.event.check_suite.conclusion == 'cancelled'
+          || github.event.check_suite.conclusion == 'action_required'
+        )
+      )
     runs-on: ubuntu-latest
     # pull-requests: read is needed for the tier gate on a /revise issue_comment
     # (situation 6): the route fetches the pull request to read its body and
@@ -161,7 +182,13 @@ jobs:
     # comment on the PR and, on hitting SDD_MAX_REVIEW_ITERATIONS, applies the
     # needs-human label. Comments and labels written by the GITHUB_TOKEN do not
     # re-trigger workflows, so this does not feed back into the route.
+    #
+    # checks: read is needed by the failed-required-check auto-revise branch
+    # (issue #203): it lists the check runs in the failing suite to name them
+    # in the revise directive. The same branch reuses the iteration-marker /
+    # needs-human machinery above.
     permissions:
+      checks: read
       contents: read
       issues: write
       pull-requests: write
@@ -171,7 +198,7 @@ jobs:
     steps:
       - name: Decide whether to run and build aw_context
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-execute@v0.1.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-execute@v0.1.1
         with:
           tier: opus
           app-id: ${{ vars.APP_ID }}
@@ -181,7 +208,7 @@ jobs:
   sdd-execute-opus:
     needs: route
     if: needs.route.outputs.should_run == 'true'
-    uses: norrietaylor/spectacles/.github/workflows/sdd-execute-opus.lock.yml@v0.1.0
+    uses: norrietaylor/spectacles/.github/workflows/sdd-execute-opus.lock.yml@v0.1.1
     with:
       aw_context: ${{ needs.route.outputs.aw_context }}
     # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
@@ -220,6 +247,9 @@ jobs:
       # Mint the App token: reading branch protection needs administration:
       # read (the gh-aw locks request it too), which the default GITHUB_TOKEN
       # lacks, and enabling auto-merge needs pull-requests + contents write.
+      # issues: write is needed by the empty-PR guard (issue #204): it labels
+      # a 0-diff PR needs-human, and a label on a PR is written through the
+      # issues endpoint.
       - name: Mint App token
         id: app
         uses: actions/create-github-app-token@v3
@@ -231,15 +261,74 @@ jobs:
           permission-administration: read
           permission-contents: write
           permission-pull-requests: write
+          permission-issues: write
       # Arm auto-merge (squash, delete-branch) only when the repo allows it
       # and the base branch protection requires at least one status check;
       # otherwise skip (issue #127). Falls back to a direct squash merge when
       # the PR is UNSTABLE with every required check green (issue #135). The
       # mechanics live in the sdd-auto-merge composite action.
       - name: Enable auto-merge when protection requires a check
-        uses: norrietaylor/spectacles/.github/actions/sdd-auto-merge@v0.1.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-auto-merge@v0.1.1
         with:
           github-token: ${{ steps.app.outputs.token }}
           pr-number: ${{ needs.sdd-execute-opus.outputs.created_pr_number }}
           owner: ${{ github.repository_owner }}
           repo: ${{ github.event.repository.name }}
+
+  # Refresh open sdd/ sibling PRs after a sibling task's PR merges (issue
+  # #207). When the cascade merges one task's PR into main, every other open
+  # sdd/ PR that touches the same files goes behind base and strands as
+  # CONFLICTING — nothing rebases or resolves it. This job sweeps the open
+  # sdd/ PRs on the merge of any sdd/ PR: a PR merely BEHIND base is refreshed
+  # in place (update-branch, which re-runs CI); a CONFLICTING PR is handed back
+  # to sdd-execute as an implicit /revise carrying a resolve-conflict directive,
+  # bounded by a hidden marker, escalating needs-human only after the cap. The
+  # posted /revise then routes to whichever tier owns each conflicting PR's
+  # linked task through that wrapper's own tier gate.
+  #
+  # DELIBERATE SINGLE-HOST SWEEP — NOT a per-tier job and NOT an omission in the
+  # haiku/sonnet wrappers. The sweep is a property of main advancing (a sibling
+  # sdd/ PR merging), not of any one tier executing, so it must fire exactly
+  # once per merge from exactly one place. All three sdd-execute-{haiku,sonnet,
+  # opus} wrappers subscribe to the same pull_request.closed event, so hosting
+  # this job in every wrapper would sweep three times per merge (triple /revise,
+  # triple update-branch). It therefore lives only here, in the opus wrapper,
+  # chosen as the arbitrary singleton host; do NOT copy it into the haiku/sonnet
+  # wrappers.
+  #
+  # Independent of the opus tier actually running: this is a top-level job whose
+  # only gate is the main-advance event below. It has no `needs:` on route /
+  # sdd-execute-opus and mints its own App token, so it fires on every merged
+  # sdd/ PR even when the merged PR (and every conflicting sibling) belongs to
+  # the haiku or sonnet tier and the opus route/execute jobs are skipped.
+  refresh-siblings:
+    if: |
+      github.event_name == 'pull_request'
+      && github.event.action == 'closed'
+      && github.event.pull_request.merged == true
+      && startsWith(github.event.pull_request.head.ref, 'sdd/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # Mint the App token: update-branch needs contents:write and posting the
+      # /revise comment needs pull-requests:write. The App identity is required
+      # so the posted /revise re-triggers the owning-tier sdd-execute wrapper
+      # (a GITHUB_TOKEN comment would not).
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+      - name: Sweep open sdd/ PRs and refresh those behind base
+        uses: norrietaylor/spectacles/.github/actions/sdd-refresh-siblings@v0.1.1
+        with:
+          github-token: ${{ steps.app.outputs.token }}
+          merged-pr-number: ${{ github.event.pull_request.number }}
+          max-resolve-iterations: ${{ vars.SDD_MAX_REVIEW_ITERATIONS }}

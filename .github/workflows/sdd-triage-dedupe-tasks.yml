@@ -37,6 +37,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Close a duplicate phase-C task sub-issue
-        uses: norrietaylor/spectacles/.github/actions/sdd-triage-dedupe-tasks@v0.1.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-triage-dedupe-tasks@v0.1.1
         with:
           github-token: ${{ github.token }}

@@ -79,14 +79,14 @@ jobs:
     steps:
       - name: Decide whether to run and build aw_context
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-triage@v0.1.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-triage@v0.1.1
         with:
           github-token: ${{ github.token }}
 
   sdd-triage:
     needs: route
     if: needs.route.outputs.should_run == 'true'
-    uses: norrietaylor/spectacles/.github/workflows/sdd-triage.lock.yml@v0.1.0
+    uses: norrietaylor/spectacles/.github/workflows/sdd-triage.lock.yml@v0.1.1
     with:
       aw_context: ${{ needs.route.outputs.aw_context }}
     # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets

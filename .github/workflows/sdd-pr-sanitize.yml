@@ -63,6 +63,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Correct the issue references in the pull request body
-        uses: norrietaylor/spectacles/.github/actions/sdd-pr-sanitize@v0.1.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-pr-sanitize@v0.1.1
         with:
           github-token: ${{ github.token }}
