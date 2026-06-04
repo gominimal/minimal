@@ -31,6 +31,9 @@ pub enum VmError {
     /// process with the guest workload's exit code), so a non-negative
     /// return is a protocol violation. `ret` is the raw libkrun return.
     StartEnterReturnedUnexpectedly { ret: i32 },
+
+    /// A required environment variable was unset or empty.
+    MissingEnv { var: &'static str },
 }
 
 impl fmt::Display for VmError {
@@ -58,6 +61,9 @@ impl fmt::Display for VmError {
                     "krun_start_enter returned {ret} but libkrun's docs say it only returns on error"
                 )
             }
+            Self::MissingEnv { var } => {
+                write!(f, "required environment variable {var} is unset or empty")
+            }
         }
     }
 }
@@ -68,7 +74,8 @@ impl std::error::Error for VmError {
             Self::Backend { source, .. } => Some(source),
             Self::NulInPath { .. }
             | Self::NulInString { .. }
-            | Self::StartEnterReturnedUnexpectedly { .. } => None,
+            | Self::StartEnterReturnedUnexpectedly { .. }
+            | Self::MissingEnv { .. } => None,
         }
     }
 }
