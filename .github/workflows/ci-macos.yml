@@ -34,6 +34,80 @@ permissions:
   contents: read
 
 jobs:
+  virtio-kernel:
+    # Pull the prebuilt virtio-linux kernel (vmlinuz / Image.gz) from the public
+    # minimal build cache — no kernel build, no GCS auth — and hand it to the
+    # macOS boot job. The packaging `minimal` CLI is Linux-only, so this runs on
+    # Linux. Cheap (a cache pull), so it is unconditional and decoupled from the
+    # self-hosted runner.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Fetch virtio-linux kernel from the build cache
+        run: ./scripts/fetch-virtio-kernel.sh "$RUNNER_TEMP/vmlinuz" aarch64
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: virtio-kernel-aarch64
+          path: ${{ runner.temp }}/vmlinuz
+          if-no-files-found: error
+
+  boot-e2e:
+    # Boot E2E (R2.4 READY round-trip) on real hardware, using the cache-pulled
+    # kernel. Separate from build-macos so a kernel-fetch hiccup never blocks the
+    # always-green clippy/test/smoke checks.
+    #
+    # NON-GATING for now (continue-on-error): the round-trip needs the R3.4 guest
+    # vsock stub (#328) and a settled marker-port contract (host
+    # VSOCK_MARKER_PORT=9799 vs the guest rootfs's 7350), and R2.2 rootfs staging
+    # (`scripts/fetch-alpine.sh`) is not yet on main. The lane is wired so it
+    # flips to required by dropping continue-on-error once those land. See #339.
+    if: ${{ vars.RUN_MACOS_CI != 'false' }}
+    needs: virtio-kernel
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Verify libkrun is available
+        run: |
+          if [ ! -f /opt/homebrew/lib/libkrun.dylib ]; then
+            echo "::error::libkrun.dylib not found under /opt/homebrew/lib. Provision the runner with: brew install slp/krun/libkrun" >&2
+            exit 1
+          fi
+      - name: Download virtio-linux kernel
+        uses: actions/download-artifact@v4
+        with:
+          name: virtio-kernel-aarch64
+          path: ${{ runner.temp }}/kernel
+      - name: Boot E2E (READY round-trip)
+        # Expected red until #328 (guest stub) + the marker-port contract land.
+        continue-on-error: true
+        run: |
+          set -x
+          # R2.2 rootfs staging (scripts/fetch-alpine.sh) is not yet on main;
+          # stage a vanilla Alpine aarch64 minirootfs inline for now. Note this
+          # rootfs has no guest READY-writer, so the round-trip cannot pass until
+          # the R3.4 stub exists — that is why this step is non-gating.
+          ROOTFS="$RUNNER_TEMP/rootfs"
+          mkdir -p "$ROOTFS"
+          curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.7-aarch64.tar.gz \
+            | tar -xz -C "$ROOTFS"
+          # boot_e2e spawns the minvmd binary, which needs the hypervisor
+          # entitlement (R1.4) — codesign the just-built debug binary.
+          cargo build -p minvmd --bin minvmd
+          codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
+          MINVMD_E2E=1 \
+          MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz" \
+          MINVMD_ROOTFS_PATH="$ROOTFS" \
+            cargo test -p minvmd --test boot_e2e -- --include-ignored --nocapture
+
   build-macos:
     # Self-hosted Apple Silicon runner. minvmd links libkrun
     # (`#[link(name = "krun")]`) and only compiles on macOS — the Linux CI
