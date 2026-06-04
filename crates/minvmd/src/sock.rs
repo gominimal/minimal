@@ -34,7 +34,7 @@ pub fn resolve_uds_path() -> PathBuf {
         }
     }
     dirs::home_dir()
-        .unwrap_or_default()
+        .expect("HOME directory must be set")
         .join(".minimal/local/minimald.sock")
 }
 
