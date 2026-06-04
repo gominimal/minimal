@@ -9,6 +9,8 @@
 //! compiles on both platforms.
 
 pub mod error;
+pub mod lifecycle;
+pub mod state;
 
 #[cfg(target_os = "macos")]
 pub mod krun;
