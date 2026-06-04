@@ -63,11 +63,9 @@ jobs:
     # Separate from build-macos so a kernel-fetch hiccup never blocks the
     # always-green clippy/test/smoke checks.
     #
-    # NON-GATING for now (continue-on-error on the test step only): flip to
-    # required by dropping continue-on-error once it is green on the runner. The
-    # marker port is settled (host + guest both use 7350) and the guest stub now
-    # writes READY by connecting out (krun_add_vsock_port == listen=false). See
-    # #326.
+    # GATING: green on the runner — kernel PE_GZ load, virtio-fs root,
+    # /init.krun exec of the stub, and the guest READY connect-out on vsock 7350
+    # (krun_add_vsock_port == listen=false; host + guest both 7350). See #326.
     if: ${{ vars.RUN_MACOS_CI != 'false' }}
     needs: virtio-kernel
     runs-on: [self-hosted, macOS, ARM64]
@@ -104,11 +102,9 @@ jobs:
       - name: Codesign minvmd (hypervisor entitlement, R1.4)
         run: codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
       - name: Boot E2E (READY round-trip)
-        # NON-GATING only on the test itself, pending first-green on the runner
-        # (the virtio-linux kernel config is validated by this boot). Setup/
-        # build/codesign above fail loudly, so this lane still catches
-        # regressions outside the known-pending boot.
-        continue-on-error: true
+        # Gating: a real Alpine microVM must boot and the guest must write READY
+        # over vsock 7350 within the budget. Also validates the virtio-linux
+        # kernel config (virtio-MMIO / VIRTIO_FS / VSOCK / HVC).
         run: |
           testbin="$(ls -1t target/debug/deps/boot_e2e-* | grep -v '\.d$' | head -1)"
           test -x "$testbin" || { echo "::error::boot_e2e test binary not found"; exit 1; }
