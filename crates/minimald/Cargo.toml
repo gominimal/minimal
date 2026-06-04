@@ -18,6 +18,7 @@ russh-sftp.workspace = true
 path-absolutize.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 
 tokio.workspace = true
 tracing.workspace = true
@@ -31,6 +32,3 @@ ot.workspace = true
 paths.workspace = true
 sessions.workspace = true
 stdlib.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true

@@ -5,6 +5,7 @@ locked_commit = "0da02c7fe4cff292388c1b9ebd611feceabb22fe"
 
 [harness]
 use = "rust"
+runtime_packages = ["socat"]
 
 [defaults]
 profile = "dev"
