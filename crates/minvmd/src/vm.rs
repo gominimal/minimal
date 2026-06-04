@@ -36,8 +36,8 @@ impl VmConfig {
 
     /// Apply this configuration to an existing libkrun [`Context`][crate::krun::Context].
     ///
-    /// Configures vcpus, RAM, kernel (with arch-appropriate format), and
-    /// rootfs. No network device is added (R2.5).
+    /// Configures vcpus, RAM, kernel (with arch-appropriate format), rootfs,
+    /// and the host UDS↔vsock bridge for minimald (R3.1).
     #[cfg(target_os = "macos")]
     pub fn apply(&self, ctx: &mut crate::krun::Context) -> Result<(), crate::error::VmError> {
         ctx.set_vm_config(self.num_vcpus, self.ram_mib)?;
@@ -49,6 +49,19 @@ impl VmConfig {
         )?;
         ctx.set_root(&self.rootfs_path)?;
         // R2.5: no network device in v0.1.
+
+        // R3.1: register the host UDS bridge (listen=true). libkrun listens on
+        // the host UDS and bridges each accepted connection to the guest process
+        // listening on vsock VSOCK_BRIDGE_PORT.
+        let uds_path = crate::sock::resolve_uds_path()
+            .map_err(|source| crate::error::VmError::Io { source })?;
+        crate::sock::prepare_socket_dir(&uds_path)
+            .map_err(|source| crate::error::VmError::Io { source })?;
+        // Drop a stale socket from a prior run; libkrun's listen-bind fails
+        // EEXIST otherwise (e.g. on a persistent runner).
+        crate::sock::remove_stale_socket(&uds_path)
+            .map_err(|source| crate::error::VmError::Io { source })?;
+        ctx.add_vsock_port2(crate::sock::VSOCK_BRIDGE_PORT, &uds_path, true)?;
         Ok(())
     }
 }

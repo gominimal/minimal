@@ -100,6 +100,22 @@ unsafe extern "C" {
     /// lands, the host→guest path to minimald.
     pub fn krun_add_vsock_port(ctx_id: u32, port: u32, c_filepath: *const c_char) -> i32;
 
+    /// Register a host UNIX socket path with direction control.
+    ///
+    /// `listen = true`: libkrun listens on the host UDS and bridges each
+    /// accepted connection to a guest process listening on `port`. Used for
+    /// the host→guest minimald bridge (R3.1).
+    ///
+    /// `listen = false`: equivalent to `krun_add_vsock_port`; the host UDS
+    /// listens and the guest connects outbound. Used for the READY marker
+    /// (R2.4).
+    pub fn krun_add_vsock_port2(
+        ctx_id: u32,
+        port: u32,
+        c_filepath: *const c_char,
+        listen: bool,
+    ) -> i32;
+
     /// Redirect the implicit console output to a host file. Used by the
     /// supervisor to capture early-boot kernel output for diagnostics.
     pub fn krun_set_console_output(ctx_id: u32, c_filepath: *const c_char) -> i32;
