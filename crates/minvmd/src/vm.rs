@@ -61,6 +61,10 @@ impl VmConfig {
         // EEXIST otherwise (e.g. on a persistent runner).
         crate::sock::remove_stale_socket(&uds_path)
             .map_err(|source| crate::error::VmError::Io { source })?;
+        // R3.5: TSI ~62-concurrent-connection cap. libkrun's TSI layer
+        // multiplexes guest vsock connections over a single host transport; the
+        // practical ceiling is ~62 concurrent connections on this port before
+        // new ones queue. Acceptable for v0.1 workloads (<10 concurrent).
         ctx.add_vsock_port2(crate::sock::VSOCK_BRIDGE_PORT, &uds_path, true)?;
         Ok(())
     }
