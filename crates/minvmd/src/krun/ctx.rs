@@ -208,8 +208,7 @@ impl Context {
         // is NUL-terminated and valid until after the FFI returns. `port` and
         // `listen` are passed by value. `ctx_id` is owned by `self` and refers
         // to a context not yet freed.
-        let ret =
-            unsafe { raw::krun_add_vsock_port2(self.ctx_id, port, cstr.as_ptr(), listen) };
+        let ret = unsafe { raw::krun_add_vsock_port2(self.ctx_id, port, cstr.as_ptr(), listen) };
         drop(cstr);
         raw::check_backend("krun_add_vsock_port2", ret)?;
         Ok(())

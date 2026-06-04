@@ -119,10 +119,7 @@ mod tests {
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000") };
         let path = resolve_uds_path().unwrap();
         unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
-        assert_eq!(
-            path,
-            PathBuf::from("/run/user/1000/minimal/minimald.sock"),
-        );
+        assert_eq!(path, PathBuf::from("/run/user/1000/minimal/minimald.sock"),);
     }
 
     #[test]
