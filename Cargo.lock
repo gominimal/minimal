@@ -3382,11 +3382,18 @@ dependencies = [
 name = "minimald"
 version = "0.0.1"
 dependencies = [
+ "args",
  "camino",
  "clap",
  "clap_complete",
  "constcat",
  "dirs",
+ "futures",
+ "graph",
+ "hakoniwa",
+ "libc",
+ "mctx",
+ "mfile",
  "ot",
  "path-absolutize",
  "paths",
