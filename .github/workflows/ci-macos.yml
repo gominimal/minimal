@@ -12,6 +12,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/ci-macos.yml"
+      - "scripts/fetch-virtio-kernel.sh"
   pull_request:
     branches: ["main"]
     paths:
@@ -19,6 +20,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/ci-macos.yml"
+      - "scripts/fetch-virtio-kernel.sh"
   workflow_dispatch:
 
 env:
@@ -86,26 +88,32 @@ jobs:
         with:
           name: virtio-kernel-aarch64
           path: ${{ runner.temp }}/kernel
-      - name: Boot E2E (READY round-trip)
-        # Expected red until #328 (guest stub) + the marker-port contract land.
-        continue-on-error: true
+      - name: Stage Alpine rootfs
+        # R2.2 rootfs staging (scripts/fetch-alpine.sh) is not yet on main; stage
+        # a vanilla Alpine aarch64 minirootfs inline for now. (No guest READY-writer
+        # yet, so the round-trip can't pass until the R3.4 stub lands — see #339.)
+        # A real setup failure here fails the job — it is not hidden behind the
+        # non-gating test below.
         run: |
-          set -x
-          # R2.2 rootfs staging (scripts/fetch-alpine.sh) is not yet on main;
-          # stage a vanilla Alpine aarch64 minirootfs inline for now. Note this
-          # rootfs has no guest READY-writer, so the round-trip cannot pass until
-          # the R3.4 stub exists — that is why this step is non-gating.
           ROOTFS="$RUNNER_TEMP/rootfs"
           mkdir -p "$ROOTFS"
           curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.7-aarch64.tar.gz \
             | tar -xz -C "$ROOTFS"
-          # boot_e2e spawns the minvmd binary, which needs the hypervisor
-          # entitlement (R1.4) — codesign the just-built debug binary.
+      - name: Build and codesign minvmd
+        # boot_e2e spawns the minvmd binary, which needs the hypervisor
+        # entitlement (R1.4). A build/codesign failure fails the job.
+        run: |
           cargo build -p minvmd --bin minvmd
           codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
+      - name: Boot E2E (READY round-trip)
+        # NON-GATING only on the test itself: expected red until #328 (guest stub)
+        # and the marker-port contract land. Setup/build/codesign above fail loudly,
+        # so this lane still catches regressions outside the known-missing pieces.
+        continue-on-error: true
+        run: |
           MINVMD_E2E=1 \
           MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz" \
-          MINVMD_ROOTFS_PATH="$ROOTFS" \
+          MINVMD_ROOTFS_PATH="$RUNNER_TEMP/rootfs" \
             cargo test -p minvmd --test boot_e2e -- --include-ignored --nocapture
 
   build-macos:
