@@ -1,8 +1,4 @@
-//! `minvmd` CLI entry point. Currently a skeleton: only `completions` is
-//! wired. `boot`, `run`, `status`, `stop`, and the hidden `__krun-vmm` child
-//! subcommand land in follow-up changes. The crate compiles on macOS (real)
-//! and Linux (stub); Linux-only `bail!` paths land alongside the subcommands
-//! that need them, so they never silently no-op.
+//! `minvmd` CLI entry point.
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -19,11 +15,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Boot the microVM and wait until the guest is up.
+    Boot {
+        /// Stay in the foreground until the VMM child exits.
+        #[arg(long)]
+        foreground: bool,
+    },
     /// Generate shell completion script.
     Completions {
         /// Shell to generate completions for.
         shell: Shell,
     },
+    /// Hidden VMM child subcommand — spawned by `boot`, not for direct use.
+    #[command(name = "__krun-vmm", hide = true)]
+    KrunVmm,
 }
 
 fn main() -> Result<()> {
@@ -36,11 +41,13 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::Boot { foreground } => minvmd::cmd::boot::run(foreground),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
             Ok(())
         }
+        Command::KrunVmm => minvmd::cmd::vmm_child::run(),
     }
 }

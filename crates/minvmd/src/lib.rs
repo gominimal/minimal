@@ -8,6 +8,7 @@
 //! since it links libkrun; portable surface (errors, state, image resolution)
 //! compiles on both platforms.
 
+pub mod cmd;
 pub mod error;
 pub mod image;
 pub mod lifecycle;
