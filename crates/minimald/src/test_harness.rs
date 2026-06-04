@@ -17,6 +17,7 @@
 
 #![cfg(test)]
 
+use std::path::Path;
 use std::sync::Arc;
 
 use camino::Utf8PathBuf;
@@ -25,7 +26,7 @@ use russh::keys::ssh_key;
 use sessions::SessionId;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::net::{UnixListener, UnixStream};
 
 use crate::connection::Connection;
 use crate::rpc::OneshotSshRpc;
@@ -105,6 +106,27 @@ impl TestServer {
         assert!(auth.success(), "auth_none should succeed on local UDS");
 
         TestClient { handle }
+    }
+
+    /// Binds a `UnixListener` at `sock` and spawns an accept loop wired
+    /// through the same russh stack `connect()` uses, so external clients
+    /// (e.g. an OpenSSH process driven by `git push`) can dial the test
+    /// server over a real UDS rather than the in-memory pair.
+    pub(crate) async fn listen_on_uds(&self, sock: &Path) {
+        let listener = UnixListener::bind(sock).unwrap();
+        let russh_config = self.russh_config.clone();
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let russh_config = russh_config.clone();
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let (_conn, session_fut) =
+                        Connection::from_socket(socket, russh_config, state, true).await;
+                    let _ = session_fut.await;
+                });
+            }
+        });
     }
 }
 
