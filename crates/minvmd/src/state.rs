@@ -143,7 +143,6 @@ impl StateDir {
     pub fn lifecycle_lock(&self) -> io::Result<RwLock<File>> {
         Ok(RwLock::new(self.open_lock_file()?))
     }
-
 }
 
 // ── StartingGuard ─────────────────────────────────────────────────────────────
