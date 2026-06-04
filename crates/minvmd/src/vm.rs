@@ -53,7 +53,8 @@ impl VmConfig {
         // R3.1: register the host UDS bridge (listen=true). libkrun listens on
         // the host UDS and bridges each accepted connection to the guest process
         // listening on vsock VSOCK_BRIDGE_PORT.
-        let uds_path = crate::sock::resolve_uds_path();
+        let uds_path = crate::sock::resolve_uds_path()
+            .map_err(|source| crate::error::VmError::Io { source })?;
         crate::sock::prepare_socket_dir(&uds_path)
             .map_err(|source| crate::error::VmError::Io { source })?;
         ctx.add_vsock_port2(crate::sock::VSOCK_BRIDGE_PORT, &uds_path, true)?;

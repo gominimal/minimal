@@ -27,15 +27,23 @@ pub const VSOCK_BRIDGE_PORT: u32 = 2222;
 ///
 /// Returns `$XDG_RUNTIME_DIR/minimal/minimald.sock` when `XDG_RUNTIME_DIR`
 /// is set and non-empty; otherwise `~/.minimal/local/minimald.sock`.
-pub fn resolve_uds_path() -> PathBuf {
+///
+/// Returns an error when `XDG_RUNTIME_DIR` is absent/empty and the home
+/// directory cannot be determined (e.g. `HOME` unset and no passwd entry).
+pub fn resolve_uds_path() -> io::Result<PathBuf> {
     if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
         if !runtime.is_empty() {
-            return PathBuf::from(runtime).join("minimal/minimald.sock");
+            return Ok(PathBuf::from(runtime).join("minimal/minimald.sock"));
         }
     }
     dirs::home_dir()
-        .expect("HOME directory must be set")
-        .join(".minimal/local/minimald.sock")
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "HOME directory is not set; cannot resolve minimald socket path",
+            )
+        })
+        .map(|home| home.join(".minimal/local/minimald.sock"))
 }
 
 /// Create the parent directory of `socket_path` with mode 0700, if absent.
@@ -86,7 +94,7 @@ mod tests {
     fn resolve_uds_path_uses_xdg_runtime_dir() {
         let _g = UDS_ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000") };
-        let path = resolve_uds_path();
+        let path = resolve_uds_path().unwrap();
         unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
         assert_eq!(
             path,
@@ -99,7 +107,7 @@ mod tests {
         let _g = UDS_ENV_LOCK.lock().unwrap();
         unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
         unsafe { std::env::set_var("HOME", "/home/user") };
-        let path = resolve_uds_path();
+        let path = resolve_uds_path().unwrap();
         unsafe { std::env::remove_var("HOME") };
         assert_eq!(
             path,
@@ -112,7 +120,7 @@ mod tests {
         let _g = UDS_ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", "") };
         unsafe { std::env::set_var("HOME", "/home/user") };
-        let path = resolve_uds_path();
+        let path = resolve_uds_path().unwrap();
         unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
         unsafe { std::env::remove_var("HOME") };
         assert_eq!(
