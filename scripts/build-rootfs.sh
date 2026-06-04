@@ -32,15 +32,25 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-OVERLAY_REVISION="2"
+OVERLAY_REVISION="4"
 
-# socat from Alpine v3.21 main; depends only on so:libc.musl, which the base
-# minirootfs already provides (verified via APKINDEX). sha256 is of the .apk.
-# Plain vars + a case lookup (below) instead of an associative array so the
-# script runs under macOS's system bash 3.2 (declare -A needs bash 4+).
+# Pinned Alpine v3.21 main apks overlaid onto the base minirootfs. socat
+# provides the vsock tooling; readline + libncursesw are socat's runtime closure
+# (it dynamically links libreadline.so.8, which needs libncursesw.so.6) that the
+# minirootfs lacks — libssl/libcrypto/libc are already in the base. NOTE: the
+# library lives in `libncursesw`, not the `ncurses-libs` metapackage (which has
+# no payload). sha256 is of each .apk. Plain vars + a case lookup (below) instead
+# of associative arrays so the script runs under macOS bash 3.2 (declare -A
+# needs bash 4+).
 SOCAT_VERSION="1.8.0.3-r0"
 SOCAT_SHA256_aarch64="7cc3f5bade7fba9cd828b94560ce9f35de61246e19ecb595098110e81cf1c9ae"
 SOCAT_SHA256_x86_64="caaad9c79573220fe100aad81487b20306c0745cb96baf5813f45fb212e8be90"
+READLINE_VERSION="8.2.13-r0"
+READLINE_SHA256_aarch64="7dad49f83ecbcfa00c5c7df044a5566b928ac1995651cfff219e1df1c2b93871"
+READLINE_SHA256_x86_64="fa4ff2347886f5516d021b9064a00259b29fc6e2608eac5588a339de244acf12"
+LIBNCURSESW_VERSION="6.5_p20241006-r3"
+LIBNCURSESW_SHA256_aarch64="c1a5a3a552ad4d44c94454555f38de71b151dc2d608ea2246d92b3bd845b7f3a"
+LIBNCURSESW_SHA256_x86_64="3919cf673e841d91865213799ccfd5f77a48f5f9f5402723167470295ee32a49"
 
 print_path_only=0
 if [[ "${1:-}" == "--print-path" ]]; then
@@ -58,13 +68,21 @@ if [[ "$print_path_only" -eq 1 ]]; then
 fi
 
 case "$arch" in
-    aarch64) socat_sha="$SOCAT_SHA256_aarch64" ;;
-    x86_64) socat_sha="$SOCAT_SHA256_x86_64" ;;
-    *) echo "build-rootfs.sh: no pinned socat sha256 for arch $arch" >&2; exit 1 ;;
+    aarch64)
+        socat_sha="$SOCAT_SHA256_aarch64"
+        readline_sha="$READLINE_SHA256_aarch64"
+        libncursesw_sha="$LIBNCURSESW_SHA256_aarch64"
+        ;;
+    x86_64)
+        socat_sha="$SOCAT_SHA256_x86_64"
+        readline_sha="$READLINE_SHA256_x86_64"
+        libncursesw_sha="$LIBNCURSESW_SHA256_x86_64"
+        ;;
+    *) echo "build-rootfs.sh: no pinned apk sha256 for arch $arch" >&2; exit 1 ;;
 esac
 
 marker="$rootfs_path/.minvmd-overlay.ok"
-marker_value="rev=$OVERLAY_REVISION socat=$socat_sha"
+marker_value="rev=$OVERLAY_REVISION socat=$socat_sha readline=$readline_sha libncursesw=$libncursesw_sha"
 
 if [[ -f "$marker" ]] && [[ "$(cat "$marker")" == "$marker_value" ]]; then
     echo "build-rootfs.sh: overlay up to date at $rootfs_path" >&2
@@ -74,29 +92,37 @@ fi
 # Ensure the base is staged + verified (idempotent; no-op on cache hit).
 "$SCRIPT_DIR/fetch-alpine.sh" >&2
 
-apk="socat-${SOCAT_VERSION}.apk"
-apk_url="https://dl-cdn.alpinelinux.org/alpine/v3.21/main/${arch}/${apk}"
-
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
-echo "build-rootfs.sh: downloading $apk_url" >&2
-curl -fsSL "$apk_url" -o "$tmpdir/$apk"
+# fetch_apk <name> <version> <sha256>: download a pinned Alpine .apk, verify its
+# sha256, and copy its usr/ payload into the rootfs. apk metadata entries
+# (.PKGINFO, .SIGN.*, .pre-install, .trigger) are dotfiles at the archive root
+# and are deliberately not copied.
+fetch_apk() {
+    apk_name="$1"
+    apk_ver="$2"
+    apk_sha="$3"
+    apk="${apk_name}-${apk_ver}.apk"
+    apk_url="https://dl-cdn.alpinelinux.org/alpine/v3.21/main/${arch}/${apk}"
+    echo "build-rootfs.sh: downloading $apk_url" >&2
+    curl -fsSL "$apk_url" -o "$tmpdir/$apk"
+    actual_sha="$(shasum -a 256 "$tmpdir/$apk" | awk '{print $1}')"
+    if [[ "$actual_sha" != "$apk_sha" ]]; then
+        echo "build-rootfs.sh: sha256 mismatch for $apk" >&2
+        echo "  expected: $apk_sha" >&2
+        echo "  actual:   $actual_sha" >&2
+        exit 1
+    fi
+    rm -rf "$tmpdir/extract"
+    mkdir -p "$tmpdir/extract"
+    tar -xzf "$tmpdir/$apk" -C "$tmpdir/extract"
+    cp -a "$tmpdir/extract/usr/." "$rootfs_path/usr/"
+}
 
-actual_sha="$(shasum -a 256 "$tmpdir/$apk" | awk '{print $1}')"
-if [[ "$actual_sha" != "$socat_sha" ]]; then
-    echo "build-rootfs.sh: sha256 mismatch for $apk" >&2
-    echo "  expected: $socat_sha" >&2
-    echo "  actual:   $actual_sha" >&2
-    exit 1
-fi
-
-# Extract into a scratch dir, then copy only the payload (usr/). apk metadata
-# entries (.PKGINFO, .SIGN.*, .pre-install, .trigger) are dotfiles at the
-# archive root and are deliberately not copied into the rootfs.
-mkdir -p "$tmpdir/extract"
-tar -xzf "$tmpdir/$apk" -C "$tmpdir/extract"
-cp -a "$tmpdir/extract/usr/." "$rootfs_path/usr/"
+fetch_apk socat "$SOCAT_VERSION" "$socat_sha"
+fetch_apk readline "$READLINE_VERSION" "$readline_sha"
+fetch_apk libncursesw "$LIBNCURSESW_VERSION" "$libncursesw_sha"
 
 # Guest bring-up workload. Replaced in production by /sbin/minimald.
 cat > "$rootfs_path/sbin/minvmd-stub-init" <<'STUB'
