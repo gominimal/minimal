@@ -49,8 +49,18 @@ fn run_macos(foreground: bool) -> Result<()> {
     let _kernel = resolve_kernel_path().context("resolving kernel path")?;
     let _rootfs = resolve_rootfs_path().context("resolving rootfs path")?;
 
-    // Create the marker socket under /tmp, named by PID for uniqueness.
-    let marker_sock_path = PathBuf::from(format!("/tmp/minvmd-marker-{}.sock", std::process::id()));
+    // Create the marker socket under /tmp with a PID + random nonce to prevent
+    // predictable-path TOCTOU attacks (local-only risk, but cheap to harden).
+    let nonce = {
+        use std::io::Read as _;
+        let mut buf = [0u8; 4];
+        let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf));
+        u32::from_le_bytes(buf)
+    };
+    let marker_sock_path = PathBuf::from(format!(
+        "/tmp/minvmd-marker-{}-{nonce:08x}.sock",
+        std::process::id()
+    ));
 
     // Remove any stale socket from a previous run.
     let _ = std::fs::remove_file(&marker_sock_path);
