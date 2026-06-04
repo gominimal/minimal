@@ -81,9 +81,10 @@ pub struct ServerState {
 impl ServerState {
     pub async fn new(config: Config) -> Result<Self, std::io::Error> {
         let minimal_state_dir = config.minimal_state_dir.clone();
+        let minimal_cache_dir = config.minimal_cache_dir.clone();
         Ok(Self {
             config,
-            sessions: sessions::Manager::init(minimal_state_dir).await?,
+            sessions: sessions::Manager::init(minimal_state_dir, minimal_cache_dir).await?,
             host_key: None,
         })
     }

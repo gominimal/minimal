@@ -737,24 +737,26 @@ impl<'a> Env<'a> {
             ),
         )]
         .into_iter();
-        let var_ctx = if let Some(args) = parsed_args {
-            common::ncl_eval::VarCtx::from_iter(
-                base.chain(args.iter().map(|(k, v)| (k.as_str(), v.clone()))),
-            )
-        } else {
-            common::ncl_eval::VarCtx::from_iter(base)
+        let mapped_task = {
+            let var_ctx = if let Some(args) = parsed_args {
+                common::ncl_eval::VarCtx::from_iter(
+                    base.chain(args.iter().map(|(k, v)| (k.as_str(), v.clone()))),
+                )
+            } else {
+                common::ncl_eval::VarCtx::from_iter(base)
+            };
+            task.map_exec_strings(|s| {
+                var_ctx
+                    .eval_string(s)
+                    .map_err(|_| anyhow::anyhow!("nickel eval failed for string: {}", s))
+            })
+            .map_err(Error::Other)?
         };
 
         Ok((
             task.interactive,
             op::TaskEnv {
-                task: &task
-                    .map_exec_strings(|s| {
-                        var_ctx
-                            .eval_string(s)
-                            .map_err(|_| anyhow::anyhow!("nickel eval failed for string: {}", s))
-                    })
-                    .map_err(Error::Other)?,
+                task: &mapped_task,
                 sandbox: &mut self.sandbox,
             }
             .resolve()

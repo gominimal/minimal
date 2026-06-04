@@ -59,19 +59,27 @@ pub struct Manager<L: Loader = DiskLoader> {
     receiver: mpsc::Receiver<ManagerMessage>,
     running: BTreeMap<L::Key, SessionHandle>,
     store: L,
+
+    minimal_state_dir: DaemonAbsPath,
+    minimal_cache_dir: DaemonAbsPath,
 }
 
 impl Manager {
     /// Launches a sessions manager managing sessions in
     /// the given minimal state dir.
-    pub async fn init(minimal_state_dir: DaemonAbsPath) -> Result<ManagerHandle, std::io::Error> {
-        let l = DiskLoader::new(minimal_state_dir)?;
+    pub async fn init(
+        minimal_state_dir: DaemonAbsPath,
+        minimal_cache_dir: DaemonAbsPath,
+    ) -> Result<ManagerHandle, std::io::Error> {
+        let l = DiskLoader::new(minimal_state_dir.clone())?;
         let running = BTreeMap::new();
         let (sender, receiver) = mpsc::channel(8);
         let mngr = Self {
             receiver,
             running,
             store: l,
+            minimal_state_dir,
+            minimal_cache_dir,
         };
 
         tokio::spawn(mngr.mainloop());
@@ -143,9 +151,13 @@ impl<L: Loader> Manager<L> {
                                 Some(h) => h.clone(),
                                 None => {
                                     // Not running, start it!
-                                    let h = Session::run(self.store.get(&k)?)
-                                        .await
-                                        .expect("TODO handle error");
+                                    let h = Session::run(
+                                        self.minimal_state_dir.clone(),
+                                        self.minimal_cache_dir.clone(),
+                                        self.store.get(&k)?,
+                                    )
+                                    .await
+                                    .expect("TODO handle error");
                                     self.running.insert(k, h.clone());
                                     h
                                 }
