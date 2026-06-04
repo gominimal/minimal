@@ -7,12 +7,14 @@
 //! On macOS:
 //! 1. Reads kernel and rootfs from `MINVMD_KERNEL_PATH` / `MINVMD_ROOTFS_PATH`.
 //! 2. Reads the READY-marker socket path from `MINVMD_MARKER_SOCK`.
-//! 3. Creates and configures a libkrun context.
-//! 4. Registers the marker socket as the host-side endpoint for
-//!    `VSOCK_MARKER_PORT`: when the guest's init connects to that vsock port
-//!    and writes `READY\n`, libkrun forwards the data through to the host
-//!    UNIX socket where the parent is listening (R2.4).
-//! 5. Calls `krun_start_enter`, which boots the VM. On success libkrun
+//! 3. Creates and configures a libkrun context (kernel, rootfs, resources).
+//! 4. Sets the guest workload via `krun_set_exec` (libkrun's `/init.krun` runs
+//!    as PID 1 and forks it); default `/sbin/minvmd-stub-init`, `MINVMD_EXEC`
+//!    overrides.
+//! 5. Registers the marker socket for `VSOCK_MARKER_PORT` (guest→host): the
+//!    guest workload connects to that vsock port and writes `READY\n`, which
+//!    libkrun bridges to the host UNIX socket where the parent listens (R2.4).
+//! 6. Calls `krun_start_enter`, which boots the VM. On success libkrun
 //!    `exit()`s with the guest workload's exit code and never returns here.
 //!
 //! On Linux this subcommand bails immediately with a "macOS only" error.
@@ -44,23 +46,46 @@ fn run_macos() -> Result<()> {
     })?;
 
     let mut ctx = Context::create().context("krun_create_ctx")?;
-    // Default 2 vcpus and 512 MiB RAM; the boot command may expose these as
-    // flags in a future change.
-    let cfg = VmConfig::new(2, 512, kernel, rootfs);
+    // 2 vCPU / 1024 MiB: 512 MiB is the practical floor to reach Alpine
+    // userspace; 1024 MiB is cheap headroom under Hypervisor.framework with no
+    // boot penalty. (Stay below the kernel's CONFIG_NR_CPUS.) The boot command
+    // may expose these as flags in a future change.
+    let cfg = VmConfig::new(2, 1024, kernel, rootfs);
     cfg.apply(&mut ctx)
         .context("applying VmConfig to krun context")?;
 
-    // Register the READY-marker vsock port. When the guest's init connects to
-    // VSOCK_MARKER_PORT and writes `READY\n`, libkrun forwards the connection
-    // to the host UNIX socket at `marker_sock`, where the parent is listening
-    // (R2.4).
+    // Set the guest workload. libkrun's own init (`/init.krun`) runs as PID 1,
+    // mounts /proc,/sys,/dev, reads this target from /.krun_config.json, and
+    // forks it — so the rootfs needs no init system, only this binary. Default
+    // to the v0.1 bring-up stub; `MINVMD_EXEC` overrides (e.g. /sbin/minimald).
+    // Pass an explicit minimal envp (not None): None inherits the full host env
+    // into the guest, which can overflow the ~2 KiB aarch64 kernel cmdline.
+    let exec =
+        std::env::var("MINVMD_EXEC").unwrap_or_else(|_| "/sbin/minvmd-stub-init".to_string());
+    let argv: [&str; 0] = [];
+    ctx.set_exec(&exec, &argv, Some(&["PATH=/usr/sbin:/usr/bin:/sbin:/bin"]))
+        .with_context(|| format!("setting guest exec workload: {exec}"))?;
+
+    // Optional early-boot console capture for diagnosing a stuck boot. Off by
+    // default; set `MINVMD_BOOT_LOG=<path>` to capture hvc0 to a host file.
+    if let Some(log_path) = std::env::var_os("MINVMD_BOOT_LOG") {
+        ctx.set_console_output(&log_path)
+            .context("setting console output log")?;
+    }
+
+    // Register the READY-marker vsock port (guest→host). The plain
+    // `krun_add_vsock_port` is `krun_add_vsock_port2(.., listen=false)`: the
+    // parent listens on the host UDS `marker_sock`; the guest workload connects
+    // to AF_VSOCK CID 2 (host) port VSOCK_MARKER_PORT and writes `READY\n`,
+    // which libkrun bridges to the parent (R2.4).
     ctx.add_vsock_port(VSOCK_MARKER_PORT, &marker_sock)
         .context("registering READY-marker vsock port")?;
 
     tracing::info!(
         port = VSOCK_MARKER_PORT,
         sock = %marker_sock,
-        "READY-marker vsock port registered; calling krun_start_enter"
+        exec = %exec,
+        "guest workload + READY-marker vsock port set; calling krun_start_enter"
     );
 
     // start_enter consumes the context and boots the VM. On success, libkrun
