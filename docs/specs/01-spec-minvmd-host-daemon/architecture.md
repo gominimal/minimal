@@ -25,7 +25,8 @@ guest workload's exit code. This forces a parent/child split
 minvmd run                       (parent — supervisor)
   └── minvmd __krun-vmm          (hidden child — calls krun_start_enter)
        └── libkrun + Alpine VM   (the actual VM)
-            └── minimald (pid-1) (in-VM, via krun_set_exec)
+            └── /init.krun (pid-1, libkrun-supplied)
+                 └── minimald   (guest workload, via krun_set_exec)
 ```
 
 - **Parent** (`minvmd run`): owns `state.toml`, `lifecycle.lock`, lifecycle
@@ -35,8 +36,10 @@ minvmd run                       (parent — supervisor)
   libkrun context (kernel, rootfs, vsock ports, vm config), then calls
   `krun_start_enter` which diverges. Authenticated to the parent via a
   single-use token in the state directory (mode 0600, deleted on first read).
-- **Guest**: Alpine minirootfs running `minimald` (or the v0.1 vsock stub)
-  as pid-1 via `krun_set_exec`.
+- **Guest**: Alpine minirootfs. libkrun's built-in `/init.krun` is pid-1
+  (mounts `/proc`, `/sys`, `/dev`); it execs the workload set via
+  `krun_set_exec` — `minimald`, or the v0.1 vsock stub. No init system in the
+  rootfs.
 
 ### Socket model (libkrun-owned, no host relay)
 
