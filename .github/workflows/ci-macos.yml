@@ -12,6 +12,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/ci-macos.yml"
+      - "scripts/**"
   pull_request:
     branches: ["main"]
     paths:
@@ -19,6 +20,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/ci-macos.yml"
+      - "scripts/**"
   workflow_dispatch:
 
 env:
@@ -34,6 +36,93 @@ permissions:
   contents: read
 
 jobs:
+  virtio-kernel:
+    # Pull the prebuilt virtio-linux kernel (vmlinuz / Image.gz) from the public
+    # minimal build cache — no kernel build, no GCS auth — and hand it to the
+    # macOS boot job. The packaging `minimal` CLI is Linux-only, so this runs on
+    # Linux. Cheap (a cache pull), so it is unconditional and decoupled from the
+    # self-hosted runner.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Fetch virtio-linux kernel from the build cache
+        run: ./scripts/fetch-virtio-kernel.sh "$RUNNER_TEMP/vmlinuz" aarch64
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: virtio-kernel-aarch64
+          path: ${{ runner.temp }}/vmlinuz
+          if-no-files-found: error
+
+  boot-e2e:
+    # Boot E2E (R2.4 READY round-trip) on real hardware, using the cache-pulled
+    # kernel and the real minvmd guest rootfs (Alpine + READY-writer stub).
+    # Separate from build-macos so a kernel-fetch hiccup never blocks the
+    # always-green clippy/test/smoke checks.
+    #
+    # NON-GATING for now (continue-on-error on the test step only): flip to
+    # required by dropping continue-on-error once it is green on the runner. The
+    # marker port is settled (host + guest both use 7350) and the guest stub now
+    # writes READY by connecting out (krun_add_vsock_port == listen=false). See
+    # #326.
+    if: ${{ vars.RUN_MACOS_CI != 'false' }}
+    needs: virtio-kernel
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Verify libkrun is available
+        run: |
+          if [ ! -f /opt/homebrew/lib/libkrun.dylib ]; then
+            echo "::error::libkrun.dylib not found under /opt/homebrew/lib. Provision the runner with: brew install slp/krun/libkrun" >&2
+            exit 1
+          fi
+      - name: Download virtio-linux kernel
+        uses: actions/download-artifact@v4
+        with:
+          name: virtio-kernel-aarch64
+          path: ${{ runner.temp }}/kernel
+      - name: Stage minvmd guest rootfs
+        # Real R2.2 rootfs: fetch the pinned Alpine minirootfs and overlay socat
+        # + the READY-writer stub (/sbin/minvmd-stub-init) via build-rootfs.sh.
+        # A setup failure fails the job — it is not hidden behind the non-gating
+        # test below.
+        run: scripts/build-rootfs.sh
+      - name: Build and codesign minvmd
+        # boot_e2e spawns the minvmd binary, which needs the hypervisor
+        # entitlement (R1.4). A build/codesign failure fails the job.
+        run: |
+          cargo build -p minvmd --bin minvmd
+          codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
+      - name: Boot E2E (READY round-trip)
+        # NON-GATING only on the test itself, pending first-green on the runner
+        # (the virtio-linux kernel config is validated by this boot). Setup/
+        # build/codesign above fail loudly, so this lane still catches
+        # regressions outside the known-pending boot.
+        continue-on-error: true
+        run: |
+          MINVMD_E2E=1 \
+          MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz" \
+          MINVMD_ROOTFS_PATH="$(scripts/build-rootfs.sh --print-path)" \
+          MINVMD_BOOT_LOG="$RUNNER_TEMP/boot.log" \
+            cargo test -p minvmd --test boot_e2e -- --include-ignored --nocapture
+      - name: Upload guest boot console log
+        # Capture hvc0 output for diagnosing a stuck/failed boot (e.g. a missing
+        # virtio driver in the kernel). Always runs so a red boot is debuggable.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minvmd-boot-log
+          path: ${{ runner.temp }}/boot.log
+          if-no-files-found: ignore
+
   build-macos:
     # Self-hosted Apple Silicon runner. minvmd links libkrun
     # (`#[link(name = "krun")]`) and only compiles on macOS — the Linux CI
