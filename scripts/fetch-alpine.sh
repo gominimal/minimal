@@ -23,10 +23,10 @@ ALPINE_MAJOR_MINOR="${ALPINE_VERSION%.*}"
 
 # sha256 of alpine-minirootfs-${ALPINE_VERSION}-<arch>.tar.gz from
 # https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_MAJOR_MINOR}/releases/<arch>/
-declare -A PINNED_SHA256=(
-    [aarch64]="d1d1a3fae5f4d6146e9742790a47fcb116199622cfb8439f218a4d5fbe5000da"
-    [x86_64]="8cba1ea3e8b500ea986a313d8eecf3d5952a2a0d23a69117bb81c023d9ceac05"
-)
+# Plain vars + a case lookup (below) instead of an associative array so the
+# script runs under macOS's system bash 3.2 (declare -A needs bash 4+).
+PINNED_SHA256_aarch64="d1d1a3fae5f4d6146e9742790a47fcb116199622cfb8439f218a4d5fbe5000da"
+PINNED_SHA256_x86_64="8cba1ea3e8b500ea986a313d8eecf3d5952a2a0d23a69117bb81c023d9ceac05"
 
 print_path_only=0
 if [[ "${1:-}" == "--print-path" ]]; then
@@ -34,16 +34,10 @@ if [[ "${1:-}" == "--print-path" ]]; then
 fi
 
 case "$(uname -m)" in
-    arm64 | aarch64) arch="aarch64" ;;
-    x86_64 | amd64) arch="x86_64" ;;
+    arm64 | aarch64) arch="aarch64"; expected_sha="$PINNED_SHA256_aarch64" ;;
+    x86_64 | amd64) arch="x86_64"; expected_sha="$PINNED_SHA256_x86_64" ;;
     *) echo "fetch-alpine.sh: unsupported host arch $(uname -m)" >&2; exit 1 ;;
 esac
-
-expected_sha="${PINNED_SHA256[$arch]:-}"
-if [[ -z "$expected_sha" ]]; then
-    echo "fetch-alpine.sh: no pinned sha256 for arch $arch" >&2
-    exit 1
-fi
 
 cache_root="${MINVMD_ROOTFS_CACHE:-$HOME/.cache/minimal/minvmd/rootfs}"
 arch_root="$cache_root/$ALPINE_VERSION/$arch"

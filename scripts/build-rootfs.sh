@@ -36,11 +36,11 @@ OVERLAY_REVISION="2"
 
 # socat from Alpine v3.21 main; depends only on so:libc.musl, which the base
 # minirootfs already provides (verified via APKINDEX). sha256 is of the .apk.
+# Plain vars + a case lookup (below) instead of an associative array so the
+# script runs under macOS's system bash 3.2 (declare -A needs bash 4+).
 SOCAT_VERSION="1.8.0.3-r0"
-declare -A SOCAT_SHA256=(
-    [aarch64]="7cc3f5bade7fba9cd828b94560ce9f35de61246e19ecb595098110e81cf1c9ae"
-    [x86_64]="caaad9c79573220fe100aad81487b20306c0745cb96baf5813f45fb212e8be90"
-)
+SOCAT_SHA256_aarch64="7cc3f5bade7fba9cd828b94560ce9f35de61246e19ecb595098110e81cf1c9ae"
+SOCAT_SHA256_x86_64="caaad9c79573220fe100aad81487b20306c0745cb96baf5813f45fb212e8be90"
 
 print_path_only=0
 if [[ "${1:-}" == "--print-path" ]]; then
@@ -57,11 +57,11 @@ if [[ "$print_path_only" -eq 1 ]]; then
     exit 0
 fi
 
-socat_sha="${SOCAT_SHA256[$arch]:-}"
-if [[ -z "$socat_sha" ]]; then
-    echo "build-rootfs.sh: no pinned socat sha256 for arch $arch" >&2
-    exit 1
-fi
+case "$arch" in
+    aarch64) socat_sha="$SOCAT_SHA256_aarch64" ;;
+    x86_64) socat_sha="$SOCAT_SHA256_x86_64" ;;
+    *) echo "build-rootfs.sh: no pinned socat sha256 for arch $arch" >&2; exit 1 ;;
+esac
 
 marker="$rootfs_path/.minvmd-overlay.ok"
 marker_value="rev=$OVERLAY_REVISION socat=$socat_sha"
