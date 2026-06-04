@@ -51,10 +51,12 @@ fn run_macos(foreground: bool) -> Result<()> {
 
     // Create the marker socket under /tmp with a PID + random nonce to prevent
     // predictable-path TOCTOU attacks (local-only risk, but cheap to harden).
-    let nonce = {
+    let nonce: u32 = {
         use std::io::Read as _;
         let mut buf = [0u8; 4];
-        let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf));
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut buf))
+            .context("reading /dev/urandom for marker socket nonce")?;
         u32::from_le_bytes(buf)
     };
     let marker_sock_path = PathBuf::from(format!(
