@@ -10,7 +10,7 @@ use crate::error::VmError;
 /// Arch-appropriate libkrun kernel format constant.
 ///
 /// - `aarch64`: `virtio-linux` ships `Image.gz` → `KRUN_KERNEL_FORMAT_IMAGE_GZ`
-/// - `x86_64`:  `virtio-linux` ships `bzImage`  → `KRUN_KERNEL_FORMAT_IMAGE_BZ2`
+/// - `x86_64`:  `virtio-linux` ships `bzImage`  → `KRUN_KERNEL_FORMAT_BZIMAGE`
 #[cfg(target_os = "macos")]
 pub fn kernel_format() -> u32 {
     #[cfg(target_arch = "aarch64")]
@@ -19,7 +19,7 @@ pub fn kernel_format() -> u32 {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        crate::krun::KRUN_KERNEL_FORMAT_IMAGE_BZ2
+        crate::krun::KRUN_KERNEL_FORMAT_BZIMAGE
     }
 }
 
@@ -56,11 +56,14 @@ pub fn resolve_rootfs_path() -> Result<PathBuf, VmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes env-var tests to avoid parallel `std::env` races.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn resolve_kernel_path_errors_on_missing_env() {
-        // SAFETY: single-threaded test; environment mutation is isolated per
-        // std::env contract in unit tests.
+        let _lock = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::remove_var("MINVMD_KERNEL_PATH") };
         let err = resolve_kernel_path().unwrap_err();
         assert!(
@@ -76,6 +79,7 @@ mod tests {
 
     #[test]
     fn resolve_kernel_path_returns_path_when_set() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::set_var("MINVMD_KERNEL_PATH", "/boot/Image.gz") };
         let path = resolve_kernel_path().unwrap();
         assert_eq!(path, std::path::PathBuf::from("/boot/Image.gz"));
@@ -84,6 +88,7 @@ mod tests {
 
     #[test]
     fn resolve_kernel_path_errors_on_empty_env() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::set_var("MINVMD_KERNEL_PATH", "") };
         let err = resolve_kernel_path().unwrap_err();
         assert!(
@@ -100,6 +105,7 @@ mod tests {
 
     #[test]
     fn resolve_rootfs_path_errors_on_missing_env() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::remove_var("MINVMD_ROOTFS_PATH") };
         let err = resolve_rootfs_path().unwrap_err();
         assert!(
@@ -117,10 +123,9 @@ mod tests {
     #[test]
     fn kernel_format_is_valid() {
         let fmt = kernel_format();
-        // Both valid format constants; just confirm the value is one of them.
         let valid = [
             crate::krun::KRUN_KERNEL_FORMAT_IMAGE_GZ,
-            crate::krun::KRUN_KERNEL_FORMAT_IMAGE_BZ2,
+            crate::krun::KRUN_KERNEL_FORMAT_BZIMAGE,
         ];
         assert!(
             valid.contains(&fmt),

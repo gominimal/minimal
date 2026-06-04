@@ -34,7 +34,7 @@ fn main() -> Result<(), minvmd::VmError> {
 
 #[cfg(target_os = "macos")]
 fn run_macos() -> Result<(), minvmd::VmError> {
-    use minvmd::krun::{Context, KRUN_KERNEL_FORMAT_IMAGE_BZ2, KRUN_KERNEL_FORMAT_IMAGE_GZ};
+    use minvmd::krun::{Context, KRUN_KERNEL_FORMAT_BZIMAGE, KRUN_KERNEL_FORMAT_IMAGE_GZ};
 
     eprintln!("STAGE: create_ctx");
     let mut ctx = Context::create()?;
@@ -69,7 +69,7 @@ fn run_macos() -> Result<(), minvmd::VmError> {
     let format = if cfg!(target_arch = "aarch64") {
         KRUN_KERNEL_FORMAT_IMAGE_GZ
     } else {
-        KRUN_KERNEL_FORMAT_IMAGE_BZ2
+        KRUN_KERNEL_FORMAT_BZIMAGE
     };
     eprintln!("STAGE: set_kernel path={kernel} format={format}");
     ctx.set_kernel(&kernel, format, None::<&std::path::Path>, None)?;

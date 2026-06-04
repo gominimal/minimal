@@ -16,11 +16,11 @@ use crate::error::VmError;
 // Kernel format constants from libkrun.h, used by `krun_set_kernel`. We only
 // model the formats minvmd actually targets:
 // - aarch64 `virtio-linux` ships `Image.gz` → `KRUN_KERNEL_FORMAT_IMAGE_GZ`
-// - x86_64  `virtio-linux` ships `bzImage`  → `KRUN_KERNEL_FORMAT_IMAGE_BZ2`
+// - x86_64  `virtio-linux` ships `bzImage`  → `KRUN_KERNEL_FORMAT_BZIMAGE`
 //
 // libkrun.h also defines RAW=0, ELF=1, PE_GZ=2, IMAGE_ZSTD=5 — added as
 // needed.
-pub const KRUN_KERNEL_FORMAT_IMAGE_BZ2: u32 = 3;
+pub const KRUN_KERNEL_FORMAT_BZIMAGE: u32 = 3;
 pub const KRUN_KERNEL_FORMAT_IMAGE_GZ: u32 = 4;
 
 // SAFETY: every function in this block is an `extern "C"` declaration that
