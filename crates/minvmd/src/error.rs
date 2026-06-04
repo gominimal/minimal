@@ -34,6 +34,10 @@ pub enum VmError {
 
     /// A required environment variable was unset or empty.
     MissingEnv { var: &'static str },
+
+    /// An I/O error outside the libkrun FFI boundary (e.g. creating or
+    /// checking the socket directory, R3.2).
+    Io { source: io::Error },
 }
 
 impl fmt::Display for VmError {
@@ -64,6 +68,9 @@ impl fmt::Display for VmError {
             Self::MissingEnv { var } => {
                 write!(f, "required environment variable {var} is unset or empty")
             }
+            Self::Io { source } => {
+                write!(f, "I/O error: {source}")
+            }
         }
     }
 }
@@ -76,6 +83,7 @@ impl std::error::Error for VmError {
             | Self::NulInString { .. }
             | Self::StartEnterReturnedUnexpectedly { .. }
             | Self::MissingEnv { .. } => None,
+            Self::Io { source } => Some(source),
         }
     }
 }

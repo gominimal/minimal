@@ -190,6 +190,31 @@ impl Context {
         Ok(())
     }
 
+    /// Register a host UNIX socket path with direction control.
+    ///
+    /// When `listen = true`, libkrun listens on the host UDS and bridges each
+    /// accepted connection to a guest process listening on `port` (host→guest,
+    /// used for the minimald bridge, R3.1). When `listen = false`, the
+    /// behaviour is equivalent to [`add_vsock_port`][Self::add_vsock_port]
+    /// (guest→host, used for the READY marker, R2.4).
+    pub fn add_vsock_port2(
+        &mut self,
+        port: u32,
+        host_socket: impl AsRef<Path>,
+        listen: bool,
+    ) -> Result<(), VmError> {
+        let cstr = cstring_from_path(host_socket.as_ref(), "vsock_port2")?;
+        // SAFETY: `cstr` is a CString owned by this stack frame; its pointer
+        // is NUL-terminated and valid until after the FFI returns. `port` and
+        // `listen` are passed by value. `ctx_id` is owned by `self` and refers
+        // to a context not yet freed.
+        let ret =
+            unsafe { raw::krun_add_vsock_port2(self.ctx_id, port, cstr.as_ptr(), listen) };
+        drop(cstr);
+        raw::check_backend("krun_add_vsock_port2", ret)?;
+        Ok(())
+    }
+
     /// Redirect implicit-console output to a host file.
     pub fn set_console_output(&mut self, path: impl AsRef<Path>) -> Result<(), VmError> {
         let cstr = cstring_from_path(path.as_ref(), "console_output")?;

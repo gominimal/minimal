@@ -12,6 +12,7 @@ pub mod cmd;
 pub mod error;
 pub mod image;
 pub mod lifecycle;
+pub mod sock;
 pub mod state;
 pub mod vm;
 
