@@ -20,7 +20,6 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use fd_lock::RwLock;
@@ -133,6 +132,7 @@ impl StateDir {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(self.lock_path())
     }
 
@@ -144,13 +144,6 @@ impl StateDir {
         Ok(RwLock::new(self.open_lock_file()?))
     }
 
-    /// Record the current time as `started_at` (Unix seconds).
-    pub(crate) fn now_unix() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    }
 }
 
 // ── StartingGuard ─────────────────────────────────────────────────────────────
