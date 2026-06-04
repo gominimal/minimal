@@ -156,9 +156,12 @@ mounts `/proc`, `/sys`, `/dev`, and execs the workload set via
   `VIRTIO_CONSOLE`/HVC all `=y` (the default cmdline carries `nomodule`).
   (translated from plan: step R2.1)
 - **R2.2**: The rootfs shall be an Alpine minirootfs (version-pinned,
-  sha256-verified). For v0.1 the path is supplied via
-  `MINVMD_ROOTFS_PATH`; staging is performed by
-  `scripts/fetch-alpine.sh`. (translated from plan: step R2.2)
+  sha256-verified). For v0.1 the path is supplied via `MINVMD_ROOTFS_PATH`;
+  `scripts/fetch-alpine.sh` stages the base and `scripts/build-rootfs.sh`
+  overlays the guest workload (`/sbin/minvmd-stub-init`) plus its runtime
+  closure (socat and the sha256-pinned `readline` + `libncursesw` apks it
+  dynamically links). The result is a directory consumed by `krun_set_root` as
+  virtio-fs — no disk image. (translated from plan: step R2.2)
 - **R2.3**: `minvmd boot` (parent) shall configure the libkrun context
   via the safe wrappers, then fork-exec a hidden
   `minvmd __krun-vmm` child that calls `krun_start_enter`. The child shall set
