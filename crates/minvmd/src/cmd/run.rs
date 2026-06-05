@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 
 /// Default timeout in seconds for `run --detach` to wait for the host UDS.
 pub const DEFAULT_DETACH_TIMEOUT_SECS: u64 = 8;
