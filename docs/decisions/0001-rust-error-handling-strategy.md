@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-06-02
 - Deciders: Evan, Tom DNetto, Norrie Taylor
-- Refs: [#352](https://github.com/gominimal/minimal/issues/352), Slack #engineering [error-handling thread](https://minimal-dev.slack.com/archives/C091HGA43NC/p1780417077788539)
+- Refs: [#352](https://github.com/gominimal/minimal/issues/352)
 
 ## Context
 
@@ -113,3 +113,14 @@ under our control.
   error enums is out of scope for this ADR unless raised separately.
 - Adds `thiserror` (library deps) and `anyhow` / `color_eyre` (binary deps) to
   the dependency set.
+
+## Sign-off & Rationale Summary
+
+This decision was reached by team consensus (Evan, Tom DNetto, Norrie Taylor)
+during an engineering discussion in June 2026. The two-layer approach —
+`thiserror` for library crates, `anyhow`/`color_eyre` for application crates —
+was selected because it separates structural error contracts (library boundaries)
+from opaque propagation (application plumbing). All three deciders confirmed that
+the approach eliminates boilerplate without sacrificing the ability to craft
+actionable user-facing messages, and that it aligns with the Rust community's
+widely-adopted conventions for this problem. No dissenting views were recorded.
