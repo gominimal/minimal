@@ -93,12 +93,13 @@ jobs:
         # A setup failure fails the job — it is not hidden behind the non-gating
         # test below.
         run: scripts/build-rootfs.sh
-      - name: Build boot E2E + minvmd (no run)
-        # Build the test harness + minvmd bin, then codesign, then run the test
-        # BINARY DIRECTLY (below). Invoking `cargo test` again after signing
-        # relinks (and unsigns) target/debug/minvmd, so krun_start_enter fails
-        # with EINVAL. A direct-binary run never touches the signature.
-        run: cargo test -p minvmd --test boot_e2e --no-run
+      - name: Build boot + bridge E2E + minvmd (no run)
+        # Build both test harnesses + the minvmd bin, then codesign, then run the
+        # test BINARIES DIRECTLY (below). Invoking `cargo test` again after
+        # signing relinks (and unsigns) target/debug/minvmd, so krun_start_enter
+        # fails with EINVAL. A direct-binary run never touches the signature, so
+        # both binaries must be built here before the single codesign.
+        run: cargo test -p minvmd --test boot_e2e --test bridge_e2e --no-run
       - name: Codesign minvmd (hypervisor entitlement, R1.4)
         run: codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
       - name: Boot E2E (READY round-trip)
@@ -112,6 +113,19 @@ jobs:
           MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz" \
           MINVMD_ROOTFS_PATH="$(scripts/build-rootfs.sh --print-path)" \
           MINVMD_BOOT_LOG="$RUNNER_TEMP/boot.log" \
+            "$testbin" --include-ignored --nocapture
+      - name: Bridge E2E (concurrent UDS↔vsock round-trip)
+        # Gating (R3.3, R3.4): boots a real microVM, opens 5 concurrent host UDS
+        # connections to the minimald bridge socket, and asserts each payload
+        # round-trips through the libkrun UDS↔vsock bridge. Runs the prebuilt
+        # binary directly so the codesigned minvmd (CARGO_BIN_EXE_minvmd) keeps
+        # its hypervisor entitlement. The test isolates XDG_RUNTIME_DIR per run.
+        run: |
+          testbin="$(ls -1t target/debug/deps/bridge_e2e-* | grep -v '\.d$' | head -1)"
+          test -x "$testbin" || { echo "::error::bridge_e2e test binary not found"; exit 1; }
+          MINVMD_E2E=1 \
+          MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz" \
+          MINVMD_ROOTFS_PATH="$(scripts/build-rootfs.sh --print-path)" \
             "$testbin" --include-ignored --nocapture
       - name: Upload guest boot console log
         # Capture hvc0 output for diagnosing a stuck/failed boot (e.g. a missing
