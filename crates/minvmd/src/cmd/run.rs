@@ -14,7 +14,11 @@
 
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Result, bail};
+// `.context()` is only called from the macOS-gated supervisor functions; on the
+// Linux stub build the trait is unused, so scope the import to match.
+#[cfg(target_os = "macos")]
+use anyhow::Context as _;
 
 /// Default timeout in seconds for `run --detach` to wait for the host UDS.
 pub const DEFAULT_DETACH_TIMEOUT_SECS: u64 = 8;
