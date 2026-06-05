@@ -19,6 +19,11 @@ description = "Builds the minimal CLI"
 exec = "cargo build --verbose"
 inherit_cwd = true
 
+[tasks.build-smoke]
+description = "Smoke-test that `minimal run` can build the CLI"
+exec = "cargo build -p minimal"
+inherit_cwd = true
+
 [tasks.test]
 exec = "cargo test --verbose"
 inherit_cwd = true
