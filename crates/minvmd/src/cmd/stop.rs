@@ -22,7 +22,9 @@ fn run_with_state_dir(dir: std::path::PathBuf) -> Result<()> {
 
     // ── Phase 1: read current state under lock ───────────────────────────────
     let vmm_pid = {
-        let mut lock = state_dir.lifecycle_lock().context("opening lifecycle lock")?;
+        let mut lock = state_dir
+            .lifecycle_lock()
+            .context("opening lifecycle lock")?;
         let _guard = lock.write().context("acquiring lifecycle write lock")?;
         let state = state_dir.read_state().context("reading state")?;
 
@@ -52,7 +54,9 @@ fn run_with_state_dir(dir: std::path::PathBuf) -> Result<()> {
 
     // ── Phase 3: reset state to Stopped (under lock) ─────────────────────────
     {
-        let mut lock = state_dir.lifecycle_lock().context("opening lifecycle lock")?;
+        let mut lock = state_dir
+            .lifecycle_lock()
+            .context("opening lifecycle lock")?;
         let _guard = lock.write().context("acquiring lifecycle write lock")?;
         let _ = std::fs::remove_file(state_dir.vmm_pid_path());
         state_dir
@@ -68,7 +72,11 @@ fn run_with_state_dir(dir: std::path::PathBuf) -> Result<()> {
 fn signal_and_wait(pid: u32) -> Result<()> {
     use std::time::{Duration, Instant};
 
-    let pid_t = pid as libc::pid_t;
+    let pid_t = libc::pid_t::try_from(pid)
+        .map_err(|_| anyhow::anyhow!("invalid vmm_pid {pid} in state"))?;
+    if pid_t <= 0 {
+        return Err(anyhow::anyhow!("invalid vmm_pid {pid} in state"));
+    }
 
     // SAFETY: kill(pid, SIGTERM) delivers SIGTERM to the named process. The pid
     // was stored in state.toml by the `run` supervisor that created the VMM
@@ -95,7 +103,10 @@ fn signal_and_wait(pid: u32) -> Result<()> {
             break;
         }
         if Instant::now() >= deadline {
-            tracing::warn!(pid, "vmm process did not exit after SIGTERM; sending SIGKILL");
+            tracing::warn!(
+                pid,
+                "vmm process did not exit after SIGTERM; sending SIGKILL"
+            );
             // SAFETY: SIGKILL is a forced termination with no side effects
             // beyond killing the named process. The pid originated from our
             // own supervised VMM child.
@@ -190,5 +201,36 @@ mod tests {
         run_with_state_dir(tmp.path().to_path_buf()).unwrap();
         let s = sd.read_state().unwrap();
         assert_eq!(s.lifecycle, Lifecycle::Stopped);
+    }
+
+    #[test]
+    fn stop_rejects_pid_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = make_state_dir(&tmp);
+        sd.write_state(&State {
+            lifecycle: Lifecycle::Running,
+            vmm_pid: Some(0),
+            started_at: None,
+        })
+        .unwrap();
+        assert!(run_with_state_dir(tmp.path().to_path_buf()).is_err());
+    }
+
+    #[test]
+    fn stop_rejects_pid_exceeding_pid_t_max() {
+        // u32::MAX > i32::MAX; try_from must fail rather than silently wrapping.
+        if libc::pid_t::try_from(u32::MAX).is_ok() {
+            // On a platform where pid_t is wider than i32, skip this guard.
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = make_state_dir(&tmp);
+        sd.write_state(&State {
+            lifecycle: Lifecycle::Running,
+            vmm_pid: Some(u32::MAX),
+            started_at: None,
+        })
+        .unwrap();
+        assert!(run_with_state_dir(tmp.path().to_path_buf()).is_err());
     }
 }

@@ -3441,6 +3441,7 @@ dependencies = [
  "fd-lock",
  "libc",
  "serde",
+ "serde_json",
  "serial_test",
  "tempfile",
  "toml 1.1.2+spec-1.1.0",

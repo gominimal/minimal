@@ -48,7 +48,9 @@ fn run_with_state_dir(json: bool, dir: std::path::PathBuf) -> Result<StatusExit>
     let state_dir = StateDir::new(dir).context("opening state dir")?;
 
     // Non-blocking read lock: detect concurrent state transitions (R4.3).
-    let mut rw = state_dir.lifecycle_lock().context("opening lifecycle lock")?;
+    let rw = state_dir
+        .lifecycle_lock()
+        .context("opening lifecycle lock")?;
     let _guard = match rw.try_read() {
         Ok(g) => g,
         Err(_) => return Ok(StatusExit::LockContention),

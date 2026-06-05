@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Result, bail};
 
 /// Default timeout in seconds for `run --detach` to wait for the host UDS.
 pub const DEFAULT_DETACH_TIMEOUT_SECS: u64 = 8;
@@ -97,8 +97,12 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
         .with_context(|| format!("spawning background run supervisor: {}", exe.display()))?;
 
     let uds_path = crate::sock::resolve_uds_path().context("resolving host UDS path")?;
-    poll_uds_ready(&uds_path, Duration::from_secs(timeout_secs))
-        .with_context(|| format!("waiting for minvmd to become ready on {}", uds_path.display()))
+    poll_uds_ready(&uds_path, Duration::from_secs(timeout_secs)).with_context(|| {
+        format!(
+            "waiting for minvmd to become ready on {}",
+            uds_path.display()
+        )
+    })
 }
 
 /// Foreground supervisor: boot the VM, manage lifecycle state, supervise until
@@ -113,7 +117,7 @@ fn run_foreground() -> Result<()> {
     use crate::cmd::MARKER_SOCK_ENV;
     use crate::image::{resolve_kernel_path, resolve_rootfs_path};
     use crate::lifecycle::{Action, Lifecycle, next_state};
-    use crate::state::{State, StateDir, StartingGuard};
+    use crate::state::{StartingGuard, State, StateDir};
 
     // Fail-fast: resolve paths before touching lifecycle state.
     let _kernel = resolve_kernel_path().context("resolving kernel path")?;
@@ -123,7 +127,9 @@ fn run_foreground() -> Result<()> {
 
     // ── Phase 1: Stopped → Starting (under lock) ───────────────────────────
     {
-        let mut lock = state_dir.lifecycle_lock().context("opening lifecycle lock")?;
+        let mut lock = state_dir
+            .lifecycle_lock()
+            .context("opening lifecycle lock")?;
         let _guard = lock.write().context("acquiring lifecycle write lock")?;
         let state = state_dir.read_state().context("reading state")?;
 
@@ -190,7 +196,9 @@ fn run_foreground() -> Result<()> {
     std::fs::write(&vmm_pid_path, format!("{child_pid}\n")).context("writing vmm.pid")?;
 
     {
-        let mut lock = state_dir.lifecycle_lock().context("opening lifecycle lock")?;
+        let mut lock = state_dir
+            .lifecycle_lock()
+            .context("opening lifecycle lock")?;
         let _guard = lock.write().context("acquiring lifecycle write lock")?;
         let state = state_dir.read_state().context("reading state")?;
         // A concurrent stop might have already reset us to Stopped; bail early.
@@ -198,7 +206,10 @@ fn run_foreground() -> Result<()> {
             let _ = child.kill();
             let _ = child.wait();
             let _ = std::fs::remove_file(&vmm_pid_path);
-            bail!("lifecycle changed to {:?} during spawn; aborting", state.lifecycle);
+            bail!(
+                "lifecycle changed to {:?} during spawn; aborting",
+                state.lifecycle
+            );
         }
         state_dir
             .write_state(&State {
@@ -236,7 +247,9 @@ fn run_foreground() -> Result<()> {
     let boot_result = match rx.recv_timeout(READY_TIMEOUT) {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(anyhow::anyhow!("boot failed: {e}")),
-        Err(_) => Err(anyhow::anyhow!("boot timed out waiting for READY marker after 5 s")),
+        Err(_) => Err(anyhow::anyhow!(
+            "boot timed out waiting for READY marker after 5 s"
+        )),
     };
 
     if let Err(e) = boot_result {
@@ -254,7 +267,9 @@ fn run_foreground() -> Result<()> {
         .unwrap_or_default()
         .as_secs();
     {
-        let mut lock = state_dir.lifecycle_lock().context("opening lifecycle lock")?;
+        let mut lock = state_dir
+            .lifecycle_lock()
+            .context("opening lifecycle lock")?;
         let _guard = lock.write().context("acquiring lifecycle write lock")?;
         let state = state_dir.read_state().context("reading state")?;
         let running = next_state(state.lifecycle, Action::MarkRunning)
@@ -292,7 +307,9 @@ fn run_foreground() -> Result<()> {
 
     // ── Phase 4: Running → Stopped (under lock) ─────────────────────────────
     {
-        let mut lock = state_dir.lifecycle_lock().context("opening lifecycle lock")?;
+        let mut lock = state_dir
+            .lifecycle_lock()
+            .context("opening lifecycle lock")?;
         let _guard = lock.write().context("acquiring lifecycle write lock")?;
         let _ = std::fs::remove_file(&vmm_pid_path);
         state_dir
