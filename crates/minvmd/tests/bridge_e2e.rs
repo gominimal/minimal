@@ -11,8 +11,8 @@
 //!
 //! The test boots a VM via `minvmd boot --foreground`, waits up to 15 s for
 //! `vm-up` on stdout, then opens 5 concurrent host UDS connections to the
-//! minimald bridge socket. Each writes a distinct payload and reads it back.
-//! All 5 must succeed (R3.3, R3.4).
+//! minimald bridge socket. Each writes a distinct payload and reads back
+//! exactly that many bytes (via `read_exact`). All 5 must succeed (R3.3, R3.4).
 //!
 //! The UDS is isolated per-run via a `tempfile::TempDir` set as
 //! `XDG_RUNTIME_DIR`, so concurrent test runs on the same machine don't share
@@ -130,22 +130,21 @@ fn bridge_e2e_concurrent_round_trip() {
                     .write_all(payload.as_bytes())
                     .map_err(|e| format!("write: {e}"))?;
 
-                // Close the write half so the guest's `cat` sees EOF and echoes
-                // everything back, then closes its end.
+                // Read back exactly as many bytes as we sent. This avoids
+                // relying on write-side shutdown propagation through the
+                // UDS↔vsock bridge; cat echoes data as it arrives, so
+                // read_exact is sufficient and never blocks waiting for EOF.
+                let mut got = vec![0u8; payload.len()];
                 stream
-                    .shutdown(std::net::Shutdown::Write)
-                    .map_err(|e| format!("shutdown(Write): {e}"))?;
+                    .read_exact(&mut got)
+                    .map_err(|e| format!("read_exact: {e}"))?;
 
-                let mut got = String::new();
-                stream
-                    .read_to_string(&mut got)
-                    .map_err(|e| format!("read_to_string: {e}"))?;
-
-                if got == payload {
+                if got == payload.as_bytes() {
                     Ok(())
                 } else {
                     Err(format!(
-                        "payload mismatch: expected {payload:?}, got {got:?}"
+                        "payload mismatch: expected {payload:?}, got {:?}",
+                        String::from_utf8_lossy(&got)
                     ))
                 }
             })
