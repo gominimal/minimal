@@ -11,3 +11,4 @@ tokio.workspace = true
 tracing-subscriber.workspace = true
 
 ot.workspace = true
+minvmd = { path = "../minvmd" }

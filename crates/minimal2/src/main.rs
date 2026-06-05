@@ -5,6 +5,8 @@ use clap_complete::Shell;
 use std::path::PathBuf;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
+mod autospawn;
+
 #[derive(Parser)]
 #[command(name = "minimal", version = env!("CARGO_PKG_VERSION"), long_version = env!("LONG_VERSION"))]
 #[command(about = "The Minimal CLI")]
@@ -18,6 +20,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// List sessions
+    Ls,
     /// Generate shell completion script
     #[command(
         long_about = "Generate a shell tab-completion script for the minimal CLI.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(minimal completions bash)"
@@ -56,6 +60,16 @@ async fn main() -> Result<(), ()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::Ls => {
+            // Ensure minvmd is running before attempting to connect (R4.5)
+            if let Err(e) = autospawn::ensure_minvmd_running() {
+                eprintln!("Failed to ensure minvmd is running: {}", e);
+                return Err(());
+            }
+            // For now, just print empty list as a placeholder
+            println!("[]");
+            Ok(())
+        }
         Command::Completions(CompletionsArgs { shell }) => {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();
