@@ -192,7 +192,11 @@ jobs:
           # so the silent detached supervisor's boot is still observable here.
           export MINVMD_BOOT_LOG="$RUNNER_TEMP/autospawn-boot.log"
           export XDG_RUNTIME_DIR="$(mktemp -d)"
-          export XDG_STATE_HOME="$(mktemp -d)"
+          # minvmd resolves its state dir via dirs::state_dir(), which ignores
+          # XDG_STATE_HOME on macOS and uses ~/.local/state. Clear it so the
+          # proof starts from a genuinely clean (NotProvisioned) state on the
+          # persistent runner.
+          rm -rf "$HOME/.local/state/minimal/minvmd"
 
           # macOS `date` has no %N; use perl's high-resolution clock for ms.
           now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time()*1000'; }
@@ -206,7 +210,7 @@ jobs:
           fail() {
             echo "::group::autospawn-e2e diagnostics"
             echo "--- minimal2 ls stderr ---"; cat "$RUNNER_TEMP/ls.err" 2>/dev/null || true
-            echo "--- state.toml ---"; find "$XDG_STATE_HOME" -name state.toml -exec cat {} \; 2>/dev/null || echo "(none)"
+            echo "--- state.toml ---"; cat "$HOME/.local/state/minimal/minvmd/state.toml" 2>/dev/null || echo "(none)"
             echo "--- guest boot console (tail) ---"; tail -80 "$MINVMD_BOOT_LOG" 2>/dev/null || echo "(no boot log — VM never started)"
             echo "::endgroup::"
             minvmd stop >/dev/null 2>&1 || true
