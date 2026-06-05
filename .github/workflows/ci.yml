@@ -28,7 +28,14 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run rustfmt
+        run: cargo fmt --all -- --check
+
+  clippy:
     runs-on: ubuntu-latest
     steps:
       - name: Free Disk Space
@@ -38,42 +45,47 @@ jobs:
           remove_dotnet: true
           remove_haskell: true
           remove_tool_cache: true
-          remove_packages: "azure-cli dotnet-sdk-8.0 temurin-* mysql* firefox"
       - uses: actions/checkout@v6
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: actions/cache@v5
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free Disk Space
+        uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-1-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-1-
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+      - uses: actions/checkout@v6
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
       - name: Check Cargo.lock is up-to-date
         run: cargo fetch --locked
-      - name: Build
-        run: cargo build --verbose
       - name: Run tests
-        run: cargo test --verbose
-      - name: Run rustfmt
-        run: cargo fmt -- --check
-      - name: Run Clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Trim cargo cache
-        run: |
-          cargo install cargo-cache --no-default-features --features ci-autoclean || true
-          cargo-cache
+        run: cargo nextest run --workspace
+      - name: Run doctests
+        run: cargo test --workspace --doc
 
-  build-in-minimal:
+  dogfood:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-minimal
-      - name: Fmt, clippy, test
-        run: minimal run ci
+      - name: Smoke-test `minimal run`
+        run: minimal run build-smoke
 
   build-release-amd64:
     runs-on: ubuntu-latest
@@ -144,7 +156,7 @@ jobs:
 
   release:
     runs-on: ubuntu-latest
-    needs: [build, build-release-amd64, build-release-arm64]
+    needs: [ci-success, build-release-amd64, build-release-arm64]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: write
@@ -228,3 +240,15 @@ jobs:
       - uses: ./.github/actions/setup-minimal
       - name: Check
         run: minimal --no-fetch check
+
+  # Single required status check for branch protection. Stays green only when
+  # every gating job below succeeds.
+  ci-success:
+    if: always()
+    needs: [fmt, clippy, test, dogfood, cargo-deny, minimal-check]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all gating jobs succeeded
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      - run: echo "All CI gates passed"

@@ -148,7 +148,17 @@ fn run_foreground() -> Result<()> {
             Lifecycle::NotProvisioned | Lifecycle::Stopped => {}
         }
 
-        let starting = next_state(state.lifecycle, Action::Start)
+        // A clean install starts NotProvisioned; provision it
+        // (NotProvisioned → Stopped) before starting, since the state machine
+        // only permits Start from Stopped.
+        let base = match state.lifecycle {
+            Lifecycle::NotProvisioned => {
+                next_state(Lifecycle::NotProvisioned, Action::Provision)
+                    .map_err(|e| anyhow::anyhow!("lifecycle transition error: {e}"))?
+            }
+            other => other,
+        };
+        let starting = next_state(base, Action::Start)
             .map_err(|e| anyhow::anyhow!("lifecycle transition error: {e}"))?;
         state_dir
             .write_state(&State {
