@@ -7,9 +7,11 @@
 //! On Linux, this module is a no-op.
 
 use std::io;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 /// Default timeout in seconds to wait for the UDS when spawning minvmd (R4.5).
+#[cfg(target_os = "macos")]
 const DEFAULT_SPAWN_TIMEOUT_SECS: u64 = 8;
 
 /// Check if minvmd needs to be spawned, and spawn it if necessary.
@@ -51,10 +53,10 @@ pub fn ensure_minvmd_running() -> io::Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("minvmd run --detach failed: {}", stderr),
-        ));
+        return Err(io::Error::other(format!(
+            "minvmd run --detach failed: {}",
+            stderr
+        )));
     }
 
     tracing::info!("minvmd spawned successfully");
@@ -70,13 +72,11 @@ pub fn ensure_minvmd_running() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     #[cfg(target_os = "linux")]
     fn test_autospawn_noop_on_linux() {
         // On Linux, ensure_minvmd_running should be a no-op and always succeed
-        let result = ensure_minvmd_running();
+        let result = super::ensure_minvmd_running();
         assert!(
             result.is_ok(),
             "ensure_minvmd_running should always succeed on Linux"
