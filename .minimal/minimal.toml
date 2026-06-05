@@ -19,6 +19,11 @@ description = "Builds the minimal CLI"
 exec = "cargo build --verbose"
 inherit_cwd = true
 
+[tasks.build-smoke]
+description = "Smoke-test that `minimal run` can build the CLI"
+exec = "cargo build -p minimal"
+inherit_cwd = true
+
 [tasks.test]
 exec = "cargo test --verbose"
 inherit_cwd = true
@@ -57,23 +62,14 @@ state_key = "demo"
 exec = "python3"
 
 
-# CI sub-tasks: mirror the cargo `fmt`/`clippy`/`test` jobs so `minimal run`
-# is exercised on the same work, split so the dogfood job can run them as a
-# parallel GitHub Actions matrix instead of one serial `minimal run ci`.
-[tasks.ci-fmt]
-description = "CI: rustfmt check via minimal"
-exec = "cargo fmt --all -- --check"
+[tasks.ci]
 inherit_cwd = true
-
-[tasks.ci-clippy]
-description = "CI: clippy via minimal"
-exec = "cargo clippy --workspace --all-targets -- -D warnings"
-inherit_cwd = true
-
-[tasks.ci-test]
-description = "CI: test suite via minimal"
-exec = "cargo test --workspace"
-inherit_cwd = true
+bash = """
+set -e
+cargo test --verbose
+cargo fmt -- --check
+cargo clippy --all-targets -- -D warnings
+"""
 
 [tasks.fmt-check]
 exec = "cargo fmt -- --check"

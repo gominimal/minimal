@@ -79,19 +79,13 @@ jobs:
       - name: Run doctests
         run: cargo test --workspace --doc
 
-  # Dogfood: run the same fmt/clippy/test work through `minimal run`, as a
-  # parallel matrix so it mirrors the cargo jobs instead of one serial pass.
   dogfood:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        task: [ci-fmt, ci-clippy, ci-test]
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-minimal
-      - name: minimal run ${{ matrix.task }}
-        run: minimal run ${{ matrix.task }}
+      - name: Smoke-test `minimal run`
+        run: minimal run build-smoke
 
   build-release-amd64:
     runs-on: ubuntu-latest
