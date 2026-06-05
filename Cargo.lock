@@ -3384,8 +3384,10 @@ version = "0.0.1"
 dependencies = [
  "clap",
  "clap_complete",
+ "minvmd",
  "ot",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 
