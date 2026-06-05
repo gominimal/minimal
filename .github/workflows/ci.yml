@@ -37,9 +37,6 @@ jobs:
 
   clippy:
     runs-on: ubuntu-latest
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Free Disk Space
         uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
@@ -48,25 +45,16 @@ jobs:
           remove_dotnet: true
           remove_haskell: true
           remove_tool_cache: true
-          remove_packages: "azure-cli dotnet-sdk-8.0 temurin-* mysql* firefox"
       - uses: actions/checkout@v6
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-      - name: Cache cargo registry
+      - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
-        with:
-          # sccache owns the compiled-object cache; rust-cache owns registry/git.
-          cache-targets: "false"
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     runs-on: ubuntu-latest
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Free Disk Space
         uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
@@ -75,16 +63,11 @@ jobs:
           remove_dotnet: true
           remove_haskell: true
           remove_tool_cache: true
-          remove_packages: "azure-cli dotnet-sdk-8.0 temurin-* mysql* firefox"
       - uses: actions/checkout@v6
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-      - name: Cache cargo registry
+      - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: "false"
       - name: Install nextest
         uses: taiki-e/install-action@v2
         with:
