@@ -1,6 +1,9 @@
 //! CLI subcommand implementations for `minvmd`.
 
 pub mod boot;
+pub mod run;
+pub mod status;
+pub mod stop;
 pub mod vmm_child;
 
 /// vsock port used by the VMM child to signal the parent that the guest is up.

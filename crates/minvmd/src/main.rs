@@ -26,6 +26,24 @@ enum Command {
         /// Shell to generate completions for.
         shell: Shell,
     },
+    /// Start the microVM supervisor (foreground by default).
+    Run {
+        /// Spawn the supervisor in the background and return once the host UDS
+        /// is accepting connections.
+        #[arg(long)]
+        detach: bool,
+        /// Timeout in seconds to wait for the host UDS when using --detach.
+        #[arg(long, default_value_t = minvmd::cmd::run::DEFAULT_DETACH_TIMEOUT_SECS)]
+        timeout: u64,
+    },
+    /// Print daemon status (exit 0 if running, 1 if stopped, 2 on lock contention).
+    Status {
+        /// Print status as a JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop the running daemon gracefully.
+    Stop,
     /// Hidden VMM child subcommand — spawned by `boot`, not for direct use.
     #[command(name = "__krun-vmm", hide = true)]
     KrunVmm,
@@ -48,6 +66,16 @@ fn main() -> Result<()> {
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
             Ok(())
         }
+        Command::Run { detach, timeout } => minvmd::cmd::run::run(detach, timeout),
+        Command::Status { json } => {
+            let exit = minvmd::cmd::status::run(json)?;
+            let code = exit.code();
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Command::Stop => minvmd::cmd::stop::run(),
         Command::KrunVmm => minvmd::cmd::vmm_child::run(),
     }
 }
