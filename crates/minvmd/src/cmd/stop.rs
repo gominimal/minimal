@@ -1,0 +1,194 @@
+//! `minvmd stop` subcommand (R4.4).
+//!
+//! Reads `vmm_pid` from `state.toml`, sends `SIGTERM` to the VMM child,
+//! waits up to 5 s, escalates to `SIGKILL` on timeout, then removes `vmm.pid`
+//! and resets `state.toml` to `Stopped`.
+//!
+//! The command is idempotent: if the daemon is already stopped (or has never
+//! been provisioned), it returns successfully with no action.
+
+use anyhow::{Context as _, Result};
+
+use crate::lifecycle::Lifecycle;
+use crate::state::{State, StateDir};
+
+/// Run the `stop` subcommand.
+pub fn run() -> Result<()> {
+    run_with_state_dir(StateDir::default_path())
+}
+
+fn run_with_state_dir(dir: std::path::PathBuf) -> Result<()> {
+    let state_dir = StateDir::new(dir).context("opening state dir")?;
+
+    // ── Phase 1: read current state under lock ───────────────────────────────
+    let vmm_pid = {
+        let mut lock = state_dir.lifecycle_lock().context("opening lifecycle lock")?;
+        let _guard = lock.write().context("acquiring lifecycle write lock")?;
+        let state = state_dir.read_state().context("reading state")?;
+
+        match state.lifecycle {
+            Lifecycle::Stopped | Lifecycle::NotProvisioned => {
+                tracing::info!("minvmd is not running");
+                return Ok(()); // idempotent: already stopped
+            }
+            Lifecycle::Stopping => {
+                tracing::info!("minvmd is already stopping");
+                return Ok(()); // idempotent: stop already in progress
+            }
+            _ => {}
+        }
+
+        state.vmm_pid // may be None during Starting before pid is written
+    };
+
+    // ── Phase 2: signal the VMM child (lock NOT held) ────────────────────────
+    // Releasing the lock during the wait allows concurrent `status` reads.
+    match vmm_pid {
+        Some(pid) => signal_and_wait(pid)?,
+        None => {
+            tracing::warn!("daemon is active but vmm_pid is absent; cleaning up state");
+        }
+    }
+
+    // ── Phase 3: reset state to Stopped (under lock) ─────────────────────────
+    {
+        let mut lock = state_dir.lifecycle_lock().context("opening lifecycle lock")?;
+        let _guard = lock.write().context("acquiring lifecycle write lock")?;
+        let _ = std::fs::remove_file(state_dir.vmm_pid_path());
+        state_dir
+            .write_state(&State::stopped())
+            .context("writing Stopped state")?;
+    }
+
+    tracing::info!("minvmd stopped");
+    Ok(())
+}
+
+/// Send `SIGTERM` to `pid`; wait up to 5 s; escalate to `SIGKILL` on timeout.
+fn signal_and_wait(pid: u32) -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    let pid_t = pid as libc::pid_t;
+
+    // SAFETY: kill(pid, SIGTERM) delivers SIGTERM to the named process. The pid
+    // was stored in state.toml by the `run` supervisor that created the VMM
+    // child; it may have already exited (ESRCH), which is handled below.
+    let r = unsafe { libc::kill(pid_t, libc::SIGTERM) };
+    if r != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            // Process does not exist; nothing to signal.
+            tracing::debug!(pid, "vmm process already gone (ESRCH)");
+            return Ok(());
+        }
+        return Err(anyhow::anyhow!("SIGTERM to pid {pid}: {err}"));
+    }
+
+    tracing::debug!(pid, "SIGTERM sent; waiting up to 5s");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        // SAFETY: kill(pid, 0) checks for process existence without delivering
+        // a signal. Errors other than ESRCH are ignored as best-effort.
+        let alive = unsafe { libc::kill(pid_t, 0) == 0 };
+        if !alive {
+            break;
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!(pid, "vmm process did not exit after SIGTERM; sending SIGKILL");
+            // SAFETY: SIGKILL is a forced termination with no side effects
+            // beyond killing the named process. The pid originated from our
+            // own supervised VMM child.
+            unsafe { libc::kill(pid_t, libc::SIGKILL) };
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lifecycle::Lifecycle;
+    use crate::state::State;
+
+    fn make_state_dir(tmp: &tempfile::TempDir) -> StateDir {
+        StateDir::new(tmp.path().to_path_buf()).expect("StateDir::new")
+    }
+
+    #[test]
+    fn stop_is_noop_when_not_provisioned() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No state.toml — should be a no-op.
+        run_with_state_dir(tmp.path().to_path_buf()).unwrap();
+    }
+
+    #[test]
+    fn stop_is_noop_when_already_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = make_state_dir(&tmp);
+        sd.write_state(&State::stopped()).unwrap();
+        run_with_state_dir(tmp.path().to_path_buf()).unwrap();
+        // State should still be Stopped.
+        let s = sd.read_state().unwrap();
+        assert_eq!(s.lifecycle, Lifecycle::Stopped);
+    }
+
+    #[test]
+    fn stop_is_noop_when_already_stopping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = make_state_dir(&tmp);
+        sd.write_state(&State {
+            lifecycle: Lifecycle::Stopping,
+            vmm_pid: Some(999_999_999),
+            started_at: None,
+        })
+        .unwrap();
+        // Should return Ok without error, even with a non-existent pid.
+        run_with_state_dir(tmp.path().to_path_buf()).unwrap();
+    }
+
+    #[test]
+    fn stop_cleans_up_running_state_with_nonexistent_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = make_state_dir(&tmp);
+        // Use a PID that cannot exist (pid 0 is the kernel scheduler on Unix).
+        // signal_and_wait will get ESRCH and skip the wait.
+        // We use a large synthetic PID that won't collide with real processes
+        // in the test runner.
+        let fake_pid = 999_998u32; // likely ESRCH in CI
+        sd.write_state(&State {
+            lifecycle: Lifecycle::Running,
+            vmm_pid: Some(fake_pid),
+            started_at: Some(0),
+        })
+        .unwrap();
+        // Write a vmm.pid file too.
+        std::fs::write(sd.vmm_pid_path(), format!("{fake_pid}\n")).unwrap();
+
+        // stop must not error even when the process is gone (ESRCH).
+        run_with_state_dir(tmp.path().to_path_buf()).unwrap();
+
+        // State must be Stopped and vmm.pid must be removed.
+        let s = sd.read_state().unwrap();
+        assert_eq!(s.lifecycle, Lifecycle::Stopped);
+        assert!(!sd.vmm_pid_path().exists(), "vmm.pid must be removed");
+    }
+
+    #[test]
+    fn stop_with_no_pid_in_state_still_resets_to_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = make_state_dir(&tmp);
+        sd.write_state(&State {
+            lifecycle: Lifecycle::Running,
+            vmm_pid: None,
+            started_at: None,
+        })
+        .unwrap();
+        run_with_state_dir(tmp.path().to_path_buf()).unwrap();
+        let s = sd.read_state().unwrap();
+        assert_eq!(s.lifecycle, Lifecycle::Stopped);
+    }
+}
