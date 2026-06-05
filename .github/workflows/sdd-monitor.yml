@@ -1,0 +1,138 @@
+name: sdd-monitor
+
+# Tier 1 of the sdd-monitor design (issue #148): detect "armed but idle"
+# tracking issues and post one `/dispatch` to unstick them.
+#
+# Why a plain utility workflow, not a gh-aw agent:
+# Tier 1 is purely mechanical — list workflow runs, list pull requests, walk
+# sub-issue trees, check labels, post a comment. There is no judgement call
+# in this loop, so an LLM in the loop only adds cost, latency, and a new
+# failure mode (model output drift). The same backstop pattern is already
+# used by sdd-pr-sanitize and sdd-triage-promote-ready (ADR 0006: a
+# deterministic workflow does the per-item work the agent has no event to
+# react to).
+#
+# Tier 2 (healing: merging UNSTABLE PRs, resetting orphaned tasks, advancing
+# sdd:review to sdd:done) and Tier 3 (escalating unrecoverable stalls to
+# needs-human) are out of scope for this PR. They are tracked as follow-ups
+# on issue #148.
+#
+# Idempotency model:
+#
+# 1. Disabled by default. The first check reads the SDD_MONITOR repo
+#    variable. The workflow only acts when SDD_MONITOR == '1'. A consumer
+#    that has not opted in pays no GitHub Actions cost beyond the no-op run.
+#
+# 2. In-flight gate. If any sdd-execute-{haiku,sonnet,opus} run is
+#    in_progress or queued anywhere in the repo, the pass exits without
+#    dispatching. This is conservative: a run targeting a different tracker
+#    still blocks all monitor dispatches for this pass. The conservatism is
+#    deliberate — correlating a workflow_run back to its tracking issue
+#    requires walking task -> Unit -> tracker per run (the run's input
+#    aw_context only names the task), and the cron backstop fires every
+#    ~10 min so a missed nudge is at most one cycle delayed. The safety
+#    case (do not stack /dispatch comments and trigger the cancellation
+#    storm described in issue #148) dominates.
+#
+# 3. Debounce. For each candidate tracker, the most recent comment whose
+#    body begins with `/dispatch` (any author, monitor-issued or
+#    operator-issued) within SDD_MONITOR_DEBOUNCE_MIN minutes (default 5)
+#    suppresses a new dispatch. This caps the rate at one dispatch per
+#    tracker per window regardless of how often the workflow fires
+#    (workflow_run completion + pull_request close + cron all converge on
+#    the same comment-history check).
+#
+# 4. Single comment per action. The audit line and the `/dispatch`
+#    directive are combined into one comment body so the dispatch
+#    wrapper's token-strict `/dispatch` match (it accepts the literal
+#    `/dispatch` followed by whitespace) still fires while operators see
+#    a one-line `sdd-monitor:` audit on the same comment.
+#
+# Triggers:
+#
+# - workflow_run completed on sdd-execute-{haiku,sonnet,opus}: react to a
+#   run finishing (success, failure, or cancellation) so a tracker that
+#   just lost its last in-flight run gets nudged immediately.
+# - pull_request closed: a merged or closed sdd/ implementation PR is the
+#   moment a task closes and the next layer could be armed.
+# - schedule */10: backstop for events lost to webhook drops or runner
+#   outages.
+
+on:
+  workflow_run:
+    workflows:
+      - sdd-execute-haiku
+      - sdd-execute-sonnet
+      - sdd-execute-opus
+    types: [completed]
+  pull_request:
+    types: [closed]
+  schedule:
+    # Every ten minutes is the backstop for missed webhook events. Tier 1
+    # is itself cheap (a handful of list calls per active tracker), so a
+    # higher cadence would be safe — ten minutes is chosen to match the
+    # debounce window order of magnitude and the typical sdd-execute run
+    # duration so most cron firings find at least one tracker actionable.
+    - cron: '*/10 * * * *'
+
+permissions:
+  contents: read
+  # actions: read is required to list sdd-execute-* workflow runs filtered
+  # by status so the in-flight gate can decide whether to dispatch.
+  actions: read
+  # pull-requests: read lists open sdd/ implementation PRs, which the
+  # armed-but-idle check excludes from candidate trackers.
+  pull-requests: read
+  # issues: read covers walking the sub-issue tree, reading labels, and
+  # listing existing comments. The /dispatch comment itself is posted with
+  # an App installation token (minted in the job below) so the dispatch
+  # wrapper's App-author carve-out admits it past the human-permission
+  # check — the default GITHUB_TOKEN's github-actions[bot] is not a
+  # repository collaborator and would be rejected.
+  issues: read
+
+jobs:
+  monitor:
+    # Top-level enable gate. A consumer that has not set SDD_MONITOR=1
+    # skips the whole job, including the App token mint, so a repo that
+    # has not opted in pays no further cost and does not need APP_ID +
+    # APP_PRIVATE_KEY configured for the monitor specifically. The
+    # second clause filters pull_request events to sdd/ branches;
+    # workflow_run and schedule events have no head ref to gate on at
+    # this level.
+    if: >-
+      vars.SDD_MONITOR == '1'
+      && (github.event_name != 'pull_request'
+        || startsWith(github.event.pull_request.head.ref, 'sdd/'))
+    # Serialize monitor passes for this repo. The three triggers
+    # (workflow_run, pull_request closed, schedule */10) can fire in
+    # close succession; without a concurrency group two passes can both
+    # clear the in-flight and debounce checks before either posts and
+    # then double-post `/dispatch` for the same tracker. cancel-in-
+    # progress is false because a running pass is cheap and worth
+    # finishing — the queued pass picks up any state change the running
+    # one missed.
+    concurrency:
+      group: sdd-monitor-${{ github.repository }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      # Mint the App installation token. The /dispatch comment posted below
+      # must be authored by the configured App so the dispatch wrapper's
+      # App-author carve-out admits it past the human-permission gate; the
+      # default GITHUB_TOKEN's github-actions[bot] is not a collaborator on
+      # the consumer repository. The same APP_ID + APP_PRIVATE_KEY pair
+      # already drives the cascade fan-out in sdd-dispatch (ADR 0014).
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+      - name: Nudge armed-but-idle trackers
+        uses: norrietaylor/spectacles/.github/actions/sdd-monitor@v0.1.0
+        with:
+          github-token: ${{ steps.app.outputs.token }}
+          debounce-min: ${{ vars.SDD_MONITOR_DEBOUNCE_MIN }}

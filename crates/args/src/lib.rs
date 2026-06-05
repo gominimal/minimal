@@ -156,16 +156,16 @@ impl Hash for ScalarArg {
 }
 
 impl ScalarArg {
-    /// Append the nickel literal representation of this value to `buf`.
-    pub fn write_nickel(&self, buf: &mut String) {
+    /// Returns this value as a Nickel value, suitable for use in an
+    /// initial-env binding.
+    pub fn to_nickel(&self) -> nickel_lang_core::eval::value::NickelValue {
+        use nickel_lang_core::eval::value::NickelValue;
         match self {
-            ScalarArg::String(s) => {
-                buf.push('"');
-                buf.push_str(s);
-                buf.push('"');
+            ScalarArg::String(s) => NickelValue::string_posless(s.as_str()),
+            ScalarArg::Number(f) => {
+                NickelValue::number_posless(nickel_lang_core::term::Number::try_from(*f).unwrap())
             }
-            ScalarArg::Number(f) => buf.push_str(&f.to_string()),
-            ScalarArg::Boolean(b) => buf.push_str(if *b { "true" } else { "false" }),
+            ScalarArg::Boolean(b) => NickelValue::bool_value_posless(*b),
         }
     }
 }
@@ -179,35 +179,18 @@ pub enum Arg {
 }
 
 impl Arg {
-    /// Append the nickel literal representation of this value to `buf`.
-    pub fn write_nickel(&self, buf: &mut String) {
+    /// Returns this value as a Nickel value, suitable for use in an
+    /// initial-env binding.
+    pub fn to_nickel(&self) -> nickel_lang_core::eval::value::NickelValue {
+        use nickel_lang_core::eval::value::{Array, NickelValue};
         match self {
-            Arg::Scalar(s) => s.write_nickel(buf),
-            Arg::Enum(s) => {
-                buf.push('"');
-                buf.push_str(s);
-                buf.push('"');
-            }
-            Arg::Array(v) => {
-                buf.push('[');
-                for (i, s) in v.iter().enumerate() {
-                    if i > 0 {
-                        buf.push_str(", ");
-                    }
-                    s.write_nickel(buf);
-                }
-                buf.push(']');
-            }
+            Arg::Scalar(s) => s.to_nickel(),
+            Arg::Enum(s) => NickelValue::string_posless(s.as_str()),
+            Arg::Array(items) => NickelValue::array_posless(
+                Array::from_iter(items.iter().map(ScalarArg::to_nickel)),
+                Vec::new(),
+            ),
         }
-    }
-
-    /// Write a `let <ident> = <value> in\n` binding into `buf`.
-    pub fn write_nickel_binding(&self, ident: &str, buf: &mut String) {
-        buf.push_str("let ");
-        buf.push_str(ident);
-        buf.push_str(" = ");
-        self.write_nickel(buf);
-        buf.push_str(" in\n");
     }
 }
 

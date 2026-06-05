@@ -13,10 +13,10 @@ pub enum Arch {
 }
 
 impl Arch {
-    pub fn as_nickel_literal(&self) -> &[u8] {
+    pub fn as_nickel_str(&self) -> &'static str {
         match self {
-            Arch::Amd64 => b"'Amd64",
-            Arch::Arm64 => b"'Arm64",
+            Arch::Amd64 => "Amd64",
+            Arch::Arm64 => "Arm64",
         }
     }
 }
@@ -67,10 +67,10 @@ pub enum OS {
 }
 
 impl OS {
-    pub fn as_nickel_literal(&self) -> &[u8] {
+    pub fn as_nickel_str(&self) -> &'static str {
         match self {
-            OS::Linux => b"'Linux",
-            OS::MacOS => b"'MacOS",
+            OS::Linux => "Linux",
+            OS::MacOS => "MacOS",
         }
     }
 }

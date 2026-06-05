@@ -296,3 +296,149 @@ impl io::Write for StdoutWriter {
         self.0.suspend(|| io::stdout().write_fmt(fmt))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Each test creates a child of the global root tracker.
+    // ProgressBar::hidden() is used inside set_op, so no terminal output occurs.
+
+    fn make_tracker() -> OpTracker {
+        OpTracker::new_with_root(&None)
+    }
+
+    #[test]
+    fn set_op_package_build_and_clear_does_not_panic() {
+        let t = make_tracker();
+        t.set_op(Operation::PackageBuild {
+            name: "mypkg".into(),
+        });
+        t.set_done();
+    }
+
+    #[test]
+    fn set_op_collect_outputs_and_clear_does_not_panic() {
+        let t = make_tracker();
+        t.set_op(Operation::CollectOutputs {
+            name: "pkg".into(),
+            outputs: vec!["out1".into(), "out2".into()],
+        });
+        t.set_done();
+    }
+
+    #[test]
+    fn set_op_fetch_pkg_and_clear_does_not_panic() {
+        let t = make_tracker();
+        t.set_op(Operation::FetchPkg {
+            name: "mypkg".into(),
+        });
+        t.set_done();
+    }
+
+    #[test]
+    fn set_op_compress_pkg_and_clear_does_not_panic() {
+        let t = make_tracker();
+        t.set_op(Operation::CompressPkg {
+            name: "mypkg".into(),
+        });
+        t.set_done();
+    }
+
+    #[test]
+    fn set_op_extract_pkg_and_clear_does_not_panic() {
+        let t = make_tracker();
+        t.set_op(Operation::ExtractPkg {
+            name: "mypkg".into(),
+        });
+        t.set_done();
+    }
+
+    #[test]
+    fn set_op_fetch_source_and_clear_does_not_panic() {
+        let t = make_tracker();
+        t.set_op(Operation::FetchSource {
+            url: "https://example.com/src.tar.gz".into(),
+        });
+        t.set_done();
+    }
+
+    #[test]
+    fn set_op_check_packages_and_clear_does_not_panic() {
+        let t = make_tracker();
+        t.set_op(Operation::Check {
+            kind: CheckKind::CheckPackages,
+            name: "pkg".into(),
+        });
+        t.set_done();
+    }
+
+    #[test]
+    fn set_op_check_stacks_and_clear_does_not_panic() {
+        let t = make_tracker();
+        t.set_op(Operation::Check {
+            kind: CheckKind::CheckStacks,
+            name: "stk".into(),
+        });
+        t.set_done();
+    }
+
+    #[test]
+    fn set_op_check_profiles_and_clear_does_not_panic() {
+        let t = make_tracker();
+        t.set_op(Operation::Check {
+            kind: CheckKind::CheckProfiles,
+            name: "prof".into(),
+        });
+        t.set_done();
+    }
+
+    #[test]
+    fn set_op_standalone_test_and_clear_does_not_panic() {
+        let t = make_tracker();
+        t.set_op(Operation::StandaloneTest {
+            name: "mytest".into(),
+        });
+        t.set_done();
+    }
+
+    #[test]
+    fn set_op_fetch_index_and_clear_does_not_panic() {
+        let t = make_tracker();
+        t.set_op(Operation::FetchIndex);
+        t.set_done();
+    }
+
+    #[test]
+    fn new_child_after_set_op_does_not_panic() {
+        let parent = make_tracker();
+        parent.set_op(Operation::PackageBuild {
+            name: "parent".into(),
+        });
+        let child = parent.new_child();
+        child.set_op(Operation::ExtractPkg {
+            name: "child".into(),
+        });
+        child.set_done();
+        parent.set_done();
+    }
+
+    #[test]
+    fn set_op_collect_outputs_long_name_truncated_does_not_panic() {
+        let t = make_tracker();
+        // outputs string exceeds 30 chars to exercise the truncation branch
+        t.set_op(Operation::CollectOutputs {
+            name: "pkg".into(),
+            outputs: vec!["a-very-long-output-name-that-exceeds-thirty-characters".into()],
+        });
+        t.set_done();
+    }
+
+    #[test]
+    fn depth_of_child_is_one_more_than_parent() {
+        let parent = make_tracker();
+        let parent_depth = parent.depth();
+        let child = parent.new_child();
+        assert_eq!(child.depth(), parent_depth + 1);
+    }
+}

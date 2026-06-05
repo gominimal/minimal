@@ -207,12 +207,28 @@ pub struct Manager {
     base_dir: PathBuf,
     state: ManagerState,
     repos: HashMap<String, Repo>,
+    /// When true, [Manager::checkout_of] / [Manager::update] return
+    /// [Error::OfflineCacheMiss] for any remote that would require a clone or fetch
+    /// rather than performing the network operation. Mirrors the value of
+    /// `mctx::Config::is_offline` (i.e. `--offline`).
+    offline: bool,
 }
 
 impl Manager {
     /// Initializes the checkouts manager in the given directory, returning a
     /// thread-safe, cloneable handle to the manager instance.
     pub fn new_in_dir<P: Into<PathBuf>>(base_dir: P) -> Result<ManagerHandle, Error> {
+        Self::new_in_dir_with_offline(base_dir, false)
+    }
+
+    /// Same as [Self::new_in_dir], but with an `offline` flag. When `offline=true`,
+    /// any operation that would require a clone or fetch (new remote, or refresh of
+    /// a known remote) surfaces as [Error::OfflineCacheMiss] rather than performing
+    /// the network operation.
+    pub fn new_in_dir_with_offline<P: Into<PathBuf>>(
+        base_dir: P,
+        offline: bool,
+    ) -> Result<ManagerHandle, Error> {
         let base_dir = base_dir.into();
         let db_path = base_dir.join("git").join("db");
         fs::create_dir_all(&db_path)?;
@@ -237,6 +253,7 @@ impl Manager {
             base_dir,
             state,
             repos,
+            offline,
         };
         Ok(ManagerHandle(Arc::new(Mutex::new(manager))))
     }
@@ -249,7 +266,23 @@ impl Manager {
     }
 
     /// Updates all repos to latest - does nothing for refs which arent symbolic (i.e. commits).
+    /// In offline mode, returns [Error::OfflineCacheMiss] — `update` is fundamentally
+    /// a network operation, and silently lameducking it would mask hard-to-debug bugs
+    /// for callers like `minimal update` that explicitly want fresh state.
     pub fn update(&mut self) -> Result<(), Error> {
+        if self.offline {
+            // Pick the first known remote for the error message; if there are
+            // no known remotes there's nothing to update, so a synthetic
+            // placeholder is clearer than a misleading Ok.
+            let remote = self
+                .state
+                .git_remotes
+                .keys()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| "<no remotes>".to_string());
+            return Err(Error::OfflineCacheMiss { remote });
+        }
         let checkouts_dir = self.git_checkouts_dir();
         for (_remote, id) in self.state.git_remotes.iter_mut() {
             let repo = self.repos.get_mut(id).unwrap();
@@ -290,7 +323,14 @@ impl Manager {
                 let checkout_dir = tempdir_in(self.git_checkouts_dir()).unwrap().keep();
                 let relative_dir = checkout_dir.strip_prefix(self.git_checkouts_dir()).unwrap();
                 let repo = self.repos.get_mut(id).unwrap();
-                repo.fetch()?;
+                // Offline: skip the fetch and try the worktree checkout against
+                // what's already in the bare repo. If the requested ref isn't
+                // there, `new_worktree` will surface a git error from below
+                // — which is the right outcome (caller gets to know the ref
+                // wasn't pre-populated).
+                if !self.offline {
+                    repo.fetch()?;
+                }
                 let checkout = repo.new_worktree(checkout_dir.clone(), at.clone())?;
                 let git_hash = checkout.rev.clone();
 
@@ -305,6 +345,13 @@ impl Manager {
             }
             // New remote, need to create
             None => {
+                if self.offline {
+                    // Offline: cannot clone an unknown remote. Surface as cache miss
+                    // so the caller sees a clean error (not a git "could not connect").
+                    return Err(Error::OfflineCacheMiss {
+                        remote: remote.to_string(),
+                    });
+                }
                 // Make id/directory for bare repository
                 let prefix = match remote.to_lowercase().rsplit_once("/") {
                     None => "checkout".to_string(),
@@ -450,6 +497,162 @@ mod tests {
             hash3,
             "d0dd1f61b33d64e29d8bc1372a94ef6a2fee76a9".to_string()
         );
+    }
+
+    /// In offline mode, asking for an unknown remote must surface as
+    /// OfflineCacheMiss without attempting any git operation.
+    #[test]
+    fn offline_unknown_remote_errors() {
+        let base_dir = tempdir().unwrap();
+        let mut manager = Manager::new_in_dir_with_offline(base_dir.path(), true).unwrap();
+
+        let result = manager.checkout_of(
+            "https://example.invalid/never-cloned",
+            GitRef::Branch("main".to_string()),
+        );
+        match result {
+            Err(Error::OfflineCacheMiss { remote }) => {
+                assert_eq!(remote, "https://example.invalid/never-cloned");
+            }
+            other => panic!("expected OfflineCacheMiss, got: {:?}", other),
+        }
+    }
+
+    /// Helper: initialise a local git repo with one commit on `branch` and
+    /// return (TempDir, commit-hash).  The TempDir must be kept alive for the
+    /// duration of the test so the path stays valid.
+    fn make_local_repo(branch: &str) -> (tempfile::TempDir, String) {
+        use std::process::Command;
+        let src = tempfile::tempdir().unwrap();
+        // Init with an explicit branch name so the test is git-version agnostic.
+        let init = Command::new("git")
+            .args(["init", "-b", branch, src.path().to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "git init failed");
+
+        for (k, v) in [("user.email", "test@example.com"), ("user.name", "Test")] {
+            Command::new("git")
+                .args(["config", k, v])
+                .current_dir(src.path())
+                .output()
+                .unwrap();
+        }
+
+        std::fs::write(src.path().join("hello.txt"), b"hello").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(src.path())
+            .output()
+            .unwrap();
+        let commit = Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(src.path())
+            .output()
+            .unwrap();
+        assert!(commit.status.success(), "git commit failed");
+
+        let rev_out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(src.path())
+            .output()
+            .unwrap();
+        let hash = String::from_utf8_lossy(&rev_out.stdout).trim().to_string();
+        (src, hash)
+    }
+
+    /// checkout_of with a previously-unseen local repo URL returns a valid
+    /// directory containing the committed file and the correct rev SHA.
+    #[test]
+    fn checkout_of_new_remote_returns_valid_path_and_rev() {
+        let (src, expected_hash) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+
+        let base = tempfile::tempdir().unwrap();
+        let mut handle = Manager::new_in_dir(base.path()).unwrap();
+
+        let (checkout_path, rev) = handle
+            .checkout_of(&remote, GitRef::Branch("main".to_string()))
+            .unwrap();
+
+        assert!(checkout_path.exists(), "checkout directory must exist");
+        assert!(
+            checkout_path.join("hello.txt").exists(),
+            "checked-out file must be present"
+        );
+        assert_eq!(rev, expected_hash, "returned rev must match HEAD");
+    }
+
+    /// A second checkout_of call for the same ref returns the cached path and
+    /// rev without creating a new worktree.
+    #[test]
+    fn checkout_of_same_branch_twice_uses_cache() {
+        let (src, _) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+
+        let base = tempfile::tempdir().unwrap();
+        let mut handle = Manager::new_in_dir(base.path()).unwrap();
+
+        let (path1, hash1) = handle
+            .checkout_of(&remote, GitRef::Branch("main".to_string()))
+            .unwrap();
+        let (path2, hash2) = handle
+            .checkout_of(&remote, GitRef::Branch("main".to_string()))
+            .unwrap();
+
+        assert_eq!(path1, path2, "second call must return the cached path");
+        assert_eq!(hash1, hash2, "both calls must return the same rev");
+    }
+
+    /// When a commit hash matching an existing branch checkout is requested,
+    /// checkout_of returns the same worktree instead of creating a second one.
+    #[test]
+    fn checkout_of_commit_ref_reuses_branch_worktree() {
+        let (src, hash) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+
+        let base = tempfile::tempdir().unwrap();
+        let mut handle = Manager::new_in_dir(base.path()).unwrap();
+
+        // First: checkout via branch.
+        let (branch_path, branch_rev) = handle
+            .checkout_of(&remote, GitRef::Branch("main".to_string()))
+            .unwrap();
+        assert_eq!(branch_rev, hash);
+
+        // Second: request the exact commit — must reuse the existing worktree.
+        let (commit_path, commit_rev) = handle
+            .checkout_of(&remote, GitRef::Commit(hash.clone()))
+            .unwrap();
+
+        assert_eq!(
+            branch_path, commit_path,
+            "commit ref must reuse the branch worktree"
+        );
+        assert_eq!(commit_rev, hash);
+    }
+
+    /// In offline mode, `update()` returns OfflineCacheMiss rather than
+    /// silently no-op'ing. Callers like `minimal update` ask explicitly for
+    /// fresh state, so noop-ing would mask hard-to-debug bugs (per review
+    /// from @twitchyliquid64).
+    #[test]
+    fn offline_update_errors() {
+        let base_dir = tempdir().unwrap();
+        let mut manager = Manager::new_in_dir_with_offline(base_dir.path(), true).unwrap();
+        match manager.update() {
+            Err(Error::OfflineCacheMiss { .. }) => {}
+            other => panic!("expected OfflineCacheMiss, got: {:?}", other),
+        }
+    }
+
+    /// Default (online) Manager keeps its existing behavior — `offline` is
+    /// false unless explicitly requested.
+    #[test]
+    fn default_manager_is_online() {
+        let base_dir = tempdir().unwrap();
+        let manager = Manager::new_in_dir(base_dir.path()).unwrap();
+        assert!(!manager.0.lock().unwrap().offline);
     }
 
     #[test]

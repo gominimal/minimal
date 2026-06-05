@@ -1,0 +1,15 @@
+[package]
+name = "minimal2"
+version = "0.0.1"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap.workspace = true
+clap_complete.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+ot.workspace = true
+minvmd = { path = "../minvmd" }

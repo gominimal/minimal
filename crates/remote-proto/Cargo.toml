@@ -7,8 +7,6 @@ license = "MIT OR Apache-2.0"
 publish.workspace = true
 
 [dependencies]
-tracing.workspace = true
-
 prost.workspace = true
 prost-types.workspace = true
 tonic.workspace = true

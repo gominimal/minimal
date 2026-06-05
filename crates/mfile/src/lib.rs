@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 use std::env::{self, home_dir};
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 
 mod error;
@@ -746,37 +748,77 @@ impl File {
         }
     }
 
+    /// Encodes a path component for use in a flat directory name.
+    ///
+    /// Escapes `-` as `--` so that `-` can be used as a component separator.
+    /// Non-UTF8 bytes are preserved as-is.
+    fn encode_component(s: &OsStr) -> OsString {
+        let mut out = Vec::with_capacity(s.len());
+        for &b in s.as_bytes() {
+            if b == b'-' {
+                out.push(b'-');
+            }
+            out.push(b);
+        }
+        OsString::from_vec(out)
+    }
+
+    /// Helper method for state_dir to simplify unit testing
+    fn state_dir_from_path<P: AsRef<Path>>(
+        state_key: &str,
+        env_base_dir: P,
+        home_dir: Option<&Path>,
+        mfile_dir: &Path,
+    ) -> PathBuf {
+        let (start_marker, components) = home_dir
+            .map(|home| mfile_dir.strip_prefix(home))
+            .and_then(|r| r.ok())
+            .map(|p| ('~', p.components()))
+            .unwrap_or_else(|| ('-', mfile_dir.components()));
+
+        let mut tail = OsString::new();
+        for (i, c) in components
+            .filter_map(|c| match c {
+                Component::Normal(s) => Some(Self::encode_component(s)),
+                _ => None,
+            })
+            .enumerate()
+        {
+            if i > 0 {
+                tail.push("-");
+            }
+            tail.push(&c);
+        }
+
+        let mut dir_name = OsString::from(start_marker.to_string());
+        dir_name.push(&tail);
+        env_base_dir.as_ref().join(dir_name).join(state_key)
+    }
+
+    /// Returns the path to a durable state directory for this project.
+    ///
+    /// The directory is derived from the path to the project's `minimal.toml`,
+    /// encoded into a single flat directory name under `env_base_dir`:
+    ///
+    /// - Path components are joined with `-`, with literal `-` escaped as `--`.
+    /// - Paths under the user's home directory are prefixed with `~`.
+    /// - All other paths are prefixed with `-`.
+    ///
+    /// For example, `~/src/my-project` with state key `"env"` becomes:
+    ///   `<env_base_dir>/~src-my--project/env`
+    ///
+    /// Returns `None` if the location of the minimal file on disk is not known.
     /// Returns the path to the durable state directory for the given key.
     ///
     /// None is returned if the location of the minimal file on disk is not known.
     pub fn state_dir<P: AsRef<Path>>(&self, state_key: &str, env_base_dir: P) -> Option<PathBuf> {
         self.dir_path().map(|mfile_dir| {
-            let hd = env::home_dir();
-
-            let (start_marker, components) = if let Some(home) = &hd
-                && mfile_dir.starts_with(home)
-            {
-                (
-                    '~',
-                    mfile_dir.strip_prefix(hd.unwrap()).unwrap().components(),
-                )
-            } else {
-                ('-', mfile_dir.components())
-            };
-
-            env_base_dir
-                .as_ref()
-                .join(format!(
-                    "{}{}",
-                    start_marker,
-                    components
-                        .filter(|c| matches!(c, Component::Normal(_)))
-                        .map(|c| c.as_os_str().to_str().unwrap())
-                        .map(|c| c.replace("-", "--"))
-                        .collect::<Vec<_>>()
-                        .join("-")
-                ))
-                .join(state_key)
+            Self::state_dir_from_path(
+                state_key,
+                env_base_dir,
+                env::home_dir().as_deref(),
+                mfile_dir,
+            )
         })
     }
 }
@@ -1124,5 +1166,105 @@ mod tests {
             err.to_string().contains("unknown output type"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn encode_component_no_dashes() {
+        assert_eq!(File::encode_component(OsStr::new("foo")), "foo");
+    }
+
+    #[test]
+    fn encode_component_with_dashes() {
+        assert_eq!(
+            File::encode_component(OsStr::new("my-project")),
+            "my--project"
+        );
+    }
+
+    #[test]
+    fn encode_component_all_dashes() {
+        assert_eq!(File::encode_component(OsStr::new("---")), "------");
+    }
+
+    #[test]
+    fn encode_component_empty() {
+        assert_eq!(File::encode_component(OsStr::new("")), "");
+    }
+
+    #[test]
+    fn encode_component_non_utf8_preserved() {
+        let input = OsStr::from_bytes(b"hello\x80world");
+        assert_eq!(File::encode_component(input).as_bytes(), b"hello\x80world");
+    }
+
+    #[test]
+    fn encode_component_non_utf8_with_dashes() {
+        let input = OsStr::from_bytes(b"he-llo\x80wor-ld");
+        assert_eq!(
+            File::encode_component(input).as_bytes(),
+            b"he--llo\x80wor--ld"
+        );
+    }
+
+    #[test]
+    fn state_dir_under_home() {
+        let result = File::state_dir_from_path(
+            "env",
+            "/tmp/state",
+            Some(Path::new("/home/user")),
+            Path::new("/home/user/src/my-project"),
+        );
+        assert_eq!(result, Path::new("/tmp/state/~src-my--project/env"));
+    }
+
+    #[test]
+    fn state_dir_outside_home() {
+        let result = File::state_dir_from_path(
+            "cache",
+            "/tmp/state",
+            Some(Path::new("/home/user")),
+            Path::new("/opt/builds/foo"),
+        );
+        assert_eq!(result, Path::new("/tmp/state/-opt-builds-foo/cache"));
+    }
+
+    #[test]
+    fn state_dir_no_home() {
+        let result =
+            File::state_dir_from_path("env", "/tmp/state", None, Path::new("/opt/builds/foo"));
+        assert_eq!(result, Path::new("/tmp/state/-opt-builds-foo/env"));
+    }
+
+    #[test]
+    fn state_dir_nested_dashes() {
+        let result = File::state_dir_from_path(
+            "env",
+            "/tmp/state",
+            Some(Path::new("/home/user")),
+            Path::new("/home/user/my-org/my-project"),
+        );
+        assert_eq!(result, Path::new("/tmp/state/~my--org-my--project/env"));
+    }
+
+    #[test]
+    fn state_dir_single_component() {
+        let result = File::state_dir_from_path(
+            "env",
+            "/tmp/state",
+            Some(Path::new("/home/user")),
+            Path::new("/home/user/project"),
+        );
+        assert_eq!(result, Path::new("/tmp/state/~project/env"));
+    }
+
+    #[test]
+    fn state_dir_home_is_mfile_dir() {
+        let result = File::state_dir_from_path(
+            "env",
+            "/tmp/state",
+            Some(Path::new("/home/user")),
+            Path::new("/home/user"),
+        );
+        assert_eq!(result, Path::new("/tmp/state/~/env"));
     }
 }

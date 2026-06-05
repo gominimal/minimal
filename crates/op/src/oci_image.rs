@@ -38,6 +38,7 @@ pub struct OciImageCreate {
 impl Runnable for OciImageCreate {
     type Result = ();
 
+    #[tracing::instrument(skip_all, err)]
     async fn run<'b>(&mut self, opts: &Options<'b>) -> Result<Self::Result, Error> {
         let mut all_deps: Vec<(BuildSpecRef, TransitivesDep)> =
             Transitives::for_toplevels(opts.graph, opts.graph.top_levels.to_vec(), false)
@@ -281,6 +282,7 @@ impl BuiltLayer {
     }
 }
 
+#[tracing::instrument(err)]
 async fn create_base_layer() -> anyhow::Result<BuiltLayer> {
     let enc = GzEncoder::new(tempfile::tempfile()?, Compression::best());
     let mut tar = tar::Builder::new(enc);
@@ -328,6 +330,7 @@ async fn create_base_layer() -> anyhow::Result<BuiltLayer> {
     })
 }
 
+#[tracing::instrument(skip_all, fields(package_name = %package_name), err)]
 async fn create_layer_from_cache(
     cache: &lcache::Cache<lcache::LocalDir>,
     spec_hash: &SpecHash,

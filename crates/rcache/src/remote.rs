@@ -75,6 +75,7 @@ pub const INDEX_FILENAME: &str = "index.shisha";
 const INDEX_EXPIRY_SECONDS: u64 = 5 * 60; // how long a fetch of the remote index is considered fresh for
 
 impl RemoteCache<Client> {
+    #[tracing::instrument(skip_all, err)]
     pub async fn new_over_https<URL: Into<ReqwestUrl>>(
         url: URL,
         index_dir: Option<PathBuf>,
@@ -91,6 +92,7 @@ impl RemoteCache<Client> {
 
 impl RemoteCache<Storage> {
     /// Instantiates a new remote cache using the given GCS client + bucket.
+    #[tracing::instrument(skip_all, fields(bucket_id = %bucket_id), err)]
     pub async fn new_with_gcs_bucket(
         storage: Storage,
         bucket_id: &str,
@@ -110,6 +112,7 @@ impl RemoteCache<Storage> {
     /// cache fast path (and therefore has no recorded generation), the index
     /// is refetched from GCS so the writer's compare-and-swap commit has an
     /// authoritative generation to match against.
+    #[tracing::instrument(skip_all, err)]
     pub async fn into_writer(
         self,
         ot: Option<OpTracker>,
@@ -217,7 +220,14 @@ impl<B: FetchBackend> RemoteCache<B> {
         self.index.exists(spec_hash)
     }
 
+    /// Returns the sha256 of the cached artifact for the given spec hash, or
+    /// `None` if it isn't in the index.
+    pub fn sha256(&self, spec_hash: &SpecHash) -> Option<[u8; 32]> {
+        self.index.sha256(spec_hash)
+    }
+
     /// Download the given spec hash into the local cache.
+    #[tracing::instrument(skip_all, fields(span_name = %span_name), err)]
     pub async fn materialize(
         &self,
         spec_hash: &SpecHash,
@@ -388,5 +398,33 @@ mod tests {
             matches!(result, Err(Error::HashMismatch { .. })),
             "expected HashMismatch, got: {result:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn sha256_returns_indexed_hash_or_none() {
+        let spec_hash = SpecHash::from_bytes([0xAA; 32]);
+        let sha256: [u8; 32] = [0xCD; 32];
+
+        // Index maps spec_hash -> sha256.
+        let mut index = RemoteIndex::default();
+        index.extend(std::iter::once((spec_hash.clone(), sha256)));
+        let mut index_bytes = Vec::new();
+        index.write_to(&mut index_bytes).unwrap();
+
+        let mut responses = std::collections::HashMap::new();
+        responses.insert(format!("mock://cache/{}", INDEX_FILENAME), index_bytes);
+
+        let rc = RemoteCache::new(
+            MockBackend { responses },
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Present spec hash -> its indexed sha256; absent -> None.
+        assert_eq!(rc.sha256(&spec_hash), Some(sha256));
+        assert_eq!(rc.sha256(&SpecHash::from_bytes([0x11; 32])), None);
     }
 }

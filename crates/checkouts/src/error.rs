@@ -24,6 +24,11 @@ pub enum Error {
 
     /// Failed to read the statefile.
     StatefileInvalid(serde_json::Error),
+
+    /// The manager is in offline mode and the requested checkout would require a
+    /// network operation (clone of an unknown remote, or fetch of a known remote).
+    /// Caller asked for a ref we'd need to download, but `--no-fetch` is set.
+    OfflineCacheMiss { remote: String },
 }
 
 impl Error {
@@ -49,6 +54,11 @@ impl fmt::Display for Error {
             Error::InvalidPath => write!(f, "invalid path"),
             Error::Other(e) => write!(f, "other: {}", e),
             Error::StatefileInvalid(e) => write!(f, "statefile invalid: {}", e),
+            Error::OfflineCacheMiss { remote } => write!(
+                f,
+                "offline cache miss for git remote {remote} — \
+                 --offline is set; pre-populate the vcs/ cache or remove the flag"
+            ),
         }
     }
 }

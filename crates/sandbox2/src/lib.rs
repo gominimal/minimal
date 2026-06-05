@@ -97,10 +97,36 @@ impl<C: Channel> Sandbox<C> {
             match i {
                 config::SandboxMapped::Dir(p) => hardlink_dir_contents(p, &rootfs)?,
                 config::SandboxMapped::TempDir(td) => hardlink_dir_contents(td.path(), &rootfs)?,
-                config::SandboxMapped::File(_p) => todo!(),
+                config::SandboxMapped::File(p) | config::SandboxMapped::FileCopy(p) => {
+                    return Err(Error::MappedFile(p.clone()));
+                }
             }
         }
         hardlink_dir_contents(&base_dir.join("synth"), &rootfs)?;
+
+        // MINIMAL_INTERNAL_CS_BUILD bundle: when the env var is "1"
+        // AND the convention path exists on host, hardlink that
+        // directory's contents into the sandbox rootfs root. This is
+        // the same mechanism the public `extra_rootfs` field used to
+        // provide; it now happens behind the (undocumented) CS flag
+        // with a hardcoded convention path, so there's no new public
+        // API surface.
+        //
+        // Convention: minimalmertic's hermetic-builder-rs stages its
+        // CS-only cache bundle (cargo-vendor, npm-cache, pnpm-store,
+        // bun-cache, pip-wheels, rust-stage0, goproxy) at
+        // /root/.cache/minimal/cs-mirror/. Inside the sandbox these
+        // appear at /cargo-vendor, /goproxy, etc. — top-level paths
+        // matching the existing pkg-build.sh offline-cache idiom.
+        //
+        // Inert when env var unset or the convention path doesn't
+        // exist (tests, dev environments, non-CS callers).
+        if std::env::var("MINIMAL_INTERNAL_CS_BUILD").as_deref() == Ok("1") {
+            let cs_mirror = Path::new("/root/.cache/minimal/cs-mirror");
+            if cs_mirror.exists() {
+                hardlink_dir_contents(cs_mirror, &rootfs)?;
+            }
+        }
         tracing::trace!("rootfs hardlinking took {:?}", hardlinking_start.elapsed());
 
         // On aarch64, autotools/libtool defaults to installing libraries
@@ -141,6 +167,11 @@ impl<C: Channel> Sandbox<C> {
                                 }
                             }
                             .map_err(|e| Error::IO("hardlinking input file", dest.clone(), e))?;
+                        }
+                        config::SandboxMapped::FileCopy(p) => {
+                            let dest = b.join(p.file_name().unwrap());
+                            fs::copy(p, &dest)
+                                .map_err(|e| Error::IO("copying input file", dest, e))?;
                         }
                         config::SandboxMapped::Dir(p) => hardlink_dir_contents(p, &b)?,
                         config::SandboxMapped::TempDir(td) => hardlink_dir_contents(td.path(), &b)?,
@@ -393,6 +424,68 @@ impl<C: Channel> Sandbox<C> {
         Self::bind_mount(&self.state_dir, "/state", rec, &mut container)?;
         Self::bind_mount(&self.base_dir.join("run"), "/run", rec, &mut container)?;
 
+        // MINIMAL_INTERNAL_CS_BUILD: undocumented bundle of behaviors
+        // needed for running minimal as a library inside a GCP
+        // Confidential Space workload. Not for general callers; we
+        // expose it as a private "I am the trusted CS builder" flag so
+        // it can't accidentally enable non-hermetic behavior in normal
+        // `minimal package <pkg>` invocations.
+        //
+        // What the bundle does:
+        //
+        // 1. Bind-mount the outer /proc into the sandbox + enable
+        //    Runctl::MountFallback. CS workload containers get OCI
+        //    MaskedPaths (containerd's default — tmpfs over
+        //    /proc/{kcore,scsi,keys,...}). The Linux kernel's
+        //    anti-unmask guard then refuses any nested procfsmount
+        //    over a masked parent, so hakoniwa's implicit
+        //    `Container::new()::procfsmount("/proc")` returns EPERM.
+        //    Workaround: bind the outer (already-masked) /proc instead
+        //    of trying to mount a fresh procfs. The MountFallback
+        //    runctl is required for the same reason — hakoniwa emits
+        //    a mandatory MS_REMOUNT after every bind, which also
+        //    fails on the masked /proc until we let it retry with the
+        //    source mount's existing flags.
+        //
+        //    Caveat (noted by @twitchyliquid64 on the PR): MountFallback
+        //    is a container-global runctl, not per-mount. It applies
+        //    to every bind in the sandbox — a sandbox that wanted to
+        //    assert e.g. NOEXEC on a target may silently end up with
+        //    the source's existing flags instead. Acceptable inside
+        //    the CS attested boundary where outer isolation handles
+        //    the actual security property; the inner hakoniwa is for
+        //    build-script reproducibility, not isolation. Filed
+        //    upstream to see if hakoniwa would accept a per-mount
+        //    runctl that would let us scope this to /proc only.
+        //
+        // 2. (Cache delivery for hermetic-builder's ecosystem caches —
+        //    cargo-vendor, npm-cache, pnpm-store, bun-cache,
+        //    pip-wheels, rust-stage0, goproxy — happens in Sandbox::new
+        //    via hardlink_dir_contents from the convention path
+        //    /root/.cache/minimal/cs-mirror/. Earlier iteration of
+        //    this PR used /state/cs-mirror-pointing symlinks here,
+        //    but /state inside each sandbox is per-build state, not
+        //    shared with the orchestrator's outer state_dir, so the
+        //    symlinks pointed at unreachable paths. The hardlink
+        //    mechanism (matching the old extra_rootfs behavior) does
+        //    the right thing without expanding public API surface.)
+        //
+        // Inert when the env var is unset; default `minimal package`
+        // invocations see no behavior change.
+        if std::env::var("MINIMAL_INTERNAL_CS_BUILD").as_deref() == Ok("1") {
+            container.bindmount_rw("/proc", "/proc");
+            container.runctl(hakoniwa::Runctl::MountFallback);
+            // Cache delivery (cargo-vendor, npm-cache, ...) is handled
+            // by the hardlink_dir_contents call in Sandbox::new — see
+            // lib.rs near line ~105. Earlier iteration of this PR
+            // used /state/<...>-pointing symlinks here, but /state
+            // inside each sandbox is per-build state (created via
+            // base_dir.join("state") in Sandbox::new), not shared with
+            // the orchestrator's outer state_dir, so the symlinks
+            // pointed at unreachable paths. The hardlink mechanism
+            // replaces them.
+        }
+
         if self.needs_bin_symlink()? {
             container.symlink("/usr/bin", "/bin");
         }
@@ -552,35 +645,50 @@ impl<C: Channel> Sandbox<C> {
             let child_stdout = child.stdout.take();
             let child_stderr = child.stderr.take();
 
-            // Stdout thread
+            // Stdout thread — like stderr, capture a rolling tail of the
+            // last ~4 KiB so the caller can include it in InvocationFailed
+            // when a build script swallows its stderr (mesa's pip install
+            // 2>/dev/null pattern) but emits the real diagnostic to stdout.
             let stdout_file = self.stdout.take();
             let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
-            let stdout_thread = std::thread::spawn(move || -> Result<Option<fs::File>, Error> {
-                let mut file = stdout_file;
-                if let Some(mut pipe) = child_stdout {
-                    let mut buf = [0u8; 8192];
-                    loop {
-                        let n = pipe
-                            .read(&mut buf)
-                            .map_err(|e| Error::IO("reading stdout pipe", Default::default(), e))?;
-                        if n == 0 {
-                            break;
+            let stdout_thread =
+                std::thread::spawn(move || -> Result<(Option<fs::File>, Vec<u8>), Error> {
+                    let mut file = stdout_file;
+                    let mut tail = Vec::new();
+                    if let Some(mut pipe) = child_stdout {
+                        let mut buf = [0u8; 8192];
+                        loop {
+                            let n = pipe.read(&mut buf).map_err(|e| {
+                                Error::IO("reading stdout pipe", Default::default(), e)
+                            })?;
+                            if n == 0 {
+                                break;
+                            }
+                            if let Some(f) = file.as_mut() {
+                                f.write_all(&buf[..n]).map_err(|e| {
+                                    Error::IO("writing stdout", Default::default(), e)
+                                })?;
+                            }
+                            tail.extend_from_slice(&buf[..n]);
+                            if tail.len() > 8192 {
+                                let start = tail.len() - 4096;
+                                tail = tail[start..].to_vec();
+                            }
+                            // Ignore send errors: the receiver may have been dropped
+                            // if the async writer errored, but we still drain the pipe.
+                            let _ = stdout_tx.blocking_send(buf[..n].to_vec());
                         }
                         if let Some(f) = file.as_mut() {
-                            f.write_all(&buf[..n])
-                                .map_err(|e| Error::IO("writing stdout", Default::default(), e))?;
+                            f.flush()
+                                .map_err(|e| Error::IO("flushing stdout", Default::default(), e))?;
                         }
-                        // Ignore send errors: the receiver may have been dropped
-                        // if the async writer errored, but we still drain the pipe.
-                        let _ = stdout_tx.blocking_send(buf[..n].to_vec());
                     }
-                    if let Some(f) = file.as_mut() {
-                        f.flush()
-                            .map_err(|e| Error::IO("flushing stdout", Default::default(), e))?;
+                    if tail.len() > 4096 {
+                        let start = tail.len() - 4096;
+                        tail = tail[start..].to_vec();
                     }
-                }
-                Ok(file)
-            });
+                    Ok((file, tail))
+                });
 
             // Stderr thread
             let stderr_file = self.stderr.take();
@@ -655,7 +763,7 @@ impl<C: Channel> Sandbox<C> {
 
                     // Recover stdout/stderr files from the reader threads.
                     // The threads will finish promptly now that pipes are closed.
-                    if let Ok(Ok(f)) = stdout_thread.join() {
+                    if let Ok(Ok((f, _tail))) = stdout_thread.join() {
                         self.stdout = f;
                     }
                     if let Ok(Ok((f, _tail))) = stderr_thread.join() {
@@ -668,7 +776,7 @@ impl<C: Channel> Sandbox<C> {
                 }
                 (stdout_fwd_res, stderr_fwd_res) = async { tokio::join!(stdout_fwd, stderr_fwd) } => {
                     // Collect results from the reader threads.
-                    let stdout_file = stdout_thread
+                    let (stdout_file, stdout_tail) = stdout_thread
                         .join()
                         .expect("stdout reader thread panicked")?;
                     let (stderr_file, stderr_tail) = stderr_thread
@@ -689,11 +797,13 @@ impl<C: Channel> Sandbox<C> {
 
                     if !status.success() {
                         let stderr_str = String::from_utf8_lossy(&stderr_tail).into_owned();
+                        let stdout_str = String::from_utf8_lossy(&stdout_tail).into_owned();
                         return Err(Error::Execution(ExecutionError::InvocationFailed {
                             idx: i,
                             code: status.code,
                             reason: status.reason.clone(),
                             stderr: stderr_str,
+                            stdout: stdout_str,
                         }));
                     }
                 }
@@ -834,6 +944,7 @@ fn locked_mount_flags(path: &Path) -> hakoniwa::MountOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use config::{Config, SandboxMapped};
 
     // /proc is mounted with nosuid,nodev on essentially every Linux distro;
     // if either stops showing up we've broken the FsFlags → MountOptions
@@ -851,5 +962,77 @@ mod tests {
     fn locked_mount_flags_empty_on_statfs_failure() {
         let opts = locked_mount_flags(Path::new("/nonexistent-path-for-statfs-test"));
         assert!(opts.is_empty());
+    }
+
+    /// Creates a tempdir with the `synth/usr/` structure required by
+    /// `Sandbox::new`. The `synth/` dir is hardlinked into the rootfs;
+    /// `usr/` must be present so the subsequent `usr/lib64 → lib` symlink
+    /// step can succeed.
+    fn make_base_with_synth() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        fs::create_dir_all(base.join("synth").join("usr")).unwrap();
+        (tmp, base)
+    }
+
+    /// `Sandbox::new` must reject a `SandboxMapped::File` entry in `config.rootfs`
+    /// with `Error::MappedFile`. Files cannot be hardlinked at the rootfs level —
+    /// only directories are valid rootfs entries.
+    #[test]
+    fn sandbox_new_rejects_mapped_file_in_rootfs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        // A file path that need not exist — the error is returned before it is accessed.
+        let phantom = base.join("phantom.txt");
+        let config = Config::new("test-reject-file").with_add_rootfs(SandboxMapped::File(phantom));
+        let result = Sandbox::new(base, config, ());
+        assert!(
+            matches!(result, Err(Error::MappedFile(_))),
+            "expected MappedFile error, got {result:?}"
+        );
+    }
+
+    /// When no explicit `state_dir` is configured, `Sandbox::new` derives it
+    /// as `base_dir/state`. The caller relies on this to bind-mount `/state`
+    /// into the container at the correct host path.
+    #[test]
+    fn sandbox_new_derives_state_dir_from_base() {
+        let (_tmp, base) = make_base_with_synth();
+        let config = Config::new("test-state-default");
+        let sandbox = Sandbox::new(base.clone(), config, ()).unwrap();
+        assert_eq!(
+            sandbox.state_dir,
+            base.join("state"),
+            "state_dir should default to base_dir/state"
+        );
+    }
+
+    /// When an explicit `state_dir` is supplied via `Config::with_state_dir`,
+    /// `Sandbox::new` must store that path verbatim so the container bind-mounts
+    /// the caller's chosen directory rather than an auto-generated one.
+    #[test]
+    fn sandbox_new_honours_explicit_state_dir() {
+        let (_tmp, base) = make_base_with_synth();
+        let state_tmp = tempfile::TempDir::new().unwrap();
+        let state_path = state_tmp.path().to_path_buf();
+        let config = Config::new("test-state-explicit").with_state_dir(state_path.clone());
+        let sandbox = Sandbox::new(base, config, ()).unwrap();
+        assert_eq!(
+            sandbox.state_dir, state_path,
+            "state_dir should match the path supplied via with_state_dir"
+        );
+    }
+
+    /// After a successful `Sandbox::new`, the minenv Unix socket must be connectable.
+    /// This exercises the channel listener thread: if the thread failed to bind or
+    /// is not running, the connect call would fail.
+    #[test]
+    fn sandbox_new_minenv_socket_is_connectable() {
+        use std::os::unix::net::UnixStream;
+        let (_tmp, base) = make_base_with_synth();
+        let config = Config::new("test-socket");
+        let sandbox = Sandbox::new(base, config, ()).unwrap();
+        let sock = sandbox.base_dir.join("run").join("minenv_sock");
+        UnixStream::connect(&sock).expect("minenv_sock should be connectable after Sandbox::new");
     }
 }

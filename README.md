@@ -27,29 +27,33 @@ The Minimal CLI
 Usage: minimal [OPTIONS] <COMMAND>
 
 Commands:
-  build        Runs the build task. Shorthand for `minimal run build`
-  test         Runs the test task. Shorthand for `minimal run test`
   run          Runs a task specified in `minimal.toml`
   update       Refreshes local checkouts of upstream packages & the standard library
+  add          Add a new tool or dependency
+  init         Automatically initialize minimal configuration based on your source tree
+  status       Shows the status of Minimal in this codebase
+  shell        Launches a development shell (shorthand for `minimal run shell`)
+  build        Runs the build task. Shorthand for `minimal run build`
+  test         Runs the test task. Shorthand for `minimal run test`
   materialize  Materializes an output specified in `minimal.toml`
   pkg          Builds the specified package(s) in a clean room, making them available in the local cache
-  check        Validates and formats nickel build-spec files
+  cache        Manipulate the local cache
+  check        Validates minimal configuration including packages, stacks, and profiles
+  dep          Generates Graphviz source code of the dependency graph
   completions  Generate shell completion script
   help         Print this message or the help of the given subcommand(s)
 
 Options:
       --minimal-dir <MINIMAL_DIR>
           Override the base directory used for operations (default: ~/.cache/minimal)
-      --stdlib-dir <STDLIB_DIR>
-          Load the minimal standard library from the given path instead
   -C, --repo-dir <REPO_DIR>
           Use the given directory as the repository root, instead of searching from the current working directory
       --no-cache
           Ignore locally-available binary artifacts (results in rebuilds unless present in a remote cache)
       --no-fetch
           Do not fetch binary artifacts from the internet
-      --no-telemetry
-          Do not share build status with sponge [env: MINIMAL_NO_TELEMETRY=]
+      --offline
+          Use only what's already in the local cache; fail on any network call
   -n, --num-parallel-builds <NUM_PARALLEL_BUILDS>
           Configure the number of parallel builds
   -h, --help
@@ -79,7 +83,8 @@ CLI archives to `gs://minimal-shim/archives/`.
 
 Manual `workflow_dispatch` with inputs:
 - `sha` (optional): short SHA to promote (defaults to latest archive in bucket)
-- `platforms` (optional): comma-separated list or `"amd64-linux,arm64-linux"`
+- `platforms` (optional): comma-separated list or `"all"` (default: `"amd64-linux,arm64-linux"`)
+- `dry_run` (optional, boolean, default `false`): when `true`, opens the approval issue and logs what would be written but skips the actual GCS config write
 
 Verifies the archive exists in GCS, then writes per-platform config files
 under `gs://minimal-shim/config/`.

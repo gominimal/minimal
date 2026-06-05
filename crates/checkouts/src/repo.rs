@@ -197,6 +197,10 @@ impl Repo {
 
         let output = Command::new("git")
             .current_dir(self.bare_repo_path())
+            // Explicitly set GIT_DIR so git recognises the bare repo as
+            // intentional even when `safe.bareRepository = explicit` is set
+            // in the system or global config (the default since git 2.49).
+            .env("GIT_DIR", self.bare_repo_path())
             .args(&args)
             .output()?;
 

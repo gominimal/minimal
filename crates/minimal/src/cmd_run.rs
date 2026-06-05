@@ -279,6 +279,7 @@ pub async fn run_task(
                 code: status.code,
                 reason: status.reason,
                 stderr: String::new(),
+                stdout: String::new(),
             });
         }
     }

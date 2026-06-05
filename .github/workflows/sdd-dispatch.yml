@@ -1,0 +1,506 @@
+name: sdd-dispatch
+
+# Thin wrapper for the sdd-dispatch agent.
+#
+# The agent itself is the reusable workflow
+# .github/workflows/sdd-dispatch.lock.yml (compiled from sdd-dispatch.md, which
+# declares on: workflow_call). This wrapper carries the real event triggers,
+# gates the /dispatch comment command to authors with repository write access,
+# walks the feature's task tree to compute the ready set, fans the cascade out
+# by posting /execute on each ready task issue via the App installation token
+# (ADR 0014 — the matching sdd-execute-{tier} wrapper picks the comment up
+# through its existing issue_comment trigger), and manages the tracking
+# issue's lifecycle and sdd:dispatched labels. A consumer repository installs
+# this wrapper unchanged.
+#
+# Selection is graph-driven, not label-driven. The ready set is computed by
+# walking the sub-issue tree (Feature -> Unit -> task per ADR 0005), parsing
+# each open task's `## Task` block for `blocked by` lines, and admitting
+# tasks whose blockers are all closed and which are not already in flight.
+# The `sdd:ready` label is a downstream artifact applied to dispatched tasks
+# as a UI hint; the graph wins.
+#
+# The gh-aw command:/slash_command trigger (with its roles: gate) is not used
+# here: that trigger is gh-aw frontmatter and only takes effect when gh aw
+# compiles a workflow. This wrapper is a hand-written GitHub Actions workflow,
+# not a gh-aw source file, so gh aw never processes it. The gating is therefore
+# done explicitly below with a real repository-permission check.
+
+on:
+  # A /dispatch comment on a tracking issue from a write-access author.
+  issue_comment:
+    types: [created]
+  # A task sub-issue closing under a tracking issue that carries
+  # sdd:dispatched. The route job walks the parent chain to find the
+  # tracking issue and filters out closures on issues outside an armed
+  # cascade.
+  issues:
+    types: [closed]
+
+permissions:
+  contents: read
+
+jobs:
+  # Resolve which situation triggered the wrapper, gate /dispatch to write
+  # access, and on the cascade path find the tracking issue this task sub-issue
+  # belongs to and confirm it carries sdd:dispatched. A non-match leaves
+  # should_run = false so the dispatch jobs are skipped.
+  #
+  # The job-level if: gate skips the route job entirely on issue_comment events
+  # whose body does not start with /dispatch (fixes issue #119 — a /spec or
+  # /execute comment posted on a tracker no longer spawns a route-job runner
+  # on this wrapper).
+  route:
+    # Token-strict match: `/dispatch` alone or followed by whitespace.
+    # `startsWith(body, '/dispatch')` would also fire for `/dispatchfoo`,
+    # consuming a route-job runner before the route step's tokenised
+    # parse rejects it. GitHub Actions expressions do not support regex
+    # matching, so enumerate the boundary characters explicitly.
+    if: |
+      github.event_name != 'issue_comment'
+      || github.event.comment.body == '/dispatch'
+      || startsWith(github.event.comment.body, '/dispatch ')
+      || startsWith(github.event.comment.body, '/dispatch\n')
+      || startsWith(github.event.comment.body, '/dispatch\r\n')
+      || startsWith(github.event.comment.body, '/dispatch\t')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+      tracking_issue: ${{ steps.decide.outputs.tracking_issue }}
+      trigger_kind: ${{ steps.decide.outputs.trigger_kind }}
+    steps:
+      - name: Decide whether to run, and find the tracking issue
+        id: decide
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-dispatch@v0.1.0
+        with:
+          app-id: ${{ vars.APP_ID }}
+          github-token: ${{ github.token }}
+
+  # Compute the ready set from the dependency graph. Walks the tracking
+  # issue's sub-issue tree, parses each open task's `depends on:` block,
+  # admits tasks whose `blocked by` references are all closed and which are
+  # not already in flight. Emits a matrix of {task, tier} pairs that the
+  # dispatch job fans out over.
+  #
+  # Also emits the precondition state on the tracking issue so the
+  # lifecycle and noop-comment jobs know whether to proceed.
+  compute:
+    needs: route
+    if: |
+      needs.route.outputs.should_run == 'true'
+      && needs.route.outputs.trigger_kind != 'fastpath_noop'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    outputs:
+      matrix: ${{ steps.compute.outputs.matrix }}
+      ready_count: ${{ steps.compute.outputs.ready_count }}
+      open_task_count: ${{ steps.compute.outputs.open_task_count }}
+      precondition: ${{ steps.compute.outputs.precondition }}
+      tracking_state: ${{ steps.compute.outputs.tracking_state }}
+      reason: ${{ steps.compute.outputs.reason }}
+    steps:
+      - name: Compute ready set and precondition state
+        id: compute
+        uses: norrietaylor/spectacles/.github/actions/sdd-dispatch-compute@v0.1.0
+        with:
+          tracking-issue: ${{ needs.route.outputs.tracking_issue }}
+          trigger-kind: ${{ needs.route.outputs.trigger_kind }}
+          github-token: ${{ github.token }}
+
+  # Fan the cascade out by posting /execute on each ready task issue. The
+  # matrix is the ready set computed above; max-parallel caps concurrent
+  # cells at SDD_DISPATCH_MAX_PARALLEL (default 5). Each cell posts one
+  # comment via the App installation token; the matching
+  # sdd-execute-{tier} wrapper picks the comment up through its existing
+  # issue_comment trigger and routes to the agent. This replaces the prior
+  # workflow_dispatch fan-out, which required an actions:write scope on the
+  # App that consumer installs did not reliably grant (issue #121 /
+  # ADR 0014).
+  dispatch:
+    # lifecycle is in needs so the tracking issue gains `sdd:dispatched`
+    # BEFORE any /execute comment is posted. Without that ordering, a fast
+    # task could close before lifecycle ran; the `issues.closed` cascade
+    # re-fire would see no `sdd:dispatched` on the tracking issue and bail,
+    # stranding any siblings the closure newly unblocked. The fastpath_noop
+    # path is unaffected: compute and lifecycle both skip on that route, so
+    # dispatch inherits the skip through the `needs` chain (GitHub Actions'
+    # default: a skipped need skips the downstream job).
+    needs: [route, compute, lifecycle]
+    if: |
+      needs.route.outputs.should_run == 'true'
+      && needs.compute.outputs.precondition == 'ok'
+      && fromJSON(needs.compute.outputs.matrix).include[0] != null
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(vars.SDD_DISPATCH_MAX_PARALLEL || '5') }}
+      matrix: ${{ fromJSON(needs.compute.outputs.matrix) }}
+    steps:
+      # Mint the App installation token. The default GITHUB_TOKEN cannot
+      # trigger another workflow run, but an App installation token can:
+      # the matching sdd-execute-{tier} wrapper sees the /execute comment
+      # posted below as an issue_comment.created event and routes the
+      # cascade to its agent.
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+      - name: Post /execute on task #${{ matrix.task }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          TASK: ${{ matrix.task }}
+        with:
+          github-token: ${{ env.APP_TOKEN }}
+          script: |
+            const task = parseInt(process.env.TASK, 10);
+            // Post an /execute comment on the task issue. The matching
+            // sdd-execute-{tier} wrapper picks the comment up through its
+            // wrapper-level command + tier gate; the route step's
+            // App-author accept logic (gated on the configured APP_ID)
+            // admits the cascade-posted comment past the human-permission
+            // check (see ADR 0014). Idempotency: a second /execute on the
+            // same task collapses at the wrapper's per-task-per-tier
+            // concurrency group, so a re-fired cascade does not
+            // double-spawn an in-flight task.
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: task,
+                body: '/execute',
+              });
+              core.info('Posted /execute on task #' + task);
+            } catch (err) {
+              core.setFailed('Failed to post /execute on task #' + task
+                + ': ' + err.message);
+            }
+      - name: Apply sdd:ready hint to dispatched task #${{ matrix.task }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          TASK: ${{ matrix.task }}
+        with:
+          github-token: ${{ env.APP_TOKEN }}
+          script: |
+            const task = parseInt(process.env.TASK, 10);
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: task,
+                labels: ['sdd:ready'],
+              });
+            } catch (err) {
+              // A 422 here means the label is already present; ignore.
+              core.info('Could not add sdd:ready to #' + task + ': '
+                + err.message);
+            }
+
+  # Manage the tracking issue's lifecycle and sdd:dispatched labels. On the
+  # first /dispatch, move sdd:ready -> sdd:in-progress and add
+  # sdd:dispatched. On a cascade fire, leave the lifecycle label alone but
+  # ensure sdd:dispatched stays present (it was the precondition for the
+  # cascade firing in the first place). When the ready set is empty AND
+  # every task is closed, remove sdd:dispatched so the cascade disarms.
+  lifecycle:
+    needs: [route, compute]
+    if: |
+      needs.route.outputs.should_run == 'true'
+      && needs.route.outputs.trigger_kind != 'fastpath_noop'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+      - name: Apply lifecycle and sdd:dispatched labels
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          TRACKING: ${{ needs.route.outputs.tracking_issue }}
+          TRIGGER_KIND: ${{ needs.route.outputs.trigger_kind }}
+          PRECONDITION: ${{ needs.compute.outputs.precondition }}
+          READY_COUNT: ${{ needs.compute.outputs.ready_count }}
+          OPEN_TASK_COUNT: ${{ needs.compute.outputs.open_task_count }}
+          TRACKING_STATE: ${{ needs.compute.outputs.tracking_state }}
+        with:
+          github-token: ${{ env.APP_TOKEN }}
+          script: |
+            const tracking = parseInt(process.env.TRACKING, 10);
+            const triggerKind = process.env.TRIGGER_KIND;
+            const precondition = process.env.PRECONDITION;
+            const readyCount = parseInt(process.env.READY_COUNT, 10);
+            const openTaskCount = parseInt(process.env.OPEN_TASK_COUNT, 10);
+            const trackingState = process.env.TRACKING_STATE;
+
+            // A failed precondition on a /dispatch (e.g. sdd:spec) does
+            // nothing to labels: no arm, no move. The noop-comment job
+            // posts the refusal.
+            if (precondition !== 'ok') {
+              return;
+            }
+
+            // First /dispatch: move sdd:ready -> sdd:in-progress and add
+            // sdd:dispatched. Idempotent: only move when the lifecycle is
+            // still sdd:ready, and only add sdd:dispatched if absent.
+            if (triggerKind === 'command') {
+              if (trackingState === 'sdd:ready') {
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: tracking,
+                    name: 'sdd:ready',
+                  });
+                } catch (err) {
+                  core.info('Could not remove sdd:ready from #' + tracking
+                    + ': ' + err.message);
+                }
+                try {
+                  await github.rest.issues.addLabels({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: tracking,
+                    labels: ['sdd:in-progress'],
+                  });
+                } catch (err) {
+                  core.info('Could not add sdd:in-progress to #' + tracking
+                    + ': ' + err.message);
+                }
+              }
+              try {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: tracking,
+                  labels: ['sdd:dispatched'],
+                });
+              } catch (err) {
+                core.info('Could not add sdd:dispatched to #' + tracking
+                  + ': ' + err.message);
+              }
+            }
+
+            // Tree drained: remove sdd:dispatched and apply the terminal
+            // sdd:done state. sdd-execute's completion sweep (step 8) is
+            // the primary path for sdd:done when the last task closes via
+            // an implementation PR merge; this branch is the fallback for
+            // the drained-via-manual-close path (no impl PR ever merged,
+            // so the sweep never ran). Idempotent: GitHub tolerates
+            // re-adding an existing label, and removeLabel is wrapped in
+            // try/catch so a missing prior label is a no-op. ADR 0005 §4
+            // names sdd-execute as the agent that hands the feature to
+            // sdd:done; this fallback covers the case where no
+            // sdd-execute run ever fires (see issue #147).
+            if (openTaskCount === 0) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: tracking,
+                  name: 'sdd:dispatched',
+                });
+                core.info('Tree drained; removed sdd:dispatched from #'
+                  + tracking);
+              } catch (err) {
+                core.info('Could not remove sdd:dispatched from #' + tracking
+                  + ': ' + err.message);
+              }
+              for (const stale of ['sdd:in-progress', 'sdd:review']) {
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: tracking,
+                    name: stale,
+                  });
+                  core.info('Tree drained; removed ' + stale + ' from #'
+                    + tracking);
+                } catch (err) {
+                  core.info('Could not remove ' + stale + ' from #'
+                    + tracking + ': ' + err.message);
+                }
+              }
+              try {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: tracking,
+                  labels: ['sdd:done'],
+                });
+                core.info('Tree drained; applied sdd:done to #' + tracking);
+              } catch (err) {
+                core.info('Could not add sdd:done to #' + tracking + ': '
+                  + err.message);
+              }
+              return;
+            }
+
+            // Mid-cascade idle (some open tasks, but every one is blocked
+            // or in flight): leave sdd:dispatched alone. The next
+            // issues.closed event on a sibling task will resume the
+            // cascade. The noop-comment job posts an informational comment
+            // on the /dispatch path; the cascade path posts none, to keep
+            // the tracking-issue thread quiet between fan-outs.
+            if (readyCount === 0) {
+              core.info('Ready set empty and tasks still open; cascade'
+                + ' remains armed.');
+            }
+
+  # Post one comment naming the noop reason when /dispatch is refused
+  # (precondition failure on sdd:spec, sdd:triage, sdd:review, sdd:done) or
+  # the ready set is empty. On the cascade path with a non-empty ready set,
+  # no comment is posted: the dispatched runs and the subsequent close
+  # events are the user-visible signal, and a tracking-issue comment per
+  # cascade fire would be noise.
+  #
+  # The wrapper writes this comment directly via the App-minted token rather
+  # than routing through the sdd-dispatch agent's add-comment safe-output:
+  # the message body is deterministic (the precondition string from compute
+  # or the empty-set explanation), there is no LLM-generated text in it, and
+  # the entire dispatcher is deterministic by design. The .md agent exists
+  # to document the contract and to compile cleanly under the lint workflow's
+  # compile-drift gate (ADR 0004); it is not invoked at runtime. See the
+  # header note in .github/workflows/sdd-dispatch.md.
+  noop-comment:
+    needs: [route, compute]
+    if: |
+      needs.route.outputs.should_run == 'true'
+      && needs.route.outputs.trigger_kind == 'command'
+      && (needs.compute.outputs.precondition != 'ok'
+          || needs.compute.outputs.ready_count == '0')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+      - name: Post the noop comment
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          TRACKING: ${{ needs.route.outputs.tracking_issue }}
+          PRECONDITION: ${{ needs.compute.outputs.precondition }}
+          REASON: ${{ needs.compute.outputs.reason }}
+          OPEN_TASK_COUNT: ${{ needs.compute.outputs.open_task_count }}
+          READY_COUNT: ${{ needs.compute.outputs.ready_count }}
+        with:
+          github-token: ${{ env.APP_TOKEN }}
+          script: |
+            const tracking = parseInt(process.env.TRACKING, 10);
+            const precondition = process.env.PRECONDITION;
+            const reason = process.env.REASON;
+            const openTaskCount = parseInt(process.env.OPEN_TASK_COUNT, 10);
+            const readyCount = parseInt(process.env.READY_COUNT, 10);
+            let body = '';
+            if (precondition === 'refuse_early'
+                || precondition === 'refuse_late'
+                || precondition === 'needs_human') {
+              body = reason;
+            } else if (readyCount === 0 && openTaskCount === 0) {
+              body = 'Every task sub-issue is closed; `sdd:dispatched`'
+                + ' removed and the cascade disarmed. `sdd:done` is'
+                + ' applied here as a fallback when no implementation PR'
+                + ' merge fired `sdd-execute`\'s completion sweep'
+                + ' (ADR 0005).';
+            } else if (readyCount === 0) {
+              body = 'Every open task is either blocked or already in'
+                + ' flight; the cascade remains armed. The next task close'
+                + ' under this tracking issue will resume dispatch.';
+            }
+            if (!body) {
+              return;
+            }
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: tracking,
+                body,
+              });
+            } catch (err) {
+              core.info('Could not post noop comment on #' + tracking
+                + ': ' + err.message);
+            }
+
+  # Fast-path /dispatch noop (ADR 0012).
+  #
+  # /dispatch on a tracking issue carrying a fast-path lifecycle label
+  # (sdd:fastpath, sdd:fastpath-review) does not arm the cascade — the
+  # fast-path flow has one task, so the fan-out machinery is unused.
+  # Post one comment pointing the human at /approve and exit. No labels
+  # are moved; the fast-path flow continues to be steered by sdd-spec's
+  # wrapper.
+  fastpath-noop-comment:
+    needs: route
+    if: |
+      needs.route.outputs.should_run == 'true'
+      && needs.route.outputs.trigger_kind == 'fastpath_noop'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+      - name: Post the fast-path noop comment
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          TRACKING: ${{ needs.route.outputs.tracking_issue }}
+        with:
+          github-token: ${{ env.APP_TOKEN }}
+          script: |
+            const tracking = parseInt(process.env.TRACKING, 10);
+            const body = '`/dispatch` is a noop on fast-path tracking'
+              + ' issues. The fast-path flow runs a single implementation'
+              + ' task, so the cascade fan-out is unused. Comment'
+              + ' `/approve` on this tracking issue (after the stub spec'
+              + ' PR merges) to dispatch the implementation directly'
+              + ' against the execution plan comment. See ADR 0012.';
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: tracking,
+                body,
+              });
+            } catch (err) {
+              core.info('Could not post fast-path noop comment on #'
+                + tracking + ': ' + err.message);
+            }

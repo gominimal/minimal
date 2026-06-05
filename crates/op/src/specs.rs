@@ -55,7 +55,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         for input in build.build_deps.iter() {
             match input {
                 BuildDep::Local { full_path, .. } => {
-                    build_deps.push(SandboxMapped::File(full_path.to_path_buf()))
+                    build_deps.push(SandboxMapped::FileCopy(full_path.to_path_buf()))
                 }
                 BuildDep::Source(source) => {
                     let resolved_src = crate::SourceLoad {

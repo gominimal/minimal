@@ -7,7 +7,6 @@ edition.workspace = true
 publish.workspace = true
 
 [dev-dependencies]
-indoc.workspace = true
 tracing-subscriber.workspace = true
 
 [dependencies]
@@ -17,7 +16,6 @@ hakoniwa.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-toml.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 

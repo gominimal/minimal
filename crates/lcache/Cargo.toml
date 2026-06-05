@@ -6,8 +6,6 @@ rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 publish.workspace = true
 
-[dev-dependencies]
-
 [dependencies]
 tracing.workspace = true
 blake3.workspace = true
@@ -20,4 +18,4 @@ serde_json.workspace = true
 common = { workspace = true }
 graph = { workspace = true }
 
-libc = "0.2"
+libc.workspace = true

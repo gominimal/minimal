@@ -17,7 +17,20 @@ pub struct RemoteStorage {
 impl RemoteStorage {
     #[tracing::instrument]
     pub async fn new(cache_dir: PathBuf, with_gcloud_auth: bool) -> Result<Self> {
-        let cache = file_cache::FileCache::new(cache_dir)?;
+        Self::new_with_offline(cache_dir, with_gcloud_auth, false).await
+    }
+
+    /// Same as [Self::new], but with an `offline` flag. When `offline=true`, any cache
+    /// miss surfaces as an error rather than a silent network fetch — see
+    /// [`file_cache::FileCacheError::OfflineCacheMiss`]. Pair with `--no-fetch` so the
+    /// flag means "I am offline; use only what's cached" end-to-end.
+    #[tracing::instrument]
+    pub async fn new_with_offline(
+        cache_dir: PathBuf,
+        with_gcloud_auth: bool,
+        offline: bool,
+    ) -> Result<Self> {
+        let cache = file_cache::FileCache::new_with_offline(cache_dir, offline)?;
 
         let client = if with_gcloud_auth {
             Storage::builder().build().await?

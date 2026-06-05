@@ -19,6 +19,11 @@ pub enum Error {
         code: i32,
         reason: String,
         stderr: String,
+        /// Last ~4 KiB of stdout (captured by sandbox2 alongside stderr).
+        /// Useful when build scripts redirect stderr away (e.g.
+        /// `pip install ... 2>/dev/null || true`) and the real
+        /// diagnostic only appears on stdout.
+        stdout: String,
     },
 
     Other(anyhow::Error),
@@ -135,10 +140,24 @@ impl fmt::Display for Error {
             }
 
             Error::Execution {
-                idx, code, reason, ..
-            } if *code == 125 => write!(f, "invocation {} failed: {}", idx, reason,),
-            Error::Execution { idx, code, .. } => {
-                write!(f, "invocation {} failed: exit code {}", idx, code,)
+                idx,
+                code,
+                reason,
+                stderr,
+                stdout,
+            } => {
+                if *code == 125 {
+                    write!(f, "invocation {idx} failed: {reason}")?;
+                } else {
+                    write!(f, "invocation {idx} failed: exit code {code}")?;
+                }
+                if !stderr.is_empty() {
+                    write!(f, "\nstderr:\n{stderr}")?;
+                }
+                if !stdout.is_empty() {
+                    write!(f, "\nstdout:\n{stdout}")?;
+                }
+                Ok(())
             }
             Error::Other(e) => write!(f, "{}", e),
         }
@@ -183,6 +202,11 @@ impl From<checkouts::Error> for Error {
             checkouts::Error::StatefileInvalid(e) => {
                 Self::Other(anyhow::anyhow!("vcs: failed parsing state file: {}", e))
             }
+            checkouts::Error::OfflineCacheMiss { remote } => Self::Other(anyhow::anyhow!(
+                "vcs: offline cache miss for remote {} — --offline is set; pre-populate \
+                 the vcs/ cache or remove the flag",
+                remote
+            )),
         }
     }
 }
@@ -232,11 +256,13 @@ impl From<sandbox2::Error> for Error {
                     code,
                     reason,
                     stderr,
+                    stdout,
                 } => Self::Execution {
                     idx,
                     code,
                     reason,
                     stderr,
+                    stdout,
                 },
                 sandbox2::error::ExecutionError::SpawnFailed(e) => {
                     Self::Other(anyhow::anyhow!("spawn failed: {}", e))
@@ -249,6 +275,10 @@ impl From<sandbox2::Error> for Error {
                 }
             },
             sandbox2::Error::Output(e) => Self::Other(e.into()),
+            sandbox2::Error::MappedFile(p) => Self::Other(anyhow::anyhow!(
+                "internal: file {} mapped to rootfs",
+                p.display()
+            )),
         }
     }
 }

@@ -1,0 +1,108 @@
+name: sdd-validate
+
+# Thin wrapper for the sdd-validate agent.
+#
+# The agent itself is the reusable workflow
+# .github/workflows/sdd-validate.lock.yml (compiled from sdd-validate.md, which
+# declares on: workflow_call). This wrapper carries the real event triggers and
+# passes the triggering entity to the agent through the aw_context input. A
+# consumer repository installs this wrapper unchanged.
+#
+# sdd-validate has no comment-command trigger, so this wrapper performs no
+# repository-permission gate: the gh-aw command:/slash_command trigger is not
+# used here. The triggers are a pull request opened or synchronized on a suite
+# branch (head ref `spec/`, `arch/`, or `sdd/`) and a tracking issue gaining
+# the sdd:ready label. The branch-prefix gate keeps the agent from commenting
+# on PRs the suite did not create — dependabot bumps, external contributions,
+# and unrelated human PRs. Suite PRs carry no distinguishing label (the
+# lifecycle label lives on the tracking issue), so the head ref is the signal,
+# matching CLAUDE.md's branch conventions and the sdd-execute/sdd-dispatch
+# wrappers' head-ref routing.
+#
+# No needs-human-removal resume is wired here. When sdd-validate escalates a
+# Blocker on a pull request, the hand-off is resumed by a fresh
+# pull_request: synchronize — the human's fix commit — not by an unlabeled
+# event: clearing needs-human without a code change would only re-run the same
+# gate set against the unchanged diff and re-post the same Blocker. A Blocker
+# at the triage boundary is advisory (validation gates neither a merge nor
+# /approve), so it needs no agent re-run. The wrapper therefore subscribes to
+# no unlabeled event. See the "Triggers this agent handles" section of
+# .github/workflows/sdd-validate.md.
+
+on:
+  # A pull request was opened or updated: the spec, architecture, or
+  # implementation boundary. synchronize also resumes a PR-boundary needs-human
+  # hand-off, since the human's fix commit fires it.
+  pull_request:
+    types: [opened, synchronize]
+  # A tracking issue gained sdd:ready: the non-pull-request triage boundary.
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  # Resolve which situation triggered the wrapper and build the aw_context the
+  # reusable workflow consumes. A non-match leaves should_run = false so the
+  # agent job is skipped.
+  #
+  # The job-level if: gate skips the route job entirely for events this wrapper
+  # does not route, so no runner spins up for them. It admits two cases:
+  #   - a pull_request whose head ref is a suite branch (`spec/`, `arch/`, or
+  #     `sdd/`); a PR on any other branch is not a suite PR and is skipped,
+  #     keeping the agent off dependabot, external, and unrelated human PRs;
+  #   - an `issues` `labeled` event for `sdd:ready` only (fixes issue #119 — the
+  #     sdd:in-progress/sdd:dispatched label mutations a /dispatch performs on a
+  #     tracker no longer spawn a route-job runner on this wrapper). Every other
+  #     label add is skipped here without a runner.
+  route:
+    if: |
+      (
+        github.event_name == 'pull_request'
+        && (
+          startsWith(github.event.pull_request.head.ref, 'spec/')
+          || startsWith(github.event.pull_request.head.ref, 'arch/')
+          || startsWith(github.event.pull_request.head.ref, 'sdd/')
+        )
+      )
+      || (
+        github.event_name == 'issues'
+        && github.event.action == 'labeled'
+        && github.event.label.name == 'sdd:ready'
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+      aw_context: ${{ steps.decide.outputs.aw_context }}
+    steps:
+      - name: Decide whether to run and build aw_context
+        id: decide
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-validate@v0.1.0
+        with:
+          github-token: ${{ github.token }}
+
+  sdd-validate:
+    needs: route
+    if: needs.route.outputs.should_run == 'true'
+    uses: norrietaylor/spectacles/.github/workflows/sdd-validate.lock.yml@v0.1.0
+    with:
+      aw_context: ${{ needs.route.outputs.aw_context }}
+    # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
+    # to a reusable workflow in a different owner than the caller.
+    secrets:
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+    # Ceiling for the called reusable workflow. Must cover the union of every
+    # nested job's permissions: the gh-aw conclusion and safe_outputs jobs
+    # need write scopes, and activation needs actions: read. sdd-validate
+    # opens no pull request, so contents stays read.
+    permissions:
+      actions: read
+      contents: read
+      discussions: write
+      issues: write
+      pull-requests: write

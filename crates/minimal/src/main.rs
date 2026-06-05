@@ -145,6 +145,21 @@ pub struct GlobalArgs {
     #[arg(long, default_value_t = false, global = true)]
     no_fetch: bool,
 
+    /// Use only what's already in the local cache for sources, VCS checkouts,
+    /// and the remote artifact cache. On cache miss, fail with a clear error
+    /// instead of attempting any network call. Useful for builds in
+    /// network-isolated environments where every input is pre-staged.
+    ///
+    /// Composes with the other cache flags:
+    ///   - implies the remote-artifact-cache-skip half of --no-fetch (you
+    ///     can't reach the artifact cache when offline anyway), so
+    ///     --offline alone is sufficient — no need for --offline --no-fetch
+    ///   - orthogonal to --no-cache and --rebuild, which control whether to
+    ///     use locally-built artifacts (--offline doesn't force a rebuild;
+    ///     it just gates the network)
+    #[arg(long, default_value_t = false, global = true)]
+    offline: bool,
+
     /// Configure the number of parallel builds
     #[arg(short, long, global = true)]
     num_parallel_builds: Option<usize>,
@@ -203,7 +218,8 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
 
     let mut config = ConfigBuilder::new()
         .with_no_cache(global_args.no_cache)
-        .with_no_fetch(global_args.no_fetch);
+        .with_no_fetch(global_args.no_fetch)
+        .with_offline(global_args.offline);
     if let Some(num_parallel_builds) = global_args.num_parallel_builds {
         config = config.with_num_parallel_builds(num_parallel_builds);
     }

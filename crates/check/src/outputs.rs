@@ -394,3 +394,94 @@ fn find_lib_in_deps(
 
     Ok(None)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CheckCtx, CheckVerdict, GraphBasedChecker};
+    use graph::Graph;
+    use lcache::Cache;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    /// Builds a minimal `CheckCtx` backed by a real `Cache<LocalDir>` rooted at
+    /// `cache_dir`.  The directory must already exist before calling this helper.
+    fn make_ctx(cache_dir: &std::path::Path, skip_checkers: Vec<String>) -> CheckCtx {
+        let cache = Cache::at_dir(cache_dir).expect("Cache::at_dir");
+        CheckCtx::new(
+            vec![],
+            skip_checkers,
+            false,
+            None,
+            cache_dir.to_path_buf(),
+            cache,
+            None,
+        )
+    }
+
+    /// Returns a unique temporary directory path under the system temp dir,
+    /// creating it on disk so that `Cache::at_dir` (which calls `canonicalize`)
+    /// succeeds.
+    fn make_tmp_dir(suffix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "check_outputs_test_{}_{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test tmp dir");
+        dir
+    }
+
+    /// When "missing runtime_deps" appears in `skip_checkers`, the checker must
+    /// return `CheckVerdict::Skip` immediately without inspecting the graph or
+    /// the cache.
+    #[tokio::test]
+    async fn missing_runtime_deps_skip_via_skip_checkers() {
+        let tmpdir = make_tmp_dir("skip_checkers");
+        let ctx = make_ctx(&tmpdir, vec!["missing runtime_deps".to_string()]);
+
+        let graph = Arc::new(RwLock::new(Graph::new()));
+        let guard = graph.read().await;
+        let result = MissingRuntimeDeps
+            .check(&ctx, "any-pkg".to_string(), &tmpdir, guard, None)
+            .await
+            .expect("check should not error");
+
+        assert!(
+            matches!(result.verdict, CheckVerdict::Skip),
+            "expected Skip when checker is in skip_checkers, got {:?}",
+            result.verdict
+        );
+
+        std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
+    }
+
+    /// When the package name is not present in the graph, the checker must
+    /// return `CheckVerdict::Skip` (it has nothing to check against).
+    #[tokio::test]
+    async fn missing_runtime_deps_skip_package_not_in_graph() {
+        let tmpdir = make_tmp_dir("no_pkg");
+        let ctx = make_ctx(&tmpdir, vec![]);
+
+        let graph = Arc::new(RwLock::new(Graph::new()));
+        let guard = graph.read().await;
+        let result = MissingRuntimeDeps
+            .check(
+                &ctx,
+                "nonexistent-package".to_string(),
+                &tmpdir,
+                guard,
+                None,
+            )
+            .await
+            .expect("check should not error");
+
+        assert!(
+            matches!(result.verdict, CheckVerdict::Skip),
+            "expected Skip when package is absent from graph, got {:?}",
+            result.verdict
+        );
+
+        std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
+    }
+}

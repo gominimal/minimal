@@ -1,0 +1,192 @@
+name: sdd-spec
+
+# Thin wrapper for the sdd-spec agent.
+#
+# The agent itself is the reusable workflow .github/workflows/sdd-spec.lock.yml
+# (compiled from sdd-spec.md, which declares on: workflow_call). This wrapper
+# carries the real event triggers, gates the comment commands to authors with
+# repository write access, and passes the triggering entity to the agent
+# through the aw_context input. A consumer repository installs this wrapper
+# unchanged.
+#
+# The gh-aw command:/slash_command trigger (with its roles: gate) is not used
+# here: that trigger is gh-aw frontmatter and only takes effect when gh aw
+# compiles a workflow. This wrapper is a hand-written GitHub Actions workflow,
+# not a gh-aw source file, so gh aw never processes it. The gating is therefore
+# done explicitly below with a real repository-permission check.
+
+on:
+  # A tracking issue gained the sdd:spec label (also fired by the
+  # feature/bug issue templates), or the needs-human label was cleared.
+  issues:
+    types: [labeled, unlabeled]
+  # A /spec or /revise comment on an issue or pull request.
+  issue_comment:
+    types: [created]
+  # A spec pull request was closed; the agent advances the lifecycle only
+  # when it was merged.
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+
+jobs:
+  # Resolve which situation triggered the wrapper and build the aw_context the
+  # reusable workflow consumes. A non-match leaves should_run = false so the
+  # agent job is skipped.
+  #
+  # The job-level if: gate skips the route job entirely on issue_comment
+  # events whose body does not start with one of the commands this wrapper
+  # owns, and on issues label events whose label this wrapper does not route
+  # (fixes issue #119 — a /dispatch or /execute comment, or the
+  # sdd:in-progress/sdd:dispatched label mutations a /dispatch performs on a
+  # tracker, no longer spawn a route-job runner on this wrapper). The route
+  # step routes an `issues` event only on `labeled` `sdd:spec`/`sdd:fastpath`
+  # or `unlabeled` `needs-human`; every other label add/remove is skipped
+  # here without a runner.
+  route:
+    if: |
+      (github.event_name != 'issue_comment' && github.event_name != 'issues')
+      || (
+        github.event_name == 'issue_comment'
+        && (
+          startsWith(github.event.comment.body, '/spec')
+          || startsWith(github.event.comment.body, '/revise')
+          || startsWith(github.event.comment.body, '/fastpath')
+          || startsWith(github.event.comment.body, '/approve')
+        )
+      )
+      || (
+        github.event_name == 'issues'
+        && (
+          (
+            github.event.action == 'labeled'
+            && (
+              github.event.label.name == 'sdd:spec'
+              || github.event.label.name == 'sdd:fastpath'
+            )
+          )
+          || (
+            github.event.action == 'unlabeled'
+            && github.event.label.name == 'needs-human'
+          )
+        )
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+      aw_context: ${{ steps.decide.outputs.aw_context }}
+      fastpath_approve: ${{ steps.decide.outputs.fastpath_approve }}
+      fastpath_tracking: ${{ steps.decide.outputs.fastpath_tracking }}
+    steps:
+      - name: Decide whether to run and build aw_context
+        id: decide
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-spec@v0.1.0
+        with:
+          github-token: ${{ github.token }}
+
+  # Fast-path /approve handler (ADR 0012).
+  #
+  # On /approve on a tracking issue carrying sdd:fastpath, the route job
+  # sets fastpath_approve=true. This job runs the deterministic dispatch:
+  # find the latest execution-plan comment on the tracking issue (matched
+  # by the `[sdd-spec:fastpath-plan]` plain-text marker), parse its
+  # `model:*` tier, mint an App token, call workflow_dispatch on the
+  # matching sdd-execute-{tier}.yml with `entry: 'fastpath'`, and move
+  # the tracking issue's lifecycle from `sdd:fastpath` to
+  # `sdd:in-progress`. The wrapper handles this entirely; the sdd-spec
+  # agent .md source is not invoked on this path.
+  #
+  # This follows the deterministic-in-wrapper pattern from #81 (ADR
+  # 0011): there is no natural-language judgement on this code path —
+  # walk a comment, parse a tier, call REST.
+  fastpath-approve:
+    needs: route
+    if: needs.route.outputs.fastpath_approve == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+      - name: Find plan comment and dispatch sdd-execute-{tier}
+        uses: norrietaylor/spectacles/.github/actions/sdd-fastpath-approve@v0.1.0
+        with:
+          github-token: ${{ steps.app.outputs.token }}
+          tracking: ${{ needs.route.outputs.fastpath_tracking }}
+
+  sdd-spec:
+    needs: route
+    if: needs.route.outputs.should_run == 'true'
+    uses: norrietaylor/spectacles/.github/workflows/sdd-spec.lock.yml@v0.1.0
+    with:
+      aw_context: ${{ needs.route.outputs.aw_context }}
+    # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
+    # to a reusable workflow in a different owner than the caller.
+    secrets:
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+      DISTILLERY_OAUTH_TOKEN: ${{ secrets.DISTILLERY_OAUTH_TOKEN }}
+    # Ceiling for the called reusable workflow. Must cover the union of every
+    # nested job's permissions: the gh-aw conclusion and safe_outputs jobs
+    # need write scopes, and activation needs actions: read.
+    permissions:
+      actions: read
+      contents: write
+      discussions: write
+      issues: write
+      pull-requests: write
+
+  # Agent-failure hand-off (fixes #122, #123).
+  #
+  # When the sdd-spec reusable workflow fails before producing safe-outputs
+  # (e.g. the "Execute GitHub Copilot CLI" step crashes, or any other infra
+  # failure the gh-aw conclusion job does not classify), the agent has posted
+  # nothing: no comment, no needs-human. The failure is invisible to the
+  # reporter and the work stalls with no auto-retry (#122, #123). This job
+  # makes that failure visible and recoverable by minting the App token (same
+  # pattern as fastpath-approve above) and posting a hand-off comment plus
+  # the `needs-human` label on the tracking issue. Clearing `needs-human`
+  # re-fires the agent (situation 6 in sdd-spec.md), so the human-driven
+  # resume stands in for the missing auto-retry.
+  #
+  # Gated on failure() and should_run so it never runs when the agent was
+  # skipped (route decided not to run) or succeeded. The aw_context JSON the
+  # route job built carries the routed item; needs-human is applied only to
+  # an issue item (the tracking issue), which is the lifecycle anchor the
+  # agent re-fires on. A pull-request item (a /revise on a spec PR, or a
+  # merged spec PR) gets a visibility comment so the failure is still
+  # surfaced, but not needs-human: that label re-fires the agent only from
+  # the tracking issue, which is not reliably derivable from a PR here.
+  failure-handoff:
+    needs: [route, sdd-spec]
+    if: failure() && needs.route.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+      - name: Post failure hand-off to tracking issue
+        uses: norrietaylor/spectacles/.github/actions/sdd-spec-failure-handoff@v0.1.0
+        with:
+          github-token: ${{ steps.app.outputs.token }}
+          aw-context: ${{ needs.route.outputs.aw_context }}

@@ -1,0 +1,259 @@
+//! Test scaffolding for exercising RPC handlers end-to-end.
+//!
+//! This module spins up a real [`ServerStateHandle`] backed by a tempdir
+//! and a real russh client connected over an in-memory `UnixStream` pair,
+//! then exposes a single typed entrypoint:
+//!
+//! ```ignore
+//! let server = TestServer::new().await;
+//! let mut client = server.connect().await;
+//! let resp = client.call::<GetVersion>(&()).await;
+//! ```
+//!
+//! Every layer the production server exercises — russh transport, the
+//! `ConnectionHandler` impl, `handle_ssh_rpc` dispatch, the concrete
+//! handler's JSON codec, and the sessions actor — runs unmodified. No
+//! mocking.
+
+#![cfg(test)]
+
+use std::sync::Arc;
+
+use camino::Utf8PathBuf;
+use paths::DaemonAbsPath;
+use russh::keys::ssh_key;
+use sessions::SessionId;
+use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
+
+use crate::connection::Connection;
+use crate::rpc::OneshotSshRpc;
+use crate::server::{Config, HostKey, ServerStateHandle};
+
+/// A minimald instance running against a tempdir, ready to accept
+/// in-memory ssh connections.
+pub(crate) struct TestServer {
+    /// Public so tests can poke at server state directly (e.g. create
+    /// sessions via the manager handle) before issuing RPCs.
+    pub(crate) state: ServerStateHandle,
+    russh_config: Arc<russh::server::Config>,
+    _temp: TempDir,
+}
+
+impl TestServer {
+    /// Spins up a fresh server backed by an empty tempdir. The tempdir
+    /// lives as long as the [`TestServer`].
+    pub(crate) async fn new() -> Self {
+        let temp = TempDir::new().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let state_dir = DaemonAbsPath::try_new(path.clone()).unwrap();
+        let cache_dir = DaemonAbsPath::try_new(path).unwrap();
+        let config = Config {
+            host_key: HostKey::Ephemeral,
+            minimal_state_dir: state_dir,
+            minimal_cache_dir: cache_dir,
+        };
+        let state = ServerStateHandle::new(config).await.unwrap();
+
+        let host_key = state.host_key().await.unwrap();
+        let russh_config = Arc::new(russh::server::Config {
+            keys: vec![host_key],
+            auth_rejection_time_initial: Some(std::time::Duration::ZERO),
+            nodelay: true,
+            ..Default::default()
+        });
+
+        Self {
+            state,
+            russh_config,
+            _temp: temp,
+        }
+    }
+
+    /// Opens an authenticated ssh session against this server, using a
+    /// `UnixStream` pair to bridge the two halves in-process.
+    ///
+    /// The server-side task is detached; it stays alive as long as the
+    /// returned [`TestClient`] keeps its half of the pair open.
+    pub(crate) async fn connect(&self) -> TestClient {
+        let (server_side, client_side) = UnixStream::pair().unwrap();
+
+        // `russh::server::run_stream` (called inside `Connection::from_socket`)
+        // performs the initial SSH-id read before returning, so we have to
+        // drive it concurrently with `connect_stream` on the client side
+        // — otherwise the two halves deadlock against the empty pipe.
+        //
+        // `was_local_uds = true` mirrors how the real server marks
+        // local-domain-socket connections; it flips `auth_none` to
+        // accept without prompting for a credential.
+        let russh_config = self.russh_config.clone();
+        let state = self.state.clone();
+        let server_setup = async move {
+            let (_conn, session_fut) =
+                Connection::from_socket(server_side, russh_config, state, true).await;
+            tokio::spawn(session_fut);
+        };
+
+        let client_config = Arc::new(russh::client::Config::default());
+        let client_setup =
+            russh::client::connect_stream(client_config, client_side, TestClientHandler);
+
+        let (_, handle) = tokio::join!(server_setup, client_setup);
+        let mut handle = handle.unwrap();
+        let auth = handle.authenticate_none("test").await.unwrap();
+        assert!(auth.success(), "auth_none should succeed on local UDS");
+
+        TestClient { handle }
+    }
+}
+
+/// An authenticated client connection against a [`TestServer`].
+pub(crate) struct TestClient {
+    handle: russh::client::Handle<TestClientHandler>,
+}
+
+impl TestClient {
+    /// Performs a single oneshot RPC end-to-end.
+    ///
+    /// Opens a session channel, requests the subsystem named by `R`,
+    /// writes the JSON-serialized request, half-closes the write side,
+    /// reads the response to EOF, and decodes it.
+    ///
+    /// Panics on any transport or codec failure — appropriate for unit
+    /// tests, which want loud failure rather than recovery.
+    pub(crate) async fn call<R: OneshotSshRpc>(&mut self, req: &R::Request<'_>) -> R::Response {
+        let channel = self.handle.channel_open_session().await.unwrap();
+        channel.request_subsystem(false, R::NAME).await.unwrap();
+
+        let body = serde_json::to_vec(req).expect("request serializes");
+        let mut stream = channel.into_stream();
+        stream.write_all(&body).await.unwrap();
+        stream.shutdown().await.unwrap();
+
+        let mut response_buf = Vec::with_capacity(1024);
+        stream.read_to_end(&mut response_buf).await.unwrap();
+        serde_json::from_slice(&response_buf).expect("response deserializes")
+    }
+
+    /// Opens an SFTP session attached to the given minimald session.
+    ///
+    /// Sets `MINIMAL_SESSION_ID` on the channel (the env-var contract the
+    /// server uses to scope the SFTP subsystem to a session), then requests
+    /// the `sftp` subsystem and hands the channel stream to the SFTP client.
+    pub(crate) async fn open_sftp(
+        &mut self,
+        session_id: SessionId,
+    ) -> russh_sftp::client::SftpSession {
+        let channel = self.handle.channel_open_session().await.unwrap();
+        channel
+            .set_env(true, "MINIMAL_SESSION_ID", session_id.to_string())
+            .await
+            .unwrap();
+        channel.request_subsystem(true, "sftp").await.unwrap();
+        russh_sftp::client::SftpSession::new(channel.into_stream())
+            .await
+            .unwrap()
+    }
+
+    /// Opens a fresh session channel, applies `env` and optionally a PTY,
+    /// fires an `exec` request for `command`, writes `stdin`, then drains
+    /// the channel to completion.
+    ///
+    /// `Ok(ExecOutcome)` when the server accepted the exec request — the
+    /// process ran (with whatever exit code or signal). `Err(ExecRejected)`
+    /// when the server returned `SSH_MSG_CHANNEL_FAILURE`, i.e. the request
+    /// was refused before a process ever started.
+    pub(crate) async fn exec(
+        &mut self,
+        env: &[(&str, &str)],
+        request_pty: bool,
+        command: &str,
+        stdin: &[u8],
+    ) -> Result<ExecOutcome, ExecRejected> {
+        use russh::ChannelMsg;
+
+        let mut channel = self.handle.channel_open_session().await.unwrap();
+        for (name, value) in env {
+            channel.set_env(true, *name, *value).await.unwrap();
+        }
+        if request_pty {
+            // Any plausible pty params will do; the server only cares
+            // that *some* pty was negotiated.
+            channel
+                .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                .await
+                .unwrap();
+        }
+        channel.exec(true, command).await.unwrap();
+        if !stdin.is_empty() {
+            channel.data_bytes(stdin.to_vec()).await.unwrap();
+        }
+        // Close write half so `cat`-style commands see EOF and exit.
+        channel.eof().await.unwrap();
+
+        // Replies arrive in request order on a single channel: one per
+        // set_env, optionally one for request_pty, then one for exec.
+        // env/pty requests on a fresh channel can't fail, so any
+        // CHANNEL_FAILURE we see is necessarily the exec request's.
+        let expected_replies_before_exec = env.len() + usize::from(request_pty);
+        let mut seen_request_reply = 0usize;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut exit_status = None;
+
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Success => seen_request_reply += 1,
+                ChannelMsg::Failure => {
+                    assert!(
+                        seen_request_reply >= expected_replies_before_exec,
+                        "unexpected CHANNEL_FAILURE before exec request reply \
+                         (saw {seen_request_reply}, expected at least \
+                         {expected_replies_before_exec})",
+                    );
+                    return Err(ExecRejected);
+                }
+                ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+                ChannelMsg::ExtendedData { data, ext: 1 } => stderr.extend_from_slice(&data),
+                ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
+                _ => {}
+            }
+        }
+
+        Ok(ExecOutcome {
+            stdout,
+            stderr,
+            exit_status,
+        })
+    }
+}
+
+/// Result of a successful SSH `exec` request — the server accepted the
+/// request, the process ran (possibly aborted), and the channel closed
+/// cleanly.
+#[derive(Debug)]
+pub(crate) struct ExecOutcome {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    /// `Some` when the server reported a numeric exit code; `None` when
+    /// the channel closed without one (e.g. signal-terminated).
+    pub exit_status: Option<u32>,
+}
+
+/// Marker for an exec request the server refused at the request layer
+/// via `SSH_MSG_CHANNEL_FAILURE`, before any process was spawned.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ExecRejected;
+
+struct TestClientHandler;
+
+impl russh::client::Handler for TestClientHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(&mut self, _: &ssh_key::PublicKey) -> Result<bool, Self::Error> {
+        // Tests run against an ephemeral key we just generated, so
+        // there is nothing to check.
+        Ok(true)
+    }
+}
