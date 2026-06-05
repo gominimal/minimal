@@ -183,23 +183,43 @@ jobs:
         # `minvmd run --detach` re-exec. A fresh XDG_RUNTIME_DIR / XDG_STATE_HOME
         # guarantees the clean (no-daemon) starting state the proof requires.
         run: |
-          set -euo pipefail
+          set -uo pipefail   # not -e: capture failures so we can dump diagnostics
           export PATH="$PWD/target/debug:$PATH"
           export MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz"
           export MINVMD_ROOTFS_PATH="$(scripts/build-rootfs.sh --print-path)"
+          # Capture the guest console; this env var propagates through the
+          # minimal2 -> `minvmd run --detach` -> `minvmd run` -> __krun-vmm chain,
+          # so the silent detached supervisor's boot is still observable here.
+          export MINVMD_BOOT_LOG="$RUNNER_TEMP/autospawn-boot.log"
           export XDG_RUNTIME_DIR="$(mktemp -d)"
           export XDG_STATE_HOME="$(mktemp -d)"
-
-          # Stop the detached supervisor on any exit so the run leaves no daemon.
-          trap 'minvmd stop >/dev/null 2>&1 || true' EXIT
 
           # macOS `date` has no %N; use perl's high-resolution clock for ms.
           now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time()*1000'; }
 
+          # On any failure, dump what the silent detach hides — minimal2's own
+          # error, the persisted state, and the guest boot console — then stop
+          # the supervisor and fail. An empty boot log means the VM never
+          # started (supervisor died before krun_start_enter); kernel output
+          # without a full boot means a stuck boot; a full boot points at a
+          # UDS/timing issue.
+          fail() {
+            echo "::group::autospawn-e2e diagnostics"
+            echo "--- minimal2 ls stderr ---"; cat "$RUNNER_TEMP/ls.err" 2>/dev/null || true
+            echo "--- state.toml ---"; find "$XDG_STATE_HOME" -name state.toml -exec cat {} \; 2>/dev/null || echo "(none)"
+            echo "--- guest boot console (tail) ---"; tail -80 "$MINVMD_BOOT_LOG" 2>/dev/null || echo "(no boot log — VM never started)"
+            echo "::endgroup::"
+            minvmd stop >/dev/null 2>&1 || true
+            exit 1
+          }
+          trap 'minvmd stop >/dev/null 2>&1 || true' EXIT
+
           # Cold: must auto-spawn minvmd and return within 8 s.
-          t0=$(now_ms); minimal2 ls; t1=$(now_ms); cold=$(( t1 - t0 ))
+          t0=$(now_ms)
+          minimal2 ls 2>"$RUNNER_TEMP/ls.err" || { echo "::error::cold 'minimal ls' failed to auto-spawn minvmd"; fail; }
+          t1=$(now_ms); cold=$(( t1 - t0 ))
           echo "cold 'minimal ls': ${cold}ms"
-          [ "$cold" -lt 8000 ] || { echo "::error::cold 'minimal ls' took ${cold}ms (>= 8000ms)"; exit 1; }
+          [ "$cold" -lt 8000 ] || { echo "::error::cold 'minimal ls' took ${cold}ms (>= 8000ms)"; fail; }
 
           # minvmd must now report running (exit 0). Poll briefly to absorb the
           # gap between the host UDS accepting and the Running state persisting.
@@ -208,12 +228,21 @@ jobs:
             if minvmd status >/dev/null 2>&1; then running=1; break; fi
             sleep 0.1
           done
-          [ "$running" = 1 ] || { minvmd status --json || true; echo "::error::minvmd did not report running after auto-spawn"; exit 1; }
+          [ "$running" = 1 ] || { echo "::error::minvmd did not report running after auto-spawn"; fail; }
 
           # Warm: minvmd already running, must return in < 500 ms.
-          t0=$(now_ms); minimal2 ls; t1=$(now_ms); warm=$(( t1 - t0 ))
+          t0=$(now_ms)
+          minimal2 ls >/dev/null 2>"$RUNNER_TEMP/ls.err" || { echo "::error::warm 'minimal ls' failed"; fail; }
+          t1=$(now_ms); warm=$(( t1 - t0 ))
           echo "warm 'minimal ls': ${warm}ms"
-          [ "$warm" -lt 500 ] || { echo "::error::warm 'minimal ls' took ${warm}ms (>= 500ms)"; exit 1; }
+          [ "$warm" -lt 500 ] || { echo "::error::warm 'minimal ls' took ${warm}ms (>= 500ms)"; fail; }
+      - name: Upload autospawn guest boot console log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autospawn-boot-log
+          path: ${{ runner.temp }}/autospawn-boot.log
+          if-no-files-found: ignore
 
   build-macos:
     # Self-hosted Apple Silicon runner. minvmd links libkrun
