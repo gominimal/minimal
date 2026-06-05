@@ -61,12 +61,18 @@ async fn main() -> Result<(), ()> {
 
     match cli.command {
         Command::Ls => {
-            // Ensure minvmd is running before attempting to connect (R4.5)
+            // Ensure the VM backend is running before listing (R4.5).
+            // minvmd auto-spawn is macOS-only today; on Linux
+            // `ensure_minvmd_running` is a no-op, so `ls` falls straight through
+            // to the placeholder output below.
+            //
+            // TODO(#311): minimal targets Linux too — implement the Linux
+            // backend and real session listing over the minimald UDS. The empty
+            // `[]` is a placeholder on both platforms until then.
             if let Err(e) = autospawn::ensure_minvmd_running() {
                 eprintln!("Failed to ensure minvmd is running: {}", e);
                 return Err(());
             }
-            // For now, just print empty list as a placeholder
             println!("[]");
             Ok(())
         }
