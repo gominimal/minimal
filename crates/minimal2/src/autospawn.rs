@@ -54,6 +54,9 @@ pub fn ensure_minvmd_running() -> io::Result<()> {
         minvmd::lifecycle::Lifecycle::Stopped | minvmd::lifecycle::Lifecycle::NotProvisioned => {
             // Not running; will spawn below
         }
+        // Lifecycle is #[non_exhaustive]; treat any future state conservatively
+        // as "not running" and fall through to spawn.
+        _ => {}
     }
 
     // Not running; spawn minvmd run --detach with timeout (R4.5)
