@@ -9,10 +9,18 @@
 use std::io;
 #[cfg(target_os = "macos")]
 use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::thread;
+#[cfg(target_os = "macos")]
+use std::time::Duration;
 
 /// Default timeout in seconds to wait for the UDS when spawning minvmd (R4.5).
 #[cfg(target_os = "macos")]
 const DEFAULT_SPAWN_TIMEOUT_SECS: u64 = 8;
+
+/// Brief wait time when minvmd is shutting down, to let it finish.
+#[cfg(target_os = "macos")]
+const STOPPING_WAIT_MS: u64 = 100;
 
 /// Check if minvmd needs to be spawned, and spawn it if necessary.
 ///
@@ -35,7 +43,17 @@ pub fn ensure_minvmd_running() -> io::Result<()> {
             tracing::debug!("minvmd already running or starting");
             return Ok(());
         }
-        _ => {}
+        minvmd::lifecycle::Lifecycle::Stopping => {
+            // Daemon is shutting down; wait briefly for it to finish before spawning.
+            // This avoids a race where we spawn a new instance while the old one is
+            // still shutting down, which could cause both to contend for resources
+            // and potentially exceed the 8s timeout budget (R4.5).
+            tracing::debug!("minvmd is stopping, waiting briefly");
+            thread::sleep(Duration::from_millis(STOPPING_WAIT_MS));
+        }
+        minvmd::lifecycle::Lifecycle::Stopped | minvmd::lifecycle::Lifecycle::NotProvisioned => {
+            // Not running; will spawn below
+        }
     }
 
     // Not running; spawn minvmd run --detach with timeout (R4.5)
