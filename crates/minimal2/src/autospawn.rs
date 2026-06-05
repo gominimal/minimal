@@ -12,15 +12,21 @@ use std::process::Command;
 #[cfg(target_os = "macos")]
 use std::thread;
 #[cfg(target_os = "macos")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Default timeout in seconds to wait for the UDS when spawning minvmd (R4.5).
 #[cfg(target_os = "macos")]
 const DEFAULT_SPAWN_TIMEOUT_SECS: u64 = 8;
 
-/// Brief wait time when minvmd is shutting down, to let it finish.
+/// Poll interval while waiting for a shutting-down minvmd to reach a terminal
+/// state before deciding whether to spawn.
 #[cfg(target_os = "macos")]
-const STOPPING_WAIT_MS: u64 = 100;
+const STOPPING_POLL_MS: u64 = 100;
+
+/// Max time to wait for an in-progress `minvmd stop` (SIGTERM → SIGKILL, ~5 s)
+/// to finish before giving up with a clear error.
+#[cfg(target_os = "macos")]
+const STOPPING_WAIT_SECS: u64 = 6;
 
 /// Check if minvmd needs to be spawned, and spawn it if necessary.
 ///
@@ -44,12 +50,31 @@ pub fn ensure_minvmd_running() -> io::Result<()> {
             return Ok(());
         }
         minvmd::lifecycle::Lifecycle::Stopping => {
-            // Daemon is shutting down; wait briefly for it to finish before spawning.
-            // This avoids a race where we spawn a new instance while the old one is
-            // still shutting down, which could cause both to contend for resources
-            // and potentially exceed the 8s timeout budget (R4.5).
-            tracing::debug!("minvmd is stopping, waiting briefly");
-            thread::sleep(Duration::from_millis(STOPPING_WAIT_MS));
+            // `minvmd stop` can take up to ~5 s (SIGTERM → SIGKILL escalation),
+            // so a fixed short sleep usually leaves the daemon still Stopping.
+            // Spawning then would make the new `minvmd run` bail on its own
+            // Stopping guard, surfacing an opaque 8 s UDS timeout. Instead poll
+            // until it reaches a terminal state, re-reading on each tick.
+            tracing::info!("minvmd is stopping; waiting for it to finish");
+            let deadline = Instant::now() + Duration::from_secs(STOPPING_WAIT_SECS);
+            loop {
+                thread::sleep(Duration::from_millis(STOPPING_POLL_MS));
+                match state_dir.read_state()?.lifecycle {
+                    // Something else restarted it in the meantime.
+                    minvmd::lifecycle::Lifecycle::Running
+                    | minvmd::lifecycle::Lifecycle::Starting => return Ok(()),
+                    // Shutdown completed; fall through to spawn.
+                    minvmd::lifecycle::Lifecycle::Stopped
+                    | minvmd::lifecycle::Lifecycle::NotProvisioned => break,
+                    _ if Instant::now() >= deadline => {
+                        return Err(io::Error::other(
+                            "minvmd is still stopping after waiting; try again shortly",
+                        ));
+                    }
+                    // Still stopping (or a future state); keep polling.
+                    _ => continue,
+                }
+            }
         }
         minvmd::lifecycle::Lifecycle::Stopped | minvmd::lifecycle::Lifecycle::NotProvisioned => {
             // Not running; will spawn below
