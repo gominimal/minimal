@@ -87,8 +87,9 @@ fn bridge_e2e_concurrent_round_trip() {
         );
     }
 
-    // The guest stub sends READY before exec-ing the vsock 2222 listener;
-    // give socat a moment to start accepting.
+    // The guest stub sends READY before exec-ing the vsock 2222 listener.
+    // Brief sleep to reduce initial connection failures; the per-connection
+    // retry loop below handles races if socat is not yet listening.
     std::thread::sleep(Duration::from_millis(200));
 
     // Open 5 concurrent host UDS connections; each writes a distinct payload
