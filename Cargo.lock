@@ -3387,6 +3387,7 @@ dependencies = [
  "minvmd",
  "ot",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 
