@@ -89,22 +89,25 @@ jobs:
             exit 1
           fi
       - name: Materialize minvmd-rootfs (ext4 image)
-        # Output must live inside the workspace: the macOS shim runs minimal in a
-        # VM and only syncs the project dir back to the host.
+        # Build the package, then take the image. NOTE: on this self-hosted
+        # runner, `minimal materialize`'s final copy step fails to read the
+        # freshly-built output back through the shim VM's /host mount ("copying
+        # output file ... No such file") even though the build wrote it to the
+        # host cache. The build itself succeeds, so on that failure we copy the
+        # image straight from the host build cache. TODO: remove once the shim
+        # /host large-file read coherence issue is fixed upstream.
         run: |
           export PATH="$HOME/.minimal/shim/bin:$PATH"
           echo "shim minimal: $(minimal --version 2>&1 | tail -1)"
-          if ! minimal materialize --output "$GITHUB_WORKSPACE/rootfs.img" --arch aarch64 minvmd-rootfs; then
-            echo "::group::minvmd-rootfs build cache diagnostics"
-            echo "--- latest minvmd-rootfs output dirs in build cache ---"
-            ls -dt "$HOME"/.cache/minimal/built/*/*/usr/share/minvmd-rootfs 2>/dev/null | head -3 | while read -r d; do
-              echo "$d:"; ls -la "$d" 2>/dev/null
-            done || echo "(no minvmd-rootfs output dir in cache — build produced nothing)"
-            echo "--- most recently written cache dirs ---"
-            ls -dt "$HOME"/.cache/minimal/built/*/* 2>/dev/null | head -3
-            echo "::endgroup::"
-            exit 1
+          minimal materialize --output "$GITHUB_WORKSPACE/rootfs.img" --arch aarch64 minvmd-rootfs || true
+          if [ ! -s "$GITHUB_WORKSPACE/rootfs.img" ]; then
+            src="$(ls -t "$HOME"/.cache/minimal/built/*/*/usr/share/minvmd-rootfs/rootfs.img 2>/dev/null | head -1)"
+            [ -n "$src" ] || { echo "::error::minvmd-rootfs image not in build cache (build produced nothing)"; exit 1; }
+            echo "materialize copy failed; using freshly-built cache output: $src"
+            cp "$src" "$GITHUB_WORKSPACE/rootfs.img"
           fi
+          [ -s "$GITHUB_WORKSPACE/rootfs.img" ] || { echo "::error::rootfs.img not produced"; exit 1; }
+          echo "rootfs.img: $(wc -c < "$GITHUB_WORKSPACE/rootfs.img") bytes"
       - name: Upload rootfs artifact
         uses: actions/upload-artifact@v4
         with:
