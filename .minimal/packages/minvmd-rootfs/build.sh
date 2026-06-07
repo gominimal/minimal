@@ -30,6 +30,10 @@ mkdir -p "$STAGE/bin" "$STAGE/sbin" "$STAGE/etc/minvmd"
 mkdir -p "$STAGE/dev" "$STAGE/proc" "$STAGE/sys" "$STAGE/run" "$STAGE/tmp"
 chmod 1777 "$STAGE/tmp"
 
+# Mountpoint for the writable state disk (/dev/vdb). It must exist in the
+# read-only root image — the guest cannot mkdir it at boot (EROFS).
+mkdir -p "$STAGE/var/lib/minimal"
+
 # Guarantee /bin/sh for the init script's shebang.
 if [ ! -e "$STAGE/bin/sh" ]; then
   if [ -e "$STAGE/bin/bash" ]; then
