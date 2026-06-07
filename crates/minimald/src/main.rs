@@ -275,15 +275,25 @@ async fn run_guest(config: Config, port: u32) -> Result<(), MainError> {
     std::fs::create_dir_all(config.minimal_cache_dir.as_utf8_path())
         .map_err(|e| MainError::IO(e, "creating cache dir"))?;
 
-    // Announce we have booted, then serve. The marker is best-effort: log but
-    // do not abort serving if the host is not listening yet.
+    // Serve over a UDS fronted by a socat vsock->UDS relay. libkrun's vsock
+    // bridge does not deliver to a tokio-vsock listener (see guest::spawn_vsock_relay),
+    // so bind the UDS, start the relay, then serve via the native UDS path. The
+    // UDS must live on the writable data disk — the root (incl. /run) is ro.
+    let guest_uds = format!("{}/minimald.sock", guest::STATE_DISK_MOUNT);
+    let _ = std::fs::remove_file(&guest_uds);
+    let listener =
+        UnixListener::bind(&guest_uds).map_err(|e| MainError::IO(e, "binding guest UDS"))?;
+    let _relay = guest::spawn_vsock_relay(port, &guest_uds)
+        .map_err(|e| MainError::IO(e, "spawning vsock relay"))?;
+
+    // Announce we have booted. Best-effort: log but do not abort serving.
     if let Err(e) = guest::emit_ready_marker().await {
         tracing::warn!(error = %e, "failed to emit boot READY marker");
     }
 
-    Server::run_on_vsock(config, port)
+    Server::run_on_uds(config, listener)
         .await
-        .map_err(|e| MainError::IO(e, "serving on vsock"))
+        .map_err(|e| MainError::IO(e, "serving on guest UDS"))
 }
 
 /// Vsock guest mode is Linux-only; on other platforms it is unsupported.
