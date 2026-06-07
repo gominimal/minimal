@@ -9,10 +9,11 @@ use crate::error::VmError;
 
 /// Arch-appropriate libkrun kernel format constant.
 ///
-/// - `aarch64`: the `virtio-kernel-raw` package ships the **uncompressed**
-///   `Image` → `KRUN_KERNEL_FORMAT_RAW`. Loading raw skips libkrun's gzip
-///   decompress, which measured ~77 ms (over half of boot-to-READY) versus a
-///   `PE_GZ` `Image.gz`. The aarch64 loader implements only RAW and PE_GZ.
+/// - `aarch64`: the kernel is shipped **uncompressed** (`fetch-virtio-kernel.sh`
+///   gunzips the upstream `Image.gz`) and loaded with `KRUN_KERNEL_FORMAT_RAW`.
+///   Loading raw skips libkrun's gzip decompress, which measured ~77 ms (over
+///   half of boot-to-READY) versus a `PE_GZ` `Image.gz`. The aarch64 loader
+///   implements only RAW and PE_GZ.
 /// - `x86_64`:  `virtio-linux` ships `bzImage`  → `KRUN_KERNEL_FORMAT_ELF`.
 #[cfg(target_os = "macos")]
 pub fn kernel_format() -> u32 {

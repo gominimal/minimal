@@ -1,10 +1,16 @@
 #!/bin/sh
-# Materialize the virtio-linux kernel (vmlinuz / Image.gz) using the `minimal`
-# CLI built from THIS repo's sources, against the repo's own `.minimal/minimal.toml`
-# (which pins the upstream commit and declares the `virtio-kernel` raw-file
-# output). No promoted CLI download, no scratch project: the kernel is pulled
-# from the public build cache keyed by the pinned `locked_commit`, so this is a
-# cache fetch, not a kernel compile (assuming a cache hit).
+# Materialize the virtio-linux kernel using the `minimal` CLI built from THIS
+# repo's sources, against the repo's own `.minimal/minimal.toml` (which pins the
+# upstream commit and declares the `virtio-kernel` raw-file output), then
+# decompress it to a raw Image. No promoted CLI download, no scratch project: the
+# kernel is pulled from the public build cache keyed by the pinned
+# `locked_commit`, so this is a cache fetch, not a kernel compile.
+#
+# The upstream output is gzip (`Image.gz`); we gunzip it here so minvmd can load
+# it with KRUN_KERNEL_FORMAT_RAW and skip libkrun's in-VMM gzip decompress
+# (~77 ms, over half of boot-to-READY). gunzip is arch-agnostic, so this runs on
+# any host (unlike building an arm64 decompression package, which a non-arm64
+# runner cannot do).
 #
 # Linux-only: package materialization runs the build pipeline natively on Linux.
 # On macOS the CLI runs inside a VM and only the project dir syncs to the host;
@@ -35,5 +41,8 @@ cargo build -p minimal
 MINIMAL="$ROOT/target/debug/minimal"
 
 mkdir -p "$(dirname "$DEST")"
-"$MINIMAL" materialize --output "$DEST" --arch "$ARCH" virtio-kernel
-echo "fetched kernel -> $DEST ($(wc -c < "$DEST" | tr -d ' ') bytes)"
+gz="$(mktemp)"
+trap 'rm -f "$gz"' EXIT
+"$MINIMAL" materialize --output "$gz" --arch "$ARCH" virtio-kernel
+gunzip -c "$gz" > "$DEST"
+echo "fetched kernel -> $DEST ($(wc -c < "$DEST" | tr -d ' ') bytes, uncompressed)"

@@ -24,9 +24,12 @@ Prereqs:
 #    macOS caveat: the shim runs minimal in a VM and only syncs the project dir
 #    back to the host, so --output MUST be a path under the repo. A /tmp path is
 #    written inside the VM and never appears on the host.
+#    The kernel output is gzip (Image.gz); gunzip it so minvmd can load it raw
+#    (KRUN_KERNEL_FORMAT_RAW) and skip libkrun's ~77 ms decompress.
 mkdir -p .scratch
-minimal materialize --output .scratch/vmlinuz    --arch aarch64 virtio-kernel
-minimal materialize --output .scratch/rootfs.img --arch aarch64 minvmd-rootfs
+minimal materialize --output .scratch/vmlinuz.gz  --arch aarch64 virtio-kernel
+gunzip -c .scratch/vmlinuz.gz > .scratch/vmlinuz
+minimal materialize --output .scratch/rootfs.img  --arch aarch64 minvmd-rootfs
 
 # 2. Build minvmd (+ minimal2 for the autospawn path) WITHOUT running.
 cargo build -p minvmd --bin minvmd -p minimal2 --bin minimal2
@@ -64,9 +67,10 @@ MINVMD_ROOTFS_PATH="$PWD/.scratch/rootfs.img" \
 ## How it boots
 
 - Kernel loaded via `krun_set_kernel` as a raw uncompressed aarch64 `Image`
-  (`KRUN_KERNEL_FORMAT_RAW`). The `virtio-kernel` output is the `virtio-kernel-raw`
-  package, which `gunzip`s the upstream `Image.gz`; loading raw skips libkrun's
-  in-VMM gzip decompress (~77 ms, over half of boot-to-READY).
+  (`KRUN_KERNEL_FORMAT_RAW`). The upstream `virtio-kernel` output is gzip
+  (`Image.gz`); `fetch-virtio-kernel.sh` (CI) and the step above (local) `gunzip`
+  it. Loading raw skips libkrun's in-VMM gzip decompress (~77 ms, over half of
+  boot-to-READY).
 - Rootfs loaded via `krun_add_disk2` as `/dev/vda`; cmdline
   `console=hvc0 root=/dev/vda rootfstype=ext4 ro init=<exec-target>`. A block
   root has **no** libkrun `/init.krun`, so the kernel runs the exec target

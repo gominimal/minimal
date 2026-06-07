@@ -44,8 +44,8 @@ cmd = ["/usr/bin/bash", "-l"]
 
 [outputs.virtio-kernel]
 type = "raw-file"
-packages = ["virtio-kernel-raw"]
-path = "usr/share/virtio-linux/Image"
+packages = ["virtio-linux"]
+path = "usr/share/virtio-linux/vmlinuz"
 
 [outputs.minvmd-rootfs]
 type = "raw-file"
