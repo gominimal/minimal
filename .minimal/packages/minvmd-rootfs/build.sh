@@ -75,6 +75,12 @@ MANIFEST
          usr/share/gdb && \
   find . \( -name '*.a' -o -name '*.la' -o -name '*.o' \) -delete 2>/dev/null || true )
 
+# Fail loudly (not silently with an empty output) if the image tool is absent.
+command -v mke2fs >/dev/null || {
+  echo "ERROR: mke2fs not found on PATH ($PATH) — is e2fsprogs in build_deps?" >&2
+  exit 1
+}
+
 # Pack the staging tree into a raw ext4 image (mke2fs -d copies the tree).
 # Read-only root, so size tight: tree size + 5% + 4 MiB headroom, in 1 KiB blocks.
 OUT="$OUTPUT_DIR/usr/share/minvmd-rootfs"
@@ -82,3 +88,12 @@ mkdir -p "$OUT"
 KB="$(du -sk "$STAGE" | cut -f1)"
 BLOCKS=$(( KB + KB / 20 + 4096 ))
 mke2fs -q -t ext4 -d "$STAGE" -b 1024 -F "$OUT/rootfs.img" "$BLOCKS"
+
+# Assert the output exists so a silent mke2fs failure surfaces here rather than
+# downstream as a missing materialize output.
+[ -s "$OUT/rootfs.img" ] || {
+  echo "ERROR: mke2fs did not produce $OUT/rootfs.img" >&2
+  ls -la "$OUT" >&2 || true
+  exit 1
+}
+echo "built rootfs.img: $(wc -c < "$OUT/rootfs.img") bytes"
