@@ -255,10 +255,12 @@ fn guest_config() -> Config {
 async fn run_guest(config: Config, port: u32) -> Result<(), MainError> {
     use minimald::guest;
 
-    // pid-1 hygiene: the kernel auto-mounts /dev (devtmpfs) but not /proc or
-    // /sys, and as pid-1 we must reap orphaned children (hakoniwa double-forks).
+    // pid-1 hygiene: the kernel auto-mounts /dev (devtmpfs) but not /proc or /sys.
     guest::mount_pseudo_filesystems();
-    guest::install_child_reaper();
+    // NB: no eager `waitpid(-1)` SIGCHLD reaper here — it races tokio's process
+    // reaping and steals exec children's exit status (ECHILD -> wrong exit code).
+    // tokio reaps its own children; reaping hakoniwa double-fork orphans needs a
+    // tokio-compatible reaper and is deferred (spec: revisit if zombies bite).
 
     // Mount the writable state disk; minimald has nowhere to write its session
     // store or host key without it (the root image is read-only).
