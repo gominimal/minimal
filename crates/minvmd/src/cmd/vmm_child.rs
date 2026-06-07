@@ -7,9 +7,11 @@
 //! On macOS:
 //! 1. Reads kernel and rootfs from `MINVMD_KERNEL_PATH` / `MINVMD_ROOTFS_PATH`.
 //! 2. Reads the READY-marker socket path from `MINVMD_MARKER_SOCK`.
-//! 3. Creates and configures a libkrun context (kernel, rootfs, resources).
-//! 4. Sets the guest workload via `krun_set_exec` (libkrun's `/init.krun` runs
-//!    as PID 1 and forks it); default `/sbin/minvmd-stub-init`, `MINVMD_EXEC`
+//! 3. Creates and configures a libkrun context (kernel + cmdline, ext4 root
+//!    disk via `krun_add_disk2`, resources).
+//! 4. Sets the guest workload via the kernel `init=` cmdline: the ext4 block
+//!    root has no libkrun `/init.krun`, so the kernel execs the workload
+//!    directly as PID 1. Default `/sbin/minvmd-stub-init`, `MINVMD_EXEC`
 //!    overrides.
 //! 5. Registers the marker socket for `VSOCK_MARKER_PORT` (guest→host): the
 //!    guest workload connects to that vsock port and writes `READY\n`, which
@@ -45,26 +47,22 @@ fn run_macos() -> Result<()> {
         format!("reading {MARKER_SOCK_ENV}: VMM child must be spawned by `minvmd boot`")
     })?;
 
-    let mut ctx = Context::create().context("krun_create_ctx")?;
-    // 2 vCPU / 1024 MiB: 512 MiB is the practical floor to reach Alpine
-    // userspace; 1024 MiB is cheap headroom under Hypervisor.framework with no
-    // boot penalty. (Stay below the kernel's CONFIG_NR_CPUS.) The boot command
-    // may expose these as flags in a future change.
-    let cfg = VmConfig::new(2, 1024, kernel, rootfs);
-    cfg.apply(&mut ctx)
-        .context("applying VmConfig to krun context")?;
-
-    // Set the guest workload. libkrun's own init (`/init.krun`) runs as PID 1,
-    // mounts /proc,/sys,/dev, reads this target from /.krun_config.json, and
-    // forks it — so the rootfs needs no init system, only this binary. Default
-    // to the v0.1 bring-up stub; `MINVMD_EXEC` overrides (e.g. /sbin/minimald).
-    // Pass an explicit minimal envp (not None): None inherits the full host env
-    // into the guest, which can overflow the ~2 KiB aarch64 kernel cmdline.
+    // Guest workload run as the kernel `init=`. The root is a block device
+    // (ext4 via krun_add_disk2), which has no libkrun `/init.krun`, so the
+    // kernel execs this directly as PID 1. Default to the v0.1 bring-up stub;
+    // `MINVMD_EXEC` overrides (e.g. /sbin/minimald in Stage 2).
     let exec =
         std::env::var("MINVMD_EXEC").unwrap_or_else(|_| "/sbin/minvmd-stub-init".to_string());
-    let argv: [&str; 0] = [];
-    ctx.set_exec(&exec, &argv, Some(&["PATH=/usr/sbin:/usr/bin:/sbin:/bin"]))
-        .with_context(|| format!("setting guest exec workload: {exec}"))?;
+
+    let mut ctx = Context::create().context("krun_create_ctx")?;
+    // 2 vCPU / 1024 MiB: 512 MiB is the practical floor to reach userspace;
+    // 1024 MiB is cheap headroom under Hypervisor.framework with no boot
+    // penalty. (Stay below the kernel's CONFIG_NR_CPUS.) The boot command may
+    // expose these as flags in a future change. `apply` configures the kernel +
+    // cmdline (with `init=exec`), the ext4 root disk, and the vsock bridge.
+    let cfg = VmConfig::new(2, 1024, kernel, rootfs, exec.clone());
+    cfg.apply(&mut ctx)
+        .context("applying VmConfig to krun context")?;
 
     // Optional early-boot console capture for diagnosing a stuck boot. Off by
     // default; set `MINVMD_BOOT_LOG=<path>` to capture hvc0 to a host file.

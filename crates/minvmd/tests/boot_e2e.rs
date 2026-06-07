@@ -7,7 +7,8 @@
 //!   this env var is set (prevents accidental VM boot on a dev machine without
 //!   a kernel and rootfs).
 //! - `MINVMD_KERNEL_PATH` and `MINVMD_ROOTFS_PATH` must be set to the paths of
-//!   the `virtio-linux` kernel image and Alpine minirootfs respectively.
+//!   the `virtio-linux` kernel image and the `minvmd-rootfs` ext4 disk image
+//!   respectively.
 //!
 //! The test spawns `minvmd boot --foreground`, waits up to 10 s for the
 //! `vm-up` marker on stdout, then kills the child. A `vm-up` line confirms

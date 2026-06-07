@@ -26,6 +26,11 @@ pub const KRUN_KERNEL_FORMAT_ELF: u32 = 1;
 pub const KRUN_KERNEL_FORMAT_PE_GZ: u32 = 2;
 pub const KRUN_KERNEL_FORMAT_IMAGE_GZ: u32 = 4;
 
+// Disk image formats from libkrun.h, used by `krun_add_disk2`. A squashfs or
+// ext4 rootfs image is a RAW block device (the filesystem lives inside it; no
+// partition table). QCOW2=1, VMDK=2 are not used by minvmd.
+pub const KRUN_DISK_FORMAT_RAW: u32 = 0;
+
 // SAFETY: every function in this block is an `extern "C"` declaration that
 // inherits its safety contract from libkrun.h. Specifically:
 //
@@ -119,6 +124,17 @@ unsafe extern "C" {
     /// Redirect the implicit console output to a host file. Used by the
     /// supervisor to capture early-boot kernel output for diagnostics.
     pub fn krun_set_console_output(ctx_id: u32, c_filepath: *const c_char) -> i32;
+
+    /// Add a disk image as a virtio-blk block device. `block_id` names the
+    /// partition; `disk_format` is one of `KRUN_DISK_FORMAT_*`. Used to back
+    /// the guest root with a squashfs/ext4 image instead of virtiofs.
+    pub fn krun_add_disk2(
+        ctx_id: u32,
+        block_id: *const c_char,
+        disk_path: *const c_char,
+        disk_format: u32,
+        read_only: bool,
+    ) -> i32;
 }
 
 /// Translate a libkrun return code into a `Result`.

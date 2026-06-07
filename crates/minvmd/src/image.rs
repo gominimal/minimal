@@ -43,7 +43,9 @@ pub fn resolve_kernel_path() -> Result<PathBuf, VmError> {
 
 /// Resolve the rootfs path from `MINVMD_ROOTFS_PATH`.
 ///
-/// Returns `VmError::MissingEnv` when the variable is unset or empty.
+/// This is the path to a read-only ext4 root disk image (loaded via
+/// `krun_add_disk2`), not a directory. Returns `VmError::MissingEnv` when the
+/// variable is unset or empty.
 pub fn resolve_rootfs_path() -> Result<PathBuf, VmError> {
     let val = std::env::var("MINVMD_ROOTFS_PATH").map_err(|_| VmError::MissingEnv {
         var: "MINVMD_ROOTFS_PATH",
