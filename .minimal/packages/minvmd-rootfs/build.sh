@@ -82,12 +82,16 @@ command -v mke2fs >/dev/null || {
 }
 
 # Pack the staging tree into a raw ext4 image (mke2fs -d copies the tree).
-# Read-only root, so size tight: tree size + 5% + 4 MiB headroom, in 1 KiB blocks.
+# Size = tree + 10% + 8 MiB headroom, in 1 KiB blocks. The headroom must cover
+# ext4 metadata (inode tables) that `du` does not account for, or `mke2fs -d`
+# can fail to fit the tree.
 OUT="$OUTPUT_DIR/usr/share/minvmd-rootfs"
 mkdir -p "$OUT"
 KB="$(du -sk "$STAGE" | cut -f1)"
-BLOCKS=$(( KB + KB / 20 + 4096 ))
-mke2fs -q -t ext4 -d "$STAGE" -b 1024 -F "$OUT/rootfs.img" "$BLOCKS"
+BLOCKS=$(( KB + KB / 10 + 8192 ))
+# No journal (`-O ^has_journal`): the root mounts read-only, so the journal is
+# pure overhead and its ~4 MiB+ reservation can overflow a tight image.
+mke2fs -q -t ext4 -O ^has_journal -d "$STAGE" -b 1024 -F "$OUT/rootfs.img" "$BLOCKS"
 
 # Assert the output exists so a silent mke2fs failure surfaces here rather than
 # downstream as a missing materialize output.
