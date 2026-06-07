@@ -1,4 +1,4 @@
-let { BuildSpec, Local, OutputData, upstream, .. } = import "minimal.ncl" in
+let { upstream, BuildSpec, Local, OutputData, .. } = import "minimal.ncl" in
 {
   name = "minvmd-rootfs",
 
