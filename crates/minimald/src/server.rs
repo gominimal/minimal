@@ -153,10 +153,17 @@ impl Server {
         let russh_config = build_russh_config(&state).await;
         let mut session_set = JoinSet::new();
         loop {
-            let (stream, _) = listener.accept().await?;
+            let (stream, peer) = listener.accept().await?;
+            tracing::info!(?peer, "accepted vsock connection");
             let (_conn_hnd, session_fut) =
                 Connection::from_stream(stream, russh_config.clone(), state.clone(), true).await;
-            session_set.spawn(session_fut);
+            // Log session errors instead of silently dropping the spawned
+            // future, so a failed handshake on the vsock transport is visible.
+            session_set.spawn(async move {
+                if let Err(e) = session_fut.await {
+                    tracing::warn!(error = %e, "vsock session ended with error");
+                }
+            });
         }
     }
 
