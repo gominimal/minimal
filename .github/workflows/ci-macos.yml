@@ -187,6 +187,14 @@ jobs:
           MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz" \
           MINVMD_ROOTFS_PATH="$RUNNER_TEMP/rootfs/rootfs.img" \
             "$testbin" --include-ignored --nocapture
+      - name: Boot latency benchmark (informational)
+        # Report boot-to-READY min/median/max on the runner. Uses the already
+        # codesigned minvmd; non-gating (boot correctness is gated by the e2e
+        # tests above), so a timing hiccup never reds the build.
+        run: |
+          MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz" \
+          MINVMD_ROOTFS_PATH="$RUNNER_TEMP/rootfs/rootfs.img" \
+            scripts/bench-minvmd-boot.sh 10 target/debug/minvmd || true
       - name: Upload guest boot console log
         # Capture hvc0 output for diagnosing a stuck/failed boot (e.g. a missing
         # virtio driver in the kernel). Always runs so a red boot is debuggable.

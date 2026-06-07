@@ -64,6 +64,21 @@ MINVMD_ROOTFS_PATH="$PWD/.scratch/rootfs.img" \
   "$testbin" --include-ignored --nocapture
 ```
 
+## Boot-latency benchmark
+
+`scripts/bench-minvmd-boot.sh` times `minvmd boot` to the guest READY marker over
+N runs (default 10) and reports min/median/max. Needs a codesigned `minvmd` and
+the kernel + rootfs paths:
+
+```sh
+MINVMD_KERNEL_PATH="$PWD/.scratch/vmlinuz" \
+MINVMD_ROOTFS_PATH="$PWD/.scratch/rootfs.img" \
+  scripts/bench-minvmd-boot.sh
+```
+
+CI runs it (informational) in the `boot-e2e` job. Typical: ~67 ms median on
+Apple Silicon — see the uncompressed-kernel note below.
+
 ## How it boots
 
 - Kernel loaded via `krun_set_kernel` as a raw uncompressed aarch64 `Image`
