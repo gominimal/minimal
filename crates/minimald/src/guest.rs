@@ -62,6 +62,50 @@ pub async fn emit_ready_marker() -> std::io::Result<()> {
     }))
 }
 
+/// Default device + mountpoint for the writable state disk.
+///
+/// The guest root image is read-only, but minimald's session store, SSH host
+/// key, and build caches need a writable location. The host attaches a second
+/// virtio-blk device (`/dev/vdb`) backed by a persistent ext4 image; we mount it
+/// here and resolve the state + cache dirs underneath it.
+pub const STATE_DISK_DEVICE: &str = "/dev/vdb";
+pub const STATE_DISK_MOUNT: &str = "/var/lib/minimal";
+
+/// Mounts the writable state disk (`device`, ext4) at `target`.
+///
+/// Unlike the pseudo-filesystem mounts this is required for guest mode: without
+/// it minimald has nowhere to write its session store or host key. An `EBUSY`
+/// (already mounted) is treated as success; any other failure is returned.
+pub fn mount_state_disk(device: &str, target: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(target)?;
+    let to_io = |_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in mount argument");
+    let c_device = CString::new(device).map_err(to_io)?;
+    let c_target = CString::new(target).map_err(to_io)?;
+    let c_fstype = CString::new("ext4").map_err(to_io)?;
+
+    // SAFETY: `mount(2)` with valid, call-lifetime C strings for
+    // source/target/fstype, no flags (read-write), and a null data pointer.
+    let rc = unsafe {
+        libc::mount(
+            c_device.as_ptr(),
+            c_target.as_ptr(),
+            c_fstype.as_ptr(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EBUSY) {
+            tracing::debug!(target, "state disk already mounted");
+            return Ok(());
+        }
+        return Err(err);
+    }
+    tracing::info!(device, target, "mounted state disk");
+    Ok(())
+}
+
 /// Mounts `/proc` and `/sys` if they are not already present.
 ///
 /// The kernel auto-mounts devtmpfs on `/dev`, but not these pseudo

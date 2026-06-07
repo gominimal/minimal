@@ -159,6 +159,19 @@ async fn main() -> Result<(), MainError> {
         return Ok(());
     }
 
+    // Guest (in-VM, pid-1) mode: activated by `--guest` or MINIMALD_VSOCK_PORT.
+    // Handled before the host-dependent state-dir resolution below — as pid-1
+    // there is no HOME, so state/cache resolve to the mounted state disk
+    // instead of `dirs::state_dir()`.
+    #[cfg(target_os = "linux")]
+    if let Command::Run(ListenArgs {
+        guest, vsock_port, ..
+    }) = &cli.command
+        && (*guest || std::env::var_os("MINIMALD_VSOCK_PORT").is_some())
+    {
+        return run_guest(guest_config(), *vsock_port).await;
+    }
+
     if let Err(e) = std::fs::create_dir_all(cli.minimal_state_dir())
         && e.kind() != std::io::ErrorKind::AlreadyExists
     {
@@ -184,16 +197,6 @@ async fn main() -> Result<(), MainError> {
         minimal_state_dir: cli.minimal_state_dir(),
         minimal_cache_dir: cli.minimal_cache_dir(),
     };
-
-    // Guest (in-VM, pid-1) mode: serve over vsock instead of a UDS socket.
-    // Activated by `--guest` or by the presence of `MINIMALD_VSOCK_PORT`.
-    if let Command::Run(ListenArgs {
-        guest, vsock_port, ..
-    }) = &cli.command
-        && (*guest || std::env::var_os("MINIMALD_VSOCK_PORT").is_some())
-    {
-        return run_guest(config, *vsock_port).await;
-    }
 
     // If we got this far we need to launch minimald.
     //
@@ -223,8 +226,31 @@ async fn main() -> Result<(), MainError> {
     Ok(())
 }
 
-/// Runs minimald as the in-VM (pid-1) guest: performs pid-1 hygiene, emits the
-/// boot READY marker, then serves SSH over the host-bridged vsock port.
+/// Builds the guest (in-VM) server config with state + cache on the mounted
+/// writable state disk. Independent of HOME/XDG, since as pid-1 neither is set
+/// and the root image is read-only.
+#[cfg(target_os = "linux")]
+fn guest_config() -> Config {
+    use minimald::guest::STATE_DISK_MOUNT;
+    let state = DaemonAbsPath::try_new(Utf8PathBuf::from(STATE_DISK_MOUNT)).unwrap();
+    let cache =
+        DaemonAbsPath::try_new(Utf8PathBuf::from(format!("{STATE_DISK_MOUNT}/cache"))).unwrap();
+    let provider =
+        sub_path!(state, "providers").join(&DaemonRelPath::try_new("local-0".to_string()).unwrap());
+    let host_key_path = sub_path!(provider, "ssh_host_ed25519_key");
+    Config {
+        host_key: HostKey::OnDisk {
+            path: host_key_path.as_utf8_path().into(),
+            create_if_missing: true,
+        },
+        minimal_state_dir: state,
+        minimal_cache_dir: cache,
+    }
+}
+
+/// Runs minimald as the in-VM (pid-1) guest: mounts the writable state disk,
+/// performs pid-1 hygiene, emits the boot READY marker, then serves SSH over
+/// the host-bridged vsock port.
 #[cfg(target_os = "linux")]
 async fn run_guest(config: Config, port: u32) -> Result<(), MainError> {
     use minimald::guest;
@@ -233,6 +259,21 @@ async fn run_guest(config: Config, port: u32) -> Result<(), MainError> {
     // /sys, and as pid-1 we must reap orphaned children (hakoniwa double-forks).
     guest::mount_pseudo_filesystems();
     guest::install_child_reaper();
+
+    // Mount the writable state disk; minimald has nowhere to write its session
+    // store or host key without it (the root image is read-only).
+    guest::mount_state_disk(guest::STATE_DISK_DEVICE, guest::STATE_DISK_MOUNT)
+        .map_err(|e| MainError::IO(e, "mounting state disk"))?;
+    // Ensure the host-key (provider) and cache dirs exist on the fresh disk.
+    let provider_dir = config
+        .minimal_state_dir
+        .as_utf8_path()
+        .join("providers")
+        .join("local-0");
+    std::fs::create_dir_all(&provider_dir)
+        .map_err(|e| MainError::IO(e, "creating provider dir"))?;
+    std::fs::create_dir_all(config.minimal_cache_dir.as_utf8_path())
+        .map_err(|e| MainError::IO(e, "creating cache dir"))?;
 
     // Announce we have booted, then serve. The marker is best-effort: log but
     // do not abort serving if the host is not listening yet.
