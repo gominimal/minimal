@@ -63,8 +63,10 @@ MINVMD_ROOTFS_PATH="$PWD/.scratch/rootfs.img" \
 
 ## How it boots
 
-- Kernel loaded via `krun_set_kernel` with the arch format (`PE_GZ` for the
-  aarch64 `Image.gz`).
+- Kernel loaded via `krun_set_kernel` as a raw uncompressed aarch64 `Image`
+  (`KRUN_KERNEL_FORMAT_RAW`). The `virtio-kernel` output is the `virtio-kernel-raw`
+  package, which `gunzip`s the upstream `Image.gz`; loading raw skips libkrun's
+  in-VMM gzip decompress (~77 ms, over half of boot-to-READY).
 - Rootfs loaded via `krun_add_disk2` as `/dev/vda`; cmdline
   `console=hvc0 root=/dev/vda rootfstype=ext4 ro init=<exec-target>`. A block
   root has **no** libkrun `/init.krun`, so the kernel runs the exec target

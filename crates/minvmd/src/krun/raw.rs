@@ -22,6 +22,7 @@ use crate::error::VmError;
 // - x86_64  `virtio-linux` ships `bzImage`  → `KRUN_KERNEL_FORMAT_ELF`. libkrun
 //   loads bzImage as ELF; `IMAGE_BZ2` (=3) is bzip2 blobs, not the bzImage
 //   container format.
+pub const KRUN_KERNEL_FORMAT_RAW: u32 = 0;
 pub const KRUN_KERNEL_FORMAT_ELF: u32 = 1;
 pub const KRUN_KERNEL_FORMAT_PE_GZ: u32 = 2;
 pub const KRUN_KERNEL_FORMAT_IMAGE_GZ: u32 = 4;
