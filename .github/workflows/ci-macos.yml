@@ -108,9 +108,10 @@ jobs:
     # Separate from build-macos so a kernel-fetch hiccup never blocks the
     # always-green clippy/test/smoke checks.
     #
-    # GATING: green on the runner — kernel PE_GZ load, virtio-fs root,
-    # /init.krun exec of the stub, and the guest READY connect-out on vsock 7350
-    # (krun_add_vsock_port == listen=false; host + guest both 7350). See #326.
+    # GATING: green on the runner — raw kernel load (KRUN_KERNEL_FORMAT_RAW),
+    # ext4 block root (/dev/vda via krun_add_disk2), kernel `init=` exec of the
+    # stub (no /init.krun on a block root), and the guest READY connect-out on
+    # vsock 7350 (krun_add_vsock_port == listen=false; host + guest both 7350).
     if: ${{ vars.RUN_MACOS_CI != 'false' }}
     needs: [virtio-kernel, minvmd-rootfs]
     runs-on: [self-hosted, macOS, ARM64]
@@ -147,9 +148,10 @@ jobs:
       - name: Codesign minvmd (hypervisor entitlement, R1.4)
         run: codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
       - name: Boot E2E (READY round-trip)
-        # Gating: a real Alpine microVM must boot and the guest must write READY
-        # over vsock 7350 within the budget. Also validates the virtio-linux
-        # kernel config (virtio-MMIO / VIRTIO_FS / VSOCK / HVC).
+        # Gating: a real microVM must boot from the ext4 root image and the
+        # guest must write READY over vsock 7350 within the budget. Also
+        # validates the virtio-linux kernel config (virtio-MMIO / VIRTIO_BLK /
+        # EXT4 / VSOCK / HVC).
         run: |
           testbin="$(ls -1t target/debug/deps/boot_e2e-* | grep -v '\.d$' | head -1)"
           test -x "$testbin" || { echo "::error::boot_e2e test binary not found"; exit 1; }
