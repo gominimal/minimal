@@ -32,3 +32,7 @@ ot.workspace = true
 paths.workspace = true
 sessions.workspace = true
 stdlib.workspace = true
+
+# The guest (vsock pid-1) transport is Linux-only.
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock.workspace = true

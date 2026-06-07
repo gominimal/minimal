@@ -135,14 +135,33 @@ impl Server {
         Server { state, listener }.run().await
     }
 
-    async fn run(self) -> Result<(), std::io::Error> {
-        let russh_config = Arc::new(russh::server::Config {
-            keys: vec![self.state.host_key().await.unwrap()],
-            auth_rejection_time_initial: Some(std::time::Duration::ZERO),
-            nodelay: true,
-            ..Default::default()
-        });
+    /// Launches minimald listening for connections on an AF_VSOCK port.
+    ///
+    /// Used by the in-VM (pid-1) guest: the host registers the port via
+    /// `krun_add_vsock_port2` and bridges client SSH connections to it.
+    /// The vsock peer is host-mediated (`net=none`) and as trusted as the
+    /// UDS peer, so accepted connections are treated as local
+    /// ([`Auth::Local`]), matching `run_on_uds`.
+    #[cfg(target_os = "linux")]
+    pub async fn run_on_vsock(config: Config, port: u32) -> Result<(), std::io::Error> {
+        use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
 
+        let state = ServerStateHandle::new(config).await?;
+        let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port))?;
+        tracing::info!(port, "minimald listening on vsock");
+
+        let russh_config = build_russh_config(&state).await;
+        let mut session_set = JoinSet::new();
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let (_conn_hnd, session_fut) =
+                Connection::from_stream(stream, russh_config.clone(), state.clone(), true).await;
+            session_set.spawn(session_fut);
+        }
+    }
+
+    async fn run(self) -> Result<(), std::io::Error> {
+        let russh_config = build_russh_config(&self.state).await;
         let mut session_set = JoinSet::new();
         loop {
             let (socket, _) = self.listener.accept().await?;
@@ -152,4 +171,14 @@ impl Server {
             session_set.spawn(session_fut);
         }
     }
+}
+
+/// Builds the shared russh server config from the server state.
+async fn build_russh_config(state: &ServerStateHandle) -> Arc<russh::server::Config> {
+    Arc::new(russh::server::Config {
+        keys: vec![state.host_key().await.unwrap()],
+        auth_rejection_time_initial: Some(std::time::Duration::ZERO),
+        nodelay: true,
+        ..Default::default()
+    })
 }
