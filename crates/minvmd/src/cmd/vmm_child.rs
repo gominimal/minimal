@@ -54,13 +54,22 @@ fn run_macos() -> Result<()> {
     let exec =
         std::env::var("MINVMD_EXEC").unwrap_or_else(|_| "/sbin/minvmd-stub-init".to_string());
 
+    // Provision the persistent writable data disk (rw /dev/vdb) the guest uses
+    // for minimald's session store + SSH host key. A sparse raw image created on
+    // first run; the guest formats it on first boot (no host mke2fs needed).
+    let data_disk = crate::state::StateDir::new(crate::state::StateDir::default_path())
+        .context("opening state dir")?
+        .data_disk_path();
+    provision_data_disk(&data_disk, DATA_DISK_BYTES).context("provisioning data disk")?;
+
     let mut ctx = Context::create().context("krun_create_ctx")?;
     // 2 vCPU / 1024 MiB: 512 MiB is the practical floor to reach userspace;
     // 1024 MiB is cheap headroom under Hypervisor.framework with no boot
     // penalty. (Stay below the kernel's CONFIG_NR_CPUS.) The boot command may
     // expose these as flags in a future change. `apply` configures the kernel +
-    // cmdline (with `init=exec`), the ext4 root disk, and the vsock bridge.
-    let cfg = VmConfig::new(2, 1024, kernel, rootfs, exec.clone());
+    // cmdline (with `init=exec`), the ext4 root disk, the rw data disk, and the
+    // vsock bridge.
+    let cfg = VmConfig::new(2, 1024, kernel, rootfs, exec.clone()).with_data_disk(data_disk);
     cfg.apply(&mut ctx)
         .context("applying VmConfig to krun context")?;
 
@@ -92,4 +101,24 @@ fn run_macos() -> Result<()> {
     // error so the parent can observe the child's non-zero exit.
     let err = ctx.start_enter();
     bail!("krun_start_enter returned unexpectedly: {err}");
+}
+
+/// Size of the persistent guest data disk. Sparse, so this is a ceiling, not
+/// an upfront allocation.
+#[cfg(target_os = "macos")]
+const DATA_DISK_BYTES: u64 = 1 << 30; // 1 GiB
+
+/// Create a sparse raw image at `path` if it does not exist. The guest formats
+/// it (ext4) on first boot, so the host needs no filesystem tooling.
+#[cfg(target_os = "macos")]
+fn provision_data_disk(path: &std::path::Path, size_bytes: u64) -> std::io::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let f = std::fs::File::create(path)?;
+    f.set_len(size_bytes)?;
+    Ok(())
 }

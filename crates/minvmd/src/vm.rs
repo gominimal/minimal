@@ -24,6 +24,10 @@ pub struct VmConfig {
     /// Guest workload run as the kernel `init=` (a block root has no libkrun
     /// `/init.krun`, so the kernel execs this directly as PID 1).
     pub exec_target: String,
+    /// Optional persistent writable data disk, attached rw as `/dev/vdb`. The
+    /// guest (minimald) formats it on first boot and mounts it for its session
+    /// store + SSH host key (the root is read-only). `None` = no data disk.
+    pub data_disk: Option<PathBuf>,
 }
 
 impl VmConfig {
@@ -42,7 +46,15 @@ impl VmConfig {
             kernel_path,
             rootfs_path,
             exec_target,
+            data_disk: None,
         }
+    }
+
+    /// Attach a persistent writable data disk (rw `/dev/vdb`). Off by default.
+    #[must_use]
+    pub fn with_data_disk(mut self, path: PathBuf) -> Self {
+        self.data_disk = Some(path);
+        self
     }
 
     /// Apply this configuration to an existing libkrun [`Context`][crate::krun::Context].
@@ -75,6 +87,11 @@ impl VmConfig {
             crate::krun::KRUN_DISK_FORMAT_RAW,
             true,
         )?;
+        // Optional writable data disk, added second so it enumerates as
+        // /dev/vdb (read_only = false). The guest formats + mounts it.
+        if let Some(data) = &self.data_disk {
+            ctx.add_disk("data", data, crate::krun::KRUN_DISK_FORMAT_RAW, false)?;
+        }
         // R2.5: no network device in v0.1.
 
         // R3.1: register the host UDS bridge (listen=true). libkrun listens on
