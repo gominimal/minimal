@@ -93,7 +93,18 @@ jobs:
         # VM and only syncs the project dir back to the host.
         run: |
           export PATH="$HOME/.minimal/shim/bin:$PATH"
-          minimal materialize --output "$GITHUB_WORKSPACE/rootfs.img" --arch aarch64 minvmd-rootfs
+          echo "shim minimal: $(minimal --version 2>&1 | tail -1)"
+          if ! minimal materialize --output "$GITHUB_WORKSPACE/rootfs.img" --arch aarch64 minvmd-rootfs; then
+            echo "::group::minvmd-rootfs build cache diagnostics"
+            echo "--- latest minvmd-rootfs output dirs in build cache ---"
+            ls -dt "$HOME"/.cache/minimal/built/*/*/usr/share/minvmd-rootfs 2>/dev/null | head -3 | while read -r d; do
+              echo "$d:"; ls -la "$d" 2>/dev/null
+            done || echo "(no minvmd-rootfs output dir in cache — build produced nothing)"
+            echo "--- most recently written cache dirs ---"
+            ls -dt "$HOME"/.cache/minimal/built/*/* 2>/dev/null | head -3
+            echo "::endgroup::"
+            exit 1
+          fi
       - name: Upload rootfs artifact
         uses: actions/upload-artifact@v4
         with:
