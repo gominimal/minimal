@@ -71,18 +71,35 @@ pub async fn emit_ready_marker() -> std::io::Result<()> {
 pub const STATE_DISK_DEVICE: &str = "/dev/vdb";
 pub const STATE_DISK_MOUNT: &str = "/var/lib/minimal";
 
-/// Mounts the writable state disk (`device`, ext4) at `target`.
+/// Mounts the writable state disk (`device`, ext4) at `target`, formatting it
+/// first if it is blank.
 ///
-/// Unlike the pseudo-filesystem mounts this is required for guest mode: without
-/// it minimald has nowhere to write its session store or host key. An `EBUSY`
-/// (already mounted) is treated as success; any other failure is returned.
+/// The host attaches a freshly-provisioned sparse image on first boot, so the
+/// device is unformatted; the first `mount(2)` fails, we `mke2fs` it (the rootfs
+/// ships e2fsprogs), and retry. On subsequent boots the disk is already ext4 and
+/// the first mount succeeds. Required for guest mode — without it minimald has
+/// nowhere to write its session store or host key.
 pub fn mount_state_disk(device: &str, target: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(target)?;
+    if raw_mount_ext4(device, target).is_ok() {
+        tracing::info!(device, target, "mounted state disk");
+        return Ok(());
+    }
+    // Likely blank on first boot — format ext4, then retry.
+    tracing::info!(device, "state disk mount failed; formatting ext4");
+    format_ext4(device)?;
+    raw_mount_ext4(device, target)?;
+    tracing::info!(device, target, "formatted + mounted state disk");
+    Ok(())
+}
+
+/// Single `mount(2)` of `device` as ext4 at `target`. `EBUSY` (already mounted)
+/// is success.
+fn raw_mount_ext4(device: &str, target: &str) -> std::io::Result<()> {
     let to_io = |_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in mount argument");
     let c_device = CString::new(device).map_err(to_io)?;
     let c_target = CString::new(target).map_err(to_io)?;
     let c_fstype = CString::new("ext4").map_err(to_io)?;
-
     // SAFETY: `mount(2)` with valid, call-lifetime C strings for
     // source/target/fstype, no flags (read-write), and a null data pointer.
     let rc = unsafe {
@@ -97,12 +114,25 @@ pub fn mount_state_disk(device: &str, target: &str) -> std::io::Result<()> {
     if rc != 0 {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EBUSY) {
-            tracing::debug!(target, "state disk already mounted");
             return Ok(());
         }
         return Err(err);
     }
-    tracing::info!(device, target, "mounted state disk");
+    Ok(())
+}
+
+/// Format `device` as ext4 via the rootfs's `mke2fs` (e2fsprogs). No journal:
+/// the data disk is small and crash-consistency is not required for the bring-up
+/// session store.
+fn format_ext4(device: &str) -> std::io::Result<()> {
+    let status = std::process::Command::new("/usr/sbin/mke2fs")
+        .args(["-q", "-F", "-t", "ext4", "-O", "^has_journal", device])
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "mke2fs on {device} failed: {status}"
+        )));
+    }
     Ok(())
 }
 
