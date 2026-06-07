@@ -139,15 +139,13 @@ fn format_ext4(device: &str) -> std::io::Result<()> {
 /// Spawn a socat relay bridging the host-mediated vsock `port` to a local UDS.
 ///
 /// libkrun's `krun_add_vsock_port2` bridge delivers inbound connections to a
-/// `socat VSOCK-LISTEN` guest listener (as exercised by minvmd's bridge_e2e) but
-/// not to a `tokio_vsock::VsockListener` — the connection never reaches accept().
-/// Until that interop is resolved we relay through socat (already in the rootfs)
-/// and let minimald serve the UDS natively via `run_on_uds`. The returned child
-/// is not kill-on-drop; pid-1's reaper handles it.
+/// `socat VSOCK-LISTEN` guest listener (the pattern minvmd's bridge_e2e proves),
+/// so we relay through socat (already in the rootfs) into minimald's native
+/// `run_on_uds` server. This reuses two independently-validated pieces rather
+/// than a direct `tokio_vsock::VsockListener` (unproven against this bridge).
+/// The returned child is not kill-on-drop; pid-1's reaper handles it.
 pub fn spawn_vsock_relay(port: u32, uds_path: &str) -> std::io::Result<std::process::Child> {
     let child = std::process::Command::new("/usr/bin/socat")
-        .arg("-d")
-        .arg("-d")
         .arg(format!("VSOCK-LISTEN:{port},fork"))
         .arg(format!("UNIX-CONNECT:{uds_path}"))
         .spawn()?;
