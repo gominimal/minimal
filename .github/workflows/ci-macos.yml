@@ -39,18 +39,25 @@ permissions:
 
 jobs:
   virtio-kernel:
-    # Pull the prebuilt virtio-linux kernel (vmlinuz / Image.gz) from the public
-    # minimal build cache — no kernel build, no GCS auth — and hand it to the
-    # macOS boot job. The packaging `minimal` CLI is Linux-only, so this runs on
-    # Linux. Cheap (a cache pull), so it is unconditional and decoupled from the
-    # self-hosted runner.
+    # Build the `minimal` CLI from THIS repo's sources, then materialize the
+    # virtio-linux kernel against the repo's own .minimal/minimal.toml. The
+    # kernel is a cache pull keyed by the pinned upstream commit (not a compile),
+    # so this stays cheap and runs on a cheap Linux runner, decoupled from the
+    # self-hosted runner. (The rootfs is built separately on the mac runner —
+    # it is a new package that must be built natively for aarch64.)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - name: Fetch virtio-linux kernel from the build cache
+      - name: Toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Build minimal CLI and materialize virtio-linux kernel
         run: ./scripts/fetch-virtio-kernel.sh "$RUNNER_TEMP/vmlinuz" aarch64
       - name: Upload kernel artifact
         uses: actions/upload-artifact@v4
@@ -59,9 +66,45 @@ jobs:
           path: ${{ runner.temp }}/vmlinuz
           if-no-files-found: error
 
+  minvmd-rootfs:
+    # Build the guest rootfs as a minimal package (ext4 image) on the
+    # self-hosted aarch64 runner. minvmd-rootfs is a new package that must be
+    # built natively for aarch64 (the build container does not emulate), and
+    # macOS package materialization runs through the minimal shim VM. Materialize
+    # once and hand the image to the boot jobs as an artifact.
+    if: ${{ vars.RUN_MACOS_CI != 'false' }}
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Verify minimal shim is available
+        # The minimal CLI shim (runs minimal in a Linux VM) must be provisioned
+        # on the runner, like libkrun. Materialization is Linux-only; on macOS it
+        # goes through the shim.
+        run: |
+          if [ ! -x "$HOME/.minimal/shim/bin/minimal" ] && ! command -v minimal >/dev/null 2>&1; then
+            echo "::error::minimal shim not found. Provision the runner with the minimal CLI shim (~/.minimal/shim/bin/minimal)." >&2
+            exit 1
+          fi
+      - name: Materialize minvmd-rootfs (ext4 image)
+        # Output must live inside the workspace: the macOS shim runs minimal in a
+        # VM and only syncs the project dir back to the host.
+        run: |
+          export PATH="$HOME/.minimal/shim/bin:$PATH"
+          minimal materialize --output "$GITHUB_WORKSPACE/rootfs.img" --arch aarch64 minvmd-rootfs
+      - name: Upload rootfs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: minvmd-rootfs-aarch64
+          path: rootfs.img
+          if-no-files-found: error
+
   boot-e2e:
     # Boot E2E (R2.4 READY round-trip) on real hardware, using the cache-pulled
-    # kernel and the real minvmd guest rootfs (Alpine + READY-writer stub).
+    # kernel and the minvmd guest rootfs ext4 image (built by the minvmd-rootfs
+    # job).
     # Separate from build-macos so a kernel-fetch hiccup never blocks the
     # always-green clippy/test/smoke checks.
     #
@@ -69,7 +112,7 @@ jobs:
     # /init.krun exec of the stub, and the guest READY connect-out on vsock 7350
     # (krun_add_vsock_port == listen=false; host + guest both 7350). See #326.
     if: ${{ vars.RUN_MACOS_CI != 'false' }}
-    needs: virtio-kernel
+    needs: [virtio-kernel, minvmd-rootfs]
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 20
     steps:
@@ -89,12 +132,11 @@ jobs:
         with:
           name: virtio-kernel-aarch64
           path: ${{ runner.temp }}/kernel
-      - name: Stage minvmd guest rootfs
-        # Real R2.2 rootfs: fetch the pinned Alpine minirootfs and overlay socat
-        # + the READY-writer stub (/sbin/minvmd-stub-init) via build-rootfs.sh.
-        # A setup failure fails the job — it is not hidden behind the non-gating
-        # test below.
-        run: scripts/build-rootfs.sh
+      - name: Download minvmd-rootfs image
+        uses: actions/download-artifact@v4
+        with:
+          name: minvmd-rootfs-aarch64
+          path: ${{ runner.temp }}/rootfs
       - name: Build boot + bridge E2E + minvmd (no run)
         # Build both test harnesses + the minvmd bin, then codesign, then run the
         # test BINARIES DIRECTLY (below). Invoking `cargo test` again after
@@ -113,7 +155,7 @@ jobs:
           test -x "$testbin" || { echo "::error::boot_e2e test binary not found"; exit 1; }
           MINVMD_E2E=1 \
           MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz" \
-          MINVMD_ROOTFS_PATH="$(scripts/build-rootfs.sh --print-path)" \
+          MINVMD_ROOTFS_PATH="$RUNNER_TEMP/rootfs/rootfs.img" \
           MINVMD_BOOT_LOG="$RUNNER_TEMP/boot.log" \
             "$testbin" --include-ignored --nocapture
       - name: Bridge E2E (concurrent UDS↔vsock round-trip)
@@ -127,7 +169,7 @@ jobs:
           test -x "$testbin" || { echo "::error::bridge_e2e test binary not found"; exit 1; }
           MINVMD_E2E=1 \
           MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz" \
-          MINVMD_ROOTFS_PATH="$(scripts/build-rootfs.sh --print-path)" \
+          MINVMD_ROOTFS_PATH="$RUNNER_TEMP/rootfs/rootfs.img" \
             "$testbin" --include-ignored --nocapture
       - name: Upload guest boot console log
         # Capture hvc0 output for diagnosing a stuck/failed boot (e.g. a missing
@@ -147,7 +189,7 @@ jobs:
     # minimal2 -> `minvmd run --detach` -> VM boot path end to end, the macOS
     # integration gate that no unit test or Linux CI can cover.
     if: ${{ vars.RUN_MACOS_CI != 'false' }}
-    needs: virtio-kernel
+    needs: [virtio-kernel, minvmd-rootfs]
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 20
     steps:
@@ -167,8 +209,11 @@ jobs:
         with:
           name: virtio-kernel-aarch64
           path: ${{ runner.temp }}/kernel
-      - name: Stage minvmd guest rootfs
-        run: scripts/build-rootfs.sh
+      - name: Download minvmd-rootfs image
+        uses: actions/download-artifact@v4
+        with:
+          name: minvmd-rootfs-aarch64
+          path: ${{ runner.temp }}/rootfs
       - name: Build minvmd + minimal2 (no run)
         # Build both bins before the single codesign. minimal2 spawns `minvmd`
         # by name from PATH; only minvmd needs the hypervisor entitlement, so
@@ -186,7 +231,7 @@ jobs:
           set -uo pipefail   # not -e: capture failures so we can dump diagnostics
           export PATH="$PWD/target/debug:$PATH"
           export MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz"
-          export MINVMD_ROOTFS_PATH="$(scripts/build-rootfs.sh --print-path)"
+          export MINVMD_ROOTFS_PATH="$RUNNER_TEMP/rootfs/rootfs.img"
           # Capture the guest console; this env var propagates through the
           # minimal2 -> `minvmd run --detach` -> `minvmd run` -> __krun-vmm chain,
           # so the silent detached supervisor's boot is still observable here.
