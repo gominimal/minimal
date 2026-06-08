@@ -38,13 +38,13 @@ permissions:
   contents: read
 
 jobs:
-  virtio-kernel:
+  artifacts:
     # Build the `minimal` CLI from THIS repo's sources, then materialize the
-    # virtio-linux kernel against the repo's own .minimal/minimal.toml. The
-    # kernel is a cache pull keyed by the pinned upstream commit (not a compile),
-    # so this stays cheap and runs on a cheap Linux runner, decoupled from the
-    # self-hosted runner. (The rootfs is built separately on the mac runner —
-    # it is a new package that must be built natively for aarch64.)
+    # guest kernel + rootfs against the repo's own .minimal/minimal.toml. Both
+    # are cache pulls keyed by the pinned upstream commit (not compiles): the
+    # upstream virtio-kernel-raw / microvm-rootfs packages' prebuilt aarch64
+    # artifacts are in the public cache, so they pull fine on a cheap x86_64
+    # Linux runner — no native arm64 build and no self-hosted runner needed.
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -57,69 +57,27 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
-      - name: Build minimal CLI and materialize virtio-linux kernel
-        run: ./scripts/fetch-virtio-kernel.sh "$RUNNER_TEMP/vmlinuz" aarch64
+      - name: Materialize guest kernel (raw Image)
+        run: ./scripts/fetch-artifact.sh virtio-kernel "$RUNNER_TEMP/vmlinuz" aarch64
+      - name: Materialize guest rootfs (ext4 image)
+        run: ./scripts/fetch-artifact.sh minvmd-rootfs "$RUNNER_TEMP/rootfs.img" aarch64
       - name: Upload kernel artifact
         uses: actions/upload-artifact@v4
         with:
           name: virtio-kernel-aarch64
           path: ${{ runner.temp }}/vmlinuz
           if-no-files-found: error
-
-  minvmd-rootfs:
-    # Build the guest rootfs (ext4 image) from the upstream microvm-rootfs
-    # package on the self-hosted aarch64 runner. It must be built natively for
-    # aarch64 (the build container does not emulate), and macOS package
-    # materialization runs through the minimal shim VM. Materialize once and hand
-    # the image to the boot jobs as an artifact.
-    if: ${{ vars.RUN_MACOS_CI != 'false' }}
-    runs-on: [self-hosted, macOS, ARM64]
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - name: Verify minimal shim is available
-        # The minimal CLI shim (runs minimal in a Linux VM) must be provisioned
-        # on the runner, like libkrun. Materialization is Linux-only; on macOS it
-        # goes through the shim.
-        run: |
-          if [ ! -x "$HOME/.minimal/shim/bin/minimal" ] && ! command -v minimal >/dev/null 2>&1; then
-            echo "::error::minimal shim not found. Provision the runner with the minimal CLI shim (~/.minimal/shim/bin/minimal)." >&2
-            exit 1
-          fi
-      - name: Materialize minvmd-rootfs (ext4 image)
-        # Build the package, then take the image. NOTE: on this self-hosted
-        # runner, `minimal materialize`'s final copy step fails to read the
-        # freshly-built output back through the shim VM's /host mount ("copying
-        # output file ... No such file") even though the build wrote it to the
-        # host cache. The build itself succeeds, so on that failure we copy the
-        # image straight from the host build cache. TODO: remove once the shim
-        # /host large-file read coherence issue is fixed upstream.
-        run: |
-          export PATH="$HOME/.minimal/shim/bin:$PATH"
-          echo "shim minimal: $(minimal --version 2>&1 | tail -1)"
-          minimal materialize --output "$GITHUB_WORKSPACE/rootfs.img" --arch aarch64 minvmd-rootfs || true
-          if [ ! -s "$GITHUB_WORKSPACE/rootfs.img" ]; then
-            src="$(ls -t "$HOME"/.cache/minimal/built/*/*/usr/share/microvm-rootfs/rootfs.img 2>/dev/null | head -1)"
-            [ -n "$src" ] || { echo "::error::minvmd-rootfs image not in build cache (build produced nothing)"; exit 1; }
-            echo "materialize copy failed; using freshly-built cache output: $src"
-            cp "$src" "$GITHUB_WORKSPACE/rootfs.img"
-          fi
-          [ -s "$GITHUB_WORKSPACE/rootfs.img" ] || { echo "::error::rootfs.img not produced"; exit 1; }
-          echo "rootfs.img: $(wc -c < "$GITHUB_WORKSPACE/rootfs.img") bytes"
       - name: Upload rootfs artifact
         uses: actions/upload-artifact@v4
         with:
           name: minvmd-rootfs-aarch64
-          path: rootfs.img
+          path: ${{ runner.temp }}/rootfs.img
           if-no-files-found: error
 
   boot-e2e:
     # Boot E2E (R2.4 READY round-trip) on real hardware, using the cache-pulled
-    # kernel and the minvmd guest rootfs ext4 image (built by the minvmd-rootfs
-    # job).
-    # Separate from build-macos so a kernel-fetch hiccup never blocks the
+    # kernel + rootfs ext4 image (both from the `artifacts` job).
+    # Separate from build-macos so an artifact-fetch hiccup never blocks the
     # always-green clippy/test/smoke checks.
     #
     # GATING: green on the runner — raw kernel load (KRUN_KERNEL_FORMAT_RAW),
@@ -127,7 +85,7 @@ jobs:
     # stub (no /init.krun on a block root), and the guest READY connect-out on
     # vsock 7350 (krun_add_vsock_port == listen=false; host + guest both 7350).
     if: ${{ vars.RUN_MACOS_CI != 'false' }}
-    needs: [virtio-kernel, minvmd-rootfs]
+    needs: [artifacts]
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 20
     steps:
@@ -213,7 +171,7 @@ jobs:
     # minimal2 -> `minvmd run --detach` -> VM boot path end to end, the macOS
     # integration gate that no unit test or Linux CI can cover.
     if: ${{ vars.RUN_MACOS_CI != 'false' }}
-    needs: [virtio-kernel, minvmd-rootfs]
+    needs: [artifacts]
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 20
     steps:

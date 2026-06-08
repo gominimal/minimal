@@ -102,6 +102,7 @@ Apple Silicon — see the uncompressed-kernel note below.
 - The guest rootfs is the upstream `microvm-rootfs` package (an ext4 image built
   from `base` + `socat`, packed with `mke2fs`). The exec target is the bring-up
   stub `/sbin/microvm-init`; `/sbin/minimald` is the production target (Stage 2).
-- In CI (`.github/workflows/ci-macos.yml`) the kernel is materialized on a Linux
-  runner and the rootfs on the self-hosted aarch64 runner; both are handed to the
+- In CI (`.github/workflows/ci-macos.yml`) the kernel + rootfs are materialized
+  on a cheap Linux runner (`scripts/fetch-artifact.sh` — cache pulls of the
+  upstream packages' prebuilt aarch64 artifacts) and handed to the self-hosted
   boot jobs as artifacts.
