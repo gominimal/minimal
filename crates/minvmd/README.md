@@ -78,8 +78,9 @@ MINVMD_ROOTFS_PATH="$PWD/.scratch/rootfs.img" \
   scripts/bench-minvmd-boot.sh
 ```
 
-CI runs it (informational) in the `boot-e2e` job. Typical: ~67 ms median on
-Apple Silicon — see the uncompressed-kernel note below.
+CI runs it (informational) in the `boot-e2e` job. Typical: ~113 ms median on
+the CI runner (Apple Silicon; faster on less-loaded hardware) — see the
+uncompressed-kernel note below.
 
 ## How it boots
 
