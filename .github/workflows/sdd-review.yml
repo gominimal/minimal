@@ -52,14 +52,14 @@ jobs:
     steps:
       - name: Decide whether to run and build aw_context
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-review@v0.1.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-review@v0.1.2
         with:
           github-token: ${{ github.token }}
 
   sdd-review:
     needs: route
     if: needs.route.outputs.should_run == 'true'
-    uses: norrietaylor/spectacles/.github/workflows/sdd-review.lock.yml@v0.1.0
+    uses: norrietaylor/spectacles/.github/workflows/sdd-review.lock.yml@v0.1.2
     with:
       aw_context: ${{ needs.route.outputs.aw_context }}
     # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
@@ -116,7 +116,7 @@ jobs:
           repositories: ${{ github.event.repository.name }}
           permission-pull-requests: write
       - name: Resolve App-bot advisory review threads
-        uses: norrietaylor/spectacles/.github/actions/sdd-resolve-review-threads@v0.1.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-resolve-review-threads@v0.1.2
         with:
           github-token: ${{ steps.app.outputs.token }}
           bot-login: ${{ steps.app.outputs.app-slug }}[bot]

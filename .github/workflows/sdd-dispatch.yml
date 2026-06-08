@@ -75,7 +75,7 @@ jobs:
     steps:
       - name: Decide whether to run, and find the tracking issue
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-dispatch@v0.1.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-dispatch@v0.1.2
         with:
           app-id: ${{ vars.APP_ID }}
           github-token: ${{ github.token }}
@@ -108,7 +108,7 @@ jobs:
     steps:
       - name: Compute ready set and precondition state
         id: compute
-        uses: norrietaylor/spectacles/.github/actions/sdd-dispatch-compute@v0.1.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-dispatch-compute@v0.1.2
         with:
           tracking-issue: ${{ needs.route.outputs.tracking_issue }}
           trigger-kind: ${{ needs.route.outputs.trigger_kind }}

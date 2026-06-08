@@ -40,7 +40,7 @@ permissions:
 
 jobs:
   distillery-sync:
-    uses: norrietaylor/spectacles/.github/workflows/distillery-sync.lock.yml@v0.1.0
+    uses: norrietaylor/spectacles/.github/workflows/distillery-sync.lock.yml@v0.1.2
     # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
     # to a reusable workflow in a different owner than the caller.
     secrets:

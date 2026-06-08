@@ -85,7 +85,7 @@ jobs:
     steps:
       - name: Decide whether to run and build aw_context
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-spec@v0.1.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-spec@v0.1.2
         with:
           github-token: ${{ github.token }}
 
@@ -121,7 +121,7 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
       - name: Find plan comment and dispatch sdd-execute-{tier}
-        uses: norrietaylor/spectacles/.github/actions/sdd-fastpath-approve@v0.1.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-fastpath-approve@v0.1.2
         with:
           github-token: ${{ steps.app.outputs.token }}
           tracking: ${{ needs.route.outputs.fastpath_tracking }}
@@ -129,7 +129,7 @@ jobs:
   sdd-spec:
     needs: route
     if: needs.route.outputs.should_run == 'true'
-    uses: norrietaylor/spectacles/.github/workflows/sdd-spec.lock.yml@v0.1.0
+    uses: norrietaylor/spectacles/.github/workflows/sdd-spec.lock.yml@v0.1.2
     with:
       aw_context: ${{ needs.route.outputs.aw_context }}
     # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
@@ -186,7 +186,7 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
       - name: Post failure hand-off to tracking issue
-        uses: norrietaylor/spectacles/.github/actions/sdd-spec-failure-handoff@v0.1.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-spec-failure-handoff@v0.1.2
         with:
           github-token: ${{ steps.app.outputs.token }}
           aw-context: ${{ needs.route.outputs.aw_context }}

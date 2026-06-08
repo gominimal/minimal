@@ -171,7 +171,7 @@ jobs:
     steps:
       - name: Decide whether to run and build aw_context
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-execute@v0.1.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-execute@v0.1.2
         with:
           tier: sonnet
           app-id: ${{ vars.APP_ID }}
@@ -181,7 +181,7 @@ jobs:
   sdd-execute-sonnet:
     needs: route
     if: needs.route.outputs.should_run == 'true'
-    uses: norrietaylor/spectacles/.github/workflows/sdd-execute-sonnet.lock.yml@v0.1.0
+    uses: norrietaylor/spectacles/.github/workflows/sdd-execute-sonnet.lock.yml@v0.1.2
     with:
       aw_context: ${{ needs.route.outputs.aw_context }}
     # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
@@ -237,7 +237,7 @@ jobs:
       # the PR is UNSTABLE with every required check green (issue #135). The
       # mechanics live in the sdd-auto-merge composite action.
       - name: Enable auto-merge when protection requires a check
-        uses: norrietaylor/spectacles/.github/actions/sdd-auto-merge@v0.1.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-auto-merge@v0.1.2
         with:
           github-token: ${{ steps.app.outputs.token }}
           pr-number: ${{ needs.sdd-execute-sonnet.outputs.created_pr_number }}
