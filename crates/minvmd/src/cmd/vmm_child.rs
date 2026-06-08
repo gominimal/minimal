@@ -11,7 +11,7 @@
 //!    disk via `krun_add_disk2`, resources).
 //! 4. Sets the guest workload via the kernel `init=` cmdline: the ext4 block
 //!    root has no libkrun `/init.krun`, so the kernel execs the workload
-//!    directly as PID 1. Default `/sbin/minvmd-stub-init`, `MINVMD_EXEC`
+//!    directly as PID 1. Default `/sbin/microvm-init`, `MINVMD_EXEC`
 //!    overrides.
 //! 5. Registers the marker socket for `VSOCK_MARKER_PORT` (guest→host): the
 //!    guest workload connects to that vsock port and writes `READY\n`, which
@@ -51,8 +51,7 @@ fn run_macos() -> Result<()> {
     // (ext4 via krun_add_disk2), which has no libkrun `/init.krun`, so the
     // kernel execs this directly as PID 1. Default to the v0.1 bring-up stub;
     // `MINVMD_EXEC` overrides (e.g. /sbin/minimald in Stage 2).
-    let exec =
-        std::env::var("MINVMD_EXEC").unwrap_or_else(|_| "/sbin/minvmd-stub-init".to_string());
+    let exec = std::env::var("MINVMD_EXEC").unwrap_or_else(|_| "/sbin/microvm-init".to_string());
 
     // Provision the persistent writable data disk (rw /dev/vdb) the guest uses
     // for minimald's session store + SSH host key. A sparse raw image created on

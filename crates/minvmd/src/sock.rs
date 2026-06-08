@@ -14,7 +14,7 @@ use std::path::PathBuf;
 /// lets the `minimal` CLI reach in-guest `minimald` over a host UDS without
 /// knowing a VM exists.
 ///
-/// The guest-side stub (`/sbin/minvmd-stub-init`) runs `socat
+/// The guest-side stub (`/sbin/microvm-init`) runs `socat
 /// VSOCK-LISTEN:2222,fork EXEC:cat` so it listens on this port. See the
 /// `minvmd-rootfs` package (`.minimal/packages/minvmd-rootfs/build.sh`,
 /// `vsock_port_bridge=2222`).

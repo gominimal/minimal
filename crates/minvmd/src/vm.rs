@@ -125,13 +125,13 @@ mod tests {
             512,
             PathBuf::from("/boot/Image.gz"),
             PathBuf::from("/var/lib/rootfs.img"),
-            "/sbin/minvmd-stub-init".to_string(),
+            "/sbin/microvm-init".to_string(),
         );
         assert_eq!(cfg.num_vcpus, 2);
         assert_eq!(cfg.ram_mib, 512);
         assert_eq!(cfg.kernel_path, PathBuf::from("/boot/Image.gz"));
         assert_eq!(cfg.rootfs_path, PathBuf::from("/var/lib/rootfs.img"));
-        assert_eq!(cfg.exec_target, "/sbin/minvmd-stub-init");
+        assert_eq!(cfg.exec_target, "/sbin/microvm-init");
     }
 
     #[test]

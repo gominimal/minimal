@@ -7,7 +7,7 @@
 # into a staging tree, drop in the bring-up init + contract manifest, and pack
 # it with mke2fs. minvmd loads the result via krun_add_disk2 with a
 # `root=/dev/vda rootfstype=ext4` cmdline (block root has no /init.krun, so the
-# kernel runs init=/sbin/minvmd-stub-init directly; devtmpfs auto-mounts /dev,
+# kernel runs init=/sbin/microvm-init directly; devtmpfs auto-mounts /dev,
 # giving the stub /dev/vsock).
 set -euo pipefail
 
@@ -22,7 +22,7 @@ for d in usr bin sbin lib lib64 etc; do
   fi
 done
 
-mkdir -p "$STAGE/bin" "$STAGE/sbin" "$STAGE/etc/minvmd"
+mkdir -p "$STAGE/bin" "$STAGE/sbin" "$STAGE/etc/microvm"
 
 # Kernel mountpoints. devtmpfs auto-mounts on /dev at boot (CONFIG_DEVTMPFS_MOUNT)
 # — without the directory it fails with "devtmpfs: error mounting -2" and the
@@ -46,7 +46,7 @@ fi
 # Bring-up workload: write the READY marker on vsock 7350 (guest connects out to
 # host CID 2; R2.4), then serve the echo bridge on vsock 2222 (R3). Retry the
 # marker briefly in case the vsock device is not live the instant init starts.
-cat > "$STAGE/sbin/minvmd-stub-init" <<'STUB'
+cat > "$STAGE/sbin/microvm-init" <<'STUB'
 #!/bin/sh
 i=0
 while [ "$i" -lt 50 ]; do
@@ -56,14 +56,14 @@ while [ "$i" -lt 50 ]; do
 done
 exec socat VSOCK-LISTEN:2222,fork EXEC:cat
 STUB
-chmod +x "$STAGE/sbin/minvmd-stub-init"
+chmod +x "$STAGE/sbin/microvm-init"
 
 # Guest rootfs contract (machine-readable record of the boot contract).
-cat > "$STAGE/etc/minvmd/manifest" <<'MANIFEST'
+cat > "$STAGE/etc/microvm/manifest" <<'MANIFEST'
 # minvmd guest rootfs contract
 # format=krun_add_disk2-ext4
 # exec_target_production=/sbin/minimald   (Stage 2; absent here)
-# exec_target_bringup=/sbin/minvmd-stub-init
+# exec_target_bringup=/sbin/microvm-init
 # vsock_port_ready=7350    guest CONNECTs out (host listen=false); writes "READY\n" once
 # vsock_port_bridge=2222   guest LISTENs (host listen=true); echoes per connection
 # net=none   init=kernel-cmdline (no /init.krun on a block-device root)

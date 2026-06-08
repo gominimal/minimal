@@ -6,9 +6,12 @@ daemon on macOS without knowing a VM exists. Spec:
 `docs/specs/01-spec-minvmd-host-daemon/`.
 
 The guest boots from two artifacts produced by the `minimal` package system:
-- **kernel** — the `virtio-linux` package's `vmlinuz` (`virtio-kernel` output).
-- **rootfs** — the `minvmd-rootfs` package's ext4 image (`minvmd-rootfs` output),
-  loaded as a block device (`krun_add_disk2` → `/dev/vda`).
+- **kernel** — the upstream `virtio-kernel-raw` package's uncompressed `Image`
+  (`virtio-kernel` output).
+- **rootfs** — the **local** `minvmd-rootfs` package's ext4 image
+  (`minvmd-rootfs` output), loaded as a block device (`krun_add_disk2` →
+  `/dev/vda`). It's a minimald-capable variant of the upstream `microvm-rootfs`
+  (adds the `/var/lib/minimal` data-disk mountpoint + keeps `e2fsprogs`).
 
 ## Run the boot verification locally (Apple Silicon)
 
@@ -24,12 +27,12 @@ Prereqs:
 #    macOS caveat: the shim runs minimal in a VM and only syncs the project dir
 #    back to the host, so --output MUST be a path under the repo. A /tmp path is
 #    written inside the VM and never appears on the host.
-#    The kernel output is gzip (Image.gz); gunzip it so minvmd can load it raw
-#    (KRUN_KERNEL_FORMAT_RAW) and skip libkrun's ~77 ms decompress.
+#    The kernel output is an uncompressed Image (virtio-kernel-raw decompresses
+#    upstream's Image.gz at build time), loaded raw (KRUN_KERNEL_FORMAT_RAW) to
+#    skip libkrun's ~77 ms in-VMM decompress.
 mkdir -p .scratch
-minimal materialize --output .scratch/vmlinuz.gz  --arch aarch64 virtio-kernel
-gunzip -c .scratch/vmlinuz.gz > .scratch/vmlinuz
-minimal materialize --output .scratch/rootfs.img  --arch aarch64 minvmd-rootfs
+minimal materialize --output .scratch/vmlinuz    --arch aarch64 virtio-kernel
+minimal materialize --output .scratch/rootfs.img --arch aarch64 minvmd-rootfs
 
 # 2. Build minvmd (+ minimal2 for the autospawn path) WITHOUT running.
 cargo build -p minvmd --bin minvmd -p minimal2 --bin minimal2
@@ -76,20 +79,21 @@ MINVMD_ROOTFS_PATH="$PWD/.scratch/rootfs.img" \
   scripts/bench-minvmd-boot.sh
 ```
 
-CI runs it (informational) in the `boot-e2e` job. Typical: ~67 ms median on
-Apple Silicon — see the uncompressed-kernel note below.
+CI runs it (informational) in the `boot-e2e` job. Typical: ~113 ms median on
+the CI runner (Apple Silicon; faster on less-loaded hardware) — see the
+uncompressed-kernel note below.
 
 ## How it boots
 
 - Kernel loaded via `krun_set_kernel` as a raw uncompressed aarch64 `Image`
-  (`KRUN_KERNEL_FORMAT_RAW`). The upstream `virtio-kernel` output is gzip
-  (`Image.gz`); `fetch-virtio-kernel.sh` (CI) and the step above (local) `gunzip`
-  it. Loading raw skips libkrun's in-VMM gzip decompress (~77 ms, over half of
+  (`KRUN_KERNEL_FORMAT_RAW`). The `virtio-kernel` output is built by the upstream
+  `virtio-kernel-raw` package, which decompresses upstream's `Image.gz` at build
+  time. Loading raw skips libkrun's in-VMM gzip decompress (~77 ms, over half of
   boot-to-READY).
 - Rootfs loaded via `krun_add_disk2` as `/dev/vda`; cmdline
   `console=hvc0 root=/dev/vda rootfstype=ext4 ro init=<exec-target>`. A block
   root has **no** libkrun `/init.krun`, so the kernel runs the exec target
-  (`MINVMD_EXEC`, default `/sbin/minvmd-stub-init`) directly as PID 1; devtmpfs
+  (`MINVMD_EXEC`, default `/sbin/microvm-init`) directly as PID 1; devtmpfs
   auto-mounts `/dev`, giving the workload `/dev/vsock`.
 - The guest writes `READY\n` on vsock port 7350 (boot marker, R2.4) and serves
   the bridge on vsock port 2222 (R3); `minvmd` registers the host UDS via
@@ -97,10 +101,13 @@ Apple Silicon — see the uncompressed-kernel note below.
 
 ## Notes
 
-- The guest rootfs is defined as a minimal package at
-  `.minimal/packages/minvmd-rootfs/` (built from upstream `socat` + `bash` +
-  `coreutils`, packed with `mke2fs`). The exec target is the bring-up stub;
-  `/sbin/minimald` is the production target (follow-up).
-- In CI (`.github/workflows/ci-macos.yml`) the kernel is materialized on a Linux
-  runner and the rootfs on the self-hosted aarch64 runner; both are handed to the
-  boot jobs as artifacts.
+- The guest rootfs is the local `.minimal/packages/minvmd-rootfs/` package — a
+  minimald-capable ext4 image (socat + bash + coreutils + e2fsprogs, packed with
+  `mke2fs`, with the `/var/lib/minimal` data-disk mountpoint). The exec target is
+  the bring-up stub `/sbin/microvm-init`; `/sbin/minimald` is the production
+  target (Stage 2).
+- In CI (`.github/workflows/ci-macos.yml`) the kernel is materialized on a cheap
+  Linux runner (`fetch-artifact.sh` — a cache pull of the upstream
+  `virtio-kernel-raw` artifact); the local rootfs is materialized on the
+  self-hosted aarch64 runner (not in the remote cache, can't cross-build). Both
+  are handed to the boot jobs as artifacts.
