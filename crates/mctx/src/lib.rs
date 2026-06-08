@@ -1049,9 +1049,10 @@ mod tests {
     #[test]
     #[ignore] // Do not run in github- does not support nested namespaces
     fn task_env() {
-        let state = tempdir().unwrap();
+        let (cache, state) = (tempdir().unwrap(), tempdir().unwrap());
         let config = ConfigBuilder::new()
             .with_state_dir(state.path().to_path_buf())
+            .with_cache_dir(cache.path().to_path_buf())
             .with_repo_dir(
                 std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
                     .join("testdata")
@@ -1214,9 +1215,10 @@ mod tests {
     #[test]
     #[ignore] // Do not run in github- does not support nested namespaces
     fn task_resolve_string_interpolation() {
-        let state = tempdir().unwrap();
+        let (cache, state) = (tempdir().unwrap(), tempdir().unwrap());
         let config = ConfigBuilder::new()
             .with_state_dir(state.path().to_path_buf())
+            .with_cache_dir(cache.path().to_path_buf())
             .with_repo_dir(
                 std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
                     .join("testdata")
