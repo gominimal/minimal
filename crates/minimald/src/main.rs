@@ -277,10 +277,11 @@ async fn run_guest(config: Config, port: u32) -> Result<(), MainError> {
     std::fs::create_dir_all(config.minimal_cache_dir.as_utf8_path())
         .map_err(|e| MainError::IO(e, "creating cache dir"))?;
 
-    // Serve over a UDS fronted by a socat vsock->UDS relay. libkrun's vsock
-    // bridge does not deliver to a tokio-vsock listener (see guest::spawn_vsock_relay),
-    // so bind the UDS, start the relay, then serve via the native UDS path. The
-    // UDS must live on the writable data disk — the root (incl. /run) is ro.
+    // Serve over a UDS fronted by a socat vsock->UDS relay. A direct
+    // tokio-vsock listener accepts the bridged connection but the SSH session
+    // over it early-eofs (see guest::spawn_vsock_relay), so bind the UDS, start
+    // the relay, then serve via the native UDS path. The UDS must live on the
+    // writable data disk — the root (incl. /run) is ro.
     let guest_uds = format!("{}/minimald.sock", guest::STATE_DISK_MOUNT);
     let _ = std::fs::remove_file(&guest_uds);
     let listener =
