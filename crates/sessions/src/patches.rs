@@ -14,9 +14,10 @@
 //!
 //! # The `FileSet` primitive
 //!
-//! [`FileSet`] is the description of "which files" — reused for patch
-//! sources, allowlists, denylists, and ignore lists. The wire form accepts
-//! three shapes (bare string, list, table); see its docs.
+//! [`FileSet`] is the description of "which files" — a single glob pattern,
+//! reused for patch sources, allowlists, denylists, and ignore lists. The
+//! wire form is always a bare string; lists of patterns live one level
+//! up (at the patches array or in policy fields).
 //!
 //! Path expansion (`~`, `$VAR`) and canonicalization are **not** performed
 //! by this module — `FileSet` stores patterns as written. Callers must
@@ -32,13 +33,13 @@
 //! # Only `ignore` from `[patch_policy]` filters these; `allow`/`deny` are
 //! # bypassed.
 //! patches = [
-//!     { dest = "~/.gitconfig",                       source = "~/dotfiles/gitconfig" },
-//!     { dest = "~/.config/alacritty/alacritty.toml", source = "~/dotfiles/alacritty.toml" },
-//!     { dest = "~/.config/nvim/",                    source = { base = "~/dotfiles/nvim", patterns = ["**/*"] } },
+//!     { dest = ".gitconfig",                       source = "~/dotfiles/gitconfig" },
+//!     { dest = ".config/alacritty/alacritty.toml", source = "~/dotfiles/alacritty.toml" },
+//!     { dest = ".config/nvim/",                    source = "~/dotfiles/nvim/**/*" },
 //!
-//!     # Multi-glob to one dest:
-//!     { dest = "~/Pictures/wallpapers/",             source = ["~/dotfiles/wallpapers/*.jpg",
-//!                                                              "~/dotfiles/wallpapers/*.png"] },
+//!     # Multi-pattern to one dest fans out into one entry per pattern:
+//!     { dest = "Pictures/wallpapers/",             source = ["~/dotfiles/wallpapers/*.jpg",
+//!                                                            "~/dotfiles/wallpapers/*.png"] },
 //! ]
 //!
 //! # Policy for non-user patches (project and package origins).
@@ -49,245 +50,225 @@
 //! ignore = ["**/.DS_Store", "**/*.bak", "**/*.swp"]
 //! ```
 
-use camino::{Utf8Component, Utf8PathBuf};
-use core::fmt;
-use paths::{HostPath, SandboxPath};
+use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
+use paths::{HostAbsPath, HostPath, SandboxRelPath};
 
 /// Errors produced when constructing patch types.
 #[non_exhaustive]
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// A pattern string failed to parse as a glob.
+    #[error("invalid glob pattern `{pattern}`: {source}")]
     InvalidGlob {
         pattern: String,
+        #[source]
         source: globset::Error,
     },
-    /// A `FileSet` had an empty `base` (e.g. `base = ""`).
-    EmptyBase,
     /// A patch destination was empty.
+    #[error("patch destination must not be empty")]
     EmptyDest,
     /// A patch destination contained a `..` component, which is rejected
     /// before path canonicalization to avoid traversal attacks.
+    #[error("patch destination `{0}` must not contain `..` components")]
     DestTraversal(Utf8PathBuf),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidGlob { pattern, source } => {
-                write!(f, "invalid glob pattern `{pattern}`: {source}")
-            }
-            Self::EmptyBase => f.write_str("`base` must not be the empty string"),
-            Self::EmptyDest => f.write_str("patch destination must not be empty"),
-            Self::DestTraversal(p) => write!(
-                f,
-                "patch destination `{p}` must not contain `..` components",
-            ),
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidGlob { source, .. } => Some(source),
-            _ => None,
-        }
-    }
+    /// A patch destination decoded to an absolute path. Dests must be
+    /// relative to the sandbox/home root.
+    #[error("Patch destination must be relative to the home directory: {0}")]
+    AbsoluteDestPath(#[source] paths::Error),
+    /// A directory walk failed while enumerating a [`FileSet`]'s
+    /// matches — typically due to permission denial or a missing
+    /// directory.
+    #[error("Failed to walk {root}: {source}")]
+    WalkFailure {
+        root: Utf8PathBuf,
+        #[source]
+        source: walkdir::Error,
+    },
+    /// A directory walk yielded an entry whose path is not valid
+    /// UTF-8. We carry the lossy form for the error message.
+    #[error("Cannot handle non-utf8 path {path_lossy}")]
+    NonUtf8Path { path_lossy: String },
+    /// The [`FileSet`] pattern has no literal path prefix (e.g.
+    /// `**/*.pem`, `*.lua`). Walking such a pattern would have to
+    /// descend from `/`, which is almost never what the user wants and
+    /// can be catastrophically expensive. Patterns must anchor to a
+    /// concrete directory.
+    #[error(
+        "pattern `{pattern}` has no literal path prefix; \
+         anchor it to a directory (e.g. `~/dotfiles/{pattern}`)"
+    )]
+    NoWalkRoot { pattern: String },
 }
 
 // =====================================================================
 // FileSet
 // =====================================================================
 
-/// A description of a set of files on the *host* filesystem: an optional
-/// base directory plus glob patterns interpreted relative to it.
+/// A set of host-filesystem files described by a single glob pattern.
 ///
-/// Patterns are parsed as globs at construction time, so malformed patterns
-/// fail at config load with a useful error rather than at apply time. Use
-/// [`FileSet::raw_patterns`] to recover the original pattern strings (e.g.
-/// for re-serialization).
+/// Patterns are parsed at construction time, so malformed input fails at
+/// config load with a useful error rather than at apply time. The
+/// underlying pattern string is recoverable via [`Self::pattern`].
 ///
-/// Absolute or `~`-prefixed patterns are valid; the [`base`](Self::base)
-/// field is meaningful only for relative patterns. `~`-prefixed bases
-/// classify as [`HostPath::Rel`] — the apply layer is responsible for
-/// expansion. The apply layer should follow `Utf8PathBuf::join` semantics
-/// when combining a base with a pattern (an absolute right-hand side
-/// replaces the left).
+/// # Walk root
+///
+/// To *enumerate* matching files, the caller walks a directory and
+/// filters with the glob. [`Self::walk_root`] returns the longest literal
+/// path prefix — the directory the walker should start from. For
+/// `~/dotfiles/nvim/**/*.lua` that's `Some("~/dotfiles/nvim")`; for
+/// `**/*.pem` it's [`None`] (no literal prefix). The host realm and `~`
+/// expansion are the caller's responsibility.
 ///
 /// # Wire format
 ///
-/// `FileSet` accepts three forms when deserialized — pick whichever is least
-/// noisy at the call site:
+/// A bare string. Lists of patterns live one level up — at the patches
+/// array, or in the policy fields — where each entry is its own
+/// `FileSet`.
 ///
 /// ```toml
-/// allow  = "~/.config/**"                                           # bare string
-/// deny   = ["~/.ssh/**", "**/id_rsa*"]                              # list
-/// source = { base = "~/dotfiles/nvim", patterns = ["**/*"] }        # full table
+/// allow  = ["~/.config/**", "/etc/xdg/**"]
+/// source = "~/dotfiles/nvim/**/*.lua"
 /// ```
 #[derive(Clone, Debug)]
 pub struct FileSet {
-    base: Option<HostPath>,
-    patterns: Vec<String>,
-    compiled: Vec<globset::Glob>,
+    glob: globset::Glob,
+    matcher: globset::GlobMatcher,
 }
 
 impl FileSet {
-    /// Construct a [`FileSet`] from raw patterns and an optional base.
+    /// Construct a [`FileSet`] from a raw pattern.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidGlob`] if any pattern fails to parse, or
-    /// [`Error::EmptyBase`] if `base` is `Some` but empty.
-    pub fn try_new<I, S>(base: Option<HostPath>, patterns: I) -> Result<Self, Error>
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        if let Some(b) = &base
-            && b.as_str().is_empty()
-        {
-            return Err(Error::EmptyBase);
-        }
-        let raw: Vec<String> = patterns.into_iter().map(Into::into).collect();
-        let compiled = raw
-            .iter()
-            .map(|p| {
-                globset::Glob::new(p).map_err(|source| Error::InvalidGlob {
-                    pattern: p.clone(),
-                    source,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
-            base,
-            patterns: raw,
-            compiled,
-        })
-    }
-
-    /// Construct an empty `FileSet`. Useful as a `Default` for policy fields
-    /// where "matches nothing" is a meaningful default.
-    #[must_use]
-    pub fn empty() -> Self {
-        Self {
-            base: None,
-            patterns: Vec::new(),
-            compiled: Vec::new(),
-        }
-    }
-
-    /// Set the base directory.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::EmptyBase`] if `base`'s underlying path is empty.
-    pub fn try_with_base(self, base: HostPath) -> Result<Self, Error> {
-        if base.as_str().is_empty() {
-            return Err(Error::EmptyBase);
-        }
-        Ok(Self {
-            base: Some(base),
-            ..self
-        })
-    }
-
-    /// Append a single pattern.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidGlob`] if the pattern fails to parse.
-    pub fn try_with_pattern(self, pattern: impl Into<String>) -> Result<Self, Error> {
+    /// Returns [`Error::InvalidGlob`] if `pattern` fails to parse.
+    pub fn try_new(pattern: impl Into<String>) -> Result<Self, Error> {
         let pattern = pattern.into();
-        let glob = globset::Glob::new(&pattern).map_err(|source| Error::InvalidGlob {
-            pattern: pattern.clone(),
-            source,
-        })?;
-        let mut new = self;
-        new.patterns.push(pattern);
-        new.compiled.push(glob);
-        Ok(new)
+        let glob = globset::Glob::new(&pattern)
+            .map_err(|source| Error::InvalidGlob { pattern, source })?;
+        let matcher = glob.compile_matcher();
+        Ok(Self { glob, matcher })
     }
 
-    /// The base directory for relative patterns, if set.
+    /// The original pattern string (suitable for re-serialization).
     #[must_use]
-    pub fn base(&self) -> Option<&HostPath> {
-        self.base.as_ref()
+    pub fn pattern(&self) -> &str {
+        self.glob.glob()
     }
 
-    /// The original pattern strings (suitable for re-serialization).
+    /// The compiled glob, for matching.
     #[must_use]
-    pub fn raw_patterns(&self) -> &[String] {
-        &self.patterns
+    pub fn glob(&self) -> &globset::Glob {
+        &self.glob
     }
 
-    /// The compiled glob patterns.
+    /// `true` iff this pattern matches `path`.
     #[must_use]
-    pub fn globs(&self) -> &[globset::Glob] {
-        &self.compiled
+    pub fn is_match(&self, path: impl AsRef<std::path::Path>) -> bool {
+        self.matcher.is_match(path.as_ref())
     }
 
-    /// Returns `true` if the set contains no patterns.
+    /// The longest literal path prefix in the pattern — the directory a
+    /// walker should start from to enumerate matches.
+    ///
+    /// Returns [`None`] when the pattern has no literal prefix (e.g.
+    /// `**/*.pem`, `*.lua`); callers needing a concrete walk root must
+    /// substitute (typically the current directory, or an error).
+    /// Otherwise returns the prefix up to — but not including — the slash
+    /// before the first metacharacter (`*`, `?`, `[`, `{`) as a
+    /// [`HostPath`]. Patterns with no metacharacters return the whole
+    /// pattern.
+    ///
+    /// The returned [`HostPath`] is unexpanded — `~` and `$VAR` are still
+    /// raw. Resolving those is the caller's responsibility.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.patterns.is_empty()
+    pub fn walk_root(&self) -> Option<HostPath> {
+        let pattern = self.pattern();
+        let mut last_slash = None;
+        for (i, c) in pattern.bytes().enumerate() {
+            match c {
+                b'/' => last_slash = Some(i),
+                b'*' | b'?' | b'[' | b'{' => {
+                    return last_slash.map(|i| HostPath::new(&pattern[..i]));
+                }
+                _ => {}
+            }
+        }
+        Some(HostPath::new(pattern))
     }
-}
 
-impl Default for FileSet {
-    fn default() -> Self {
-        Self::empty()
+    /// Walk the host filesystem under [`Self::walk_root`] and collect
+    /// every file whose path matches this pattern.
+    ///
+    /// Per-entry failures (walk errors, non-UTF-8 paths) are accumulated
+    /// into the returned `Vec<Error>` rather than aborting the walk —
+    /// callers decide whether a partial result is acceptable.
+    ///
+    /// `~` and `$VAR` are **not** expanded; the walker passes the raw
+    /// prefix to the OS. Expand before invoking, or accept that
+    /// `~/...` patterns resolve to nothing.
+    ///
+    /// Patterns with no literal path prefix (e.g. `**/*.pem`, `*.lua`)
+    /// would have to start their walk from `/` — virtually never what
+    /// the caller wants. Such patterns produce an empty result with a
+    /// single [`Error::NoWalkRoot`] entry instead of walking the entire
+    /// root filesystem.
+    #[must_use]
+    pub fn resolve(&self, follow_links: bool) -> (Vec<HostPath>, Vec<Error>) {
+        let Some(root) = self.walk_root() else {
+            return (
+                Vec::new(),
+                vec![Error::NoWalkRoot {
+                    pattern: self.pattern().to_owned(),
+                }],
+            );
+        };
+        let root_path = root.as_utf8_path().to_path_buf();
+
+        let mut paths = Vec::new();
+        let mut errors = Vec::new();
+        for entry_result in walkdir::WalkDir::new(&root).follow_links(follow_links) {
+            match entry_result {
+                Ok(entry) if !entry.file_type().is_file() => {}
+                Ok(entry) => match Utf8PathBuf::from_path_buf(entry.into_path()) {
+                    Ok(p) if self.is_match(&p) => paths.push(HostPath::new(p)),
+                    Ok(_) => {}
+                    Err(p) => errors.push(Error::NonUtf8Path {
+                        path_lossy: p.to_string_lossy().into_owned(),
+                    }),
+                },
+                Err(source) => errors.push(Error::WalkFailure {
+                    root: root_path.clone(),
+                    source,
+                }),
+            }
+        }
+        (paths, errors)
     }
 }
 
 impl PartialEq for FileSet {
     fn eq(&self, other: &Self) -> bool {
-        // `compiled` is derived from `patterns`, so equality on the raw inputs
-        // implies equality of the compiled forms.
-        self.base == other.base && self.patterns == other.patterns
+        self.pattern() == other.pattern()
     }
 }
 impl Eq for FileSet {}
 
 impl std::hash::Hash for FileSet {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.base.hash(state);
-        self.patterns.hash(state);
+        self.pattern().hash(state);
     }
 }
 
 impl serde::Serialize for FileSet {
     fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let len = 1 + usize::from(self.base.is_some());
-        let mut st = ser.serialize_struct("FileSet", len)?;
-        if let Some(b) = &self.base {
-            st.serialize_field("base", b)?;
-        }
-        st.serialize_field("patterns", &self.patterns)?;
-        st.end()
+        ser.serialize_str(self.pattern())
     }
 }
 
 impl<'de> serde::Deserialize<'de> for FileSet {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(serde::Deserialize)]
-        #[serde(untagged)]
-        enum Repr {
-            Full {
-                #[serde(default)]
-                base: Option<HostPath>,
-                patterns: Vec<String>,
-            },
-            Many(Vec<String>),
-            One(String),
-        }
-        let (base, patterns) = match Repr::deserialize(deserializer)? {
-            Repr::Full { base, patterns } => (base, patterns),
-            Repr::Many(p) => (None, p),
-            Repr::One(p) => (None, vec![p]),
-        };
-        Self::try_new(base, patterns).map_err(serde::de::Error::custom)
+        let s = String::deserialize(deserializer)?;
+        Self::try_new(s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -310,7 +291,7 @@ impl<'de> serde::Deserialize<'de> for FileSet {
 /// destination path cannot be passed to host I/O without going through a
 /// [`paths::Translator`] first.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct PatchDest(SandboxPath);
+pub struct PatchDest(SandboxRelPath);
 
 impl PatchDest {
     /// Construct a `PatchDest` after validation.
@@ -330,12 +311,13 @@ impl PatchDest {
         {
             return Err(Error::DestTraversal(path));
         }
-        Ok(Self(SandboxPath::new(path)))
+        Ok(Self(
+            SandboxRelPath::try_new(path).map_err(Error::AbsoluteDestPath)?,
+        ))
     }
 
     /// Borrow the underlying sandbox path.
-    #[must_use]
-    pub fn as_sandbox_path(&self) -> &SandboxPath {
+    pub fn as_sandbox_path(&self) -> &SandboxRelPath {
         &self.0
     }
 }
@@ -404,9 +386,58 @@ impl Patch {
 
 /// An ordered collection of [`Patch`] entries — the wire form of a
 /// `patches = [...]` array.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+///
+/// At the wire layer, a single row may carry either one `source` pattern
+/// or a list. List-shaped rows fan out into one [`Patch`] per pattern
+/// (the `description` and `dest` are shared across the fan-out). After
+/// deserialization every [`Patch`] holds exactly one [`FileSet`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(transparent)]
 pub struct Patches(Vec<Patch>);
+
+impl<'de> serde::Deserialize<'de> for Patches {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Source {
+            One(FileSet),
+            Many(Vec<FileSet>),
+        }
+        #[derive(serde::Deserialize)]
+        struct Row {
+            #[serde(default)]
+            description: Option<String>,
+            source: Source,
+            dest: PatchDest,
+        }
+        let rows: Vec<Row> = Vec::deserialize(deserializer)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for Row {
+            description,
+            source,
+            dest,
+        } in rows
+        {
+            match source {
+                Source::One(fs) => out.push(Patch {
+                    description,
+                    source: fs,
+                    dest,
+                }),
+                Source::Many(fss) => {
+                    for fs in fss {
+                        out.push(Patch {
+                            description: description.clone(),
+                            source: fs,
+                            dest: dest.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(Self(out))
+    }
+}
 
 impl Patches {
     /// Construct an empty collection. Useful as the start of a builder
@@ -472,35 +503,76 @@ impl<'a> IntoIterator for &'a Patches {
     }
 }
 
+impl IntoIterator for Patches {
+    type Item = Patch;
+    type IntoIter = std::vec::IntoIter<Patch>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
 // =====================================================================
 // PatchPolicy
 // =====================================================================
 
 /// Policy gating which patches are honored.
 ///
-/// Applied at the session-construction layer based on a patch's source:
+/// Patches are checked **per source file** after the patch's
+/// [`FileSet`] is walked on the host filesystem. Each enumerated source
+/// path runs through this policy; the patch's `dest` is *not* matched.
 ///
 /// - **User-origin patches** (from a [`Loadout`]): only
 ///   [`ignore`](Self::ignore) applies. `allow` and `deny` are bypassed —
 ///   the user is the policy for their own declarations.
 /// - **Project- and Package-origin patches**: all three fields apply.
-///   A patch is honored iff its destination matches `allow`, does not
-///   match `deny`, and does not match `ignore`. Patches matching only
-///   `ignore` are silently dropped; matching `deny` is an error/prompt;
-///   matching neither `allow` nor `ignore` triggers a permission prompt.
+///   A source file is honored iff its host path matches `allow`, does
+///   not match `deny`, and does not match `ignore`. Files matching only
+///   `ignore` are silently dropped; matching `deny` is an error;
+///   matching neither `allow` nor `ignore` triggers a permission prompt
+///   via [`PolicyHooks`](crate::composable::PolicyHooks).
 ///
-/// Precedence within the policy: `ignore` first (silent), then `deny`
-/// (reject), then `allow` (permit). Anything else prompts.
+/// Precedence: `ignore` first (silent), then `deny` (reject), then
+/// `allow` (permit). Anything else prompts.
 ///
 /// [`Loadout`]: crate::loadout::Loadout
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PatchPolicy {
-    #[serde(default, skip_serializing_if = "FileSet::is_empty")]
-    allow: FileSet,
-    #[serde(default, skip_serializing_if = "FileSet::is_empty")]
-    deny: FileSet,
-    #[serde(default, skip_serializing_if = "FileSet::is_empty")]
-    ignore: FileSet,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_one_or_many"
+    )]
+    allow: Vec<FileSet>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_one_or_many"
+    )]
+    deny: Vec<FileSet>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_one_or_many"
+    )]
+    ignore: Vec<FileSet>,
+}
+
+/// Accepts either a single pattern (bare string) or a list of patterns.
+fn deserialize_one_or_many<'de, D>(d: D) -> Result<Vec<FileSet>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        One(FileSet),
+        Many(Vec<FileSet>),
+    }
+    Ok(match Repr::deserialize(d)? {
+        Repr::One(f) => vec![f],
+        Repr::Many(v) => v,
+    })
 }
 
 impl PatchPolicy {
@@ -514,19 +586,19 @@ impl PatchPolicy {
 
     /// Replace the `allow` set.
     #[must_use]
-    pub fn with_allow(self, allow: FileSet) -> Self {
+    pub fn with_allow(self, allow: Vec<FileSet>) -> Self {
         Self { allow, ..self }
     }
 
     /// Replace the `deny` set.
     #[must_use]
-    pub fn with_deny(self, deny: FileSet) -> Self {
+    pub fn with_deny(self, deny: Vec<FileSet>) -> Self {
         Self { deny, ..self }
     }
 
     /// Replace the `ignore` set.
     #[must_use]
-    pub fn with_ignore(self, ignore: FileSet) -> Self {
+    pub fn with_ignore(self, ignore: Vec<FileSet>) -> Self {
         Self { ignore, ..self }
     }
 
@@ -540,7 +612,7 @@ impl PatchPolicy {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        Ok(self.with_allow(FileSet::try_new(None, patterns)?))
+        Ok(self.with_allow(try_collect_filesets(patterns)?))
     }
 
     /// Replace the `deny` set, constructing it from raw patterns.
@@ -553,7 +625,7 @@ impl PatchPolicy {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        Ok(self.with_deny(FileSet::try_new(None, patterns)?))
+        Ok(self.with_deny(try_collect_filesets(patterns)?))
     }
 
     /// Replace the `ignore` set, constructing it from raw patterns.
@@ -566,28 +638,123 @@ impl PatchPolicy {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        Ok(self.with_ignore(FileSet::try_new(None, patterns)?))
+        Ok(self.with_ignore(try_collect_filesets(patterns)?))
     }
 
     /// Paths non-user patches **may** target. Does not apply to
     /// user-origin patches.
     #[must_use]
-    pub fn allow(&self) -> &FileSet {
+    pub fn allow(&self) -> &[FileSet] {
         &self.allow
     }
 
     /// Paths non-user patches **must not** target. Does not apply to
     /// user-origin patches.
     #[must_use]
-    pub fn deny(&self) -> &FileSet {
+    pub fn deny(&self) -> &[FileSet] {
         &self.deny
     }
 
     /// Paths to silently drop without prompting. **Applies to every
     /// origin, user-origin included.**
     #[must_use]
-    pub fn ignore(&self) -> &FileSet {
+    pub fn ignore(&self) -> &[FileSet] {
         &self.ignore
+    }
+
+    /// Categorize a single source-file path against this policy.
+    ///
+    /// Precedence: `ignore` first, then a source-aware branch. For
+    /// user-origin items ([`Source::UserLoadout`]), `allow` and `deny`
+    /// do not apply — anything not ignored is implicitly allowed. For
+    /// every other source, the precedence continues `deny` → `allow` →
+    /// `NeedsApproval`.
+    ///
+    /// `item` reports its provenance via [`Provenanced`]; the resolver
+    /// constructs `T` types that carry their own source, so the caller
+    /// doesn't have to clone-and-borrow at the call site.
+    ///
+    /// Per-pattern provenance is preserved on the `FileSet` slices for a
+    /// later inspection command; the decision itself does not name it.
+    ///
+    /// [`Source::UserLoadout`]: crate::composable::Source::UserLoadout
+    /// [`Provenanced`]: crate::composable::Provenanced
+    #[must_use]
+    pub fn check<T: crate::composable::Provenanced>(
+        &self,
+        path: &Utf8Path,
+        item: T,
+    ) -> crate::composable::CheckOutcome<T> {
+        use crate::composable::{CheckOutcome, Decision, Source};
+        if filesets_match(&self.ignore, path) {
+            return CheckOutcome::Decided(Decision::Ignored);
+        }
+        if matches!(item.source(), Source::UserLoadout { .. }) {
+            return CheckOutcome::Decided(Decision::Allowed(item));
+        }
+        if filesets_match(&self.deny, path) {
+            CheckOutcome::Decided(Decision::Denied(item))
+        } else if filesets_match(&self.allow, path) {
+            CheckOutcome::Decided(Decision::Allowed(item))
+        } else {
+            CheckOutcome::NeedsApproval(item)
+        }
+    }
+}
+
+/// `true` iff any `FileSet` in `sets` matches `path`.
+fn filesets_match(sets: &[FileSet], path: &Utf8Path) -> bool {
+    sets.iter().any(|fs| fs.is_match(path))
+}
+
+fn try_collect_filesets<I, S>(patterns: I) -> Result<Vec<FileSet>, Error>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    patterns.into_iter().map(FileSet::try_new).collect()
+}
+
+/// A single patch's resolved endpoints: where the file lives on the
+/// host, and where it lands inside the sandbox.
+///
+/// The field is `host_path` (not `source`) so it doesn't collide with
+/// [`Provenanced::source`](crate::composable::Provenanced::source) when
+/// accessed via `SessionPatch::patch().host_path()`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ResolvedPatch {
+    host_path: HostAbsPath,
+    destination: SandboxRelPath,
+}
+
+impl ResolvedPatch {
+    #[must_use]
+    pub fn new(host_path: HostAbsPath, destination: SandboxRelPath) -> Self {
+        Self {
+            host_path,
+            destination,
+        }
+    }
+
+    /// The absolute host path of the file being copied.
+    pub fn host_path(&self) -> &HostAbsPath {
+        &self.host_path
+    }
+
+    /// The sandbox-relative destination the file is copied to.
+    pub fn destination(&self) -> &SandboxRelPath {
+        &self.destination
+    }
+}
+
+impl core::fmt::Display for ResolvedPatch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{} → {}",
+            self.host_path.as_str(),
+            self.destination.as_str(),
+        )
     }
 }
 
@@ -608,28 +775,16 @@ mod tests {
         toml::from_str::<Wrap<T>>(toml_str).unwrap().x
     }
 
+    fn patterns(sets: &[FileSet]) -> Vec<&str> {
+        sets.iter().map(FileSet::pattern).collect()
+    }
+
     // ---- FileSet ----
 
     #[test]
     fn fileset_from_bare_string() {
         let fs: FileSet = parse(r#"x = "~/.gitconfig""#);
-        assert_eq!(fs.raw_patterns(), &["~/.gitconfig"]);
-        assert!(fs.base().is_none());
-        assert_eq!(fs.globs().len(), 1);
-    }
-
-    #[test]
-    fn fileset_from_list() {
-        let fs: FileSet = parse(r#"x = ["**/*.jpg", "**/*.png"]"#);
-        assert_eq!(fs.raw_patterns(), &["**/*.jpg", "**/*.png"]);
-        assert_eq!(fs.globs().len(), 2);
-    }
-
-    #[test]
-    fn fileset_from_full_table() {
-        let fs: FileSet = parse(r#"x = { base = "./assets", patterns = ["**/*.jpg"] }"#);
-        assert_eq!(fs.base().map(HostPath::as_str), Some("./assets"));
-        assert_eq!(fs.raw_patterns(), &["**/*.jpg"]);
+        assert_eq!(fs.pattern(), "~/.gitconfig");
     }
 
     #[test]
@@ -639,30 +794,33 @@ mod tests {
     }
 
     #[test]
-    fn fileset_rejects_empty_base() {
-        let err =
-            toml::from_str::<Wrap<FileSet>>(r#"x = { base = "", patterns = ["a"] }"#).unwrap_err();
-        assert!(err.to_string().contains("base"), "got: {err}");
-    }
-
-    #[test]
-    fn fileset_round_trip() {
-        let original =
-            FileSet::try_new(Some(HostPath::new("./themes")), ["**/*", "**/*.toml"]).unwrap();
+    fn fileset_round_trips_as_bare_string() {
+        let original = FileSet::try_new("./themes/**/*.toml").unwrap();
         let s = toml::to_string(&Wrap {
             x: original.clone(),
         })
         .unwrap();
+        assert_eq!(s.trim(), r#"x = "./themes/**/*.toml""#);
         let parsed: FileSet = parse(&s);
         assert_eq!(parsed, original);
     }
 
     #[test]
-    fn fileset_serializes_without_base_when_none() {
-        let fs = FileSet::try_new(None, ["a"]).unwrap();
-        let s = toml::to_string(&Wrap { x: fs }).unwrap();
-        assert!(s.contains("patterns"));
-        assert!(!s.contains("base"));
+    fn fileset_walk_root_extracts_literal_prefix() {
+        let cases = [
+            ("~/dotfiles/nvim/**/*.lua", Some("~/dotfiles/nvim")),
+            ("/etc/xdg/**", Some("/etc/xdg")),
+            ("~/.gitconfig", Some("~/.gitconfig")),
+            ("**/*.pem", None),
+            ("*.lua", None),
+            ("src/?oo.rs", Some("src")),
+            ("a/b/{c,d}", Some("a/b")),
+        ];
+        for (pattern, expected) in cases {
+            let fs = FileSet::try_new(pattern).unwrap();
+            let expected = expected.map(HostPath::new);
+            assert_eq!(fs.walk_root(), expected, "pattern: {pattern}");
+        }
     }
 
     // ---- PatchDest ----
@@ -681,15 +839,6 @@ mod tests {
     }
 
     #[test]
-    fn patchdest_classifies_absolute_and_home_paths() {
-        let abs = PatchDest::try_new("/etc/foo").unwrap();
-        assert!(abs.as_sandbox_path().is_absolute());
-        // Tilde-prefixed paths classify as Rel — apply layer expands them.
-        let home = PatchDest::try_new("~/.gitconfig").unwrap();
-        assert!(!home.as_sandbox_path().is_absolute());
-    }
-
-    #[test]
     fn patch_deserialize_rejects_bad_dest() {
         let err = toml::from_str::<Wrap<Patch>>(r#"x = { dest = "foo/../bar", source = "a" }"#)
             .unwrap_err();
@@ -700,21 +849,55 @@ mod tests {
 
     #[test]
     fn patch_with_string_source() {
-        let p: Patch = parse(r#"x = { dest = "/etc/foo.conf", source = "./foo.conf" }"#);
-        assert_eq!(p.dest().as_sandbox_path().as_str(), "/etc/foo.conf");
-        assert_eq!(p.source().raw_patterns(), &["./foo.conf"]);
+        let p: Patch = parse(r#"x = { dest = "etc/foo.conf", source = "./foo.conf" }"#);
+        assert_eq!(p.dest().as_sandbox_path().as_str(), "etc/foo.conf");
+        assert_eq!(p.source().pattern(), "./foo.conf");
     }
 
     #[test]
     fn patches_deserialize_from_array() {
         let src = r#"
             x = [
-                { dest = "/a", source = "a" },
-                { dest = "/b", source = ["b1", "b2"] },
+                { dest = "a", source = "a" },
+                { dest = "b", source = "b" },
             ]
         "#;
         let ps: Patches = parse(src);
         assert_eq!(ps.len(), 2);
+    }
+
+    #[test]
+    fn patches_fan_out_multi_pattern_source() {
+        let src = r#"
+            x = [
+                { dest = "wallpapers", source = ["a/*.jpg", "a/*.png"] },
+            ]
+        "#;
+        let ps: Patches = parse(src);
+        // One row, two patterns → two patches with the same dest.
+        assert_eq!(ps.len(), 2);
+        let dests: Vec<_> = ps
+            .iter()
+            .map(|p| p.dest().as_sandbox_path().as_str().to_owned())
+            .collect();
+        assert_eq!(dests, ["wallpapers", "wallpapers"]);
+        let sources: Vec<_> = ps.iter().map(|p| p.source().pattern().to_owned()).collect();
+        assert_eq!(sources, ["a/*.jpg", "a/*.png"]);
+    }
+
+    #[test]
+    fn patches_fan_out_propagates_description() {
+        let src = r#"
+            x = [
+                { description = "lovely-fonts", dest = "fonts", source = ["a.ttf", "b.ttf"] },
+            ]
+        "#;
+        let ps: Patches = parse(src);
+        assert_eq!(ps.len(), 2);
+        // `description` is private; the Debug output reveals it. Both
+        // fan-out entries must carry the same description as the source row.
+        let dbg = format!("{ps:?}");
+        assert_eq!(dbg.matches("lovely-fonts").count(), 2);
     }
 
     // ---- PatchPolicy ----
@@ -727,9 +910,9 @@ mod tests {
             ignore = ["**/.DS_Store"]
         "#;
         let policy: PatchPolicy = toml::from_str(src).unwrap();
-        assert_eq!(policy.allow().raw_patterns().len(), 2);
-        assert_eq!(policy.deny().raw_patterns().len(), 2);
-        assert_eq!(policy.ignore().raw_patterns().len(), 1);
+        assert_eq!(patterns(policy.allow()), ["~/.config/**", "/etc/xdg/**"]);
+        assert_eq!(patterns(policy.deny()), ["~/.ssh/**", "**/*.pem"]);
+        assert_eq!(patterns(policy.ignore()), ["**/.DS_Store"]);
     }
 
     #[test]
@@ -741,6 +924,12 @@ mod tests {
     }
 
     #[test]
+    fn patch_policy_accepts_bare_string_for_each_field() {
+        let policy: PatchPolicy = toml::from_str(r#"deny = "~/.ssh/**""#).unwrap();
+        assert_eq!(patterns(policy.deny()), ["~/.ssh/**"]);
+    }
+
+    #[test]
     fn patch_policy_builder_methods() {
         let p = PatchPolicy::empty()
             .try_with_allow(["~/.config/**"])
@@ -749,9 +938,9 @@ mod tests {
             .unwrap()
             .try_with_ignore(["**/.DS_Store"])
             .unwrap();
-        assert_eq!(p.allow().raw_patterns(), &["~/.config/**"]);
-        assert_eq!(p.deny().raw_patterns(), &["~/.ssh/**", "**/*.pem"]);
-        assert_eq!(p.ignore().raw_patterns(), &["**/.DS_Store"]);
+        assert_eq!(patterns(p.allow()), ["~/.config/**"]);
+        assert_eq!(patterns(p.deny()), ["~/.ssh/**", "**/*.pem"]);
+        assert_eq!(patterns(p.ignore()), ["**/.DS_Store"]);
     }
 
     #[test]
@@ -760,47 +949,22 @@ mod tests {
         assert!(matches!(err, Error::InvalidGlob { .. }), "got: {err:?}");
     }
 
-    // ---- FileSet builders ----
-
     #[test]
-    fn fileset_try_with_base_and_pattern_chain() {
-        let fs = FileSet::empty()
-            .try_with_base(HostPath::new("./themes"))
-            .unwrap()
-            .try_with_pattern("**/*")
-            .unwrap()
-            .try_with_pattern("**/*.toml")
-            .unwrap();
-        assert_eq!(fs.base().map(HostPath::as_str), Some("./themes"));
-        assert_eq!(fs.raw_patterns(), &["**/*", "**/*.toml"]);
-    }
-
-    #[test]
-    fn fileset_try_with_base_rejects_empty() {
-        let err = FileSet::empty()
-            .try_with_base(HostPath::new(""))
-            .unwrap_err();
-        assert!(matches!(err, Error::EmptyBase), "got: {err:?}");
-    }
-
-    #[test]
-    fn fileset_try_with_pattern_propagates_invalid_glob() {
-        let err = FileSet::empty().try_with_pattern("[bad").unwrap_err();
-        assert!(matches!(err, Error::InvalidGlob { .. }), "got: {err:?}");
+    fn patch_policy_skips_empty_fields_on_serialize() {
+        let p = PatchPolicy::empty().try_with_allow(["A"]).unwrap();
+        let s = toml::to_string(&p).unwrap();
+        assert!(s.contains("allow"), "expected allow, got: {s}");
+        assert!(!s.contains("deny"), "expected no deny, got: {s}");
+        assert!(!s.contains("ignore"), "expected no ignore, got: {s}");
     }
 
     // ---- Patches builders ----
 
     #[test]
     fn patches_builder_surfaces_compose() {
-        let make = |s: &str| {
-            Patch::new(
-                FileSet::try_new(None, [s]).unwrap(),
-                PatchDest::try_new(format!("/{s}")).unwrap(),
-            )
-        };
+        let make =
+            |s: &str| Patch::new(FileSet::try_new(s).unwrap(), PatchDest::try_new(s).unwrap());
 
-        // collect / with_patch / push all feed the same internal Vec.
         let collected: Patches = ["a", "b"].into_iter().map(make).collect();
         let mut built = Patches::empty().with_patch(make("a"));
         built.push(make("b"));
@@ -810,12 +974,8 @@ mod tests {
 
     #[test]
     fn patches_extend_appends_other_collection() {
-        let make = |s: &str| {
-            Patch::new(
-                FileSet::try_new(None, [s]).unwrap(),
-                PatchDest::try_new(format!("/{s}")).unwrap(),
-            )
-        };
+        let make =
+            |s: &str| Patch::new(FileSet::try_new(s).unwrap(), PatchDest::try_new(s).unwrap());
         let mut ps: Patches = ["a", "b"].into_iter().map(make).collect();
         let extra: Patches = ["c", "d"].into_iter().map(make).collect();
         ps.extend(extra);
@@ -823,12 +983,6 @@ mod tests {
             .iter()
             .map(|p| p.dest().as_sandbox_path().as_str().to_owned())
             .collect();
-        assert_eq!(dests, ["/a", "/b", "/c", "/d"]);
-    }
-
-    #[test]
-    fn fileset_accepts_absolute_base() {
-        let fs = FileSet::try_new(Some(HostPath::new("/etc/xdg")), ["**/*.conf"]).unwrap();
-        assert_eq!(fs.base().map(HostPath::as_str), Some("/etc/xdg"));
+        assert_eq!(dests, ["a", "b", "c", "d"]);
     }
 }

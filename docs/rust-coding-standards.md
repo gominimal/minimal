@@ -25,8 +25,8 @@ validating constructor and keeps the inner value unconstructable elsewhere.
 
 ## Error Handling
 
-- Library crates: typed error enum. Variants are distinct failure modes.
-- Application crates: anyhow::Result. Attach .context(...) / .with_context(|| ...) at layer boundaries.
+- Library crates: typed error enum via thiserror. `#[derive(Debug, thiserror::Error)]`; `#[error("...")]` for Display, `#[from]` for From. Variants are distinct failure modes. Keep `#[non_exhaustive]` on public error enums. See [decision 0001](decisions/0001-rust-error-handling-strategy.md).
+- Application crates: anyhow::Result for opaque propagation. Attach .context(...) / .with_context(|| ...) at layer boundaries. User-facing CLIs use color_eyre instead of anyhow for better-formatted reports.
 - unwrap()/panic! only for broken invariants. unwrap() in tests only; in production use expect("why the invariant holds"). Never for recoverable conditions.
 - Never swallow errors. No let _ = result; or .ok() discards without a comment justifying it.
 - Preserve the source chain. Wrap, don't replace; errors trace back via source().

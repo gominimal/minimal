@@ -52,9 +52,9 @@ either = { version = "1.16", default-features = false }
 flate2 = "1.1"
 futures = "0.3"
 generational-arena = {version = "0.2", features = ["serde"] }
-google-cloud-gax = "1.12"
+google-cloud-gax = "1.13"
 google-cloud-auth = "1.5"
-google-cloud-storage = "1.6"
+google-cloud-storage = "1.7"
 # Revert back to crates.io dep once new version is released.
 hakoniwa = { git = "https://github.com/souk4711/hakoniwa.git", rev = "65d12eaae6786cd312aa74784514eb3a072dfe38", features = ["cgroups"] }
 http-body = "1"
@@ -65,10 +65,10 @@ jaq-all = "0.1.0"
 libc = "0.2"
 lzma-rs = "0.3"
 
-# Revert back to crates.io dep once 0.18 is released.
-nickel-lang-core = { git = "https://github.com/nickel-lang/nickel.git", rev = "b2a3a14673a29fbea9c61d466c0284a3dc854520", default-features = false, features = ["format"] }
+nickel-lang-core = { version = "0.18", default-features = false, features = ["format"] }
 
 nix = { version = "0.31", features = ["fs"] }
+nutype = { version = "0.6", features = ["serde"] }
 object = { version = "0.39", default-features = false, features = ["archive", "elf", "read_core", "std"] }
 oci-spec = "0.10"
 path-absolutize = "3.1"
@@ -102,6 +102,7 @@ tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+thiserror = "2"
 url = "2" # keep in sync with reqwest
 uuid = { version = "1.23", features = ["v4", "v7", "serde"] }
 zstd = "0.13"
