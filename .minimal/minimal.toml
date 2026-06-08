@@ -1,7 +1,7 @@
 [upstream] # Source of software & tooling
 repo = "https://github.com/gominimal/pkgs"
 branch = "main"
-locked_commit = "133db0c"
+locked_commit = "64e6866"
 
 [harness]
 use = "rust"
@@ -42,15 +42,18 @@ packages = ["bash", "coreutils", "diffutils", "findutils", "tar"]
 env_vars.test = "ello"
 cmd = ["/usr/bin/bash", "-l"]
 
+# Raw (uncompressed) kernel Image from the upstream virtio-kernel-raw package,
+# loaded via KRUN_KERNEL_FORMAT_RAW (no in-VMM gzip decompress) for faster boot.
 [outputs.virtio-kernel]
 type = "raw-file"
-packages = ["virtio-linux"]
-path = "usr/share/virtio-linux/vmlinuz"
+packages = ["virtio-kernel-raw"]
+path = "usr/share/virtio-linux/Image"
 
+# Guest rootfs ext4 image from the upstream microvm-rootfs package.
 [outputs.minvmd-rootfs]
 type = "raw-file"
-packages = ["minvmd-rootfs"]
-path = "usr/share/minvmd-rootfs/rootfs.img"
+packages = ["microvm-rootfs"]
+path = "usr/share/microvm-rootfs/rootfs.img"
 
 [tasks.vim]
 profile = "demo"

@@ -67,11 +67,11 @@ jobs:
           if-no-files-found: error
 
   minvmd-rootfs:
-    # Build the guest rootfs as a minimal package (ext4 image) on the
-    # self-hosted aarch64 runner. minvmd-rootfs is a new package that must be
-    # built natively for aarch64 (the build container does not emulate), and
-    # macOS package materialization runs through the minimal shim VM. Materialize
-    # once and hand the image to the boot jobs as an artifact.
+    # Build the guest rootfs (ext4 image) from the upstream microvm-rootfs
+    # package on the self-hosted aarch64 runner. It must be built natively for
+    # aarch64 (the build container does not emulate), and macOS package
+    # materialization runs through the minimal shim VM. Materialize once and hand
+    # the image to the boot jobs as an artifact.
     if: ${{ vars.RUN_MACOS_CI != 'false' }}
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 20
@@ -101,7 +101,7 @@ jobs:
           echo "shim minimal: $(minimal --version 2>&1 | tail -1)"
           minimal materialize --output "$GITHUB_WORKSPACE/rootfs.img" --arch aarch64 minvmd-rootfs || true
           if [ ! -s "$GITHUB_WORKSPACE/rootfs.img" ]; then
-            src="$(ls -t "$HOME"/.cache/minimal/built/*/*/usr/share/minvmd-rootfs/rootfs.img 2>/dev/null | head -1)"
+            src="$(ls -t "$HOME"/.cache/minimal/built/*/*/usr/share/microvm-rootfs/rootfs.img 2>/dev/null | head -1)"
             [ -n "$src" ] || { echo "::error::minvmd-rootfs image not in build cache (build produced nothing)"; exit 1; }
             echo "materialize copy failed; using freshly-built cache output: $src"
             cp "$src" "$GITHUB_WORKSPACE/rootfs.img"
