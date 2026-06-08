@@ -75,7 +75,7 @@ jobs:
     steps:
       - name: Decide whether to run, and find the tracking issue
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-dispatch@v0.1.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-dispatch@v0.1.2
         with:
           app-id: ${{ vars.APP_ID }}
           github-token: ${{ github.token }}
@@ -105,10 +105,11 @@ jobs:
       precondition: ${{ steps.compute.outputs.precondition }}
       tracking_state: ${{ steps.compute.outputs.tracking_state }}
       reason: ${{ steps.compute.outputs.reason }}
+      closeable_units: ${{ steps.compute.outputs.closeable_units }}
     steps:
       - name: Compute ready set and precondition state
         id: compute
-        uses: norrietaylor/spectacles/.github/actions/sdd-dispatch-compute@v0.1.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-dispatch-compute@v0.1.2
         with:
           tracking-issue: ${{ needs.route.outputs.tracking_issue }}
           trigger-kind: ${{ needs.route.outputs.trigger_kind }}
@@ -189,7 +190,7 @@ jobs:
               core.setFailed('Failed to post /execute on task #' + task
                 + ': ' + err.message);
             }
-      - name: Apply sdd:ready hint to dispatched task #${{ matrix.task }}
+      - name: Claim dispatched task #${{ matrix.task }} as sdd:in-progress
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           APP_TOKEN: ${{ steps.app.outputs.token }}
@@ -198,17 +199,55 @@ jobs:
           github-token: ${{ env.APP_TOKEN }}
           script: |
             const task = parseInt(process.env.TASK, 10);
+            // Claim the task deterministically at dispatch time: mark it
+            // sdd:in-progress and drop sdd:ready, mirroring the
+            // tracking-issue move in the lifecycle job. Done here (not in
+            // the agent run) so a dispatched-but-not-yet-booted task is
+            // visibly in flight, never indistinguishable from an
+            // un-dispatched sdd:ready task (#200). The write uses the App
+            // token; #143's trigger guard makes execute ignore issues
+            // label events (except `unlabeled needs-human`), so this does
+            // not re-fire or cancel the execute run.
+            // Add sdd:in-progress first; only drop sdd:ready once the task is
+            // confirmed in-progress, so an unexpected add failure (403/5xx)
+            // never leaves the task with neither label. A 422 means the label
+            // is already present (idempotent); any other status is fatal.
+            let inProgressPresent = false;
             try {
               await github.rest.issues.addLabels({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: task,
-                labels: ['sdd:ready'],
+                labels: ['sdd:in-progress'],
               });
+              inProgressPresent = true;
             } catch (err) {
-              // A 422 here means the label is already present; ignore.
-              core.info('Could not add sdd:ready to #' + task + ': '
-                + err.message);
+              if (err.status === 422) {
+                inProgressPresent = true;
+              } else {
+                throw err;
+              }
+            }
+            if (inProgressPresent) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: task,
+                  name: 'sdd:ready',
+                });
+              } catch (err) {
+                // A 404 means sdd:ready was already absent; idempotent.
+                // Any other status (permission, transient API failure)
+                // is fatal so dispatch-state drift surfaces as a job
+                // failure rather than being silently swallowed, mirroring
+                // the 422 handling on the paired sdd:in-progress add above.
+                if (err.status === 404) {
+                  core.info('sdd:ready already absent on #' + task);
+                } else {
+                  throw err;
+                }
+              }
             }
 
   # Manage the tracking issue's lifecycle and sdd:dispatched labels. On the
@@ -245,6 +284,7 @@ jobs:
           READY_COUNT: ${{ needs.compute.outputs.ready_count }}
           OPEN_TASK_COUNT: ${{ needs.compute.outputs.open_task_count }}
           TRACKING_STATE: ${{ needs.compute.outputs.tracking_state }}
+          CLOSEABLE_UNITS: ${{ needs.compute.outputs.closeable_units }}
         with:
           github-token: ${{ env.APP_TOKEN }}
           script: |
@@ -260,6 +300,63 @@ jobs:
             // posts the refusal.
             if (precondition !== 'ok') {
               return;
+            }
+
+            // Deterministic Unit-close (#233). compute's tree walk
+            // nominates every Unit under this tracking issue whose every
+            // task child is now closed while the Unit itself is still open
+            // (the fail-closed test lives in sdd-dispatch-compute: a child
+            // whose state cannot be read is not 'closed', so its Unit is
+            // never nominated). We close those Units here, on the same
+            // deterministic event that drains the tree — replacing the
+            // prompt-driven Unit-close that ADR 0005 §4-5 parked on
+            // sdd-execute's step-8 sweep, which only fired on a merged-PR
+            // run and missed manual closes. sdd-execute retains that sweep
+            // as an idempotent backup during the transition (#233).
+            //
+            // Loop safety: closing a Unit re-fires this wrapper on the
+            // Unit's own issues.closed event, but sdd-route-dispatch only
+            // arms the cascade when the closed issue is a *task* (its
+            // parent walk reaches the tracker in exactly two hops). A Unit
+            // is one hop below the tracker, so the walk yields walked === 1,
+            // route emits should_run = false, and every dispatch job skips.
+            // A Unit has no parent Unit, so there is no further Unit to
+            // cascade-close. The close therefore terminates here; the only
+            // downstream effect is that the tracker's existing drain logic
+            // (openTaskCount === 0 -> sdd:done, below) may run on the next
+            // task close. No infinite loop is possible.
+            //
+            // Idempotency: compute only nominates Units that are still open,
+            // but the close is also wrapped in try/catch so a redundant
+            // close on an already-closed Unit (or any transient API error)
+            // is a no-op, mirroring the dual-path sdd:done contract below.
+            // The write uses the App installation token (issues: write),
+            // the same token this job uses to mutate labels.
+            let closeableUnits = [];
+            try {
+              closeableUnits = JSON.parse(process.env.CLOSEABLE_UNITS || '[]');
+            } catch (err) {
+              // A malformed payload must not crash the lifecycle job (which
+              // also owns the sdd:done drain below); treat it as "no Units
+              // to close" — fail-closed, never a false close.
+              core.info('Could not parse CLOSEABLE_UNITS; skipping Unit-close: '
+                + err.message);
+              closeableUnits = [];
+            }
+            for (const unit of closeableUnits) {
+              try {
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: unit,
+                  state: 'closed',
+                });
+                core.info('All tasks closed under Unit #' + unit
+                  + '; closed the Unit.');
+              } catch (err) {
+                core.info('Could not close Unit #' + unit + ': '
+                  + err.message);
+              }
             }
 
             // First /dispatch: move sdd:ready -> sdd:in-progress and add
@@ -298,8 +395,9 @@ jobs:
                   labels: ['sdd:dispatched'],
                 });
               } catch (err) {
-                core.info('Could not add sdd:dispatched to #' + tracking
+                core.setFailed('Could not add sdd:dispatched to #' + tracking
                   + ': ' + err.message);
+                throw err;
               }
             }
 
