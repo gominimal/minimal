@@ -142,6 +142,14 @@ impl Server {
     /// The vsock peer is host-mediated (`net=none`) and as trusted as the
     /// UDS peer, so accepted connections are treated as local
     /// ([`Auth::Local`]), matching `run_on_uds`.
+    ///
+    /// NB: over libkrun's `krun_add_vsock_port2` bridge this *accepts*
+    /// connections fine, but a full SSH session dies with "Protocol error: early
+    /// eof" shortly after accept — the bridged vsock stream does not sustain a
+    /// bidirectional session (a single short request/response works). The
+    /// deployed guest therefore relays the bridge port through socat to a UDS and
+    /// serves via `run_on_uds`; this direct path is kept as the building block /
+    /// for a future bridge fix.
     #[cfg(target_os = "linux")]
     pub async fn run_on_vsock(config: Config, port: u32) -> Result<(), std::io::Error> {
         use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
