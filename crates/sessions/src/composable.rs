@@ -548,11 +548,16 @@ pub enum ResolveError {
     /// At least one patch source or policy pattern starts with `~`,
     /// but resolving the host home directory failed.
     ///
-    /// Both failure modes (no home available; non-UTF-8 home path)
-    /// live under one variant because the home lookup happens once at
-    /// the start of resolution — not per pattern — so the error has
-    /// no pattern context to surface. Match on the inner
-    /// [`HomeResolutionFailure`] to distinguish causes.
+    /// All three failure modes (no home available, non-UTF-8 home
+    /// path, non-absolute home path) live under one [`HomeUnresolved`]
+    /// variant because the home lookup happens once at the start of
+    /// resolution — not per pattern — so the error has no pattern
+    /// context to surface. Match on the inner [`HomeResolutionFailure`]
+    /// to distinguish [`Unavailable`][HomeResolutionFailure::Unavailable],
+    /// [`NotUtf8`][HomeResolutionFailure::NotUtf8], and
+    /// [`NotAbsolute`][HomeResolutionFailure::NotAbsolute].
+    ///
+    /// [`HomeUnresolved`]: Self::HomeUnresolved
     #[error("a `~`-prefixed pattern requires home expansion, but {0}")]
     HomeUnresolved(#[from] HomeResolutionFailure),
 }
@@ -1195,26 +1200,35 @@ fn expand_policy_home_opt(
     }
 }
 
-/// `true` if any [`FileSet`](crate::patches::FileSet) in `sets`
-/// starts with `~`.
-fn any_tilde(sets: &[crate::patches::FileSet]) -> bool {
-    sets.iter().any(|fs| fs.pattern().starts_with('~'))
+/// `true` if `pattern` is a candidate for home expansion — exactly
+/// `"~"` or beginning with `"~/"`. `~user/...` (POSIX per-user
+/// expansion) is intentionally excluded: [`expand_home`] doesn't
+/// implement it, and treating it as a tilde pattern here would trigger
+/// a needless home lookup that could fail spuriously.
+fn needs_home_expansion(pattern: &str) -> bool {
+    pattern == "~" || pattern.starts_with("~/")
 }
 
-/// `true` if any pattern in the policy starts with `~`. Used at the
-/// top of [`resolve_patches`] to decide whether to invoke the home
-/// lookup.
+/// `true` if any [`FileSet`](crate::patches::FileSet) in `sets` needs
+/// home expansion (per [`needs_home_expansion`]).
+fn any_tilde(sets: &[crate::patches::FileSet]) -> bool {
+    sets.iter().any(|fs| needs_home_expansion(fs.pattern()))
+}
+
+/// `true` if any pattern in the policy needs home expansion. Used at
+/// the top of [`resolve_patches`] to decide whether to invoke the
+/// home lookup.
 fn policy_has_tilde_pattern(p: &crate::patches::PatchPolicy) -> bool {
     any_tilde(p.allow()) || any_tilde(p.deny()) || any_tilde(p.ignore())
 }
 
-/// `true` if any patch source pattern starts with `~`. Used at the
-/// top of [`resolve_patches`] alongside [`policy_has_tilde_pattern`]
+/// `true` if any patch source pattern needs home expansion. Used at
+/// the top of [`resolve_patches`] alongside [`policy_has_tilde_pattern`]
 /// to decide whether to invoke the home lookup.
 fn patches_have_tilde_pattern(items: &[ProvenancedPatch]) -> bool {
     items
         .iter()
-        .any(|pp| pp.patch.source().pattern().starts_with('~'))
+        .any(|pp| needs_home_expansion(pp.patch.source().pattern()))
 }
 
 /// Compute the destination for a single source file under a patch's
@@ -2059,6 +2073,30 @@ mod tests {
                 ),
                 "got: {err:?}",
             );
+        }
+
+        /// A `~user/...` pattern is POSIX per-user expansion, which
+        /// `expand_home` doesn't implement. The tilde predicate must
+        /// not treat it as a home-expansion candidate; otherwise an
+        /// unavailable home lookup would surface `HomeUnresolved` for
+        /// a pattern that the resolver wouldn't have touched anyway.
+        #[test]
+        fn user_prefixed_tilde_does_not_trigger_home_lookup() {
+            let (_tmp, patch) = single_file_patch("conf.toml", "conf");
+            let pp = ProvenancedPatch::new(patch, user_source());
+            let policy = PatchPolicy::empty()
+                .try_with_deny(["~someuser/.ssh/**"])
+                .unwrap();
+            // `no_home()` would error if the lookup were invoked.
+            let resolved = resolve_patches(
+                vec![pp],
+                policy,
+                &PassThroughHook,
+                ResolveOptions::default(),
+                &no_home(),
+            )
+            .unwrap();
+            assert_eq!(resolved.0.len(), 1);
         }
 
         /// The returned policy preserves raw `~` patterns — round-trip

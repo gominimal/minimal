@@ -15,8 +15,10 @@
 //! #   - `source` `~` is expanded at *session-resolution* time against
 //! #     the host home (via the Composer's home lookup —
 //! #     dirs::home_dir by default).
-//! #   - `dest` `~` is expanded at *apply* time against the sandbox
-//! #     home (a different home; the resolver leaves it as-is).
+//! #   - `dest` `~` is left unexpanded by the resolver. `PatchDest` is
+//! #     validated as sandbox-home-relative; any expansion of a leading
+//! #     `~` happens in the sandbox runtime against the sandbox home,
+//! #     not here.
 //! patches = [
 //!     # Helix: single config files plus a themes directory.
 //!     { dest = "~/.config/helix/config.toml",

@@ -177,8 +177,8 @@ declarative sources (loadout, project, packages) to the final
   lossless. When any `~`-prefixed pattern is in scope, the home
   lookup is invoked once up-front; failures surface as
   `ResolveError::HomeUnresolved` (with an inner
-  `HomeResolutionFailure::{Unavailable, NotUtf8}` distinguishing the
-  cause) rather than silently matching nothing.
+  `HomeResolutionFailure::{Unavailable, NotUtf8, NotAbsolute}`
+  distinguishing the cause) rather than silently matching nothing.
 - **`Composer::merge` is pure aggregation today.** Two contributors
   pushing the same var name both survive into `Resolution.vars()`.
   Conflict resolution (precedence, dedup, error-on-conflict) will live
