@@ -13,7 +13,7 @@ pub mod vmm_child;
 /// the VMM child. The parent reads `READY` to confirm boot (R2.4).
 ///
 /// Must match the guest rootfs's READY/agent port. The canonical value is
-/// `7350` — both the guest rootfs manifest (`etc/minvmd/manifest`:
+/// `7350` — both the guest rootfs manifest (`etc/microvm/manifest`:
 /// `vsock_port_ready=7350`) and the reference impl (min-ctl: cold boot to a TCP
 /// connection on `127.0.0.1:7350`) use it. The host previously used `9799`,
 /// which no guest emits on, so the READY marker never arrived.
