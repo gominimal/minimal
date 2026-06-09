@@ -63,49 +63,45 @@ use std::str::FromStr;
 
 /// Errors produced when constructing var primitives.
 #[non_exhaustive]
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// A var name was empty.
+    #[error("variable name must not be empty")]
     EmptyName,
     /// A var name failed POSIX validation (used by [`StrictVarName`]).
+    #[error(
+        "variable name `{0}` is not POSIX-shaped (expected `[A-Z_][A-Z0-9_]*`); \
+         use the `vars_lenient` form for non-POSIX names"
+    )]
     NotPosixName(String),
     /// A var name contained `=` or NUL, which the kernel won't accept.
+    #[error("variable name `{0}` contains `=` or NUL, which the kernel rejects")]
     InvalidLenientName(String),
     /// A pattern string failed to parse as a glob.
+    #[error("invalid glob pattern `{pattern}`: {source}")]
     InvalidGlob {
         pattern: String,
+        #[source]
         source: globset::Error,
     },
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyName => f.write_str("variable name must not be empty"),
-            Self::NotPosixName(s) => write!(
-                f,
-                "variable name `{s}` is not POSIX-shaped \
-                 (expected `[A-Z_][A-Z0-9_]*`); use the `vars_lenient` \
-                 form for non-POSIX names",
-            ),
-            Self::InvalidLenientName(s) => write!(
-                f,
-                "variable name `{s}` contains `=` or NUL, which the kernel rejects",
-            ),
-            Self::InvalidGlob { pattern, source } => {
-                write!(f, "invalid glob pattern `{pattern}`: {source}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidGlob { source, .. } => Some(source),
-            _ => None,
-        }
-    }
+    /// Resolving an inherited variable's value via the environment lookup
+    /// (default: [`std::env::var`]) failed.
+    #[error("unable to get value of environment variable {name}: {source}")]
+    ResolutionFailure {
+        name: String,
+        #[source]
+        source: std::env::VarError,
+    },
+    /// Compiling the precomputed [`globset::GlobSet`] matcher failed.
+    /// Each individual pattern was already validated by
+    /// [`globset::Glob::new`]; this error covers failures of the
+    /// *combined* regex — typically size or complexity limits when
+    /// many patterns alternate together.
+    #[error("failed to compile combined glob matcher: {source}")]
+    InvalidGlobSet {
+        #[source]
+        source: globset::Error,
+    },
 }
 
 // =====================================================================
@@ -149,6 +145,12 @@ impl StrictVarName {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Consume the newtype and return the underlying [`String`].
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
     }
 }
 
@@ -215,6 +217,12 @@ impl LenientVarName {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Consume the newtype and return the underlying [`String`].
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
     }
 }
 
@@ -293,6 +301,12 @@ impl LenientVarEntry {
     #[must_use]
     pub fn value(&self) -> &VarValue {
         &self.value
+    }
+
+    /// Consume the entry and return its components.
+    #[must_use]
+    pub fn into_parts(self) -> (LenientVarName, VarValue) {
+        (self.name, self.value)
     }
 }
 
@@ -456,10 +470,21 @@ impl<'de> serde::Deserialize<'de> for VarValue {
 /// Patterns are compiled at construction time so malformed ones fail at
 /// config load. Used by [`VarsPolicy`] to express allow/deny/ignore
 /// lists.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct VarNameGlobs {
     patterns: Vec<String>,
     compiled: Vec<globset::Glob>,
+    set: globset::GlobSet,
+}
+
+impl Default for VarNameGlobs {
+    fn default() -> Self {
+        Self {
+            patterns: Vec::new(),
+            compiled: Vec::new(),
+            set: globset::GlobSet::empty(),
+        }
+    }
 }
 
 impl VarNameGlobs {
@@ -489,9 +514,11 @@ impl VarNameGlobs {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let set = build_set(&compiled)?;
         Ok(Self {
             patterns: raw,
             compiled,
+            set,
         })
     }
 
@@ -510,6 +537,7 @@ impl VarNameGlobs {
         let mut new = self;
         new.patterns.push(pattern);
         new.compiled.push(glob);
+        new.set = build_set(&new.compiled)?;
         Ok(new)
     }
 
@@ -530,6 +558,22 @@ impl VarNameGlobs {
     pub fn is_empty(&self) -> bool {
         self.patterns.is_empty()
     }
+
+    /// `true` iff any pattern in this set matches `name`.
+    #[must_use]
+    pub fn is_match(&self, name: &str) -> bool {
+        self.set.is_match(name)
+    }
+}
+
+fn build_set(globs: &[globset::Glob]) -> Result<globset::GlobSet, Error> {
+    let mut b = globset::GlobSetBuilder::new();
+    for g in globs {
+        b.add(g.clone());
+    }
+    // Individual `Glob::new` validation does not bound the *combined*
+    // regex, which can hit `regex` crate size/complexity limits.
+    b.build().map_err(|source| Error::InvalidGlobSet { source })
 }
 
 impl PartialEq for VarNameGlobs {
@@ -685,6 +729,137 @@ impl VarsPolicy {
     #[must_use]
     pub fn ignore(&self) -> &VarNameGlobs {
         &self.ignore
+    }
+
+    /// Categorize a single variable against this policy.
+    ///
+    /// Precedence: `ignore` first, then a source-aware branch. For
+    /// user-origin items ([`Source::UserLoadout`]), `allow` and `deny`
+    /// do not apply — anything not ignored is implicitly allowed. For
+    /// every other source, the precedence continues `deny` → `allow` →
+    /// `NeedsApproval`.
+    ///
+    /// `item` reports its provenance via [`Provenanced`]; the resolver
+    /// constructs `T` types that carry their own source, so the caller
+    /// doesn't have to clone-and-borrow at the call site.
+    ///
+    /// Provenance of the *matched pattern* is not reported here; surface
+    /// that via a separate inspection command.
+    ///
+    /// [`Source::UserLoadout`]: crate::composable::Source::UserLoadout
+    /// [`Provenanced`]: crate::composable::Provenanced
+    #[must_use]
+    pub fn check<T: crate::composable::Provenanced>(
+        &self,
+        name: &str,
+        item: T,
+    ) -> crate::composable::CheckOutcome<T> {
+        use crate::composable::{CheckOutcome, Decision, Source};
+        if self.ignore.is_match(name) {
+            return CheckOutcome::Decided(Decision::Ignored);
+        }
+        if matches!(item.source(), Source::UserLoadout { .. }) {
+            return CheckOutcome::Decided(Decision::Allowed(item));
+        }
+        if self.deny.is_match(name) {
+            CheckOutcome::Decided(Decision::Denied(item))
+        } else if self.allow.is_match(name) {
+            CheckOutcome::Decided(Decision::Allowed(item))
+        } else {
+            CheckOutcome::NeedsApproval(item)
+        }
+    }
+}
+
+/// A variable name paired with the value it should resolve to after
+/// applying [`VarValue`] semantics (inheriting from the environment,
+/// falling back to a default, or taking a literal).
+///
+/// Both fields are raw strings: by the time a session is being
+/// activated, the OS is the next consumer and doesn't care about our
+/// strict/lenient name distinction. The newtype invariants are still
+/// upheld upstream — `ResolvedVar` only stores the post-resolution
+/// snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ResolvedVar {
+    name: String,
+    value: String,
+}
+
+impl ResolvedVar {
+    /// The variable's name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The resolved value.
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// Resolve a variable against an arbitrary environment-lookup function.
+    /// The thread-able shape lets tests pin every branch without touching
+    /// the process environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ResolutionFailure`] if `lookup` returns an error
+    /// that the variant's semantics surface (every error for
+    /// [`VarValue::Inherit`]; only [`std::env::VarError::NotUnicode`] for
+    /// [`VarValue::InheritWithDefault`]).
+    pub fn resolve_with<F>(name: String, value: VarValue, lookup: F) -> Result<Self, Error>
+    where
+        F: FnOnce(&str) -> Result<String, std::env::VarError>,
+    {
+        let resolved_value = match value {
+            VarValue::Specified { value } => value,
+            VarValue::Inherit => lookup(&name).map_err(|source| Error::ResolutionFailure {
+                name: name.clone(),
+                source,
+            })?,
+            VarValue::InheritWithDefault { default } => match lookup(&name) {
+                Ok(value) => value,
+                Err(std::env::VarError::NotPresent) => default,
+                Err(source @ std::env::VarError::NotUnicode(_)) => {
+                    return Err(Error::ResolutionFailure {
+                        name: name.clone(),
+                        source,
+                    });
+                }
+            },
+        };
+        Ok(Self {
+            name,
+            value: resolved_value,
+        })
+    }
+
+    /// Resolve a variable against the process environment via
+    /// [`std::env::var`]. Sugar for [`Self::resolve_with`] with the
+    /// default lookup.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::resolve_with`].
+    pub fn resolve(name: String, value: VarValue) -> Result<Self, Error> {
+        Self::resolve_with(name, value, |l| std::env::var(l))
+    }
+}
+
+impl TryFrom<(StrictVarName, VarValue)> for ResolvedVar {
+    type Error = Error;
+    fn try_from((name, value): (StrictVarName, VarValue)) -> Result<Self, Error> {
+        Self::resolve(name.into_inner(), value)
+    }
+}
+
+impl TryFrom<LenientVarEntry> for ResolvedVar {
+    type Error = Error;
+    fn try_from(entry: LenientVarEntry) -> Result<Self, Self::Error> {
+        let (name, value) = entry.into_parts();
+        Self::resolve(name.into_inner(), value)
     }
 }
 
@@ -958,5 +1133,90 @@ mod tests {
         let e: LenientVarEntry = (n.clone(), v.clone()).into();
         assert_eq!(e.name(), &n);
         assert_eq!(e.value(), &v);
+    }
+
+    // ---- ResolvedVar ----
+
+    fn make_lookup<'a>(
+        entries: &'a [(&'a str, &'a str)],
+    ) -> impl Fn(&str) -> Result<String, std::env::VarError> + 'a {
+        move |name| {
+            entries
+                .iter()
+                .find_map(|(k, v)| (*k == name).then(|| (*v).to_owned()))
+                .ok_or(std::env::VarError::NotPresent)
+        }
+    }
+
+    #[test]
+    fn resolved_var_specified_does_not_consult_lookup() {
+        let r = ResolvedVar::resolve_with("EDITOR".into(), VarValue::specified("hx"), |_| {
+            panic!("lookup must not be called for Specified")
+        })
+        .unwrap();
+        assert_eq!(r.name(), "EDITOR");
+        assert_eq!(r.value(), "hx");
+    }
+
+    #[test]
+    fn resolved_var_inherit_returns_lookup_value() {
+        let lookup = make_lookup(&[("LANG", "en_US.UTF-8")]);
+        let r = ResolvedVar::resolve_with("LANG".into(), VarValue::Inherit, lookup).unwrap();
+        assert_eq!(r.value(), "en_US.UTF-8");
+    }
+
+    #[test]
+    fn resolved_var_inherit_surfaces_not_present_as_error() {
+        let lookup = make_lookup(&[]);
+        let err = ResolvedVar::resolve_with("LANG".into(), VarValue::Inherit, lookup).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::ResolutionFailure {
+                source: std::env::VarError::NotPresent,
+                ..
+            },
+        ));
+    }
+
+    #[test]
+    fn resolved_var_inherit_with_default_falls_back_when_unset() {
+        let lookup = make_lookup(&[]);
+        let r =
+            ResolvedVar::resolve_with("LANG".into(), VarValue::inherit_with_default("C"), lookup)
+                .unwrap();
+        assert_eq!(r.value(), "C");
+    }
+
+    #[test]
+    fn resolved_var_inherit_with_default_prefers_env_value() {
+        let lookup = make_lookup(&[("LANG", "en_US.UTF-8")]);
+        let r =
+            ResolvedVar::resolve_with("LANG".into(), VarValue::inherit_with_default("C"), lookup)
+                .unwrap();
+        assert_eq!(r.value(), "en_US.UTF-8");
+    }
+
+    #[test]
+    fn resolved_var_inherit_with_default_surfaces_not_unicode_as_error() {
+        use std::ffi::OsString;
+        let lookup = |_: &str| Err(std::env::VarError::NotUnicode(OsString::from("bad")));
+        let err =
+            ResolvedVar::resolve_with("LANG".into(), VarValue::inherit_with_default("C"), lookup)
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::ResolutionFailure {
+                source: std::env::VarError::NotUnicode(_),
+                ..
+            },
+        ));
+    }
+
+    #[test]
+    fn resolved_var_error_source_chain_includes_var_error() {
+        let lookup = make_lookup(&[]);
+        let err = ResolvedVar::resolve_with("LANG".into(), VarValue::Inherit, lookup).unwrap_err();
+        let source = std::error::Error::source(&err);
+        assert!(source.is_some(), "expected source on ResolutionFailure");
     }
 }

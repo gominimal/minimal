@@ -68,6 +68,7 @@ lzma-rs = "0.3"
 nickel-lang-core = { version = "0.18", default-features = false, features = ["format"] }
 
 nix = { version = "0.31", features = ["fs"] }
+nutype = { version = "0.6", features = ["serde"] }
 object = { version = "0.39", default-features = false, features = ["archive", "elf", "read_core", "std"] }
 oci-spec = "0.10"
 path-absolutize = "3.1"
@@ -102,6 +103,7 @@ tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+thiserror = "2"
 url = "2" # keep in sync with reqwest
 uuid = { version = "1.23", features = ["v4", "v7", "serde"] }
 zstd = "0.13"

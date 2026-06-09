@@ -65,6 +65,15 @@ on:
   # directly.
   pull_request:
     types: [unlabeled, closed]
+  # A check suite that completed on a pull request this agent opened. A
+  # failure conclusion on an `sdd/` branch is treated as an implicit
+  # /revise (issue #203): a required CI check failed and merge is BLOCKED,
+  # so the build is handed back to sdd-execute to fix on the same branch,
+  # mirroring the CHANGES_REQUESTED path. A success/neutral suite does not
+  # trigger a revise. The route step bounds the retries and escalates with
+  # needs-human after the cap.
+  check_suite:
+    types: [completed]
 
 permissions:
   contents: read
@@ -108,8 +117,20 @@ permissions:
 # where cancel-in-progress killed the originating run's safe_outputs tail
 # and its auto-merge job. The route step acts only on /execute and
 # /revise comments, so a non-command comment in a unique group is safe.
+#
+# A check_suite.completed event (the CI-failure -> implicit /revise path)
+# carries neither github.event.issue.number nor github.event.pull_request
+# .number — the PR is in github.event.check_suite.pull_requests[]. Without
+# a dedicated branch the expression fell through to the github.run_id
+# fallback, giving every failed suite its own group so cancel-in-progress
+# never collapsed concurrent /revise runs on the same PR (issues #227,
+# #228). Key on the suite's PR number (head_branch fallback when no PR is
+# linked), but ONLY for the same actionable suites the route job acts on:
+# a failure-like conclusion on an sdd/ branch. A success/neutral suite is
+# left on the throwaway github.run_id key so it cannot land in an active
+# /revise group and cancel a running revise before no-opping in route.
 concurrency:
-  group: sdd-execute-sonnet-${{ github.event.action == 'unlabeled' && github.run_id || (github.event_name == 'issue_comment' && !startsWith(github.event.comment.body, '/execute') && !startsWith(github.event.comment.body, '/revise')) && github.run_id || github.event.issue.number || github.event.pull_request.number || fromJSON(github.event.inputs.aw_context || '{}').item_number || github.run_id }}
+  group: sdd-execute-sonnet-${{ github.event.action == 'unlabeled' && github.run_id || (github.event_name == 'issue_comment' && !startsWith(github.event.comment.body, '/execute') && !startsWith(github.event.comment.body, '/revise')) && github.run_id || (github.event_name == 'check_suite' && github.event.action == 'completed' && startsWith(github.event.check_suite.head_branch, 'sdd/') && (github.event.check_suite.conclusion == 'failure' || github.event.check_suite.conclusion == 'timed_out' || github.event.check_suite.conclusion == 'cancelled' || github.event.check_suite.conclusion == 'action_required') && (github.event.check_suite.pull_requests[0].number || github.event.check_suite.head_branch)) || github.event.issue.number || github.event.pull_request.number || fromJSON(github.event.inputs.aw_context || '{}').item_number || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -132,7 +153,8 @@ jobs:
   # without an API call).
   route:
     if: |
-      (github.event_name != 'issue_comment' && github.event_name != 'issues')
+      (github.event_name != 'issue_comment' && github.event_name != 'issues'
+        && github.event_name != 'check_suite')
       || (
         github.event_name == 'issue_comment'
         && (
@@ -148,6 +170,17 @@ jobs:
         && github.event.action == 'unlabeled'
         && github.event.label.name == 'needs-human'
       )
+      || (
+        github.event_name == 'check_suite'
+        && github.event.action == 'completed'
+        && startsWith(github.event.check_suite.head_branch, 'sdd/')
+        && (
+          github.event.check_suite.conclusion == 'failure'
+          || github.event.check_suite.conclusion == 'timed_out'
+          || github.event.check_suite.conclusion == 'cancelled'
+          || github.event.check_suite.conclusion == 'action_required'
+        )
+      )
     runs-on: ubuntu-latest
     # pull-requests: read is needed for the tier gate on a /revise issue_comment
     # (situation 6): the route fetches the pull request to read its body and
@@ -161,7 +194,13 @@ jobs:
     # comment on the PR and, on hitting SDD_MAX_REVIEW_ITERATIONS, applies the
     # needs-human label. Comments and labels written by the GITHUB_TOKEN do not
     # re-trigger workflows, so this does not feed back into the route.
+    #
+    # checks: read is needed by the failed-required-check auto-revise branch
+    # (issue #203): it lists the check runs in the failing suite to name them
+    # in the revise directive. The same branch reuses the iteration-marker /
+    # needs-human machinery above.
     permissions:
+      checks: read
       contents: read
       issues: write
       pull-requests: write
@@ -171,7 +210,7 @@ jobs:
     steps:
       - name: Decide whether to run and build aw_context
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-execute@v0.1.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-execute@v0.1.2
         with:
           tier: sonnet
           app-id: ${{ vars.APP_ID }}
@@ -181,7 +220,7 @@ jobs:
   sdd-execute-sonnet:
     needs: route
     if: needs.route.outputs.should_run == 'true'
-    uses: norrietaylor/spectacles/.github/workflows/sdd-execute-sonnet.lock.yml@v0.1.0
+    uses: norrietaylor/spectacles/.github/workflows/sdd-execute-sonnet.lock.yml@v0.1.2
     with:
       aw_context: ${{ needs.route.outputs.aw_context }}
     # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
@@ -189,6 +228,10 @@ jobs:
     secrets:
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
       COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+      # OTLP collector URL (write-only ingest key embedded). Mapped explicitly so
+      # the reusable lock's observability.otlp endpoint resolves; unset is fine
+      # (if-missing: warn). See ADR 0020.
+      GH_AW_OTEL_ENDPOINT: ${{ secrets.GH_AW_OTEL_ENDPOINT }}
     # Ceiling for the called reusable workflow. Must cover the union of every
     # nested job's permissions: the gh-aw conclusion and safe_outputs jobs
     # need write scopes, and activation needs actions: read.
@@ -220,6 +263,9 @@ jobs:
       # Mint the App token: reading branch protection needs administration:
       # read (the gh-aw locks request it too), which the default GITHUB_TOKEN
       # lacks, and enabling auto-merge needs pull-requests + contents write.
+      # issues: write is needed by the empty-PR guard (issue #204): it labels
+      # a 0-diff PR needs-human, and a label on a PR is written through the
+      # issues endpoint.
       - name: Mint App token
         id: app
         uses: actions/create-github-app-token@v3
@@ -231,13 +277,14 @@ jobs:
           permission-administration: read
           permission-contents: write
           permission-pull-requests: write
+          permission-issues: write
       # Arm auto-merge (squash, delete-branch) only when the repo allows it
       # and the base branch protection requires at least one status check;
       # otherwise skip (issue #127). Falls back to a direct squash merge when
       # the PR is UNSTABLE with every required check green (issue #135). The
       # mechanics live in the sdd-auto-merge composite action.
       - name: Enable auto-merge when protection requires a check
-        uses: norrietaylor/spectacles/.github/actions/sdd-auto-merge@v0.1.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-auto-merge@v0.1.2
         with:
           github-token: ${{ steps.app.outputs.token }}
           pr-number: ${{ needs.sdd-execute-sonnet.outputs.created_pr_number }}

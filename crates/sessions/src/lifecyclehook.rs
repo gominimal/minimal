@@ -7,33 +7,20 @@
 //! enforce the same invariant.
 
 use camino::Utf8PathBuf;
-use core::fmt;
 use paths::ConfigRelPath;
 
 /// Errors produced when constructing a [`LifecycleHook`].
 #[non_exhaustive]
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// No hook script was provided.
     ///
     /// Returned by [`LifecycleHookBuilder::build`] (and therefore by
     /// deserialization) when none of `on_activate`, `on_destroy`, or
     /// `on_failure` is set.
+    #[error("At least one of on_activate, on_destroy, or on_failure must be specified")]
     EmptyLifecycleHook,
 }
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyLifecycleHook => write!(
-                f,
-                "At least one of on_activate, on_destroy, or on_failure must be specified"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 /// A script executed by a lifecycle hook.
 ///

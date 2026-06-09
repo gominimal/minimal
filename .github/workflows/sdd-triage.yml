@@ -76,17 +76,19 @@ jobs:
     outputs:
       should_run: ${{ steps.decide.outputs.should_run }}
       aw_context: ${{ steps.decide.outputs.aw_context }}
+      phase: ${{ steps.decide.outputs.phase }}
+      item_number: ${{ steps.decide.outputs.item_number }}
     steps:
       - name: Decide whether to run and build aw_context
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-triage@v0.1.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-triage@v0.1.2
         with:
           github-token: ${{ github.token }}
 
   sdd-triage:
     needs: route
     if: needs.route.outputs.should_run == 'true'
-    uses: norrietaylor/spectacles/.github/workflows/sdd-triage.lock.yml@v0.1.0
+    uses: norrietaylor/spectacles/.github/workflows/sdd-triage.lock.yml@v0.1.2
     with:
       aw_context: ${{ needs.route.outputs.aw_context }}
     # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
@@ -94,6 +96,10 @@ jobs:
     secrets:
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
       COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+      # OTLP collector URL (write-only ingest key embedded). Mapped explicitly so
+      # the reusable lock's observability.otlp endpoint resolves; unset is fine
+      # (if-missing: warn). See ADR 0020.
+      GH_AW_OTEL_ENDPOINT: ${{ secrets.GH_AW_OTEL_ENDPOINT }}
       DISTILLERY_OAUTH_TOKEN: ${{ secrets.DISTILLERY_OAUTH_TOKEN }}
     # Ceiling for the called reusable workflow. Must cover the union of every
     # nested job's permissions: the gh-aw conclusion and safe_outputs jobs
@@ -104,3 +110,107 @@ jobs:
       discussions: write
       issues: write
       pull-requests: write
+
+  # Deterministic DAG backstop for phase C (ADR 0010, issue #229).
+  #
+  # The agent's in-prompt cycle check is the PRIMARY guarantee: it upholds
+  # zero-create-issue-on-cycle, refusing to materialize a tree whose plan
+  # implies a cycle. This job is the AUTHORITATIVE backstop for a cycle that
+  # slips past the LLM. It runs AFTER the agent materializes the tree
+  # (needs: sdd-triage), walks the Feature -> Unit -> task sub-issues
+  # deterministically, and parks the tracking issue with needs-human if a
+  # cycle (or an incomplete tree it cannot fully resolve) is found. It gates
+  # on phase == 'C' (the /approve materialization) so it never runs on the
+  # design or plan-preview phases, which create no task tree to check.
+  cycle-detect:
+    needs: [route, sdd-triage]
+    # always(): the backstop must also run when sdd-triage FAILS partway
+    # through phase C, because a partial materialization can leave a cyclic
+    # or incomplete tree on the issues — exactly the state the deterministic
+    # cycle/tree_incomplete park exists to catch. Gate on route succeeding
+    # (so phase is a valid value) and on sdd-triage having actually run
+    # (result != 'skipped'); a non-phase-C run still no-ops on the phase
+    # check.
+    if: >-
+      always()
+      && needs.route.result == 'success'
+      && needs.route.outputs.phase == 'C'
+      && needs.sdd-triage.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Detect a dependency cycle in the materialized tree
+        id: detect
+        uses: norrietaylor/spectacles/.github/actions/sdd-cycle-detect@v0.1.2
+        with:
+          tracking-issue: ${{ needs.route.outputs.item_number }}
+          github-token: ${{ github.token }}
+      # Park the tree only when the detector found a real cycle or could not
+      # fully resolve the tree. Mint the App token the same way the other
+      # deterministic jobs do (sdd-dispatch's lifecycle/noop jobs) so the
+      # label write and comment carry the App identity.
+      - name: Mint App token
+        id: app
+        if: steps.detect.outputs.cycle == 'true' || steps.detect.outputs.tree_incomplete == 'true'
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+      - name: Park the tracking issue with needs-human
+        if: steps.detect.outputs.cycle == 'true' || steps.detect.outputs.tree_incomplete == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          TRACKING: ${{ needs.route.outputs.item_number }}
+          CYCLE: ${{ steps.detect.outputs.cycle }}
+          CYCLE_PATH: ${{ steps.detect.outputs.cycle_path }}
+          TREE_INCOMPLETE: ${{ steps.detect.outputs.tree_incomplete }}
+        with:
+          github-token: ${{ env.APP_TOKEN }}
+          script: |
+            const tracking = parseInt(process.env.TRACKING, 10);
+            const cycle = process.env.CYCLE === 'true';
+            const cyclePath = process.env.CYCLE_PATH || '';
+            const treeIncomplete = process.env.TREE_INCOMPLETE === 'true';
+            let body;
+            if (cycle) {
+              body = 'Deterministic DAG backstop: the materialized task tree'
+                + ' has a dependency cycle (' + cyclePath + '). The agent\'s'
+                + ' in-prompt cycle check did not catch it (ADR 0010), so this'
+                + ' backstop parked the tracking issue. Break the cycle by'
+                + ' editing the `blocked by` lines on the named tasks, then'
+                + ' clear `needs-human` to resume triage.';
+            } else {
+              body = 'Deterministic DAG backstop: a `blocked by` reference on a'
+                + ' task points at a number that is neither in the walked'
+                + ' Feature -> Unit -> task tree nor a resolvable issue in this'
+                + ' repository, so the dependency graph could not be fully'
+                + ' verified for cycles. Fix the dangling `blocked by`'
+                + ' reference, then clear `needs-human` to resume triage.';
+            }
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: tracking,
+                labels: ['needs-human'],
+              });
+            } catch (err) {
+              core.info('Could not add needs-human to #' + tracking + ': '
+                + err.message);
+            }
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: tracking,
+                body,
+              });
+            } catch (err) {
+              core.setFailed('Could not post backstop comment on #'
+                + tracking + ': ' + err.message);
+            }

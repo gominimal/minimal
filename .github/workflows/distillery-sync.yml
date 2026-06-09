@@ -40,7 +40,7 @@ permissions:
 
 jobs:
   distillery-sync:
-    uses: norrietaylor/spectacles/.github/workflows/distillery-sync.lock.yml@v0.1.0
+    uses: norrietaylor/spectacles/.github/workflows/distillery-sync.lock.yml@v0.1.2
     # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
     # to a reusable workflow in a different owner than the caller.
     secrets:
@@ -49,10 +49,17 @@ jobs:
       # the same mapping every sdd-* wrapper carries.
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
       COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+      # OTLP collector URL (write-only ingest key embedded). Mapped explicitly so
+      # the reusable lock's observability.otlp endpoint resolves; unset is fine
+      # (if-missing: warn). See ADR 0020.
+      GH_AW_OTEL_ENDPOINT: ${{ secrets.GH_AW_OTEL_ENDPOINT }}
       DISTILLERY_OAUTH_TOKEN: ${{ secrets.DISTILLERY_OAUTH_TOKEN }}
     # Ceiling for the called reusable workflow. Must cover the union of every
     # nested job's permissions: the gh-aw conclusion and safe_outputs jobs
-    # need issues: write, and activation needs actions: read.
+    # need issues: write, discussions: write, and pull-requests: write; the
+    # activation needs actions: read. A reusable workflow whose job requests a
+    # scope above this ceiling fails at startup, so this set must track the
+    # lock's job permissions.
     permissions:
       actions: read
       contents: read
