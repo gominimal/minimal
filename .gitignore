@@ -4,3 +4,7 @@ target/
 
 # minvmd local dev scratch (kernel/rootfs materialized for local boot)
 .scratch/
+
+# Claude Code / git worktree scratch dirs (agent worktrees, embedded repos)
+.claude/
+.worktrees/

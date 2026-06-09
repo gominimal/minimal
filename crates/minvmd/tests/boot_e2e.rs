@@ -6,14 +6,14 @@
 //! - `MINVMD_E2E=1`: even with `--include-ignored`, the test self-skips unless
 //!   this env var is set (prevents accidental VM boot on a dev machine without
 //!   a kernel and rootfs).
-//! - `MINVMD_KERNEL_PATH` and `MINVMD_ROOTFS_PATH` must be set to the paths of
-//!   the `virtio-linux` kernel image and the `minvmd-rootfs` ext4 disk image
-//!   respectively.
+//! - `MINVMD_KERNEL_PATH`, `MINVMD_ROOTFS_PATH`, and `MINVMD_INITRAMFS` must be
+//!   set to the paths of the `virtio-linux` kernel image, the `minvmd-rootfs`
+//!   ext4 disk image, and the minimald initramfs cpio respectively.
 //!
 //! The test spawns `minvmd boot --foreground`, waits up to 10 s for the
 //! `vm-up` marker on stdout, then kills the child. A `vm-up` line confirms
-//! that the guest's init wrote `READY\n` to the vsock marker port and the
-//! parent received it (R2.4).
+//! that the guest's `/init` (minimald) wrote `READY\n` to the vsock marker port
+//! and the parent received it (R2.4).
 
 #![cfg(target_os = "macos")]
 
@@ -31,7 +31,11 @@ fn boot_e2e_ready_marker_round_trip() {
         return;
     }
 
-    for var in &["MINVMD_KERNEL_PATH", "MINVMD_ROOTFS_PATH"] {
+    for var in &[
+        "MINVMD_KERNEL_PATH",
+        "MINVMD_ROOTFS_PATH",
+        "MINVMD_INITRAMFS",
+    ] {
         assert!(
             std::env::var(var).is_ok(),
             "boot_e2e: {var} must be set when MINVMD_E2E=1"
