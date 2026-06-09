@@ -7,23 +7,23 @@ use std::path::PathBuf;
 
 use crate::error::VmError;
 
-/// Arch-appropriate libkrun kernel format constant.
+/// Arch-appropriate libkrun kernel format.
 ///
 /// - `aarch64`: the kernel is shipped **uncompressed** (`fetch-virtio-kernel.sh`
-///   gunzips the upstream `Image.gz`) and loaded with `KRUN_KERNEL_FORMAT_RAW`.
+///   gunzips the upstream `Image.gz`) and loaded with `KernelFormat::Raw`.
 ///   Loading raw skips libkrun's gzip decompress, which measured ~77 ms (over
-///   half of boot-to-READY) versus a `PE_GZ` `Image.gz`. The aarch64 loader
+///   half of boot-to-READY) versus a `PeGz` `Image.gz`. The aarch64 loader
 ///   implements only RAW and PE_GZ.
-/// - `x86_64`:  `virtio-linux` ships `bzImage`  → `KRUN_KERNEL_FORMAT_ELF`.
+/// - `x86_64`:  `virtio-linux` ships `bzImage`  → `KernelFormat::Elf`.
 #[cfg(target_os = "macos")]
-pub fn kernel_format() -> u32 {
+pub fn kernel_format() -> crate::krun::KernelFormat {
     #[cfg(target_arch = "aarch64")]
     {
-        crate::krun::KRUN_KERNEL_FORMAT_RAW
+        crate::krun::KernelFormat::Raw
     }
     #[cfg(target_arch = "x86_64")]
     {
-        crate::krun::KRUN_KERNEL_FORMAT_ELF
+        crate::krun::KernelFormat::Elf
     }
 }
 
@@ -133,8 +133,8 @@ mod tests {
         // aarch64 ships the uncompressed Image → RAW (skips the libkrun gzip
         // decompress). x86_64 ships bzImage → ELF.
         #[cfg(target_arch = "aarch64")]
-        assert_eq!(fmt, crate::krun::KRUN_KERNEL_FORMAT_RAW);
+        assert_eq!(fmt, crate::krun::KernelFormat::Raw);
         #[cfg(target_arch = "x86_64")]
-        assert_eq!(fmt, crate::krun::KRUN_KERNEL_FORMAT_ELF);
+        assert_eq!(fmt, crate::krun::KernelFormat::Elf);
     }
 }

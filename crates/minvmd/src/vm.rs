@@ -99,11 +99,11 @@ impl VmConfig {
             ctx.add_disk(
                 "root",
                 &self.rootfs_path,
-                crate::krun::KRUN_DISK_FORMAT_RAW,
+                crate::krun::DiskFormat::Raw,
                 true,
             )?;
             if let Some(data) = &self.data_disk {
-                ctx.add_disk("data", data, crate::krun::KRUN_DISK_FORMAT_RAW, false)?;
+                ctx.add_disk("data", data, crate::krun::DiskFormat::Raw, false)?;
             }
         } else {
             let cmdline = format!(
@@ -119,13 +119,13 @@ impl VmConfig {
             ctx.add_disk(
                 "root",
                 &self.rootfs_path,
-                crate::krun::KRUN_DISK_FORMAT_RAW,
+                crate::krun::DiskFormat::Raw,
                 true,
             )?;
             // Optional writable data disk, added second so it enumerates as
             // /dev/vdb (read_only = false). The guest formats + mounts it.
             if let Some(data) = &self.data_disk {
-                ctx.add_disk("data", data, crate::krun::KRUN_DISK_FORMAT_RAW, false)?;
+                ctx.add_disk("data", data, crate::krun::DiskFormat::Raw, false)?;
             }
         }
         // R2.5: no network device in v0.1.
