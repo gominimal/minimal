@@ -62,6 +62,136 @@ pub async fn emit_ready_marker() -> std::io::Result<()> {
     }))
 }
 
+/// Default device + mountpoint for the writable state disk.
+///
+/// The guest root image is read-only, but minimald's session store, SSH host
+/// key, and build caches need a writable location. The host attaches a second
+/// virtio-blk device (`/dev/vdb`) backed by a persistent ext4 image; we mount it
+/// here and resolve the state + cache dirs underneath it.
+pub const STATE_DISK_DEVICE: &str = "/dev/vdb";
+pub const STATE_DISK_MOUNT: &str = "/var/lib/minimal";
+
+/// Mounts the writable state disk (`device`, ext4) at `target`, formatting it
+/// first if it is blank.
+///
+/// The host attaches a freshly-provisioned sparse image on first boot, so the
+/// device is unformatted; the first `mount(2)` fails, we `mke2fs` it (the rootfs
+/// ships e2fsprogs), and retry. On subsequent boots the disk is already ext4 and
+/// the first mount succeeds. Required for guest mode — without it minimald has
+/// nowhere to write its session store or host key.
+pub fn mount_state_disk(device: &str, target: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(target)?;
+    if raw_mount_ext4(device, target).is_ok() {
+        tracing::info!(device, target, "mounted state disk");
+        return Ok(());
+    }
+    // Likely blank on first boot — format ext4, then retry.
+    tracing::info!(device, "state disk mount failed; formatting ext4");
+    format_ext4(device)?;
+    raw_mount_ext4(device, target)?;
+    tracing::info!(device, target, "formatted + mounted state disk");
+    Ok(())
+}
+
+/// Single `mount(2)` of `device` as ext4 (read-write) at `target`. `EBUSY`
+/// (already mounted) is success.
+fn raw_mount_ext4(device: &str, target: &str) -> std::io::Result<()> {
+    raw_mount(device, target, "ext4", 0)
+}
+
+/// `mount(2)` with explicit flags. `EBUSY` (already mounted) is treated as
+/// success.
+fn raw_mount(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    flags: libc::c_ulong,
+) -> std::io::Result<()> {
+    let to_io = |_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in mount argument");
+    let c_source = CString::new(source).map_err(to_io)?;
+    let c_target = CString::new(target).map_err(to_io)?;
+    let c_fstype = CString::new(fstype).map_err(to_io)?;
+    // SAFETY: `mount(2)` with valid, call-lifetime C strings for
+    // source/target/fstype, the given flags, and a null data pointer.
+    let rc = unsafe {
+        libc::mount(
+            c_source.as_ptr(),
+            c_target.as_ptr(),
+            c_fstype.as_ptr(),
+            flags,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EBUSY) {
+            return Ok(());
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// SPIKE M2: enter the upstream guest rootfs from the initramfs. Mounts the
+/// rootfs block `device` (ext4, read-only) at `newroot`, brings up the
+/// pseudo-filesystems + a writable tmpfs (for session state) inside it, then
+/// chroots in. minimald (static, already running) keeps executing with the
+/// rootfs as its filesystem view, so `/bin/sh`, `socat`, and their glibc libs
+/// resolve. The `newroot/{dev,proc,sys,run}` mountpoints must exist in the
+/// rootfs (the generic microvm-rootfs provides them).
+pub fn enter_rootfs(device: &str, newroot: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(newroot)?;
+    raw_mount(device, newroot, "ext4", libc::MS_RDONLY)?;
+    raw_mount("devtmpfs", &format!("{newroot}/dev"), "devtmpfs", 0)?;
+    raw_mount("proc", &format!("{newroot}/proc"), "proc", 0)?;
+    raw_mount("sysfs", &format!("{newroot}/sys"), "sysfs", 0)?;
+    raw_mount("tmpfs", &format!("{newroot}/run"), "tmpfs", 0)?;
+
+    let to_io = |_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in chroot path");
+    let c_newroot = CString::new(newroot).map_err(to_io)?;
+    // SAFETY: `chroot(2)` with a valid C string for the new root.
+    if unsafe { libc::chroot(c_newroot.as_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    std::env::set_current_dir("/")?;
+    tracing::info!(device, "entered upstream rootfs (chroot)");
+    Ok(())
+}
+
+/// Format `device` as ext4 via the rootfs's `mke2fs` (e2fsprogs). No journal:
+/// the data disk is small and crash-consistency is not required for the bring-up
+/// session store.
+fn format_ext4(device: &str) -> std::io::Result<()> {
+    let status = std::process::Command::new("/usr/sbin/mke2fs")
+        .args(["-q", "-F", "-t", "ext4", "-O", "^has_journal", device])
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "mke2fs on {device} failed: {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Spawn a socat relay bridging the host-mediated vsock `port` to a local UDS.
+///
+/// A direct `tokio_vsock::VsockListener` (`Server::run_on_vsock`) *accepts* the
+/// bridged connection fine, but the SSH session over it dies almost immediately
+/// with `Protocol error: early eof` — libkrun's bridged vsock stream does not
+/// sustain a full bidirectional SSH session (a single short request/response, as
+/// in minvmd's bridge_e2e, works). socat terminates the vsock and hands russh a
+/// stable UNIX-domain stream over which the session completes, so we relay
+/// through socat (already in the rootfs) into minimald's native `run_on_uds`.
+/// The returned child is not kill-on-drop; pid-1's reaper handles it.
+pub fn spawn_vsock_relay(port: u32, uds_path: &str) -> std::io::Result<std::process::Child> {
+    let child = std::process::Command::new("/usr/bin/socat")
+        .arg(format!("VSOCK-LISTEN:{port},fork"))
+        .arg(format!("UNIX-CONNECT:{uds_path}"))
+        .spawn()?;
+    tracing::info!(port, uds = uds_path, "started vsock->uds relay (socat)");
+    Ok(child)
+}
+
 /// Mounts `/proc` and `/sys` if they are not already present.
 ///
 /// The kernel auto-mounts devtmpfs on `/dev`, but not these pseudo
@@ -73,6 +203,13 @@ pub fn mount_pseudo_filesystems() {
     mount_if_absent("/sys", "sysfs", "sysfs");
 }
 
+/// Mounts devtmpfs on `/dev`. The kernel auto-mounts it for a block-device root,
+/// but NOT for an initramfs root — so an initramfs pid-1 must do it to get
+/// `/dev/vsock`, `/dev/vda`, etc. EBUSY (already mounted) is benign.
+pub fn mount_dev() {
+    mount_if_absent("/dev", "devtmpfs", "devtmpfs");
+}
+
 /// Mounts `fstype` at `target` unless `target/<sentinel-of-fstype>` already
 /// exists, i.e. unless it already looks mounted. Failures are logged, not
 /// fatal: a pid-1 that can't mount /proc should still try to serve.
@@ -82,6 +219,7 @@ fn mount_if_absent(target: &str, source: &str, fstype: &str) {
     let sentinel = match target {
         "/proc" => "/proc/self",
         "/sys" => "/sys/kernel",
+        "/dev" => "/dev/null",
         _ => target,
     };
     if std::path::Path::new(sentinel).exists() {

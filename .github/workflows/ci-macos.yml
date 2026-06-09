@@ -45,8 +45,10 @@ jobs:
     # upstream virtio-kernel-raw / microvm-rootfs packages' prebuilt aarch64
     # artifacts are in the public cache, so they pull fine on a cheap x86_64
     # Linux runner — no native arm64 build and no self-hosted runner needed.
+    # The initramfs build cross-compiles minimald for aarch64-musl (~13 min cold,
+    # then cached by rust-cache), so the timeout has headroom.
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v6
         with:
@@ -55,12 +57,33 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+      - name: Cache cargo + build artifacts (incl. the aarch64 cross target)
+        # Raw actions/cache (not Swatinem) — it preserves the full
+        # target/aarch64-unknown-linux-musl tree, so the initramfs cross-compile
+        # is incremental after the first run. Mirrors build-release-arm64.
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-stage2-artifacts-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-stage2-artifacts-
       - name: Materialize guest kernel (raw Image)
         run: ./scripts/fetch-artifact.sh virtio-kernel "$RUNNER_TEMP/vmlinuz" aarch64
       - name: Materialize guest rootfs (ext4 image)
         run: ./scripts/fetch-artifact.sh minvmd-rootfs "$RUNNER_TEMP/rootfs.img" aarch64
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Build guest initramfs (minimald as /init)
+        # Stage 2: cross-compile minimald to static aarch64 + pack as the
+        # initramfs /init. The guest rootfs stays generic; minimald is delivered
+        # by the initramfs, not baked into the rootfs.
+        run: ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs.cpio"
       - name: Upload kernel artifact
         uses: actions/upload-artifact@v4
         with:
@@ -72,6 +95,12 @@ jobs:
         with:
           name: minvmd-rootfs-aarch64
           path: ${{ runner.temp }}/rootfs.img
+          if-no-files-found: error
+      - name: Upload initramfs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: minimald-initramfs-aarch64
+          path: ${{ runner.temp }}/initramfs.cpio
           if-no-files-found: error
 
   boot-e2e:
@@ -110,13 +139,18 @@ jobs:
         with:
           name: minvmd-rootfs-aarch64
           path: ${{ runner.temp }}/rootfs
-      - name: Build boot + bridge E2E + minvmd (no run)
-        # Build both test harnesses + the minvmd bin, then codesign, then run the
+      - name: Download guest initramfs
+        uses: actions/download-artifact@v4
+        with:
+          name: minimald-initramfs-aarch64
+          path: ${{ runner.temp }}/initramfs
+      - name: Build E2E harnesses + minvmd (no run)
+        # Build all test harnesses + the minvmd bin, then codesign, then run the
         # test BINARIES DIRECTLY (below). Invoking `cargo test` again after
         # signing relinks (and unsigns) target/debug/minvmd, so krun_start_enter
         # fails with EINVAL. A direct-binary run never touches the signature, so
-        # both binaries must be built here before the single codesign.
-        run: cargo test -p minvmd --test boot_e2e --test bridge_e2e --no-run
+        # the binaries must be built here before the single codesign.
+        run: cargo test -p minvmd --test boot_e2e --test bridge_e2e --test minimald_session_e2e --no-run
       - name: Codesign minvmd (hypervisor entitlement, R1.4)
         run: codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
       - name: Boot E2E (READY round-trip)
@@ -145,6 +179,19 @@ jobs:
           MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz" \
           MINVMD_ROOTFS_PATH="$RUNNER_TEMP/rootfs/rootfs.img" \
             "$testbin" --include-ignored --nocapture
+      - name: Session E2E (Stage 2 — initramfs minimald, full session)
+        # Gating: boots the GENERIC upstream rootfs with minimald shipped as the
+        # initramfs /init; a russh client over the bridge authenticates, creates
+        # a session, and execs a command, asserting stdout + exit status. Proves
+        # the full Stage-2 path with no minimald baked into the rootfs.
+        run: |
+          testbin="$(ls -1t target/debug/deps/minimald_session_e2e-* | grep -v '\.d$' | head -1)"
+          test -x "$testbin" || { echo "::error::minimald_session_e2e test binary not found"; exit 1; }
+          MINVMD_E2E=1 \
+          MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz" \
+          MINVMD_ROOTFS_PATH="$RUNNER_TEMP/rootfs/rootfs.img" \
+          MINVMD_INITRAMFS="$RUNNER_TEMP/initramfs/initramfs.cpio" \
+            "$testbin" --include-ignored --nocapture --exact minimald_exec_over_bridge
       - name: Boot latency benchmark (informational)
         # Report boot-to-READY min/median/max on the runner. Uses the already
         # codesigned minvmd; non-gating (boot correctness is gated by the e2e

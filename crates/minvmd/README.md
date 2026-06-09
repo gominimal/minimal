@@ -107,3 +107,30 @@ uncompressed-kernel note below.
   on a cheap Linux runner (`scripts/fetch-artifact.sh` — cache pulls of the
   upstream packages' prebuilt aarch64 artifacts) and handed to the self-hosted
   boot jobs as artifacts.
+
+## Stage 2: minimald via initramfs
+
+minimald runs the guest as pid-1, shipped as the **initramfs `/init`** (a cpio of
+the cross-compiled static binary) rather than baked into the rootfs. The rootfs
+stays the **generic** upstream `microvm-rootfs`. minimald mounts `/dev`, mounts
+the rootfs (`/dev/vda`), and `chroot`s into it so `/bin/sh` + `socat` resolve,
+then serves a session over the bridge (socat vsock→UDS relay + `run_on_uds`,
+with tmpfs state at `/run/minimal`).
+
+```sh
+# build the initramfs (cross-compiles minimald to static aarch64, packs a cpio)
+scripts/build-initramfs.sh .scratch/initramfs.cpio
+
+# boot it: minimald-as-/init + the GENERIC rootfs, MINVMD_INITRAMFS set
+export MINVMD_KERNEL_PATH="$PWD/.scratch/vmlinuz"
+export MINVMD_ROOTFS_PATH="$PWD/.scratch/rootfs.img"   # generic microvm-rootfs
+export MINVMD_INITRAMFS="$PWD/.scratch/initramfs.cpio"
+minvmd boot --foreground   # vm-up = minimald READY from the initramfs
+
+# full session e2e (russh client → CreateSession → exec) over the initramfs:
+testbin="$(ls -1t target/debug/deps/minimald_session_e2e-* | grep -v '\.d$' | head -1)"
+MINVMD_E2E=1 "$testbin" --include-ignored --nocapture --exact minimald_exec_over_bridge
+```
+
+Session state is on tmpfs (ephemeral); a persistent data disk (which needs a way
+to `mke2fs` it) is a follow-up.

@@ -24,6 +24,14 @@ pub struct VmConfig {
     /// Guest workload run as the kernel `init=` (a block root has no libkrun
     /// `/init.krun`, so the kernel execs this directly as PID 1).
     pub exec_target: String,
+    /// Optional persistent writable data disk, attached rw as `/dev/vdb`. The
+    /// guest (minimald) formats it on first boot and mounts it for its session
+    /// store + SSH host key (the root is read-only). `None` = no data disk.
+    pub data_disk: Option<PathBuf>,
+    /// SPIKE: optional initramfs image. When set, the kernel boots the initramfs
+    /// (running its `/init`) instead of a block-device root — the spike path for
+    /// shipping minimald as pid-1 without baking it into a rootfs.
+    pub initramfs: Option<PathBuf>,
 }
 
 impl VmConfig {
@@ -42,7 +50,23 @@ impl VmConfig {
             kernel_path,
             rootfs_path,
             exec_target,
+            data_disk: None,
+            initramfs: None,
         }
+    }
+
+    /// Attach a persistent writable data disk (rw `/dev/vdb`). Off by default.
+    #[must_use]
+    pub fn with_data_disk(mut self, path: PathBuf) -> Self {
+        self.data_disk = Some(path);
+        self
+    }
+
+    /// SPIKE: boot an initramfs (kernel runs its `/init`) instead of a block root.
+    #[must_use]
+    pub fn with_initramfs(mut self, path: PathBuf) -> Self {
+        self.initramfs = Some(path);
+        self
     }
 
     /// Apply this configuration to an existing libkrun [`Context`][crate::krun::Context].
@@ -59,22 +83,51 @@ impl VmConfig {
         // explicit `init=` cmdline (libkrun's virtiofs-only default cmdline does
         // not apply). devtmpfs auto-mounts /dev in the guest, giving the
         // workload /dev/vsock for the READY marker and bridge.
-        let cmdline = format!(
-            "console=hvc0 root=/dev/vda rootfstype=ext4 ro init={}",
-            self.exec_target
-        );
-        ctx.set_kernel(
-            &self.kernel_path,
-            crate::image::kernel_format(),
-            None::<&std::path::Path>,
-            Some(&cmdline),
-        )?;
-        ctx.add_disk(
-            "root",
-            &self.rootfs_path,
-            crate::krun::KRUN_DISK_FORMAT_RAW,
-            true,
-        )?;
+        if let Some(initramfs) = &self.initramfs {
+            // SPIKE: initramfs boot. The kernel unpacks the initramfs into a RAM
+            // root and runs its `/init` (no `root=`/`init=` cmdline). minimald-as-
+            // /init mounts devtmpfs itself, then (M2) mounts the rootfs disk below
+            // and chroots into it.
+            ctx.set_kernel(
+                &self.kernel_path,
+                crate::image::kernel_format(),
+                Some(initramfs),
+                Some("console=hvc0"),
+            )?;
+            // Attach the rootfs as a block device (/dev/vda) for the initramfs
+            // /init to mount + chroot into; the kernel root is the initramfs.
+            ctx.add_disk(
+                "root",
+                &self.rootfs_path,
+                crate::krun::KRUN_DISK_FORMAT_RAW,
+                true,
+            )?;
+            if let Some(data) = &self.data_disk {
+                ctx.add_disk("data", data, crate::krun::KRUN_DISK_FORMAT_RAW, false)?;
+            }
+        } else {
+            let cmdline = format!(
+                "console=hvc0 root=/dev/vda rootfstype=ext4 ro init={}",
+                self.exec_target
+            );
+            ctx.set_kernel(
+                &self.kernel_path,
+                crate::image::kernel_format(),
+                None::<&std::path::Path>,
+                Some(&cmdline),
+            )?;
+            ctx.add_disk(
+                "root",
+                &self.rootfs_path,
+                crate::krun::KRUN_DISK_FORMAT_RAW,
+                true,
+            )?;
+            // Optional writable data disk, added second so it enumerates as
+            // /dev/vdb (read_only = false). The guest formats + mounts it.
+            if let Some(data) = &self.data_disk {
+                ctx.add_disk("data", data, crate::krun::KRUN_DISK_FORMAT_RAW, false)?;
+            }
+        }
         // R2.5: no network device in v0.1.
 
         // R3.1: register the host UDS bridge (listen=true). libkrun listens on

@@ -180,10 +180,15 @@ impl Server {
         let mut session_set = JoinSet::new();
         loop {
             let (socket, _) = self.listener.accept().await?;
+            tracing::info!("accepted UDS connection");
             let (_conn_hnd, session_fut) =
                 Connection::from_socket(socket, russh_config.clone(), self.state.clone(), true)
                     .await;
-            session_set.spawn(session_fut);
+            session_set.spawn(async move {
+                if let Err(e) = session_fut.await {
+                    tracing::warn!(error = %e, "session ended with error");
+                }
+            });
         }
     }
 }

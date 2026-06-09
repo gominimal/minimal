@@ -92,6 +92,13 @@ impl StateDir {
         self.dir.join("vmm.pid")
     }
 
+    /// Path to the persistent writable guest state disk image. The guest mounts
+    /// this rw ext4 disk (formatting it on first boot) for minimald's session
+    /// store + SSH host key, since the root image is read-only.
+    pub fn data_disk_path(&self) -> PathBuf {
+        self.dir.join("data.img")
+    }
+
     /// Read the current state from `state.toml`.
     ///
     /// Returns `State { lifecycle: NotProvisioned, .. }` when the file does
