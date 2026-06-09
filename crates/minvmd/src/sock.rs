@@ -14,9 +14,10 @@ use std::path::PathBuf;
 /// lets the `minimal` CLI reach in-guest `minimald` over a host UDS without
 /// knowing a VM exists.
 ///
-/// The guest-side stub (`/sbin/minvmd-stub-init`) runs `socat
-/// VSOCK-LISTEN:2222,fork EXEC:cat` so it listens on this port. See
-/// `scripts/build-rootfs.sh` (`vsock_port_bridge=2222`).
+/// The guest-side stub (`/sbin/microvm-init`) runs `socat
+/// VSOCK-LISTEN:2222,fork EXEC:cat` so it listens on this port. See the
+/// `minvmd-rootfs` package (`.minimal/packages/minvmd-rootfs/build.sh`,
+/// `vsock_port_bridge=2222`).
 ///
 /// TSI ~62-concurrent-connection cap: libkrun's TSI layer multiplexes guest
 /// vsock connections over a single host transport; the practical ceiling is

@@ -7,7 +7,7 @@
 //!   this env var is set (prevents accidental VM boot on a dev machine without
 //!   a kernel and rootfs).
 //! - `MINVMD_KERNEL_PATH` and `MINVMD_ROOTFS_PATH` must point to the kernel
-//!   image and Alpine minirootfs respectively.
+//!   image and the `minvmd-rootfs` ext4 disk image respectively.
 //!
 //! The test boots a VM via `minvmd boot --foreground`, waits up to 15 s for
 //! `vm-up` on stdout, then opens 5 concurrent host UDS connections to the

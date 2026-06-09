@@ -9,16 +9,17 @@ use crate::error::VmError;
 
 /// Arch-appropriate libkrun kernel format constant.
 ///
-/// - `aarch64`: `virtio-linux` ships `Image.gz` → `KRUN_KERNEL_FORMAT_PE_GZ`.
-///   The aarch64 loader implements only RAW and PE_GZ; PE_GZ decompresses the
-///   gzipped image. `IMAGE_GZ` is x86_64-only and returns
-///   `KernelFormatUnsupported` on aarch64.
+/// - `aarch64`: the kernel is shipped **uncompressed** (`fetch-virtio-kernel.sh`
+///   gunzips the upstream `Image.gz`) and loaded with `KRUN_KERNEL_FORMAT_RAW`.
+///   Loading raw skips libkrun's gzip decompress, which measured ~77 ms (over
+///   half of boot-to-READY) versus a `PE_GZ` `Image.gz`. The aarch64 loader
+///   implements only RAW and PE_GZ.
 /// - `x86_64`:  `virtio-linux` ships `bzImage`  → `KRUN_KERNEL_FORMAT_ELF`.
 #[cfg(target_os = "macos")]
 pub fn kernel_format() -> u32 {
     #[cfg(target_arch = "aarch64")]
     {
-        crate::krun::KRUN_KERNEL_FORMAT_PE_GZ
+        crate::krun::KRUN_KERNEL_FORMAT_RAW
     }
     #[cfg(target_arch = "x86_64")]
     {
@@ -43,7 +44,9 @@ pub fn resolve_kernel_path() -> Result<PathBuf, VmError> {
 
 /// Resolve the rootfs path from `MINVMD_ROOTFS_PATH`.
 ///
-/// Returns `VmError::MissingEnv` when the variable is unset or empty.
+/// This is the path to a read-only ext4 root disk image (loaded via
+/// `krun_add_disk2`), not a directory. Returns `VmError::MissingEnv` when the
+/// variable is unset or empty.
 pub fn resolve_rootfs_path() -> Result<PathBuf, VmError> {
     let val = std::env::var("MINVMD_ROOTFS_PATH").map_err(|_| VmError::MissingEnv {
         var: "MINVMD_ROOTFS_PATH",
@@ -127,10 +130,10 @@ mod tests {
     #[test]
     fn kernel_format_matches_arch() {
         let fmt = kernel_format();
-        // aarch64 must use PE_GZ for Image.gz — IMAGE_GZ (=4) is x86_64-only and
-        // returns KernelFormatUnsupported on the aarch64 libkrun loader.
+        // aarch64 ships the uncompressed Image → RAW (skips the libkrun gzip
+        // decompress). x86_64 ships bzImage → ELF.
         #[cfg(target_arch = "aarch64")]
-        assert_eq!(fmt, crate::krun::KRUN_KERNEL_FORMAT_PE_GZ);
+        assert_eq!(fmt, crate::krun::KRUN_KERNEL_FORMAT_RAW);
         #[cfg(target_arch = "x86_64")]
         assert_eq!(fmt, crate::krun::KRUN_KERNEL_FORMAT_ELF);
     }
