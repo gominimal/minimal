@@ -116,6 +116,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "2"
 url = "2" # keep in sync with reqwest
 uuid = { version = "1.23", features = ["v4", "v7", "serde"] }
+vt100-ctt = "0.17"
 zstd = "0.13"
 
 moka = { version = "0.12", default-features = false, features = ["sync"] }

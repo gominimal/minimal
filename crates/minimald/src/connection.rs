@@ -2,6 +2,7 @@ use russh::{
     Channel as RuChannel, ChannelId,
     server::{Config as RuConfig, Msg, RunningSession, Session},
 };
+use sessions::SessionId;
 use std::{
     collections::BTreeMap,
     fmt,
@@ -17,6 +18,7 @@ use crate::{
     ChannelConfig, RequestedPty, exec,
     rpc::{self},
     server::ServerStateHandle,
+    sessions::SessionKeyPredicate,
     sftp,
 };
 
@@ -369,7 +371,54 @@ impl russh::server::Handler for ConnectionHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         protocol_trace!("Got shell_request on channel {id}");
-        session.channel_failure(id)?; // TODO: handle shell request
+
+        let conn = self.0.clone();
+        let serv = conn.0.lock().await.serv.clone();
+        let mut conn_lock = conn.lock().await;
+        let Some((channel, config)) = conn_lock.take(id) else {
+            session.channel_failure(id)?;
+            return Ok(());
+        };
+        drop(conn_lock);
+        if config.pty.is_none() {
+            tracing::warn!("channel {id}: pty not requested for shell session",);
+            session.channel_failure(id)?;
+            return Ok(());
+        }
+
+        let Some(session_id_str) = config.env_vars.get(crate::MINIMAL_SESSION_ID_ENV) else {
+            tracing::warn!("shell request rejected on channel {id}: missing MINIMAL_SESSION_ID",);
+            session.channel_failure(id)?;
+            return Ok(());
+        };
+        let Ok(session_id) = SessionId::parse_str(session_id_str) else {
+            tracing::warn!(
+                value = %session_id_str,
+                "shell request rejected on channel {id}: not a uuid",
+            );
+            session.channel_failure(id)?;
+            return Ok(());
+        };
+
+        let mngr = serv.sessions_manager().await;
+        let session_handle = match mngr.get_session(SessionKeyPredicate::Id(session_id)).await {
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                tracing::warn!(%session_id, "shell request rejected: unknown session");
+                session.channel_failure(id)?;
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(%session_id, error = %e, "shell request rejected: lookup failed");
+                session.channel_failure(id)?;
+                return Ok(());
+            }
+        };
+
+        session.channel_success(id)?;
+        tokio::spawn(async move {
+            session_handle.attach(channel, config).await;
+        });
         Ok(())
     }
 

@@ -3428,11 +3428,13 @@ name = "minimald"
 version = "0.0.1"
 dependencies = [
  "args",
+ "bytes",
  "camino",
  "clap",
  "clap_complete",
  "constcat",
  "dirs",
+ "either",
  "futures",
  "graph",
  "hakoniwa",
@@ -3453,6 +3455,7 @@ dependencies = [
  "tokio-vsock",
  "tracing",
  "tracing-subscriber",
+ "vt100-ctt",
 ]
 
 [[package]]
