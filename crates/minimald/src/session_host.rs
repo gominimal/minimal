@@ -450,9 +450,10 @@ impl Host {
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        let container = env
+        let mut container = env
             .container()
             .map_err(|e| io::Error::other(format!("building container failed: {}", e)))?;
+        container.set_session_leader();
 
         let pty = Pty::open(sz)?;
         let mut command = env

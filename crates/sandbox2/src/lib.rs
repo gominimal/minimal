@@ -297,6 +297,12 @@ impl AsRef<hakoniwa::Container> for Container {
 }
 
 impl Container {
+    /// Instructs the container to perform the setsid() & associate controlling
+    /// terminal dance.
+    pub fn set_session_leader(&mut self) {
+        self.container.runctl(hakoniwa::Runctl::NewSession);
+    }
+
     fn command_inner<C, I, IE, ArgS, EnvK, EnvV>(
         &self,
         sandbox: &Sandbox<C>,

@@ -66,7 +66,7 @@ google-cloud-gax = "1.13"
 google-cloud-auth = "1.5"
 google-cloud-storage = "1.7"
 # Revert back to crates.io dep once new version is released.
-hakoniwa = { git = "https://github.com/souk4711/hakoniwa.git", rev = "65d12eaae6786cd312aa74784514eb3a072dfe38", features = ["cgroups"] }
+hakoniwa = { git = "https://github.com/souk4711/hakoniwa.git", rev = "41ce36e087fa1fcf28d17123042d150e71c09705", features = ["cgroups"] }
 http-body = "1"
 hex = "0.4"
 indicatif = "0.18"

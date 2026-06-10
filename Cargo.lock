@@ -2100,7 +2100,7 @@ dependencies = [
 [[package]]
 name = "hakoniwa"
 version = "1.7.0"
-source = "git+https://github.com/souk4711/hakoniwa.git?rev=65d12eaae6786cd312aa74784514eb3a072dfe38#65d12eaae6786cd312aa74784514eb3a072dfe38"
+source = "git+https://github.com/souk4711/hakoniwa.git?rev=41ce36e087fa1fcf28d17123042d150e71c09705#41ce36e087fa1fcf28d17123042d150e71c09705"
 dependencies = [
  "bitflags",
  "caps",
