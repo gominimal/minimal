@@ -170,6 +170,7 @@ enum BindingMsg {
     Stdin(Vec<u8>),
     TeardownDueToStdoutErr(std::io::Error),
     TeardownDueToSuperceded,
+    TeardownDueToDetach,
 }
 
 /// A connection between a [`Host`] and an SSH channel.
@@ -258,6 +259,10 @@ impl Binding {
                         }
                         BindingMsg::TeardownDueToSuperceded => {
                             let _ = w.write_all(b"\r\nDisconnecting - session attached to from a different connection\r\n").await;
+                            break;
+                        }
+                        BindingMsg::TeardownDueToDetach => {
+                            let _ = w.write_all(b"\r\nDetaching due to ctrl-w.\r\n").await;
                             break;
                         }
                     };
@@ -567,6 +572,17 @@ impl Host {
             Some(msg) = self.remote_rx.recv(), if self.stdin_buf.is_none() => {
                 match msg {
                     Either::Left(b) => {
+                        if b.len() == 1 && b[0] == 0x17 { // ctrl-w
+                            if let Some((tx, _hnd)) = self.remote.as_mut() {
+                                match tx.send(BindingMsg::TeardownDueToDetach).await {
+                                    Ok(()) => {},
+                                    Err(e) => {
+                                        tracing::warn!("failed sending detach signal to remote: {e}");
+                                    }
+                                };
+                                self.remote = None;
+                            }
+                        };
                         self.stdin_buf = Some((b, 0));
                     }
                     Either::Right(sz) => {
