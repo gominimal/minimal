@@ -8,6 +8,7 @@
 use either::Either;
 use russh::Channel;
 use russh::server::Msg;
+use std::future::Future;
 use std::io;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -18,6 +19,7 @@ use tokio::sync::mpsc::error::SendError;
 use tokio::task::JoinHandle;
 
 use crate::RequestedPty;
+#[cfg(not(test))]
 use crate::session::SessionHandle;
 
 /// The dimensions of a terminal.
@@ -90,6 +92,15 @@ impl Pty {
         let master = unsafe { OwnedFd::from_raw_fd(master) };
         let slave = unsafe { OwnedFd::from_raw_fd(slave) };
 
+        // `openpty` returns fds without close-on-exec. Set it so these fds
+        // don't leak into unrelated child processes that happen to `fork`
+        // concurrently: a leaked slave fd would keep this master from ever
+        // seeing EOF when our own child exits, stalling teardown. The child we
+        // intend to wire up still gets its stdio via `dup2`, which is unaffected
+        // by the source fd's close-on-exec flag.
+        set_cloexec(master.as_raw_fd())?;
+        set_cloexec(slave.as_raw_fd())?;
+
         Ok(Self { master, slave })
     }
 
@@ -124,13 +135,18 @@ impl Pty {
     }
 }
 
-/// Duplicates an `OwnedFd` into a new, independent `OwnedFd` via `dup(2)`.
+/// Duplicates an `OwnedFd` into a new, independent close-on-exec `OwnedFd`.
+///
+/// Uses `F_DUPFD_CLOEXEC` rather than `dup(2)` so the duplicate is born
+/// close-on-exec — otherwise a slave dup awaiting a `spawn` could be inherited
+/// by an unrelated child `fork`ed concurrently and keep the pty open past our
+/// own child's exit.
 fn dup_fd(fd: &OwnedFd) -> io::Result<OwnedFd> {
-    let raw = unsafe { libc::dup(fd.as_raw_fd()) };
+    let raw = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if raw < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: `dup` succeeded, so `raw` is a valid, open fd.
+    // SAFETY: `fcntl(F_DUPFD_CLOEXEC)` succeeded, so `raw` is a valid, open fd.
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
@@ -278,6 +294,53 @@ impl Binding {
     }
 }
 
+/// A handle to a launched session process.
+///
+/// Abstracts the process the [`Host`] supervises so its runtime loop can be
+/// driven against a real sandboxed process or a test double. The unused
+/// `hakoniwa::ExitStatus` payload is reduced to a portable exit code.
+pub(crate) trait SessionProcess: Send + 'static {
+    /// Returns `Some(code)` if the process has exited, `None` if still running.
+    fn try_wait(&mut self) -> io::Result<Option<i32>>;
+    /// Blocks until the process exits, returning its exit code.
+    fn wait(&mut self) -> io::Result<i32>;
+    /// Sends a kill signal to the process.
+    fn kill(&mut self) -> io::Result<()>;
+}
+
+/// Opens a PTY of the requested size, launches the session process wired to the
+/// slave side, and yields the master side plus a handle to the process.
+///
+/// This is the seam between the generic [`Host`] runtime and the backend that
+/// actually creates a process (building the context/graph/env/container and the
+/// launch command). The launcher owns PTY creation because the slave side is
+/// consumed differently per backend — duplicated into the process's
+/// stdin/stdout/stderr for the real sandbox, or retained for a test double.
+pub(crate) trait SessionLauncher {
+    /// The running-process handle this launcher produces.
+    type Process: SessionProcess;
+    /// A value held for the session's lifetime purely for its `Drop` (e.g. the
+    /// sandbox files backing the running process's rootfs). Dropped after
+    /// [`Self::Process`].
+    type Guard: Send + 'static;
+
+    fn launch(
+        self,
+        sz: WinSize,
+    ) -> impl Future<Output = io::Result<Launched<Self::Process, Self::Guard>>> + Send;
+}
+
+/// The product of [`SessionLauncher::launch`].
+pub(crate) struct Launched<P, G> {
+    /// Master side of the launched process's PTY; the slave is wired to the
+    /// process. The [`Host`] reads its stdout and writes its stdin here.
+    master: OwnedFd,
+    /// Handle used to wait on / signal the launched process.
+    process: P,
+    /// Kept alive for the session; see [`SessionLauncher::Guard`].
+    guard: G,
+}
+
 /// Actor messages to a [`Host`].
 enum Message {
     Kill,
@@ -311,7 +374,11 @@ impl HostHandle {
 }
 
 /// The state of the session process.
-pub struct Host {
+///
+/// Generic over the [`SessionProcess`] it supervises and the [`SessionLauncher`]
+/// guard kept alive for the session, so the runtime loop can be driven against a
+/// real sandboxed process or a test double.
+pub(crate) struct Host<P: SessionProcess, G: Send + 'static> {
     /// Channel for actor messages via [`HostHandle`].
     receiver: mpsc::Receiver<Message>,
 
@@ -324,7 +391,7 @@ pub struct Host {
     /// In-memory representation of the terminal state.
     parser: vt100_ctt::Parser,
     /// The session process.
-    process: hakoniwa::Child,
+    process: P,
     /// The master-side fd of the Pty.
     master: AsyncFd<std::fs::File>,
 
@@ -343,16 +410,17 @@ pub struct Host {
     // (<buffer>, <number of bytes from buffer already written>)
     stdin_buf: Option<(bytes::Bytes, usize)>,
 
-    // Keeps the session's `Env` — and the `Context` and `Graph` it borrows —
-    // alive for as long as this host (and thus the session process) lives.
-    // Declared last so it is dropped after `process`: the process is torn down
-    // before the sandbox files backing its rootfs are removed. Never read; held
-    // purely for its `Drop`.
-    _session_env: SessionEnv,
+    // Keeps launcher-owned resources (e.g. the session's `Env` and the
+    // `Context`/`Graph` it borrows) alive for as long as this host (and thus the
+    // session process) lives. Declared last so it is dropped after `process`:
+    // the process is torn down before the sandbox files backing its rootfs are
+    // removed. Never read; held purely for its `Drop`.
+    _guard: G,
 }
 
 /// Owns the [`mctx::Env`] for a session, along with the [`mctx::Context`] and
-/// [`graph::Graph`] it borrows, keeping all three alive for the session.
+/// [`graph::Graph`] it borrows, keeping all three alive for the session. Used
+/// as the [`SandboxLauncher`]'s [`SessionLauncher::Guard`].
 ///
 /// `Env<'a>` borrows the context and graph mutably and owns the temp dirs and
 /// sandbox base directory that hold the running process's rootfs. We can't
@@ -360,7 +428,8 @@ pub struct Host {
 /// struct), so the context and graph are leaked to obtain `'static` borrows for
 /// the env; the raw pointers are retained here so the leaked allocations can be
 /// reclaimed once the env is dropped.
-struct SessionEnv {
+#[cfg(not(test))]
+pub(crate) struct SessionEnv {
     /// `Some` for the whole lifetime of the value; taken in `drop` so the env
     /// is dropped before the context and graph it borrows are freed.
     env: Option<mctx::Env<'static>>,
@@ -370,11 +439,14 @@ struct SessionEnv {
 
 // SAFETY: `mctx::Context`, `graph::Graph`, and `mctx::Env` are all `Send`
 // (the context and graph round-trip through `spawn_blocking`, and the env is
-// held across `.await` in `Host::spawn`). The raw pointers merely retain
-// ownership of the leaked allocations so they can be freed in `drop`; they are
-// never dereferenced concurrently with the `&'static mut` borrows held by `env`.
+// held across `.await` in `SandboxLauncher::launch`). The raw pointers merely
+// retain ownership of the leaked allocations so they can be freed in `drop`;
+// they are never dereferenced concurrently with the `&'static mut` borrows held
+// by `env`.
+#[cfg(not(test))]
 unsafe impl Send for SessionEnv {}
 
+#[cfg(not(test))]
 impl Drop for SessionEnv {
     fn drop(&mut self) {
         // Drop the env first, so its sandbox (and the listener thread holding
@@ -382,8 +454,9 @@ impl Drop for SessionEnv {
         // are still valid.
         self.env = None;
         // SAFETY: `ctx`/`graph` were produced by `Box::into_raw` in
-        // `Host::spawn` and have not been freed. Their only borrower, `env`,
-        // was just dropped above, so no references into them remain.
+        // `SandboxLauncher::launch` and have not been freed. Their only
+        // borrower, `env`, was just dropped above, so no references into them
+        // remain.
         unsafe {
             drop(Box::from_raw(self.graph));
             drop(Box::from_raw(self.ctx));
@@ -391,17 +464,57 @@ impl Drop for SessionEnv {
     }
 }
 
-impl Host {
-    pub async fn spawn(
-        sz: WinSize,
-        channel: Option<Channel<Msg>>,
-        mut ctx: mctx::Context,
-        _session: SessionHandle,
-    ) -> Result<HostHandle, std::io::Error> {
+/// A launched session process backed by a sandboxed [`hakoniwa::Child`].
+#[cfg(not(test))]
+pub(crate) struct SandboxProcess(hakoniwa::Child);
+
+#[cfg(not(test))]
+impl SessionProcess for SandboxProcess {
+    fn try_wait(&mut self) -> io::Result<Option<i32>> {
+        self.0
+            .try_wait()
+            .map(|status| status.map(|s| s.code))
+            .map_err(|e| io::Error::other(format!("wait failed: {e}")))
+    }
+
+    fn wait(&mut self) -> io::Result<i32> {
+        self.0
+            .wait()
+            .map(|s| s.code)
+            .map_err(|e| io::Error::other(format!("wait failed: {e}")))
+    }
+
+    fn kill(&mut self) -> io::Result<()> {
+        self.0
+            .kill()
+            .map_err(|e| io::Error::other(format!("kill failed: {e}")))
+    }
+}
+
+/// The real [`SessionLauncher`]: evaluates a minimal context into a graph,
+/// builds a sandboxed `/bin/bash`, and wires it to a freshly opened PTY.
+#[cfg(not(test))]
+pub(crate) struct SandboxLauncher {
+    pub(crate) ctx: mctx::Context,
+    // The session this host belongs to. Not yet read, but retained so the
+    // launcher carries the full session identity for future use (and to mirror
+    // the prior `Host::spawn` signature).
+    #[allow(dead_code)]
+    pub(crate) session: SessionHandle,
+}
+
+#[cfg(not(test))]
+impl SessionLauncher for SandboxLauncher {
+    type Process = SandboxProcess;
+    type Guard = SessionEnv;
+
+    async fn launch(self, sz: WinSize) -> io::Result<Launched<SandboxProcess, SessionEnv>> {
+        let ctx = self.ctx;
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
         // graph construction) — run it on the blocking pool so it
         // doesn't stall the async executor.
         let (ctx, graph_result) = tokio::task::spawn_blocking(move || {
+            let mut ctx = ctx;
             let r = ctx.graph_from_all_packages().map_err(|e| e.to_string());
             (ctx, r)
         })
@@ -412,7 +525,7 @@ impl Host {
         // Leak the context and graph so the env can borrow them for `'static`.
         // The env owns the sandbox base dir and temp dirs backing the running
         // process's rootfs; if it (and the values it borrows) were dropped when
-        // `spawn` returns, those files would be deleted out from under the live
+        // `launch` returns, those files would be deleted out from under the live
         // process. The returned `SessionEnv` keeps all three alive for the
         // session and frees the leaked allocations when the host is dropped.
         // The addresses are carried as `usize` (not `*mut`) so this future
@@ -464,6 +577,123 @@ impl Host {
         let (master, slave) = pty.into_fds();
         command.stderr(hakoniwa::Stdio::from(slave));
 
+        let process = command
+            .spawn()
+            .map_err(|e| io::Error::other(format!("exec failed: {}", e)))?;
+        // `command`/`container` no longer borrow `env`, so it can be moved into
+        // the host (via `SessionEnv`) to keep its backing files alive.
+        drop(container);
+
+        Ok(Launched {
+            master,
+            process: SandboxProcess(process),
+            guard: SessionEnv {
+                env: Some(env),
+                ctx: ctx_addr as *mut mctx::Context,
+                graph: graph_addr as *mut graph::Graph,
+            },
+        })
+    }
+}
+
+/// A launched session process backed by a plain host [`std::process::Child`].
+#[cfg(test)]
+pub(crate) struct MockProcess(std::process::Child);
+
+#[cfg(test)]
+impl SessionProcess for MockProcess {
+    fn try_wait(&mut self) -> io::Result<Option<i32>> {
+        Ok(self.0.try_wait()?.map(|s| s.code().unwrap_or(-1)))
+    }
+
+    fn wait(&mut self) -> io::Result<i32> {
+        Ok(self.0.wait()?.code().unwrap_or(-1))
+    }
+
+    fn kill(&mut self) -> io::Result<()> {
+        self.0.kill()
+    }
+}
+
+/// The sentinel stdin line that makes [`MockLauncher`]'s program exit; any
+/// other line is echoed back. Lets a test observe an echo round trip while the
+/// process is still alive, then trigger teardown deterministically.
+#[cfg(test)]
+pub(crate) const MOCK_EXIT_LINE: &str = "quit";
+
+/// A test [`SessionLauncher`] that wires a plain, un-sandboxed host process to a
+/// freshly opened PTY — so the [`Host`] runtime can be exercised end-to-end
+/// without building a real sandbox (which needs packages unavailable in the
+/// unit-test environment).
+///
+/// The launched program echoes each line of stdin back prefixed with `got:`,
+/// and exits only on the [`MOCK_EXIT_LINE`] sentinel — so a test can confirm
+/// stdin delivery and stdout forwarding before deterministically triggering
+/// process-exit teardown.
+#[cfg(test)]
+pub(crate) struct MockLauncher;
+
+#[cfg(test)]
+impl SessionLauncher for MockLauncher {
+    type Process = MockProcess;
+    type Guard = ();
+
+    async fn launch(self, sz: WinSize) -> io::Result<Launched<MockProcess, ()>> {
+        let pty = Pty::open(sz)?;
+
+        let script = format!(
+            r#"while read line; do [ "$line" = {MOCK_EXIT_LINE} ] && exit 0; printf 'got:%s\n' "$line"; done"#
+        );
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-c").arg(&script);
+        command.stdin(std::process::Stdio::from(pty.dup_slave_fd()?));
+        command.stdout(std::process::Stdio::from(pty.dup_slave_fd()?));
+        let (master, slave) = pty.into_fds();
+        command.stderr(std::process::Stdio::from(slave));
+
+        let process = command.spawn()?;
+
+        Ok(Launched {
+            master,
+            process: MockProcess(process),
+            guard: (),
+        })
+    }
+}
+
+impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
+    /// Spawns a session host from the given launcher, wiring it to `channel` if
+    /// one is supplied, and drives its runtime loop on a background task.
+    pub async fn spawn<L>(
+        launcher: L,
+        sz: WinSize,
+        channel: Option<Channel<Msg>>,
+    ) -> Result<HostHandle, std::io::Error>
+    where
+        L: SessionLauncher<Process = P, Guard = G>,
+    {
+        let (host, handle) = Self::build(launcher, sz, channel).await?;
+        tokio::spawn(host.mainloop());
+        Ok(handle)
+    }
+
+    /// Builds the host and its handle from a launcher without spawning the
+    /// runtime loop, so callers (notably tests) can drive [`Self::step`]
+    /// directly and observe the host's state.
+    async fn build<L>(
+        launcher: L,
+        sz: WinSize,
+        channel: Option<Channel<Msg>>,
+    ) -> Result<(Self, HostHandle), std::io::Error>
+    where
+        L: SessionLauncher<Process = P, Guard = G>,
+    {
+        let Launched {
+            master,
+            process,
+            guard,
+        } = launcher.launch(sz).await?;
+
         let parser = vt100_ctt::Parser::new(sz.rows, sz.cols, 0);
         let (sender, receiver) = mpsc::channel(8);
         let (remote_tx, remote_rx) = mpsc::channel(4);
@@ -472,12 +702,6 @@ impl Host {
             let file = unsafe { std::fs::File::from_raw_fd(master.into_raw_fd()) };
             AsyncFd::new(file)?
         };
-        let process = command
-            .spawn()
-            .map_err(|e| io::Error::other(format!("exec failed: {}", e)))?;
-        // `command`/`container` no longer borrow `env`, so it can be moved into
-        // the host (via `SessionEnv`) to keep its backing files alive.
-        drop(container);
 
         let mut host = Host {
             receiver,
@@ -491,37 +715,24 @@ impl Host {
             remote_rx,
             stdout_buf: vec![0u8; 8 * 1024],
             stdin_buf: None,
-            _session_env: SessionEnv {
-                env: Some(env),
-                ctx: ctx_addr as *mut mctx::Context,
-                graph: graph_addr as *mut graph::Graph,
-            },
+            _guard: guard,
         };
         if let Some(channel) = channel {
             host.attach(channel, sz, true).await;
         }
-        tokio::spawn(host.mainloop());
 
-        Ok(HostHandle { sender })
+        Ok((host, HostHandle { sender }))
     }
 
-    pub async fn mainloop(mut self) -> Result<hakoniwa::ExitStatus, std::io::Error> {
+    pub async fn mainloop(mut self) -> Result<i32, std::io::Error> {
         loop {
-            match self
-                .process
-                .try_wait()
-                .map_err(|e| io::Error::other(format!("wait failed: {}", e)))?
-            {
-                None => {}
-                Some(exit_status) => return Ok(exit_status),
+            if let Some(exit_code) = self.process.try_wait()? {
+                return Ok(exit_code);
             }
 
-            if let Err(()) = self.step().await {
-                return self
-                    .process
-                    .wait()
-                    .map_err(|e| io::Error::other(format!("wait failed: {}", e)));
-            };
+            if self.step().await.is_err() {
+                return self.process.wait();
+            }
         }
     }
 
@@ -653,6 +864,20 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Marks a file descriptor close-on-exec (`FD_CLOEXEC`).
+fn set_cloexec(fd: RawFd) -> io::Result<()> {
+    // SAFETY: fd is a valid open file descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let ret = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }
