@@ -7,6 +7,7 @@ pub mod guest;
 pub mod rpc;
 pub mod server;
 mod session;
+pub mod session_host;
 mod sessions;
 mod sftp;
 #[cfg(test)]

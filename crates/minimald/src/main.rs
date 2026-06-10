@@ -5,7 +5,7 @@ use camino::Utf8PathBuf;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use paths::{CwdRelative, Daemon, DaemonAbsPath, DaemonRelPath, sub_path};
-use tokio::net::UnixListener;
+use tokio::{net::UnixListener, runtime::Builder};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use minimald::server::{Config, HostKey, Server};
@@ -126,8 +126,17 @@ pub enum MainError {
     IO(std::io::Error, &'static str),
 }
 
-#[tokio::main]
-async fn main() -> Result<(), MainError> {
+fn main() -> Result<(), MainError> {
+    let runtime = Builder::new_multi_thread()
+        .thread_name("minimald-worker")
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), MainError> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new("info")
             .add_directive("topiary=off".parse().unwrap())
