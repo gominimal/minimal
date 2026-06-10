@@ -129,20 +129,8 @@ mod tests {
         let p: UserPolicy = toml::from_str(src).unwrap();
         assert_eq!(p.vars().allow().raw_patterns(), &["MY_APP_*"]);
         assert_eq!(p.vars().deny().raw_patterns(), &["AWS_*"]);
-        let allow: Vec<&str> = p
-            .patches()
-            .allow()
-            .iter()
-            .map(crate::patches::FileSet::pattern)
-            .collect();
-        let deny: Vec<&str> = p
-            .patches()
-            .deny()
-            .iter()
-            .map(crate::patches::FileSet::pattern)
-            .collect();
-        assert_eq!(allow, ["~/.config/**"]);
-        assert_eq!(deny, ["~/.ssh/**"]);
+        assert_eq!(p.patches().allow(), ["~/.config/**"]);
+        assert_eq!(p.patches().deny(), ["~/.ssh/**"]);
     }
 
     #[test]

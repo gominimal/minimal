@@ -10,6 +10,7 @@ use uuid::Uuid;
 use paths::HostAbsPath;
 
 pub mod composable;
+pub mod expansion;
 pub mod lifecyclehook;
 pub mod loadout;
 pub mod patches;
