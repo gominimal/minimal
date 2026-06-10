@@ -558,6 +558,7 @@ impl SessionLauncher for SandboxLauncher {
                     "bash".to_string(),
                     "socat".to_string(),
                     "coreutils".to_string(),
+                    "claude-code".to_string(),
                 ],
             )
             .await
