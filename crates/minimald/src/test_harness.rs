@@ -178,6 +178,27 @@ impl TestClient {
             .unwrap()
     }
 
+    /// Opens an interactive shell channel attached to the given minimald
+    /// session, mirroring what a real client does: sets `MINIMAL_SESSION_ID`,
+    /// negotiates a PTY, then issues a `shell` request. Returns the live
+    /// channel so the caller can write stdin and drain stdout/teardown itself.
+    pub(crate) async fn open_shell(
+        &mut self,
+        session_id: SessionId,
+    ) -> russh::Channel<russh::client::Msg> {
+        let channel = self.handle.channel_open_session().await.unwrap();
+        channel
+            .set_env(true, crate::MINIMAL_SESSION_ID_ENV, session_id.to_string())
+            .await
+            .unwrap();
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .unwrap();
+        channel.request_shell(true).await.unwrap();
+        channel
+    }
+
     /// Opens a fresh session channel, applies `env` and optionally a PTY,
     /// fires an `exec` request for `command`, writes `stdin`, then drains
     /// the channel to completion.
