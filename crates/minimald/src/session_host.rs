@@ -323,14 +323,20 @@ pub struct Host {
     /// The master-side fd of the Pty.
     master: AsyncFd<std::fs::File>,
 
-    // Writer for bytes coming from the remote - i.e. 'stdin' that needs to
-    // get written to the pty.
+    // Writer for bytes coming from the remote - i.e. 'stdin' keystrokes
+    // that need to get written to the pty. Clones of this sender are
+    // given to [`Binding::spawn`].
     remote_tx: mpsc::Sender<Either<bytes::Bytes, RequestedPty>>,
-    // Recieve end for bytes coming from the remote.
+    // Recieve-end for bytes coming from the remote - i.e. 'stdin' keystrokes.
+    // We process this end.
     remote_rx: mpsc::Receiver<Either<bytes::Bytes, RequestedPty>>,
 
     // Temporary buffer for reading from the pty master (i.e. 'stdout').
     stdout_buf: Vec<u8>,
+    // Bytes that need to be written to the pty master (i.e. 'stdin').
+    //
+    // (<buffer>, <number of bytes from buffer already written>)
+    stdin_buf: Option<(bytes::Bytes, usize)>,
 
     // Keeps the session's `Env` — and the `Context` and `Graph` it borrows —
     // alive for as long as this host (and thus the session process) lives.
@@ -478,6 +484,7 @@ impl Host {
             remote_tx,
             remote_rx,
             stdout_buf: vec![0u8; 8 * 1024],
+            stdin_buf: None,
             _session_env: SessionEnv {
                 env: Some(env),
                 ctx: ctx_addr as *mut mctx::Context,
@@ -552,29 +559,39 @@ impl Host {
                     Err(_would_block) => {},
                 }
             },
-            // Read from remote (ssh channel) - these bytes need writing to session process stdin
-            Some(msg) = self.remote_rx.recv() => {
+            // Read from remote (ssh channel) - these keystrokes need writing to the pty.
+            //
+            // To ensure we never block service of reads from the master side of the pty ('stdout'),
+            // we only consume new keystrokes if we have none waiting to be written to the pty, and
+            // pending writes to the pty are serviced async by their own select arm (below).
+            Some(msg) = self.remote_rx.recv(), if self.stdin_buf.is_none() => {
                 match msg {
                     Either::Left(b) => {
-                        let mut b = &b[..];
-                        while !b.is_empty() {
-                            match self.master.writable().await.expect("todo write handle error").try_io(|fd|fd.get_ref().write(b)) {
-                                Ok(Ok(0)) => {},
-                                Ok(Ok(n)) => {
-                                    b = &b[n..];
-                                }
-                                Ok(Err(e)) => {
-                                    todo!("handle error writing to stdin: {e}");
-                                }
-                                Err(_would_block) => {},
-                            }
-                        }
+                        self.stdin_buf = Some((b, 0));
                     }
                     Either::Right(sz) => {
                         self.set_size(WinSize::from(&sz));
                     },
                 }
             },
+            // Write buffered keystrokes into the pty, if any,
+            w = self.master.writable(), if self.stdin_buf.is_some() => {
+                let (buff, n) = self.stdin_buf.as_mut().unwrap();
+                match w.expect("todo write handle error").try_io(|fd|fd.get_ref().write(&buff[*n..])) {
+                    Ok(Ok(extra)) => {
+                        if (*n+extra) == buff.len() {
+                            self.stdin_buf = None;
+                        } else {
+                            *n += extra;
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        todo!("handle error writing to stdin: {e}");
+                    }
+                    Err(_would_block) => {},
+                }
+            }
+
         }
 
         Ok(())
