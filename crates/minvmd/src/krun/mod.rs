@@ -18,7 +18,4 @@ mod ctx;
 mod raw;
 
 pub use ctx::Context;
-pub use raw::{
-    KRUN_DISK_FORMAT_RAW, KRUN_KERNEL_FORMAT_ELF, KRUN_KERNEL_FORMAT_IMAGE_GZ,
-    KRUN_KERNEL_FORMAT_PE_GZ, KRUN_KERNEL_FORMAT_RAW,
-};
+pub use raw::{DiskFormat, KernelFormat};

@@ -35,6 +35,16 @@ strip = true
 lto = true
 codegen-units = 1
 
+# Fast-compiling profile for the Stage-2 guest initramfs minimald. The release
+# profile's full LTO + codegen-units=1 dominate the cross-compile time, and the
+# initramfs binary doesn't need them (it just reaches READY + serves a session).
+# Drops the cross-compile from ~13 min toward a few minutes.
+[profile.initramfs]
+inherits = "release"
+opt-level = 1
+lto = false
+codegen-units = 16
+
 [workspace.dependencies]
 anyhow = "1.0"
 blake3 = { version = "1", features = ["serde"] }
@@ -94,6 +104,7 @@ tar = "0.4"
 tempfile = "3.27"
 tokio = { version = "1.52", features = ["full"] }
 tokio-stream = "0.1"
+tokio-vsock = "0.7"
 tokio-util = "0.7"
 toml = "1.1"
 toml_edit = "0.25"

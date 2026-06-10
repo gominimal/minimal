@@ -134,6 +134,19 @@ async fn main() -> Result<(), MainError> {
         .with(filter)
         .init();
 
+    // Run as the initramfs `/init` (pid-1 in the guest) — detect via argv[0]
+    // basename (the kernel appends its own cmdline tokens to init's argv, so an
+    // arg-count check is unreliable). Handle before clap, which requires a
+    // subcommand.
+    #[cfg(target_os = "linux")]
+    if std::env::args_os()
+        .next()
+        .map(|a0| std::path::Path::new(&a0).file_name() == Some(std::ffi::OsStr::new("init")))
+        .unwrap_or(false)
+    {
+        return run_initramfs().await;
+    }
+
     let cli = Cli::parse();
 
     // Handle non-{launch,run} commands.
@@ -150,17 +163,28 @@ async fn main() -> Result<(), MainError> {
         return Err(MainError::IO(e, "creating minimal dir"));
     }
 
-    // If we got this far we need to launch minimald.
-    //
-    // Ensure the socket's parent directory exists.
-    let socket_path = cli.listen_on();
-    if let Some(parent) = socket_path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
+    // The host-key path lives under the instance dir; ensure it exists for
+    // both the UDS and vsock paths.
+    if let Err(e) = std::fs::create_dir_all(cli.client_instance_dir())
         && e.kind() != std::io::ErrorKind::AlreadyExists
     {
         return Err(MainError::IO(e, "creating provider dir"));
     }
 
+    // Setup the server config (shared by the UDS and vsock transports).
+    let config = Config {
+        host_key: HostKey::OnDisk {
+            path: sub_path!(cli.client_instance_dir(), "ssh_host_ed25519_key")
+                .as_utf8_path()
+                .into(),
+            create_if_missing: true,
+        },
+        minimal_state_dir: cli.minimal_state_dir(),
+        minimal_cache_dir: cli.minimal_cache_dir(),
+    };
+
+    // If we got this far we need to launch minimald.
+    //
     // Listen on the UDS socket.
     if let Err(e) = std::fs::remove_file(cli.listen_on())
         && e.kind() != std::io::ErrorKind::NotFound
@@ -177,18 +201,6 @@ async fn main() -> Result<(), MainError> {
 
     // TODO: When we have a daemonize command, daemonize here.
 
-    // Setup the server.
-    let config = Config {
-        host_key: HostKey::OnDisk {
-            path: sub_path!(cli.client_instance_dir(), "ssh_host_ed25519_key")
-                .as_utf8_path()
-                .into(),
-            create_if_missing: true,
-        },
-        minimal_state_dir: cli.minimal_state_dir(),
-        minimal_cache_dir: cli.minimal_cache_dir(),
-    };
-
     match cli.command {
         Command::Completions(_) => unreachable!(),
         Command::Run(_) => Server::run_on_uds(config, listener),
@@ -197,4 +209,75 @@ async fn main() -> Result<(), MainError> {
     .unwrap();
 
     Ok(())
+}
+
+/// Builds a guest server config rooted at `base` (state, cache, host key).
+///
+/// `base` is the hardcoded absolute guest state root (`/run/minimal`); the path
+/// newtype constructors below therefore cannot fail, so a failure is a broken
+/// invariant rather than a recoverable error.
+#[cfg(target_os = "linux")]
+fn guest_config_at(base: &str) -> Config {
+    let state = DaemonAbsPath::try_new(Utf8PathBuf::from(base))
+        .expect("guest state root `base` is an absolute path");
+    let cache = DaemonAbsPath::try_new(Utf8PathBuf::from(format!("{base}/cache")))
+        .expect("guest cache dir under an absolute `base` is an absolute path");
+    let provider = sub_path!(state, "providers").join(
+        &DaemonRelPath::try_new("local-0".to_string()).expect("`local-0` is a valid relative path"),
+    );
+    let host_key_path = sub_path!(provider, "ssh_host_ed25519_key");
+    Config {
+        host_key: HostKey::OnDisk {
+            path: host_key_path.as_utf8_path().into(),
+            create_if_missing: true,
+        },
+        minimal_state_dir: state,
+        minimal_cache_dir: cache,
+    }
+}
+
+/// Run as the initramfs `/init` (pid-1) and reach the boot READY contract
+/// against the GENERIC upstream rootfs — no minimald baked into the rootfs.
+///
+/// Mounts `/dev`, then mounts the upstream rootfs (`/dev/vda`) and chroots into
+/// it so the userland (`/bin/sh`, libs) resolves. Session state lives on a tmpfs
+/// (`/run/minimal`) — no data disk, no `mke2fs`. Emits READY, then serves on the
+/// guest UDS (the host-bridged vsock relay is layered on in a follow-up). Falls
+/// back to READY-only + idle if there is no rootfs disk.
+#[cfg(target_os = "linux")]
+async fn run_initramfs() -> Result<(), MainError> {
+    use minimald::guest;
+
+    // /dev in the initramfs first, so /dev/vda and /dev/vsock exist.
+    guest::mount_dev();
+
+    if let Err(e) = guest::enter_rootfs("/dev/vda", "/newroot") {
+        tracing::warn!(error = %e, "no rootfs disk; initramfs READY-only");
+        guest::mount_pseudo_filesystems();
+        let _ = guest::emit_ready_marker().await;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
+    }
+
+    // Inside the upstream rootfs now. Session state on the tmpfs at /run/minimal.
+    const BASE: &str = "/run/minimal";
+    std::fs::create_dir_all(format!("{BASE}/providers/local-0"))
+        .map_err(|e| MainError::IO(e, "creating provider dir"))?;
+    std::fs::create_dir_all(format!("{BASE}/cache"))
+        .map_err(|e| MainError::IO(e, "creating cache dir"))?;
+    let config = guest_config_at(BASE);
+
+    let guest_uds = format!("{BASE}/minimald.sock");
+    let _ = std::fs::remove_file(&guest_uds);
+    let listener =
+        UnixListener::bind(&guest_uds).map_err(|e| MainError::IO(e, "binding guest UDS"))?;
+
+    if let Err(e) = guest::emit_ready_marker().await {
+        tracing::warn!(error = %e, "initramfs: READY marker failed");
+    }
+    tracing::info!("initramfs: booted as pid-1 from upstream rootfs (tmpfs state)");
+    Server::run_on_uds(config, listener)
+        .await
+        .map_err(|e| MainError::IO(e, "serving on guest UDS"))
 }

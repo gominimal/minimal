@@ -13,24 +13,32 @@ use std::io;
 
 use crate::error::VmError;
 
-// Kernel format constants from libkrun.h, used by `krun_set_kernel`. Full enum:
-// RAW=0, ELF=1, PE_GZ=2, IMAGE_BZ2=3, IMAGE_GZ=4, IMAGE_ZSTD=5. minvmd targets:
-// - aarch64 `virtio-linux` ships `Image.gz` → `KRUN_KERNEL_FORMAT_PE_GZ`. The
-//   aarch64 loader implements only RAW and PE_GZ; PE_GZ scans for the gzip
-//   magic and decompresses. `IMAGE_GZ` (=4) is x86_64-only and returns
-//   `KernelFormatUnsupported` on aarch64.
-// - x86_64  `virtio-linux` ships `bzImage`  → `KRUN_KERNEL_FORMAT_ELF`. libkrun
-//   loads bzImage as ELF; `IMAGE_BZ2` (=3) is bzip2 blobs, not the bzImage
-//   container format.
-pub const KRUN_KERNEL_FORMAT_RAW: u32 = 0;
-pub const KRUN_KERNEL_FORMAT_ELF: u32 = 1;
-pub const KRUN_KERNEL_FORMAT_PE_GZ: u32 = 2;
-pub const KRUN_KERNEL_FORMAT_IMAGE_GZ: u32 = 4;
+/// Kernel image format for `krun_set_kernel`. Values match libkrun.h (full enum:
+/// RAW=0, ELF=1, PE_GZ=2, IMAGE_BZ2=3, IMAGE_GZ=4, IMAGE_ZSTD=5; the unused ones
+/// are omitted). minvmd targets:
+/// - aarch64 `virtio-linux` ships `Image.gz` → `PeGz`. The aarch64 loader
+///   implements only RAW and PE_GZ; PE_GZ scans for the gzip magic and
+///   decompresses. `ImageGz` (=4) is x86_64-only and returns
+///   `KernelFormatUnsupported` on aarch64.
+/// - x86_64 `virtio-linux` ships `bzImage` → `Elf`. libkrun loads bzImage as
+///   ELF; `IMAGE_BZ2` (=3) is bzip2 blobs, not the bzImage container format.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KernelFormat {
+    Raw = 0,
+    Elf = 1,
+    PeGz = 2,
+    ImageGz = 4,
+}
 
-// Disk image formats from libkrun.h, used by `krun_add_disk2`. A squashfs or
-// ext4 rootfs image is a RAW block device (the filesystem lives inside it; no
-// partition table). QCOW2=1, VMDK=2 are not used by minvmd.
-pub const KRUN_DISK_FORMAT_RAW: u32 = 0;
+/// Disk image format for `krun_add_disk2`. A squashfs or ext4 rootfs image is a
+/// `Raw` block device (the filesystem lives inside it; no partition table).
+/// QCOW2=1, VMDK=2 are not used by minvmd.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DiskFormat {
+    Raw = 0,
+}
 
 // SAFETY: every function in this block is an `extern "C"` declaration that
 // inherits its safety contract from libkrun.h. Specifically:

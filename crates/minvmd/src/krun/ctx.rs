@@ -139,7 +139,7 @@ impl Context {
     pub fn set_kernel(
         &mut self,
         kernel_path: impl AsRef<Path>,
-        kernel_format: u32,
+        kernel_format: raw::KernelFormat,
         initramfs: Option<impl AsRef<Path>>,
         cmdline: Option<&str>,
     ) -> Result<(), VmError> {
@@ -162,7 +162,7 @@ impl Context {
             raw::krun_set_kernel(
                 self.ctx_id,
                 kernel_cstr.as_ptr(),
-                kernel_format,
+                kernel_format as u32,
                 initramfs_ptr,
                 cmdline_ptr,
             )
@@ -215,12 +215,11 @@ impl Context {
     }
 
     /// Add a disk image as a virtio-blk block device backing `block_id`.
-    /// `disk_format` is one of `raw::KRUN_DISK_FORMAT_*`.
     pub fn add_disk(
         &mut self,
         block_id: &str,
         disk_path: impl AsRef<Path>,
-        disk_format: u32,
+        disk_format: raw::DiskFormat,
         read_only: bool,
     ) -> Result<(), VmError> {
         let id_cstr = cstring_from_str(block_id, "block_id")?;
@@ -234,7 +233,7 @@ impl Context {
                 self.ctx_id,
                 id_cstr.as_ptr(),
                 path_cstr.as_ptr(),
-                disk_format,
+                disk_format as u32,
                 read_only,
             )
         };

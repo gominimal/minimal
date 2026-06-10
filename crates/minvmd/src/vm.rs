@@ -1,7 +1,7 @@
 //! VM configuration builder.
 //!
 //! [`VmConfig`] collects the parameters needed to configure a libkrun context
-//! (vcpus, RAM, kernel, root disk, exec target). No network device is added in
+//! (vcpus, RAM, kernel, initramfs, root disk). No network device is added in
 //! v0.1; gvproxy/TSI integration is tracked in #160.
 
 use std::path::PathBuf;
@@ -19,11 +19,12 @@ pub struct VmConfig {
     /// Kernel image path.
     pub kernel_path: PathBuf,
     /// Path to the read-only ext4 root disk image (loaded via `krun_add_disk2`
-    /// as `/dev/vda`).
+    /// as `/dev/vda`). The initramfs `/init` (minimald) mounts + chroots into it.
     pub rootfs_path: PathBuf,
-    /// Guest workload run as the kernel `init=` (a block root has no libkrun
-    /// `/init.krun`, so the kernel execs this directly as PID 1).
-    pub exec_target: String,
+    /// Initramfs image the kernel boots: it unpacks into a RAM root and runs its
+    /// `/init` (minimald as pid-1), instead of booting a block-device root. This
+    /// is how minimald is shipped as pid-1 without baking it into the rootfs.
+    pub initramfs: PathBuf,
 }
 
 impl VmConfig {
@@ -34,45 +35,40 @@ impl VmConfig {
         ram_mib: u32,
         kernel_path: PathBuf,
         rootfs_path: PathBuf,
-        exec_target: String,
+        initramfs: PathBuf,
     ) -> Self {
         Self {
             num_vcpus,
             ram_mib,
             kernel_path,
             rootfs_path,
-            exec_target,
+            initramfs,
         }
     }
 
     /// Apply this configuration to an existing libkrun [`Context`][crate::krun::Context].
     ///
-    /// Configures vcpus, RAM, kernel + cmdline, the ext4 root disk, and the host
-    /// UDS↔vsock bridge for minimald (R3.1).
+    /// Configures vcpus, RAM, kernel + initramfs, the ext4 root disk, and the
+    /// host UDS↔vsock bridge for minimald (R3.1).
     #[cfg(target_os = "macos")]
     pub fn apply(&self, ctx: &mut crate::krun::Context) -> Result<(), crate::error::VmError> {
         ctx.set_vm_config(self.num_vcpus, self.ram_mib)?;
 
-        // Boot from a read-only ext4 disk image (krun_add_disk2 → /dev/vda)
-        // rather than a virtiofs directory. A block root has no libkrun
-        // `/init.krun`, so the kernel runs the guest workload directly via an
-        // explicit `init=` cmdline (libkrun's virtiofs-only default cmdline does
-        // not apply). devtmpfs auto-mounts /dev in the guest, giving the
-        // workload /dev/vsock for the READY marker and bridge.
-        let cmdline = format!(
-            "console=hvc0 root=/dev/vda rootfstype=ext4 ro init={}",
-            self.exec_target
-        );
+        // Initramfs boot: the kernel unpacks the initramfs into a RAM root and
+        // runs its `/init` (no `root=`/`init=` cmdline). minimald-as-/init mounts
+        // devtmpfs itself, then mounts the rootfs disk below and chroots into it.
         ctx.set_kernel(
             &self.kernel_path,
             crate::image::kernel_format(),
-            None::<&std::path::Path>,
-            Some(&cmdline),
+            Some(&self.initramfs),
+            Some("console=hvc0"),
         )?;
+        // Attach the rootfs as a block device (/dev/vda) for the initramfs
+        // `/init` to mount + chroot into; the kernel root is the initramfs.
         ctx.add_disk(
             "root",
             &self.rootfs_path,
-            crate::krun::KRUN_DISK_FORMAT_RAW,
+            crate::krun::DiskFormat::Raw,
             true,
         )?;
         // R2.5: no network device in v0.1.
@@ -108,13 +104,13 @@ mod tests {
             512,
             PathBuf::from("/boot/Image.gz"),
             PathBuf::from("/var/lib/rootfs.img"),
-            "/sbin/microvm-init".to_string(),
+            PathBuf::from("/var/lib/initramfs.cpio"),
         );
         assert_eq!(cfg.num_vcpus, 2);
         assert_eq!(cfg.ram_mib, 512);
         assert_eq!(cfg.kernel_path, PathBuf::from("/boot/Image.gz"));
         assert_eq!(cfg.rootfs_path, PathBuf::from("/var/lib/rootfs.img"));
-        assert_eq!(cfg.exec_target, "/sbin/microvm-init");
+        assert_eq!(cfg.initramfs, PathBuf::from("/var/lib/initramfs.cpio"));
     }
 
     #[test]
@@ -124,11 +120,11 @@ mod tests {
             256,
             PathBuf::from("/k"),
             PathBuf::from("/r"),
-            "/sbin/init".to_string(),
+            PathBuf::from("/i"),
         );
         let cfg2 = cfg.clone();
         assert_eq!(cfg.num_vcpus, cfg2.num_vcpus);
         assert_eq!(cfg.ram_mib, cfg2.ram_mib);
-        assert_eq!(cfg.exec_target, cfg2.exec_target);
+        assert_eq!(cfg.initramfs, cfg2.initramfs);
     }
 }

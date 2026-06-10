@@ -5,14 +5,14 @@
 //! double-underscore prefix).
 //!
 //! On macOS:
-//! 1. Reads kernel and rootfs from `MINVMD_KERNEL_PATH` / `MINVMD_ROOTFS_PATH`.
+//! 1. Reads kernel, rootfs, and initramfs paths from `MINVMD_KERNEL_PATH` /
+//!    `MINVMD_ROOTFS_PATH` / `MINVMD_INITRAMFS`.
 //! 2. Reads the READY-marker socket path from `MINVMD_MARKER_SOCK`.
-//! 3. Creates and configures a libkrun context (kernel + cmdline, ext4 root
+//! 3. Creates and configures a libkrun context (kernel + initramfs, ext4 root
 //!    disk via `krun_add_disk2`, resources).
-//! 4. Sets the guest workload via the kernel `init=` cmdline: the ext4 block
-//!    root has no libkrun `/init.krun`, so the kernel execs the workload
-//!    directly as PID 1. Default `/sbin/microvm-init`, `MINVMD_EXEC`
-//!    overrides.
+//! 4. Boots the initramfs: the kernel unpacks it into a RAM root and runs its
+//!    `/init` (minimald) as PID 1; `/init` mounts the ext4 rootfs (`/dev/vda`)
+//!    and chroots into it.
 //! 5. Registers the marker socket for `VSOCK_MARKER_PORT` (guest→host): the
 //!    guest workload connects to that vsock port and writes `READY\n`, which
 //!    libkrun bridges to the host UNIX socket where the parent listens (R2.4).
@@ -37,29 +37,24 @@ fn run_macos() -> Result<()> {
     use anyhow::Context as _;
 
     use crate::cmd::{MARKER_SOCK_ENV, VSOCK_MARKER_PORT};
-    use crate::image::{resolve_kernel_path, resolve_rootfs_path};
+    use crate::image::{resolve_initramfs_path, resolve_kernel_path, resolve_rootfs_path};
     use crate::krun::Context;
     use crate::vm::VmConfig;
 
     let kernel = resolve_kernel_path().context("resolving kernel path")?;
     let rootfs = resolve_rootfs_path().context("resolving rootfs path")?;
+    let initramfs = resolve_initramfs_path().context("resolving initramfs path")?;
     let marker_sock = std::env::var(MARKER_SOCK_ENV).with_context(|| {
         format!("reading {MARKER_SOCK_ENV}: VMM child must be spawned by `minvmd boot`")
     })?;
-
-    // Guest workload run as the kernel `init=`. The root is a block device
-    // (ext4 via krun_add_disk2), which has no libkrun `/init.krun`, so the
-    // kernel execs this directly as PID 1. Default to the v0.1 bring-up stub;
-    // `MINVMD_EXEC` overrides (e.g. /sbin/minimald in Stage 2).
-    let exec = std::env::var("MINVMD_EXEC").unwrap_or_else(|_| "/sbin/microvm-init".to_string());
 
     let mut ctx = Context::create().context("krun_create_ctx")?;
     // 2 vCPU / 1024 MiB: 512 MiB is the practical floor to reach userspace;
     // 1024 MiB is cheap headroom under Hypervisor.framework with no boot
     // penalty. (Stay below the kernel's CONFIG_NR_CPUS.) The boot command may
     // expose these as flags in a future change. `apply` configures the kernel +
-    // cmdline (with `init=exec`), the ext4 root disk, and the vsock bridge.
-    let cfg = VmConfig::new(2, 1024, kernel, rootfs, exec.clone());
+    // initramfs, the ext4 root disk, and the vsock bridge.
+    let cfg = VmConfig::new(2, 1024, kernel, rootfs, initramfs);
     cfg.apply(&mut ctx)
         .context("applying VmConfig to krun context")?;
 
@@ -81,8 +76,7 @@ fn run_macos() -> Result<()> {
     tracing::info!(
         port = VSOCK_MARKER_PORT,
         sock = %marker_sock,
-        exec = %exec,
-        "guest workload + READY-marker vsock port set; calling krun_start_enter"
+        "initramfs boot + READY-marker vsock port set; calling krun_start_enter"
     );
 
     // start_enter consumes the context and boots the VM. On success, libkrun
