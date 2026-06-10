@@ -331,6 +331,53 @@ pub struct Host {
 
     // Temporary buffer for reading from the pty master (i.e. 'stdout').
     stdout_buf: Vec<u8>,
+
+    // Keeps the session's `Env` — and the `Context` and `Graph` it borrows —
+    // alive for as long as this host (and thus the session process) lives.
+    // Declared last so it is dropped after `process`: the process is torn down
+    // before the sandbox files backing its rootfs are removed. Never read; held
+    // purely for its `Drop`.
+    _session_env: SessionEnv,
+}
+
+/// Owns the [`mctx::Env`] for a session, along with the [`mctx::Context`] and
+/// [`graph::Graph`] it borrows, keeping all three alive for the session.
+///
+/// `Env<'a>` borrows the context and graph mutably and owns the temp dirs and
+/// sandbox base directory that hold the running process's rootfs. We can't
+/// store the env next to the values it borrows (that would be a self-referential
+/// struct), so the context and graph are leaked to obtain `'static` borrows for
+/// the env; the raw pointers are retained here so the leaked allocations can be
+/// reclaimed once the env is dropped.
+struct SessionEnv {
+    /// `Some` for the whole lifetime of the value; taken in `drop` so the env
+    /// is dropped before the context and graph it borrows are freed.
+    env: Option<mctx::Env<'static>>,
+    ctx: *mut mctx::Context,
+    graph: *mut graph::Graph,
+}
+
+// SAFETY: `mctx::Context`, `graph::Graph`, and `mctx::Env` are all `Send`
+// (the context and graph round-trip through `spawn_blocking`, and the env is
+// held across `.await` in `Host::spawn`). The raw pointers merely retain
+// ownership of the leaked allocations so they can be freed in `drop`; they are
+// never dereferenced concurrently with the `&'static mut` borrows held by `env`.
+unsafe impl Send for SessionEnv {}
+
+impl Drop for SessionEnv {
+    fn drop(&mut self) {
+        // Drop the env first, so its sandbox (and the listener thread holding
+        // the borrowed context/graph) is torn down while the context and graph
+        // are still valid.
+        self.env = None;
+        // SAFETY: `ctx`/`graph` were produced by `Box::into_raw` in
+        // `Host::spawn` and have not been freed. Their only borrower, `env`,
+        // was just dropped above, so no references into them remain.
+        unsafe {
+            drop(Box::from_raw(self.graph));
+            drop(Box::from_raw(self.ctx));
+        }
+    }
 }
 
 impl Host {
@@ -343,18 +390,41 @@ impl Host {
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
         // graph construction) — run it on the blocking pool so it
         // doesn't stall the async executor.
-        let (mut ctx, graph_result) = tokio::task::spawn_blocking(move || {
+        let (ctx, graph_result) = tokio::task::spawn_blocking(move || {
             let r = ctx.graph_from_all_packages().map_err(|e| e.to_string());
             (ctx, r)
         })
         .await
         .map_err(io::Error::other)?;
-        let mut graph = graph_result.map_err(io::Error::other)?;
+        let graph = graph_result.map_err(io::Error::other)?;
 
-        let mut env = ctx
+        // Leak the context and graph so the env can borrow them for `'static`.
+        // The env owns the sandbox base dir and temp dirs backing the running
+        // process's rootfs; if it (and the values it borrows) were dropped when
+        // `spawn` returns, those files would be deleted out from under the live
+        // process. The returned `SessionEnv` keeps all three alive for the
+        // session and frees the leaked allocations when the host is dropped.
+        // The addresses are carried as `usize` (not `*mut`) so this future
+        // stays `Send` across the `make_env` await below; they are cast back to
+        // pointers only when building the `SessionEnv`.
+        let ctx_addr = Box::into_raw(Box::new(ctx)) as usize;
+        let graph_addr = Box::into_raw(Box::new(graph)) as usize;
+        // SAFETY: both addresses were just produced by `Box::into_raw`, so they
+        // point to valid, aligned, uniquely owned allocations. We hand out a
+        // single `&'static mut` for each to `make_env`; the allocations are not
+        // accessed again through these addresses until `SessionEnv::drop`
+        // reclaims them, after the borrowing env has been dropped.
+        let (ctx_ref, graph_ref) = unsafe {
+            (
+                &mut *(ctx_addr as *mut mctx::Context),
+                &mut *(graph_addr as *mut graph::Graph),
+            )
+        };
+
+        let mut env = ctx_ref
             .make_env(
                 "session",
-                &mut graph,
+                graph_ref,
                 None,
                 Some(&"default-state".to_string()),
                 None,
@@ -390,19 +460,29 @@ impl Host {
             let file = unsafe { std::fs::File::from_raw_fd(master.into_raw_fd()) };
             AsyncFd::new(file)?
         };
+        let process = command
+            .spawn()
+            .map_err(|e| io::Error::other(format!("exec failed: {}", e)))?;
+        // `command`/`container` no longer borrow `env`, so it can be moved into
+        // the host (via `SessionEnv`) to keep its backing files alive.
+        drop(container);
+
         let mut host = Host {
             receiver,
             remote: None,
             sz,
             parser,
-            process: command
-                .spawn()
-                .map_err(|e| io::Error::other(format!("exec failed: {}", e)))?,
+            process,
             master,
 
             remote_tx,
             remote_rx,
             stdout_buf: vec![0u8; 8 * 1024],
+            _session_env: SessionEnv {
+                env: Some(env),
+                ctx: ctx_addr as *mut mctx::Context,
+                graph: graph_addr as *mut graph::Graph,
+            },
         };
         if let Some(channel) = channel {
             host.attach(channel, sz, true).await;
