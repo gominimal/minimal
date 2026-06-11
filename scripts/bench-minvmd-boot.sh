@@ -21,27 +21,53 @@ BIN="${2:-./target/debug/minvmd}"
 
 : "${MINVMD_KERNEL_PATH:?set MINVMD_KERNEL_PATH to the (uncompressed) kernel image}"
 : "${MINVMD_ROOTFS_PATH:?set MINVMD_ROOTFS_PATH to the rootfs ext4 image}"
+: "${MINVMD_INITRAMFS:?set MINVMD_INITRAMFS to the guest initramfs cpio (minvmd boot needs all three)}"
+for v in MINVMD_KERNEL_PATH MINVMD_ROOTFS_PATH MINVMD_INITRAMFS; do
+  [ -f "${!v}" ] || { echo "$v points at a missing file: ${!v}" >&2; exit 1; }
+done
 [ -x "$BIN" ] || { echo "minvmd binary not found/executable: $BIN" >&2; exit 1; }
 command -v perl >/dev/null || { echo "perl required for sub-ms timing" >&2; exit 1; }
 
+# A healthy boot reaches READY in well under a second; cap each attempt so a
+# broken setup fails fast instead of looking hung for minutes.
+#
+# Boot invocations below redirect stdin from /dev/null: GNU timeout runs the
+# command in its own (background) process group, and with a TTY on stdin and
+# MINVMD_BOOT_LOG unset, libkrun's console setup tcsetattr()s the terminal —
+# SIGTTOU then stops the whole group and the boot dies silently at the timeout.
+BOOT_TIMEOUT=12
+OUT="$(mktemp -t bench-minvmd.XXXXXX)"
+
 now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time()*1000'; }
-teardown() { pkill -f "__krun-vmm" 2>/dev/null; sleep 0.5; }
+# SIGKILL, not TERM: a VM in krun_start_enter ignores SIGTERM, so a leaked
+# __krun-vmm (e.g. from a Ctrl-C'd foreground boot) would otherwise hold the
+# bridge socket and make every subsequent boot fail.
+teardown() { pkill -9 -f "__krun-vmm" 2>/dev/null; pkill -9 -f "$BIN boot" 2>/dev/null; sleep 0.3; }
 
-trap teardown EXIT
+# Tear down on normal exit AND on Ctrl-C / kill, so an interrupt never leaves a
+# detached VM running (and the run stops promptly instead of deferring).
+trap 'teardown; rm -f "$OUT"' EXIT
+trap 'echo; echo "interrupted — tearing down" >&2; teardown; exit 130' INT TERM
 
-# Warmup (page-cache the kernel/rootfs; first boot is cold).
+# Warmup (page-cache the kernel/rootfs; the first boot is cold). Fail loudly here
+# if the artifacts/codesign are wrong, rather than silently N times below.
+echo "warming up (cold boot, discarded)…" >&2
 teardown
-timeout 20 "$BIN" boot >/dev/null 2>&1
+if ! timeout "$BOOT_TIMEOUT" "$BIN" boot </dev/null >"$OUT" 2>&1 || ! grep -q vm-up "$OUT"; then
+  echo "warmup boot did not reach vm-up — check artifacts, codesign, and libkrun:" >&2
+  tail -6 "$OUT" >&2
+  exit 1
+fi
 teardown
 
 samples=()
-for _ in $(seq 1 "$N"); do
+for i in $(seq 1 "$N"); do
   t0="$(now_ms)"
-  if timeout 20 "$BIN" boot >/tmp/.bench-minvmd.out 2>/dev/null && grep -q vm-up /tmp/.bench-minvmd.out; then
-    t1="$(now_ms)"
-    samples+=( "$(( t1 - t0 ))" )
+  if timeout "$BOOT_TIMEOUT" "$BIN" boot </dev/null >"$OUT" 2>/dev/null && grep -q vm-up "$OUT"; then
+    t1="$(now_ms)"; ms="$(( t1 - t0 ))"; samples+=( "$ms" )
+    printf 'run %2d/%d: %4d ms\n' "$i" "$N" "$ms" >&2
   else
-    echo "warning: a boot did not reach vm-up" >&2
+    printf 'run %2d/%d: FAILED (no vm-up)\n' "$i" "$N" >&2
   fi
   teardown
 done
