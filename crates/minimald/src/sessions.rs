@@ -23,14 +23,14 @@ pub enum SessionKeyPredicate {
 }
 
 /// Transport / internal error when communicating with the sessions actor.
-pub type ResponseError = std::io::Error;
+type SessionsError = std::io::Error;
 
 /// Encapsulates the return channel for messages back from the actor.
-struct Responder<T>(oneshot::Sender<Result<T, ResponseError>>);
+struct Responder<T>(oneshot::Sender<Result<T, SessionsError>>);
 
 impl<T> Responder<T> {
     /// Constructs both ends of the return channel.
-    pub fn channel() -> (Self, oneshot::Receiver<Result<T, ResponseError>>) {
+    pub fn channel() -> (Self, oneshot::Receiver<Result<T, SessionsError>>) {
         let (send, recv) = oneshot::channel();
         (Self(send), recv)
     }
@@ -38,7 +38,7 @@ impl<T> Responder<T> {
     /// Awaits the provided future, transmitting its result to the caller.
     pub async fn handle<F>(self, fut: F)
     where
-        F: Future<Output = Result<T, ResponseError>>,
+        F: Future<Output = Result<T, SessionsError>>,
     {
         let _ = self.0.send(fut.await);
     }
@@ -114,7 +114,7 @@ impl<L: Loader> Manager<L> {
                         .map(|k| {
                             let s = self.store.get(&k)?;
                             let r = s.record();
-                            Ok::<_, ResponseError>(SessionInfo {
+                            Ok::<_, SessionsError>(SessionInfo {
                                 id: r.id,
                                 name: r.name.clone(),
                             })
@@ -126,7 +126,7 @@ impl<L: Loader> Manager<L> {
             // Gets the record for a specific session.
             ManagerMessage::GetRecord(pred, r) => {
                 r.handle(async {
-                    Ok::<_, ResponseError>(match pred {
+                    Ok::<_, SessionsError>(match pred {
                         SessionKeyPredicate::Id(id) => self
                             .store
                             .find_by_id(&id)?
@@ -186,7 +186,7 @@ pub struct ManagerHandle(mpsc::Sender<ManagerMessage>);
 
 impl ManagerHandle {
     /// Lists the sessions known to this (minimald) instance.
-    pub async fn list(&self) -> Result<Vec<SessionInfo>, ResponseError> {
+    pub async fn list(&self) -> Result<Vec<SessionInfo>, SessionsError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(ManagerMessage::List(send)).await;
@@ -197,7 +197,7 @@ impl ManagerHandle {
     pub async fn get_record(
         &self,
         pred: SessionKeyPredicate,
-    ) -> Result<Option<sessions::Record>, ResponseError> {
+    ) -> Result<Option<sessions::Record>, SessionsError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(ManagerMessage::GetRecord(pred, send)).await;
@@ -208,7 +208,7 @@ impl ManagerHandle {
     pub async fn create_session(
         &self,
         record: sessions::Record,
-    ) -> Result<SessionId, ResponseError> {
+    ) -> Result<SessionId, SessionsError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
@@ -222,7 +222,7 @@ impl ManagerHandle {
     pub async fn get_session(
         &self,
         pred: SessionKeyPredicate,
-    ) -> Result<Option<SessionHandle>, ResponseError> {
+    ) -> Result<Option<SessionHandle>, SessionsError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(ManagerMessage::GetSession(pred, send)).await;
