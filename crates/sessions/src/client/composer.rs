@@ -264,6 +264,14 @@ impl Provenanced for SessionVar {
     }
 }
 
+impl crate::core::expansion::VarLookup for [SessionVar] {
+    fn lookup(&self, name: &str) -> Option<&str> {
+        self.iter()
+            .find(|v| v.var.name() == name)
+            .map(|v| v.var.value())
+    }
+}
+
 /// One patch file that survived policy resolution, paired with its
 /// origin. See [`SessionVar`] for the rationale.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -657,8 +665,11 @@ pub(crate) fn expand_patch_sources(
         .into_iter()
         .map(|pp| {
             let (patch, provenance) = pp.into_parts();
-            let source =
-                crate::core::expansion::expand_source(patch.source(), resolved_vars, home_fallback)?;
+            let source = crate::core::expansion::expand_source(
+                patch.source(),
+                resolved_vars,
+                home_fallback,
+            )?;
             Ok(ExpandedProvenancedPatch {
                 source,
                 dest: patch.dest().clone(),

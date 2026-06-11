@@ -498,7 +498,7 @@ impl PatchPolicy {
     /// by any pattern.
     pub fn expand_with(
         &self,
-        resolved_vars: &[crate::client::composer::SessionVar],
+        resolved_vars: &(impl crate::core::expansion::VarLookup + ?Sized),
         home_fallback: Option<&str>,
     ) -> Result<ExpandedPatchPolicy, crate::core::expansion::ExpandError> {
         let expand_one =
@@ -941,21 +941,14 @@ mod tests {
 
     // ---- PatchPolicy::expand_with ----
 
-    /// Build a `SessionVar` with the given name + value. Uses a
-    /// user-origin source because resolution doesn't consult it.
-    fn sv(name: &str, value: &str) -> crate::client::composer::SessionVar {
-        let resolved = crate::core::primitives::ResolvedVar::resolve_with(
+    /// Build a `ResolvedVar` with the given name + value.
+    fn sv(name: &str, value: &str) -> crate::core::primitives::ResolvedVar {
+        crate::core::primitives::ResolvedVar::resolve_with(
             name.into(),
             crate::core::primitives::VarValue::specified(value),
             |_| Err(std::env::VarError::NotPresent),
         )
-        .unwrap();
-        crate::client::composer::SessionVar::new(
-            resolved,
-            crate::core::source::Source::UserLoadout {
-                name: "test".into(),
-            },
-        )
+        .unwrap()
     }
 
     /// Each list expands independently. Patterns referencing the same
@@ -967,7 +960,7 @@ mod tests {
             .with_deny(["$HOME/.ssh/**"])
             .with_ignore(["~/.DS_Store"]);
         let vars = [sv("HOME", "/h")];
-        let expanded = policy.expand_with(&vars, None).unwrap();
+        let expanded = policy.expand_with(vars.as_slice(), None).unwrap();
         let pats = |sets: &[FileSet]| -> Vec<String> {
             sets.iter().map(|f| f.pattern().to_owned()).collect()
         };
@@ -984,8 +977,8 @@ mod tests {
         let policy = PatchPolicy::empty()
             .with_allow(["/etc/**"])
             .with_deny(["$NOPE/*"]);
-        let vars = [];
-        let err = policy.expand_with(&vars, None).unwrap_err();
+        let vars: [crate::core::primitives::ResolvedVar; 0] = [];
+        let err = policy.expand_with(vars.as_slice(), None).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1006,8 +999,8 @@ mod tests {
             .with_allow(["/etc/xdg/**"])
             .with_deny(["/**/*.pem"])
             .with_ignore(["/**/.DS_Store"]);
-        let vars = [];
-        let expanded = policy.expand_with(&vars, None).unwrap();
+        let vars: [crate::core::primitives::ResolvedVar; 0] = [];
+        let expanded = policy.expand_with(vars.as_slice(), None).unwrap();
         // Patterns pass through globset intact.
         assert_eq!(expanded.allow().len(), 1);
         assert_eq!(expanded.deny().len(), 1);
