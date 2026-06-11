@@ -795,8 +795,9 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
                                 };
                                 self.remote = None;
                             }
+                        } else {
+                            self.stdin_buf = Some((b, 0));
                         };
-                        self.stdin_buf = Some((b, 0));
                     }
                     Either::Right(sz) => {
                         self.set_size(WinSize::from(&sz));
