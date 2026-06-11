@@ -416,8 +416,14 @@ impl russh::server::Handler for ConnectionHandler {
         };
 
         session.channel_success(id)?;
+        let hnd = session.handle();
         tokio::spawn(async move {
-            session_handle.attach(channel, config).await;
+            if let Err(e) = session_handle.attach(channel, config).await {
+                let _ = hnd
+                    .data(id, format!("Error attaching to session: {e}\r\n"))
+                    .await;
+                let _ = hnd.close(id).await;
+            }
         });
         Ok(())
     }

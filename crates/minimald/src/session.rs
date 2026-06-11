@@ -1,18 +1,45 @@
-use mctx::ConfigBuilder;
-use paths::DaemonAbsPath;
-use russh::{Channel, server::Msg};
-use sessions::store::SessionObject;
-use tokio::sync::{mpsc, oneshot};
-
 use crate::{
     ChannelConfig,
     session_host::{self, WinSize},
 };
+use mctx::ConfigBuilder;
+use paths::DaemonAbsPath;
+use russh::{Channel, server::Msg};
+use sessions::store::SessionObject;
+use std::fmt::{self};
+use tokio::sync::{mpsc, oneshot};
+
+/// An error that occurred when attaching to a running session/its-shell.
+#[derive(Debug)]
+pub enum AttachError {
+    SpawnFailed(std::io::Error),
+    NoPty,
+    ContextCreationFailed(String),
+}
+
+impl std::error::Error for AttachError {}
+
+impl fmt::Display for AttachError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AttachError::ContextCreationFailed(e) => {
+                write!(f, "init of minimal context: {e}")
+            }
+            AttachError::NoPty => write!(f, "SSH channel did not configure a PTY"),
+            AttachError::SpawnFailed(e) => write!(f, "session spawn: {e}"),
+        }
+    }
+}
 
 enum SessionMessage {
     GetWorkspacePath(oneshot::Sender<DaemonAbsPath>),
     MakeContext(oneshot::Sender<Result<mctx::Context, String>>),
-    Attach(SessionHandle, Channel<Msg>, ChannelConfig),
+    Attach(
+        oneshot::Sender<Result<(), AttachError>>,
+        SessionHandle,
+        Channel<Msg>,
+        ChannelConfig,
+    ),
 }
 
 /// Manages a running session.
@@ -35,6 +62,9 @@ impl<S: SessionObject> Session<S> {
         minimal_cache_dir: DaemonAbsPath,
         session: S,
     ) -> Result<SessionHandle, std::io::Error> {
+        let wsp = session.workspace_path();
+        std::fs::create_dir_all(&wsp).unwrap();
+
         let (sender, receiver) = mpsc::channel(8);
         let mngr = Self {
             host: None,
@@ -60,14 +90,13 @@ impl<S: SessionObject> Session<S> {
         match msg {
             SessionMessage::GetWorkspacePath(r) => {
                 let wsp = self.session.workspace_path();
-                std::fs::create_dir_all(&wsp).unwrap();
                 let _ = r.send(wsp);
             }
             SessionMessage::MakeContext(r) => {
                 let _ = r.send(self.context());
             }
-            SessionMessage::Attach(session_hnd, channel, config) => {
-                self.attach(session_hnd, channel, config).await
+            SessionMessage::Attach(r, session_hnd, channel, config) => {
+                let _ = r.send(self.attach(session_hnd, channel, config).await);
             }
         }
     }
@@ -77,18 +106,22 @@ impl<S: SessionObject> Session<S> {
         session_hnd: SessionHandle,
         channel: Channel<Msg>,
         config: ChannelConfig,
-    ) {
-        let sz = WinSize::from(config.pty.as_ref().unwrap());
+    ) -> Result<(), AttachError> {
+        let sz = WinSize::from(match config.pty.as_ref() {
+            Some(pty) => pty,
+            None => return Err(AttachError::NoPty),
+        });
+
         match &mut self.host {
             None => self.mint_session_host(session_hnd, channel, sz).await,
             Some(h) => {
                 match h.attach(channel, sz).await {
-                    Ok(()) => {}
+                    Ok(()) => Ok(()),
                     Err((channel, sz)) => {
                         // session host is dead
-                        self.mint_session_host(session_hnd, channel, sz).await;
+                        self.mint_session_host(session_hnd, channel, sz).await
                     }
-                };
+                }
             }
         }
     }
@@ -98,35 +131,41 @@ impl<S: SessionObject> Session<S> {
         session_hnd: SessionHandle,
         channel: Channel<Msg>,
         sz: WinSize,
-    ) {
-        let launcher = self.session_launcher(session_hnd);
+    ) -> Result<(), AttachError> {
+        let launcher = self.session_launcher(session_hnd)?;
         let h = Box::pin(session_host::Host::spawn(launcher, sz, Some(channel)))
             .await
-            .unwrap();
+            .map_err(AttachError::SpawnFailed)?;
         self.host = Some(h);
+        Ok(())
     }
 
     /// Builds the session launcher used to mint a session host: the real
     /// sandboxed shell in production.
     #[cfg(not(test))]
-    fn session_launcher(&mut self, session: SessionHandle) -> session_host::SandboxLauncher {
-        session_host::SandboxLauncher {
-            ctx: self.context().unwrap(),
+    fn session_launcher(
+        &mut self,
+        session: SessionHandle,
+    ) -> Result<session_host::SandboxLauncher, AttachError> {
+        Ok(session_host::SandboxLauncher {
+            ctx: self.context().map_err(AttachError::ContextCreationFailed)?,
             session,
-        }
+        })
     }
 
     /// Under test, swap in a mock launcher that runs a plain host process wired
     /// to the pty, exercising the session-host runtime without building a real
     /// sandbox (which needs packages unavailable in the unit-test tempdir).
     #[cfg(test)]
-    fn session_launcher(&mut self, _session: SessionHandle) -> session_host::MockLauncher {
-        session_host::MockLauncher
+    fn session_launcher(
+        &mut self,
+        _session: SessionHandle,
+    ) -> Result<session_host::MockLauncher, AttachError> {
+        Ok(session_host::MockLauncher)
     }
 
     fn context(&mut self) -> Result<mctx::Context, String> {
         let wsp = self.session.workspace_path();
-        std::fs::create_dir_all(&wsp).unwrap();
         match ConfigBuilder::new()
             .with_repo_dir(wsp.as_utf8_path())
             .with_cache_dir(self.minimal_cache_dir.as_utf8_path())
@@ -160,11 +199,18 @@ impl SessionHandle {
         recv.await.expect("corresponding session is dead")
     }
 
-    pub async fn attach(&self, channel: Channel<Msg>, config: ChannelConfig) {
-        self.0
-            .send(SessionMessage::Attach(self.clone(), channel, config))
-            .await
-            .expect("corresponding session is dead");
+    pub async fn attach(
+        &self,
+        channel: Channel<Msg>,
+        config: ChannelConfig,
+    ) -> Result<(), AttachError> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .0
+            .send(SessionMessage::Attach(send, self.clone(), channel, config))
+            .await;
+        recv.await.expect("corresponding session is dead")
     }
 }
 
