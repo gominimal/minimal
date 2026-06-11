@@ -140,8 +140,7 @@ impl ProvenancedPackage {
         }
     }
 
-    /// The package name (typically the form `name@version` used to
-    /// identify a package in the graph).
+    /// The package name used to identify it in the graph.
     #[must_use]
     pub fn package(&self) -> &str {
         &self.package
