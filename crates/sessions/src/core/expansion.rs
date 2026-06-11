@@ -34,11 +34,11 @@
 //!   home-relative paths — they expand to an absolute form during
 //!   substitution.
 //!
-//! [`StrictVarName`]: crate::vars::StrictVarName
-//! [`SessionVar`]: crate::composable::SessionVar
+//! [`StrictVarName`]: crate::core::primitives::StrictVarName
+//! [`SessionVar`]: crate::client::composer::SessionVar
 
-use crate::composable::SessionVar;
-use crate::patches::FileSet;
+use crate::client::composer::SessionVar;
+use crate::core::primitives::FileSet;
 
 /// Errors produced when expanding a patch source.
 #[non_exhaustive]
@@ -56,7 +56,7 @@ pub enum ExpandError {
 
     /// The fully-expanded string failed to parse as a glob.
     #[error("expanded source is not a valid glob: {0}")]
-    PostExpansionInvalid(#[from] crate::patches::Error),
+    PostExpansionInvalid(#[from] crate::core::primitives::PatchError),
 
     /// A `..` path component was found anywhere in the (raw or
     /// substituted) pattern. Parent-dir components are rejected
@@ -267,7 +267,7 @@ fn is_name_byte(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
 }
 
-/// Enforce [`crate::vars::StrictVarName`] shape: `[A-Z_][A-Z0-9_]*`.
+/// Enforce [`crate::core::primitives::StrictVarName`] shape: `[A-Z_][A-Z0-9_]*`.
 fn validate_strict_var_name(name: &str) -> Result<(), &'static str> {
     let mut chars = name.chars();
     let first = chars.next().ok_or("empty variable name")?;
@@ -312,8 +312,9 @@ fn escape_glob_metas(value: &str, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::composable::{SessionVar, Source};
-    use crate::vars::{ResolvedVar, VarValue};
+    use crate::client::composer::SessionVar;
+    use crate::core::primitives::{ResolvedVar, VarValue};
+    use crate::core::source::Source;
 
     fn user_source() -> Source {
         Source::UserLoadout {

@@ -1,13 +1,14 @@
+//! Composer: accumulator for contributions and resolver to a [`Resolution`].
+
 use core::fmt;
 
-use camino::{Utf8Path, Utf8PathBuf};
-
-use paths::{HostAbsPath, HostPath, SandboxRelPath};
-
-use crate::{
-    patches::{Patch, PatchPolicy, ResolvedPatch},
-    policy::UserPolicy,
-    vars::{ResolvedVar, VarsPolicy},
+use crate::client::enumerate::{ExpandedProvenancedPatch, PatchFile, enumerate_patch_files};
+use crate::client::hooks::{HookResult, PolicyHooks, Unapproved};
+use crate::core::decision::{CheckOutcome, Decision, ItemDecision};
+use crate::core::policy::{PatchPolicy, UserPolicy, VarsPolicy};
+use crate::core::primitives::{ResolvedPatch, ResolvedVar};
+use crate::core::source::{
+    Provenanced, ProvenancedHook, ProvenancedPackage, ProvenancedPatch, ProvenancedVar, Source,
 };
 
 /// Errors produced while composing a [`Composable`] into a [`Composer`].
@@ -18,181 +19,20 @@ pub enum Error {
     #[error("variable contribution failed: {source}")]
     Var {
         #[from]
-        source: crate::vars::Error,
+        source: crate::core::primitives::VarError,
     },
     /// A patch declaration failed validation.
     #[error("patch contribution failed: {source}")]
     Patch {
         #[from]
-        source: crate::patches::Error,
+        source: crate::core::primitives::PatchError,
     },
     /// A lifecycle hook declaration failed validation.
     #[error("lifecycle hook contribution failed: {source}")]
     LifecycleHook {
         #[from]
-        source: crate::lifecyclehook::Error,
+        source: crate::core::lifecyclehook::Error,
     },
-}
-
-/// Where a contribution came from — the provenance attached to every
-/// item that flows through the resolver.
-///
-/// `Source` is what makes the user-origin bypass possible
-/// ([`VarsPolicy::check`](crate::vars::VarsPolicy::check) /
-/// [`PatchPolicy::check`](crate::patches::PatchPolicy::check) inspect
-/// this) and what error messages name when an item is rejected.
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Source {
-    /// The user's own [`Loadout`](crate::loadout::Loadout). Bypasses
-    /// `allow`/`deny` checks (only `ignore` still applies).
-    UserLoadout { name: String },
-    /// A project's `minimal.toml`, identified by the path of the
-    /// config file.
-    Project { path: HostPath },
-    /// A specific package's declaration, identified by package name.
-    Package { name: String },
-}
-
-impl fmt::Display for Source {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UserLoadout { name } => write!(f, "user loadout `{name}`"),
-            Self::Project { path } => write!(f, "project `{path}`"),
-            Self::Package { name } => write!(f, "package `{name}`"),
-        }
-    }
-}
-
-/// Trait for types that know which [`Source`] contributed them.
-///
-/// The resolver takes `T: Provenanced` so policy `check` methods can
-/// query the source without the caller having to thread it through
-/// alongside the item.
-pub trait Provenanced {
-    /// The [`Source`] this item came from.
-    fn source(&self) -> &Source;
-}
-
-/// A [`ResolvedVar`] tagged with its [`Source`] for the resolver.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ProvenancedVar {
-    var: ResolvedVar,
-    source: Source,
-}
-
-impl ProvenancedVar {
-    /// Construct a [`ProvenancedVar`] from a resolved variable and its
-    /// origin.
-    #[must_use]
-    pub fn new(var: ResolvedVar, source: Source) -> Self {
-        Self { var, source }
-    }
-
-    /// The wrapped [`ResolvedVar`].
-    #[must_use]
-    pub fn var(&self) -> &ResolvedVar {
-        &self.var
-    }
-}
-
-impl Provenanced for ProvenancedVar {
-    fn source(&self) -> &Source {
-        &self.source
-    }
-}
-
-/// A [`Patch`] tagged with its [`Source`] for the resolver.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ProvenancedPatch {
-    patch: Patch,
-    source: Source,
-}
-
-impl ProvenancedPatch {
-    /// Construct a [`ProvenancedPatch`] from a patch declaration and
-    /// its origin.
-    #[must_use]
-    pub fn new(patch: Patch, source: Source) -> Self {
-        Self { patch, source }
-    }
-
-    /// The wrapped [`Patch`].
-    #[must_use]
-    pub fn patch(&self) -> &Patch {
-        &self.patch
-    }
-}
-
-impl Provenanced for ProvenancedPatch {
-    fn source(&self) -> &Source {
-        &self.source
-    }
-}
-
-/// A package name tagged with its [`Source`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ProvenancedPackage {
-    package: String,
-    source: Source,
-}
-
-impl ProvenancedPackage {
-    /// Construct a [`ProvenancedPackage`] from a package name and its
-    /// origin.
-    #[must_use]
-    pub fn new(package: impl Into<String>, source: Source) -> Self {
-        Self {
-            package: package.into(),
-            source,
-        }
-    }
-
-    /// The package name (typically the form `name@version` used to
-    /// identify a package in the graph).
-    #[must_use]
-    pub fn package(&self) -> &str {
-        &self.package
-    }
-}
-
-impl Provenanced for ProvenancedPackage {
-    fn source(&self) -> &Source {
-        &self.source
-    }
-}
-
-/// A [`LifecycleHook`](crate::lifecyclehook::LifecycleHook) tagged with
-/// its [`Source`].
-///
-/// Lifecycle hooks run inside the sandbox (or its equivalent isolated
-/// environment), so they don't go through the policy gate — they
-/// pass through resolution unchanged.
-#[derive(Clone, Debug)]
-pub struct ProvenancedHook {
-    hook: crate::lifecyclehook::LifecycleHook,
-    source: Source,
-}
-
-impl ProvenancedHook {
-    /// Construct a [`ProvenancedHook`] from a hook declaration and its
-    /// origin.
-    #[must_use]
-    pub fn new(hook: crate::lifecyclehook::LifecycleHook, source: Source) -> Self {
-        Self { hook, source }
-    }
-
-    /// The wrapped [`LifecycleHook`](crate::lifecyclehook::LifecycleHook).
-    #[must_use]
-    pub fn hook(&self) -> &crate::lifecyclehook::LifecycleHook {
-        &self.hook
-    }
-}
-
-impl Provenanced for ProvenancedHook {
-    fn source(&self) -> &Source {
-        &self.source
-    }
 }
 
 /// A single source's contribution to a session, materialized as a
@@ -339,158 +179,6 @@ pub trait Composable {
 // Resolution: deciding what survives the user's policy
 // =====================================================================
 
-/// What the policy decided about a single item.
-///
-/// `Ignored` carries no payload — the caller silently drops the item.
-/// `Allowed` and `Denied` carry the item through so callers can collect
-/// it (or, in the case of `Denied`, name it in the error).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Decision<T> {
-    /// The item passes the policy and should be included.
-    Allowed(T),
-    /// The item matches an `ignore` rule and should be silently dropped.
-    Ignored,
-    /// The item is explicitly forbidden; session construction aborts.
-    Denied(T),
-}
-
-/// The outcome of a single policy `check`.
-///
-/// `NeedsApproval` hands the item back so the resolve loop can prompt
-/// for it via a [`PolicyHooks`] callback and re-check.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum CheckOutcome<T> {
-    /// The policy reached a verdict on its own.
-    Decided(Decision<T>),
-    /// No rule matched; the item must be referred to a [`PolicyHooks`]
-    /// callback for an application-level decision.
-    NeedsApproval(T),
-}
-
-/// One item the policy could not decide. The item is held by reference
-/// so the resolve loop retains ownership for the second pass.
-///
-/// Constructed only by the resolver; hooks receive these as borrowed
-/// slices. The fields are inaccessible to outside code on purpose —
-/// nothing prevents constructing one, but the lifetimes are tied to
-/// the resolver's frame and there's no sensible way to manufacture
-/// matched references elsewhere.
-#[derive(Clone, Debug)]
-pub struct Unapproved<'a, T: ?Sized> {
-    item: &'a T,
-    source: &'a Source,
-}
-
-impl<'a, T: ?Sized> Unapproved<'a, T> {
-    /// The item the policy couldn't decide on (e.g. a variable name or
-    /// patch source path).
-    #[must_use]
-    pub fn item(&self) -> &'a T {
-        self.item
-    }
-
-    /// The [`Source`] that contributed this item — useful for prompts
-    /// like "project `~/foo` wants to set `AWS_KEY`."
-    #[must_use]
-    pub fn source(&self) -> &'a Source {
-        self.source
-    }
-}
-
-/// One application-supplied decision per `Unapproved` item, returned by
-/// a [`PolicyHooks`] callback in the same order the items were given.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ItemDecision {
-    /// Approve this item without recording a rule.
-    AllowOnce,
-    /// Reject this item without recording a rule.
-    DenyOnce,
-    /// Re-check against the (possibly mutated) policy.
-    UseRule,
-}
-
-/// The hook's response to the batch of unapproved items.
-///
-/// Hooks **cannot** mutate the policy directly. If the application
-/// updates the policy in response to the prompt, it returns the updated
-/// copy in `updated_policy`. `None` means "no rule changes." The
-/// resolver installs `updated_policy` (if `Some`) before re-checking
-/// any `UseRule` decisions in this batch.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum HookResult<P> {
-    /// Per-item decisions, indexed parallel to the input slice, plus
-    /// an optional updated policy snapshot.
-    Decided {
-        decisions: Vec<ItemDecision>,
-        updated_policy: Option<P>,
-    },
-    /// User chose to abort session construction.
-    Abort,
-}
-
-impl<P> HookResult<P> {
-    /// Construct a [`Decided`](Self::Decided) result that leaves the
-    /// policy unchanged.
-    #[must_use]
-    pub fn decided(decisions: Vec<ItemDecision>) -> Self {
-        Self::Decided {
-            decisions,
-            updated_policy: None,
-        }
-    }
-
-    /// Construct a [`Decided`](Self::Decided) result that installs a
-    /// new policy snapshot.
-    #[must_use]
-    pub fn decided_with_policy(decisions: Vec<ItemDecision>, updated_policy: P) -> Self {
-        Self::Decided {
-            decisions,
-            updated_policy: Some(updated_policy),
-        }
-    }
-
-    /// Construct an [`Abort`](Self::Abort) result.
-    #[must_use]
-    pub fn abort() -> Self {
-        Self::Abort
-    }
-}
-
-/// Application-supplied hooks for handling items the policy couldn't
-/// decide on its own.
-///
-/// Hooks receive an owned copy of the *narrow* domain policy
-/// (`VarsPolicy` / `PatchPolicy`); they cannot mutate the resolver's
-/// state directly. To add rules, return a modified policy snapshot in
-/// [`HookResult::Decided::updated_policy`] — wider mutations to the
-/// full [`UserPolicy`] are not exposed here.
-///
-/// # `~` in returned patch policies
-///
-/// Patch-policy patterns are stored verbatim and round-trip losslessly.
-/// When a hook adds (or modifies) a patch-policy rule with a leading
-/// `~`, return it in `~`-form — the resolver re-expands the policy
-/// internally for matching, while the returned policy keeps the raw
-/// form so the caller can persist it. Do **not** expand `~` inside the
-/// hook; double-resolution will produce wrong matches.
-///
-/// Vars policies have no analogous `~`-expansion concern: variable
-/// names are not paths, so the home directory is not relevant on the
-/// vars side.
-pub trait PolicyHooks {
-    fn on_var_unapproved(
-        &self,
-        policy: VarsPolicy,
-        items: &[Unapproved<'_, str>],
-    ) -> HookResult<VarsPolicy>;
-
-    fn on_patch_unapproved(
-        &self,
-        policy: PatchPolicy,
-        items: &[Unapproved<'_, camino::Utf8Path>],
-    ) -> HookResult<PatchPolicy>;
-}
-
 /// Errors raised by the resolution pass.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
@@ -517,14 +205,16 @@ pub enum ResolveError {
     /// surfaced by every `FileSet::resolve` invocation are accumulated
     /// — none are discarded.
     #[error("patch resolution failed ({} error(s)):{}", sources.len(), DisplayJoin(sources))]
-    PatchWalk { sources: Vec<crate::patches::Error> },
+    PatchWalk {
+        sources: Vec<crate::core::primitives::PatchError>,
+    },
     /// Expanding `~/` or `$VAR` references in a patch source or policy
     /// pattern failed. Surfaces every failure mode of
-    /// [`expand_source`](crate::expansion::expand_source): malformed
+    /// [`expand_source`](crate::core::expansion::expand_source): malformed
     /// syntax, a referenced var that is not in the resolved-vars set,
     /// or a post-expansion string that fails to parse as a glob.
     #[error("patch source expansion failed: {0}")]
-    Expansion(#[from] crate::expansion::ExpandError),
+    Expansion(#[from] crate::core::expansion::ExpandError),
 }
 
 /// Render a slice of `Display`-able errors as one indented bullet per
@@ -655,173 +345,6 @@ impl Resolution {
     }
 }
 
-/// A [`crate::patches::PatchPolicy`] with all `~/` and `$VAR`
-/// references expanded into concrete glob patterns against a set of
-/// resolved session vars.
-///
-/// Produced from a raw [`crate::patches::PatchPolicy`] via
-/// [`crate::patches::PatchPolicy::expand_with`] at the resolver's
-/// main entry point; the resolver matches against this form, not the
-/// raw policy. The raw policy is preserved separately so it can
-/// round-trip through serialization unchanged.
-#[derive(Clone, Debug)]
-pub struct ExpandedPatchPolicy {
-    allow: Vec<crate::patches::FileSet>,
-    deny: Vec<crate::patches::FileSet>,
-    ignore: Vec<crate::patches::FileSet>,
-}
-
-impl ExpandedPatchPolicy {
-    /// Construct an `ExpandedPatchPolicy` directly from already-expanded
-    /// pattern lists.
-    ///
-    /// This constructor is `pub(crate)` because the only legitimate
-    /// way to produce an [`ExpandedPatchPolicy`] from outside this
-    /// crate is via [`crate::patches::PatchPolicy::expand_with`] — the
-    /// type's whole job is to be the validated-and-expanded form of a
-    /// raw policy. Exposing a public constructor (or `with_*` setters)
-    /// would let callers smuggle arbitrary `FileSet`s past the
-    /// expansion step and bypass the round-trip guarantee documented
-    /// on [`crate::patches::PatchPolicy`].
-    ///
-    /// Order is positional. Inside this crate the only caller is
-    /// `expand_with`, which threads each list explicitly; if more
-    /// callers appear, switch back to a builder.
-    pub(crate) fn from_expanded(
-        allow: Vec<crate::patches::FileSet>,
-        deny: Vec<crate::patches::FileSet>,
-        ignore: Vec<crate::patches::FileSet>,
-    ) -> Self {
-        Self {
-            allow,
-            deny,
-            ignore,
-        }
-    }
-
-    /// Expanded `allow` patterns.
-    #[must_use]
-    pub fn allow(&self) -> &[crate::patches::FileSet] {
-        &self.allow
-    }
-
-    /// Expanded `deny` patterns.
-    #[must_use]
-    pub fn deny(&self) -> &[crate::patches::FileSet] {
-        &self.deny
-    }
-
-    /// Expanded `ignore` patterns.
-    #[must_use]
-    pub fn ignore(&self) -> &[crate::patches::FileSet] {
-        &self.ignore
-    }
-
-    /// Categorize a file against this expanded policy.
-    ///
-    /// `target` is the canonical host path the file resolves to (what
-    /// I/O will actually touch). `link` is `Some` only when symlink
-    /// resolution produced a distinct path — i.e. the walker
-    /// traversed an actual symlink. Both forms are checked
-    /// independently and the outcomes are combined.
-    ///
-    /// **Precedence within one path:** `ignore` first, then a
-    /// source-aware branch. For user-origin items
-    /// ([`Source::UserLoadout`]), `allow` and `deny` do not apply —
-    /// anything not ignored is implicitly allowed. For every other
-    /// source, the precedence continues `deny` → `allow` →
-    /// `NeedsApproval`.
-    ///
-    /// **Combination precedence:** `Denied` > `Ignored` >
-    /// `NeedsApproval` > `Allowed`. Any deny on either path wins
-    /// (security first); no deny but an ignore on either path drops
-    /// the file; otherwise any prompt wins; both must independently
-    /// `Allowed` for the file to pass cleanly. When `link` is
-    /// `None` only the target is checked.
-    ///
-    /// Cost: one or two [`decide`](Self::decide) calls; each scans up
-    /// to three pattern lists (`ignore`, `deny`, `allow`). Fine at
-    /// typical patch counts.
-    #[must_use]
-    pub fn check<T: Provenanced>(
-        &self,
-        link: Option<&camino::Utf8Path>,
-        target: &camino::Utf8Path,
-        item: T,
-    ) -> CheckOutcome<T> {
-        let source = item.source();
-        let target_decision = self.decide(target, source);
-        let combined = match link {
-            Some(l) => self.decide(l, source).combine(target_decision),
-            None => target_decision,
-        };
-        attach_decision(combined, item)
-    }
-
-    /// Path-only decision; no item ownership involved. Internal
-    /// helper used by both [`check`](Self::check) and
-    /// [`check_dual`](Self::check_dual).
-    fn decide(&self, path: &camino::Utf8Path, source: &Source) -> PathDecision {
-        if filesets_match(&self.ignore, path) {
-            return PathDecision::Ignored;
-        }
-        if matches!(source, Source::UserLoadout { .. }) {
-            return PathDecision::Allowed;
-        }
-        if filesets_match(&self.deny, path) {
-            PathDecision::Denied
-        } else if filesets_match(&self.allow, path) {
-            PathDecision::Allowed
-        } else {
-            PathDecision::NeedsApproval
-        }
-    }
-}
-
-/// Path-level decision used internally by
-/// [`ExpandedPatchPolicy::decide`]. The public-facing outcome
-/// ([`CheckOutcome`]) carries the item; this type doesn't, so it can
-/// be computed for the same item against multiple paths and combined.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PathDecision {
-    Allowed,
-    Ignored,
-    Denied,
-    NeedsApproval,
-}
-
-impl PathDecision {
-    /// Combine two per-path decisions into one. Precedence (most
-    /// restrictive first):
-    /// `Denied` > `Ignored` > `NeedsApproval` > `Allowed`.
-    fn combine(self, other: Self) -> Self {
-        use PathDecision::{Allowed, Denied, Ignored, NeedsApproval};
-        if self == Denied || other == Denied {
-            return Denied;
-        }
-        if self == Ignored || other == Ignored {
-            return Ignored;
-        }
-        if self == NeedsApproval || other == NeedsApproval {
-            return NeedsApproval;
-        }
-        Allowed
-    }
-}
-
-fn attach_decision<T>(decision: PathDecision, item: T) -> CheckOutcome<T> {
-    match decision {
-        PathDecision::Allowed => CheckOutcome::Decided(Decision::Allowed(item)),
-        PathDecision::Ignored => CheckOutcome::Decided(Decision::Ignored),
-        PathDecision::Denied => CheckOutcome::Decided(Decision::Denied(item)),
-        PathDecision::NeedsApproval => CheckOutcome::NeedsApproval(item),
-    }
-}
-
-fn filesets_match(sets: &[crate::patches::FileSet], path: &camino::Utf8Path) -> bool {
-    sets.iter().any(|fs| fs.is_match(path))
-}
-
 /// Configuration for [`Composer::resolve`].
 ///
 /// Defaults to symlink-safe behavior (no following) — appropriate for
@@ -829,7 +352,7 @@ fn filesets_match(sets: &[crate::patches::FileSet], path: &camino::Utf8Path) -> 
 /// patch source.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ResolveOptions {
-    /// If `true`, [`FileSet::resolve`](crate::patches::FileSet::resolve)
+    /// If `true`, [`FileSet::resolve`](crate::core::primitives::FileSet::resolve)
     /// follows symlinks while walking patch sources. Off by default.
     pub follow_symlinks: bool,
 }
@@ -1014,7 +537,7 @@ impl Composer {
 /// supplies extractors for the `Denied` arm so the helper stays
 /// agnostic to whether items are vars or patches. Closures are `Fn` so
 /// they're reusable across loop iterations.
-fn apply_decision<T>(
+pub(crate) fn apply_decision<T>(
     decision: Decision<T>,
     allowed: &mut Vec<T>,
     name_of: impl Fn(&T) -> String,
@@ -1034,19 +557,19 @@ fn apply_decision<T>(
     Ok(())
 }
 
-fn resolve_vars(
+pub(crate) fn resolve_vars(
     items: Vec<ProvenancedVar>,
     mut policy: VarsPolicy,
     hooks: &dyn PolicyHooks,
 ) -> Result<(Vec<SessionVar>, VarsPolicy), ResolveError> {
-    let name_of = |pv: &ProvenancedVar| pv.var.name().to_owned();
-    let source_of = |pv: ProvenancedVar| pv.source;
+    let name_of = |pv: &ProvenancedVar| pv.var().name().to_owned();
+    let source_of = |pv: ProvenancedVar| pv.into_parts().1;
 
     // Pass 1: categorize.
     let mut allowed: Vec<ProvenancedVar> = Vec::new();
     let mut unapproved: Vec<ProvenancedVar> = Vec::new();
     for pv in items {
-        let name = pv.var.name().to_owned();
+        let name = pv.var().name().to_owned();
         match policy.check(&name, pv) {
             CheckOutcome::Decided(d) => apply_decision(d, &mut allowed, name_of, source_of)?,
             CheckOutcome::NeedsApproval(pv) => unapproved.push(pv),
@@ -1058,8 +581,8 @@ fn resolve_vars(
         let view: Vec<Unapproved<'_, str>> = unapproved
             .iter()
             .map(|pv| Unapproved {
-                item: pv.var.name(),
-                source: &pv.source,
+                item: pv.var().name(),
+                source: pv.source(),
             })
             .collect();
         let decisions = match hooks.on_var_unapproved(policy.clone(), &view) {
@@ -1091,7 +614,7 @@ fn resolve_vars(
                     });
                 }
                 ItemDecision::UseRule => {
-                    let name = pv.var.name().to_owned();
+                    let name = pv.var().name().to_owned();
                     match policy.check(&name, pv) {
                         CheckOutcome::Decided(d) => {
                             apply_decision(d, &mut allowed, name_of, source_of)?;
@@ -1099,7 +622,7 @@ fn resolve_vars(
                         CheckOutcome::NeedsApproval(pv) => {
                             return Err(ResolveError::HookContract {
                                 kind: "UseRule returned for a var the policy still cannot decide",
-                                context: format!("variable `{}`", pv.var.name()),
+                                context: format!("variable `{}`", pv.var().name()),
                             });
                         }
                     }
@@ -1111,84 +634,21 @@ fn resolve_vars(
     Ok((
         allowed
             .into_iter()
-            .map(|pv| SessionVar {
-                var: pv.var,
-                source: pv.source,
+            .map(|pv| {
+                let (var, source) = pv.into_parts();
+                SessionVar { var, source }
             })
             .collect(),
         policy,
     ))
 }
 
-/// Per-file entry derived from a [`Patch`] after its source [`FileSet`]
-/// is walked.
-///
-/// `link_path` is `Some` only when symlink resolution produced a
-/// distinct path from `target_path` — i.e. `follow_symlinks: true` was
-/// set AND the walker traversed an actual symlink. In every other case
-/// the link is implicitly the target, and `link_path` is `None`.
-///
-/// Both paths are realmed [`HostAbsPath`] — the resolver upholds the
-/// absoluteness invariant via the
-/// [`ExpandError::NotAbsolute`](crate::expansion::ExpandError::NotAbsolute)
-/// gate at expansion time, and `target_path` is also canonical (via
-/// [`std::fs::canonicalize`]).
-///
-/// Policy matching runs against both when both are present — a deny
-/// on either wins.
-///
-/// [`Patch`]: crate::patches::Patch
-/// [`FileSet`]: crate::patches::FileSet
-struct PatchFile {
-    /// `Some` when the file was reached via a symlink that resolved
-    /// to a distinct canonical target; `None` when no link is in play
-    /// (the common case).
-    link_path: Option<HostAbsPath>,
-    /// Canonical absolute path the link resolves to. Always the path
-    /// used for actual host I/O.
-    target_path: HostAbsPath,
-    /// Destination for this file, relative to the sandbox user's home
-    /// directory. Derived from the user-facing path (link when present,
-    /// target otherwise) relative to the patch's walk root, joined
-    /// under the patch's `dest`.
-    dest: SandboxRelPath,
-    /// The original patch's provenance.
-    provenance: Source,
-}
-
-impl PatchFile {
-    /// The path the user "asked for" — the link form when distinct
-    /// from the target, otherwise the target itself. Used for
-    /// user-facing display (error messages, prompt context) and dest
-    /// computation.
-    fn user_facing(&self) -> &HostAbsPath {
-        self.link_path.as_ref().unwrap_or(&self.target_path)
-    }
-}
-
-impl Provenanced for PatchFile {
-    fn source(&self) -> &Source {
-        &self.provenance
-    }
-}
-
-/// A patch whose source string has been expanded into a concrete
-/// [`FileSet`] against the session's resolved vars. Internal handoff
-/// type between [`expand_patch_sources`] and [`enumerate_patch_files`].
-///
-/// [`FileSet`]: crate::patches::FileSet
-struct ExpandedProvenancedPatch {
-    source: crate::patches::FileSet,
-    dest: crate::patches::PatchDest,
-    provenance: Source,
-}
-
 /// Expand every patch's raw source string against `resolved_vars` and
 /// return the parallel list with `FileSet` sources. Fails fast on the
-/// first [`ExpandError`](crate::expansion::ExpandError); a partial
+/// first [`ExpandError`](crate::core::expansion::ExpandError); a partial
 /// resolution would let some patches reach the walker with their
 /// references intact, which silently matches wrong paths.
-fn expand_patch_sources(
+pub(crate) fn expand_patch_sources(
     patches: Vec<ProvenancedPatch>,
     resolved_vars: &[SessionVar],
     home_fallback: Option<&str>,
@@ -1196,202 +656,19 @@ fn expand_patch_sources(
     patches
         .into_iter()
         .map(|pp| {
+            let (patch, provenance) = pp.into_parts();
             let source =
-                crate::expansion::expand_source(pp.patch.source(), resolved_vars, home_fallback)?;
+                crate::core::expansion::expand_source(patch.source(), resolved_vars, home_fallback)?;
             Ok(ExpandedProvenancedPatch {
                 source,
-                dest: pp.patch.dest().clone(),
-                provenance: pp.source,
+                dest: patch.dest().clone(),
+                provenance,
             })
         })
         .collect()
 }
 
-/// Walk each pre-expanded patch's `FileSet` and produce one
-/// [`PatchFile`] per matched host file.
-///
-/// **Path safety:** every yielded file is canonicalized via
-/// [`std::fs::canonicalize`] — so when `follow_symlinks` is true the
-/// symlink target is known, and dual-path policy checks become
-/// possible downstream. The walk itself starts from the un-canonical
-/// `walk_root` so the yielded link paths preserve the user's
-/// structural intent (matching against the original glob pattern and
-/// driving dest computation).
-///
-/// `..` and `.` components are rejected at expansion time, so they
-/// can't appear in the walk root or yielded paths. A non-existent
-/// walk root surfaces as a walkdir error on first iteration.
-///
-/// All errors across every patch are accumulated — a permission-denied
-/// subtree under one patch doesn't hide an unwalkable pattern in
-/// another. If any error occurred, they surface together as
-/// [`ResolveError::PatchWalk`]; otherwise the file list is returned
-/// cleanly.
-fn enumerate_patch_files(
-    items: Vec<ExpandedProvenancedPatch>,
-    follow_symlinks: bool,
-) -> Result<Vec<PatchFile>, ResolveError> {
-    let mut out = Vec::new();
-    let mut accumulated_errors = Vec::new();
-    for pp in items {
-        let Some(walk_root) = pp.source.walk_root() else {
-            accumulated_errors.push(crate::patches::Error::NoWalkRoot {
-                pattern: pp.source.pattern().to_owned(),
-            });
-            continue;
-        };
-        let walk_root_path = walk_root.as_utf8_path().to_path_buf();
-        let dest_root = pp.dest.as_sandbox_path().as_utf8_path();
-        for entry_result in
-            walkdir::WalkDir::new(walk_root_path.as_std_path()).follow_links(follow_symlinks)
-        {
-            let entry = match entry_result {
-                Ok(entry) => entry,
-                Err(source) => {
-                    accumulated_errors.push(crate::patches::Error::WalkFailure {
-                        root: walk_root_path.clone(),
-                        source,
-                    });
-                    continue;
-                }
-            };
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let link_path = match Utf8PathBuf::from_path_buf(entry.into_path()) {
-                Ok(p) => p,
-                Err(p) => {
-                    accumulated_errors.push(crate::patches::Error::NonUtf8Path {
-                        path_lossy: p.to_string_lossy().into_owned(),
-                    });
-                    continue;
-                }
-            };
-            if !pp.source.is_match(&link_path) {
-                continue;
-            }
-            // Walker-yielded paths are descended from `walk_root_path`,
-            // which is an absolute path because expansion already
-            // rejected anything else. `new_unchecked` is sound.
-            let walker_path = HostAbsPath::new_unchecked(link_path.clone());
-            // When `follow_symlinks` is true, canonicalize each match
-            // to obtain the symlink target. Default mode skips this:
-            // walkdir filters symlinks-to-files at the `is_file()`
-            // check above, so the walker-yielded path *is* the
-            // canonical form (or near enough), and canonicalizing
-            // would swap in OS-level prefix-symlink forms (e.g.
-            // macOS's `/tmp` → `/private/tmp`) that policy patterns
-            // don't anticipate.
-            let (link_path, target_path) = if follow_symlinks {
-                let canonical = match canonicalize_utf8(&link_path) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        accumulated_errors.push(e);
-                        continue;
-                    }
-                };
-                let target = HostAbsPath::new_unchecked(canonical);
-                // `Some(link)` only if the canonical target actually
-                // differs from the walker path. For non-symlink
-                // files, target == walker_path and we record None.
-                let link = if target.as_utf8_path() == walker_path.as_utf8_path() {
-                    None
-                } else {
-                    Some(walker_path)
-                };
-                (link, target)
-            } else {
-                (None, walker_path)
-            };
-            let user_facing = link_path.as_ref().unwrap_or(&target_path);
-            let dest = compute_dest(user_facing.as_utf8_path(), &walk_root_path, dest_root);
-            out.push(PatchFile {
-                link_path,
-                target_path,
-                dest,
-                provenance: pp.provenance.clone(),
-            });
-        }
-    }
-    if accumulated_errors.is_empty() {
-        return Ok(out);
-    }
-    Err(ResolveError::PatchWalk {
-        sources: accumulated_errors,
-    })
-}
-
-/// [`std::fs::canonicalize`] with UTF-8 enforcement.
-///
-/// Returns [`crate::patches::Error::CanonicalizeFailure`] for any IO
-/// error — the path doesn't exist, the process can't traverse the
-/// prefix, or (most subtly) the path is a symlink loop. Returns
-/// [`crate::patches::Error::NonUtf8CanonicalPath`] if the canonical
-/// form contains non-UTF-8 bytes (e.g. a parent directory with a
-/// non-UTF-8 name).
-fn canonicalize_utf8(path: &Utf8Path) -> Result<Utf8PathBuf, crate::patches::Error> {
-    match std::fs::canonicalize(path.as_std_path()) {
-        Ok(p) => {
-            Utf8PathBuf::from_path_buf(p).map_err(|p| crate::patches::Error::NonUtf8CanonicalPath {
-                path_lossy: p.to_string_lossy().into_owned(),
-            })
-        }
-        Err(source) => Err(crate::patches::Error::CanonicalizeFailure {
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
-}
-
-/// Compute the destination for a single source file under a patch's
-/// `dest`. The result is relative to the sandbox user's home directory,
-/// inherited from the patch's [`PatchDest`].
-///
-/// - **Single-file patches** (`walk_root == source_path`): `dest` is
-///   used verbatim.
-/// - **Multi-file patches**: the source path's components beneath
-///   `walk_root` are appended to `dest`. The strip is path-component
-///   aware (camino's `strip_prefix`), so `/etc/xdg` will not match
-///   `/etc/xdgfoo/`.
-///
-/// # Invariants (panic conditions)
-///
-/// Both panics describe resolver-internal contracts that
-/// `enumerate_patch_files` is responsible for upholding. They should
-/// be unreachable in normal operation; if one fires, it indicates a
-/// bug in this crate.
-///
-/// 1. `walk_root` must be a path-component prefix of `source_path`.
-///    `enumerate_patch_files` walks `walk_root`, so every file it
-///    yields is a descendant.
-/// 2. `dest_root` is relative (it came from a [`SandboxRelPath`]) and
-///    `suffix` is relative (it's the stripped tail), so the join
-///    cannot produce an absolute path.
-fn compute_dest(
-    source_path: &Utf8Path,
-    walk_root: &Utf8Path,
-    dest_root: &Utf8Path,
-) -> SandboxRelPath {
-    let root_path = walk_root;
-    let joined: Utf8PathBuf = if source_path == root_path {
-        dest_root.to_path_buf()
-    } else {
-        let suffix = source_path.strip_prefix(root_path).unwrap_or_else(|_| {
-            panic!(
-                "resolver invariant: source path {source_path} is outside walk root {root_path}",
-            )
-        });
-        if dest_root.as_str().is_empty() {
-            suffix.to_path_buf()
-        } else {
-            dest_root.join(suffix)
-        }
-    };
-    SandboxRelPath::try_new(joined)
-        .expect("resolver invariant: dest_root and suffix are both relative")
-}
-
-fn resolve_patches(
+pub(crate) fn resolve_patches(
     items: Vec<ProvenancedPatch>,
     mut policy: PatchPolicy,
     hooks: &dyn PolicyHooks,
@@ -1446,7 +723,7 @@ fn resolve_patches(
         // the user-facing path (link form when distinct, target
         // otherwise); if a hook needs both forms separately, that's a
         // future API extension.
-        let view: Vec<Unapproved<'_, Utf8Path>> = unapproved
+        let view: Vec<Unapproved<'_, camino::Utf8Path>> = unapproved
             .iter()
             .map(|pf| Unapproved {
                 item: pf.user_facing().as_utf8_path(),
@@ -1531,8 +808,8 @@ fn resolve_patches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::patches::PatchDest;
-    use crate::vars::{ResolvedVar, VarValue};
+    use crate::core::primitives::{Patch, PatchDest, VarValue};
+    use camino::Utf8Path;
     use std::cell::RefCell;
 
     // =================================================================
@@ -1547,7 +824,7 @@ mod tests {
 
     fn project_source() -> Source {
         Source::Project {
-            path: HostPath::new("/repo"),
+            path: paths::HostPath::new("/repo"),
         }
     }
 
@@ -2012,7 +1289,7 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    ResolveError::Expansion(crate::expansion::ExpandError::UndefinedVar { ref name })
+                    ResolveError::Expansion(crate::core::expansion::ExpandError::UndefinedVar { ref name })
                         if name == "HOME"
                 ),
                 "got: {err:?}",
@@ -2099,7 +1376,7 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    ResolveError::Expansion(crate::expansion::ExpandError::UndefinedVar { ref name })
+                    ResolveError::Expansion(crate::core::expansion::ExpandError::UndefinedVar { ref name })
                         if name == "HOME"
                 ),
                 "got: {err:?}",
@@ -2128,7 +1405,9 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    ResolveError::Expansion(crate::expansion::ExpandError::NotAbsolute { .. })
+                    ResolveError::Expansion(
+                        crate::core::expansion::ExpandError::NotAbsolute { .. }
+                    )
                 ),
                 "got: {err:?}",
             );
@@ -2253,7 +1532,7 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    ResolveError::Expansion(crate::expansion::ExpandError::UndefinedVar { ref name })
+                    ResolveError::Expansion(crate::core::expansion::ExpandError::UndefinedVar { ref name })
                         if name == "NOT_RESOLVED"
                 ),
                 "got: {err:?}",
@@ -2449,82 +1728,6 @@ mod tests {
     }
 
     // =================================================================
-    // PathDecision combinator
-    // =================================================================
-
-    mod path_decision_combinator {
-        use super::*;
-        use PathDecision::{Allowed, Denied, Ignored, NeedsApproval};
-
-        #[test]
-        fn deny_beats_everything() {
-            assert_eq!(Denied.combine(Allowed), Denied);
-            assert_eq!(Allowed.combine(Denied), Denied);
-            assert_eq!(Denied.combine(Ignored), Denied);
-            assert_eq!(Ignored.combine(Denied), Denied);
-            assert_eq!(Denied.combine(NeedsApproval), Denied);
-            assert_eq!(NeedsApproval.combine(Denied), Denied);
-            assert_eq!(Denied.combine(Denied), Denied);
-        }
-
-        #[test]
-        fn ignore_beats_approval_and_allow_but_not_deny() {
-            assert_eq!(Ignored.combine(Allowed), Ignored);
-            assert_eq!(Allowed.combine(Ignored), Ignored);
-            assert_eq!(Ignored.combine(NeedsApproval), Ignored);
-            assert_eq!(NeedsApproval.combine(Ignored), Ignored);
-            assert_eq!(Ignored.combine(Ignored), Ignored);
-        }
-
-        #[test]
-        fn approval_beats_allow() {
-            assert_eq!(NeedsApproval.combine(Allowed), NeedsApproval);
-            assert_eq!(Allowed.combine(NeedsApproval), NeedsApproval);
-            assert_eq!(NeedsApproval.combine(NeedsApproval), NeedsApproval);
-        }
-
-        #[test]
-        fn both_allowed_is_allowed() {
-            assert_eq!(Allowed.combine(Allowed), Allowed);
-        }
-    }
-
-    // =================================================================
-    // compute_dest invariants
-    // =================================================================
-
-    mod compute_dest_invariants {
-        use super::*;
-
-        #[test]
-        fn multi_file_appends_relative_path() {
-            let source = Utf8Path::new("/etc/xdg/sub/file.conf");
-            let walk_root = Utf8Path::new("/etc/xdg");
-            let dest = compute_dest(source, walk_root, Utf8Path::new("config"));
-            assert_eq!(dest.as_str(), "config/sub/file.conf");
-        }
-
-        #[test]
-        fn single_file_uses_dest_verbatim() {
-            let source = Utf8Path::new("/home/u/file.conf");
-            let walk_root = Utf8Path::new("/home/u/file.conf");
-            let dest = compute_dest(source, walk_root, Utf8Path::new("etc/foo.conf"));
-            assert_eq!(dest.as_str(), "etc/foo.conf");
-        }
-
-        /// Regression for component-boundary strip — `/etc/xdg` must
-        /// not match `/etc/xdgfoo/bar`. Resolver invariant; we panic
-        /// rather than produce a garbage dest.
-        #[test]
-        #[should_panic(expected = "outside walk root")]
-        fn panics_on_source_outside_walk_root() {
-            let source = Utf8Path::new("/etc/xdgfoo/bar");
-            let walk_root = Utf8Path::new("/etc/xdg");
-            let _ = compute_dest(source, walk_root, Utf8Path::new("dst"));
-        }
-    }
-
-    // =================================================================
     // Composer public API
     // =================================================================
 
@@ -2693,7 +1896,7 @@ mod tests {
                 fn contribute(self, _env: EnvLookup<'_>) -> Result<Contribution, Error> {
                     // Trigger a real construction-time error from one of
                     // the underlying domains.
-                    crate::patches::FileSet::try_new("[invalid").map_err(Error::from)?;
+                    crate::core::primitives::FileSet::try_new("[invalid").map_err(Error::from)?;
                     unreachable!()
                 }
             }
@@ -2706,7 +1909,7 @@ mod tests {
         /// pass through to the final Resolution unchanged.
         #[test]
         fn packages_and_hooks_pass_through() {
-            use crate::lifecyclehook::{HookScript, LifecycleHook};
+            use crate::core::lifecyclehook::{HookScript, LifecycleHook};
 
             struct LoadoutWithExtras;
             impl Composable for LoadoutWithExtras {
@@ -2737,8 +1940,8 @@ mod tests {
         /// resolves `LANG` when a contributor's var is `inherit = true`.
         #[test]
         fn with_env_overrides_lookup_for_inheriting_vars() {
-            use crate::loadout::{Loadout, LoadoutName};
-            use crate::vars::{StrictVarName, VarValue};
+            use crate::core::loadout::{Loadout, LoadoutName};
+            use crate::core::primitives::{StrictVarName, VarValue};
 
             let loadout = Loadout::new(LoadoutName::try_new("dev").unwrap())
                 .with_var(StrictVarName::try_new("LANG").unwrap(), VarValue::Inherit);
@@ -2764,9 +1967,9 @@ mod tests {
         /// verify all four kinds reach the Resolution.
         #[test]
         fn loadout_contributes_all_four_kinds() {
-            use crate::lifecyclehook::{HookScript, LifecycleHook};
-            use crate::loadout::{Loadout, LoadoutName};
-            use crate::vars::{StrictVarName, VarValue};
+            use crate::core::lifecyclehook::{HookScript, LifecycleHook};
+            use crate::core::loadout::{Loadout, LoadoutName};
+            use crate::core::primitives::{StrictVarName, VarValue};
 
             let (_tmp, patch) = single_file_patch("conf.toml", "etc/conf.toml");
 
@@ -2801,23 +2004,6 @@ mod tests {
             assert_eq!(resolution.packages()[0].source(), &expected);
             assert_eq!(resolution.lifecycle_hooks()[0].source(), &expected);
         }
-    }
-
-    // =================================================================
-    // FileSet::resolve direct (unit, not via resolver)
-    // =================================================================
-
-    #[test]
-    fn fileset_resolve_errors_when_pattern_has_no_walk_root() {
-        let fs = crate::patches::FileSet::try_new("**/*.pem").unwrap();
-        let (paths, errors) = fs.resolve(false);
-        assert!(paths.is_empty());
-        assert_eq!(errors.len(), 1);
-        assert!(
-            matches!(&errors[0], crate::patches::Error::NoWalkRoot { .. }),
-            "got: {:?}",
-            errors[0],
-        );
     }
 
     // =================================================================

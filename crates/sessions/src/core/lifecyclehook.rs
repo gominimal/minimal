@@ -76,7 +76,7 @@ impl HookScript {
 /// # Example — programmatic construction
 ///
 /// ```
-/// use sessions::lifecyclehook::{HookScript, LifecycleHook};
+/// use sessions::core::lifecyclehook::{HookScript, LifecycleHook};
 ///
 /// let hook = LifecycleHook::builder()
 ///     .with_on_activate(HookScript::Inline("echo activated".into()))
@@ -94,7 +94,7 @@ impl HookScript {
 /// # Example — TOML deserialization
 ///
 /// ```
-/// use sessions::lifecyclehook::{HookScript, LifecycleHook};
+/// use sessions::core::lifecyclehook::{HookScript, LifecycleHook};
 ///
 /// let src = r#"
 /// on_activate = { type = "inline", value = "echo hello" }
