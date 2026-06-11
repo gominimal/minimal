@@ -135,21 +135,74 @@ impl Server {
         Server { state, listener }.run().await
     }
 
-    async fn run(self) -> Result<(), std::io::Error> {
-        let russh_config = Arc::new(russh::server::Config {
-            keys: vec![self.state.host_key().await.unwrap()],
-            auth_rejection_time_initial: Some(std::time::Duration::ZERO),
-            nodelay: true,
-            ..Default::default()
-        });
+    /// Launches minimald listening for connections directly on an AF_VSOCK port.
+    ///
+    /// Used by the in-VM (pid-1) guest: the host registers the port via
+    /// `krun_add_vsock_port2` and bridges client SSH connections to it. The
+    /// vsock peer is host-mediated (`net=none`) and as trusted as the UDS peer,
+    /// so accepted connections are treated as local ([`Auth::Local`]), matching
+    /// `run_on_uds`. Sessions are driven over the bridged vsock stream directly,
+    /// with no socat UDS relay in between.
+    ///
+    /// Requires libkrun >= 1.19.0: on 1.18.1 the bridged vsock intermittently
+    /// stalled a full session (a multi-descriptor TX-chain bug in libkrun's vsock
+    /// device, fixed upstream by `0ecf4d5f7`); a socat relay was the prior
+    /// workaround.
+    #[cfg(target_os = "linux")]
+    pub async fn run_on_vsock(config: Config, port: u32) -> Result<(), std::io::Error> {
+        use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
 
+        let state = ServerStateHandle::new(config).await?;
+        let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port))?;
+        tracing::info!(port, "minimald listening on vsock");
+
+        let russh_config = build_russh_config(&state)
+            .await
+            .map_err(std::io::Error::other)?;
+        let mut session_set = JoinSet::new();
+        loop {
+            let (stream, peer) = listener.accept().await?;
+            tracing::info!(?peer, "accepted vsock connection");
+            let (_conn_hnd, session_fut) =
+                Connection::from_stream(stream, russh_config.clone(), state.clone(), true).await;
+            // Log session errors instead of silently dropping the spawned
+            // future, so a failed handshake on the vsock transport is visible.
+            session_set.spawn(async move {
+                if let Err(e) = session_fut.await {
+                    tracing::warn!(error = %e, "vsock session ended with error");
+                }
+            });
+        }
+    }
+
+    async fn run(self) -> Result<(), std::io::Error> {
+        let russh_config = build_russh_config(&self.state)
+            .await
+            .map_err(std::io::Error::other)?;
         let mut session_set = JoinSet::new();
         loop {
             let (socket, _) = self.listener.accept().await?;
+            tracing::info!("accepted UDS connection");
             let (_conn_hnd, session_fut) =
                 Connection::from_socket(socket, russh_config.clone(), self.state.clone(), true)
                     .await;
-            session_set.spawn(session_fut);
+            session_set.spawn(async move {
+                if let Err(e) = session_fut.await {
+                    tracing::warn!(error = %e, "session ended with error");
+                }
+            });
         }
     }
+}
+
+/// Builds the shared russh server config from the server state.
+async fn build_russh_config(
+    state: &ServerStateHandle,
+) -> Result<Arc<russh::server::Config>, KeyError> {
+    Ok(Arc::new(russh::server::Config {
+        keys: vec![state.host_key().await?],
+        auth_rejection_time_initial: Some(std::time::Duration::ZERO),
+        nodelay: true,
+        ..Default::default()
+    }))
 }

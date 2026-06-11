@@ -53,20 +53,30 @@ export MINVMD_INITRAMFS="$PWD/.scratch/initramfs.cpio"
 target/debug/minvmd boot --foreground   # vm-up = minimald READY from the initramfs
 ```
 
-## E2E test (boot READY round-trip)
+## E2E tests (boot READY + full session)
 
-`MINVMD_E2E=1`-gated, `#[ignore]` by default. Run the prebuilt test binary
+`MINVMD_E2E=1`-gated, `#[ignore]` by default. Run the prebuilt test binaries
 directly — `cargo test` after signing relinks and unsigns `minvmd`.
 
 ```sh
-cargo test -p minvmd --test boot_e2e --no-run
+cargo test -p minvmd --test boot_e2e --test minimald_session_e2e --no-run
 codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
+
+# boot READY round-trip:
 testbin="$(ls -1t target/debug/deps/boot_e2e-* | grep -v '\.d$' | head -1)"
 MINVMD_E2E=1 \
 MINVMD_KERNEL_PATH="$PWD/.scratch/vmlinuz" \
 MINVMD_ROOTFS_PATH="$PWD/.scratch/rootfs.img" \
 MINVMD_INITRAMFS="$PWD/.scratch/initramfs.cpio" \
   "$testbin" --include-ignored --nocapture
+
+# full session (russh client → CreateSession → exec) over the bridge:
+testbin="$(ls -1t target/debug/deps/minimald_session_e2e-* | grep -v '\.d$' | head -1)"
+MINVMD_E2E=1 \
+MINVMD_KERNEL_PATH="$PWD/.scratch/vmlinuz" \
+MINVMD_ROOTFS_PATH="$PWD/.scratch/rootfs.img" \
+MINVMD_INITRAMFS="$PWD/.scratch/initramfs.cpio" \
+  "$testbin" --include-ignored --nocapture --exact minimald_exec_over_bridge
 ```
 
 ## Boot-latency benchmark
@@ -99,8 +109,11 @@ CI runs it (informational) in the `boot-e2e` job.
   `chroot`s into it so `/bin/sh` + libs resolve, then writes `READY\n` on vsock
   port 7350 (boot marker, R2.4).
 - `minvmd` registers the host UDS bridge via
-  `krun_add_vsock_port2(.., listen = true)`; the guest-side relay that serves the
-  full session over it lands in a follow-up.
+  `krun_add_vsock_port2(.., listen = true)`; minimald serves SSH directly on that
+  vsock port (`run_on_vsock`), so the `minimal` CLI's connection reaches the
+  session with no in-guest relay. **Requires libkrun >= 1.19.0** — 1.18.1's vsock
+  device intermittently stalled a direct session (multi-descriptor TX-chain bug,
+  fixed upstream); the prior workaround was a socat vsock→UDS relay.
 
 ## Notes
 

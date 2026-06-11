@@ -8,6 +8,7 @@ use std::{
     sync::{Arc, LazyLock},
 };
 use tokio::{
+    io::{AsyncRead, AsyncWrite},
     net::UnixStream,
     sync::{Mutex, MutexGuard},
 };
@@ -121,18 +122,24 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub(crate) async fn from_socket(
-        s: UnixStream,
+    /// Drives a new SSH connection over an arbitrary byte stream.
+    ///
+    /// The russh stack is transport-agnostic, so this accepts any
+    /// async stream: a [`UnixStream`] for the native UDS daemon or a
+    /// vsock stream for the in-VM (pid-1) guest. `is_local` marks the
+    /// peer as pre-authenticated ([`Auth::Local`]); both the UDS and the
+    /// host-mediated vsock transports are equally trusted.
+    pub(crate) async fn from_stream<S>(
+        s: S,
         c: Arc<RuConfig>,
         serv: ServerStateHandle,
-        was_local_uds: bool,
-    ) -> (ConnectionHandle, RunningSession<ConnectionHandler>) {
+        is_local: bool,
+    ) -> (ConnectionHandle, RunningSession<ConnectionHandler>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let h = ConnectionHandle(Arc::new(Mutex::new(Self {
-            auth: if was_local_uds {
-                Auth::Local
-            } else {
-                Auth::Pending
-            },
+            auth: if is_local { Auth::Local } else { Auth::Pending },
             ssh_username: None,
             channels: BTreeMap::new(),
             serv,
@@ -144,6 +151,16 @@ impl Connection {
                 .await
                 .unwrap(),
         )
+    }
+
+    /// Thin wrapper over [`Connection::from_stream`] for the UDS transport.
+    pub(crate) async fn from_socket(
+        s: UnixStream,
+        c: Arc<RuConfig>,
+        serv: ServerStateHandle,
+        was_local_uds: bool,
+    ) -> (ConnectionHandle, RunningSession<ConnectionHandler>) {
+        Self::from_stream(s, c, serv, was_local_uds).await
     }
 
     pub(crate) fn pending_config_mut(&mut self, id: ChannelId) -> Option<&mut ChannelConfig> {

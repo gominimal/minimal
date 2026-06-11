@@ -20,3 +20,8 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 serial_test.workspace = true
 tempfile.workspace = true
+# Session e2e test (minimald_session_e2e): a russh client over the bridge.
+russh.workspace = true
+tokio.workspace = true
+sessions.workspace = true
+paths.workspace = true

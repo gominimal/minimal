@@ -10,6 +10,11 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use minimald::server::{Config, HostKey, Server};
 
+/// Default AF_VSOCK port the guest relay listens on (the boot-contract bridge
+/// port the host registers via `krun_add_vsock_port2`).
+#[cfg(target_os = "linux")]
+const DEFAULT_VSOCK_PORT: u32 = 2222;
+
 #[derive(Parser)]
 #[command(name = "minimald", version = env!("CARGO_PKG_VERSION"), long_version = env!("LONG_VERSION"))]
 #[command(about = "The Minimal daemon")]
@@ -236,20 +241,28 @@ fn guest_config_at(base: &str) -> Config {
     }
 }
 
-/// Run as the initramfs `/init` (pid-1) and reach the boot READY contract
-/// against the GENERIC upstream rootfs — no minimald baked into the rootfs.
+/// Run as the initramfs `/init` (pid-1) and serve a full session against the
+/// GENERIC upstream rootfs — no minimald baked into the rootfs.
 ///
 /// Mounts `/dev`, then mounts the upstream rootfs (`/dev/vda`) and chroots into
 /// it so the userland (`/bin/sh`, libs) resolves. Session state lives on a tmpfs
-/// (`/run/minimal`) — no data disk, no `mke2fs`. Emits READY, then serves on the
-/// guest UDS (the host-bridged vsock relay is layered on in a follow-up). Falls
-/// back to READY-only + idle if there is no rootfs disk.
+/// (`/run/minimal`) — no data disk, no `mke2fs`. Emits READY, then serves SSH
+/// directly over the host-bridged AF_VSOCK port (no socat relay). Falls back to
+/// READY-only + idle if there is no rootfs disk.
+///
+/// Requires libkrun >= 1.19.0 on the host: 1.18.1's vsock device mis-handled
+/// multi-descriptor TX chains from Linux 6.2+ guests, intermittently stalling a
+/// direct session (fixed upstream by libkrun `0ecf4d5f7`).
 #[cfg(target_os = "linux")]
 async fn run_initramfs() -> Result<(), MainError> {
     use minimald::guest;
 
     // /dev in the initramfs first, so /dev/vda and /dev/vsock exist.
     guest::mount_dev();
+    // NB: no eager `waitpid(-1)` SIGCHLD reaper — it races tokio's process
+    // reaping and steals exec children's exit status (ECHILD -> wrong exit code).
+    // tokio reaps its own children; reaping hakoniwa double-fork orphans needs a
+    // tokio-compatible reaper and is deferred (spec: revisit if zombies bite).
 
     if let Err(e) = guest::enter_rootfs("/dev/vda", "/newroot") {
         tracing::warn!(error = %e, "no rootfs disk; initramfs READY-only");
@@ -268,16 +281,11 @@ async fn run_initramfs() -> Result<(), MainError> {
         .map_err(|e| MainError::IO(e, "creating cache dir"))?;
     let config = guest_config_at(BASE);
 
-    let guest_uds = format!("{BASE}/minimald.sock");
-    let _ = std::fs::remove_file(&guest_uds);
-    let listener =
-        UnixListener::bind(&guest_uds).map_err(|e| MainError::IO(e, "binding guest UDS"))?;
-
     if let Err(e) = guest::emit_ready_marker().await {
         tracing::warn!(error = %e, "initramfs: READY marker failed");
     }
-    tracing::info!("initramfs: booted as pid-1 from upstream rootfs (tmpfs state)");
-    Server::run_on_uds(config, listener)
+    tracing::info!("initramfs: serving session over vsock from upstream rootfs (tmpfs state)");
+    Server::run_on_vsock(config, DEFAULT_VSOCK_PORT)
         .await
-        .map_err(|e| MainError::IO(e, "serving on guest UDS"))
+        .map_err(|e| MainError::IO(e, "serving on guest vsock"))
 }

@@ -114,8 +114,8 @@ jobs:
     # initramfs boot (minimald as `/init`, pid-1), minimald mounting the ext4
     # rootfs (/dev/vda via krun_add_disk2) + chrooting, and the guest READY
     # connect-out on vsock 7350 (krun_add_vsock_port == listen=false; host +
-    # guest both 7350). The vsock session round-trip is gated separately once the
-    # relay lands.
+    # guest both 7350). The full vsock session round-trip is gated by the Session
+    # E2E step below (direct run_on_vsock; needs libkrun >= 1.19.0).
     if: ${{ vars.RUN_MACOS_CI != 'false' }}
     needs: [artifacts]
     runs-on: [self-hosted, macOS, ARM64]
@@ -147,13 +147,13 @@ jobs:
         with:
           name: minimald-initramfs-aarch64
           path: ${{ runner.temp }}/initramfs
-      - name: Build boot E2E + minvmd (no run)
-        # Build the test harness + the minvmd bin, then codesign, then run the
-        # test BINARY DIRECTLY (below). Invoking `cargo test` again after signing
-        # relinks (and unsigns) target/debug/minvmd, so krun_start_enter fails
-        # with EINVAL. A direct-binary run never touches the signature, so the
-        # binary must be built here before the single codesign.
-        run: cargo test -p minvmd --test boot_e2e --no-run
+      - name: Build E2E harnesses + minvmd (no run)
+        # Build the test harnesses + the minvmd bin, then codesign, then run the
+        # test BINARIES DIRECTLY (below). Invoking `cargo test` again after
+        # signing relinks (and unsigns) target/debug/minvmd, so krun_start_enter
+        # fails with EINVAL. A direct-binary run never touches the signature, so
+        # the binaries must be built here before the single codesign.
+        run: cargo test -p minvmd --test boot_e2e --test minimald_session_e2e --no-run
       - name: Codesign minvmd (hypervisor entitlement, R1.4)
         run: codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
       - name: Boot E2E (initramfs minimald, READY round-trip)
@@ -170,6 +170,21 @@ jobs:
           MINVMD_INITRAMFS="$RUNNER_TEMP/initramfs/initramfs.cpio" \
           MINVMD_BOOT_LOG="$RUNNER_TEMP/boot.log" \
             "$testbin" --include-ignored --nocapture
+      - name: Session E2E (full session over the bridge)
+        # Gating: boots the GENERIC upstream rootfs with minimald shipped as the
+        # initramfs /init; a russh client over the bridge authenticates, creates
+        # a session, and execs a command, asserting stdout + exit status. Proves
+        # the full Stage-2 path (direct vsock session via run_on_vsock, no socat
+        # relay) with no minimald baked into the rootfs. Needs libkrun >= 1.19.0
+        # on the runner.
+        run: |
+          testbin="$(ls -1t target/debug/deps/minimald_session_e2e-* | grep -v '\.d$' | head -1)"
+          test -x "$testbin" || { echo "::error::minimald_session_e2e test binary not found"; exit 1; }
+          MINVMD_E2E=1 \
+          MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz" \
+          MINVMD_ROOTFS_PATH="$RUNNER_TEMP/rootfs/rootfs.img" \
+          MINVMD_INITRAMFS="$RUNNER_TEMP/initramfs/initramfs.cpio" \
+            "$testbin" --include-ignored --nocapture --exact minimald_exec_over_bridge
       - name: Boot latency benchmark (informational)
         # Report boot-to-READY min/median/max on the runner. Uses the already
         # codesigned minvmd; non-gating (boot correctness is gated by the e2e
@@ -187,6 +202,124 @@ jobs:
         with:
           name: minvmd-boot-log
           path: ${{ runner.temp }}/boot.log
+          if-no-files-found: ignore
+
+  autospawn-e2e:
+    # Auto-spawn E2E — the R4.5 CLI proof artifact, on real hardware. From a
+    # clean state `minimal ls` must auto-spawn minvmd and return within 8 s;
+    # `minvmd status` must then report running; a second `minimal ls` must
+    # complete in < 500 ms (warm reuse). This exercises the real
+    # minimal2 -> `minvmd run --detach` -> VM boot -> initramfs minimald session
+    # path end to end, the macOS integration gate that no unit test can cover.
+    if: ${{ vars.RUN_MACOS_CI != 'false' }}
+    needs: [artifacts]
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Verify libkrun is available
+        run: |
+          if [ ! -f /opt/homebrew/lib/libkrun.dylib ]; then
+            echo "::error::libkrun.dylib not found under /opt/homebrew/lib. Provision the runner with: brew install slp/krun/libkrun" >&2
+            exit 1
+          fi
+      - name: Download virtio-linux kernel
+        uses: actions/download-artifact@v4
+        with:
+          name: virtio-kernel-aarch64
+          path: ${{ runner.temp }}/kernel
+      - name: Download minvmd-rootfs image
+        uses: actions/download-artifact@v4
+        with:
+          name: minvmd-rootfs-aarch64
+          path: ${{ runner.temp }}/rootfs
+      - name: Download guest initramfs
+        uses: actions/download-artifact@v4
+        with:
+          name: minimald-initramfs-aarch64
+          path: ${{ runner.temp }}/initramfs
+      - name: Build minvmd + minimal2 (no run)
+        # Build both bins before the single codesign. minimal2 spawns `minvmd`
+        # by name from PATH; only minvmd needs the hypervisor entitlement, so
+        # codesigning it must be the last thing to touch the binary.
+        run: cargo build -p minvmd --bin minvmd -p minimal2 --bin minimal2
+      - name: Codesign minvmd (hypervisor entitlement, R1.4)
+        run: codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
+      - name: Auto-spawn E2E (minimal ls cold/warm, R4.5)
+        # Run the prebuilt binaries directly (never `cargo run`, which would
+        # relink and unsign minvmd). minimal2 finds `minvmd` via PATH; all three
+        # of MINVMD_KERNEL_PATH / MINVMD_ROOTFS_PATH / MINVMD_INITRAMFS propagate
+        # through the `minvmd run --detach` re-exec. A fresh XDG_RUNTIME_DIR /
+        # XDG_STATE_HOME guarantees the clean (no-daemon) starting state.
+        run: |
+          set -uo pipefail   # not -e: capture failures so we can dump diagnostics
+          export PATH="$PWD/target/debug:$PATH"
+          export MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz"
+          export MINVMD_ROOTFS_PATH="$RUNNER_TEMP/rootfs/rootfs.img"
+          export MINVMD_INITRAMFS="$RUNNER_TEMP/initramfs/initramfs.cpio"
+          # Capture the guest console; this env var propagates through the
+          # minimal2 -> `minvmd run --detach` -> `minvmd run` -> __krun-vmm chain,
+          # so the silent detached supervisor's boot is still observable here.
+          export MINVMD_BOOT_LOG="$RUNNER_TEMP/autospawn-boot.log"
+          export XDG_RUNTIME_DIR="$(mktemp -d)"
+          # minvmd resolves its state dir via dirs::state_dir(), which ignores
+          # XDG_STATE_HOME on macOS and uses ~/.local/state. Clear it so the
+          # proof starts from a genuinely clean (NotProvisioned) state on the
+          # persistent runner.
+          rm -rf "$HOME/.local/state/minimal/minvmd"
+
+          # macOS `date` has no %N; use perl's high-resolution clock for ms.
+          now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time()*1000'; }
+
+          # On any failure, dump what the silent detach hides — minimal2's own
+          # error, the persisted state, and the guest boot console — then stop
+          # the supervisor and fail. An empty boot log means the VM never
+          # started (supervisor died before krun_start_enter); kernel output
+          # without a full boot means a stuck boot; a full boot points at a
+          # UDS/timing issue.
+          fail() {
+            echo "::group::autospawn-e2e diagnostics"
+            echo "--- minimal2 ls stderr ---"; cat "$RUNNER_TEMP/ls.err" 2>/dev/null || true
+            echo "--- state.toml ---"; cat "$HOME/.local/state/minimal/minvmd/state.toml" 2>/dev/null || echo "(none)"
+            echo "--- guest boot console (tail) ---"; tail -80 "$MINVMD_BOOT_LOG" 2>/dev/null || echo "(no boot log — VM never started)"
+            echo "::endgroup::"
+            minvmd stop >/dev/null 2>&1 || true
+            exit 1
+          }
+          trap 'minvmd stop >/dev/null 2>&1 || true' EXIT
+
+          # Cold: must auto-spawn minvmd and return within 8 s.
+          t0=$(now_ms)
+          minimal2 ls 2>"$RUNNER_TEMP/ls.err" || { echo "::error::cold 'minimal ls' failed to auto-spawn minvmd"; fail; }
+          t1=$(now_ms); cold=$(( t1 - t0 ))
+          echo "cold 'minimal ls': ${cold}ms"
+          [ "$cold" -lt 8000 ] || { echo "::error::cold 'minimal ls' took ${cold}ms (>= 8000ms)"; fail; }
+
+          # minvmd must now report running (exit 0). Poll briefly to absorb the
+          # gap between the host UDS accepting and the Running state persisting.
+          running=0
+          for _ in $(seq 1 50); do
+            if minvmd status >/dev/null 2>&1; then running=1; break; fi
+            sleep 0.1
+          done
+          [ "$running" = 1 ] || { echo "::error::minvmd did not report running after auto-spawn"; fail; }
+
+          # Warm: minvmd already running, must return in < 500 ms.
+          t0=$(now_ms)
+          minimal2 ls >/dev/null 2>"$RUNNER_TEMP/ls.err" || { echo "::error::warm 'minimal ls' failed"; fail; }
+          t1=$(now_ms); warm=$(( t1 - t0 ))
+          echo "warm 'minimal ls': ${warm}ms"
+          [ "$warm" -lt 500 ] || { echo "::error::warm 'minimal ls' took ${warm}ms (>= 500ms)"; fail; }
+      - name: Upload autospawn guest boot console log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autospawn-boot-log
+          path: ${{ runner.temp }}/autospawn-boot.log
           if-no-files-found: ignore
 
   build-macos:
