@@ -3571,30 +3571,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "multi"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "args",
- "checkouts",
- "common",
- "generational-arena",
- "graph",
- "hakoniwa",
- "libc",
- "mctx",
- "mfile",
- "sandbox2",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "vt100-ctt",
-]
-
-[[package]]
 name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
