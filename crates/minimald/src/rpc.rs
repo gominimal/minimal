@@ -61,6 +61,47 @@ pub(crate) trait OneshotSshRpc {
     }
 }
 
+/// A convinence wrapper to let a response type be able to carry an error.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum Errorable<S: std::fmt::Debug + PartialEq> {
+    Ok(S),
+    Err { error: String },
+}
+
+impl<S: std::fmt::Debug + PartialEq> Errorable<S> {
+    pub fn unwrap(self) -> S {
+        match self {
+            Self::Ok(s) => s,
+            Errorable::Err { error } => panic!("unwrap of error value: {error}"),
+        }
+    }
+
+    pub fn ok(self) -> Option<S> {
+        match self {
+            Self::Ok(s) => Some(s),
+            Errorable::Err { .. } => None,
+        }
+    }
+    pub fn err(self) -> Option<String> {
+        match self {
+            Self::Ok(_) => None,
+            Errorable::Err { error } => Some(error),
+        }
+    }
+}
+
+impl<T: std::fmt::Debug + PartialEq, E: ToString> From<Result<T, E>> for Errorable<T> {
+    fn from(value: Result<T, E>) -> Self {
+        match value {
+            Err(e) => Self::Err {
+                error: e.to_string(),
+            },
+            Ok(t) => Self::Ok(t),
+        }
+    }
+}
+
 /// An RPC to get the version of minimald.
 pub struct GetVersion;
 
@@ -203,7 +244,7 @@ pub struct CreateSessionRequest {
 }
 
 /// The response for a [`CreateSession`] RPC.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateSessionResponse {
     pub id: SessionId,
 }
@@ -211,7 +252,7 @@ pub struct CreateSessionResponse {
 impl OneshotSshRpc for CreateSession {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "CreateSession");
     type Request<'a> = CreateSessionRequest;
-    type Response = CreateSessionResponse;
+    type Response = Errorable<CreateSessionResponse>;
 }
 
 impl CreateSession {
@@ -219,11 +260,13 @@ impl CreateSession {
         let res = self
             .handle_channel(c, async |req| {
                 let mngr = s.sessions_manager().await;
-                Ok(CreateSessionResponse {
-                    id: mngr
-                        .create_session(req.record)
-                        .await
-                        .map_err(|e| ConnectionError::Internal(e.to_string()))?,
+
+                Ok(match mngr.create_session(req.record).await {
+                    Ok(id) => Errorable::Ok(CreateSessionResponse { id }),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
+                        error: "A session with that name already exists".to_string(),
+                    },
+                    Err(e) => return Err(ConnectionError::Internal(e.to_string())),
                 })
             })
             .await;
@@ -371,7 +414,8 @@ mod tests {
                     attrs: Default::default(),
                 },
             })
-            .await;
+            .await
+            .unwrap();
 
         assert!(create_session.id != SessionId::nil());
 
@@ -395,6 +439,44 @@ mod tests {
                 id: create_session.id,
                 name: Some("my session".to_string()),
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_session_errors_if_name_not_unique() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let create_session = client
+            .call::<CreateSession>(&CreateSessionRequest {
+                record: sessions::Record {
+                    id: SessionId::nil(),
+                    name: Some("my session".to_string()),
+                    username: None,
+                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
+                    attrs: Default::default(),
+                },
+            })
+            .await
+            .unwrap();
+
+        assert!(create_session.id != SessionId::nil());
+
+        assert_eq!(
+            client
+                .call::<CreateSession>(&CreateSessionRequest {
+                    record: sessions::Record {
+                        id: SessionId::nil(),
+                        name: Some("my session".to_string()),
+                        username: None,
+                        project_path: HostAbsPath::try_new("/uwu").unwrap(),
+                        attrs: Default::default(),
+                    },
+                })
+                .await,
+            Errorable::Err {
+                error: "A session with that name already exists".to_string()
+            }
         );
     }
 }

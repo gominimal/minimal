@@ -2100,7 +2100,7 @@ dependencies = [
 [[package]]
 name = "hakoniwa"
 version = "1.7.0"
-source = "git+https://github.com/souk4711/hakoniwa.git?rev=65d12eaae6786cd312aa74784514eb3a072dfe38#65d12eaae6786cd312aa74784514eb3a072dfe38"
+source = "git+https://github.com/souk4711/hakoniwa.git?rev=41ce36e087fa1fcf28d17123042d150e71c09705#41ce36e087fa1fcf28d17123042d150e71c09705"
 dependencies = [
  "bitflags",
  "caps",
@@ -3428,11 +3428,13 @@ name = "minimald"
 version = "0.0.1"
 dependencies = [
  "args",
+ "bytes",
  "camino",
  "clap",
  "clap_complete",
  "constcat",
  "dirs",
+ "either",
  "futures",
  "graph",
  "hakoniwa",
@@ -3453,6 +3455,7 @@ dependencies = [
  "tokio-vsock",
  "tracing",
  "tracing-subscriber",
+ "vt100-ctt",
 ]
 
 [[package]]
@@ -5566,6 +5569,7 @@ version = "0.0.1"
 dependencies = [
  "camino",
  "common",
+ "dirs",
  "globset",
  "nutype",
  "paths",

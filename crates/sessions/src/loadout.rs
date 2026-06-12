@@ -11,8 +11,14 @@
 //! packages = ["helix", "zellij"]
 //!
 //! # `dest` paths are inside the sandbox; `source` paths are on the host.
-//! # `~` on either side is expanded at apply time (sandbox-home for dest,
-//! # host-home for source).
+//! # `~`-expansion is split by realm:
+//! #   - `source` `~` is expanded at *session-resolution* time against
+//! #     the host home (via the Composer's home lookup —
+//! #     dirs::home_dir by default).
+//! #   - `dest` `~` is left unexpanded by the resolver. `PatchDest` is
+//! #     validated as sandbox-home-relative; any expansion of a leading
+//! #     `~` happens in the sandbox runtime against the sandbox home,
+//! #     not here.
 //! patches = [
 //!     # Helix: single config files plus a themes directory.
 //!     { dest = "~/.config/helix/config.toml",
