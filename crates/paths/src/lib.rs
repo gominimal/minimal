@@ -959,6 +959,12 @@ impl<R: CwdResolvable> FromStr for CwdRelative<R> {
     }
 }
 
+impl<R: CwdResolvable> From<AbsPath<R>> for CwdRelative<R> {
+    fn from(value: AbsPath<R>) -> Self {
+        Self(EitherPath::Abs(value))
+    }
+}
+
 impl<R: CwdResolvable> Clone for CwdRelative<R> {
     fn clone(&self) -> Self {
         Self(self.0.clone())

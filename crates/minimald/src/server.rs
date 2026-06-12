@@ -4,7 +4,8 @@ use russh::keys::{PrivateKey, ssh_key::Error as KeyError};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::net::UnixListener;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
@@ -121,74 +122,95 @@ impl ServerStateHandle {
     }
 }
 
-/// A listening minimald server.
-#[derive(Debug)]
-pub struct Server {
-    state: ServerStateHandle,
-    listener: UnixListener,
+/// A transport that accepts byte-stream connections for the SSH server.
+///
+/// The russh stack is transport-agnostic, so any listener yielding an
+/// async byte stream works: a [`UnixListener`] for the native UDS daemon
+/// or a [`tokio_vsock::VsockListener`] for the in-VM (pid-1) guest.
+pub trait Listener: Send {
+    /// The accepted connection's byte stream.
+    type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
+    /// Peer address, used only for logging.
+    type Addr: std::fmt::Debug;
+
+    /// Short transport name for log fields, e.g. `"uds"` / `"vsock"`.
+    const TRANSPORT: &'static str;
+    /// Whether peers on this transport are pre-authenticated as local
+    /// ([`Auth::Local`]). Both the UDS and the host-mediated vsock
+    /// transports are equally trusted, so both set this to `true`.
+    const IS_LOCAL: bool;
+
+    fn accept(&self) -> impl Future<Output = std::io::Result<(Self::Stream, Self::Addr)>> + Send;
 }
 
-impl Server {
-    /// Launches minimald, listening for connections on the given UDS socket.
-    pub async fn run_on_uds(config: Config, listener: UnixListener) -> Result<(), std::io::Error> {
-        let state = ServerStateHandle::new(config).await?;
-        Server { state, listener }.run().await
+impl Listener for UnixListener {
+    type Stream = UnixStream;
+    type Addr = tokio::net::unix::SocketAddr;
+
+    const TRANSPORT: &'static str = "uds";
+    const IS_LOCAL: bool = true;
+
+    async fn accept(&self) -> std::io::Result<(Self::Stream, Self::Addr)> {
+        UnixListener::accept(self).await
     }
+}
 
-    /// Launches minimald listening for connections directly on an AF_VSOCK port.
-    ///
-    /// Used by the in-VM (pid-1) guest: the host registers the port via
-    /// `krun_add_vsock_port2` and bridges client SSH connections to it. The
-    /// vsock peer is host-mediated (`net=none`) and as trusted as the UDS peer,
-    /// so accepted connections are treated as local ([`Auth::Local`]), matching
-    /// `run_on_uds`. Sessions are driven over the bridged vsock stream directly,
-    /// with no socat UDS relay in between.
-    ///
-    /// Requires libkrun >= 1.19.0: on 1.18.1 the bridged vsock intermittently
-    /// stalled a full session (a multi-descriptor TX-chain bug in libkrun's vsock
-    /// device, fixed upstream by `0ecf4d5f7`); a socat relay was the prior
-    /// workaround.
-    #[cfg(target_os = "linux")]
-    pub async fn run_on_vsock(config: Config, port: u32) -> Result<(), std::io::Error> {
-        use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
+/// The AF_VSOCK transport, used by the in-VM (pid-1) guest: the host
+/// registers the port via `krun_add_vsock_port2` and bridges client SSH
+/// connections to it. The vsock peer is host-mediated (`net=none`) and as
+/// trusted as the UDS peer, so accepted connections are treated as local
+/// ([`Auth::Local`]), matching the UDS transport. Sessions are driven over
+/// the bridged vsock stream directly, with no socat UDS relay in between.
+///
+/// Requires libkrun >= 1.19.0: on 1.18.1 the bridged vsock intermittently
+/// stalled a full session (a multi-descriptor TX-chain bug in libkrun's vsock
+/// device, fixed upstream by `0ecf4d5f7`); a socat relay was the prior
+/// workaround.
+#[cfg(target_os = "linux")]
+impl Listener for tokio_vsock::VsockListener {
+    type Stream = tokio_vsock::VsockStream;
+    type Addr = tokio_vsock::VsockAddr;
 
+    const TRANSPORT: &'static str = "vsock";
+    const IS_LOCAL: bool = true;
+
+    async fn accept(&self) -> std::io::Result<(Self::Stream, Self::Addr)> {
+        tokio_vsock::VsockListener::accept(self).await
+    }
+}
+
+/// A listening minimald server.
+#[derive(Debug)]
+pub struct Server;
+
+impl Server {
+    /// Launches minimald, accepting connections on the given listener and
+    /// driving an SSH session over each until the listener errors.
+    pub async fn run<L: Listener>(config: Config, listener: L) -> Result<(), std::io::Error> {
         let state = ServerStateHandle::new(config).await?;
-        let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port))?;
-        tracing::info!(port, "minimald listening on vsock");
-
         let russh_config = build_russh_config(&state)
             .await
             .map_err(std::io::Error::other)?;
         let mut session_set = JoinSet::new();
-        loop {
-            let (stream, peer) = listener.accept().await?;
-            tracing::info!(?peer, "accepted vsock connection");
-            let (_conn_hnd, session_fut) =
-                Connection::from_stream(stream, russh_config.clone(), state.clone(), true).await;
-            // Log session errors instead of silently dropping the spawned
-            // future, so a failed handshake on the vsock transport is visible.
-            session_set.spawn(async move {
-                if let Err(e) = session_fut.await {
-                    tracing::warn!(error = %e, "vsock session ended with error");
-                }
-            });
-        }
-    }
 
-    async fn run(self) -> Result<(), std::io::Error> {
-        let russh_config = build_russh_config(&self.state)
-            .await
-            .map_err(std::io::Error::other)?;
-        let mut session_set = JoinSet::new();
         loop {
-            let (socket, _) = self.listener.accept().await?;
-            tracing::info!("accepted UDS connection");
+            // Drain any completed sessions to prevent unbounded growth.
+            while let Some(result) = session_set.try_join_next() {
+                if let Err(e) = result {
+                    tracing::error!(error = %e, "session task panicked");
+                }
+            }
+
+            let (stream, peer) = listener.accept().await?;
+            tracing::info!(?peer, transport = L::TRANSPORT, "accepted connection");
             let (_conn_hnd, session_fut) =
-                Connection::from_socket(socket, russh_config.clone(), self.state.clone(), true)
+                Connection::from_stream(stream, russh_config.clone(), state.clone(), L::IS_LOCAL)
                     .await;
+            // Log session errors instead of silently dropping the spawned
+            // future, so a failed handshake is visible on any transport.
             session_set.spawn(async move {
                 if let Err(e) = session_fut.await {
-                    tracing::warn!(error = %e, "session ended with error");
+                    tracing::warn!(error = %e, transport = L::TRANSPORT, "session ended with error");
                 }
             });
         }

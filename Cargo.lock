@@ -3441,6 +3441,7 @@ dependencies = [
  "libc",
  "mctx",
  "mfile",
+ "nix 0.31.3",
  "ot",
  "path-absolutize",
  "paths",
