@@ -20,11 +20,15 @@ on:
   # feature/bug issue templates), or the needs-human label was cleared.
   issues:
     types: [labeled, unlabeled]
-  # A /spec or /revise comment on an issue or pull request.
+  # A /spec, /revise, /fastpath (or /agile), or /approve comment on an
+  # issue or pull request.
   issue_comment:
     types: [created]
-  # A spec pull request was closed; the agent advances the lifecycle only
-  # when it was merged.
+  # A spec pull request was closed. Merged: the agent advances the
+  # lifecycle — or, when the sdd:approved marker is recorded, the
+  # approved-merge-dispatch job dispatches deterministically (ADR 0024).
+  # Closed without merge: the approved-clear job drops a stale
+  # sdd:approved marker.
   pull_request:
     types: [closed]
 
@@ -54,6 +58,7 @@ jobs:
           startsWith(github.event.comment.body, '/spec')
           || startsWith(github.event.comment.body, '/revise')
           || startsWith(github.event.comment.body, '/fastpath')
+          || startsWith(github.event.comment.body, '/agile')
           || startsWith(github.event.comment.body, '/approve')
         )
       )
@@ -82,24 +87,32 @@ jobs:
       aw_context: ${{ steps.decide.outputs.aw_context }}
       fastpath_approve: ${{ steps.decide.outputs.fastpath_approve }}
       fastpath_tracking: ${{ steps.decide.outputs.fastpath_tracking }}
+      approved_dispatch: ${{ steps.decide.outputs.approved_dispatch }}
+      approved_clear: ${{ steps.decide.outputs.approved_clear }}
+      approved_tracking: ${{ steps.decide.outputs.approved_tracking }}
     steps:
       - name: Decide whether to run and build aw_context
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-spec@v0.1.2
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-spec@v0.2.0
         with:
           github-token: ${{ github.token }}
 
-  # Fast-path /approve handler (ADR 0012).
+  # Fast-path /approve handler (ADR 0012, amended by ADR 0024).
   #
-  # On /approve on a tracking issue carrying sdd:fastpath, the route job
-  # sets fastpath_approve=true. This job runs the deterministic dispatch:
-  # find the latest execution-plan comment on the tracking issue (matched
-  # by the `[sdd-spec:fastpath-plan]` plain-text marker), parse its
-  # `model:*` tier, mint an App token, call workflow_dispatch on the
-  # matching sdd-execute-{tier}.yml with `entry: 'fastpath'`, and move
-  # the tracking issue's lifecycle from `sdd:fastpath` to
-  # `sdd:in-progress`. The wrapper handles this entirely; the sdd-spec
-  # agent .md source is not invoked on this path.
+  # On /approve on a tracking issue carrying sdd:fastpath or
+  # sdd:fastpath-review, the route job sets fastpath_approve=true. This
+  # job runs the deterministic approval handling. With the spec PR merged
+  # (sdd:fastpath): find the latest execution-plan comment on the tracking
+  # issue (matched by the `[sdd-spec:fastpath-plan]` plain-text marker),
+  # parse its `model:*` tier, mint an App token, call workflow_dispatch on
+  # the matching sdd-execute-{tier}.yml with `entry: 'fastpath'`, and move
+  # the tracking issue's lifecycle to `sdd:in-progress`. With the spec PR
+  # still open (sdd:fastpath-review): record the approval as the
+  # orthogonal sdd:approved marker and — when SDD_AUTO_MERGE is set — arm
+  # squash auto-merge on the spec PR, so the merge event dispatches via
+  # the approved-merge-dispatch job below; merge and approve commute. The
+  # wrapper handles this entirely; the sdd-spec agent .md source is not
+  # invoked on this path.
   #
   # This follows the deterministic-in-wrapper pattern from #81 (ADR
   # 0011): there is no natural-language judgement on this code path —
@@ -120,18 +133,81 @@ jobs:
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
-      - name: Find plan comment and dispatch sdd-execute-{tier}
-        uses: norrietaylor/spectacles/.github/actions/sdd-fastpath-approve@v0.1.2
+      - name: Record approval or dispatch sdd-execute-{tier}
+        uses: norrietaylor/spectacles/.github/actions/sdd-fastpath-approve@v0.2.0
         with:
           github-token: ${{ steps.app.outputs.token }}
           tracking: ${{ needs.route.outputs.fastpath_tracking }}
+          mode: approve
+          auto-merge: ${{ vars.SDD_AUTO_MERGE }}
+
+  # Deterministic merge dispatch (ADR 0024). A spec PR merged while the
+  # tracking issue carries the sdd:approved marker (the human approved
+  # before merging): dispatch the single sdd-execute-{tier} run against
+  # the execution plan comment, clear sdd:approved, and advance the
+  # lifecycle to sdd:in-progress. The sdd-spec agent is suppressed for
+  # this trigger (the route job sets should_run=false), so the
+  # merge-side lifecycle handling has exactly one owner.
+  approved-merge-dispatch:
+    needs: route
+    if: needs.route.outputs.approved_dispatch == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+      - name: Dispatch sdd-execute-{tier} for the approved merged spec PR
+        uses: norrietaylor/spectacles/.github/actions/sdd-fastpath-approve@v0.2.0
+        with:
+          github-token: ${{ steps.app.outputs.token }}
+          tracking: ${{ needs.route.outputs.approved_tracking }}
+          mode: merged
+
+  # Stale-approval clear (ADR 0024). A spec PR closed *without* merging
+  # while the tracking issue carries sdd:approved: the recorded approval
+  # no longer refers to a mergeable spec, so drop the marker. Re-approval
+  # is required once a new spec PR exists.
+  approved-clear:
+    needs: route
+    if: needs.route.outputs.approved_clear == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+      - name: Clear the stale sdd:approved marker
+        uses: norrietaylor/spectacles/.github/actions/sdd-fastpath-approve@v0.2.0
+        with:
+          github-token: ${{ steps.app.outputs.token }}
+          tracking: ${{ needs.route.outputs.approved_tracking }}
+          mode: clear
 
   sdd-spec:
     needs: route
     if: needs.route.outputs.should_run == 'true'
-    uses: norrietaylor/spectacles/.github/workflows/sdd-spec.lock.yml@v0.1.2
+    uses: norrietaylor/spectacles/.github/workflows/sdd-spec.lock.yml@v0.2.0
     with:
       aw_context: ${{ needs.route.outputs.aw_context }}
+      # Single-PR classifier diff ceiling (ADR 0024). Maps the consumer's
+      # optional SDD_AGILE_MAX variable into the lock's agile_max input;
+      # unset passes empty and the agent falls back to 800.
+      agile_max: ${{ vars.SDD_AGILE_MAX }}
     # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
     # to a reusable workflow in a different owner than the caller.
     secrets:
@@ -190,7 +266,7 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
       - name: Post failure hand-off to tracking issue
-        uses: norrietaylor/spectacles/.github/actions/sdd-spec-failure-handoff@v0.1.2
+        uses: norrietaylor/spectacles/.github/actions/sdd-spec-failure-handoff@v0.2.0
         with:
           github-token: ${{ steps.app.outputs.token }}
           aw-context: ${{ needs.route.outputs.aw_context }}

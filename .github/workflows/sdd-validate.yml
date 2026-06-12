@@ -81,14 +81,14 @@ jobs:
     steps:
       - name: Decide whether to run and build aw_context
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-validate@v0.1.2
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-validate@v0.2.0
         with:
           github-token: ${{ github.token }}
 
   sdd-validate:
     needs: route
     if: needs.route.outputs.should_run == 'true'
-    uses: norrietaylor/spectacles/.github/workflows/sdd-validate.lock.yml@v0.1.2
+    uses: norrietaylor/spectacles/.github/workflows/sdd-validate.lock.yml@v0.2.0
     with:
       aw_context: ${{ needs.route.outputs.aw_context }}
     # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets

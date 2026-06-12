@@ -47,7 +47,7 @@ with write access to the repository.
 
 | Command | Where | Effect |
 |---|---|---|
-| `/spec` | this tracking issue | re-run `sdd-spec` to draft or revise the spec |
+| `/spec` | this tracking issue | re-run `sdd-spec` to draft the spec. To change an **open** spec PR, comment `/revise <note>` on that PR — `/spec` never opens a second spec |
 | `/fastpath` | this tracking issue | confirm a single-session change; `sdd-spec` produces a stub spec PR and an execution plan comment in one run (ADR 0012) |
 | `/triage` | this tracking issue, after the spec PR is merged | start `sdd-triage` phase A (architecture) |
 | `/approve` | this tracking issue | full path: confirm the proposed plan so `sdd-triage` creates the Unit and task sub-issues. Fast path: dispatch the execution plan against `sdd-execute-{tier}` |

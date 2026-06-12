@@ -40,7 +40,14 @@ permissions:
 
 jobs:
   distillery-sync:
-    uses: norrietaylor/spectacles/.github/workflows/distillery-sync.lock.yml@v0.1.2
+    uses: norrietaylor/spectacles/.github/workflows/distillery-sync.lock.yml@v0.2.0
+    # Thread the consumer's DISTILLERY_DOC_GLOBS variable into the reusable
+    # workflow as an input. A repo variable cannot be read inside the agent
+    # prompt (`vars.*` is not an allowed gh-aw body expression), but a
+    # workflow_call input can. Unset variable → empty string → the agent's
+    # built-in default glob set, so a wrapper that omits this stays correct.
+    with:
+      doc_globs: ${{ vars.DISTILLERY_DOC_GLOBS }}
     # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
     # to a reusable workflow in a different owner than the caller.
     secrets:

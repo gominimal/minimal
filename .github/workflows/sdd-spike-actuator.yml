@@ -66,7 +66,7 @@ jobs:
       # walk errored) means this is not a spike-wave member to actuate.
       - name: Resolve the parent tracking issue
         id: tree
-        uses: norrietaylor/spectacles/.github/actions/sdd-spike-tree@v0.1.2
+        uses: norrietaylor/spectacles/.github/actions/sdd-spike-tree@v0.2.0
         with:
           mode: actuator
           spike-issue: ${{ github.event.issue.number }}

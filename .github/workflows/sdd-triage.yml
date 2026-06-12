@@ -81,16 +81,20 @@ jobs:
     steps:
       - name: Decide whether to run and build aw_context
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-triage@v0.1.2
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-triage@v0.2.0
         with:
           github-token: ${{ github.token }}
 
   sdd-triage:
     needs: route
     if: needs.route.outputs.should_run == 'true'
-    uses: norrietaylor/spectacles/.github/workflows/sdd-triage.lock.yml@v0.1.2
+    uses: norrietaylor/spectacles/.github/workflows/sdd-triage.lock.yml@v0.2.0
     with:
       aw_context: ${{ needs.route.outputs.aw_context }}
+      # Task-bundling diff floor (ADR 0022). Maps the consumer's optional
+      # SDD_TRIAGE_MIN_TASK variable into the lock's min_task input; unset
+      # passes empty and the agent falls back to 300.
+      min_task: ${{ vars.SDD_TRIAGE_MIN_TASK }}
     # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
     # to a reusable workflow in a different owner than the caller.
     secrets:
@@ -143,7 +147,7 @@ jobs:
     steps:
       - name: Detect a dependency cycle in the materialized tree
         id: detect
-        uses: norrietaylor/spectacles/.github/actions/sdd-cycle-detect@v0.1.2
+        uses: norrietaylor/spectacles/.github/actions/sdd-cycle-detect@v0.2.0
         with:
           tracking-issue: ${{ needs.route.outputs.item_number }}
           github-token: ${{ github.token }}

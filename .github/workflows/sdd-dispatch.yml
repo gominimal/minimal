@@ -33,9 +33,12 @@ on:
   # A task sub-issue closing under a tracking issue that carries
   # sdd:dispatched. The route job walks the parent chain to find the
   # tracking issue and filters out closures on issues outside an armed
-  # cascade.
+  # cascade. The `labeled` type is the opt-in auto-dispatch trigger
+  # (ADR 0025): when the consumer sets SDD_AUTO_DISPATCH, a tracking
+  # issue gaining sdd:ready (sdd-triage phase C completion) arms the
+  # cascade as if a /dispatch had been typed.
   issues:
-    types: [closed]
+    types: [closed, labeled]
 
 permissions:
   contents: read
@@ -56,13 +59,35 @@ jobs:
     # consuming a route-job runner before the route step's tokenised
     # parse rejects it. GitHub Actions expressions do not support regex
     # matching, so enumerate the boundary characters explicitly.
+    #
+    # An `issues: labeled` event only spawns a runner for the sdd:ready
+    # label with SDD_AUTO_DISPATCH set (ADR 0025); every other label
+    # add is skipped here without a runner (the issue #119 discipline).
+    # The SDD_AUTO_DISPATCH comparison matches the composite action's
+    # trim+lowercase parse for case: GitHub Actions expression `==`
+    # ignores case on strings, so 'True'/'TRUE' pass this gate too.
+    # Only a whitespace-padded value diverges (the action would trim
+    # it; this gate skips first), so the effective contract is the
+    # documented exact values '1'/'true', case-insensitively.
     if: |
-      github.event_name != 'issue_comment'
-      || github.event.comment.body == '/dispatch'
-      || startsWith(github.event.comment.body, '/dispatch ')
-      || startsWith(github.event.comment.body, '/dispatch\n')
-      || startsWith(github.event.comment.body, '/dispatch\r\n')
-      || startsWith(github.event.comment.body, '/dispatch\t')
+      (github.event_name != 'issue_comment' && github.event_name != 'issues')
+      || (
+        github.event_name == 'issue_comment'
+        && (
+          github.event.comment.body == '/dispatch'
+          || startsWith(github.event.comment.body, '/dispatch ')
+          || startsWith(github.event.comment.body, '/dispatch\n')
+          || startsWith(github.event.comment.body, '/dispatch\r\n')
+          || startsWith(github.event.comment.body, '/dispatch\t')
+        )
+      )
+      || (github.event_name == 'issues' && github.event.action == 'closed')
+      || (
+        github.event_name == 'issues'
+        && github.event.action == 'labeled'
+        && github.event.label.name == 'sdd:ready'
+        && (vars.SDD_AUTO_DISPATCH == '1' || vars.SDD_AUTO_DISPATCH == 'true')
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -75,10 +100,14 @@ jobs:
     steps:
       - name: Decide whether to run, and find the tracking issue
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-dispatch@v0.1.2
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-dispatch@v0.2.0
         with:
           app-id: ${{ vars.APP_ID }}
           github-token: ${{ github.token }}
+          # Opt-in auto-dispatch on phase C completion (ADR 0025). Maps
+          # the consumer's optional SDD_AUTO_DISPATCH variable in; unset
+          # passes empty and the sdd:ready labeled trigger stays inert.
+          auto-dispatch: ${{ vars.SDD_AUTO_DISPATCH }}
 
   # Compute the ready set from the dependency graph. Walks the tracking
   # issue's sub-issue tree, parses each open task's `depends on:` block,
@@ -109,7 +138,7 @@ jobs:
     steps:
       - name: Compute ready set and precondition state
         id: compute
-        uses: norrietaylor/spectacles/.github/actions/sdd-dispatch-compute@v0.1.2
+        uses: norrietaylor/spectacles/.github/actions/sdd-dispatch-compute@v0.2.0
         with:
           tracking-issue: ${{ needs.route.outputs.tracking_issue }}
           trigger-kind: ${{ needs.route.outputs.trigger_kind }}
