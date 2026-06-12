@@ -67,8 +67,9 @@ on:
     types: [unlabeled, closed]
   # A check suite that completed on a pull request this agent opened. A
   # failure conclusion on an `sdd/` branch is treated as an implicit
-  # /revise (issue #203): a required CI check failed and merge is BLOCKED,
-  # so the build is handed back to sdd-execute to fix on the same branch,
+  # /revise (issue #203): by default every failing check qualifies, or only
+  # required checks when SDD_REVISE_ON_CHECKS=required (issue #259), and the
+  # build is handed back to sdd-execute to fix on the same branch,
   # mirroring the CHANGES_REQUESTED path. A success/neutral suite does not
   # trigger a revise. The route step bounds the retries and escalates with
   # needs-human after the cap.
@@ -195,7 +196,7 @@ jobs:
     # needs-human label. Comments and labels written by the GITHUB_TOKEN do not
     # re-trigger workflows, so this does not feed back into the route.
     #
-    # checks: read is needed by the failed-required-check auto-revise branch
+    # checks: read is needed by the failed-check auto-revise branch
     # (issue #203): it lists the check runs in the failing suite to name them
     # in the revise directive. The same branch reuses the iteration-marker /
     # needs-human machinery above.
@@ -210,17 +211,19 @@ jobs:
     steps:
       - name: Decide whether to run and build aw_context
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-execute@v0.1.2
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-execute@v0.2.0
         with:
           tier: opus
           app-id: ${{ vars.APP_ID }}
           max-review-iterations: ${{ vars.SDD_MAX_REVIEW_ITERATIONS }}
+          revise-on-checks: ${{ vars.SDD_REVISE_ON_CHECKS }}
+          revise-checks-exclude: ${{ vars.SDD_REVISE_CHECKS_EXCLUDE }}
           github-token: ${{ github.token }}
 
   sdd-execute-opus:
     needs: route
     if: needs.route.outputs.should_run == 'true'
-    uses: norrietaylor/spectacles/.github/workflows/sdd-execute-opus.lock.yml@v0.1.2
+    uses: norrietaylor/spectacles/.github/workflows/sdd-execute-opus.lock.yml@v0.2.0
     with:
       aw_context: ${{ needs.route.outputs.aw_context }}
     # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
@@ -284,7 +287,7 @@ jobs:
       # the PR is UNSTABLE with every required check green (issue #135). The
       # mechanics live in the sdd-auto-merge composite action.
       - name: Enable auto-merge when protection requires a check
-        uses: norrietaylor/spectacles/.github/actions/sdd-auto-merge@v0.1.2
+        uses: norrietaylor/spectacles/.github/actions/sdd-auto-merge@v0.2.0
         with:
           github-token: ${{ steps.app.outputs.token }}
           pr-number: ${{ needs.sdd-execute-opus.outputs.created_pr_number }}
@@ -343,7 +346,7 @@ jobs:
           permission-pull-requests: write
           permission-issues: write
       - name: Sweep open sdd/ PRs and refresh those behind base
-        uses: norrietaylor/spectacles/.github/actions/sdd-refresh-siblings@v0.1.2
+        uses: norrietaylor/spectacles/.github/actions/sdd-refresh-siblings@v0.2.0
         with:
           github-token: ${{ steps.app.outputs.token }}
           merged-pr-number: ${{ github.event.pull_request.number }}
