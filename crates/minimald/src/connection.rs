@@ -10,7 +10,6 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    net::UnixStream,
     sync::{Mutex, MutexGuard},
 };
 
@@ -153,16 +152,6 @@ impl Connection {
                 .await
                 .unwrap(),
         )
-    }
-
-    /// Thin wrapper over [`Connection::from_stream`] for the UDS transport.
-    pub(crate) async fn from_socket(
-        s: UnixStream,
-        c: Arc<RuConfig>,
-        serv: ServerStateHandle,
-        was_local_uds: bool,
-    ) -> (ConnectionHandle, RunningSession<ConnectionHandler>) {
-        Self::from_stream(s, c, serv, was_local_uds).await
     }
 
     pub(crate) fn pending_config_mut(&mut self, id: ChannelId) -> Option<&mut ChannelConfig> {

@@ -96,28 +96,32 @@ fn raw_mount(
 }
 
 /// Enter the generic upstream guest rootfs from the initramfs. Mounts the rootfs
-/// block `device` (ext4, read-only) at `newroot`, brings up the
-/// pseudo-filesystems + a writable tmpfs (for session state) inside it, then
-/// chroots in. minimald (static, already running) keeps executing with the
-/// rootfs as its filesystem view, so `/bin/sh` and its libs resolve. The
-/// `newroot/{dev,proc,sys,run}` mountpoints must exist in the rootfs (the
-/// generic microvm-rootfs provides them).
-pub fn enter_rootfs(device: &str, newroot: &str) -> std::io::Result<()> {
-    std::fs::create_dir_all(newroot)?;
-    raw_mount(device, newroot, "ext4", libc::MS_RDONLY)?;
-    raw_mount("devtmpfs", &format!("{newroot}/dev"), "devtmpfs", 0)?;
-    raw_mount("proc", &format!("{newroot}/proc"), "proc", 0)?;
-    raw_mount("sysfs", &format!("{newroot}/sys"), "sysfs", 0)?;
-    raw_mount("tmpfs", &format!("{newroot}/run"), "tmpfs", 0)?;
+/// block `device` (ext4, read-only), brings up the pseudo-filesystems +
+/// a writable tmpfs (for session state) inside it, then chroots in.
+///
+/// NOTE: The rootfs at the time this function is called is expected to be the initramfs.
+/// If it is instead another filesystem, then its memory will not be reclaimed.
+///
+/// The `/{dev,proc,sys,run}` mountpoints must already exist on the provided rootfs
+/// device.
+pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
+    const NEWROOT: &str = "/newroot";
+    std::fs::create_dir_all(NEWROOT)?;
+    raw_mount(device, NEWROOT, "ext4", libc::MS_RDONLY)?;
+    raw_mount("devtmpfs", &format!("{NEWROOT}/dev"), "devtmpfs", 0)?;
+    raw_mount("proc", &format!("{NEWROOT}/proc"), "proc", 0)?;
+    raw_mount("sysfs", &format!("{NEWROOT}/sys"), "sysfs", 0)?;
+    raw_mount("tmpfs", &format!("{NEWROOT}/run"), "tmpfs", 0)?;
 
     let to_io = |_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in chroot path");
-    let c_newroot = CString::new(newroot).map_err(to_io)?;
+    let c_newroot = CString::new(NEWROOT).map_err(to_io)?;
     // SAFETY: `chroot(2)` with a valid C string for the new root.
     if unsafe { libc::chroot(c_newroot.as_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
     std::env::set_current_dir("/")?;
-    tracing::info!(device, "entered upstream rootfs (chroot)");
+
+    tracing::info!(device, "switched to upstream rootfs (pivot_root)");
     Ok(())
 }
 

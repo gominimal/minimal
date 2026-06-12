@@ -92,7 +92,7 @@ impl TestServer {
         let state = self.state.clone();
         let server_setup = async move {
             let (_conn, session_fut) =
-                Connection::from_socket(server_side, russh_config, state, true).await;
+                Connection::from_stream(server_side, russh_config, state, true).await;
             tokio::spawn(session_fut);
         };
 
@@ -122,7 +122,7 @@ impl TestServer {
                 let state = state.clone();
                 tokio::spawn(async move {
                     let (_conn, session_fut) =
-                        Connection::from_socket(socket, russh_config, state, true).await;
+                        Connection::from_stream(socket, russh_config, state, true).await;
                     let _ = session_fut.await;
                 });
             }
