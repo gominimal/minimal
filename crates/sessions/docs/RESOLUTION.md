@@ -40,6 +40,15 @@ declarative sources (loadout, project, packages) to the final
 │ (policy-gated) │  │ (policy-gated)   │  │ (pass-through; no  │
 └───────┬────────┘  └────────┬─────────┘  │  policy gate)      │
         │                    │            └─────────┬──────────┘
+        │                    │ pre-walk:            │
+        │                    │   expand `~` in each │
+        │                    │   FileSet source     │
+        │                    │   pattern, and in    │
+        │                    │   each PatchPolicy   │
+        │                    │   allow/deny/ignore  │
+        │                    │   pattern, against   │
+        │                    │   the host home.     │
+        │                    │                      │
         │                    │ for each Patch:      │
         │                    │   FileSet::resolve() │
         │                    │   ── walkdir + glob ►│
@@ -157,6 +166,19 @@ declarative sources (loadout, project, packages) to the final
   surface as `ResolveError::PatchConfig` and take priority over
   transient IO failures, which surface as `ResolveError::PatchWalk`.
   Nothing is silently dropped.
+- **Source `~` is expanded at resolution; dest has no `~` to expand.**
+  Patch source `FileSet` patterns and `PatchPolicy` patterns have
+  their leading `~` expanded against the host home (via `Composer`'s
+  home lookup — `dirs::home_dir` by default) before the walker runs.
+  Patch *destination* paths (`PatchDest`) are always relative to the
+  sandbox user's home directory; `~` and absolute paths are rejected
+  at construction, so nothing needs to be expanded for dests. Patterns
+  retain their `~` form in returned policies, so save/load is
+  lossless. When any `~`-prefixed pattern is in scope, the home
+  lookup is invoked once up-front; failures surface as
+  `ResolveError::HomeUnresolved` (with an inner
+  `HomeResolutionFailure::{Unavailable, NotUtf8, NotAbsolute}`
+  distinguishing the cause) rather than silently matching nothing.
 - **`Composer::merge` is pure aggregation today.** Two contributors
   pushing the same var name both survive into `Resolution.vars()`.
   Conflict resolution (precedence, dedup, error-on-conflict) will live

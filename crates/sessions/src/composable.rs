@@ -307,6 +307,24 @@ impl Contribution {
 /// [`std::env::var`]; tests pass a synthetic closure.
 pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Result<String, std::env::VarError>;
 
+/// A lookup function for resolving the host user's home directory.
+///
+/// Threaded through [`Composer::resolve`] so the patch resolver can
+/// expand leading `~` in source patterns. Returns `None` when no home
+/// is available (e.g. `$HOME` unset and no `passwd` entry); the
+/// resolver surfaces that as [`ResolveError::HomeUnresolved`] when a
+/// pattern actually requires it.
+///
+/// Invoked at most twice per resolution: once at the top of
+/// [`Composer::resolve`] if any `~`-prefixed pattern exists, and once
+/// more if a hook returns an `updated_policy` introducing new
+/// `~`-prefixed rules. A `~`-free policy in a `HOME`-less environment
+/// never triggers the lookup.
+///
+/// Production callers should pass [`dirs::home_dir`]; tests can pin a
+/// synthetic closure via [`Composer::with_home`].
+pub type HomeLookup<'a> = &'a dyn Fn() -> Option<std::path::PathBuf>;
+
 /// Anything that can contribute primitives (vars, patches, packages,
 /// lifecycle hooks) to a [`Composer`] during session construction.
 ///
@@ -464,6 +482,19 @@ impl<P> HookResult<P> {
 /// state directly. To add rules, return a modified policy snapshot in
 /// [`HookResult::Decided::updated_policy`] — wider mutations to the
 /// full [`UserPolicy`] are not exposed here.
+///
+/// # `~` in returned patch policies
+///
+/// Patch-policy patterns are stored verbatim and round-trip losslessly.
+/// When a hook adds (or modifies) a patch-policy rule with a leading
+/// `~`, return it in `~`-form — the resolver re-expands the policy
+/// internally for matching, while the returned policy keeps the raw
+/// form so the caller can persist it. Do **not** expand `~` inside the
+/// hook; double-resolution will produce wrong matches.
+///
+/// Vars policies have no analogous `~`-expansion concern: variable
+/// names are not paths, so the home directory is not relevant on the
+/// vars side.
 pub trait PolicyHooks {
     fn on_var_unapproved(
         &self,
@@ -514,6 +545,42 @@ pub enum ResolveError {
     /// — none are discarded.
     #[error("patch resolution failed ({} error(s)):{}", sources.len(), DisplayJoin(sources))]
     PatchWalk { sources: Vec<crate::patches::Error> },
+    /// At least one patch source or policy pattern starts with `~`,
+    /// but resolving the host home directory failed.
+    ///
+    /// All three failure modes (no home available, non-UTF-8 home
+    /// path, non-absolute home path) live under one [`HomeUnresolved`]
+    /// variant because the home lookup happens once at the start of
+    /// resolution — not per pattern — so the error has no pattern
+    /// context to surface. Match on the inner [`HomeResolutionFailure`]
+    /// to distinguish [`Unavailable`][HomeResolutionFailure::Unavailable],
+    /// [`NotUtf8`][HomeResolutionFailure::NotUtf8], and
+    /// [`NotAbsolute`][HomeResolutionFailure::NotAbsolute].
+    ///
+    /// [`HomeUnresolved`]: Self::HomeUnresolved
+    #[error("a `~`-prefixed pattern requires home expansion, but {0}")]
+    HomeUnresolved(#[from] HomeResolutionFailure),
+}
+
+/// Why home-directory resolution failed during patch resolution.
+///
+/// All variants describe operator/environment problems, not
+/// loadout-config problems: the loadout author can't fix any of them.
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum HomeResolutionFailure {
+    /// No home directory was found (e.g. `$HOME` unset and no
+    /// `passwd` entry).
+    #[error("no home directory was found")]
+    Unavailable,
+    /// The home directory's path is not valid UTF-8.
+    #[error("home directory is not valid UTF-8: `{lossy}`")]
+    NotUtf8 { lossy: String },
+    /// The home directory's path is not absolute. Home is expected to
+    /// be absolute by POSIX convention; a relative result indicates a
+    /// misbehaving `HomeLookup`.
+    #[error("home directory is not absolute: `{0}`")]
+    NotAbsolute(Utf8PathBuf),
 }
 
 /// Render a slice of `Display`-able errors as one indented bullet per
@@ -564,7 +631,8 @@ pub struct SessionPatch {
 }
 
 impl SessionPatch {
-    /// The resolved patch (host path + sandbox destination).
+    /// The resolved patch — host source path plus the destination
+    /// relative to the sandbox user's home directory.
     #[must_use]
     pub fn patch(&self) -> &ResolvedPatch {
         &self.patch
@@ -658,7 +726,16 @@ pub struct ResolveOptions {
 /// work until `resolve` is called. This separates declarative
 /// accumulation from the (potentially interactive) resolution pass.
 /// Boxed env-lookup closure stored in [`Composer`].
-type StoredEnv = Box<dyn Fn(&str) -> Result<String, std::env::VarError>>;
+///
+/// `Send + Sync` so [`Composer`] itself is `Send + Sync` and can be
+/// built on one thread and resolved on another (e.g. async server
+/// handing the composer off to a worker pool). Closures captured by
+/// [`Composer::with_env`] must satisfy the bound; the defaults
+/// (function pointers like `std::env::var`) trivially do.
+type StoredEnv = Box<dyn Fn(&str) -> Result<String, std::env::VarError> + Send + Sync>;
+/// Boxed home-lookup closure stored in [`Composer`]. `Send + Sync`
+/// for the reasons documented on [`StoredEnv`].
+type StoredHome = Box<dyn Fn() -> Option<std::path::PathBuf> + Send + Sync>;
 
 pub struct Composer {
     vars: Vec<ProvenancedVar>,
@@ -666,6 +743,7 @@ pub struct Composer {
     packages: Vec<ProvenancedPackage>,
     lifecycle_hooks: Vec<ProvenancedHook>,
     env: StoredEnv,
+    home: StoredHome,
 }
 
 impl fmt::Debug for Composer {
@@ -676,6 +754,7 @@ impl fmt::Debug for Composer {
             .field("packages", &self.packages)
             .field("lifecycle_hooks", &self.lifecycle_hooks)
             .field("env", &"<closure>")
+            .field("home", &"<closure>")
             .finish()
     }
 }
@@ -686,26 +765,45 @@ impl Default for Composer {
     }
 }
 
+// Compile-time guarantee: `Composer` is `Send + Sync`. If a future
+// change to a field (or to one of the stored-closure type aliases)
+// removes either auto-trait, this assertion fails at compile time
+// and the offending field is named in the error.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Composer>();
+};
+
 impl Composer {
-    /// Construct an empty composer with [`std::env::var`] as the env
-    /// lookup. Suitable for production code.
+    /// Construct an empty composer with default lookups:
+    /// [`std::env::var`] for env, [`dirs::home_dir`] for home.
+    /// Suitable for production code.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_env(Box::new(|name| std::env::var(name)))
-    }
-
-    /// Construct an empty composer with a custom env lookup. Useful for
-    /// tests that want to pin env behavior without touching the
-    /// process environment.
-    #[must_use]
-    pub fn with_env(env: StoredEnv) -> Self {
         Self {
             vars: Vec::new(),
             patches: Vec::new(),
             packages: Vec::new(),
             lifecycle_hooks: Vec::new(),
-            env,
+            env: Box::new(|name| std::env::var(name)),
+            home: Box::new(dirs::home_dir),
         }
+    }
+
+    /// Replace the env lookup. Useful for tests that want to pin env
+    /// behavior without touching the process environment.
+    #[must_use]
+    pub fn with_env(mut self, env: StoredEnv) -> Self {
+        self.env = env;
+        self
+    }
+
+    /// Replace the home-directory lookup. Useful for tests that want
+    /// to pin a synthetic `$HOME` without touching `dirs::home_dir`.
+    #[must_use]
+    pub fn with_home(mut self, home: StoredHome) -> Self {
+        self.home = home;
+        self
     }
 
     /// Take a [`Composable`]'s contribution and merge it into this
@@ -773,7 +871,7 @@ impl Composer {
         let (vars_policy, patches_policy) = policy.into_parts();
         let (vars, vars_policy) = resolve_vars(self.vars, vars_policy, hooks)?;
         let (patches, patches_policy) =
-            resolve_patches(self.patches, patches_policy, hooks, options)?;
+            resolve_patches(self.patches, patches_policy, hooks, options, &*self.home)?;
         let final_policy = UserPolicy::empty()
             .with_vars(vars_policy)
             .with_patches(patches_policy);
@@ -909,7 +1007,8 @@ fn resolve_vars(
 struct PatchFile {
     /// Absolute host path to the file.
     source_path: Utf8PathBuf,
-    /// Destination inside the sandbox for this file.
+    /// Destination for this file, relative to the sandbox user's home
+    /// directory.
     dest: SandboxRelPath,
     /// The original patch's provenance.
     provenance: Source,
@@ -933,18 +1032,29 @@ impl Provenanced for PatchFile {
 fn enumerate_patch_files(
     items: Vec<ProvenancedPatch>,
     follow_symlinks: bool,
+    home: Option<&HostAbsPath>,
 ) -> Result<Vec<PatchFile>, ResolveError> {
     let mut out = Vec::new();
     let mut accumulated_errors = Vec::new();
     for pp in items {
-        let Some(walk_root) = pp.patch.source().walk_root() else {
+        // Expand a leading `~` in the FileSet pattern before walking.
+        // `expand_home` returns a fresh FileSet (via re-parse) or a
+        // borrow of the existing one — `Cow` derefs to `&FileSet`
+        // either way. Gate on `home` so `expand_home` only ever
+        // receives a concrete `&HostAbsPath`.
+        let expanded_source = match home {
+            Some(h) => expand_home(pp.patch.source(), h)?,
+            None => std::borrow::Cow::Borrowed(pp.patch.source()),
+        };
+
+        let Some(walk_root) = expanded_source.walk_root() else {
             // FileSet::resolve will also report NoWalkRoot; we still
             // call it for symmetry of error accumulation.
-            let (_files, errors) = pp.patch.source().resolve(follow_symlinks);
+            let (_files, errors) = expanded_source.resolve(follow_symlinks);
             accumulated_errors.extend(errors);
             continue;
         };
-        let (files, errors) = pp.patch.source().resolve(follow_symlinks);
+        let (files, errors) = expanded_source.resolve(follow_symlinks);
         accumulated_errors.extend(errors);
         let dest_root = pp.patch.dest().as_sandbox_path().as_utf8_path();
         for file in files {
@@ -969,14 +1079,161 @@ fn enumerate_patch_files(
     Err(ResolveError::PatchWalk { sources: walk })
 }
 
+/// Expand a leading `~` or `~/` prefix in a
+/// [`FileSet`](crate::patches::FileSet) pattern against the resolved
+/// home directory.
+///
+/// Only the literal `~` (alone) or `~/<rest>` prefix is expanded —
+/// `~user` is intentionally not supported, and a mid-path `~` is
+/// preserved as a literal `~` character.
+///
+/// Returns the original `FileSet` borrowed (zero alloc) when the
+/// pattern doesn't begin with `~`. Returns a fresh `FileSet` (one
+/// re-parse) when expansion happens.
+///
+/// The home argument is unconditional: callers are expected to gate
+/// the call on whether any tilde pattern is in scope, so by the time
+/// this function runs we always know a usable home is available.
+fn expand_home<'a>(
+    fs: &'a crate::patches::FileSet,
+    home: &HostAbsPath,
+) -> Result<std::borrow::Cow<'a, crate::patches::FileSet>, ResolveError> {
+    let pattern = fs.pattern();
+    let suffix = if pattern == "~" {
+        ""
+    } else if let Some(rest) = pattern.strip_prefix("~/") {
+        rest
+    } else {
+        return Ok(std::borrow::Cow::Borrowed(fs));
+    };
+    // Trim trailing slashes once so both arms below produce
+    // symmetric output (no `//` in the `~/x` case, no trailing `/`
+    // in the bare `~` case).
+    let home = home.as_str().trim_end_matches('/');
+    let expanded = if suffix.is_empty() {
+        home.to_owned()
+    } else {
+        format!("{home}/{suffix}")
+    };
+    let new_fs = crate::patches::FileSet::try_new(expanded)
+        .map_err(|e| ResolveError::PatchConfig { sources: vec![e] })?;
+    Ok(std::borrow::Cow::Owned(new_fs))
+}
+
+/// Resolve the host home directory via the supplied [`HomeLookup`],
+/// normalizing to UTF-8 and enforcing absoluteness. Surfaces all
+/// three failure modes as [`ResolveError::HomeUnresolved`].
+fn resolve_home(lookup: HomeLookup<'_>) -> Result<HostAbsPath, ResolveError> {
+    let Some(path) = lookup() else {
+        return Err(ResolveError::HomeUnresolved(
+            HomeResolutionFailure::Unavailable,
+        ));
+    };
+    let utf8 = Utf8PathBuf::from_path_buf(path).map_err(|p| {
+        ResolveError::HomeUnresolved(HomeResolutionFailure::NotUtf8 {
+            lossy: p.to_string_lossy().into_owned(),
+        })
+    })?;
+    HostAbsPath::try_new(utf8).map_err(|e| match e {
+        paths::Error::NotAbsolute(p) => {
+            ResolveError::HomeUnresolved(HomeResolutionFailure::NotAbsolute(p))
+        }
+        other => panic!("HostAbsPath::try_new returned unexpected variant: {other:?}"),
+    })
+}
+
 /// `true` for errors that mean "the user's loadout/project config is
 /// wrong" rather than "the host filesystem misbehaved."
 fn is_patch_config_error(e: &crate::patches::Error) -> bool {
     matches!(e, crate::patches::Error::NoWalkRoot { .. })
 }
 
-/// Compute the sandbox destination for a single source file under a
-/// patch's `dest`.
+/// Produce a [`PatchPolicy`] whose `allow` / `deny` / `ignore` patterns
+/// have had leading `~` expanded against `home`.
+///
+/// The resolver keeps two policies in flight: the raw form (handed to
+/// the hook, returned to the caller — preserves round-trip) and this
+/// expanded form (used for the actual `check` calls — patterns
+/// actually match the on-disk paths the walker yields).
+///
+/// Per-list short-circuit: any list with no `~`-prefixed pattern is
+/// reused verbatim. Lists that need expansion are rebuilt. A policy
+/// with `~` only in `deny` (say) leaves `allow` and `ignore`
+/// untouched.
+///
+/// Takes `home` unconditionally; callers that don't have a home
+/// resolved should not call this function at all (the policy is
+/// already in its final form). [`expand_policy_home_opt`] is the
+/// convenience wrapper for the common case.
+fn expand_policy_home(
+    raw: &crate::patches::PatchPolicy,
+    home: &HostAbsPath,
+) -> Result<crate::patches::PatchPolicy, ResolveError> {
+    fn map_sets(
+        sets: &[crate::patches::FileSet],
+        home: &HostAbsPath,
+    ) -> Result<Vec<crate::patches::FileSet>, ResolveError> {
+        if !any_tilde(sets) {
+            // No expansion needed; clone the list as-is.
+            return Ok(sets.to_vec());
+        }
+        sets.iter()
+            .map(|fs| Ok(expand_home(fs, home)?.into_owned()))
+            .collect()
+    }
+    Ok(crate::patches::PatchPolicy::empty()
+        .with_allow(map_sets(raw.allow(), home)?)
+        .with_deny(map_sets(raw.deny(), home)?)
+        .with_ignore(map_sets(raw.ignore(), home)?))
+}
+
+/// `Option<&HostAbsPath>` wrapper around [`expand_policy_home`]: when
+/// `home` is `None` (no `~` patterns anywhere), the raw policy is
+/// already its own expanded form, so just clone it.
+fn expand_policy_home_opt(
+    raw: &crate::patches::PatchPolicy,
+    home: Option<&HostAbsPath>,
+) -> Result<crate::patches::PatchPolicy, ResolveError> {
+    match home {
+        Some(h) => expand_policy_home(raw, h),
+        None => Ok(raw.clone()),
+    }
+}
+
+/// `true` if `pattern` is a candidate for home expansion — exactly
+/// `"~"` or beginning with `"~/"`. `~user/...` (POSIX per-user
+/// expansion) is intentionally excluded: [`expand_home`] doesn't
+/// implement it, and treating it as a tilde pattern here would trigger
+/// a needless home lookup that could fail spuriously.
+fn needs_home_expansion(pattern: &str) -> bool {
+    pattern == "~" || pattern.starts_with("~/")
+}
+
+/// `true` if any [`FileSet`](crate::patches::FileSet) in `sets` needs
+/// home expansion (per [`needs_home_expansion`]).
+fn any_tilde(sets: &[crate::patches::FileSet]) -> bool {
+    sets.iter().any(|fs| needs_home_expansion(fs.pattern()))
+}
+
+/// `true` if any pattern in the policy needs home expansion. Used at
+/// the top of [`resolve_patches`] to decide whether to invoke the
+/// home lookup.
+fn policy_has_tilde_pattern(p: &crate::patches::PatchPolicy) -> bool {
+    any_tilde(p.allow()) || any_tilde(p.deny()) || any_tilde(p.ignore())
+}
+
+/// `true` if any patch source pattern needs home expansion. Used at
+/// the top of [`resolve_patches`] alongside [`policy_has_tilde_pattern`]
+/// to decide whether to invoke the home lookup.
+fn patches_have_tilde_pattern(items: &[ProvenancedPatch]) -> bool {
+    items
+        .iter()
+        .any(|pp| needs_home_expansion(pp.patch.source().pattern()))
+}
+
+/// Compute the destination for a single source file under a patch's
+/// `dest`. The result is relative to the sandbox user's home directory,
+/// inherited from the patch's [`PatchDest`].
 ///
 /// - **Single-file patches** (`walk_root == source_path`): `dest` is
 ///   used verbatim.
@@ -1027,24 +1284,48 @@ fn resolve_patches(
     mut policy: PatchPolicy,
     hooks: &dyn PolicyHooks,
     options: ResolveOptions,
+    home_lookup: HomeLookup<'_>,
 ) -> Result<(Vec<SessionPatch>, PatchPolicy), ResolveError> {
     let name_of = |pf: &PatchFile| pf.source_path.as_str().to_owned();
     let source_of = |pf: PatchFile| pf.provenance;
 
-    let files = enumerate_patch_files(items, options.follow_symlinks)?;
+    // Resolve the host home directory up-front if (and only if) any
+    // `~`-prefixed pattern is in scope. Cached as `Option<HostAbsPath>`
+    // and reused across passes; refreshed only if the hook later
+    // introduces a `~`-prefixed rule into the policy and we hadn't
+    // resolved before. A `~`-free resolution never invokes the
+    // lookup.
+    let mut home: Option<HostAbsPath> =
+        if patches_have_tilde_pattern(&items) || policy_has_tilde_pattern(&policy) {
+            Some(resolve_home(home_lookup)?)
+        } else {
+            None
+        };
+
+    let files = enumerate_patch_files(items, options.follow_symlinks, home.as_ref())?;
+
+    // Two policies in flight:
+    //   - `policy` (raw): handed to the hook, returned to the caller —
+    //     patterns retain their `~` form so the policy round-trips.
+    //   - `expanded`: home-expanded copy used for the actual `check`
+    //     calls — patterns actually match the absolute paths the
+    //     walker yields. Re-derived whenever the hook updates the
+    //     policy.
+    let mut expanded = expand_policy_home_opt(&policy, home.as_ref())?;
 
     // Pass 1: categorize per file.
     let mut allowed: Vec<PatchFile> = Vec::new();
     let mut unapproved: Vec<PatchFile> = Vec::new();
     for pf in files {
         let path = pf.source_path.clone();
-        match policy.check(&path, pf) {
+        match expanded.check(&path, pf) {
             CheckOutcome::Decided(d) => apply_decision(d, &mut allowed, name_of, source_of)?,
             CheckOutcome::NeedsApproval(pf) => unapproved.push(pf),
         }
     }
     if !unapproved.is_empty() {
-        // Pass 2: prompt.
+        // Pass 2: prompt. Hand the hook the *raw* policy so any rules
+        // it adds stay in `~/`-relative form.
         let view: Vec<Unapproved<'_, Utf8Path>> = unapproved
             .iter()
             .map(|pf| Unapproved {
@@ -1059,6 +1340,12 @@ fn resolve_patches(
             } => {
                 if let Some(new_policy) = updated_policy {
                     policy = new_policy;
+                    // If the hook introduced `~`-prefixed rules and we
+                    // hadn't already resolved home, resolve it now.
+                    if home.is_none() && policy_has_tilde_pattern(&policy) {
+                        home = Some(resolve_home(home_lookup)?);
+                    }
+                    expanded = expand_policy_home_opt(&policy, home.as_ref())?;
                 }
                 decisions
             }
@@ -1082,7 +1369,7 @@ fn resolve_patches(
                 }
                 ItemDecision::UseRule => {
                     let path = pf.source_path.clone();
-                    match policy.check(&path, pf) {
+                    match expanded.check(&path, pf) {
                         CheckOutcome::Decided(d) => {
                             apply_decision(d, &mut allowed, name_of, source_of)?;
                         }
@@ -1135,6 +1422,13 @@ mod tests {
         Source::Project {
             path: HostPath::new("/repo"),
         }
+    }
+
+    /// Default `HomeLookup` for tests: returns `None`. Tests that
+    /// actually need home expansion (or whose paths happen to start
+    /// with `~`) should override this.
+    fn no_home() -> impl Fn() -> Option<std::path::PathBuf> {
+        || None
     }
 
     fn pv_with(name: &str, source: Source) -> ProvenancedVar {
@@ -1426,8 +1720,14 @@ mod tests {
             let (_tmp, patch) = single_file_patch("hello.txt", "config/hello.txt");
             let pp = ProvenancedPatch::new(patch, user_source());
             let policy = PatchPolicy::empty();
-            let (resolved, _) =
-                resolve_patches(vec![pp], policy, &PanicHook, ResolveOptions::default()).unwrap();
+            let (resolved, _) = resolve_patches(
+                vec![pp],
+                policy,
+                &PanicHook,
+                ResolveOptions::default(),
+                &no_home(),
+            )
+            .unwrap();
             assert_eq!(resolved.len(), 1);
             assert_eq!(resolved[0].source(), &user_source());
         }
@@ -1444,6 +1744,7 @@ mod tests {
                 policy,
                 &PassThroughHook,
                 ResolveOptions::default(),
+                &no_home(),
             )
             .unwrap();
             assert_eq!(resolved.len(), 1);
@@ -1460,6 +1761,7 @@ mod tests {
                 policy,
                 &PassThroughHook,
                 ResolveOptions::default(),
+                &no_home(),
             )
             .unwrap_err();
             assert!(matches!(err, ResolveError::Denied { .. }), "got: {err:?}");
@@ -1472,8 +1774,14 @@ mod tests {
             let (_tmp, patch) = single_file_patch("secret.pem", "config/x");
             let pp = ProvenancedPatch::new(patch, user_source());
             let policy = PatchPolicy::empty().try_with_deny(["**/*.pem"]).unwrap();
-            let (resolved, _) =
-                resolve_patches(vec![pp], policy, &PanicHook, ResolveOptions::default()).unwrap();
+            let (resolved, _) = resolve_patches(
+                vec![pp],
+                policy,
+                &PanicHook,
+                ResolveOptions::default(),
+                &no_home(),
+            )
+            .unwrap();
             assert_eq!(resolved.len(), 1);
         }
 
@@ -1482,8 +1790,14 @@ mod tests {
             let (_tmp, patch) = single_file_patch("trash.bak", "config/x");
             let pp = ProvenancedPatch::new(patch, user_source());
             let policy = PatchPolicy::empty().try_with_ignore(["**/*.bak"]).unwrap();
-            let (resolved, _) =
-                resolve_patches(vec![pp], policy, &PanicHook, ResolveOptions::default()).unwrap();
+            let (resolved, _) = resolve_patches(
+                vec![pp],
+                policy,
+                &PanicHook,
+                ResolveOptions::default(),
+                &no_home(),
+            )
+            .unwrap();
             assert!(resolved.is_empty());
         }
 
@@ -1505,8 +1819,14 @@ mod tests {
             );
             let pp = ProvenancedPatch::new(patch, user_source());
             let policy = PatchPolicy::empty();
-            let (mut resolved, _) =
-                resolve_patches(vec![pp], policy, &PanicHook, ResolveOptions::default()).unwrap();
+            let (mut resolved, _) = resolve_patches(
+                vec![pp],
+                policy,
+                &PanicHook,
+                ResolveOptions::default(),
+                &no_home(),
+            )
+            .unwrap();
             resolved.sort();
             let dests: Vec<_> = resolved
                 .iter()
@@ -1525,8 +1845,14 @@ mod tests {
             );
             let pp = ProvenancedPatch::new(patch, user_source());
             let policy = PatchPolicy::empty();
-            let err = resolve_patches(vec![pp], policy, &PanicHook, ResolveOptions::default())
-                .unwrap_err();
+            let err = resolve_patches(
+                vec![pp],
+                policy,
+                &PanicHook,
+                ResolveOptions::default(),
+                &no_home(),
+            )
+            .unwrap_err();
             assert!(
                 matches!(err, ResolveError::PatchWalk { ref sources } if !sources.is_empty()),
                 "got: {err:?}",
@@ -1543,12 +1869,361 @@ mod tests {
             );
             let pp = ProvenancedPatch::new(patch, user_source());
             let policy = PatchPolicy::empty();
-            let err = resolve_patches(vec![pp], policy, &PanicHook, ResolveOptions::default())
-                .unwrap_err();
+            let err = resolve_patches(
+                vec![pp],
+                policy,
+                &PanicHook,
+                ResolveOptions::default(),
+                &no_home(),
+            )
+            .unwrap_err();
             assert!(
                 matches!(err, ResolveError::PatchConfig { ref sources } if !sources.is_empty()),
                 "got: {err:?}",
             );
+        }
+
+        /// A `~/...` source pattern with a missing home directory
+        /// surfaces as `HomeUnresolved` — not a silent empty walk.
+        ///
+        /// Uses `&PanicHook` because the error must fire from the
+        /// up-front home-resolution step in `resolve_patches`, before
+        /// any patch is even walked or routed to the hook. If a future
+        /// refactor reorders resolution to walk/check before resolving
+        /// home, this test fails fast at the panic hook with a clear
+        /// "hook should not have been invoked" message rather than a
+        /// confusing wrong-error assertion.
+        #[test]
+        fn tilde_pattern_with_missing_home_errors() {
+            let patch = Patch::new(
+                FileSet::try_new("~/dotfiles/conf").unwrap(),
+                PatchDest::try_new("conf").unwrap(),
+            );
+            let pp = ProvenancedPatch::new(patch, user_source());
+            let policy = PatchPolicy::empty();
+            let err = resolve_patches(
+                vec![pp],
+                policy,
+                &PanicHook,
+                ResolveOptions::default(),
+                &no_home(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ResolveError::HomeUnresolved(HomeResolutionFailure::Unavailable),
+                ),
+                "got: {err:?}",
+            );
+        }
+
+        /// `~/...` source expansion against a stubbed home directory
+        /// successfully walks and finds files.
+        #[test]
+        fn tilde_pattern_expands_with_home_lookup() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
+            // Layout under the stubbed home:
+            //   <home>/dotfiles/conf
+            std::fs::create_dir_all(root.join("dotfiles").as_std_path()).unwrap();
+            std::fs::write(root.join("dotfiles/conf").as_std_path(), "x").unwrap();
+
+            let patch = Patch::new(
+                FileSet::try_new("~/dotfiles/conf").unwrap(),
+                PatchDest::try_new("conf").unwrap(),
+            );
+            let pp = ProvenancedPatch::new(patch, user_source());
+            let policy = PatchPolicy::empty();
+            let home_path = root.clone().into_std_path_buf();
+            let home = move || Some(home_path.clone());
+            let (resolved, _) = resolve_patches(
+                vec![pp],
+                policy,
+                &PanicHook,
+                ResolveOptions::default(),
+                &home,
+            )
+            .unwrap();
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(
+                resolved[0].patch().host_path().as_str(),
+                root.join("dotfiles/conf").as_str(),
+            );
+        }
+
+        /// A `deny = ["~/.ssh/**"]` policy pattern actually denies a
+        /// project-origin patch whose source matches the expanded
+        /// path. Without policy expansion the deny would silently
+        /// match nothing (literal `~` vs. absolute `/home/...`).
+        #[test]
+        fn policy_tilde_pattern_actually_denies() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
+            std::fs::create_dir_all(root.join(".ssh").as_std_path()).unwrap();
+            std::fs::write(root.join(".ssh/id_rsa").as_std_path(), "secret").unwrap();
+
+            // Project-origin so the deny rule applies (user origin
+            // bypasses).
+            let patch = Patch::new(
+                FileSet::try_new(root.join(".ssh/id_rsa").as_str()).unwrap(),
+                PatchDest::try_new("id_rsa").unwrap(),
+            );
+            let pp = ProvenancedPatch::new(patch, project_source());
+
+            let policy = PatchPolicy::empty().try_with_deny(["~/.ssh/**"]).unwrap();
+            let home_path = root.clone().into_std_path_buf();
+            let home = move || Some(home_path.clone());
+
+            let err = resolve_patches(
+                vec![pp],
+                policy,
+                &PassThroughHook,
+                ResolveOptions::default(),
+                &home,
+            )
+            .unwrap_err();
+            assert!(matches!(err, ResolveError::Denied { .. }), "got: {err:?}");
+        }
+
+        /// A home lookup returning a non-UTF-8 path surfaces as
+        /// `HomeUnresolved::NotUtf8` — distinct from the "no home
+        /// available" case.
+        #[cfg(unix)]
+        #[test]
+        fn non_utf8_home_surfaces_as_not_utf8() {
+            use std::os::unix::ffi::OsStringExt;
+
+            let patch = Patch::new(
+                FileSet::try_new("~/conf").unwrap(),
+                PatchDest::try_new("conf").unwrap(),
+            );
+            let pp = ProvenancedPatch::new(patch, user_source());
+            let policy = PatchPolicy::empty();
+            // 0xFF 0xFE is invalid UTF-8.
+            let bad_home =
+                std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xFF, 0xFE]));
+            let home = move || Some(bad_home.clone());
+            let err = resolve_patches(
+                vec![pp],
+                policy,
+                &PanicHook,
+                ResolveOptions::default(),
+                &home,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ResolveError::HomeUnresolved(HomeResolutionFailure::NotUtf8 { .. }),
+                ),
+                "got: {err:?}",
+            );
+        }
+
+        /// A home lookup returning a relative path surfaces as
+        /// `HomeResolutionFailure::NotAbsolute` — home is supposed to be
+        /// absolute by POSIX convention, and a relative result means a
+        /// broken lookup, not a config error.
+        #[test]
+        fn relative_home_surfaces_as_not_absolute() {
+            let patch = Patch::new(
+                FileSet::try_new("~/conf").unwrap(),
+                PatchDest::try_new("conf").unwrap(),
+            );
+            let pp = ProvenancedPatch::new(patch, user_source());
+            let policy = PatchPolicy::empty();
+            let home = || Some(std::path::PathBuf::from("relative/home"));
+            let err = resolve_patches(
+                vec![pp],
+                policy,
+                &PanicHook,
+                ResolveOptions::default(),
+                &home,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ResolveError::HomeUnresolved(HomeResolutionFailure::NotAbsolute(_)),
+                ),
+                "got: {err:?}",
+            );
+        }
+
+        /// A policy with a `~`-prefixed pattern but no home lookup
+        /// surfaces as `HomeUnresolved` — not silently allowed.
+        #[test]
+        fn policy_tilde_pattern_without_home_errors() {
+            let (_tmp, patch) = single_file_patch("conf.toml", "conf");
+            let pp = ProvenancedPatch::new(patch, user_source());
+            let policy = PatchPolicy::empty().try_with_deny(["~/.ssh/**"]).unwrap();
+            let err = resolve_patches(
+                vec![pp],
+                policy,
+                &PanicHook,
+                ResolveOptions::default(),
+                &no_home(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ResolveError::HomeUnresolved(HomeResolutionFailure::Unavailable),
+                ),
+                "got: {err:?}",
+            );
+        }
+
+        /// A `~user/...` pattern is POSIX per-user expansion, which
+        /// `expand_home` doesn't implement. The tilde predicate must
+        /// not treat it as a home-expansion candidate; otherwise an
+        /// unavailable home lookup would surface `HomeUnresolved` for
+        /// a pattern that the resolver wouldn't have touched anyway.
+        #[test]
+        fn user_prefixed_tilde_does_not_trigger_home_lookup() {
+            let (_tmp, patch) = single_file_patch("conf.toml", "conf");
+            let pp = ProvenancedPatch::new(patch, user_source());
+            let policy = PatchPolicy::empty()
+                .try_with_deny(["~someuser/.ssh/**"])
+                .unwrap();
+            // `no_home()` would error if the lookup were invoked.
+            let resolved = resolve_patches(
+                vec![pp],
+                policy,
+                &PassThroughHook,
+                ResolveOptions::default(),
+                &no_home(),
+            )
+            .unwrap();
+            assert_eq!(resolved.0.len(), 1);
+        }
+
+        /// The returned policy preserves raw `~` patterns — round-trip
+        /// safe. Expansion is internal-only.
+        #[test]
+        fn returned_policy_preserves_raw_tilde_patterns() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
+            let file = root.join("hello.txt");
+            std::fs::write(file.as_std_path(), "x").unwrap();
+
+            let patch = Patch::new(
+                FileSet::try_new(file.as_str()).unwrap(),
+                PatchDest::try_new("hello.txt").unwrap(),
+            );
+            let pp = ProvenancedPatch::new(patch, user_source());
+
+            let policy = PatchPolicy::empty()
+                .try_with_allow(["~/.config/**"])
+                .unwrap();
+            let home_path = root.clone().into_std_path_buf();
+            let home = move || Some(home_path.clone());
+
+            let (_resolved, policy_out) = resolve_patches(
+                vec![pp],
+                policy,
+                &PanicHook,
+                ResolveOptions::default(),
+                &home,
+            )
+            .unwrap();
+
+            // Returned policy still says `~/.config/**`, not the
+            // expanded form.
+            let allow_patterns: Vec<&str> = policy_out
+                .allow()
+                .iter()
+                .map(crate::patches::FileSet::pattern)
+                .collect();
+            assert_eq!(allow_patterns, ["~/.config/**"]);
+        }
+
+        /// Policies with no `~` patterns must not invoke the home
+        /// lookup. Pinned by a panicking lookup that fails the test
+        /// if it's called. This is the documented fast-path guarantee
+        /// for `HOME`-less environments.
+        #[test]
+        fn no_tilde_policy_does_not_invoke_home_lookup() {
+            let (_tmp, patch) = single_file_patch("conf.toml", "conf");
+            let pp = ProvenancedPatch::new(patch, user_source());
+            // No `~` anywhere — neither the patch source pattern
+            // (absolute tempdir) nor the policy pattern.
+            let policy = PatchPolicy::empty()
+                .try_with_deny(["/etc/forbidden/**"])
+                .unwrap();
+            let panic_home = || -> Option<std::path::PathBuf> {
+                panic!("home lookup must not be invoked when no `~` patterns are present");
+            };
+            let (_resolved, _) = resolve_patches(
+                vec![pp],
+                policy,
+                &PanicHook,
+                ResolveOptions::default(),
+                &panic_home,
+            )
+            .unwrap();
+        }
+
+        /// A hook that returns an `updated_policy` containing a new
+        /// `~`-prefixed deny rule must have that rule enforced in
+        /// Pass 3 — exercising the `expanded = expand_policy_home(...)`
+        /// re-derivation after the hook update.
+        #[test]
+        fn hook_added_tilde_rule_is_enforced_after_reexpansion() {
+            /// Hook that returns `UseRule` for every item and installs
+            /// a new `~/*.pem` deny rule in `updated_policy`.
+            struct TildeDenyAddingHook;
+            impl PolicyHooks for TildeDenyAddingHook {
+                fn on_var_unapproved(
+                    &self,
+                    _: VarsPolicy,
+                    items: &[Unapproved<'_, str>],
+                ) -> HookResult<VarsPolicy> {
+                    HookResult::decided(vec![ItemDecision::UseRule; items.len()])
+                }
+                fn on_patch_unapproved(
+                    &self,
+                    policy: PatchPolicy,
+                    items: &[Unapproved<'_, camino::Utf8Path>],
+                ) -> HookResult<PatchPolicy> {
+                    // Hand back the policy with an added `~/*.pem`
+                    // deny rule. The resolver must re-expand before
+                    // re-checking on UseRule, or the literal `~`
+                    // pattern won't match the absolute source path.
+                    let updated = policy.try_with_deny(["~/*.pem"]).unwrap();
+                    HookResult::decided_with_policy(
+                        vec![ItemDecision::UseRule; items.len()],
+                        updated,
+                    )
+                }
+            }
+
+            let tmp = tempfile::tempdir().unwrap();
+            let root = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
+            let file = root.join("secret.pem");
+            std::fs::write(file.as_std_path(), "x").unwrap();
+
+            // Project-origin so allow/deny applies.
+            let patch = Patch::new(
+                FileSet::try_new(file.as_str()).unwrap(),
+                PatchDest::try_new("secret.pem").unwrap(),
+            );
+            let pp = ProvenancedPatch::new(patch, project_source());
+
+            let policy = PatchPolicy::empty();
+            let home_path = root.clone().into_std_path_buf();
+            let home = move || Some(home_path.clone());
+
+            let err = resolve_patches(
+                vec![pp],
+                policy,
+                &TildeDenyAddingHook,
+                ResolveOptions::default(),
+                &home,
+            )
+            .unwrap_err();
+            assert!(matches!(err, ResolveError::Denied { .. }), "got: {err:?}");
         }
     }
 
@@ -1806,7 +2481,7 @@ mod tests {
             let loadout = Loadout::new(LoadoutName::try_new("dev").unwrap())
                 .with_var(StrictVarName::try_new("LANG").unwrap(), VarValue::Inherit);
 
-            let mut composer = Composer::with_env(Box::new(|name| {
+            let mut composer = Composer::new().with_env(Box::new(|name| {
                 if name == "LANG" {
                     Ok("en_US.UTF-8".into())
                 } else {

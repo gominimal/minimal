@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 common.workspace = true
+dirs.workspace = true
 globset.workspace = true
 camino.workspace = true
 nutype.workspace = true
