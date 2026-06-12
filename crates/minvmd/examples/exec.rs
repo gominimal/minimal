@@ -99,7 +99,7 @@ async fn main() {
                 "\x1b[2m→ exit {}\x1b[0m",
                 exit.map(|c| c as i32).unwrap_or(-1)
             );
-            std::process::exit(exit.unwrap_or(0) as i32);
+            std::process::exit(exit.map(|c| c as i32).unwrap_or(1));
         }
         Err(e) => {
             eprintln!("error: {e}");

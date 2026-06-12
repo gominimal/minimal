@@ -27,6 +27,7 @@ for v in MINVMD_KERNEL_PATH MINVMD_ROOTFS_PATH MINVMD_INITRAMFS; do
 done
 [ -x "$BIN" ] || { echo "minvmd binary not found/executable: $BIN" >&2; exit 1; }
 command -v perl >/dev/null || { echo "perl required for sub-ms timing" >&2; exit 1; }
+command -v timeout >/dev/null || { echo "timeout required (install GNU coreutils)" >&2; exit 1; }
 
 # A healthy boot reaches READY in well under a second; cap each attempt so a
 # broken setup fails fast instead of looking hung for minutes.
@@ -53,7 +54,7 @@ trap 'echo; echo "interrupted — tearing down" >&2; teardown; exit 130' INT TER
 # if the artifacts/codesign are wrong, rather than silently N times below.
 echo "warming up (cold boot, discarded)…" >&2
 teardown
-if ! timeout "$BOOT_TIMEOUT" "$BIN" boot </dev/null >"$OUT" 2>&1 || ! grep -q vm-up "$OUT"; then
+if ! timeout "$BOOT_TIMEOUT" "$BIN" boot </dev/null >"$OUT" 2>&1 || ! grep -qx vm-up "$OUT"; then
   echo "warmup boot did not reach vm-up — check artifacts, codesign, and libkrun:" >&2
   tail -6 "$OUT" >&2
   exit 1
@@ -63,7 +64,7 @@ teardown
 samples=()
 for i in $(seq 1 "$N"); do
   t0="$(now_ms)"
-  if timeout "$BOOT_TIMEOUT" "$BIN" boot </dev/null >"$OUT" 2>/dev/null && grep -q vm-up "$OUT"; then
+  if timeout "$BOOT_TIMEOUT" "$BIN" boot </dev/null >"$OUT" 2>/dev/null && grep -qx vm-up "$OUT"; then
     t1="$(now_ms)"; ms="$(( t1 - t0 ))"; samples+=( "$ms" )
     printf 'run %2d/%d: %4d ms\n' "$i" "$N" "$ms" >&2
   else
