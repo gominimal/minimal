@@ -29,13 +29,14 @@ all three are already platform-agnostic.
 
 libkrun exports the **same C API** on macOS (Hypervisor.framework) and
 Linux (KVM). The platform difference is internal to the library. At the FFI
-boundary, `krun/raw.rs` and `krun/ctx.rs` need no code changes — the
+boundary, `krun/raw.rs` and `krun/ctx.rs` need no API-level changes — the
 `extern "C"` block carries no platform qualifier and the safe wrappers are
-already correct. The change is mechanical because the current
+already correct. Enabling Linux nonetheless requires removing the
 `#[cfg(target_os = "macos")]` guards on `pub mod krun`, `kernel_format()`,
-and `VmConfig::apply()` are not expressing a meaningful platform split —
-they exist only because the macOS implementation came first. Extending to
-Linux therefore requires:
+and `VmConfig::apply()`, and adding a Linux linker-setup branch in
+`build.rs`. The change is mechanical because those guards are not
+expressing a meaningful platform split — they exist only because the macOS
+implementation came first. Extending to Linux therefore requires:
 
 1. **Build script** (`build.rs`): add a Linux linker-setup branch. The
    current `build.rs` returns early on non-macOS (it is explicitly a no-op
@@ -83,12 +84,13 @@ guards and extending `build.rs` is the minimum change.
 
 ### `crates/minvmd/build.rs`
 
-`CARGO_CFG_TARGET_OS == "linux"` branch added alongside the existing macOS
-branch. Emits `cargo:rustc-link-search=native=${LIBKRUN_PREFIX}/lib` and
-`cargo:rustc-link-arg=-Wl,-rpath,${LIBKRUN_PREFIX}/lib`, defaulting
-`LIBKRUN_PREFIX` to `/usr`. This matches the Fedora/RHEL package path
-(`dnf install libkrun-devel` → `/usr/lib`) and the runner provisioning
-convention that uses `LIBKRUN_PREFIX`.
+A `CARGO_CFG_TARGET_OS == "linux"` branch will be added alongside the
+existing macOS branch. The new Linux branch will emit
+`cargo:rustc-link-search=native=${LIBKRUN_PREFIX}/lib` and
+`cargo:rustc-link-arg=-Wl,-rpath,${LIBKRUN_PREFIX}/lib`, with
+`LIBKRUN_PREFIX` defaulting to `/usr` (proposed default, matching the
+Fedora `dnf install libkrun-devel` path at `/usr/lib`). The runner
+provisioning convention also uses `LIBKRUN_PREFIX` to override this default.
 
 ### `crates/minvmd/src/lib.rs`
 
