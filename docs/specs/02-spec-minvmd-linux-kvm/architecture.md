@@ -28,15 +28,21 @@ all three are already platform-agnostic.
 ### Why this is a mechanical change, not an architecture decision
 
 libkrun exports the **same C API** on macOS (Hypervisor.framework) and
-Linux (KVM). The platform difference is internal to the library and
-invisible at the FFI boundary in `krun/raw.rs`. The `extern "C"` block is
-already annotated `#[link(name = "krun")]` with no platform qualifier; the
-safe wrappers in `krun/ctx.rs` require no change. Extending to Linux is
-therefore primarily:
+Linux (KVM). The platform difference is internal to the library. At the FFI
+boundary, `krun/raw.rs` and `krun/ctx.rs` need no code changes — the
+`extern "C"` block carries no platform qualifier and the safe wrappers are
+already correct. The change is mechanical because the current
+`#[cfg(target_os = "macos")]` guards on `pub mod krun`, `kernel_format()`,
+and `VmConfig::apply()` are not expressing a meaningful platform split —
+they exist only because the macOS implementation came first. Extending to
+Linux therefore requires:
 
-1. **Build script** (`build.rs`): emit `rustc-link-search` and `-rpath`
-   for Linux, defaulting to `/usr` (Fedora `dnf install libkrun-devel` path)
-   with the same `LIBKRUN_PREFIX` override as macOS.
+1. **Build script** (`build.rs`): add a Linux linker-setup branch. The
+   current `build.rs` returns early on non-macOS (it is explicitly a no-op
+   on Linux and never links libkrun). The new branch emits
+   `cargo:rustc-link-search` and `cargo:rustc-link-arg=-Wl,-rpath` via
+   `LIBKRUN_PREFIX` (defaulting to `/usr`, the Fedora
+   `dnf install libkrun-devel` path).
 2. **Module gating** (`lib.rs`): remove the `#[cfg(target_os = "macos")]`
    guard on `pub mod krun` so the FFI module is compiled on Linux.
 3. **Kernel format** (`image.rs`): remove the `#[cfg(target_os = "macos")]`
@@ -153,8 +159,9 @@ unchanged. The test bodies require no change.
 A Linux KVM e2e job on a self-hosted KVM-capable runner (GCP nested-virt or
 equivalent). It provisions libkrun ≥ 1.19.0, materializes the kernel +
 rootfs + initramfs from Minimal packages, sets `MINVMD_E2E=1`, and runs
-`cargo test -p minvmd -- --include-ignored`. Initially `continue-on-error:
-true`; promoted to required once the runner is stable.
+`cargo test -p minvmd -- --include-ignored`. The job is required (no
+`continue-on-error`) from the moment it is introduced — failures must
+block merges to close the Linux-host support gap.
 
 ## Alternatives considered
 
