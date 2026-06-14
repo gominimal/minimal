@@ -241,6 +241,108 @@ jobs:
       - name: Check
         run: minimal --no-fetch check
 
+  minvmd-linux-kvm-e2e:
+    # minvmd Linux/KVM end-to-end on a self-hosted KVM-capable runner (#411,
+    # #410). libkrun's KVM backend boots the guest; the three e2e tests cover the
+    # READY round-trip (R2.4), the full minimald session over the bridge, and
+    # concurrent bridge round-trips (R3.3/R3.4). A Linux runner can materialize
+    # the guest artifacts itself (the scripts are Linux-only), so unlike the
+    # macOS workflow no separate artifact job is needed.
+    #
+    # OPT-IN: ci.yml is not path-scoped, so this job runs only when the
+    # RUN_LINUX_KVM_CI repo variable is 'true'. Set it once a runner labelled
+    # `[self-hosted, linux, kvm]` is provisioned with /dev/kvm + libkrun.
+    # NON-GATING: deliberately absent from ci-success below, so an unavailable
+    # runner never blocks PRs.
+    if: ${{ vars.RUN_LINUX_KVM_CI == 'true' }}
+    runs-on: [self-hosted, linux, kvm]
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Export guest artifact paths
+        # `runner.temp` is not available in job-level `env:`, so publish the
+        # artifact paths (and the E2E gate) to $GITHUB_ENV for the e2e + bench
+        # steps to inherit.
+        run: |
+          {
+            echo "MINVMD_E2E=1"
+            echo "MINVMD_KERNEL_PATH=$RUNNER_TEMP/vmlinuz"
+            echo "MINVMD_ROOTFS_PATH=$RUNNER_TEMP/rootfs.img"
+            echo "MINVMD_INITRAMFS=$RUNNER_TEMP/initramfs.cpio"
+          } >> "$GITHUB_ENV"
+      - name: Verify /dev/kvm is available
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm not found — provision a KVM-capable runner." >&2
+            exit 1
+          fi
+      - name: Verify libkrun is available
+        # libkrun (KVM backend) must be preprovisioned on the runner. minvmd's
+        # build script auto-detects it; fail fast with guidance if it is missing
+        # rather than silently building the no-op stub.
+        run: |
+          if ! ls /usr/local/lib/libkrun.so* /usr/lib/libkrun.so* /usr/lib/*/libkrun.so* >/dev/null 2>&1; then
+            echo "::error::libkrun.so not found — install libkrun on the runner (or set LIBKRUN_PREFIX)." >&2
+            exit 1
+          fi
+      - name: Resolve guest arch
+        id: arch
+        run: |
+          case "$(uname -m)" in
+            aarch64|arm64) echo "arch=aarch64" >> "$GITHUB_OUTPUT"; echo "target=aarch64-unknown-linux-musl" >> "$GITHUB_OUTPUT" ;;
+            x86_64) echo "arch=x86_64"  >> "$GITHUB_OUTPUT"; echo "target=x86_64-unknown-linux-musl"  >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::unsupported runner arch $(uname -m)"; exit 1 ;;
+          esac
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Cache cargo + build artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ steps.arch.outputs.arch }}-minvmd-kvm-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ steps.arch.outputs.arch }}-minvmd-kvm-
+      - name: Materialize guest kernel (raw Image)
+        run: ./scripts/fetch-artifact.sh virtio-kernel "$RUNNER_TEMP/vmlinuz" "${{ steps.arch.outputs.arch }}"
+      - name: Materialize guest rootfs (ext4 image)
+        run: ./scripts/fetch-artifact.sh minvmd-rootfs "$RUNNER_TEMP/rootfs.img" "${{ steps.arch.outputs.arch }}"
+      - name: Build guest initramfs (minimald as /init)
+        run: ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs.cpio" "${{ steps.arch.outputs.target }}"
+      - name: Build minvmd
+        run: cargo build -p minvmd --bin minvmd
+      - name: Boot E2E (READY round-trip, R2.4)
+        env:
+          MINVMD_BOOT_LOG: ${{ runner.temp }}/boot.log
+        run: cargo test -p minvmd --test boot_e2e -- --include-ignored --nocapture
+      - name: Session E2E (full minimald session over the bridge)
+        run: cargo test -p minvmd --test minimald_session_e2e -- --include-ignored --nocapture --exact minimald_exec_over_bridge
+      - name: Bridge E2E (concurrent UDS↔vsock round-trips, R3.3/R3.4)
+        run: cargo test -p minvmd --test bridge_e2e -- --include-ignored --nocapture
+      - name: Boot latency benchmark (informational)
+        # Report boot-to-READY min/median/max against the ~75 ms macOS baseline.
+        # Non-gating (boot correctness is gated by the e2e tests above), so a
+        # timing hiccup never reds the build.
+        run: scripts/bench-minvmd-boot.sh 10 target/debug/minvmd || true
+      - name: Upload guest boot console log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minvmd-linux-boot-log
+          path: ${{ runner.temp }}/boot.log
+          if-no-files-found: ignore
+
   # Single required status check for branch protection. Stays green only when
   # every gating job below succeeds.
   ci-success:

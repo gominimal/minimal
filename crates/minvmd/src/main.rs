@@ -7,7 +7,9 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[derive(Parser)]
 #[command(name = "minvmd", version = env!("CARGO_PKG_VERSION"))]
-#[command(about = "macOS-only host daemon that brings up a Linux microVM via libkrun")]
+#[command(
+    about = "Host daemon that brings up a Linux microVM via libkrun (macOS/HVF or Linux/KVM)"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

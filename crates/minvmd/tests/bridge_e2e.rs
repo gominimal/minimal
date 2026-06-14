@@ -1,7 +1,7 @@
 //! Bridge end-to-end test: concurrent UDS↔vsock round-trips (R3.3, R3.4).
 //!
 //! Gates:
-//! - `#[cfg(target_os = "macos")]`: libkrun is macOS-only.
+//! - `#[cfg(minvmd_libkrun)]`: needs libkrun (macOS, or Linux with libkrun).
 //! - `#[ignore]`: skipped by default; run with `cargo test -- --include-ignored`.
 //! - `MINVMD_E2E=1`: even with `--include-ignored`, the test self-skips unless
 //!   this env var is set (prevents accidental VM boot on a dev machine without
@@ -18,7 +18,7 @@
 //! `XDG_RUNTIME_DIR`, so concurrent test runs on the same machine don't share
 //! a socket path.
 
-#![cfg(target_os = "macos")]
+#![cfg(minvmd_libkrun)]
 
 use serial_test::serial;
 use std::io::{BufRead, BufReader, Read, Write};

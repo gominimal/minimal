@@ -15,7 +15,7 @@ use crate::error::VmError;
 ///   half of boot-to-READY) versus a `PeGz` `Image.gz`. The aarch64 loader
 ///   implements only RAW and PE_GZ.
 /// - `x86_64`:  `virtio-linux` ships `bzImage`  → `KernelFormat::Elf`.
-#[cfg(target_os = "macos")]
+#[cfg(minvmd_libkrun)]
 pub fn kernel_format() -> crate::krun::KernelFormat {
     #[cfg(target_arch = "aarch64")]
     {
@@ -142,7 +142,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(minvmd_libkrun)]
     #[test]
     fn kernel_format_matches_arch() {
         let fmt = kernel_format();

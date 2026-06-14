@@ -50,7 +50,7 @@ impl VmConfig {
     ///
     /// Configures vcpus, RAM, kernel + initramfs, the ext4 root disk, and the
     /// host UDS↔vsock bridge for minimald (R3.1).
-    #[cfg(target_os = "macos")]
+    #[cfg(minvmd_libkrun)]
     pub fn apply(&self, ctx: &mut crate::krun::Context) -> Result<(), crate::error::VmError> {
         ctx.set_vm_config(self.num_vcpus, self.ram_mib)?;
 

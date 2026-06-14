@@ -1,7 +1,7 @@
 //! Boot end-to-end test: READY-marker round-trip (R2.4).
 //!
 //! Gates:
-//! - `#[cfg(target_os = "macos")]`: libkrun is macOS-only.
+//! - `#[cfg(minvmd_libkrun)]`: needs libkrun (macOS, or Linux with libkrun).
 //! - `#[ignore]`: skipped by default; run with `cargo test -- --include-ignored`.
 //! - `MINVMD_E2E=1`: even with `--include-ignored`, the test self-skips unless
 //!   this env var is set (prevents accidental VM boot on a dev machine without
@@ -15,7 +15,7 @@
 //! that the guest's `/init` (minimald) wrote `READY\n` to the vsock marker port
 //! and the parent received it (R2.4).
 
-#![cfg(target_os = "macos")]
+#![cfg(minvmd_libkrun)]
 
 use serial_test::serial;
 use std::io::{BufRead, BufReader};
