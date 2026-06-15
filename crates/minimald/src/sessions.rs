@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
-use crate::session::{Session, SessionHandle};
+use crate::{
+    session::{Session, SessionHandle},
+    session_host::HostAttrs,
+};
 use paths::DaemonAbsPath;
 use sessions::{
     SessionId,
@@ -13,6 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 pub struct SessionInfo {
     pub id: SessionId,
     pub name: Option<String>,
+    pub attrs: Option<HostAttrs>,
 }
 
 /// A key you can use to identify a session.
@@ -109,17 +113,22 @@ impl<L: Loader> Manager<L> {
             // Lists all sessions.
             ManagerMessage::List(r) => {
                 r.handle(async {
-                    self.store
-                        .keys()
-                        .map(|k| {
+                    let mut out = Vec::with_capacity(32);
+                    for k in self.store.keys() {
+                        out.push({
                             let s = self.store.get(&k)?;
                             let r = s.record();
-                            Ok::<_, SessionsError>(SessionInfo {
+                            SessionInfo {
                                 id: r.id,
                                 name: r.name.clone(),
-                            })
-                        })
-                        .collect::<Result<_, _>>()
+                                attrs: match self.running.get(&k) {
+                                    Some(h) => h.get_attrs().await,
+                                    None => None,
+                                },
+                            }
+                        });
+                    }
+                    Ok(out)
                 })
                 .await;
             }
