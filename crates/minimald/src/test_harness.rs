@@ -179,6 +179,22 @@ impl TestClient {
             .unwrap()
     }
 
+    /// Opens a session channel, applies `env`, and requests the named
+    /// subsystem, returning the live channel so the caller can stream
+    /// arbitrary bytes through it (e.g. a zstd-compressed tarball).
+    pub(crate) async fn open_subsystem(
+        &mut self,
+        subsystem: &str,
+        env: &[(&str, &str)],
+    ) -> russh::Channel<russh::client::Msg> {
+        let channel = self.handle.channel_open_session().await.unwrap();
+        for (name, value) in env {
+            channel.set_env(true, *name, *value).await.unwrap();
+        }
+        channel.request_subsystem(true, subsystem).await.unwrap();
+        channel
+    }
+
     /// Opens an interactive shell channel attached to the given minimald
     /// session, mirroring what a real client does: sets `MINIMAL_SESSION_ID`,
     /// negotiates a PTY, then issues a `shell` request. Returns the live
