@@ -1,18 +1,21 @@
 use minimald_rpc::{
     CreateSession, CreateSessionResponse, Errorable, GetSessionRecord, GetSessionRecordRequest,
     GetSessionRecordResponse, GetVersion, GetVersionResponse, ListSessions, ListSessionsEntry,
-    ListSessionsResponse, OneshotSshRpc,
+    ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
     server::{Msg, Session},
 };
+use sessions::SessionId;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::spawn;
 
 use crate::{
+    ChannelConfig,
     connection::{ConnectionError, ConnectionHandle},
     server::ServerStateHandle,
+    sessions::SessionKeyPredicate,
 };
 
 /// Server-side serving glue for [`OneshotSshRpc`]s.
@@ -148,6 +151,56 @@ async fn serve_create_session(s: ServerStateHandle, c: RuChannel<Msg>) {
     }
 }
 
+pub(crate) const STREAM_WORKSPACE_FILES: &str =
+    constcat::concat!(RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst");
+
+async fn serve_stream_workspace_files(
+    s: ServerStateHandle,
+    config: ChannelConfig,
+    mut c: RuChannel<Msg>,
+) {
+    if let Err(msg) = unpack_workspace_files(&s, &config, &mut c).await {
+        let _ = c.extended_data_bytes(1, msg).await;
+    }
+    let _ = c.close().await;
+}
+
+/// Unpacks the zstd-compressed tarball streamed over `c` into the
+/// workspace directory of the session named by the channel environment.
+///
+/// On failure, returns the human-readable message to relay back to the
+/// client over the channel's extended-data stream.
+async fn unpack_workspace_files(
+    s: &ServerStateHandle,
+    config: &ChannelConfig,
+    c: &mut RuChannel<Msg>,
+) -> Result<(), String> {
+    let session_id_str = config
+        .env_vars
+        .get(crate::MINIMAL_SESSION_ID_ENV)
+        .ok_or("missing env-var MINIMAL_SESSION_ID")?;
+    let session_id =
+        SessionId::parse_str(session_id_str).map_err(|e| format!("parsing session UUID: {e}"))?;
+
+    let mngr = s.sessions_manager().await;
+    let session_handle = mngr
+        .get_session(SessionKeyPredicate::Id(session_id))
+        .await
+        .map_err(|e| format!("session UUID lookup failed: {e}"))?
+        .ok_or("unknown session UUID")?;
+    let workspace_path = session_handle.workspace_path().await;
+
+    let reader = async_compression::tokio::bufread::ZstdDecoder::new(tokio::io::BufReader::new(
+        c.make_reader(),
+    ));
+    async_tar::Archive::new(reader)
+        .unpack(workspace_path.as_utf8_path())
+        .await
+        .map_err(|e| format!("unpack failed: {e}"))?;
+
+    Ok(())
+}
+
 /// Handles an RPC going over an SSH subsystem channel.
 ///
 /// This method takes ownership of the ssh channel, including
@@ -165,15 +218,19 @@ pub async fn handle_ssh_rpc(
     session: &mut Session,
 ) -> Result<(), ConnectionError> {
     // Take the channel from connection state if its a known RPC.
-    let channel = match name {
-        GetVersion::NAME | ListSessions::NAME | GetSessionRecord::NAME | CreateSession::NAME => {
+    let res = match name {
+        GetVersion::NAME
+        | ListSessions::NAME
+        | GetSessionRecord::NAME
+        | CreateSession::NAME
+        | STREAM_WORKSPACE_FILES => {
             let mut conn_lock = c.lock().await;
             let c_hnd = match conn_lock.take(id) {
                 None => {
                     session.channel_failure(id)?;
                     return Ok(());
                 }
-                Some((channel, _p)) => channel,
+                Some((channel, config)) => (channel, config),
             };
             drop(conn_lock);
             session.channel_success(id)?;
@@ -184,8 +241,8 @@ pub async fn handle_ssh_rpc(
             None
         }
     };
-    let channel = match channel {
-        Some(c) => c,
+    let (channel, config) = match res {
+        Some((channel, config)) => (channel, config),
         None => return Ok(()),
     };
 
@@ -195,6 +252,7 @@ pub async fn handle_ssh_rpc(
         ListSessions::NAME => spawn(serve_list_sessions(s, channel)),
         GetSessionRecord::NAME => spawn(serve_get_session_record(s, channel)),
         CreateSession::NAME => spawn(serve_create_session(s, channel)),
+        STREAM_WORKSPACE_FILES => spawn(serve_stream_workspace_files(s, config, channel)),
         _ => unreachable!(),
     };
 
@@ -203,12 +261,131 @@ pub async fn handle_ssh_rpc(
 
 #[cfg(test)]
 mod tests {
-    use minimald_rpc::CreateSessionRequest;
+    use minimald_rpc::{CreateSession, CreateSessionRequest};
     use paths::HostAbsPath;
     use sessions::SessionId;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
-    use crate::test_harness::TestServer;
+    use crate::MINIMAL_SESSION_ID_ENV;
+    use crate::sessions::SessionKeyPredicate;
+    use crate::test_harness::{TestClient, TestServer};
+
+    /// Serializes `(path, contents)` entries into a tar archive and
+    /// zstd-compresses it, producing exactly the wire format that
+    /// [`serve_stream_workspace_files`] decodes.
+    async fn tar_zst(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut tar = async_tar::Builder::new(Vec::new());
+        for (path, contents) in entries {
+            let mut header = async_tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            tar.append_data(&mut header, path, *contents).await.unwrap();
+        }
+        let tar_bytes = tar.into_inner().await.unwrap();
+
+        let mut encoder = async_compression::tokio::write::ZstdEncoder::new(Vec::new());
+        encoder.write_all(&tar_bytes).await.unwrap();
+        encoder.shutdown().await.unwrap();
+        encoder.into_inner()
+    }
+
+    /// Creates a session through the public RPC and returns its id.
+    async fn fresh_session(client: &mut TestClient) -> SessionId {
+        client
+            .call::<CreateSession>(&CreateSessionRequest {
+                record: sessions::Record {
+                    id: SessionId::nil(),
+                    name: Some("stream-test".to_string()),
+                    username: None,
+                    project_path: HostAbsPath::try_new("/tmp").unwrap(),
+                    attrs: Default::default(),
+                },
+            })
+            .await
+            .unwrap()
+            .id
+    }
+
+    #[tokio::test]
+    async fn stream_workspace_files_unpacks_tarball_into_workspace() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let payload = tar_zst(&[
+            ("hello.txt", b"hello world\n"),
+            ("dir/nested.txt", b"nested contents"),
+        ])
+        .await;
+
+        let channel = client
+            .open_subsystem(
+                STREAM_WORKSPACE_FILES,
+                &[(MINIMAL_SESSION_ID_ENV, &session_id.to_string())],
+            )
+            .await;
+        let mut stream = channel.into_stream();
+        stream.write_all(&payload).await.unwrap();
+        // Half-close so the server's decoder sees EOF; then read to the
+        // server's channel close so the unpack has completed on-disk
+        // before we assert.
+        stream.shutdown().await.unwrap();
+        let mut trailing = Vec::new();
+        stream.read_to_end(&mut trailing).await.unwrap();
+
+        let mngr = server.state.sessions_manager().await;
+        let handle = mngr
+            .get_session(SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("freshly-created session should be retrievable");
+        let workspace = handle.workspace_path().await;
+
+        assert_eq!(
+            tokio::fs::read(workspace.as_utf8_path().join("hello.txt"))
+                .await
+                .unwrap(),
+            b"hello world\n",
+        );
+        assert_eq!(
+            tokio::fs::read(workspace.as_utf8_path().join("dir/nested.txt"))
+                .await
+                .unwrap(),
+            b"nested contents",
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_workspace_files_rejects_unknown_session() {
+        use russh::ChannelMsg;
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        // A well-formed but unknown session id: the handler should report
+        // an error on stderr (ssh extended data) rather than unpacking.
+        let mut channel = client
+            .open_subsystem(
+                STREAM_WORKSPACE_FILES,
+                &[(MINIMAL_SESSION_ID_ENV, &SessionId::nil().to_string())],
+            )
+            .await;
+        channel.eof().await.unwrap();
+
+        let mut stderr = Vec::new();
+        while let Some(msg) = channel.wait().await {
+            if let ChannelMsg::ExtendedData { data, ext: 1 } = msg {
+                stderr.extend_from_slice(&data);
+            }
+        }
+
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("unknown session"),
+            "expected an unknown-session error on stderr, got {:?}",
+            String::from_utf8_lossy(&stderr),
+        );
+    }
 
     #[tokio::test]
     async fn get_version_returns_compiled_in_versions() {
