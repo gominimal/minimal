@@ -22,12 +22,7 @@ pub(crate) async fn check_stack(
     use nickel_lang_core::program::{BuilderError, ProgramBuilder};
     use nickel_lang_core::{error::NullReporter, eval::cache::CacheImpl, program::Program};
 
-    // TODO: Transitioning from 'harness' => 'stack', remove after May 2026
-    let entry_file = if stacks_dir.join(&stack).join("harness.ncl").exists() {
-        stacks_dir.join(&stack).join("harness.ncl")
-    } else {
-        stacks_dir.join(&stack).join("stack.ncl")
-    };
+    let entry_file = stacks_dir.join(&stack).join("stack.ncl");
 
     let program_res: Result<Program<CacheImpl>, _> = ProgramBuilder::new()
         .add_source(

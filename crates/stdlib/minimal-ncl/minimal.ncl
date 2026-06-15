@@ -289,9 +289,6 @@ let CmdSpec = std.contract.any_of [
         matches_project_if_any | Array StackMatcherEntry | optional,
         matches_project_priority | Number | optional,
     },
-    # TODO: Remove after May 2026.
-    harness | Dyn -> Stack | doc "Constructs a stack." =
-        fun spec => spec | Stack,
     stack | Dyn -> Stack | doc "Constructs a stack." =
         fun spec => spec | Stack,
 

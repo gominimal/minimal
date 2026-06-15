@@ -147,4 +147,4 @@ remote-client = { version = "0.0.1", path = "crates/remote-client" }
 sandbox2 = { version = "0.0.1", path = "crates/sandbox2" }
 sessions = { version = "0.0.1", path = "crates/sessions" }
 
-stdlib = { version = "0.0.15", path = "crates/stdlib" }
+stdlib = { version = "0.0.16", path = "crates/stdlib" }

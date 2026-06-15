@@ -292,24 +292,6 @@ impl Loader {
             }
         }
         src.push_str("\tstacks = [\n");
-        // TODO: Remove after May 2026 (harnesses kept for compatibility).
-        match std::fs::read_dir(layer_dir.as_ref().join("harnesses")) {
-            Err(e) => {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    return Err(e.into());
-                }
-            }
-            Ok(d) => {
-                for e in d {
-                    let e = e?;
-                    if e.file_type()?.is_dir() {
-                        src.push_str("  import \"");
-                        src.push_str(e.path().to_str().unwrap());
-                        src.push_str("/harness.ncl\",\n");
-                    }
-                }
-            }
-        }
         match std::fs::read_dir(layer_dir.as_ref().join("stacks")) {
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::NotFound {
@@ -572,7 +554,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp_dir.path().join("packages")).unwrap();
         std::fs::create_dir(temp_dir.path().join("profiles")).unwrap();
-        std::fs::create_dir(temp_dir.path().join("harnesses")).unwrap();
+        std::fs::create_dir(temp_dir.path().join("stacks")).unwrap();
 
         // Create multiple packages
         for pkg_name in &["package-a", "package-b", "package-c"] {
@@ -609,15 +591,15 @@ mod tests {
             },
         )
         .unwrap();
-        // Make a harness called rust
-        let harness_dir = temp_dir.path().join("harnesses").join("rust");
+        // Make a stack called rust
+        let harness_dir = temp_dir.path().join("stacks").join("rust");
         std::fs::create_dir(&harness_dir).unwrap();
         std::fs::write(
-            harness_dir.join("harness.ncl"),
+            harness_dir.join("stack.ncl"),
             indoc! {
             "
-            let {harness, ..} = import \"minimal.ncl\" in
-            harness {
+            let {stack, ..} = import \"minimal.ncl\" in
+            stack {
         		name = \"rust\"
         	}
 			"

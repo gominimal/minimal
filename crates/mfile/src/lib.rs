@@ -496,6 +496,8 @@ pub struct File {
     #[serde(default, alias = "default")]
     pub defaults: Defaults,
     /// The stack configured on this repository, if any.
+    ///
+    /// TODO: Remove `harness` alias after July 2026.
     #[serde(default, alias = "harness")]
     pub stack: Option<Stack>,
 

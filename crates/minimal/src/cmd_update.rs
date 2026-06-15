@@ -79,6 +79,7 @@ pub async fn cmd_update(_args: UpdateArgs, ctx: &mut Context) -> Result<(), Erro
             .map_err(|e| Error::Other(anyhow::Error::from(e)))?;
 
         let mut did_upgrade_fmt = false;
+        // TODO: Remove after June 2026.
         if let Some(t) = doc.remove("harness") {
             println!("Renamed `[harness]` to its new name `[stack]`");
             doc.insert("stack", t);

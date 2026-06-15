@@ -1,9 +1,9 @@
 [upstream] # Source of software & tooling
 repo = "https://github.com/gominimal/pkgs"
 branch = "main"
-locked_commit = "64e6866"
+locked_commit = "560b0d09914758441770363ed60823dff6c921b4"
 
-[harness]
+[stack]
 use = "rust"
 runtime_packages = ["socat"]
 
