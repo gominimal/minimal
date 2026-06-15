@@ -222,7 +222,8 @@ mod tests {
     use russh::ChannelMsg;
     use sessions::SessionId;
 
-    use crate::rpc::{CreateSession, CreateSessionRequest};
+    use minimald_rpc::{CreateSession, CreateSessionRequest};
+
     use crate::test_harness::{TestClient, TestServer};
 
     /// Creates a fresh session on the server and returns its id.

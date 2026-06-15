@@ -1205,8 +1205,9 @@ mod tests {
         use paths::HostAbsPath;
         use sessions::SessionId;
 
+        use minimald_rpc::{CreateSession, CreateSessionRequest};
+
         use crate::MINIMAL_SESSION_ID_ENV;
-        use crate::rpc::{CreateSession, CreateSessionRequest};
         use crate::sessions::SessionKeyPredicate;
         use crate::test_harness::{TestClient, TestServer};
 

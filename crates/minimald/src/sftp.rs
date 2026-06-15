@@ -467,7 +467,8 @@ mod tests {
     use sessions::SessionId;
     use tokio::io::AsyncWriteExt;
 
-    use crate::rpc::{CreateSession, CreateSessionRequest};
+    use minimald_rpc::{CreateSession, CreateSessionRequest};
+
     use crate::test_harness::TestServer;
 
     /// Creates a fresh session through the public CreateSession RPC and

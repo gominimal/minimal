@@ -31,6 +31,7 @@ args.workspace = true
 graph.workspace = true
 mctx.workspace = true
 mfile.workspace = true
+minimald-rpc.workspace = true
 ot.workspace = true
 paths.workspace = true
 sessions.workspace = true
