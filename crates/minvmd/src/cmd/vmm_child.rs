@@ -15,7 +15,7 @@
 //!    and chroots into it.
 //! 5. Registers the marker socket for `VSOCK_MARKER_PORT` (guest→host): the
 //!    guest workload connects to that vsock port and writes `READY\n`, which
-//!    libkrun bridges to the host UNIX socket where the parent listens (R2.4).
+//!    libkrun bridges to the host UNIX socket where the parent listens.
 //! 6. Calls `krun_start_enter`, which boots the VM. On success libkrun
 //!    `exit()`s with the guest workload's exit code and never returns here.
 //!
@@ -69,7 +69,7 @@ fn run_vmm() -> Result<()> {
     // `krun_add_vsock_port` is `krun_add_vsock_port2(.., listen=false)`: the
     // parent listens on the host UDS `marker_sock`; the guest workload connects
     // to AF_VSOCK CID 2 (host) port VSOCK_MARKER_PORT and writes `READY\n`,
-    // which libkrun bridges to the parent (R2.4).
+    // which libkrun bridges to the parent.
     ctx.add_vsock_port(VSOCK_MARKER_PORT, &marker_sock)
         .context("registering READY-marker vsock port")?;
 

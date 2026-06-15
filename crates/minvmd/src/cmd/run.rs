@@ -66,6 +66,11 @@ pub fn poll_uds_ready(path: &std::path::Path, timeout: Duration) -> Result<()> {
 
 #[cfg(minvmd_libkrun)]
 fn run_supervisor(detach: bool, timeout_secs: u64) -> Result<()> {
+    // R2.4: fail fast with an actionable error if the hypervisor backend is
+    // unavailable (Linux: /dev/kvm). No-op on macOS. Runs in the foreground
+    // caller so the user sees the error directly, even under --detach.
+    crate::cmd::ensure_hypervisor_accessible()?;
+
     if detach {
         return run_detach(timeout_secs);
     }

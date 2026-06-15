@@ -244,7 +244,7 @@ jobs:
   minvmd-linux-kvm-e2e:
     # minvmd Linux/KVM end-to-end on a self-hosted KVM-capable runner (#411,
     # #410). libkrun's KVM backend boots the guest; the three e2e tests cover the
-    # READY round-trip (R2.4), the full minimald session over the bridge, and
+    # READY round-trip (R3.1), the full minimald session over the bridge, and
     # concurrent bridge round-trips (R3.3/R3.4). A Linux runner can materialize
     # the guest artifacts itself (the scripts are Linux-only), so unlike the
     # macOS workflow no separate artifact job is needed.
@@ -322,7 +322,7 @@ jobs:
         run: ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs.cpio" "${{ steps.arch.outputs.target }}"
       - name: Build minvmd
         run: cargo build -p minvmd --bin minvmd
-      - name: Boot E2E (READY round-trip, R2.4)
+      - name: Boot E2E (READY round-trip, R3.1)
         env:
           MINVMD_BOOT_LOG: ${{ runner.temp }}/boot.log
         run: cargo test -p minvmd --test boot_e2e -- --include-ignored --nocapture

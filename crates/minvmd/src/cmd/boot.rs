@@ -45,6 +45,10 @@ fn run_boot(foreground: bool) -> Result<()> {
     use crate::image::{resolve_kernel_path, resolve_rootfs_path};
     use crate::state::StateDir;
 
+    // R2.4: fail fast with an actionable error if the hypervisor backend is
+    // unavailable (Linux: /dev/kvm). No-op on macOS.
+    crate::cmd::ensure_hypervisor_accessible()?;
+
     // Fail-fast: resolve paths before spawning anything.
     let _kernel = resolve_kernel_path().context("resolving kernel path")?;
     let _rootfs = resolve_rootfs_path().context("resolving rootfs path")?;

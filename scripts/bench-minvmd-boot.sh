@@ -7,10 +7,14 @@
 # the gzip kernel decompress was ~77 ms of a ~146 ms boot (fixed by shipping the
 # kernel uncompressed + KRUN_KERNEL_FORMAT_RAW → ~67 ms).
 #
-# macOS-only (minvmd boots a libkrun microVM via Hypervisor.framework). The
-# minvmd binary must be codesigned with the hypervisor entitlement first:
+# Runs on macOS (Hypervisor.framework) and Linux (KVM) — minvmd abstracts the
+# backend via libkrun. The script body is portable (perl/pkill/timeout/sort).
+#
+# macOS only: the minvmd binary must be codesigned with the hypervisor
+# entitlement before it can boot a VM:
 #   cargo build -p minvmd --bin minvmd
 #   codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
+# Linux needs no codesigning — KVM access is governed by /dev/kvm permissions.
 #
 # Usage:
 #   MINVMD_KERNEL_PATH=... MINVMD_ROOTFS_PATH=... scripts/bench-minvmd-boot.sh [N] [minvmd-binary]
