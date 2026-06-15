@@ -293,7 +293,7 @@ impl crate::composable::Composable for Loadout {
 mod tests {
     use super::*;
     use crate::lifecyclehook::HookScript;
-    use crate::patches::{FileSet, PatchDest};
+    use crate::patches::PatchDest;
     use crate::vars::LenientVarName;
 
     #[test]
@@ -399,10 +399,7 @@ mod tests {
             .with_on_activate(HookScript::inline("echo hi"))
             .build()
             .unwrap();
-        let patch = Patch::new(
-            FileSet::try_new("a").unwrap(),
-            PatchDest::try_new("a").unwrap(),
-        );
+        let patch = Patch::new("a", PatchDest::try_new("a").unwrap());
 
         let l = Loadout::new(LoadoutName::try_new("Test").unwrap())
             .with_package("helix")
