@@ -86,19 +86,19 @@ jobs:
         # not baked into the rootfs.
         run: ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs.cpio"
       - name: Upload kernel artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: virtio-kernel-aarch64
           path: ${{ runner.temp }}/vmlinuz
           if-no-files-found: error
       - name: Upload rootfs artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: minvmd-rootfs-aarch64
           path: ${{ runner.temp }}/rootfs.img
           if-no-files-found: error
       - name: Upload initramfs artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: minimald-initramfs-aarch64
           path: ${{ runner.temp }}/initramfs.cpio
@@ -133,17 +133,17 @@ jobs:
             exit 1
           fi
       - name: Download virtio-linux kernel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: virtio-kernel-aarch64
           path: ${{ runner.temp }}/kernel
       - name: Download minvmd-rootfs image
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: minvmd-rootfs-aarch64
           path: ${{ runner.temp }}/rootfs
       - name: Download guest initramfs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: minimald-initramfs-aarch64
           path: ${{ runner.temp }}/initramfs
@@ -198,7 +198,7 @@ jobs:
         # Capture hvc0 output for diagnosing a stuck/failed boot (e.g. a missing
         # virtio driver in the kernel). Always runs so a red boot is debuggable.
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: minvmd-boot-log
           path: ${{ runner.temp }}/boot.log
@@ -228,17 +228,17 @@ jobs:
             exit 1
           fi
       - name: Download virtio-linux kernel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: virtio-kernel-aarch64
           path: ${{ runner.temp }}/kernel
       - name: Download minvmd-rootfs image
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: minvmd-rootfs-aarch64
           path: ${{ runner.temp }}/rootfs
       - name: Download guest initramfs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: minimald-initramfs-aarch64
           path: ${{ runner.temp }}/initramfs
@@ -316,7 +316,7 @@ jobs:
           [ "$warm" -lt 500 ] || { echo "::error::warm 'minimal ls' took ${warm}ms (>= 500ms)"; fail; }
       - name: Upload autospawn guest boot console log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: autospawn-boot-log
           path: ${{ runner.temp }}/autospawn-boot.log
