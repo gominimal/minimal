@@ -1,6 +1,6 @@
 use crate::{
     ChannelConfig,
-    session_host::{self, WinSize},
+    session_host::{self, HostAttrs, WinSize},
 };
 use mctx::ConfigBuilder;
 use paths::DaemonAbsPath;
@@ -40,6 +40,7 @@ enum SessionMessage {
         Channel<Msg>,
         ChannelConfig,
     ),
+    GetHostAttrs(oneshot::Sender<Option<HostAttrs>>),
 }
 
 /// Manages a running session.
@@ -97,6 +98,12 @@ impl<S: SessionObject> Session<S> {
             }
             SessionMessage::Attach(r, session_hnd, channel, config) => {
                 let _ = r.send(self.attach(session_hnd, channel, config).await);
+            }
+            SessionMessage::GetHostAttrs(r) => {
+                let _ = r.send(match self.host.as_ref() {
+                    None => None,
+                    Some(h) => h.get_attrs().await.ok(),
+                });
             }
         }
     }
@@ -188,6 +195,13 @@ impl SessionHandle {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(SessionMessage::GetWorkspacePath(send)).await;
+        recv.await.expect("corresponding session is dead")
+    }
+    /// Returns the host attributes of the running session, if any.
+    pub async fn get_attrs(&self) -> Option<HostAttrs> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self.0.send(SessionMessage::GetHostAttrs(send)).await;
         recv.await.expect("corresponding session is dead")
     }
 

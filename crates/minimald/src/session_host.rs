@@ -12,10 +12,11 @@ use std::future::Future;
 use std::io;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::time::SystemTime;
 use tokio::io::AsyncWriteExt;
 use tokio::io::unix::AsyncFd;
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::SendError;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::RequestedPty;
@@ -345,6 +346,65 @@ pub(crate) struct Launched<P, G> {
 enum Message {
     Kill,
     Attach(Channel<Msg>, WinSize),
+    GetAttrs(oneshot::Sender<HostAttrs>),
+
+    SetTitleCallback(String),
+    VisualBellCallback,
+    AudibleBellCallback,
+}
+
+/// Handles callback events from the terminal parser, transmitting them to the host.
+struct ParserEventHandler(WeakHostHandle);
+
+impl vt100_ctt::Callbacks for ParserEventHandler {
+    fn set_window_title(&mut self, _: &mut vt100_ctt::Screen, title: &[u8]) {
+        self.0.set_title_cb(title);
+    }
+    fn audible_bell(&mut self, _: &mut vt100_ctt::Screen) {
+        self.0.audible_bell_cb();
+    }
+    fn visual_bell(&mut self, _: &mut vt100_ctt::Screen) {
+        self.0.visual_bell_cb();
+    }
+}
+
+/// A handle to the session host that does not prevent the host
+/// from being closed.
+#[derive(Debug, Clone)]
+struct WeakHostHandle {
+    sender: mpsc::WeakSender<Message>,
+}
+
+impl WeakHostHandle {
+    fn set_title_cb(&mut self, title: &[u8]) {
+        let title = match String::from_utf8(title.to_vec()) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Ignoring non-utf8 terminal title: {e}");
+                return;
+            }
+        };
+
+        if let Some(sender) = self.sender.upgrade()
+            && let Err(e) = sender.try_send(Message::SetTitleCallback(title))
+        {
+            tracing::warn!("Dropping title update: {e}");
+        }
+    }
+    fn audible_bell_cb(&mut self) {
+        if let Some(sender) = self.sender.upgrade()
+            && let Err(e) = sender.try_send(Message::AudibleBellCallback)
+        {
+            tracing::warn!("Dropping audible bell: {e}");
+        }
+    }
+    fn visual_bell_cb(&mut self) {
+        if let Some(sender) = self.sender.upgrade()
+            && let Err(e) = sender.try_send(Message::VisualBellCallback)
+        {
+            tracing::warn!("Dropping visual bell: {e}");
+        }
+    }
 }
 
 /// The handle to the session host - the running process.
@@ -354,6 +414,12 @@ pub struct HostHandle {
 }
 
 impl HostHandle {
+    fn make_weak(&self) -> WeakHostHandle {
+        WeakHostHandle {
+            sender: self.sender.downgrade(),
+        }
+    }
+
     pub async fn kill(&self) -> Result<(), ()> {
         match self.sender.send(Message::Kill).await {
             Ok(()) => Ok(()),
@@ -371,6 +437,35 @@ impl HostHandle {
             Err(e) => unreachable!("{:?}", e),
         }
     }
+
+    /// Returns the terminal attributes.
+    pub async fn get_attrs(&self) -> Result<HostAttrs, ()> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        match self.sender.send(Message::GetAttrs(send)).await {
+            Ok(()) => Ok(recv.await.expect("host died")),
+            Err(SendError(Message::GetAttrs(_))) => Err(()),
+            Err(e) => unreachable!("{:?}", e),
+        }
+    }
+}
+
+/// Various attributes about the running terminal.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct HostAttrs {
+    /// The title set by the terminal, if any.
+    pub(crate) title: Option<(String, SystemTime)>,
+    /// The number of times the audible bell signal was send into the terminal,
+    /// and the last time it was received.
+    pub(crate) audible_bell: (usize, Option<SystemTime>),
+    /// The number of times the visual bell signal was send into the terminal,
+    /// and the last time it was received.
+    pub(crate) visual_bell: (usize, Option<SystemTime>),
+
+    /// When the last byte was sent by the process into the terminal.
+    pub(crate) stdout_last: Option<SystemTime>,
+    /// When the last byte was sent to the process from a binding.
+    pub(crate) stdin_last: Option<SystemTime>,
 }
 
 /// The state of the session process.
@@ -389,11 +484,13 @@ pub(crate) struct Host<P: SessionProcess, G: Send + 'static> {
     /// The last-set pty terminal size.
     sz: WinSize,
     /// In-memory representation of the terminal state.
-    parser: vt100_ctt::Parser,
+    parser: vt100_ctt::Parser<ParserEventHandler>,
     /// The session process.
     process: P,
     /// The master-side fd of the Pty.
     master: AsyncFd<std::fs::File>,
+    /// Various attributes about the running terminal.
+    attrs: HostAttrs,
 
     // Writer for bytes coming from the remote - i.e. 'stdin' keystrokes
     // that need to get written to the pty. Clones of this sender are
@@ -695,8 +792,16 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             guard,
         } = launcher.launch(sz).await?;
 
-        let parser = vt100_ctt::Parser::new(sz.rows, sz.cols, 0);
         let (sender, receiver) = mpsc::channel(8);
+        let handle = HostHandle { sender };
+
+        let parser = vt100_ctt::Parser::new_with_callbacks(
+            sz.rows,
+            sz.cols,
+            0,
+            ParserEventHandler(handle.make_weak()),
+        );
+
         let (remote_tx, remote_rx) = mpsc::channel(4);
         let master = {
             set_nonblocking(master.as_raw_fd())?;
@@ -711,6 +816,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             parser,
             process,
             master,
+            attrs: HostAttrs::default(),
 
             remote_tx,
             remote_rx,
@@ -718,11 +824,12 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             stdin_buf: None,
             _guard: guard,
         };
+
         if let Some(channel) = channel {
             host.attach(channel, sz, true).await;
         }
 
-        Ok((host, HostHandle { sender }))
+        Ok((host, handle))
     }
 
     pub async fn mainloop(mut self) -> Result<i32, std::io::Error> {
@@ -748,6 +855,22 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
                     Message::Attach(channel, sz) => {
                         self.attach(channel, sz, false).await;
                     }
+                    Message::SetTitleCallback(title) => {
+                        self.attrs.title = Some((title, SystemTime::now()));
+                    }
+                    Message::AudibleBellCallback => {
+                        let (count, last) = &mut self.attrs.audible_bell;
+                        *count += 1;
+                        *last = Some(SystemTime::now());
+                    }
+                    Message::VisualBellCallback => {
+                        let (count, last) = &mut self.attrs.visual_bell;
+                        *count += 1;
+                        *last = Some(SystemTime::now());
+                    }
+                    Message::GetAttrs(s) => {
+                        let _ = s.send(self.attrs.clone());
+                    }
                 }
             },
             // Read from master - stdout of session process => ssh channel (if any)
@@ -756,6 +879,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
                     Ok(Ok(0)) => {},
                     Ok(Ok(n)) => {
                         let b = &self.stdout_buf[..n];
+                        self.attrs.stdout_last = Some(SystemTime::now());
                         self.parser.process(b);
                         if let Some((tx, _hnd)) = self.remote.as_mut() {
                             match tx.send(BindingMsg::Stdin(b.to_vec())).await {
@@ -785,6 +909,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             Some(msg) = self.remote_rx.recv(), if self.stdin_buf.is_none() => {
                 match msg {
                     Either::Left(b) => {
+                        self.attrs.stdin_last = Some(SystemTime::now());
                         if b.len() == 1 && b[0] == 0x17 { // ctrl-w
                             if let Some((tx, _hnd)) = self.remote.as_mut() {
                                 match tx.send(BindingMsg::TeardownDueToDetach).await {
@@ -889,6 +1014,7 @@ fn set_cloexec(fd: RawFd) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     const DEFAULT_SIZE: WinSize = WinSize {
         rows: 24,
@@ -957,5 +1083,64 @@ mod tests {
         let got = pty.get_size().expect("failed to get size");
         assert_eq!(got.rows, 50);
         assert_eq!(got.cols, 200);
+    }
+
+    /// Drives a host backed by the mock echo program and confirms the terminal
+    /// attributes are tracked and surfaced via [`HostHandle::get_attrs`]:
+    /// feeding stdin an OSC "set window title" escape makes the mock echo it
+    /// back onto the terminal, where the parser records the title; the round
+    /// trip also stamps the stdin/stdout activity times.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_attrs_tracks_title_and_io_times() {
+        // Build the host directly (no SSH binding) so the test can feed stdin
+        // through a clone of the host's own remote sender, then drive its
+        // runtime loop on a background task.
+        let (host, handle) = Host::build(MockLauncher, DEFAULT_SIZE, None)
+            .await
+            .expect("failed to build host");
+        let stdin = host.remote_tx.clone();
+        tokio::spawn(host.mainloop());
+
+        // OSC "set window title" (ESC ] 0 ; <title> BEL), sent as one line. The
+        // mock echoes the line back (prefixed with `got:`), so the raw escape
+        // reaches the host's terminal parser on stdout and fires the set-title
+        // callback. The trailing newline is what makes the mock's `read` return
+        // and echo via `printf`, carrying the escape bytes through unmangled.
+        let title = "hello-title";
+        let osc = format!("\x1b]0;{title}\x07\n");
+        stdin
+            .send(Either::Left(bytes::Bytes::from(osc.into_bytes())))
+            .await
+            .expect("failed to send stdin");
+
+        // Poll until the title has been recorded (or time out).
+        let attrs = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let attrs = handle.get_attrs().await.unwrap();
+                if attrs.title.is_some() {
+                    break attrs;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for the terminal title to be recorded");
+
+        let (got_title, _when) = attrs.title.expect("title should be set");
+        assert_eq!(
+            got_title, title,
+            "the parsed title should match what was set"
+        );
+
+        // The stdin write and the echoed stdout should both have stamped their
+        // last-activity times.
+        assert!(
+            attrs.stdin_last.is_some(),
+            "stdin_last should be stamped after feeding stdin",
+        );
+        assert!(
+            attrs.stdout_last.is_some(),
+            "stdout_last should be stamped after the echo arrived",
+        );
     }
 }

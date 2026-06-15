@@ -9,6 +9,7 @@
 //!
 //! The server-side serving glue lives in the `minimald` crate.
 
+use chrono::Utc;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sessions::SessionId;
 
@@ -97,11 +98,36 @@ impl OneshotSshRpc for GetVersion {
 /// An RPC to list sessions managed by this minimald.
 pub struct ListSessions;
 
+/// Describes how many times a bell fired, as well as when it last fired.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Bell {
+    pub count: usize,
+    pub last: chrono::DateTime<Utc>,
+}
+
+/// Describes a terminal title
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Title {
+    pub value: String,
+    pub updated_at: chrono::DateTime<Utc>,
+}
+
+/// Describes attributes about a running session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunningSessionAttrs {
+    pub last_stdout: Option<chrono::DateTime<Utc>>,
+    pub last_stdin: Option<chrono::DateTime<Utc>>,
+    pub title: Option<Title>,
+    pub audible_bell: Option<Bell>,
+    pub visual_bell: Option<Bell>,
+}
+
 /// An entry in the ListSessions response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ListSessionsEntry {
     pub id: SessionId,
     pub name: Option<String>,
+    pub attrs: Option<RunningSessionAttrs>,
 }
 
 /// The response to the [`ListSessions`] RPC.

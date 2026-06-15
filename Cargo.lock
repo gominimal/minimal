@@ -3430,6 +3430,7 @@ dependencies = [
  "args",
  "bytes",
  "camino",
+ "chrono",
  "clap",
  "clap_complete",
  "constcat",
@@ -3464,6 +3465,7 @@ dependencies = [
 name = "minimald-rpc"
 version = "0.0.1"
 dependencies = [
+ "chrono",
  "constcat",
  "serde",
  "sessions",

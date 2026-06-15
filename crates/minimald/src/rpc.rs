@@ -82,6 +82,22 @@ async fn serve_list_sessions(s: ServerStateHandle, c: RuChannel<Msg>) {
                     .map(|i| ListSessionsEntry {
                         id: i.id,
                         name: i.name,
+                        attrs: i.attrs.map(|a| minimald_rpc::RunningSessionAttrs {
+                            last_stdout: a.stdout_last.map(|i| i.into()),
+                            last_stdin: a.stdin_last.map(|i| i.into()),
+                            title: a.title.map(|(value, set_at)| minimald_rpc::Title {
+                                value,
+                                updated_at: set_at.into(),
+                            }),
+                            visual_bell: a.visual_bell.1.map(|t| minimald_rpc::Bell {
+                                count: a.visual_bell.0,
+                                last: t.into(),
+                            }),
+                            audible_bell: a.audible_bell.1.map(|t| minimald_rpc::Bell {
+                                count: a.audible_bell.0,
+                                last: t.into(),
+                            }),
+                        }),
                     })
                     .collect(),
             })
@@ -296,6 +312,7 @@ mod tests {
             vec![ListSessionsEntry {
                 id: create_session.id,
                 name: Some("my session".to_string()),
+                attrs: None,
             }]
         );
     }
