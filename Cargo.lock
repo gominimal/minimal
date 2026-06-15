@@ -3441,6 +3441,7 @@ dependencies = [
  "libc",
  "mctx",
  "mfile",
+ "minimald-rpc",
  "nix 0.31.3",
  "ot",
  "path-absolutize",
@@ -3457,6 +3458,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vt100-ctt",
+]
+
+[[package]]
+name = "minimald-rpc"
+version = "0.0.1"
+dependencies = [
+ "constcat",
+ "serde",
+ "sessions",
 ]
 
 [[package]]
@@ -3479,6 +3489,7 @@ dependencies = [
  "dirs",
  "fd-lock",
  "libc",
+ "minimald-rpc",
  "paths",
  "russh",
  "serde",

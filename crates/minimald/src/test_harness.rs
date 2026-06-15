@@ -28,8 +28,9 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
+use minimald_rpc::OneshotSshRpc;
+
 use crate::connection::Connection;
-use crate::rpc::OneshotSshRpc;
 use crate::server::{Config, HostKey, ServerStateHandle};
 
 /// A minimald instance running against a tempdir, ready to accept

@@ -425,7 +425,7 @@ impl russh::server::Handler for ConnectionHandler {
     ) -> Result<(), Self::Error> {
         protocol_trace!("Got subsystem_request on channel {id}: subsystem={name}");
 
-        if name.starts_with(rpc::RPC_SUBSYSTEM_PREFIX) {
+        if name.starts_with(minimald_rpc::RPC_SUBSYSTEM_PREFIX) {
             let c = self.0.clone();
             let s = c.0.lock().await.serv.clone();
             rpc::handle_ssh_rpc(s, c, name, id, session).await?;

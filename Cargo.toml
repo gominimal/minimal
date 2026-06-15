@@ -17,6 +17,7 @@ members = [
     "crates/minimal",
     "crates/minimal2",
     "crates/minimald",
+    "crates/minimald-rpc",
     "crates/minvmd",
     "crates/remote-client",
     "crates/remote-proto",
@@ -134,6 +135,7 @@ checkouts = { version = "0.0.1", path = "crates/checkouts" }
 common = { version = "0.0.1", path = "crates/common" }
 decode = { version = "0.0.1", path = "crates/decode" }
 mctx = { version = "0.0.1", path = "crates/mctx" }
+minimald-rpc = { version = "0.0.1", path = "crates/minimald-rpc" }
 mfile = { version = "0.0.1", path = "crates/mfile" }
 op = { version = "0.0.1", path = "crates/op" }
 ot = { version = "0.0.1", path = "crates/ot" }
