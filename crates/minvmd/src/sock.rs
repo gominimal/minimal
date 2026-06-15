@@ -105,6 +105,17 @@ pub fn verify_socket_permissions(socket_path: &std::path::Path) -> io::Result<()
     Ok(())
 }
 
+/// Tighten the bridge socket at `socket_path` to owner-only (0600).
+///
+/// libkrun creates the listening socket with default permissions (typically
+/// 0755), so the parent enforces 0600 once the socket exists — only the owner
+/// should be able to connect to the daemon. (The containing dir is already
+/// 0700, so this is defense in depth.)
+pub fn enforce_socket_permissions(socket_path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -180,6 +191,17 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let err = verify_socket_permissions(&path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn enforce_socket_permissions_tightens_to_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.sock");
+        std::fs::File::create(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        enforce_socket_permissions(&path).unwrap();
+        verify_socket_permissions(&path).unwrap();
     }
 
     #[test]
