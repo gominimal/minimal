@@ -3457,10 +3457,18 @@ dependencies = [
 name = "minimal2"
 version = "0.0.1"
 dependencies = [
+ "camino",
+ "chrono",
  "clap",
  "clap_complete",
+ "minimald-rpc",
  "minvmd",
  "ot",
+ "paths",
+ "russh",
+ "serde",
+ "serde_json",
+ "sessions",
  "tokio",
  "tracing",
  "tracing-subscriber",
