@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 pub mod connection;
+pub mod env;
 mod exec;
 #[cfg(target_os = "linux")]
 pub mod guest;

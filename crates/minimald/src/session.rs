@@ -31,8 +31,14 @@ impl fmt::Display for AttachError {
     }
 }
 
+pub struct SessionPaths {
+    pub working: DaemonAbsPath,
+    pub cache: DaemonAbsPath,
+    pub home: DaemonAbsPath,
+}
+
 enum SessionMessage {
-    GetWorkspacePath(oneshot::Sender<DaemonAbsPath>),
+    GetPaths(oneshot::Sender<SessionPaths>),
     MakeContext(oneshot::Sender<Result<mctx::Context, String>>),
     Attach(
         oneshot::Sender<Result<(), AttachError>>,
@@ -66,8 +72,9 @@ impl<S: SessionObject> Session<S> {
         minimal_cache_dir: DaemonAbsPath,
         session: S,
     ) -> Result<SessionHandle, std::io::Error> {
-        let wsp = session.workspace_path();
-        std::fs::create_dir_all(&wsp).unwrap();
+        std::fs::create_dir_all(session.workspace_path()).unwrap();
+        std::fs::create_dir_all(session.home_path()).unwrap();
+        std::fs::create_dir_all(session.cache_path()).unwrap();
 
         let (sender, receiver) = mpsc::channel(8);
         let mngr = Self {
@@ -93,9 +100,8 @@ impl<S: SessionObject> Session<S> {
     /// Handles a specific message recieved by the session.
     async fn handle_message(&mut self, msg: SessionMessage) {
         match msg {
-            SessionMessage::GetWorkspacePath(r) => {
-                let wsp = self.session.workspace_path();
-                let _ = r.send(wsp);
+            SessionMessage::GetPaths(r) => {
+                let _ = r.send(self.paths());
             }
             SessionMessage::MakeContext(r) => {
                 let _ = r.send(self.context());
@@ -151,9 +157,14 @@ impl<S: SessionObject> Session<S> {
         sz: WinSize,
     ) -> Result<(), AttachError> {
         let launcher = self.session_launcher(session_hnd)?;
-        let h = Box::pin(session_host::Host::spawn(launcher, sz, Some(channel)))
-            .await
-            .map_err(AttachError::SpawnFailed)?;
+        let h = Box::pin(session_host::Host::spawn(
+            launcher,
+            self.paths(),
+            sz,
+            Some(channel),
+        ))
+        .await
+        .map_err(AttachError::SpawnFailed)?;
         self.host = Some(h);
         Ok(())
     }
@@ -194,6 +205,13 @@ impl<S: SessionObject> Session<S> {
             Ok(c) => mctx::Context::new(c).map_err(|e| e.to_string()),
         }
     }
+    fn paths(&self) -> SessionPaths {
+        SessionPaths {
+            working: self.session.workspace_path(),
+            cache: self.session.cache_path(),
+            home: self.session.home_path(),
+        }
+    }
 }
 
 /// The handle to the session.
@@ -201,11 +219,11 @@ impl<S: SessionObject> Session<S> {
 pub struct SessionHandle(mpsc::Sender<SessionMessage>);
 
 impl SessionHandle {
-    /// Returns the path where the session workspace is located.
-    pub async fn workspace_path(&self) -> DaemonAbsPath {
+    /// Returns paths on the daemon backing various internals of the session.
+    pub async fn paths(&self) -> SessionPaths {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(SessionMessage::GetWorkspacePath(send)).await;
+        let _ = self.0.send(SessionMessage::GetPaths(send)).await;
         recv.await.expect("corresponding session is dead")
     }
     /// Returns the host attributes of the running session, if any.

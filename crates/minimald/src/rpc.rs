@@ -210,13 +210,13 @@ async fn unpack_workspace_files(
         .await
         .map_err(|e| format!("session UUID lookup failed: {e}"))?
         .ok_or("unknown session UUID")?;
-    let workspace_path = session_handle.workspace_path().await;
+    let paths = session_handle.paths().await;
 
     let reader = async_compression::tokio::bufread::ZstdDecoder::new(tokio::io::BufReader::new(
         c.make_reader(),
     ));
     async_tar::Archive::new(reader)
-        .unpack(workspace_path.as_utf8_path())
+        .unpack(paths.working.as_utf8_path())
         .await
         .map_err(|e| format!("unpack failed: {e}"))?;
 
@@ -364,16 +364,16 @@ mod tests {
             .await
             .unwrap()
             .expect("freshly-created session should be retrievable");
-        let workspace = handle.workspace_path().await;
+        let paths = handle.paths().await;
 
         assert_eq!(
-            tokio::fs::read(workspace.as_utf8_path().join("hello.txt"))
+            tokio::fs::read(paths.working.as_utf8_path().join("hello.txt"))
                 .await
                 .unwrap(),
             b"hello world\n",
         );
         assert_eq!(
-            tokio::fs::read(workspace.as_utf8_path().join("dir/nested.txt"))
+            tokio::fs::read(paths.working.as_utf8_path().join("dir/nested.txt"))
                 .await
                 .unwrap(),
             b"nested contents",

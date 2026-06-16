@@ -18,6 +18,8 @@ pub trait SessionObject: Sized + Send + Clone + 'static + std::fmt::Debug {
 
     fn key(&self) -> &Self::Key;
     fn workspace_path(&self) -> DaemonAbsPath;
+    fn home_path(&self) -> DaemonAbsPath;
+    fn cache_path(&self) -> DaemonAbsPath;
 }
 
 /// Describes the primary key a [`Loader`] uses to reference
@@ -122,6 +124,16 @@ impl SessionObject for DiskSession {
         let base = sub_path!(self.minimal_state_dir, "sessions")
             .join(&DaemonRelPath::try_new(&self.key.dir_key).unwrap());
         sub_path!(base, "tree")
+    }
+    fn home_path(&self) -> DaemonAbsPath {
+        let base = sub_path!(self.minimal_state_dir, "sessions")
+            .join(&DaemonRelPath::try_new(&self.key.dir_key).unwrap());
+        sub_path!(base, "home")
+    }
+    fn cache_path(&self) -> DaemonAbsPath {
+        let base = sub_path!(self.minimal_state_dir, "sessions")
+            .join(&DaemonRelPath::try_new(&self.key.dir_key).unwrap());
+        sub_path!(base, "cache")
     }
 }
 
