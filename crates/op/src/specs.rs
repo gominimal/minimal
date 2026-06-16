@@ -368,3 +368,134 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SourceFetcher;
+    use decode::Layer;
+    use graph::{BuildSpecRef, Graph};
+    use indoc::indoc;
+    use lcache::Cache;
+    use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
+
+    /// A [`SourceFetcher`] that must never be called. The build paths exercised
+    /// here short-circuit before any source is fetched, so reaching either
+    /// method indicates the function (or the test) took an unexpected branch.
+    #[derive(Debug)]
+    struct UnusedFetcher;
+
+    impl SourceFetcher for UnusedFetcher {
+        async fn download_web(
+            &self,
+            _url: &str,
+            _sha256: &str,
+            _op: &OpTracker,
+        ) -> anyhow::Result<PathBuf> {
+            unreachable!("source fetch must not happen on these build paths")
+        }
+
+        async fn download_gcs(
+            &self,
+            _bucket_id: String,
+            _file: &str,
+            _sha256: &str,
+            _op: &OpTracker,
+        ) -> anyhow::Result<PathBuf> {
+            unreachable!("source fetch must not happen on these build paths")
+        }
+    }
+
+    fn graph_from(ncl: &str) -> Graph {
+        Graph::new()
+            .ingest(Layer::new_for_test(ncl.to_string()).unwrap())
+            .unwrap()
+    }
+
+    fn spec_build<'a>(
+        spec: &'a BuildSpecRef,
+        fetcher: &'a UnusedFetcher,
+    ) -> SpecBuild<'a, UnusedFetcher> {
+        SpecBuild {
+            spec,
+            remote_fetcher: fetcher,
+            override_deps: None,
+            stdout_writer: None,
+            stderr_writer: None,
+            cancel: CancellationToken::new(),
+            cpu_weight: None,
+        }
+    }
+
+    /// A spec with no build deps and an empty command is a "pure collection":
+    /// running it does no build work and commits an empty output directory.
+    #[test]
+    fn run_pure_collection_commits_empty_outputs_with_zero_build_time() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp.path()).unwrap();
+        let dg = graph_from(indoc! {r#"
+            let {BuildSpec, ..} = import "minimal.ncl" in
+            {
+                name = "collection",
+                build_deps = [],
+                cmd = "",
+            } | BuildSpec
+        "#});
+        let bsr = *dg.by_name("collection").unwrap();
+        let fetcher = UnusedFetcher;
+        let mut sb = spec_build(&bsr, &fetcher);
+        let opts = Options {
+            cache: cache.clone(),
+            graph: &dg,
+            exec_base: "/not-exists".into(),
+            ot: None,
+        };
+
+        let result = futures::executor::block_on(sb.run(&opts)).unwrap();
+
+        // No build is executed for a collection, so no time is spent building...
+        assert_eq!(result.build_ms, 0);
+        // ...and the caller is handed a real, usable output directory.
+        assert!(
+            result.outputs.path().is_dir(),
+            "a committed collection must yield an existing output directory"
+        );
+    }
+
+    /// A spec whose declared target is not the host cannot be built, and the
+    /// error must name the offending target so the caller understands why.
+    #[test]
+    fn run_rejects_spec_targeting_a_non_host_system() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp.path()).unwrap();
+        // amd64/macos is never a supported host (macOS hosts are arm64 only),
+        // so this spec is unbuildable on whatever host runs the test suite.
+        let dg = graph_from(indoc! {r#"
+            let {BuildSpec, ..} = import "minimal.ncl" in
+            {
+                name = "cross",
+                build_deps = [],
+                cmd = "echo hi",
+                target = "amd64/macos",
+            } | BuildSpec
+        "#});
+        let bsr = *dg.by_name("cross").unwrap();
+        let fetcher = UnusedFetcher;
+        let mut sb = spec_build(&bsr, &fetcher);
+        let opts = Options {
+            cache: cache.clone(),
+            graph: &dg,
+            exec_base: "/not-exists".into(),
+            ot: None,
+        };
+
+        let err = futures::executor::block_on(sb.run(&opts)).unwrap_err();
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("amd64/macos"),
+            "error should name the unbuildable target, got: {msg}"
+        );
+    }
+}
