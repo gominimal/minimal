@@ -463,4 +463,30 @@ mod tests {
             "expected 'not a valid target' in: {out:?}"
         );
     }
+
+    #[test]
+    fn nickel_error_renders_diagnostic() {
+        // A Nickel contract violation loaded through the decoder surfaces as
+        // `Error::Nickel`. `report_to` must render its underlying Nickel
+        // diagnostic to the writer rather than emitting nothing.
+        let err = crate::Layer::new_for_test(
+            "let {Attrs, ..} = import \"minimal.ncl\" in {unknown_attr = \"a\"} | Attrs"
+                .to_string(),
+        )
+        .expect_err("a contract violation should fail to load");
+        assert!(
+            matches!(err, Error::Nickel(_)),
+            "expected Error::Nickel, got {err:?}"
+        );
+
+        let out = capture(&err);
+        assert!(
+            !out.is_empty(),
+            "expected a rendered diagnostic, got empty output"
+        );
+        assert!(
+            out.contains("error"),
+            "expected an error diagnostic in: {out:?}"
+        );
+    }
 }
