@@ -2,7 +2,9 @@
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
+use std::io::Write as _;
 use std::path::PathBuf;
+use std::process::Stdio;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 mod autospawn;
@@ -22,15 +24,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// List sessions
-    Ls,
+    Ls(LsArgs),
     /// Activate (create) a new session
     Activate(ActivateArgs),
     /// Attach to an existing session
     Attach(AttachArgs),
     /// Destroy (terminate) a session
     Destroy(DestroyArgs),
-    /// Interactive session dashboard (k9s-like TUI)
-    #[command(hide = true)]
+    /// Interactive session picker (requires fzf)
     Dash,
     /// Generate shell completion script
     #[command(
@@ -70,6 +71,13 @@ struct AttachArgs {
 }
 
 #[derive(Debug, Args)]
+struct LsArgs {
+    /// Output raw session IDs (one per line) for piping into fzf
+    #[arg(long)]
+    raw: bool,
+}
+
+#[derive(Debug, Args)]
 struct DestroyArgs {
     /// Session identifier (UUID or session name)
     session: String,
@@ -98,15 +106,11 @@ async fn main() -> Result<(), ()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Ls => cmd_ls(&cli.global_args).await,
+        Command::Ls(args) => cmd_ls(&cli.global_args, args).await,
         Command::Activate(args) => cmd_activate(&cli.global_args, args).await,
         Command::Attach(args) => cmd_attach(&cli.global_args, args).await,
         Command::Destroy(args) => cmd_destroy(&cli.global_args, args).await,
-        Command::Dash => {
-            // TODO(#159): implement k9s-like TUI session dashboard
-            eprintln!("[#159] dash: not yet implemented");
-            Ok(())
-        }
+        Command::Dash => cmd_dash(&cli.global_args).await,
         Command::Completions(CompletionsArgs { shell }) => {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();
@@ -127,7 +131,7 @@ async fn connect_daemon(global: &GlobalArgs) -> Result<client::Client, ()> {
 }
 
 /// List sessions via the `ListSessions` RPC.
-async fn cmd_ls(global: &GlobalArgs) -> Result<(), ()> {
+async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), ()> {
     if let Err(e) = autospawn::ensure_minvmd_running() {
         eprintln!("Failed to ensure minvmd is running: {e}");
         return Err(());
@@ -142,7 +146,17 @@ async fn cmd_ls(global: &GlobalArgs) -> Result<(), ()> {
         .map_err(|e| eprintln!("ListSessions RPC failed: {e}"))?;
 
     if resp.sessions.is_empty() {
-        println!("No active sessions.");
+        if !args.raw {
+            println!("No active sessions.");
+        }
+        return Ok(());
+    }
+
+    if args.raw {
+        // Machine-readable: one session ID per line for fzf piping.
+        for entry in &resp.sessions {
+            println!("{}", entry.id);
+        }
         return Ok(());
     }
 
@@ -316,4 +330,102 @@ async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), ()> {
         args.session
     );
     Ok(())
+}
+/// Interactive session picker via fzf.
+///
+/// Lists sessions, pipes them into `fzf` for fuzzy selection, then attaches
+/// to the chosen session. Falls back to a plain table if fzf is not
+/// available or stdout is not a terminal.
+async fn cmd_dash(global: &GlobalArgs) -> Result<(), ()> {
+    if let Err(e) = autospawn::ensure_minvmd_running() {
+        eprintln!("Failed to ensure minvmd is running: {e}");
+        return Err(());
+    }
+
+    let mut client = connect_daemon(global).await?;
+
+    use minimald_rpc::ListSessions;
+    let resp = client
+        .oneshot_rpc::<ListSessions>(())
+        .await
+        .map_err(|e| eprintln!("ListSessions RPC failed: {e}"))?;
+
+    if resp.sessions.is_empty() {
+        println!("No active sessions.");
+        return Ok(());
+    }
+
+    // Build fzf input lines: "<id>  <name>"
+    let mut lines = Vec::with_capacity(resp.sessions.len());
+    for entry in &resp.sessions {
+        lines.push(format!(
+            "{}  {}",
+            entry.id,
+            entry.name.as_deref().unwrap_or("-")
+        ));
+    }
+
+    // Try spawning fzf.  If it's missing or the output is not a terminal,
+    // fall back to plain table output.
+    let input = lines.join("\n");
+    let output = match std::process::Command::new("fzf")
+        .args([
+            "--height=~40%",
+            "--layout=reverse",
+            "--border",
+            "--prompt=minimal attach> ",
+            "--print-query",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+    {
+        Ok(mut child) => {
+            if let Some(ref mut stdin) = child.stdin {
+                let _ = stdin.write_all(input.as_bytes());
+            }
+            child
+                .wait_with_output()
+                .map_err(|e| eprintln!("fzf failed: {e}"))?
+        }
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                // fzf not installed; emit a plain table and a tip.
+                eprintln!("fzf not found — install fzf for interactive selection.");
+                eprintln!();
+                return cmd_ls(global, LsArgs { raw: false }).await;
+            }
+            return Err(eprintln!("failed to spawn fzf: {e}"));
+        }
+    };
+
+    if !output.status.success() {
+        // Non-zero exit (e.g. 130 = Esc): user cancelled, exit silently.
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // fzf --print-query outputs two lines: the query string, then the selection.
+    let selected = stdout
+        .lines()
+        .nth(1) // skip query line, take selection line
+        .and_then(|line| line.split_whitespace().next())
+        .map(|s| s.to_string());
+
+    let session_id = match selected {
+        Some(id) => id,
+        None => {
+            // Shouldn't happen with --print-query but guard anyway.
+            return Ok(());
+        }
+    };
+
+    // Chain into attach (non-interactive exec path — attach with no --command
+    // shows session info).
+    let attach_args = AttachArgs {
+        session: session_id,
+        command: None,
+    };
+    cmd_attach(global, attach_args).await
 }
