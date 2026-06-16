@@ -16,7 +16,8 @@
 //!   accidentally become a wildcard.
 //! - Looking up a referenced name that isn't in the resolved-vars set
 //!   is a hard error ([`ExpandError::UndefinedVar`]). Substitution
-//!   sources its values from the session's resolved [`SessionVar`]s.
+//!   sources its values from the resolved-vars set the caller passes
+//!   in via [`VarLookup`].
 //!   **One narrow exception:** the *tilde prefix* (`~` / `~/...`)
 //!   accepts a `HOME` fallback from process env (threaded through
 //!   the `home_fallback` parameter), so `~/foo` works without the
@@ -34,11 +35,27 @@
 //!   home-relative paths — they expand to an absolute form during
 //!   substitution.
 //!
-//! [`StrictVarName`]: crate::vars::StrictVarName
-//! [`SessionVar`]: crate::composable::SessionVar
+//! [`StrictVarName`]: crate::core::primitives::StrictVarName
 
-use crate::composable::SessionVar;
-use crate::patches::FileSet;
+use crate::core::primitives::{FileSet, ResolvedVar};
+
+/// Name → value lookup contract used by [`expand_source`].
+///
+/// Decouples the expander from any particular session-var carrier.
+/// Core implements it for `[ResolvedVar]`; the client wraps its own
+/// provenance-bearing var type by implementing this trait separately.
+pub trait VarLookup {
+    /// Return the value bound to `name`, or `None` if no such var.
+    fn lookup(&self, name: &str) -> Option<&str>;
+}
+
+impl VarLookup for [ResolvedVar] {
+    fn lookup(&self, name: &str) -> Option<&str> {
+        self.iter()
+            .find(|v| v.name() == name)
+            .map(ResolvedVar::value)
+    }
+}
 
 /// Errors produced when expanding a patch source.
 #[non_exhaustive]
@@ -56,7 +73,7 @@ pub enum ExpandError {
 
     /// The fully-expanded string failed to parse as a glob.
     #[error("expanded source is not a valid glob: {0}")]
-    PostExpansionInvalid(#[from] crate::patches::Error),
+    PostExpansionInvalid(#[from] crate::core::primitives::PatchError),
 
     /// A `..` path component was found anywhere in the (raw or
     /// substituted) pattern. Parent-dir components are rejected
@@ -107,7 +124,7 @@ pub enum ExpandError {
 /// document the invariant, not because it can fire.
 pub fn expand_source(
     raw: &str,
-    resolved_vars: &[SessionVar],
+    resolved_vars: &(impl VarLookup + ?Sized),
     home_fallback: Option<&str>,
 ) -> Result<FileSet, ExpandError> {
     let mut out = String::with_capacity(raw.len());
@@ -117,7 +134,8 @@ pub fn expand_source(
     // Tilde prefix: `~` alone or `~/...`. Any other tilde form is
     // literal.
     if bytes.first() == Some(&b'~') && bytes.get(1).is_none_or(|&c| c == b'/') {
-        let home = lookup(resolved_vars, "HOME")
+        let home = resolved_vars
+            .lookup("HOME")
             .or(home_fallback)
             .ok_or_else(|| ExpandError::UndefinedVar {
                 name: "HOME".into(),
@@ -136,9 +154,11 @@ pub fn expand_source(
                 continue;
             }
             let (name, consumed) = parse_var_ref(bytes, i)?;
-            let value = lookup(resolved_vars, name).ok_or_else(|| ExpandError::UndefinedVar {
-                name: name.to_owned(),
-            })?;
+            let value = resolved_vars
+                .lookup(name)
+                .ok_or_else(|| ExpandError::UndefinedVar {
+                    name: name.to_owned(),
+                })?;
             escape_glob_metas(value, &mut out);
             i += consumed;
             continue;
@@ -209,12 +229,6 @@ fn normalize_path(s: &str) -> Result<String, ExpandError> {
     Ok(out)
 }
 
-fn lookup<'a>(vars: &'a [SessionVar], name: &str) -> Option<&'a str> {
-    vars.iter()
-        .find(|v| v.var().name() == name)
-        .map(|v| v.var().value())
-}
-
 /// Parse a `$VAR` or `${VAR}` reference starting at `bytes[at]` (which
 /// is the `$`). Returns `(name, bytes_consumed_including_dollar)`.
 fn parse_var_ref(bytes: &[u8], at: usize) -> Result<(&str, usize), ExpandError> {
@@ -267,7 +281,7 @@ fn is_name_byte(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
 }
 
-/// Enforce [`crate::vars::StrictVarName`] shape: `[A-Z_][A-Z0-9_]*`.
+/// Enforce [`crate::core::primitives::StrictVarName`] shape: `[A-Z_][A-Z0-9_]*`.
 fn validate_strict_var_name(name: &str) -> Result<(), &'static str> {
     let mut chars = name.chars();
     let first = chars.next().ok_or("empty variable name")?;
@@ -312,24 +326,16 @@ fn escape_glob_metas(value: &str, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::composable::{SessionVar, Source};
-    use crate::vars::{ResolvedVar, VarValue};
+    use crate::core::primitives::{ResolvedVar, VarValue};
 
-    fn user_source() -> Source {
-        Source::UserLoadout {
-            name: "test".into(),
-        }
-    }
-
-    fn sv(name: &str, value: &str) -> SessionVar {
-        let resolved = ResolvedVar::resolve_with(name.into(), VarValue::specified(value), |_| {
+    fn sv(name: &str, value: &str) -> ResolvedVar {
+        ResolvedVar::resolve_with(name.into(), VarValue::specified(value), |_| {
             Err(std::env::VarError::NotPresent)
         })
-        .unwrap();
-        SessionVar::new(resolved, user_source())
+        .unwrap()
     }
 
-    fn expand(raw: &str, vars: &[SessionVar]) -> Result<String, ExpandError> {
+    fn expand(raw: &str, vars: &[ResolvedVar]) -> Result<String, ExpandError> {
         // Tests default to no env fallback so existing assertions
         // about "no resolved HOME → error" stay deterministic.
         expand_source(raw, vars, None).map(|fs| fs.pattern().to_owned())
@@ -337,7 +343,7 @@ mod tests {
 
     fn expand_with_env_home(
         raw: &str,
-        vars: &[SessionVar],
+        vars: &[ResolvedVar],
         home_fallback: &str,
     ) -> Result<String, ExpandError> {
         expand_source(raw, vars, Some(home_fallback)).map(|fs| fs.pattern().to_owned())

@@ -1,16 +1,38 @@
-//! Patches: descriptions of files brought into a session and the policy
-//! controlling which non-user patches are honored.
+//! Origin-free primitives for vars and patches.
 //!
-//! # Sources
+//! # Names
 //!
-//! Patches can be declared by three kinds of source — a user [`Loadout`],
-//! a project's `minimal.toml`, and individual package specs — and each
-//! source contributes its patches to the session. The primitives here
-//! are origin-free: provenance is known to the session-construction
-//! layer that combines the three sources, and that layer is where the
-//! [`PatchPolicy`] gate applies (see [`PatchPolicy`] for the rules).
+//! Two flavors of name are recognized:
 //!
-//! [`Loadout`]: crate::loadout::Loadout
+//! - [`StrictVarName`] — POSIX-shaped (`[A-Z_][A-Z0-9_]*`). The default; what
+//!   the bare-string wire form decodes into. Catches typos like `MY VAR`
+//!   at config-load time.
+//! - [`LenientVarName`] — anything the Linux kernel accepts (no `=`, no
+//!   NUL). Loud, explicit opt-in via the `vars_lenient` array form on
+//!   [`crate::core::loadout::Loadout`]; never produced by the bare-string path.
+//!
+//! [`VarName`] is the sum of the two for places that need to hold either.
+//!
+//! # Values
+//!
+//! [`VarValue`] is what the variable should resolve to:
+//!
+//! - [`Inherit`](VarValue::Inherit) — pass through from the parent env.
+//! - [`InheritWithDefault`](VarValue::InheritWithDefault) — pass through
+//!   from the parent, fall back to `default` if unset.
+//! - [`Specified`](VarValue::Specified) — set to a specific value,
+//!   ignoring the parent.
+//!
+//! # Provenance
+//!
+//! The primitives in this module are origin-free. A variable's or
+//! patch's provenance is determined by which source file it appears in
+//! — a [`Loadout`] is always user-originated; equivalent project /
+//! package primitives carry their own origins by virtue of where they
+//! live. The session-construction layer combines the three sources and
+//! attaches origin per-source.
+//!
+//! [`Loadout`]: crate::core::loadout::Loadout
 //!
 //! # The `FileSet` primitive
 //!
@@ -23,9 +45,9 @@
 //!
 //! - **`FileSet` itself** stores patterns as written. No expansion at
 //!   construction or matching time.
-//! - **The session resolver** ([`composable::Composer::resolve`](crate::composable::Composer::resolve))
+//! - **The session resolver** ([`Composer::resolve`](crate::client::composer::Composer::resolve))
 //!   expands leading `~` in patch *source* patterns and in
-//!   [`PatchPolicy`] patterns at the start of resolution, against
+//!   [`PatchPolicy`](crate::core::policy::PatchPolicy) patterns at the start of resolution, against
 //!   `dirs::home_dir` (or a `Composer::with_home(...)` override).
 //!   Patterns retain their `~` form in returned policies for
 //!   round-trippability.
@@ -34,38 +56,64 @@
 //!   and absolute paths are rejected at construction.
 //! - **The apply layer** is responsible for `$VAR` expansion and
 //!   canonicalization across the board.
-//!
-//! # Example user config
-//!
-//! ```toml
-//! # User-origin patches — applied unconditionally outside hermetic builds.
-//! # Only `ignore` from `[patch_policy]` filters these; `allow`/`deny` are
-//! # bypassed.
-//! patches = [
-//!     { dest = ".gitconfig",                       source = "~/dotfiles/gitconfig" },
-//!     { dest = ".config/alacritty/alacritty.toml", source = "~/dotfiles/alacritty.toml" },
-//!     { dest = ".config/nvim/",                    source = "~/dotfiles/nvim/**/*" },
-//!
-//!     # Multi-pattern to one dest fans out into one entry per pattern:
-//!     { dest = "Pictures/wallpapers/",             source = ["~/dotfiles/wallpapers/*.jpg",
-//!                                                            "~/dotfiles/wallpapers/*.png"] },
-//! ]
-//!
-//! # Policy for non-user patches (project and package origins).
-//! # `ignore` here also applies to user-origin patches above.
-//! [patch_policy]
-//! allow  = ["~/.config/**", "~/.local/share/applications/**", "/etc/xdg/**"]
-//! deny   = ["~/.ssh/**", "~/.aws/**", "**/id_rsa*", "**/*.pem"]
-//! ignore = ["**/.DS_Store", "**/*.bak", "**/*.swp"]
-//! ```
+
+use core::fmt;
+use std::str::FromStr;
 
 use camino::{Utf8Component, Utf8PathBuf};
 use paths::{HostAbsPath, HostPath, SandboxRelPath};
 
+// =====================================================================
+// Errors
+// =====================================================================
+
+/// Errors produced when constructing var primitives.
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum VarError {
+    /// A var name was empty.
+    #[error("variable name must not be empty")]
+    EmptyName,
+    /// A var name failed POSIX validation (used by [`StrictVarName`]).
+    #[error(
+        "variable name `{0}` is not POSIX-shaped (expected `[A-Z_][A-Z0-9_]*`); \
+         use the `vars_lenient` form for non-POSIX names"
+    )]
+    NotPosixName(String),
+    /// A var name contained `=` or NUL, which the kernel won't accept.
+    #[error("variable name `{0}` contains `=` or NUL, which the kernel rejects")]
+    InvalidLenientName(String),
+    /// A pattern string failed to parse as a glob.
+    #[error("invalid glob pattern `{pattern}`: {source}")]
+    InvalidGlob {
+        pattern: String,
+        #[source]
+        source: globset::Error,
+    },
+    /// Resolving an inherited variable's value via the environment lookup
+    /// (default: [`std::env::var`]) failed.
+    #[error("unable to get value of environment variable {name}: {source}")]
+    ResolutionFailure {
+        name: String,
+        #[source]
+        source: std::env::VarError,
+    },
+    /// Compiling the precomputed [`globset::GlobSet`] matcher failed.
+    /// Each individual pattern was already validated by
+    /// [`globset::Glob::new`]; this error covers failures of the
+    /// *combined* regex — typically size or complexity limits when
+    /// many patterns alternate together.
+    #[error("failed to compile combined glob matcher: {source}")]
+    InvalidGlobSet {
+        #[source]
+        source: globset::Error,
+    },
+}
+
 /// Errors produced when constructing patch types.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
-pub enum Error {
+pub enum PatchError {
     /// A pattern string failed to parse as a glob.
     #[error("invalid glob pattern `{pattern}`: {source}")]
     InvalidGlob {
@@ -125,6 +173,459 @@ pub enum Error {
 }
 
 // =====================================================================
+// Names
+// =====================================================================
+
+/// A POSIX-shaped environment variable name: `[A-Z_][A-Z0-9_]*`.
+///
+/// Stricter than what the kernel will accept, intentionally — the strict
+/// form catches typos at config-load time and matches the convention
+/// every well-behaved program in the ecosystem expects.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StrictVarName(String);
+
+impl StrictVarName {
+    /// Construct after validating against POSIX rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VarError::EmptyName`] for empty input, or
+    /// [`VarError::NotPosixName`] if the name contains anything outside
+    /// `[A-Z_][A-Z0-9_]*`.
+    pub fn try_new(s: impl Into<String>) -> Result<Self, VarError> {
+        let s = s.into();
+        let mut chars = s.chars();
+        let Some(first) = chars.next() else {
+            return Err(VarError::EmptyName);
+        };
+        if !(first.is_ascii_uppercase() || first == '_') {
+            return Err(VarError::NotPosixName(s));
+        }
+        for c in chars {
+            if !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') {
+                return Err(VarError::NotPosixName(s));
+            }
+        }
+        Ok(Self(s))
+    }
+
+    /// Borrow the underlying name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume the newtype and return the underlying [`String`].
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl AsRef<str> for StrictVarName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for StrictVarName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl serde::Serialize for StrictVarName {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(&self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for StrictVarName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Self::try_new(s).map_err(serde::de::Error::custom)
+    }
+}
+
+impl FromStr for StrictVarName {
+    type Err = VarError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::try_new(s)
+    }
+}
+
+/// A lenient environment variable name: anything the Linux kernel
+/// accepts (no `=`, no NUL byte).
+///
+/// Use sparingly — programs reading the env almost universally assume
+/// POSIX-shaped names. Reach for this only when integrating with an
+/// existing system that already publishes weird names.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LenientVarName(String);
+
+impl LenientVarName {
+    /// Construct after rejecting `=` and NUL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VarError::EmptyName`] for empty input, or
+    /// [`VarError::InvalidLenientName`] if the name contains `=` or NUL.
+    pub fn try_new(s: impl Into<String>) -> Result<Self, VarError> {
+        let s = s.into();
+        if s.is_empty() {
+            return Err(VarError::EmptyName);
+        }
+        if s.contains('=') || s.contains('\0') {
+            return Err(VarError::InvalidLenientName(s));
+        }
+        Ok(Self(s))
+    }
+
+    /// Borrow the underlying name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume the newtype and return the underlying [`String`].
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl AsRef<str> for LenientVarName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for LenientVarName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl serde::Serialize for LenientVarName {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(&self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for LenientVarName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Self::try_new(s).map_err(serde::de::Error::custom)
+    }
+}
+
+impl FromStr for LenientVarName {
+    type Err = VarError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::try_new(s)
+    }
+}
+
+/// One entry in the lenient-vars array form.
+///
+/// Used by [`crate::core::loadout::Loadout`] as the wire-form representation
+/// of a single non-POSIX variable. The map form (`vars = { ... }`) can't
+/// carry the strict/lenient distinction in its keys, so lenient names
+/// require a separate array (`[[vars_lenient]]`); each element is one
+/// of these.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LenientVarEntry {
+    name: LenientVarName,
+    value: VarValue,
+}
+
+impl LenientVarEntry {
+    /// Construct an entry from a pre-validated name.
+    #[must_use]
+    pub fn new(name: LenientVarName, value: VarValue) -> Self {
+        Self { name, value }
+    }
+
+    /// Construct an entry from a raw string name, validating it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`VarError`] from [`LenientVarName::try_new`] if `name`
+    /// is empty or contains `=` / NUL.
+    pub fn try_new(name: impl Into<String>, value: VarValue) -> Result<Self, VarError> {
+        Ok(Self {
+            name: LenientVarName::try_new(name)?,
+            value,
+        })
+    }
+
+    /// The variable's name.
+    #[must_use]
+    pub fn name(&self) -> &LenientVarName {
+        &self.name
+    }
+
+    /// The resolution rule.
+    #[must_use]
+    pub fn value(&self) -> &VarValue {
+        &self.value
+    }
+
+    /// Consume the entry and return its components.
+    #[must_use]
+    pub fn into_parts(self) -> (LenientVarName, VarValue) {
+        (self.name, self.value)
+    }
+}
+
+impl From<(LenientVarName, VarValue)> for LenientVarEntry {
+    fn from((name, value): (LenientVarName, VarValue)) -> Self {
+        Self { name, value }
+    }
+}
+
+/// A variable name — either [`Strict`](Self::Strict) (POSIX) or
+/// [`Lenient`](Self::Lenient) (Linux-permissive).
+///
+/// Used in unified contexts where either kind may appear (e.g.
+/// [`crate::core::loadout::Loadout::all_vars`]). The wire form on
+/// [`crate::core::loadout::Loadout`] itself keeps strict and lenient in
+/// separate fields so a bare-string TOML key can never accidentally
+/// smuggle a non-POSIX name through.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum VarName {
+    /// POSIX-shaped.
+    Strict(StrictVarName),
+    /// Linux-permissive.
+    Lenient(LenientVarName),
+}
+
+impl VarName {
+    /// Borrow the underlying name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Strict(n) => n.as_str(),
+            Self::Lenient(n) => n.as_str(),
+        }
+    }
+}
+
+impl fmt::Display for VarName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<StrictVarName> for VarName {
+    fn from(n: StrictVarName) -> Self {
+        Self::Strict(n)
+    }
+}
+
+impl From<LenientVarName> for VarName {
+    fn from(n: LenientVarName) -> Self {
+        Self::Lenient(n)
+    }
+}
+
+// =====================================================================
+// VarValue
+// =====================================================================
+
+/// The resolution rule for a variable: inherited, inherited with a
+/// fallback, or set to a literal value.
+///
+/// # Wire form
+///
+/// Untagged — the shape distinguishes the variant:
+///
+/// ```toml
+/// EDITOR = "vim"                                # → Specified
+/// HOME   = { inherit = true }                   # → Inherit
+/// LANG   = { inherit = true, default = "C" }    # → InheritWithDefault
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum VarValue {
+    /// Pass through from the parent environment.
+    Inherit,
+    /// Pass through; fall back to `default` if the parent is unset.
+    InheritWithDefault {
+        /// Value to use when the parent env has no entry.
+        default: String,
+    },
+    /// Set to `value`, ignoring the parent environment.
+    Specified {
+        /// Literal value.
+        value: String,
+    },
+}
+
+impl VarValue {
+    /// Construct a [`Specified`](Self::Specified) value.
+    #[must_use]
+    pub fn specified(value: impl Into<String>) -> Self {
+        Self::Specified {
+            value: value.into(),
+        }
+    }
+
+    /// Construct an [`InheritWithDefault`](Self::InheritWithDefault) value.
+    #[must_use]
+    pub fn inherit_with_default(default: impl Into<String>) -> Self {
+        Self::InheritWithDefault {
+            default: default.into(),
+        }
+    }
+}
+
+impl serde::Serialize for VarValue {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        match self {
+            Self::Specified { value } => ser.serialize_str(value),
+            Self::Inherit => {
+                let mut st = ser.serialize_struct("Inherit", 1)?;
+                st.serialize_field("inherit", &true)?;
+                st.end()
+            }
+            Self::InheritWithDefault { default } => {
+                let mut st = ser.serialize_struct("InheritWithDefault", 2)?;
+                st.serialize_field("inherit", &true)?;
+                st.serialize_field("default", default)?;
+                st.end()
+            }
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for VarValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Specified(String),
+            Inherit {
+                inherit: bool,
+                #[serde(default)]
+                default: Option<String>,
+            },
+        }
+        match Repr::deserialize(deserializer)? {
+            Repr::Specified(value) => Ok(Self::Specified { value }),
+            Repr::Inherit {
+                inherit: true,
+                default: Some(default),
+            } => Ok(Self::InheritWithDefault { default }),
+            Repr::Inherit {
+                inherit: true,
+                default: None,
+            } => Ok(Self::Inherit),
+            Repr::Inherit { inherit: false, .. } => Err(serde::de::Error::custom(
+                "`inherit = false` is not a meaningful variable specification; \
+                 omit the variable entirely instead",
+            )),
+        }
+    }
+}
+
+// =====================================================================
+// ResolvedVar
+// =====================================================================
+
+/// A variable name paired with the value it should resolve to after
+/// applying [`VarValue`] semantics (inheriting from the environment,
+/// falling back to a default, or taking a literal).
+///
+/// Both fields are raw strings: by the time a session is being
+/// activated, the OS is the next consumer and doesn't care about our
+/// strict/lenient name distinction. The newtype invariants are still
+/// upheld upstream — `ResolvedVar` only stores the post-resolution
+/// snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ResolvedVar {
+    name: String,
+    value: String,
+}
+
+impl ResolvedVar {
+    /// The variable's name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The resolved value.
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// Resolve a variable against an arbitrary environment-lookup function.
+    /// The thread-able shape lets tests pin every branch without touching
+    /// the process environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VarError::ResolutionFailure`] if `lookup` returns an error
+    /// that the variant's semantics surface (every error for
+    /// [`VarValue::Inherit`]; only [`std::env::VarError::NotUnicode`] for
+    /// [`VarValue::InheritWithDefault`]).
+    pub fn resolve_with<F>(name: String, value: VarValue, lookup: F) -> Result<Self, VarError>
+    where
+        F: FnOnce(&str) -> Result<String, std::env::VarError>,
+    {
+        let resolved_value = match value {
+            VarValue::Specified { value } => value,
+            VarValue::Inherit => lookup(&name).map_err(|source| VarError::ResolutionFailure {
+                name: name.clone(),
+                source,
+            })?,
+            VarValue::InheritWithDefault { default } => match lookup(&name) {
+                Ok(value) => value,
+                Err(std::env::VarError::NotPresent) => default,
+                Err(source @ std::env::VarError::NotUnicode(_)) => {
+                    return Err(VarError::ResolutionFailure {
+                        name: name.clone(),
+                        source,
+                    });
+                }
+            },
+        };
+        Ok(Self {
+            name,
+            value: resolved_value,
+        })
+    }
+
+    /// Resolve a variable against the process environment via
+    /// [`std::env::var`]. Sugar for [`Self::resolve_with`] with the
+    /// default lookup.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::resolve_with`].
+    pub fn resolve(name: String, value: VarValue) -> Result<Self, VarError> {
+        Self::resolve_with(name, value, |l| std::env::var(l))
+    }
+}
+
+impl TryFrom<(StrictVarName, VarValue)> for ResolvedVar {
+    type Error = VarError;
+    fn try_from((name, value): (StrictVarName, VarValue)) -> Result<Self, VarError> {
+        Self::resolve(name.into_inner(), value)
+    }
+}
+
+impl TryFrom<LenientVarEntry> for ResolvedVar {
+    type Error = VarError;
+    fn try_from(entry: LenientVarEntry) -> Result<Self, Self::Error> {
+        let (name, value) = entry.into_parts();
+        Self::resolve(name.into_inner(), value)
+    }
+}
+
+// =====================================================================
 // FileSet
 // =====================================================================
 
@@ -164,11 +665,11 @@ impl FileSet {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidGlob`] if `pattern` fails to parse.
-    pub fn try_new(pattern: impl Into<String>) -> Result<Self, Error> {
+    /// Returns [`PatchError::InvalidGlob`] if `pattern` fails to parse.
+    pub fn try_new(pattern: impl Into<String>) -> Result<Self, PatchError> {
         let pattern = pattern.into();
         let glob = globset::Glob::new(&pattern)
-            .map_err(|source| Error::InvalidGlob { pattern, source })?;
+            .map_err(|source| PatchError::InvalidGlob { pattern, source })?;
         let matcher = glob.compile_matcher();
         Ok(Self { glob, matcher })
     }
@@ -267,7 +768,7 @@ impl FileSet {
     /// every file whose path matches this pattern.
     ///
     /// Per-entry failures (walk errors, non-UTF-8 paths) are accumulated
-    /// into the returned `Vec<Error>` rather than aborting the walk —
+    /// into the returned `Vec<PatchError>` rather than aborting the walk —
     /// callers decide whether a partial result is acceptable.
     ///
     /// `~` and `$VAR` are **not** expanded; the walker passes the raw
@@ -277,14 +778,14 @@ impl FileSet {
     /// Patterns with no literal path prefix (e.g. `**/*.pem`, `*.lua`)
     /// would have to start their walk from `/` — virtually never what
     /// the caller wants. Such patterns produce an empty result with a
-    /// single [`Error::NoWalkRoot`] entry instead of walking the entire
+    /// single [`PatchError::NoWalkRoot`] entry instead of walking the entire
     /// root filesystem.
     #[must_use]
-    pub fn resolve(&self, follow_links: bool) -> (Vec<HostPath>, Vec<Error>) {
+    pub fn resolve(&self, follow_links: bool) -> (Vec<HostPath>, Vec<PatchError>) {
         let Some(root) = self.walk_root() else {
             return (
                 Vec::new(),
-                vec![Error::NoWalkRoot {
+                vec![PatchError::NoWalkRoot {
                     pattern: self.pattern().to_owned(),
                 }],
             );
@@ -299,11 +800,11 @@ impl FileSet {
                 Ok(entry) => match Utf8PathBuf::from_path_buf(entry.into_path()) {
                     Ok(p) if self.is_match(&p) => paths.push(HostPath::new(p)),
                     Ok(_) => {}
-                    Err(p) => errors.push(Error::NonUtf8Path {
+                    Err(p) => errors.push(PatchError::NonUtf8Path {
                         path_lossy: p.to_string_lossy().into_owned(),
                     }),
                 },
-                Err(source) => errors.push(Error::WalkFailure {
+                Err(source) => errors.push(PatchError::WalkFailure {
                     root: root_path.clone(),
                     source,
                 }),
@@ -375,12 +876,12 @@ impl PatchDest {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::EmptyDest`] for empty paths, or
-    /// [`Error::DestTraversal`] for paths containing `..` components.
-    pub fn try_new(path: impl Into<Utf8PathBuf>) -> Result<Self, Error> {
+    /// Returns [`PatchError::EmptyDest`] for empty paths, or
+    /// [`PatchError::DestTraversal`] for paths containing `..` components.
+    pub fn try_new(path: impl Into<Utf8PathBuf>) -> Result<Self, PatchError> {
         let path = path.into();
         if path.as_str().is_empty() {
-            return Err(Error::EmptyDest);
+            return Err(PatchError::EmptyDest);
         }
         // Walk components: drop CurDir, fail on ParentDir, keep the
         // rest. RootDir (an absolute path) is allowed through here so
@@ -390,12 +891,12 @@ impl PatchDest {
         for component in path.components() {
             match component {
                 Utf8Component::CurDir => {}
-                Utf8Component::ParentDir => return Err(Error::DestTraversal(path)),
+                Utf8Component::ParentDir => return Err(PatchError::DestTraversal(path)),
                 other => normalized.push(other.as_str()),
             }
         }
         Ok(Self(
-            SandboxRelPath::try_new(normalized).map_err(Error::AbsoluteDestPath)?,
+            SandboxRelPath::try_new(normalized).map_err(PatchError::AbsoluteDestPath)?,
         ))
     }
 
@@ -429,7 +930,7 @@ impl<'de> serde::Deserialize<'de> for PatchDest {
 /// `source` is the *raw, unexpanded* path string straight from the wire
 /// — it may contain `~/` or `$VAR` / `${VAR}` references. Resolution
 /// against the session's resolved variables happens later (see
-/// [`crate::expansion::expand_source`]); attempting to parse it as a
+/// [`crate::core::expansion::expand_source`]); attempting to parse it as a
 /// glob directly would silently match a literal `$VAR` directory name.
 ///
 /// For single-file sources, `dest` is the destination file path. For
@@ -441,7 +942,7 @@ impl<'de> serde::Deserialize<'de> for PatchDest {
 /// to the session-construction layer that combines a [`Loadout`], a
 /// project config, and package specs.
 ///
-/// [`Loadout`]: crate::loadout::Loadout
+/// [`Loadout`]: crate::core::loadout::Loadout
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Patch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -602,187 +1103,15 @@ impl IntoIterator for Patches {
 }
 
 // =====================================================================
-// PatchPolicy
+// ResolvedPatch
 // =====================================================================
-
-/// Policy gating which patches are honored.
-///
-/// Patches are checked **per source file** after the patch's
-/// [`FileSet`] is walked on the host filesystem. Each enumerated source
-/// path runs through this policy; the patch's `dest` is *not* matched.
-///
-/// - **User-origin patches** (from a [`Loadout`]): only
-///   [`ignore`](Self::ignore) applies. `allow` and `deny` are bypassed —
-///   the user is the policy for their own declarations.
-/// - **Project- and Package-origin patches**: all three fields apply.
-///   A source file is honored iff its host path matches `allow`, does
-///   not match `deny`, and does not match `ignore`. Files matching only
-///   `ignore` are silently dropped; matching `deny` is an error;
-///   matching neither `allow` nor `ignore` triggers a permission prompt
-///   via [`PolicyHooks`](crate::composable::PolicyHooks).
-///
-/// Precedence: `ignore` first (silent), then `deny` (reject), then
-/// `allow` (permit). Anything else prompts.
-///
-/// # `~/` and `$VAR` expansion
-///
-/// Policy patterns are stored as raw strings, so they may contain
-/// `~/` prefixes or `$VAR` / `${VAR}` references. Expansion happens
-/// at session-construction time, against the session's resolved
-/// variables (see
-/// [`crate::expansion::expand_source`]). Patterns retain their raw
-/// form in the policy returned from
-/// [`Composer::resolve`](crate::composable::Composer::resolve), so
-/// the policy round-trips losslessly across save / load.
-///
-/// [`Loadout`]: crate::loadout::Loadout
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct PatchPolicy {
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "deserialize_one_or_many"
-    )]
-    allow: Vec<String>,
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "deserialize_one_or_many"
-    )]
-    deny: Vec<String>,
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "deserialize_one_or_many"
-    )]
-    ignore: Vec<String>,
-}
-
-/// Accepts either a single pattern (bare string) or a list of patterns.
-fn deserialize_one_or_many<'de, D>(d: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::Deserialize;
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Repr {
-        One(String),
-        Many(Vec<String>),
-    }
-    Ok(match Repr::deserialize(d)? {
-        Repr::One(s) => vec![s],
-        Repr::Many(v) => v,
-    })
-}
-
-impl PatchPolicy {
-    /// Construct an empty policy. Build it up with [`Self::with_allow`],
-    /// [`Self::with_deny`], and [`Self::with_ignore`].
-    #[must_use]
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
-    /// Replace the `allow` set with raw pattern strings. Patterns are
-    /// not validated until expansion happens at resolution time.
-    #[must_use]
-    pub fn with_allow<I, S>(self, patterns: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Self {
-            allow: patterns.into_iter().map(Into::into).collect(),
-            ..self
-        }
-    }
-
-    /// Replace the `deny` set with raw pattern strings.
-    #[must_use]
-    pub fn with_deny<I, S>(self, patterns: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Self {
-            deny: patterns.into_iter().map(Into::into).collect(),
-            ..self
-        }
-    }
-
-    /// Replace the `ignore` set with raw pattern strings.
-    #[must_use]
-    pub fn with_ignore<I, S>(self, patterns: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Self {
-            ignore: patterns.into_iter().map(Into::into).collect(),
-            ..self
-        }
-    }
-
-    /// Raw patterns non-user patches **may** target. Does not apply to
-    /// user-origin patches.
-    #[must_use]
-    pub fn allow(&self) -> &[String] {
-        &self.allow
-    }
-
-    /// Raw patterns non-user patches **must not** target. Does not
-    /// apply to user-origin patches.
-    #[must_use]
-    pub fn deny(&self) -> &[String] {
-        &self.deny
-    }
-
-    /// Raw patterns silently dropped without prompting. **Applies to
-    /// every origin, user-origin included.**
-    #[must_use]
-    pub fn ignore(&self) -> &[String] {
-        &self.ignore
-    }
-
-    /// Expand the raw patterns against `resolved_vars` and produce an
-    /// [`ExpandedPatchPolicy`] suitable for matching.
-    ///
-    /// Every pattern is run through
-    /// [`crate::expansion::expand_source`]; the first failure stops
-    /// the expansion and is returned.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first [`crate::expansion::ExpandError`] produced
-    /// by any pattern.
-    ///
-    /// [`ExpandedPatchPolicy`]: crate::composable::ExpandedPatchPolicy
-    pub fn expand_with(
-        &self,
-        resolved_vars: &[crate::composable::SessionVar],
-        home_fallback: Option<&str>,
-    ) -> Result<crate::composable::ExpandedPatchPolicy, crate::expansion::ExpandError> {
-        let expand_one = |raws: &[String]| -> Result<Vec<FileSet>, crate::expansion::ExpandError> {
-            raws.iter()
-                .map(|r| crate::expansion::expand_source(r, resolved_vars, home_fallback))
-                .collect()
-        };
-        let allow = expand_one(&self.allow)?;
-        let deny = expand_one(&self.deny)?;
-        let ignore = expand_one(&self.ignore)?;
-        Ok(crate::composable::ExpandedPatchPolicy::from_expanded(
-            allow, deny, ignore,
-        ))
-    }
-}
 
 /// A single patch's resolved endpoints: where the file lives on the
 /// host, and where it lands inside the sandbox (relative to the
 /// sandbox user's home directory).
 ///
 /// The field is `host_path` (not `source`) so it doesn't collide with
-/// [`Provenanced::source`](crate::composable::Provenanced::source) when
+/// [`Provenanced::source`](crate::core::source::Provenanced::source) when
 /// accessed via `SessionPatch::patch().host_path()`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResolvedPatch {
@@ -839,8 +1168,239 @@ mod tests {
         toml::from_str::<Wrap<T>>(toml_str).unwrap().x
     }
 
-    fn patterns(sets: &[String]) -> Vec<&str> {
-        sets.iter().map(String::as_str).collect()
+    // ---- StrictVarName ----
+
+    #[test]
+    fn strict_accepts_canonical_names() {
+        for n in ["FOO", "_BAR", "MY_APP_HOME", "X1", "_"] {
+            assert!(StrictVarName::try_new(n).is_ok(), "rejected: {n}");
+        }
+    }
+
+    #[test]
+    fn strict_rejects_non_posix_shapes() {
+        for n in ["", "lowercase", "1FOO", "FOO-BAR", "FOO BAR", "FOO=BAR"] {
+            assert!(StrictVarName::try_new(n).is_err(), "accepted: {n}");
+        }
+    }
+
+    #[test]
+    fn strict_deserialize_rejects_lowercase() {
+        let err = toml::from_str::<Wrap<StrictVarName>>(r#"x = "foo""#).unwrap_err();
+        assert!(err.to_string().contains("POSIX"), "got: {err}");
+    }
+
+    #[test]
+    fn strict_round_trips_through_toml() {
+        let original = StrictVarName::try_new("MY_APP_HOME").unwrap();
+        let s = toml::to_string(&Wrap {
+            x: original.clone(),
+        })
+        .unwrap();
+        let parsed: StrictVarName = parse(&s);
+        assert_eq!(parsed, original);
+    }
+
+    // ---- LenientVarName ----
+
+    #[test]
+    fn lenient_accepts_unusual_but_kernel_legal_names() {
+        for n in ["weird-thing", "lowercase", "1foo", "foo.bar"] {
+            assert!(LenientVarName::try_new(n).is_ok(), "rejected: {n}");
+        }
+    }
+
+    #[test]
+    fn lenient_rejects_kernel_illegal_names() {
+        assert!(LenientVarName::try_new("").is_err());
+        assert!(LenientVarName::try_new("foo=bar").is_err());
+        assert!(LenientVarName::try_new("foo\0bar").is_err());
+    }
+
+    // ---- VarValue ----
+
+    #[test]
+    fn varvalue_rejects_inherit_false() {
+        let err = toml::from_str::<Wrap<VarValue>>(r"x = { inherit = false }").unwrap_err();
+        assert!(err.to_string().contains("inherit = false"), "got: {err}");
+    }
+
+    #[test]
+    fn varvalue_specified_round_trips_as_bare_string() {
+        let v = VarValue::Specified {
+            value: "vim".into(),
+        };
+        let s = toml::to_string(&Wrap { x: v.clone() }).unwrap();
+        assert_eq!(s.trim(), r#"x = "vim""#);
+        let parsed: VarValue = parse(&s);
+        assert_eq!(parsed, v);
+    }
+
+    #[test]
+    fn varvalue_inherit_round_trips_as_table() {
+        for original in [
+            VarValue::Inherit,
+            VarValue::InheritWithDefault {
+                default: "C".into(),
+            },
+        ] {
+            let s = toml::to_string(&Wrap {
+                x: original.clone(),
+            })
+            .unwrap();
+            let parsed: VarValue = parse(&s);
+            assert_eq!(parsed, original);
+        }
+    }
+
+    // ---- VarValue helpers ----
+
+    #[test]
+    fn varvalue_specified_helper() {
+        let v = VarValue::specified("vim");
+        assert_eq!(
+            v,
+            VarValue::Specified {
+                value: "vim".into()
+            }
+        );
+    }
+
+    #[test]
+    fn varvalue_inherit_with_default_helper() {
+        let v = VarValue::inherit_with_default("C");
+        assert_eq!(
+            v,
+            VarValue::InheritWithDefault {
+                default: "C".into()
+            }
+        );
+    }
+
+    // ---- Name FromStr ----
+
+    #[test]
+    fn strict_var_name_parses_via_from_str() {
+        let n: StrictVarName = "EDITOR".parse().unwrap();
+        assert_eq!(n.as_str(), "EDITOR");
+        let err = "lowercase".parse::<StrictVarName>().unwrap_err();
+        assert!(matches!(err, VarError::NotPosixName(_)));
+    }
+
+    #[test]
+    fn lenient_var_name_parses_via_from_str() {
+        let n: LenientVarName = "weird-thing".parse().unwrap();
+        assert_eq!(n.as_str(), "weird-thing");
+        let err = "foo=bar".parse::<LenientVarName>().unwrap_err();
+        assert!(matches!(err, VarError::InvalidLenientName(_)));
+    }
+
+    // ---- LenientVarEntry helpers ----
+
+    #[test]
+    fn lenient_entry_try_new_validates_name() {
+        let e = LenientVarEntry::try_new("weird-thing", VarValue::specified("x")).unwrap();
+        assert_eq!(e.name().as_str(), "weird-thing");
+    }
+
+    #[test]
+    fn lenient_entry_try_new_rejects_bad_name() {
+        let err = LenientVarEntry::try_new("a=b", VarValue::specified("x")).unwrap_err();
+        assert!(matches!(err, VarError::InvalidLenientName(_)));
+    }
+
+    #[test]
+    fn lenient_entry_from_tuple() {
+        let n = LenientVarName::try_new("x").unwrap();
+        let v = VarValue::specified("1");
+        let e: LenientVarEntry = (n.clone(), v.clone()).into();
+        assert_eq!(e.name(), &n);
+        assert_eq!(e.value(), &v);
+    }
+
+    // ---- ResolvedVar ----
+
+    fn make_lookup<'a>(
+        entries: &'a [(&'a str, &'a str)],
+    ) -> impl Fn(&str) -> Result<String, std::env::VarError> + 'a {
+        move |name| {
+            entries
+                .iter()
+                .find_map(|(k, v)| (*k == name).then(|| (*v).to_owned()))
+                .ok_or(std::env::VarError::NotPresent)
+        }
+    }
+
+    #[test]
+    fn resolved_var_specified_does_not_consult_lookup() {
+        let r = ResolvedVar::resolve_with("EDITOR".into(), VarValue::specified("hx"), |_| {
+            panic!("lookup must not be called for Specified")
+        })
+        .unwrap();
+        assert_eq!(r.name(), "EDITOR");
+        assert_eq!(r.value(), "hx");
+    }
+
+    #[test]
+    fn resolved_var_inherit_returns_lookup_value() {
+        let lookup = make_lookup(&[("LANG", "en_US.UTF-8")]);
+        let r = ResolvedVar::resolve_with("LANG".into(), VarValue::Inherit, lookup).unwrap();
+        assert_eq!(r.value(), "en_US.UTF-8");
+    }
+
+    #[test]
+    fn resolved_var_inherit_surfaces_not_present_as_error() {
+        let lookup = make_lookup(&[]);
+        let err = ResolvedVar::resolve_with("LANG".into(), VarValue::Inherit, lookup).unwrap_err();
+        assert!(matches!(
+            err,
+            VarError::ResolutionFailure {
+                source: std::env::VarError::NotPresent,
+                ..
+            },
+        ));
+    }
+
+    #[test]
+    fn resolved_var_inherit_with_default_falls_back_when_unset() {
+        let lookup = make_lookup(&[]);
+        let r =
+            ResolvedVar::resolve_with("LANG".into(), VarValue::inherit_with_default("C"), lookup)
+                .unwrap();
+        assert_eq!(r.value(), "C");
+    }
+
+    #[test]
+    fn resolved_var_inherit_with_default_prefers_env_value() {
+        let lookup = make_lookup(&[("LANG", "en_US.UTF-8")]);
+        let r =
+            ResolvedVar::resolve_with("LANG".into(), VarValue::inherit_with_default("C"), lookup)
+                .unwrap();
+        assert_eq!(r.value(), "en_US.UTF-8");
+    }
+
+    #[test]
+    fn resolved_var_inherit_with_default_surfaces_not_unicode_as_error() {
+        use std::ffi::OsString;
+        let lookup = |_: &str| Err(std::env::VarError::NotUnicode(OsString::from("bad")));
+        let err =
+            ResolvedVar::resolve_with("LANG".into(), VarValue::inherit_with_default("C"), lookup)
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            VarError::ResolutionFailure {
+                source: std::env::VarError::NotUnicode(_),
+                ..
+            },
+        ));
+    }
+
+    #[test]
+    fn resolved_var_error_source_chain_includes_var_error() {
+        let lookup = make_lookup(&[]);
+        let err = ResolvedVar::resolve_with("LANG".into(), VarValue::Inherit, lookup).unwrap_err();
+        let source = std::error::Error::source(&err);
+        assert!(source.is_some(), "expected source on ResolutionFailure");
     }
 
     // ---- FileSet ----
@@ -919,14 +1479,14 @@ mod tests {
 
     #[test]
     fn patchdest_rejects_empty() {
-        assert!(matches!(PatchDest::try_new(""), Err(Error::EmptyDest)));
+        assert!(matches!(PatchDest::try_new(""), Err(PatchError::EmptyDest)));
     }
 
     #[test]
     fn patchdest_rejects_traversal() {
         assert!(matches!(
             PatchDest::try_new("foo/../bar"),
-            Err(Error::DestTraversal(_))
+            Err(PatchError::DestTraversal(_))
         ));
     }
 
@@ -954,7 +1514,7 @@ mod tests {
         // of what later normalization would produce.
         assert!(matches!(
             PatchDest::try_new("etc/.././foo"),
-            Err(Error::DestTraversal(_))
+            Err(PatchError::DestTraversal(_))
         ));
     }
 
@@ -1020,65 +1580,6 @@ mod tests {
         assert_eq!(dbg.matches("lovely-fonts").count(), 2);
     }
 
-    // ---- PatchPolicy ----
-
-    #[test]
-    fn patch_policy_full_example() {
-        let src = r#"
-            allow = ["~/.config/**", "/etc/xdg/**"]
-            deny = ["~/.ssh/**", "**/*.pem"]
-            ignore = ["**/.DS_Store"]
-        "#;
-        let policy: PatchPolicy = toml::from_str(src).unwrap();
-        assert_eq!(patterns(policy.allow()), ["~/.config/**", "/etc/xdg/**"]);
-        assert_eq!(patterns(policy.deny()), ["~/.ssh/**", "**/*.pem"]);
-        assert_eq!(patterns(policy.ignore()), ["**/.DS_Store"]);
-    }
-
-    #[test]
-    fn patch_policy_defaults_when_omitted() {
-        let policy: PatchPolicy = toml::from_str("").unwrap();
-        assert!(policy.allow().is_empty());
-        assert!(policy.deny().is_empty());
-        assert!(policy.ignore().is_empty());
-    }
-
-    #[test]
-    fn patch_policy_accepts_bare_string_for_each_field() {
-        let policy: PatchPolicy = toml::from_str(r#"deny = "~/.ssh/**""#).unwrap();
-        assert_eq!(patterns(policy.deny()), ["~/.ssh/**"]);
-    }
-
-    #[test]
-    fn patch_policy_builder_methods() {
-        let p = PatchPolicy::empty()
-            .with_allow(["~/.config/**"])
-            .with_deny(["~/.ssh/**", "**/*.pem"])
-            .with_ignore(["**/.DS_Store"]);
-        assert_eq!(patterns(p.allow()), ["~/.config/**"]);
-        assert_eq!(patterns(p.deny()), ["~/.ssh/**", "**/*.pem"]);
-        assert_eq!(patterns(p.ignore()), ["**/.DS_Store"]);
-    }
-
-    #[test]
-    fn patch_policy_stores_invalid_pattern_without_validating() {
-        // Patterns are no longer parsed at construction time; an invalid
-        // glob is held verbatim and only fails at expansion-time, after
-        // var substitution gets a chance to fix it. This documents that
-        // shift.
-        let p = PatchPolicy::empty().with_allow(["[bad"]);
-        assert_eq!(patterns(p.allow()), ["[bad"]);
-    }
-
-    #[test]
-    fn patch_policy_skips_empty_fields_on_serialize() {
-        let p = PatchPolicy::empty().with_allow(["A"]);
-        let s = toml::to_string(&p).unwrap();
-        assert!(s.contains("allow"), "expected allow, got: {s}");
-        assert!(!s.contains("deny"), "expected no deny, got: {s}");
-        assert!(!s.contains("ignore"), "expected no ignore, got: {s}");
-    }
-
     // ---- Patches builders ----
 
     #[test]
@@ -1103,80 +1604,5 @@ mod tests {
             .map(|p| p.dest().as_sandbox_path().as_str().to_owned())
             .collect();
         assert_eq!(dests, ["a", "b", "c", "d"]);
-    }
-
-    // ---- PatchPolicy::expand_with ----
-
-    /// Build a `SessionVar` with the given name + value. Uses a
-    /// user-origin source because resolution doesn't consult it.
-    fn sv(name: &str, value: &str) -> crate::composable::SessionVar {
-        let resolved = crate::vars::ResolvedVar::resolve_with(
-            name.into(),
-            crate::vars::VarValue::specified(value),
-            |_| Err(std::env::VarError::NotPresent),
-        )
-        .unwrap();
-        crate::composable::SessionVar::new(
-            resolved,
-            crate::composable::Source::UserLoadout {
-                name: "test".into(),
-            },
-        )
-    }
-
-    /// Each list expands independently. Patterns referencing the same
-    /// `HOME` get the same substituted prefix.
-    #[test]
-    fn expand_with_substitutes_all_three_lists() {
-        let policy = PatchPolicy::empty()
-            .with_allow(["~/cfg/**"])
-            .with_deny(["$HOME/.ssh/**"])
-            .with_ignore(["~/.DS_Store"]);
-        let vars = [sv("HOME", "/h")];
-        let expanded = policy.expand_with(&vars, None).unwrap();
-        let pats = |sets: &[FileSet]| -> Vec<String> {
-            sets.iter().map(|f| f.pattern().to_owned()).collect()
-        };
-        assert_eq!(pats(expanded.allow()), ["/h/cfg/**"]);
-        assert_eq!(pats(expanded.deny()), ["/h/.ssh/**"]);
-        assert_eq!(pats(expanded.ignore()), ["/h/.DS_Store"]);
-    }
-
-    /// A pattern in any list referencing an unresolved var bubbles
-    /// out as `ExpandError::UndefinedVar`. Short-circuits on the first
-    /// failure.
-    #[test]
-    fn expand_with_propagates_first_undefined_var() {
-        let policy = PatchPolicy::empty()
-            .with_allow(["/etc/**"])
-            .with_deny(["$NOPE/*"]);
-        let vars = [];
-        let err = policy.expand_with(&vars, None).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                crate::expansion::ExpandError::UndefinedVar { ref name }
-                    if name == "NOPE"
-            ),
-            "got: {err:?}",
-        );
-    }
-
-    /// A policy with no expansion-needing patterns resolves against an
-    /// empty var set with no error. This is the dominant fast path —
-    /// no `~/` or `$VAR` anywhere means no lookup pressure on the
-    /// resolved-vars set at all.
-    #[test]
-    fn expand_with_empty_vars_works_when_no_expansion_needed() {
-        let policy = PatchPolicy::empty()
-            .with_allow(["/etc/xdg/**"])
-            .with_deny(["/**/*.pem"])
-            .with_ignore(["/**/.DS_Store"]);
-        let vars = [];
-        let expanded = policy.expand_with(&vars, None).unwrap();
-        // Patterns pass through globset intact.
-        assert_eq!(expanded.allow().len(), 1);
-        assert_eq!(expanded.deny().len(), 1);
-        assert_eq!(expanded.ignore().len(), 1);
     }
 }

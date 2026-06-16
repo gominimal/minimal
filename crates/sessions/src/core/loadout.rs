@@ -51,9 +51,8 @@ use std::collections::BTreeMap;
 
 use nutype::nutype;
 
-use crate::lifecyclehook::LifecycleHook;
-use crate::patches::{Patch, Patches};
-use crate::vars::{LenientVarEntry, StrictVarName, VarName, VarValue};
+use crate::core::lifecyclehook::LifecycleHook;
+use crate::core::primitives::{LenientVarEntry, Patch, Patches, StrictVarName, VarName, VarValue};
 
 /// A loadout's identifier — trimmed, non-empty, and free of path
 /// separators and NUL bytes.
@@ -104,8 +103,8 @@ impl Loadout {
     /// the additive `with_*` methods:
     ///
     /// ```
-    /// use sessions::loadout::{Loadout, LoadoutName};
-    /// use sessions::vars::{StrictVarName, VarValue};
+    /// use sessions::core::loadout::{Loadout, LoadoutName};
+    /// use sessions::core::primitives::{StrictVarName, VarValue};
     ///
     /// let l = Loadout::new(LoadoutName::try_new("dev").unwrap())
     ///     .with_package("helix")
@@ -244,23 +243,23 @@ impl Loadout {
     }
 }
 
-impl crate::composable::Composable for Loadout {
-    /// Materialize the loadout as a [`Contribution`](crate::composable::Contribution),
+impl crate::client::composer::Composable for Loadout {
+    /// Materialize the loadout as a [`Contribution`](crate::client::composer::Contribution),
     /// tagging every primitive with [`Source::UserLoadout`].
     ///
     /// Inherited / default-bearing var values are resolved via `env`
     /// at this point.
     ///
-    /// [`Source::UserLoadout`]: crate::composable::Source::UserLoadout
+    /// [`Source::UserLoadout`]: crate::core::source::Source::UserLoadout
     fn contribute(
         self,
-        env: crate::composable::EnvLookup<'_>,
-    ) -> Result<crate::composable::Contribution, crate::composable::Error> {
-        use crate::composable::{
-            Contribution, ProvenancedHook, ProvenancedPackage, ProvenancedPatch, ProvenancedVar,
-            Source,
+        env: crate::client::composer::EnvLookup<'_>,
+    ) -> Result<crate::client::composer::Contribution, crate::client::composer::Error> {
+        use crate::client::composer::Contribution;
+        use crate::core::primitives::ResolvedVar;
+        use crate::core::source::{
+            ProvenancedHook, ProvenancedPackage, ProvenancedPatch, ProvenancedVar, Source,
         };
-        use crate::vars::ResolvedVar;
 
         let source = Source::UserLoadout {
             name: self.name.into_inner(),
@@ -292,9 +291,8 @@ impl crate::composable::Composable for Loadout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lifecyclehook::HookScript;
-    use crate::patches::PatchDest;
-    use crate::vars::LenientVarName;
+    use crate::core::lifecyclehook::HookScript;
+    use crate::core::primitives::{LenientVarName, PatchDest};
 
     #[test]
     fn all_vars_yields_strict_then_lenient() {
