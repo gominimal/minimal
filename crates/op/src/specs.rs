@@ -490,7 +490,9 @@ mod tests {
             ot: None,
         };
 
-        let err = futures::executor::block_on(sb.run(&opts)).unwrap_err();
+        let err = futures::executor::block_on(sb.run(&opts))
+            .err()
+            .expect("SpecBuild::run should fail for an unbuildable target");
 
         let msg = format!("{err}");
         assert!(
