@@ -66,6 +66,14 @@ pub enum WdSetup {
         read_only: bool,
         fs_mappings: Vec<common::FsMapping>,
     },
+    /// The layout used for a minimal session.
+    ///
+    /// The homedir is at /home, and the working directory is at /workbench (unless overridden).
+    Session {
+        home: PathBuf,
+        working: PathBuf,
+        working_name_override: Option<String>,
+    },
 }
 
 impl WdSetup {
@@ -191,12 +199,21 @@ impl Config {
     /// the given files as contents of the isolated working directory.
     pub fn with_isolated_wd<I: Iterator<Item = SandboxMapped>>(mut self, inputs: I) -> Self {
         match &mut self.wd {
-            WdSetup::BoundDir { .. } => {
+            WdSetup::BoundDir { .. } | WdSetup::Session { .. } => {
                 self.wd = WdSetup::Isolated {
                     working_inputs: inputs.into_iter().collect(),
                 };
             }
             WdSetup::Isolated { working_inputs } => working_inputs.extend(inputs),
+        };
+        self
+    }
+    /// Configures the sandbox following the layout for a session.
+    pub fn with_session_dirs(mut self, home: PathBuf, working: PathBuf) -> Self {
+        self.wd = WdSetup::Session {
+            home,
+            working,
+            working_name_override: None,
         };
         self
     }
@@ -395,6 +412,7 @@ impl Config {
             WdSetup::BoundDir { .. } => std::env::home_dir()
                 .and_then(|p| p.to_str().map(String::from))
                 .unwrap_or_else(|| "/state/home".to_string()),
+            WdSetup::Session { .. } => "/home".to_string(),
         };
         match &self.username {
             Some(n) => common::synth_user_group_config(&sd, n, &home),
