@@ -186,8 +186,8 @@ fn set_winsize(fd: RawFd, size: WinSize) -> io::Result<()> {
 enum BindingMsg {
     Stdin(Vec<u8>),
     TeardownDueToStdoutErr(std::io::Error),
-    TeardownDueToSuperceded,
-    TeardownDueToDetach,
+    TeardownDueToSuperceded(Vec<u8>),
+    TeardownDueToDetach(Vec<u8>),
 }
 
 /// A connection between a [`Host`] and an SSH channel.
@@ -274,11 +274,13 @@ impl Binding {
                             }
                             break;
                         }
-                        BindingMsg::TeardownDueToSuperceded => {
+                        BindingMsg::TeardownDueToSuperceded(unwind_codes) => {
+                            let _ = w.write_all(&unwind_codes).await;
                             let _ = w.write_all(b"\r\nDisconnecting - session attached to from a different connection\r\n").await;
                             break;
                         }
-                        BindingMsg::TeardownDueToDetach => {
+                        BindingMsg::TeardownDueToDetach(unwind_codes) => {
+                            let _ = w.write_all(&unwind_codes).await;
                             let _ = w.write_all(b"\r\nDetaching due to ctrl-w.\r\n").await;
                             break;
                         }
@@ -911,8 +913,9 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
                     Either::Left(b) => {
                         self.attrs.stdin_last = Some(SystemTime::now());
                         if b.len() == 1 && b[0] == 0x17 { // ctrl-w
+                            let uc = self.unwind_codes();
                             if let Some((tx, _hnd)) = self.remote.as_mut() {
-                                match tx.send(BindingMsg::TeardownDueToDetach).await {
+                                match tx.send(BindingMsg::TeardownDueToDetach(uc)).await {
                                     Ok(()) => {},
                                     Err(e) => {
                                         tracing::warn!("failed sending detach signal to remote: {e}");
@@ -965,7 +968,9 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
         if let Some((old_tx, old_join_hnd)) = self.remote.replace(new_binding) {
             // If there was a binding we just swapped out, tell it to
             // shut down and wait for it to finish.
-            let _ = old_tx.send(BindingMsg::TeardownDueToSuperceded).await;
+            let _ = old_tx
+                .send(BindingMsg::TeardownDueToSuperceded(self.unwind_codes()))
+                .await;
             let _ = old_join_hnd.await;
         }
 
@@ -980,6 +985,32 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             self.parser.screen_mut().set_size(sz.rows, sz.cols);
             self.sz = sz;
         }
+    }
+
+    /// Computes terminal escape sequences to return the outer terminal
+    /// to a normal state on detach.
+    fn unwind_codes(&self) -> Vec<u8> {
+        let live = self.parser.screen();
+        let clean = vt100_ctt::Parser::new(live.size().0, live.size().1, 0)
+            .screen()
+            .clone();
+
+        // app keypad/cursor, paste, mouse
+        let mut out = clean.input_mode_diff(live);
+        // disable alternate screen
+        if live.alternate_screen() {
+            out.extend_from_slice(b"\x1b[?1049l");
+        }
+        // disable hidden cursor
+        if live.hide_cursor() {
+            out.extend_from_slice(b"\x1b[?25h");
+        }
+
+        // blind: reset text colors etc ('SGR')
+        out.extend_from_slice(b"\x1b[m");
+        // blind: disable focus reporting
+        out.extend_from_slice(b"\x1b[?1004l");
+        out
     }
 }
 
