@@ -3461,6 +3461,8 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "dirs",
+ "minimald",
  "minimald-rpc",
  "minvmd",
  "ot",
@@ -3478,6 +3480,7 @@ dependencies = [
 name = "minimald"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "args",
  "async-compression",
  "async-tar",
@@ -3489,6 +3492,7 @@ dependencies = [
  "constcat",
  "dirs",
  "either",
+ "fd-lock",
  "futures",
  "graph",
  "hakoniwa",
@@ -3509,6 +3513,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-vsock",
+ "toml 1.1.2+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "vt100-ctt",

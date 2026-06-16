@@ -176,12 +176,29 @@ impl Client {
     }
 }
 
-/// Resolve the daemon socket path, defaulting to `minvmd::sock::resolve_uds_path()`.
+/// Resolve the daemon socket path.
 ///
-/// If `--minimal-dir` is set, use `<minimal_dir>/minimald.sock` instead.
+/// On Linux: `$XDG_STATE_HOME/minimal/providers/local-0/ssh.sock` (matching
+/// `minimald`'s `listen_on()`).
+///
+/// On macOS: delegates to `minvmd::sock::resolve_uds_path()` (the bridge
+/// socket created by the minvmd host daemon).
+///
+/// If `--minimal-dir` is set, use `<minimal_dir>/providers/local-0/ssh.sock`
+/// on Linux, or `<minimal_dir>/minimald.sock` on macOS.
 pub fn resolve_socket_path(minimal_dir_override: Option<&std::path::Path>) -> std::io::Result<std::path::PathBuf> {
     if let Some(dir) = minimal_dir_override {
+        #[cfg(target_os = "linux")]
+        return Ok(dir.join("providers/local-0/ssh.sock"));
+        #[cfg(target_os = "macos")]
         return Ok(dir.join("minimald.sock"));
     }
+    #[cfg(target_os = "linux")]
+    {
+        let state = dirs::state_dir()
+            .unwrap_or_else(|| dirs::home_dir().unwrap().join(".local/state"));
+        Ok(state.join("minimal/providers/local-0/ssh.sock"))
+    }
+    #[cfg(target_os = "macos")]
     minvmd::sock::resolve_uds_path()
 }

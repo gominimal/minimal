@@ -5,7 +5,7 @@ use camino::Utf8PathBuf;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use paths::{CwdRelative, Daemon, DaemonAbsPath, DaemonRelPath, sub_path};
-use tokio::{net::UnixListener, runtime::Builder};
+use tokio::runtime::Builder;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use minimald::server::{Config, HostKey, Server};
@@ -125,6 +125,10 @@ enum Command {
     Completions(CompletionsArgs),
     /// Runs the minimald server in the foreground.
     Run(ListenArgs),
+    /// Print the daemon status (human-readable or JSON).
+    Status(StatusArgs),
+    /// Stop the daemon gracefully (SIGTERM, then SIGKILL after 5s).
+    Stop,
 }
 
 /// The arguments for the completions subcommand.
@@ -133,6 +137,14 @@ struct CompletionsArgs {
     /// The shell type for a CLI completion script should be printed
     #[arg(value_parser)]
     shell: Shell,
+}
+
+/// Arguments for the status subcommand.
+#[derive(Debug, clap::Args)]
+struct StatusArgs {
+    /// Output status as JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Shared arguments for all subcommands.
@@ -181,6 +193,18 @@ pub struct ListenArgs {
     #[arg(long)]
     #[clap(hide = true)]
     mount_rootfs: Option<String>,
+
+    /// Run the daemon in the background (detached from the terminal).
+    ///
+    /// Spawns a child process that survives the parent shell, then returns
+    /// once the UDS socket is accepting connections.
+    #[arg(long, default_value_t = false)]
+    detach: bool,
+
+    /// Timeout in seconds for `--detach` to wait for the UDS socket to become
+    /// ready. Defaults to 4 seconds (shorter than minvmd since no VM boot).
+    #[arg(long, default_value_t = minimald::cmd::run::DEFAULT_DETACH_TIMEOUT_SECS)]
+    detach_timeout: u64,
 }
 
 /// An error at the top level of minimald.
@@ -234,6 +258,8 @@ async fn async_main() -> Result<(), MainError> {
                 vsock: true,
                 mount_dev: true,
                 mount_rootfs: Some("/dev/vda".to_string()),
+                detach: false,
+                detach_timeout: minimald::cmd::run::DEFAULT_DETACH_TIMEOUT_SECS,
             }),
             global_args: GlobalArgs {
                 minimal_state_dir: Some(DaemonAbsPath::try_new("/run/minimal").unwrap().into()),
@@ -253,6 +279,18 @@ async fn async_main() -> Result<(), MainError> {
         let mut cmd = Cli::command();
         let name = cmd.get_name().to_string();
         clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+        return Ok(());
+    }
+
+    // Handle status and stop commands (no server needed).
+    if let Command::Status(args) = cli.command {
+        let exit = minimald::cmd::status::run(args.json)
+            .map_err(|e| MainError::Other(e.to_string()))?;
+        std::process::exit(exit.code());
+    }
+    if let Command::Stop = cli.command {
+        minimald::cmd::stop::run()
+            .map_err(|e| MainError::Other(e.to_string()))?;
         return Ok(());
     }
 
@@ -310,29 +348,18 @@ async fn async_main() -> Result<(), MainError> {
     // If we got this far we need to launch minimald.
     if !cli.listen_args().unwrap().vsock {
         // standard path, listening on UDS socket
-        if let Err(e) = std::fs::remove_file(cli.listen_on())
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(MainError::IO(e, "socket already in use"));
-        }
-        let listener = UnixListener::bind(cli.listen_on())
-            .map_err(|e| MainError::IO(e, "listening to socket"))?;
+        let listen_on = cli.listen_on();
+        let listen_args = cli.listen_args().unwrap();
 
-        tracing::info!("Started listening on {}", cli.listen_on());
-        let (opts, ssh_name) = cli.ssh_args();
-        tracing::info!(
-            "Run the following to debug the socket:\n\nssh \\\n\t{} \\\n\t{}",
-            opts.into_iter()
-                .map(|(n, v)| format!("-o '{n}={v}'"))
-                .collect::<Vec<String>>()
-                .join(" \\\n\t"),
-            ssh_name,
-        );
-        // TODO: When we have a daemonize command, daemonize here.
-
-        Server::run(config, listener)
-            .await
-            .map_err(|e| MainError::IO(e, "serving on UDS"))
+        minimald::cmd::run::run(
+            listen_args.detach,
+            listen_args.detach_timeout,
+            listen_on.as_utf8_path().as_std_path(),
+            config,
+            listen_args.instance_num,
+        )
+        .await
+        .map_err(|e| MainError::Other(e.to_string()))
     } else {
         // micro-vm path, listen on vsock
         if let Err(e) = guest::emit_ready_marker().await {

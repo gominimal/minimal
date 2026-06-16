@@ -1,18 +1,23 @@
-//! Auto-spawn logic for minvmd on macOS (R4.5).
+//! Auto-spawn logic for minimald and minvmd.
 //!
-//! On macOS, checks the minvmd state before connecting to the UDS. If minvmd
+//! On macOS: checks the `minvmd` state before connecting to the UDS. If minvmd
 //! is not running, spawns `minvmd run --detach` and waits for the UDS to become
 //! available.
 //!
-//! On Linux, this module is a no-op.
+//! On Linux: checks the `minimald` state before connecting to the UDS. If
+//! minimald is not running, spawns `minimald run --detach` and waits for the
+//! UDS to become available.
 
 use std::io;
+
 #[cfg(target_os = "macos")]
 use std::process::Command;
 #[cfg(target_os = "macos")]
 use std::thread;
 #[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
+
+// ── macOS: minvmd auto-spawn ─────────────────────────────────────────────────
 
 /// Default timeout in seconds to wait for the UDS when spawning minvmd (R4.5).
 #[cfg(target_os = "macos")]
@@ -35,7 +40,7 @@ const STOPPING_WAIT_SECS: u64 = 6;
 /// - If not running, spawns `minvmd run --detach` with a timeout
 /// - Returns an error if spawn fails
 ///
-/// On Linux, this is a no-op since minvmd does not exist on Linux.
+/// On Linux, delegates to the `minimald` auto-spawn path.
 #[cfg(target_os = "macos")]
 pub fn ensure_minvmd_running() -> io::Result<()> {
     let state_dir = minvmd::state::StateDir::new(minvmd::state::StateDir::default_path())?;
@@ -109,10 +114,90 @@ pub fn ensure_minvmd_running() -> io::Result<()> {
     Ok(())
 }
 
-/// On Linux, auto-spawn is a no-op since minvmd is not available.
+// ── Linux: minimald auto-spawn ───────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
+
+/// Default timeout in seconds to wait for the UDS when spawning minimald.
+/// Shorter than minvmd's 8s since there is no VM boot.
+#[cfg(target_os = "linux")]
+const MINIMALD_SPAWN_TIMEOUT_SECS: u64 = 4;
+
+/// On Linux, auto-spawn `minimald run --detach` if the daemon is not already
+/// running.
 #[cfg(target_os = "linux")]
 pub fn ensure_minvmd_running() -> io::Result<()> {
-    tracing::debug!("ensure_minvmd_running is a no-op on Linux");
+    ensure_minimald_running()
+}
+
+/// Check if minimald needs to be spawned, and spawn it if necessary.
+///
+/// Adapted from the `minvmd` macOS auto-spawn logic. Uses the same lifecycle
+/// state machine (`minimald::state::StateDir`) to determine whether the daemon
+/// is already running, starting, or stopping, and spawns `minimald run --detach`
+/// when appropriate.
+#[cfg(target_os = "linux")]
+fn ensure_minimald_running() -> io::Result<()> {
+    use minimald::lifecycle::Lifecycle;
+    use minimald::state::StateDir;
+
+    let state_dir = StateDir::new(StateDir::default_path())?;
+
+    // Read current state before connecting.
+    let state = state_dir.read_state()?;
+
+    match state.lifecycle {
+        Lifecycle::Running | Lifecycle::Starting => {
+            tracing::debug!("minimald already running or starting");
+            return Ok(());
+        }
+        Lifecycle::Stopping => {
+            tracing::info!("minimald is stopping; waiting for it to finish");
+            let deadline = Instant::now() + Duration::from_secs(6);
+            loop {
+                std::thread::sleep(Duration::from_millis(100));
+                match state_dir.read_state()?.lifecycle {
+                    Lifecycle::Running | Lifecycle::Starting => return Ok(()),
+                    Lifecycle::Stopped | Lifecycle::NotProvisioned => break,
+                    _ if Instant::now() >= deadline => {
+                        return Err(io::Error::other(
+                            "minimald is still stopping after waiting; try again shortly",
+                        ));
+                    }
+                    _ => continue,
+                }
+            }
+        }
+        Lifecycle::Stopped | Lifecycle::NotProvisioned => {
+            // Not running; will spawn below
+        }
+        _ => {}
+    }
+
+    tracing::info!(
+        "spawning minimald run --detach with timeout {}",
+        MINIMALD_SPAWN_TIMEOUT_SECS
+    );
+    let output = Command::new("minimald")
+        .arg("run")
+        .arg("--detach")
+        .arg("--detach-timeout")
+        .arg(MINIMALD_SPAWN_TIMEOUT_SECS.to_string())
+        .output()
+        .map_err(|e| io::Error::new(e.kind(), format!("failed to spawn minimald: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(io::Error::other(format!(
+            "minimald run --detach failed: {}",
+            stderr
+        )));
+    }
+
+    tracing::info!("minimald spawned successfully");
     Ok(())
 }
 
@@ -120,12 +205,25 @@ pub fn ensure_minvmd_running() -> io::Result<()> {
 mod tests {
     #[test]
     #[cfg(target_os = "linux")]
-    fn test_autospawn_noop_on_linux() {
-        // On Linux, ensure_minvmd_running should be a no-op and always succeed
+    fn test_autospawn_on_linux() {
+        // On Linux, ensure_minvmd_running delegates to minimald auto-spawn.
+        // If minimald is already running (or the binary is available), it
+        // should succeed. If the binary is not installed, the spawn may fail
+        // — that's expected in a dev environment without minimald on PATH.
         let result = super::ensure_minvmd_running();
-        assert!(
-            result.is_ok(),
-            "ensure_minvmd_running should always succeed on Linux"
-        );
+        match result {
+            Ok(()) => {} // all good
+            Err(e) => {
+                // Acceptable: minimald binary not installed (dev env).
+                // Not acceptable: assertion failures or panics.
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("failed to spawn minimald")
+                        || msg.contains("No such file")
+                        || msg.contains("minimald is not running"),
+                    "unexpected auto-spawn error: {msg}"
+                );
+            }
+        }
     }
 }

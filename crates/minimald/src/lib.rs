@@ -1,15 +1,18 @@
 use std::collections::BTreeMap;
 
+pub mod cmd;
 pub mod connection;
 mod exec;
 #[cfg(target_os = "linux")]
 pub mod guest;
+pub mod lifecycle;
 pub mod rpc;
 pub mod server;
 mod session;
 pub mod session_host;
 mod sessions;
 mod sftp;
+pub mod state;
 #[cfg(test)]
 mod test_harness;
 

@@ -9,6 +9,7 @@ clap.workspace = true
 clap_complete.workspace = true
 camino.workspace = true
 chrono.workspace = true
+dirs.workspace = true
 minimald-rpc.workspace = true
 paths.workspace = true
 russh.workspace = true
@@ -20,4 +21,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 minvmd = { path = "../minvmd" }
+minimald = { path = "../minimald" }
 ot.workspace = true
