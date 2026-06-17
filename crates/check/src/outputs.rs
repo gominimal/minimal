@@ -506,13 +506,24 @@ mod tests {
             .expect("stdlib crate dir must exist");
         let layer = {
             let _guard = ENV_LOCK.lock().expect("env lock");
+            let prev_manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR");
             // SAFETY: every test that mutates CARGO_MANIFEST_DIR does so while
             // holding ENV_LOCK, and no other code in this test binary reads the
             // variable, so this set never races with another thread's access.
             unsafe {
                 std::env::set_var("CARGO_MANIFEST_DIR", &stdlib);
             }
-            Layer::new_for_test(nickel.to_string()).expect("parse test layer")
+            let parsed = Layer::new_for_test(nickel.to_string());
+            // Restore the prior value before releasing ENV_LOCK so the redirect
+            // cannot leak into later tests and make them order-dependent.
+            // SAFETY: same invariant as the set above — still under ENV_LOCK.
+            unsafe {
+                match prev_manifest_dir {
+                    Some(v) => std::env::set_var("CARGO_MANIFEST_DIR", v),
+                    None => std::env::remove_var("CARGO_MANIFEST_DIR"),
+                }
+            }
+            parsed.expect("parse test layer")
         };
         let graph = Graph::new().ingest(layer).expect("ingest test layer");
         Arc::new(RwLock::new(graph))
