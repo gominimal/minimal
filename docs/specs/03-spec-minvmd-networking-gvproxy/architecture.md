@@ -35,6 +35,7 @@ A new networking module that owns:
 - `fn gvproxy_bin() -> std::path::PathBuf` — resolves the gvproxy binary path via `MINVMD_GVPROXY_PATH` env var or defaults to `"gvproxy"` (resolved via `PATH`)
 - `fn spawn_gvproxy(net_fd: RawFd) -> Result<Child>` — spawns gvproxy with `--fd <net_fd>` argument
 - `enum NetworkPolicy { Open, Allowlist(Vec<String>) }` — network access policy for a VM session
+- `enum PolicyError { Denied { host: String } }` — `#[derive(Debug, thiserror::Error)]` error returned by the enforcement hook; for this spec it has a single `Denied` variant reserved for the follow-up allowlist work, so the hook can grow real failure modes without changing its signature
 - `fn check_network_policy(policy: &NetworkPolicy) -> Result<(), PolicyError>` — enforcement hook (currently always returns `Ok(())`)
 
 ### Changes to `crates/minvmd/src/cmd/run.rs`
@@ -44,13 +45,13 @@ A new networking module that owns:
 - Call `resolve_net_mode()` to determine whether to use gvproxy or TSI
 - When `GvProxy` mode:
   - Create a Unix socketpair before spawning the VMM child
-  - Clear `FD_CLOEXEC` on the gvproxy-side FD to ensure it survives the spawn
-  - Spawn gvproxy via `spawn_gvproxy(gvproxy_fd)` before spawning the VMM child
+  - Clear `FD_CLOEXEC` on **both** ends of the socketpair before the respective spawns: on the gvproxy-side FD so it survives the gvproxy spawn, and on the VMM-side FD so it survives the VMM child's `fork()+exec()`. Both FDs must be inheritable for the handoff to work; clearing only the gvproxy side would leave the VMM child unable to open the FD named by `MINVMD_NET_FD`.
+  - Spawn gvproxy via `spawn_gvproxy(gvproxy_fd)` before spawning the VMM child. No explicit readiness handshake is required: the socketpair buffers frames written by the guest before gvproxy's read loop starts, so the two children may be spawned in sequence without coordination. gvproxy connecting late only delays the first packet; it does not drop the connection (a `SOCK_STREAM` socketpair is connected at creation, so there is no connect-before-listen race — the VMM's virtio-net device is wired to an already-open FD, not a pending connection).
   - Export the VMM-side FD number as `MINVMD_NET_FD=<n>` in the VMM child's environment
-  - Close the gvproxy-side FD in the parent after gvproxy has started
+  - Close the gvproxy-side FD in the parent after gvproxy has started (the VMM-side FD is likewise closed in the parent after the VMM child is spawned, leaving each FD owned solely by its child)
 - Call `check_network_policy(&NetworkPolicy::Open)` before spawning gvproxy (early-exit on error)
-- In all exit paths (boot failure, VMM child exit, signal), call `gvproxy_child.kill()` and `gvproxy_child.wait()` to ensure no orphans
-- The `StartingGuard` drop path must also kill gvproxy
+- In all exit paths (boot failure, VMM child exit, signal), call `gvproxy_child.kill()` then `gvproxy_child.wait()` to ensure no orphans. Reaping is best-effort: `kill()` on an already-exited child is ignored (`ESRCH` treated as success), `wait()` retries on `EINTR`, and a reap failure is logged at `tracing::warn!` but never aborts the exit path — the supervisor always proceeds to its own teardown so a stuck gvproxy cannot wedge `minvmd` shutdown.
+- The `StartingGuard` drop path must also kill gvproxy. `StartingGuard` is the existing RAII guard defined in `crates/minvmd/src/state.rs` that resets the persisted lifecycle state to `Stopped` on drop unless `commit()` was called (R4.6); the gvproxy reap is hooked into the same early-exit path so that a bail before `commit()` tears down gvproxy alongside the state reset.
 
 ### Changes to `crates/minvmd/src/state.rs`
 
@@ -88,6 +89,7 @@ The existing `VmConfig.apply()` will:
 - Add a branch:
   - When `net_mode == NetworkMode::GvProxy` and `net_fd` is `Some(fd)`: call `ctx.set_passt_fd(fd)`
   - When `net_mode == NetworkMode::Tsi` or `net_fd` is `None`: no `set_passt_fd` call; libkrun's built-in TSI shim handles guest networking as before
+  - The `net_mode == NetworkMode::GvProxy` with `net_fd == None` combination is a silent fall-through to the TSI branch, **not** a hard error: `apply()` logs at `tracing::warn!` that gvproxy mode was requested but no FD was supplied (gvproxy unavailable or failed to spawn) and continues with TSI so the VM still boots with working networking. The supervisor in `run.rs` owns the decision of whether a missing gvproxy is fatal; by the time `apply()` runs, falling back is strictly better than aborting a VM that already started.
 - Remove the `#[cfg(target_os = "macos")]` gate on `apply()` — the method becomes platform-agnostic since `krun_set_passt_fd` works on both macOS (Hypervisor.framework) and Linux (KVM)
 
 ### Changes to `crates/minvmd/src/cmd/vmm_child.rs`
