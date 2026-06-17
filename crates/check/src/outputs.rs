@@ -399,8 +399,9 @@ fn find_lib_in_deps(
 mod tests {
     use super::*;
     use crate::{CheckCtx, CheckVerdict, GraphBasedChecker};
+    use decode::Layer;
     use graph::Graph;
-    use lcache::Cache;
+    use lcache::{Cache, EntryMeta, MetaInner};
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -480,6 +481,192 @@ mod tests {
             matches!(result.verdict, CheckVerdict::Skip),
             "expected Skip when package is absent from graph, got {:?}",
             result.verdict
+        );
+
+        std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
+    }
+
+    /// Serializes the `CARGO_MANIFEST_DIR` redirect in `graph_with_pkg` so
+    /// concurrent ingesting tests never race on the process environment.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Ingests a single inline-Nickel package into a fresh graph and returns it
+    /// wrapped for the checker. The package declares no runtime deps, so its
+    /// transitive runtime-dep set is empty.
+    ///
+    /// `Layer::new_for_test` resolves `import "minimal.ncl"` relative to
+    /// `CARGO_MANIFEST_DIR/minimal-ncl`, a directory the `check` crate does not
+    /// ship. We point the variable at the `stdlib` crate (which owns the
+    /// canonical `minimal-ncl`) for the duration of the parse, mirroring the
+    /// redirect used by the `minimal` crate's tests.
+    fn graph_with_pkg(nickel: &str) -> Arc<RwLock<Graph>> {
+        let stdlib = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../stdlib")
+            .canonicalize()
+            .expect("stdlib crate dir must exist");
+        let layer = {
+            let _guard = ENV_LOCK.lock().expect("env lock");
+            // SAFETY: every test that mutates CARGO_MANIFEST_DIR does so while
+            // holding ENV_LOCK, and no other code in this test binary reads the
+            // variable, so this set never races with another thread's access.
+            unsafe {
+                std::env::set_var("CARGO_MANIFEST_DIR", &stdlib);
+            }
+            Layer::new_for_test(nickel.to_string()).expect("parse test layer")
+        };
+        let graph = Graph::new().ingest(layer).expect("ingest test layer");
+        Arc::new(RwLock::new(graph))
+    }
+
+    /// When the package exists in the graph but its build artifacts were never
+    /// committed to the cache, the checker has nothing to inspect and must
+    /// return `Skip` rather than erroring or failing.
+    #[tokio::test]
+    async fn missing_runtime_deps_skip_when_build_not_cached() {
+        let tmpdir = make_tmp_dir("no_cached_build");
+        let ctx = make_ctx(&tmpdir, vec![]);
+
+        let graph = graph_with_pkg(
+            r#"
+            let {BuildSpec, OutputData, ..} = import "minimal.ncl" in
+            {
+                name = "uncached",
+                build_deps = [],
+                cmd = "",
+                outputs = { out = {glob = "out"} | OutputData },
+            } | BuildSpec
+            "#,
+        );
+        let guard = graph.read().await;
+        let result = MissingRuntimeDeps
+            .check(&ctx, "uncached".to_string(), &tmpdir, guard, None)
+            .await
+            .expect("check should not error when the build is uncached");
+
+        assert!(
+            matches!(result.verdict, CheckVerdict::Skip),
+            "expected Skip when the package build is absent from the cache, got {:?}",
+            result.verdict
+        );
+
+        std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
+    }
+
+    /// A package whose only output is plain data (not an ELF object) imports no
+    /// executable dependency, so the checker must report `Pass` with no errors.
+    #[tokio::test]
+    async fn missing_runtime_deps_pass_when_outputs_have_no_elf_imports() {
+        let tmpdir = make_tmp_dir("pass_no_imports");
+        let ctx = make_ctx(&tmpdir, vec![]);
+
+        let graph = graph_with_pkg(
+            r#"
+            let {BuildSpec, OutputData, ..} = import "minimal.ncl" in
+            {
+                name = "datapkg",
+                build_deps = [],
+                cmd = "",
+                outputs = { doc = {glob = "readme.txt"} | OutputData },
+            } | BuildSpec
+            "#,
+        );
+
+        // Fake a completed build: a single non-ELF data file. The checker should
+        // collect no imports and no script interpreters from it.
+        let spec_hash = {
+            let g = graph.read().await;
+            g.spec_hash(g.by_name("datapkg").expect("pkg in graph"))
+        };
+        let pending = ctx.cache.write_dir(&spec_hash).expect("write cache dir");
+        std::fs::write(
+            pending.path().join("readme.txt"),
+            b"just some text, not an ELF binary",
+        )
+        .expect("write output file");
+        pending
+            .finalize(EntryMeta {
+                inner: MetaInner::Spec("datapkg".to_string()),
+                ..Default::default()
+            })
+            .expect("finalize cache entry");
+
+        let guard = graph.read().await;
+        let result = MissingRuntimeDeps
+            .check(&ctx, "datapkg".to_string(), &tmpdir, guard, None)
+            .await
+            .expect("check should not error");
+
+        assert!(
+            matches!(result.verdict, CheckVerdict::Pass),
+            "expected Pass when no output imports an executable dependency, got {:?} (errors: {:?})",
+            result.verdict,
+            result.err
+        );
+        assert!(
+            result.err.is_empty(),
+            "expected no errors on the Pass path, got {:?}",
+            result.err
+        );
+
+        std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
+    }
+
+    /// A binary output that is a shebang script must declare a runtime dep that
+    /// provides its interpreter. When no dep does, the checker must `Fail` and
+    /// name the missing interpreter.
+    #[tokio::test]
+    async fn missing_runtime_deps_fails_when_script_interpreter_absent() {
+        let tmpdir = make_tmp_dir("missing_interp");
+        let ctx = make_ctx(&tmpdir, vec![]);
+
+        let graph = graph_with_pkg(
+            r#"
+            let {BuildSpec, OutputBin, ..} = import "minimal.ncl" in
+            {
+                name = "scriptpkg",
+                build_deps = [],
+                cmd = "",
+                outputs = {
+                    bin = {glob = "run.sh", allow_missing_interpreter = false} | OutputBin,
+                },
+            } | BuildSpec
+            "#,
+        );
+
+        // Fake a completed build whose only output is a shebang script whose
+        // interpreter (/bin/sh) is provided by no runtime dependency.
+        let spec_hash = {
+            let g = graph.read().await;
+            g.spec_hash(g.by_name("scriptpkg").expect("pkg in graph"))
+        };
+        let pending = ctx.cache.write_dir(&spec_hash).expect("write cache dir");
+        std::fs::write(pending.path().join("run.sh"), b"#!/bin/sh\necho hi\n")
+            .expect("write output file");
+        pending
+            .finalize(EntryMeta {
+                inner: MetaInner::Spec("scriptpkg".to_string()),
+                ..Default::default()
+            })
+            .expect("finalize cache entry");
+
+        let guard = graph.read().await;
+        let result = MissingRuntimeDeps
+            .check(&ctx, "scriptpkg".to_string(), &tmpdir, guard, None)
+            .await
+            .expect("check should not error");
+
+        assert!(
+            matches!(result.verdict, CheckVerdict::Fail),
+            "expected Fail when a script interpreter is not in runtime deps, got {:?}",
+            result.verdict
+        );
+        assert!(
+            result
+                .err
+                .iter()
+                .any(|e| e.contains("interpreter") && e.contains("bin/sh")),
+            "expected an error naming the missing interpreter, got {:?}",
+            result.err
         );
 
         std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
