@@ -1,0 +1,218 @@
+name: CI (Linux KVM)
+
+# minvmd Linux/KVM end-to-end on GitHub-hosted runners (#410, #411).
+#
+# Split from ci.yml and PATH-SCOPED so it runs only when the minvmd surface
+# changes: it builds libkrun (incl. libkrunfw, which compiles a kernel) from
+# source, so it is far heavier than a normal lane and should not burden unrelated
+# PRs. Unlike the earlier self-hosted incarnation it needs no preprovisioned
+# runner — KVM is available on GitHub-hosted Linux runners (x86_64 ubuntu-latest
+# and arm64 ubuntu-24.04-arm), and libkrun is built + cached here.
+#
+# NON-GATING: absent from ci.yml's `ci-success`, so a KVM/runner hiccup never
+# blocks a PR. The boot/session/bridge e2e tests assert correctness; the daemon
+# lifecycle step exercises `run --detach`/`status`/`stop`; the latency benchmark
+# is informational.
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "crates/minvmd/**"
+      - "crates/minimald/**"
+      - "scripts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".minimal/minimal.toml"
+      - ".github/workflows/ci-linux-kvm.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "crates/minvmd/**"
+      - "crates/minimald/**"
+      - "scripts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".minimal/minimal.toml"
+      - ".github/workflows/ci-linux-kvm.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Cancel superseded runs so the heavy libkrun build isn't queued on stale commits.
+concurrency:
+  group: ci-linux-kvm-${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  minvmd-linux-kvm-e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build dependencies
+        # protoc: the `minimal` CLI (materialize) build. The rest: libkrunfw's
+        # kernel compile (flex/bison/bc/libelf/libssl/pyelftools/cpio) and
+        # libkrun's bindgen + link (clang/libclang/pkg-config/patchelf).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler \
+            build-essential flex bison bc libelf-dev libssl-dev \
+            python3 python3-pyelftools cpio \
+            clang libclang-dev pkg-config patchelf git
+
+      - name: Enable /dev/kvm access
+        # GitHub-hosted Linux runners expose /dev/kvm but the runner user is not
+        # in the `kvm` group; widen the node so libkrun can open it. Fail fast
+        # with a clear message if this runner has no KVM at all.
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm not present on ${{ matrix.os }} (${{ matrix.arch }}); this runner lacks KVM." >&2
+            exit 1
+          fi
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Resolve build paths
+        # Publish the libkrun prefix and guest-artifact paths (plus the E2E gate)
+        # to $GITHUB_ENV for later steps; `runner.temp`/`$HOME` are not available
+        # in job-level `env:`.
+        run: |
+          {
+            echo "KRUN_PREFIX=$HOME/.krun"
+            echo "MINVMD_E2E=1"
+            echo "MINVMD_KERNEL_PATH=$RUNNER_TEMP/vmlinuz"
+            echo "MINVMD_ROOTFS_PATH=$RUNNER_TEMP/rootfs.img"
+            echo "MINVMD_INITRAMFS=$RUNNER_TEMP/initramfs.cpio"
+          } >> "$GITHUB_ENV"
+
+      - name: Cache libkrun (libkrunfw v5.5.0 + libkrun v1.19.0)
+        # Keyed on the pinned versions + arch: the kernel compile only runs on a
+        # cache miss. Bump the suffix when scripts/build-libkrun.sh changes pins.
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.KRUN_PREFIX }}
+          key: ${{ matrix.arch }}-libkrun-fw5.5.0-krun1.19.0-blk
+
+      - name: Build libkrun from source (cached)
+        run: ./scripts/build-libkrun.sh "$KRUN_PREFIX"
+
+      - name: Export libkrun link + runtime paths
+        # LIBKRUN_PREFIX: minvmd build.rs link-search dir (it emits an rpath to
+        # it too). LD_LIBRARY_PATH: libkrun.so -> libkrunfw.so.5 at runtime.
+        run: |
+          {
+            echo "LIBKRUN_PREFIX=$KRUN_PREFIX/lib64"
+            echo "LD_LIBRARY_PATH=$KRUN_PREFIX/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          } >> "$GITHUB_ENV"
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Cache cargo + build artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ matrix.arch }}-minvmd-kvm-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.arch }}-minvmd-kvm-
+
+      - name: Materialize guest kernel (raw Image)
+        run: ./scripts/fetch-artifact.sh virtio-kernel "$RUNNER_TEMP/vmlinuz" "${{ matrix.arch }}"
+
+      - name: Materialize guest rootfs (ext4 image)
+        run: ./scripts/fetch-artifact.sh minvmd-rootfs "$RUNNER_TEMP/rootfs.img" "${{ matrix.arch }}"
+
+      - name: Build guest initramfs (minimald as /init)
+        run: ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs.cpio" "${{ matrix.target }}"
+
+      - name: Build minvmd
+        run: cargo build -p minvmd --bin minvmd
+
+      - name: Boot E2E (READY round-trip, R3.1)
+        env:
+          MINVMD_BOOT_LOG: ${{ runner.temp }}/boot.log
+        run: cargo test -p minvmd --test boot_e2e -- --include-ignored --nocapture
+
+      - name: Session E2E (full minimald session over the bridge)
+        run: cargo test -p minvmd --test minimald_session_e2e -- --include-ignored --nocapture --exact minimald_exec_over_bridge
+
+      - name: Bridge E2E (concurrent UDS↔vsock round-trips, R3.3/R3.4)
+        run: cargo test -p minvmd --test bridge_e2e -- --include-ignored --nocapture
+
+      - name: Daemon lifecycle (run --detach → status → stop, R4.2/R4.3/R4.4)
+        # Exercises the supervised daemon path that manages state.toml lifecycle,
+        # which the raw `boot` e2e tests above do not cover.
+        env:
+          MINVMD_BOOT_LOG: ${{ runner.temp }}/boot-daemon.log
+        run: |
+          set -euo pipefail
+          BIN=target/debug/minvmd
+
+          echo "::group::run --detach"
+          "$BIN" run --detach --timeout 30
+          echo "::endgroup::"
+
+          echo "::group::status (expect running)"
+          "$BIN" status --json | tee status.json
+          "$BIN" status   # exit 0 == Running
+          grep -q '"state":"running"' status.json
+          grep -q '"vmm_pid":[0-9]' status.json
+          echo "::endgroup::"
+
+          echo "::group::stop"
+          "$BIN" stop
+          echo "::endgroup::"
+
+          echo "::group::status (expect stopped)"
+          "$BIN" status --json | tee status-after.json
+          grep -q '"state":"stopped"' status-after.json
+          # `status` exits 1 when stopped; assert that explicitly without tripping set -e.
+          if "$BIN" status; then echo "::error::expected non-zero status exit after stop"; exit 1; fi
+          echo "::endgroup::"
+
+          echo "daemon lifecycle OK"
+
+      - name: Boot latency benchmark (informational)
+        # Report boot-to-READY min/median/max. Non-gating (correctness is gated
+        # by the e2e tests above), so a timing hiccup never reds the build.
+        run: scripts/bench-minvmd-boot.sh 10 target/debug/minvmd || true
+
+      - name: Upload guest boot console logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minvmd-linux-boot-log-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/boot.log
+            ${{ runner.temp }}/boot-daemon.log
+          if-no-files-found: ignore
