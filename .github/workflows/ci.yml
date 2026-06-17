@@ -30,6 +30,7 @@ permissions:
 jobs:
   fmt:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - name: Run rustfmt
@@ -37,6 +38,7 @@ jobs:
 
   clippy:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Free Disk Space
         uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
@@ -55,6 +57,7 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - name: Free Disk Space
         uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
@@ -81,6 +84,7 @@ jobs:
 
   dogfood:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-minimal
@@ -89,6 +93,7 @@ jobs:
 
   build-release-amd64:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v6
@@ -122,6 +127,7 @@ jobs:
 
   build-release-arm64:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v6
@@ -150,12 +156,14 @@ jobs:
 
   cargo-deny:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [ci-success, build-release-amd64, build-release-arm64]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
@@ -235,6 +243,7 @@ jobs:
 
   minimal-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-minimal
@@ -247,6 +256,7 @@ jobs:
     if: always()
     needs: [fmt, clippy, test, dogfood, cargo-deny, minimal-check]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Verify all gating jobs succeeded
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
