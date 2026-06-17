@@ -78,7 +78,8 @@ jaq-all = "0.2.0"
 libc = "0.2"
 lzma-rs = "0.3"
 
-nickel-lang-core = { version = "0.18", default-features = false, features = ["format"] }
+# Revert back to crates.io dep once new version is released.
+nickel-lang-core = { git = "https://github.com/nickel-lang/nickel.git", rev = "e8a0ab95e52ab31ac9a8ae1a3bef854d8de73cea", default-features = false, features = ["format"] }
 
 nix = { version = "0.31", features = ["fs"] }
 nutype = { version = "0.7", features = ["serde"] }
@@ -119,7 +120,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "2"
 url = "2" # keep in sync with reqwest
 uuid = { version = "1.23", features = ["v4", "v7", "serde"] }
-vt100-ctt = "0.17"
+vt100-ctt = { version = "0.17", default-features = false }
 zstd = "0.13"
 
 moka = { version = "0.12", default-features = false, features = ["sync"] }

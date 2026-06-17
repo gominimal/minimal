@@ -210,3 +210,48 @@ impl OneshotSshRpc for RenameSession {
     type Request<'a> = RenameSessionRequest;
     type Response = Errorable<RenameSessionResponse>;
 }
+
+// ---------------------------------------------------------------------------
+// Session-creation flow (multi-round contribution composition).
+//
+// Distinct from the simpler [`CreateSession`] above: that one takes a
+// fully-formed [`sessions::Record`]; the flow below composes the record
+// by walking client contributions and daemon-side closures across one or
+// more rounds. Each call returns a [`SessionStep`]: either the next round
+// of pending items or a protocol-level fault.
+//
+// TODO: these three RPCs are the building blocks for what is eventually
+// going to subsume `CreateSession` — once the multi-round flow lands on
+// the daemon, the terminal `SessionStep` will assemble a `sessions::Record`
+// and the single-shot `CreateSession` becomes redundant. Keeping them
+// separate for now so the existing `CreateSession` callers stay working
+// while the contribution flow is built out.
+
+/// An RPC to open a new session and receive the first round of items
+/// the client must resolve.
+pub struct SessionCreate;
+
+impl OneshotSshRpc for SessionCreate {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "SessionCreate");
+    type Request<'a> = sessions::wire::request::SessionCreateRequest;
+    type Response = Errorable<sessions::wire::request::SessionStep>;
+}
+
+/// An RPC to submit the client's verdicts for one round and receive the
+/// next round (or a `complete` signal in [`sessions::wire::request::ContributionResponse`]).
+pub struct SubmitVerdict;
+
+impl OneshotSshRpc for SubmitVerdict {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "SubmitVerdict");
+    type Request<'a> = sessions::wire::request::ContributionVerdict;
+    type Response = Errorable<sessions::wire::request::SessionStep>;
+}
+
+/// An RPC to abort an in-flight session-creation flow.
+pub struct SessionAbort;
+
+impl OneshotSshRpc for SessionAbort {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "SessionAbort");
+    type Request<'a> = sessions::wire::request::Abort;
+    type Response = Errorable<()>;
+}
