@@ -14,7 +14,12 @@ use crate::error::VmError;
 ///   Loading raw skips libkrun's gzip decompress, which measured ~77 ms (over
 ///   half of boot-to-READY) versus a `PeGz` `Image.gz`. The aarch64 loader
 ///   implements only RAW and PE_GZ.
-/// - `x86_64`:  `virtio-linux` ships `bzImage`  → `KernelFormat::Elf`.
+/// - `x86_64`:  `virtio-linux` ships a `bzImage` → `KernelFormat::ImageGz`.
+///   A bzImage is a PE/`MZ` container that embeds the `vmlinux` ELF as a
+///   gzip member; libkrun's `ImageGz` loader scans for the gzip magic
+///   (`1f 8b 08`), inflates that single member, and ELF-loads the result.
+///   Loading it as `Elf` directly fails (`krun_start_enter` → EINVAL) because
+///   the ELF loader is handed the PE container, not the inner vmlinux.
 #[cfg(minvmd_libkrun)]
 pub fn kernel_format() -> crate::krun::KernelFormat {
     #[cfg(target_arch = "aarch64")]
@@ -23,7 +28,7 @@ pub fn kernel_format() -> crate::krun::KernelFormat {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        crate::krun::KernelFormat::Elf
+        crate::krun::KernelFormat::ImageGz
     }
 }
 
@@ -147,10 +152,11 @@ mod tests {
     fn kernel_format_matches_arch() {
         let fmt = kernel_format();
         // aarch64 ships the uncompressed Image → RAW (skips the libkrun gzip
-        // decompress). x86_64 ships bzImage → ELF.
+        // decompress). x86_64 ships a bzImage → IMAGE_GZ (libkrun inflates the
+        // embedded gzip vmlinux and ELF-loads it).
         #[cfg(target_arch = "aarch64")]
         assert_eq!(fmt, crate::krun::KernelFormat::Raw);
         #[cfg(target_arch = "x86_64")]
-        assert_eq!(fmt, crate::krun::KernelFormat::Elf);
+        assert_eq!(fmt, crate::krun::KernelFormat::ImageGz);
     }
 }

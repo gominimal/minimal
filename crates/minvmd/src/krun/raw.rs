@@ -20,8 +20,11 @@ use crate::error::VmError;
 ///   implements only RAW and PE_GZ; PE_GZ scans for the gzip magic and
 ///   decompresses. `ImageGz` (=4) is x86_64-only and returns
 ///   `KernelFormatUnsupported` on aarch64.
-/// - x86_64 `virtio-linux` ships `bzImage` → `Elf`. libkrun loads bzImage as
-///   ELF; `IMAGE_BZ2` (=3) is bzip2 blobs, not the bzImage container format.
+/// - x86_64 `virtio-linux` ships a `bzImage` → `ImageGz` (=4). A bzImage embeds
+///   the `vmlinux` ELF as a gzip member; libkrun's `ImageGz` loader scans for
+///   the gzip magic, inflates it, and ELF-loads the result. `IMAGE_BZ2` (=3) is
+///   the bzip2 variant, and `Elf` (=1) would (wrongly) hand the PE/`MZ`
+///   container straight to the ELF loader.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KernelFormat {
