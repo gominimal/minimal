@@ -45,7 +45,7 @@ use sandbox2::config::{Config, SandboxMapped};
 use sandbox2::{Container, Sandbox};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, spawn_blocking};
 
 /// The min helper script installed at `/usr/bin/min` inside the sandbox.
 const MIN_SCRIPT: &str = include_str!("env_min_helper.sh");
@@ -257,6 +257,7 @@ impl Env {
             )
             .unwrap(),
             state_dir: args.state_base_dir.clone(),
+            working: args.cwd.clone(),
             task_name: args.name.clone(),
             has_packages: transitives.keys().copied().collect(),
             ot: args.ot.clone(),
@@ -386,6 +387,9 @@ struct SessionChannel {
     rootfs: DaemonAbsPath,
     /// The host directory backing `/state`.
     state_dir: DaemonAbsPath,
+    /// The host directory the working directory.
+    working: DaemonAbsPath,
+
     /// The environment name, used when adding task packages.
     task_name: String,
     /// Packages already materialized into the rootfs.
@@ -565,24 +569,40 @@ impl SessionChannel {
         }
 
         let cache = self.ctx.local_cache();
+
+        // Resolve the newly-needed packages to their cache directories,
+        // then hardlink them in within a blocking thread.
+        let mut pkg_dirs = Vec::new();
         for bsr in transitives.keys() {
             if self.has_packages.insert(*bsr) {
-                let src = match cache.read_dir(&new_graph.spec_hash(bsr)) {
-                    Ok(entry) => entry,
+                match cache.read_dir(&new_graph.spec_hash(bsr)) {
+                    Ok(entry) => pkg_dirs.push(entry.path().to_path_buf()),
                     Err(e) => {
                         let _ = writeln!(stream, "error: {e}");
                         return;
                     }
-                };
-                if let Err(e) = common::hardlink_dir_contents(
-                    src.path(),
-                    self.rootfs.as_utf8_path().as_std_path(),
-                ) {
-                    let _ = writeln!(stream, "error: {e}");
-                    return;
                 }
             }
         }
+        let rootfs = self.rootfs.as_utf8_path().as_std_path().to_path_buf();
+        let hardlink = spawn_blocking(move || {
+            pkg_dirs
+                .iter()
+                .try_for_each(|src| common::hardlink_dir_contents(src, &rootfs))
+        })
+        .await;
+        match hardlink {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = writeln!(stream, "error: hardlinking: {e}");
+                return;
+            }
+            Err(e) => {
+                let _ = writeln!(stream, "error: spawn: {e}");
+                return;
+            }
+        }
+
         let _ = writeln!(
             stream,
             "msg:Installed {}",
@@ -702,7 +722,7 @@ impl SessionChannel {
             let _ = std::fs::create_dir_all(&output_base);
 
             let cache = build_ctx.local_cache();
-            let (stdout_writer, stderr_writer) = StreamWriter::pair(stream);
+            let (stdout_writer, stderr_writer) = StreamWriter::pair(stream)?;
             let res = op::PatchedBuild {
                 spec: &bsr,
                 remote_fetcher: &remote_storage,
@@ -774,7 +794,8 @@ impl SessionChannel {
                 .make_env(
                     task_name,
                     &mut graph,
-                    task.inherit_cwd.then(|| std::env::current_dir().unwrap()),
+                    task.inherit_cwd
+                        .then(|| self.working.as_utf8_path().as_std_path().to_path_buf()),
                     task.state_key.as_ref(),
                     Some(&task.patch),
                     Some(&task.vars),
@@ -792,7 +813,8 @@ impl SessionChannel {
                 return Ok(());
             }
 
-            let (stdout_writer, stderr_writer) = StreamWriter::pair(stream);
+            let (stdout_writer, stderr_writer) = StreamWriter::pair(stream)
+                .map_err(|e| Error::IO("creating writers", Default::default(), e))?;
             env.run(invocations, Some(stdout_writer), Some(stderr_writer))
                 .await
         }
@@ -825,9 +847,9 @@ struct StreamWriter {
 }
 
 impl StreamWriter {
-    fn pair(stream: &UnixStream) -> (Self, Self) {
-        let shared = Arc::new(Mutex::new(stream.try_clone().unwrap()));
-        (
+    fn pair(stream: &UnixStream) -> Result<(Self, Self), std::io::Error> {
+        let shared = Arc::new(Mutex::new(stream.try_clone()?));
+        Ok((
             Self {
                 stream: shared.clone(),
                 buf: Vec::new(),
@@ -836,7 +858,7 @@ impl StreamWriter {
                 stream: shared,
                 buf: Vec::new(),
             },
-        )
+        ))
     }
 
     fn emit_lines(&mut self) {
@@ -885,7 +907,8 @@ mod tests {
     /// Builds a `Context` and `Graph` from mctx's fakerepo fixture, plus a
     /// `SessionChannel` wired to them with a dummy receiver so handlers can be
     /// driven directly.
-    fn setup_channel() -> (TempDir, TempDir, SessionChannel) {
+    fn setup_channel() -> (TempDir, TempDir, TempDir, SessionChannel) {
+        let cwd = tempdir().unwrap();
         let state = tempdir().unwrap();
         let rootfs = tempdir().unwrap();
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -911,6 +934,10 @@ mod tests {
                 Utf8PathBuf::try_from(state.path().to_path_buf()).unwrap(),
             )
             .unwrap(),
+            working: DaemonAbsPath::try_new(
+                Utf8PathBuf::try_from(cwd.path().to_path_buf()).unwrap(),
+            )
+            .unwrap(),
             task_name: "test-task".to_string(),
             has_packages: HashSet::new(),
             ot: None,
@@ -918,7 +945,7 @@ mod tests {
             graph,
             rx,
         };
-        (state, rootfs, channel)
+        (state, rootfs, cwd, channel)
     }
 
     /// Reads all currently-available lines from a `UnixStream`.
@@ -932,7 +959,7 @@ mod tests {
 
     #[tokio::test]
     async fn errs_on_unknown_command() {
-        let (_state, _rootfs, mut chan) = setup_channel();
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel();
         let (mut ours, theirs) = UnixStream::pair().unwrap();
 
         chan.handle("garbage-input", &mut ours).await;
@@ -948,7 +975,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_finds_known_package() {
-        let (_state, _rootfs, mut chan) = setup_channel();
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel();
         let (mut ours, theirs) = UnixStream::pair().unwrap();
 
         // "uroot" is a known package in the fakerepo fixture.

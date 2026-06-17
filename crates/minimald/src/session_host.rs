@@ -6,6 +6,8 @@
 //! The [`Host`] struct holds the running state of an active session.
 
 use either::Either;
+#[cfg(not(test))]
+use mfile::EnvVarValue;
 use russh::Channel;
 use russh::server::Msg;
 use std::future::Future;
@@ -341,6 +343,8 @@ pub(crate) trait SessionLauncher {
 
     fn launch(
         self,
+        name: String,
+        username: String,
         paths: SessionPaths,
         sz: WinSize,
     ) -> impl Future<Output = io::Result<Launched<Self::Process, Self::Guard>>> + Send;
@@ -577,6 +581,8 @@ impl SessionLauncher for SandboxLauncher {
 
     async fn launch(
         self,
+        name: String,
+        username: String,
         paths: SessionPaths,
         sz: WinSize,
     ) -> io::Result<Launched<SandboxProcess, crate::env::Env>> {
@@ -600,8 +606,19 @@ impl SessionLauncher for SandboxLauncher {
         let mut env = crate::env::Env::build(
             ctx,
             graph,
-            crate::env::EnvArgs::new("session", paths.working, paths.home, paths.cache)
-                .with_packages(["base", "bash", "socat", "coreutils", "claude-code"]),
+            crate::env::EnvArgs::new(name, paths.working, paths.home, paths.cache)
+                .with_packages(["base", "bash", "socat", "coreutils", "claude-code"])
+                .with_env_vars(
+                    [(
+                        "PS1".to_string(),
+                        EnvVarValue::Value(
+                            r"\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "
+                                .to_string(),
+                        ),
+                    )]
+                    .into(),
+                )
+                .with_username(username),
         )
         .await?;
 
@@ -674,6 +691,8 @@ impl SessionLauncher for MockLauncher {
 
     async fn launch(
         self,
+        _name: String,
+        _username: String,
         _paths: SessionPaths,
         sz: WinSize,
     ) -> io::Result<Launched<MockProcess, ()>> {
@@ -704,6 +723,8 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
     /// one is supplied, and drives its runtime loop on a background task.
     pub async fn spawn<L>(
         launcher: L,
+        name: String,
+        username: String,
         paths: SessionPaths,
         sz: WinSize,
         channel: Option<Channel<Msg>>,
@@ -711,7 +732,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
     where
         L: SessionLauncher<Process = P, Guard = G>,
     {
-        let (host, handle) = Self::build(launcher, paths, sz, channel).await?;
+        let (host, handle) = Self::build(launcher, name, username, paths, sz, channel).await?;
         tokio::spawn(host.mainloop());
         Ok(handle)
     }
@@ -721,6 +742,8 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
     /// directly and observe the host's state.
     async fn build<L>(
         launcher: L,
+        name: String,
+        username: String,
         paths: SessionPaths,
         sz: WinSize,
         channel: Option<Channel<Msg>>,
@@ -732,7 +755,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             master,
             process,
             guard,
-        } = launcher.launch(paths, sz).await?;
+        } = launcher.launch(name, username, paths, sz).await?;
 
         let (sender, receiver) = mpsc::channel(8);
         let handle = HostHandle { sender };
@@ -1076,6 +1099,8 @@ mod tests {
         // runtime loop on a background task.
         let (host, handle) = Host::build(
             MockLauncher,
+            "test-session".to_string(),
+            "user".to_string(),
             SessionPaths {
                 working: DaemonAbsPath::root(),
                 cache: DaemonAbsPath::root(),

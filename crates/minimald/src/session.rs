@@ -43,6 +43,7 @@ enum SessionMessage {
     Attach(
         oneshot::Sender<Result<(), AttachError>>,
         SessionHandle,
+        String,
         Channel<Msg>,
         ChannelConfig,
     ),
@@ -72,9 +73,9 @@ impl<S: SessionObject> Session<S> {
         minimal_cache_dir: DaemonAbsPath,
         session: S,
     ) -> Result<SessionHandle, std::io::Error> {
-        std::fs::create_dir_all(session.workspace_path()).unwrap();
-        std::fs::create_dir_all(session.home_path()).unwrap();
-        std::fs::create_dir_all(session.cache_path()).unwrap();
+        std::fs::create_dir_all(session.workspace_path())?;
+        std::fs::create_dir_all(session.home_path())?;
+        std::fs::create_dir_all(session.cache_path())?;
 
         let (sender, receiver) = mpsc::channel(8);
         let mngr = Self {
@@ -106,8 +107,11 @@ impl<S: SessionObject> Session<S> {
             SessionMessage::MakeContext(r) => {
                 let _ = r.send(self.context());
             }
-            SessionMessage::Attach(r, session_hnd, channel, config) => {
-                let _ = r.send(self.attach(session_hnd, channel, config).await);
+            SessionMessage::Attach(r, session_hnd, conn_username, channel, config) => {
+                let _ = r.send(
+                    self.attach(session_hnd, conn_username, channel, config)
+                        .await,
+                );
             }
             SessionMessage::GetHostAttrs(r) => {
                 let _ = r.send(match self.host.as_ref() {
@@ -128,6 +132,7 @@ impl<S: SessionObject> Session<S> {
     async fn attach(
         &mut self,
         session_hnd: SessionHandle,
+        conn_username: String,
         channel: Channel<Msg>,
         config: ChannelConfig,
     ) -> Result<(), AttachError> {
@@ -137,13 +142,17 @@ impl<S: SessionObject> Session<S> {
         });
 
         match &mut self.host {
-            None => self.mint_session_host(session_hnd, channel, sz).await,
+            None => {
+                self.mint_session_host(session_hnd, conn_username, channel, sz)
+                    .await
+            }
             Some(h) => {
                 match h.attach(channel, sz).await {
                     Ok(()) => Ok(()),
                     Err((channel, sz)) => {
                         // session host is dead
-                        self.mint_session_host(session_hnd, channel, sz).await
+                        self.mint_session_host(session_hnd, conn_username, channel, sz)
+                            .await
                     }
                 }
             }
@@ -153,12 +162,27 @@ impl<S: SessionObject> Session<S> {
     async fn mint_session_host(
         &mut self,
         session_hnd: SessionHandle,
+        conn_username: String,
         channel: Channel<Msg>,
         sz: WinSize,
     ) -> Result<(), AttachError> {
+        let name = {
+            let record = self.session.record();
+            match &record.name {
+                Some(s) => s.clone(),
+                None => record
+                    .project_path
+                    .file_name()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "session".to_string()),
+            }
+        };
+
         let launcher = self.session_launcher(session_hnd)?;
         let h = Box::pin(session_host::Host::spawn(
             launcher,
+            name,
+            conn_username,
             self.paths(),
             sz,
             Some(channel),
@@ -264,6 +288,7 @@ impl SessionHandle {
 
     pub async fn attach(
         &self,
+        conn_username: String,
         channel: Channel<Msg>,
         config: ChannelConfig,
     ) -> Result<(), AttachError> {
@@ -271,7 +296,13 @@ impl SessionHandle {
         // Ignore send errors - the recv will also fail.
         let _ = self
             .0
-            .send(SessionMessage::Attach(send, self.clone(), channel, config))
+            .send(SessionMessage::Attach(
+                send,
+                self.clone(),
+                conn_username,
+                channel,
+                config,
+            ))
             .await;
         recv.await.expect("corresponding session is dead")
     }

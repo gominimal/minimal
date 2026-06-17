@@ -45,7 +45,7 @@ __min_rpc() {
 
 min_search() {
     local term="$1"
-    if [[ -z "$term" || -z "$term" ]]; then
+    if [[ -z "$term" ]]; then
         echo "Usage: min_search <search term>" >&2
         return 1
     fi
@@ -55,7 +55,7 @@ min_search() {
 
 min_patched_pkg() {
     local pkg="$1"
-    if [[ -z "$pkg" || -z "$pkg" ]]; then
+    if [[ -z "$pkg" ]]; then
         echo "Usage: min_patched_pkg <package-name>" >&2
         return 1
     fi

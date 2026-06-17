@@ -105,6 +105,13 @@ pub struct DiskSession {
     record: Record,
 }
 
+impl DiskSession {
+    fn root_path(&self) -> DaemonAbsPath {
+        sub_path!(self.minimal_state_dir, "sessions")
+            .join(&DaemonRelPath::try_new(&self.key.dir_key).unwrap())
+    }
+}
+
 impl SessionObject for DiskSession {
     type Key = DiskSessionKey;
 
@@ -121,19 +128,13 @@ impl SessionObject for DiskSession {
         &self.key
     }
     fn workspace_path(&self) -> DaemonAbsPath {
-        let base = sub_path!(self.minimal_state_dir, "sessions")
-            .join(&DaemonRelPath::try_new(&self.key.dir_key).unwrap());
-        sub_path!(base, "tree")
+        sub_path!(self.root_path(), "tree")
     }
     fn home_path(&self) -> DaemonAbsPath {
-        let base = sub_path!(self.minimal_state_dir, "sessions")
-            .join(&DaemonRelPath::try_new(&self.key.dir_key).unwrap());
-        sub_path!(base, "home")
+        sub_path!(self.root_path(), "home")
     }
     fn cache_path(&self) -> DaemonAbsPath {
-        let base = sub_path!(self.minimal_state_dir, "sessions")
-            .join(&DaemonRelPath::try_new(&self.key.dir_key).unwrap());
-        sub_path!(base, "cache")
+        sub_path!(self.root_path(), "cache")
     }
 }
 
@@ -347,15 +348,18 @@ impl Loader for DiskLoader {
 
         let mut obj = self.get(key)?;
         let short = obj.key.dir_key.to_string();
-        if let Some(old_name) = &obj.record.name {
-            self.index.name_to_id.remove(old_name);
-        }
+        let old_name = obj.record.name.clone();
 
         obj.record.name = Some(new_name.clone());
         self.write_record(&short, &obj.record)?;
 
+        // Only mutate in-memory index after disk writes succeed
+        if let Some(old_name) = &old_name {
+            self.index.name_to_id.remove(old_name);
+        }
         self.index.name_to_id.insert(new_name, obj.record.id);
         self.flush_index()?;
+
         Ok(())
     }
 }
