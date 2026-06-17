@@ -37,17 +37,22 @@ if [ -e "$PREFIX/lib64/libkrun.so" ]; then
   exit 0
 fi
 
-# Parallelise the recursive kernel build via MAKEFLAGS (inherited by sub-makes).
-export MAKEFLAGS="-j$(nproc)"
+JOBS="$(nproc)"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 # ── libkrunfw: guest kernel firmware (compiles a Linux kernel) ────────────────
+# NOTE: run with `cd` + an explicit `-j`, NOT `make -C` and NOT an exported
+# MAKEFLAGS. libkrunfw's Makefile forwards `$(MAKEFLAGS)` verbatim into the
+# kernel's recursive make; `-C` turns on print-directory mode, which injects a
+# bare `w` token into MAKEFLAGS that the kernel make then treats as a goal
+# (`make w` → "No rule to make target 'w'"). A plain in-dir `make -jN` forwards
+# a clean MAKEFLAGS and parallelises the kernel build correctly.
 git clone --depth 1 --branch "$LIBKRUNFW_TAG" \
   https://github.com/containers/libkrunfw "$WORK/libkrunfw"
-make -C "$WORK/libkrunfw"
-make -C "$WORK/libkrunfw" install PREFIX="$PREFIX"
+( cd "$WORK/libkrunfw" && make -j"$JOBS" )
+( cd "$WORK/libkrunfw" && make install PREFIX="$PREFIX" )
 
 # ── libkrun: KVM backend (BLK=1 for virtio-blk / krun_add_disk2) ──────────────
 git clone --depth 1 --branch "$LIBKRUN_TAG" \
@@ -56,8 +61,8 @@ git clone --depth 1 --branch "$LIBKRUN_TAG" \
 export LIBRARY_PATH="$PREFIX/lib64${LIBRARY_PATH:+:$LIBRARY_PATH}"
 export LD_LIBRARY_PATH="$PREFIX/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export PKG_CONFIG_PATH="$PREFIX/lib64/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-make -C "$WORK/libkrun" BLK=1
-make -C "$WORK/libkrun" BLK=1 install PREFIX="$PREFIX"
+( cd "$WORK/libkrun" && make BLK=1 -j"$JOBS" )
+( cd "$WORK/libkrun" && make BLK=1 install PREFIX="$PREFIX" )
 
 echo "build-libkrun: installed libkrun $LIBKRUN_TAG + libkrunfw $LIBKRUNFW_TAG into $PREFIX/lib64"
 ls -l "$PREFIX/lib64"/libkrun.so* "$PREFIX/lib64"/libkrunfw.so*

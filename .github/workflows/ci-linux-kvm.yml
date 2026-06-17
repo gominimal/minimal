@@ -1,13 +1,17 @@
 name: CI (Linux KVM)
 
-# minvmd Linux/KVM end-to-end on GitHub-hosted runners (#410, #411).
+# minvmd Linux/KVM end-to-end on a GitHub-hosted runner (#410, #411).
 #
 # Split from ci.yml and PATH-SCOPED so it runs only when the minvmd surface
 # changes: it builds libkrun (incl. libkrunfw, which compiles a kernel) from
 # source, so it is far heavier than a normal lane and should not burden unrelated
 # PRs. Unlike the earlier self-hosted incarnation it needs no preprovisioned
-# runner — KVM is available on GitHub-hosted Linux runners (x86_64 ubuntu-latest
-# and arm64 ubuntu-24.04-arm), and libkrun is built + cached here.
+# runner — KVM is available on GitHub-hosted x86_64 Linux runners, and libkrun is
+# built + cached here.
+#
+# x86_64 ONLY: GitHub-hosted arm64 runners (ubuntu-24.04-arm) do not expose
+# /dev/kvm, so the Linux/KVM e2e can only run on x86_64. aarch64 + libkrun boot
+# is already covered by the macOS lane (ci-macos.yml, Apple Silicon / HVF).
 #
 # NON-GATING: absent from ci.yml's `ci-success`, so a KVM/runner hiccup never
 # blocks a PR. The boot/session/bridge e2e tests assert correctness; the daemon
@@ -49,17 +53,7 @@ permissions:
 
 jobs:
   minvmd-linux-kvm-e2e:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            arch: x86_64
-            target: x86_64-unknown-linux-musl
-          - os: ubuntu-24.04-arm
-            arch: aarch64
-            target: aarch64-unknown-linux-musl
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest # x86_64; KVM-capable
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
@@ -82,12 +76,12 @@ jobs:
             clang libclang-dev pkg-config patchelf git
 
       - name: Enable /dev/kvm access
-        # GitHub-hosted Linux runners expose /dev/kvm but the runner user is not
-        # in the `kvm` group; widen the node so libkrun can open it. Fail fast
-        # with a clear message if this runner has no KVM at all.
+        # GitHub-hosted x86_64 Linux runners expose /dev/kvm but the runner user
+        # is not in the `kvm` group; widen the node so libkrun can open it. Fail
+        # fast with a clear message if this runner has no KVM at all.
         run: |
           if [ ! -e /dev/kvm ]; then
-            echo "::error::/dev/kvm not present on ${{ matrix.os }} (${{ matrix.arch }}); this runner lacks KVM." >&2
+            echo "::error::/dev/kvm not present on this runner; cannot run the Linux/KVM e2e." >&2
             exit 1
           fi
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
@@ -110,12 +104,12 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Cache libkrun (libkrunfw v5.5.0 + libkrun v1.19.0)
-        # Keyed on the pinned versions + arch: the kernel compile only runs on a
-        # cache miss. Bump the suffix when scripts/build-libkrun.sh changes pins.
+        # Keyed on the pinned versions: the kernel compile only runs on a cache
+        # miss. Bump the suffix when scripts/build-libkrun.sh changes pins.
         uses: actions/cache@v5
         with:
           path: ${{ env.KRUN_PREFIX }}
-          key: ${{ matrix.arch }}-libkrun-fw5.5.0-krun1.19.0-blk
+          key: x86_64-libkrun-fw5.5.0-krun1.19.0-blk
 
       - name: Build libkrun from source (cached)
         run: ./scripts/build-libkrun.sh "$KRUN_PREFIX"
@@ -143,17 +137,17 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-${{ matrix.arch }}-minvmd-kvm-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ matrix.arch }}-minvmd-kvm-
+          key: ${{ runner.os }}-x86_64-minvmd-kvm-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-x86_64-minvmd-kvm-
 
       - name: Materialize guest kernel (raw Image)
-        run: ./scripts/fetch-artifact.sh virtio-kernel "$RUNNER_TEMP/vmlinuz" "${{ matrix.arch }}"
+        run: ./scripts/fetch-artifact.sh virtio-kernel "$RUNNER_TEMP/vmlinuz" x86_64
 
       - name: Materialize guest rootfs (ext4 image)
-        run: ./scripts/fetch-artifact.sh minvmd-rootfs "$RUNNER_TEMP/rootfs.img" "${{ matrix.arch }}"
+        run: ./scripts/fetch-artifact.sh minvmd-rootfs "$RUNNER_TEMP/rootfs.img" x86_64
 
       - name: Build guest initramfs (minimald as /init)
-        run: ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs.cpio" "${{ matrix.target }}"
+        run: ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs.cpio" x86_64-unknown-linux-musl
 
       - name: Build minvmd
         run: cargo build -p minvmd --bin minvmd
@@ -211,7 +205,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: minvmd-linux-boot-log-${{ matrix.arch }}
+          name: minvmd-linux-boot-log-x86_64
           path: |
             ${{ runner.temp }}/boot.log
             ${{ runner.temp }}/boot-daemon.log
