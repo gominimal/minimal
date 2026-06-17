@@ -218,9 +218,12 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::status (expect stopped)"
-          "$BIN" status --json | tee status-after.json
+          # `status`/`status --json` exit 1 when stopped (documented), so capture
+          # without tripping set -e / pipefail, then assert structurally.
+          "$BIN" status --json > status-after.json || true
+          cat status-after.json
           jq -e '.state == "stopped"' status-after.json
-          # `status` exits 1 when stopped; assert that explicitly without tripping set -e.
+          # Also confirm the documented non-zero exit for the stopped state.
           if "$BIN" status; then echo "::error::expected non-zero status exit after stop"; exit 1; fi
           echo "::endgroup::"
 
