@@ -203,23 +203,9 @@ impl Server {
 
             let (stream, peer) = listener.accept().await?;
             tracing::info!(?peer, transport = L::TRANSPORT, "accepted connection");
-            let (_conn_hnd, session_fut) = match Connection::from_stream(
-                stream,
-                russh_config.clone(),
-                state.clone(),
-                L::IS_LOCAL,
-            )
-            .await
-            {
-                Ok(conn) => conn,
-                Err(e) => {
-                    // A handshake failure must not take the daemon down — in
-                    // the guest minimald is pid-1. Drop this connection and
-                    // keep accepting.
-                    tracing::warn!(error = %e, transport = L::TRANSPORT, "SSH handshake failed; dropping connection");
-                    continue;
-                }
-            };
+            let (_conn_hnd, session_fut) =
+                Connection::from_stream(stream, russh_config.clone(), state.clone(), L::IS_LOCAL)
+                    .await;
             // Log session errors instead of silently dropping the spawned
             // future, so a failed handshake is visible on any transport.
             session_set.spawn(async move {
