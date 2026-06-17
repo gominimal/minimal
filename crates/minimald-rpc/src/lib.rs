@@ -190,3 +190,23 @@ impl OneshotSshRpc for CreateSession {
     type Request<'a> = CreateSessionRequest;
     type Response = Errorable<CreateSessionResponse>;
 }
+
+/// An RPC to rename an existing session.
+pub struct RenameSession;
+
+/// The request for a [`RenameSession`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameSessionRequest {
+    pub id: SessionId,
+    pub new_name: String,
+}
+
+/// The response for a [`RenameSession`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RenameSessionResponse;
+
+impl OneshotSshRpc for RenameSession {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "RenameSession");
+    type Request<'a> = RenameSessionRequest;
+    type Response = Errorable<RenameSessionResponse>;
+}

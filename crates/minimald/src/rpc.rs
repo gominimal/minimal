@@ -1,7 +1,8 @@
 use minimald_rpc::{
     CreateSession, CreateSessionResponse, Errorable, GetSessionRecord, GetSessionRecordRequest,
     GetSessionRecordResponse, GetVersion, GetVersionResponse, ListSessions, ListSessionsEntry,
-    ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX,
+    ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
+    RenameSessionResponse,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -151,6 +152,27 @@ async fn serve_create_session(s: ServerStateHandle, c: RuChannel<Msg>) {
     }
 }
 
+async fn serve_rename_session(s: ServerStateHandle, c: RuChannel<Msg>) {
+    let res = RenameSession
+        .handle_channel(c, async |req| {
+            let res = s
+                .sessions_manager()
+                .await
+                .rename_session(req.id, req.new_name)
+                .await;
+            match res {
+                Ok(()) => Ok(Errorable::Ok(RenameSessionResponse)),
+                Err(e) => Ok(Errorable::Err {
+                    error: e.to_string(),
+                }),
+            }
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", RenameSession::NAME, e);
+    }
+}
+
 pub(crate) const STREAM_WORKSPACE_FILES: &str =
     constcat::concat!(RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst");
 
@@ -223,6 +245,7 @@ pub async fn handle_ssh_rpc(
         | ListSessions::NAME
         | GetSessionRecord::NAME
         | CreateSession::NAME
+        | RenameSession::NAME
         | STREAM_WORKSPACE_FILES => {
             let mut conn_lock = c.lock().await;
             let c_hnd = match conn_lock.take(id) {
@@ -252,6 +275,7 @@ pub async fn handle_ssh_rpc(
         ListSessions::NAME => spawn(serve_list_sessions(s, channel)),
         GetSessionRecord::NAME => spawn(serve_get_session_record(s, channel)),
         CreateSession::NAME => spawn(serve_create_session(s, channel)),
+        RenameSession::NAME => spawn(serve_rename_session(s, channel)),
         STREAM_WORKSPACE_FILES => spawn(serve_stream_workspace_files(s, config, channel)),
         _ => unreachable!(),
     };
@@ -261,7 +285,7 @@ pub async fn handle_ssh_rpc(
 
 #[cfg(test)]
 mod tests {
-    use minimald_rpc::{CreateSession, CreateSessionRequest};
+    use minimald_rpc::{CreateSession, CreateSessionRequest, RenameSessionRequest};
     use paths::HostAbsPath;
     use sessions::SessionId;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -529,6 +553,63 @@ mod tests {
             Errorable::Err {
                 error: "A session with that name already exists".to_string()
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_session_propagates_into_the_running_session() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        // Bring the session up before renaming, so the rename has to reach the
+        // live actor's in-memory record rather than only touching disk.
+        let mngr = server.state.sessions_manager().await;
+        let handle = mngr
+            .get_session(SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("freshly-created session should be retrievable");
+
+        let resp = client
+            .call::<RenameSession>(&RenameSessionRequest {
+                id: session_id,
+                new_name: "renamed".to_string(),
+            })
+            .await;
+        assert_eq!(resp, Errorable::Ok(RenameSessionResponse));
+
+        // The record held by the running session reflects the new name...
+        let record = handle.record().await;
+        assert_eq!(record.name.as_deref(), Some("renamed"));
+        // ...while its id is untouched by the rename.
+        assert_eq!(record.id, session_id);
+
+        // The rename is reflected by GetRecord...
+        let get_session = client
+            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(record.id))
+            .await;
+        assert_eq!(
+            get_session.record.as_ref().unwrap().name,
+            Some("renamed".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_session_errors_for_unknown_id() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let resp = client
+            .call::<RenameSession>(&RenameSessionRequest {
+                id: SessionId::nil(),
+                new_name: "renamed".to_string(),
+            })
+            .await;
+
+        assert!(
+            matches!(resp, Errorable::Err { error } if error.contains("no session with ID")),
+            "expected an unknown-id error",
         );
     }
 }
