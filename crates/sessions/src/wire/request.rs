@@ -3,12 +3,12 @@
 //! Flow:
 //!
 //! 1. Client → daemon: [`SessionCreateRequest`] containing the
-//!    [`ResolvedContribution`] composed from the user's loadouts.
-//! 2. Daemon → client: zero or more [`ContributionResponse`]
-//!    messages with package- and project-sourced items that need
-//!    client-side policy gating. `complete` signals the last one.
-//! 3. Client → daemon: [`ContributionVerdict`] per response, OR
-//!    [`Abort`] to bail.
+//!    [`WireContribution`] composed from the user's loadouts.
+//! 2. Daemon → client: a single [`ContributionResponse`] with the
+//!    package- and project-sourced items that need client-side
+//!    policy gating.
+//! 3. Client → daemon: [`ContributionVerdict`] with per-item
+//!    decisions, OR [`Abort`] to bail.
 
 use super::errors::WireError;
 use super::policy::{WirePatchVerdict, WireVarVerdict};
@@ -29,17 +29,18 @@ pub struct SessionCreateRequest {
     pub protocol_version: u32,
     /// Absolute host path to the project directory.
     pub project_path: paths::HostAbsPath,
-    /// Already-resolved contribution from the user's loadouts.
-    pub contribution: ResolvedContribution,
+    /// The user's already-gated contribution.
+    pub contribution: WireContribution,
 }
 
-/// What the client has already resolved + policy-gated for the daemon.
+/// The client's composed contribution, wire-shaped: var values
+/// resolved, patch sources expanded to concrete files, every item
+/// already gated by the user policy.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ResolvedContribution {
-    /// Resolved variables that survived user policy.
+pub struct WireContribution {
+    /// Variables that passed the user policy gate.
     pub vars: Vec<WireSessionVar>,
-    /// Resolved patch files that survived user policy. File contents
-    /// stream out-of-band.
+    /// Patch files that passed the user policy gate.
     pub patches: Vec<WireSessionPatch>,
     /// Lifecycle hooks (no policy applies).
     pub lifecycle_hooks: Vec<WireProvenancedHook>,
@@ -50,34 +51,27 @@ pub struct ResolvedContribution {
 /// Daemon → Client: items from the daemon-side closure (packages,
 /// project config) that need client-side policy + prompts.
 ///
-/// More than one response may flow per session: if a hook adds a
-/// rule, or a newly approved package pulls more transitive deps that
-/// themselves contribute items, the daemon emits another response.
-/// `complete = true` on the final one.
+/// Sent once per session. After receiving the matching
+/// [`ContributionVerdict`] (or an [`Abort`]), the daemon assembles
+/// the session.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContributionResponse {
-    /// Session id assigned by the daemon on the first response.
+    /// Session id assigned by the daemon.
     pub session_id: SessionId,
-    /// Zero-based round counter. Verdicts must echo this back.
-    pub round: u32,
     /// Pending variables awaiting policy + prompt.
     pub vars: Vec<WirePendingVar>,
     /// Pending patches awaiting policy + prompt.
     pub patches: Vec<WirePendingPatch>,
     /// Lifecycle hooks (no policy applies; pass through to client).
     pub lifecycle_hooks: Vec<WireProvenancedHook>,
-    /// `true` if this is the final response — daemon is ready to
-    /// assemble the session once it receives this round's verdict.
-    pub complete: bool,
 }
 
-/// Client → Daemon: per-item verdicts on one response's pending items.
+/// Client → Daemon: per-item verdicts on the [`ContributionResponse`]'s
+/// pending items.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContributionVerdict {
     /// Matches [`ContributionResponse::session_id`].
     pub session_id: SessionId,
-    /// Matches [`ContributionResponse::round`].
-    pub round: u32,
     /// One verdict per pending var.
     pub vars: Vec<WireVarVerdict>,
     /// One verdict per pending patch.
@@ -98,6 +92,7 @@ pub struct Abort {
 }
 
 /// Why the client aborted.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AbortReason {
@@ -128,20 +123,15 @@ pub enum AbortReason {
     },
 }
 
-/// One step of the session-creation flow as seen by the client.
-///
-/// Returned by every round-advancing RPC (`SessionCreate`,
-/// `SubmitVerdict`). Either the daemon has another (possibly terminal)
-/// round of pending items — distinguish via
-/// [`ContributionResponse::complete`] — or it surfaces a protocol-level
-/// fault that the transport layer didn't catch.
+/// Daemon's reply to a session-creation RPC: either the batch of
+/// pending items needing client-side gating, or a protocol-level
+/// fault the transport layer didn't catch.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionStep {
-    /// Next batch of pending items. `ContributionResponse::complete`
-    /// flags the terminal round.
-    Round {
-        /// The round payload.
+    /// Pending items awaiting client verdicts.
+    Response {
+        /// The pending-items payload.
         response: ContributionResponse,
     },
     /// Protocol-level failure detected by the daemon (e.g. unknown
@@ -182,7 +172,7 @@ mod tests {
         let req = SessionCreateRequest {
             protocol_version: 1,
             project_path: paths::HostAbsPath::try_new("/repo").unwrap(),
-            contribution: ResolvedContribution {
+            contribution: WireContribution {
                 vars: vec![WireSessionVar {
                     var: WireResolvedVar {
                         name: "EDITOR".into(),
@@ -217,7 +207,7 @@ mod tests {
 
     #[test]
     fn empty_contribution_round_trips() {
-        let c = ResolvedContribution::default();
+        let c = WireContribution::default();
         assert_eq!(round_trip(&c), c);
     }
 
@@ -225,7 +215,6 @@ mod tests {
     fn contribution_response_round_trips() {
         let r = ContributionResponse {
             session_id: session_id(),
-            round: 0,
             vars: vec![WirePendingVar {
                 id: PendingId::new(1),
                 name: "RUSTC".into(),
@@ -236,7 +225,6 @@ mod tests {
             }],
             patches: vec![],
             lifecycle_hooks: vec![],
-            complete: false,
         };
         assert_eq!(round_trip(&r), r);
     }
@@ -245,7 +233,6 @@ mod tests {
     fn contribution_verdict_round_trips() {
         let v = ContributionVerdict {
             session_id: session_id(),
-            round: 0,
             vars: vec![WireVarVerdict::Approved {
                 id: PendingId::new(1),
                 value: WireResolvedVar {
@@ -299,20 +286,18 @@ mod tests {
 
     #[test]
     fn session_step_round_trips_both_variants() {
-        let round = SessionStep::Round {
+        let response = SessionStep::Response {
             response: ContributionResponse {
                 session_id: session_id(),
-                round: 0,
                 vars: vec![],
                 patches: vec![],
                 lifecycle_hooks: vec![],
-                complete: true,
             },
         };
         let fault = SessionStep::Fault {
             error: WireError::UnknownSessionId,
         };
-        assert_eq!(round_trip(&round), round);
+        assert_eq!(round_trip(&response), response);
         assert_eq!(round_trip(&fault), fault);
     }
 

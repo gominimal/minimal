@@ -1,435 +1,57 @@
-//! Composer: accumulator for contributions and resolver to a [`Resolution`].
+//! Client-side composer: gathers a user's loadouts, runs them through
+//! their policy, and emits a wire contribution to ship to the daemon.
 
-use core::fmt;
-
-use crate::client::enumerate::{ExpandedProvenancedPatch, PatchFile, enumerate_patch_files};
-use crate::client::hooks::{HookResult, PolicyHooks, Unapproved};
-use crate::core::decision::{CheckOutcome, Decision, ItemDecision};
-use crate::core::policy::{PatchPolicy, UserPolicy, VarsPolicy};
-use crate::core::primitives::{ResolvedPatch, ResolvedVar};
-use crate::core::source::{
-    Provenanced, ProvenancedHook, ProvenancedPackage, ProvenancedPatch, ProvenancedVar, Source,
+use crate::core::compose::{
+    Composable, ComposeError, ComposeOptions, Composition, Contribution, Error, StoredEnv,
+    compose_contribution, default_env,
 };
+use crate::core::loadout::Loadout;
+use crate::core::policy::UserPolicy;
+use crate::wire::request::WireContribution;
 
-/// Errors produced while composing a [`Composable`] into a [`Composer`].
-#[non_exhaustive]
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// A variable declaration failed validation or resolution.
-    #[error("variable contribution failed: {source}")]
-    Var {
-        #[from]
-        source: crate::core::primitives::VarError,
-    },
-    /// A patch declaration failed validation.
-    #[error("patch contribution failed: {source}")]
-    Patch {
-        #[from]
-        source: crate::core::primitives::PatchError,
-    },
-    /// A lifecycle hook declaration failed validation.
-    #[error("lifecycle hook contribution failed: {source}")]
-    LifecycleHook {
-        #[from]
-        source: crate::core::lifecyclehook::Error,
-    },
-}
-
-/// A single source's contribution to a session, materialized as a
-/// concrete value rather than streamed into a [`Composer`].
+/// Accumulator for a user's loadouts, composed into a
+/// [`WireContribution`] by [`Self::compose`].
 ///
-/// Returned by [`Composable::contribute`]. The composer drains
-/// `Contribution`s as it accumulates them — the indirection through
-/// this struct keeps the boundary between contributor and composer
-/// crisp:
+/// User-origin items always reach a `Decided` outcome under
+/// [`UserPolicy`] (the allow step auto-passes for them; `ignore`
+/// and `deny` still apply), so the compose pass needs no
+/// [`PolicyHooks`] — nothing here can land in a "needs approval"
+/// state.
 ///
-/// - **Contributors** build a `Contribution` (often with the builder
-///   methods) and hand it back. They don't need any access to
-///   [`Composer`] internals.
-/// - **Tests** can verify a contributor's output in isolation
-///   (`loadout.contribute()` returns the same `Contribution` regardless
-///   of which composer it's fed into).
-/// - **The composer** owns the merge step in one place — useful when
-///   conflict-resolution semantics are added later.
-#[derive(Clone, Debug, Default)]
-pub struct Contribution {
-    vars: Vec<ProvenancedVar>,
-    patches: Vec<ProvenancedPatch>,
-    packages: Vec<ProvenancedPackage>,
-    lifecycle_hooks: Vec<ProvenancedHook>,
-}
-
-impl Contribution {
-    /// Construct an empty contribution.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Append a var (builder style).
-    #[must_use]
-    pub fn with_var(mut self, v: ProvenancedVar) -> Self {
-        self.vars.push(v);
-        self
-    }
-
-    /// Append a patch (builder style).
-    #[must_use]
-    pub fn with_patch(mut self, p: ProvenancedPatch) -> Self {
-        self.patches.push(p);
-        self
-    }
-
-    /// Append a package (builder style).
-    #[must_use]
-    pub fn with_package(mut self, p: ProvenancedPackage) -> Self {
-        self.packages.push(p);
-        self
-    }
-
-    /// Append a lifecycle hook (builder style).
-    #[must_use]
-    pub fn with_hook(mut self, h: ProvenancedHook) -> Self {
-        self.lifecycle_hooks.push(h);
-        self
-    }
-
-    /// Append a var in place. Useful inside a loop.
-    pub fn push_var(&mut self, v: ProvenancedVar) {
-        self.vars.push(v);
-    }
-
-    /// Append a patch in place.
-    pub fn push_patch(&mut self, p: ProvenancedPatch) {
-        self.patches.push(p);
-    }
-
-    /// Append a package in place.
-    pub fn push_package(&mut self, p: ProvenancedPackage) {
-        self.packages.push(p);
-    }
-
-    /// Append a lifecycle hook in place.
-    pub fn push_hook(&mut self, h: ProvenancedHook) {
-        self.lifecycle_hooks.push(h);
-    }
-
-    /// All vars contributed so far.
-    #[must_use]
-    pub fn vars(&self) -> &[ProvenancedVar] {
-        &self.vars
-    }
-
-    /// All patches contributed so far.
-    #[must_use]
-    pub fn patches(&self) -> &[ProvenancedPatch] {
-        &self.patches
-    }
-
-    /// All packages contributed so far.
-    #[must_use]
-    pub fn packages(&self) -> &[ProvenancedPackage] {
-        &self.packages
-    }
-
-    /// All lifecycle hooks contributed so far.
-    #[must_use]
-    pub fn lifecycle_hooks(&self) -> &[ProvenancedHook] {
-        &self.lifecycle_hooks
-    }
-}
-
-/// A lookup function for resolving inherited environment variables.
-///
-/// Threaded through [`Composable::contribute`] so var declarations
-/// with `inherit = true` (or `InheritWithDefault`) can be resolved
-/// against an arbitrary environment — production callers pass
-/// [`std::env::var`]; tests pass a synthetic closure.
-pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Result<String, std::env::VarError>;
-
-/// Anything that can contribute primitives (vars, patches, packages,
-/// lifecycle hooks) to a [`Composer`] during session construction.
-///
-/// Implementors are user-curated sources of session state — loadouts,
-/// project configs, and package specs. The trait is the funnel that
-/// brings their declarations into one place to be resolved against the
-/// user's [`UserPolicy`].
-///
-/// The trait does *not* require [`Provenanced`]: a contributor isn't
-/// itself an "item" — it's the *source* of items. Each contributor
-/// knows its own [`Source`] and tags its primitives accordingly.
-pub trait Composable {
-    /// Produce this source's [`Contribution`].
-    ///
-    /// Consuming `self` matches the one-shot nature of contribution:
-    /// each contributor is "spent" once it hands off its primitives.
-    /// `env` resolves any inherited variables the contributor needs to
-    /// materialize.
-    ///
-    /// # Errors
-    ///
-    /// Implementations return an [`Error`] when their primitives fail
-    /// their own construction-time validation (e.g. an invalid glob,
-    /// an empty patch destination, or an env lookup that surfaced an
-    /// error).
-    fn contribute(self, env: EnvLookup<'_>) -> Result<Contribution, Error>;
-}
-
-// =====================================================================
-// Resolution: deciding what survives the user's policy
-// =====================================================================
-
-/// Errors raised by the resolution pass.
-#[non_exhaustive]
-#[derive(Debug, thiserror::Error)]
-pub enum ResolveError {
-    /// Policy explicitly denied an item; session construction aborts.
-    ///
-    /// `from` is the contributor whose item was rejected. The field is
-    /// not named `source` because thiserror auto-promotes that name to
-    /// [`std::error::Error::source`] and [`Source`] is provenance
-    /// metadata, not an error.
-    #[error("policy denied `{what}` (from {from})")]
-    Denied { what: String, from: Source },
-    /// User cancelled at the prompt.
-    #[error("user aborted session construction")]
-    Aborted,
-    /// Hook returned a result that violates the contract: wrong number
-    /// of decisions, or `UseRule` for an item the policy still couldn't
-    /// decide after mutation. `context` names the offending item or
-    /// batch so the message points somewhere concrete.
-    #[error("policy hook contract violation: {kind} ({context})")]
-    HookContract { kind: &'static str, context: String },
-    /// One or more patch source filesystem walks failed with IO-level
-    /// errors (permission denied, non-UTF-8 paths, etc.). All errors
-    /// surfaced by every `FileSet::resolve` invocation are accumulated
-    /// — none are discarded.
-    #[error("patch resolution failed ({} error(s)):{}", sources.len(), DisplayJoin(sources))]
-    PatchWalk {
-        sources: Vec<crate::core::primitives::PatchError>,
-    },
-    /// Expanding `~/` or `$VAR` references in a patch source or policy
-    /// pattern failed. Surfaces every failure mode of
-    /// [`expand_source`](crate::core::expansion::expand_source): malformed
-    /// syntax, a referenced var that is not in the resolved-vars set,
-    /// or a post-expansion string that fails to parse as a glob.
-    #[error("patch source expansion failed: {0}")]
-    Expansion(#[from] crate::core::expansion::ExpandError),
-}
-
-/// Render a slice of `Display`-able errors as one indented bullet per
-/// line, for embedding inside a parent error message.
-struct DisplayJoin<'a, E: fmt::Display>(&'a [E]);
-
-impl<E: fmt::Display> fmt::Display for DisplayJoin<'_, E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for e in self.0 {
-            write!(f, "\n  - {e}")?;
-        }
-        Ok(())
-    }
-}
-
-/// One environment variable that survived policy resolution, paired
-/// with its origin.
-///
-/// The source is retained so downstream layers (CLI inspection, audit
-/// logs, error reporting) can attribute each decision back to the
-/// contributor that asked for it.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct SessionVar {
-    var: ResolvedVar,
-    source: Source,
-}
-
-impl SessionVar {
-    /// Construct directly. Outside the resolver, the only callers
-    /// expected to use this are tests building synthetic sessions.
-    #[cfg(test)]
-    #[must_use]
-    pub fn new(var: ResolvedVar, source: Source) -> Self {
-        Self { var, source }
-    }
-
-    /// The resolved variable that survived policy resolution.
-    #[must_use]
-    pub fn var(&self) -> &ResolvedVar {
-        &self.var
-    }
-}
-
-impl Provenanced for SessionVar {
-    fn source(&self) -> &Source {
-        &self.source
-    }
-}
-
-impl crate::core::expansion::VarLookup for [SessionVar] {
-    fn lookup(&self, name: &str) -> Option<&str> {
-        self.iter()
-            .find(|v| v.var.name() == name)
-            .map(|v| v.var.value())
-    }
-}
-
-/// One patch file that survived policy resolution, paired with its
-/// origin. See [`SessionVar`] for the rationale.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SessionPatch {
-    patch: ResolvedPatch,
-    source: Source,
-}
-
-impl SessionPatch {
-    /// The resolved patch — host source path plus the destination
-    /// relative to the sandbox user's home directory.
-    #[must_use]
-    pub fn patch(&self) -> &ResolvedPatch {
-        &self.patch
-    }
-}
-
-impl Provenanced for SessionPatch {
-    fn source(&self) -> &Source {
-        &self.source
-    }
-}
-
-/// Everything that survived policy resolution.
-///
-/// Vars and patches are policy-gated. Packages and lifecycle hooks
-/// pass through unchanged — packages are graph-resolved downstream,
-/// and hooks execute inside an isolated environment, so neither has a
-/// policy in this layer.
-#[derive(Clone, Debug, Default)]
-pub struct Resolution {
-    vars: Vec<SessionVar>,
-    patches: Vec<SessionPatch>,
-    packages: Vec<ProvenancedPackage>,
-    lifecycle_hooks: Vec<ProvenancedHook>,
-}
-
-impl Resolution {
-    /// The vars that survived resolution, each paired with its source.
-    #[must_use]
-    pub fn vars(&self) -> &[SessionVar] {
-        &self.vars
-    }
-
-    /// The patches that survived resolution, each paired with its
-    /// source. Multi-file patches appear as one [`SessionPatch`] per
-    /// matched file.
-    #[must_use]
-    pub fn patches(&self) -> &[SessionPatch] {
-        &self.patches
-    }
-
-    /// The packages contributed to the session, each paired with its
-    /// source. Pass-through; no policy gate.
-    #[must_use]
-    pub fn packages(&self) -> &[ProvenancedPackage] {
-        &self.packages
-    }
-
-    /// The lifecycle hooks contributed to the session, each paired
-    /// with its source. Pass-through; no policy gate.
-    #[must_use]
-    pub fn lifecycle_hooks(&self) -> &[ProvenancedHook] {
-        &self.lifecycle_hooks
-    }
-
-    /// Consume the [`Resolution`] and return the underlying vectors
-    /// for moving into downstream layers.
-    #[must_use]
-    pub fn into_parts(
-        self,
-    ) -> (
-        Vec<SessionVar>,
-        Vec<SessionPatch>,
-        Vec<ProvenancedPackage>,
-        Vec<ProvenancedHook>,
-    ) {
-        (self.vars, self.patches, self.packages, self.lifecycle_hooks)
-    }
-}
-
-/// Configuration for [`Composer::resolve`].
-///
-/// Defaults to symlink-safe behavior (no following) — appropriate for
-/// dotfile trees where a symlink may legitimately point outside the
-/// patch source.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ResolveOptions {
-    /// If `true`, [`FileSet::resolve`](crate::core::primitives::FileSet::resolve)
-    /// follows symlinks while walking patch sources. Off by default.
-    pub follow_symlinks: bool,
-}
-
-// =====================================================================
-// Composer
-// =====================================================================
-
-/// Accumulator for contributions from one or more [`Composable`]
-/// sources, drained by [`Composer::resolve`] into a [`Resolution`].
-///
-/// Contributors push vars and patches; the composer does no policy
-/// work until `resolve` is called. This separates declarative
-/// accumulation from the (potentially interactive) resolution pass.
-/// Boxed env-lookup closure stored in [`Composer`].
-///
-/// `Send + Sync` so [`Composer`] itself is `Send + Sync` and can be
-/// built on one thread and resolved on another (e.g. async server
-/// handing the composer off to a worker pool). Closures captured by
-/// [`Composer::with_env`] must satisfy the bound; the defaults
-/// (function pointers like `std::env::var`) trivially do.
-type StoredEnv = Box<dyn Fn(&str) -> Result<String, std::env::VarError> + Send + Sync>;
-
-pub struct Composer {
-    vars: Vec<ProvenancedVar>,
-    patches: Vec<ProvenancedPatch>,
-    packages: Vec<ProvenancedPackage>,
-    lifecycle_hooks: Vec<ProvenancedHook>,
+/// [`PolicyHooks`]: crate::core::hooks::PolicyHooks
+pub struct UserComposer {
+    contribution: Contribution,
     env: StoredEnv,
 }
 
-impl fmt::Debug for Composer {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Composer")
-            .field("vars", &self.vars)
-            .field("patches", &self.patches)
-            .field("packages", &self.packages)
-            .field("lifecycle_hooks", &self.lifecycle_hooks)
+impl core::fmt::Debug for UserComposer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("UserComposer")
+            .field("contribution", &self.contribution)
             .field("env", &"<closure>")
             .finish()
     }
 }
 
-impl Default for Composer {
+impl Default for UserComposer {
     fn default() -> Self {
         Self::new()
     }
 }
 
-// Compile-time guarantee: `Composer` is `Send + Sync`. If a future
-// change to a field (or to one of the stored-closure type aliases)
-// removes either auto-trait, this assertion fails at compile time
-// and the offending field is named in the error.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<Composer>();
+    assert_send_sync::<UserComposer>();
 };
 
-impl Composer {
+impl UserComposer {
     /// Construct an empty composer with the default env lookup
-    /// ([`std::env::var`]). Suitable for production code.
+    /// ([`std::env::var`]).
     #[must_use]
     pub fn new() -> Self {
         Self {
-            vars: Vec::new(),
-            patches: Vec::new(),
-            packages: Vec::new(),
-            lifecycle_hooks: Vec::new(),
-            env: Box::new(|name| std::env::var(name)),
+            contribution: Contribution::new(),
+            env: default_env(),
         }
     }
 
@@ -441,1620 +63,225 @@ impl Composer {
         self
     }
 
-    /// Take a [`Composable`]'s contribution and merge it into this
-    /// composer. The canonical entry point for populating a composer.
+    /// Add a [`Loadout`] to this composer.
     ///
     /// # Errors
     ///
-    /// Returns any error the contributor surfaces from [`Composable::contribute`].
-    pub fn add(&mut self, c: impl Composable) -> Result<(), Error> {
-        self.merge(c.contribute(&*self.env)?);
+    /// Returns any error the loadout surfaces while resolving inherit
+    /// or `InheritWithDefault` variables against `env`.
+    pub fn add(&mut self, loadout: Loadout) -> Result<(), Error> {
+        let incoming = loadout.contribute(&*self.env)?;
+        self.contribution = std::mem::take(&mut self.contribution).merge(incoming)?;
         Ok(())
     }
 
-    /// Add every [`Composable`] in `items` in order. Stops at the
-    /// first failure and returns that error.
+    /// Add every [`Loadout`] in `items` in order. Stops at the
+    /// first failure.
     ///
     /// # Errors
     ///
-    /// Returns the first [`Error`] surfaced by any contributor.
-    pub fn add_all<C, I>(&mut self, items: I) -> Result<(), Error>
-    where
-        C: Composable,
-        I: IntoIterator<Item = C>,
-    {
-        for c in items {
-            self.add(c)?;
+    /// Returns the first [`Error`] surfaced by any loadout.
+    pub fn add_all<I: IntoIterator<Item = Loadout>>(&mut self, items: I) -> Result<(), Error> {
+        for loadout in items {
+            self.add(loadout)?;
         }
         Ok(())
     }
 
-    /// Drain a [`Contribution`] into the composer.
+    /// Compose every accumulated loadout against `policy` and emit
+    /// the wire form ready to ship to the daemon.
     ///
-    /// This is the single internal merge step — when conflict
-    /// resolution lands, it lives here. Today: pure aggregation, no
-    /// dedup / no merge policy.
-    fn merge(&mut self, mut c: Contribution) {
-        self.vars.append(&mut c.vars);
-        self.patches.append(&mut c.patches);
-        self.packages.append(&mut c.packages);
-        self.lifecycle_hooks.append(&mut c.lifecycle_hooks);
-    }
-
-    /// Resolve every accumulated contribution against `policy`.
-    ///
-    /// Invokes `hooks` once per domain to handle items the policy
-    /// couldn't decide; hooks may return updated policy snapshots
-    /// mid-flight. The (possibly updated) [`UserPolicy`] is returned
-    /// alongside the [`Resolution`] so callers can persist any rules
-    /// the hook added.
-    ///
-    /// The whole resolution aborts on the first explicit `Denied`,
-    /// the hook returning `Abort`, or a hook contract violation. On
-    /// error, the policy is consumed and lost; callers wanting to
-    /// retain it across a failed resolution must clone beforehand.
+    /// This composer only accepts loadouts via [`Self::add`], so every
+    /// item carries `Source::UserLoadout`: the policy's allow step
+    /// auto-passes, but `deny` and `ignore` still apply (so a user
+    /// loadout entry matching a deny rule is rejected, and a match
+    /// on ignore is silently dropped).
     ///
     /// # Errors
     ///
-    /// See [`ResolveError`].
-    pub fn resolve(
+    /// See [`ComposeError`]. The hookless path returns
+    /// [`ComposeError::HookRequired`] if a `Loadout::contribute` impl
+    /// ever produces a non-user-origin item — a contributor bug, since
+    /// loadouts must tag everything `Source::UserLoadout`.
+    pub fn compose(
         self,
         policy: UserPolicy,
-        hooks: &dyn PolicyHooks,
-        options: ResolveOptions,
-    ) -> Result<(Resolution, UserPolicy), ResolveError> {
-        let (vars_policy, patches_policy) = policy.into_parts();
-        let (vars, vars_policy) = resolve_vars(self.vars, vars_policy, hooks)?;
-        // Patch sources and policy patterns expand against the
-        // resolved vars produced by `resolve_vars`. Explicit `$VAR`
-        // references require an explicit `SessionVar` — no env
-        // fallback. The tilde prefix (`~/...`) is the one exception:
-        // it falls back to the ambient `HOME` if the loadout didn't
-        // declare one, so users don't have to write
-        // `HOME = { inherit = true }` just to use `~/dotfiles/...`.
-        let ambient_home = (self.env)("HOME").ok();
-        let (patches, patches_policy) = resolve_patches(
-            self.patches,
-            patches_policy,
-            hooks,
-            options,
-            &vars,
-            ambient_home.as_deref(),
-        )?;
-        let final_policy = UserPolicy::empty()
-            .with_vars(vars_policy)
-            .with_patches(patches_policy);
-        let resolution = Resolution {
-            vars,
-            patches,
-            packages: self.packages,
-            lifecycle_hooks: self.lifecycle_hooks,
-        };
-        Ok((resolution, final_policy))
+        options: ComposeOptions,
+    ) -> Result<WireContribution, ComposeError> {
+        let (composition, _final_policy) =
+            compose_contribution(self.contribution, policy, None, options, &*self.env)?;
+        Ok(composition_to_wire(composition))
     }
 }
 
-// =====================================================================
-// Per-domain resolution
-// =====================================================================
-
-/// Push, drop, or fail on a single [`Decision`].
-///
-/// Used by Pass 1 (categorizing every item) and by Pass 3's `UseRule`
-/// branch (re-checking after the hook mutated the policy). The caller
-/// supplies extractors for the `Denied` arm so the helper stays
-/// agnostic to whether items are vars or patches. Closures are `Fn` so
-/// they're reusable across loop iterations.
-pub(crate) fn apply_decision<T>(
-    decision: Decision<T>,
-    allowed: &mut Vec<T>,
-    name_of: impl Fn(&T) -> String,
-    source_of: impl Fn(T) -> Source,
-) -> Result<(), ResolveError> {
-    match decision {
-        Decision::Allowed(t) => allowed.push(t),
-        Decision::Ignored => {}
-        Decision::Denied(t) => {
-            let what = name_of(&t);
-            return Err(ResolveError::Denied {
-                what,
-                from: source_of(t),
-            });
-        }
+fn composition_to_wire(composition: Composition) -> WireContribution {
+    let (vars, patches, packages, lifecycle_hooks) = composition.into_parts();
+    WireContribution {
+        vars: vars.into_iter().map(Into::into).collect(),
+        patches: patches.into_iter().map(Into::into).collect(),
+        lifecycle_hooks: lifecycle_hooks.into_iter().map(Into::into).collect(),
+        requested_packages: packages.into_iter().map(Into::into).collect(),
     }
-    Ok(())
 }
-
-pub(crate) fn resolve_vars(
-    items: Vec<ProvenancedVar>,
-    mut policy: VarsPolicy,
-    hooks: &dyn PolicyHooks,
-) -> Result<(Vec<SessionVar>, VarsPolicy), ResolveError> {
-    let name_of = |pv: &ProvenancedVar| pv.var().name().to_owned();
-    let source_of = |pv: ProvenancedVar| pv.into_parts().1;
-
-    // Pass 1: categorize.
-    let mut allowed: Vec<ProvenancedVar> = Vec::new();
-    let mut unapproved: Vec<ProvenancedVar> = Vec::new();
-    for pv in items {
-        let name = pv.var().name().to_owned();
-        match policy.check(&name, pv) {
-            CheckOutcome::Decided(d) => apply_decision(d, &mut allowed, name_of, source_of)?,
-            CheckOutcome::NeedsApproval(pv) => unapproved.push(pv),
-        }
-    }
-    if !unapproved.is_empty() {
-        // Pass 2: prompt. Hand the hook an owned copy of the policy
-        // so it cannot mutate ours directly.
-        let view: Vec<Unapproved<'_, str>> = unapproved
-            .iter()
-            .map(|pv| Unapproved {
-                item: pv.var().name(),
-                source: pv.source(),
-            })
-            .collect();
-        let decisions = match hooks.on_var_unapproved(policy.clone(), &view) {
-            HookResult::Decided {
-                decisions,
-                updated_policy,
-            } => {
-                if let Some(new_policy) = updated_policy {
-                    policy = new_policy;
-                }
-                decisions
-            }
-            HookResult::Abort => return Err(ResolveError::Aborted),
-        };
-        if decisions.len() != unapproved.len() {
-            return Err(ResolveError::HookContract {
-                kind: "var-domain hook returned the wrong number of decisions",
-                context: format!("expected {}, got {}", unapproved.len(), decisions.len()),
-            });
-        }
-        // Pass 3: apply.
-        for (pv, decision) in unapproved.into_iter().zip(decisions) {
-            match decision {
-                ItemDecision::AllowOnce => allowed.push(pv),
-                ItemDecision::DenyOnce => {
-                    return Err(ResolveError::Denied {
-                        what: name_of(&pv),
-                        from: source_of(pv),
-                    });
-                }
-                ItemDecision::UseRule => {
-                    let name = pv.var().name().to_owned();
-                    match policy.check(&name, pv) {
-                        CheckOutcome::Decided(d) => {
-                            apply_decision(d, &mut allowed, name_of, source_of)?;
-                        }
-                        CheckOutcome::NeedsApproval(pv) => {
-                            return Err(ResolveError::HookContract {
-                                kind: "UseRule returned for a var the policy still cannot decide",
-                                context: format!("variable `{}`", pv.var().name()),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok((
-        allowed
-            .into_iter()
-            .map(|pv| {
-                let (var, source) = pv.into_parts();
-                SessionVar { var, source }
-            })
-            .collect(),
-        policy,
-    ))
-}
-
-/// Expand every patch's raw source string against `resolved_vars` and
-/// return the parallel list with `FileSet` sources. Fails fast on the
-/// first [`ExpandError`](crate::core::expansion::ExpandError); a partial
-/// resolution would let some patches reach the walker with their
-/// references intact, which silently matches wrong paths.
-pub(crate) fn expand_patch_sources(
-    patches: Vec<ProvenancedPatch>,
-    resolved_vars: &[SessionVar],
-    home_fallback: Option<&str>,
-) -> Result<Vec<ExpandedProvenancedPatch>, ResolveError> {
-    patches
-        .into_iter()
-        .map(|pp| {
-            let (patch, provenance) = pp.into_parts();
-            let source = crate::core::expansion::expand_source(
-                patch.source(),
-                resolved_vars,
-                home_fallback,
-            )?;
-            Ok(ExpandedProvenancedPatch {
-                source,
-                dest: patch.dest().clone(),
-                provenance,
-            })
-        })
-        .collect()
-}
-
-pub(crate) fn resolve_patches(
-    items: Vec<ProvenancedPatch>,
-    mut policy: PatchPolicy,
-    hooks: &dyn PolicyHooks,
-    options: ResolveOptions,
-    resolved_vars: &[SessionVar],
-    home_fallback: Option<&str>,
-) -> Result<(Vec<SessionPatch>, PatchPolicy), ResolveError> {
-    let name_of = |pf: &PatchFile| pf.user_facing().as_str().to_owned();
-    let source_of = |pf: PatchFile| pf.provenance;
-
-    // Two policies in flight:
-    //   - `policy` (raw): handed to the hook, returned to the caller —
-    //     patterns retain their `~/` and `$VAR` form so the policy
-    //     round-trips through serialization.
-    //   - `expanded`: var-expanded copy used for the actual `check`
-    //     calls — patterns actually match the absolute paths the
-    //     walker yields. Re-derived whenever the hook updates the
-    //     policy.
-    //
-    // Expand the *policy* first so a malformed pattern (undefined
-    // `$VAR`, parent-dir traversal, etc.) surfaces before any
-    // filesystem work happens. Otherwise a costly walk could complete
-    // only to be discarded by a policy-expansion error the user has
-    // no IO context for.
-    let mut expanded = policy.expand_with(resolved_vars, home_fallback)?;
-
-    // Expand every patch source: convert raw strings to `FileSet`s
-    // against the already-resolved vars. The resulting list is what
-    // the walker actually traverses.
-    let expanded_patches = expand_patch_sources(items, resolved_vars, home_fallback)?;
-    let files = enumerate_patch_files(expanded_patches, options.follow_symlinks)?;
-
-    // Pass 1: categorize per file. Dual-path check — both the link
-    // path (what the walker yielded, if distinct) and the canonical
-    // target path must pass policy; a deny on either wins.
-    let mut allowed: Vec<PatchFile> = Vec::new();
-    let mut unapproved: Vec<PatchFile> = Vec::new();
-    for pf in files {
-        let link = pf
-            .link_path
-            .as_ref()
-            .map(|p| p.as_utf8_path().to_path_buf());
-        let target = pf.target_path.as_utf8_path().to_path_buf();
-        match expanded.check(link.as_deref(), &target, pf) {
-            CheckOutcome::Decided(d) => apply_decision(d, &mut allowed, name_of, source_of)?,
-            CheckOutcome::NeedsApproval(pf) => unapproved.push(pf),
-        }
-    }
-    if !unapproved.is_empty() {
-        // Pass 2: prompt. Hand the hook the *raw* policy so any rules
-        // it adds stay in pre-expansion form. Prompt items present
-        // the user-facing path (link form when distinct, target
-        // otherwise); if a hook needs both forms separately, that's a
-        // future API extension.
-        let view: Vec<Unapproved<'_, camino::Utf8Path>> = unapproved
-            .iter()
-            .map(|pf| Unapproved {
-                item: pf.user_facing().as_utf8_path(),
-                source: &pf.provenance,
-            })
-            .collect();
-        let decisions = match hooks.on_patch_unapproved(policy.clone(), &view) {
-            HookResult::Decided {
-                decisions,
-                updated_policy,
-            } => {
-                if let Some(new_policy) = updated_policy {
-                    policy = new_policy;
-                    // Re-expand the new policy against the same vars.
-                    // A pattern in the hook's policy that references an
-                    // unresolved var becomes a hard `Expansion` error.
-                    expanded = policy.expand_with(resolved_vars, home_fallback)?;
-                }
-                decisions
-            }
-            HookResult::Abort => return Err(ResolveError::Aborted),
-        };
-        if decisions.len() != unapproved.len() {
-            return Err(ResolveError::HookContract {
-                kind: "patch-domain hook returned the wrong number of decisions",
-                context: format!("expected {}, got {}", unapproved.len(), decisions.len()),
-            });
-        }
-        // Pass 3: apply.
-        for (pf, decision) in unapproved.into_iter().zip(decisions) {
-            match decision {
-                ItemDecision::AllowOnce => allowed.push(pf),
-                ItemDecision::DenyOnce => {
-                    return Err(ResolveError::Denied {
-                        what: name_of(&pf),
-                        from: source_of(pf),
-                    });
-                }
-                ItemDecision::UseRule => {
-                    let link = pf
-                        .link_path
-                        .as_ref()
-                        .map(|p| p.as_utf8_path().to_path_buf());
-                    let target = pf.target_path.as_utf8_path().to_path_buf();
-                    match expanded.check(link.as_deref(), &target, pf) {
-                        CheckOutcome::Decided(d) => {
-                            apply_decision(d, &mut allowed, name_of, source_of)?;
-                        }
-                        CheckOutcome::NeedsApproval(pf) => {
-                            return Err(ResolveError::HookContract {
-                                kind: "UseRule returned for a patch file the policy still cannot decide",
-                                context: format!("source path `{}`", pf.user_facing()),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok((
-        allowed
-            .into_iter()
-            .map(|pf| SessionPatch {
-                // `host_path` is the *canonical target* — that's where
-                // the content actually lives. `dest` is computed from
-                // the user-facing (link if distinct, target otherwise)
-                // path's relationship to the walk root, so the user's
-                // structural intent is preserved.
-                patch: ResolvedPatch::new(pf.target_path, pf.dest),
-                source: pf.provenance,
-            })
-            .collect(),
-        policy,
-    ))
-}
-
-// =====================================================================
-// Tests
-// =====================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::primitives::{Patch, PatchDest, VarValue};
-    use camino::Utf8Path;
-    use std::cell::RefCell;
+    use crate::core::lifecyclehook::{HookScript, LifecycleHook};
+    use crate::core::loadout::LoadoutName;
+    use crate::core::policy::VarsPolicy;
+    use crate::core::primitives::{Patch, PatchDest, StrictVarName, VarValue};
 
-    // =================================================================
-    // Shared helpers + hook fixtures
-    // =================================================================
-
-    fn user_source() -> Source {
-        Source::UserLoadout {
-            name: "test".into(),
-        }
+    fn loadout_named(name: &str) -> Loadout {
+        Loadout::new(LoadoutName::try_new(name).unwrap())
     }
 
-    fn project_source() -> Source {
-        Source::Project {
-            path: paths::HostPath::new("/repo"),
-        }
+    /// User-origin vars survive into the wire form with their resolved
+    /// values intact.
+    #[test]
+    fn vars_serialize_into_wire_form() {
+        let mut composer = UserComposer::new();
+        composer
+            .add(loadout_named("dev").with_var(
+                StrictVarName::try_new("EDITOR").unwrap(),
+                VarValue::specified("hx"),
+            ))
+            .unwrap();
+        let wire = composer
+            .compose(UserPolicy::empty(), ComposeOptions::default())
+            .unwrap();
+        assert_eq!(wire.vars.len(), 1);
+        assert_eq!(wire.vars[0].var.name, "EDITOR");
+        assert_eq!(wire.vars[0].var.value, "hx");
+        assert!(matches!(
+            wire.vars[0].source,
+            crate::wire::primitives::WireSource::UserLoadout { ref name } if name == "dev"
+        ));
     }
 
-    fn pv_with(name: &str, source: Source) -> ProvenancedVar {
-        ProvenancedVar::new(
-            ResolvedVar::resolve_with(name.into(), VarValue::specified("x"), |_| {
-                Err(std::env::VarError::NotPresent)
-            })
-            .unwrap(),
-            source,
-        )
+    /// User policy's `ignore` rule still applies on the client-side
+    /// path — matching vars are dropped before they hit the wire.
+    #[test]
+    fn ignore_filters_user_vars() {
+        let policy =
+            UserPolicy::empty().with_vars(VarsPolicy::empty().try_with_ignore(["_*"]).unwrap());
+        let mut composer = UserComposer::new();
+        composer
+            .add(
+                loadout_named("dev")
+                    .with_var(
+                        StrictVarName::try_new("_TMP").unwrap(),
+                        VarValue::specified("x"),
+                    )
+                    .with_var(
+                        StrictVarName::try_new("EDITOR").unwrap(),
+                        VarValue::specified("hx"),
+                    ),
+            )
+            .unwrap();
+        let wire = composer.compose(policy, ComposeOptions::default()).unwrap();
+        assert_eq!(wire.vars.len(), 1);
+        assert_eq!(wire.vars[0].var.name, "EDITOR");
     }
 
-    /// Default `pv` uses a Project source so allow/deny/prompt logic
-    /// actually exercises — user origin would short-circuit via the
-    /// bypass.
-    fn pv(name: &str) -> ProvenancedVar {
-        pv_with(name, project_source())
+    /// Packages and lifecycle hooks pass through unchanged.
+    #[test]
+    fn packages_and_hooks_pass_through() {
+        let hook = LifecycleHook::builder()
+            .with_on_activate(HookScript::inline("echo hi"))
+            .build()
+            .unwrap();
+        let mut composer = UserComposer::new();
+        composer
+            .add(
+                loadout_named("dev")
+                    .with_package("helix")
+                    .with_lifecycle_hook(hook),
+            )
+            .unwrap();
+        let wire = composer
+            .compose(UserPolicy::empty(), ComposeOptions::default())
+            .unwrap();
+        assert_eq!(wire.requested_packages.len(), 1);
+        assert_eq!(wire.requested_packages[0].name, "helix");
+        assert_eq!(wire.lifecycle_hooks.len(), 1);
     }
 
-    type VarsPolicyMutator = Box<dyn Fn(&mut VarsPolicy)>;
-
-    /// Hook driver: enqueue var-domain responses; panic on patch-domain.
-    /// `with_mutator` lets a test mutate the *owned copy* of the policy
-    /// before the hook's response is consumed; the resulting copy is
-    /// what's returned in `updated_policy`.
-    struct ScriptedHook {
-        var_responses: RefCell<Vec<HookResult<VarsPolicy>>>,
-        var_mutate: RefCell<Vec<VarsPolicyMutator>>,
+    /// `add_all` runs a sequence of loadouts. Multiple loadouts
+    /// accumulate independently.
+    #[test]
+    fn add_all_runs_a_sequence_of_loadouts() {
+        let l1 = loadout_named("a").with_var(
+            StrictVarName::try_new("EDITOR").unwrap(),
+            VarValue::specified("hx"),
+        );
+        let l2 = loadout_named("b").with_var(
+            StrictVarName::try_new("LANG").unwrap(),
+            VarValue::specified("C"),
+        );
+        let mut composer = UserComposer::new();
+        composer.add_all([l1, l2]).unwrap();
+        let wire = composer
+            .compose(UserPolicy::empty(), ComposeOptions::default())
+            .unwrap();
+        assert_eq!(wire.vars.len(), 2);
     }
 
-    impl ScriptedHook {
-        fn new(responses: Vec<HookResult<VarsPolicy>>) -> Self {
-            Self {
-                var_responses: RefCell::new(responses),
-                var_mutate: RefCell::new(Vec::new()),
-            }
-        }
-        fn with_mutator<F: Fn(&mut VarsPolicy) + 'static>(mut self, f: F) -> Self {
-            self.var_mutate.get_mut().push(Box::new(f));
-            self
-        }
-    }
-
-    impl PolicyHooks for ScriptedHook {
-        fn on_var_unapproved(
-            &self,
-            mut policy: VarsPolicy,
-            _items: &[Unapproved<'_, str>],
-        ) -> HookResult<VarsPolicy> {
-            let mutated = self
-                .var_mutate
-                .borrow_mut()
-                .pop()
-                .inspect(|m| m(&mut policy));
-            let response = self
-                .var_responses
-                .borrow_mut()
-                .pop()
-                .unwrap_or_else(|| panic!("ScriptedHook: ran out of queued var responses"));
-            // If a mutator ran and the response didn't already specify
-            // an updated_policy, install the mutated copy.
-            if mutated.is_some() {
-                match response {
-                    HookResult::Decided {
-                        decisions,
-                        updated_policy: None,
-                    } => HookResult::decided_with_policy(decisions, policy),
-                    other => other,
-                }
+    /// `with_env` lets tests pin env behavior without touching the
+    /// process environment. The provided closure resolves `LANG`
+    /// when a loadout's var is `inherit = true`.
+    #[test]
+    fn with_env_overrides_lookup_for_inheriting_vars() {
+        let loadout = loadout_named("dev")
+            .with_var(StrictVarName::try_new("LANG").unwrap(), VarValue::Inherit);
+        let mut composer = UserComposer::new().with_env(Box::new(|name| {
+            if name == "LANG" {
+                Ok("en_US.UTF-8".into())
             } else {
-                response
+                Err(std::env::VarError::NotPresent)
             }
-        }
-
-        fn on_patch_unapproved(
-            &self,
-            _policy: PatchPolicy,
-            _items: &[Unapproved<'_, camino::Utf8Path>],
-        ) -> HookResult<PatchPolicy> {
-            panic!("patch hook not expected in these tests")
-        }
+        }));
+        composer.add(loadout).unwrap();
+        let wire = composer
+            .compose(UserPolicy::empty(), ComposeOptions::default())
+            .unwrap();
+        assert_eq!(wire.vars.len(), 1);
+        assert_eq!(wire.vars[0].var.name, "LANG");
+        assert_eq!(wire.vars[0].var.value, "en_US.UTF-8");
     }
 
-    /// Hook that panics on either domain. Used by tests asserting that
-    /// the hook MUST NOT be reached — typically because a bypass or
-    /// other short-circuit was supposed to fire first.
-    struct PanicHook;
-    impl PolicyHooks for PanicHook {
-        fn on_var_unapproved(
-            &self,
-            _: VarsPolicy,
-            _: &[Unapproved<'_, str>],
-        ) -> HookResult<VarsPolicy> {
-            panic!("var hook should not have been invoked")
-        }
-        fn on_patch_unapproved(
-            &self,
-            _: PatchPolicy,
-            _: &[Unapproved<'_, camino::Utf8Path>],
-        ) -> HookResult<PatchPolicy> {
-            panic!("patch hook should not have been invoked")
-        }
-    }
-
-    /// Hook that approves everything (`AllowOnce` for every item). Used
-    /// when the test cares about flow rather than hook semantics.
-    struct PassThroughHook;
-    impl PolicyHooks for PassThroughHook {
-        fn on_var_unapproved(
-            &self,
-            _: VarsPolicy,
-            items: &[Unapproved<'_, str>],
-        ) -> HookResult<VarsPolicy> {
-            HookResult::decided(vec![ItemDecision::AllowOnce; items.len()])
-        }
-        fn on_patch_unapproved(
-            &self,
-            _: PatchPolicy,
-            items: &[Unapproved<'_, camino::Utf8Path>],
-        ) -> HookResult<PatchPolicy> {
-            HookResult::decided(vec![ItemDecision::AllowOnce; items.len()])
-        }
-    }
-
-    /// Build a `Patch` with a single-file source rooted at a tempdir.
-    /// Returns the tempdir guard (caller keeps alive) and the patch.
-    fn single_file_patch(name: &str, dest: &str) -> (tempfile::TempDir, Patch) {
+    /// End-to-end: a loadout with vars, patches, packages, and a
+    /// hook contributes all four kinds.
+    #[test]
+    fn loadout_contributes_all_four_kinds() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
-        let file = root.join(name);
+        let root = camino::Utf8Path::from_path(tmp.path()).unwrap();
+        let file = root.join("conf.toml");
         std::fs::write(file.as_std_path(), "x").unwrap();
-        let patch = Patch::new(file.as_str(), PatchDest::try_new(dest).unwrap());
-        (tmp, patch)
-    }
+        let patch = Patch::new(file.as_str(), PatchDest::try_new("etc/conf.toml").unwrap());
 
-    // =================================================================
-    // Vars resolution
-    // =================================================================
-
-    mod vars_resolution {
-        use super::*;
-
-        #[test]
-        fn allow_passes_through_with_source_preserved() {
-            let policy = VarsPolicy::empty().try_with_allow(["A_*"]).unwrap();
-            let (out, _) = resolve_vars(vec![pv("A_FOO")], policy, &PanicHook).unwrap();
-            assert_eq!(out.len(), 1);
-            assert_eq!(out[0].var().name(), "A_FOO");
-            assert_eq!(out[0].source(), &project_source());
-        }
-
-        #[test]
-        fn ignore_drops_silently() {
-            let policy = VarsPolicy::empty().try_with_ignore(["_*"]).unwrap();
-            let (out, _) = resolve_vars(vec![pv("_TMP")], policy, &PanicHook).unwrap();
-            assert!(out.is_empty());
-        }
-
-        #[test]
-        fn deny_errors() {
-            let policy = VarsPolicy::empty().try_with_deny(["AWS_*"]).unwrap();
-            let err = resolve_vars(vec![pv("AWS_KEY")], policy, &PanicHook).unwrap_err();
-            assert!(matches!(err, ResolveError::Denied { .. }), "got: {err:?}");
-        }
-
-        /// User-origin items bypass `allow`/`deny` and never reach the
-        /// hook. `PanicHook` ensures that path stays cold.
-        #[test]
-        fn user_loadout_bypasses_deny_without_prompting() {
-            let policy = VarsPolicy::empty().try_with_deny(["AWS_*"]).unwrap();
-            let (out, _) =
-                resolve_vars(vec![pv_with("AWS_KEY", user_source())], policy, &PanicHook).unwrap();
-            assert_eq!(out.len(), 1);
-            assert_eq!(out[0].var().name(), "AWS_KEY");
-        }
-
-        /// Even user-origin items are still subject to `ignore`.
-        #[test]
-        fn user_loadout_still_honors_ignore() {
-            let policy = VarsPolicy::empty().try_with_ignore(["_*"]).unwrap();
-            let (out, _) =
-                resolve_vars(vec![pv_with("_TMP", user_source())], policy, &PanicHook).unwrap();
-            assert!(out.is_empty());
-        }
-
-        /// The bypass is user-only — `Source::Package` items still hit
-        /// `deny`.
-        #[test]
-        fn package_origin_still_denied() {
-            let policy = VarsPolicy::empty().try_with_deny(["AWS_*"]).unwrap();
-            let pkg_pv = pv_with(
-                "AWS_KEY",
-                Source::Package {
-                    name: "evil-pkg".into(),
-                },
-            );
-            let err = resolve_vars(vec![pkg_pv], policy, &PanicHook).unwrap_err();
-            assert!(matches!(err, ResolveError::Denied { .. }), "got: {err:?}");
-        }
-
-        #[test]
-        fn hook_allow_once() {
-            let policy = VarsPolicy::empty();
-            let hook = ScriptedHook::new(vec![HookResult::decided(vec![ItemDecision::AllowOnce])]);
-            let (out, _) = resolve_vars(vec![pv("MY_FOO")], policy, &hook).unwrap();
-            assert_eq!(out.len(), 1);
-        }
-
-        #[test]
-        fn hook_deny_once() {
-            let policy = VarsPolicy::empty();
-            let hook = ScriptedHook::new(vec![HookResult::decided(vec![ItemDecision::DenyOnce])]);
-            let err = resolve_vars(vec![pv("MY_FOO")], policy, &hook).unwrap_err();
-            assert!(matches!(err, ResolveError::Denied { .. }));
-        }
-
-        #[test]
-        fn hook_use_rule_without_mutation_errors_as_hook_contract() {
-            let policy = VarsPolicy::empty();
-            let hook = ScriptedHook::new(vec![HookResult::decided(vec![ItemDecision::UseRule])]);
-            let err = resolve_vars(vec![pv("MY_FOO")], policy, &hook).unwrap_err();
-            assert!(
-                matches!(err, ResolveError::HookContract { .. }),
-                "got: {err:?}"
-            );
-        }
-
-        #[test]
-        fn hook_abort_propagates() {
-            let policy = VarsPolicy::empty();
-            let hook = ScriptedHook::new(vec![HookResult::Abort]);
-            let err = resolve_vars(vec![pv("MY_FOO")], policy, &hook).unwrap_err();
-            assert!(matches!(err, ResolveError::Aborted));
-        }
-
-        #[test]
-        fn hook_decision_count_mismatch_errors() {
-            let policy = VarsPolicy::empty();
-            let hook = ScriptedHook::new(vec![HookResult::decided(vec![
-                ItemDecision::AllowOnce,
-                ItemDecision::AllowOnce,
-            ])]);
-            let err = resolve_vars(vec![pv("MY_FOO")], policy, &hook).unwrap_err();
-            assert!(
-                matches!(err, ResolveError::HookContract { .. }),
-                "got: {err:?}"
-            );
-        }
-
-        /// Hook returns three different decisions over three items;
-        /// mutator adds a rule the middle `UseRule` consults. Catches
-        /// zip-ordering regressions in Pass 3.
-        #[test]
-        fn hook_mixed_batch_applies_decisions_in_order() {
-            let policy = VarsPolicy::empty();
-            let hook = ScriptedHook::new(vec![HookResult::decided(vec![
-                ItemDecision::AllowOnce,
-                ItemDecision::UseRule,
-                ItemDecision::AllowOnce,
-            ])])
-            .with_mutator(|p| {
-                *p = p.clone().try_with_allow(["MIDDLE_*"]).unwrap();
-            });
-            let (out, _) = resolve_vars(
-                vec![pv("FIRST"), pv("MIDDLE_OK"), pv("LAST")],
-                policy,
-                &hook,
-            )
-            .unwrap();
-            let names: Vec<_> = out.iter().map(|sv| sv.var().name()).collect();
-            assert_eq!(names, ["FIRST", "MIDDLE_OK", "LAST"]);
-        }
-    }
-
-    // =================================================================
-    // Patches resolution
-    // =================================================================
-
-    mod patches_resolution {
-        use super::*;
-
-        /// User origin + empty policy: short-circuits at Pass 1.
-        /// `PanicHook` proves no prompt is needed.
-        #[test]
-        fn user_origin_single_file_short_circuits() {
-            let (_tmp, patch) = single_file_patch("hello.txt", "config/hello.txt");
-            let pp = ProvenancedPatch::new(patch, user_source());
-            let policy = PatchPolicy::empty();
-            let (resolved, _) = resolve_patches(
-                vec![pp],
-                policy,
-                &PanicHook,
-                ResolveOptions::default(),
-                &[],
-                None,
-            )
-            .unwrap();
-            assert_eq!(resolved.len(), 1);
-            assert_eq!(resolved[0].source(), &user_source());
-        }
-
-        /// Project origin + empty policy: must prompt; `PassThroughHook`
-        /// approves.
-        #[test]
-        fn project_origin_goes_through_prompt() {
-            let (_tmp, patch) = single_file_patch("conf.toml", "etc/conf.toml");
-            let pp = ProvenancedPatch::new(patch, project_source());
-            let policy = PatchPolicy::empty();
-            let (resolved, _) = resolve_patches(
-                vec![pp],
-                policy,
-                &PassThroughHook,
-                ResolveOptions::default(),
-                &[],
-                None,
-            )
-            .unwrap();
-            assert_eq!(resolved.len(), 1);
-            assert_eq!(resolved[0].source(), &project_source());
-        }
-
-        #[test]
-        fn deny_via_policy_errors() {
-            let (_tmp, patch) = single_file_patch("secret.pem", "config/x");
-            let pp = ProvenancedPatch::new(patch, project_source());
-            let policy = PatchPolicy::empty().with_deny(["/**/*.pem"]);
-            let err = resolve_patches(
-                vec![pp],
-                policy,
-                &PassThroughHook,
-                ResolveOptions::default(),
-                &[],
-                None,
-            )
-            .unwrap_err();
-            assert!(matches!(err, ResolveError::Denied { .. }), "got: {err:?}");
-        }
-
-        /// User-origin patches bypass `deny`. `PanicHook` ensures bypass
-        /// at Pass 1, not via the prompt.
-        #[test]
-        fn user_loadout_bypasses_deny() {
-            let (_tmp, patch) = single_file_patch("secret.pem", "config/x");
-            let pp = ProvenancedPatch::new(patch, user_source());
-            let policy = PatchPolicy::empty().with_deny(["/**/*.pem"]);
-            let (resolved, _) = resolve_patches(
-                vec![pp],
-                policy,
-                &PanicHook,
-                ResolveOptions::default(),
-                &[],
-                None,
-            )
-            .unwrap();
-            assert_eq!(resolved.len(), 1);
-        }
-
-        #[test]
-        fn user_loadout_still_honors_ignore() {
-            let (_tmp, patch) = single_file_patch("trash.bak", "config/x");
-            let pp = ProvenancedPatch::new(patch, user_source());
-            let policy = PatchPolicy::empty().with_ignore(["/**/*.bak"]);
-            let (resolved, _) = resolve_patches(
-                vec![pp],
-                policy,
-                &PanicHook,
-                ResolveOptions::default(),
-                &[],
-                None,
-            )
-            .unwrap();
-            assert!(resolved.is_empty());
-        }
-
-        /// Build a [`SessionVar`] for tests where the resolver expects
-        /// a value to substitute into `$VAR` or `~/` references.
-        fn home_var(value: &str) -> SessionVar {
-            let resolved =
-                ResolvedVar::resolve_with("HOME".into(), VarValue::specified(value), |_| {
-                    Err(std::env::VarError::NotPresent)
-                })
-                .unwrap();
-            SessionVar::new(resolved, user_source())
-        }
-
-        /// Multi-file glob expands to N `SessionPatch`es with dests
-        /// rebuilt from the relative tail.
-        #[test]
-        fn multi_file_glob_fans_out_with_relative_dest() {
-            let tmp = tempfile::tempdir().unwrap();
-            let root = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
-            std::fs::write(root.join("a.lua").as_std_path(), "a").unwrap();
-            std::fs::create_dir_all(root.join("sub").as_std_path()).unwrap();
-            std::fs::write(root.join("sub/b.lua").as_std_path(), "b").unwrap();
-            std::fs::write(root.join("skip.txt").as_std_path(), "x").unwrap();
-
-            let pattern = format!("{root}/**/*.lua");
-            let patch = Patch::new(pattern, PatchDest::try_new("nvim").unwrap());
-            let pp = ProvenancedPatch::new(patch, user_source());
-            let policy = PatchPolicy::empty();
-            let (mut resolved, _) = resolve_patches(
-                vec![pp],
-                policy,
-                &PanicHook,
-                ResolveOptions::default(),
-                &[],
-                None,
-            )
-            .unwrap();
-            resolved.sort();
-            let dests: Vec<_> = resolved
-                .iter()
-                .map(|sp| sp.patch().destination().as_str())
-                .collect();
-            assert_eq!(dests, ["nvim/a.lua", "nvim/sub/b.lua"]);
-        }
-
-        /// Walking a non-existent directory surfaces as
-        /// `ResolveError::PatchWalk` (IO-shaped).
-        #[test]
-        fn walk_failure_surfaces_as_patch_walk() {
-            let patch = Patch::new(
-                "/definitely/does/not/exist/*",
-                PatchDest::try_new("x").unwrap(),
-            );
-            let pp = ProvenancedPatch::new(patch, user_source());
-            let policy = PatchPolicy::empty();
-            let err = resolve_patches(
-                vec![pp],
-                policy,
-                &PanicHook,
-                ResolveOptions::default(),
-                &[],
-                None,
-            )
-            .unwrap_err();
-            assert!(
-                matches!(err, ResolveError::PatchWalk { ref sources } if !sources.is_empty()),
-                "got: {err:?}",
-            );
-        }
-
-        /// A `~/...` source pattern with no `HOME` in the resolved
-        /// vars surfaces as `Expansion(UndefinedVar)` — not a silent
-        /// empty walk. `PanicHook` proves the error fires before any
-        /// hook routing.
-        #[test]
-        fn tilde_pattern_with_missing_home_var_errors() {
-            let patch = Patch::new("~/dotfiles/conf", PatchDest::try_new("conf").unwrap());
-            let pp = ProvenancedPatch::new(patch, user_source());
-            let policy = PatchPolicy::empty();
-            let err = resolve_patches(
-                vec![pp],
-                policy,
-                &PanicHook,
-                ResolveOptions::default(),
-                &[],
-                None,
-            )
-            .unwrap_err();
-            assert!(
-                matches!(
-                    err,
-                    ResolveError::Expansion(crate::core::expansion::ExpandError::UndefinedVar { ref name })
-                        if name == "HOME"
-                ),
-                "got: {err:?}",
-            );
-        }
-
-        /// `~/...` source expansion against a `HOME` session var
-        /// successfully walks and finds files.
-        #[test]
-        fn tilde_pattern_expands_with_home_session_var() {
-            let tmp = tempfile::tempdir().unwrap();
-            let root = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
-            std::fs::create_dir_all(root.join("dotfiles").as_std_path()).unwrap();
-            std::fs::write(root.join("dotfiles/conf").as_std_path(), "x").unwrap();
-
-            let patch = Patch::new("~/dotfiles/conf", PatchDest::try_new("conf").unwrap());
-            let pp = ProvenancedPatch::new(patch, user_source());
-            let policy = PatchPolicy::empty();
-            let vars = [home_var(root.as_str())];
-            let (resolved, _) = resolve_patches(
-                vec![pp],
-                policy,
-                &PanicHook,
-                ResolveOptions::default(),
-                &vars,
-                None,
-            )
-            .unwrap();
-            assert_eq!(resolved.len(), 1);
-            assert_eq!(
-                resolved[0].patch().host_path().as_str(),
-                root.join("dotfiles/conf").as_str(),
-            );
-        }
-
-        /// A `deny = ["~/.ssh/**"]` policy pattern actually denies a
-        /// project-origin patch after policy expansion against
-        /// the resolved `HOME`.
-        #[test]
-        fn policy_tilde_pattern_actually_denies() {
-            let tmp = tempfile::tempdir().unwrap();
-            let root = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
-            std::fs::create_dir_all(root.join(".ssh").as_std_path()).unwrap();
-            std::fs::write(root.join(".ssh/id_rsa").as_std_path(), "secret").unwrap();
-
-            let patch = Patch::new(
-                root.join(".ssh/id_rsa").as_str(),
-                PatchDest::try_new("id_rsa").unwrap(),
-            );
-            let pp = ProvenancedPatch::new(patch, project_source());
-
-            let policy = PatchPolicy::empty().with_deny(["~/.ssh/**"]);
-            let vars = [home_var(root.as_str())];
-
-            let err = resolve_patches(
-                vec![pp],
-                policy,
-                &PassThroughHook,
-                ResolveOptions::default(),
-                &vars,
-                None,
-            )
-            .unwrap_err();
-            assert!(matches!(err, ResolveError::Denied { .. }), "got: {err:?}");
-        }
-
-        /// A policy with a `~`-prefixed pattern and no `HOME` in the
-        /// resolved-vars set fails up-front with `Expansion`, not a
-        /// silent allow.
-        #[test]
-        fn policy_tilde_pattern_without_home_var_errors() {
-            let (_tmp, patch) = single_file_patch("conf.toml", "conf");
-            let pp = ProvenancedPatch::new(patch, user_source());
-            let policy = PatchPolicy::empty().with_deny(["~/.ssh/**"]);
-            let err = resolve_patches(
-                vec![pp],
-                policy,
-                &PanicHook,
-                ResolveOptions::default(),
-                &[],
-                None,
-            )
-            .unwrap_err();
-            assert!(
-                matches!(
-                    err,
-                    ResolveError::Expansion(crate::core::expansion::ExpandError::UndefinedVar { ref name })
-                        if name == "HOME"
-                ),
-                "got: {err:?}",
-            );
-        }
-
-        /// `~user/...` is not a tilde-prefix expansion candidate, so
-        /// it passes through expansion literally — and is then
-        /// rejected by the absoluteness check because it doesn't
-        /// start with `/`. Surfaces as `ResolveError::Expansion`
-        /// carrying `ExpandError::NotAbsolute`.
-        #[test]
-        fn user_prefixed_tilde_is_rejected_as_relative() {
-            let (_tmp, patch) = single_file_patch("conf.toml", "conf");
-            let pp = ProvenancedPatch::new(patch, user_source());
-            let policy = PatchPolicy::empty().with_deny(["~someuser/.ssh/**"]);
-            let err = resolve_patches(
-                vec![pp],
-                policy,
-                &PanicHook,
-                ResolveOptions::default(),
-                &[],
-                None,
-            )
-            .unwrap_err();
-            assert!(
-                matches!(
-                    err,
-                    ResolveError::Expansion(
-                        crate::core::expansion::ExpandError::NotAbsolute { .. }
-                    )
-                ),
-                "got: {err:?}",
-            );
-        }
-
-        /// The returned policy preserves raw `~/` patterns — round-trip
-        /// safe. Expansion happens to an internal copy only.
-        #[test]
-        fn returned_policy_preserves_raw_tilde_patterns() {
-            let tmp = tempfile::tempdir().unwrap();
-            let root = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
-            let file = root.join("hello.txt");
-            std::fs::write(file.as_std_path(), "x").unwrap();
-
-            let patch = Patch::new(file.as_str(), PatchDest::try_new("hello.txt").unwrap());
-            let pp = ProvenancedPatch::new(patch, user_source());
-
-            let policy = PatchPolicy::empty().with_allow(["~/.config/**"]);
-            let vars = [home_var(root.as_str())];
-
-            let (_resolved, policy_out) = resolve_patches(
-                vec![pp],
-                policy,
-                &PanicHook,
-                ResolveOptions::default(),
-                &vars,
-                None,
-            )
+        let hook = LifecycleHook::builder()
+            .with_on_activate(HookScript::inline("echo hi"))
+            .build()
             .unwrap();
 
-            assert_eq!(policy_out.allow(), ["~/.config/**"]);
-        }
-
-        /// Hook returns an `updated_policy` with a fresh `~/*.pem`
-        /// deny rule. The resolver must re-expand against the same
-        /// resolved-vars and enforce the rule on `UseRule` re-check.
-        #[test]
-        fn hook_added_tilde_rule_is_enforced_after_reexpansion() {
-            struct TildeDenyAddingHook;
-            impl PolicyHooks for TildeDenyAddingHook {
-                fn on_var_unapproved(
-                    &self,
-                    _: VarsPolicy,
-                    items: &[Unapproved<'_, str>],
-                ) -> HookResult<VarsPolicy> {
-                    HookResult::decided(vec![ItemDecision::UseRule; items.len()])
-                }
-                fn on_patch_unapproved(
-                    &self,
-                    policy: PatchPolicy,
-                    items: &[Unapproved<'_, camino::Utf8Path>],
-                ) -> HookResult<PatchPolicy> {
-                    let updated = policy.with_deny(["~/*.pem"]);
-                    HookResult::decided_with_policy(
-                        vec![ItemDecision::UseRule; items.len()],
-                        updated,
-                    )
-                }
-            }
-
-            let tmp = tempfile::tempdir().unwrap();
-            let root = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
-            let file = root.join("secret.pem");
-            std::fs::write(file.as_std_path(), "x").unwrap();
-
-            let patch = Patch::new(file.as_str(), PatchDest::try_new("secret.pem").unwrap());
-            let pp = ProvenancedPatch::new(patch, project_source());
-
-            let policy = PatchPolicy::empty();
-            let vars = [home_var(root.as_str())];
-
-            let err = resolve_patches(
-                vec![pp],
-                policy,
-                &TildeDenyAddingHook,
-                ResolveOptions::default(),
-                &vars,
-                None,
+        let loadout = loadout_named("dev")
+            .with_var(
+                StrictVarName::try_new("EDITOR").unwrap(),
+                VarValue::specified("hx"),
             )
-            .unwrap_err();
-            assert!(matches!(err, ResolveError::Denied { .. }), "got: {err:?}");
-        }
+            .with_package("helix")
+            .with_patch(patch)
+            .with_lifecycle_hook(hook);
 
-        /// Hook returns an `updated_policy` that references a var not
-        /// in the resolved-vars set. Strict re-expansion: surfaces as
-        /// `ResolveError::Expansion`, not silent fall-through.
-        #[test]
-        fn hook_policy_referencing_unknown_var_errors_strictly() {
-            struct UnknownVarHook;
-            impl PolicyHooks for UnknownVarHook {
-                fn on_var_unapproved(
-                    &self,
-                    _: VarsPolicy,
-                    items: &[Unapproved<'_, str>],
-                ) -> HookResult<VarsPolicy> {
-                    HookResult::decided(vec![ItemDecision::UseRule; items.len()])
-                }
-                fn on_patch_unapproved(
-                    &self,
-                    policy: PatchPolicy,
-                    items: &[Unapproved<'_, camino::Utf8Path>],
-                ) -> HookResult<PatchPolicy> {
-                    let updated = policy.with_deny(["$NOT_RESOLVED/*"]);
-                    HookResult::decided_with_policy(
-                        vec![ItemDecision::UseRule; items.len()],
-                        updated,
-                    )
-                }
-            }
-            let (_tmp, patch) = single_file_patch("conf.toml", "conf");
-            let pp = ProvenancedPatch::new(patch, project_source());
-            let policy = PatchPolicy::empty();
-            let err = resolve_patches(
-                vec![pp],
-                policy,
-                &UnknownVarHook,
-                ResolveOptions::default(),
-                &[],
-                None,
-            )
-            .unwrap_err();
-            assert!(
-                matches!(
-                    err,
-                    ResolveError::Expansion(crate::core::expansion::ExpandError::UndefinedVar { ref name })
-                        if name == "NOT_RESOLVED"
-                ),
-                "got: {err:?}",
-            );
-        }
-
-        // ---- canonicalization + symlink dual-path ----
-
-        /// Create a symlink (Unix-only).
-        #[cfg(unix)]
-        fn symlink(target: &std::path::Path, link: &std::path::Path) {
-            std::os::unix::fs::symlink(target, link).expect("symlink");
-        }
-
-        /// A symlinked walk root walks the link's contents (preserving
-        /// link-path semantics) and each yielded file's canonical
-        /// target is captured. Verifies that follow-symlinks descent
-        /// works end-to-end and matches against the link-form pattern.
-        #[cfg(unix)]
-        #[test]
-        fn symlinked_walk_root_yields_link_paths_under_pattern() {
-            let tmp = tempfile::tempdir().unwrap();
-            let tmp_root = Utf8Path::from_path(tmp.path()).unwrap();
-            let real = tmp_root.join("real");
-            std::fs::create_dir_all(real.as_std_path()).unwrap();
-            std::fs::write(real.join("conf.toml").as_std_path(), "x").unwrap();
-            let link = tmp_root.join("link");
-            symlink(real.as_std_path(), link.as_std_path());
-
-            let patch = Patch::new(
-                format!("{link}/**/*.toml"),
-                PatchDest::try_new("etc").unwrap(),
-            );
-            let pp = ProvenancedPatch::new(patch, user_source());
-            let policy = PatchPolicy::empty();
-            let (resolved, _) = resolve_patches(
-                vec![pp],
-                policy,
-                &PanicHook,
-                ResolveOptions {
-                    follow_symlinks: true,
-                },
-                &[],
-                None,
-            )
+        let mut composer = UserComposer::new();
+        composer.add(loadout).unwrap();
+        let wire = composer
+            .compose(UserPolicy::empty(), ComposeOptions::default())
             .unwrap();
-            assert_eq!(resolved.len(), 1);
-        }
-
-        /// With `follow_symlinks: true`, a symlink file pointing to a
-        /// denied location must be rejected. Even though the link's
-        /// own path is allowed, the target's path matches deny.
-        /// Deny-wins-over-allowed is the security-critical case.
-        #[cfg(unix)]
-        #[test]
-        fn symlink_target_denied_wins_over_link_allowed() {
-            let tmp = tempfile::tempdir().unwrap();
-            // Canonicalize the tempdir root so the policy patterns
-            // below match the form the resolver actually sees. On
-            // macOS `tempdir()` returns paths under `/var/folders/...`,
-            // which is itself a symlink to `/private/var/folders/...`;
-            // with `follow_symlinks: true` the resolver canonicalizes
-            // each matched file and that prefix swap would mis-match
-            // a policy pattern written against the as-returned form.
-            let canonical = std::fs::canonicalize(tmp.path()).unwrap();
-            let root = Utf8Path::from_path(&canonical).unwrap().to_path_buf();
-            // /tmp/.../allowed_dir/secret -> /tmp/.../denied_dir/leak
-            let allowed_dir = root.join("allowed_dir");
-            let denied_dir = root.join("denied_dir");
-            std::fs::create_dir_all(allowed_dir.as_std_path()).unwrap();
-            std::fs::create_dir_all(denied_dir.as_std_path()).unwrap();
-            let target_file = denied_dir.join("leak");
-            std::fs::write(target_file.as_std_path(), "secret").unwrap();
-            let link_file = allowed_dir.join("secret");
-            symlink(target_file.as_std_path(), link_file.as_std_path());
-
-            // Patch source covers `allowed_dir/**`. With follow_symlinks
-            // the link is followed and yielded as a file.
-            let patch = Patch::new(
-                format!("{allowed_dir}/**"),
-                PatchDest::try_new("etc").unwrap(),
-            );
-            let pp = ProvenancedPatch::new(patch, project_source());
-            // Deny matches the canonical target, not the link.
-            let policy = PatchPolicy::empty().with_deny([format!("{denied_dir}/**")]);
-            let err = resolve_patches(
-                vec![pp],
-                policy,
-                &PassThroughHook,
-                ResolveOptions {
-                    follow_symlinks: true,
-                },
-                &[],
-                None,
-            )
-            .unwrap_err();
-            assert!(matches!(err, ResolveError::Denied { .. }), "got: {err:?}");
-        }
-
-        /// With `follow_symlinks: true` walking over a *non-*symlinked
-        /// file, canonicalization yields the same path the walker
-        /// produced — so `PatchFile::link_path` ends up `None` (no
-        /// distinct link form to record). Verified by asserting the
-        /// file passes a policy whose deny pattern is written in the
-        /// *canonical* form: there's no separate link path to clear
-        /// the deny against, so it works as a single-path check.
-        #[cfg(unix)]
-        #[test]
-        fn follow_symlinks_on_normal_file_uses_target_only() {
-            let tmp = tempfile::tempdir().unwrap();
-            // Canonicalize the tempdir root — see the comment on
-            // `symlink_target_denied_wins_over_link_allowed` for why
-            // macOS makes this necessary.
-            let canonical = std::fs::canonicalize(tmp.path()).unwrap();
-            let root = Utf8Path::from_path(&canonical).unwrap().to_path_buf();
-            // No symlink here — just a plain file. With `follow_symlinks`
-            // on, canonicalization runs but yields the same path.
-            std::fs::write(root.join("ok.txt").as_std_path(), "x").unwrap();
-            let patch = Patch::new(
-                format!("{root}/**/*.txt"),
-                PatchDest::try_new("etc").unwrap(),
-            );
-            let pp = ProvenancedPatch::new(patch, project_source());
-            // Allow that matches the canonical path. If link were
-            // erroneously set to Some(walker_path), and walker_path
-            // happened to differ from canonical (e.g. via prefix-level
-            // OS symlinks), this allow wouldn't cover it. On a plain
-            // file with no link, link_path is None and the allow on
-            // the target alone is sufficient.
-            let policy = PatchPolicy::empty().with_allow([format!("{root}/**")]);
-            let (resolved, _) = resolve_patches(
-                vec![pp],
-                policy,
-                &PanicHook,
-                ResolveOptions {
-                    follow_symlinks: true,
-                },
-                &[],
-                None,
-            )
-            .unwrap();
-            assert_eq!(resolved.len(), 1);
-        }
-
-        /// Regression for the macOS-style symlinked walk-root prefix
-        /// case (e.g. `/tmp` → `/private/tmp`). With
-        /// `follow_symlinks: false` — the default — canonicalization
-        /// must NOT happen, otherwise policy patterns written against
-        /// the user-visible prefix (`<link>/...`) mis-match the
-        /// canonical target prefix (`<real>/...`) and innocent files
-        /// silently fall through to `NeedsApproval`. This test
-        /// reconstructs that scenario locally: a symlinked directory
-        /// as the walk-root prefix, plus an allow pattern written in
-        /// link-prefix terms. With the fix, the file matches policy
-        /// `allow` at Pass 1 and `PanicHook` is never invoked. Without
-        /// the fix, dual-path mis-matches and resolution routes the
-        /// file to the hook — `PanicHook` then panics with a clear
-        /// message.
-        #[cfg(unix)]
-        #[test]
-        fn symlinked_prefix_in_default_mode_matches_link_form_policy() {
-            let tmp = tempfile::tempdir().unwrap();
-            let tmp_root = Utf8Path::from_path(tmp.path()).unwrap();
-            let real = tmp_root.join("real_dir");
-            std::fs::create_dir_all(real.as_std_path()).unwrap();
-            std::fs::write(real.join("conf.toml").as_std_path(), "x").unwrap();
-            // `link_dir` is a symlink to `real_dir`. Patch source +
-            // policy allow are both written against `link_dir`.
-            let link = tmp_root.join("link_dir");
-            symlink(real.as_std_path(), link.as_std_path());
-
-            let patch = Patch::new(
-                format!("{link}/**/*.toml"),
-                PatchDest::try_new("etc").unwrap(),
-            );
-            let pp = ProvenancedPatch::new(patch, project_source());
-
-            // Allow pattern written in link-prefix terms. In default
-            // mode (no follow_symlinks), canonicalization must not
-            // swap in `real_dir`; otherwise this allow won't match.
-            let policy = PatchPolicy::empty().with_allow([format!("{link}/**")]);
-            let (resolved, _) = resolve_patches(
-                vec![pp],
-                policy,
-                &PanicHook,
-                ResolveOptions::default(),
-                &[],
-                None,
-            )
-            .unwrap();
-            assert_eq!(resolved.len(), 1);
-        }
-    }
-
-    // =================================================================
-    // Composer public API
-    // =================================================================
-
-    mod composer_api {
-        use super::*;
-
-        #[test]
-        fn empty_composer_yields_empty_resolution() {
-            let composer = Composer::new();
-            let (resolution, _) = composer
-                .resolve(UserPolicy::empty(), &PanicHook, ResolveOptions::default())
-                .unwrap();
-            assert!(resolution.vars().is_empty());
-            assert!(resolution.patches().is_empty());
-        }
-
-        #[test]
-        fn minimal_session_round_trips() {
-            let (_tmp, patch) = single_file_patch("conf.toml", "etc/conf.toml");
-            let loadout = FakeLoadout {
-                source: user_source(),
-                var_names: vec!["EDITOR"],
-                patches: vec![patch],
-            };
-            let mut composer = Composer::new();
-            composer.add(loadout).unwrap();
-            let (resolution, _policy_out) = composer
-                .resolve(UserPolicy::empty(), &PanicHook, ResolveOptions::default())
-                .unwrap();
-            assert_eq!(resolution.vars().len(), 1);
-            assert_eq!(resolution.patches().len(), 1);
-        }
-
-        /// When a hook returns `updated_policy: Some(new)`, the
-        /// returned `UserPolicy` carries that mutation. Project-origin
-        /// item forces a prompt; hook returns an updated `VarsPolicy`
-        /// with an `allow = ["MUT_*"]` rule.
-        #[test]
-        fn returned_policy_carries_hook_mutation() {
-            struct MutatingHook;
-            impl PolicyHooks for MutatingHook {
-                fn on_var_unapproved(
-                    &self,
-                    policy: VarsPolicy,
-                    items: &[Unapproved<'_, str>],
-                ) -> HookResult<VarsPolicy> {
-                    let updated = policy.try_with_allow(["MUT_*"]).unwrap();
-                    HookResult::decided_with_policy(
-                        vec![ItemDecision::UseRule; items.len()],
-                        updated,
-                    )
-                }
-                fn on_patch_unapproved(
-                    &self,
-                    _: PatchPolicy,
-                    items: &[Unapproved<'_, camino::Utf8Path>],
-                ) -> HookResult<PatchPolicy> {
-                    HookResult::decided(vec![ItemDecision::AllowOnce; items.len()])
-                }
-            }
-
-            let mut composer = Composer::new();
-            composer
-                .add(FakeLoadout::vars(project_source(), vec!["MUT_FOO"]))
-                .unwrap();
-
-            let (_resolution, policy_out) = composer
-                .resolve(
-                    UserPolicy::empty(),
-                    &MutatingHook,
-                    ResolveOptions::default(),
-                )
-                .unwrap();
-            assert!(
-                policy_out.vars().allow().is_match("MUT_FOO"),
-                "expected MUT_* allow rule on returned policy, got: {:?}",
-                policy_out.vars().allow(),
-            );
-        }
-
-        /// Test scaffold: a tiny Composable that contributes a fixed
-        /// set of vars and patches sharing one source.
-        struct FakeLoadout {
-            source: Source,
-            var_names: Vec<&'static str>,
-            patches: Vec<Patch>,
-        }
-
-        impl FakeLoadout {
-            fn vars(source: Source, var_names: Vec<&'static str>) -> Self {
-                Self {
-                    source,
-                    var_names,
-                    patches: Vec::new(),
-                }
-            }
-        }
-
-        impl Provenanced for FakeLoadout {
-            fn source(&self) -> &Source {
-                &self.source
-            }
-        }
-
-        impl Composable for FakeLoadout {
-            fn contribute(self, _env: EnvLookup<'_>) -> Result<Contribution, Error> {
-                let mut c = Contribution::new();
-                for name in self.var_names {
-                    c.push_var(pv_with(name, self.source.clone()));
-                }
-                for patch in self.patches {
-                    c.push_patch(ProvenancedPatch::new(patch, self.source.clone()));
-                }
-                Ok(c)
-            }
-        }
-
-        /// `Composer::add` drives the canonical contributor path.
-        #[test]
-        fn add_drains_a_composable() {
-            let loadout = FakeLoadout::vars(user_source(), vec!["EDITOR", "LANG"]);
-            let mut composer = Composer::new();
-            composer.add(loadout).unwrap();
-            let (resolution, _) = composer
-                .resolve(UserPolicy::empty(), &PanicHook, ResolveOptions::default())
-                .unwrap();
-            assert_eq!(resolution.vars().len(), 2);
-        }
-
-        /// `Composer::add_all` runs a sequence of contributors. Multiple
-        /// sources accumulate independently.
-        #[test]
-        fn add_all_runs_a_sequence_of_contributors() {
-            let loadouts = vec![
-                FakeLoadout::vars(user_source(), vec!["EDITOR"]),
-                FakeLoadout::vars(project_source(), vec!["LANG", "TZ"]),
-            ];
-            let mut composer = Composer::new();
-            composer.add_all(loadouts).unwrap();
-            let (resolution, _) = composer
-                .resolve(
-                    UserPolicy::empty(),
-                    &PassThroughHook,
-                    ResolveOptions::default(),
-                )
-                .unwrap();
-            assert_eq!(resolution.vars().len(), 3);
-            let by_source: Vec<_> = resolution.vars().iter().map(SessionVar::source).collect();
-            assert!(by_source.contains(&&user_source()));
-            assert!(by_source.contains(&&project_source()));
-        }
-
-        /// `Composer::add` propagates a contributor's error verbatim.
-        #[test]
-        fn add_propagates_contributor_error() {
-            struct FailingLoadout;
-            impl Provenanced for FailingLoadout {
-                fn source(&self) -> &Source {
-                    static S: std::sync::OnceLock<Source> = std::sync::OnceLock::new();
-                    S.get_or_init(|| Source::UserLoadout {
-                        name: "failing".into(),
-                    })
-                }
-            }
-            impl Composable for FailingLoadout {
-                fn contribute(self, _env: EnvLookup<'_>) -> Result<Contribution, Error> {
-                    // Trigger a real construction-time error from one of
-                    // the underlying domains.
-                    crate::core::primitives::FileSet::try_new("[invalid").map_err(Error::from)?;
-                    unreachable!()
-                }
-            }
-            let mut composer = Composer::new();
-            let err = composer.add(FailingLoadout).unwrap_err();
-            assert!(matches!(err, Error::Patch { .. }), "got: {err:?}");
-        }
-
-        /// Packages and lifecycle hooks contributed via a Composable
-        /// pass through to the final Resolution unchanged.
-        #[test]
-        fn packages_and_hooks_pass_through() {
-            use crate::core::lifecyclehook::{HookScript, LifecycleHook};
-
-            struct LoadoutWithExtras;
-            impl Composable for LoadoutWithExtras {
-                fn contribute(self, _env: EnvLookup<'_>) -> Result<Contribution, Error> {
-                    let hook = LifecycleHook::builder()
-                        .with_on_activate(HookScript::inline("echo go"))
-                        .build()?;
-                    Ok(Contribution::new()
-                        .with_package(ProvenancedPackage::new("helix", user_source()))
-                        .with_package(ProvenancedPackage::new("zellij", user_source()))
-                        .with_hook(ProvenancedHook::new(hook, user_source())))
-                }
-            }
-
-            let mut composer = Composer::new();
-            composer.add(LoadoutWithExtras).unwrap();
-            let (resolution, _) = composer
-                .resolve(UserPolicy::empty(), &PanicHook, ResolveOptions::default())
-                .unwrap();
-            assert_eq!(resolution.packages().len(), 2);
-            assert_eq!(resolution.packages()[0].package(), "helix");
-            assert_eq!(resolution.lifecycle_hooks().len(), 1);
-            assert_eq!(resolution.lifecycle_hooks()[0].source(), &user_source());
-        }
-
-        /// `Composer::with_env` lets tests pin env behavior without
-        /// touching the process environment. The provided closure
-        /// resolves `LANG` when a contributor's var is `inherit = true`.
-        #[test]
-        fn with_env_overrides_lookup_for_inheriting_vars() {
-            use crate::core::loadout::{Loadout, LoadoutName};
-            use crate::core::primitives::{StrictVarName, VarValue};
-
-            let loadout = Loadout::new(LoadoutName::try_new("dev").unwrap())
-                .with_var(StrictVarName::try_new("LANG").unwrap(), VarValue::Inherit);
-
-            let mut composer = Composer::new().with_env(Box::new(|name| {
-                if name == "LANG" {
-                    Ok("en_US.UTF-8".into())
-                } else {
-                    Err(std::env::VarError::NotPresent)
-                }
-            }));
-            composer.add(loadout).unwrap();
-            let (resolution, _) = composer
-                .resolve(UserPolicy::empty(), &PanicHook, ResolveOptions::default())
-                .unwrap();
-            assert_eq!(resolution.vars().len(), 1);
-            assert_eq!(resolution.vars()[0].var().name(), "LANG");
-            assert_eq!(resolution.vars()[0].var().value(), "en_US.UTF-8");
-        }
-
-        /// End-to-end test that `Loadout` is now a real `Composable`.
-        /// Push a loadout with vars, patches, packages, and a hook;
-        /// verify all four kinds reach the Resolution.
-        #[test]
-        fn loadout_contributes_all_four_kinds() {
-            use crate::core::lifecyclehook::{HookScript, LifecycleHook};
-            use crate::core::loadout::{Loadout, LoadoutName};
-            use crate::core::primitives::{StrictVarName, VarValue};
-
-            let (_tmp, patch) = single_file_patch("conf.toml", "etc/conf.toml");
-
-            let hook = LifecycleHook::builder()
-                .with_on_activate(HookScript::inline("echo hi"))
-                .build()
-                .unwrap();
-
-            let loadout = Loadout::new(LoadoutName::try_new("dev").unwrap())
-                .with_var(
-                    StrictVarName::try_new("EDITOR").unwrap(),
-                    VarValue::specified("hx"),
-                )
-                .with_package("helix")
-                .with_patch(patch)
-                .with_lifecycle_hook(hook);
-
-            let mut composer = Composer::new();
-            composer.add(loadout).unwrap();
-            let (resolution, _) = composer
-                .resolve(UserPolicy::empty(), &PanicHook, ResolveOptions::default())
-                .unwrap();
-            assert_eq!(resolution.vars().len(), 1);
-            assert_eq!(resolution.patches().len(), 1);
-            assert_eq!(resolution.packages().len(), 1);
-            assert_eq!(resolution.lifecycle_hooks().len(), 1);
-
-            // All four share the same UserLoadout source.
-            let expected = Source::UserLoadout { name: "dev".into() };
-            assert_eq!(resolution.vars()[0].source(), &expected);
-            assert_eq!(resolution.patches()[0].source(), &expected);
-            assert_eq!(resolution.packages()[0].source(), &expected);
-            assert_eq!(resolution.lifecycle_hooks()[0].source(), &expected);
-        }
-    }
-
-    // =================================================================
-    // Display snapshots — guard the user-facing error strings.
-    // =================================================================
-
-    mod display_snapshots {
-        use super::*;
-
-        #[test]
-        fn resolve_error_denied() {
-            let err = ResolveError::Denied {
-                what: "AWS_KEY".into(),
-                from: user_source(),
-            };
-            assert_eq!(
-                err.to_string(),
-                "policy denied `AWS_KEY` (from user loadout `test`)",
-            );
-        }
-
-        #[test]
-        fn resolve_error_aborted() {
-            assert_eq!(
-                ResolveError::Aborted.to_string(),
-                "user aborted session construction",
-            );
-        }
-
-        #[test]
-        fn source_variants() {
-            assert_eq!(user_source().to_string(), "user loadout `test`");
-            assert_eq!(project_source().to_string(), "project `/repo`");
-            assert_eq!(
-                Source::Package {
-                    name: "evil".into(),
-                }
-                .to_string(),
-                "package `evil`",
-            );
-        }
+        assert_eq!(wire.vars.len(), 1);
+        assert_eq!(wire.patches.len(), 1);
+        assert_eq!(wire.requested_packages.len(), 1);
+        assert_eq!(wire.lifecycle_hooks.len(), 1);
     }
 }

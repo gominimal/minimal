@@ -1,6 +1,6 @@
 //! Application-supplied callbacks for items the policy couldn't decide.
 //!
-//! The resolver hands the application a batch of [`Unapproved`] items
+//! The gate hands the application a batch of [`Unapproved`] items
 //! per domain and waits for a [`HookResult`] with one [`ItemDecision`]
 //! per item (and, optionally, a mutated policy snapshot).
 
@@ -9,13 +9,13 @@ use crate::core::policy::{PatchPolicy, VarsPolicy};
 use crate::core::source::Source;
 
 /// One item the policy could not decide. The item is held by reference
-/// so the resolve loop retains ownership for the second pass.
+/// so the gate loop retains ownership for the second pass.
 ///
-/// Constructed only by the resolver; hooks receive these as borrowed
-/// slices. The fields are inaccessible to outside code on purpose —
-/// nothing prevents constructing one, but the lifetimes are tied to
-/// the resolver's frame and there's no sensible way to manufacture
-/// matched references elsewhere.
+/// Constructed only by the gate functions in `core::compose`; hooks
+/// receive these as borrowed slices. The fields are inaccessible to
+/// outside code on purpose — nothing prevents constructing one, but the
+/// lifetimes are tied to the gate's frame and there's no sensible way
+/// to manufacture matched references elsewhere.
 #[derive(Clone, Debug)]
 pub struct Unapproved<'a, T: ?Sized> {
     pub(crate) item: &'a T,
@@ -42,9 +42,9 @@ impl<'a, T: ?Sized> Unapproved<'a, T> {
 ///
 /// Hooks **cannot** mutate the policy directly. If the application
 /// updates the policy in response to the prompt, it returns the updated
-/// copy in `updated_policy`. `None` means "no rule changes." The
-/// resolver installs `updated_policy` (if `Some`) before re-checking
-/// any `UseRule` decisions in this batch.
+/// copy in `updated_policy`. `None` means "no rule changes." The gate
+/// installs `updated_policy` (if `Some`) before re-checking any
+/// `UseRule` decisions in this batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HookResult<P> {
     /// Per-item decisions, indexed parallel to the input slice, plus
@@ -89,7 +89,7 @@ impl<P> HookResult<P> {
 /// decide on its own.
 ///
 /// Hooks receive an owned copy of the *narrow* domain policy
-/// (`VarsPolicy` / `PatchPolicy`); they cannot mutate the resolver's
+/// (`VarsPolicy` / `PatchPolicy`); they cannot mutate the gate's
 /// state directly. To add rules, return a modified policy snapshot in
 /// [`HookResult::Decided::updated_policy`] — wider mutations to the
 /// full [`UserPolicy`](crate::core::policy::UserPolicy) are not
@@ -99,10 +99,10 @@ impl<P> HookResult<P> {
 ///
 /// Patch-policy patterns are stored verbatim and round-trip losslessly.
 /// When a hook adds (or modifies) a patch-policy rule with a leading
-/// `~`, return it in `~`-form — the resolver re-expands the policy
+/// `~`, return it in `~`-form — the gate re-expands the policy
 /// internally for matching, while the returned policy keeps the raw
 /// form so the caller can persist it. Do **not** expand `~` inside the
-/// hook; double-resolution will produce wrong matches.
+/// hook; double-expansion will produce wrong matches.
 ///
 /// Vars policies have no analogous `~`-expansion concern: variable
 /// names are not paths, so the home directory is not relevant on the
