@@ -1,11 +1,11 @@
 use crate::{
     ChannelConfig,
-    session_host::{self, WinSize},
+    session_host::{self, HostAttrs, WinSize},
 };
 use mctx::ConfigBuilder;
 use paths::DaemonAbsPath;
 use russh::{Channel, server::Msg};
-use sessions::store::SessionObject;
+use sessions::{Record, store::SessionObject};
 use std::fmt::{self};
 use tokio::sync::{mpsc, oneshot};
 
@@ -31,15 +31,26 @@ impl fmt::Display for AttachError {
     }
 }
 
+pub struct SessionPaths {
+    pub working: DaemonAbsPath,
+    pub cache: DaemonAbsPath,
+    pub home: DaemonAbsPath,
+}
+
 enum SessionMessage {
-    GetWorkspacePath(oneshot::Sender<DaemonAbsPath>),
+    GetPaths(oneshot::Sender<SessionPaths>),
     MakeContext(oneshot::Sender<Result<mctx::Context, String>>),
     Attach(
         oneshot::Sender<Result<(), AttachError>>,
         SessionHandle,
+        String,
         Channel<Msg>,
         ChannelConfig,
     ),
+    GetHostAttrs(oneshot::Sender<Option<HostAttrs>>),
+    RefreshRecord(Record),
+    #[cfg(test)]
+    GetRecord(oneshot::Sender<Record>),
 }
 
 /// Manages a running session.
@@ -62,8 +73,9 @@ impl<S: SessionObject> Session<S> {
         minimal_cache_dir: DaemonAbsPath,
         session: S,
     ) -> Result<SessionHandle, std::io::Error> {
-        let wsp = session.workspace_path();
-        std::fs::create_dir_all(&wsp).unwrap();
+        std::fs::create_dir_all(session.workspace_path())?;
+        std::fs::create_dir_all(session.home_path())?;
+        std::fs::create_dir_all(session.cache_path())?;
 
         let (sender, receiver) = mpsc::channel(8);
         let mngr = Self {
@@ -85,18 +97,34 @@ impl<S: SessionObject> Session<S> {
             self.handle_message(msg).await;
         }
     }
+
     /// Handles a specific message recieved by the session.
     async fn handle_message(&mut self, msg: SessionMessage) {
         match msg {
-            SessionMessage::GetWorkspacePath(r) => {
-                let wsp = self.session.workspace_path();
-                let _ = r.send(wsp);
+            SessionMessage::GetPaths(r) => {
+                let _ = r.send(self.paths());
             }
             SessionMessage::MakeContext(r) => {
                 let _ = r.send(self.context());
             }
-            SessionMessage::Attach(r, session_hnd, channel, config) => {
-                let _ = r.send(self.attach(session_hnd, channel, config).await);
+            SessionMessage::Attach(r, session_hnd, conn_username, channel, config) => {
+                let _ = r.send(
+                    self.attach(session_hnd, conn_username, channel, config)
+                        .await,
+                );
+            }
+            SessionMessage::GetHostAttrs(r) => {
+                let _ = r.send(match self.host.as_ref() {
+                    None => None,
+                    Some(h) => h.get_attrs().await.ok(),
+                });
+            }
+            SessionMessage::RefreshRecord(r) => {
+                self.session.refresh_from_record(r);
+            }
+            #[cfg(test)]
+            SessionMessage::GetRecord(r) => {
+                let _ = r.send(self.session.record().clone());
             }
         }
     }
@@ -104,6 +132,7 @@ impl<S: SessionObject> Session<S> {
     async fn attach(
         &mut self,
         session_hnd: SessionHandle,
+        conn_username: String,
         channel: Channel<Msg>,
         config: ChannelConfig,
     ) -> Result<(), AttachError> {
@@ -113,13 +142,17 @@ impl<S: SessionObject> Session<S> {
         });
 
         match &mut self.host {
-            None => self.mint_session_host(session_hnd, channel, sz).await,
+            None => {
+                self.mint_session_host(session_hnd, conn_username, channel, sz)
+                    .await
+            }
             Some(h) => {
                 match h.attach(channel, sz).await {
                     Ok(()) => Ok(()),
                     Err((channel, sz)) => {
                         // session host is dead
-                        self.mint_session_host(session_hnd, channel, sz).await
+                        self.mint_session_host(session_hnd, conn_username, channel, sz)
+                            .await
                     }
                 }
             }
@@ -129,13 +162,33 @@ impl<S: SessionObject> Session<S> {
     async fn mint_session_host(
         &mut self,
         session_hnd: SessionHandle,
+        conn_username: String,
         channel: Channel<Msg>,
         sz: WinSize,
     ) -> Result<(), AttachError> {
+        let name = {
+            let record = self.session.record();
+            match &record.name {
+                Some(s) => s.clone(),
+                None => record
+                    .project_path
+                    .file_name()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "session".to_string()),
+            }
+        };
+
         let launcher = self.session_launcher(session_hnd)?;
-        let h = Box::pin(session_host::Host::spawn(launcher, sz, Some(channel)))
-            .await
-            .map_err(AttachError::SpawnFailed)?;
+        let h = Box::pin(session_host::Host::spawn(
+            launcher,
+            name,
+            conn_username,
+            self.paths(),
+            sz,
+            Some(channel),
+        ))
+        .await
+        .map_err(AttachError::SpawnFailed)?;
         self.host = Some(h);
         Ok(())
     }
@@ -176,6 +229,13 @@ impl<S: SessionObject> Session<S> {
             Ok(c) => mctx::Context::new(c).map_err(|e| e.to_string()),
         }
     }
+    fn paths(&self) -> SessionPaths {
+        SessionPaths {
+            working: self.session.workspace_path(),
+            cache: self.session.cache_path(),
+            home: self.session.home_path(),
+        }
+    }
 }
 
 /// The handle to the session.
@@ -183,11 +243,18 @@ impl<S: SessionObject> Session<S> {
 pub struct SessionHandle(mpsc::Sender<SessionMessage>);
 
 impl SessionHandle {
-    /// Returns the path where the session workspace is located.
-    pub async fn workspace_path(&self) -> DaemonAbsPath {
+    /// Returns paths on the daemon backing various internals of the session.
+    pub async fn paths(&self) -> SessionPaths {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(SessionMessage::GetWorkspacePath(send)).await;
+        let _ = self.0.send(SessionMessage::GetPaths(send)).await;
+        recv.await.expect("corresponding session is dead")
+    }
+    /// Returns the host attributes of the running session, if any.
+    pub async fn get_attrs(&self) -> Option<HostAttrs> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self.0.send(SessionMessage::GetHostAttrs(send)).await;
         recv.await.expect("corresponding session is dead")
     }
 
@@ -199,8 +266,29 @@ impl SessionHandle {
         recv.await.expect("corresponding session is dead")
     }
 
+    /// Returns the session record currently held by the live session actor.
+    ///
+    /// This reads the actor's in-memory copy, not the on-disk record, so
+    /// tests can assert that updates have propagated into the running session.
+    #[cfg(test)]
+    pub(crate) async fn record(&self) -> Record {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self.0.send(SessionMessage::GetRecord(send)).await;
+        recv.await.expect("corresponding session is dead")
+    }
+
+    /// Tell the session that the underlying session record was updated.
+    pub(crate) async fn apply_record(&self, new_record: Record) {
+        self.0
+            .send(SessionMessage::RefreshRecord(new_record))
+            .await
+            .expect("corresponding session is dead");
+    }
+
     pub async fn attach(
         &self,
+        conn_username: String,
         channel: Channel<Msg>,
         config: ChannelConfig,
     ) -> Result<(), AttachError> {
@@ -208,7 +296,13 @@ impl SessionHandle {
         // Ignore send errors - the recv will also fail.
         let _ = self
             .0
-            .send(SessionMessage::Attach(send, self.clone(), channel, config))
+            .send(SessionMessage::Attach(
+                send,
+                self.clone(),
+                conn_username,
+                channel,
+                config,
+            ))
             .await;
         recv.await.expect("corresponding session is dead")
     }
@@ -222,7 +316,8 @@ mod tests {
     use russh::ChannelMsg;
     use sessions::SessionId;
 
-    use crate::rpc::{CreateSession, CreateSessionRequest};
+    use minimald_rpc::{CreateSession, CreateSessionRequest};
+
     use crate::test_harness::{TestClient, TestServer};
 
     /// Creates a fresh session on the server and returns its id.

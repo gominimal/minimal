@@ -31,10 +31,6 @@ use tempfile::TempDir;
 
 const BOOT_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// SSH subsystem name for the CreateSession RPC (mirrors
-/// `minimald::rpc::RPC_SUBSYSTEM_PREFIX` + "CreateSession"; minimald is
-/// Linux-only so it cannot be imported into this macOS test).
-const CREATE_SESSION_SUBSYSTEM: &str = "minimald-v1-CreateSession";
 /// Env var the server reads to scope an exec to a session
 /// (mirrors `minimald::MINIMAL_SESSION_ID_ENV`).
 const MINIMAL_SESSION_ID_ENV: &str = "MINIMAL_SESSION_ID";
@@ -129,18 +125,6 @@ impl Guest {
 
 // --- Full session: russh client → CreateSession → exec → stdout ---
 
-/// CreateSession request payload (mirrors `minimald::rpc::CreateSessionRequest`).
-#[derive(serde::Serialize)]
-struct CreateSessionRequest {
-    record: sessions::Record,
-}
-
-/// CreateSession response payload (mirrors `minimald::rpc::CreateSessionResponse`).
-#[derive(serde::Deserialize)]
-struct CreateSessionResponse {
-    id: sessions::SessionId,
-}
-
 /// russh client handler: accept the guest's ephemeral host key.
 struct ClientHandler;
 
@@ -192,6 +176,7 @@ async fn run_session_exec(
     sock_path: &Path,
     command: &str,
 ) -> Result<(String, Option<u32>), String> {
+    use minimald_rpc::{CreateSession, CreateSessionRequest, OneshotSshRpc};
     use russh::ChannelMsg;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -235,7 +220,7 @@ async fn run_session_exec(
             .await
             .map_err(|e| format!("open CreateSession channel: {e}"))?;
         channel
-            .request_subsystem(false, CREATE_SESSION_SUBSYSTEM)
+            .request_subsystem(false, CreateSession::NAME)
             .await
             .map_err(|e| format!("request_subsystem: {e}"))?;
 
@@ -262,9 +247,11 @@ async fn run_session_exec(
         rpc.read_to_end(&mut resp_buf)
             .await
             .map_err(|e| format!("read response: {e}"))?;
-        let resp: CreateSessionResponse =
+        let resp: <CreateSession as OneshotSshRpc>::Response =
             serde_json::from_slice(&resp_buf).map_err(|e| format!("decode response: {e}"))?;
-        resp.id
+        resp.ok()
+            .ok_or_else(|| "CreateSession returned an error".to_string())?
+            .id
     };
 
     // Exec the command in that session.

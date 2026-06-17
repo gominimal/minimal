@@ -368,6 +368,7 @@ impl russh::server::Handler for ConnectionHandler {
             session.channel_failure(id)?;
             return Ok(());
         };
+        let conn_username = conn_lock.ssh_username.clone().expect("already authed");
         drop(conn_lock);
         if config.pty.is_none() {
             tracing::warn!("channel {id}: pty not requested for shell session",);
@@ -407,7 +408,7 @@ impl russh::server::Handler for ConnectionHandler {
         session.channel_success(id)?;
         let hnd = session.handle();
         tokio::spawn(async move {
-            if let Err(e) = session_handle.attach(channel, config).await {
+            if let Err(e) = session_handle.attach(conn_username, channel, config).await {
                 let _ = hnd
                     .data(id, format!("Error attaching to session: {e}\r\n"))
                     .await;
@@ -425,7 +426,7 @@ impl russh::server::Handler for ConnectionHandler {
     ) -> Result<(), Self::Error> {
         protocol_trace!("Got subsystem_request on channel {id}: subsystem={name}");
 
-        if name.starts_with(rpc::RPC_SUBSYSTEM_PREFIX) {
+        if name.starts_with(minimald_rpc::RPC_SUBSYSTEM_PREFIX) {
             let c = self.0.clone();
             let s = c.0.lock().await.serv.clone();
             rpc::handle_ssh_rpc(s, c, name, id, session).await?;

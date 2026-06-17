@@ -121,12 +121,7 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
             None
         },
         if args.kind.check_stacks() {
-            // TODO: Remove after May 2026.
-            if upstream_dir.join("harnesses").exists() {
-                Some(upstream_dir.join("harnesses"))
-            } else {
-                Some(upstream_dir.join("stacks"))
-            }
+            Some(upstream_dir.join("stacks"))
         } else {
             None
         },

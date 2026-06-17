@@ -1,0 +1,212 @@
+//! Wire contract for minimald's oneshot SSH RPCs.
+//!
+//! This crate holds the protocol surface shared between the minimald server
+//! and its clients: the subsystem names, the request/response payload types,
+//! and the [`OneshotSshRpc`] trait that pairs them. It deliberately carries no
+//! transport or server dependencies (no `russh`, no `tokio`) so that clients
+//! — including the test harness and cross-platform integration tests — encode
+//! and decode requests through the very same types the server handles.
+//!
+//! The server-side serving glue lives in the `minimald` crate.
+
+use chrono::Utc;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sessions::SessionId;
+
+pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
+
+/// Describes a minimal-specific RPC method sent over ssh.
+///
+/// Oneshot RPCs are not streaming. The trait pairs a subsystem name with its
+/// request and response schemas; both the server (which decodes the request
+/// and encodes the response) and clients (which do the reverse) implement
+/// against this single contract.
+pub trait OneshotSshRpc {
+    /// The subsystem name used to call for this RPC.
+    const NAME: &'static str;
+    /// The type schema of the request.
+    ///
+    /// Bound on `Serialize` exists so that clients (including the test
+    /// harness) can encode requests through the same type the handler
+    /// decodes them with.
+    type Request<'a>: Deserialize<'a> + Serialize;
+    /// The type schema of the response.
+    ///
+    /// Bound on `DeserializeOwned` exists for symmetry with `Request`:
+    /// clients decode the same type the handler emitted.
+    type Response: Serialize + DeserializeOwned;
+}
+
+/// A convinence wrapper to let a response type be able to carry an error.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum Errorable<S: std::fmt::Debug + PartialEq> {
+    Ok(S),
+    Err { error: String },
+}
+
+impl<S: std::fmt::Debug + PartialEq> Errorable<S> {
+    pub fn unwrap(self) -> S {
+        match self {
+            Self::Ok(s) => s,
+            Errorable::Err { error } => panic!("unwrap of error value: {error}"),
+        }
+    }
+
+    pub fn ok(self) -> Option<S> {
+        match self {
+            Self::Ok(s) => Some(s),
+            Errorable::Err { .. } => None,
+        }
+    }
+    pub fn err(self) -> Option<String> {
+        match self {
+            Self::Ok(_) => None,
+            Errorable::Err { error } => Some(error),
+        }
+    }
+}
+
+impl<T: std::fmt::Debug + PartialEq, E: ToString> From<Result<T, E>> for Errorable<T> {
+    fn from(value: Result<T, E>) -> Self {
+        match value {
+            Err(e) => Self::Err {
+                error: e.to_string(),
+            },
+            Ok(t) => Self::Ok(t),
+        }
+    }
+}
+
+/// An RPC to get the version of minimald.
+pub struct GetVersion;
+
+/// The response to the [`GetVersion`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetVersionResponse {
+    pub version: String,
+    pub long_version: String,
+    pub stdlib_version: String,
+}
+
+impl OneshotSshRpc for GetVersion {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetVersion");
+    type Request<'a> = ();
+    type Response = GetVersionResponse;
+}
+
+/// An RPC to list sessions managed by this minimald.
+pub struct ListSessions;
+
+/// Describes how many times a bell fired, as well as when it last fired.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Bell {
+    pub count: usize,
+    pub last: chrono::DateTime<Utc>,
+}
+
+/// Describes a terminal title
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Title {
+    pub value: String,
+    pub updated_at: chrono::DateTime<Utc>,
+}
+
+/// Describes attributes about a running session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunningSessionAttrs {
+    pub last_stdout: Option<chrono::DateTime<Utc>>,
+    pub last_stdin: Option<chrono::DateTime<Utc>>,
+    pub title: Option<Title>,
+    pub audible_bell: Option<Bell>,
+    pub visual_bell: Option<Bell>,
+}
+
+/// An entry in the ListSessions response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListSessionsEntry {
+    pub id: SessionId,
+    pub name: Option<String>,
+    pub attrs: Option<RunningSessionAttrs>,
+}
+
+/// The response to the [`ListSessions`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListSessionsResponse {
+    pub sessions: Vec<ListSessionsEntry>,
+}
+
+impl OneshotSshRpc for ListSessions {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ListSessions");
+    type Request<'a> = ();
+    type Response = ListSessionsResponse;
+}
+
+/// An RPC to read the session record for a session corresponding to the request.
+pub struct GetSessionRecord;
+
+/// The request for a [`GetSessionRecord`] RPC.
+///
+/// Serialized examples:
+///
+///  * `{"name": "my-session"}`
+///  * `{"id": "<some-uuid>"}`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GetSessionRecordRequest {
+    Name(String),
+    Id(SessionId),
+}
+
+/// The response for a [`GetSessionRecord`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetSessionRecordResponse {
+    pub record: Option<sessions::Record>,
+}
+
+impl OneshotSshRpc for GetSessionRecord {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetSessionRecord");
+    type Request<'a> = GetSessionRecordRequest;
+    type Response = GetSessionRecordResponse;
+}
+
+/// An RPC to create a new session based on the given record.
+pub struct CreateSession;
+
+/// The request for a [`CreateSession`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSessionRequest {
+    pub record: sessions::Record,
+}
+
+/// The response for a [`CreateSession`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateSessionResponse {
+    pub id: SessionId,
+}
+
+impl OneshotSshRpc for CreateSession {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "CreateSession");
+    type Request<'a> = CreateSessionRequest;
+    type Response = Errorable<CreateSessionResponse>;
+}
+
+/// An RPC to rename an existing session.
+pub struct RenameSession;
+
+/// The request for a [`RenameSession`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameSessionRequest {
+    pub id: SessionId,
+    pub new_name: String,
+}
+
+/// The response for a [`RenameSession`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RenameSessionResponse;
+
+impl OneshotSshRpc for RenameSession {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "RenameSession");
+    type Request<'a> = RenameSessionRequest;
+    type Response = Errorable<RenameSessionResponse>;
+}

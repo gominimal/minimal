@@ -25,3 +25,7 @@ russh.workspace = true
 tokio.workspace = true
 sessions.workspace = true
 paths.workspace = true
+# Shares minimald's RPC wire types so the test encodes/decodes through the
+# same definitions the server uses (minimald itself is Linux-only and cannot
+# be imported into this macOS test, but the wire-types crate is portable).
+minimald-rpc.workspace = true

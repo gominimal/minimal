@@ -1,0 +1,12 @@
+[package]
+name = "minimald-rpc"
+version = "0.0.1"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+constcat.workspace = true
+chrono.workspace = true
+serde.workspace = true
+
+sessions.workspace = true

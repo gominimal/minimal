@@ -700,7 +700,7 @@ pub(crate) async fn handle_exec(
             };
             exec_task.run(channel).await;
         } else {
-            let workspace = session_handle.workspace_path().await;
+            let paths = session_handle.paths().await;
             let exec_task = ExecTask {
                 conn,
                 serv,
@@ -708,7 +708,7 @@ pub(crate) async fn handle_exec(
                 channel_id: id,
                 exec: TokioExec {
                     argv,
-                    cwd: workspace,
+                    cwd: paths.working,
                     env: config.env_vars,
                 },
             };
@@ -765,9 +765,9 @@ async fn handle_git_receive(
     session.channel_success(id)?;
 
     spawn(async move {
-        let workspace = session_handle.workspace_path().await;
+        let paths = session_handle.paths().await;
 
-        let dotgit_dir = workspace.as_utf8_path().join(".git");
+        let dotgit_dir = paths.working.as_utf8_path().join(".git");
         if let Ok(false) = tokio::fs::try_exists(&dotgit_dir).await {
             // No .git directory exists, so this is likely
             // the first push to populate. Create an empty git
@@ -775,7 +775,7 @@ async fn handle_git_receive(
             // the ref it recieves.
             let res = tokio::process::Command::new("git")
                 .arg("init")
-                .current_dir(workspace.as_utf8_path())
+                .current_dir(paths.working.as_utf8_path())
                 .output()
                 .await;
             if let Err(e) = res {
@@ -824,7 +824,7 @@ async fn handle_git_receive(
                     "git -c core.hooksPath={} receive-pack .",
                     hooks_tmp.path().to_str().unwrap()
                 ),
-                cwd: workspace,
+                cwd: paths.working,
                 env: BTreeMap::new(),
             },
         };
@@ -1205,8 +1205,9 @@ mod tests {
         use paths::HostAbsPath;
         use sessions::SessionId;
 
+        use minimald_rpc::{CreateSession, CreateSessionRequest};
+
         use crate::MINIMAL_SESSION_ID_ENV;
-        use crate::rpc::{CreateSession, CreateSessionRequest};
         use crate::sessions::SessionKeyPredicate;
         use crate::test_harness::{TestClient, TestServer};
 
@@ -1293,11 +1294,11 @@ mod tests {
                 .await
                 .unwrap()
                 .expect("freshly-created session should be retrievable");
-            let workspace = session_handle.workspace_path().await;
+            let paths = session_handle.paths().await;
             // getcwd resolves symlinks (e.g. /tmp -> /private/tmp on some
             // platforms); canonicalize both sides so the comparison is
             // about the same inode rather than spelling.
-            let expected = std::fs::canonicalize(workspace.as_str()).unwrap();
+            let expected = std::fs::canonicalize(paths.working.as_str()).unwrap();
 
             let out = client
                 .exec(
@@ -1405,8 +1406,8 @@ mod tests {
                 .await
                 .unwrap()
                 .expect("session should be retrievable");
-            let workspace = session_handle.workspace_path().await;
-            let pushed = workspace.as_utf8_path().join("hello.txt");
+            let paths = session_handle.paths().await;
+            let pushed = paths.working.as_utf8_path().join("hello.txt");
             let contents = tokio::fs::read(&pushed)
                 .await
                 .unwrap_or_else(|e| panic!("reading pushed file {pushed} failed: {e}"));

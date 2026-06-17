@@ -9,13 +9,10 @@ use uuid::Uuid;
 
 use paths::HostAbsPath;
 
-pub mod composable;
-pub mod lifecyclehook;
-pub mod loadout;
-pub mod patches;
-pub mod policy;
+pub mod client;
+pub mod core;
 pub mod store;
-pub mod vars;
+pub mod wire;
 
 /// A session ID, a newtype over a UUID.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]

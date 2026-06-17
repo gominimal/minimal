@@ -1,37 +1,32 @@
+use minimald_rpc::{
+    CreateSession, CreateSessionResponse, Errorable, GetSessionRecord, GetSessionRecordRequest,
+    GetSessionRecordResponse, GetVersion, GetVersionResponse, ListSessions, ListSessionsEntry,
+    ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
+    RenameSessionResponse,
+};
 use russh::{
     Channel as RuChannel, ChannelId,
     server::{Msg, Session},
 };
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sessions::SessionId;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::spawn;
 
 use crate::{
+    ChannelConfig,
     connection::{ConnectionError, ConnectionHandle},
     server::ServerStateHandle,
+    sessions::SessionKeyPredicate,
 };
 
-pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
-
-/// Describes a minimal-specific RPC method sent over ssh.
+/// Server-side serving glue for [`OneshotSshRpc`]s.
 ///
-/// Oneshot RPCs are not streaming.
-pub(crate) trait OneshotSshRpc {
-    /// The subsystem name used to call for this RPC.
-    const NAME: &'static str;
-    /// The type schema of the request.
-    ///
-    /// Bound on `Serialize` exists so that clients (including the test
-    /// harness) can encode requests through the same type the handler
-    /// decodes them with.
-    type Request<'a>: Deserialize<'a> + Serialize;
-    /// The type schema of the response.
-    ///
-    /// Bound on `DeserializeOwned` exists for symmetry with `Request`:
-    /// clients decode the same type the handler emitted.
-    type Response: Serialize + DeserializeOwned;
-
+/// The wire contract (names, request/response schemas) lives in the
+/// `minimald-rpc` crate so clients can share it; this extension trait keeps
+/// the transport-bound half — reading the request and writing the response
+/// over an SSH channel — local to the server, where `russh` and
+/// [`ConnectionError`] are available.
+trait ServeOneshot: OneshotSshRpc {
     /// Helper to deserialize the request and serialize the response
     /// down the given SSH channel, calling the provided async handler
     /// function to compute the response.
@@ -61,219 +56,171 @@ pub(crate) trait OneshotSshRpc {
     }
 }
 
-/// A convinence wrapper to let a response type be able to carry an error.
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
-#[serde(untagged)]
-pub enum Errorable<S: std::fmt::Debug + PartialEq> {
-    Ok(S),
-    Err { error: String },
-}
+impl<T: OneshotSshRpc> ServeOneshot for T {}
 
-impl<S: std::fmt::Debug + PartialEq> Errorable<S> {
-    pub fn unwrap(self) -> S {
-        match self {
-            Self::Ok(s) => s,
-            Errorable::Err { error } => panic!("unwrap of error value: {error}"),
-        }
-    }
-
-    pub fn ok(self) -> Option<S> {
-        match self {
-            Self::Ok(s) => Some(s),
-            Errorable::Err { .. } => None,
-        }
-    }
-    pub fn err(self) -> Option<String> {
-        match self {
-            Self::Ok(_) => None,
-            Errorable::Err { error } => Some(error),
-        }
-    }
-}
-
-impl<T: std::fmt::Debug + PartialEq, E: ToString> From<Result<T, E>> for Errorable<T> {
-    fn from(value: Result<T, E>) -> Self {
-        match value {
-            Err(e) => Self::Err {
-                error: e.to_string(),
-            },
-            Ok(t) => Self::Ok(t),
-        }
-    }
-}
-
-/// An RPC to get the version of minimald.
-pub struct GetVersion;
-
-/// The response to the [`GetVersion`] RPC.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetVersionResponse {
-    pub version: String,
-    pub long_version: String,
-    pub stdlib_version: String,
-}
-
-impl OneshotSshRpc for GetVersion {
-    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetVersion");
-    type Request<'a> = ();
-    type Response = GetVersionResponse;
-}
-
-impl GetVersion {
-    pub async fn handle(self, c: RuChannel<Msg>) {
-        let res = self
-            .handle_channel(c, async |_req| {
-                Ok(GetVersionResponse {
-                    version: env!("CARGO_PKG_VERSION").to_string(),
-                    long_version: env!("LONG_VERSION").to_string(),
-                    stdlib_version: stdlib::VERSION.to_string(),
-                })
+async fn serve_get_version(c: RuChannel<Msg>) {
+    let res = GetVersion
+        .handle_channel(c, async |_req| {
+            Ok(GetVersionResponse {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                long_version: env!("LONG_VERSION").to_string(),
+                stdlib_version: stdlib::VERSION.to_string(),
             })
-            .await;
-        if let Err(e) = res {
-            tracing::warn!("RPC handler for {} failed: {}", Self::NAME, e);
-        }
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", GetVersion::NAME, e);
     }
 }
 
-/// An RPC to list sessions managed by this minimald.
-pub struct ListSessions;
-
-/// An entry in the ListSessions response.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ListSessionsEntry {
-    pub id: SessionId,
-    pub name: Option<String>,
-}
-
-/// The response to the [`ListSessions`] RPC.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListSessionsResponse {
-    pub sessions: Vec<ListSessionsEntry>,
-}
-
-impl OneshotSshRpc for ListSessions {
-    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ListSessions");
-    type Request<'a> = ();
-    type Response = ListSessionsResponse;
-}
-
-impl ListSessions {
-    pub async fn handle(self, s: ServerStateHandle, c: RuChannel<Msg>) {
-        let res = self
-            .handle_channel(c, async |_req| {
-                let mngr = s.sessions_manager().await;
-                Ok(ListSessionsResponse {
-                    sessions: mngr
-                        .list()
-                        .await
-                        .map_err(|e| ConnectionError::Internal(e.to_string()))?
-                        .into_iter()
-                        .map(|i| ListSessionsEntry {
-                            id: i.id,
-                            name: i.name,
-                        })
-                        .collect(),
-                })
+async fn serve_list_sessions(s: ServerStateHandle, c: RuChannel<Msg>) {
+    let res = ListSessions
+        .handle_channel(c, async |_req| {
+            let mngr = s.sessions_manager().await;
+            Ok(ListSessionsResponse {
+                sessions: mngr
+                    .list()
+                    .await
+                    .map_err(|e| ConnectionError::Internal(e.to_string()))?
+                    .into_iter()
+                    .map(|i| ListSessionsEntry {
+                        id: i.id,
+                        name: i.name,
+                        attrs: i.attrs.map(|a| minimald_rpc::RunningSessionAttrs {
+                            last_stdout: a.stdout_last.map(|i| i.into()),
+                            last_stdin: a.stdin_last.map(|i| i.into()),
+                            title: a.title.map(|(value, set_at)| minimald_rpc::Title {
+                                value,
+                                updated_at: set_at.into(),
+                            }),
+                            visual_bell: a.visual_bell.1.map(|t| minimald_rpc::Bell {
+                                count: a.visual_bell.0,
+                                last: t.into(),
+                            }),
+                            audible_bell: a.audible_bell.1.map(|t| minimald_rpc::Bell {
+                                count: a.audible_bell.0,
+                                last: t.into(),
+                            }),
+                        }),
+                    })
+                    .collect(),
             })
-            .await;
-        if let Err(e) = res {
-            tracing::warn!("RPC handler for {} failed: {}", Self::NAME, e);
-        }
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", ListSessions::NAME, e);
     }
 }
 
-/// An RPC to read the session record for a session corresponding to the request.
-pub struct GetSessionRecord;
+async fn serve_get_session_record(s: ServerStateHandle, c: RuChannel<Msg>) {
+    use crate::sessions::SessionKeyPredicate;
+    let res = GetSessionRecord
+        .handle_channel(c, async |req| {
+            let mngr = s.sessions_manager().await;
+            Ok(GetSessionRecordResponse {
+                record: mngr
+                    .get_record(match req {
+                        GetSessionRecordRequest::Id(id) => SessionKeyPredicate::Id(id),
+                        GetSessionRecordRequest::Name(name) => SessionKeyPredicate::Name(name),
+                    })
+                    .await
+                    .map_err(|e| ConnectionError::Internal(e.to_string()))?,
+            })
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", GetSessionRecord::NAME, e);
+    }
+}
 
-/// The request for a [`GetSessionRecord`] RPC.
+async fn serve_create_session(s: ServerStateHandle, c: RuChannel<Msg>) {
+    let res = CreateSession
+        .handle_channel(c, async |req| {
+            let mngr = s.sessions_manager().await;
+
+            Ok(match mngr.create_session(req.record).await {
+                Ok(id) => Errorable::Ok(CreateSessionResponse { id }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
+                    error: "A session with that name already exists".to_string(),
+                },
+                Err(e) => return Err(ConnectionError::Internal(e.to_string())),
+            })
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", CreateSession::NAME, e);
+    }
+}
+
+async fn serve_rename_session(s: ServerStateHandle, c: RuChannel<Msg>) {
+    let res = RenameSession
+        .handle_channel(c, async |req| {
+            let res = s
+                .sessions_manager()
+                .await
+                .rename_session(req.id, req.new_name)
+                .await;
+            match res {
+                Ok(()) => Ok(Errorable::Ok(RenameSessionResponse)),
+                Err(e) => Ok(Errorable::Err {
+                    error: e.to_string(),
+                }),
+            }
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", RenameSession::NAME, e);
+    }
+}
+
+pub(crate) const STREAM_WORKSPACE_FILES: &str =
+    constcat::concat!(RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst");
+
+async fn serve_stream_workspace_files(
+    s: ServerStateHandle,
+    config: ChannelConfig,
+    mut c: RuChannel<Msg>,
+) {
+    if let Err(msg) = unpack_workspace_files(&s, &config, &mut c).await {
+        let _ = c.extended_data_bytes(1, msg).await;
+    }
+    let _ = c.close().await;
+}
+
+/// Unpacks the zstd-compressed tarball streamed over `c` into the
+/// workspace directory of the session named by the channel environment.
 ///
-/// Serialized examples:
-///
-///  * `{"name": "my-session"}`
-///  * `{"id": "<some-uuid>"}`
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GetSessionRecordRequest {
-    Name(String),
-    Id(SessionId),
-}
+/// On failure, returns the human-readable message to relay back to the
+/// client over the channel's extended-data stream.
+async fn unpack_workspace_files(
+    s: &ServerStateHandle,
+    config: &ChannelConfig,
+    c: &mut RuChannel<Msg>,
+) -> Result<(), String> {
+    let session_id_str = config
+        .env_vars
+        .get(crate::MINIMAL_SESSION_ID_ENV)
+        .ok_or("missing env-var MINIMAL_SESSION_ID")?;
+    let session_id =
+        SessionId::parse_str(session_id_str).map_err(|e| format!("parsing session UUID: {e}"))?;
 
-/// The response for a [`GetSessionRecord`] RPC.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetSessionRecordResponse {
-    pub record: Option<sessions::Record>,
-}
+    let mngr = s.sessions_manager().await;
+    let session_handle = mngr
+        .get_session(SessionKeyPredicate::Id(session_id))
+        .await
+        .map_err(|e| format!("session UUID lookup failed: {e}"))?
+        .ok_or("unknown session UUID")?;
+    let paths = session_handle.paths().await;
 
-impl OneshotSshRpc for GetSessionRecord {
-    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetSessionRecord");
-    type Request<'a> = GetSessionRecordRequest;
-    type Response = GetSessionRecordResponse;
-}
+    let reader = async_compression::tokio::bufread::ZstdDecoder::new(tokio::io::BufReader::new(
+        c.make_reader(),
+    ));
+    async_tar::Archive::new(reader)
+        .unpack(paths.working.as_utf8_path())
+        .await
+        .map_err(|e| format!("unpack failed: {e}"))?;
 
-impl GetSessionRecord {
-    pub async fn handle(self, s: ServerStateHandle, c: RuChannel<Msg>) {
-        use crate::sessions::SessionKeyPredicate;
-        let res = self
-            .handle_channel(c, async |req| {
-                let mngr = s.sessions_manager().await;
-                Ok(GetSessionRecordResponse {
-                    record: mngr
-                        .get_record(match req {
-                            GetSessionRecordRequest::Id(id) => SessionKeyPredicate::Id(id),
-                            GetSessionRecordRequest::Name(name) => SessionKeyPredicate::Name(name),
-                        })
-                        .await
-                        .map_err(|e| ConnectionError::Internal(e.to_string()))?,
-                })
-            })
-            .await;
-        if let Err(e) = res {
-            tracing::warn!("RPC handler for {} failed: {}", Self::NAME, e);
-        }
-    }
-}
-
-/// An RPC to create a new session based on the given record.
-pub struct CreateSession;
-
-/// The request for a [`CreateSession`] RPC.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateSessionRequest {
-    pub record: sessions::Record,
-}
-
-/// The response for a [`CreateSession`] RPC.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CreateSessionResponse {
-    pub id: SessionId,
-}
-
-impl OneshotSshRpc for CreateSession {
-    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "CreateSession");
-    type Request<'a> = CreateSessionRequest;
-    type Response = Errorable<CreateSessionResponse>;
-}
-
-impl CreateSession {
-    pub async fn handle(self, s: ServerStateHandle, c: RuChannel<Msg>) {
-        let res = self
-            .handle_channel(c, async |req| {
-                let mngr = s.sessions_manager().await;
-
-                Ok(match mngr.create_session(req.record).await {
-                    Ok(id) => Errorable::Ok(CreateSessionResponse { id }),
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
-                        error: "A session with that name already exists".to_string(),
-                    },
-                    Err(e) => return Err(ConnectionError::Internal(e.to_string())),
-                })
-            })
-            .await;
-        if let Err(e) = res {
-            tracing::warn!("RPC handler for {} failed: {}", Self::NAME, e);
-        }
-    }
+    Ok(())
 }
 
 /// Handles an RPC going over an SSH subsystem channel.
@@ -293,15 +240,20 @@ pub async fn handle_ssh_rpc(
     session: &mut Session,
 ) -> Result<(), ConnectionError> {
     // Take the channel from connection state if its a known RPC.
-    let channel = match name {
-        GetVersion::NAME | ListSessions::NAME | GetSessionRecord::NAME | CreateSession::NAME => {
+    let res = match name {
+        GetVersion::NAME
+        | ListSessions::NAME
+        | GetSessionRecord::NAME
+        | CreateSession::NAME
+        | RenameSession::NAME
+        | STREAM_WORKSPACE_FILES => {
             let mut conn_lock = c.lock().await;
             let c_hnd = match conn_lock.take(id) {
                 None => {
                     session.channel_failure(id)?;
                     return Ok(());
                 }
-                Some((channel, _p)) => channel,
+                Some((channel, config)) => (channel, config),
             };
             drop(conn_lock);
             session.channel_success(id)?;
@@ -312,17 +264,19 @@ pub async fn handle_ssh_rpc(
             None
         }
     };
-    let channel = match channel {
-        Some(c) => c,
+    let (channel, config) = match res {
+        Some((channel, config)) => (channel, config),
         None => return Ok(()),
     };
 
     // Handle the named RPC.
     match name {
-        GetVersion::NAME => spawn(GetVersion.handle(channel)),
-        ListSessions::NAME => spawn(ListSessions.handle(s, channel)),
-        GetSessionRecord::NAME => spawn(GetSessionRecord.handle(s, channel)),
-        CreateSession::NAME => spawn(CreateSession.handle(s, channel)),
+        GetVersion::NAME => spawn(serve_get_version(channel)),
+        ListSessions::NAME => spawn(serve_list_sessions(s, channel)),
+        GetSessionRecord::NAME => spawn(serve_get_session_record(s, channel)),
+        CreateSession::NAME => spawn(serve_create_session(s, channel)),
+        RenameSession::NAME => spawn(serve_rename_session(s, channel)),
+        STREAM_WORKSPACE_FILES => spawn(serve_stream_workspace_files(s, config, channel)),
         _ => unreachable!(),
     };
 
@@ -331,10 +285,131 @@ pub async fn handle_ssh_rpc(
 
 #[cfg(test)]
 mod tests {
+    use minimald_rpc::{CreateSession, CreateSessionRequest, RenameSessionRequest};
     use paths::HostAbsPath;
+    use sessions::SessionId;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
-    use crate::test_harness::TestServer;
+    use crate::MINIMAL_SESSION_ID_ENV;
+    use crate::sessions::SessionKeyPredicate;
+    use crate::test_harness::{TestClient, TestServer};
+
+    /// Serializes `(path, contents)` entries into a tar archive and
+    /// zstd-compresses it, producing exactly the wire format that
+    /// [`serve_stream_workspace_files`] decodes.
+    async fn tar_zst(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut tar = async_tar::Builder::new(Vec::new());
+        for (path, contents) in entries {
+            let mut header = async_tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            tar.append_data(&mut header, path, *contents).await.unwrap();
+        }
+        let tar_bytes = tar.into_inner().await.unwrap();
+
+        let mut encoder = async_compression::tokio::write::ZstdEncoder::new(Vec::new());
+        encoder.write_all(&tar_bytes).await.unwrap();
+        encoder.shutdown().await.unwrap();
+        encoder.into_inner()
+    }
+
+    /// Creates a session through the public RPC and returns its id.
+    async fn fresh_session(client: &mut TestClient) -> SessionId {
+        client
+            .call::<CreateSession>(&CreateSessionRequest {
+                record: sessions::Record {
+                    id: SessionId::nil(),
+                    name: Some("stream-test".to_string()),
+                    username: None,
+                    project_path: HostAbsPath::try_new("/tmp").unwrap(),
+                    attrs: Default::default(),
+                },
+            })
+            .await
+            .unwrap()
+            .id
+    }
+
+    #[tokio::test]
+    async fn stream_workspace_files_unpacks_tarball_into_workspace() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let payload = tar_zst(&[
+            ("hello.txt", b"hello world\n"),
+            ("dir/nested.txt", b"nested contents"),
+        ])
+        .await;
+
+        let channel = client
+            .open_subsystem(
+                STREAM_WORKSPACE_FILES,
+                &[(MINIMAL_SESSION_ID_ENV, &session_id.to_string())],
+            )
+            .await;
+        let mut stream = channel.into_stream();
+        stream.write_all(&payload).await.unwrap();
+        // Half-close so the server's decoder sees EOF; then read to the
+        // server's channel close so the unpack has completed on-disk
+        // before we assert.
+        stream.shutdown().await.unwrap();
+        let mut trailing = Vec::new();
+        stream.read_to_end(&mut trailing).await.unwrap();
+
+        let mngr = server.state.sessions_manager().await;
+        let handle = mngr
+            .get_session(SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("freshly-created session should be retrievable");
+        let paths = handle.paths().await;
+
+        assert_eq!(
+            tokio::fs::read(paths.working.as_utf8_path().join("hello.txt"))
+                .await
+                .unwrap(),
+            b"hello world\n",
+        );
+        assert_eq!(
+            tokio::fs::read(paths.working.as_utf8_path().join("dir/nested.txt"))
+                .await
+                .unwrap(),
+            b"nested contents",
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_workspace_files_rejects_unknown_session() {
+        use russh::ChannelMsg;
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        // A well-formed but unknown session id: the handler should report
+        // an error on stderr (ssh extended data) rather than unpacking.
+        let mut channel = client
+            .open_subsystem(
+                STREAM_WORKSPACE_FILES,
+                &[(MINIMAL_SESSION_ID_ENV, &SessionId::nil().to_string())],
+            )
+            .await;
+        channel.eof().await.unwrap();
+
+        let mut stderr = Vec::new();
+        while let Some(msg) = channel.wait().await {
+            if let ChannelMsg::ExtendedData { data, ext: 1 } = msg {
+                stderr.extend_from_slice(&data);
+            }
+        }
+
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("unknown session"),
+            "expected an unknown-session error on stderr, got {:?}",
+            String::from_utf8_lossy(&stderr),
+        );
+    }
 
     #[tokio::test]
     async fn get_version_returns_compiled_in_versions() {
@@ -438,6 +513,7 @@ mod tests {
             vec![ListSessionsEntry {
                 id: create_session.id,
                 name: Some("my session".to_string()),
+                attrs: None,
             }]
         );
     }
@@ -477,6 +553,63 @@ mod tests {
             Errorable::Err {
                 error: "A session with that name already exists".to_string()
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_session_propagates_into_the_running_session() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        // Bring the session up before renaming, so the rename has to reach the
+        // live actor's in-memory record rather than only touching disk.
+        let mngr = server.state.sessions_manager().await;
+        let handle = mngr
+            .get_session(SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("freshly-created session should be retrievable");
+
+        let resp = client
+            .call::<RenameSession>(&RenameSessionRequest {
+                id: session_id,
+                new_name: "renamed".to_string(),
+            })
+            .await;
+        assert_eq!(resp, Errorable::Ok(RenameSessionResponse));
+
+        // The record held by the running session reflects the new name...
+        let record = handle.record().await;
+        assert_eq!(record.name.as_deref(), Some("renamed"));
+        // ...while its id is untouched by the rename.
+        assert_eq!(record.id, session_id);
+
+        // The rename is reflected by GetRecord...
+        let get_session = client
+            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(record.id))
+            .await;
+        assert_eq!(
+            get_session.record.as_ref().unwrap().name,
+            Some("renamed".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_session_errors_for_unknown_id() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let resp = client
+            .call::<RenameSession>(&RenameSessionRequest {
+                id: SessionId::nil(),
+                new_name: "renamed".to_string(),
+            })
+            .await;
+
+        assert!(
+            matches!(resp, Errorable::Err { error } if error.contains("no session with ID")),
+            "expected an unknown-id error",
         );
     }
 }

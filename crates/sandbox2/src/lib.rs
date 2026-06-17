@@ -37,6 +37,8 @@ impl Channel for () {
     }
 }
 
+const SESSION_DEFAULT_WD: &str = "workbench";
+
 /// An initialized sandbox.
 ///
 /// Sandboxes can have a [`Channel`] wired to the outside world for interactive operations and mutations
@@ -219,6 +221,23 @@ impl<C: Channel> Sandbox<C> {
                     }
                 }
             }
+            WdSetup::Session {
+                home: _,
+                working: _,
+                working_name_override,
+            } => {
+                let rootfs_cwd = rootfs.join(
+                    working_name_override
+                        .as_ref()
+                        .cloned()
+                        .unwrap_or_else(|| SESSION_DEFAULT_WD.to_string()),
+                );
+                fs::create_dir_all(&rootfs_cwd)
+                    .map_err(|e| Error::IO("create cwd", rootfs_cwd, e))?;
+                let rootfs_home = rootfs.join("home");
+                fs::create_dir_all(&rootfs_home)
+                    .map_err(|e| Error::IO("create home", rootfs_home.clone(), e))?;
+            }
         }
 
         // Setup /state
@@ -226,14 +245,17 @@ impl<C: Channel> Sandbox<C> {
             None => base_dir.join("state"),
             Some(s) => s.to_path_buf(),
         };
-        fs::create_dir_all(state_dir.join("home"))
-            .map_err(|e| Error::IO("mkdir /state/home", state_dir.join("home"), e))?;
-        fs::create_dir_all(state_dir.join("data"))
-            .map_err(|e| Error::IO("mkdir /state/data", state_dir.join("data"), e))?;
+
+        if !matches!(&config.wd, WdSetup::Session { .. }) {
+            fs::create_dir_all(state_dir.join("home"))
+                .map_err(|e| Error::IO("mkdir /state/home", state_dir.join("home"), e))?;
+            fs::create_dir_all(state_dir.join("data"))
+                .map_err(|e| Error::IO("mkdir /state/data", state_dir.join("data"), e))?;
+            fs::create_dir_all(state_dir.join("state"))
+                .map_err(|e| Error::IO("mkdir /state/state", state_dir.join("state"), e))?;
+        }
         fs::create_dir_all(state_dir.join("cache"))
             .map_err(|e| Error::IO("mkdir /state/cache", state_dir.join("cache"), e))?;
-        fs::create_dir_all(state_dir.join("state"))
-            .map_err(|e| Error::IO("mkdir /state/state", state_dir.join("state"), e))?;
 
         // Create /run/minenv_sock as the pipe to higher-level functions.
         let run_dir = base_dir.join("run");
@@ -326,21 +348,54 @@ impl Container {
                 sandbox.config.wd.bound_dir_sandbox_cwd().to_str().unwrap()
             ),
             WdSetup::Isolated { .. } => "/build".to_string(),
+            WdSetup::Session {
+                home: _,
+                working: _,
+                working_name_override,
+            } => {
+                format!(
+                    "/{}",
+                    working_name_override
+                        .as_ref()
+                        .cloned()
+                        .unwrap_or_else(|| SESSION_DEFAULT_WD.to_string())
+                )
+            }
         });
 
-        command.env("XDG_CONFIG_HOME", "/state/home");
-        command.env("XDG_DATA_HOME", "/state/data");
-        command.env("XDG_CACHE_HOME", "/state/cache");
-        command.env("XDG_STATE_HOME", "/state/state");
-        command.env("XDG_RUNTIME_DIR", "/run");
-        command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
-        if let WdSetup::Isolated { .. } = sandbox.config.wd {
-            command.env("HOME", "/state/home");
-        } else if let Ok(h) = std::env::var("HOME") {
-            command.env("HOME", &h);
+        // Set XDG vars
+        if let WdSetup::Session { .. } = &sandbox.config.wd {
+            command.env("XDG_STATE_HOME", "/home/.local/state");
+            command.env("XDG_CONFIG_HOME", "/home/.config");
+            command.env("XDG_DATA_HOME", "/home/.local/share");
+            command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/home/.local/bin"); // adds /home/.local/bin
         } else {
-            command.env("HOME", "/state/home");
+            // Both build and BoundWd layouts
+            command.env("XDG_STATE_HOME", "/state/state");
+            command.env("XDG_CONFIG_HOME", "/state/home");
+            command.env("XDG_DATA_HOME", "/state/data");
+            command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+        }
+        command.env("XDG_CACHE_HOME", "/state/cache");
+        command.env("XDG_RUNTIME_DIR", "/run");
+
+        // Set HOME
+        match &sandbox.config.wd {
+            WdSetup::Isolated { .. } => {
+                command.env("HOME", "/state/home");
+            }
+            WdSetup::Session { .. } => {
+                command.env("HOME", "/home");
+            }
+            WdSetup::BoundDir { .. } => {
+                if let Ok(h) = std::env::var("HOME") {
+                    command.env("HOME", &h);
+                } else {
+                    command.env("HOME", "/state/home");
+                }
+            }
         };
+
         if let WdSetup::Isolated { .. } = sandbox.config.wd {
             command.env("OUTPUT_DIR", "/build/output");
             command.env("GIT_TERMINAL_PROMPT", "0");
@@ -520,6 +575,38 @@ impl<C: Channel> Sandbox<C> {
                 };
                 Self::bind_mount(path, &container_path, opts, &mut container)?;
             }
+            WdSetup::Session {
+                home,
+                working,
+                working_name_override,
+            } => {
+                // mount the given home path to /home
+                Self::bind_mount(
+                    home,
+                    "/home",
+                    BindOpts {
+                        recursive: true,
+                        read_only: false,
+                    },
+                    &mut container,
+                )?;
+                // mount the given working directory to /{SESSION_DEFAULT_WD} (unless overridden)
+                Self::bind_mount(
+                    working,
+                    &format!(
+                        "/{}",
+                        working_name_override
+                            .as_ref()
+                            .cloned()
+                            .unwrap_or_else(|| SESSION_DEFAULT_WD.to_string())
+                    ),
+                    BindOpts {
+                        recursive: true,
+                        read_only: false,
+                    },
+                    &mut container,
+                )?;
+            }
         }
         // Mount in any file mappings
         if let WdSetup::BoundDir { fs_mappings, .. } = &self.config.wd {
@@ -589,6 +676,7 @@ impl<C: Channel> Sandbox<C> {
                 match &self.config.wd {
                     WdSetup::Isolated { .. } => self.base_dir.join("build"),
                     WdSetup::BoundDir { path, .. } => path.clone(),
+                    WdSetup::Session { working, .. } => working.clone(),
                 }
                 .join(&program),
             )
@@ -1040,5 +1128,42 @@ mod tests {
         let sandbox = Sandbox::new(base, config, ()).unwrap();
         let sock = sandbox.base_dir.join("run").join("minenv_sock");
         UnixStream::connect(&sock).expect("minenv_sock should be connectable after Sandbox::new");
+    }
+
+    /// A `BoundDir` (task) sandbox configured with a nested working directory
+    /// and a mix of file and directory mappings must construct successfully and
+    /// come up fully operational. This drives the `WdSetup::BoundDir` arm of
+    /// `Sandbox::new` — shadow-cwd creation and the fs-mapping target loop —
+    /// which every other constructor test (all `Isolated`) leaves unexercised.
+    /// The asserted contract mirrors the `Isolated` socket test: `new` returns
+    /// `Ok` and the minenv socket is connectable, proving the constructor ran to
+    /// completion for a bound-dir config rather than panicking or erroring in
+    /// the bound-dir branch.
+    #[test]
+    fn sandbox_new_accepts_bound_dir_with_file_and_dir_mappings() {
+        use std::os::unix::net::UnixStream;
+        let (_tmp, base) = make_base_with_synth();
+        let file_mapping = common::FsMapping {
+            host_path: "/host/etc/app.conf".to_string(),
+            sandbox_path: Some("/etc/app.conf".to_string()),
+            is_file: true,
+            ..Default::default()
+        };
+        let dir_mapping = common::FsMapping {
+            host_path: "/host/opt/data".to_string(),
+            sandbox_path: Some("/opt/data".to_string()),
+            is_file: false,
+            ..Default::default()
+        };
+        let config = Config::new("test-bound-dir").with_wd(
+            "/work/project",
+            false,
+            vec![file_mapping, dir_mapping],
+        );
+        let sandbox = Sandbox::new(base, config, ())
+            .expect("bound-dir sandbox with file and dir mappings should construct");
+        let sock = sandbox.base_dir.join("run").join("minenv_sock");
+        UnixStream::connect(&sock)
+            .expect("minenv_sock should be connectable after a bound-dir Sandbox::new");
     }
 }

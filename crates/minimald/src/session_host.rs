@@ -6,21 +6,36 @@
 //! The [`Host`] struct holds the running state of an active session.
 
 use either::Either;
+#[cfg(not(test))]
+use mfile::EnvVarValue;
 use russh::Channel;
 use russh::server::Msg;
 use std::future::Future;
 use std::io;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::time::SystemTime;
 use tokio::io::AsyncWriteExt;
 use tokio::io::unix::AsyncFd;
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::SendError;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::RequestedPty;
 #[cfg(not(test))]
 use crate::session::SessionHandle;
+use crate::session::SessionPaths;
+
+/// Command sequence for the ctrl-w key chord, when the kitty keyboard protocol
+/// is negotiated.
+///
+/// Corresponds to: Kitty: CSI 119 ; 5 u
+const CTRL_W_CSI_U: &[u8] = b"\x1b[119;5u";
+/// Command sequence for the ctrl-w key chord, when the modifyOtherKeys key
+/// sequences are used by the outer terminal.
+///
+/// Corrsponds to: modifyOtherKeys: CSI 27 ; 5 ; 119 ~
+const CTRL_W_CSI_27: &[u8] = b"\x1b[27;5;119~";
 
 /// The dimensions of a terminal.
 ///
@@ -185,8 +200,8 @@ fn set_winsize(fd: RawFd, size: WinSize) -> io::Result<()> {
 enum BindingMsg {
     Stdin(Vec<u8>),
     TeardownDueToStdoutErr(std::io::Error),
-    TeardownDueToSuperceded,
-    TeardownDueToDetach,
+    TeardownDueToSuperceded(Vec<u8>),
+    TeardownDueToDetach(Vec<u8>),
 }
 
 /// A connection between a [`Host`] and an SSH channel.
@@ -273,11 +288,13 @@ impl Binding {
                             }
                             break;
                         }
-                        BindingMsg::TeardownDueToSuperceded => {
+                        BindingMsg::TeardownDueToSuperceded(unwind_codes) => {
+                            let _ = w.write_all(&unwind_codes).await;
                             let _ = w.write_all(b"\r\nDisconnecting - session attached to from a different connection\r\n").await;
                             break;
                         }
-                        BindingMsg::TeardownDueToDetach => {
+                        BindingMsg::TeardownDueToDetach(unwind_codes) => {
+                            let _ = w.write_all(&unwind_codes).await;
                             let _ = w.write_all(b"\r\nDetaching due to ctrl-w.\r\n").await;
                             break;
                         }
@@ -326,6 +343,9 @@ pub(crate) trait SessionLauncher {
 
     fn launch(
         self,
+        name: String,
+        username: String,
+        paths: SessionPaths,
         sz: WinSize,
     ) -> impl Future<Output = io::Result<Launched<Self::Process, Self::Guard>>> + Send;
 }
@@ -345,6 +365,65 @@ pub(crate) struct Launched<P, G> {
 enum Message {
     Kill,
     Attach(Channel<Msg>, WinSize),
+    GetAttrs(oneshot::Sender<HostAttrs>),
+
+    SetTitleCallback(String),
+    VisualBellCallback,
+    AudibleBellCallback,
+}
+
+/// Handles callback events from the terminal parser, transmitting them to the host.
+struct ParserEventHandler(WeakHostHandle);
+
+impl vt100_ctt::Callbacks for ParserEventHandler {
+    fn set_window_title(&mut self, _: &mut vt100_ctt::Screen, title: &[u8]) {
+        self.0.set_title_cb(title);
+    }
+    fn audible_bell(&mut self, _: &mut vt100_ctt::Screen) {
+        self.0.audible_bell_cb();
+    }
+    fn visual_bell(&mut self, _: &mut vt100_ctt::Screen) {
+        self.0.visual_bell_cb();
+    }
+}
+
+/// A handle to the session host that does not prevent the host
+/// from being closed.
+#[derive(Debug, Clone)]
+struct WeakHostHandle {
+    sender: mpsc::WeakSender<Message>,
+}
+
+impl WeakHostHandle {
+    fn set_title_cb(&mut self, title: &[u8]) {
+        let title = match String::from_utf8(title.to_vec()) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Ignoring non-utf8 terminal title: {e}");
+                return;
+            }
+        };
+
+        if let Some(sender) = self.sender.upgrade()
+            && let Err(e) = sender.try_send(Message::SetTitleCallback(title))
+        {
+            tracing::warn!("Dropping title update: {e}");
+        }
+    }
+    fn audible_bell_cb(&mut self) {
+        if let Some(sender) = self.sender.upgrade()
+            && let Err(e) = sender.try_send(Message::AudibleBellCallback)
+        {
+            tracing::warn!("Dropping audible bell: {e}");
+        }
+    }
+    fn visual_bell_cb(&mut self) {
+        if let Some(sender) = self.sender.upgrade()
+            && let Err(e) = sender.try_send(Message::VisualBellCallback)
+        {
+            tracing::warn!("Dropping visual bell: {e}");
+        }
+    }
 }
 
 /// The handle to the session host - the running process.
@@ -354,6 +433,12 @@ pub struct HostHandle {
 }
 
 impl HostHandle {
+    fn make_weak(&self) -> WeakHostHandle {
+        WeakHostHandle {
+            sender: self.sender.downgrade(),
+        }
+    }
+
     pub async fn kill(&self) -> Result<(), ()> {
         match self.sender.send(Message::Kill).await {
             Ok(()) => Ok(()),
@@ -371,6 +456,35 @@ impl HostHandle {
             Err(e) => unreachable!("{:?}", e),
         }
     }
+
+    /// Returns the terminal attributes.
+    pub async fn get_attrs(&self) -> Result<HostAttrs, ()> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        match self.sender.send(Message::GetAttrs(send)).await {
+            Ok(()) => Ok(recv.await.expect("host died")),
+            Err(SendError(Message::GetAttrs(_))) => Err(()),
+            Err(e) => unreachable!("{:?}", e),
+        }
+    }
+}
+
+/// Various attributes about the running terminal.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct HostAttrs {
+    /// The title set by the terminal, if any.
+    pub(crate) title: Option<(String, SystemTime)>,
+    /// The number of times the audible bell signal was send into the terminal,
+    /// and the last time it was received.
+    pub(crate) audible_bell: (usize, Option<SystemTime>),
+    /// The number of times the visual bell signal was send into the terminal,
+    /// and the last time it was received.
+    pub(crate) visual_bell: (usize, Option<SystemTime>),
+
+    /// When the last byte was sent by the process into the terminal.
+    pub(crate) stdout_last: Option<SystemTime>,
+    /// When the last byte was sent to the process from a binding.
+    pub(crate) stdin_last: Option<SystemTime>,
 }
 
 /// The state of the session process.
@@ -389,11 +503,13 @@ pub(crate) struct Host<P: SessionProcess, G: Send + 'static> {
     /// The last-set pty terminal size.
     sz: WinSize,
     /// In-memory representation of the terminal state.
-    parser: vt100_ctt::Parser,
+    parser: vt100_ctt::Parser<ParserEventHandler>,
     /// The session process.
     process: P,
     /// The master-side fd of the Pty.
     master: AsyncFd<std::fs::File>,
+    /// Various attributes about the running terminal.
+    attrs: HostAttrs,
 
     // Writer for bytes coming from the remote - i.e. 'stdin' keystrokes
     // that need to get written to the pty. Clones of this sender are
@@ -410,58 +526,13 @@ pub(crate) struct Host<P: SessionProcess, G: Send + 'static> {
     // (<buffer>, <number of bytes from buffer already written>)
     stdin_buf: Option<(bytes::Bytes, usize)>,
 
-    // Keeps launcher-owned resources (e.g. the session's `Env` and the
-    // `Context`/`Graph` it borrows) alive for as long as this host (and thus the
-    // session process) lives. Declared last so it is dropped after `process`:
-    // the process is torn down before the sandbox files backing its rootfs are
-    // removed. Never read; held purely for its `Drop`.
+    // Keeps launcher-owned resources (the session's `Env`, which owns the
+    // sandbox files backing the running process's rootfs along with the context
+    // and graph) alive for as long as this host (and thus the session process)
+    // lives. Declared last so it is dropped after `process`: the process is torn
+    // down before the sandbox files backing its rootfs are removed. Never read;
+    // held purely for its `Drop`.
     _guard: G,
-}
-
-/// Owns the [`mctx::Env`] for a session, along with the [`mctx::Context`] and
-/// [`graph::Graph`] it borrows, keeping all three alive for the session. Used
-/// as the [`SandboxLauncher`]'s [`SessionLauncher::Guard`].
-///
-/// `Env<'a>` borrows the context and graph mutably and owns the temp dirs and
-/// sandbox base directory that hold the running process's rootfs. We can't
-/// store the env next to the values it borrows (that would be a self-referential
-/// struct), so the context and graph are leaked to obtain `'static` borrows for
-/// the env; the raw pointers are retained here so the leaked allocations can be
-/// reclaimed once the env is dropped.
-#[cfg(not(test))]
-pub(crate) struct SessionEnv {
-    /// `Some` for the whole lifetime of the value; taken in `drop` so the env
-    /// is dropped before the context and graph it borrows are freed.
-    env: Option<mctx::Env<'static>>,
-    ctx: *mut mctx::Context,
-    graph: *mut graph::Graph,
-}
-
-// SAFETY: `mctx::Context`, `graph::Graph`, and `mctx::Env` are all `Send`
-// (the context and graph round-trip through `spawn_blocking`, and the env is
-// held across `.await` in `SandboxLauncher::launch`). The raw pointers merely
-// retain ownership of the leaked allocations so they can be freed in `drop`;
-// they are never dereferenced concurrently with the `&'static mut` borrows held
-// by `env`.
-#[cfg(not(test))]
-unsafe impl Send for SessionEnv {}
-
-#[cfg(not(test))]
-impl Drop for SessionEnv {
-    fn drop(&mut self) {
-        // Drop the env first, so its sandbox (and the listener thread holding
-        // the borrowed context/graph) is torn down while the context and graph
-        // are still valid.
-        self.env = None;
-        // SAFETY: `ctx`/`graph` were produced by `Box::into_raw` in
-        // `SandboxLauncher::launch` and have not been freed. Their only
-        // borrower, `env`, was just dropped above, so no references into them
-        // remain.
-        unsafe {
-            drop(Box::from_raw(self.graph));
-            drop(Box::from_raw(self.ctx));
-        }
-    }
 }
 
 /// A launched session process backed by a sandboxed [`hakoniwa::Child`].
@@ -506,9 +577,15 @@ pub(crate) struct SandboxLauncher {
 #[cfg(not(test))]
 impl SessionLauncher for SandboxLauncher {
     type Process = SandboxProcess;
-    type Guard = SessionEnv;
+    type Guard = crate::env::Env;
 
-    async fn launch(self, sz: WinSize) -> io::Result<Launched<SandboxProcess, SessionEnv>> {
+    async fn launch(
+        self,
+        name: String,
+        username: String,
+        paths: SessionPaths,
+        sz: WinSize,
+    ) -> io::Result<Launched<SandboxProcess, crate::env::Env>> {
         let ctx = self.ctx;
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
         // graph construction) — run it on the blocking pool so it
@@ -522,57 +599,34 @@ impl SessionLauncher for SandboxLauncher {
         .map_err(io::Error::other)?;
         let graph = graph_result.map_err(io::Error::other)?;
 
-        // Leak the context and graph so the env can borrow them for `'static`.
-        // The env owns the sandbox base dir and temp dirs backing the running
-        // process's rootfs; if it (and the values it borrows) were dropped when
-        // `launch` returns, those files would be deleted out from under the live
-        // process. The returned `SessionEnv` keeps all three alive for the
-        // session and frees the leaked allocations when the host is dropped.
-        // The addresses are carried as `usize` (not `*mut`) so this future
-        // stays `Send` across the `make_env` await below; they are cast back to
-        // pointers only when building the `SessionEnv`.
-        let ctx_addr = Box::into_raw(Box::new(ctx)) as usize;
-        let graph_addr = Box::into_raw(Box::new(graph)) as usize;
-        // SAFETY: both addresses were just produced by `Box::into_raw`, so they
-        // point to valid, aligned, uniquely owned allocations. We hand out a
-        // single `&'static mut` for each to `make_env`; the allocations are not
-        // accessed again through these addresses until `SessionEnv::drop`
-        // reclaims them, after the borrowing env has been dropped.
-        let (ctx_ref, graph_ref) = unsafe {
-            (
-                &mut *(ctx_addr as *mut mctx::Context),
-                &mut *(graph_addr as *mut graph::Graph),
-            )
-        };
+        // The env owns the context, graph and the sandbox files backing the
+        // running process's rootfs, so it is `Send + 'static` and can be moved
+        // into the host as the guard that keeps those files alive — no leaking
+        // or self-referential borrows required.
+        let mut env = crate::env::Env::build(
+            ctx,
+            graph,
+            crate::env::EnvArgs::new(name, paths.working, paths.home, paths.cache)
+                .with_packages(["base", "bash", "socat", "coreutils", "claude-code"])
+                .with_env_vars(
+                    [(
+                        "PS1".to_string(),
+                        EnvVarValue::Value(
+                            r"\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "
+                                .to_string(),
+                        ),
+                    )]
+                    .into(),
+                )
+                .with_username(username),
+        )
+        .await?;
 
-        let mut env = ctx_ref
-            .make_env(
-                "session",
-                graph_ref,
-                None,
-                Some(&"default-state".to_string()),
-                None,
-                None,
-                vec![
-                    "base".to_string(),
-                    "bash".to_string(),
-                    "socat".to_string(),
-                    "coreutils".to_string(),
-                    "claude-code".to_string(),
-                ],
-            )
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))?;
-
-        let mut container = env
-            .container()
-            .map_err(|e| io::Error::other(format!("building container failed: {}", e)))?;
+        let mut container = env.container()?;
         container.set_session_leader();
 
         let pty = Pty::open(sz)?;
-        let mut command = env
-            .command(&container, "/bin/bash", ["--noprofile", "-l"])
-            .map_err(|e| io::Error::other(format!("building command failed: {}", e)))?;
+        let mut command = env.command(&container, "/bin/bash", ["--noprofile", "-l"])?;
         command.stdin(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
         command.stdout(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
         let (master, slave) = pty.into_fds();
@@ -582,17 +636,13 @@ impl SessionLauncher for SandboxLauncher {
             .spawn()
             .map_err(|e| io::Error::other(format!("exec failed: {}", e)))?;
         // `command`/`container` no longer borrow `env`, so it can be moved into
-        // the host (via `SessionEnv`) to keep its backing files alive.
+        // the host to keep its backing files alive.
         drop(container);
 
         Ok(Launched {
             master,
             process: SandboxProcess(process),
-            guard: SessionEnv {
-                env: Some(env),
-                ctx: ctx_addr as *mut mctx::Context,
-                graph: graph_addr as *mut graph::Graph,
-            },
+            guard: env,
         })
     }
 }
@@ -639,7 +689,13 @@ impl SessionLauncher for MockLauncher {
     type Process = MockProcess;
     type Guard = ();
 
-    async fn launch(self, sz: WinSize) -> io::Result<Launched<MockProcess, ()>> {
+    async fn launch(
+        self,
+        _name: String,
+        _username: String,
+        _paths: SessionPaths,
+        sz: WinSize,
+    ) -> io::Result<Launched<MockProcess, ()>> {
         let pty = Pty::open(sz)?;
 
         let script = format!(
@@ -667,13 +723,16 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
     /// one is supplied, and drives its runtime loop on a background task.
     pub async fn spawn<L>(
         launcher: L,
+        name: String,
+        username: String,
+        paths: SessionPaths,
         sz: WinSize,
         channel: Option<Channel<Msg>>,
     ) -> Result<HostHandle, std::io::Error>
     where
         L: SessionLauncher<Process = P, Guard = G>,
     {
-        let (host, handle) = Self::build(launcher, sz, channel).await?;
+        let (host, handle) = Self::build(launcher, name, username, paths, sz, channel).await?;
         tokio::spawn(host.mainloop());
         Ok(handle)
     }
@@ -683,6 +742,9 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
     /// directly and observe the host's state.
     async fn build<L>(
         launcher: L,
+        name: String,
+        username: String,
+        paths: SessionPaths,
         sz: WinSize,
         channel: Option<Channel<Msg>>,
     ) -> Result<(Self, HostHandle), std::io::Error>
@@ -693,10 +755,18 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             master,
             process,
             guard,
-        } = launcher.launch(sz).await?;
+        } = launcher.launch(name, username, paths, sz).await?;
 
-        let parser = vt100_ctt::Parser::new(sz.rows, sz.cols, 0);
         let (sender, receiver) = mpsc::channel(8);
+        let handle = HostHandle { sender };
+
+        let parser = vt100_ctt::Parser::new_with_callbacks(
+            sz.rows,
+            sz.cols,
+            0,
+            ParserEventHandler(handle.make_weak()),
+        );
+
         let (remote_tx, remote_rx) = mpsc::channel(4);
         let master = {
             set_nonblocking(master.as_raw_fd())?;
@@ -711,6 +781,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             parser,
             process,
             master,
+            attrs: HostAttrs::default(),
 
             remote_tx,
             remote_rx,
@@ -718,11 +789,12 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             stdin_buf: None,
             _guard: guard,
         };
+
         if let Some(channel) = channel {
             host.attach(channel, sz, true).await;
         }
 
-        Ok((host, HostHandle { sender }))
+        Ok((host, handle))
     }
 
     pub async fn mainloop(mut self) -> Result<i32, std::io::Error> {
@@ -748,6 +820,22 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
                     Message::Attach(channel, sz) => {
                         self.attach(channel, sz, false).await;
                     }
+                    Message::SetTitleCallback(title) => {
+                        self.attrs.title = Some((title, SystemTime::now()));
+                    }
+                    Message::AudibleBellCallback => {
+                        let (count, last) = &mut self.attrs.audible_bell;
+                        *count += 1;
+                        *last = Some(SystemTime::now());
+                    }
+                    Message::VisualBellCallback => {
+                        let (count, last) = &mut self.attrs.visual_bell;
+                        *count += 1;
+                        *last = Some(SystemTime::now());
+                    }
+                    Message::GetAttrs(s) => {
+                        let _ = s.send(self.attrs.clone());
+                    }
                 }
             },
             // Read from master - stdout of session process => ssh channel (if any)
@@ -756,6 +844,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
                     Ok(Ok(0)) => {},
                     Ok(Ok(n)) => {
                         let b = &self.stdout_buf[..n];
+                        self.attrs.stdout_last = Some(SystemTime::now());
                         self.parser.process(b);
                         if let Some((tx, _hnd)) = self.remote.as_mut() {
                             match tx.send(BindingMsg::Stdin(b.to_vec())).await {
@@ -785,9 +874,17 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             Some(msg) = self.remote_rx.recv(), if self.stdin_buf.is_none() => {
                 match msg {
                     Either::Left(b) => {
-                        if b.len() == 1 && b[0] == 0x17 { // ctrl-w
+                        self.attrs.stdin_last = Some(SystemTime::now());
+
+                        // ctrl-w
+                        let is_detach = b.len() == 1 && b[0] == 0x17 ||
+                            b == CTRL_W_CSI_U ||
+                            b == CTRL_W_CSI_27;
+
+                        if is_detach {
+                            let uc = self.unwind_codes();
                             if let Some((tx, _hnd)) = self.remote.as_mut() {
-                                match tx.send(BindingMsg::TeardownDueToDetach).await {
+                                match tx.send(BindingMsg::TeardownDueToDetach(uc)).await {
                                     Ok(()) => {},
                                     Err(e) => {
                                         tracing::warn!("failed sending detach signal to remote: {e}");
@@ -840,7 +937,9 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
         if let Some((old_tx, old_join_hnd)) = self.remote.replace(new_binding) {
             // If there was a binding we just swapped out, tell it to
             // shut down and wait for it to finish.
-            let _ = old_tx.send(BindingMsg::TeardownDueToSuperceded).await;
+            let _ = old_tx
+                .send(BindingMsg::TeardownDueToSuperceded(self.unwind_codes()))
+                .await;
             let _ = old_join_hnd.await;
         }
 
@@ -855,6 +954,32 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             self.parser.screen_mut().set_size(sz.rows, sz.cols);
             self.sz = sz;
         }
+    }
+
+    /// Computes terminal escape sequences to return the outer terminal
+    /// to a normal state on detach.
+    fn unwind_codes(&self) -> Vec<u8> {
+        let live = self.parser.screen();
+        let clean = vt100_ctt::Parser::new(live.size().0, live.size().1, 0)
+            .screen()
+            .clone();
+
+        // app keypad/cursor, paste, mouse
+        let mut out = clean.input_mode_diff(live);
+        // disable alternate screen
+        if live.alternate_screen() {
+            out.extend_from_slice(b"\x1b[?1049l");
+        }
+        // disable hidden cursor
+        if live.hide_cursor() {
+            out.extend_from_slice(b"\x1b[?25h");
+        }
+
+        // blind: reset text colors etc ('SGR')
+        out.extend_from_slice(b"\x1b[m");
+        // blind: disable focus reporting
+        out.extend_from_slice(b"\x1b[?1004l");
+        out
     }
 }
 
@@ -888,7 +1013,10 @@ fn set_cloexec(fd: RawFd) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use paths::DaemonAbsPath;
+
     use super::*;
+    use std::time::Duration;
 
     const DEFAULT_SIZE: WinSize = WinSize {
         rows: 24,
@@ -957,5 +1085,75 @@ mod tests {
         let got = pty.get_size().expect("failed to get size");
         assert_eq!(got.rows, 50);
         assert_eq!(got.cols, 200);
+    }
+
+    /// Drives a host backed by the mock echo program and confirms the terminal
+    /// attributes are tracked and surfaced via [`HostHandle::get_attrs`]:
+    /// feeding stdin an OSC "set window title" escape makes the mock echo it
+    /// back onto the terminal, where the parser records the title; the round
+    /// trip also stamps the stdin/stdout activity times.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_attrs_tracks_title_and_io_times() {
+        // Build the host directly (no SSH binding) so the test can feed stdin
+        // through a clone of the host's own remote sender, then drive its
+        // runtime loop on a background task.
+        let (host, handle) = Host::build(
+            MockLauncher,
+            "test-session".to_string(),
+            "user".to_string(),
+            SessionPaths {
+                working: DaemonAbsPath::root(),
+                cache: DaemonAbsPath::root(),
+                home: DaemonAbsPath::root(),
+            },
+            DEFAULT_SIZE,
+            None,
+        )
+        .await
+        .expect("failed to build host");
+        let stdin = host.remote_tx.clone();
+        tokio::spawn(host.mainloop());
+
+        // OSC "set window title" (ESC ] 0 ; <title> BEL), sent as one line. The
+        // mock echoes the line back (prefixed with `got:`), so the raw escape
+        // reaches the host's terminal parser on stdout and fires the set-title
+        // callback. The trailing newline is what makes the mock's `read` return
+        // and echo via `printf`, carrying the escape bytes through unmangled.
+        let title = "hello-title";
+        let osc = format!("\x1b]0;{title}\x07\n");
+        stdin
+            .send(Either::Left(bytes::Bytes::from(osc.into_bytes())))
+            .await
+            .expect("failed to send stdin");
+
+        // Poll until the title has been recorded (or time out).
+        let attrs = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let attrs = handle.get_attrs().await.unwrap();
+                if attrs.title.is_some() {
+                    break attrs;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for the terminal title to be recorded");
+
+        let (got_title, _when) = attrs.title.expect("title should be set");
+        assert_eq!(
+            got_title, title,
+            "the parsed title should match what was set"
+        );
+
+        // The stdin write and the echoed stdout should both have stamped their
+        // last-activity times.
+        assert!(
+            attrs.stdin_last.is_some(),
+            "stdin_last should be stamped after feeding stdin",
+        );
+        assert!(
+            attrs.stdout_last.is_some(),
+            "stdout_last should be stamped after the echo arrived",
+        );
     }
 }

@@ -125,15 +125,18 @@ fn run_boot(foreground: bool) -> Result<()> {
         Ok(Ok(())) => {
             println!("vm-up");
             // R3.2: by the time READY arrives, libkrun has created and is
-            // listening on the minimald bridge socket. Verify it is
-            // owner-only (0600) from the parent process.
+            // listening on the minimald bridge socket. libkrun creates it with
+            // default permissions, so tighten it to owner-only (0600) from the
+            // parent process.
             match crate::sock::resolve_uds_path() {
                 Ok(uds_path) => {
-                    if let Err(e) = crate::sock::verify_socket_permissions(&uds_path) {
+                    if let Err(e) = crate::sock::enforce_socket_permissions(&uds_path)
+                        .and_then(|()| crate::sock::verify_socket_permissions(&uds_path))
+                    {
                         tracing::warn!(
                             path = %uds_path.display(),
                             error = %e,
-                            "minimald bridge socket permissions check failed",
+                            "could not secure minimald bridge socket to 0600",
                         );
                     }
                 }

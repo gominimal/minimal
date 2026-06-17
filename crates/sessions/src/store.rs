@@ -1,6 +1,6 @@
 //! Manages session state on disk.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, io::ErrorKind::AlreadyExists};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -10,12 +10,16 @@ use paths::{DaemonAbsPath, DaemonRelPath, sub_path};
 use crate::{Record, SessionId};
 
 /// Describes the session object yielded by [`Loader`].
-pub trait SessionObject: Sized + Send + 'static + std::fmt::Debug {
+pub trait SessionObject: Sized + Send + Clone + 'static + std::fmt::Debug {
     type Key: SessionKey;
 
     fn record(&self) -> &Record;
+    fn refresh_from_record(&mut self, r: Record);
+
     fn key(&self) -> &Self::Key;
     fn workspace_path(&self) -> DaemonAbsPath;
+    fn home_path(&self) -> DaemonAbsPath;
+    fn cache_path(&self) -> DaemonAbsPath;
 }
 
 /// Describes the primary key a [`Loader`] uses to reference
@@ -69,6 +73,15 @@ pub trait Loader {
     /// Returns an I/O error if the session directory, record, or index
     /// cannot be written.
     fn create(&mut self, record: Record) -> Result<Self::Key, std::io::Error>;
+
+    /// Renames the session with the given key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the session directory, record, or index
+    /// cannot be written.
+    /// `AlreadyExists` is returned if a session with that name already exists.
+    fn rename(&mut self, key: &Self::Key, new_name: String) -> Result<(), std::io::Error>;
 }
 
 /// The concrete key used to identify sessions from [`DiskLoader`].
@@ -85,11 +98,18 @@ impl SessionKey for DiskSessionKey {
 }
 
 /// The concrete session object from [`DiskLoader`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DiskSession {
     key: DiskSessionKey,
     minimal_state_dir: DaemonAbsPath,
     record: Record,
+}
+
+impl DiskSession {
+    fn root_path(&self) -> DaemonAbsPath {
+        sub_path!(self.minimal_state_dir, "sessions")
+            .join(&DaemonRelPath::try_new(&self.key.dir_key).unwrap())
+    }
 }
 
 impl SessionObject for DiskSession {
@@ -98,13 +118,23 @@ impl SessionObject for DiskSession {
     fn record(&self) -> &Record {
         &self.record
     }
+    fn refresh_from_record(&mut self, r: Record) {
+        let id = self.record.id;
+        self.record = r;
+        self.record.id = id; // ID must never change
+    }
+
     fn key(&self) -> &DiskSessionKey {
         &self.key
     }
     fn workspace_path(&self) -> DaemonAbsPath {
-        let base = sub_path!(self.minimal_state_dir, "sessions")
-            .join(&DaemonRelPath::try_new(&self.key.dir_key).unwrap());
-        sub_path!(base, "tree")
+        sub_path!(self.root_path(), "tree")
+    }
+    fn home_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root_path(), "home")
+    }
+    fn cache_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root_path(), "cache")
     }
 }
 
@@ -185,7 +215,7 @@ impl DiskLoader {
     /// The write is staged into a sibling temp file and then atomically
     /// renamed into place, so a crash mid-write can never leave a partially
     /// serialized `index.json` behind.
-    fn flush(&self) -> Result<(), std::io::Error> {
+    fn flush_index(&self) -> Result<(), std::io::Error> {
         let sessions_dir = self.minimal_dir.as_utf8_path().join("sessions");
         let index_file = sessions_dir.join("index.json");
         let tmp_file = sessions_dir.join("index.json.tmp");
@@ -199,6 +229,30 @@ impl DiskLoader {
         common::renameat2::renameat2_cwd(tmp_file.as_std_path(), index_file.as_std_path(), 0)?;
         #[cfg(not(target_os = "linux"))]
         std::fs::rename(&tmp_file, &index_file)?;
+
+        Ok(())
+    }
+
+    /// Writes the given session record to disk.
+    ///
+    /// The write is staged into a sibling temp file and then atomically
+    /// renamed into place, so a crash mid-write can never leave a partially
+    /// serialized `record.json` behind.
+    fn write_record(&mut self, short: &String, record: &Record) -> Result<(), std::io::Error> {
+        let session_dir = self.minimal_dir.as_utf8_path().join("sessions").join(short);
+        std::fs::create_dir_all(&session_dir)?;
+        let record_file = session_dir.join("record.json");
+        let tmp_file = session_dir.join("record.json.tmp");
+
+        let file = std::fs::File::create(&tmp_file)?;
+        serde_json::to_writer(&file, &record)?;
+        file.sync_all()?;
+        drop(file);
+
+        #[cfg(target_os = "linux")]
+        common::renameat2::renameat2_cwd(tmp_file.as_std_path(), record_file.as_std_path(), 0)?;
+        #[cfg(not(target_os = "linux"))]
+        std::fs::rename(&tmp_file, &record_file)?;
 
         Ok(())
     }
@@ -232,18 +286,11 @@ impl Loader for DiskLoader {
             short = format!("{:05x}", n.wrapping_add(1));
         }
 
-        let session_dir = self
-            .minimal_dir
-            .as_utf8_path()
-            .join("sessions")
-            .join(&short);
-        std::fs::create_dir_all(&session_dir)?;
-        let record_file = session_dir.join("record.json");
-        serde_json::to_writer(std::fs::File::create(record_file)?, &record)?;
+        self.write_record(&short, &record)?;
 
         self.index
             .insert(short.clone(), SessionId(uuid), record.name);
-        self.flush()?;
+        self.flush_index()?;
 
         Ok(DiskSessionKey {
             session_id: SessionId(uuid),
@@ -289,6 +336,31 @@ impl Loader for DiskLoader {
             key: key.clone(),
             record,
         })
+    }
+
+    fn rename(&mut self, key: &Self::Key, new_name: String) -> Result<(), std::io::Error> {
+        if self.index.find_by_name(&new_name).is_some() {
+            return Err(std::io::Error::new(
+                AlreadyExists,
+                format!("a session with the name `{new_name}` already exists"),
+            ));
+        }
+
+        let mut obj = self.get(key)?;
+        let short = obj.key.dir_key.to_string();
+        let old_name = obj.record.name.clone();
+
+        obj.record.name = Some(new_name.clone());
+        self.write_record(&short, &obj.record)?;
+
+        // Only mutate in-memory index after disk writes succeed
+        if let Some(old_name) = &old_name {
+            self.index.name_to_id.remove(old_name);
+        }
+        self.index.name_to_id.insert(new_name, obj.record.id);
+        self.flush_index()?;
+
+        Ok(())
     }
 }
 
@@ -407,5 +479,114 @@ mod tests {
         let stored = reloaded.get(&key).unwrap();
         assert_eq!(&stored.record().id, original.id());
         assert_eq!(stored.record().name.as_deref(), Some("my-session"));
+    }
+
+    #[test]
+    fn rename_updates_the_on_disk_record() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        loader.rename(&key, "renamed".to_string()).unwrap();
+
+        // The record read back from disk reflects the new name.
+        assert_eq!(
+            loader.get(&key).unwrap().record().name.as_deref(),
+            Some("renamed")
+        );
+    }
+
+    #[test]
+    fn rename_remaps_the_name_index() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        loader.rename(&key, "renamed".to_string()).unwrap();
+
+        // The new name resolves to the session...
+        assert_eq!(loader.find_by_name("renamed").unwrap(), Some(key));
+        // ...and the old name no longer resolves to anything.
+        assert_eq!(loader.find_by_name("my-session").unwrap(), None);
+    }
+
+    #[test]
+    fn rename_leaves_the_id_and_key_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        let id = *key.id();
+        loader.rename(&key, "renamed".to_string()).unwrap();
+
+        // Renaming touches only the name; the id and short key are stable.
+        assert_eq!(loader.find_by_id(&id).unwrap().as_ref(), Some(&key));
+        assert_eq!(&loader.get(&key).unwrap().record().id, &id);
+    }
+
+    #[test]
+    fn rename_persists_across_loader_reinit() {
+        let tmp = TempDir::new().unwrap();
+
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        loader.rename(&key, "renamed".to_string()).unwrap();
+        drop(loader);
+
+        // Both the record write and the index flush must survive a reload.
+        let reloaded = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        assert_eq!(
+            reloaded.get(&key).unwrap().record().name.as_deref(),
+            Some("renamed")
+        );
+        assert_eq!(reloaded.find_by_name("renamed").unwrap(), Some(key));
+        assert_eq!(reloaded.find_by_name("my-session").unwrap(), None);
+    }
+
+    #[test]
+    fn rename_errors_when_the_target_name_is_taken() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let first = loader.create(sample_record()).unwrap();
+        loader
+            .create({
+                let mut record = sample_record();
+                record.name = Some("other".to_string());
+                record
+            })
+            .unwrap();
+
+        // "other" is already taken, so renaming the first session onto it fails.
+        assert_eq!(
+            loader
+                .rename(&first, "other".to_string())
+                .err()
+                .map(|e| e.kind()),
+            Some(ErrorKind::AlreadyExists)
+        );
+        // The failed rename left the original name intact.
+        assert_eq!(loader.find_by_name("my-session").unwrap(), Some(first));
+    }
+
+    #[test]
+    fn rename_names_a_previously_unnamed_session() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader
+            .create({
+                let mut record = sample_record();
+                record.name = None;
+                record
+            })
+            .unwrap();
+        loader.rename(&key, "now-named".to_string()).unwrap();
+
+        assert_eq!(
+            loader.get(&key).unwrap().record().name.as_deref(),
+            Some("now-named")
+        );
+        assert_eq!(loader.find_by_name("now-named").unwrap(), Some(key));
     }
 }
