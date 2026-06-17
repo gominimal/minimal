@@ -1041,4 +1041,41 @@ mod tests {
         let sock = sandbox.base_dir.join("run").join("minenv_sock");
         UnixStream::connect(&sock).expect("minenv_sock should be connectable after Sandbox::new");
     }
+
+    /// A `BoundDir` (task) sandbox configured with a nested working directory
+    /// and a mix of file and directory mappings must construct successfully and
+    /// come up fully operational. This drives the `WdSetup::BoundDir` arm of
+    /// `Sandbox::new` — shadow-cwd creation and the fs-mapping target loop —
+    /// which every other constructor test (all `Isolated`) leaves unexercised.
+    /// The asserted contract mirrors the `Isolated` socket test: `new` returns
+    /// `Ok` and the minenv socket is connectable, proving the constructor ran to
+    /// completion for a bound-dir config rather than panicking or erroring in
+    /// the bound-dir branch.
+    #[test]
+    fn sandbox_new_accepts_bound_dir_with_file_and_dir_mappings() {
+        use std::os::unix::net::UnixStream;
+        let (_tmp, base) = make_base_with_synth();
+        let file_mapping = common::FsMapping {
+            host_path: "/host/etc/app.conf".to_string(),
+            sandbox_path: Some("/etc/app.conf".to_string()),
+            is_file: true,
+            ..Default::default()
+        };
+        let dir_mapping = common::FsMapping {
+            host_path: "/host/opt/data".to_string(),
+            sandbox_path: Some("/opt/data".to_string()),
+            is_file: false,
+            ..Default::default()
+        };
+        let config = Config::new("test-bound-dir").with_wd(
+            "/work/project",
+            false,
+            vec![file_mapping, dir_mapping],
+        );
+        let sandbox = Sandbox::new(base, config, ())
+            .expect("bound-dir sandbox with file and dir mappings should construct");
+        let sock = sandbox.base_dir.join("run").join("minenv_sock");
+        UnixStream::connect(&sock)
+            .expect("minenv_sock should be connectable after a bound-dir Sandbox::new");
+    }
 }
