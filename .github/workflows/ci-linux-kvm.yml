@@ -106,16 +106,27 @@ jobs:
             echo "MINVMD_INITRAMFS=$RUNNER_TEMP/initramfs.cpio"
           } >> "$GITHUB_ENV"
 
-      - name: Cache libkrun (libkrunfw v5.5.0 + libkrun v1.19.0)
-        # Keyed on the pinned versions: the kernel compile only runs on a cache
-        # miss. Bump the suffix when scripts/build-libkrun.sh changes pins.
-        uses: actions/cache@v5
+      - name: Restore libkrun cache (libkrunfw v5.5.0 + libkrun v1.19.0)
+        id: krun-cache
+        # Keyed on the pinned versions: the kernel compile only runs on a miss.
+        # Bump the suffix when scripts/build-libkrun.sh changes pins.
+        uses: actions/cache/restore@v5
         with:
           path: ${{ env.KRUN_PREFIX }}
           key: x86_64-libkrun-fw5.5.0-krun1.19.0-blk
 
       - name: Build libkrun from source (cached)
         run: ./scripts/build-libkrun.sh "$KRUN_PREFIX"
+
+      - name: Save libkrun cache
+        # Save right after the build so the expensive kernel compile is cached
+        # even when a later step (e2e/bench) fails — the default post-job save is
+        # skipped on job failure. Skipped on a cache hit (keys are immutable).
+        if: steps.krun-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ env.KRUN_PREFIX }}
+          key: x86_64-libkrun-fw5.5.0-krun1.19.0-blk
 
       - name: Export libkrun link + runtime paths
         # LIBKRUN_PREFIX: minvmd build.rs link-search dir (it emits an rpath to
