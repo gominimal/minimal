@@ -23,6 +23,17 @@ use crate::RequestedPty;
 #[cfg(not(test))]
 use crate::session::SessionHandle;
 
+/// Command sequence for the ctrl-w key chord, when the kitty keyboard protocol
+/// is negotiated.
+///
+/// Corresponds to: Kitty: CSI 119 ; 5 u
+const CTRL_W_CSI_U: &[u8] = b"\x1b[119;5u";
+/// Command sequence for the ctrl-w key chord, when the modifyOtherKeys key
+/// sequences are used by the outer terminal.
+///
+/// Corrsponds to: modifyOtherKeys: CSI 27 ; 5 ; 119 ~
+const CTRL_W_CSI_27: &[u8] = b"\x1b[27;5;119~";
+
 /// The dimensions of a terminal.
 ///
 /// This is the libc-facing view of a terminal size, mirroring `libc::winsize`.
@@ -912,7 +923,13 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
                 match msg {
                     Either::Left(b) => {
                         self.attrs.stdin_last = Some(SystemTime::now());
-                        if b.len() == 1 && b[0] == 0x17 { // ctrl-w
+
+                        // ctrl-w
+                        let is_detach = b.len() == 1 && b[0] == 0x17 ||
+                            b == CTRL_W_CSI_U ||
+                            b == CTRL_W_CSI_27;
+
+                        if is_detach {
                             let uc = self.unwind_codes();
                             if let Some((tx, _hnd)) = self.remote.as_mut() {
                                 match tx.send(BindingMsg::TeardownDueToDetach(uc)).await {
