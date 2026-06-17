@@ -12,7 +12,8 @@ description: Complete CLI reference for all Minimal commands (run, build, test, 
 | `--minimal-dir <PATH>` | | Override the base directory used for operations (default: `~/.cache/minimal`) |
 | `--no-cache` | | Ignore locally-available binary artifacts (forces rebuilds unless present in remote cache) |
 | `--no-fetch` | | Do not fetch binary artifacts from the internet |
-| `--num-parallel-builds <N>` | `-j` | Configure the number of parallel builds |
+| `--offline` | | Use only what's already in the local cache; fail on any network call. Useful for builds in network-isolated environments. |
+| `--num-parallel-builds <N>` | `-n` | Configure the number of parallel builds |
 
 ## Commands
 
@@ -83,19 +84,19 @@ See [`[outputs.*]`](/reference/minimal-dot-toml#outputs) for the full configurat
 
 ### `check [FILTER_NAMES...]` {#check}
 
-Validates Minimal's configuration including packages, harnesses, and profiles.
+Validates Minimal's configuration including packages, stacks, and profiles.
 
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--fix` | `-f` | Attempt to fix any issues |
 | `--skip-checkers <NAMES>` | `-s` | Comma-delimited checker names to skip |
 | `--packages` | | Check packages defined in the codebase |
-| `--harnesses` | | Check harnesses defined in the codebase |
+| `--stacks` | | Check stacks defined in the codebase |
 | `--profiles` | | Check profiles defined in the codebase |
 
 If no type flags are specified, all types are checked by default.
 
-If filter names are specified, any package, harness, or profile matching a specified name is checked.
+If filter names are specified, any package, stack, or profile matching a specified name is checked.
 
 ### `dep [PACKAGES...]`
 
