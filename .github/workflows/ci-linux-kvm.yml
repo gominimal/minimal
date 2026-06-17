@@ -113,7 +113,7 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ${{ env.KRUN_PREFIX }}
-          key: x86_64-libkrun-fw5.5.0-krun1.19.0-blk
+          key: x86_64-libkrun-fw5.5.0-krun1.19.0-blk-stamped
 
       - name: Build libkrun from source (cached)
         run: ./scripts/build-libkrun.sh "$KRUN_PREFIX"
@@ -126,7 +126,7 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: ${{ env.KRUN_PREFIX }}
-          key: x86_64-libkrun-fw5.5.0-krun1.19.0-blk
+          key: x86_64-libkrun-fw5.5.0-krun1.19.0-blk-stamped
 
       - name: Export libkrun link + runtime paths
         # LIBKRUN_PREFIX: minvmd build.rs link-search dir (it emits an rpath to
