@@ -195,10 +195,21 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::status (expect running)"
-          "$BIN" status --json | tee status.json
+          # `run --detach` returns once the host UDS accepts connections, which
+          # libkrun opens early in VM setup — slightly ahead of the supervisor's
+          # Starting->Running transition (set after the guest READY marker). Poll
+          # status (up to ~15s) for Running rather than asserting immediately.
+          # jq parses structurally (preinstalled on GitHub runners) so the check
+          # doesn't break on harmless JSON formatting changes.
+          for _ in $(seq 1 75); do
+            "$BIN" status --json > status.json || true
+            if jq -e '.state == "running" and (.vmm_pid | type == "number")' status.json >/dev/null; then
+              break
+            fi
+            sleep 0.2
+          done
+          cat status.json
           "$BIN" status   # exit 0 == Running
-          # Parse structurally (jq is preinstalled on GitHub runners) so the
-          # assertion doesn't break on harmless JSON formatting changes.
           jq -e '.state == "running" and (.vmm_pid | type == "number")' status.json
           echo "::endgroup::"
 
