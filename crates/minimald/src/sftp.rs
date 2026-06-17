@@ -448,12 +448,12 @@ pub(crate) async fn handle_sftp_subsystem(
             return Ok(());
         }
     };
-    let workspace = session_handle.workspace_path().await;
+    let paths = session_handle.paths().await;
 
     session.channel_success(id)?;
     spawn(russh_sftp::server::run(
         channel.into_stream(),
-        SftpSession::new(workspace),
+        SftpSession::new(paths.working),
     ));
 
     Ok(())

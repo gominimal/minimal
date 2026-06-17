@@ -6,6 +6,8 @@
 //! The [`Host`] struct holds the running state of an active session.
 
 use either::Either;
+#[cfg(not(test))]
+use mfile::EnvVarValue;
 use russh::Channel;
 use russh::server::Msg;
 use std::future::Future;
@@ -22,6 +24,7 @@ use tokio::task::JoinHandle;
 use crate::RequestedPty;
 #[cfg(not(test))]
 use crate::session::SessionHandle;
+use crate::session::SessionPaths;
 
 /// Command sequence for the ctrl-w key chord, when the kitty keyboard protocol
 /// is negotiated.
@@ -340,6 +343,9 @@ pub(crate) trait SessionLauncher {
 
     fn launch(
         self,
+        name: String,
+        username: String,
+        paths: SessionPaths,
         sz: WinSize,
     ) -> impl Future<Output = io::Result<Launched<Self::Process, Self::Guard>>> + Send;
 }
@@ -520,58 +526,13 @@ pub(crate) struct Host<P: SessionProcess, G: Send + 'static> {
     // (<buffer>, <number of bytes from buffer already written>)
     stdin_buf: Option<(bytes::Bytes, usize)>,
 
-    // Keeps launcher-owned resources (e.g. the session's `Env` and the
-    // `Context`/`Graph` it borrows) alive for as long as this host (and thus the
-    // session process) lives. Declared last so it is dropped after `process`:
-    // the process is torn down before the sandbox files backing its rootfs are
-    // removed. Never read; held purely for its `Drop`.
+    // Keeps launcher-owned resources (the session's `Env`, which owns the
+    // sandbox files backing the running process's rootfs along with the context
+    // and graph) alive for as long as this host (and thus the session process)
+    // lives. Declared last so it is dropped after `process`: the process is torn
+    // down before the sandbox files backing its rootfs are removed. Never read;
+    // held purely for its `Drop`.
     _guard: G,
-}
-
-/// Owns the [`mctx::Env`] for a session, along with the [`mctx::Context`] and
-/// [`graph::Graph`] it borrows, keeping all three alive for the session. Used
-/// as the [`SandboxLauncher`]'s [`SessionLauncher::Guard`].
-///
-/// `Env<'a>` borrows the context and graph mutably and owns the temp dirs and
-/// sandbox base directory that hold the running process's rootfs. We can't
-/// store the env next to the values it borrows (that would be a self-referential
-/// struct), so the context and graph are leaked to obtain `'static` borrows for
-/// the env; the raw pointers are retained here so the leaked allocations can be
-/// reclaimed once the env is dropped.
-#[cfg(not(test))]
-pub(crate) struct SessionEnv {
-    /// `Some` for the whole lifetime of the value; taken in `drop` so the env
-    /// is dropped before the context and graph it borrows are freed.
-    env: Option<mctx::Env<'static>>,
-    ctx: *mut mctx::Context,
-    graph: *mut graph::Graph,
-}
-
-// SAFETY: `mctx::Context`, `graph::Graph`, and `mctx::Env` are all `Send`
-// (the context and graph round-trip through `spawn_blocking`, and the env is
-// held across `.await` in `SandboxLauncher::launch`). The raw pointers merely
-// retain ownership of the leaked allocations so they can be freed in `drop`;
-// they are never dereferenced concurrently with the `&'static mut` borrows held
-// by `env`.
-#[cfg(not(test))]
-unsafe impl Send for SessionEnv {}
-
-#[cfg(not(test))]
-impl Drop for SessionEnv {
-    fn drop(&mut self) {
-        // Drop the env first, so its sandbox (and the listener thread holding
-        // the borrowed context/graph) is torn down while the context and graph
-        // are still valid.
-        self.env = None;
-        // SAFETY: `ctx`/`graph` were produced by `Box::into_raw` in
-        // `SandboxLauncher::launch` and have not been freed. Their only
-        // borrower, `env`, was just dropped above, so no references into them
-        // remain.
-        unsafe {
-            drop(Box::from_raw(self.graph));
-            drop(Box::from_raw(self.ctx));
-        }
-    }
 }
 
 /// A launched session process backed by a sandboxed [`hakoniwa::Child`].
@@ -616,9 +577,15 @@ pub(crate) struct SandboxLauncher {
 #[cfg(not(test))]
 impl SessionLauncher for SandboxLauncher {
     type Process = SandboxProcess;
-    type Guard = SessionEnv;
+    type Guard = crate::env::Env;
 
-    async fn launch(self, sz: WinSize) -> io::Result<Launched<SandboxProcess, SessionEnv>> {
+    async fn launch(
+        self,
+        name: String,
+        username: String,
+        paths: SessionPaths,
+        sz: WinSize,
+    ) -> io::Result<Launched<SandboxProcess, crate::env::Env>> {
         let ctx = self.ctx;
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
         // graph construction) — run it on the blocking pool so it
@@ -632,57 +599,34 @@ impl SessionLauncher for SandboxLauncher {
         .map_err(io::Error::other)?;
         let graph = graph_result.map_err(io::Error::other)?;
 
-        // Leak the context and graph so the env can borrow them for `'static`.
-        // The env owns the sandbox base dir and temp dirs backing the running
-        // process's rootfs; if it (and the values it borrows) were dropped when
-        // `launch` returns, those files would be deleted out from under the live
-        // process. The returned `SessionEnv` keeps all three alive for the
-        // session and frees the leaked allocations when the host is dropped.
-        // The addresses are carried as `usize` (not `*mut`) so this future
-        // stays `Send` across the `make_env` await below; they are cast back to
-        // pointers only when building the `SessionEnv`.
-        let ctx_addr = Box::into_raw(Box::new(ctx)) as usize;
-        let graph_addr = Box::into_raw(Box::new(graph)) as usize;
-        // SAFETY: both addresses were just produced by `Box::into_raw`, so they
-        // point to valid, aligned, uniquely owned allocations. We hand out a
-        // single `&'static mut` for each to `make_env`; the allocations are not
-        // accessed again through these addresses until `SessionEnv::drop`
-        // reclaims them, after the borrowing env has been dropped.
-        let (ctx_ref, graph_ref) = unsafe {
-            (
-                &mut *(ctx_addr as *mut mctx::Context),
-                &mut *(graph_addr as *mut graph::Graph),
-            )
-        };
+        // The env owns the context, graph and the sandbox files backing the
+        // running process's rootfs, so it is `Send + 'static` and can be moved
+        // into the host as the guard that keeps those files alive — no leaking
+        // or self-referential borrows required.
+        let mut env = crate::env::Env::build(
+            ctx,
+            graph,
+            crate::env::EnvArgs::new(name, paths.working, paths.home, paths.cache)
+                .with_packages(["base", "bash", "socat", "coreutils", "claude-code"])
+                .with_env_vars(
+                    [(
+                        "PS1".to_string(),
+                        EnvVarValue::Value(
+                            r"\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "
+                                .to_string(),
+                        ),
+                    )]
+                    .into(),
+                )
+                .with_username(username),
+        )
+        .await?;
 
-        let mut env = ctx_ref
-            .make_env(
-                "session",
-                graph_ref,
-                None,
-                Some(&"default-state".to_string()),
-                None,
-                None,
-                vec![
-                    "base".to_string(),
-                    "bash".to_string(),
-                    "socat".to_string(),
-                    "coreutils".to_string(),
-                    "claude-code".to_string(),
-                ],
-            )
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))?;
-
-        let mut container = env
-            .container()
-            .map_err(|e| io::Error::other(format!("building container failed: {}", e)))?;
+        let mut container = env.container()?;
         container.set_session_leader();
 
         let pty = Pty::open(sz)?;
-        let mut command = env
-            .command(&container, "/bin/bash", ["--noprofile", "-l"])
-            .map_err(|e| io::Error::other(format!("building command failed: {}", e)))?;
+        let mut command = env.command(&container, "/bin/bash", ["--noprofile", "-l"])?;
         command.stdin(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
         command.stdout(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
         let (master, slave) = pty.into_fds();
@@ -692,17 +636,13 @@ impl SessionLauncher for SandboxLauncher {
             .spawn()
             .map_err(|e| io::Error::other(format!("exec failed: {}", e)))?;
         // `command`/`container` no longer borrow `env`, so it can be moved into
-        // the host (via `SessionEnv`) to keep its backing files alive.
+        // the host to keep its backing files alive.
         drop(container);
 
         Ok(Launched {
             master,
             process: SandboxProcess(process),
-            guard: SessionEnv {
-                env: Some(env),
-                ctx: ctx_addr as *mut mctx::Context,
-                graph: graph_addr as *mut graph::Graph,
-            },
+            guard: env,
         })
     }
 }
@@ -749,7 +689,13 @@ impl SessionLauncher for MockLauncher {
     type Process = MockProcess;
     type Guard = ();
 
-    async fn launch(self, sz: WinSize) -> io::Result<Launched<MockProcess, ()>> {
+    async fn launch(
+        self,
+        _name: String,
+        _username: String,
+        _paths: SessionPaths,
+        sz: WinSize,
+    ) -> io::Result<Launched<MockProcess, ()>> {
         let pty = Pty::open(sz)?;
 
         let script = format!(
@@ -777,13 +723,16 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
     /// one is supplied, and drives its runtime loop on a background task.
     pub async fn spawn<L>(
         launcher: L,
+        name: String,
+        username: String,
+        paths: SessionPaths,
         sz: WinSize,
         channel: Option<Channel<Msg>>,
     ) -> Result<HostHandle, std::io::Error>
     where
         L: SessionLauncher<Process = P, Guard = G>,
     {
-        let (host, handle) = Self::build(launcher, sz, channel).await?;
+        let (host, handle) = Self::build(launcher, name, username, paths, sz, channel).await?;
         tokio::spawn(host.mainloop());
         Ok(handle)
     }
@@ -793,6 +742,9 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
     /// directly and observe the host's state.
     async fn build<L>(
         launcher: L,
+        name: String,
+        username: String,
+        paths: SessionPaths,
         sz: WinSize,
         channel: Option<Channel<Msg>>,
     ) -> Result<(Self, HostHandle), std::io::Error>
@@ -803,7 +755,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             master,
             process,
             guard,
-        } = launcher.launch(sz).await?;
+        } = launcher.launch(name, username, paths, sz).await?;
 
         let (sender, receiver) = mpsc::channel(8);
         let handle = HostHandle { sender };
@@ -1061,6 +1013,8 @@ fn set_cloexec(fd: RawFd) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use paths::DaemonAbsPath;
+
     use super::*;
     use std::time::Duration;
 
@@ -1143,9 +1097,20 @@ mod tests {
         // Build the host directly (no SSH binding) so the test can feed stdin
         // through a clone of the host's own remote sender, then drive its
         // runtime loop on a background task.
-        let (host, handle) = Host::build(MockLauncher, DEFAULT_SIZE, None)
-            .await
-            .expect("failed to build host");
+        let (host, handle) = Host::build(
+            MockLauncher,
+            "test-session".to_string(),
+            "user".to_string(),
+            SessionPaths {
+                working: DaemonAbsPath::root(),
+                cache: DaemonAbsPath::root(),
+                home: DaemonAbsPath::root(),
+            },
+            DEFAULT_SIZE,
+            None,
+        )
+        .await
+        .expect("failed to build host");
         let stdin = host.remote_tx.clone();
         tokio::spawn(host.mainloop());
 

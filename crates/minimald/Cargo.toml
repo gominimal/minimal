@@ -31,12 +31,16 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 args.workspace = true
+check.workspace = true
+common.workspace = true
 graph.workspace = true
 mctx.workspace = true
 mfile.workspace = true
 minimald-rpc.workspace = true
+op.workspace = true
 ot.workspace = true
 paths.workspace = true
+sandbox2.workspace = true
 sessions.workspace = true
 stdlib.workspace = true
 
