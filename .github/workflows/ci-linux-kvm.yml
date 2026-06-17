@@ -64,13 +64,16 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install build dependencies
-        # protoc: the `minimal` CLI (materialize) build. The rest: libkrunfw's
+        # protoc + libprotobuf-dev: the `minimal` CLI (materialize) build. The
+        # well-known protos (google/protobuf/*.proto) live in libprotobuf-dev,
+        # which protobuf-compiler only pulls via recommends — so name it
+        # explicitly since we use --no-install-recommends. The rest: libkrunfw's
         # kernel compile (flex/bison/bc/libelf/libssl/pyelftools/cpio) and
         # libkrun's bindgen + link (clang/libclang/pkg-config/patchelf).
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            protobuf-compiler \
+            protobuf-compiler libprotobuf-dev \
             build-essential flex bison bc libelf-dev libssl-dev \
             python3 python3-pyelftools cpio \
             clang libclang-dev pkg-config patchelf git
