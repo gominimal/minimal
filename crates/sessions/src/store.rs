@@ -1,6 +1,9 @@
 //! Manages session state on disk.
 
-use std::{collections::BTreeMap, io::ErrorKind::AlreadyExists};
+use std::{
+    collections::BTreeMap,
+    io::ErrorKind::{AlreadyExists, NotFound},
+};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -82,6 +85,15 @@ pub trait Loader {
     /// cannot be written.
     /// `AlreadyExists` is returned if a session with that name already exists.
     fn rename(&mut self, key: &Self::Key, new_name: String) -> Result<(), std::io::Error>;
+
+    /// Deletes the session with the given key, dropping its index entries and
+    /// removing its on-disk directory tree (record, workspace, home, cache).
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the record cannot be read or the index cannot be
+    /// flushed. A missing directory tree is not an error.
+    fn delete(&mut self, key: &Self::Key) -> Result<(), std::io::Error>;
 }
 
 /// The concrete key used to identify sessions from [`DiskLoader`].
@@ -152,6 +164,14 @@ impl Index {
         }
     }
 
+    /// Removes a session's entries from both the short and name indexes.
+    pub fn remove(&mut self, short: &str, name: Option<&str>) {
+        self.short_to_id.remove(short);
+        if let Some(name) = name {
+            self.name_to_id.remove(name);
+        }
+    }
+
     /// Iterates over all (shortname, session id) pairs.
     pub fn iter(&self) -> impl Iterator<Item = (&String, &SessionId)> {
         self.short_to_id.iter()
@@ -173,6 +193,14 @@ impl Index {
             .iter()
             .find(|(_short, iter_id)| *iter_id == id)
             .map(|(short, _)| short)
+    }
+
+    /// Returns the name corresponding to the given session ID, if it has one.
+    pub fn name_by_id(&self, id: &SessionId) -> Option<&String> {
+        self.name_to_id
+            .iter()
+            .find(|(_name, iter_id)| *iter_id == id)
+            .map(|(name, _)| name)
     }
 }
 
@@ -361,6 +389,34 @@ impl Loader for DiskLoader {
         self.flush_index()?;
 
         Ok(())
+    }
+
+    fn delete(&mut self, key: &Self::Key) -> Result<(), std::io::Error> {
+        let short = key.dir_key.to_string();
+        // Discover the name index entry from the index itself, not by reading
+        // the record: index cleanup must not depend on the on-disk tree still
+        // existing, or a half-deleted session (dir gone, index entries left)
+        // could never be scrubbed.
+        let name = self.index.name_by_id(key.id()).cloned();
+
+        // Drop the index entries and flush before touching the filesystem: the
+        // index is the source of truth for `keys()`, so removing it first means
+        // a crash mid-delete can only ever orphan a directory (invisible and
+        // harmless), never leave a key pointing at a removed tree.
+        self.index.remove(&short, name.as_deref());
+        self.flush_index()?;
+
+        let session_dir = self
+            .minimal_dir
+            .as_utf8_path()
+            .join("sessions")
+            .join(&short);
+        match std::fs::remove_dir_all(&session_dir) {
+            Ok(()) => Ok(()),
+            // A missing tree is fine — the session is gone either way.
+            Err(e) if e.kind() == NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -567,6 +623,77 @@ mod tests {
         );
         // The failed rename left the original name intact.
         assert_eq!(loader.find_by_name("my-session").unwrap(), Some(first));
+    }
+
+    #[test]
+    fn delete_removes_record_and_index_entries() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        let dir = tmp.path().join("sessions").join(&key.dir_key);
+        assert!(dir.exists(), "session dir should exist before delete");
+
+        loader.delete(&key).unwrap();
+
+        // The on-disk tree is gone, and neither lookup resolves any more.
+        assert!(!dir.exists(), "session dir should be removed after delete");
+        assert_eq!(loader.find_by_id(key.id()).unwrap(), None);
+        assert_eq!(loader.find_by_name("my-session").unwrap(), None);
+        assert!(
+            loader.keys().next().is_none(),
+            "keys() should be empty after the only session is deleted"
+        );
+    }
+
+    #[test]
+    fn delete_scrubs_index_when_directory_is_already_missing() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+
+        // Simulate a half-deleted session: the directory tree is gone but the
+        // index entries remain. delete() must still succeed (a missing tree is
+        // not an error) and scrub the stale index entries.
+        let dir = tmp.path().join("sessions").join(&key.dir_key);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        loader.delete(&key).unwrap();
+
+        assert_eq!(loader.find_by_id(key.id()).unwrap(), None);
+        assert_eq!(loader.find_by_name("my-session").unwrap(), None);
+        assert!(
+            loader.keys().next().is_none(),
+            "stale index entries should be removed even with the dir missing"
+        );
+    }
+
+    #[test]
+    fn delete_frees_the_name_for_reuse() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        loader.delete(&key).unwrap();
+
+        // The name index entry was dropped, so the same name can be taken again.
+        loader.create(sample_record()).unwrap();
+    }
+
+    #[test]
+    fn delete_persists_across_loader_reinit() {
+        let tmp = TempDir::new().unwrap();
+
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        loader.delete(&key).unwrap();
+        drop(loader);
+
+        // The index flush survived the reload: the session stays gone.
+        let reloaded = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        assert_eq!(reloaded.find_by_id(key.id()).unwrap(), None);
+        assert!(reloaded.keys().next().is_none());
     }
 
     #[test]

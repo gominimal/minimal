@@ -54,6 +54,7 @@ enum ManagerMessage {
     GetSession(SessionKeyPredicate, Responder<Option<SessionHandle>>),
     CreateSession(sessions::Record, Responder<SessionId>),
     RenameSession(SessionId, String, Responder<()>),
+    DestroySession(SessionId, Responder<()>),
 }
 
 /// Manages session instances, and session state on disk.
@@ -205,6 +206,27 @@ impl<L: Loader> Manager<L> {
                 })
                 .await
             }
+            // Destroys a session: tears down its running host and actor (if
+            // any), then removes its on-disk record.
+            ManagerMessage::DestroySession(id, r) => {
+                r.handle(async {
+                    let k = self.store.find_by_id(&id)?.ok_or_else(|| {
+                        std::io::Error::new(
+                            NotFound,
+                            format!("no session with ID `{}`", id.as_ref()),
+                        )
+                    })?;
+                    // Stop the live session first (killing its host and waiting
+                    // for the sandbox to be released) so the on-disk tree is
+                    // free to remove.
+                    if let Some(hnd) = self.running.remove(&k) {
+                        hnd.destroy().await;
+                    }
+                    self.store.delete(&k)?;
+                    Ok(())
+                })
+                .await
+            }
         }
     }
 }
@@ -271,5 +293,114 @@ impl ManagerHandle {
             .send(ManagerMessage::RenameSession(id, new_name, send))
             .await;
         recv.await.expect("corresponding sessions manager is dead")
+    }
+
+    /// Destroys the session with the given ID, cascadingly tearing down its
+    /// running host and actor (if any) before removing its on-disk record.
+    ///
+    /// Returns a `NotFound` error if no session with that ID is known.
+    pub async fn destroy_session(&self, id: SessionId) -> Result<(), SessionsError> {
+        let (send, recv) = Responder::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self.0.send(ManagerMessage::DestroySession(id, send)).await;
+        recv.await.expect("corresponding sessions manager is dead")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paths::HostAbsPath;
+    use std::io::ErrorKind;
+    use tempfile::TempDir;
+
+    fn daemon_dir(tmp: &TempDir) -> DaemonAbsPath {
+        DaemonAbsPath::try_new(tmp.path().to_str().unwrap()).unwrap()
+    }
+
+    fn sample_record() -> sessions::Record {
+        sessions::Record {
+            id: SessionId::nil(),
+            name: Some("doomed".to_string()),
+            username: None,
+            project_path: HostAbsPath::try_new("/proj").unwrap(),
+            attrs: Default::default(),
+        }
+    }
+
+    async fn manager() -> (TempDir, TempDir, ManagerHandle) {
+        let state = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        let mngr = Manager::init(daemon_dir(&state), daemon_dir(&cache))
+            .await
+            .unwrap();
+        (state, cache, mngr)
+    }
+
+    /// Destroying a known-but-not-running session removes its record so it no
+    /// longer resolves or lists, and frees its name for reuse.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn destroy_removes_a_non_running_session() {
+        let (_state, _cache, mngr) = manager().await;
+        let id = mngr.create_session(sample_record()).await.unwrap();
+
+        mngr.destroy_session(id).await.unwrap();
+
+        assert!(
+            mngr.get_record(SessionKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .is_none(),
+            "the record should be gone after destroy"
+        );
+        assert!(mngr.list().await.unwrap().is_empty());
+        // The name index entry was dropped, so the name can be taken again.
+        mngr.create_session(sample_record()).await.unwrap();
+    }
+
+    /// Destroying a session that has been brought up (its actor is running, but
+    /// no host is attached) tears the actor down and removes the record.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn destroy_tears_down_a_running_session() {
+        let (_state, _cache, mngr) = manager().await;
+        let id = mngr.create_session(sample_record()).await.unwrap();
+
+        // Bring the session actor up (populating the running map) without
+        // attaching a host.
+        let handle = mngr
+            .get_session(SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("session should resolve");
+
+        mngr.destroy_session(id).await.unwrap();
+
+        // The destroy cascade completed: the record is gone, and a fresh
+        // get_session no longer resolves the (now removed) session.
+        assert!(
+            mngr.get_record(SessionKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            mngr.get_session(SessionKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .is_none(),
+            "the session should no longer resolve after destroy"
+        );
+        drop(handle);
+    }
+
+    /// Destroying an unknown ID is a `NotFound` error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn destroy_unknown_id_errors() {
+        let (_state, _cache, mngr) = manager().await;
+        let err = mngr
+            .destroy_session(SessionId::nil())
+            .await
+            .expect_err("destroying an unknown id should error");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 }

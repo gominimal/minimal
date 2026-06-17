@@ -721,6 +721,10 @@ impl SessionLauncher for MockLauncher {
 impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
     /// Spawns a session host from the given launcher, wiring it to `channel` if
     /// one is supplied, and drives its runtime loop on a background task.
+    ///
+    /// Returns the [`HostHandle`] alongside the [`JoinHandle`] of the runtime
+    /// loop, so the owner can await full teardown (process reaped, sandbox guard
+    /// dropped) after issuing a [`HostHandle::kill`].
     pub async fn spawn<L>(
         launcher: L,
         name: String,
@@ -728,13 +732,13 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
         paths: SessionPaths,
         sz: WinSize,
         channel: Option<Channel<Msg>>,
-    ) -> Result<HostHandle, std::io::Error>
+    ) -> Result<(HostHandle, JoinHandle<Result<i32, std::io::Error>>), std::io::Error>
     where
         L: SessionLauncher<Process = P, Guard = G>,
     {
         let (host, handle) = Self::build(launcher, name, username, paths, sz, channel).await?;
-        tokio::spawn(host.mainloop());
-        Ok(handle)
+        let task = tokio::spawn(host.mainloop());
+        Ok((handle, task))
     }
 
     /// Builds the host and its handle from a launcher without spawning the
@@ -809,13 +813,42 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
         }
     }
 
+    /// Notifies the attached binding (if any) that the pty master has errored,
+    /// so it can tear the ssh channel down.
+    ///
+    /// Used on any pty read/write failure — in practice the process dying closes
+    /// every slave fd, so the master reports `EIO`; this is the signal to unwind
+    /// the host. The binding suppresses the (expected) `EIO` text on its end.
+    ///
+    /// The notice is sent best-effort with `try_send`, never awaited: the
+    /// binding drains this queue in the same `select!` as its (potentially
+    /// blocking) write to the ssh remote, so awaiting a full queue could wedge
+    /// teardown behind a stuck remote. If the queue is full the notice is
+    /// dropped — the host returns regardless, and dropping its sender closes the
+    /// binding on its next turn.
+    async fn notify_remote_pty_err(&mut self, e: std::io::Error) {
+        tracing::warn!(error = %e, "pty master error; tearing down host");
+        if let Some((tx, _hnd)) = self.remote.as_mut() {
+            let _ = tx.try_send(BindingMsg::TeardownDueToStdoutErr(e));
+        }
+    }
+
     pub async fn step(&mut self) -> Result<(), ()> {
         tokio::select! {
             // Read actor messages.
             Some(msg) = self.receiver.recv() => {
                 match msg {
                     Message::Kill => {
-                        tracing::info!("kill res: {:?}", self.process.kill());
+                        if let Err(e) = self.process.kill() {
+                            tracing::warn!(error = %e, "killing session process");
+                        }
+                        // Drive teardown directly rather than waiting for the
+                        // pty to report the death: a hangup on the master does
+                        // not reliably wake `readable()`, so a killed process
+                        // that produced no draining output would otherwise leave
+                        // the loop parked forever. Returning `Err` makes
+                        // `mainloop` reap via `wait()` and return.
+                        return Err(());
                     }
                     Message::Attach(channel, sz) => {
                         self.attach(channel, sz, false).await;
@@ -840,7 +873,16 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             },
             // Read from master - stdout of session process => ssh channel (if any)
             r = self.master.readable() => {
-                match r.expect("todo read handle error").try_io(|fd| fd.get_ref().read(&mut self.stdout_buf)) {
+                let mut guard = match r {
+                    Ok(g) => g,
+                    Err(e) => {
+                        // The io reactor failed to report readiness; the master
+                        // is unusable, so unwind rather than panic.
+                        self.notify_remote_pty_err(e).await;
+                        return Err(());
+                    }
+                };
+                match guard.try_io(|fd| fd.get_ref().read(&mut self.stdout_buf)) {
                     Ok(Ok(0)) => {},
                     Ok(Ok(n)) => {
                         let b = &self.stdout_buf[..n];
@@ -857,10 +899,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
                         }
                     }
                     Ok(Err(e)) => {
-                        tracing::warn!(error = %e, "Reading pty master");
-                        if let Some((tx, _hnd)) = self.remote.as_mut() {
-                            let _ = tx.send(BindingMsg::TeardownDueToStdoutErr(e)).await;
-                        }
+                        self.notify_remote_pty_err(e).await;
                         return Err(());
                     },
                     Err(_would_block) => {},
@@ -903,8 +942,18 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             },
             // Write buffered keystrokes into the pty, if any,
             w = self.master.writable(), if self.stdin_buf.is_some() => {
+                let mut guard = match w {
+                    Ok(g) => g,
+                    Err(e) => {
+                        // The io reactor failed to report writability; the master
+                        // is unusable, so unwind rather than panic.
+                        self.notify_remote_pty_err(e).await;
+                        return Err(());
+                    }
+                };
                 let (buff, n) = self.stdin_buf.as_mut().unwrap();
-                match w.expect("todo write handle error").try_io(|fd|fd.get_ref().write(&buff[*n..])) {
+                let res = guard.try_io(|fd| fd.get_ref().write(&buff[*n..]));
+                match res {
                     Ok(Ok(extra)) => {
                         if (*n+extra) == buff.len() {
                             self.stdin_buf = None;
@@ -912,8 +961,13 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
                             *n += extra;
                         }
                     }
+                    // A write failure means the slave side is gone (the process
+                    // died, e.g. on kill): EIO closes every slave fd. Tear the
+                    // host down so it gets reaped, instead of panicking and
+                    // leaking the process as a zombie.
                     Ok(Err(e)) => {
-                        todo!("handle error writing to stdin: {e}");
+                        self.notify_remote_pty_err(e).await;
+                        return Err(());
                     }
                     Err(_would_block) => {},
                 }
@@ -1154,6 +1208,41 @@ mod tests {
         assert!(
             attrs.stdout_last.is_some(),
             "stdout_last should be stamped after the echo arrived",
+        );
+    }
+
+    /// Killing a host tears it down cleanly: the runtime loop observes the
+    /// process die (its slave fds close, so the master reports `EIO`), reaps it,
+    /// and returns — the task terminates without panicking or leaking a zombie.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kill_tears_down_host_and_reaps_process() {
+        let (host, handle) = Host::build(
+            MockLauncher,
+            "test-session".to_string(),
+            "user".to_string(),
+            SessionPaths {
+                working: DaemonAbsPath::root(),
+                cache: DaemonAbsPath::root(),
+                home: DaemonAbsPath::root(),
+            },
+            DEFAULT_SIZE,
+            None,
+        )
+        .await
+        .expect("failed to build host");
+        let task = tokio::spawn(host.mainloop());
+
+        handle.kill().await.expect("kill should reach the host");
+
+        // The mainloop must terminate (task resolves) without panicking. A
+        // `JoinError` here would mean the host task panicked during teardown.
+        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("host mainloop should terminate after kill")
+            .expect("host task should not panic during teardown");
+        assert!(
+            outcome.is_ok(),
+            "mainloop should return the reaped exit status, got: {outcome:?}",
         );
     }
 }
