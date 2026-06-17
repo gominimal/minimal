@@ -5,7 +5,7 @@ use crate::{
 use mctx::ConfigBuilder;
 use paths::DaemonAbsPath;
 use russh::{Channel, server::Msg};
-use sessions::store::SessionObject;
+use sessions::{Record, store::SessionObject};
 use std::fmt::{self};
 use tokio::sync::{mpsc, oneshot};
 
@@ -41,6 +41,9 @@ enum SessionMessage {
         ChannelConfig,
     ),
     GetHostAttrs(oneshot::Sender<Option<HostAttrs>>),
+    RefreshRecord(Record),
+    #[cfg(test)]
+    GetRecord(oneshot::Sender<Record>),
 }
 
 /// Manages a running session.
@@ -86,6 +89,7 @@ impl<S: SessionObject> Session<S> {
             self.handle_message(msg).await;
         }
     }
+
     /// Handles a specific message recieved by the session.
     async fn handle_message(&mut self, msg: SessionMessage) {
         match msg {
@@ -104,6 +108,13 @@ impl<S: SessionObject> Session<S> {
                     None => None,
                     Some(h) => h.get_attrs().await.ok(),
                 });
+            }
+            SessionMessage::RefreshRecord(r) => {
+                self.session.refresh_from_record(r);
+            }
+            #[cfg(test)]
+            SessionMessage::GetRecord(r) => {
+                let _ = r.send(self.session.record().clone());
             }
         }
     }
@@ -211,6 +222,26 @@ impl SessionHandle {
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(SessionMessage::MakeContext(send)).await;
         recv.await.expect("corresponding session is dead")
+    }
+
+    /// Returns the session record currently held by the live session actor.
+    ///
+    /// This reads the actor's in-memory copy, not the on-disk record, so
+    /// tests can assert that updates have propagated into the running session.
+    #[cfg(test)]
+    pub(crate) async fn record(&self) -> Record {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self.0.send(SessionMessage::GetRecord(send)).await;
+        recv.await.expect("corresponding session is dead")
+    }
+
+    /// Tell the session that the underlying session record was updated.
+    pub(crate) async fn apply_record(&self, new_record: Record) {
+        self.0
+            .send(SessionMessage::RefreshRecord(new_record))
+            .await
+            .expect("corresponding session is dead");
     }
 
     pub async fn attach(

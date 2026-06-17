@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, io::ErrorKind::NotFound};
 
 use crate::{
     session::{Session, SessionHandle},
@@ -53,6 +53,7 @@ enum ManagerMessage {
     GetRecord(SessionKeyPredicate, Responder<Option<sessions::Record>>),
     GetSession(SessionKeyPredicate, Responder<Option<SessionHandle>>),
     CreateSession(sessions::Record, Responder<SessionId>),
+    RenameSession(SessionId, String, Responder<()>),
 }
 
 /// Manages session instances, and session state on disk.
@@ -185,6 +186,25 @@ impl<L: Loader> Manager<L> {
                 })
                 .await;
             }
+            // Renames an existing session with the given ID.
+            ManagerMessage::RenameSession(id, new_name, r) => {
+                r.handle(async {
+                    match self.store.find_by_id(&id)? {
+                        None => Err(std::io::Error::new(
+                            NotFound,
+                            format!("no session with ID `{}`", id.as_ref()),
+                        )),
+                        Some(k) => {
+                            self.store.rename(&k, new_name.clone())?;
+                            if let Some(hnd) = self.running.get(&k) {
+                                hnd.apply_record(self.store.get(&k)?.record().clone()).await;
+                            }
+                            Ok(())
+                        }
+                    }
+                })
+                .await
+            }
         }
     }
 }
@@ -235,6 +255,21 @@ impl ManagerHandle {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(ManagerMessage::GetSession(pred, send)).await;
+        recv.await.expect("corresponding sessions manager is dead")
+    }
+
+    /// Renames the given session to the given name.
+    pub async fn rename_session(
+        &self,
+        id: SessionId,
+        new_name: String,
+    ) -> Result<(), SessionsError> {
+        let (send, recv) = Responder::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .0
+            .send(ManagerMessage::RenameSession(id, new_name, send))
+            .await;
         recv.await.expect("corresponding sessions manager is dead")
     }
 }
