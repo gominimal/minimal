@@ -32,9 +32,18 @@ LIBKRUN_TAG="v1.19.0"
 mkdir -p "$PREFIX"
 PREFIX="$(cd "$PREFIX" && pwd)" # absolutise
 
+# Gate the skip on a version stamp, not mere file presence: a restored prefix
+# (or a local reuse) built from different pins must be rebuilt, not silently
+# accepted.
+STAMP_FILE="$PREFIX/lib64/.minvmd-libkrun-build-stamp"
+EXPECTED_STAMP="libkrunfw=${LIBKRUNFW_TAG};libkrun=${LIBKRUN_TAG}"
+
 if [ -e "$PREFIX/lib64/libkrun.so" ]; then
-  echo "build-libkrun: libkrun already present in $PREFIX/lib64 — skipping build"
-  exit 0
+  if [ -f "$STAMP_FILE" ] && [ "$(cat "$STAMP_FILE")" = "$EXPECTED_STAMP" ]; then
+    echo "build-libkrun: pinned libkrun ($EXPECTED_STAMP) already in $PREFIX/lib64 — skipping build"
+    exit 0
+  fi
+  echo "build-libkrun: existing libkrun found but version stamp missing/mismatched; rebuilding"
 fi
 
 JOBS="$(nproc)"
@@ -64,5 +73,6 @@ export PKG_CONFIG_PATH="$PREFIX/lib64/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_P
 ( cd "$WORK/libkrun" && make BLK=1 -j"$JOBS" )
 ( cd "$WORK/libkrun" && make BLK=1 install PREFIX="$PREFIX" )
 
+printf '%s\n' "$EXPECTED_STAMP" > "$STAMP_FILE"
 echo "build-libkrun: installed libkrun $LIBKRUN_TAG + libkrunfw $LIBKRUNFW_TAG into $PREFIX/lib64"
 ls -l "$PREFIX/lib64"/libkrun.so* "$PREFIX/lib64"/libkrunfw.so*
