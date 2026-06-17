@@ -211,6 +211,25 @@ impl OneshotSshRpc for RenameSession {
     type Response = Errorable<RenameSessionResponse>;
 }
 
+/// An RPC to destroy an existing session.
+pub struct DestroySession;
+
+/// The request for a [`DestroySession`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DestroySessionRequest {
+    pub id: SessionId,
+}
+
+/// The response for a [`DestroySession`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DestroySessionResponse;
+
+impl OneshotSshRpc for DestroySession {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "DestroySession");
+    type Request<'a> = DestroySessionRequest;
+    type Response = Errorable<DestroySessionResponse>;
+}
+
 // ---------------------------------------------------------------------------
 // Session-creation flow (multi-round contribution composition).
 //
