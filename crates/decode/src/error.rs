@@ -489,4 +489,35 @@ mod tests {
             "expected an error diagnostic in: {out:?}"
         );
     }
+
+    /// Every variant test above passes `TermPos::None`, so they exercise only
+    /// the unlabeled branch of `report_to`. When a variant instead carries a
+    /// real source position, `report_to` must attach a primary label and render
+    /// the offending source span — the user-facing "point at the code" output.
+    ///
+    /// Loading a bare record with no type annotation surfaces `Error::MissingTy`
+    /// carrying the record's real span, so its report must include both the
+    /// diagnostic message and the offending source rendered under the label.
+    #[test]
+    fn report_renders_source_span_for_positioned_error() {
+        let err = crate::Layer::new_for_test("{ foo = 1 }".to_string())
+            .expect_err("a record without a type annotation should fail to decode");
+        let Error::MissingTy(_, pos) = &err else {
+            panic!("expected Error::MissingTy, got {err:?}");
+        };
+        assert!(
+            pos.into_opt().is_some(),
+            "expected a real source position so the primary-label branch runs, got {pos:?}"
+        );
+
+        let out = capture(&err);
+        assert!(
+            out.contains("record was not given a type"),
+            "expected the diagnostic message in: {out:?}"
+        );
+        assert!(
+            out.contains("foo"),
+            "expected the offending source rendered under the label in: {out:?}"
+        );
+    }
 }
