@@ -121,21 +121,6 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
     }
     std::env::set_current_dir("/")?;
 
-    // pid-1 inherits no PATH from the kernel. Set the conventional guest PATH so
-    // minimald's own tool lookups against the rootfs userland resolve — notably
-    // `git`, which the session-context init shells out to for the upstream
-    // checkout (`checkouts::command_exists`); without it, interactive attach
-    // fails with "git command was not found in path".
-    // SAFETY: runs once on the guest boot path (pid-1, just after chroot) before
-    // the SSH server accepts connections or spawns any session task, so no other
-    // thread is reading the environment concurrently.
-    unsafe {
-        std::env::set_var(
-            "PATH",
-            "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin",
-        );
-    }
-
     tracing::info!(device, "switched to upstream rootfs (pivot_root)");
     Ok(())
 }
