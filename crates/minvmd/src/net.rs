@@ -109,22 +109,22 @@ mod tests {
 
     use super::*;
 
-    // Serialise all tests that mutate MINVMD_NETMODE / MINVMD_GVPROXY_PATH so
-    // they don't race when `cargo test` runs them in parallel. Mutating
-    // process-global env vars is `unsafe` on the 2024 edition.
-    static NETMODE_LOCK: Mutex<()> = Mutex::new(());
-    static GVPROXY_PATH_LOCK: Mutex<()> = Mutex::new(());
+    // Serialise every test that mutates the environment behind a single lock.
+    // `set_var`/`remove_var` mutate process-global state (and are `unsafe` on
+    // the 2024 edition), so distinct per-variable locks would still let two
+    // tests touch the environment concurrently. One lock covers all of them.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn resolve_net_mode_unset_defaults_to_gvproxy() {
-        let _g = NETMODE_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap();
         unsafe { std::env::remove_var("MINVMD_NETMODE") };
         assert_eq!(resolve_net_mode(), NetworkMode::GvProxy);
     }
 
     #[test]
     fn resolve_net_mode_gvproxy() {
-        let _g = NETMODE_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("MINVMD_NETMODE", "gvproxy") };
         assert_eq!(resolve_net_mode(), NetworkMode::GvProxy);
         unsafe { std::env::remove_var("MINVMD_NETMODE") };
@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn resolve_net_mode_tsi() {
-        let _g = NETMODE_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("MINVMD_NETMODE", "tsi") };
         assert_eq!(resolve_net_mode(), NetworkMode::Tsi);
         unsafe { std::env::remove_var("MINVMD_NETMODE") };
@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn resolve_net_mode_invalid_falls_back_to_gvproxy() {
-        let _g = NETMODE_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("MINVMD_NETMODE", "invalid") };
         assert_eq!(resolve_net_mode(), NetworkMode::GvProxy);
         unsafe { std::env::remove_var("MINVMD_NETMODE") };
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn gvproxy_bin_from_env() {
-        let _g = GVPROXY_PATH_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("MINVMD_GVPROXY_PATH", "/custom/path/to/gvproxy") };
         assert_eq!(gvproxy_bin(), PathBuf::from("/custom/path/to/gvproxy"));
         unsafe { std::env::remove_var("MINVMD_GVPROXY_PATH") };
@@ -156,14 +156,14 @@ mod tests {
 
     #[test]
     fn gvproxy_bin_unset_defaults_to_gvproxy() {
-        let _g = GVPROXY_PATH_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap();
         unsafe { std::env::remove_var("MINVMD_GVPROXY_PATH") };
         assert_eq!(gvproxy_bin(), PathBuf::from("gvproxy"));
     }
 
     #[test]
     fn spawn_gvproxy_returns_error_when_binary_not_found() {
-        let _g = GVPROXY_PATH_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap();
         // Use a binary path that definitely does not exist.
         unsafe { std::env::set_var("MINVMD_GVPROXY_PATH", "/nonexistent/gvproxy") };
         let result = spawn_gvproxy(3);
