@@ -35,9 +35,13 @@ eliminated.
 This spec adds gvproxy as the default outbound network transport for
 `minvmd`-managed VMs, with TSI remaining selectable as a fallback. It applies
 to both the macOS (Hypervisor.framework) and Linux (KVM) VM paths, since
-`krun_set_passt_fd` is platform-agnostic. It also wires the network allowlist
-enforcement hook — the call site and stub function that will carry the
-taskspec `network` declaration into policy enforcement in a follow-up.
+`krun_set_passt_fd` is platform-agnostic. The transport-agnostic gvproxy
+spawn/lookup helpers are factored into a standalone `gvproxy` crate so the
+Linux per-sandbox path (`sandbox2`) can reuse the same spawn code with a
+different FD source (see "Shared gvproxy crate and per-path FD sources"). It
+also wires the network allowlist enforcement hook — the call site and stub
+function that will carry the taskspec `network` declaration into policy
+enforcement in a follow-up.
 
 DNS and port-forwarding are flagged as explicit sub-items and are deferred
 (see Non-Goals).
@@ -111,42 +115,57 @@ wired to this call site in a follow-up.
 
 **Purpose:** `minvmd`'s supervisor creates a Unix socketpair, spawns a gvproxy
 child with one end, exports the other end's FD to the VMM child, and reaps
-gvproxy on every exit path (clean stop, crash, boot failure). A new
-`crates/minvmd/src/net.rs` module owns the `NetworkMode` type and the gvproxy
-process management helpers.
+gvproxy on every exit path (clean stop, crash, boot failure). The
+transport-agnostic spawn/lookup helpers live in a shared `gvproxy` crate
+(`crates/gvproxy`); `crates/minvmd/src/net.rs` owns the `minvmd`-specific
+`NetworkMode` selection and a thin override-variable wrapper.
 
 **Depends on:** None
 
 **Affected areas:**
-- `crates/minvmd/src/net.rs` (new)
+- `crates/gvproxy/src/lib.rs` (new) — shared spawn/lookup helpers
+- `crates/minvmd/src/net.rs` (new) — `NetworkMode`, mode selection
 - `crates/minvmd/src/cmd/run.rs`
 - `crates/minvmd/src/state.rs`
 
 **Baseline:** No networking module or gvproxy-related code exists in
-`crates/minvmd/src/`. The `run_foreground` function in `cmd/run.rs` spawns
-only the VMM child. `State` carries `vmm_pid: Option<u32>` but no gvproxy pid.
-All Unit 1 requirements are **new work**.
+`crates/minvmd/src/`, and no `gvproxy` crate exists. The `run_foreground`
+function in `cmd/run.rs` spawns only the VMM child. `State` carries
+`vmm_pid: Option<u32>` but no gvproxy pid. All Unit 1 requirements are
+**new work**.
 
 **Functional Requirements:**
 
-- **R1.1**: `crates/minvmd/src/net.rs` shall define:
+- **R1.1**: The transport-agnostic gvproxy helpers live in a shared `gvproxy`
+  crate (`crates/gvproxy`, deps: `anyhow`, `tracing`), reusable by both the
+  macOS VM path and the Linux per-sandbox path. `crates/minvmd/src/net.rs`
+  owns the `minvmd`-specific mode selection:
   - `enum NetworkMode { GvProxy, Tsi }` — the two supported transport modes.
+    TSI is a libkrun feature with no analogue on other transports, so this type
+    stays in `minvmd`, not the shared crate.
   - `fn resolve_net_mode() -> NetworkMode` — reads `MINVMD_NETMODE` env var;
     returns `NetworkMode::GvProxy` when the var is unset or set to `"gvproxy"`,
     `NetworkMode::Tsi` when set to `"tsi"`. Any other value logs a warning and
     falls back to `NetworkMode::GvProxy`.
-  - `fn gvproxy_bin() -> std::path::PathBuf` — resolves the gvproxy binary:
-    `MINVMD_GVPROXY_PATH` env var if set, otherwise `"gvproxy"` (resolved via
-    `PATH` by the OS when spawned).
+  - `fn gvproxy_bin() -> std::path::PathBuf` — thin wrapper over
+    `gvproxy::gvproxy_bin("MINVMD_GVPROXY_PATH")`: the override variable name is
+    `minvmd`'s, the lookup logic is shared. Returns the override value if set,
+    otherwise `"gvproxy"` (resolved via `PATH` by the OS when spawned).
 
-- **R1.2**: `net.rs` shall define `fn spawn_gvproxy(net_fd: RawFd) -> Result<Child>` that:
-  - Spawns the binary from `gvproxy_bin()` with the argument `--fd <net_fd>`.
+- **R1.2**: The shared `gvproxy` crate shall define
+  `fn spawn_gvproxy(bin: impl AsRef<Path>, net_fd: RawFd) -> anyhow::Result<Child>`
+  that:
+  - Spawns `bin` with the argument `--fd <net_fd>`.
   - Sets `stdin`, `stdout`, and `stderr` to `Stdio::null()` on the gvproxy
     child (gvproxy logs over the FD, not stdio).
-  - The `net_fd` end of the socketpair must **not** have `FD_CLOEXEC` set before
-    this call so it survives the spawn (the caller is responsible for clearing it).
+  - Documents that `net_fd` must **not** have `FD_CLOEXEC` set before this call
+    so it survives the spawn (the caller is responsible for clearing it).
   - Returns the `std::process::Child` handle; the caller owns reaping.
   - Returns an `Err` with a clear message when the binary is not found.
+
+  The binary path is a parameter (not read inside the helper) so each caller
+  supplies its own override variable. `minvmd::net` re-exports `spawn_gvproxy`;
+  `cmd/run.rs` invokes it as `spawn_gvproxy(gvproxy_bin(), net_fd)`.
 
 - **R1.3**: `cmd/run.rs`'s `run_foreground` function (macOS + Linux, replacing
   the macOS-only bail) shall:
@@ -179,9 +198,10 @@ All Unit 1 requirements are **new work**.
 
 1. **Test:** `cargo test -p minvmd net::` passes — unit tests in `net.rs`
    verify `resolve_net_mode` returns `GvProxy` by default and `Tsi` when
-   `MINVMD_NETMODE=tsi` is set; tests use `serial_test` to isolate env-var
-   mutations. Demonstrates the mode-selection logic is correct before any
-   process is spawned.
+   `MINVMD_NETMODE=tsi` is set; tests serialise env-var mutation behind a
+   single process-global `Mutex` (env mutation is `unsafe`/process-global on
+   the 2024 edition). Demonstrates the mode-selection logic is correct before
+   any process is spawned.
 2. **CLI:** `MINVMD_NETMODE=tsi MINVMD_E2E=1 cargo test -p minvmd --test
    minimald_session_e2e -- --include-ignored` passes — the existing session
    e2e continues to work with TSI mode selected, proving the fallback path is
@@ -350,9 +370,11 @@ All Unit 3 requirements are **new work**.
 - **Actual network filtering / allowlist enforcement.** The hook body is a
   no-op; real enforcement is a follow-up dependent on the capability envelope
   issue.
-- **Linux namespace sandbox path sharing gvproxy code.** Whether the
-  `sandbox2`-backed namespace path shares the same gvproxy integration is an
-  open question (see below); out of scope here.
+- **Linux namespace sandbox path integration.** The shared `gvproxy` crate
+  makes the spawn helper reusable by `sandbox2`, but wiring the namespace path
+  to gvproxy (unsharing a net namespace, `Network::RustSlirp`, feeding
+  `rustslirp_tapfd` to `spawn_gvproxy`, per-sandbox lifecycle) is out of scope
+  here. See Open Question 4.
 - **DNS configuration.** The guest relies on gvproxy's built-in DNS resolver
   (resolves from the host's system resolver). Configurable per-VM DNS is a
   future sub-item.
@@ -382,6 +404,26 @@ inherits all FDs that do not have `FD_CLOEXEC`. The parent clears
 `FD_CLOEXEC` on the VMM-side FD before spawning the VMM child, and sets it
 on the gvproxy-side FD (already consumed by gvproxy) to prevent leaking it
 into the VMM child.
+
+### Shared gvproxy crate and per-path FD sources
+
+The spawn/lookup helpers are factored into a standalone `gvproxy` crate
+(`crates/gvproxy`, deps: `anyhow`, `tracing`) so both network paths reuse the
+same `gvproxy --fd <n>` invocation while sourcing the FD differently:
+
+- **macOS VM path** (`minvmd`, this spec): `<n>` is one end of the supervisor's
+  `socketpair`; the other end is handed to libkrun via `krun_set_passt_fd`. One
+  gvproxy per VM — every sandbox inside the VM shares the guest's single `eth0`.
+- **Linux per-sandbox path** (`sandbox2`, deferred): `<n>` is the tap FD from
+  hakoniwa's `Child::rustslirp_tapfd`, obtained after configuring the
+  `hakoniwa::Container` with `Network::RustSlirp`. One gvproxy per sandbox.
+
+`krun_set_passt_fd` cannot consume a hakoniwa tap FD, and hakoniwa is
+Linux-only, so the two integrations **compose** rather than replace each other:
+the VM path gets traffic into the guest; the per-sandbox path layers isolation
+on top. Only the binary lookup and spawn are shared — `NetworkMode`,
+`resolve_net_mode`, and the `MINVMD_NETMODE`/`MINVMD_GVPROXY_PATH` variable
+names stay in `minvmd`.
 
 ### TSI coexistence
 
@@ -416,8 +458,9 @@ where gvproxy does not self-exit promptly.
 - Safe wrappers in `ctx.rs` validate inputs in safe Rust before crossing the
   FFI boundary, per the same standard.
 - The `net.rs` module shall have `#[cfg(test)]` unit tests covering at minimum
-  `resolve_net_mode` and `check_network_policy` with `serial_test` isolation
-  for env-var mutations.
+  `resolve_net_mode` and `check_network_policy`, serialising env-var mutation
+  behind a single process-global `Mutex`. The shared `gvproxy` crate carries
+  its own unit tests for `gvproxy_bin` and `spawn_gvproxy`.
 - Commit messages follow Conventional Commits; the implementing PR uses
   `feat(minvmd-net):` as the scope prefix.
 
@@ -442,10 +485,15 @@ where gvproxy does not self-exit promptly.
    initramfs). This is an ADR-worthy decision; for this spec, enforcement
    granularity is VM-level and irrelevant (the hook is a no-op).
 
-4. **Linux namespace sandbox path.** Does `sandbox2` (the namespace-based
-   isolation path for Linux hosts without `/dev/kvm`) share the gvproxy
-   integration code, or does it use a separate mechanism? Deferred to a
-   follow-up. This spec touches only the libkrun VMM path.
+4. **Linux namespace sandbox path.** The transport-agnostic spawn/lookup
+   helpers now live in the shared `gvproxy` crate so `sandbox2` can reuse them
+   (see "Shared gvproxy crate and per-path FD sources"). What remains open is
+   the `sandbox2` side itself: unsharing a net namespace, configuring the
+   hakoniwa container with `Network::RustSlirp`, and feeding `rustslirp_tapfd`
+   to `spawn_gvproxy` — deferred to a follow-up. This spec still touches only
+   the libkrun VMM path. The follow-up must verify the pinned hakoniwa fork
+   (`souk4711/hakoniwa` rev `41ce36e`) exposes `Network::RustSlirp` and
+   `Child::rustslirp_tapfd`; if not, a fork bump is required.
 
 5. **libkrun version verification.** `krun_set_passt_fd` appeared in libkrun
    v1.18. The implementing PR should verify the function is present in the
