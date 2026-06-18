@@ -3355,7 +3355,6 @@ dependencies = [
  "mctx",
  "mfile",
  "minimald-rpc",
- "nix 0.31.3",
  "op",
  "ot",
  "path-absolutize",
