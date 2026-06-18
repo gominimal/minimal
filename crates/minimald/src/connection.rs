@@ -135,7 +135,7 @@ impl Connection {
         c: Arc<RuConfig>,
         serv: ServerStateHandle,
         is_local: bool,
-    ) -> (ConnectionHandle, RunningSession<ConnectionHandler>)
+    ) -> Result<(ConnectionHandle, RunningSession<ConnectionHandler>), ConnectionError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -146,12 +146,12 @@ impl Connection {
             serv,
         })));
 
-        (
-            h.clone(),
-            russh::server::run_stream(c, s, ConnectionHandler(h))
-                .await
-                .unwrap(),
-        )
+        // A handshake failure (e.g. a client that connects then drops) must not
+        // propagate as a panic: in the guest, minimald is pid-1, so a panic here
+        // kills init and takes down the whole VM. Surface the error so the accept
+        // loop can drop the connection and keep serving.
+        let session = russh::server::run_stream(c, s, ConnectionHandler(h.clone())).await?;
+        Ok((h, session))
     }
 
     pub(crate) fn pending_config_mut(&mut self, id: ChannelId) -> Option<&mut ChannelConfig> {
