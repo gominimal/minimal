@@ -1,7 +1,7 @@
 [upstream] # Source of software & tooling
 repo = "https://github.com/gominimal/pkgs"
 branch = "main"
-locked_commit = "560b0d09914758441770363ed60823dff6c921b4"
+locked_commit = "087287e4b6f448eaf3d0ca7198dad384a0778b6d"
 
 [stack]
 use = "rust"
@@ -54,6 +54,16 @@ path = "usr/share/virtio-linux/Image"
 type = "raw-file"
 packages = ["microvm-rootfs"]
 path = "usr/share/microvm-rootfs/rootfs.img"
+
+# libkrun KVM backend (shared lib + its libkrunfw firmware) from the upstream
+# libkrun package. Materialized as an OCI image whose layers carry the full
+# runtime closure; scripts/fetch-libkrun.sh extracts just libkrun.so* and
+# libkrunfw.so* into a link/runtime prefix. This replaces the from-source
+# scripts/build-libkrun.sh — libkrunfw compiles a guest kernel, far too heavy to
+# rebuild in CI on every run.
+[outputs.libkrun]
+type = "oci-image"
+packages = ["libkrun"]
 
 [tasks.vim]
 profile = "demo"
