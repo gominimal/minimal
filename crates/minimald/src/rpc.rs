@@ -1,8 +1,8 @@
 use minimald_rpc::{
-    CreateSession, CreateSessionResponse, Errorable, GetSessionRecord, GetSessionRecordRequest,
-    GetSessionRecordResponse, GetVersion, GetVersionResponse, ListSessions, ListSessionsEntry,
-    ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
-    RenameSessionResponse,
+    CreateSession, CreateSessionResponse, DestroySession, DestroySessionResponse, Errorable,
+    GetSessionRecord, GetSessionRecordRequest, GetSessionRecordResponse, GetVersion,
+    GetVersionResponse, ListSessions, ListSessionsEntry, ListSessionsResponse, OneshotSshRpc,
+    RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -173,6 +173,23 @@ async fn serve_rename_session(s: ServerStateHandle, c: RuChannel<Msg>) {
     }
 }
 
+async fn serve_destroy_session(s: ServerStateHandle, c: RuChannel<Msg>) {
+    let res = DestroySession
+        .handle_channel(c, async |req| {
+            let res = s.sessions_manager().await.destroy_session(req.id).await;
+            match res {
+                Ok(()) => Ok(Errorable::Ok(DestroySessionResponse)),
+                Err(e) => Ok(Errorable::Err {
+                    error: e.to_string(),
+                }),
+            }
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", DestroySession::NAME, e);
+    }
+}
+
 pub(crate) const STREAM_WORKSPACE_FILES: &str =
     constcat::concat!(RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst");
 
@@ -246,6 +263,7 @@ pub async fn handle_ssh_rpc(
         | GetSessionRecord::NAME
         | CreateSession::NAME
         | RenameSession::NAME
+        | DestroySession::NAME
         | STREAM_WORKSPACE_FILES => {
             let mut conn_lock = c.lock().await;
             let c_hnd = match conn_lock.take(id) {
@@ -276,6 +294,7 @@ pub async fn handle_ssh_rpc(
         GetSessionRecord::NAME => spawn(serve_get_session_record(s, channel)),
         CreateSession::NAME => spawn(serve_create_session(s, channel)),
         RenameSession::NAME => spawn(serve_rename_session(s, channel)),
+        DestroySession::NAME => spawn(serve_destroy_session(s, channel)),
         STREAM_WORKSPACE_FILES => spawn(serve_stream_workspace_files(s, config, channel)),
         _ => unreachable!(),
     };
@@ -285,7 +304,9 @@ pub async fn handle_ssh_rpc(
 
 #[cfg(test)]
 mod tests {
-    use minimald_rpc::{CreateSession, CreateSessionRequest, RenameSessionRequest};
+    use minimald_rpc::{
+        CreateSession, CreateSessionRequest, DestroySessionRequest, RenameSessionRequest,
+    };
     use paths::HostAbsPath;
     use sessions::SessionId;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -604,6 +625,49 @@ mod tests {
             .call::<RenameSession>(&RenameSessionRequest {
                 id: SessionId::nil(),
                 new_name: "renamed".to_string(),
+            })
+            .await;
+
+        assert!(
+            matches!(resp, Errorable::Err { error } if error.contains("no session with ID")),
+            "expected an unknown-id error",
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_session_removes_it_from_get_and_list() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let resp = client
+            .call::<DestroySession>(&DestroySessionRequest { id: session_id })
+            .await;
+        assert_eq!(resp, Errorable::Ok(DestroySessionResponse));
+
+        // The record is gone: it no longer resolves by id...
+        let get_session = client
+            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(session_id))
+            .await;
+        assert!(get_session.record.is_none());
+
+        // ...and it's dropped from the listing.
+        let list_sessions = client.call::<ListSessions>(&()).await;
+        assert!(
+            list_sessions.sessions.is_empty(),
+            "destroyed session should not be listed, got {:?}",
+            list_sessions.sessions,
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_session_errors_for_unknown_id() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let resp = client
+            .call::<DestroySession>(&DestroySessionRequest {
+                id: SessionId::nil(),
             })
             .await;
 

@@ -7,7 +7,9 @@ use paths::DaemonAbsPath;
 use russh::{Channel, server::Msg};
 use sessions::{Record, store::SessionObject};
 use std::fmt::{self};
+use std::ops::ControlFlow;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 /// An error that occurred when attaching to a running session/its-shell.
 #[derive(Debug)]
@@ -49,6 +51,7 @@ enum SessionMessage {
     ),
     GetHostAttrs(oneshot::Sender<Option<HostAttrs>>),
     RefreshRecord(Record),
+    Destroy(oneshot::Sender<()>),
     #[cfg(test)]
     GetRecord(oneshot::Sender<Record>),
 }
@@ -63,7 +66,12 @@ pub struct Session<S: SessionObject> {
     minimal_cache_dir: DaemonAbsPath,
     session: S,
 
-    host: Option<session_host::HostHandle>,
+    /// The running host, if minted, paired with the `JoinHandle` of its runtime
+    /// loop so teardown can be awaited on destroy.
+    host: Option<(
+        session_host::HostHandle,
+        JoinHandle<Result<i32, std::io::Error>>,
+    )>,
 }
 
 impl<S: SessionObject> Session<S> {
@@ -94,12 +102,17 @@ impl<S: SessionObject> Session<S> {
     /// session.
     async fn mainloop(mut self) {
         while let Some(msg) = self.receiver.recv().await {
-            self.handle_message(msg).await;
+            if self.handle_message(msg).await.is_break() {
+                break;
+            }
         }
     }
 
     /// Handles a specific message recieved by the session.
-    async fn handle_message(&mut self, msg: SessionMessage) {
+    ///
+    /// Returns [`ControlFlow::Break`] when the session has been destroyed and
+    /// the actor loop should exit.
+    async fn handle_message(&mut self, msg: SessionMessage) -> ControlFlow<()> {
         match msg {
             SessionMessage::GetPaths(r) => {
                 let _ = r.send(self.paths());
@@ -116,16 +129,34 @@ impl<S: SessionObject> Session<S> {
             SessionMessage::GetHostAttrs(r) => {
                 let _ = r.send(match self.host.as_ref() {
                     None => None,
-                    Some(h) => h.get_attrs().await.ok(),
+                    Some((h, _)) => h.get_attrs().await.ok(),
                 });
             }
             SessionMessage::RefreshRecord(r) => {
                 self.session.refresh_from_record(r);
             }
+            SessionMessage::Destroy(r) => {
+                self.destroy().await;
+                let _ = r.send(());
+                return ControlFlow::Break(());
+            }
             #[cfg(test)]
             SessionMessage::GetRecord(r) => {
                 let _ = r.send(self.session.record().clone());
             }
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Tears down the running host, if any, waiting for the process to be reaped
+    /// and the sandbox guard to be dropped before returning.
+    async fn destroy(&mut self) {
+        if let Some((host, task)) = self.host.take() {
+            // Signal the process to die, then await the runtime loop so the
+            // sandbox files backing its rootfs are released before the caller
+            // removes the session's directory tree.
+            let _ = host.kill().await;
+            let _ = task.await;
         }
     }
 
@@ -146,7 +177,7 @@ impl<S: SessionObject> Session<S> {
                 self.mint_session_host(session_hnd, conn_username, channel, sz)
                     .await
             }
-            Some(h) => {
+            Some((h, _)) => {
                 match h.attach(channel, sz).await {
                     Ok(()) => Ok(()),
                     Err((channel, sz)) => {
@@ -284,6 +315,16 @@ impl SessionHandle {
             .send(SessionMessage::RefreshRecord(new_record))
             .await
             .expect("corresponding session is dead");
+    }
+
+    /// Tears down the session: kills its host (if any), waits for teardown, and
+    /// stops the actor. The handle is dead once this returns.
+    pub(crate) async fn destroy(&self) {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self.0.send(SessionMessage::Destroy(send)).await;
+        // If the actor died before acking, the session is gone all the same.
+        let _ = recv.await;
     }
 
     pub async fn attach(
