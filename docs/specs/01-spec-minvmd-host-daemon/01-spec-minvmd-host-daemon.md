@@ -286,10 +286,11 @@ auto-spawns it; subsequent calls reuse; `minvmd status` introspects;
   SIGKILL on timeout, then remove `vmm.pid` and reset `state.toml` to
   `Stopped`. The command shall be idempotent.
   (translated from plan: step R4.4)
-- **R4.5**: On macOS, `crates/minimal2` shall check `state.toml` before
-  connecting to the UDS; if no `minvmd` is running it shall spawn
-  `minvmd run --detach` and wait (with timeout) for the UDS. On Linux
-  this path shall be a no-op. (translated from plan: step R4.5)
+- **R4.5**: On macOS and Linux, `crates/minimal2` shall check `state.toml`
+  before connecting to the UDS; if no `minvmd` is running it shall spawn
+  `minvmd run --detach` and wait (with timeout) for the UDS. On targets
+  with no minvmd backend this path shall be a no-op. (translated from
+  plan: step R4.5; Linux enabled once minvmd gained a KVM backend.)
 - **R4.6**: State transitions shall be guarded by an `fd-lock`-style
   file lock on `lifecycle.lock` so concurrent CLI invocations cannot
   race. Recovery from a panicking transition shall be handled by an RAII
