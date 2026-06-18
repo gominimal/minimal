@@ -1,9 +1,10 @@
 # minvmd
 
-macOS-only host daemon that boots a Linux microVM via libkrun and registers a
-host UNIX socket ↔ in-VM `minimald` vsock bridge, so the `minimal` CLI can reach
-a Linux session daemon on macOS without knowing a VM exists. Spec:
-`docs/specs/01-spec-minvmd-host-daemon/`.
+Host daemon (macOS/HVF or Linux/KVM) that boots a Linux microVM via libkrun and
+registers a host UNIX socket ↔ in-VM `minimald` vsock bridge, so the `minimal`
+CLI can reach a Linux session daemon without knowing a VM exists. Specs:
+`docs/specs/01-spec-minvmd-host-daemon/` (daemon) and
+`docs/specs/02-spec-minvmd-linux-kvm/` (Linux/KVM).
 
 minimald runs the guest as **pid-1, shipped as the initramfs `/init`** (a cpio of
 the cross-compiled static binary) rather than baked into the rootfs. The guest
@@ -53,10 +54,114 @@ export MINVMD_INITRAMFS="$PWD/.scratch/initramfs.cpio"
 target/debug/minvmd boot --foreground   # vm-up = minimald READY from the initramfs
 ```
 
-## E2E tests (boot READY + full session)
+## Run the boot verification locally (Linux / KVM)
 
-`MINVMD_E2E=1`-gated, `#[ignore]` by default. Run the prebuilt test binaries
-directly — `cargo test` after signing relinks and unsigns `minvmd`.
+On a Linux host with `/dev/kvm`, minvmd links libkrun's KVM backend and boots
+natively — **no Docker, no codesigning**. Unlike macOS, `materialize` runs the
+build pipeline directly, so a native host (aarch64 *or* x86_64) materializes its
+own artifacts. This is the same flow as the `ci-linux-kvm.yml` lane.
+
+Prereqs:
+- A KVM-capable Linux host, and membership in the `kvm` group (durable — see the
+  note at the end).
+- A Rust toolchain plus `protoc`, `jq`, and `cpio`. For the no-Docker initramfs
+  build you also need `musl-gcc` and the `<arch>-unknown-linux-musl` target.
+
+`ARCH` drives every step — set it to the host arch:
+
+```sh
+ARCH=aarch64                       # or x86_64
+RUST_MUSL="${ARCH}-unknown-linux-musl"
+KRUN_PREFIX="$HOME/.krun"
+mkdir -p .scratch
+
+# 1. libkrun (+ its libkrunfw firmware) from the upstream `libkrun` package. A
+#    CACHE FETCH keyed by the pinned upstream commit — NOT a from-source build
+#    (libkrunfw would otherwise compile a guest kernel). Extracts libkrun.so* +
+#    libkrunfw.so* into $KRUN_PREFIX, a flat link/runtime prefix.
+./scripts/fetch-libkrun.sh "$KRUN_PREFIX" "$ARCH"
+
+# 2. Guest kernel + generic rootfs (cache fetches of the upstream packages).
+./scripts/fetch-artifact.sh virtio-kernel .scratch/vmlinuz    "$ARCH"
+./scripts/fetch-artifact.sh minvmd-rootfs .scratch/rootfs.img "$ARCH"
+
+# 3. Initramfs (minimald cross-compiled to a static musl binary, packed as /init).
+scripts/build-initramfs.sh .scratch/initramfs.cpio "$RUST_MUSL"   # uses `cross` (Docker)
+
+# 4. Build minvmd. LIBKRUN_PREFIX must point at the POPULATED prefix from step 1
+#    BEFORE this build: build.rs trusts the env var's presence to emit the real
+#    (libkrun-linking) cfg + an rpath to it. Build before step 1 finishes and you
+#    get the runtime-bailing stub.
+export LIBKRUN_PREFIX="$KRUN_PREFIX"
+export LD_LIBRARY_PATH="$KRUN_PREFIX${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+cargo build -p minvmd --bin minvmd
+
+# 5. Boot. minvmd needs LD_LIBRARY_PATH at runtime too: libkrun dlopen()s
+#    libkrunfw.so.5 from the prefix (it is not a link-time DT_NEEDED).
+export MINVMD_KERNEL_PATH="$PWD/.scratch/vmlinuz"
+export MINVMD_ROOTFS_PATH="$PWD/.scratch/rootfs.img"
+export MINVMD_INITRAMFS="$PWD/.scratch/initramfs.cpio"
+export MINVMD_BOOT_LOG="$PWD/.scratch/boot.log"   # guest hvc0 console
+sg kvm -c "LD_LIBRARY_PATH=$KRUN_PREFIX ./target/debug/minvmd boot --foreground"
+# vm-up on stdout = minimald READY from the initramfs (R2.4).
+```
+
+**No Docker?** Replace step 3 with a native musl build of minimald, then pack the
+cpio yourself:
+
+```sh
+env CC_${ARCH}_unknown_linux_musl=musl-gcc \
+    "CARGO_TARGET_$(echo "$ARCH" | tr a-z A-Z)_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" \
+    cargo build -p minimald --profile initramfs --target "$RUST_MUSL"
+STAGE="$(mktemp -d)"
+mkdir -p "$STAGE"/dev "$STAGE"/proc "$STAGE"/sys "$STAGE"/newroot
+cp "target/$RUST_MUSL/initramfs/minimald" "$STAGE/init"
+( cd "$STAGE" && find . | cpio -o -H newc ) > .scratch/initramfs.cpio
+rm -rf "$STAGE"
+```
+
+### E2E tests (Linux)
+
+No codesigning on Linux, so `cargo test` works directly. With the artifacts from
+steps 1–3 and the libkrun env from step 4 exported (mirrors the CI lane's test
+steps):
+
+```sh
+sg kvm -c "env LD_LIBRARY_PATH=$KRUN_PREFIX \
+  MINVMD_E2E=1 \
+  MINVMD_KERNEL_PATH=$PWD/.scratch/vmlinuz \
+  MINVMD_ROOTFS_PATH=$PWD/.scratch/rootfs.img \
+  MINVMD_INITRAMFS=$PWD/.scratch/initramfs.cpio \
+  cargo test -p minvmd --test boot_e2e --test minimald_session_e2e \
+    -- --include-ignored --nocapture --exact minimald_exec_over_bridge"
+```
+
+(Drop `--exact minimald_exec_over_bridge` to run every test in both binaries; it
+is shown because `minimald_session_e2e` has other, non-bridge cases.)
+
+`/dev/kvm` access: the device node is recreated on every VM teardown, which wipes
+any `setfacl` ACL — so an ACL grant lasts a single boot. The durable fix is group
+membership (survives node recreation); `sg kvm -c '…'` picks it up without a
+re-login:
+
+```sh
+sudo usermod -aG kvm "$USER"   # one-time
+```
+
+Gotchas:
+- `minvmd boot` is the raw boot primitive and does **not** update `state.toml`,
+  so `minvmd status`/`stop` report "stopped"/"not running" even while the VM is
+  up. The lifecycle (`state.toml`) is the supervisor's job — use `minvmd run
+  --detach` / `status` / `stop` to exercise it. Kill a stray `boot` VM by PID
+  (the `boot` parent + its hidden `__krun-vmm` child).
+- **Requires libkrun >= 1.19.0** (BLK=1 for `krun_add_disk2`, plus the vsock
+  TX-chain fix). The upstream `libkrun` package already pins 1.19.0.
+
+## E2E tests (macOS)
+
+`MINVMD_E2E=1`-gated, `#[ignore]` by default. On macOS, run the prebuilt test
+binaries directly — `cargo test` after signing relinks and unsigns `minvmd`. (On
+Linux there is no signing step; see "E2E tests (Linux)" above.)
 
 ```sh
 cargo test -p minvmd --test boot_e2e --test minimald_session_e2e --no-run
