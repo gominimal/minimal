@@ -11,8 +11,9 @@
 //!   Wrappers translate negative-errno returns into [`crate::error::VmError`]
 //!   via [`crate::krun::raw::check_backend`].
 //!
-//! This module is macOS-only. On Linux, `minvmd` ships only the runtime stub
-//! and never links libkrun.
+//! This module compiles only under the `minvmd_libkrun` cfg (macOS always;
+//! Linux when libkrun is installed). Otherwise `minvmd` ships only the runtime
+//! stub and never links libkrun.
 
 mod ctx;
 mod raw;

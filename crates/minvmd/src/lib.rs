@@ -1,12 +1,14 @@
-//! `minvmd` — the macOS-only host daemon that brings up a Linux microVM via
-//! libkrun, supervises its lifecycle, and bridges a host UDS to a vsock port
-//! inside the VM so the `minimal` CLI can talk to `minimald` transparently.
+//! `minvmd` — the host daemon that brings up a Linux microVM via libkrun,
+//! supervises its lifecycle, and bridges a host UDS to a vsock port inside the
+//! VM so the `minimal` CLI can talk to `minimald` transparently.
 //!
-//! This crate compiles on `aarch64-apple-darwin` and `x86_64-apple-darwin` as
-//! the real implementation, and on `target_os = "linux"` as a runtime-bailing
-//! stub so existing Linux-only CI stays green. The `krun` module is macOS-only
-//! since it links libkrun; portable surface (errors, state, image resolution)
-//! compiles on both platforms.
+//! The real (libkrun-linking) implementation is gated on the `minvmd_libkrun`
+//! cfg emitted by the build script: always set on macOS (Hypervisor.framework),
+//! and set on Linux when libkrun is installed (KVM). Without it the crate
+//! compiles to a runtime-bailing stub so stock Linux CI — which has no libkrun —
+//! stays green. The `krun` module links libkrun and so compiles only under that
+//! cfg; the portable surface (errors, state, image resolution) compiles
+//! everywhere.
 
 pub mod cmd;
 pub mod error;
@@ -16,7 +18,7 @@ pub mod sock;
 pub mod state;
 pub mod vm;
 
-#[cfg(target_os = "macos")]
+#[cfg(minvmd_libkrun)]
 pub mod krun;
 
 pub use error::VmError;

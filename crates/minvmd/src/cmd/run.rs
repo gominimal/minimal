@@ -9,15 +9,15 @@
 //! session via `setsid`) and returns only once the host UDS is accepting
 //! connections or the configurable timeout expires (R4.2).
 //!
-//! On Linux this subcommand bails immediately with a "macOS only" error so the
-//! Linux-only CI stays green.
+//! Without libkrun this subcommand bails immediately with a "no libkrun" error
+//! so the stock Linux CI (which has no libkrun) stays green.
 
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-// `.context()` is only called from the macOS-gated supervisor functions; on the
-// Linux stub build the trait is unused, so scope the import to match.
-#[cfg(target_os = "macos")]
+// `.context()` is only called from the libkrun-gated supervisor functions; on
+// the stub build the trait is unused, so scope the import to match.
+#[cfg(minvmd_libkrun)]
 use anyhow::Context as _;
 
 /// Default timeout in seconds for `run --detach` to wait for the host UDS.
@@ -29,13 +29,13 @@ pub const DEFAULT_DETACH_TIMEOUT_SECS: u64 = 8;
 ///   host UDS until it accepts connections (up to `timeout_secs`).
 /// - `timeout_secs`: only used when `detach` is true; default 8 s.
 pub fn run(detach: bool, timeout_secs: u64) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    return run_macos(detach, timeout_secs);
+    #[cfg(minvmd_libkrun)]
+    return run_supervisor(detach, timeout_secs);
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(minvmd_libkrun))]
     {
         let _ = (detach, timeout_secs);
-        bail!("`minvmd run` is macOS-only; this Linux build is a no-op stub");
+        bail!("`minvmd run` requires libkrun (macOS, or Linux with libkrun installed)");
     }
 }
 
@@ -64,8 +64,13 @@ pub fn poll_uds_ready(path: &std::path::Path, timeout: Duration) -> Result<()> {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn run_macos(detach: bool, timeout_secs: u64) -> Result<()> {
+#[cfg(minvmd_libkrun)]
+fn run_supervisor(detach: bool, timeout_secs: u64) -> Result<()> {
+    // R2.4: fail fast with an actionable error if the hypervisor backend is
+    // unavailable (Linux: /dev/kvm). No-op on macOS. Runs in the foreground
+    // caller so the user sees the error directly, even under --detach.
+    crate::cmd::ensure_hypervisor_accessible()?;
+
     if detach {
         return run_detach(timeout_secs);
     }
@@ -74,7 +79,7 @@ fn run_macos(detach: bool, timeout_secs: u64) -> Result<()> {
 
 /// Spawn `minvmd run` as a detached background supervisor, then poll the host
 /// UDS until it accepts connections (up to `timeout_secs`).
-#[cfg(target_os = "macos")]
+#[cfg(minvmd_libkrun)]
 fn run_detach(timeout_secs: u64) -> Result<()> {
     use std::os::unix::process::CommandExt as _;
 
@@ -111,7 +116,7 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
 
 /// Foreground supervisor: boot the VM, manage lifecycle state, supervise until
 /// the VMM child exits.
-#[cfg(target_os = "macos")]
+#[cfg(minvmd_libkrun)]
 fn run_foreground() -> Result<()> {
     use std::io::{BufRead as _, BufReader, Read as _};
     use std::os::unix::net::UnixListener;
@@ -365,13 +370,13 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(minvmd_libkrun))]
     #[test]
-    fn run_bails_on_non_macos() {
+    fn run_bails_without_libkrun() {
         let err = run(false, DEFAULT_DETACH_TIMEOUT_SECS).unwrap_err();
         assert!(
-            err.to_string().contains("macOS-only"),
-            "expected macOS-only message, got: {err}"
+            err.to_string().contains("requires libkrun"),
+            "expected libkrun-required message, got: {err}"
         );
     }
 }

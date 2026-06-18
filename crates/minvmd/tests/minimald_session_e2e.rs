@@ -12,13 +12,13 @@
 //! relay) → session exec. Requires libkrun >= 1.19.0 on the host.
 //!
 //! Gates:
-//! - `#[cfg(target_os = "macos")]`: libkrun is macOS-only.
+//! - `#[cfg(minvmd_libkrun)]`: needs libkrun (macOS, or Linux with libkrun).
 //! - `#[ignore]` + `MINVMD_E2E=1`: skipped unless explicitly enabled.
 //! - `MINVMD_KERNEL_PATH`, `MINVMD_ROOTFS_PATH`, `MINVMD_INITRAMFS` must point to
 //!   the kernel, the GENERIC rootfs, and the minimald initramfs cpio (minimald
 //!   boots as the initramfs `/init`; nothing is baked into the rootfs).
 
-#![cfg(target_os = "macos")]
+#![cfg(minvmd_libkrun)]
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};

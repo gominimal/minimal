@@ -4,7 +4,7 @@
 //! by `minvmd boot` and is not intended to be run directly by users (hence the
 //! double-underscore prefix).
 //!
-//! On macOS:
+//! With libkrun (macOS via Hypervisor.framework, Linux via KVM):
 //! 1. Reads kernel, rootfs, and initramfs paths from `MINVMD_KERNEL_PATH` /
 //!    `MINVMD_ROOTFS_PATH` / `MINVMD_INITRAMFS`.
 //! 2. Reads the READY-marker socket path from `MINVMD_MARKER_SOCK`.
@@ -15,25 +15,25 @@
 //!    and chroots into it.
 //! 5. Registers the marker socket for `VSOCK_MARKER_PORT` (guest→host): the
 //!    guest workload connects to that vsock port and writes `READY\n`, which
-//!    libkrun bridges to the host UNIX socket where the parent listens (R2.4).
+//!    libkrun bridges to the host UNIX socket where the parent listens.
 //! 6. Calls `krun_start_enter`, which boots the VM. On success libkrun
 //!    `exit()`s with the guest workload's exit code and never returns here.
 //!
-//! On Linux this subcommand bails immediately with a "macOS only" error.
+//! Without libkrun this subcommand bails immediately with a "no libkrun" error.
 
 use anyhow::{Result, bail};
 
 /// Run the `__krun-vmm` subcommand.
 pub fn run() -> Result<()> {
-    #[cfg(target_os = "macos")]
-    return run_macos();
+    #[cfg(minvmd_libkrun)]
+    return run_vmm();
 
-    #[cfg(not(target_os = "macos"))]
-    bail!("`minvmd __krun-vmm` is macOS-only; this Linux build is a no-op stub");
+    #[cfg(not(minvmd_libkrun))]
+    bail!("`minvmd __krun-vmm` requires libkrun (macOS, or Linux with libkrun installed)");
 }
 
-#[cfg(target_os = "macos")]
-fn run_macos() -> Result<()> {
+#[cfg(minvmd_libkrun)]
+fn run_vmm() -> Result<()> {
     use anyhow::Context as _;
 
     use crate::cmd::{MARKER_SOCK_ENV, VSOCK_MARKER_PORT};
@@ -69,7 +69,7 @@ fn run_macos() -> Result<()> {
     // `krun_add_vsock_port` is `krun_add_vsock_port2(.., listen=false)`: the
     // parent listens on the host UDS `marker_sock`; the guest workload connects
     // to AF_VSOCK CID 2 (host) port VSOCK_MARKER_PORT and writes `READY\n`,
-    // which libkrun bridges to the parent (R2.4).
+    // which libkrun bridges to the parent.
     ctx.add_vsock_port(VSOCK_MARKER_PORT, &marker_sock)
         .context("registering READY-marker vsock port")?;
 

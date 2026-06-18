@@ -303,8 +303,8 @@ impl Drop for Context {
 
 /// Build a `CString` from a path, mapping interior NULs to a typed error.
 fn cstring_from_path(path: &Path, what: &'static str) -> Result<CString, VmError> {
-    // Use OsStr bytes on Unix; libkrun is macOS-only so we can rely on
-    // `as_bytes()`.
+    // Use OsStr bytes on Unix; libkrun only ships on Unix (macOS/Linux) so we
+    // can rely on `as_bytes()`.
     use std::os::unix::ffi::OsStrExt;
     CString::new(path.as_os_str().as_bytes()).map_err(|_| VmError::NulInPath {
         what,

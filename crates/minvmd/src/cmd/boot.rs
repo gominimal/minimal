@@ -12,8 +12,8 @@
 //! 6. With `--foreground`: stays alive until the VMM child exits, propagating
 //!    its exit code.
 //!
-//! On Linux this subcommand bails immediately with a "macOS only" error so the
-//! Linux-only CI stays green.
+//! Without libkrun this subcommand bails immediately with a "no libkrun" error
+//! so the stock Linux CI (which has no libkrun) stays green.
 
 use anyhow::{Result, bail};
 
@@ -22,18 +22,18 @@ use anyhow::{Result, bail};
 /// `foreground`: if true, block until the VMM child process exits after the VM
 /// is confirmed up.
 pub fn run(foreground: bool) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    return run_macos(foreground);
+    #[cfg(minvmd_libkrun)]
+    return run_boot(foreground);
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(minvmd_libkrun))]
     {
         let _ = foreground;
-        bail!("`minvmd boot` is macOS-only; this Linux build is a no-op stub");
+        bail!("`minvmd boot` requires libkrun (macOS, or Linux with libkrun installed)");
     }
 }
 
-#[cfg(target_os = "macos")]
-fn run_macos(foreground: bool) -> Result<()> {
+#[cfg(minvmd_libkrun)]
+fn run_boot(foreground: bool) -> Result<()> {
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
@@ -44,6 +44,10 @@ fn run_macos(foreground: bool) -> Result<()> {
     use crate::cmd::MARKER_SOCK_ENV;
     use crate::image::{resolve_kernel_path, resolve_rootfs_path};
     use crate::state::StateDir;
+
+    // R2.4: fail fast with an actionable error if the hypervisor backend is
+    // unavailable (Linux: /dev/kvm). No-op on macOS.
+    crate::cmd::ensure_hypervisor_accessible()?;
 
     // Fail-fast: resolve paths before spawning anything.
     let _kernel = resolve_kernel_path().context("resolving kernel path")?;

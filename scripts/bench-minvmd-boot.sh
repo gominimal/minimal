@@ -7,13 +7,20 @@
 # the gzip kernel decompress was ~77 ms of a ~146 ms boot (fixed by shipping the
 # kernel uncompressed + KRUN_KERNEL_FORMAT_RAW → ~67 ms).
 #
-# macOS-only (minvmd boots a libkrun microVM via Hypervisor.framework). The
-# minvmd binary must be codesigned with the hypervisor entitlement first:
+# Runs on macOS (Hypervisor.framework) and Linux (KVM) — minvmd abstracts the
+# backend via libkrun. The script body is portable (perl/pkill/timeout/sort).
+#
+# macOS only: the minvmd binary must be codesigned with the hypervisor
+# entitlement before it can boot a VM:
 #   cargo build -p minvmd --bin minvmd
 #   codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
+# Linux needs no codesigning — KVM access is governed by /dev/kvm permissions.
 #
 # Usage:
-#   MINVMD_KERNEL_PATH=... MINVMD_ROOTFS_PATH=... scripts/bench-minvmd-boot.sh [N] [minvmd-binary]
+#   MINVMD_KERNEL_PATH=... MINVMD_ROOTFS_PATH=... MINVMD_INITRAMFS=... \
+#     scripts/bench-minvmd-boot.sh [N] [minvmd-binary]
+# All three artifact paths are required (minvmd boot needs kernel + rootfs +
+# initramfs).
 set -uo pipefail
 
 N="${1:-10}"
@@ -27,7 +34,15 @@ for v in MINVMD_KERNEL_PATH MINVMD_ROOTFS_PATH MINVMD_INITRAMFS; do
 done
 [ -x "$BIN" ] || { echo "minvmd binary not found/executable: $BIN" >&2; exit 1; }
 command -v perl >/dev/null || { echo "perl required for sub-ms timing" >&2; exit 1; }
-command -v timeout >/dev/null || { echo "timeout required (install GNU coreutils)" >&2; exit 1; }
+# GNU coreutils ships `timeout`, but Homebrew installs it as `gtimeout` unless
+# the gnubin dir is on PATH — accept either so the macOS path works out of box.
+if command -v timeout >/dev/null; then
+  TIMEOUT=timeout
+elif command -v gtimeout >/dev/null; then
+  TIMEOUT=gtimeout
+else
+  echo "timeout/gtimeout required (install GNU coreutils)" >&2; exit 1
+fi
 
 # A healthy boot reaches READY in well under a second; cap each attempt so a
 # broken setup fails fast instead of looking hung for minutes.
@@ -54,7 +69,7 @@ trap 'echo; echo "interrupted — tearing down" >&2; teardown; exit 130' INT TER
 # if the artifacts/codesign are wrong, rather than silently N times below.
 echo "warming up (cold boot, discarded)…" >&2
 teardown
-if ! timeout "$BOOT_TIMEOUT" "$BIN" boot </dev/null >"$OUT" 2>&1 || ! grep -qx vm-up "$OUT"; then
+if ! "$TIMEOUT" "$BOOT_TIMEOUT" "$BIN" boot </dev/null >"$OUT" 2>&1 || ! grep -qx vm-up "$OUT"; then
   echo "warmup boot did not reach vm-up — check artifacts, codesign, and libkrun:" >&2
   tail -6 "$OUT" >&2
   exit 1
@@ -64,7 +79,7 @@ teardown
 samples=()
 for i in $(seq 1 "$N"); do
   t0="$(now_ms)"
-  if timeout "$BOOT_TIMEOUT" "$BIN" boot </dev/null >"$OUT" 2>/dev/null && grep -qx vm-up "$OUT"; then
+  if "$TIMEOUT" "$BOOT_TIMEOUT" "$BIN" boot </dev/null >"$OUT" 2>/dev/null && grep -qx vm-up "$OUT"; then
     t1="$(now_ms)"; ms="$(( t1 - t0 ))"; samples+=( "$ms" )
     printf 'run %2d/%d: %4d ms\n' "$i" "$N" "$ms" >&2
   else

@@ -22,3 +22,71 @@ pub const VSOCK_MARKER_PORT: u32 = 7350;
 /// Environment variable that carries the host-side UNIX socket path for the
 /// READY marker from the parent to the VMM child.
 pub const MARKER_SOCK_ENV: &str = "MINVMD_MARKER_SOCK";
+
+/// Verify the host hypervisor backend is accessible before booting a VM (R2.4).
+///
+/// On Linux, libkrun drives KVM, which needs a readable `/dev/kvm`. Probe it
+/// with an `O_RDONLY` open so `boot`/`run` fail fast with an actionable message
+/// instead of an opaque libkrun error from `krun_start_enter`. On macOS the
+/// check is skipped — Hypervisor.framework availability is verified by
+/// `krun_create_ctx` itself.
+#[cfg(minvmd_libkrun)]
+pub(crate) fn ensure_hypervisor_accessible() -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .open("/dev/kvm")
+            .map(|_| ())
+            .map_err(|e| kvm_access_error(&e))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    Ok(())
+}
+
+/// Map a `/dev/kvm` open failure to an actionable, user-facing error (R2.4).
+///
+/// `ENOENT` → the KVM module is not loaded / the host has no hardware
+/// virtualization; `EACCES` → the caller is not in the `kvm` group. Other
+/// errors are wrapped verbatim. Kept platform-independent (so it is exercised
+/// by unit tests on every libkrun build) even though it is only invoked on
+/// Linux.
+#[cfg(minvmd_libkrun)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn kvm_access_error(err: &std::io::Error) -> anyhow::Error {
+    use std::io::ErrorKind;
+
+    match err.kind() {
+        ErrorKind::NotFound => anyhow::anyhow!(
+            "/dev/kvm not found: the KVM kernel module is not loaded or the host has no \
+             hardware virtualization. Load it (`modprobe kvm` plus `kvm_intel`/`kvm_amd`) \
+             or run on a KVM-capable host."
+        ),
+        ErrorKind::PermissionDenied => anyhow::anyhow!(
+            "/dev/kvm: permission denied. Add your user to the `kvm` group \
+             (`sudo usermod -aG kvm $USER`, then re-login) or adjust the device permissions."
+        ),
+        _ => anyhow::anyhow!("opening /dev/kvm: {err}"),
+    }
+}
+
+#[cfg(all(test, minvmd_libkrun))]
+mod tests {
+    use super::kvm_access_error;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn enoent_maps_to_module_guidance() {
+        let msg = kvm_access_error(&Error::from(ErrorKind::NotFound)).to_string();
+        assert!(msg.contains("/dev/kvm"), "got: {msg}");
+        assert!(msg.contains("not loaded"), "got: {msg}");
+    }
+
+    #[test]
+    fn eacces_maps_to_kvm_group_guidance() {
+        let msg = kvm_access_error(&Error::from(ErrorKind::PermissionDenied)).to_string();
+        assert!(msg.contains("permission denied"), "got: {msg}");
+        assert!(msg.contains("`kvm` group"), "got: {msg}");
+    }
+}
