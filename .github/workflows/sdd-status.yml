@@ -129,6 +129,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Refresh the status comment
-        uses: norrietaylor/spectacles/.github/actions/sdd-status@v0.2.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-status@v0.3.0
         with:
           github-token: ${{ github.token }}
