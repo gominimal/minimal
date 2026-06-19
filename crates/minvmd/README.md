@@ -132,12 +132,22 @@ sg kvm -c "env LD_LIBRARY_PATH=$KRUN_PREFIX \
   MINVMD_KERNEL_PATH=$PWD/.scratch/vmlinuz \
   MINVMD_ROOTFS_PATH=$PWD/.scratch/rootfs.img \
   MINVMD_INITRAMFS=$PWD/.scratch/initramfs.cpio \
-  cargo test -p minvmd --test boot_e2e --test minimald_session_e2e \
+  cargo test -p minvmd --test boot_e2e -- --include-ignored --nocapture"
+
+sg kvm -c "env LD_LIBRARY_PATH=$KRUN_PREFIX \
+  MINVMD_E2E=1 \
+  MINVMD_KERNEL_PATH=$PWD/.scratch/vmlinuz \
+  MINVMD_ROOTFS_PATH=$PWD/.scratch/rootfs.img \
+  MINVMD_INITRAMFS=$PWD/.scratch/initramfs.cpio \
+  cargo test -p minvmd --test minimald_session_e2e \
     -- --include-ignored --nocapture --exact minimald_exec_over_bridge"
 ```
 
-(Drop `--exact minimald_exec_over_bridge` to run every test in both binaries; it
-is shown because `minimald_session_e2e` has other, non-bridge cases.)
+(Two invocations, mirroring the CI lane's separate steps. `--exact` is passed to
+every selected `--test` binary, so combining both binaries under one
+`--exact minimald_exec_over_bridge` would run zero tests in `boot_e2e`. The
+`--exact` filter on `minimald_session_e2e` selects the bridge case; that binary
+has other, non-bridge cases. Drop it to run all of them.)
 
 `/dev/kvm` access: the device node is recreated on every VM teardown, which wipes
 any `setfacl` ACL — so an ACL grant lasts a single boot. The durable fix is group
