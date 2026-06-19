@@ -1,0 +1,9 @@
+[package]
+name = "gvproxy"
+version = "0.0.1"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true

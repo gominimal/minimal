@@ -26,14 +26,24 @@ The network allowlist enforcement hook is a call site in the boot path wired to 
 
 ## Data and interface changes
 
+### New crate: `crates/gvproxy`
+
+A standalone, transport-agnostic crate (deps: `anyhow`, `tracing`) holding the
+gvproxy spawn/lookup helpers, reusable by both the macOS VM path (`minvmd`) and
+the Linux per-sandbox path (`sandbox2`):
+
+- `fn gvproxy_bin(env_override: &str) -> std::path::PathBuf` — resolves the gvproxy binary path via the named override env var, or defaults to `"gvproxy"` (resolved via `PATH`)
+- `fn spawn_gvproxy(bin: impl AsRef<Path>, net_fd: RawFd) -> anyhow::Result<Child>` — spawns `bin` with `--fd <net_fd>`. The FD source differs per path: a socketpair end handed to libkrun's `krun_set_passt_fd` (macOS VM), or hakoniwa's `rustslirp_tapfd` from a `Network::RustSlirp` container (Linux sandbox).
+
 ### New module: `crates/minvmd/src/net.rs`
 
-A new networking module that owns:
+A new networking module that owns the `minvmd`-specific mode selection (TSI is a
+libkrun feature, so it stays here, not in the shared crate):
 
 - `enum NetworkMode { GvProxy, Tsi }` — the two supported transport modes
 - `fn resolve_net_mode() -> NetworkMode` — reads `MINVMD_NETMODE` env var; returns `GvProxy` by default
-- `fn gvproxy_bin() -> std::path::PathBuf` — resolves the gvproxy binary path via `MINVMD_GVPROXY_PATH` env var or defaults to `"gvproxy"` (resolved via `PATH`)
-- `fn spawn_gvproxy(net_fd: RawFd) -> Result<Child>` — spawns gvproxy with `--fd <net_fd>` argument
+- `fn gvproxy_bin() -> std::path::PathBuf` — thin wrapper over `gvproxy::gvproxy_bin("MINVMD_GVPROXY_PATH")`
+- re-exports `gvproxy::spawn_gvproxy` for the boot path
 - `enum NetworkPolicy { Open, Allowlist(Vec<String>) }` — network access policy for a VM session
 - `enum PolicyError { Denied { host: String } }` — `#[derive(Debug, thiserror::Error)]` error returned by the enforcement hook; for this spec it has a single `Denied` variant reserved for the follow-up allowlist work, so the hook can grow real failure modes without changing its signature
 - `fn check_network_policy(policy: &NetworkPolicy) -> Result<(), PolicyError>` — enforcement hook (currently always returns `Ok(())`)
@@ -174,7 +184,7 @@ None. This spec is consistent with the prior architecture decisions.
 
 - **DNS configuration and port-forwarding:** Explicit DNS configuration and port-forwarding rules via gvproxy are flagged as future sub-items in the spec's Non-Goals section. The guest relies on gvproxy's built-in DNS resolver (resolves from the host's system resolver) for this spec.
 
-- **Linux namespace sandbox path:** Whether `sandbox2` (the namespace-based isolation path for Linux hosts without `/dev/kvm`) shares the gvproxy integration code is an open question flagged by the spec. Out of scope for this architecture; this spec touches only the libkrun VMM path.
+- **Linux namespace sandbox path:** The transport-agnostic spawn/lookup helpers are factored into the shared `gvproxy` crate so `sandbox2` can reuse them; what remains is the `sandbox2` side itself (net-namespace unshare, `Network::RustSlirp`, feeding `rustslirp_tapfd` to `spawn_gvproxy`, per-sandbox lifecycle). Out of scope for this architecture; this spec touches only the libkrun VMM path. The follow-up must confirm the pinned hakoniwa fork (`souk4711/hakoniwa` rev `41ce36e`) exposes `Network::RustSlirp` and `Child::rustslirp_tapfd`.
 
 ## Verification
 
