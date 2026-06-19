@@ -100,7 +100,7 @@ jobs:
     steps:
       - name: Decide whether to run, and find the tracking issue
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-dispatch@v0.2.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-dispatch@v0.3.0
         with:
           app-id: ${{ vars.APP_ID }}
           github-token: ${{ github.token }}
@@ -138,7 +138,7 @@ jobs:
     steps:
       - name: Compute ready set and precondition state
         id: compute
-        uses: norrietaylor/spectacles/.github/actions/sdd-dispatch-compute@v0.2.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-dispatch-compute@v0.3.0
         with:
           tracking-issue: ${{ needs.route.outputs.tracking_issue }}
           trigger-kind: ${{ needs.route.outputs.trigger_kind }}
@@ -631,3 +631,68 @@ jobs:
               core.info('Could not post fast-path noop comment on #'
                 + tracking + ': ' + err.message);
             }
+
+  # Deterministic command acknowledgment (issue #294). Adds a 👀 reaction to the
+  # triggering comment as soon as the route job decides to act, before the agent
+  # starts, so the human sees the command was received. Gated on a comment being
+  # present, so label/PR/dispatch triggers (no comment) never react. Reacts as
+  # the App so the 👀 matches the pipeline's bot identity. Best-effort: the
+  # sdd-ack-reaction action never fails the step.
+  ack:
+    needs: route
+    if: ${{ (needs.route.outputs.should_run == 'true') && github.event.comment.id }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      reaction_id: ${{ steps.ack.outputs.reaction-id }}
+    steps:
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-issues: write
+          permission-pull-requests: write
+      - name: Ack the command with 👀
+        id: ack
+        uses: norrietaylor/spectacles/.github/actions/sdd-ack-reaction@v0.3.0
+        with:
+          github-token: ${{ steps.app.outputs.token }}
+          mode: ack
+          comment-id: ${{ github.event.comment.id }}
+          comment-type: ${{ github.event_name == 'pull_request_review_comment' && 'review' || 'issue' }}
+
+  # Terminal reaction (issue #294). Clears the 👀 and adds the run's outcome
+  # (🚀 ran / 😕 noop / 👎 failed), derived deterministically from the job
+  # results above — never from the agent. Runs always() so a failed run still
+  # replaces the ack.
+  ack-terminal:
+    needs: [route, ack, compute, lifecycle, dispatch, noop-comment, fastpath-noop-comment]
+    if: ${{ always() && (needs.route.outputs.should_run == 'true') && github.event.comment.id }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-issues: write
+          permission-pull-requests: write
+      - name: Replace 👀 with the run outcome
+        uses: norrietaylor/spectacles/.github/actions/sdd-ack-reaction@v0.3.0
+        with:
+          github-token: ${{ steps.app.outputs.token }}
+          mode: terminal
+          comment-id: ${{ github.event.comment.id }}
+          comment-type: ${{ github.event_name == 'pull_request_review_comment' && 'review' || 'issue' }}
+          ack-reaction-id: ${{ needs.ack.outputs.reaction_id }}
+          outcome: ${{ (needs.compute.result == 'failure' || needs.compute.result == 'cancelled' || needs.lifecycle.result == 'failure' || needs.lifecycle.result == 'cancelled' || needs.dispatch.result == 'failure' || needs.dispatch.result == 'cancelled') && 'failed' || (needs.dispatch.result == 'success' && 'ran' || 'noop') }}
