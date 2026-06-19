@@ -69,7 +69,7 @@ jobs:
     steps:
       - name: Resolve the tracking issue and the drain state
         id: tree
-        uses: norrietaylor/spectacles/.github/actions/sdd-spike-tree@v0.2.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-spike-tree@v0.3.0
         with:
           mode: reentry
           spike-issue: ${{ github.event.issue.number }}
@@ -94,35 +94,42 @@ jobs:
     steps:
       - name: Build the phase-B re-entry context
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-triage@v0.2.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-triage@v0.3.0
         with:
           github-token: ${{ github.token }}
           reentry-tracking-issue: ${{ needs.walk.outputs.tracking_issue }}
 
-  # Re-enter sdd-triage phase B for the tracking issue. Calls the same reusable
-  # lock the sdd-triage wrapper calls, mapping the same secrets explicitly
-  # (cross-owner workflow_call does not inherit them) — including
-  # GH_AW_OTEL_ENDPOINT so the lock's observability.otlp endpoint resolves.
+  # Re-enter the plan phase for the tracking issue. The spike-wave drain
+  # re-enters phase B (the plan), so this calls the per-phase plan lock
+  # (issue #271, ADR 0029), mapping the same secrets explicitly (cross-owner
+  # workflow_call does not inherit them) — including GH_AW_OTEL_ENDPOINT so the
+  # lock's observability.otlp endpoint resolves. The plan phase carries no MCP,
+  # so no DISTILLERY_OAUTH_TOKEN.
   sdd-triage:
     needs: route
     if: needs.route.outputs.should_run == 'true'
-    uses: norrietaylor/spectacles/.github/workflows/sdd-triage.lock.yml@v0.2.0
+    uses: norrietaylor/spectacles/.github/workflows/sdd-triage-plan.lock.yml@v0.3.0
     with:
       aw_context: ${{ needs.route.outputs.aw_context }}
+      min_task: ${{ vars.SDD_TRIAGE_MIN_TASK }}
     secrets:
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
-      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       # OTLP collector URL (write-only ingest key embedded). Mapped explicitly so
       # the reusable lock's observability.otlp endpoint resolves; unset is fine
       # (if-missing: warn). See ADR 0020.
       GH_AW_OTEL_ENDPOINT: ${{ secrets.GH_AW_OTEL_ENDPOINT }}
-      DISTILLERY_OAUTH_TOKEN: ${{ secrets.DISTILLERY_OAUTH_TOKEN }}
-    # Ceiling for the called reusable workflow. Must cover the union of every
-    # nested job's permissions: the gh-aw conclusion and safe_outputs jobs
-    # need write scopes, and activation needs actions: read.
+    # Ceiling for the called reusable workflow. The plan phase only comments and
+    # labels (no file writes), so the ceiling matches the sdd-triage wrapper's
+    # plan job.
     permissions:
       actions: read
-      contents: write
+      contents: read
       discussions: write
       issues: write
+      # write (not read): the called sdd-triage-plan lock's gh-aw
+      # safe_outputs/conclusion jobs request pull-requests: write, and a reusable
+      # callee may not exceed the caller job's grant — read here startup_fails
+      # the whole workflow on every issue close/unlabel. See issue #298 (same
+      # class as #295/#296, which fixed the sdd-triage wrapper's plan job).
       pull-requests: write

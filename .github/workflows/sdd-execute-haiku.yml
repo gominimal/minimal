@@ -79,59 +79,38 @@ on:
 permissions:
   contents: read
 
-# Concurrency group keyed on the task issue number AND this variant's tier.
-# A stale sdd-dispatch fan-out racing with a manual /execute on the same task
-# in the same tier collapses to one running cell: cancel-in-progress: true
-# supersedes the in-progress cell with the later trigger so a user-initiated
-# /execute wins over a stale dispatch (and vice versa: a fresh dispatch wins
-# over an earlier in-flight cell). The tier discriminator is required because
-# the three sdd-execute-{haiku,sonnet,opus} wrappers all subscribe to the same
-# event triggers; without the tier suffix a non-matching-tier wake would land
-# in the same group as the matching-tier run and the cancel-in-progress rule
-# could kill the only run doing real work (issue #124). Cancel-in-progress is
-# set on the wrapper itself because the gh-aw lock declares its own
-# activation-level concurrency keyed on the workflow name; this wrapper-level
-# group adds the per-task-per-tier dimension on top.
+# Concurrency: cancellation is scoped to ISSUE-keyed runs only. PR-attached
+# triggers (pull_request, pull_request_review, pull_request_review_comment,
+# check_suite, and a /revise issue_comment on a PR) each get a unique
+# github.run_id group, so they NEVER cancel-in-progress. A cancelled run renders
+# as a red check on the PR and reads as failed CI even though it was only
+# superseded; scoping cancellation off the PR-attached surface removes that
+# false signal (issue #271 option 3, ADR 0030). The single-revise collapse those
+# runs used to get from cancellation when concurrent failed-check suites landed
+# on the same head (issues #227, #228) is now provided cooperatively by
+# sdd-route-execute's sha-keyed revise claim: the first run claims the head sha,
+# a later run for the same head defers (no-op success) instead of being killed.
+#
+# Cancellation survives for the issue-keyed agent runs that do NOT attach to a
+# PR: a /execute comment on a task sub-issue and a workflow_dispatch from
+# sdd-dispatch share the per-task-per-tier group, so a stale dispatch racing a
+# manual /execute on the same task collapses to one running cell (issue #124).
+# The tier suffix keeps a non-matching-tier wake out of the matching tier's
+# group. cancel-in-progress is set on the wrapper because the gh-aw lock has its
+# own activation-level concurrency keyed on the workflow name; this wrapper
+# group adds the per-task-per-tier dimension. These cancellations never attach
+# to a PR, so they never paint a red check.
 #
 # The fromJSON(github.event.inputs.aw_context || '{}') branch reads the
 # dispatcher's well-formed aw_context JSON for the workflow_dispatch path.
-# Manual workflow_dispatch invocations that supply malformed JSON will fail
-# workflow evaluation here, which is the correct failure mode (the route
-# step's try/catch would silently ignore them and the run would do nothing
-# useful).
 #
-# A label-removal event (issues.unlabeled / pull_request.unlabeled) is routed
-# to its own throwaway group (github.run_id) so it never lands in a task's
-# shared per-task-per-tier group. At step 2 the agent removes its own task's
-# sdd:ready label; that self-induced issues.unlabeled event re-fires this
-# wrapper, and without the carve-out it entered the active run's group where
-# cancel-in-progress killed the running agent mid-work (issue #143). The only
-# label-removal the route step acts on is needs-human (a resume), which runs
-# when no agent is in flight, so a unique group is safe there too.
-#
-# An issue_comment whose body is not a recognized command (/execute or
-# /revise) is routed to its own throwaway group for the same reason.
-# gh-aw's create-pull-request fallback-to-issue posts an "Issue created:
-# #<n>" notice on the task issue via the App token (issue #142); that
-# App-authored comment re-fires this wrapper as issue_comment.created,
-# and without the carve-out it landed in the active run's per-task group
-# where cancel-in-progress killed the originating run's safe_outputs tail
-# and its auto-merge job. The route step acts only on /execute and
-# /revise comments, so a non-command comment in a unique group is safe.
-#
-# A check_suite.completed event (the CI-failure -> implicit /revise path)
-# carries neither github.event.issue.number nor github.event.pull_request
-# .number — the PR is in github.event.check_suite.pull_requests[]. Without
-# a dedicated branch the expression fell through to the github.run_id
-# fallback, giving every failed suite its own group so cancel-in-progress
-# never collapsed concurrent /revise runs on the same PR (issues #227,
-# #228). Key on the suite's PR number (head_branch fallback when no PR is
-# linked), but ONLY for the same actionable suites the route job acts on:
-# a failure-like conclusion on an sdd/ branch. A success/neutral suite is
-# left on the throwaway github.run_id key so it cannot land in an active
-# /revise group and cancel a running revise before no-opping in route.
+# A label-removal (issues.unlabeled resume) and a non-command issue_comment keep
+# their own throwaway run_id groups: the agent's self-induced sdd:ready unlabeled
+# event (issue #143) and gh-aw's App-authored "Issue created" comment (issue
+# #142) re-fire this wrapper and must not land in an active per-task group where
+# cancel-in-progress would kill the run doing real work.
 concurrency:
-  group: sdd-execute-haiku-${{ github.event.action == 'unlabeled' && github.run_id || (github.event_name == 'issue_comment' && !startsWith(github.event.comment.body, '/execute') && !startsWith(github.event.comment.body, '/revise')) && github.run_id || (github.event_name == 'check_suite' && github.event.action == 'completed' && startsWith(github.event.check_suite.head_branch, 'sdd/') && (github.event.check_suite.conclusion == 'failure' || github.event.check_suite.conclusion == 'timed_out' || github.event.check_suite.conclusion == 'cancelled' || github.event.check_suite.conclusion == 'action_required') && (github.event.check_suite.pull_requests[0].number || github.event.check_suite.head_branch)) || github.event.issue.number || github.event.pull_request.number || fromJSON(github.event.inputs.aw_context || '{}').item_number || github.run_id }}
+  group: sdd-execute-haiku-${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || github.event_name == 'pull_request_review_comment' || github.event_name == 'check_suite') && github.run_id || (github.event_name == 'issue_comment' && github.event.issue.pull_request) && github.run_id || github.event.action == 'unlabeled' && github.run_id || (github.event_name == 'issue_comment' && !startsWith(github.event.comment.body, '/execute') && !startsWith(github.event.comment.body, '/revise')) && github.run_id || github.event.issue.number || fromJSON(github.event.inputs.aw_context || '{}').item_number || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -211,7 +190,7 @@ jobs:
     steps:
       - name: Decide whether to run and build aw_context
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-execute@v0.2.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-execute@v0.3.0
         with:
           tier: haiku
           app-id: ${{ vars.APP_ID }}
@@ -223,14 +202,14 @@ jobs:
   sdd-execute-haiku:
     needs: route
     if: needs.route.outputs.should_run == 'true'
-    uses: norrietaylor/spectacles/.github/workflows/sdd-execute-haiku.lock.yml@v0.2.0
+    uses: norrietaylor/spectacles/.github/workflows/sdd-execute-haiku.lock.yml@v0.3.0
     with:
       aw_context: ${{ needs.route.outputs.aw_context }}
     # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
     # to a reusable workflow in a different owner than the caller.
     secrets:
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
-      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       # OTLP collector URL (write-only ingest key embedded). Mapped explicitly so
       # the reusable lock's observability.otlp endpoint resolves; unset is fine
       # (if-missing: warn). See ADR 0020.
@@ -287,9 +266,74 @@ jobs:
       # the PR is UNSTABLE with every required check green (issue #135). The
       # mechanics live in the sdd-auto-merge composite action.
       - name: Enable auto-merge when protection requires a check
-        uses: norrietaylor/spectacles/.github/actions/sdd-auto-merge@v0.2.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-auto-merge@v0.3.0
         with:
           github-token: ${{ steps.app.outputs.token }}
           pr-number: ${{ needs.sdd-execute-haiku.outputs.created_pr_number }}
           owner: ${{ github.repository_owner }}
           repo: ${{ github.event.repository.name }}
+
+  # Deterministic command acknowledgment (issue #294). Adds a 👀 reaction to the
+  # triggering comment as soon as the route job decides to act, before the agent
+  # starts, so the human sees the command was received. Gated on a comment being
+  # present, so label/PR/dispatch triggers (no comment) never react. Reacts as
+  # the App so the 👀 matches the pipeline's bot identity. Best-effort: the
+  # sdd-ack-reaction action never fails the step.
+  ack:
+    needs: route
+    if: ${{ (needs.route.outputs.should_run == 'true') && github.event.comment.id }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      reaction_id: ${{ steps.ack.outputs.reaction-id }}
+    steps:
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-issues: write
+          permission-pull-requests: write
+      - name: Ack the command with 👀
+        id: ack
+        uses: norrietaylor/spectacles/.github/actions/sdd-ack-reaction@v0.3.0
+        with:
+          github-token: ${{ steps.app.outputs.token }}
+          mode: ack
+          comment-id: ${{ github.event.comment.id }}
+          comment-type: ${{ github.event_name == 'pull_request_review_comment' && 'review' || 'issue' }}
+
+  # Terminal reaction (issue #294). Clears the 👀 and adds the run's outcome
+  # (🚀 ran / 😕 noop / 👎 failed), derived deterministically from the job
+  # results above — never from the agent. Runs always() so a failed run still
+  # replaces the ack.
+  ack-terminal:
+    needs: [route, ack, sdd-execute-haiku]
+    if: ${{ always() && (needs.route.outputs.should_run == 'true') && github.event.comment.id }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-issues: write
+          permission-pull-requests: write
+      - name: Replace 👀 with the run outcome
+        uses: norrietaylor/spectacles/.github/actions/sdd-ack-reaction@v0.3.0
+        with:
+          github-token: ${{ steps.app.outputs.token }}
+          mode: terminal
+          comment-id: ${{ github.event.comment.id }}
+          comment-type: ${{ github.event_name == 'pull_request_review_comment' && 'review' || 'issue' }}
+          ack-reaction-id: ${{ needs.ack.outputs.reaction_id }}
+          outcome: ${{ needs.sdd-execute-haiku.result == 'success' && 'ran' || 'failed' }}

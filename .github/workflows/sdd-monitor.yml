@@ -168,7 +168,7 @@ jobs:
           permission-pull-requests: read
           permission-issues: write
       - name: Nudge armed-but-idle trackers
-        uses: norrietaylor/spectacles/.github/actions/sdd-monitor@v0.2.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-monitor@v0.3.0
         with:
           # App token: PR/issue reads + the /dispatch comment (App-authored so
           # the dispatch wrapper's carve-out admits it).
