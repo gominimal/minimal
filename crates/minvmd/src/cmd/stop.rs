@@ -154,6 +154,7 @@ mod tests {
         sd.write_state(&State {
             lifecycle: Lifecycle::Stopping,
             vmm_pid: Some(999_999_999),
+            gvproxy_pid: None,
             started_at: None,
         })
         .unwrap();
@@ -173,6 +174,7 @@ mod tests {
         sd.write_state(&State {
             lifecycle: Lifecycle::Running,
             vmm_pid: Some(fake_pid),
+            gvproxy_pid: None,
             started_at: Some(0),
         })
         .unwrap();
@@ -195,6 +197,7 @@ mod tests {
         sd.write_state(&State {
             lifecycle: Lifecycle::Running,
             vmm_pid: None,
+            gvproxy_pid: None,
             started_at: None,
         })
         .unwrap();
@@ -210,6 +213,7 @@ mod tests {
         sd.write_state(&State {
             lifecycle: Lifecycle::Running,
             vmm_pid: Some(0),
+            gvproxy_pid: None,
             started_at: None,
         })
         .unwrap();
@@ -228,6 +232,7 @@ mod tests {
         sd.write_state(&State {
             lifecycle: Lifecycle::Running,
             vmm_pid: Some(u32::MAX),
+            gvproxy_pid: None,
             started_at: None,
         })
         .unwrap();
