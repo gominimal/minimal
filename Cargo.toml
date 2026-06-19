@@ -8,7 +8,6 @@ members = [
     "crates/common",
     "crates/decode",
     "crates/graph",
-    "crates/gvproxy",
     "crates/mctx",
     "crates/mfile",
     "crates/op",
@@ -133,7 +132,6 @@ petgraph = "0.8"
 # our crates
 args = { version = "0.0.1", path = "crates/args" }
 graph = { version = "0.0.1", path = "crates/graph" }
-gvproxy = { version = "0.0.1", path = "crates/gvproxy" }
 lcache = { version = "0.0.1", path = "crates/lcache" }
 rcache = { version = "0.0.1", path = "crates/rcache" }
 check = { version = "0.0.1", path = "crates/check" }
