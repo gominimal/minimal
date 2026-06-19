@@ -6,6 +6,10 @@
 //! [`gvproxy`] crate. The transport-agnostic gvproxy spawn/lookup helpers come
 //! from that crate; `gvproxy_bin` below wraps the lookup with `minvmd`'s own
 //! override variable.
+//!
+//! This module also defines the network policy enforcement hook (R3.1, R3.2, R3.3).
+//! `check_network_policy` enforces the VM session's network access policy before boot.
+//! Currently it is a no-op (policy default: open / allow all).
 
 use std::path::PathBuf;
 
@@ -61,6 +65,31 @@ pub fn resolve_net_mode() -> NetworkMode {
 #[must_use]
 pub fn gvproxy_bin() -> PathBuf {
     gvproxy::gvproxy_bin("MINVMD_GVPROXY_PATH")
+}
+
+/// The network access policy for a VM session.
+///
+/// `Open` permits all outbound connections. `Allowlist` is reserved for
+/// future enforcement once the taskspec `network` declaration is wired in.
+#[derive(Debug, Clone)]
+pub enum NetworkPolicy {
+    /// Allow all outbound network connections.
+    Open,
+    /// Restrict outbound connections to a set of hostnames or CIDR ranges.
+    /// Unused in v1; reserved for future enforcement.
+    Allowlist(Vec<String>),
+}
+
+/// Check whether the given network policy permits the session to start.
+///
+/// Currently always returns `Ok(())` (policy default: open).
+/// A future spec will implement allowlist enforcement once the taskspec `network`
+/// declaration is available.
+pub fn check_network_policy(policy: &NetworkPolicy) -> anyhow::Result<()> {
+    match policy {
+        NetworkPolicy::Open => Ok(()),
+        NetworkPolicy::Allowlist(_) => Ok(()), // no-op in v1
+    }
 }
 
 #[cfg(test)]
@@ -119,5 +148,16 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         unsafe { std::env::remove_var("MINVMD_GVPROXY_PATH") };
         assert_eq!(gvproxy_bin(), PathBuf::from("gvproxy"));
+    }
+
+    #[test]
+    fn check_network_policy_open_is_ok() {
+        assert!(check_network_policy(&NetworkPolicy::Open).is_ok());
+    }
+
+    #[test]
+    fn check_network_policy_allowlist_is_ok() {
+        let policy = NetworkPolicy::Allowlist(vec!["example.com".to_string()]);
+        assert!(check_network_policy(&policy).is_ok());
     }
 }

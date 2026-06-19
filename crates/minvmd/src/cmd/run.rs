@@ -199,6 +199,13 @@ fn run_foreground() -> Result<()> {
         .set_nonblocking(false)
         .context("setting listener to blocking")?;
 
+    // Wire the taskspec `network` declaration here once the capability envelope
+    // (see capability-envelope tracking issue) is available. Replace
+    // `NetworkPolicy::Open` with the resolved policy from the task's network
+    // declaration.
+    crate::net::check_network_policy(&crate::net::NetworkPolicy::Open)
+        .context("network policy check failed")?;
+
     let exe = std::env::current_exe().context("resolving current executable path")?;
     let mut child = std::process::Command::new(&exe)
         .arg("__krun-vmm")
