@@ -40,7 +40,7 @@ permissions:
 
 jobs:
   distillery-sync:
-    uses: norrietaylor/spectacles/.github/workflows/distillery-sync.lock.yml@v0.2.0
+    uses: norrietaylor/spectacles/.github/workflows/distillery-sync.lock.yml@v0.3.0
     # Thread the consumer's DISTILLERY_DOC_GLOBS variable into the reusable
     # workflow as an input. A repo variable cannot be read inside the agent
     # prompt (`vars.*` is not an allowed gh-aw body expression), but a
@@ -55,7 +55,7 @@ jobs:
       # persistent status issue, so the wrapper must pass the App private key —
       # the same mapping every sdd-* wrapper carries.
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
-      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       # OTLP collector URL (write-only ingest key embedded). Mapped explicitly so
       # the reusable lock's observability.otlp endpoint resolves; unset is fine
       # (if-missing: warn). See ADR 0020.
