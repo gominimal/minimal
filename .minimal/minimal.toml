@@ -58,9 +58,9 @@ path = "usr/share/microvm-rootfs/rootfs.img"
 # libkrun KVM backend (shared lib + its libkrunfw firmware) from the upstream
 # libkrun package. Materialized as an OCI image whose layers carry the full
 # runtime closure; scripts/fetch-libkrun.sh extracts just libkrun.so* and
-# libkrunfw.so* into a link/runtime prefix. This replaces the from-source
-# scripts/build-libkrun.sh — libkrunfw compiles a guest kernel, far too heavy to
-# rebuild in CI on every run.
+# libkrunfw.so* into a link/runtime prefix. This replaces the former from-source
+# build — libkrunfw compiles a guest kernel, far too heavy to rebuild in CI on
+# every run.
 [outputs.libkrun]
 type = "oci-image"
 packages = ["libkrun"]
