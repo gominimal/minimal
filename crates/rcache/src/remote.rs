@@ -217,6 +217,15 @@ impl<B: FetchBackend> RemoteCache<B> {
         self.index.exists(spec_hash)
     }
 
+    /// Returns the SHA256 of the build for the given spec hash, if present.
+    /// Thin passthrough to the index (`materialize` resolves the same value
+    /// internally). The hermetic builder's B0b chain-to-hex0 enforcement maps a
+    /// cache-served spec_hash to its artifact sha to probe the signer-published
+    /// mirror envelope `gs://<MIRROR>/sha256/<sha>.intoto`.
+    pub fn sha256(&self, spec_hash: &SpecHash) -> Option<[u8; 32]> {
+        self.index.sha256(spec_hash)
+    }
+
     /// Download the given spec hash into the local cache.
     pub async fn materialize(
         &self,
