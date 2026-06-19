@@ -94,6 +94,7 @@ fn print_json(state: &State, uptime_seconds: Option<u64>) -> Result<()> {
     let json = serde_json::json!({
         "state": lifecycle_state_str(state.lifecycle),
         "vmm_pid": state.vmm_pid,
+        "gvproxy_pid": state.gvproxy_pid,
         "uptime_seconds": uptime_seconds,
         "vcpus": 2u8,
         "ram_mib": 1024u32,
@@ -151,6 +152,7 @@ mod tests {
         sd.write_state(&State {
             lifecycle: Lifecycle::Running,
             vmm_pid: Some(12345),
+            gvproxy_pid: None,
             started_at: Some(1_700_000_000),
         })
         .unwrap();
@@ -165,6 +167,7 @@ mod tests {
         sd.write_state(&State {
             lifecycle: Lifecycle::Starting,
             vmm_pid: None,
+            gvproxy_pid: None,
             started_at: None,
         })
         .unwrap();
@@ -179,6 +182,7 @@ mod tests {
         sd.write_state(&State {
             lifecycle: Lifecycle::Running,
             vmm_pid: Some(99),
+            gvproxy_pid: None,
             started_at: Some(0),
         })
         .unwrap();

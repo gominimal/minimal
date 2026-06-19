@@ -36,6 +36,8 @@ pub struct State {
     pub lifecycle: Lifecycle,
     /// PID of the vmm child process, if one is running.
     pub vmm_pid: Option<u32>,
+    /// PID of the gvproxy child process, if one is running (R1.4).
+    pub gvproxy_pid: Option<u32>,
     /// Unix timestamp (seconds) when the daemon last entered `Running`.
     pub started_at: Option<u64>,
 }
@@ -46,6 +48,7 @@ impl State {
         Self {
             lifecycle: Lifecycle::Stopped,
             vmm_pid: None,
+            gvproxy_pid: None,
             started_at: None,
         }
     }
@@ -102,6 +105,7 @@ impl StateDir {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(State {
                 lifecycle: Lifecycle::NotProvisioned,
                 vmm_pid: None,
+                gvproxy_pid: None,
                 started_at: None,
             }),
             Err(e) => Err(e),
@@ -188,6 +192,7 @@ impl Drop for StartingGuard {
         let result = state_dir.read_state().and_then(|mut s| {
             s.lifecycle = Lifecycle::Stopped;
             s.vmm_pid = None;
+            s.gvproxy_pid = None;
             s.started_at = None;
             state_dir.write_state(&s)
         });
@@ -220,6 +225,7 @@ mod tests {
         let original = State {
             lifecycle: Lifecycle::Running,
             vmm_pid: Some(12345),
+            gvproxy_pid: Some(12346),
             started_at: Some(1_700_000_000),
         };
         sd.write_state(&original).expect("write");
@@ -227,6 +233,7 @@ mod tests {
         let read_back = sd.read_state().expect("read");
         assert_eq!(read_back.lifecycle, Lifecycle::Running);
         assert_eq!(read_back.vmm_pid, Some(12345));
+        assert_eq!(read_back.gvproxy_pid, Some(12346));
         assert_eq!(read_back.started_at, Some(1_700_000_000));
     }
 
@@ -238,6 +245,7 @@ mod tests {
         let s = sd.read_state().expect("read");
         assert_eq!(s.lifecycle, Lifecycle::NotProvisioned);
         assert!(s.vmm_pid.is_none());
+        assert!(s.gvproxy_pid.is_none());
         assert!(s.started_at.is_none());
     }
 
@@ -302,6 +310,7 @@ mod tests {
         sd.write_state(&State {
             lifecycle: Lifecycle::Starting,
             vmm_pid: Some(999),
+            gvproxy_pid: Some(1000),
             started_at: Some(42),
         })
         .expect("write starting");
@@ -319,6 +328,7 @@ mod tests {
             "guard must reset to Stopped on uncommitted drop"
         );
         assert!(s.vmm_pid.is_none(), "vmm_pid cleared on reset");
+        assert!(s.gvproxy_pid.is_none(), "gvproxy_pid cleared on reset");
         assert!(s.started_at.is_none(), "started_at cleared on reset");
     }
 
@@ -330,6 +340,7 @@ mod tests {
         sd.write_state(&State {
             lifecycle: Lifecycle::Running,
             vmm_pid: Some(777),
+            gvproxy_pid: Some(778),
             started_at: Some(99),
         })
         .expect("write running");
@@ -344,5 +355,6 @@ mod tests {
             "committed guard must not overwrite state"
         );
         assert_eq!(s.vmm_pid, Some(777));
+        assert_eq!(s.gvproxy_pid, Some(778));
     }
 }
