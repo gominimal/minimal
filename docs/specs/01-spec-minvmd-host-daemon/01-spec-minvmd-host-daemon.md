@@ -13,10 +13,11 @@ supersedes:
 `minimal` is a declarative package manager and build system. On Linux,
 `minimald` (the session daemon) runs natively and the CLI talks to it over
 a UNIX domain socket. On macOS there is no native Linux namespace support,
-so a microVM is required to host `minimald`. `minvmd` is the macOS-only
-host daemon that fills this gap: it boots a Linux microVM via libkrun,
-supervises its lifecycle, and bridges a host UDS to a vsock port inside
-the VM so the `minimal` CLI can talk to `minimald` transparently.
+so a microVM is required to host `minimald`. `minvmd` is the host daemon
+that fills this gap: it boots a Linux microVM via libkrun (Hypervisor.framework
+on macOS, KVM on Linux), supervises its lifecycle, and bridges a host UDS to a
+vsock port inside the VM so the `minimal` CLI can talk to `minimald`
+transparently.
 
 The crate already exists in the workspace at `crates/minvmd/` with FFI
 bindings (`src/krun/raw.rs`), safe wrappers (`src/krun/ctx.rs`), typed
@@ -29,8 +30,9 @@ the remaining work to make the daemon functional end-to-end: VM boot
 with a real kernel and rootfs, the UDS↔vsock bridge, and the lifecycle
 daemon (auto-spawn, status, stop).
 
-Networking is explicitly deferred to #160. The crate compiles to a
-no-op stub on Linux so the existing Linux-only CI stays green.
+Networking is explicitly deferred to [#160](https://github.com/gominimal/minimal/issues/160).
+The crate builds and runs on Linux via libkrun's KVM backend, exercised by the
+dedicated Linux/KVM CI lane (`ci-linux-kvm.yml`).
 
 ## Introduction/Overview
 
@@ -48,8 +50,8 @@ that macOS imposes. The daemon:
 
 ## Goals
 
-1. `crates/minvmd` builds green on macOS (aarch64 + x86_64); no-op shim
-   on Linux; no CI regressions on the Linux-only workflow.
+1. `crates/minvmd` builds green on macOS (aarch64 + x86_64) and Linux
+   (x86_64 via KVM); no CI regressions.
 2. `minimal` CLI on macOS opens a connection to in-VM `minimald` over a
    host UDS without knowing a VM exists (transparent vsock bridge).
 3. VM boots from a `virtio-linux` kernel + Alpine rootfs in under ~5 s
@@ -92,8 +94,8 @@ with no rootfs work.
 **Functional Requirements:**
 
 - **R1.1**: The `minvmd` crate shall compile on `aarch64-apple-darwin`
-  and `x86_64-apple-darwin` and shall compile to a no-op stub on
-  `target_os = "linux"` so the existing Linux-only CI stays green.
+  and `x86_64-apple-darwin`, and shall build and run natively on
+  `x86_64-unknown-linux-gnu` via libkrun's KVM backend.
   (translated from plan: step R1.1)
 - **R1.2**: FFI bindings shall live in a single `src/krun/raw.rs` module;
   every `unsafe` call shall carry a `// SAFETY:` comment naming the
@@ -286,10 +288,11 @@ auto-spawns it; subsequent calls reuse; `minvmd status` introspects;
   SIGKILL on timeout, then remove `vmm.pid` and reset `state.toml` to
   `Stopped`. The command shall be idempotent.
   (translated from plan: step R4.4)
-- **R4.5**: On macOS, `crates/minimal2` shall check `state.toml` before
-  connecting to the UDS; if no `minvmd` is running it shall spawn
-  `minvmd run --detach` and wait (with timeout) for the UDS. On Linux
-  this path shall be a no-op. (translated from plan: step R4.5)
+- **R4.5**: On macOS and Linux, `crates/minimal2` shall check `state.toml`
+  before connecting to the UDS; if no `minvmd` is running it shall spawn
+  `minvmd run --detach` and wait (with timeout) for the UDS. On targets
+  with no minvmd backend this path shall be a no-op. (translated from
+  plan: step R4.5; Linux enabled once minvmd gained a KVM backend.)
 - **R4.6**: State transitions shall be guarded by an `fd-lock`-style
   file lock on `lifecycle.lock` so concurrent CLI invocations cannot
   race. Recovery from a panicking transition shall be handled by an RAII
@@ -326,7 +329,6 @@ auto-spawns it; subsequent calls reuse; `minvmd status` introspects;
 - **`brew services` registration** — auto-spawn from the CLI suffices
   for v0.1.
 - **PTY supervision / session sandboxing** — those live in `minimald`.
-- **Linux build of `minvmd`** beyond the no-op shim.
 - **OS suspend/resume of the VM, RAM resizing, vcpu hot-add.**
 - **Lifting code from reference impl** — patterns only, no vendoring.
 
@@ -432,8 +434,9 @@ hold under this model.
   only `default`). Lifecycle enum is
   `NotProvisioned | Stopped | Starting | Running | Stopping`.
 - **Auto-spawn from `minimal2`** — implementation lives in
-  `crates/minimal2/src/main.rs` behind `#[cfg(target_os = "macos")]`.
-  On Linux it is a no-op.
+  `crates/minimal2/src/autospawn.rs`, gated
+  `#[cfg(any(target_os = "macos", target_os = "linux"))]` and invoked from
+  `main.rs`. Enabled on both macOS and Linux.
 
 ## Security Considerations
 
@@ -454,9 +457,9 @@ hold under this model.
 | Check | Command |
 |---|---|
 | Lint  | `cargo clippy --allow-dirty --fix --all-targets -- -D warnings` |
-| Build | `cargo build -p minvmd` (Linux: shim; macOS: full) |
+| Build | `cargo build -p minvmd` (full on macOS and Linux) |
 | Test  | `cargo test -p minvmd` (unit + pure); `MINVMD_E2E=1 cargo test -p minvmd -- --include-ignored` (full) |
 
-**CI gate:** existing Linux-only CI stays green via the no-op shim.
-Optional `build-macos` job running `cargo check -p minvmd` once a Mac
-runner is available.
+**CI gate:** the Linux/KVM lane (`ci-linux-kvm.yml`) builds and boots
+`minvmd` on x86_64; macOS coverage runs on the Apple Silicon lane
+(`ci-macos.yml`).

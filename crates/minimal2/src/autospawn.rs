@@ -1,55 +1,79 @@
-//! Auto-spawn logic for minvmd on macOS (R4.5).
+//! Auto-spawn logic for minvmd (R4.5).
 //!
-//! On macOS, checks the minvmd state before connecting to the UDS. If minvmd
-//! is not running, spawns `minvmd run --detach` and waits for the UDS to become
-//! available.
-//!
-//! On Linux, this module is a no-op.
+//! Before connecting to the minvmd UDS, the CLI reads `state.toml`. If minvmd is
+//! not running it spawns `minvmd run --detach` and waits (with a timeout) for the
+//! UDS to become available. This runs on both macOS (Hypervisor.framework) and
+//! Linux (KVM); on any other target it is a no-op.
 
 use std::io;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::thread;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::time::{Duration, Instant};
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use minvmd::lifecycle::Lifecycle;
+
 /// Default timeout in seconds to wait for the UDS when spawning minvmd (R4.5).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const DEFAULT_SPAWN_TIMEOUT_SECS: u64 = 8;
 
 /// Poll interval while waiting for a shutting-down minvmd to reach a terminal
 /// state before deciding whether to spawn.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const STOPPING_POLL_MS: u64 = 100;
 
 /// Max time to wait for an in-progress `minvmd stop` (SIGTERM → SIGKILL, ~5 s)
 /// to finish before giving up with a clear error.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const STOPPING_WAIT_SECS: u64 = 6;
 
-/// Check if minvmd needs to be spawned, and spawn it if necessary.
+/// What to do given the lifecycle read from `state.toml`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Debug, PartialEq, Eq)]
+enum Decision {
+    /// minvmd is already up (or coming up); nothing to do.
+    AlreadyRunning,
+    /// minvmd is shutting down; wait for it to reach a terminal state first.
+    WaitForStopping,
+    /// minvmd is not running; spawn it.
+    Spawn,
+}
+
+/// Pure mapping from a lifecycle state to the action the CLI should take. Kept
+/// separate from the I/O so it can be exhaustively unit-tested. `Lifecycle` is
+/// `#[non_exhaustive]`, so any future state is treated conservatively as "spawn".
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn classify(lifecycle: Lifecycle) -> Decision {
+    match lifecycle {
+        Lifecycle::Running | Lifecycle::Starting => Decision::AlreadyRunning,
+        Lifecycle::Stopping => Decision::WaitForStopping,
+        Lifecycle::Stopped | Lifecycle::NotProvisioned => Decision::Spawn,
+        _ => Decision::Spawn,
+    }
+}
+
+/// Check whether minvmd needs to be spawned, and spawn it if necessary (R4.5).
 ///
-/// On macOS (R4.5):
-/// - Reads the minvmd state from `state.toml`
-/// - If not running, spawns `minvmd run --detach` with a timeout
-/// - Returns an error if spawn fails
+/// - Reads the minvmd state from `state.toml`.
+/// - If already running/starting, returns immediately.
+/// - If stopping, waits for the shutdown to finish, then spawns.
+/// - Otherwise spawns `minvmd run --detach` with a timeout.
 ///
-/// On Linux, this is a no-op since minvmd does not exist on Linux.
-#[cfg(target_os = "macos")]
+/// On targets with no minvmd backend this is a no-op (see below).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn ensure_minvmd_running() -> io::Result<()> {
     let state_dir = minvmd::state::StateDir::new(minvmd::state::StateDir::default_path())?;
 
-    // Read current state (R4.5: check state.toml before connecting)
-    let state = state_dir.read_state()?;
-
-    // If already running or starting, no need to spawn
-    match state.lifecycle {
-        minvmd::lifecycle::Lifecycle::Running | minvmd::lifecycle::Lifecycle::Starting => {
+    // Read current state (R4.5: check state.toml before connecting).
+    match classify(state_dir.read_state()?.lifecycle) {
+        Decision::AlreadyRunning => {
             tracing::debug!("minvmd already running or starting");
             return Ok(());
         }
-        minvmd::lifecycle::Lifecycle::Stopping => {
+        Decision::WaitForStopping => {
             // `minvmd stop` can take up to ~5 s (SIGTERM → SIGKILL escalation),
             // so a fixed short sleep usually leaves the daemon still Stopping.
             // Spawning then would make the new `minvmd run` bail on its own
@@ -59,32 +83,27 @@ pub fn ensure_minvmd_running() -> io::Result<()> {
             let deadline = Instant::now() + Duration::from_secs(STOPPING_WAIT_SECS);
             loop {
                 thread::sleep(Duration::from_millis(STOPPING_POLL_MS));
-                match state_dir.read_state()?.lifecycle {
+                match classify(state_dir.read_state()?.lifecycle) {
                     // Something else restarted it in the meantime.
-                    minvmd::lifecycle::Lifecycle::Running
-                    | minvmd::lifecycle::Lifecycle::Starting => return Ok(()),
+                    Decision::AlreadyRunning => return Ok(()),
                     // Shutdown completed; fall through to spawn.
-                    minvmd::lifecycle::Lifecycle::Stopped
-                    | minvmd::lifecycle::Lifecycle::NotProvisioned => break,
-                    _ if Instant::now() >= deadline => {
+                    Decision::Spawn => break,
+                    Decision::WaitForStopping if Instant::now() >= deadline => {
                         return Err(io::Error::other(
                             "minvmd is still stopping after waiting; try again shortly",
                         ));
                     }
-                    // Still stopping (or a future state); keep polling.
-                    _ => continue,
+                    // Still stopping; keep polling.
+                    Decision::WaitForStopping => continue,
                 }
             }
         }
-        minvmd::lifecycle::Lifecycle::Stopped | minvmd::lifecycle::Lifecycle::NotProvisioned => {
-            // Not running; will spawn below
+        Decision::Spawn => {
+            // Not running; will spawn below.
         }
-        // Lifecycle is #[non_exhaustive]; treat any future state conservatively
-        // as "not running" and fall through to spawn.
-        _ => {}
     }
 
-    // Not running; spawn minvmd run --detach with timeout (R4.5)
+    // Not running; spawn minvmd run --detach with timeout (R4.5).
     tracing::info!(
         "spawning minvmd run --detach with timeout {}",
         DEFAULT_SPAWN_TIMEOUT_SECS
@@ -109,23 +128,33 @@ pub fn ensure_minvmd_running() -> io::Result<()> {
     Ok(())
 }
 
-/// On Linux, auto-spawn is a no-op since minvmd is not available.
-#[cfg(target_os = "linux")]
+/// On targets without a minvmd backend (e.g. Windows), auto-spawn is a no-op.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn ensure_minvmd_running() -> io::Result<()> {
-    tracing::debug!("ensure_minvmd_running is a no-op on Linux");
+    tracing::debug!("ensure_minvmd_running is a no-op on this platform");
     Ok(())
 }
 
 #[cfg(test)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod tests {
+    use super::{Decision, classify};
+    use minvmd::lifecycle::Lifecycle;
+
     #[test]
-    #[cfg(target_os = "linux")]
-    fn test_autospawn_noop_on_linux() {
-        // On Linux, ensure_minvmd_running should be a no-op and always succeed
-        let result = super::ensure_minvmd_running();
-        assert!(
-            result.is_ok(),
-            "ensure_minvmd_running should always succeed on Linux"
-        );
+    fn running_or_starting_needs_no_spawn() {
+        assert_eq!(classify(Lifecycle::Running), Decision::AlreadyRunning);
+        assert_eq!(classify(Lifecycle::Starting), Decision::AlreadyRunning);
+    }
+
+    #[test]
+    fn stopped_or_not_provisioned_spawns() {
+        assert_eq!(classify(Lifecycle::Stopped), Decision::Spawn);
+        assert_eq!(classify(Lifecycle::NotProvisioned), Decision::Spawn);
+    }
+
+    #[test]
+    fn stopping_waits_for_terminal_state() {
+        assert_eq!(classify(Lifecycle::Stopping), Decision::WaitForStopping);
     }
 }

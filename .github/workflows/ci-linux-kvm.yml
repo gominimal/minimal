@@ -3,11 +3,10 @@ name: CI (Linux KVM)
 # minvmd Linux/KVM end-to-end on a GitHub-hosted runner (#410, #411).
 #
 # Split from ci.yml and PATH-SCOPED so it runs only when the minvmd surface
-# changes: it builds libkrun (incl. libkrunfw, which compiles a kernel) from
-# source, so it is far heavier than a normal lane and should not burden unrelated
-# PRs. Unlike the earlier self-hosted incarnation it needs no preprovisioned
-# runner — KVM is available on GitHub-hosted x86_64 Linux runners, and libkrun is
-# built + cached here.
+# changes. It needs no preprovisioned runner — KVM is available on GitHub-hosted
+# x86_64 Linux runners, and libkrun is materialized from the upstream package
+# cache (a cache fetch keyed by the pinned locked_commit, NOT a from-source
+# build) alongside the guest kernel + rootfs.
 #
 # x86_64 ONLY: GitHub-hosted arm64 runners (ubuntu-24.04-arm) do not expose
 # /dev/kvm, so the Linux/KVM e2e can only run on x86_64. aarch64 + libkrun boot
@@ -43,7 +42,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# Cancel superseded runs so the heavy libkrun build isn't queued on stale commits.
+# Cancel superseded runs so the e2e job isn't queued on stale commits.
 concurrency:
   group: ci-linux-kvm-${{ github.ref }}-${{ github.workflow }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
@@ -67,16 +66,15 @@ jobs:
         # protoc + libprotobuf-dev: the `minimal` CLI (materialize) build. The
         # well-known protos (google/protobuf/*.proto) live in libprotobuf-dev,
         # which protobuf-compiler only pulls via recommends — so name it
-        # explicitly since we use --no-install-recommends. The rest: libkrunfw's
-        # kernel compile (flex/bison/bc/libelf/libssl/pyelftools/cpio) and
-        # libkrun's bindgen + link (clang/libclang/pkg-config/patchelf).
+        # explicitly since we use --no-install-recommends. cpio: packs the guest
+        # initramfs (scripts/build-initramfs.sh). git: source fetches during the
+        # CLI build. libkrun no longer builds from source here, so its old kernel
+        # /bindgen toolchain (flex/bison/bc/libelf/clang/patchelf/…) is gone.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             protobuf-compiler libprotobuf-dev \
-            build-essential flex bison bc libelf-dev libssl-dev \
-            python3 python3-pyelftools cpio \
-            clang libclang-dev pkg-config patchelf git
+            cpio git
 
       - name: Enable /dev/kvm access
         # GitHub-hosted x86_64 Linux runners expose /dev/kvm but the runner user
@@ -106,35 +104,14 @@ jobs:
             echo "MINVMD_INITRAMFS=$RUNNER_TEMP/initramfs.cpio"
           } >> "$GITHUB_ENV"
 
-      - name: Restore libkrun cache (libkrunfw v5.5.0 + libkrun v1.19.0)
-        id: krun-cache
-        # Keyed on the pinned versions: the kernel compile only runs on a miss.
-        # Bump the suffix when scripts/build-libkrun.sh changes pins.
-        uses: actions/cache/restore@v5
-        with:
-          path: ${{ env.KRUN_PREFIX }}
-          key: x86_64-libkrun-fw5.5.0-krun1.19.0-blk-stamped
-
-      - name: Build libkrun from source (cached)
-        run: ./scripts/build-libkrun.sh "$KRUN_PREFIX"
-
-      - name: Save libkrun cache
-        # Save right after the build so the expensive kernel compile is cached
-        # even when a later step (e2e/bench) fails — the default post-job save is
-        # skipped on job failure. Skipped on a cache hit (keys are immutable).
-        if: steps.krun-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
-        with:
-          path: ${{ env.KRUN_PREFIX }}
-          key: x86_64-libkrun-fw5.5.0-krun1.19.0-blk-stamped
-
       - name: Export libkrun link + runtime paths
         # LIBKRUN_PREFIX: minvmd build.rs link-search dir (it emits an rpath to
-        # it too). LD_LIBRARY_PATH: libkrun.so -> libkrunfw.so.5 at runtime.
+        # it too). LD_LIBRARY_PATH: libkrun.so -> libkrunfw.so.5 at runtime. Both
+        # point at the flat prefix that the materialize step below populates.
         run: |
           {
-            echo "LIBKRUN_PREFIX=$KRUN_PREFIX/lib64"
-            echo "LD_LIBRARY_PATH=$KRUN_PREFIX/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            echo "LIBKRUN_PREFIX=$KRUN_PREFIX"
+            echo "LD_LIBRARY_PATH=$KRUN_PREFIX${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           } >> "$GITHUB_ENV"
 
       - name: Install cross
@@ -153,6 +130,12 @@ jobs:
             target/
           key: ${{ runner.os }}-x86_64-minvmd-kvm-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-x86_64-minvmd-kvm-
+
+      - name: Materialize libkrun prefix (upstream package)
+        # Cache fetch of the upstream libkrun package (libkrun.so + libkrunfw.so.5),
+        # extracted into $KRUN_PREFIX. Runs after the cargo cache restore so the
+        # `minimal` CLI build it drives is incremental.
+        run: ./scripts/fetch-libkrun.sh "$KRUN_PREFIX" x86_64
 
       - name: Materialize guest kernel (raw Image)
         run: ./scripts/fetch-artifact.sh virtio-kernel "$RUNNER_TEMP/vmlinuz" x86_64
