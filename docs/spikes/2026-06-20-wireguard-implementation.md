@@ -221,10 +221,27 @@ approach's in-process integration benefit.
    implementation; remove the cgo-via-shared-library option. The parenthetical
    "wireguard-go (compiled to a shared library via cgo)" should become
    "boringtun (pure-Rust WireGuard, `boringtun` crate)."
-2. **Context section amendment:** Update the context paragraph in
-   `03-spec-networking.md` ("wireguard-go (Tailscale userspace netstack)")
-   and the building-block diagram in `networking-with-diagrams.md` ("wireguard-go
-   / Tailscale userspace netstack") to read "boringtun (pure-Rust WireGuard)."
+2. **Full wireguard-go reference sweep (daemon and CLI):** boringtun applies
+   to both `minimald` (daemon) and the `minimal` CLI (also pure Rust), so all
+   wireguard-go references in the networking spec must be updated together to
+   avoid internal inconsistency. Six locations need amendment:
+   - `03-spec-networking.md` context paragraph (line 26): "wireguard-go (Tailscale
+     userspace netstack)" → "boringtun (pure-Rust WireGuard)"
+   - `03-spec-networking.md` R4.3 (line 318): "with wireguard-go bundled so no
+     system WireGuard package is required" → "with boringtun bundled so no
+     system WireGuard package is required"
+   - `networking-with-diagrams.md` building-block B6 label (line 437):
+     "wireguard-go / Tailscale userspace netstack" → "boringtun (pure-Rust
+     WireGuard)"
+   - `networking-with-diagrams.md` UC2 diagram, `WG` node (line 287):
+     "wireguard-go peer (bundled in minimal CLI or system WG client)" →
+     "boringtun peer (bundled in minimal CLI or system WG client)"
+   - `networking-with-diagrams.md` deployment-model diagram, `LapWG` node
+     (line 503): "wireguard-go peer (bundled in minimal CLI)" → "boringtun peer
+     (bundled in minimal CLI)"
+   - `networking-with-diagrams.md` Option A prose (lines 585–588): "Each
+     minimald is a wireguard-go peer" → "Each minimald is a boringtun peer";
+     "wireguard-go is bundled" → "boringtun is bundled"
 3. **Workspace dependency pin:** When Unit 4 implementation begins, pin
    `boringtun` in `[workspace.dependencies]` with `features = []` and add it to
    `minimald/Cargo.toml` behind the `wg` feature flag.
