@@ -67,14 +67,17 @@ Linux, over vsock through the libkrun VM on macOS.
    for own-IP PTasks; VM-wide egress is enforced for DM1/DM3/DM4.
 4. Static and dynamic ingress port mappings are configurable per PTask spec;
    the default for own-IP PTasks is deny-all-external.
-5. DNS hostnames resolve for PTask services and network-accessible `minimald`
-   instances on the local host; a browser can reach a PTask webserver by
-   hostname without memorizing an IP (UC2a).
+5. DNS hostnames resolve for own-IP and host-net PTask services, and
+   network-accessible `minimald` instances; a browser can reach a PTask
+   webserver by hostname without memorizing an IP (UC2a).
 6. A wireguard-go mesh enables authenticated remote PTask-to-PTask and
    laptop-to-PTask access (UC7 + UC2b option A).
 7. An HTTPS reverse proxy on `minimald` (mTLS/OIDC) enables ad-hoc remote
    browser access without a mesh client (UC2b option B).
 8. All of the above require no root privilege per-invocation.
+9. SSH port-forwarding over `minimald`'s existing SSH transport provides a
+   fallback remote-access path for restricted networks where WireGuard is
+   blocked.
 
 ## User Stories
 
@@ -93,6 +96,12 @@ Linux, over vsock through the libkrun VM on macOS.
 - As a Developer, I share a URL with a teammate who opens it in a browser;
   `minimald`'s HTTPS reverse proxy authenticates and routes the request without
   any client install on the teammate's machine (UC2b option B).
+- As a Developer, I open `http://my-service.ptask.local` in a browser on the
+  same host and reach a webserver running inside a `HostNet` PTask (the hostname
+  resolves to the host's loopback address).
+- As a Developer on a network where WireGuard is blocked, I run
+  `minimal ssh-forward <session> 8080:127.0.0.1:80` and a local port tunnels
+  over SSH to a service inside a remote PTask (SSH fallback for UC2b).
 
 ## Demoable Units of Work
 
@@ -137,7 +146,7 @@ extended network-mode types in `crates/minimald-rpc/`
   is over a unix socket or SCM_RIGHTS; on DM1 (macOS/libkrun VM) it is over
   vsock via the per-PTask shuttle process already used for boot signalling.
 - **R1.6**: Each `OwnIp` PTask shall be assigned a unique IP from the gvproxy
-  switch subnet (configurable; default `100.64.0.0/16` or similar RFC-5737
+  switch subnet (configurable; default `100.64.0.0/16` or similar RFC-6598
   range). The assigned IP shall not be reused by another PTask during the
   lifetime of the `minimald` process.
 - **R1.7**: Two `OwnIp` PTasks on the same host shall reach each other by TCP
@@ -221,8 +230,9 @@ types, gvproxy filter/portfwd API integration
 
 ### Unit 3: DNS hostname management (UC2a, UC2c)
 
-**Purpose:** DNS-resolvable hostnames for PTask services and network-accessible
-`minimald` instances so users reach services by name, not by rotating IPs.
+**Purpose:** DNS-resolvable hostnames for own-IP and host-net PTask services,
+and network-accessible `minimald` instances, so users reach services by name,
+not by rotating IPs.
 
 **Depends on:** Unit 1
 
@@ -252,6 +262,13 @@ DNS integration), new hostname manager module, host-side DNS configuration path
 - **R3.5**: All hostname registration and deregistration events shall emit a
   structured `tracing` event with fields: `session_id`, `hostname`, `ip`,
   `action` (`registered` / `deregistered`).
+- **R3.6**: `minimald` shall register a DNS hostname for each `HostNet` PTask
+  on launch, in the same format as R3.1 (`<session-name>.<host-id>.min.local`).
+  The hostname shall resolve to `127.0.0.1` for local-only `minimald`
+  configurations, or to the host's configured network interface address for DM5
+  (network-accessible) configurations. The hostname shall be deregistered when
+  the session exits. This enables hostname-driven access to `HostNet` PTask
+  services without memorizing the host's IP address.
 
 **Proof Artifacts:**
 
@@ -262,6 +279,10 @@ DNS integration), new hostname manager module, host-side DNS configuration path
 2. **CLI:** `curl http://<session-name>.<host-id>.min.local/` from the local host
    returns HTTP 200 from a webserver running inside an own-IP PTask — demonstrates
    UC2a local browser access.
+3. **CLI:** `curl http://<session-name>.<host-id>.min.local:<port>/` from the
+   local host returns HTTP 200 from a webserver running inside a `HostNet` PTask
+   (hostname resolves to `127.0.0.1`) — demonstrates UC2 hostname-driven access
+   for host-net PTask services (R3.6).
 
 ---
 
@@ -269,8 +290,9 @@ DNS integration), new hostname manager module, host-side DNS configuration path
 
 **Purpose:** Authenticated remote connectivity: remote PTask-to-PTask across
 hosts (UC7), laptop joining the mesh to reach PTasks by hostname (UC2b option A),
-and HTTPS reverse proxy on `minimald` for no-client remote browser access
-(UC2b option B).
+HTTPS reverse proxy on `minimald` for no-client remote browser access
+(UC2b option B), and SSH port-forwarding as a fallback transport for networks
+where WireGuard is blocked.
 
 **Depends on:** Unit 1, Unit 3
 
@@ -314,6 +336,13 @@ management)
   a feature flag and shall not affect binary size or startup time when unconfigured.
 - **R4.8**: `minimal mesh join`, `minimal mesh leave`, and `minimal mesh status`
   shall be documented with examples in the CLI help text.
+- **R4.9**: `minimald` shall expose SSH port-forwarding (using the `russh` SSH
+  server already embedded for PTask re-attach) as a fallback remote-access
+  transport for networks where WireGuard is blocked. `minimal ssh-forward
+  <session> <local-port>:<remote-addr>:<remote-port>` shall set up a
+  `LocalForward`-style TCP tunnel to a service reachable from within the named
+  `OwnIp` PTask, authenticated by the same credentials used for re-attach. This
+  path requires no WireGuard configuration and carries TCP only.
 
 **Proof Artifacts:**
 
@@ -324,6 +353,10 @@ management)
 2. **CLI:** From a laptop in the mesh, `curl http://<session-name>.<host-id>.min.local/`
    returns HTTP 200 from a webserver in an own-IP PTask on a remote host, routed
    over the WireGuard tunnel — demonstrates UC2b option A remote mesh access.
+3. **CLI:** `minimal ssh-forward <session> 8080:127.0.0.1:80` with the WireGuard
+   feature flag disabled establishes a TCP tunnel; `curl http://localhost:8080/`
+   returns HTTP 200 from a webserver inside the PTask — demonstrates the SSH
+   fallback for restricted networks (R4.9).
 
 ---
 
@@ -381,6 +414,17 @@ made during Unit 4 design, informed by build-chain and maintenance consideration
 Native Linux (DM2) has no VM boundary to defend. VM-wide egress (UC5) therefore
 collapses to per-PTask egress (UC3). The spec reflects this by marking `vm_egress`
 as a configuration error on DM2 (R2.5).
+
+### SSH port-forwarding as a restricted-network fallback
+
+`minimald` embeds `russh` for PTask re-attach (SSH over UDS/TCP). SSH
+`LocalForward`-style port-forwarding reuses that authenticated transport — no
+credential setup beyond `minimal login` is required. The WireGuard mesh
+(R4.1–R4.3) is the primary remote-access path for UC2b and UC7; SSH
+port-forwarding (R4.9) is the fallback for networks where WireGuard's UDP cannot
+get out. The fallback supports TCP only and does not deliver the hostname-driven
+browser access of the mesh path, but it preserves authenticated remote service
+access in restricted environments.
 
 ## Repository Standards
 
