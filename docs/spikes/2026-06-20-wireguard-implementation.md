@@ -68,7 +68,8 @@ production adoption at the subnet-router level.
 - **Integration into non-Go binaries:** wireguard-go is a Go program. Embedding
   it in a Rust binary requires one of two paths:
   - **Subprocess:** Run the `wireguard-go` binary as a child process; communicate
-    via its JSON configuration socket. minimald manages the lifecycle alongside
+    via its UAPI socket (a line-based key=value text protocol over a Unix
+    socket). minimald manages the lifecycle alongside
     gvproxy. Simple from a Rust perspective but adds a second supervised process.
   - **cgo shared library:** Build wireguard-go with
     `go build -buildmode=c-shared -o libwireguard.so`. This embeds the Go runtime
@@ -85,7 +86,8 @@ production adoption at the subnet-router level.
 - **Source:** `boringtun` crate on crates.io (Cloudflare), version 0.7.1 (May
   2026; preceded by 0.7.0 in January 2026 with critical security updates, and
   0.6.0 in July 2023). GitHub: `github.com/cloudflare/boringtun`. Development
-  pace had an ~18-month gap between 0.6.0 and 0.7.0, but resumed actively in
+  pace had an ~30-month gap between 0.6.0 (July 2023) and 0.7.0 (January 2026,
+  approximately 2.5 years), but resumed actively in
   early 2026 with security-focused releases; the WireGuard protocol is stable
   (RFC equivalent), so implementation-level churn risk is low.
 - **Production use:** Cloudflare WARP (their consumer VPN product) and Mullvad
@@ -245,12 +247,12 @@ approach's in-process integration benefit.
 3. **Workspace dependency pin:** When Unit 4 implementation begins, pin
    `boringtun` in `[workspace.dependencies]` with `features = []` and add it to
    `minimald/Cargo.toml` behind the `wg` feature flag.
-4. **Risk register entry:** Note that boringtun exhibited an ~18-month release
-   gap (0.6.0 July 2023 → 0.7.0 January 2026) before resuming active
-   maintenance with security-focused releases in early 2026. Flag this cadence
-   pattern as a known risk in Unit 4 task descriptions; retain the checkpoint
-   to re-evaluate if no version is released within 18 months of the prior
-   release.
+4. **Risk register entry:** Note that boringtun exhibited an ~30-month release
+   gap (0.6.0 July 2023 → 0.7.0 January 2026, approximately 2.5 years) before
+   resuming active maintenance with security-focused releases in early 2026.
+   Flag this cadence pattern as a known risk in Unit 4 task descriptions;
+   retain the checkpoint to re-evaluate if no version is released within
+   30 months of the prior release.
 5. **Follow-up spike (if needed):** If v2 requirements add Tailscale-style
    peer coordination or the boringtun crate shows signs of abandonment, open a
    follow-up spike comparing wireguard-go subprocess integration with the then-
