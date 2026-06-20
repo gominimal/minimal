@@ -1,0 +1,57 @@
+name: CI gvproxy
+
+# Builds the gvproxy switch binary (gvisor-tap-vsock) from the pinned source
+# in vendor/gvproxy/ and publishes its SHA-256. The source dependency graph is
+# cryptographically verified against the checked-in vendor/gvproxy/go.sum, so
+# the binary is built from a pinned source — never a pre-built download
+# (architecture assumption: gvproxy-source-build).
+on:
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "vendor/gvproxy/**"
+      - ".github/workflows/ci-gvproxy.yml"
+  push:
+    branches: ["main"]
+    paths:
+      - "vendor/gvproxy/**"
+      - ".github/workflows/ci-gvproxy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-gvproxy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: vendor/gvproxy/go.mod
+          cache-dependency-path: vendor/gvproxy/go.sum
+      - name: Verify pinned dependency graph (go.sum)
+        working-directory: vendor/gvproxy
+        run: go mod verify
+      - name: Build gvproxy from pinned source
+        working-directory: vendor/gvproxy
+        run: |
+          go build -trimpath -o "${RUNNER_TEMP}/gvproxy" \
+            github.com/containers/gvisor-tap-vsock/cmd/gvproxy
+      - name: Record SHA-256 of the built binary
+        run: |
+          DIGEST="$(sha256sum "${RUNNER_TEMP}/gvproxy" | awk '{print $1}')"
+          echo "gvproxy sha256: ${DIGEST}"
+          {
+            echo "### gvproxy build"
+            echo ""
+            echo "- version: \`v0.8.9\` (pinned in vendor/gvproxy/go.mod)"
+            echo "- sha256: \`${DIGEST}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+      - name: Upload gvproxy binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: gvproxy-linux-amd64
+          path: ${{ runner.temp }}/gvproxy
+          if-no-files-found: error
