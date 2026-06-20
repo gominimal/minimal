@@ -82,10 +82,12 @@ production adoption at the subnet-router level.
 
 ### boringtun
 
-- **Source:** `boringtun` crate on crates.io (Cloudflare), version 0.6.x as of
-  mid-2025. GitHub: `github.com/cloudflare/boringtun`. Development pace is
-  slower than wireguard-go but the WireGuard protocol is stable (RFC
-  equivalent), so the slower churn is not a safety concern.
+- **Source:** `boringtun` crate on crates.io (Cloudflare), version 0.7.1 (May
+  2026; preceded by 0.7.0 in January 2026 with critical security updates, and
+  0.6.0 in July 2023). GitHub: `github.com/cloudflare/boringtun`. Development
+  pace had an ~18-month gap between 0.6.0 and 0.7.0, but resumed actively in
+  early 2026 with security-focused releases; the WireGuard protocol is stable
+  (RFC equivalent), so implementation-level churn risk is low.
 - **Production use:** Cloudflare WARP (their consumer VPN product) and Mullvad
   VPN both use boringtun in production, proving it handles sustained real-world
   traffic. Neither deploys at Tailscale's device count, but both are at a
@@ -181,7 +183,7 @@ boringtun's integration advantages for a Rust project:
 | Cross-compilation | High — C cross-compiler | Medium — separate binary | Low — Rust toolchain |
 | Process count | Same (in-proc) | +1 (alongside gvproxy) | Same (in-proc) |
 | Production subnet-router | Tailscale-scale | Tailscale-scale | Cloudflare/Mullvad-scale |
-| Maintenance risk | Low | Low | Medium (slower cadence) |
+| Maintenance risk | Low | Low | Low–Medium (gap resolved in 2026) |
 
 If boringtun's maintenance pace declines materially or the v1 manual-key-exchange
 model is replaced with Tailscale-style coordination, revisiting wireguard-go via
@@ -226,9 +228,12 @@ approach's in-process integration benefit.
 3. **Workspace dependency pin:** When Unit 4 implementation begins, pin
    `boringtun` in `[workspace.dependencies]` with `features = []` and add it to
    `minimald/Cargo.toml` behind the `wg` feature flag.
-4. **Risk register entry:** Flag boringtun's slower maintenance cadence as a
-   known risk in the Unit 4 task descriptions; add a checkpoint to re-evaluate
-   if a boringtun version is not released within 18 months of the prior release.
+4. **Risk register entry:** Note that boringtun exhibited an ~18-month release
+   gap (0.6.0 July 2023 → 0.7.0 January 2026) before resuming active
+   maintenance with security-focused releases in early 2026. Flag this cadence
+   pattern as a known risk in Unit 4 task descriptions; retain the checkpoint
+   to re-evaluate if no version is released within 18 months of the prior
+   release.
 5. **Follow-up spike (if needed):** If v2 requirements add Tailscale-style
    peer coordination or the boringtun crate shows signs of abandonment, open a
    follow-up spike comparing wireguard-go subprocess integration with the then-
@@ -244,9 +249,11 @@ approach's in-process integration benefit.
 - `github.com/tailscale/wireguard-go`: Tailscale fork, derives from upstream
   wireguard-go with Tailscale-specific extensions (netstack, subnet-router
   coordination). Production scale: millions of Tailscale nodes.
-- `github.com/cloudflare/boringtun` (`boringtun` crate, v0.6.x): Cloudflare's
-  pure-Rust WireGuard implementation. Production use confirmed in Cloudflare
-  WARP and Mullvad VPN.
+- `github.com/cloudflare/boringtun` (`boringtun` crate, v0.7.1 as of June
+  2026): Cloudflare's pure-Rust WireGuard implementation. Production use
+  confirmed in Cloudflare WARP and Mullvad VPN. Actively maintained as of
+  spike date (0.7.0 January 2026 with critical security updates, 0.7.1 May
+  2026).
 
 ## Spec documents reviewed
 
