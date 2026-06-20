@@ -130,9 +130,10 @@ interface address for DM5.
 
 `minimald` embeds a WireGuard peer via a feature-flagged `wg` module. When
 the mesh configuration is present, `minimald` joins the mesh as a
-subnet-router peer advertising its gvproxy switch subnet. The `boringtun`
-vs `wireguard-go` choice is the second open design question (needs-spike
-below).
+subnet-router peer advertising its gvproxy switch subnet. **boringtun**
+(pure Rust WireGuard) is the chosen WireGuard implementation for v1, settled
+by spike #486 and confirmed by the maintainer. The wireguard-go subprocess
+path is the v2 escalation if peer coordination is needed or boringtun stalls.
 
 The HTTPS reverse proxy (`proxy` module) uses `hyper`/`axum` for HTTP/1.1 +
 WebSocket, `rustls` for TLS (no OpenSSL dependency). Both `wg` and `proxy`
@@ -268,7 +269,7 @@ proposed here is the typed replacement for that placeholder.
 | `gvproxy-source-build` | gvproxy is built from vendored Go source rather than downloaded as a pre-built binary | settled | spec § "Technical Considerations": "Building from source is preferred for reproducibility and eliminates supply-chain risk" (informed by spec-networking) |
 | `https-proxy-hyper-rustls` | The Unit 4 HTTPS reverse proxy uses hyper/axum for HTTP and rustls for TLS, matching the workspace's existing ecosystem | settled | spec § "Technical Considerations"; `rustls` is listed as a no-OpenSSL-dependency choice; `hyper`/`axum` are named as consistent with workspace deps |
 | `dns-hostname-mechanism` | The system resolver supports PTask hostname registration without root privilege per-invocation via either `*.localhost` wildcard (rootless on macOS; requires systemd-resolved or NetworkManager on Linux) or a one-time `/etc/resolver`-equivalent setup | needs-spike | spec Open Questions item 1: "Decision needed before Unit 3 implementation begins"; whether `*.localhost` wildcard resolution is reliably available on common Linux distributions (Ubuntu, Fedora, Arch, Debian) is not settleable from the repo working tree; R3.4 requires rootless per-invocation operation |
-| `wireguard-implementation` | Unit 4 WireGuard uses either wireguard-go (cgo + Go toolchain, already needed for gvproxy) or boringtun (pure Rust WireGuard, no additional toolchain) | needs-spike | spec Open Questions for R4.1: "decision is made during Unit 4 design, informed by build-chain and maintenance considerations"; boringtun's production maturity relative to wireguard-go (Tailscale's reference implementation) cannot be assessed from the repo working tree |
+| `wireguard-implementation` | Unit 4 WireGuard implementation is **boringtun** (pure Rust); wireguard-go subprocess is the v2 escalation path if peer coordination is needed or boringtun stalls | settled | spike #486 concluded boringtun for v1: clean Cargo feature-flag support for R4.7, zero additional build-chain dependencies, sufficient production maturity (Cloudflare WARP, Mullvad VPN) for the AllowedIPs-based subnet-router model; cgo path substantially more complex than hypothesised; maintainer confirmed on #478 (informed by #486) |
 
 ALREADY EXISTS: `sandbox2::Config::disable_networking: bool` — covers R1.2 (NoNet) and R1.3 (HostNet) in boolean form. The trimodal enum refactor replaces this field, preserving its semantics for the two existing modes.
 
