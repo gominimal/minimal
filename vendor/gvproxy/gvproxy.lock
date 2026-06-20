@@ -1,0 +1,7 @@
+# gvproxy (gvisor-tap-vsock) pinned pre-built release, verified by SHA-256.
+# Source: https://github.com/containers/gvisor-tap-vsock/releases/tag/v0.8.9
+# Digests are the upstream-published sha256sums for each release asset.
+version=v0.8.9
+gvproxy-linux-amd64=3011c5629c9138d2050fb23c510e09ae53e30ec52e6a9ab85632bc1550e8ef63
+gvproxy-linux-arm64=6ecca02839254c9a0cc184bba7aac63755a22d7ed10d455b852528a99d7f7d4b
+gvproxy-darwin=c6f7b4bc7f21bf810b5cf54e04d979b014c5d96472a03a9e97fe62a00940067c
