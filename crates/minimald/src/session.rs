@@ -233,6 +233,7 @@ impl<S: SessionObject> Session<S> {
     ) -> Result<session_host::SandboxLauncher, AttachError> {
         Ok(session_host::SandboxLauncher {
             ctx: self.context().map_err(AttachError::ContextCreationFailed)?,
+            network_mode: self.session.record().network,
             session,
         })
     }
@@ -370,7 +371,7 @@ mod tests {
                     name: Some("shell-test".to_string()),
                     username: None,
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                    network: Default::default(),
+                    network: sessions::NetworkMode::default(),
                     attrs: Default::default(),
                 },
             })

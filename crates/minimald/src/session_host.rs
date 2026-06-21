@@ -567,6 +567,7 @@ impl SessionProcess for SandboxProcess {
 #[cfg(not(test))]
 pub(crate) struct SandboxLauncher {
     pub(crate) ctx: mctx::Context,
+    pub(crate) network_mode: sessions::NetworkMode,
     // The session this host belongs to. Not yet read, but retained so the
     // launcher carries the full session identity for future use (and to mirror
     // the prior `Host::spawn` signature).
@@ -608,6 +609,7 @@ impl SessionLauncher for SandboxLauncher {
             graph,
             crate::env::EnvArgs::new(name, paths.working, paths.home, paths.cache)
                 .with_packages(["base", "bash", "socat", "coreutils", "claude-code"])
+                .with_network_mode(self.network_mode)
                 .with_env_vars(
                     [(
                         "PS1".to_string(),

@@ -170,7 +170,7 @@ async fn run_session_exec(
                 username: None,
                 project_path: paths::HostAbsPath::try_new("/tmp")
                     .map_err(|e| format!("project_path: {e}"))?,
-                network: Default::default(),
+                network: sessions::NetworkMode::default(),
                 attrs: Default::default(),
             },
         };

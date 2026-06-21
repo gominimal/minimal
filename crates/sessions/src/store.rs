@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use paths::{DaemonAbsPath, DaemonRelPath, sub_path};
 
-use crate::{Record, SessionId};
+use crate::{NetworkMode, Record, SessionId};
 
 /// Describes the session object yielded by [`Loader`].
 pub trait SessionObject: Sized + Send + Clone + 'static + std::fmt::Debug {
@@ -437,7 +437,7 @@ mod tests {
             name: Some("my-session".to_string()),
             username: Some("alice".to_string()),
             project_path: HostAbsPath::try_new("/home/alice/proj").unwrap(),
-            network: Default::default(),
+            network: NetworkMode::default(),
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()
                 .collect(),

@@ -344,7 +344,7 @@ mod tests {
                     name: Some("stream-test".to_string()),
                     username: None,
                     project_path: HostAbsPath::try_new("/tmp").unwrap(),
-                    network: Default::default(),
+                    network: sessions::NetworkMode::default(),
                     attrs: Default::default(),
                 },
             })
@@ -508,7 +508,7 @@ mod tests {
                     name: Some("my session".to_string()),
                     username: None,
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                    network: Default::default(),
+                    network: sessions::NetworkMode::default(),
                     attrs: Default::default(),
                 },
             })
@@ -553,7 +553,7 @@ mod tests {
                     name: Some("my session".to_string()),
                     username: None,
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                    network: Default::default(),
+                    network: sessions::NetworkMode::default(),
                     attrs: Default::default(),
                 },
             })
@@ -570,7 +570,7 @@ mod tests {
                         name: Some("my session".to_string()),
                         username: None,
                         project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                        network: Default::default(),
+                        network: sessions::NetworkMode::default(),
                         attrs: Default::default(),
                     },
                 })
