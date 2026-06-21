@@ -312,7 +312,7 @@ where
             }
         }
     }
-    Ok(())
+    // No Ok(()) — outer loop has type `!`; coerces to anyhow::Result<()>.
 }
 ```
 
@@ -517,7 +517,7 @@ was correct with one material correction.
    `tokio::net::UnixStream` handles the gvproxy socket.
 
 4. **IP allocation strategy** (R1.6): use `dhcpStaticLeases` with pre-assigned
-   MAC→IP entries rather than dynamic DHCP; minimald maintains the allocation
+   IP→MAC entries (IP as key, MAC as value) rather than dynamic DHCP; minimald maintains the allocation
    map in its process state and writes it to the gvproxy YAML on each new PTask
    attachment. An alternative is dynamic DHCP + polling `/leases` to discover
    the assigned IP, but this is non-deterministic and adds latency.
