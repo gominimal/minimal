@@ -269,7 +269,7 @@ async fn tap_to_switch<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    let mut buf = vec![0u8; 1518 + 14]; // MTU + Ethernet header
+    let mut buf = vec![0u8; 1518]; // max Ethernet frame excl. FCS (+4 for 802.1Q VLAN)
     loop {
         let n = loop {
             let mut guard = tap.readable().await?;
@@ -280,8 +280,11 @@ where
         };
         if n == 0 { break; }
         let len = (n as u16).to_le_bytes();
-        sock.write_all(&len).await?;
-        sock.write_all(&buf[..n]).await?;
+        // Combined buffer avoids desync if the socket closes between writes.
+        let mut framed = Vec::with_capacity(2 + n);
+        framed.extend_from_slice(&len);
+        framed.extend_from_slice(&buf[..n]);
+        sock.write_all(&framed).await?;
     }
     Ok(())
 }
