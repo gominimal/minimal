@@ -189,7 +189,7 @@ minimald                                    gvproxy
 create TAP device "tap-ptask-N" in netns
 open TAP fd (O_RDWR on /dev/net/tun)
 set MAC 52:54:00:00:00:NN on tap device
-bring link up (SIOCNETIFFLAGS IFF_UP)
+bring link up (SIOCSIFFLAGS IFF_UP)
 assign IP via DHCP or static config
 
 connect(unix, /run/minimald/gvproxy-api.sock) ───►
@@ -225,6 +225,7 @@ alongside the PTask.
 
 ```rust
 use std::io::{Read, Write};
+use std::os::fd::{FromRawFd, IntoRawFd};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::io::unix::AsyncFd;
