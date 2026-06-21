@@ -247,6 +247,8 @@ pub async fn attach_to_switch(
     //    pread/pwrite; TAP character devices do not support pread/pwrite and
     //    require plain read/write with non-blocking mode + AsyncFd for epoll
     //    readiness notification.
+    // SAFETY: tap_fd.into_raw_fd() transfers ownership of a valid, open, caller-owned
+    // file descriptor. File takes exclusive ownership and will close it on drop.
     let tap_file = unsafe { std::fs::File::from_raw_fd(tap_fd.into_raw_fd()) };
     tap_file.set_nonblocking(true)?;
     let tap = Arc::new(AsyncFd::new(tap_file)?);
@@ -269,7 +271,9 @@ async fn tap_to_switch<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    let mut buf = vec![0u8; 1518]; // max Ethernet frame excl. FCS (+4 for 802.1Q VLAN)
+    // Sized for the default MTU of 1500: 1514 (max frame excl. FCS) + 4 (802.1Q VLAN) = 1518.
+    // Scoped to gvproxy's default -mtu 1500; derive from the configured MTU in the real impl.
+    let mut buf = vec![0u8; 1518];
     loop {
         let n = loop {
             let mut guard = tap.readable().await?;
