@@ -197,8 +197,8 @@ write("POST /connect HTTP/1.0\r\nHost: …\r\n\r\n") ─►
                                             hijack conn, register switch port
         ◄─── [no response; raw frame exchange begins] ───►
 
-goroutine rx: read(tap_fd) → LE_u16(len) + frame → write(sock)
-goroutine tx: read(sock) → LE_u16(len) → read(frame) → write(tap_fd)
+async task rx: read(tap_fd) → LE_u16(len) + frame → write(sock)
+async task tx: read(sock) → LE_u16(len) → read(frame) → write(tap_fd)
 ```
 
 gvproxy's switch learns the source MAC of every frame arriving on a port
