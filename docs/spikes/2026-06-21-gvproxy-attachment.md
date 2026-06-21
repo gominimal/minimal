@@ -224,9 +224,10 @@ This sketch is the U1-T2 implementation target. It lives in `sandbox2` or a new
 alongside the PTask.
 
 ```rust
-use std::os::unix::net::UnixStream;
+use std::io::{Read, Write};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::fs::File;
+use tokio::io::unix::AsyncFd;
 
 /// Attach a TAP fd to a running gvproxy instance over its unix socket.
 /// `tap_fd`: open fd of the TAP device (opened from host namespace).
@@ -241,39 +242,57 @@ pub async fn attach_to_switch(
     // 2. Send the HTTP "connect" request (raw, no response expected).
     sock.write_all(b"POST /connect HTTP/1.0\r\nHost: gvproxy\r\n\r\n").await?;
 
-    // 3. Wrap the TAP fd for async I/O.
-    let tap = unsafe { tokio::fs::File::from_raw_fd(tap_fd.into_raw_fd()) };
-    let (tap_rx, tap_tx) = tokio::io::split(tap);
-    let (sock_rx, sock_tx) = sock.into_split();
+    // 3. Wrap the TAP fd for epoll-driven async I/O.
+    //    tokio::fs::File routes all I/O through a blocking thread pool via
+    //    pread/pwrite; TAP character devices do not support pread/pwrite and
+    //    require plain read/write with non-blocking mode + AsyncFd for epoll
+    //    readiness notification.
+    let tap_file = unsafe { std::fs::File::from_raw_fd(tap_fd.into_raw_fd()) };
+    tap_file.set_nonblocking(true)?;
+    let tap = Arc::new(AsyncFd::new(tap_file)?);
 
     // 4. Two relay tasks: tap→socket and socket→tap.
-    let t1 = tokio::spawn(tap_to_switch(tap_rx, sock_tx));
+    let tap_tx = Arc::clone(&tap);
+    let (sock_rx, sock_tx) = sock.into_split();
+    let t1 = tokio::spawn(tap_to_switch(tap, sock_tx));
     let t2 = tokio::spawn(switch_to_tap(sock_rx, tap_tx));
-    tokio::try_join!(t1, t2)?;
+    let (r1, r2) = tokio::try_join!(t1, t2)?;
+    r1?; r2?;
     Ok(())
 }
 
 /// TAP → gvproxy: read raw Ethernet frames, prepend 2-byte LE length.
-async fn tap_to_switch<R, W>(mut tap: R, mut sock: W)
+async fn tap_to_switch<W>(
+    tap: Arc<AsyncFd<std::fs::File>>,
+    mut sock: W,
+) -> anyhow::Result<()>
 where
-    R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
     let mut buf = vec![0u8; 1518 + 14]; // MTU + Ethernet header
     loop {
-        let n = tap.read(&mut buf).await?;
+        let n = loop {
+            let mut guard = tap.readable().await?;
+            match guard.try_io(|inner| inner.get_ref().read(&mut buf)) {
+                Ok(result) => break result?,
+                Err(_) => continue, // WouldBlock; re-register for readiness
+            }
+        };
         if n == 0 { break; }
         let len = (n as u16).to_le_bytes();
         sock.write_all(&len).await?;
         sock.write_all(&buf[..n]).await?;
     }
+    Ok(())
 }
 
 /// gvproxy → TAP: read 2-byte LE length, then frame, write to TAP.
-async fn switch_to_tap<R, W>(mut sock: R, mut tap: W)
+async fn switch_to_tap<R>(
+    mut sock: R,
+    tap: Arc<AsyncFd<std::fs::File>>,
+) -> anyhow::Result<()>
 where
     R: AsyncReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
 {
     let mut size_buf = [0u8; 2];
     loop {
@@ -281,8 +300,16 @@ where
         let n = u16::from_le_bytes(size_buf) as usize;
         let mut buf = vec![0u8; n];
         sock.read_exact(&mut buf).await?;
-        tap.write_all(&buf).await?;
+        // TAP writes are atomic for single Ethernet frames within MTU.
+        loop {
+            let mut guard = tap.writable().await?;
+            match guard.try_io(|inner| inner.get_ref().write_all(&buf)) {
+                Ok(result) => { result?; break; }
+                Err(_) => continue, // WouldBlock; re-register for readiness
+            }
+        }
     }
+    Ok(())
 }
 ```
 
@@ -480,9 +507,11 @@ was correct with one material correction.
 
 3. **Implement relay in Rust** (R1.5, issue #496): the Rust sketch above is the
    implementation target for the TAP↔gvproxy relay inside `sandbox2` or a
-   `minimald::network` module. Use `tokio::io::split` for the async relay loops.
-   The `tun-tap` or `nix` crate handles TAP device creation; `tokio::net::
-   UnixStream` handles the gvproxy socket.
+   `minimald::network` module. Use `tokio::io::unix::AsyncFd` with non-blocking
+   mode for the TAP fd (epoll-driven; `tokio::fs::File` uses `pread`/`pwrite`
+   which TAP devices do not support); wrap in `Arc` to share between the two
+   relay tasks. The `tun-tap` or `nix` crate handles TAP device creation;
+   `tokio::net::UnixStream` handles the gvproxy socket.
 
 4. **IP allocation strategy** (R1.6): use `dhcpStaticLeases` with pre-assigned
    MAC→IP entries rather than dynamic DHCP; minimald maintains the allocation
