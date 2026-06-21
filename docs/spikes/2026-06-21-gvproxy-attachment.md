@@ -240,7 +240,7 @@ pub async fn attach_to_switch(
     let mut sock = tokio::net::UnixStream::connect(api_sock).await?;
 
     // 2. Send the HTTP "connect" request (raw, no response expected).
-    sock.write_all(b"POST /connect HTTP/1.0\r\nHost: gvproxy\r\n\r\n").await?;
+    sock.write_all(b"POST /connect HTTP/1.0\r\nHost: localhost\r\n\r\n").await?;
 
     // 3. Wrap the TAP fd for epoll-driven async I/O.
     //    tokio::fs::File routes all I/O through a blocking thread pool via
@@ -344,7 +344,7 @@ device creation should be added as a pre-spawn hook.
    │           │           │
   relay A     relay B    gvisor netstack
  ┌─┴──────┐  ┌─┴──────┐
- │tap-A   │  │tap-B   │   (host namespace, relay goroutines)
+ │tap-A   │  │tap-B   │   (host namespace, relay tasks)
  │in netns│  │in netns│
  └────────┘  └────────┘
   100.64.0.2  100.64.0.3   (assigned via DHCP or static lease)
@@ -482,8 +482,8 @@ was correct with one material correction.
    connection is hijacked with no HTTP response; Ethernet frames are exchanged
    in HyperKit framing (2-byte LE uint16 length prefix + raw Ethernet). No
    SCM_RIGHTS fd passing occurs. The "tap fd" language in R1.5 is misleading:
-   gvproxy never receives a file descriptor; instead, minimald runs a relay
-   goroutine that bridges the netns-internal TAP device to gvproxy's socket.
+   gvproxy never receives a file descriptor; instead, minimald runs an async
+   relay task that bridges the netns-internal TAP device to gvproxy's socket.
    This relay is straightforward async I/O (Tokio tasks).
 
 3. **L2/IP/route**: For `OwnIp`, a TAP device in the PTask netns gets a unique
@@ -502,7 +502,7 @@ was correct with one material correction.
 1. **Correct R1.5** in `docs/specs/03-spec-networking/03-spec-networking.md`:
    replace "passing the tap file descriptor to the running gvproxy as a new
    switch client. On DM2 the fd-pass is over a unix socket or SCM_RIGHTS" with
-   "minimald runs a relay goroutine per OwnIp PTask that bridges the netns TAP
+   "minimald runs an async relay task per OwnIp PTask that bridges the netns TAP
    device to gvproxy via HTTP POST to `/connect` on the management unix socket,
    using HyperKit framing (2-byte LE length prefix + raw Ethernet frames). No
    SCM_RIGHTS or fd-passing is involved."
