@@ -708,7 +708,7 @@ impl Context {
                 patches,
                 env_vars,
                 hostname: Some(name.to_string()),
-                override_disable_networking: Some(false),
+                override_network_mode: Some(sandbox2::NetworkMode::HostNet),
                 ot: self.config.ot.clone(),
             },
         )

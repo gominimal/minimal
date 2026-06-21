@@ -482,6 +482,7 @@ mod tests {
                     name: Some("sftp-test".to_string()),
                     username: None,
                     project_path: HostAbsPath::try_new("/tmp").unwrap(),
+                    network: Default::default(),
                     attrs: Default::default(),
                 },
             })

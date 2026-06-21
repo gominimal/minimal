@@ -5120,6 +5120,7 @@ dependencies = [
  "globset",
  "hakoniwa",
  "nix 0.31.3",
+ "sessions",
  "tempfile",
  "tokio",
  "tokio-util",

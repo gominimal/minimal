@@ -270,7 +270,11 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
             .with_isolated_wd(inputs.into_iter())
             .with_rootfs(rootfs.into_iter())
             .with_dns(needs_dns)
-            .with_disable_networking(!needs_dns && !needs_internet);
+            .with_network_mode(if !needs_dns && !needs_internet {
+                sandbox2::NetworkMode::NoNet
+            } else {
+                sandbox2::NetworkMode::HostNet
+            });
         if let Some(a) = &build.build_args {
             config = config.with_build_args(a.iter());
         }
