@@ -43,6 +43,7 @@ use ot::OpTracker;
 use paths::DaemonAbsPath;
 use sandbox2::config::{Config, SandboxMapped};
 use sandbox2::{Container, Sandbox};
+use sessions::NetworkMode;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, spawn_blocking};
@@ -69,6 +70,7 @@ pub struct EnvArgs {
     patches: Option<EnvPatches>,
     env_vars: Option<HashMap<String, EnvVarValue>>,
     ot: Option<OpTracker>,
+    network_mode: NetworkMode,
 }
 
 impl EnvArgs {
@@ -90,6 +92,7 @@ impl EnvArgs {
             patches: None,
             env_vars: None,
             ot: None,
+            network_mode: NetworkMode::HostNet,
         }
     }
 
@@ -130,6 +133,13 @@ impl EnvArgs {
     #[must_use]
     pub fn with_username(mut self, username: String) -> Self {
         self.username = Some(username);
+        self
+    }
+
+    /// Sets the network isolation mode for the session sandbox.
+    #[must_use]
+    pub fn with_network_mode(mut self, mode: NetworkMode) -> Self {
+        self.network_mode = mode;
         self
     }
 }
@@ -233,6 +243,7 @@ impl Env {
             )
             .with_state_dir(args.state_base_dir.as_utf8_path())
             .with_env_vars(pkg_env_vars.into_iter())
+            .with_network_mode(args.network_mode)
             .with_hostname(args.name.clone())
             .with_username(args.username.unwrap_or_else(|| "user".to_string()));
 

@@ -13,6 +13,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sessions::SessionId;
 
+pub use sessions::{IpProto, NetworkMode};
+
 pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
 
 /// Describes a minimal-specific RPC method sent over ssh.

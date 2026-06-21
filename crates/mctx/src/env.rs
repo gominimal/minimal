@@ -492,8 +492,8 @@ pub struct EnvArgs<'a> {
     /// The hostname to set, if any.
     pub hostname: Option<String>,
 
-    /// If set, enables or disables networking.
-    pub override_disable_networking: Option<bool>,
+    /// If set, overrides the network isolation mode for the sandbox.
+    pub override_network_mode: Option<sandbox2::NetworkMode>,
     /// The operation tracker to use downstream, if applicable.
     pub ot: Option<OpTracker>,
 }
@@ -562,14 +562,17 @@ impl<'a> Env<'a> {
             )
             .with_state_dir(&args.state_base_dir)
             .with_dns(
-                args.override_disable_networking
-                    .map(|v| !v)
+                args.override_network_mode
+                    .map(|m| !matches!(m, sandbox2::NetworkMode::NoNet))
                     .unwrap_or(needs_dns),
             )
-            .with_disable_networking(
-                args.override_disable_networking
-                    .unwrap_or(!needs_dns && !needs_internet),
-            )
+            .with_network_mode(args.override_network_mode.unwrap_or(
+                if !needs_dns && !needs_internet {
+                    sandbox2::NetworkMode::NoNet
+                } else {
+                    sandbox2::NetworkMode::HostNet
+                },
+            ))
             .with_env_vars(pkg_env_vars.into_iter());
         if let Some(hn) = &args.hostname {
             config = config.with_hostname(hn);

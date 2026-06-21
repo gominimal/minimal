@@ -324,6 +324,7 @@ mod tests {
             name: Some("doomed".to_string()),
             username: None,
             project_path: HostAbsPath::try_new("/proj").unwrap(),
+            network: sessions::NetworkMode::default(),
             attrs: Default::default(),
         }
     }

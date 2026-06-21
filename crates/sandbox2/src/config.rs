@@ -4,6 +4,8 @@ use std::fs;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 
+pub use sessions::NetworkMode;
+
 /// Something in the FS that needs to be mapped into the sandbox.
 #[derive(Debug)]
 pub enum SandboxMapped {
@@ -123,8 +125,8 @@ pub struct Config {
 
     /// Synthesize DNS config.
     pub setup_dns_config: bool,
-    /// Disable all networking.
-    pub disable_networking: bool,
+    /// The network isolation mode for this sandbox.
+    pub network_mode: NetworkMode,
 
     /// The hostname to set in the environment, if any.
     pub hostname: Option<String>,
@@ -162,7 +164,7 @@ impl Config {
         Self {
             name: name.into(),
             setup_dns_config: true,
-            disable_networking: false,
+            network_mode: NetworkMode::HostNet,
             env_vars: HashMap::with_capacity(12),
             hostname: None,
             username: None,
@@ -247,9 +249,9 @@ impl Config {
         self.rootfs.insert(file);
         self
     }
-    /// Sets whether networking is required.
-    pub fn with_disable_networking(mut self, disable_networking: bool) -> Self {
-        self.disable_networking = disable_networking;
+    /// Sets the network isolation mode for this sandbox.
+    pub fn with_network_mode(mut self, mode: NetworkMode) -> Self {
+        self.network_mode = mode;
         self
     }
     /// Sets whether DNS should be configured.

@@ -14,6 +14,33 @@ pub mod core;
 pub mod store;
 pub mod wire;
 
+/// The network isolation mode for a `PTask` (session).
+///
+/// Defaults to [`NetworkMode::HostNet`] for backwards compatibility with
+/// existing sessions that predate this field.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMode {
+    /// No network namespace; all network syscalls fail or see no interfaces.
+    NoNet,
+    /// Share the host (or VM) network namespace. Current default.
+    #[default]
+    HostNet,
+    /// Own IP via the gvproxy switch: new netns + tap + switch attachment.
+    OwnIp,
+}
+
+/// An IP transport protocol, used in egress/ingress policy rules.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpProto {
+    Tcp,
+    Udp,
+    Icmp,
+}
+
 /// A session ID, a newtype over a UUID.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionId(Uuid);
@@ -64,6 +91,12 @@ pub struct Record {
     pub username: Option<String>,
     /// The absolute path upon which this session was built from.
     pub project_path: HostAbsPath,
+
+    /// The network isolation mode for this session.
+    ///
+    /// Defaults to [`NetworkMode::HostNet`] when absent (existing sessions).
+    #[serde(default)]
+    pub network: NetworkMode,
 
     /// Free-form attributes.
     pub attrs: BTreeMap<String, String>,

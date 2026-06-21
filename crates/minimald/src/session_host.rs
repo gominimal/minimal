@@ -25,6 +25,8 @@ use crate::RequestedPty;
 #[cfg(not(test))]
 use crate::session::SessionHandle;
 use crate::session::SessionPaths;
+#[cfg(not(test))]
+use sessions::NetworkMode;
 
 /// Command sequence for the ctrl-w key chord, when the kitty keyboard protocol
 /// is negotiated.
@@ -572,6 +574,7 @@ pub(crate) struct SandboxLauncher {
     // the prior `Host::spawn` signature).
     #[allow(dead_code)]
     pub(crate) session: SessionHandle,
+    pub(crate) network_mode: NetworkMode,
 }
 
 #[cfg(not(test))]
@@ -618,6 +621,7 @@ impl SessionLauncher for SandboxLauncher {
                     )]
                     .into(),
                 )
+                .with_network_mode(self.network_mode)
                 .with_username(username),
         )
         .await?;

@@ -1222,6 +1222,7 @@ mod tests {
                         name: Some("exec-test".to_string()),
                         username: None,
                         project_path: HostAbsPath::try_new("/tmp").unwrap(),
+                        network: sessions::NetworkMode::default(),
                         attrs: Default::default(),
                     },
                 })

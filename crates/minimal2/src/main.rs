@@ -250,6 +250,7 @@ async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), ()>
         name: args.name.clone(),
         username,
         project_path: abs_path,
+        network: sessions::NetworkMode::default(),
         attrs: Default::default(),
     };
 
