@@ -41,8 +41,9 @@ use mfile::{EnvPatches, EnvVarValue};
 use op::Runnable;
 use ot::OpTracker;
 use paths::DaemonAbsPath;
-use sandbox2::config::{Config, NetworkMode, SandboxMapped};
+use sandbox2::config::{Config, SandboxMapped};
 use sandbox2::{Container, Sandbox};
+use sessions::NetworkMode;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, spawn_blocking};
@@ -65,11 +66,11 @@ pub struct EnvArgs {
     home: DaemonAbsPath,
     state_base_dir: DaemonAbsPath,
 
-    network_mode: NetworkMode,
     packages: Vec<String>,
     patches: Option<EnvPatches>,
     env_vars: Option<HashMap<String, EnvVarValue>>,
     ot: Option<OpTracker>,
+    network_mode: NetworkMode,
 }
 
 impl EnvArgs {
@@ -87,19 +88,12 @@ impl EnvArgs {
             cwd: cwd.into(),
             home: home.into(),
             state_base_dir: state_base_dir.into(),
-            network_mode: NetworkMode::HostNet,
             packages: Vec::new(),
             patches: None,
             env_vars: None,
             ot: None,
+            network_mode: NetworkMode::HostNet,
         }
-    }
-
-    /// Sets the network isolation mode for the sandbox.
-    #[must_use]
-    pub fn with_network_mode(mut self, mode: NetworkMode) -> Self {
-        self.network_mode = mode;
-        self
     }
 
     /// Sets the packages (by name) that should be available in the environment.
@@ -139,6 +133,13 @@ impl EnvArgs {
     #[must_use]
     pub fn with_username(mut self, username: String) -> Self {
         self.username = Some(username);
+        self
+    }
+
+    /// Sets the network isolation mode for the session sandbox.
+    #[must_use]
+    pub fn with_network_mode(mut self, mode: NetworkMode) -> Self {
+        self.network_mode = mode;
         self
     }
 }
@@ -241,8 +242,8 @@ impl Env {
                     .map(|ce| SandboxMapped::Dir(ce.path().to_path_buf())),
             )
             .with_state_dir(args.state_base_dir.as_utf8_path())
-            .with_network_mode(args.network_mode)
             .with_env_vars(pkg_env_vars.into_iter())
+            .with_network_mode(args.network_mode)
             .with_hostname(args.name.clone())
             .with_username(args.username.unwrap_or_else(|| "user".to_string()));
 

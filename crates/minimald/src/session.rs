@@ -371,7 +371,7 @@ mod tests {
                     name: Some("shell-test".to_string()),
                     username: None,
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                    network: sessions::NetworkMode::default(),
+                    network: Default::default(),
                     attrs: Default::default(),
                 },
             })

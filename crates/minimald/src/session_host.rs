@@ -25,6 +25,8 @@ use crate::RequestedPty;
 #[cfg(not(test))]
 use crate::session::SessionHandle;
 use crate::session::SessionPaths;
+#[cfg(not(test))]
+use sessions::NetworkMode;
 
 /// Command sequence for the ctrl-w key chord, when the kitty keyboard protocol
 /// is negotiated.
@@ -567,12 +569,12 @@ impl SessionProcess for SandboxProcess {
 #[cfg(not(test))]
 pub(crate) struct SandboxLauncher {
     pub(crate) ctx: mctx::Context,
-    pub(crate) network_mode: sessions::NetworkMode,
     // The session this host belongs to. Not yet read, but retained so the
     // launcher carries the full session identity for future use (and to mirror
     // the prior `Host::spawn` signature).
     #[allow(dead_code)]
     pub(crate) session: SessionHandle,
+    pub(crate) network_mode: NetworkMode,
 }
 
 #[cfg(not(test))]
@@ -609,7 +611,6 @@ impl SessionLauncher for SandboxLauncher {
             graph,
             crate::env::EnvArgs::new(name, paths.working, paths.home, paths.cache)
                 .with_packages(["base", "bash", "socat", "coreutils", "claude-code"])
-                .with_network_mode(self.network_mode)
                 .with_env_vars(
                     [(
                         "PS1".to_string(),
@@ -620,6 +621,7 @@ impl SessionLauncher for SandboxLauncher {
                     )]
                     .into(),
                 )
+                .with_network_mode(self.network_mode)
                 .with_username(username),
         )
         .await?;
