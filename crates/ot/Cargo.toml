@@ -6,5 +6,15 @@ license = "MIT OR Apache-2.0"
 edition.workspace = true
 publish.workspace = true
 
+[features]
+default = ["indicatif"]
+# The indicatif renderer (legacy single-terminal CLI path). Disable to build the
+# pure operation-tracking core with no rendering dependency.
+indicatif = ["dep:indicatif", "tokio/rt"]
+
 [dependencies]
-indicatif.workspace = true
+indicatif = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

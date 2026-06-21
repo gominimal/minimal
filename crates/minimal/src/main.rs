@@ -216,7 +216,14 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         global_args,
     } = cli;
 
+    // One operation tree for this CLI invocation, rendered to stderr. Threaded
+    // into the Context so all operations attach to it (replacing the former
+    // process-global root).
+    let ot_root = ot::OpTracker::new_root();
+    ot::render_to_stderr(ot_root.clone());
+
     let mut config = ConfigBuilder::new()
+        .with_operation_tracker(ot_root)
         .with_no_cache(global_args.no_cache)
         .with_no_fetch(global_args.no_fetch)
         .with_offline(global_args.offline);
