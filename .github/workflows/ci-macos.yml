@@ -128,6 +128,12 @@ jobs:
           persist-credentials: false
       - name: Toolchain
         uses: dtolnay/rust-toolchain@stable
+      - name: Provision libkrun (slp/krun tap)
+        # Self-install libkrun so macOS jobs no longer depend on hand-provisioned
+        # runner state — a missing libkrun.dylib silently broke every code PR.
+        # Idempotent (a no-op when already present); same slp/krun tap the runner
+        # setup used, so the supply-chain surface is unchanged.
+        run: brew install slp/krun/libkrun
       - name: Verify libkrun is available
         run: |
           if [ ! -f /opt/homebrew/lib/libkrun.dylib ]; then
@@ -223,6 +229,12 @@ jobs:
           persist-credentials: false
       - name: Toolchain
         uses: dtolnay/rust-toolchain@stable
+      - name: Provision libkrun (slp/krun tap)
+        # Self-install libkrun so macOS jobs no longer depend on hand-provisioned
+        # runner state — a missing libkrun.dylib silently broke every code PR.
+        # Idempotent (a no-op when already present); same slp/krun tap the runner
+        # setup used, so the supply-chain surface is unchanged.
+        run: brew install slp/krun/libkrun
       - name: Verify libkrun is available
         run: |
           if [ ! -f /opt/homebrew/lib/libkrun.dylib ]; then
@@ -346,12 +358,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - name: Provision libkrun (slp/krun tap)
+        # Self-install libkrun from the slp/krun tap so this job no longer depends
+        # on hand-provisioned runner state. Idempotent (a no-op when already
+        # present); same tap the runner setup used, so the supply-chain surface
+        # is unchanged.
+        run: brew install slp/krun/libkrun
       - name: Verify libkrun is available
-        # libkrun must be preprovisioned on the runner (it ships from the
-        # third-party slp/krun tap, github.com/slp/homebrew-krun). CI does not
-        # install it: auto-installing a third-party tap on a persistent runner
-        # is a supply-chain risk and would require bypassing Homebrew's tap
-        # trust. Provisioning is part of runner setup: `brew install slp/krun/libkrun`.
         run: |
           if [ ! -f /opt/homebrew/lib/libkrun.dylib ]; then
             echo "::error::libkrun.dylib not found under /opt/homebrew/lib. Provision the runner with: brew install slp/krun/libkrun" >&2
