@@ -1,13 +1,18 @@
 //! Tracking of long-running operations, so that pretty progress bars
 //! can be printed.
 
-use std::{
-    fmt::Display,
-    sync::{Arc, Mutex, OnceLock, Weak},
-    time::Duration,
+use std::fmt::Display;
+use std::sync::{
+    Arc, Mutex, Weak,
+    atomic::{AtomicU64, Ordering},
 };
 
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use tokio::sync::Notify;
+
+#[cfg(feature = "indicatif")]
+mod indicatif_shim;
+#[cfg(feature = "indicatif")]
+pub use indicatif_shim::{IndicatifShim, StdoutWriter, render_to_stderr};
 
 #[derive(Debug, Clone)]
 pub enum CheckKind {
@@ -39,125 +44,105 @@ pub enum Operation {
     FetchIndex,
 }
 
+/// A stable identifier for a node in the operation tree.
+///
+/// Ids are unique within a single tree (i.e. per [`RootShared`]) and never
+/// reused, so a renderer can diff successive snapshots to learn which rows
+/// appeared, changed, or vanished. `0` is reserved for the root node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct OpId(u64);
+
+/// Quantitative progress of an operation: how far through, and the total if
+/// known. Stored in the state core so a renderer can draw a bar without
+/// reaching into indicatif.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    pub pos: u64,
+    pub len: Option<u64>,
+}
+
+/// State shared by every node of a single operation tree, owned via `Arc`.
+///
+/// Created once per root (see [`OpTracker::new_root`]) and cloned into each
+/// child so the whole tree shares one change counter and wakeup primitive.
 #[derive(Debug, Default)]
+struct RootShared {
+    /// Bumped on every mutation anywhere in the tree. The source of truth a
+    /// driver polls to decide whether a repaint is due.
+    version: AtomicU64,
+    /// Wakeup for the tree's driver awaiting the next change. A tree has a
+    /// single consumer (one renderer per root), so `notify_one` is used: a
+    /// mutation that races ahead of the driver leaves a stored permit rather
+    /// than being lost, and `version` reconciles coalesced bumps.
+    notify: Notify,
+    /// Allocator for [`OpId`]s within this tree.
+    next_id: AtomicU64,
+}
+
+impl RootShared {
+    /// Records a mutation: bump the version and wake the driver (or leave a
+    /// permit if it is not currently parked).
+    fn bump(&self) {
+        self.version.fetch_add(1, Ordering::Relaxed);
+        self.notify.notify_one();
+    }
+
+    /// Allocates the next unique [`OpId`] for this tree (root is `0`).
+    fn alloc_id(&self) -> OpId {
+        OpId(self.next_id.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+}
+
+/// An immutable view of one operation, produced by [`OpTracker::snapshot`].
+///
+/// A flat `Vec<OpSnapshot>` in pre-order is the "slice of progress" a renderer
+/// consumes: already in display order, with `depth` carrying the indentation.
+#[derive(Debug, Clone)]
+pub struct OpSnapshot {
+    pub id: OpId,
+    pub depth: usize,
+    pub op: Option<Operation>,
+    pub progress: Option<Progress>,
+}
+
+#[derive(Debug)]
 struct TrackerInner {
+    id: OpId,
     depth: usize,
+    // Strong reference to the parent, pinning the ancestor chain alive so a live
+    // node stays reachable from the root during `snapshot` traversal, which
+    // descends through `children` (held only by `Weak`). Never read directly;
+    // its role is purely to own the chain upward.
+    #[allow(dead_code)]
     parent: Option<OpTracker>,
     op: Option<Operation>,
+    progress: Option<Progress>,
     children: Vec<Weak<Mutex<TrackerInner>>>,
-    pg: Option<ProgressBar>,
+    shared: Arc<RootShared>,
 }
 
 impl TrackerInner {
-    fn set_length(&self, length: u64) {
-        if let Some(pg) = &self.pg {
-            pg.set_length(length);
-        }
+    fn set_length(&mut self, length: u64) {
+        self.progress = Some(Progress {
+            pos: self.progress.map_or(0, |p| p.pos),
+            len: Some(length),
+        });
+        self.shared.bump();
     }
-    fn increment(&self, amt: u64) {
-        if let Some(pg) = &self.pg {
-            pg.inc(amt);
-        }
+    fn increment(&mut self, amt: u64) {
+        self.progress = Some(Progress {
+            pos: self.progress.map_or(amt, |p| p.pos + amt),
+            len: self.progress.and_then(|p| p.len),
+        });
+        self.shared.bump();
     }
 
-    pub fn set_op(&mut self, op: Option<Operation>) {
+    fn set_op(&mut self, op: Option<Operation>) {
         self.op = op;
-
-        // Depending on the operation type, create a progress bar.
-        match (&self.op, &self.pg) {
-            (Some(Operation::PackageBuild { name }), _) => {
-                let new_pg = ProgressBar::hidden().with_style(
-                    ProgressStyle::with_template("{prefix}{spinner} Building package: {msg}")
-                        .unwrap(),
-                );
-                new_pg.set_message(name.clone());
-                new_pg.enable_steady_tick(Duration::from_millis(100));
-                self.install(new_pg);
-            }
-            (Some(Operation::CollectOutputs { name, outputs }), _) => {
-                let new_pg = ProgressBar::hidden().with_style(
-                    ProgressStyle::with_template("{prefix}{spinner} Collect outputs for {msg}")
-                        .unwrap(),
-                );
-
-                let s = outputs.to_vec().join(" ");
-                let outputs_str = match s.char_indices().nth(30) {
-                    Some((idx, _)) => format!("{}...", &s[..idx]),
-                    None => s.to_string(),
-                };
-                new_pg.set_message(format!("{name}: {outputs_str}"));
-                new_pg.enable_steady_tick(Duration::from_millis(50));
-                self.install(new_pg);
-            }
-            (Some(Operation::ExtractPkg { name }), _) => {
-                let new_pg = ProgressBar::hidden().with_style(
-                    ProgressStyle::with_template("{prefix}{spinner} Extract: {msg}").unwrap(),
-                );
-                new_pg.set_message(name.clone());
-                new_pg.enable_steady_tick(Duration::from_millis(50));
-                self.install(new_pg);
-            }
-            (Some(Operation::CompressPkg { name }), _) => {
-                let new_pg = ProgressBar::hidden().with_style(
-                    ProgressStyle::with_template("{prefix}{spinner} Compress: {msg}").unwrap(),
-                );
-                new_pg.set_message(name.clone());
-                new_pg.enable_steady_tick(Duration::from_millis(80));
-                self.install(new_pg);
-            }
-            (Some(Operation::FetchPkg { name }), _) => {
-                let new_pg = ProgressBar::hidden()
-                    .with_style(ProgressStyle::with_template("{prefix}Fetch: {msg:35!} [{wide_bar}]     {decimal_bytes:9!} / {decimal_total_bytes:9!}   ETA: {eta:5!}").unwrap().progress_chars("=> "));
-                new_pg.set_message(name.clone());
-                self.install(new_pg);
-            }
-            (Some(Operation::FetchIndex), _) => {
-                let new_pg = ProgressBar::hidden()
-                    .with_style(ProgressStyle::with_template("{prefix}Update remote index  {msg:35!} [{wide_bar}]     {decimal_bytes:9!} / {decimal_total_bytes:9!}   ETA: {eta:5!}").unwrap().progress_chars("=> "));
-                new_pg.set_message("");
-                self.install(new_pg);
-            }
-            (Some(Operation::FetchSource { url }), _) => {
-                let new_pg = ProgressBar::hidden()
-                    .with_style(ProgressStyle::with_template("{prefix}Fetch source: {msg:35!} [{wide_bar}]     {decimal_bytes:9!} / {decimal_total_bytes:9!}   ETA: {eta:5!}").unwrap().progress_chars("=> "));
-                new_pg.set_message(url.clone());
-                self.install(new_pg);
-            }
-            (Some(Operation::Check { kind, name }), _) => {
-                let new_pg = ProgressBar::hidden().with_style(
-                    ProgressStyle::with_template("{prefix}{spinner} Checking: {msg}").unwrap(),
-                );
-                new_pg.set_message(format!("{} {}", kind, name));
-                new_pg.enable_steady_tick(Duration::from_millis(100));
-                self.install(new_pg);
-            }
-            (Some(Operation::StandaloneTest { name }), _) => {
-                let new_pg = ProgressBar::hidden().with_style(
-                    ProgressStyle::with_template("{prefix}{spinner} Test: {msg}").unwrap(),
-                );
-                new_pg.set_message(name.clone());
-                new_pg.enable_steady_tick(Duration::from_millis(50));
-                self.install(new_pg);
-            }
-            // No operation remains but a progress bar exists. Set it to finished and remove our reference.
-            (None, Some(pg)) => {
-                pg.finish_and_clear();
-                self.pg = None;
-            }
-            _ => {}
-        }
-    }
-
-    fn install(&mut self, pg: ProgressBar) {
-        if self.depth > 1 {
-            pg.set_prefix(format!("{}{}", "  ".repeat((self.depth - 1) * 2), "↳ "));
-        }
-        if let Some(p) = &self.parent {
-            p.install_progress(pg.clone());
-        } else {
-            global_progress().add(pg.clone());
-        }
-        self.pg = Some(pg);
+        // A fresh operation starts with no measured progress; FetchPkg & co.
+        // call set_length once they learn the content length.
+        self.progress = None;
+        self.shared.bump();
     }
 }
 
@@ -171,31 +156,53 @@ pub struct OpTracker {
 }
 
 impl OpTracker {
-    /// Creates a new OpTracker which is a child of the given root, if any.
+    /// Creates a fresh root of a new operation tree, with its own change
+    /// counter and wakeup primitive. Each independent rendering context (the
+    /// CLI process, or a single daemon session) owns one root.
+    pub fn new_root() -> OpTracker {
+        OpTracker {
+            inner: Arc::new(Mutex::new(TrackerInner {
+                id: OpId(0),
+                depth: 0,
+                parent: None,
+                op: None,
+                progress: None,
+                children: Vec::with_capacity(32),
+                shared: Arc::new(RootShared::default()),
+            })),
+        }
+    }
+
+    /// Creates a new operation node as a child of the given root.
+    ///
+    /// `None` means "untracked": the node is created under a fresh, unrendered
+    /// throwaway tree, so progress calls on it are valid no-ops. Pass `Some` to
+    /// attach the operation to a real, rendered tree.
     pub fn new_with_root(root_op: &Option<OpTracker>) -> OpTracker {
         match root_op {
-            None => root().new_child(),
+            None => OpTracker::new_root().new_child(),
             Some(root) => root.new_child(),
         }
     }
 
     /// Creates and returns a new operation which is a child of self.
     pub fn new_child(&self) -> OpTracker {
-        let depth = self.depth();
+        let mut parent = self.inner.lock().unwrap();
+        let shared = parent.shared.clone();
 
         let new = OpTracker {
             inner: Arc::new(Mutex::new(TrackerInner {
-                depth: depth + 1,
+                id: shared.alloc_id(),
+                depth: parent.depth + 1,
                 parent: Some(self.clone()),
-                ..Default::default()
+                op: None,
+                progress: None,
+                children: Vec::new(),
+                shared,
             })),
         };
 
-        self.inner
-            .lock()
-            .unwrap()
-            .children
-            .push(Arc::downgrade(&new.inner));
+        parent.children.push(Arc::downgrade(&new.inner));
         new
     }
 
@@ -221,88 +228,70 @@ impl OpTracker {
         self.inner.lock().unwrap().depth
     }
 
-    /// Called by a child to register their new progress bar.
-    fn install_progress(&self, pg: ProgressBar) {
-        let s = self.inner.lock().unwrap();
-        match (&s.pg, &s.parent) {
-            // We (parent) have a progress bar, child should follow
-            (Some(parent_pg), _) => {
-                global_progress().insert_after(parent_pg, pg);
-            }
-            // Parent has no progress but theres a grandparent, recurse
-            (None, Some(parent)) => parent.install_progress(pg),
-            // Root node with no progress bar, directly add to global MultiProgress
-            (None, None) => {
-                global_progress().add(pg);
-            }
+    /// Returns a pre-order (depth-first) snapshot of this subtree, in display
+    /// order. The returned `Vec` is decoupled from the live tree: a renderer
+    /// can hold and diff it without keeping any lock.
+    pub fn snapshot(&self) -> Vec<OpSnapshot> {
+        let mut out = Vec::new();
+        self.snapshot_into(&mut out);
+        out
+    }
+
+    fn snapshot_into(&self, out: &mut Vec<OpSnapshot>) {
+        // Collect this node's row and its live children under a single brief
+        // lock, then recurse with the lock released so we never hold two node
+        // locks at once.
+        let children = {
+            let s = self.inner.lock().unwrap();
+            out.push(OpSnapshot {
+                id: s.id,
+                depth: s.depth,
+                op: s.op.clone(),
+                progress: s.progress,
+            });
+            s.children
+                .iter()
+                .filter_map(Weak::upgrade)
+                .map(|inner| OpTracker { inner })
+                .collect::<Vec<_>>()
+        };
+        for child in children {
+            child.snapshot_into(out);
         }
     }
-}
 
-static ROOT: OnceLock<OpTracker> = OnceLock::new();
-
-/// Returns the root operation tracker.
-pub fn root() -> OpTracker {
-    ROOT.get_or_init(|| OpTracker {
-        inner: Arc::new(Mutex::new(TrackerInner {
-            children: Vec::with_capacity(32),
-            ..Default::default()
-        })),
-    })
-    .clone()
-}
-
-static MP: OnceLock<MultiProgress> = OnceLock::new();
-
-fn global_progress() -> MultiProgress {
-    MP.get_or_init(MultiProgress::new).clone()
-}
-
-use std::io;
-
-/// A writer to stdout which coordinates with printing progress bars.
-pub struct StdoutWriter(MultiProgress);
-
-impl Default for StdoutWriter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl StdoutWriter {
-    pub fn new() -> Self {
-        StdoutWriter(global_progress())
-    }
-}
-
-impl io::Write for StdoutWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.suspend(|| io::stdout().write(buf))
+    /// Returns the tree's current change version. Increases on every mutation
+    /// anywhere in the tree; a driver polls this to decide whether to repaint.
+    pub fn version(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap()
+            .shared
+            .version
+            .load(Ordering::Relaxed)
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        self.0.suspend(|| io::stdout().flush())
-    }
-
-    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
-        self.0.suspend(|| io::stdout().write_vectored(bufs))
-    }
-
-    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.0.suspend(|| io::stdout().write_all(buf))
-    }
-
-    fn write_fmt(&mut self, fmt: std::fmt::Arguments<'_>) -> io::Result<()> {
-        self.0.suspend(|| io::stdout().write_fmt(fmt))
+    /// Awaits the next change anywhere in the tree.
+    ///
+    /// [`version`](Self::version) is the source of truth; pair the two. The
+    /// tree assumes a single consumer (one renderer per root): a mutation that
+    /// races ahead of an un-parked driver leaves a stored permit, so the next
+    /// `changed()` returns immediately rather than missing the update. Drivers
+    /// render, read the version, `await changed()`, then re-check the version.
+    pub async fn changed(&self) {
+        let shared = self.inner.lock().unwrap().shared.clone();
+        shared.notify.notified().await;
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
-    // Each test creates a child of the global root tracker.
-    // ProgressBar::hidden() is used inside set_op, so no terminal output occurs.
+    // Each test creates a child of the global root tracker. The core no longer
+    // renders, so these exercise pure state transitions with no terminal output.
 
     fn make_tracker() -> OpTracker {
         OpTracker::new_with_root(&None)
@@ -440,5 +429,136 @@ mod tests {
         let parent_depth = parent.depth();
         let child = parent.new_child();
         assert_eq!(child.depth(), parent_depth + 1);
+    }
+
+    #[test]
+    fn snapshot_is_preorder_with_node_and_children() {
+        let root = OpTracker::new_root();
+        root.set_op(Operation::PackageBuild {
+            name: "root".into(),
+        });
+        let a = root
+            .new_child()
+            .with_op(Operation::ExtractPkg { name: "a".into() });
+        let _b = root
+            .new_child()
+            .with_op(Operation::CompressPkg { name: "b".into() });
+        let _a1 = a
+            .new_child()
+            .with_op(Operation::FetchPkg { name: "a1".into() });
+
+        let snap = root.snapshot();
+        // root, a, a1, b — pre-order: a's subtree before sibling b.
+        let names: Vec<_> = snap
+            .iter()
+            .map(|s| match &s.op {
+                Some(Operation::PackageBuild { name })
+                | Some(Operation::ExtractPkg { name })
+                | Some(Operation::CompressPkg { name })
+                | Some(Operation::FetchPkg { name }) => name.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(names, vec!["root", "a", "a1", "b"]);
+        // Depth carries indentation: root at 0, children at 1, grandchild at 2.
+        assert_eq!(
+            snap.iter().map(|s| s.depth).collect::<Vec<_>>(),
+            vec![0, 1, 2, 1]
+        );
+    }
+
+    #[test]
+    fn snapshot_ids_are_unique_within_a_tree() {
+        let root = OpTracker::new_root();
+        let _a = root.new_child();
+        let _b = root.new_child();
+        let mut ids: Vec<_> = root.snapshot().iter().map(|s| s.id).collect();
+        let total = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), total, "ids must be unique");
+    }
+
+    #[test]
+    fn version_advances_on_each_mutation() {
+        let root = OpTracker::new_root();
+        let child = root.new_child();
+        let v0 = root.version();
+        child.set_op(Operation::FetchPkg { name: "p".into() });
+        let v1 = root.version();
+        child.set_length(100);
+        let v2 = root.version();
+        child.increment(10);
+        let v3 = root.version();
+        child.set_done();
+        let v4 = root.version();
+        assert!(v0 < v1 && v1 < v2 && v2 < v3 && v3 < v4);
+    }
+
+    #[test]
+    fn progress_is_tracked_in_state() {
+        let root = OpTracker::new_root();
+        let child = root.new_child();
+        child.set_op(Operation::FetchPkg { name: "p".into() });
+        child.set_length(100);
+        child.increment(30);
+        child.increment(12);
+
+        let row = root
+            .snapshot()
+            .into_iter()
+            .find(|s| s.depth == 1)
+            .expect("child row present");
+        assert_eq!(
+            row.progress,
+            Some(Progress {
+                pos: 42,
+                len: Some(100)
+            })
+        );
+    }
+
+    #[test]
+    fn set_op_resets_progress() {
+        let root = OpTracker::new_root();
+        let child = root.new_child();
+        child.set_op(Operation::FetchPkg { name: "p".into() });
+        child.set_length(100);
+        child.increment(50);
+        // Transitioning to a new operation clears the measured progress.
+        child.set_op(Operation::ExtractPkg { name: "p".into() });
+
+        let row = root
+            .snapshot()
+            .into_iter()
+            .find(|s| s.depth == 1)
+            .expect("child row present");
+        assert_eq!(row.progress, None);
+    }
+
+    #[test]
+    fn distinct_roots_have_independent_versions() {
+        let r1 = OpTracker::new_root();
+        let r2 = OpTracker::new_root();
+        r1.new_child()
+            .set_op(Operation::PackageBuild { name: "x".into() });
+        assert!(r1.version() > 0);
+        assert_eq!(r2.version(), 0, "mutating one tree must not touch another");
+    }
+
+    #[tokio::test]
+    async fn changed_wakes_on_mutation() {
+        let root = OpTracker::new_root();
+        let child = root.new_child();
+        let waiter = root.clone();
+        // Register the wait, then mutate from another task; the notify must wake.
+        let h = tokio::spawn(async move { waiter.changed().await });
+        // Yield so the spawned task reaches the await point before we notify.
+        tokio::task::yield_now().await;
+        child.set_op(Operation::PackageBuild { name: "x".into() });
+        tokio::time::timeout(Duration::from_secs(1), h)
+            .await
+            .expect("changed() should wake within timeout")
+            .expect("waiter task should not panic");
     }
 }
