@@ -14,7 +14,7 @@ pub mod core;
 pub mod store;
 pub mod wire;
 
-/// The network isolation mode for a PTask (session).
+/// The network isolation mode for a `PTask` (session).
 ///
 /// Defaults to [`NetworkMode::HostNet`] for backwards compatibility with
 /// existing sessions that predate this field.
