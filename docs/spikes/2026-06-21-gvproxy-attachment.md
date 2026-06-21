@@ -455,7 +455,7 @@ confirmed.
 Additional management endpoints:
 
 ```
-GET /leases    → {ip: mac} DHCP lease table (MAC to IP mapping)
+GET /leases    → {ip: mac} DHCP lease table (IP to MAC mapping)
 GET /cam       → {mac: portid} switch CAM table (who is on which port)
 GET /stats     → {sent, received, …} byte counters
 ```
@@ -534,6 +534,28 @@ was correct with one material correction.
 6. **Subnet CLI flag gap**: there is no `-subnet` CLI flag. Restarting gvproxy
    (on a restart-of-minimald) regenerates the YAML, which is the correct path.
    Document this in the gvproxy lifecycle spec (issue #497).
+
+# Residual Risks / Live Trial Needed
+
+The following findings are source-confirmed but not yet live-tested. A live
+trial against an actual gvproxy process is recommended before U1-T2
+implementation begins:
+
+- **`dhcpStaticLeases` YAML assignment**: source reading confirms the
+  `{ip: mac}` key format, but live behavior of gvproxy's DHCP server
+  honouring a static lease (first DHCP request, renewal, IP shown in `/leases`)
+  has not been exercised in a real netns.
+- **HyperKit framing / first-ARP timing**: the source confirms 2-byte LE
+  length prefix, but the exact sequence (first frame triggers CAM population,
+  switch broadcast behaviour on ARP requests) has not been traced on a live
+  process.
+- **Multi-client concurrent attachment**: the `-listen` accept loop is
+  source-confirmed as multi-goroutine, but concurrent attachment of two PTasks
+  and the resulting switch isolation has not been exercised.
+- **`-ssh-port -1` with `-config`**: source shows `-ssh-port` is overridden by
+  `-config`, emitting a warning. Whether the default `2222` forward is still
+  inserted when `-config` is present without an explicit `-ssh-port -1` needs a
+  live `--help`/process trace to confirm.
 
 # Artifacts
 
