@@ -72,7 +72,7 @@ server or from `dhcpStaticLeases` in the config.
   -listen-bess string   unixpacket socket (Bess-compatible; single client)
   -listen-qemu string   unix socket (Qemu protocol; single client)
   -listen-vfkit string  unixgram socket (vfkit-compatible; single client)
-  -listen-vpnkit string VPNKit socket (Hyperkit; multi-client accept loop)
+  -listen-vpnkit string VPNKit socket (Hyperkit; single-client: not suitable for DM2)
   -mtu int              Set the MTU (default 1500)
   -ssh-port int         Port to expose inside the VM; -1 to disable (default 2222)
   -pid-file string      Write PID here
@@ -378,10 +378,7 @@ every PTask netns. minimald must maintain a per-host allocation table
 2. The gvisor/Linux kernel in netns-A ARPs for `100.64.0.3`; the ARP goes to
    the TAP, relay-A reads it and sends it to gvproxy.
 3. gvproxy's switch broadcasts the ARP to all other ports (including the
-   gateway, which does not own `100.64.0.3`). Relay-B receives the ARP reply
-   from PTask B and writes it to TAP-B (PTask B replies because it has that IP).
-   **Wait** — actually gvproxy's gateway (`LinkEndpoint`) is the ARP responder
-   for the gateway IP only. For PTask-to-PTask ARP:
+   gateway, which does not own `100.64.0.3`). For PTask-to-PTask ARP:
    - ARP request for `100.64.0.3` arrives at the switch from relay-A.
    - gvproxy broadcasts to all connected ports; relay-B delivers it to TAP-B.
    - PTask B replies with an ARP reply; relay-B delivers that to the switch.
@@ -417,9 +414,12 @@ PTask is possible by bringing `lo` up if needed for intra-PTask IPC.
 
 ## 5. Port-forward / management API (gateway HTTP)
 
-The HTTP API is served on the same unix socket as `/connect`. It is also served
-internally within the virtual network on `http://<gatewayIP>:80` (accessible
-from within PTasks via the gateway's virtual IP).
+The HTTP API is served on the unix socket (same listener as `/connect`) and is
+accessible only from the host side. The gateway's internal HTTP on port 80
+(reachable from within PTasks at the gateway IP) is a separate gvisor netstack
+endpoint serving DNS and DHCP only; it does not route to `ServicesMux()` and
+does not expose the management or port-forward endpoints. The management API is
+unix-socket only: PTasks cannot reach it.
 
 The API relevant to Unit 2:
 
