@@ -747,10 +747,11 @@ pub(crate) fn gate_patches(
 /// See [`ComposeError`].
 pub(crate) fn compose_contribution(
     contribution: Contribution,
+    expansion_vars: &[SessionVar],
     policy: UserPolicy,
     hooks: Option<&dyn PolicyHooks>,
     options: ComposeOptions,
-    env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+    home_fallback: Option<&str>,
 ) -> Result<(Composition, UserPolicy), ComposeError> {
     let Contribution {
         vars,
@@ -763,17 +764,26 @@ pub(crate) fn compose_contribution(
     // Patch sources and policy patterns expand against the resolved
     // vars. Explicit `$VAR` references require an explicit
     // `SessionVar` — no env fallback. The tilde prefix (`~/...`) is
-    // the one exception: it falls back to the ambient `HOME` if the
-    // loadout didn't declare one, so users don't have to write
-    // `HOME = { inherit = true }` just to use `~/dotfiles/...`.
-    let ambient_home = env("HOME").ok();
+    // the one exception: it falls back to `home_fallback` if the
+    // loadout didn't declare a `HOME` var.
+    //
+    // `expansion_vars` carries pre-gated vars from an outer scope
+    // (e.g. the client's wire contribution as seen by the daemon)
+    // so daemon-side patches can resolve `$VAR` / `~` against them.
+    // They precede locally-gated vars in the lookup so the
+    // user-side declaration wins on conflict.
+    let combined_for_lookup: Vec<SessionVar> = expansion_vars
+        .iter()
+        .cloned()
+        .chain(gated_vars.iter().cloned())
+        .collect();
     let (gated_patches, patches_policy) = gate_patches(
         patches,
         patches_policy,
         hooks,
         options,
-        &gated_vars,
-        ambient_home.as_deref(),
+        &combined_for_lookup,
+        home_fallback,
     )?;
     let final_policy = UserPolicy::empty()
         .with_vars(vars_policy)

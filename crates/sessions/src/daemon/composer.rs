@@ -70,7 +70,10 @@ impl SessionComposer {
     /// Returns any error the contributor surfaces from [`Composable::contribute`].
     pub fn add(&mut self, c: impl Composable) -> Result<(), Error> {
         let incoming = c.contribute(&*self.env)?;
-        self.contribution = std::mem::take(&mut self.contribution).merge(incoming)?;
+        // Merge on a clone so a `Conflict` leaves `self.contribution`
+        // untouched. See `UserComposer::add` for details.
+        let merged = self.contribution.clone().merge(incoming)?;
+        self.contribution = merged;
         Ok(())
     }
 
@@ -108,8 +111,17 @@ impl SessionComposer {
         policy: UserPolicy,
         options: ComposeOptions,
     ) -> Result<Composition, ComposeError> {
+        // Reconstruct the client's already-gated vars as expansion
+        // context so daemon-side patches can resolve `$VAR` / `~`
+        // references against them. The daemon must NEVER use its own
+        // process environment for expansion — that's exclusively the
+        // client's job. `home_fallback` is therefore `None` here:
+        // either `HOME` is in the client's wire vars or `~/...`
+        // patterns in daemon patches fail.
+        let client_vars: Vec<crate::core::compose::SessionVar> =
+            self.client.vars.iter().cloned().map(Into::into).collect();
         let (mut composition, _final_policy) =
-            compose_contribution(self.contribution, policy, None, options, &*self.env)?;
+            compose_contribution(self.contribution, &client_vars, policy, None, options, None)?;
         composition.extend_from_wire(self.client)?;
         Ok(composition)
     }

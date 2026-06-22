@@ -50,12 +50,21 @@ pub enum WireError {
 }
 
 impl From<crate::core::compose::ComposeError> for WireError {
-    /// Collapse a rich local resolve error to the wire envelope. The
+    /// Collapse a rich local compose error to the wire envelope. The
     /// `Display` summary is used; the source chain is dropped at the
     /// boundary.
+    ///
+    /// `InvalidWireItem` — the one variant that represents bad client
+    /// input rather than a daemon-internal problem — maps to
+    /// [`WireError::InvalidContribution`]. Everything else collapses
+    /// to [`WireError::Internal`].
     fn from(e: crate::core::compose::ComposeError) -> Self {
-        Self::Internal {
-            message: e.to_string(),
+        let message = e.to_string();
+        match e {
+            crate::core::compose::ComposeError::InvalidWireItem { .. } => {
+                Self::InvalidContribution { message }
+            }
+            _ => Self::Internal { message },
         }
     }
 }
@@ -120,10 +129,8 @@ mod tests {
         );
     }
 
-    /// `From<ComposeError>` collapses to `Internal` with the local
-    /// error's `Display` text. Verifies the conversion exists and
-    /// doesn't accidentally expand the wire schema with structured
-    /// fields.
+    /// `From<ComposeError>` collapses most variants to `Internal`
+    /// with the local error's `Display` text.
     #[test]
     fn from_compose_error_collapses_to_internal() {
         let local = crate::core::compose::ComposeError::Aborted;
@@ -131,6 +138,21 @@ mod tests {
         assert!(
             matches!(wire, WireError::Internal { .. }),
             "expected Internal, got: {wire:?}",
+        );
+    }
+
+    /// `InvalidWireItem` represents bad client input and maps to
+    /// `InvalidContribution`, not `Internal`.
+    #[test]
+    fn from_compose_error_invalid_wire_item_maps_to_invalid_contribution() {
+        let local = crate::core::compose::ComposeError::InvalidWireItem {
+            what: "lifecycle hook with no callbacks",
+            context: "empty hook".into(),
+        };
+        let wire: WireError = local.into();
+        assert!(
+            matches!(wire, WireError::InvalidContribution { .. }),
+            "expected InvalidContribution, got: {wire:?}",
         );
     }
 }

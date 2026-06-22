@@ -71,7 +71,12 @@ impl UserComposer {
     /// or `InheritWithDefault` variables against `env`.
     pub fn add(&mut self, loadout: Loadout) -> Result<(), Error> {
         let incoming = loadout.contribute(&*self.env)?;
-        self.contribution = std::mem::take(&mut self.contribution).merge(incoming)?;
+        // Merge on a clone so a `Conflict` leaves `self.contribution`
+        // untouched. Today `Conflict` is uninhabited so the clone is
+        // unused on the error path; it becomes load-bearing when
+        // conflict-detection variants land.
+        let merged = self.contribution.clone().merge(incoming)?;
+        self.contribution = merged;
         Ok(())
     }
 
@@ -108,8 +113,18 @@ impl UserComposer {
         policy: UserPolicy,
         options: ComposeOptions,
     ) -> Result<WireContribution, ComposeError> {
-        let (composition, _final_policy) =
-            compose_contribution(self.contribution, policy, None, options, &*self.env)?;
+        // Tilde fallback comes from the user's env on the client side
+        // (this is the user's own process environment, so it's the
+        // right HOME to use when the loadout doesn't declare one).
+        let home_fallback = (*self.env)("HOME").ok();
+        let (composition, _final_policy) = compose_contribution(
+            self.contribution,
+            &[],
+            policy,
+            None,
+            options,
+            home_fallback.as_deref(),
+        )?;
         Ok(composition_to_wire(composition))
     }
 }
