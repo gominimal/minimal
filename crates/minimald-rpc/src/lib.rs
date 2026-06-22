@@ -323,6 +323,7 @@ pub struct IngressPolicy {
 
 /// The effective networking policy for a named session, as returned by
 /// [`GetSessionPolicy`].
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionPolicy {
     /// Egress policy; `None` when the session is not `OwnIp` or no explicit
@@ -330,6 +331,12 @@ pub struct SessionPolicy {
     pub egress: Option<EgressPolicy>,
     /// Ingress policy; `None` when the session is not `OwnIp`.
     pub ingress: Option<IngressPolicy>,
+}
+
+impl SessionPolicy {
+    pub fn new(egress: Option<EgressPolicy>, ingress: Option<IngressPolicy>) -> Self {
+        Self { egress, ingress }
+    }
 }
 
 /// An RPC to read the effective networking policy for a session (R2.6).
@@ -354,6 +361,7 @@ impl OneshotSshRpc for GetSessionPolicy {
 pub struct DynamicPortMap;
 
 /// Request for the [`DynamicPortMap`] RPC.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DynamicPortMapRequest {
     pub id: SessionId,
@@ -362,7 +370,19 @@ pub struct DynamicPortMapRequest {
     pub proto: IpProto,
 }
 
+impl DynamicPortMapRequest {
+    pub fn new(id: SessionId, external_port: u16, internal_port: u16, proto: IpProto) -> Self {
+        Self {
+            id,
+            external_port,
+            internal_port,
+            proto,
+        }
+    }
+}
+
 /// Response for the [`DynamicPortMap`] RPC.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DynamicPortMapResponse;
 

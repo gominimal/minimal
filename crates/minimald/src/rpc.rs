@@ -207,10 +207,10 @@ async fn serve_get_session_policy(s: ServerStateHandle, c: RuChannel<Msg>) {
                 None => Ok(Errorable::Err {
                     error: "no session found".to_string(),
                 }),
-                Some(_) => Ok(Errorable::Ok(SessionPolicy {
-                    egress: None,
-                    ingress: Some(IngressPolicy::default()),
-                })),
+                Some(_) => Ok(Errorable::Ok(SessionPolicy::new(
+                    None,
+                    Some(IngressPolicy::default()),
+                ))),
             }
         })
         .await;
