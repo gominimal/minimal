@@ -188,7 +188,9 @@ async fn relay_tap_to_switch<W>(tap: Arc<AsyncFd<std::fs::File>>, mut sock: W) -
 where
     W: AsyncWriteExt + Unpin,
 {
-    let mut buf = vec![0u8; max_frame()];
+    // One byte larger than max_frame() so a full-size 1518-byte VLAN-tagged
+    // frame gives n < buf.len() and is not mistaken for a truncated one.
+    let mut buf = vec![0u8; max_frame() + 1];
     loop {
         let n = loop {
             let mut guard = tap.readable().await?;
@@ -236,6 +238,10 @@ where
             Err(e) => return Err(e),
         }
         let n = u16::from_le_bytes(len_buf) as usize;
+        if n == 0 {
+            tracing::warn!("switch sent zero-length frame claim; skipping");
+            continue;
+        }
         // Trust nothing the control socket claims about length: a frame larger
         // than the MTU-derived maximum would overrun the tap and points at a
         // malformed or hostile peer, so reject it rather than size an

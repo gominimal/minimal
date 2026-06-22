@@ -430,14 +430,22 @@ impl GvproxySwitch {
             // not relay onto a dead socket (R1.4 unexpected-exit handling).
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    tracing::error!(?status, "gvproxy exited unexpectedly; signalling attached PTasks");
+                    tracing::error!(
+                        ?status,
+                        "gvproxy exited unexpectedly; signalling attached PTasks"
+                    );
                     // Replace the channel so future attachers get a fresh receiver
                     // while all current receivers fire and know to tear down.
                     let (new_tx, _) = watch::channel(false);
                     let old_tx = std::mem::replace(&mut self.exit_tx, new_tx);
                     let _ = old_tx.send(true);
                     self.child = None;
-                    self.attached = 0;
+                    // Do NOT reset self.attached: old PTasks will call detach()
+                    // as they observe the exit signal, decrementing the counter
+                    // naturally. Resetting here races with new-generation
+                    // attachers and can cause a stale detach() to saturating_sub
+                    // the new generation's count to 0, triggering a spurious
+                    // stop() on a live switch.
                 }
                 Ok(None) => return Ok(()),
                 Err(e) => return Err(NetError::Io(e)),
@@ -493,8 +501,17 @@ impl GvproxySwitch {
     async fn wait_for_socket(&mut self, sock: &Path) -> Result<(), NetError> {
         let deadline = tokio::time::Instant::now() + SOCKET_READY_TIMEOUT;
         loop {
-            if sock.exists() {
-                return Ok(());
+            // Probe with an actual connect rather than just checking file
+            // existence: bind() creates the socket file before listen() is
+            // called, so sock.exists() can return true while ECONNREFUSED
+            // would still occur in attach_to_switch on a scheduler stall
+            // between gvproxy's bind and listen.
+            match tokio::net::UnixStream::connect(sock).await {
+                Ok(_) => return Ok(()),
+                Err(e)
+                    if e.kind() == io::ErrorKind::ConnectionRefused
+                        || e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(NetError::Io(e)),
             }
             // If gvproxy died during startup, surface its status rather than
             // spinning until the timeout.
