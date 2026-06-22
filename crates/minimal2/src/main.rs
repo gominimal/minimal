@@ -413,15 +413,15 @@ async fn cmd_session_policy(global: &GlobalArgs, args: PolicyArgs) -> Result<(),
         .await
         .map_err(|e| eprintln!("GetSessionPolicy RPC failed: {e}"))?;
 
-    match resp.ok() {
-        Some(policy) => {
+    match resp {
+        minimald_rpc::Errorable::Ok(policy) => {
             let json = serde_json::to_string(&policy)
                 .map_err(|e| eprintln!("Failed to serialize policy: {e}"))?;
             println!("{json}");
             Ok(())
         }
-        None => {
-            eprintln!("No session found matching '{}'", args.session);
+        minimald_rpc::Errorable::Err { error } => {
+            eprintln!("{error}");
             Err(())
         }
     }
