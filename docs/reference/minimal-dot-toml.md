@@ -125,9 +125,10 @@ Each `[outputs.<name>]` section defines an artifact that can be produced with
 type = "<output type>"          # required; alias: `ty`
 packages = ["<package>", ...]   # optional; defaults to ["base"] when empty
 arch = "<arch>"                 # optional; e.g. "amd64", "arm64"
-entrypoint = "<cmd>"            # optional; string or list of strings
-cmd = ["<arg>", ...]            # optional; string or list of strings
-vars = { KEY = "value" }        # optional; alias: `env_vars`
+path = "<path>"                 # raw-file only; required there, invalid for oci-image
+entrypoint = "<cmd>"            # oci-image only; string or list of strings
+cmd = ["<arg>", ...]            # oci-image only; string or list of strings
+vars = { KEY = "value" }        # oci-image only; alias: `env_vars`
 ```
 
 #### Output types
@@ -135,15 +136,19 @@ vars = { KEY = "value" }        # optional; alias: `env_vars`
 | `type` | Description |
 |--------|-------------|
 | `oci-image` | A Linux OCI image archive built from `packages`. Compatible with `docker load` and OCI-compatible registries. |
+| `raw-file` | A single file extracted from `packages` at the given `path`. Useful for pulling one artifact (a kernel image, a rootfs image, …) out of a package's file tree. |
 
 #### Fields
 
-- **`type`** (alias: `ty`) — The output kind. Currently only `oci-image` is supported.
+- **`type`** (alias: `ty`) — The output kind, either `oci-image` or `raw-file`. Defaults to `oci-image` when omitted.
 - **`packages`** — Packages to include in the materialized output. When omitted or empty, defaults to `["base"]`.
 - **`arch`** — Target architecture for OCI images. Common values: `amd64`, `arm64`. The CLI flag [`--arch`](/reference/cli#materialize) overrides this; if neither is set, the host architecture is used.
-- **`entrypoint`** — OCI image entrypoint. May be a string (`"/app/server"`) or a list (`["/bin/sh", "-c"]`).
-- **`cmd`** — OCI image default command. Same string-or-list shape as `entrypoint`.
-- **`vars`** (alias: `env_vars`) — Environment variables baked into the image as a `KEY = "value"` table.
+- **`path`** — _(`raw-file` only)_ Path, relative to the package file tree, of the single file to extract. Required for `raw-file` outputs; supplying it on an `oci-image` output is an error.
+- **`entrypoint`** — _(`oci-image` only)_ OCI image entrypoint. May be a string (`"/app/server"`) or a list (`["/bin/sh", "-c"]`).
+- **`cmd`** — _(`oci-image` only)_ OCI image default command. Same string-or-list shape as `entrypoint`.
+- **`vars`** (alias: `env_vars`) — _(`oci-image` only)_ Environment variables baked into the image as a `KEY = "value"` table.
+
+Setting an `oci-image`-only field (`entrypoint`, `cmd`, `vars`) on a `raw-file` output — or setting `path` on an `oci-image` output — is rejected when the `minimal.toml` is parsed.
 
 #### Examples
 
@@ -177,4 +182,18 @@ Override the architecture at the command line:
 
 ```sh
 minimal materialize app --arch amd64 -o ./app-amd64.tar
+```
+
+A `raw-file` output extracts a single file from a package. Here the kernel
+`Image` is pulled out of the `virtio-kernel-raw` package:
+
+```toml
+[outputs.virtio-kernel]
+type = "raw-file"
+packages = ["virtio-kernel-raw"]
+path = "usr/share/virtio-linux/Image"
+```
+
+```sh
+minimal materialize virtio-kernel -o ./Image
 ```
