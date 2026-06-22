@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Run rustfmt
         run: cargo fmt --all -- --check
 
@@ -47,7 +47,7 @@ jobs:
           remove_dotnet: true
           remove_haskell: true
           remove_tool_cache: true
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Cache cargo registry and build artifacts
@@ -66,7 +66,7 @@ jobs:
           remove_dotnet: true
           remove_haskell: true
           remove_tool_cache: true
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Cache cargo registry and build artifacts
@@ -86,7 +86,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-minimal
       - name: Smoke-test `minimal run`
         run: minimal run build-smoke
@@ -96,7 +96,7 @@ jobs:
     timeout-minutes: 45
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
       - name: Add Rust target
@@ -130,7 +130,7 @@ jobs:
     timeout-minutes: 45
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install cross
         uses: taiki-e/install-action@v2
         with:
@@ -158,7 +158,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   release:
@@ -170,7 +170,7 @@ jobs:
       contents: write
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Download amd64 binary
         uses: actions/download-artifact@v8
         with:
@@ -245,7 +245,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-minimal
       - name: Check
         run: minimal --no-fetch check

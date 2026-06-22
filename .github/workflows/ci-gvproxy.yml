@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Fetch and verify pinned gvproxy binary
         run: bash scripts/fetch-gvproxy.sh "${RUNNER_TEMP}/gvproxy"
       - name: Record pinned version + digest
@@ -40,7 +40,7 @@ jobs:
             echo "- linux-amd64 sha256: \`$(sha256sum "${RUNNER_TEMP}/gvproxy" | awk '{print $1}')\`"
           } >> "${GITHUB_STEP_SUMMARY}"
       - name: Upload gvproxy binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gvproxy-linux-amd64
           path: ${{ runner.temp }}/gvproxy

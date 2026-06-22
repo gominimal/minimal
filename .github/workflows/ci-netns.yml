@@ -51,7 +51,7 @@ jobs:
     runs-on: ubuntu-latest # x86_64; unprivileged userns + sudo for netns/tap
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Toolchain
