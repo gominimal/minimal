@@ -31,6 +31,8 @@ enum Command {
     Attach(AttachArgs),
     /// Destroy (terminate) a session
     Destroy(DestroyArgs),
+    /// Session inspection subcommands
+    Session(SessionArgs),
     /// Proxy stdio to a daemon UDS socket (used as an SSH ProxyCommand).
     #[command(hide = true)]
     Proxy(ProxyArgs),
@@ -39,6 +41,24 @@ enum Command {
         long_about = "Generate a shell tab-completion script for the minimal CLI.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(minimal completions bash)"
     )]
     Completions(CompletionsArgs),
+}
+
+#[derive(Debug, Args)]
+struct SessionArgs {
+    #[command(subcommand)]
+    command: SessionCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    /// Print the effective networking policy for a session as JSON
+    Policy(PolicyArgs),
+}
+
+#[derive(Debug, Args)]
+struct PolicyArgs {
+    /// Session identifier (UUID or session name)
+    session: String,
 }
 
 /// Shared arguments all subcommands
@@ -118,6 +138,9 @@ async fn main() -> Result<(), ()> {
         Command::Activate(args) => cmd_activate(&cli.global_args, args).await,
         Command::Attach(args) => cmd_attach(&cli.global_args, args).await,
         Command::Destroy(args) => cmd_destroy(&cli.global_args, args).await,
+        Command::Session(SessionArgs {
+            command: SessionCommand::Policy(args),
+        }) => cmd_session_policy(&cli.global_args, args).await,
         Command::Proxy(args) => cmd_proxy(args).await,
         Command::Completions(CompletionsArgs { shell }) => {
             let mut cmd = Cli::command();
@@ -367,6 +390,41 @@ async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), ()> {
     // exec() only returns on failure
     eprintln!("failed to exec ssh: {err}");
     Err(())
+}
+
+/// Print the effective networking policy for a session as JSON.
+async fn cmd_session_policy(global: &GlobalArgs, args: PolicyArgs) -> Result<(), ()> {
+    if let Err(e) = autospawn::ensure_minvmd_running() {
+        eprintln!("Failed to ensure minvmd is running: {e}");
+        return Err(());
+    }
+
+    let mut client = connect_daemon(global).await?;
+
+    use minimald_rpc::{GetSessionPolicy, GetSessionPolicyRequest};
+    let lookup = if let Ok(id) = sessions::SessionId::parse_str(&args.session) {
+        GetSessionPolicyRequest::Id(id)
+    } else {
+        GetSessionPolicyRequest::Name(args.session.clone())
+    };
+
+    let resp = client
+        .oneshot_rpc::<GetSessionPolicy>(lookup)
+        .await
+        .map_err(|e| eprintln!("GetSessionPolicy RPC failed: {e}"))?;
+
+    match resp {
+        minimald_rpc::Errorable::Ok(policy) => {
+            let json = serde_json::to_string(&policy)
+                .map_err(|e| eprintln!("Failed to serialize policy: {e}"))?;
+            println!("{json}");
+            Ok(())
+        }
+        minimald_rpc::Errorable::Err { error } => {
+            eprintln!("{error}");
+            Err(())
+        }
+    }
 }
 
 /// Destroy (terminate) a session.

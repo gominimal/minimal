@@ -276,3 +276,163 @@ impl OneshotSshRpc for SessionAbort {
     type Request<'a> = sessions::wire::request::Abort;
     type Response = Errorable<()>;
 }
+
+// ---------------------------------------------------------------------------
+// Networking policy types (Unit 2: egress, ingress, dynamic port mapping).
+// ---------------------------------------------------------------------------
+
+/// A single static ingress port mapping for an `OwnIp` PTask.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortMapping {
+    /// Host-side port that forwards inbound connections into the PTask.
+    pub external_port: u16,
+    /// PTask-side port that receives forwarded connections.
+    pub internal_port: u16,
+    /// Transport protocol for this mapping.
+    pub proto: IpProto,
+}
+
+/// Effective egress policy for an `OwnIp` PTask.
+///
+/// Each field is `None` to mean allow-all for that dimension. Absent `egress`
+/// config on a session is equivalent to all-`None` (allow-all).
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct EgressPolicy {
+    /// Allowed destination CIDR prefixes; `None` means allow-all subnets.
+    pub allow_subnets: Option<Vec<String>>,
+    /// Allowed destination DNS hostnames; `None` means allow-all hosts.
+    pub allow_dns_hosts: Option<Vec<String>>,
+    /// Allowed IP protocols; `None` means allow all protocols.
+    pub allow_protocols: Option<Vec<IpProto>>,
+}
+
+/// Effective ingress policy for an `OwnIp` PTask.
+///
+/// Default (empty `port_mappings`, no `dynamic_allowed_range`) is deny-all-external.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct IngressPolicy {
+    /// Static port mappings applied at PTask launch.
+    pub port_mappings: Vec<PortMapping>,
+    /// Inclusive port range within which dynamic port-mapping requests are
+    /// accepted; `None` means dynamic mapping is disallowed.
+    pub dynamic_allowed_range: Option<(u16, u16)>,
+}
+
+/// The effective networking policy for a named session, as returned by
+/// [`GetSessionPolicy`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionPolicy {
+    /// Egress policy; `None` when the session is not `OwnIp` or no explicit
+    /// egress config is present (allow-all).
+    pub egress: Option<EgressPolicy>,
+    /// Ingress policy; `None` when the session is not `OwnIp`.
+    pub ingress: Option<IngressPolicy>,
+}
+
+impl SessionPolicy {
+    pub fn new(egress: Option<EgressPolicy>, ingress: Option<IngressPolicy>) -> Self {
+        Self { egress, ingress }
+    }
+}
+
+/// An RPC to read the effective networking policy for a session (R2.6).
+pub struct GetSessionPolicy;
+
+/// Request for the [`GetSessionPolicy`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GetSessionPolicyRequest {
+    Name(String),
+    Id(SessionId),
+}
+
+impl OneshotSshRpc for GetSessionPolicy {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetSessionPolicy");
+    type Request<'a> = GetSessionPolicyRequest;
+    type Response = Errorable<SessionPolicy>;
+}
+
+/// An RPC for a process inside a PTask to request a dynamic ingress port
+/// mapping at runtime (R2.4).
+pub struct DynamicPortMap;
+
+/// Request for the [`DynamicPortMap`] RPC.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicPortMapRequest {
+    pub id: SessionId,
+    pub external_port: u16,
+    pub internal_port: u16,
+    pub proto: IpProto,
+}
+
+impl DynamicPortMapRequest {
+    pub fn new(id: SessionId, external_port: u16, internal_port: u16, proto: IpProto) -> Self {
+        Self {
+            id,
+            external_port,
+            internal_port,
+            proto,
+        }
+    }
+}
+
+/// Response for the [`DynamicPortMap`] RPC.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DynamicPortMapResponse;
+
+impl OneshotSshRpc for DynamicPortMap {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "DynamicPortMap");
+    type Request<'a> = DynamicPortMapRequest;
+    type Response = Errorable<DynamicPortMapResponse>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_types_are_present_and_serializable() {
+        // PortMapping construction and round-trip
+        let mapping = PortMapping {
+            external_port: 8080,
+            internal_port: 80,
+            proto: IpProto::Tcp,
+        };
+        let json = serde_json::to_string(&mapping).unwrap();
+        let rt: PortMapping = serde_json::from_str(&json).unwrap();
+        assert_eq!(rt, mapping);
+
+        // IngressPolicy default and round-trip
+        let ingress = IngressPolicy {
+            port_mappings: vec![mapping],
+            dynamic_allowed_range: Some((10000, 20000)),
+        };
+        let json = serde_json::to_string(&ingress).unwrap();
+        let rt: IngressPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(rt, ingress);
+
+        // EgressPolicy default serializes without error
+        let egress = EgressPolicy::default();
+        let json = serde_json::to_string(&egress).unwrap();
+        let _: EgressPolicy = serde_json::from_str(&json).unwrap();
+
+        // SessionPolicy with null egress and default ingress matches expected CLI output
+        let policy = SessionPolicy {
+            egress: None,
+            ingress: Some(IngressPolicy::default()),
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        assert!(json.contains("\"egress\":null"), "got: {json}");
+        assert!(json.contains("\"port_mappings\":[]"), "got: {json}");
+        assert!(
+            json.contains("\"dynamic_allowed_range\":null"),
+            "got: {json}"
+        );
+    }
+}

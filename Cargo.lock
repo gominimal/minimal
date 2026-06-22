@@ -3391,6 +3391,7 @@ dependencies = [
  "chrono",
  "constcat",
  "serde",
+ "serde_json",
  "sessions",
 ]
 

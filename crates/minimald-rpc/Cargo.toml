@@ -10,3 +10,6 @@ chrono.workspace = true
 serde.workspace = true
 
 sessions.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

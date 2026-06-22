@@ -1,8 +1,9 @@
 use minimald_rpc::{
     CreateSession, CreateSessionResponse, DestroySession, DestroySessionResponse, Errorable,
-    GetSessionRecord, GetSessionRecordRequest, GetSessionRecordResponse, GetVersion,
-    GetVersionResponse, ListSessions, ListSessionsEntry, ListSessionsResponse, OneshotSshRpc,
-    RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse,
+    GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest,
+    GetSessionRecordResponse, GetVersion, GetVersionResponse, IngressPolicy, ListSessions,
+    ListSessionsEntry, ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
+    RenameSessionResponse, SessionPolicy,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -190,6 +191,34 @@ async fn serve_destroy_session(s: ServerStateHandle, c: RuChannel<Msg>) {
     }
 }
 
+async fn serve_get_session_policy(s: ServerStateHandle, c: RuChannel<Msg>) {
+    let res = GetSessionPolicy
+        .handle_channel(c, async |req| {
+            let mngr = s.sessions_manager().await;
+            let predicate = match req {
+                GetSessionPolicyRequest::Id(id) => SessionKeyPredicate::Id(id),
+                GetSessionPolicyRequest::Name(name) => SessionKeyPredicate::Name(name),
+            };
+            let record = mngr
+                .get_record(predicate)
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            match record {
+                None => Ok(Errorable::Err {
+                    error: "no session found".to_string(),
+                }),
+                Some(_) => Ok(Errorable::Ok(SessionPolicy::new(
+                    None,
+                    Some(IngressPolicy::default()),
+                ))),
+            }
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", GetSessionPolicy::NAME, e);
+    }
+}
+
 pub(crate) const STREAM_WORKSPACE_FILES: &str =
     constcat::concat!(RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst");
 
@@ -264,6 +293,7 @@ pub async fn handle_ssh_rpc(
         | CreateSession::NAME
         | RenameSession::NAME
         | DestroySession::NAME
+        | GetSessionPolicy::NAME
         | STREAM_WORKSPACE_FILES => {
             let mut conn_lock = c.lock().await;
             let c_hnd = match conn_lock.take(id) {
@@ -295,6 +325,7 @@ pub async fn handle_ssh_rpc(
         CreateSession::NAME => spawn(serve_create_session(s, channel)),
         RenameSession::NAME => spawn(serve_rename_session(s, channel)),
         DestroySession::NAME => spawn(serve_destroy_session(s, channel)),
+        GetSessionPolicy::NAME => spawn(serve_get_session_policy(s, channel)),
         STREAM_WORKSPACE_FILES => spawn(serve_stream_workspace_files(s, config, channel)),
         _ => unreachable!(),
     };
