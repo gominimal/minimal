@@ -682,4 +682,96 @@ mod tests {
 
         std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
     }
+
+    /// When a binary output is a shebang script whose interpreter IS provided by
+    /// a declared runtime dependency, the checker must resolve it through that
+    /// dependency's cached build and report `Pass` with no errors. This exercises
+    /// the satisfied branch of the interpreter check together with the
+    /// transitive-runtime-dep collection — a path the other tests, which all use
+    /// dependency-free packages, never reach.
+    #[tokio::test]
+    async fn missing_runtime_deps_pass_when_interpreter_provided_by_runtime_dep() {
+        let tmpdir = make_tmp_dir("interp_satisfied");
+        let ctx = make_ctx(&tmpdir, vec![]);
+
+        // graph_with_pkg ingests the whole layer; `app` (the BuildSpec the
+        // expression evaluates to) becomes the top-level build, and its declared
+        // runtime dependency `shprovider` is ingested alongside it. This gives the
+        // checker a non-empty transitive runtime-dep set — a path the other tests,
+        // which all use dependency-free packages, never reach.
+        let graph = graph_with_pkg(
+            r#"
+            let {BuildSpec, OutputBin, OutputData, ..} = import "minimal.ncl" in
+            let shprovider = {
+                name = "shprovider",
+                build_deps = [],
+                cmd = "",
+                outputs = { interp = {glob = "bin/sh"} | OutputData },
+            } | BuildSpec
+            in
+            {
+                name = "app",
+                build_deps = [],
+                runtime_deps = [shprovider],
+                cmd = "",
+                outputs = {
+                    bin = {glob = "run.sh", allow_missing_interpreter = false} | OutputBin,
+                },
+            } | BuildSpec
+            "#,
+        );
+
+        let (app_hash, dep_hash) = {
+            let g = graph.read().await;
+            (
+                g.spec_hash(g.by_name("app").expect("app in graph")),
+                g.spec_hash(g.by_name("shprovider").expect("shprovider in graph")),
+            )
+        };
+
+        // Fake the runtime dependency's completed build: it ships the interpreter
+        // at `bin/sh`, the path the shebang in `app` resolves to.
+        let dep_pending = ctx.cache.write_dir(&dep_hash).expect("write dep cache dir");
+        std::fs::create_dir_all(dep_pending.path().join("bin")).expect("create dep bin dir");
+        std::fs::write(dep_pending.path().join("bin/sh"), b"#!/bin/sh\n")
+            .expect("write interpreter file");
+        dep_pending
+            .finalize(EntryMeta {
+                inner: MetaInner::Spec("shprovider".to_string()),
+                ..Default::default()
+            })
+            .expect("finalize dep cache entry");
+
+        // Fake `app`'s completed build: a single shebang script whose interpreter
+        // (/bin/sh) is satisfied only by the runtime dependency above.
+        let app_pending = ctx.cache.write_dir(&app_hash).expect("write app cache dir");
+        std::fs::write(app_pending.path().join("run.sh"), b"#!/bin/sh\necho hi\n")
+            .expect("write output file");
+        app_pending
+            .finalize(EntryMeta {
+                inner: MetaInner::Spec("app".to_string()),
+                ..Default::default()
+            })
+            .expect("finalize app cache entry");
+
+        let guard = graph.read().await;
+        let result = MissingRuntimeDeps
+            .check(&ctx, "app".to_string(), &tmpdir, guard, None)
+            .await
+            .expect("check should not error");
+
+        assert!(
+            matches!(result.verdict, CheckVerdict::Pass),
+            "expected Pass when the script interpreter is provided by a runtime dep, got {:?} (errors: {:?})",
+            result.verdict,
+            result.err
+        );
+        assert!(
+            result.err.is_empty(),
+            "expected no errors when the interpreter is satisfied, got {:?}",
+            result.err
+        );
+
+        std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
+    }
 }
