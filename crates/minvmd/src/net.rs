@@ -8,19 +8,29 @@
 //! switch client and the PTask is assigned a unique IP from the switch subnet
 //! ([`GvproxySwitch::attach_ptask`], R1.5).
 //!
-//! The supervisor terminates gvproxy with the same SIGTERM → timeout → SIGKILL
-//! sequence the vmm child uses ([`terminate_child`], R1.4), and every switch
-//! lifecycle event — spawn, stop, attach (with assigned IP), detach — is emitted
-//! as a structured `tracing` event (R1.8). This module contains no
-//! `println!`/`eprintln!`.
+//! The supervisor tears gvproxy down with the same SIGTERM → timeout → SIGKILL
+//! sequence the vmm child uses ([`GvproxySwitch::stop`], R1.4) and runs a
+//! background tokio task that detects an unexpected gvproxy exit, emits a
+//! `tracing::error!`, and fires the [`SwitchExit`] notification returned from
+//! [`GvproxyConfig::spawn`] (R1.4 detection half). Every switch lifecycle event
+//! — spawn, stop, attach (with assigned IP), detach — is emitted as a structured
+//! `tracing` event (R1.8). This module contains no `println!`/`eprintln!`.
+//!
+//! Supervision is async: [`GvproxyConfig::spawn`] and [`GvproxySwitch::stop`]
+//! run within a tokio runtime (the async networking layer the spec mandates),
+//! so neither blocks a worker thread during teardown.
 
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
-use std::time::{Duration, Instant};
+use std::process::ExitStatus;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use minimald_rpc::IpProto;
+use tokio::process::{Child, Command};
+use tokio::sync::oneshot;
 
 /// Default time to wait for gvproxy to exit on SIGTERM before escalating to
 /// SIGKILL.
@@ -126,66 +136,90 @@ impl GvproxyConfig {
         ]
     }
 
-    /// Spawn and begin supervising the gvproxy switch process (R1.4).
+    /// Spawn and begin supervising the gvproxy switch process (R1.4), returning
+    /// the switch handle and a [`SwitchExit`] that fires if gvproxy exits
+    /// unexpectedly.
+    ///
+    /// Must be called within a tokio runtime: a background supervision task is
+    /// spawned to await the child and detect an unexpected exit.
     ///
     /// # Errors
     ///
     /// Returns the spawn error if the gvproxy binary cannot be launched.
-    pub fn spawn(self) -> io::Result<GvproxySwitch> {
+    pub fn spawn(self) -> io::Result<(GvproxySwitch, SwitchExit)> {
         let child = Command::new(&self.binary).args(self.argv()).spawn()?;
-        let pid = child.id();
+        let (switch, exit) =
+            GvproxySwitch::supervise(child, self.subnet, self.term_timeout, self.switch_socket);
         tracing::info!(
-            pid,
+            pid = switch.pid(),
             binary = %self.binary.display(),
-            switch_socket = %self.switch_socket.display(),
+            switch_socket = %switch.switch_socket().display(),
             "gvproxy switch spawned",
         );
-        Ok(GvproxySwitch::new(
-            child,
-            self.subnet,
-            self.term_timeout,
-            self.switch_socket,
-        ))
+        Ok((switch, exit))
     }
 }
 
 /// A running, supervised gvproxy switch.
 ///
-/// Dropping the handle tears the switch down with [`terminate_child`]. Each
-/// own-IP PTask is attached with [`attach_ptask`](GvproxySwitch::attach_ptask),
-/// which assigns it the next free switch IP and never reuses an IP for the
-/// lifetime of this handle.
+/// Call [`stop`](GvproxySwitch::stop) for an orderly async teardown
+/// (SIGTERM → grace → SIGKILL, driven on the tokio timer). Dropping the handle
+/// is a best-effort fallback that SIGKILLs the process without blocking; the
+/// background supervision task reaps it. Each own-IP PTask is attached with
+/// [`attach_ptask`](GvproxySwitch::attach_ptask), which assigns it the next free
+/// switch IP and never reuses an IP for the lifetime of this handle.
 #[derive(Debug)]
 pub struct GvproxySwitch {
-    child: Child,
+    /// PID of the supervised gvproxy process. The `Child` itself is owned by the
+    /// supervision task, which is the sole reaper.
+    pid: u32,
     subnet: SwitchSubnet,
     term_timeout: Duration,
     switch_socket: PathBuf,
     /// Next switch-client index to assign; starts at 2 (1 is the gateway).
     next_index: u32,
+    /// Set before any intentional teardown so the supervision task classifies
+    /// the resulting child exit as a clean stop rather than an unexpected crash.
+    stopping: Arc<AtomicBool>,
+    /// Handle to the background supervision task; `None` once [`stop`] has
+    /// consumed it.
+    ///
+    /// [`stop`]: GvproxySwitch::stop
+    supervisor: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl GvproxySwitch {
-    /// Adopt an already-spawned gvproxy `child` for supervision.
-    pub(crate) fn new(
+    /// Adopt an already-spawned gvproxy `child` and start its background
+    /// supervision task (R1.4 detection half). Must be called within a tokio
+    /// runtime.
+    pub(crate) fn supervise(
         child: Child,
         subnet: SwitchSubnet,
         term_timeout: Duration,
         switch_socket: PathBuf,
-    ) -> Self {
-        Self {
-            child,
+    ) -> (Self, SwitchExit) {
+        let pid = child
+            .id()
+            .expect("a freshly spawned child always has a PID before it is awaited");
+        let stopping = Arc::new(AtomicBool::new(false));
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let supervisor = tokio::spawn(supervise_switch(child, pid, Arc::clone(&stopping), exit_tx));
+        let switch = Self {
+            pid,
             subnet,
             term_timeout,
             switch_socket,
             next_index: 2,
-        }
+            stopping,
+            supervisor: Some(supervisor),
+        };
+        (switch, SwitchExit { rx: exit_rx })
     }
 
     /// The PID of the supervised gvproxy process.
     #[must_use]
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        self.pid
     }
 
     /// The unix socket gvproxy listens on for switch-client attachment.
@@ -211,7 +245,7 @@ impl GvproxySwitch {
         tracing::info!(
             ptask = %label,
             switch_ip = %switch_ip,
-            gvproxy_pid = self.child.id(),
+            gvproxy_pid = self.pid,
             "PTask attached to gvproxy switch",
         );
         Some(PtaskAttachment {
@@ -228,21 +262,56 @@ impl GvproxySwitch {
         tracing::info!(
             ptask = %attachment.label,
             switch_ip = %attachment.switch_ip,
-            gvproxy_pid = self.child.id(),
+            gvproxy_pid = self.pid,
             "PTask detached from gvproxy switch",
         );
+    }
+
+    /// Tear the switch down cleanly (R1.4): deliver SIGTERM, wait up to
+    /// `term_timeout` for gvproxy to exit, then escalate to SIGKILL.
+    ///
+    /// The grace period is driven on the tokio timer
+    /// ([`tokio::time::timeout`]) against the supervision task, so no thread is
+    /// blocked — call this from async context for an orderly shutdown. `Drop`
+    /// is only a best-effort, non-blocking fallback.
+    pub async fn stop(mut self) {
+        // Mark the exit intentional *before* signalling so the supervision task
+        // classifies the resulting `wait()` as a clean stop, not a crash.
+        self.stopping.store(true, Ordering::Release);
+        let Some(mut supervisor) = self.supervisor.take() else {
+            // Already stopped.
+            return;
+        };
+        let pid = self.pid as libc::pid_t;
+        signal_child(pid, libc::SIGTERM, "SIGTERM");
+        // The supervision task completes once it has reaped the child, so
+        // awaiting it (bounded by the grace period) is the exit signal.
+        if tokio::time::timeout(self.term_timeout, &mut supervisor)
+            .await
+            .is_err()
+        {
+            signal_child(pid, libc::SIGKILL, "SIGKILL");
+            let _ = supervisor.await;
+        }
     }
 }
 
 impl Drop for GvproxySwitch {
     fn drop(&mut self) {
-        let pid = self.child.id();
-        // Best-effort teardown: Drop cannot propagate an error, so a failed
-        // wait is logged rather than returned.
-        match terminate_child(&mut self.child, self.term_timeout) {
-            Ok(()) => tracing::info!(pid, "gvproxy switch stopped"),
-            Err(error) => tracing::error!(pid, %error, "gvproxy switch teardown failed"),
-        }
+        // `stop()` already consumed the supervisor and tore the switch down.
+        let Some(_supervisor) = self.supervisor.take() else {
+            return;
+        };
+        // Fire-and-forget fallback: `Drop` cannot await, so mark the exit
+        // intentional and SIGKILL immediately, leaving the detached supervision
+        // task to reap the child. No blocking poll runs here (the async
+        // `stop()` is the path that waits for a graceful SIGTERM exit).
+        self.stopping.store(true, Ordering::Release);
+        signal_child(self.pid as libc::pid_t, libc::SIGKILL, "SIGKILL");
+        tracing::debug!(
+            pid = self.pid,
+            "gvproxy switch dropped without stop(); SIGKILL sent, reap deferred to supervisor",
+        );
     }
 }
 
@@ -275,31 +344,58 @@ impl PtaskAttachment {
     }
 }
 
-/// Terminate `child` with the SIGTERM → `timeout` → SIGKILL sequence used for
-/// the vmm child (R1.4), then reap it.
+/// Notification that the supervised gvproxy switch exited **unexpectedly** —
+/// i.e. not via [`GvproxySwitch::stop`] or `Drop` (R1.4 detection half).
+/// Returned from [`GvproxyConfig::spawn`]; await it to react to an unplanned
+/// gvproxy death.
 ///
-/// # Errors
-///
-/// Returns an I/O error if waiting on the child fails.
-pub fn terminate_child(child: &mut Child, timeout: Duration) -> io::Result<()> {
-    if child.try_wait()?.is_some() {
-        // Already exited; nothing to signal.
-        return Ok(());
+/// Per #522's scope this carries detection plus the signal only; the consumer
+/// that tears down the host's own-IP PTasks on this signal is deferred to #526.
+#[derive(Debug)]
+#[must_use = "await SwitchExit to learn when the gvproxy switch exits unexpectedly"]
+pub struct SwitchExit {
+    rx: oneshot::Receiver<ExitStatus>,
+}
+
+impl SwitchExit {
+    /// Await the unexpected-exit notification. Resolves to the gvproxy
+    /// [`ExitStatus`] when the switch exits unexpectedly, or `None` when it is
+    /// torn down intentionally (the notify channel closes without a value).
+    pub async fn recv(self) -> Option<ExitStatus> {
+        self.rx.await.ok()
     }
+}
 
-    let pid = child.id() as libc::pid_t;
-    signal_child(pid, libc::SIGTERM, "SIGTERM");
-
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if child.try_wait()?.is_some() {
-            return Ok(());
+/// Background supervision task body (R1.4 detection half): await the supervised
+/// gvproxy `child` and classify its exit. An intentional teardown sets
+/// `stopping` before signalling, so a resolved `wait()` with `stopping` set is
+/// an orderly stop; otherwise the exit is unexpected — a `tracing::error!` is
+/// emitted and `exit_tx` fires so a caller can react. This task is the sole
+/// reaper of the child.
+async fn supervise_switch(
+    mut child: Child,
+    pid: u32,
+    stopping: Arc<AtomicBool>,
+    exit_tx: oneshot::Sender<ExitStatus>,
+) {
+    match child.wait().await {
+        Ok(status) => {
+            if stopping.load(Ordering::Acquire) {
+                tracing::info!(pid, code = status.code(), "gvproxy switch stopped");
+            } else {
+                tracing::error!(
+                    pid,
+                    code = status.code(),
+                    "gvproxy switch exited unexpectedly",
+                );
+                // Receiver may already be dropped; the exit is logged regardless.
+                let _ = exit_tx.send(status);
+            }
         }
-        std::thread::sleep(Duration::from_millis(20));
+        Err(error) => {
+            tracing::error!(pid, %error, "waiting on gvproxy switch failed");
+        }
     }
-
-    signal_child(pid, libc::SIGKILL, "SIGKILL");
-    child.wait().map(|_| ())
 }
 
 /// Deliver `signal` to `pid` best-effort, logging any delivery failure other
@@ -441,14 +537,30 @@ mod tests {
         );
     }
 
-    #[test]
-    fn attach_assigns_unique_sequential_ips() {
-        let mut switch = GvproxySwitch::new(
+    fn supervise_sleep() -> (GvproxySwitch, SwitchExit) {
+        GvproxySwitch::supervise(
             spawn_sleep(),
             SwitchSubnet::default(),
             Duration::from_secs(2),
             PathBuf::from("/run/minvmd/switch.sock"),
-        );
+        )
+    }
+
+    /// Wait up to ~2 s for `pid` to be reaped, yielding to the supervision task
+    /// between probes (the reap is asynchronous).
+    async fn await_reaped(pid: u32) -> bool {
+        for _ in 0..200 {
+            if !pid_is_alive(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn attach_assigns_unique_sequential_ips() {
+        let (mut switch, _exit) = supervise_sleep();
 
         let a = switch.attach_ptask("ptask-a").expect("attach a");
         let b = switch.attach_ptask("ptask-b").expect("attach b");
@@ -457,32 +569,58 @@ mod tests {
         assert_eq!(b.switch_ip(), Ipv4Addr::new(100, 64, 0, 3));
         assert_ne!(a.switch_ip(), b.switch_ip(), "IPs must be unique");
         switch.detach_ptask(&a);
+        switch.stop().await;
     }
 
-    #[test]
-    fn drop_terminates_supervised_child() {
-        let child = spawn_sleep();
-        let pid = child.id();
+    #[tokio::test]
+    async fn stop_terminates_supervised_child() {
+        let (switch, _exit) = supervise_sleep();
+        let pid = switch.pid();
+        assert!(pid_is_alive(pid), "child should be alive before stop");
+
+        // SIGTERM on `sleep` is immediate; stop() awaits the supervisor's reap.
+        switch.stop().await;
+        assert!(!pid_is_alive(pid), "child must be terminated after stop");
+    }
+
+    #[tokio::test]
+    async fn drop_sigkills_supervised_child_without_blocking() {
+        let (switch, _exit) = supervise_sleep();
+        let pid = switch.pid();
         assert!(pid_is_alive(pid), "child should be alive before drop");
 
-        let switch = GvproxySwitch::new(
-            child,
+        // Drop is fire-and-forget: it SIGKILLs immediately and leaves the
+        // detached supervision task to reap the child asynchronously.
+        drop(switch);
+        assert!(
+            await_reaped(pid).await,
+            "child must be killed and reaped after drop",
+        );
+    }
+
+    #[tokio::test]
+    async fn unexpected_exit_fires_notify() {
+        // A child that exits on its own — no stop()/drop — is an unexpected
+        // exit: the supervisor emits tracing::error! and fires the notify
+        // channel (R1.4 detection half).
+        let (switch, exit) = GvproxySwitch::supervise(
+            Command::new("true").spawn().expect("spawn true"),
             SwitchSubnet::default(),
             Duration::from_secs(2),
             PathBuf::from("/run/minvmd/switch.sock"),
         );
+
+        let status = tokio::time::timeout(Duration::from_secs(5), exit.recv())
+            .await
+            .expect("unexpected-exit notify should fire within 5s");
+        assert!(
+            status.is_some(),
+            "an unexpected exit must deliver an ExitStatus over the notify channel",
+        );
+
+        // `switch` is kept alive until after the notify so `stopping` stays
+        // false while the supervisor classifies the exit.
         drop(switch);
-
-        // SIGTERM on `sleep` is immediate; the child is reaped by Drop.
-        assert!(!pid_is_alive(pid), "child must be terminated after drop");
-    }
-
-    #[test]
-    fn terminate_child_reaps_running_child() {
-        let mut child = spawn_sleep();
-        let pid = child.id();
-        terminate_child(&mut child, Duration::from_secs(2)).expect("terminate");
-        assert!(!pid_is_alive(pid), "terminate_child must reap the process");
     }
 
     #[test]

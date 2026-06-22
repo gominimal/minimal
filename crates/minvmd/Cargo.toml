@@ -20,12 +20,15 @@ tracing-subscriber.workspace = true
 # VM network mode and VM-wide egress policy (minimald itself is Linux-only and
 # cannot be imported here, but the wire-types crate is portable).
 minimald-rpc.workspace = true
+# Async gvproxy switch supervision in `net`: the background exit-detection task
+# and the async `stop()` teardown run on the tokio runtime the networking layer
+# mandates (no blocking I/O in async context).
+tokio.workspace = true
 
 [dev-dependencies]
 serial_test.workspace = true
 tempfile.workspace = true
 # Session e2e test (minimald_session_e2e): a russh client over the bridge.
 russh.workspace = true
-tokio.workspace = true
 sessions.workspace = true
 paths.workspace = true
