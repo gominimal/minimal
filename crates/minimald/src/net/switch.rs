@@ -29,7 +29,7 @@ use tokio::task::JoinHandle;
 use super::DEFAULT_MTU;
 
 /// `ioctl` request number for `TUNSETIFF` (set the tap/tun interface a fd backs).
-const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
+const TUNSETIFF: libc::Ioctl = 0x4004_54ca;
 /// `IFF_TAP`: the device is an Ethernet (layer-2) tap, not a layer-3 tun.
 const IFF_TAP: libc::c_short = 0x0002;
 /// `IFF_NO_PI`: do not prepend the 4-byte packet-info header to frames.
