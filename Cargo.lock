@@ -3327,7 +3327,6 @@ dependencies = [
  "clap",
  "clap_complete",
  "dirs",
- "libc",
  "minimald-rpc",
  "minvmd",
  "ot",
@@ -5401,7 +5400,6 @@ version = "0.0.1"
 dependencies = [
  "camino",
  "common",
- "dirs",
  "globset",
  "nutype",
  "paths",
