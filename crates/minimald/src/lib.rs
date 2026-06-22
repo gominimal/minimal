@@ -5,6 +5,8 @@ pub mod env;
 mod exec;
 #[cfg(target_os = "linux")]
 pub mod guest;
+#[cfg(target_os = "linux")]
+pub mod net;
 pub mod rpc;
 pub mod server;
 mod session;
