@@ -3377,6 +3377,7 @@ dependencies = [
  "sessions",
  "stdlib",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-vsock",
  "tracing",

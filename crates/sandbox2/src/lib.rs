@@ -479,6 +479,26 @@ impl<C: Channel> Sandbox<C> {
             .unshare(hakoniwa::Namespace::Cgroup)
             .runctl(hakoniwa::Runctl::IgnoreCgroupSetupFailed);
 
+        // Network isolation (R1.4/R1.7). `HostNet` keeps the host/VM network
+        // namespace (the current default). `NoNet` and `OwnIp` both run in a
+        // fresh network namespace: a `NoNet` PTask is left with only a down
+        // `lo`, so every egress attempt fails with `ENETUNREACH` (UC1); an
+        // `OwnIp` PTask additionally gets a tap device + gvproxy switch relay
+        // wired up by `minimald::net` once its namespace exists. Where
+        // unprivileged network namespaces are unavailable we degrade to the
+        // host namespace rather than fail the spawn, mirroring the
+        // cgroup-setup fallback above.
+        if isolates_network(self.config.network_mode) {
+            if network_namespaces_available() {
+                container.unshare(hakoniwa::Namespace::Network);
+            } else {
+                tracing::warn!(
+                    mode = ?self.config.network_mode,
+                    "network namespaces unavailable; falling back to host network"
+                );
+            }
+        }
+
         let rec = BindOpts {
             recursive: true,
             read_only: false,
@@ -1036,6 +1056,33 @@ fn locked_mount_flags(path: &Path) -> hakoniwa::MountOptions {
     opts
 }
 
+/// Best-effort probe for whether this host can create network namespaces.
+///
+/// Reads `/proc/sys/user/max_net_namespaces`: a missing file or a zero limit
+/// means network namespaces are unavailable, so [`NetworkMode::NoNet`] and
+/// [`NetworkMode::OwnIp`] degrade to the host network namespace rather than
+/// failing the spawn. This mirrors the cgroup-setup fallback and the
+/// `locked_mount_flags` "warn and continue" precedent.
+fn network_namespaces_available() -> bool {
+    std::fs::read_to_string("/proc/sys/user/max_net_namespaces")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .is_some_and(|n| n > 0)
+}
+
+/// Whether `mode` runs the sandbox in its own network namespace rather than
+/// sharing the host's.
+///
+/// [`NetworkMode::HostNet`] shares the host/VM network namespace (the default);
+/// every other mode — [`NetworkMode::NoNet`] and [`NetworkMode::OwnIp`] —
+/// isolates the sandbox in a fresh network namespace. This is the predicate
+/// `new_container` uses to decide whether to unshare the network namespace, and
+/// the contract a `NoNet` PTask's no-egress behaviour (UC1) rests on.
+#[must_use]
+pub fn isolates_network(mode: NetworkMode) -> bool {
+    mode != NetworkMode::HostNet
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1057,6 +1104,13 @@ mod tests {
     fn locked_mount_flags_empty_on_statfs_failure() {
         let opts = locked_mount_flags(Path::new("/nonexistent-path-for-statfs-test"));
         assert!(opts.is_empty());
+    }
+
+    #[test]
+    fn host_net_shares_the_network_namespace_others_isolate() {
+        assert!(!isolates_network(NetworkMode::HostNet));
+        assert!(isolates_network(NetworkMode::NoNet));
+        assert!(isolates_network(NetworkMode::OwnIp));
     }
 
     /// Creates a tempdir with the `synth/usr/` structure required by
