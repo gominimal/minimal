@@ -29,7 +29,7 @@ use tokio::task::JoinHandle;
 use super::DEFAULT_MTU;
 
 /// `ioctl` request number for `TUNSETIFF` (set the tap/tun interface a fd backs).
-const TUNSETIFF: libc::Ioctl = 0x4004_54ca;
+const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
 /// `IFF_TAP`: the device is an Ethernet (layer-2) tap, not a layer-3 tun.
 const IFF_TAP: libc::c_short = 0x0002;
 /// `IFF_NO_PI`: do not prepend the 4-byte packet-info header to frames.
@@ -195,6 +195,17 @@ where
         if n == 0 {
             return Ok(());
         }
+        // A tap read is frame-atomic, but a frame larger than the buffer is
+        // silently truncated to `buf.len()` by the kernel. Forwarding it would
+        // emit corrupt bytes under a correct-looking length prefix, so drop it
+        // and make the truncation observable instead of silently corrupting.
+        if n == buf.len() {
+            tracing::warn!(
+                n,
+                "tap frame filled the buffer; dropping possibly-truncated jumbo frame"
+            );
+            continue;
+        }
         // One combined write keeps the length prefix and frame atomic even if
         // the socket closes between writes.
         let mut framed = Vec::with_capacity(2 + n);
@@ -211,6 +222,7 @@ where
     R: AsyncReadExt + Unpin,
 {
     let mut len_buf = [0u8; 2];
+    let mut frame = vec![0u8; max_frame()];
     loop {
         match sock.read_exact(&mut len_buf).await {
             Ok(_) => {}
@@ -219,11 +231,20 @@ where
             Err(e) => return Err(e),
         }
         let n = u16::from_le_bytes(len_buf) as usize;
-        let mut frame = vec![0u8; n];
-        sock.read_exact(&mut frame).await?;
+        // Trust nothing the control socket claims about length: a frame larger
+        // than the MTU-derived maximum would overrun the tap and points at a
+        // malformed or hostile peer, so reject it rather than size an
+        // allocation to it.
+        if n > frame.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("switch frame length {n} exceeds max {}", frame.len()),
+            ));
+        }
+        sock.read_exact(&mut frame[..n]).await?;
         loop {
             let mut guard = tap.writable().await?;
-            match guard.try_io(|inner| inner.get_ref().write_all(&frame)) {
+            match guard.try_io(|inner| inner.get_ref().write_all(&frame[..n])) {
                 Ok(result) => {
                     result?;
                     break;

@@ -268,6 +268,13 @@ impl IpAllocator {
 /// the spike). minimald owns the allocation table and writes it here before
 /// every (re)start so the switch's static leases match minimald's address
 /// book.
+///
+/// gvproxy reads this file only at spawn time, so a rewrite triggered by a
+/// later [`attach`](GvproxySwitch::attach) takes effect only on the next switch
+/// (re)start. That is intentional: an `OwnIp` PTask configures its switch
+/// address statically (the spike's static-lease recipe) rather than via DHCP,
+/// so `dhcpStaticLeases` is a startup-time seed, not a live source a running
+/// gvproxy must re-read for each new PTask.
 #[must_use]
 pub fn render_gvproxy_config(subnet: SwitchSubnet, leases: &[PtaskLease]) -> String {
     let mut s = String::with_capacity(256 + leases.len() * 48);
@@ -415,8 +422,15 @@ impl GvproxySwitch {
         }
 
         let sock = self.control_socket();
-        // A stale socket from a previous run blocks gvproxy's own bind.
-        let _ = std::fs::remove_file(&sock);
+        // A stale socket from a previous run blocks gvproxy's own bind. If it
+        // cannot be cleared, fail now rather than let `wait_for_socket` mistake
+        // the leftover path for a freshly-bound one and report a switch that
+        // never actually came up.
+        match std::fs::remove_file(&sock) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(NetError::Io(e)),
+        }
 
         let mut cmd = Command::new(&self.binary);
         cmd.arg("-config")
@@ -432,6 +446,9 @@ impl GvproxySwitch {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // If the supervisor is dropped without a clean `stop()` (an error path
+        // or a panic), make sure gvproxy is reaped rather than orphaned.
+        cmd.kill_on_drop(true);
 
         tracing::info!(binary = %self.binary.display(), socket = %sock.display(), "spawning gvproxy switch");
         let child = cmd.spawn().map_err(|source| NetError::Spawn {
@@ -440,7 +457,14 @@ impl GvproxySwitch {
         })?;
         self.child = Some(child);
 
-        self.wait_for_socket(&sock).await
+        // If the control socket never appears, tear the half-started child down
+        // so its timeout cannot leave gvproxy orphaned and a later attach does
+        // not relay onto a process that never bound.
+        if let Err(e) = self.wait_for_socket(&sock).await {
+            let _ = self.stop().await;
+            return Err(e);
+        }
+        Ok(())
     }
 
     async fn wait_for_socket(&mut self, sock: &Path) -> Result<(), NetError> {

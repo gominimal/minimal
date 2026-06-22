@@ -273,6 +273,9 @@ impl From<sandbox2::Error> for Error {
                 sandbox2::error::ExecutionError::MountError { .. } => {
                     Self::Other(anyhow::anyhow!(e.to_string()))
                 }
+                sandbox2::error::ExecutionError::NetworkIsolationUnavailable { .. } => {
+                    Self::Other(anyhow::anyhow!(e.to_string()))
+                }
             },
             sandbox2::Error::Output(e) => Self::Other(e.into()),
             sandbox2::Error::MappedFile(p) => Self::Other(anyhow::anyhow!(

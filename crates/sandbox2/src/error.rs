@@ -69,6 +69,13 @@ pub enum ExecutionError {
         msg: &'static str,
         path: PathBuf,
     },
+    /// A [`NetworkMode`](crate::NetworkMode) that requires its own network
+    /// namespace was requested, but this host cannot create one. We fail closed
+    /// rather than silently fall back to host networking, which would void the
+    /// isolation the mode promises (spec R1.2).
+    NetworkIsolationUnavailable {
+        mode: crate::NetworkMode,
+    },
     Cancelled,
 }
 
@@ -101,6 +108,13 @@ impl fmt::Display for ExecutionError {
             Self::MountError { msg, path } => {
                 write!(f, "Failed to mount {}: {}", path.display(), msg)
             }
+            Self::NetworkIsolationUnavailable { mode } => {
+                write!(
+                    f,
+                    "network mode {mode:?} requires its own network namespace, \
+                     but this host cannot create one"
+                )
+            }
             Self::Cancelled => {
                 write!(f, "Execution cancelled")
             }
@@ -114,6 +128,7 @@ impl std::error::Error for ExecutionError {
             Self::InvocationFailed { .. } => None,
             Self::SpawnFailed(e) => Some(e),
             Self::MountError { .. } => None,
+            Self::NetworkIsolationUnavailable { .. } => None,
             Self::Cancelled => None,
         }
     }
