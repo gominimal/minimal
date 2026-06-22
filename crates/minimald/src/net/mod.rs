@@ -133,15 +133,21 @@ impl SwitchSubnet {
     ///
     /// # Errors
     ///
-    /// Returns [`NetError::SubnetExhausted`] if the prefix is too wide to hold
-    /// the reserved network/gateway/host-alias/broadcast addresses plus at
-    /// least one PTask address (`prefix > 30`).
+    /// Returns [`NetError::SubnetExhausted`] for a prefix outside `8..=29`. A
+    /// prefix narrower than /29 has no room for the reserved
+    /// network/gateway/host-alias/broadcast addresses plus a PTask address. A
+    /// prefix wider than /8 lets the high octet vary, which
+    /// [`MacAddr::for_switch_ip`] does not fold into the derived MAC, so two
+    /// addresses differing only in that octet would collide.
     pub fn new(base: Ipv4Addr, prefix: u8) -> Result<Self, NetError> {
         let s = Self { base, prefix };
-        // We reserve four addresses (network, gateway, host-alias, broadcast).
-        // A /29 (8 addresses) leaves four allocatable hosts; a /30 (4) leaves
-        // none, so anything narrower than /29 has no room for a PTask.
-        if prefix > 29 {
+        // Reserve four addresses (network, gateway, host-alias, broadcast): a
+        // /29 (8 addresses) leaves four allocatable hosts, a /30 (4) leaves
+        // none, so anything narrower than /29 has no room for a PTask. The lower
+        // bound keeps MacAddr::for_switch_ip collision-free — it derives the MAC
+        // from the low three octets, so the high octet must be pinned by the
+        // prefix (/8 or narrower).
+        if !(8..=29).contains(&prefix) {
             return Err(NetError::SubnetExhausted(s));
         }
         Ok(s)
@@ -514,13 +520,22 @@ impl GvproxySwitch {
                 Err(e) => return Err(NetError::Io(e)),
             }
             // If gvproxy died during startup, surface its status rather than
-            // spinning until the timeout.
-            if let Some(child) = self.child.as_mut()
-                && let Ok(Some(status)) = child.try_wait()
-            {
-                let code = status.code();
-                self.child = None;
-                return Err(NetError::UnexpectedExit(code));
+            // spinning until the timeout. A try_wait() error (e.g. the child was
+            // already reaped) is surfaced too, not swallowed into a misleading
+            // SocketTimeout.
+            if let Some(child) = self.child.as_mut() {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let code = status.code();
+                        self.child = None;
+                        return Err(NetError::UnexpectedExit(code));
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        self.child = None;
+                        return Err(NetError::Io(e));
+                    }
+                }
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(NetError::SocketTimeout(
@@ -636,6 +651,16 @@ mod tests {
     fn subnet_rejects_overly_narrow_prefix() {
         assert!(matches!(
             SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 30),
+            Err(NetError::SubnetExhausted(_))
+        ));
+    }
+
+    #[test]
+    fn subnet_rejects_overly_wide_prefix() {
+        // A prefix wider than /8 lets the high octet vary, which the derived MAC
+        // does not cover, so the constructor rejects it to keep MACs unique.
+        assert!(matches!(
+            SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 7),
             Err(NetError::SubnetExhausted(_))
         ));
     }

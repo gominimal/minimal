@@ -255,9 +255,17 @@ where
         sock.read_exact(&mut frame[..n]).await?;
         loop {
             let mut guard = tap.writable().await?;
-            match guard.try_io(|inner| inner.get_ref().write_all(&frame[..n])) {
+            // One non-blocking write per try_io call: write_all could issue
+            // several syscalls and, on a partial write then EAGAIN, restart the
+            // whole frame from byte 0 — re-emitting the already-written prefix.
+            // A tap write is frame-atomic, so a single write delivers the whole
+            // frame; a short count would mean a malformed write we surface.
+            match guard.try_io(|inner| inner.get_ref().write(&frame[..n])) {
                 Ok(result) => {
-                    result?;
+                    let written = result?;
+                    if written != n {
+                        tracing::warn!(written, n, "short tap write; frame may be truncated");
+                    }
                     break;
                 }
                 Err(_would_block) => continue,
