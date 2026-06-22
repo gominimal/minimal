@@ -358,9 +358,15 @@ pub struct SwitchExit {
 }
 
 impl SwitchExit {
-    /// Await the unexpected-exit notification. Resolves to the gvproxy
-    /// [`ExitStatus`] when the switch exits unexpectedly, or `None` when it is
-    /// torn down intentionally (the notify channel closes without a value).
+    /// Await the unexpected-exit notification. Resolves to `Some(status)` with
+    /// the gvproxy [`ExitStatus`] when the switch exits unexpectedly.
+    ///
+    /// `None` means the notify channel closed without a value, which covers two
+    /// cases: an intentional teardown via [`GvproxySwitch::stop`] or `Drop`, and
+    /// the rare supervision failure where `child.wait()` itself errored (no
+    /// `ExitStatus` exists to report — that path is logged via `tracing::error!`
+    /// in [`supervise_switch`]). A caller that must distinguish the two relies on
+    /// whether it requested the teardown.
     pub async fn recv(self) -> Option<ExitStatus> {
         self.rx.await.ok()
     }
