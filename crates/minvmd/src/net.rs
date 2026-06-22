@@ -70,7 +70,8 @@ impl SwitchSubnet {
         if index == 0 || index >= span.checked_sub(1)? {
             return None;
         }
-        Some(Ipv4Addr::from(u32::from(self.base) + index))
+        let addr = u32::from(self.base).checked_add(index)?;
+        Some(Ipv4Addr::from(addr))
     }
 }
 
