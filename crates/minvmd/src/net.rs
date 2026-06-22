@@ -288,11 +288,7 @@ pub fn terminate_child(child: &mut Child, timeout: Duration) -> io::Result<()> {
     }
 
     let pid = child.id() as libc::pid_t;
-    // SAFETY: `kill(2)` takes a pid and a signal number and touches no memory;
-    // an unknown/dead pid simply returns ESRCH, which is harmless here.
-    unsafe {
-        libc::kill(pid, libc::SIGTERM);
-    }
+    signal_child(pid, libc::SIGTERM, "SIGTERM");
 
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -302,11 +298,29 @@ pub fn terminate_child(child: &mut Child, timeout: Duration) -> io::Result<()> {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    // SAFETY: same invariants as the SIGTERM above.
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
-    }
+    signal_child(pid, libc::SIGKILL, "SIGKILL");
     child.wait().map(|_| ())
+}
+
+/// Deliver `signal` to `pid` best-effort, logging any delivery failure other
+/// than the benign `ESRCH` (the process has already exited — the expected race
+/// during teardown). The result is intentionally not propagated: teardown
+/// cannot recover from a failed signal, but an unexpected errno (e.g. `EPERM`,
+/// `EINVAL`) should be visible in the logs rather than silently swallowed.
+fn signal_child(pid: libc::pid_t, signal: libc::c_int, signal_name: &str) {
+    // SAFETY: `kill(2)` takes a pid and a signal number and touches no memory.
+    let rc = unsafe { libc::kill(pid, signal) };
+    if rc != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            tracing::warn!(
+                pid,
+                signal = signal_name,
+                %error,
+                "signal delivery to gvproxy switch failed",
+            );
+        }
+    }
 }
 
 /// VM-wide egress policy stub (R2.5 / Unit 2), aligned with the per-PTask egress
