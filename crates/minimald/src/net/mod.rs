@@ -26,6 +26,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
+use tokio::sync::watch;
 
 /// Default gvproxy switch subnet: the RFC 6598 (CGNAT) `100.64.0.0/16` block.
 ///
@@ -200,6 +201,15 @@ pub struct PtaskLease {
     pub mac: MacAddr,
 }
 
+/// Returned by [`GvproxySwitch::attach`].
+pub struct AttachResult {
+    /// The allocated IP/MAC for this PTask's tap device.
+    pub lease: PtaskLease,
+    /// Fires (`true`) when gvproxy exits unexpectedly; the PTask should tear
+    /// down its tap relay on receipt.
+    pub exit_signal: watch::Receiver<bool>,
+}
+
 /// Hands out unique switch addresses, never reusing one for the lifetime of
 /// the allocator (R1.6).
 #[derive(Debug)]
@@ -317,6 +327,9 @@ pub struct GvproxySwitch {
     attached: usize,
     /// The running gvproxy child, if started.
     child: Option<Child>,
+    /// Signals attached PTasks when gvproxy exits unexpectedly. Replaced
+    /// on each unexpected exit so new attachers get a fresh receiver.
+    exit_tx: watch::Sender<bool>,
 }
 
 impl GvproxySwitch {
@@ -334,12 +347,14 @@ impl GvproxySwitch {
         state_dir: impl Into<PathBuf>,
         subnet: SwitchSubnet,
     ) -> Self {
+        let (exit_tx, _) = watch::channel(false);
         Self {
             binary: binary.into(),
             state_dir: state_dir.into(),
             allocator: IpAllocator::new(subnet),
             attached: 0,
             child: None,
+            exit_tx,
         }
     }
 
@@ -360,13 +375,14 @@ impl GvproxySwitch {
     /// Allocates an address for a new PTask, (re)writes the config, ensures
     /// gvproxy is running, and bumps the attach count.
     ///
-    /// The returned [`PtaskLease`] is the IP/MAC the caller must configure on
-    /// the PTask's tap device before relaying it onto the switch.
+    /// Returns an [`AttachResult`] with the allocated lease and a receiver that
+    /// fires `true` when gvproxy exits unexpectedly; the caller should tear down
+    /// the PTask's tap relay when the signal fires.
     ///
     /// # Errors
     ///
     /// Propagates config-write, spawn, and socket-readiness failures.
-    pub async fn attach(&mut self) -> Result<PtaskLease, NetError> {
+    pub async fn attach(&mut self) -> Result<AttachResult, NetError> {
         let lease = self.allocator.allocate()?;
         self.write_config()?;
         self.ensure_running().await?;
@@ -377,7 +393,8 @@ impl GvproxySwitch {
             attached = self.attached,
             "attached OwnIp PTask to gvproxy switch"
         );
-        Ok(lease)
+        let exit_signal = self.exit_tx.subscribe();
+        Ok(AttachResult { lease, exit_signal })
     }
 
     /// Records that a PTask detached. When the last one leaves, the switch is
@@ -413,8 +430,14 @@ impl GvproxySwitch {
             // not relay onto a dead socket (R1.4 unexpected-exit handling).
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    tracing::error!(?status, "gvproxy exited unexpectedly; restarting switch");
+                    tracing::error!(?status, "gvproxy exited unexpectedly; signalling attached PTasks");
+                    // Replace the channel so future attachers get a fresh receiver
+                    // while all current receivers fire and know to tear down.
+                    let (new_tx, _) = watch::channel(false);
+                    let old_tx = std::mem::replace(&mut self.exit_tx, new_tx);
+                    let _ = old_tx.send(true);
                     self.child = None;
+                    self.attached = 0;
                 }
                 Ok(None) => return Ok(()),
                 Err(e) => return Err(NetError::Io(e)),

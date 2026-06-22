@@ -64,11 +64,11 @@ fn sudo_ok(label: &str, args: &[&str]) {
 
 /// UC1 — a `NoNet` PTask cannot egress.
 ///
-/// `sandbox2::isolates_network(NoNet)` is the production decision that places a
-/// `NoNet` sandbox in its own network namespace; referencing it ties this proof
-/// to the new code (it does not exist on the base branch). The empty namespace
-/// that decision yields — only a down `lo`, no routes — is what makes egress
-/// fail, which the test then exercises directly.
+/// Drives the egress attempt through `unshare --net`, which calls the same
+/// `CLONE_NEWNET` syscall that `sandbox2::new_container` calls for
+/// `NetworkMode::NoNet`. If `new_container` stopped calling `CLONE_NEWNET`,
+/// the `isolates_network` assertion would no longer match the actual namespacing
+/// behaviour; the `unshare --net` egress test guards the OS-level contract.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs a network namespace; gated on MINIMALD_NETNS_TEST, run by ci-netns.yml"]
 async fn netns_uc1_nonet_refuses_egress() {
@@ -81,30 +81,22 @@ async fn netns_uc1_nonet_refuses_egress() {
     assert!(sandbox2::isolates_network(sandbox2::NetworkMode::NoNet));
     assert!(!sandbox2::isolates_network(sandbox2::NetworkMode::HostNet));
 
-    let ns = "minimald_uc1";
-    let _ = sudo(&["ip", "netns", "del", ns]); // best-effort pre-clean
-
-    sudo_ok("create NoNet namespace", &["ip", "netns", "add", ns]);
-
-    // From inside the empty namespace, a TCP connect to a public address must
-    // fail: there is no route out (ENETUNREACH) — the UC1 isolation guarantee.
+    // Exercise the same OS primitive that sandbox2::new_container uses for NoNet
+    // (CLONE_NEWNET via unshare): enter a fresh, empty network namespace and
+    // attempt egress. The namespace has only a down lo and no routes, so the
+    // TCP connect must fail with ENETUNREACH — the same contract new_container
+    // enforces for NoNet PTasks.
     let egress = sudo(&[
-        "ip",
-        "netns",
-        "exec",
-        ns,
-        "timeout",
-        "5",
+        "unshare",
+        "--net",
         "bash",
         "-c",
         "exec 3<>/dev/tcp/8.8.8.8/80",
     ]);
 
-    let _ = sudo(&["ip", "netns", "del", ns]); // cleanup before asserting
-
     assert!(
         !egress.status.success(),
-        "egress unexpectedly succeeded from a NoNet namespace; isolation is not enforced"
+        "egress unexpectedly succeeded from a CLONE_NEWNET namespace; NoNet isolation is not enforced"
     );
 }
 
@@ -124,9 +116,12 @@ async fn netns_uc6_ownip_ptask_to_ptask() {
     let mut switch = GvproxySwitch::new(gvproxy_bin(), state.path());
     let subnet = SwitchSubnet::default();
 
-    // Attach two PTasks; each gets a unique, never-reused switch address.
-    let lease_a = switch.attach().await.expect("attach PTask A");
-    let lease_b = switch.attach().await.expect("attach PTask B");
+    // Attach two PTasks; each gets a unique, never-reused switch address plus an
+    // exit-signal receiver.
+    let minimald::net::AttachResult { lease: lease_a, .. } =
+        switch.attach().await.expect("attach PTask A");
+    let minimald::net::AttachResult { lease: lease_b, .. } =
+        switch.attach().await.expect("attach PTask B");
     assert_ne!(lease_a.ip, lease_b.ip);
     let sock = switch.control_socket();
 
@@ -137,20 +132,28 @@ async fn netns_uc6_ownip_ptask_to_ptask() {
     // crosses the gvproxy L2 switch entirely in userspace.
     const PORT: u16 = 9009;
     let mut server = b.spawn_listener(PORT);
-    // Give the listener a moment to bind, and the switch a moment to learn MACs.
-    tokio::time::sleep(Duration::from_millis(750)).await;
 
-    let client = sudo(&[
-        "ip",
-        "netns",
-        "exec",
-        a.ns(),
-        "timeout",
-        "10",
-        "bash",
-        "-c",
-        &format!("exec 3<>/dev/tcp/{}/{PORT}; head -c2 <&3", lease_b.ip),
-    ]);
+    // Retry the connect until the listener is ready and the switch has learned
+    // MACs. A fixed sleep is flaky on slow CI runners; retrying up to a deadline
+    // is deterministic.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let client = loop {
+        let out = sudo(&[
+            "ip",
+            "netns",
+            "exec",
+            a.ns(),
+            "timeout",
+            "2",
+            "bash",
+            "-c",
+            &format!("exec 3<>/dev/tcp/{}/{PORT}; head -c2 <&3", lease_b.ip),
+        ]);
+        if out.status.success() || tokio::time::Instant::now() >= deadline {
+            break out;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
 
     let _ = server.kill();
     let _ = server.wait();
