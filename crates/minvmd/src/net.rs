@@ -578,12 +578,20 @@ impl Drop for GvproxySwitch {
         // intentional and SIGKILL immediately, leaving the detached supervision
         // task to reap the child. No blocking poll runs here (the async
         // `stop()` is the path that waits for a graceful SIGTERM exit).
-        self.stopping.store(true, Ordering::Release);
-        signal_child(self.pid as libc::pid_t, libc::SIGKILL, "SIGKILL");
-        tracing::debug!(
-            pid = self.pid,
-            "gvproxy switch dropped without stop(); SIGKILL sent, reap deferred to supervisor",
-        );
+        //
+        // Only SIGKILL if this drop is the first to claim teardown. If a
+        // `PtaskAttachment::Drop` (or anything else) already flipped `stopping`
+        // the child is reaped and its PID may have been recycled, so an
+        // unconditional SIGKILL could land on an unrelated process. `swap`
+        // makes the claim atomic, mirroring the SIGTERM guard on the last
+        // attachment drop.
+        if !self.stopping.swap(true, Ordering::AcqRel) {
+            signal_child(self.pid as libc::pid_t, libc::SIGKILL, "SIGKILL");
+            tracing::debug!(
+                pid = self.pid,
+                "gvproxy switch dropped without stop(); SIGKILL sent, reap deferred to supervisor",
+            );
+        }
     }
 }
 
@@ -596,6 +604,7 @@ impl Drop for GvproxySwitch {
 /// switch so it tears down when the last own-IP PTask exits (R1.4). Every drop
 /// path logs the detach; [`GvproxySwitch::detach_ptask`] is just a named way to
 /// drop it at a chosen point and is equivalent to an implicit scope-exit drop.
+#[must_use = "dropping PtaskAttachment decrements the attached count and may terminate the switch"]
 #[derive(Debug)]
 pub struct PtaskAttachment {
     label: String,
@@ -640,6 +649,13 @@ impl Drop for PtaskAttachment {
         // signalling `self.pid` here could deliver SIGTERM to an unrelated
         // process. `swap` makes the claim atomic and race-free against a
         // concurrent stop or drop.
+        //
+        // Residual gap: an *independent* gvproxy crash never sets `stopping`,
+        // so the last drop still signals `self.pid`. The supervision task has
+        // reaped the child by then, leaving a recycled-PID window between that
+        // reap and this drop that the `swap` guard cannot close — it only keys
+        // on an intentional teardown (`stop`/`GvproxySwitch::Drop`) having set
+        // the flag, which a crash does not.
         if prev == 1 && !self.stopping.swap(true, Ordering::AcqRel) {
             // Last own-IP PTask detached; terminate the switch (R1.4).
             signal_child(self.pid as libc::pid_t, libc::SIGTERM, "SIGTERM");
@@ -1032,8 +1048,10 @@ mod tests {
             await_reaped(pid).await,
             "switch must be terminated after the last PTask detaches",
         );
-        // Prevent the GvproxySwitch destructor from trying to stop an already-dead
-        // switch; consume it so the supervisor JoinHandle is dropped cleanly.
+        // The last detach already SIGTERM'd the switch and claimed `stopping`,
+        // so consuming it here just drops the supervisor JoinHandle: the
+        // guarded `GvproxySwitch::Drop` sees `stopping` set and skips its
+        // SIGKILL rather than signalling the now-reaped (possibly recycled) PID.
         drop(switch);
     }
 
