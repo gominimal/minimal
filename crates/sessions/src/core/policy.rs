@@ -3,9 +3,11 @@
 //!
 //! [`UserPolicy`] bundles the per-domain policies — [`VarsPolicy`] for
 //! environment variables and [`PatchPolicy`] for file patches. Both
-//! gate *non-user* declarations only; user-origin declarations from a
-//! [`Loadout`] are subject to each domain's `ignore` rule but bypass
-//! `allow` / `deny`.
+//! gate every declaration regardless of origin; user-origin
+//! declarations from a [`Loadout`] don't need to be explicitly
+//! `allow`-listed (they auto-pass that check), but `ignore` and
+//! `deny` apply to them just as they do to project- and
+//! package-origin items.
 //!
 //! Kept separate from [`Loadout`] on purpose: the user's policy is
 //! about what they let other sources contribute, not about what *they*
@@ -188,17 +190,16 @@ impl<'de> serde::Deserialize<'de> for VarNameGlobs {
 
 /// Policy gating which variable declarations are honored.
 ///
-/// Applied at the session-construction layer based on a declaration's
-/// source:
+/// Applied at the session-construction layer. Precedence is the same
+/// for every origin: `ignore` first (silent), then `deny` (reject),
+/// then origin-aware allow (auto-allow for user-origin, otherwise
+/// require an `allow` match or prompt).
 ///
-/// - **User-origin** (variables coming from a [`Loadout`]): only
-///   [`ignore`](Self::ignore) applies. `allow` and `deny` are bypassed
-///   — the user is the policy for their own declarations.
-/// - **Project- and Package-origin**: all three fields apply. A
-///   declaration is honored iff its name matches `allow`, does not match
-///   `deny`, and does not match `ignore`. Matching `ignore` is silent;
-///   matching `deny` is an error/prompt; matching neither `allow` nor
-///   `ignore` triggers a permission prompt.
+/// - **User-origin** (variables coming from a [`Loadout`]):
+///   `ignore` drops, `deny` rejects, otherwise auto-allowed. The
+///   user doesn't need to `allow`-list their own loadout items.
+/// - **Project- and Package-origin**: `ignore` drops, `deny` rejects,
+///   then `allow` must match or the item prompts.
 ///
 /// [`Loadout`]: crate::core::loadout::Loadout
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -285,22 +286,21 @@ impl VarsPolicy {
         Ok(self.with_ignore(VarNameGlobs::try_new(patterns)?))
     }
 
-    /// Names non-user declarations may set. Does not apply to
-    /// user-origin declarations.
+    /// Names non-user declarations may set. User-origin declarations
+    /// don't need to match this — they auto-pass the allow step (but
+    /// are still subject to `deny` and `ignore`).
     #[must_use]
     pub fn allow(&self) -> &VarNameGlobs {
         &self.allow
     }
 
-    /// Names non-user declarations must not set. Does not apply to
-    /// user-origin declarations.
+    /// Names no declaration may set, regardless of origin.
     #[must_use]
     pub fn deny(&self) -> &VarNameGlobs {
         &self.deny
     }
 
-    /// Names to silently drop without prompting. Applies to every
-    /// origin, user-origin included.
+    /// Names to silently drop without prompting, regardless of origin.
     #[must_use]
     pub fn ignore(&self) -> &VarNameGlobs {
         &self.ignore
@@ -308,13 +308,14 @@ impl VarsPolicy {
 
     /// Categorize a single variable against this policy.
     ///
-    /// Precedence: `ignore` first, then a source-aware branch. For
-    /// user-origin items ([`Source::UserLoadout`]), `allow` and `deny`
-    /// do not apply — anything not ignored is implicitly allowed. For
-    /// every other source, the precedence continues `deny` → `allow` →
-    /// `NeedsApproval`.
+    /// Precedence: `ignore` first (silent drop), then `deny` (reject
+    /// regardless of origin), then the origin-aware allow step. For
+    /// user-origin items ([`Source::UserLoadout`]), the allow step
+    /// auto-passes — the user doesn't need to allow-list their own
+    /// loadout entries. For every other source, `allow` must match
+    /// or the item routes to `NeedsApproval`.
     ///
-    /// `item` reports its provenance via [`Provenanced`]; the resolver
+    /// `item` reports its provenance via [`Provenanced`]; the composer
     /// constructs `T` types that carry their own source, so the caller
     /// doesn't have to clone-and-borrow at the call site.
     ///
@@ -328,12 +329,13 @@ impl VarsPolicy {
         if self.ignore.is_match(name) {
             return CheckOutcome::Decided(Decision::Ignored);
         }
+        if self.deny.is_match(name) {
+            return CheckOutcome::Decided(Decision::Denied(item));
+        }
         if matches!(item.source(), Source::UserLoadout { .. }) {
             return CheckOutcome::Decided(Decision::Allowed(item));
         }
-        if self.deny.is_match(name) {
-            CheckOutcome::Decided(Decision::Denied(item))
-        } else if self.allow.is_match(name) {
+        if self.allow.is_match(name) {
             CheckOutcome::Decided(Decision::Allowed(item))
         } else {
             CheckOutcome::NeedsApproval(item)
@@ -351,18 +353,16 @@ impl VarsPolicy {
 /// [`FileSet`] is walked on the host filesystem. Each enumerated source
 /// path runs through this policy; the patch's `dest` is *not* matched.
 ///
-/// - **User-origin patches** (from a [`Loadout`]): only
-///   [`ignore`](Self::ignore) applies. `allow` and `deny` are bypassed —
-///   the user is the policy for their own declarations.
-/// - **Project- and Package-origin patches**: all three fields apply.
-///   A source file is honored iff its host path matches `allow`, does
-///   not match `deny`, and does not match `ignore`. Files matching only
-///   `ignore` are silently dropped; matching `deny` is an error;
-///   matching neither `allow` nor `ignore` triggers a permission prompt
-///   via [`PolicyHooks`](crate::client::hooks::PolicyHooks).
+/// - **User-origin patches** (from a [`Loadout`]): `ignore` drops,
+///   `deny` rejects, otherwise auto-allowed. The user doesn't need
+///   to `allow`-list their own loadout patches.
+/// - **Project- and Package-origin patches**: `ignore` drops, `deny`
+///   rejects, then `allow` must match or the file routes to a
+///   prompt via [`PolicyHooks`](crate::core::hooks::PolicyHooks).
 ///
 /// Precedence: `ignore` first (silent), then `deny` (reject), then
-/// `allow` (permit). Anything else prompts.
+/// origin-aware `allow`. Anything not matched by any of those
+/// (project/package origin) prompts.
 ///
 /// # `~/` and `$VAR` expansion
 ///
@@ -372,8 +372,8 @@ impl VarsPolicy {
 /// variables (see
 /// [`crate::core::expansion::expand_source`]). Patterns retain their raw
 /// form in the policy returned from
-/// [`Composer::resolve`](crate::client::composer::Composer::resolve), so
-/// the policy round-trips losslessly across save / load.
+/// the composition pipeline (see [`crate::core::compose`]), so the
+/// policy round-trips losslessly across save / load.
 ///
 /// [`Loadout`]: crate::core::loadout::Loadout
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -425,7 +425,7 @@ impl PatchPolicy {
     }
 
     /// Replace the `allow` set with raw pattern strings. Patterns are
-    /// not validated until expansion happens at resolution time.
+    /// not validated until expansion happens at gate time.
     #[must_use]
     pub fn with_allow<I, S>(self, patterns: I) -> Self
     where
@@ -464,22 +464,22 @@ impl PatchPolicy {
         }
     }
 
-    /// Raw patterns non-user patches **may** target. Does not apply to
-    /// user-origin patches.
+    /// Raw patterns non-user patches **may** target. User-origin
+    /// patches auto-pass this step (but are still subject to `deny`
+    /// and `ignore`).
     #[must_use]
     pub fn allow(&self) -> &[String] {
         &self.allow
     }
 
-    /// Raw patterns non-user patches **must not** target. Does not
-    /// apply to user-origin patches.
+    /// Raw patterns no patch may target, regardless of origin.
     #[must_use]
     pub fn deny(&self) -> &[String] {
         &self.deny
     }
 
-    /// Raw patterns silently dropped without prompting. **Applies to
-    /// every origin, user-origin included.**
+    /// Raw patterns silently dropped without prompting, regardless
+    /// of origin.
     #[must_use]
     pub fn ignore(&self) -> &[String] {
         &self.ignore
@@ -572,8 +572,8 @@ impl UserPolicy {
 
     /// Consume the policy and return the underlying narrow policies.
     ///
-    /// Used by the resolution loop, which moves each narrow policy
-    /// into the corresponding per-domain resolver and rebuilds a
+    /// Used by the composition pipeline, which moves each narrow
+    /// policy into the corresponding per-domain gate and rebuilds a
     /// `UserPolicy` from the (possibly updated) results.
     #[must_use]
     pub fn into_parts(self) -> (VarsPolicy, PatchPolicy) {
@@ -597,9 +597,9 @@ fn patch_policy_is_default(p: &PatchPolicy) -> bool {
 /// concrete glob patterns against a set of resolved session vars.
 ///
 /// Produced from a raw [`PatchPolicy`] via
-/// [`PatchPolicy::expand_with`] at the resolver's main entry point;
-/// the resolver matches against this form, not the raw policy. The
-/// raw policy is preserved separately so it can round-trip through
+/// [`PatchPolicy::expand_with`] at the patch gate's main entry point;
+/// the gate matches against this form, not the raw policy. The raw
+/// policy is preserved separately so it can round-trip through
 /// serialization unchanged.
 #[derive(Clone, Debug)]
 pub struct ExpandedPatchPolicy {
@@ -662,11 +662,11 @@ impl ExpandedPatchPolicy {
     /// traversed an actual symlink. Both forms are checked
     /// independently and the outcomes are combined.
     ///
-    /// **Precedence within one path:** `ignore` first, then a
-    /// source-aware branch. For user-origin items
-    /// ([`Source::UserLoadout`]), `allow` and `deny` do not apply —
-    /// anything not ignored is implicitly allowed. For every other
-    /// source, the precedence continues `deny` → `allow` →
+    /// **Precedence within one path:** `ignore` first (silent drop),
+    /// then `deny` (reject regardless of origin), then the
+    /// origin-aware allow step. For user-origin items
+    /// ([`Source::UserLoadout`]) the allow step auto-passes; for
+    /// every other source `allow` must match or the path routes to
     /// `NeedsApproval`.
     ///
     /// **Combination precedence:** `Denied` > `Ignored` >
@@ -702,12 +702,13 @@ impl ExpandedPatchPolicy {
         if filesets_match(&self.ignore, path) {
             return PathDecision::Ignored;
         }
+        if filesets_match(&self.deny, path) {
+            return PathDecision::Denied;
+        }
         if matches!(source, Source::UserLoadout { .. }) {
             return PathDecision::Allowed;
         }
-        if filesets_match(&self.deny, path) {
-            PathDecision::Denied
-        } else if filesets_match(&self.allow, path) {
+        if filesets_match(&self.allow, path) {
             PathDecision::Allowed
         } else {
             PathDecision::NeedsApproval
