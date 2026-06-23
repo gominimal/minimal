@@ -548,21 +548,30 @@ impl GvproxySwitch {
     /// is only a best-effort, non-blocking fallback.
     pub async fn stop(mut self) {
         // Mark the exit intentional *before* signalling so the supervision task
-        // classifies the resulting `wait()` as a clean stop, not a crash.
-        self.stopping.store(true, Ordering::Release);
+        // classifies the resulting `wait()` as a clean stop, not a crash. Use
+        // `swap` (not `store`) so this is symmetric with the guards on
+        // `GvproxySwitch::Drop` and the last-detach `PtaskAttachment::Drop`: if a
+        // last-detach drop already claimed teardown and sent SIGTERM, the child
+        // may already be reaped and its PID recycled, so `stop()` must not
+        // re-signal `pid` — it only awaits the supervisor for the exit.
+        let already_claimed = self.stopping.swap(true, Ordering::AcqRel);
         let Some(mut supervisor) = self.supervisor.take() else {
             // Already stopped.
             return;
         };
         let pid = self.pid as libc::pid_t;
-        signal_child(pid, libc::SIGTERM, "SIGTERM");
+        if !already_claimed {
+            signal_child(pid, libc::SIGTERM, "SIGTERM");
+        }
         // The supervision task completes once it has reaped the child, so
         // awaiting it (bounded by the grace period) is the exit signal.
         if tokio::time::timeout(self.term_timeout, &mut supervisor)
             .await
             .is_err()
         {
-            signal_child(pid, libc::SIGKILL, "SIGKILL");
+            if !already_claimed {
+                signal_child(pid, libc::SIGKILL, "SIGKILL");
+            }
             let _ = supervisor.await;
         }
     }
