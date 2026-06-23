@@ -769,12 +769,18 @@ impl SessionLauncher for SandboxLauncher {
                     // `kill_on_drop(true)` calls in `exec.rs`/`net/mod.rs` guard
                     // against) — so kill and reap it explicitly before
                     // propagating the error.
+                    // `kill` and `wait` are independent: when `kill` fails with
+                    // `ESRCH` because the process already exited during the
+                    // attach window, the child still needs reaping, so `wait`
+                    // must run regardless of `kill`'s result (the standard
+                    // `SIGKILL`-then-`waitpid` idiom).
                     if let Err(kill_err) = process.kill() {
                         tracing::warn!(
                             error = %kill_err,
                             "killing sandbox process after OwnIp attach failure"
                         );
-                    } else if let Err(wait_err) = process.wait() {
+                    }
+                    if let Err(wait_err) = process.wait() {
                         tracing::warn!(
                             error = %wait_err,
                             "reaping sandbox process after OwnIp attach failure"
