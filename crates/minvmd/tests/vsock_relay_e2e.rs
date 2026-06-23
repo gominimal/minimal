@@ -57,6 +57,31 @@ fn own_ip_ptask_gets_switch_ip_via_vsock_relay() {
     rt.block_on(run_relay_proof());
 }
 
+/// Runs `ip <args...>` and asserts it succeeded. The CI step runs this test
+/// under `sudo -E`, so `ip` already has `CAP_NET_ADMIN`; no `sudo` prefix is
+/// needed (unlike the unprivileged minimald netns proof).
+fn ip_ok(label: &str, args: &[&str]) {
+    use std::process::Command;
+    let out = Command::new("ip")
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("spawn `ip {}`: {e}", args.join(" ")));
+    assert!(
+        out.status.success(),
+        "{label} (`ip {}`) failed: status={:?}\nstderr={}",
+        args.join(" "),
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// Runs `ip netns exec <ns> ip <args...>` and asserts it succeeded.
+fn ip_in_ns(ns: &str, args: &[&str]) {
+    let mut full = vec!["netns", "exec", ns, "ip"];
+    full.extend_from_slice(args);
+    ip_ok("configure netns", &full);
+}
+
 /// The DM1 proof body. Only reached under the env gate on a capable host.
 async fn run_relay_proof() {
     use std::net::Ipv4Addr;
@@ -103,8 +128,19 @@ async fn run_relay_proof() {
     .with_network_mode(NetworkMode::OwnIp);
     assert!(vm.is_own_ip(), "VM must be an OwnIp PTask");
     let tap_name = VmConfig::tap_name(2);
+    let netns = format!("ptask-{tap_name}");
 
-    // 3. Provision the tap + start the async TAP↔gvproxy relay. The attach
+    // 3. Create the PTask network namespace up front. `attach_ptask` opens the
+    //    tap in the host namespace and starts the relay; the tap interface is
+    //    then moved into this netns and statically configured there (the
+    //    gvproxy spike's Option B static-lease recipe — gvproxy does the lease
+    //    seeding, but the netns side still has to apply the address). The
+    //    host-side relay fd keeps working after the interface changes
+    //    namespaces.
+    let _ = Command::new("ip").args(["netns", "del", &netns]).output();
+    ip_ok("create netns", &["netns", "add", &netns]);
+
+    // 4. Provision the tap + start the async TAP↔gvproxy relay. The attach
     //    allocates the first switch IP (index 2) and returns a handle whose
     //    lifetime owns the relay task.
     let attachment = switch
@@ -112,7 +148,7 @@ async fn run_relay_proof() {
         .await
         .expect("attach OwnIp PTask to gvproxy switch");
 
-    // 4. Assert the assigned IP is on the 100.64.0.0/16 switch subnet.
+    // 5. Assert the assigned IP is on the 100.64.0.0/16 switch subnet.
     let ip = attachment.switch_ip();
     assert_eq!(ip, first_ip, "first PTask must get index-2 switch IP");
     assert_eq!(
@@ -121,10 +157,35 @@ async fn run_relay_proof() {
         "switch IP must be on 100.64.0.0/16, got {ip}"
     );
 
-    // 5. Assert the IP is observable inside the VM's PTask netns (the relay
-    //    carried the static-lease config through), and that frames traverse the
-    //    switch (a gateway ping round-trips over the relay).
-    let netns = format!("ptask-{tap_name}");
+    // 6. Move the tap into the PTask netns and configure its switch address
+    //    there (static config, mirroring the minimald UC6 netns proof). The MAC
+    //    must match the `dhcpStaticLeases` key gvproxy was seeded with so the
+    //    switch routes the lease's IP to this port.
+    let mac = attachment.mac().to_string();
+    let cidr = format!("{ip}/16");
+    let gateway: Ipv4Addr = subnet.gateway().expect("switch gateway");
+    let gw = gateway.to_string();
+    ip_ok(
+        "move tap into netns",
+        &["link", "set", &tap_name, "netns", &netns],
+    );
+    ip_in_ns(&netns, &["link", "set", &tap_name, "address", &mac]);
+    ip_in_ns(&netns, &["addr", "add", &cidr, "dev", &tap_name]);
+    ip_in_ns(&netns, &["link", "set", &tap_name, "up"]);
+    ip_in_ns(&netns, &["link", "set", "lo", "up"]);
+    // Same-subnet gateway reachability needs no default route (the gateway is
+    // on-link), but add it so the namespace mirrors a real OwnIp PTask. Tolerate
+    // failure: the IP assertion and the on-link gateway ping below do not depend
+    // on it.
+    let _ = Command::new("ip")
+        .args([
+            "netns", "exec", &netns, "ip", "route", "add", "default", "via", &gw,
+        ])
+        .output();
+
+    // 7. Assert the IP is observable inside the VM's PTask netns (the static
+    //    config landed on the interface), and that frames traverse the switch
+    //    (a gateway ping round-trips over the relay).
     let addr_out = Command::new("ip")
         .args([
             "netns", "exec", &netns, "ip", "-4", "addr", "show", "dev", &tap_name,
@@ -137,7 +198,6 @@ async fn run_relay_proof() {
         "PTask netns {netns} must carry switch IP {ip}; got:\n{addr_text}"
     );
 
-    let gateway: Ipv4Addr = subnet.gateway().expect("switch gateway");
     let ping = Command::new("ip")
         .args([
             "netns",
@@ -157,7 +217,10 @@ async fn run_relay_proof() {
         "PTask must reach the switch gateway {gateway} via the relay (frames must traverse the switch)"
     );
 
-    // 6. Teardown: detach the PTask (drops the relay) and stop the switch.
+    // 8. Teardown: detach the PTask (drops the relay, closing the tap fd and
+    //    removing the moved interface with it), then drop the netns and stop the
+    //    switch.
     switch.detach_ptask(attachment);
+    let _ = Command::new("ip").args(["netns", "del", &netns]).output();
     switch.stop().await;
 }
