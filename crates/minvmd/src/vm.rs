@@ -63,6 +63,24 @@ impl VmConfig {
         self
     }
 
+    /// Whether this VM joins the per-host gvproxy switch as an own-IP client.
+    ///
+    /// Only an [`NetworkMode::OwnIp`] VM provisions a tap + relay; `HostNet` and
+    /// `NoNet` never attach to the switch (R1.5).
+    #[must_use]
+    pub fn is_own_ip(&self) -> bool {
+        matches!(self.network_mode, NetworkMode::OwnIp)
+    }
+
+    /// The tap interface name this VM's own-IP PTask is bridged onto, derived
+    /// from `index` so each PTask on a host gets a distinct, deterministic name.
+    ///
+    /// The name fits the kernel's 15-char `IFNAMSIZ` limit for any `u32` index.
+    #[must_use]
+    pub fn tap_name(index: u32) -> String {
+        format!("vmtap{index}")
+    }
+
     /// Apply this configuration to an existing libkrun [`Context`][crate::krun::Context].
     ///
     /// Configures vcpus, RAM, kernel + initramfs, the ext4 root disk, and the
@@ -158,6 +176,34 @@ mod tests {
         )
         .with_network_mode(NetworkMode::OwnIp);
         assert_eq!(cfg.network_mode, NetworkMode::OwnIp);
+        assert!(cfg.is_own_ip());
+    }
+
+    #[test]
+    fn host_net_and_no_net_are_not_own_ip() {
+        let base = VmConfig::new(
+            1,
+            256,
+            PathBuf::from("/k"),
+            PathBuf::from("/r"),
+            PathBuf::from("/i"),
+        );
+        assert!(
+            !base
+                .clone()
+                .with_network_mode(NetworkMode::HostNet)
+                .is_own_ip()
+        );
+        assert!(!base.with_network_mode(NetworkMode::NoNet).is_own_ip());
+    }
+
+    #[test]
+    fn tap_name_is_deterministic_and_within_ifnamsiz() {
+        assert_eq!(VmConfig::tap_name(2), "vmtap2");
+        assert_eq!(VmConfig::tap_name(3), "vmtap3");
+        assert_ne!(VmConfig::tap_name(2), VmConfig::tap_name(3));
+        // Kernel IFNAMSIZ is 16 (15 usable chars); the widest u32 must fit.
+        assert!(VmConfig::tap_name(u32::MAX).len() < 16);
     }
 
     #[test]

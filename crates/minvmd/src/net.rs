@@ -3,10 +3,25 @@
 //!
 //! On DM1/DM3/DM4 a libkrun VM runs `minimald`; `minvmd` supervises exactly one
 //! gvproxy process per host VM ([`GvproxySwitch`]) that serves every own-IP
-//! PTask as a switch client. A PTask attaches over the per-PTask vsock shuttle
-//! already used for boot signalling: its tap fd is handed to gvproxy as a new
-//! switch client and the PTask is assigned a unique IP from the switch subnet
-//! ([`GvproxySwitch::attach_ptask`], R1.5).
+//! PTask as a switch client. A PTask attaches by provisioning a tap device in
+//! its network namespace and running an async TAP↔gvproxy-socket relay
+//! ([`GvproxySwitch::attach_ptask`], R1.5); it is assigned a unique IP from the
+//! switch subnet, which is seeded into gvproxy's `dhcpStaticLeases` via the
+//! `-config` YAML.
+//!
+//! The gvproxy v0.8.9 spike (`docs/spikes/2026-06-21-gvproxy-attachment.md`)
+//! established that the attachment is **not** an SCM_RIGHTS fd-pass. Instead
+//! `minvmd`:
+//!
+//! 1. writes a gvproxy `-config` YAML carrying the subnet, gateway, NAT alias,
+//!    and `dhcpStaticLeases` ([`render_gvproxy_config`]) — the subnet is
+//!    YAML-only (gvproxy v0.8.9 has no `-subnet` CLI flag);
+//! 2. opens a tap device in the host namespace ([`open_tap`]) and (the caller)
+//!    moves it into the PTask's netns and configures its MAC/IP/route there,
+//! 3. runs an async relay ([`attach_to_switch`]) that bridges the host-side tap
+//!    fd to gvproxy's control socket: a bare `POST /connect` HTTP upgrade, then
+//!    raw Ethernet frames framed with a 2-byte little-endian length prefix (the
+//!    HyperKit protocol).
 //!
 //! The supervisor tears gvproxy down with the same SIGTERM → timeout → SIGKILL
 //! sequence the vmm child uses ([`GvproxySwitch::stop`], R1.4) and runs a
@@ -20,6 +35,7 @@
 //! run within a tokio runtime (the async networking layer the spec mandates),
 //! so neither blocks a worker thread during teardown.
 
+use std::fmt;
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -32,9 +48,20 @@ use minimald_rpc::IpProto;
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 
+#[cfg(target_os = "linux")]
+mod relay;
+#[cfg(target_os = "linux")]
+pub use relay::{SwitchRelay, attach_to_switch, open_tap};
+
 /// Default time to wait for gvproxy to exit on SIGTERM before escalating to
 /// SIGKILL.
 pub const DEFAULT_TERM_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// MTU advertised to the switch and the tap devices. gvproxy's own default.
+pub const DEFAULT_MTU: u16 = 1500;
+
+/// Stable, locally-administered MAC for the switch gateway.
+pub const GATEWAY_MAC: MacAddr = MacAddr([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd]);
 
 /// The IPv4 subnet the gvproxy switch hands out to own-IP PTasks.
 ///
@@ -56,6 +83,12 @@ impl Default for SwitchSubnet {
     }
 }
 
+impl fmt::Display for SwitchSubnet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.base, self.prefix)
+    }
+}
+
 impl SwitchSubnet {
     /// Construct a subnet from its network base address and prefix length.
     #[must_use]
@@ -67,6 +100,16 @@ impl SwitchSubnet {
     #[must_use]
     pub fn gateway(&self) -> Option<Ipv4Addr> {
         self.host(1)
+    }
+
+    /// The host-alias address gvproxy NATs to the host loopback so a PTask can
+    /// reach host services (the second-from-last usable address). `None` for a
+    /// subnet too small to carry one.
+    #[must_use]
+    pub fn host_alias(&self) -> Option<Ipv4Addr> {
+        let span = 1u32.checked_shl(u32::from(32 - self.prefix.min(32)))?;
+        // broadcast - 1 (span - 2 from the base); reuse `host` for the bounds.
+        self.host(span.checked_sub(2)?)
     }
 
     /// The host address at `index` within the subnet, or `None` when `index`
@@ -85,6 +128,72 @@ impl SwitchSubnet {
     }
 }
 
+/// A 48-bit Ethernet MAC address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MacAddr(pub [u8; 6]);
+
+impl fmt::Display for MacAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let [a, b, c, d, e, g] = self.0;
+        write!(f, "{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{g:02x}")
+    }
+}
+
+impl MacAddr {
+    /// Derives a stable, locally-administered unicast MAC for a switch IP.
+    ///
+    /// Uses the QEMU OUI `52:54:00` (locally administered) followed by the low
+    /// three octets of the address. Within a single `/16` (or narrower) switch
+    /// subnet the low three octets are unique, so the derived MAC is
+    /// collision-free and deterministic — `minvmd` can pre-seed gvproxy's
+    /// static-lease table without round-tripping through DHCP.
+    #[must_use]
+    pub fn for_switch_ip(ip: Ipv4Addr) -> Self {
+        let o = ip.octets();
+        Self([0x52, 0x54, 0x00, o[1], o[2], o[3]])
+    }
+}
+
+/// Renders the gvproxy `-config` YAML for the given subnet and static leases.
+///
+/// gvproxy v0.8.9 has no `-subnet` CLI flag: the subnet, gateway, NAT alias, and
+/// DHCP static leases are all expressed through a `-config` YAML file (see the
+/// spike). `minvmd` owns the allocation table and writes it here before every
+/// (re)start so the switch's static leases match `minvmd`'s address book.
+///
+/// gvproxy reads this file only at spawn time, so a rewrite triggered by a later
+/// attach takes effect only on the next switch (re)start. That is intentional:
+/// an `OwnIp` PTask configures its switch address statically (the spike's
+/// static-lease recipe) rather than via DHCP, so `dhcpStaticLeases` is a
+/// startup-time seed, not a live source a running gvproxy must re-read.
+#[must_use]
+pub fn render_gvproxy_config(subnet: SwitchSubnet, leases: &[(Ipv4Addr, MacAddr)]) -> String {
+    let mut s = String::with_capacity(256 + leases.len() * 48);
+    s.push_str("stack:\n");
+    s.push_str(&format!("  mtu: {DEFAULT_MTU}\n"));
+    s.push_str(&format!("  subnet: \"{subnet}\"\n"));
+    if let Some(gateway) = subnet.gateway() {
+        s.push_str(&format!("  gatewayIP: \"{gateway}\"\n"));
+    }
+    s.push_str(&format!("  gatewayMacAddress: \"{GATEWAY_MAC}\"\n"));
+    if let Some(alias) = subnet.host_alias() {
+        s.push_str("  nat:\n");
+        s.push_str(&format!("    \"{alias}\": \"127.0.0.1\"\n"));
+        s.push_str("  gatewayVirtualIPs:\n");
+        s.push_str(&format!("    - \"{alias}\"\n"));
+    }
+    s.push_str("  dhcpStaticLeases:\n");
+    if leases.is_empty() {
+        // gvproxy accepts an empty map; keep the key present for clarity.
+        s.push_str("    {}\n");
+    } else {
+        for (ip, mac) in leases {
+            s.push_str(&format!("    \"{ip}\": \"{mac}\"\n"));
+        }
+    }
+    s
+}
+
 /// Builder for the per-host gvproxy switch process.
 #[derive(Debug, Clone)]
 pub struct GvproxyConfig {
@@ -92,6 +201,8 @@ pub struct GvproxyConfig {
     binary: PathBuf,
     /// Unix socket gvproxy listens on for switch-client attachment.
     switch_socket: PathBuf,
+    /// Path the `-config` YAML is written to before spawn.
+    config_path: PathBuf,
     /// Subnet the switch assigns to own-IP PTasks.
     subnet: SwitchSubnet,
     /// Grace period before SIGTERM escalates to SIGKILL on teardown.
@@ -100,14 +211,29 @@ pub struct GvproxyConfig {
 
 impl GvproxyConfig {
     /// Construct a config for the gvproxy `binary` listening on `switch_socket`.
+    ///
+    /// The `-config` YAML defaults to `gvproxy.yaml` alongside `switch_socket`;
+    /// override it with [`with_config_path`](Self::with_config_path).
     #[must_use]
     pub fn new(binary: PathBuf, switch_socket: PathBuf) -> Self {
+        let config_path = switch_socket
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("gvproxy.yaml");
         Self {
             binary,
             switch_socket,
+            config_path,
             subnet: SwitchSubnet::default(),
             term_timeout: DEFAULT_TERM_TIMEOUT,
         }
+    }
+
+    /// Override the path the gvproxy `-config` YAML is written to.
+    #[must_use]
+    pub fn with_config_path(mut self, config_path: PathBuf) -> Self {
+        self.config_path = config_path;
+        self
     }
 
     /// Override the switch subnet (default `100.64.0.0/16`).
@@ -124,29 +250,64 @@ impl GvproxyConfig {
         self
     }
 
-    /// The argument vector passed to the gvproxy binary: it listens on the
-    /// switch socket for client attachment. The switch subnet and per-client
-    /// routes are configured over gvproxy's control API after start, not via
-    /// argv.
+    /// The path the `-config` YAML is written to.
+    #[must_use]
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+
+    /// The argument vector passed to the gvproxy binary: it reads the subnet +
+    /// static leases from the `-config` YAML and listens on the switch socket
+    /// for client attachment.
+    ///
+    /// `-ssh-port -1` disables gvproxy's default `127.0.0.1:2222 → :22` forward,
+    /// which targets an address that does not exist on our custom subnet.
     #[must_use]
     pub fn argv(&self) -> Vec<String> {
         vec![
+            "-config".to_string(),
+            self.config_path.display().to_string(),
             "-listen".to_string(),
             format!("unix://{}", self.switch_socket.display()),
+            "-ssh-port".to_string(),
+            "-1".to_string(),
         ]
+    }
+
+    /// Write the gvproxy `-config` YAML for the configured subnet with the given
+    /// static `leases`, creating the parent directory if needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error if the parent directory or the file cannot be
+    /// written.
+    pub fn write_config(&self, leases: &[(Ipv4Addr, MacAddr)]) -> io::Result<()> {
+        if let Some(dir) = self.config_path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(
+            &self.config_path,
+            render_gvproxy_config(self.subnet, leases),
+        )
     }
 
     /// Spawn and begin supervising the gvproxy switch process (R1.4), returning
     /// the switch handle and a [`SwitchExit`] that fires if gvproxy exits
     /// unexpectedly.
     ///
+    /// The `-config` YAML is (re)written from `leases` before spawn so gvproxy's
+    /// static-lease table matches the caller's address book. Pass `&[]` to start
+    /// with an empty lease map (leases seed only at spawn time).
+    ///
     /// Must be called within a tokio runtime: a background supervision task is
     /// spawned to await the child and detect an unexpected exit.
     ///
     /// # Errors
     ///
-    /// Returns the spawn error if the gvproxy binary cannot be launched.
-    pub fn spawn(self) -> io::Result<(GvproxySwitch, SwitchExit)> {
+    /// Returns the I/O error if the config cannot be written or the gvproxy
+    /// binary cannot be launched.
+    pub fn spawn(self, leases: &[(Ipv4Addr, MacAddr)]) -> io::Result<(GvproxySwitch, SwitchExit)> {
+        self.write_config(leases)?;
         let child = Command::new(&self.binary).args(self.argv()).spawn()?;
         let (switch, exit) =
             GvproxySwitch::supervise(child, self.subnet, self.term_timeout, self.switch_socket);
@@ -154,6 +315,7 @@ impl GvproxyConfig {
             pid = switch.pid(),
             binary = %self.binary.display(),
             switch_socket = %switch.switch_socket().display(),
+            config = %self.config_path.display(),
             "gvproxy switch spawned",
         );
         Ok((switch, exit))
@@ -228,43 +390,108 @@ impl GvproxySwitch {
         &self.switch_socket
     }
 
-    /// Attach an own-IP PTask as a switch client (R1.5), assigning it the next
-    /// free IP from the switch subnet. `label` identifies the PTask in the
-    /// emitted tracing event (R1.8).
+    /// Allocate the next free switch IP without provisioning a tap or relay.
     ///
-    /// Returns `None` when the subnet is exhausted.
-    ///
-    /// The caller hands the PTask's tap file descriptor to gvproxy over the
-    /// per-PTask vsock shuttle; that fd-pass is platform-specific (vsock on
-    /// DM1, SCM_RIGHTS on DM2) and is layered on top of this assignment.
-    pub fn attach_ptask(&mut self, label: impl Into<String>) -> Option<PtaskAttachment> {
-        let index = self.next_index;
-        let switch_ip = self.subnet.host(index)?;
+    /// Returns the assigned IP and its derived MAC, or `None` when the subnet is
+    /// exhausted. Used by [`attach_ptask`](Self::attach_ptask) and by callers
+    /// that only need an address (e.g. seeding the `-config` lease table).
+    fn allocate_ip(&mut self) -> Option<(Ipv4Addr, MacAddr)> {
+        let switch_ip = self.subnet.host(self.next_index)?;
         self.next_index += 1;
+        Some((switch_ip, MacAddr::for_switch_ip(switch_ip)))
+    }
+
+    /// Attach an own-IP PTask as a switch client (R1.5), assigning it the next
+    /// free IP from the switch subnet, provisioning a tap device named
+    /// `tap_name`, and starting the async TAP↔gvproxy relay. `label` identifies
+    /// the PTask in the emitted tracing event (R1.8).
+    ///
+    /// The returned [`PtaskAttachment`] owns the relay handle: dropping it (or
+    /// calling [`detach_ptask`](Self::detach_ptask)) tears the relay down and
+    /// detaches the PTask. The caller is responsible for moving the tap
+    /// interface into the PTask's netns and configuring its MAC/IP/route there
+    /// (the spike's static-lease recipe) between this call and any traffic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::AddrNotAvailable`] when the subnet is exhausted,
+    /// or the underlying I/O error if the tap cannot be opened or the relay
+    /// cannot connect to the switch socket.
+    #[cfg(target_os = "linux")]
+    pub async fn attach_ptask(
+        &mut self,
+        label: impl Into<String>,
+        tap_name: &str,
+    ) -> io::Result<PtaskAttachment> {
+        let (switch_ip, mac) = self.allocate_ip().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "gvproxy switch subnet exhausted; no free PTask address remains",
+            )
+        })?;
+        let index = self.next_index - 1;
+        let label = label.into();
+
+        let tap = open_tap(tap_name)?;
+        let relay = attach_to_switch(tap, &self.switch_socket).await?;
+
+        tracing::info!(
+            ptask = %label,
+            switch_ip = %switch_ip,
+            mac = %mac,
+            tap = %tap_name,
+            gvproxy_pid = self.pid,
+            "PTask attached to gvproxy switch",
+        );
+        Ok(PtaskAttachment {
+            label,
+            switch_ip,
+            mac,
+            index,
+            relay: Some(relay),
+        })
+    }
+
+    /// Allocate a switch IP + MAC for a PTask without opening a tap or relay.
+    ///
+    /// This is the portable subset of [`attach_ptask`](Self::attach_ptask) used
+    /// by the lease-table seeding path and by non-Linux builds (where tap
+    /// provisioning is unavailable). Returns `None` when the subnet is exhausted.
+    pub fn allocate_ptask(&mut self, label: impl Into<String>) -> Option<PtaskAttachment> {
+        let (switch_ip, mac) = self.allocate_ip()?;
+        let index = self.next_index - 1;
         let label = label.into();
         tracing::info!(
             ptask = %label,
             switch_ip = %switch_ip,
+            mac = %mac,
             gvproxy_pid = self.pid,
-            "PTask attached to gvproxy switch",
+            "PTask allocated a gvproxy switch IP",
         );
         Some(PtaskAttachment {
             label,
             switch_ip,
+            mac,
             index,
+            #[cfg(target_os = "linux")]
+            relay: None,
         })
     }
 
     /// Detach a previously attached PTask from the switch (R1.8). The IP is not
     /// returned to the pool — it is retired for this handle's lifetime so a
     /// later PTask never inherits a still-cached peer's address (R1.6 intent).
-    pub fn detach_ptask(&self, attachment: &PtaskAttachment) {
+    ///
+    /// Consumes the attachment so its relay handle is dropped, which closes the
+    /// gvproxy connection and stops both relay directions.
+    pub fn detach_ptask(&self, attachment: PtaskAttachment) {
         tracing::info!(
             ptask = %attachment.label,
             switch_ip = %attachment.switch_ip,
             gvproxy_pid = self.pid,
             "PTask detached from gvproxy switch",
         );
+        // `attachment` drops here, aborting its relay tasks (if any).
     }
 
     /// Tear the switch down cleanly (R1.4): deliver SIGTERM, wait up to
@@ -315,13 +542,22 @@ impl Drop for GvproxySwitch {
     }
 }
 
-/// A PTask's attachment to the gvproxy switch: the assigned IP plus the client
-/// index it was allocated at.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A PTask's attachment to the gvproxy switch: the assigned IP/MAC, the client
+/// index it was allocated at, and (on Linux, for a full attach) the relay handle
+/// whose lifetime keeps the tap↔switch bridge alive.
+#[derive(Debug)]
 pub struct PtaskAttachment {
     label: String,
     switch_ip: Ipv4Addr,
+    mac: MacAddr,
     index: u32,
+    /// The running TAP↔switch relay; `None` for an allocate-only attachment
+    /// ([`GvproxySwitch::allocate_ptask`]). Held purely for its RAII lifetime —
+    /// dropping it aborts the relay tasks and detaches the PTask — so it is never
+    /// read directly.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    relay: Option<SwitchRelay>,
 }
 
 impl PtaskAttachment {
@@ -337,10 +573,23 @@ impl PtaskAttachment {
         self.switch_ip
     }
 
+    /// The MAC derived from this PTask's switch IP (its `dhcpStaticLeases` key).
+    #[must_use]
+    pub fn mac(&self) -> MacAddr {
+        self.mac
+    }
+
     /// The switch-client index this PTask was allocated at.
     #[must_use]
     pub fn index(&self) -> u32 {
         self.index
+    }
+
+    /// The `(ip, mac)` static-lease entry for this PTask, for seeding gvproxy's
+    /// `dhcpStaticLeases`.
+    #[must_use]
+    pub fn lease(&self) -> (Ipv4Addr, MacAddr) {
+        (self.switch_ip, self.mac)
     }
 }
 
@@ -517,6 +766,9 @@ mod tests {
         // First client IP (index 2) and a high host within /16.
         assert_eq!(net.host(2), Some(Ipv4Addr::new(100, 64, 0, 2)));
         assert_eq!(net.host(258), Some(Ipv4Addr::new(100, 64, 1, 2)));
+        // Host alias is the second-from-last usable address.
+        assert_eq!(net.host_alias(), Some(Ipv4Addr::new(100, 64, 255, 254)));
+        assert_eq!(net.to_string(), "100.64.0.0/16");
     }
 
     #[test]
@@ -529,7 +781,15 @@ mod tests {
     }
 
     #[test]
-    fn argv_listens_on_switch_socket() {
+    fn mac_is_derived_deterministically_from_ip() {
+        // 52:54:00 OUI followed by the low three octets of 100.64.0.2 in hex.
+        let ip = Ipv4Addr::new(100, 64, 0, 2);
+        assert_eq!(MacAddr::for_switch_ip(ip).to_string(), "52:54:00:40:00:02");
+        assert_eq!(MacAddr::for_switch_ip(ip), MacAddr::for_switch_ip(ip));
+    }
+
+    #[test]
+    fn argv_passes_config_and_listens_on_switch_socket() {
         let cfg = GvproxyConfig::new(
             PathBuf::from("/usr/bin/gvproxy"),
             PathBuf::from("/run/minvmd/switch.sock"),
@@ -537,10 +797,48 @@ mod tests {
         assert_eq!(
             cfg.argv(),
             vec![
+                "-config".to_string(),
+                "/run/minvmd/gvproxy.yaml".to_string(),
                 "-listen".to_string(),
                 "unix:///run/minvmd/switch.sock".to_string(),
+                "-ssh-port".to_string(),
+                "-1".to_string(),
             ]
         );
+        assert_eq!(cfg.config_path(), Path::new("/run/minvmd/gvproxy.yaml"));
+    }
+
+    #[test]
+    fn config_yaml_carries_subnet_gateway_and_leases() {
+        let ip = Ipv4Addr::new(100, 64, 0, 2);
+        let mac = MacAddr::for_switch_ip(ip);
+        let yaml = render_gvproxy_config(SwitchSubnet::default(), &[(ip, mac)]);
+        assert!(yaml.contains("subnet: \"100.64.0.0/16\""));
+        assert!(yaml.contains("gatewayIP: \"100.64.0.1\""));
+        assert!(yaml.contains(&format!("\"{ip}\": \"{mac}\"")));
+        // Host alias is NAT'd to loopback and never allocated.
+        assert!(yaml.contains("\"100.64.255.254\": \"127.0.0.1\""));
+    }
+
+    #[test]
+    fn empty_config_still_emits_a_lease_map() {
+        let yaml = render_gvproxy_config(SwitchSubnet::default(), &[]);
+        assert!(yaml.contains("dhcpStaticLeases:"));
+        assert!(yaml.contains("{}"));
+    }
+
+    #[test]
+    fn write_config_creates_parent_and_file() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let cfg = GvproxyConfig::new(
+            PathBuf::from("/usr/bin/gvproxy"),
+            dir.path().join("nested/switch.sock"),
+        );
+        let ip = Ipv4Addr::new(100, 64, 0, 2);
+        cfg.write_config(&[(ip, MacAddr::for_switch_ip(ip))])
+            .expect("write config");
+        let body = std::fs::read_to_string(cfg.config_path()).expect("read config");
+        assert!(body.contains("100.64.0.0/16"));
     }
 
     fn supervise_sleep() -> (GvproxySwitch, SwitchExit) {
@@ -565,16 +863,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_assigns_unique_sequential_ips() {
+    async fn allocate_assigns_unique_sequential_ips() {
         let (mut switch, _exit) = supervise_sleep();
 
-        let a = switch.attach_ptask("ptask-a").expect("attach a");
-        let b = switch.attach_ptask("ptask-b").expect("attach b");
+        let a = switch.allocate_ptask("ptask-a").expect("allocate a");
+        let b = switch.allocate_ptask("ptask-b").expect("allocate b");
 
         assert_eq!(a.switch_ip(), Ipv4Addr::new(100, 64, 0, 2));
         assert_eq!(b.switch_ip(), Ipv4Addr::new(100, 64, 0, 3));
         assert_ne!(a.switch_ip(), b.switch_ip(), "IPs must be unique");
-        switch.detach_ptask(&a);
+        assert_eq!(a.mac(), MacAddr::for_switch_ip(a.switch_ip()));
+        switch.detach_ptask(a);
         switch.stop().await;
     }
 
