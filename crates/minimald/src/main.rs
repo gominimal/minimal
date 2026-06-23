@@ -311,6 +311,14 @@ async fn async_main() -> Result<(), MainError> {
     // If we got this far we need to launch minimald.
     if !cli.listen_args().unwrap().vsock {
         // standard path, listening on UDS socket
+
+        // DM2 (native-Linux host): bind the B5 host-side egress proxy listener
+        // as a startup reachability check. PTask `*.min.internal` hostnames (Unit 3)
+        // are resolved host-side and routed by `Host:` header through this proxy;
+        // the host resolver is never consulted. A bind failure warns with a
+        // remedy (this supersedes the former R3.4 systemd-resolved probe).
+        let _ = minimald::net::proxy::bind_listener(minimald::net::proxy::DEFAULT_PROXY_ADDR).await;
+
         if let Err(e) = std::fs::remove_file(cli.listen_on())
             && e.kind() != std::io::ErrorKind::NotFound
         {

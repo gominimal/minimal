@@ -30,6 +30,21 @@ pub enum SessionKeyPredicate {
 /// Transport / internal error when communicating with the sessions actor.
 type SessionsError = std::io::Error;
 
+/// The name a PTask hostname is registered under: the session's assigned name,
+/// or the project directory's basename when unnamed (matching how a session
+/// host derives its display name).
+#[cfg(target_os = "linux")]
+fn registry_name(record: &sessions::Record) -> String {
+    match &record.name {
+        Some(s) => s.clone(),
+        None => record
+            .project_path
+            .file_name()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "session".to_string()),
+    }
+}
+
 /// Encapsulates the return channel for messages back from the actor.
 struct Responder<T>(oneshot::Sender<Result<T, SessionsError>>);
 
@@ -72,6 +87,12 @@ pub struct Manager<L: Loader = DiskLoader> {
     /// The daemon-scoped gvproxy switch, handed to each session it starts so an
     /// `OwnIp` PTask attaches to the one per-host switch (R1.4/R1.5/R1.6).
     net_switch: Arc<Mutex<crate::net::GvproxySwitch>>,
+
+    /// In-memory PTask hostname registry (Unit 3, DM2). Owned directly because
+    /// the manager is an actor with exclusive `&mut self` access, so no lock is
+    /// needed. `HostNet` PTasks register on launch and withdraw on teardown.
+    #[cfg(target_os = "linux")]
+    hostnames: crate::net::dns::HostnameRegistry,
 }
 
 impl Manager {
@@ -92,6 +113,8 @@ impl Manager {
             minimal_state_dir,
             minimal_cache_dir,
             net_switch,
+            #[cfg(target_os = "linux")]
+            hostnames: crate::net::dns::HostnameRegistry::new(crate::net::dns::DEFAULT_HOST_ID),
         };
 
         tokio::spawn(mngr.mainloop());
@@ -168,14 +191,28 @@ impl<L: Loader> Manager<L> {
                                 Some(h) => h.clone(),
                                 None => {
                                     // Not running, start it!
+                                    let obj = self.store.get(&k)?;
+                                    // Register a `HostNet` PTask's hostname on
+                                    // launch (R3.6); it routes to loopback.
+                                    // `OwnIp` registration is deferred to #542.
+                                    // Capture the id and name before `obj` is
+                                    // moved into `Session::run`.
+                                    #[cfg(target_os = "linux")]
+                                    let host_net_reg = (obj.record().network
+                                        == sessions::NetworkMode::HostNet)
+                                        .then(|| (obj.record().id, registry_name(obj.record())));
                                     let h = Session::run(
                                         self.minimal_state_dir.clone(),
                                         self.minimal_cache_dir.clone(),
-                                        self.store.get(&k)?,
+                                        obj,
                                         Arc::clone(&self.net_switch),
                                     )
                                     .await
                                     .expect("TODO handle error");
+                                    #[cfg(target_os = "linux")]
+                                    if let Some((id, name)) = host_net_reg {
+                                        self.hostnames.register_host_net(id, &name);
+                                    }
                                     self.running.insert(k, h.clone());
                                     h
                                 }
@@ -223,12 +260,24 @@ impl<L: Loader> Manager<L> {
                             format!("no session with ID `{}`", id.as_ref()),
                         )
                     })?;
+                    // Derive the hostname registry key from the record up front,
+                    // letting a read error propagate before anything is torn
+                    // down. `deregister` is a no-op for a session that never
+                    // registered one, so it is called unconditionally.
+                    #[cfg(target_os = "linux")]
+                    let host_net_name = registry_name(self.store.get(&k)?.record());
                     // Stop the live session first (killing its host and waiting
                     // for the sandbox to be released) so the on-disk tree is
                     // free to remove.
                     if let Some(hnd) = self.running.remove(&k) {
                         hnd.destroy().await;
                     }
+                    // Withdraw the PTask hostname (R3.5) before the fallible
+                    // on-disk delete, so a `delete` failure leaves a stale
+                    // on-disk record (repairable on restart) but never a stale
+                    // routing entry pointing at a destroyed session.
+                    #[cfg(target_os = "linux")]
+                    self.hostnames.deregister(&host_net_name);
                     self.store.delete(&k)?;
                     Ok(())
                 })
