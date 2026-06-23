@@ -625,9 +625,14 @@ impl Drop for PtaskAttachment {
             attached = prev.saturating_sub(1),
             "PTask detached from gvproxy switch",
         );
-        if prev == 1 {
+        // Only the drop that flips `stopping` from false → true signals.
+        // If `stop()` (or `GvproxySwitch::Drop`) already claimed teardown the
+        // child is reaped and its PID may have been recycled by the OS, so
+        // signalling `self.pid` here could deliver SIGTERM to an unrelated
+        // process. `swap` makes the claim atomic and race-free against a
+        // concurrent stop or drop.
+        if prev == 1 && !self.stopping.swap(true, Ordering::AcqRel) {
             // Last own-IP PTask detached; terminate the switch (R1.4).
-            self.stopping.store(true, Ordering::Release);
             signal_child(self.pid as libc::pid_t, libc::SIGTERM, "SIGTERM");
             tracing::info!(
                 gvproxy_pid = self.pid,
