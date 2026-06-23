@@ -41,7 +41,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use minimald_rpc::IpProto;
@@ -62,6 +62,21 @@ pub const DEFAULT_MTU: u16 = 1500;
 
 /// Stable, locally-administered MAC for the switch gateway.
 pub const GATEWAY_MAC: MacAddr = MacAddr([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd]);
+
+/// Error returned when [`SwitchSubnet::new`] is called with a prefix that
+/// would make every [`SwitchSubnet::host`] call return `None`.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SwitchSubnetError {
+    /// The prefix is outside the range that allows at least one host address.
+    ///
+    /// Valid range: `1..=30`. A prefix of `0` overflows the host-bit shift;
+    /// a prefix of `31` or `32` leaves no integer index where
+    /// [`SwitchSubnet::host`] returns `Some`; a prefix above `32` is not
+    /// a valid IPv4 prefix length.
+    #[error("prefix /{0} is invalid for a gvproxy subnet (valid: /1..=/30)")]
+    InvalidPrefix(u8),
+}
 
 /// The IPv4 subnet the gvproxy switch hands out to own-IP PTasks.
 ///
@@ -91,9 +106,18 @@ impl fmt::Display for SwitchSubnet {
 
 impl SwitchSubnet {
     /// Construct a subnet from its network base address and prefix length.
-    #[must_use]
-    pub fn new(base: Ipv4Addr, prefix: u8) -> Self {
-        Self { base, prefix }
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SwitchSubnetError::InvalidPrefix`] for a prefix outside
+    /// `1..=30`. A prefix of `0` makes every [`host`](Self::host) call return
+    /// `None` via shift overflow; a prefix of `31` or `32` leaves no integer
+    /// index where `host` returns `Some`.
+    pub fn new(base: Ipv4Addr, prefix: u8) -> Result<Self, SwitchSubnetError> {
+        if !(1..=30).contains(&prefix) {
+            return Err(SwitchSubnetError::InvalidPrefix(prefix));
+        }
+        Ok(Self { base, prefix })
     }
 
     /// The gateway address the switch itself answers on (index 1).
@@ -340,6 +364,12 @@ pub struct GvproxySwitch {
     switch_socket: PathBuf,
     /// Next switch-client index to assign; starts at 2 (1 is the gateway).
     next_index: u32,
+    /// Number of currently-attached PTasks. Incremented by [`attach_ptask`]
+    /// and decremented (via RAII Drop) when a [`PtaskAttachment`] is dropped.
+    /// The switch terminates automatically when this reaches zero (R1.4).
+    ///
+    /// [`attach_ptask`]: GvproxySwitch::attach_ptask
+    attached_count: Arc<AtomicU32>,
     /// Set before any intentional teardown so the supervision task classifies
     /// the resulting child exit as a clean stop rather than an unexpected crash.
     stopping: Arc<AtomicBool>,
@@ -364,6 +394,7 @@ impl GvproxySwitch {
             .id()
             .expect("a freshly spawned child always has a PID before it is awaited");
         let stopping = Arc::new(AtomicBool::new(false));
+        let attached_count = Arc::new(AtomicU32::new(0));
         let (exit_tx, exit_rx) = oneshot::channel();
         let supervisor = tokio::spawn(supervise_switch(child, pid, Arc::clone(&stopping), exit_tx));
         let switch = Self {
@@ -372,6 +403,7 @@ impl GvproxySwitch {
             term_timeout,
             switch_socket,
             next_index: 2,
+            attached_count,
             stopping,
             supervisor: Some(supervisor),
         };
@@ -440,12 +472,14 @@ impl GvproxySwitch {
         let tap = open_tap(tap_name)?;
         let relay = attach_to_switch(tap, &self.switch_socket).await?;
 
+        let prev = self.attached_count.fetch_add(1, Ordering::AcqRel);
         tracing::info!(
             ptask = %label,
             switch_ip = %switch_ip,
             mac = %mac,
             tap = %tap_name,
             gvproxy_pid = self.pid,
+            attached = prev + 1,
             "PTask attached to gvproxy switch",
         );
         Ok(PtaskAttachment {
@@ -454,6 +488,9 @@ impl GvproxySwitch {
             mac,
             index,
             relay: Some(relay),
+            pid: self.pid,
+            stopping: Arc::clone(&self.stopping),
+            attached_count: Arc::clone(&self.attached_count),
         })
     }
 
@@ -465,13 +502,15 @@ impl GvproxySwitch {
     pub fn allocate_ptask(&mut self, label: impl Into<String>) -> Option<PtaskAttachment> {
         let (switch_ip, mac) = self.allocate_ip()?;
         let index = self.next_index - 1;
+        let prev = self.attached_count.fetch_add(1, Ordering::AcqRel);
         let label = label.into();
         tracing::info!(
             ptask = %label,
             switch_ip = %switch_ip,
             mac = %mac,
             gvproxy_pid = self.pid,
-            "PTask allocated a gvproxy switch IP",
+            attached = prev + 1,
+            "PTask attached to gvproxy switch",
         );
         Some(PtaskAttachment {
             label,
@@ -480,23 +519,24 @@ impl GvproxySwitch {
             index,
             #[cfg(target_os = "linux")]
             relay: None,
+            pid: self.pid,
+            stopping: Arc::clone(&self.stopping),
+            attached_count: Arc::clone(&self.attached_count),
         })
     }
 
-    /// Detach a previously attached PTask from the switch (R1.8). The IP is not
-    /// returned to the pool — it is retired for this handle's lifetime so a
-    /// later PTask never inherits a still-cached peer's address (R1.6 intent).
+    /// Detach a previously attached PTask from the switch (R1.8). Consumes the
+    /// attachment; the RAII [`Drop`] impl decrements the count and terminates
+    /// the switch if this was the last attached PTask (R1.4).
     ///
-    /// Consumes the attachment so its relay handle is dropped, which closes the
-    /// gvproxy connection and stops both relay directions.
+    /// The IP is retired for this handle's lifetime so a later PTask never
+    /// inherits a still-cached peer's address (R1.6 intent).
+    ///
+    /// This is exactly equivalent to dropping the attachment; it touches no
+    /// switch state, so it takes `&self` and is callable through a shared
+    /// borrow.
     pub fn detach_ptask(&self, attachment: PtaskAttachment) {
-        tracing::info!(
-            ptask = %attachment.label,
-            switch_ip = %attachment.switch_ip,
-            gvproxy_pid = self.pid,
-            "PTask detached from gvproxy switch",
-        );
-        // `attachment` drops here, aborting its relay tasks (if any).
+        drop(attachment);
     }
 
     /// Tear the switch down cleanly (R1.4): deliver SIGTERM, wait up to
@@ -508,21 +548,30 @@ impl GvproxySwitch {
     /// is only a best-effort, non-blocking fallback.
     pub async fn stop(mut self) {
         // Mark the exit intentional *before* signalling so the supervision task
-        // classifies the resulting `wait()` as a clean stop, not a crash.
-        self.stopping.store(true, Ordering::Release);
+        // classifies the resulting `wait()` as a clean stop, not a crash. Use
+        // `swap` (not `store`) so this is symmetric with the guards on
+        // `GvproxySwitch::Drop` and the last-detach `PtaskAttachment::Drop`: if a
+        // last-detach drop already claimed teardown and sent SIGTERM, the child
+        // may already be reaped and its PID recycled, so `stop()` must not
+        // re-signal `pid` — it only awaits the supervisor for the exit.
+        let already_claimed = self.stopping.swap(true, Ordering::AcqRel);
         let Some(mut supervisor) = self.supervisor.take() else {
             // Already stopped.
             return;
         };
         let pid = self.pid as libc::pid_t;
-        signal_child(pid, libc::SIGTERM, "SIGTERM");
+        if !already_claimed {
+            signal_child(pid, libc::SIGTERM, "SIGTERM");
+        }
         // The supervision task completes once it has reaped the child, so
         // awaiting it (bounded by the grace period) is the exit signal.
         if tokio::time::timeout(self.term_timeout, &mut supervisor)
             .await
             .is_err()
         {
-            signal_child(pid, libc::SIGKILL, "SIGKILL");
+            if !already_claimed {
+                signal_child(pid, libc::SIGKILL, "SIGKILL");
+            }
             let _ = supervisor.await;
         }
     }
@@ -538,18 +587,33 @@ impl Drop for GvproxySwitch {
         // intentional and SIGKILL immediately, leaving the detached supervision
         // task to reap the child. No blocking poll runs here (the async
         // `stop()` is the path that waits for a graceful SIGTERM exit).
-        self.stopping.store(true, Ordering::Release);
-        signal_child(self.pid as libc::pid_t, libc::SIGKILL, "SIGKILL");
-        tracing::debug!(
-            pid = self.pid,
-            "gvproxy switch dropped without stop(); SIGKILL sent, reap deferred to supervisor",
-        );
+        //
+        // Only SIGKILL if this drop is the first to claim teardown. If a
+        // `PtaskAttachment::Drop` (or anything else) already flipped `stopping`
+        // the child is reaped and its PID may have been recycled, so an
+        // unconditional SIGKILL could land on an unrelated process. `swap`
+        // makes the claim atomic, mirroring the SIGTERM guard on the last
+        // attachment drop.
+        if !self.stopping.swap(true, Ordering::AcqRel) {
+            signal_child(self.pid as libc::pid_t, libc::SIGKILL, "SIGKILL");
+            tracing::debug!(
+                pid = self.pid,
+                "gvproxy switch dropped without stop(); SIGKILL sent, reap deferred to supervisor",
+            );
+        }
     }
 }
 
 /// A PTask's attachment to the gvproxy switch: the assigned IP/MAC, the client
 /// index it was allocated at, and (on Linux, for a full attach) the relay handle
 /// whose lifetime keeps the tap↔switch bridge alive.
+///
+/// This is an RAII handle: dropping it decrements the shared attached-PTask
+/// counter and, when the count reaches zero, delivers `SIGTERM` to the gvproxy
+/// switch so it tears down when the last own-IP PTask exits (R1.4). Every drop
+/// path logs the detach; [`GvproxySwitch::detach_ptask`] is just a named way to
+/// drop it at a chosen point and is equivalent to an implicit scope-exit drop.
+#[must_use = "dropping PtaskAttachment decrements the attached count and may terminate the switch"]
 #[derive(Debug)]
 pub struct PtaskAttachment {
     label: String,
@@ -563,6 +627,53 @@ pub struct PtaskAttachment {
     #[cfg(target_os = "linux")]
     #[allow(dead_code)]
     relay: Option<SwitchRelay>,
+    /// PID of the supervised gvproxy process — needed to deliver SIGTERM when
+    /// the last attachment drops.
+    pid: u32,
+    /// Shared with the parent [`GvproxySwitch`]; set to `true` before
+    /// delivering a termination signal so the supervision task classifies the
+    /// resulting exit as intentional rather than unexpected.
+    stopping: Arc<AtomicBool>,
+    /// Live attachment counter shared with the parent [`GvproxySwitch`].
+    attached_count: Arc<AtomicU32>,
+}
+
+impl Drop for PtaskAttachment {
+    fn drop(&mut self) {
+        let prev = self.attached_count.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(
+            prev > 0,
+            "attached_count underflowed — PtaskAttachment dropped more times than it was attached",
+        );
+        tracing::info!(
+            ptask = %self.label,
+            switch_ip = %self.switch_ip,
+            gvproxy_pid = self.pid,
+            attached = prev.saturating_sub(1),
+            "PTask detached from gvproxy switch",
+        );
+        // Only the drop that flips `stopping` from false → true signals.
+        // If `stop()` (or `GvproxySwitch::Drop`) already claimed teardown the
+        // child is reaped and its PID may have been recycled by the OS, so
+        // signalling `self.pid` here could deliver SIGTERM to an unrelated
+        // process. `swap` makes the claim atomic and race-free against a
+        // concurrent stop or drop.
+        //
+        // Residual gap: an *independent* gvproxy crash never sets `stopping`,
+        // so the last drop still signals `self.pid`. The supervision task has
+        // reaped the child by then, leaving a recycled-PID window between that
+        // reap and this drop that the `swap` guard cannot close — it only keys
+        // on an intentional teardown (`stop`/`GvproxySwitch::Drop`) having set
+        // the flag, which a crash does not.
+        if prev == 1 && !self.stopping.swap(true, Ordering::AcqRel) {
+            // Last own-IP PTask detached; terminate the switch (R1.4).
+            signal_child(self.pid as libc::pid_t, libc::SIGTERM, "SIGTERM");
+            tracing::info!(
+                gvproxy_pid = self.pid,
+                "last own-IP PTask detached; SIGTERM sent to gvproxy switch",
+            );
+        }
+    }
 }
 
 impl PtaskAttachment {
@@ -794,7 +905,54 @@ mod tests {
     }
 
     #[test]
-    fn argv_passes_config_and_listens_on_switch_socket() {
+    fn subnet_new_rejects_zero_prefix() {
+        assert!(
+            matches!(
+                SwitchSubnet::new(Ipv4Addr::new(100, 64, 0, 0), 0),
+                Err(SwitchSubnetError::InvalidPrefix(0))
+            ),
+            "prefix /0 makes host() always return None via shift overflow",
+        );
+    }
+
+    #[test]
+    fn subnet_new_rejects_prefix_31() {
+        // /31 has span=2, span-1=1; every host() index satisfies index>=1 → None.
+        assert!(matches!(
+            SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 31),
+            Err(SwitchSubnetError::InvalidPrefix(31))
+        ));
+    }
+
+    #[test]
+    fn subnet_new_rejects_prefix_32() {
+        // /32 has span=1, span-1=0; host(0) is the network address → None, so
+        // every host() call returns None — the pathology the validation guards.
+        assert!(matches!(
+            SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 32),
+            Err(SwitchSubnetError::InvalidPrefix(32))
+        ));
+    }
+
+    #[test]
+    fn subnet_new_rejects_prefix_above_32() {
+        assert!(matches!(
+            SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 33),
+            Err(SwitchSubnetError::InvalidPrefix(33))
+        ));
+    }
+
+    #[test]
+    fn subnet_new_accepts_valid_prefixes() {
+        // /1 (widest valid) and /30 (narrowest valid — gateway at index 1 fits).
+        assert!(SwitchSubnet::new(Ipv4Addr::new(128, 0, 0, 0), 1).is_ok());
+        assert!(SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 30).is_ok());
+        let net = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 30).unwrap();
+        assert_eq!(net.gateway(), Some(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn argv_listens_on_switch_socket() {
         let cfg = GvproxyConfig::new(
             PathBuf::from("/usr/bin/gvproxy"),
             PathBuf::from("/run/minvmd/switch.sock"),
@@ -878,8 +1036,32 @@ mod tests {
         assert_eq!(b.switch_ip(), Ipv4Addr::new(100, 64, 0, 3));
         assert_ne!(a.switch_ip(), b.switch_ip(), "IPs must be unique");
         assert_eq!(a.mac(), MacAddr::for_switch_ip(a.switch_ip()));
+        // Detach a; b is dropped at end of scope.
         switch.detach_ptask(a);
         switch.stop().await;
+    }
+
+    #[tokio::test]
+    async fn last_ptask_detach_terminates_switch() {
+        // Dropping the final PtaskAttachment should SIGTERM the switch and the
+        // supervision task should classify it as an intentional stop (R1.4).
+        let (mut switch, _exit) = supervise_sleep();
+        let pid = switch.pid();
+
+        let a = switch.allocate_ptask("ptask-a").expect("allocate");
+        assert!(pid_is_alive(pid), "switch should be alive with one PTask");
+
+        // Explicitly detach (consuming the attachment): count hits zero → SIGTERM.
+        switch.detach_ptask(a);
+        assert!(
+            await_reaped(pid).await,
+            "switch must be terminated after the last PTask detaches",
+        );
+        // The last detach already SIGTERM'd the switch and claimed `stopping`,
+        // so consuming it here just drops the supervisor JoinHandle: the
+        // guarded `GvproxySwitch::Drop` sees `stopping` set and skips its
+        // SIGKILL rather than signalling the now-reaped (possibly recycled) PID.
+        drop(switch);
     }
 
     #[tokio::test]
