@@ -16,9 +16,13 @@ use crate::core::decision::{CheckOutcome, Decision, ItemDecision};
 use crate::core::enumerate::{ExpandedProvenancedPatch, PatchFile, enumerate_patch_files};
 use crate::core::hooks::{HookResult, PolicyHooks, Unapproved};
 use crate::core::policy::{PatchPolicy, UserPolicy, VarsPolicy};
-use crate::core::primitives::{ResolvedPatch, ResolvedVar};
+use crate::core::primitives::{ResolvedPatch, ResolvedVar, VarError};
 use crate::core::source::{
     Provenanced, ProvenancedHook, ProvenancedPackage, ProvenancedPatch, ProvenancedVar, Source,
+};
+use crate::wire::policy::{WirePatchVerdict, WireVarVerdict};
+use crate::wire::primitives::{
+    PendingId, WirePendingVar, WireResolvedVar, WireSessionPatch, WireSessionVar,
 };
 
 /// Errors produced while a [`Composable`] materializes its
@@ -240,6 +244,17 @@ pub enum ComposeError {
         /// Free-form context.
         context: String,
     },
+    /// A pending patch's destination violates [`PatchDest`]'s
+    /// invariants (empty path, traversal component, absolute path).
+    /// Surfaces from `handle_response` when reconstructing a
+    /// `WirePendingPatch` into its domain form.
+    ///
+    /// [`PatchDest`]: crate::core::primitives::PatchDest
+    #[error("invalid pending patch destination: {source}")]
+    InvalidPendingPatchDest {
+        #[source]
+        source: crate::core::primitives::PatchError,
+    },
     /// Expanding `~/` or `$VAR` references in a patch source or policy
     /// pattern failed. Surfaces every failure mode of
     /// [`expand_source`](crate::core::expansion::expand_source): malformed
@@ -247,6 +262,62 @@ pub enum ComposeError {
     /// or a post-expansion string that fails to parse as a glob.
     #[error("patch source expansion failed: {0}")]
     Expansion(#[from] crate::core::expansion::ExpandError),
+    /// A pending var with an `Inherit`-shaped spec could not be
+    /// resolved against the client's environment (e.g. the variable
+    /// was absent and the spec had no `default`). Surfaces from
+    /// `handle_response` when processing a daemon-emitted pending
+    /// var.
+    #[error("could not resolve pending var `{name}`: {source}")]
+    VarResolution {
+        /// The pending variable's name.
+        name: String,
+        /// The underlying env-lookup failure.
+        #[source]
+        source: std::env::VarError,
+    },
+}
+
+/// Which policy domain a hook contract violation refers to. Keeps
+/// the `HookContract` message constructors exhaustively dispatched
+/// instead of stringly-typed.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum HookDomain {
+    Var,
+    Patch,
+}
+
+impl ComposeError {
+    /// Build the `HookContract` variant fired when a hook returns
+    /// `UseRule` for an item that the policy still can't decide
+    /// after the hook's `updated_policy` is installed. `item_label`
+    /// should already include any quoting the caller wants.
+    pub(crate) fn use_rule_undecided(domain: HookDomain, item_label: String) -> Self {
+        let kind = match domain {
+            HookDomain::Var => "UseRule returned for a var the policy still cannot decide",
+            HookDomain::Patch => "UseRule returned for a patch file the policy still cannot decide",
+        };
+        Self::HookContract {
+            kind,
+            context: item_label,
+        }
+    }
+
+    /// Build the `HookContract` variant fired when the hook returns
+    /// the wrong number of decisions for the batch.
+    pub(crate) fn hook_decision_count_mismatch(
+        domain: HookDomain,
+        expected: usize,
+        got: usize,
+    ) -> Self {
+        let kind = match domain {
+            HookDomain::Var => "var-domain hook returned the wrong number of decisions",
+            HookDomain::Patch => "patch-domain hook returned the wrong number of decisions",
+        };
+        Self::HookContract {
+            kind,
+            context: format!("expected {expected}, got {got}"),
+        }
+    }
 }
 
 /// Render a slice of `Display`-able errors as one indented bullet per
@@ -262,52 +333,66 @@ impl<E: fmt::Display> fmt::Display for DisplayJoin<'_, E> {
     }
 }
 
-/// One environment variable that survived the policy gate, paired
-/// with its origin.
+/// One environment variable that survived the policy gate.
 ///
-/// The source is retained so downstream layers (CLI inspection, audit
-/// logs, error reporting) can attribute each decision back to the
-/// contributor that asked for it.
+/// A thin typestate wrapper over [`ProvenancedVar`] — same data, but
+/// the type encodes that the contained var has been gated. The
+/// distinction matters at API boundaries: a function taking
+/// `&[SessionVar]` is documented to consume only post-gate items.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct SessionVar {
-    var: ResolvedVar,
-    source: Source,
-}
+pub struct SessionVar(ProvenancedVar);
 
 impl SessionVar {
+    /// Direct construction. Crate-internal because outside callers
+    /// should obtain `SessionVar`s by going through the gate (e.g.
+    /// `UserComposer::compose`) or reconstructing one from a
+    /// [`WireSessionVar`] via the `From` impl — both of which
+    /// guarantee provenance is
+    /// truthful. `pub(crate)` exposes it for in-crate handlers (e.g.
+    /// `client::handler`) that build session vars from already-gated
+    /// wire payloads.
+    #[must_use]
+    pub(crate) fn new(var: ResolvedVar, source: Source) -> Self {
+        Self(ProvenancedVar::new(var, source))
+    }
+
+    /// Lift a [`ProvenancedVar`] that has passed the gate into a
+    /// `SessionVar`. Zero-cost (no allocation, no clone).
+    #[must_use]
+    pub(crate) fn from_provenanced(pv: ProvenancedVar) -> Self {
+        Self(pv)
+    }
+
     /// The variable that survived the policy gate.
     #[must_use]
     pub fn var(&self) -> &ResolvedVar {
-        &self.var
+        self.0.var()
     }
 
     /// Consume the [`SessionVar`] and return `(var, source)`.
     #[must_use]
     pub fn into_parts(self) -> (ResolvedVar, Source) {
-        (self.var, self.source)
+        self.0.into_parts()
     }
 }
 
 impl Provenanced for SessionVar {
     fn source(&self) -> &Source {
-        &self.source
+        self.0.source()
     }
 }
 
 impl crate::core::expansion::VarLookup for [SessionVar] {
     fn lookup(&self, name: &str) -> Option<&str> {
         self.iter()
-            .find(|v| v.var.name() == name)
-            .map(|v| v.var.value())
+            .find(|v| v.var().name() == name)
+            .map(|v| v.var().value())
     }
 }
 
-impl From<crate::wire::primitives::WireSessionVar> for SessionVar {
-    fn from(v: crate::wire::primitives::WireSessionVar) -> Self {
-        Self {
-            var: v.var.into(),
-            source: v.source.into(),
-        }
+impl From<WireSessionVar> for SessionVar {
+    fn from(v: WireSessionVar) -> Self {
+        Self::new(v.var.into(), v.source.into())
     }
 }
 
@@ -340,11 +425,154 @@ impl Provenanced for SessionPatch {
     }
 }
 
-impl From<crate::wire::primitives::WireSessionPatch> for SessionPatch {
-    fn from(p: crate::wire::primitives::WireSessionPatch) -> Self {
+impl From<WireSessionPatch> for SessionPatch {
+    fn from(p: WireSessionPatch) -> Self {
         Self {
             patch: p.patch.into(),
             source: p.source.into(),
+        }
+    }
+}
+
+/// One environment variable the daemon emitted as pending: id-tagged
+/// for wire correlation, paired with the resolved domain
+/// [`ProvenancedVar`] the client built from the wire spec + env.
+///
+/// Bridges wire and domain on the verdict-emitting side: the policy
+/// check consumes the inner `ProvenancedVar`; the consuming
+/// `into_*` methods on this type produce the matching
+/// [`WireVarVerdict`] without extra clones.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PendingVar {
+    id: PendingId,
+    var: ProvenancedVar,
+}
+
+impl PendingVar {
+    /// Build from a wire pending var by resolving its spec against
+    /// `env`. Delegates to [`ResolvedVar::resolve_with`] for the
+    /// env-handling logic so the rules stay in one place.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ComposeError::VarResolution`] if the spec asks for
+    /// an env lookup that fails (and `InheritWithDefault` can't
+    /// recover via its default).
+    pub(crate) fn from_wire(
+        wire: WirePendingVar,
+        env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+    ) -> Result<Self, ComposeError> {
+        let resolved = ResolvedVar::resolve_with(wire.name, wire.spec.into(), env).map_err(
+            |err| match err {
+                VarError::ResolutionFailure { name, source } => {
+                    ComposeError::VarResolution { name, source }
+                }
+                // `resolve_with` only ever emits `ResolutionFailure`.
+                other => unreachable!("ResolvedVar::resolve_with returned {other:?}"),
+            },
+        )?;
+        Ok(Self {
+            id: wire.id,
+            var: ProvenancedVar::new(resolved, wire.source.into()),
+        })
+    }
+
+    /// Reassemble after the policy check hands the inner
+    /// [`ProvenancedVar`] back (`Allowed`, `Denied`, or
+    /// `NeedsApproval`). The id is supplied separately because the
+    /// policy machinery doesn't know about it.
+    #[must_use]
+    pub(crate) fn reassemble(id: PendingId, var: ProvenancedVar) -> Self {
+        Self { id, var }
+    }
+
+    /// Borrow the inner [`ProvenancedVar`]. Used to feed `policy.check`.
+    #[must_use]
+    pub(crate) fn provenanced(&self) -> &ProvenancedVar {
+        &self.var
+    }
+
+    /// The variable's name.
+    #[must_use]
+    pub(crate) fn name(&self) -> &str {
+        self.var.var().name()
+    }
+
+    /// Consume into `(id, ProvenancedVar)` for moves that the
+    /// classifier needs to hand into `policy.check`.
+    #[must_use]
+    pub(crate) fn into_parts(self) -> (PendingId, ProvenancedVar) {
+        (self.id, self.var)
+    }
+
+    /// Consume and emit an Approved verdict carrying the resolved
+    /// name and value back to the daemon.
+    #[must_use]
+    pub(crate) fn into_approved_verdict(self) -> WireVarVerdict {
+        let (resolved, _source) = self.var.into_parts();
+        let (name, value) = resolved.into_parts();
+        WireVarVerdict::Approved {
+            id: self.id,
+            value: WireResolvedVar { name, value },
+        }
+    }
+
+    /// Consume and emit a Denied verdict.
+    #[must_use]
+    pub(crate) fn into_denied_verdict(self) -> WireVarVerdict {
+        let (resolved, _source) = self.var.into_parts();
+        let (name, _value) = resolved.into_parts();
+        WireVarVerdict::Denied { id: self.id, name }
+    }
+}
+
+/// One filesystem entry the daemon emitted as pending: id-tagged for
+/// wire correlation, paired with the canonical [`PatchFile`] the
+/// client's walker produced.
+///
+/// Bridges wire and domain on the patch verdict-emitting side, same
+/// role as [`PendingVar`] does for vars.
+pub(crate) struct PendingPatchFile {
+    id: PendingId,
+    file: PatchFile,
+}
+
+impl PendingPatchFile {
+    #[must_use]
+    pub(crate) fn new(id: PendingId, file: PatchFile) -> Self {
+        Self { id, file }
+    }
+
+    /// Borrow the underlying file (e.g. to build an `Unapproved`
+    /// view for hook prompts).
+    #[must_use]
+    pub(crate) fn file(&self) -> &PatchFile {
+        &self.file
+    }
+
+    /// Consume into `(id, PatchFile)` so the classifier can hand the
+    /// file into `policy.check`.
+    #[must_use]
+    pub(crate) fn into_parts(self) -> (PendingId, PatchFile) {
+        (self.id, self.file)
+    }
+
+    /// Consume and emit an Approved verdict carrying the canonical
+    /// target path back to the daemon.
+    #[must_use]
+    pub(crate) fn into_approved_verdict(self) -> WirePatchVerdict {
+        WirePatchVerdict::Approved {
+            id: self.id,
+            host_path: self.file.target_path,
+        }
+    }
+
+    /// Consume and emit a Denied verdict.
+    #[must_use]
+    pub(crate) fn into_denied_verdict(self) -> WirePatchVerdict {
+        WirePatchVerdict::Denied {
+            id: self.id,
+            host_path: self.file.target_path,
         }
     }
 }
@@ -464,6 +692,73 @@ pub struct ComposeOptions {
 // Per-domain gating
 // =====================================================================
 
+/// Invoke a var-domain hook on a batch of unapproved items. The
+/// hook gets `policy` cloned (it can't mutate the caller's directly);
+/// on success the caller gets back `(decisions, policy)` where
+/// `policy` is the hook's `updated_policy` if it returned one, else
+/// the original. Decision count is validated; mismatches return
+/// `HookContract`.
+///
+/// Lifts the boilerplate (call hook, handle `Abort`, fold in
+/// `updated_policy`, validate decision count) shared by [`gate_vars`]
+/// (Phase 1 of `docs/COMPOSITION.md`) and
+/// [`handle_response`](crate::client::handler::handle_response)
+/// (Phase 3).
+pub(crate) fn prompt_var_hook(
+    hooks: &dyn PolicyHooks,
+    policy: VarsPolicy,
+    view: &[Unapproved<'_, str>],
+) -> Result<(Vec<ItemDecision>, VarsPolicy), ComposeError> {
+    match hooks.on_var_unapproved(policy.clone(), view) {
+        HookResult::Abort => Err(ComposeError::Aborted),
+        HookResult::Decided {
+            decisions,
+            updated_policy,
+        } => {
+            if decisions.len() != view.len() {
+                return Err(ComposeError::hook_decision_count_mismatch(
+                    HookDomain::Var,
+                    view.len(),
+                    decisions.len(),
+                ));
+            }
+            Ok((decisions, updated_policy.unwrap_or(policy)))
+        }
+    }
+}
+
+/// Invoke a patch-domain hook on a batch of unapproved files. Same
+/// shape as [`prompt_var_hook`], plus a `bool` indicating whether
+/// the hook installed an `updated_policy` — the caller uses that
+/// flag to decide whether to re-expand the policy's patterns against
+/// the resolved vars.
+pub(crate) fn prompt_patch_hook(
+    hooks: &dyn PolicyHooks,
+    policy: PatchPolicy,
+    view: &[Unapproved<'_, camino::Utf8Path>],
+) -> Result<(Vec<ItemDecision>, PatchPolicy, bool), ComposeError> {
+    match hooks.on_patch_unapproved(policy.clone(), view) {
+        HookResult::Abort => Err(ComposeError::Aborted),
+        HookResult::Decided {
+            decisions,
+            updated_policy,
+        } => {
+            if decisions.len() != view.len() {
+                return Err(ComposeError::hook_decision_count_mismatch(
+                    HookDomain::Patch,
+                    view.len(),
+                    decisions.len(),
+                ));
+            }
+            let (policy, updated) = match updated_policy {
+                Some(new) => (new, true),
+                None => (policy, false),
+            };
+            Ok((decisions, policy, updated))
+        }
+    }
+}
+
 /// Push, drop, or fail on a single [`Decision`].
 ///
 /// Used by Pass 1 (categorizing every item) and by Pass 3's `UseRule`
@@ -524,8 +819,7 @@ pub(crate) fn gate_vars(
                 from: source_of(pv),
             });
         };
-        // Pass 2: prompt. Hand the hook an owned copy of the policy
-        // so it cannot mutate ours directly.
+        // Pass 2: prompt.
         let view: Vec<Unapproved<'_, str>> = unapproved
             .iter()
             .map(|pv| Unapproved {
@@ -533,24 +827,8 @@ pub(crate) fn gate_vars(
                 source: pv.source(),
             })
             .collect();
-        let decisions = match hooks.on_var_unapproved(policy.clone(), &view) {
-            HookResult::Decided {
-                decisions,
-                updated_policy,
-            } => {
-                if let Some(new_policy) = updated_policy {
-                    policy = new_policy;
-                }
-                decisions
-            }
-            HookResult::Abort => return Err(ComposeError::Aborted),
-        };
-        if decisions.len() != unapproved.len() {
-            return Err(ComposeError::HookContract {
-                kind: "var-domain hook returned the wrong number of decisions",
-                context: format!("expected {}, got {}", unapproved.len(), decisions.len()),
-            });
-        }
+        let (decisions, new_policy) = prompt_var_hook(hooks, policy, &view)?;
+        policy = new_policy;
         // Pass 3: apply.
         for (pv, decision) in unapproved.into_iter().zip(decisions) {
             match decision {
@@ -562,10 +840,10 @@ pub(crate) fn gate_vars(
                             apply_decision(d, &mut allowed, name_of, source_of)?;
                         }
                         CheckOutcome::NeedsApproval(pv) => {
-                            return Err(ComposeError::HookContract {
-                                kind: "UseRule returned for a var the policy still cannot decide",
-                                context: format!("variable `{}`", pv.var().name()),
-                            });
+                            return Err(ComposeError::use_rule_undecided(
+                                HookDomain::Var,
+                                format!("variable `{}`", pv.var().name()),
+                            ));
                         }
                     }
                 }
@@ -576,10 +854,7 @@ pub(crate) fn gate_vars(
     Ok((
         allowed
             .into_iter()
-            .map(|pv| {
-                let (var, source) = pv.into_parts();
-                SessionVar { var, source }
-            })
+            .map(SessionVar::from_provenanced)
             .collect(),
         policy,
     ))
@@ -674,24 +949,10 @@ pub(crate) fn gate_patches(
                 source: &pf.provenance,
             })
             .collect();
-        let decisions = match hooks.on_patch_unapproved(policy.clone(), &view) {
-            HookResult::Decided {
-                decisions,
-                updated_policy,
-            } => {
-                if let Some(new_policy) = updated_policy {
-                    policy = new_policy;
-                    expanded = policy.expand_with(gated_vars, home_fallback)?;
-                }
-                decisions
-            }
-            HookResult::Abort => return Err(ComposeError::Aborted),
-        };
-        if decisions.len() != unapproved.len() {
-            return Err(ComposeError::HookContract {
-                kind: "patch-domain hook returned the wrong number of decisions",
-                context: format!("expected {}, got {}", unapproved.len(), decisions.len()),
-            });
+        let (decisions, new_policy, policy_updated) = prompt_patch_hook(hooks, policy, &view)?;
+        policy = new_policy;
+        if policy_updated {
+            expanded = policy.expand_with(gated_vars, home_fallback)?;
         }
         // Pass 3: apply.
         for (pf, decision) in unapproved.into_iter().zip(decisions) {
@@ -708,10 +969,10 @@ pub(crate) fn gate_patches(
                             apply_decision(d, &mut allowed, name_of, source_of)?;
                         }
                         CheckOutcome::NeedsApproval(pf) => {
-                            return Err(ComposeError::HookContract {
-                                kind: "UseRule returned for a patch file the policy still cannot decide",
-                                context: format!("source path `{}`", pf.user_facing()),
-                            });
+                            return Err(ComposeError::use_rule_undecided(
+                                HookDomain::Patch,
+                                format!("source path `{}`", pf.user_facing()),
+                            ));
                         }
                     }
                 }
@@ -1223,10 +1484,7 @@ mod tests {
                     Err(std::env::VarError::NotPresent)
                 })
                 .unwrap();
-            SessionVar {
-                var: resolved,
-                source: user_source(),
-            }
+            SessionVar::new(resolved, user_source())
         }
 
         #[test]
