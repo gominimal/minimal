@@ -20,12 +20,13 @@
 //! run within a tokio runtime (the async networking layer the spec mandates),
 //! so neither blocks a worker thread during teardown.
 
+use std::fmt;
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use minimald_rpc::IpProto;
@@ -35,6 +36,25 @@ use tokio::sync::oneshot;
 /// Default time to wait for gvproxy to exit on SIGTERM before escalating to
 /// SIGKILL.
 pub const DEFAULT_TERM_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Error returned by [`SwitchSubnet::new`] when `prefix` is 0 or greater than
+/// 32; either value makes every [`SwitchSubnet::host`] call return `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidPrefixError {
+    pub prefix: u8,
+}
+
+impl fmt::Display for InvalidPrefixError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "switch subnet prefix {} is outside the valid range 1..=32",
+            self.prefix
+        )
+    }
+}
+
+impl std::error::Error for InvalidPrefixError {}
 
 /// The IPv4 subnet the gvproxy switch hands out to own-IP PTasks.
 ///
@@ -58,9 +78,16 @@ impl Default for SwitchSubnet {
 
 impl SwitchSubnet {
     /// Construct a subnet from its network base address and prefix length.
-    #[must_use]
-    pub fn new(base: Ipv4Addr, prefix: u8) -> Self {
-        Self { base, prefix }
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidPrefixError`] if `prefix` is 0 or greater than 32;
+    /// those values make every [`SwitchSubnet::host`] call return `None`.
+    pub fn new(base: Ipv4Addr, prefix: u8) -> Result<Self, InvalidPrefixError> {
+        if prefix == 0 || prefix > 32 {
+            return Err(InvalidPrefixError { prefix });
+        }
+        Ok(Self { base, prefix })
     }
 
     /// The gateway address the switch itself answers on (index 1).
@@ -178,6 +205,9 @@ pub struct GvproxySwitch {
     switch_socket: PathBuf,
     /// Next switch-client index to assign; starts at 2 (1 is the gateway).
     next_index: u32,
+    /// Number of PTasks currently attached; the switch stops when this drops to
+    /// zero (R1.4).
+    attached_count: Arc<AtomicU32>,
     /// Set before any intentional teardown so the supervision task classifies
     /// the resulting child exit as a clean stop rather than an unexpected crash.
     stopping: Arc<AtomicBool>,
@@ -210,6 +240,7 @@ impl GvproxySwitch {
             term_timeout,
             switch_socket,
             next_index: 2,
+            attached_count: Arc::new(AtomicU32::new(0)),
             stopping,
             supervisor: Some(supervisor),
         };
@@ -241,30 +272,34 @@ impl GvproxySwitch {
         let index = self.next_index;
         let switch_ip = self.subnet.host(index)?;
         self.next_index += 1;
+        let count = self.attached_count.fetch_add(1, Ordering::Relaxed) + 1;
         let label = label.into();
         tracing::info!(
             ptask = %label,
             switch_ip = %switch_ip,
             gvproxy_pid = self.pid,
+            attached = count,
             "PTask attached to gvproxy switch",
         );
         Some(PtaskAttachment {
             label,
             switch_ip,
             index,
+            attached_count: Arc::clone(&self.attached_count),
+            stopping: Arc::clone(&self.stopping),
+            pid: self.pid,
         })
     }
 
-    /// Detach a previously attached PTask from the switch (R1.8). The IP is not
-    /// returned to the pool — it is retired for this handle's lifetime so a
-    /// later PTask never inherits a still-cached peer's address (R1.6 intent).
-    pub fn detach_ptask(&self, attachment: &PtaskAttachment) {
-        tracing::info!(
-            ptask = %attachment.label,
-            switch_ip = %attachment.switch_ip,
-            gvproxy_pid = self.pid,
-            "PTask detached from gvproxy switch",
-        );
+    /// Detach a previously attached PTask from the switch. Consuming the
+    /// attachment decrements the attached count; when the count reaches zero
+    /// the switch child receives SIGTERM (R1.4). The IP is not returned to the
+    /// pool — it is retired for this handle's lifetime so a later PTask never
+    /// inherits a still-cached peer's address (R1.6 intent).
+    pub fn detach_ptask(&mut self, attachment: PtaskAttachment) {
+        // The PtaskAttachment Drop impl handles tracing, count decrement, and
+        // SIGTERM when the last attachment is released.
+        drop(attachment);
     }
 
     /// Tear the switch down cleanly (R1.4): deliver SIGTERM, wait up to
@@ -317,11 +352,22 @@ impl Drop for GvproxySwitch {
 
 /// A PTask's attachment to the gvproxy switch: the assigned IP plus the client
 /// index it was allocated at.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Dropping this handle (via [`GvproxySwitch::detach_ptask`] or ordinary drop)
+/// decrements the switch's attached count; when the count reaches zero, the
+/// switch child receives SIGTERM (R1.4).
+#[derive(Debug)]
 pub struct PtaskAttachment {
     label: String,
     switch_ip: Ipv4Addr,
     index: u32,
+    /// Shared live-count; decremented exactly once in `Drop`.
+    attached_count: Arc<AtomicU32>,
+    /// Shared stopping flag; set before SIGTERM so the supervisor classifies
+    /// the resulting exit as an orderly stop.
+    stopping: Arc<AtomicBool>,
+    /// PID of the supervised gvproxy process.
+    pid: u32,
 }
 
 impl PtaskAttachment {
@@ -341,6 +387,28 @@ impl PtaskAttachment {
     #[must_use]
     pub fn index(&self) -> u32 {
         self.index
+    }
+}
+
+impl Drop for PtaskAttachment {
+    fn drop(&mut self) {
+        let prev = self.attached_count.fetch_sub(1, Ordering::AcqRel);
+        let new_count = prev.saturating_sub(1);
+        tracing::info!(
+            ptask = %self.label,
+            switch_ip = %self.switch_ip,
+            gvproxy_pid = self.pid,
+            attached = new_count,
+            "PTask detached from gvproxy switch",
+        );
+        if prev == 1 {
+            tracing::info!(
+                gvproxy_pid = self.pid,
+                "last PTask detached; stopping gvproxy switch",
+            );
+            self.stopping.store(true, Ordering::Release);
+            signal_child(self.pid as libc::pid_t, libc::SIGTERM, "SIGTERM");
+        }
     }
 }
 
@@ -571,10 +639,15 @@ mod tests {
         let a = switch.attach_ptask("ptask-a").expect("attach a");
         let b = switch.attach_ptask("ptask-b").expect("attach b");
 
-        assert_eq!(a.switch_ip(), Ipv4Addr::new(100, 64, 0, 2));
-        assert_eq!(b.switch_ip(), Ipv4Addr::new(100, 64, 0, 3));
-        assert_ne!(a.switch_ip(), b.switch_ip(), "IPs must be unique");
-        switch.detach_ptask(&a);
+        let a_ip = a.switch_ip();
+        let b_ip = b.switch_ip();
+        assert_eq!(a_ip, Ipv4Addr::new(100, 64, 0, 2));
+        assert_eq!(b_ip, Ipv4Addr::new(100, 64, 0, 3));
+        assert_ne!(a_ip, b_ip, "IPs must be unique");
+        // Detach a (count: 2 -> 1); b is still attached.
+        switch.detach_ptask(a);
+        // Explicit stop; b drops at end of scope (count 1 -> 0, benign SIGTERM
+        // to an already-stopped process — ESRCH is expected and logged).
         switch.stop().await;
     }
 
@@ -639,5 +712,43 @@ mod tests {
         assert_eq!(policy.allow_subnets(), ["10.0.0.0/8"]);
         assert_eq!(policy.allow_protocols(), [IpProto::Tcp]);
         assert!(policy.allow_dns_hosts().is_empty());
+    }
+
+    #[test]
+    fn new_rejects_prefix_zero() {
+        let err = SwitchSubnet::new(Ipv4Addr::new(100, 64, 0, 0), 0).unwrap_err();
+        assert_eq!(err.prefix, 0);
+        assert!(
+            err.to_string().contains("1..=32"),
+            "error message: {err}",
+        );
+    }
+
+    #[test]
+    fn new_rejects_prefix_above_32() {
+        let err = SwitchSubnet::new(Ipv4Addr::new(100, 64, 0, 0), 33).unwrap_err();
+        assert_eq!(err.prefix, 33);
+    }
+
+    #[test]
+    fn new_accepts_valid_prefix_range() {
+        assert!(SwitchSubnet::new(Ipv4Addr::new(100, 64, 0, 0), 1).is_ok());
+        assert!(SwitchSubnet::new(Ipv4Addr::new(100, 64, 0, 0), 16).is_ok());
+        assert!(SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 32).is_ok());
+    }
+
+    #[tokio::test]
+    async fn last_ptask_detach_stops_switch() {
+        let (mut switch, _exit) = supervise_sleep();
+        let pid = switch.pid();
+        assert!(pid_is_alive(pid), "switch should be running before attach");
+
+        let a = switch.attach_ptask("ptask-a").expect("attach a");
+        // Dropping via detach_ptask (count 1 -> 0) should fire SIGTERM.
+        switch.detach_ptask(a);
+        assert!(
+            await_reaped(pid).await,
+            "switch must stop after last PTask detaches",
+        );
     }
 }
