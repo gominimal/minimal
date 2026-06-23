@@ -259,9 +259,13 @@ impl<L: Loader> Manager<L> {
                         )
                     })?;
                     // Withdraw the PTask hostname before the record is removed
-                    // (R3.5). A no-op for a session that never registered one.
+                    // (R3.5). Derive the name from the record up front, letting a
+                    // read error propagate (the `delete` below would fail on the
+                    // same error), so the hostname is never leaked by a silently
+                    // dropped `Err`. `deregister` is a no-op for a session that
+                    // never registered one, so it is called unconditionally.
                     #[cfg(target_os = "linux")]
-                    let host_net_name = self.store.get(&k).ok().map(|o| registry_name(o.record()));
+                    let host_net_name = registry_name(self.store.get(&k)?.record());
                     // Stop the live session first (killing its host and waiting
                     // for the sandbox to be released) so the on-disk tree is
                     // free to remove.
@@ -270,9 +274,7 @@ impl<L: Loader> Manager<L> {
                     }
                     self.store.delete(&k)?;
                     #[cfg(target_os = "linux")]
-                    if let Some(name) = host_net_name {
-                        self.hostnames.deregister(&name);
-                    }
+                    self.hostnames.deregister(&host_net_name);
                     Ok(())
                 })
                 .await

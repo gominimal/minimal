@@ -148,6 +148,7 @@ impl HostnameRegistry {
 
 /// The result of probing the system resolver for `*.localhost` synthesis (R3.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProbeOutcome {
     /// `*.localhost` resolves to loopback; PTask hostnames will resolve.
     Active,
