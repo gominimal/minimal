@@ -1,13 +1,13 @@
 //! In-memory PTask hostname registry: the host-side routing table for the B5
 //! egress proxy (Unit 3, UC2a) on the native-Linux (DM2) path.
 //!
-//! ## `*.localhost` + host-side egress proxy
+//! ## `*.min.internal` + host-side egress proxy
 //!
 //! Open Question 1 of the networking spec is settled in favour of the spec's B5
 //! model (re-scoped 2026-06-23, superseding spike #485's systemd-resolved
-//! finding): a PTask hostname takes the form `<session>.<host-id>.localhost`,
+//! finding): a PTask hostname takes the form `<session>.<host-id>.min.internal`,
 //! and both resolution and routing stay **host-side**. The host resolver is
-//! never consulted and `minimald` writes nothing to it — `*.localhost` (the TLD
+//! never consulted and `minimald` writes nothing to it — `*.min.internal` (the TLD
 //! is an opaque label) is mapped internally by the host-side egress proxy
 //! ([`super::proxy`]), which routes each incoming request to the right PTask by
 //! its `Host:` header. This registry is the lookup table that proxy consults —
@@ -33,7 +33,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use sessions::SessionId;
 
 /// The DNS suffix every PTask hostname carries (see the module docs).
-pub const LOCALHOST_SUFFIX: &str = "localhost";
+pub const HOSTNAME_SUFFIX: &str = "min.internal";
 
 /// Default `<host-id>`: a stable short name for this `minimald` instance. The
 /// host-id is configurable; this is the value used when none is configured.
@@ -42,7 +42,7 @@ pub const DEFAULT_HOST_ID: &str = "local";
 /// The loopback address a local-only (non-DM5) PTask hostname routes to (R3.6).
 const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
-/// A registered PTask hostname of the form `<session>.<host-id>.localhost`.
+/// A registered PTask hostname of the form `<session>.<host-id>.min.internal`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Hostname(String);
 
@@ -50,7 +50,7 @@ impl Hostname {
     /// Builds the hostname for a PTask. DNS names are case-insensitive, so the
     /// rendered form is lower-cased to keep lookups stable.
     fn for_ptask(session_name: &str, host_id: &str) -> Self {
-        Self(format!("{session_name}.{host_id}.{LOCALHOST_SUFFIX}").to_ascii_lowercase())
+        Self(format!("{session_name}.{host_id}.{HOSTNAME_SUFFIX}").to_ascii_lowercase())
     }
 
     /// The hostname as a string slice.
@@ -162,7 +162,7 @@ impl HostnameRegistry {
     /// Resolves a `Host:` header to the address a host-side proxy routes the
     /// request to, or `None` if no live PTask owns that hostname.
     ///
-    /// This is the registry/proxy contract: every `*.localhost` name resolves to
+    /// This is the registry/proxy contract: every `*.min.internal` name resolves to
     /// loopback in the DNS layer, so the per-PTask routing decision is made here,
     /// by hostname. The header's optional `:port` suffix is ignored and matching
     /// is case-insensitive, matching how a real `Host:` header arrives.
@@ -179,7 +179,7 @@ impl HostnameRegistry {
 ///
 /// Handles both the common `name:port` form and the bracketed IPv6 literal
 /// form (`[::1]:8080`), where the port follows the closing bracket rather than
-/// the first colon. The registry only ever holds `*.localhost` names, so an
+/// the first colon. The registry only ever holds `*.min.internal` names, so an
 /// IPv6 literal never routes; parsing it correctly keeps a naive split-on-first-
 /// colon from silently truncating `[::1]` to `[`. Shared with [`super::proxy`],
 /// which splits the same authority into host and port.
@@ -202,7 +202,7 @@ mod tests {
 
     /// Proof artifact 1 (registry/proxy contract): registering a `HostNet`
     /// PTask makes the host-side proxy route its `Host:` header to `127.0.0.1`;
-    /// deregistering withdraws it so the proxy no longer routes it. `*.localhost`
+    /// deregistering withdraws it so the proxy no longer routes it. `*.min.internal`
     /// is synthesized to loopback statically by the resolver, so this asserts the
     /// registry/proxy routing contract, not a `getaddrinfo` lifecycle.
     #[test]
@@ -210,21 +210,24 @@ mod tests {
         let mut reg = HostnameRegistry::new("dev");
 
         let hostname = reg.register_host_net(SessionId::nil(), "myservice");
-        assert_eq!(hostname.as_str(), "myservice.dev.localhost");
+        assert_eq!(hostname.as_str(), "myservice.dev.min.internal");
 
         // The host-side proxy routes a request by its `Host:` header to the PTask
         // — with or without the `:port` a real header carries.
         let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        assert_eq!(reg.resolve("myservice.dev.localhost"), Some(loopback));
-        assert_eq!(reg.resolve("myservice.dev.localhost:8080"), Some(loopback));
+        assert_eq!(reg.resolve("myservice.dev.min.internal"), Some(loopback));
+        assert_eq!(
+            reg.resolve("myservice.dev.min.internal:8080"),
+            Some(loopback)
+        );
 
         // After the session exits the entry is gone and the proxy no longer
         // routes it.
         let removed = reg
             .deregister("myservice")
             .expect("hostname was registered");
-        assert_eq!(removed.as_str(), "myservice.dev.localhost");
-        assert_eq!(reg.resolve("myservice.dev.localhost"), None);
+        assert_eq!(removed.as_str(), "myservice.dev.min.internal");
+        assert_eq!(reg.resolve("myservice.dev.min.internal"), None);
     }
 
     /// Port stripping handles both the common `name:port` form and the
@@ -233,10 +236,13 @@ mod tests {
     /// silently truncating `[::1]` to `[` at the first colon.
     #[test]
     fn host_component_strips_port_including_bracketed_ipv6() {
-        assert_eq!(host_component("svc.dev.localhost"), "svc.dev.localhost");
         assert_eq!(
-            host_component("svc.dev.localhost:8080"),
-            "svc.dev.localhost"
+            host_component("svc.dev.min.internal"),
+            "svc.dev.min.internal"
+        );
+        assert_eq!(
+            host_component("svc.dev.min.internal:8080"),
+            "svc.dev.min.internal"
         );
         assert_eq!(host_component("[::1]:8080"), "[::1]");
         assert_eq!(host_component("[::1]"), "[::1]");

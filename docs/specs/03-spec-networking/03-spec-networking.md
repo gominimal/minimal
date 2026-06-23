@@ -242,7 +242,7 @@ DNS integration), new hostname manager module, host-side DNS configuration path
 **Functional Requirements:**
 
 - **R3.1**: `minimald` shall register a DNS hostname for each `OwnIp` PTask on
-  launch. The hostname format shall be `<session-name>.<host-id>.localhost`
+  launch. The hostname format shall be `<session-name>.<host-id>.min.internal`
   (where `<host-id>` is a stable short name for the `minimald` instance,
   configurable). The hostname shall resolve to the PTask's gvproxy switch IP
   from processes on the same host. The hostname shall be deregistered when the
@@ -252,12 +252,12 @@ DNS integration), new hostname manager module, host-side DNS configuration path
   to an IP address when connecting to a `minimald` (UC2c).
 - **R3.3**: A browser on the same host shall reach a webserver inside an `OwnIp`
   PTask by its hostname (R3.1) without memorizing an IP (UC2a). The DNS
-  resolution mechanism is `*.localhost` + a **host-side egress proxy** (Open
+  resolution mechanism is `*.min.internal` + a **host-side egress proxy** (Open
   Question 1, B5): resolution and routing both stay host-side. A client points
   `HTTP(S)_PROXY` (or a PAC file) at the proxy, which routes each request to the
   right PTask by its `Host:` header through an in-memory registry — a `HostNet`
   PTask to `127.0.0.1`, an `OwnIp` PTask to its gvproxy switch IP. The host
-  resolver is never consulted, so `*.localhost` is an opaque label the proxy maps
+  resolver is never consulted, so `*.min.internal` is an opaque label the proxy maps
   internally and the mechanism requires no systemd.
 - **R3.4**: DNS hostname registration and routing shall require no root privilege
   and no host-resolver configuration. On startup `minimald` shall perform a
@@ -273,7 +273,7 @@ DNS integration), new hostname manager module, host-side DNS configuration path
   hostname-registry key (per the hostname-manager architecture), which is
   mutable and reusable, so both are carried.
 - **R3.6**: `minimald` shall register a DNS hostname for each `HostNet` PTask
-  on launch, in the same format as R3.1 (`<session-name>.<host-id>.localhost`).
+  on launch, in the same format as R3.1 (`<session-name>.<host-id>.min.internal`).
   The hostname shall resolve to `127.0.0.1` for local-only `minimald`
   configurations, or to the host's configured network interface address for DM5
   (network-accessible) configurations. The hostname shall be deregistered when
@@ -288,10 +288,10 @@ DNS integration), new hostname manager module, host-side DNS configuration path
    proxy returns a gateway error rather than a stale route. No
    `getaddrinfo`/host-resolver dependency — the proxy contract is asserted
    directly — demonstrating the R3.1/R3.6 registration lifecycle.
-2. **CLI:** `curl http://<session-name>.<host-id>.localhost/` from the local host
+2. **CLI:** `curl http://<session-name>.<host-id>.min.internal/` from the local host
    returns HTTP 200 from a webserver running inside an own-IP PTask — demonstrates
    UC2a local browser access.
-3. **CLI:** `curl http://<session-name>.<host-id>.localhost:<port>/` from the
+3. **CLI:** `curl http://<session-name>.<host-id>.min.internal:<port>/` from the
    local host returns HTTP 200 from a webserver running inside a `HostNet` PTask
    (hostname resolves to `127.0.0.1`) — demonstrates UC2 hostname-driven access
    for host-net PTask services (R3.6).
@@ -362,7 +362,7 @@ management)
    network namespaces, WireGuard mesh configured, asserts that a TCP connect from
    a PTask on instance A to a PTask on instance B (via their switch IPs across the
    mesh tunnel) succeeds — demonstrates UC7 remote PTask-to-PTask.
-2. **CLI:** From a laptop in the mesh, `curl http://<session-name>.<host-id>.localhost/`
+2. **CLI:** From a laptop in the mesh, `curl http://<session-name>.<host-id>.min.internal/`
    returns HTTP 200 from a webserver in an own-IP PTask on a remote host, routed
    over the WireGuard tunnel — demonstrates UC2b option A remote mesh access.
 3. **CLI:** `minimal ssh-forward <session> 8080:127.0.0.1:80` with the WireGuard
@@ -401,10 +401,10 @@ PTask-to-PTask) path without additional bridging. The CPU overhead of a shared
 gvproxy is acceptable for a developer-workstation workload
 (informed by `docs/specs/03-spec-networking/networking-with-diagrams.md`).
 
-### DNS resolution: `*.localhost` + host-side egress proxy (decided)
+### DNS resolution: `*.min.internal` + host-side egress proxy (decided)
 
 R3.3 required a hostname-resolution mechanism. The networking spec's B5 model —
-**`*.localhost` + a host-side egress proxy** — settles it, keeping both
+**`*.min.internal` + a host-side egress proxy** — settles it, keeping both
 resolution and routing host-side. This re-scope (2026-06-23) supersedes spike
 #485's earlier systemd-resolved synthesis finding, which assumed a host resolver
 the sandbox (hakoniwa) and microVM (libkrun) runtimes do not have:
@@ -416,7 +416,7 @@ the sandbox (hakoniwa) and microVM (libkrun) runtimes do not have:
   PTask to `127.0.0.1`, an `OwnIp` PTask to its gvproxy switch IP through the
   switch relay.
 - The host resolver is **never consulted**: `minimald` writes nothing to it and
-  reads nothing from it. `*.localhost` (or any TLD) is an opaque label the proxy
+  reads nothing from it. `*.min.internal` (or any TLD) is an opaque label the proxy
   maps internally, so the no-systemd runtimes and the TLD choice are both
   irrelevant to correctness. `minimald` only performs a startup reachability
   check that the proxy listener can bind, warning with a remediation if it
@@ -477,7 +477,7 @@ access in restricted environments.
 ## Open Questions
 
 1. **DNS resolution mechanism** (R3.3, Unit 3): **Resolved (B5,
-   re-scoped 2026-06-23, superseding spike #485):** `*.localhost` + a
+   re-scoped 2026-06-23, superseding spike #485):** `*.min.internal` + a
    **host-side egress proxy**. Resolution and routing both stay host-side: the
    proxy routes by `Host:` header / `CONNECT` authority through an in-memory
    registry, and the host resolver is never consulted — so the mechanism needs

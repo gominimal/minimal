@@ -1,6 +1,6 @@
 //! The B5 host-side egress proxy and its shared routing core.
 //!
-//! Unit 3 (UC2a) resolves PTask `*.localhost` hostnames **host-side**: the host
+//! Unit 3 (UC2a) resolves PTask `*.min.internal` hostnames **host-side**: the host
 //! resolver is never consulted, so the no-systemd sandbox (hakoniwa) and microVM
 //! (libkrun) runtimes and the TLD choice are both irrelevant to correctness. A
 //! client points `HTTP(S)_PROXY` (or a PAC file) at this proxy, which routes
@@ -13,7 +13,7 @@
 //! [`Router`] is that routing core, factored so #502 (the B8 HTTPS/mTLS reverse
 //! proxy) extends it by terminating TLS in front of the same `Host:`-header →
 //! registry → target lookup rather than duplicating it. The host-side
-//! `*.localhost` decision supersedes spike #485's systemd-resolved finding
+//! `*.min.internal` decision supersedes spike #485's systemd-resolved finding
 //! (spec Open Question 1).
 
 use std::io;
@@ -27,7 +27,7 @@ use tokio::net::{TcpListener, TcpStream};
 use super::dns::HostnameRegistry;
 
 /// Default address the egress proxy listens on: loopback, where every
-/// `*.localhost` name is reachable. Clients reach it via `HTTP(S)_PROXY`.
+/// `*.min.internal` name is reachable. Clients reach it via `HTTP(S)_PROXY`.
 pub const DEFAULT_PROXY_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7654);
 
 /// Upstream port used when a routed authority carries no explicit `:port`.
@@ -143,7 +143,7 @@ pub async fn bind_listener(addr: SocketAddr) -> Option<TcpListener> {
                 %addr,
                 status = "unavailable",
                 error = %error,
-                remedy = "free the listen address; PTask *.localhost hostnames will not route until the egress proxy can bind",
+                remedy = "free the listen address; PTask *.min.internal hostnames will not route until the egress proxy can bind",
                 "host-side egress proxy could not bind its listener"
             );
             None
@@ -391,7 +391,7 @@ mod tests {
     async fn host_header_routes_through_proxy_then_not_found_after_deregister() {
         let backend_port = spawn_backend().await;
 
-        // `myservice.dev.localhost` → 127.0.0.1 (HostNet, R3.6); the client's
+        // `myservice.dev.min.internal` → 127.0.0.1 (HostNet, R3.6); the client's
         // `:port` selects the upstream port, so it reaches the backend.
         let shared = Arc::new(Shared(RwLock::new(HostnameRegistry::new("dev"))));
         shared
@@ -405,7 +405,7 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         tokio::spawn(serve(proxy, router));
 
-        let authority = format!("myservice.dev.localhost:{backend_port}");
+        let authority = format!("myservice.dev.min.internal:{backend_port}");
         let routed = proxy_get(proxy_addr, &authority).await;
         assert!(
             routed.contains("200 OK"),
@@ -434,16 +434,16 @@ mod tests {
         let router = Router::new(Arc::new(reg));
 
         assert_eq!(
-            router.route("web.dev.localhost:8080"),
+            router.route("web.dev.min.internal:8080"),
             Some(SocketAddr::new(switch_ip, 8080))
         );
         // Absent an explicit port the default upstream port is used.
         assert_eq!(
-            router.route("web.dev.localhost"),
+            router.route("web.dev.min.internal"),
             Some(SocketAddr::new(switch_ip, DEFAULT_UPSTREAM_PORT))
         );
         // An unregistered host does not route.
-        assert_eq!(router.route("ghost.dev.localhost"), None);
+        assert_eq!(router.route("ghost.dev.min.internal"), None);
     }
 
     /// Proof artifact 3 (R3.4 supersession): when the listen address cannot be
@@ -480,18 +480,18 @@ mod tests {
     /// carries it in the `Host:` header. Both parse to the same authority.
     #[test]
     fn parse_request_reads_connect_and_host_authorities() {
-        let connect = parse_request(b"CONNECT web.dev.localhost:443 HTTP/1.1\r\n\r\n").unwrap();
+        let connect = parse_request(b"CONNECT web.dev.min.internal:443 HTTP/1.1\r\n\r\n").unwrap();
         assert!(matches!(connect.kind, RequestKind::Connect));
-        assert_eq!(connect.authority, "web.dev.localhost:443");
+        assert_eq!(connect.authority, "web.dev.min.internal:443");
 
         let forward =
-            parse_request(b"GET / HTTP/1.1\r\nHost: web.dev.localhost:8080\r\n\r\n").unwrap();
+            parse_request(b"GET / HTTP/1.1\r\nHost: web.dev.min.internal:8080\r\n\r\n").unwrap();
         assert!(matches!(forward.kind, RequestKind::Forward));
-        assert_eq!(forward.authority, "web.dev.localhost:8080");
+        assert_eq!(forward.authority, "web.dev.min.internal:8080");
     }
 
     /// A forward request from an `HTTP_PROXY`-configured client carries an
-    /// absolute-form request target (`GET http://web.dev.localhost/path HTTP/1.1`).
+    /// absolute-form request target (`GET http://web.dev.min.internal/path HTTP/1.1`).
     /// The proxy routes it by `Host:` header and replays the buffered head
     /// verbatim, so the upstream receives the absolute-form request line
     /// unchanged — RFC 9112 requires an origin server to accept it. Complements
@@ -522,11 +522,11 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         tokio::spawn(serve(proxy, router));
 
-        let request_line = format!("GET http://web.dev.localhost:{backend_port}/path HTTP/1.1");
+        let request_line = format!("GET http://web.dev.min.internal:{backend_port}/path HTTP/1.1");
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         client
             .write_all(
-                format!("{request_line}\r\nHost: web.dev.localhost:{backend_port}\r\n\r\n")
+                format!("{request_line}\r\nHost: web.dev.min.internal:{backend_port}\r\n\r\n")
                     .as_bytes(),
             )
             .await

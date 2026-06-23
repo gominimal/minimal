@@ -313,7 +313,7 @@ async fn async_main() -> Result<(), MainError> {
         // standard path, listening on UDS socket
 
         // DM2 (native-Linux host): bind the B5 host-side egress proxy listener
-        // as a startup reachability check. PTask `*.localhost` hostnames (Unit 3)
+        // as a startup reachability check. PTask `*.min.internal` hostnames (Unit 3)
         // are resolved host-side and routed by `Host:` header through this proxy;
         // the host resolver is never consulted. A bind failure warns with a
         // remedy (this supersedes the former R3.4 systemd-resolved probe).
