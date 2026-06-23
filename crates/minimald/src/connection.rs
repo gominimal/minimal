@@ -7,9 +7,11 @@ use std::{
     collections::BTreeMap,
     fmt,
     sync::{Arc, LazyLock},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
+    net::TcpStream,
     sync::{Mutex, MutexGuard},
 };
 
@@ -444,5 +446,86 @@ impl russh::server::Handler for ConnectionHandler {
     async fn channel_close(&mut self, id: ChannelId, _: &mut Session) -> Result<(), Self::Error> {
         protocol_trace!("Got channel_close on channel {id}");
         self.0.0.lock().await.handle_channel_close(id)
+    }
+
+    /// SSH `LocalForward` / `direct-tcpip` handler (R4.9).
+    ///
+    /// When an authenticated client runs `ssh -L local:remote_host:remote_port`,
+    /// OpenSSH opens a `direct-tcpip` channel requesting a TCP connection from
+    /// the server side to `(host_to_connect, port_to_connect)`. This handler
+    /// accepts the request, connects to the target, and relays bytes
+    /// bidirectionally between the SSH channel and the upstream TCP connection.
+    ///
+    /// Only authenticated (local) connections may forward ports; unauthenticated
+    /// connections are rejected by returning `false`.
+    ///
+    /// The connection attempt times out after 10 seconds; a failure rejects the
+    /// channel so the SSH client receives a clean error rather than hanging.
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: RuChannel<Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        originator_address: &str,
+        originator_port: u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        protocol_trace!(
+            "Got channel_open_direct_tcpip: {host_to_connect}:{port_to_connect} \
+             from {originator_address}:{originator_port}"
+        );
+
+        if self.0.lock().await.auth != Auth::Local {
+            return Ok(false);
+        }
+
+        let host = host_to_connect.to_string();
+        let port = match u16::try_from(port_to_connect) {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!(port = port_to_connect, "direct-tcpip: port out of range");
+                return Ok(false);
+            }
+        };
+
+        // Connect to the target before accepting the channel. If the target is
+        // unreachable within the grace period, reject rather than leaving the
+        // client with an open-but-dead channel.
+        let upstream = match tokio::time::timeout(
+            Duration::from_secs(10),
+            TcpStream::connect((host.as_str(), port)),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    %host,
+                    port,
+                    %error,
+                    "direct-tcpip: could not connect to target"
+                );
+                return Ok(false);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    %host,
+                    port,
+                    "direct-tcpip: connection to target timed out"
+                );
+                return Ok(false);
+            }
+        };
+
+        // Relay bytes bidirectionally: SSH channel ↔ upstream TCP.
+        tokio::spawn(async move {
+            let mut stream = channel.into_stream();
+            let mut up = upstream;
+            if let Err(e) = tokio::io::copy_bidirectional(&mut stream, &mut up).await {
+                tracing::debug!(error = %e, "direct-tcpip relay ended with error");
+            }
+        });
+
+        Ok(true)
     }
 }

@@ -4,6 +4,11 @@ version = "0.0.1"
 edition.workspace = true
 publish.workspace = true
 
+[features]
+# Enables the B8 HTTPS reverse proxy with mTLS termination (R4.4–R4.7) in front
+# of the shared B5 routing core. Requires the rustls/rcgen/tokio-rustls deps.
+networking-proxy = ["dep:rcgen", "dep:rustls", "dep:tokio-rustls"]
+
 [dependencies]
 async-compression.workspace = true
 async-tar.workspace = true
@@ -44,6 +49,10 @@ paths.workspace = true
 sandbox2.workspace = true
 sessions.workspace = true
 stdlib.workspace = true
+
+rcgen = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
 
 # The guest (initramfs pid-1) boot path is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]

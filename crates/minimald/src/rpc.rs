@@ -1,10 +1,12 @@
 use minimald_rpc::{
     CreateSession, CreateSessionResponse, DestroySession, DestroySessionResponse, Errorable,
     GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest,
-    GetSessionRecordResponse, GetVersion, GetVersionResponse, ListSessions, ListSessionsEntry,
-    ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
-    RenameSessionResponse,
+    GetSessionRecordResponse, GetVersion, GetVersionResponse, IngressPolicy, IssueClientCert,
+    ListSessions, ListSessionsEntry, ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX,
+    RenameSession, RenameSessionResponse, SessionPolicy,
 };
+#[cfg(feature = "networking-proxy")]
+use minimald_rpc::{IssueClientCertRequest, IssueClientCertResponse};
 use russh::{
     Channel as RuChannel, ChannelId,
     server::{Msg, Session},
@@ -224,6 +226,32 @@ async fn serve_get_session_policy(s: ServerStateHandle, c: RuChannel<Msg>) {
     }
 }
 
+/// Signs a fresh client certificate for the `minimal login` flow and returns
+/// the cert DER, key DER, and CA cert DER so the client can authenticate to
+/// the HTTPS reverse proxy. Only compiled when the `networking-proxy` feature
+/// is enabled.
+#[cfg(feature = "networking-proxy")]
+async fn serve_issue_client_cert(s: ServerStateHandle, c: RuChannel<Msg>) {
+    let res = IssueClientCert
+        .handle_channel(c, async |req: IssueClientCertRequest| {
+            let ca = s.cert_authority().await;
+            match ca.sign_client_cert(&req.subject_cn) {
+                Ok((cert_pem, key_pem)) => Ok(Errorable::Ok(IssueClientCertResponse {
+                    cert_pem,
+                    key_pem,
+                    ca_cert_pem: ca.ca_cert_pem.clone(),
+                })),
+                Err(e) => Ok(Errorable::Err {
+                    error: e.to_string(),
+                }),
+            }
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", IssueClientCert::NAME, e);
+    }
+}
+
 pub(crate) const STREAM_WORKSPACE_FILES: &str =
     constcat::concat!(RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst");
 
@@ -299,7 +327,8 @@ pub async fn handle_ssh_rpc(
         | RenameSession::NAME
         | DestroySession::NAME
         | GetSessionPolicy::NAME
-        | STREAM_WORKSPACE_FILES => {
+        | STREAM_WORKSPACE_FILES
+        | IssueClientCert::NAME => {
             let mut conn_lock = c.lock().await;
             let c_hnd = match conn_lock.take(id) {
                 None => {
@@ -322,16 +351,47 @@ pub async fn handle_ssh_rpc(
         None => return Ok(()),
     };
 
-    // Handle the named RPC.
+    // Handle the named RPC (fire-and-forget; join handles are discarded).
     match name {
-        GetVersion::NAME => spawn(serve_get_version(channel)),
-        ListSessions::NAME => spawn(serve_list_sessions(s, channel)),
-        GetSessionRecord::NAME => spawn(serve_get_session_record(s, channel)),
-        CreateSession::NAME => spawn(serve_create_session(s, channel)),
-        RenameSession::NAME => spawn(serve_rename_session(s, channel)),
-        DestroySession::NAME => spawn(serve_destroy_session(s, channel)),
-        GetSessionPolicy::NAME => spawn(serve_get_session_policy(s, channel)),
-        STREAM_WORKSPACE_FILES => spawn(serve_stream_workspace_files(s, config, channel)),
+        GetVersion::NAME => {
+            spawn(serve_get_version(channel));
+        }
+        ListSessions::NAME => {
+            spawn(serve_list_sessions(s, channel));
+        }
+        GetSessionRecord::NAME => {
+            spawn(serve_get_session_record(s, channel));
+        }
+        CreateSession::NAME => {
+            spawn(serve_create_session(s, channel));
+        }
+        RenameSession::NAME => {
+            spawn(serve_rename_session(s, channel));
+        }
+        DestroySession::NAME => {
+            spawn(serve_destroy_session(s, channel));
+        }
+        GetSessionPolicy::NAME => {
+            spawn(serve_get_session_policy(s, channel));
+        }
+        STREAM_WORKSPACE_FILES => {
+            spawn(serve_stream_workspace_files(s, config, channel));
+        }
+        IssueClientCert::NAME => {
+            #[cfg(feature = "networking-proxy")]
+            {
+                spawn(serve_issue_client_cert(s, channel));
+            }
+            #[cfg(not(feature = "networking-proxy"))]
+            {
+                tracing::warn!(
+                    "IssueClientCert RPC called but the networking-proxy \
+                     feature is not enabled; dropping the request"
+                );
+                drop(s);
+                drop(channel);
+            }
+        }
         _ => unreachable!(),
     };
 
