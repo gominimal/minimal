@@ -531,7 +531,11 @@ impl GvproxySwitch {
     ///
     /// The IP is retired for this handle's lifetime so a later PTask never
     /// inherits a still-cached peer's address (R1.6 intent).
-    pub fn detach_ptask(&mut self, attachment: PtaskAttachment) {
+    ///
+    /// This is exactly equivalent to dropping the attachment; it touches no
+    /// switch state, so it takes `&self` and is callable through a shared
+    /// borrow.
+    pub fn detach_ptask(&self, attachment: PtaskAttachment) {
         drop(attachment);
     }
 
@@ -589,8 +593,9 @@ impl Drop for GvproxySwitch {
 ///
 /// This is an RAII handle: dropping it decrements the shared attached-PTask
 /// counter and, when the count reaches zero, delivers `SIGTERM` to the gvproxy
-/// switch so it tears down when the last own-IP PTask exits (R1.4). Call
-/// [`GvproxySwitch::detach_ptask`] to drop it explicitly with a log event.
+/// switch so it tears down when the last own-IP PTask exits (R1.4). Every drop
+/// path logs the detach; [`GvproxySwitch::detach_ptask`] is just a named way to
+/// drop it at a chosen point and is equivalent to an implicit scope-exit drop.
 #[derive(Debug)]
 pub struct PtaskAttachment {
     label: String,
@@ -618,6 +623,10 @@ pub struct PtaskAttachment {
 impl Drop for PtaskAttachment {
     fn drop(&mut self) {
         let prev = self.attached_count.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(
+            prev > 0,
+            "attached_count underflowed — PtaskAttachment dropped more times than it was attached",
+        );
         tracing::info!(
             ptask = %self.label,
             switch_ip = %self.switch_ip,
@@ -887,6 +896,16 @@ mod tests {
         assert!(matches!(
             SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 31),
             Err(SwitchSubnetError::InvalidPrefix(31))
+        ));
+    }
+
+    #[test]
+    fn subnet_new_rejects_prefix_32() {
+        // /32 has span=1, span-1=0; host(0) is the network address → None, so
+        // every host() call returns None — the pathology the validation guards.
+        assert!(matches!(
+            SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 32),
+            Err(SwitchSubnetError::InvalidPrefix(32))
         ));
     }
 
