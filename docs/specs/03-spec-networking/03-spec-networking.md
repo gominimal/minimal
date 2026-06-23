@@ -251,17 +251,21 @@ DNS integration), new hostname manager module, host-side DNS configuration path
   a configured DNS hostname. The `minimal` CLI shall accept a hostname in addition
   to an IP address when connecting to a `minimald` (UC2c).
 - **R3.3**: A browser on the same host shall reach a webserver inside an `OwnIp`
-  PTask by its hostname (R3.1) without memorizing an IP (UC2a). The request
-  routes through the gvproxy published port on `127.0.0.1`. The DNS resolution
-  mechanism is `*.localhost` + a host-side proxy (Open Question 1, resolved by
-  spike #485): the system resolver synthesizes every `*.localhost` name to
-  loopback statically, and the host-side proxy routes each request to the right
-  PTask by its `Host:` header.
-- **R3.4**: DNS hostname registration shall require no root privilege per-invocation.
-  If the mechanism requires a one-time install step (e.g. a system resolver
-  configuration), `minimald` shall detect whether the step has been performed and
-  emit a `tracing::warn!` with a human-readable remediation instruction when the
-  setup is incomplete.
+  PTask by its hostname (R3.1) without memorizing an IP (UC2a). The DNS
+  resolution mechanism is `*.localhost` + a **host-side egress proxy** (Open
+  Question 1, B5): resolution and routing both stay host-side. A client points
+  `HTTP(S)_PROXY` (or a PAC file) at the proxy, which routes each request to the
+  right PTask by its `Host:` header through an in-memory registry — a `HostNet`
+  PTask to `127.0.0.1`, an `OwnIp` PTask to its gvproxy switch IP. The host
+  resolver is never consulted, so `*.localhost` is an opaque label the proxy maps
+  internally and the mechanism requires no systemd.
+- **R3.4**: DNS hostname registration and routing shall require no root privilege
+  and no host-resolver configuration. On startup `minimald` shall perform a
+  reachability check on the egress-proxy listener and emit a `tracing::warn!`
+  (`component = "dns-proxy"`, `status = "unavailable"`) with a human-readable
+  remediation when the listener cannot bind. (This supersedes the former
+  systemd-resolved synthesis probe; the no-systemd sandbox and microVM runtimes
+  never required it.)
 - **R3.5**: All hostname registration and deregistration events shall emit a
   structured `tracing` event with fields: `session_id`, `session_name`,
   `hostname`, `ip`, `action` (`registered` / `deregistered`). `session_id` is
@@ -278,10 +282,12 @@ DNS integration), new hostname manager module, host-side DNS configuration path
 
 **Proof Artifacts:**
 
-1. **Test:** Integration test starts an `OwnIp` PTask, resolves its hostname
-   via the system resolver (`getaddrinfo`), asserts it resolves to the expected
-   gvproxy switch IP, then confirms the hostname no longer resolves after the
-   PTask exits — demonstrates R3.1 registration lifecycle.
+1. **Test:** Registry/proxy routing contract. Register a PTask hostname, drive a
+   request bearing its `Host:` header through the host-side egress proxy, and
+   assert it routes to the registered target; after the PTask exits, assert the
+   proxy returns a gateway error rather than a stale route. No
+   `getaddrinfo`/host-resolver dependency — the proxy contract is asserted
+   directly — demonstrating the R3.1/R3.6 registration lifecycle.
 2. **CLI:** `curl http://<session-name>.<host-id>.localhost/` from the local host
    returns HTTP 200 from a webserver running inside an own-IP PTask — demonstrates
    UC2a local browser access.
@@ -395,27 +401,34 @@ PTask-to-PTask) path without additional bridging. The CPU overhead of a shared
 gvproxy is acceptable for a developer-workstation workload
 (informed by `docs/specs/03-spec-networking/networking-with-diagrams.md`).
 
-### DNS resolution: `*.localhost` + host-side proxy (decided)
+### DNS resolution: `*.localhost` + host-side egress proxy (decided)
 
-R3.3 required a hostname-resolution mechanism. Spike #485 settled it in favour
-of **`*.localhost` + a host-side proxy** over the one-time
-`/etc/resolver`/resolver-config alternative, because it needs no privileged
-write per session and no documented install step beyond an active system
-resolver:
+R3.3 required a hostname-resolution mechanism. The networking spec's B5 model —
+**`*.localhost` + a host-side egress proxy** — settles it, keeping both
+resolution and routing host-side. This re-scope (2026-06-23) supersedes spike
+#485's earlier systemd-resolved synthesis finding, which assumed a host resolver
+the sandbox (hakoniwa) and microVM (libkrun) runtimes do not have:
 
-- The system resolver synthesizes every `*.localhost` name to a loopback
-  address statically (guaranteed on macOS; provided by systemd-resolved or
-  NetworkManager on Linux). `minimald` writes nothing to the resolver per
-  session; it only probes at startup that the synthesis is available and warns
-  with a remediation if it is not (R3.4).
-- Because that synthesis is static and identical for every name, the DNS layer
-  cannot distinguish PTasks. A host-side proxy is the discriminator: it routes
-  each incoming request to the right PTask by its `Host:` header, consulting an
-  in-memory hostname registry `minimald` maintains.
+- The host-side egress proxy is the single discriminator. A client points
+  `HTTP(S)_PROXY` (or a PAC file) at it — the zero-root cross-platform path — and
+  the proxy routes each request to the right PTask by its `Host:` header,
+  consulting an in-memory hostname registry `minimald` maintains: a `HostNet`
+  PTask to `127.0.0.1`, an `OwnIp` PTask to its gvproxy switch IP through the
+  switch relay.
+- The host resolver is **never consulted**: `minimald` writes nothing to it and
+  reads nothing from it. `*.localhost` (or any TLD) is an opaque label the proxy
+  maps internally, so the no-systemd runtimes and the TLD choice are both
+  irrelevant to correctness. `minimald` only performs a startup reachability
+  check that the proxy listener can bind, warning with a remediation if it
+  cannot (R3.4).
+- The same `Host:`-header → registry → target routing core is the foundation
+  #502 (the B8 minimald HTTPS/mTLS reverse proxy) extends by terminating TLS in
+  front of it.
 
 The rejected alternative — a one-time `/etc/resolver` (macOS) or resolver
 config (Linux) — has a simpler per-session path but requires a documented
-privileged setup step, which conflicts with the rootless goal.
+privileged setup step, which conflicts with the rootless goal; it remains the
+macOS root-write fallback, not the default.
 
 ### WireGuard implementation: wireguard-go vs boringtun
 
@@ -463,12 +476,17 @@ access in restricted environments.
 
 ## Open Questions
 
-1. **DNS resolution mechanism** (R3.3, Unit 3): **Resolved (spike #485):**
-   `*.localhost` + host-side proxy, over one-time
-   `/etc/resolver`/resolver-config registration. The `*.localhost` path is fully
-   rootless; it requires only that the system resolver synthesize wildcard
-   localhost patterns, which `minimald` probes at startup and warns about if
-   absent (R3.4). See the "DNS resolution" design consideration above.
+1. **DNS resolution mechanism** (R3.3, Unit 3): **Resolved (B5,
+   re-scoped 2026-06-23, superseding spike #485):** `*.localhost` + a
+   **host-side egress proxy**. Resolution and routing both stay host-side: the
+   proxy routes by `Host:` header / `CONNECT` authority through an in-memory
+   registry, and the host resolver is never consulted — so the mechanism needs
+   no systemd (the sandbox and microVM runtimes have none) and the TLD is an
+   opaque label. Clients reach the proxy via `HTTP(S)_PROXY`/PAC, the zero-root
+   cross-platform path; `/etc/resolver` (macOS root write) remains the rejected
+   fallback. `minimald` performs a startup egress-proxy reachability check and
+   warns if the listener cannot bind (R3.4). See the "DNS resolution" design
+   consideration above.
 2. **Egress default policy** (R2.1): The spec defaults absent `egress` to
    allow-all. Confirm with SecOps whether a deny-all default is required for
    compliance; changing the default is a breaking change to existing PTask

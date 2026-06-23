@@ -1,28 +1,30 @@
-//! In-memory PTask hostname registry and a startup probe for the system
-//! resolver: the DNS half of Unit 3 (UC2a) on the native-Linux (DM2) path.
+//! In-memory PTask hostname registry: the host-side routing table for the B5
+//! egress proxy (Unit 3, UC2a) on the native-Linux (DM2) path.
 //!
-//! ## `*.localhost` + host-side proxy
+//! ## `*.localhost` + host-side egress proxy
 //!
-//! Open Question 1 of the networking spec is settled (spike #485): a PTask
-//! hostname takes the form `<session>.<host-id>.localhost`. Every `*.localhost`
-//! name is synthesized to a loopback address *statically* by the system
-//! resolver (systemd-resolved on Linux, built in on macOS), with no privileged
-//! per-session resolver write — the mechanism is fully rootless (R3.4). Because
-//! that synthesis is static and lifecycle independent, the DNS layer cannot tell
-//! one PTask from another; the discriminator is a host-side proxy that routes an
-//! incoming request to the right PTask by its `Host:` header. This registry is
-//! the lookup table that proxy consults — [`HostnameRegistry::resolve`] is the
-//! routing decision for a `Host:` header. The HTTP reverse-proxy front end that
-//! drives it (the rest of UC2a) is tracked separately and is not part of this
-//! module.
+//! Open Question 1 of the networking spec is settled in favour of the spec's B5
+//! model (re-scoped 2026-06-23, superseding spike #485's systemd-resolved
+//! finding): a PTask hostname takes the form `<session>.<host-id>.localhost`,
+//! and both resolution and routing stay **host-side**. The host resolver is
+//! never consulted and `minimald` writes nothing to it — `*.localhost` (the TLD
+//! is an opaque label) is mapped internally by the host-side egress proxy
+//! ([`super::proxy`]), which routes each incoming request to the right PTask by
+//! its `Host:` header. This registry is the lookup table that proxy consults —
+//! [`HostnameRegistry::resolve`] is the routing decision for a `Host:` header.
+//! Because resolution is host-side, the no-systemd sandbox (hakoniwa) and
+//! microVM (libkrun) runtimes never resolve anything, and the TLD choice is
+//! irrelevant to correctness.
 //!
-//! `HostNet` PTasks register to `127.0.0.1` (R3.6). `OwnIp` registration to the
-//! gvproxy switch IP is deferred to #542 (the switch is not yet wired into the
-//! live `minimald` session path); [`HostnameRegistry::register`] already takes
-//! the target address, so that work is a caller change, not a registry change.
+//! `HostNet` PTasks register to `127.0.0.1` (R3.6); `OwnIp` PTasks register to
+//! their gvproxy switch IP (R3.1), which the proxy reaches through the switch
+//! relay. [`HostnameRegistry::register`] takes the target address, so both modes
+//! are the same registry call with a different target.
 //!
-//! Covers R3.4 (resolver probe), R3.5 (structured register/deregister tracing),
-//! and R3.6 (`HostNet` registration).
+//! Covers R3.5 (structured register/deregister tracing) and R3.6 (`HostNet`
+//! registration). The former systemd-resolved startup probe (R3.4) is removed by
+//! the re-scope; an egress-proxy reachability check
+//! ([`super::proxy::bind_listener`]) replaces it.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -36,10 +38,6 @@ pub const LOCALHOST_SUFFIX: &str = "localhost";
 /// Default `<host-id>`: a stable short name for this `minimald` instance. The
 /// host-id is configurable; this is the value used when none is configured.
 pub const DEFAULT_HOST_ID: &str = "local";
-
-/// The sentinel name the startup probe resolves to detect `*.localhost`
-/// synthesis (R3.4). Never registered; only ever looked up.
-pub const PROBE_HOSTNAME: &str = "minimald-probe.localhost";
 
 /// The loopback address a local-only (non-DM5) PTask hostname routes to (R3.6).
 const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -183,8 +181,9 @@ impl HostnameRegistry {
 /// form (`[::1]:8080`), where the port follows the closing bracket rather than
 /// the first colon. The registry only ever holds `*.localhost` names, so an
 /// IPv6 literal never routes; parsing it correctly keeps a naive split-on-first-
-/// colon from silently truncating `[::1]` to `[`.
-fn host_component(host_header: &str) -> &str {
+/// colon from silently truncating `[::1]` to `[`. Shared with [`super::proxy`],
+/// which splits the same authority into host and port.
+pub(crate) fn host_component(host_header: &str) -> &str {
     if host_header.starts_with('[') {
         // IPv6 literal: the host is everything up to and including the closing
         // bracket; any `:port` follows it.
@@ -197,91 +196,9 @@ fn host_component(host_header: &str) -> &str {
     }
 }
 
-/// The result of probing the system resolver for `*.localhost` synthesis (R3.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ProbeOutcome {
-    /// `*.localhost` resolves to loopback; PTask hostnames will resolve.
-    Active,
-    /// `*.localhost` does not resolve; a remediation warning has been emitted.
-    Inactive,
-}
-
-/// Resolves a hostname through the operating system resolver (`getaddrinfo`),
-/// returning the addresses it yields. An NXDOMAIN/lookup failure surfaces as an
-/// `Err`. Suitable as the `resolve` argument to [`probe_resolver`] in
-/// production.
-///
-/// # Errors
-///
-/// Propagates the resolver error (including NXDOMAIN) verbatim.
-pub fn system_resolver(hostname: &str) -> std::io::Result<Vec<IpAddr>> {
-    use std::net::ToSocketAddrs;
-    Ok((hostname, 0u16)
-        .to_socket_addrs()?
-        .map(|s| s.ip())
-        .collect())
-}
-
-/// Probes whether the system resolver synthesizes `*.localhost` to loopback,
-/// emitting a `tracing::warn!` with a human-readable remediation when it does
-/// not (R3.4). `resolve` performs the lookup; injecting it keeps the probe
-/// testable without depending on the host's resolver configuration.
-pub fn probe_resolver<F>(resolve: F) -> ProbeOutcome
-where
-    F: FnOnce(&str) -> std::io::Result<Vec<IpAddr>>,
-{
-    match resolve(PROBE_HOSTNAME) {
-        Ok(addrs) if addrs.iter().any(|a| a.is_loopback()) => ProbeOutcome::Active,
-        // Either the name did not resolve (NXDOMAIN) or it resolved to a
-        // non-loopback address — in both cases `*.localhost` synthesis is not in
-        // effect, so PTask hostnames will not resolve until it is enabled.
-        Ok(_) | Err(_) => {
-            tracing::warn!(
-                resolver = "systemd-resolved",
-                status = "inactive",
-                remedy = "systemctl enable --now systemd-resolved",
-                probe = PROBE_HOSTNAME,
-                "system resolver does not synthesize *.localhost; PTask hostnames will not resolve until it is enabled"
-            );
-            ProbeOutcome::Inactive
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-    use tracing_subscriber::fmt::MakeWriter;
-
-    /// A `MakeWriter` that accumulates everything written into a shared buffer,
-    /// so a test can assert on the structured fields a `tracing` event emitted.
-    #[derive(Clone, Default)]
-    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl CaptureWriter {
-        fn contents(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-        }
-    }
-
-    impl std::io::Write for CaptureWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> MakeWriter<'a> for CaptureWriter {
-        type Writer = CaptureWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
 
     /// Proof artifact 1 (registry/proxy contract): registering a `HostNet`
     /// PTask makes the host-side proxy route its `Host:` header to `127.0.0.1`;
@@ -331,41 +248,5 @@ mod tests {
     fn deregister_unknown_session_is_a_noop() {
         let mut reg = HostnameRegistry::new("dev");
         assert_eq!(reg.deregister("ghost"), None);
-    }
-
-    /// Proof artifact 2 (R3.4): when the resolver returns NXDOMAIN for the
-    /// probe name, startup emits a `tracing::warn!` carrying the
-    /// `resolver = "systemd-resolved"` and `status = "inactive"` structured
-    /// fields, and the probe reports the resolver inactive.
-    #[test]
-    fn probe_warns_when_resolver_returns_nxdomain() {
-        let buf = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-
-        let outcome = tracing::subscriber::with_default(subscriber, || {
-            probe_resolver(|_name| Err(std::io::Error::from(std::io::ErrorKind::NotFound)))
-        });
-
-        assert_eq!(outcome, ProbeOutcome::Inactive);
-        let logged = buf.contents();
-        assert!(
-            logged.contains(r#"resolver="systemd-resolved""#),
-            "expected the resolver field, got: {logged}"
-        );
-        assert!(
-            logged.contains(r#"status="inactive""#),
-            "expected the inactive status field, got: {logged}"
-        );
-    }
-
-    /// When `*.localhost` synthesizes to loopback the probe reports the resolver
-    /// active and emits no warning.
-    #[test]
-    fn probe_is_active_when_localhost_synthesizes_to_loopback() {
-        let outcome = probe_resolver(|_name| Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]));
-        assert_eq!(outcome, ProbeOutcome::Active);
     }
 }

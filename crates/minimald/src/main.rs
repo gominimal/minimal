@@ -312,15 +312,12 @@ async fn async_main() -> Result<(), MainError> {
     if !cli.listen_args().unwrap().vsock {
         // standard path, listening on UDS socket
 
-        // DM2 (native-Linux host): probe that the system resolver synthesizes
-        // `*.localhost` so PTask hostnames (Unit 3) resolve. Registration is
-        // rootless under the `*.localhost` model (spike #485), so this is a
-        // detection-only probe that warns with a remedy if it is unavailable
-        // (R3.4). Run off the async worker since `getaddrinfo` is blocking.
-        let _ = tokio::task::spawn_blocking(|| {
-            minimald::net::dns::probe_resolver(minimald::net::dns::system_resolver)
-        })
-        .await;
+        // DM2 (native-Linux host): bind the B5 host-side egress proxy listener
+        // as a startup reachability check. PTask `*.localhost` hostnames (Unit 3)
+        // are resolved host-side and routed by `Host:` header through this proxy;
+        // the host resolver is never consulted. A bind failure warns with a
+        // remedy (this supersedes the former R3.4 systemd-resolved probe).
+        let _ = minimald::net::proxy::bind_listener(minimald::net::proxy::DEFAULT_PROXY_ADDR).await;
 
         if let Err(e) = std::fs::remove_file(cli.listen_on())
             && e.kind() != std::io::ErrorKind::NotFound

@@ -17,6 +17,7 @@
 //! reuse), and R1.8 (structured tracing for every switch lifecycle event).
 
 pub mod dns;
+pub mod proxy;
 pub mod switch;
 
 use std::fmt;
