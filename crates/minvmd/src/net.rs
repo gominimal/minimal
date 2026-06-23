@@ -103,7 +103,7 @@ impl SwitchSubnet {
     }
 
     /// The host-alias address gvproxy NATs to the host loopback so a PTask can
-    /// reach host services (the second-from-last usable address). `None` for a
+    /// reach host services (the last usable address). `None` for a
     /// subnet too small to carry one.
     #[must_use]
     pub fn host_alias(&self) -> Option<Ipv4Addr> {
@@ -397,6 +397,11 @@ impl GvproxySwitch {
     /// that only need an address (e.g. seeding the `-config` lease table).
     fn allocate_ip(&mut self) -> Option<(Ipv4Addr, MacAddr)> {
         let switch_ip = self.subnet.host(self.next_index)?;
+        // Never hand out the NAT host-alias address (gvproxy maps it to the host
+        // loopback); reserving it keeps the "never allocated" invariant true.
+        if Some(switch_ip) == self.subnet.host_alias() {
+            return None;
+        }
         self.next_index += 1;
         Some((switch_ip, MacAddr::for_switch_ip(switch_ip)))
     }
