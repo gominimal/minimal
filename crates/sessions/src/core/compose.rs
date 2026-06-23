@@ -57,21 +57,241 @@ pub enum Error {
     },
 }
 
-/// Conflicts surfaced by [`Contribution::merge`].
+/// Conflicts surfaced when two contributions disagree on a value.
 ///
-/// Empty today (the merge logic just appends), reserved for the
-/// upcoming conflict-detection rules (e.g. two contributors setting
-/// the same variable to different values).
+/// A `Conflict` is *always* fatal today: composition cannot proceed
+/// when contributors disagree on what a single var should resolve to
+/// or where a single patch should come from. The escape hatch is the
+/// user's policy ignore list, which (when it matches) drops the
+/// offending items during the gate; conflict detection runs
+/// *post-gate* on the survivors, so ignored items never reach the
+/// comparison.
+///
+/// Packages and lifecycle hooks have no conflict variants: packages
+/// dedupe (set semantics, no value to disagree on) and hooks
+/// concatenate (both run, in declaration order).
 #[non_exhaustive]
-#[derive(Debug, thiserror::Error)]
-pub enum Conflict {}
+#[derive(Debug)]
+pub enum Conflict {
+    /// Two or more contributors set the same variable name to
+    /// different resolved values.
+    VarValueMismatch {
+        /// The variable name in question.
+        name: String,
+        /// Every contributor under this name, paired with the value
+        /// they wanted. Always at least two entries; same-value
+        /// duplicates are included so the user sees the full
+        /// picture, even though they're not what caused the conflict.
+        disagreeing_values: Vec<(Source, String)>,
+    },
+    /// Two or more contributors set the same patch destination to
+    /// different sources.
+    PatchSourceMismatch {
+        /// The destination (sandbox-relative) that contributors
+        /// disagreed on.
+        dest: paths::SandboxRelPath,
+        /// Every contributor under this destination, paired with the
+        /// source they declared.
+        ///
+        /// The `String` is the contributor's declared source: the
+        /// raw glob pattern pre-gate (which may still contain `~`
+        /// or `$VAR`), or the resolved absolute `host_path`
+        /// post-gate. Either way it identifies the input file the
+        /// contributor wanted copied.
+        disagreeing_sources: Vec<(Source, String)>,
+    },
+}
+
+impl fmt::Display for Conflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::VarValueMismatch {
+                name,
+                disagreeing_values,
+            } => {
+                write!(f, "variable `{name}` set to conflicting values:")?;
+                for (source, value) in disagreeing_values {
+                    write!(f, "\n  - {value:?} (from {source})")?;
+                }
+                // No "set it in your loadout to override" hint:
+                // merge has no override semantics — adding another
+                // loadout value just adds another disagreeing
+                // contributor. Dropping all of them via the ignore
+                // list is the only working escape today.
+                write!(
+                    f,
+                    "\nhint: add `{name}` to your policy's ignore list \
+                     to drop all of these contributors"
+                )
+            }
+            Self::PatchSourceMismatch {
+                dest,
+                disagreeing_sources,
+            } => {
+                write!(f, "patch destination `{dest}` has conflicting sources:")?;
+                for (source, src) in disagreeing_sources {
+                    write!(f, "\n  - {src:?} (from {source})")?;
+                }
+                // PatchPolicy matches against *source* paths, not
+                // destinations — the hint must steer the user to a
+                // pattern that matches the sources shown above, not
+                // the destination.
+                write!(
+                    f,
+                    "\nhint: add a pattern matching the conflicting source path(s) \
+                     above to your patch policy's ignore list to drop both, \
+                     or remove one of the contributors"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for Conflict {}
+
+// =====================================================================
+// Merge-time conflict detection helpers
+// =====================================================================
+//
+// These three small fns are the *only* place per-domain merge rules
+// live. Both [`compose_contribution`] (post-gate, per-side) and
+// [`Composition::extend_from_wire`] (post-gate cross-process) call
+// them on already-gated items. [`Contribution::merge`] does not
+// invoke them — running the checks pre-gate would fire before the
+// user's `ignore` policy could drop offending contributors. The
+// closure-driven extractors let one body serve every item type that
+// impls [`Provenanced`] — `ProvenancedVar` / `SessionVar` for vars,
+// `ProvenancedPatch` / `SessionPatch` for patches.
+//
+// O(n²) worst case, but allocates only on the conflict path: the
+// hot path is "no conflicts" and walks without building any
+// intermediate map. For the small batches typical here (≪100 items),
+// quadratic is cheaper than a `HashMap` allocation.
+
+/// Scan `items` for two entries that share a var name but disagree
+/// on the resolved value. The first such name found short-circuits
+/// the scan and emits a [`Conflict::VarValueMismatch`] listing every
+/// contribution under that name — including any agreeing duplicates,
+/// so the message shows the full picture.
+///
+/// Returns `Ok(())` when every name has at most one distinct value
+/// (duplicate same-value entries are not conflicts).
+///
+/// Taking an `IntoIterator` (rather than `&[T]`) lets callers feed
+/// a chained iterator over two separate sources without first
+/// allocating the union — important for atomic merges where the
+/// helper runs *before* either side has been mutated.
+fn check_var_mismatches<'a, T: Provenanced + 'a>(
+    items: impl IntoIterator<Item = &'a T>,
+    name: impl Fn(&T) -> &str,
+    value: impl Fn(&T) -> &str,
+) -> Result<(), Conflict> {
+    group_by_key(items, &name)
+        .into_iter()
+        .find_map(|(n, group)| disagreement(&group, &value).then_some((n, group)))
+        .map(|(n, group)| Conflict::VarValueMismatch {
+            name: n.to_owned(),
+            disagreeing_values: collect_contributions(group, &value),
+        })
+        .map_or(Ok(()), Err)
+}
+
+/// Patch counterpart to [`check_var_mismatches`]. `dest` is the
+/// conflict key; `pattern` is the source-side representation that
+/// disagreement is checked against — the raw source pattern pre-gate,
+/// the resolved host path post-gate. Either way it stringifies into
+/// the [`Conflict::PatchSourceMismatch`] message.
+fn check_patch_mismatches<'a, T: Provenanced + 'a>(
+    items: impl IntoIterator<Item = &'a T>,
+    dest: impl Fn(&T) -> &paths::SandboxRelPath,
+    pattern: impl Fn(&T) -> &str,
+) -> Result<(), Conflict> {
+    group_by_key(items, &dest)
+        .into_iter()
+        .find_map(|(d, group)| disagreement(&group, &pattern).then_some((d, group)))
+        .map(|(d, group)| Conflict::PatchSourceMismatch {
+            dest: d.clone(),
+            disagreeing_sources: collect_contributions(group, &pattern),
+        })
+        .map_or(Ok(()), Err)
+}
+
+/// Bucket `items` by `key`, preserving the order in which keys are
+/// first encountered. `O(n × distinct-keys)` — fine for the small
+/// batches typical here, and avoids the determinism / dependency
+/// cost of a `HashMap`.
+fn group_by_key<'a, T: 'a, K: PartialEq>(
+    items: impl IntoIterator<Item = &'a T>,
+    key: impl Fn(&'a T) -> K,
+) -> Vec<(K, Vec<&'a T>)> {
+    items.into_iter().fold(Vec::new(), |mut acc, item| {
+        let k = key(item);
+        match acc.iter_mut().find(|(g, _)| *g == k) {
+            Some((_, bucket)) => bucket.push(item),
+            None => acc.push((k, vec![item])),
+        }
+        acc
+    })
+}
+
+/// True when the items in `group` aren't unanimous on what
+/// `extract` returns. Compares every item against the first; bails
+/// on the first mismatch. An empty group is vacuously unanimous,
+/// so this avoids any precondition on `group_by_key`'s output shape.
+fn disagreement<T>(group: &[&T], extract: impl Fn(&T) -> &str) -> bool {
+    let mut it = group.iter();
+    let Some(first) = it.next().map(|x| extract(x)) else {
+        return false;
+    };
+    it.any(|x| extract(x) != first)
+}
+
+/// Render every item in `group` as a `(Source, owned-value)` pair
+/// for embedding in a `Conflict`'s `contributions` field.
+fn collect_contributions<T: Provenanced>(
+    group: Vec<&T>,
+    extract: impl Fn(&T) -> &str,
+) -> Vec<(Source, String)> {
+    group
+        .into_iter()
+        .map(|x| (x.source().clone(), extract(x).to_owned()))
+        .collect()
+}
+
+/// Stable in-place dedupe by string key — first occurrence wins,
+/// later duplicates are dropped. Used for packages, whose set
+/// semantics mean two contributors asking for the same package is
+/// not a conflict (there's no value to disagree on).
+///
+/// Not used for vars or patches: same-key same-value duplicates are
+/// harmless and kept (matches the prior "pure aggregation" behavior
+/// on the no-disagreement path).
+fn dedupe_by_name<T>(items: &mut Vec<T>, name: impl Fn(&T) -> &str) {
+    // PERF: `seen` is `Vec<String>` (one allocation per unique key)
+    // rather than `Vec<&str>` borrowing from `items`. The borrow-tied
+    // shape fights `retain`'s `FnMut` requirements — its closure can't
+    // hold a borrow of `items` while `retain` itself owns one. The
+    // owned approach is the simplest version that compiles; for the
+    // small package sets we dedupe over (typically ≤ ~20), the
+    // allocation cost is irrelevant.
+    let mut seen: Vec<String> = Vec::new();
+    items.retain(|item| {
+        let n = name(item);
+        if seen.iter().any(|s| s == n) {
+            false
+        } else {
+            seen.push(n.to_owned());
+            true
+        }
+    });
+}
 
 /// A single source's contribution to a session, materialized as a
 /// concrete value rather than streamed into a composer.
 ///
 /// Returned by [`Composable::contribute`]. A composer accumulates
 /// these into one bucket via [`Self::merge`] before the gate runs.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Contribution {
     pub(crate) vars: Vec<ProvenancedVar>,
     pub(crate) patches: Vec<ProvenancedPatch>,
@@ -106,26 +326,34 @@ impl Contribution {
         self.lifecycle_hooks.push(h);
     }
 
-    /// Merge two contributions into one. Used by composers to
+    /// Merge `other` into `self` in place. Used by composers to
     /// accumulate per-source contributions into one bucket.
+    ///
+    /// Pure aggregation: concatenates vars/patches/hooks and dedupes
+    /// packages. Disagreement *between* contributors (same var, two
+    /// values; same patch dest, two sources) is **not** detected
+    /// here — it would fire before the policy gate runs, making the
+    /// user's `ignore` rule incapable of dropping the offending
+    /// items. Conflict detection happens post-gate in
+    /// [`compose_contribution`] so ignored items are filtered out
+    /// first; only post-gate survivors get compared.
     ///
     /// # Errors
     ///
-    /// Returns [`Conflict`] when the upcoming merge rules detect that
-    /// the two contributions disagree on an item (e.g. the same
-    /// variable set to different values). Today the merge is pure
-    /// concatenation, so the result is always `Ok` — the `Result`
-    /// shape is reserved for those rules.
+    /// `Result` shape preserved as a placeholder: a future
+    /// interactive resolution hook could legitimately fail here.
+    /// Today the body is infallible.
     #[allow(
         clippy::unnecessary_wraps,
-        reason = "Conflict variants will land; the Result shape is the API contract"
+        reason = "Result shape reserved for future interactive resolution"
     )]
-    pub(crate) fn merge(mut self, other: Contribution) -> Result<Self, Conflict> {
+    pub(crate) fn merge(&mut self, other: Contribution) -> Result<(), Conflict> {
         self.vars.extend(other.vars);
         self.patches.extend(other.patches);
         self.packages.extend(other.packages);
+        dedupe_by_name(&mut self.packages, ProvenancedPackage::package);
         self.lifecycle_hooks.extend(other.lifecycle_hooks);
-        Ok(self)
+        Ok(())
     }
 
     /// All vars contributed so far.
@@ -274,6 +502,19 @@ pub enum ComposeError {
         /// The underlying env-lookup failure.
         #[source]
         source: std::env::VarError,
+    },
+    /// Two contributors disagreed on a var value or patch source.
+    /// Surfaces from the post-gate checks in
+    /// [`compose_contribution`] (each side's own composition) and
+    /// from the cross-process merge in
+    /// [`Composition::extend_from_wire`].
+    /// [`Contribution::merge`] is pure aggregation and never
+    /// produces this variant.
+    #[error("contribution merge conflict: {source}")]
+    Conflict {
+        #[from]
+        #[source]
+        source: Conflict,
     },
 }
 
@@ -642,23 +883,33 @@ impl Composition {
     }
 
     /// Append an already-gated wire contribution. The wire form has
-    /// passed the user's policy on the client; items land verbatim.
+    /// passed the user's policy on the client; items land verbatim
+    /// **unless** they conflict with what's already in `self`.
     ///
-    /// Atomic: if any item fails to convert, `self` is left unchanged
-    /// and the error is returned.
+    /// Atomic: all fallible conversions and all conflict checks run
+    /// *before* any mutation. On `Err` (either a malformed wire item
+    /// or a `Conflict`), `self` is untouched.
+    ///
+    /// Per-domain rules at this cross-process merge: vars and
+    /// patches error on mismatched values / sources (same name +
+    /// same value or same dest + same source is harmless and both
+    /// kept); packages deduplicate by name; lifecycle hooks
+    /// concatenate.
     ///
     /// # Errors
     ///
-    /// Surfaces [`ComposeError::InvalidWireItem`] if converting a
-    /// contributed lifecycle hook hits the empty-hook case the domain
-    /// type rejects.
+    /// - [`ComposeError::InvalidWireItem`] if a wire lifecycle hook
+    ///   has no callbacks.
+    /// - [`ComposeError::Conflict`] if a wire var or patch disagrees
+    ///   with one already in `self`.
     pub(crate) fn extend_from_wire(
         &mut self,
         wire: crate::wire::request::WireContribution,
     ) -> Result<(), ComposeError> {
-        // Convert the fallible items up front so a failure on any one
-        // leaves `self` untouched.
-        let domain_hooks = wire
+        // Convert every fallible incoming item up front, into locals,
+        // before any mutation of `self`. A failure here leaves
+        // `self` untouched.
+        let incoming_hooks = wire
             .lifecycle_hooks
             .into_iter()
             .map(|wire_hook| {
@@ -670,14 +921,35 @@ impl Composition {
                     })
             })
             .collect::<Result<Vec<ProvenancedHook>, _>>()?;
+        let incoming_vars: Vec<SessionVar> = wire.vars.into_iter().map(SessionVar::from).collect();
+        let incoming_patches: Vec<SessionPatch> =
+            wire.patches.into_iter().map(SessionPatch::from).collect();
+        let incoming_packages: Vec<ProvenancedPackage> = wire
+            .requested_packages
+            .into_iter()
+            .map(Into::into)
+            .collect();
 
-        self.vars
-            .extend(wire.vars.into_iter().map(SessionVar::from));
-        self.patches
-            .extend(wire.patches.into_iter().map(SessionPatch::from));
-        self.packages
-            .extend(wire.requested_packages.into_iter().map(Into::into));
-        self.lifecycle_hooks.extend(domain_hooks);
+        // Run conflict checks against the chained union before
+        // touching `self`. `Conflict` propagates through
+        // `ComposeError::Conflict` via the `#[from]` impl.
+        check_var_mismatches(
+            self.vars.iter().chain(incoming_vars.iter()),
+            |v| v.var().name(),
+            |v| v.var().value(),
+        )?;
+        check_patch_mismatches(
+            self.patches.iter().chain(incoming_patches.iter()),
+            |p| p.patch().destination(),
+            |p| p.patch().host_path().as_str(),
+        )?;
+
+        // Checks passed — commit.
+        self.vars.extend(incoming_vars);
+        self.patches.extend(incoming_patches);
+        self.packages.extend(incoming_packages);
+        dedupe_by_name(&mut self.packages, ProvenancedPackage::package);
+        self.lifecycle_hooks.extend(incoming_hooks);
         Ok(())
     }
 }
@@ -1028,6 +1300,10 @@ pub(crate) fn compose_contribution(
     } = contribution;
     let (vars_policy, patches_policy) = policy.into_parts();
     let (gated_vars, vars_policy) = gate_vars(vars, vars_policy, hooks)?;
+    // Conflict detection runs post-gate so that the user's `ignore`
+    // policy can drop offending contributors before they're compared.
+    // See `Conflict` for the per-domain rules.
+    check_var_mismatches(gated_vars.iter(), |v| v.var().name(), |v| v.var().value())?;
     // Patch sources and policy patterns expand against the resolved
     // vars. Explicit `$VAR` references require an explicit
     // `SessionVar` — no env fallback. The tilde prefix (`~/...`) is
@@ -1051,6 +1327,11 @@ pub(crate) fn compose_contribution(
         options,
         &combined_for_lookup,
         home_fallback,
+    )?;
+    check_patch_mismatches(
+        gated_patches.iter(),
+        |p| p.patch().destination(),
+        |p| p.patch().host_path().as_str(),
     )?;
     let final_policy = UserPolicy::empty()
         .with_vars(vars_policy)
@@ -1092,8 +1373,16 @@ mod tests {
     }
 
     fn pv_with(name: &str, source: Source) -> ProvenancedVar {
+        pv_value(name, "x", source)
+    }
+
+    fn pv(name: &str) -> ProvenancedVar {
+        pv_with(name, project_source())
+    }
+
+    fn pv_value(name: &str, value: &str, source: Source) -> ProvenancedVar {
         ProvenancedVar::new(
-            ResolvedVar::resolve_with(name.into(), VarValue::specified("x"), |_| {
+            ResolvedVar::resolve_with(name.into(), VarValue::specified(value), |_| {
                 Err(std::env::VarError::NotPresent)
             })
             .unwrap(),
@@ -1101,8 +1390,11 @@ mod tests {
         )
     }
 
-    fn pv(name: &str) -> ProvenancedVar {
-        pv_with(name, project_source())
+    fn pp(source_pattern: &str, dest: &str, prov: Source) -> ProvenancedPatch {
+        ProvenancedPatch::new(
+            Patch::new(source_pattern, PatchDest::try_new(dest).unwrap()),
+            prov,
+        )
     }
 
     type VarsPolicyMutator = Box<dyn Fn(&mut VarsPolicy)>;
@@ -1967,6 +2259,633 @@ mod tests {
                 "package `evil`",
             );
         }
+
+        #[test]
+        fn conflict_var_value_mismatch() {
+            let c = Conflict::VarValueMismatch {
+                name: "EDITOR".into(),
+                disagreeing_values: vec![
+                    (
+                        Source::Package {
+                            name: "helix".into(),
+                        },
+                        "hx".into(),
+                    ),
+                    (Source::UserLoadout { name: "dev".into() }, "vim".into()),
+                ],
+            };
+            assert_eq!(
+                c.to_string(),
+                "variable `EDITOR` set to conflicting values:\n  \
+                 - \"hx\" (from package `helix`)\n  \
+                 - \"vim\" (from user loadout `dev`)\n\
+                 hint: add `EDITOR` to your policy's ignore list \
+                 to drop all of these contributors",
+            );
+        }
+
+        #[test]
+        fn conflict_patch_source_mismatch() {
+            let c = Conflict::PatchSourceMismatch {
+                dest: paths::SandboxRelPath::try_new(".config/helix/themes").unwrap(),
+                disagreeing_sources: vec![
+                    (
+                        Source::Package {
+                            name: "helix".into(),
+                        },
+                        "/usr/share/helix/themes/nord.toml".into(),
+                    ),
+                    (
+                        Source::UserLoadout { name: "dev".into() },
+                        "/home/u/dotfiles/themes/nord.toml".into(),
+                    ),
+                ],
+            };
+            assert_eq!(
+                c.to_string(),
+                "patch destination `.config/helix/themes` has conflicting sources:\n  \
+                 - \"/usr/share/helix/themes/nord.toml\" (from package `helix`)\n  \
+                 - \"/home/u/dotfiles/themes/nord.toml\" (from user loadout `dev`)\n\
+                 hint: add a pattern matching the conflicting source path(s) above \
+                 to your patch policy's ignore list to drop both, \
+                 or remove one of the contributors",
+            );
+        }
+
+        #[test]
+        fn compose_error_wraps_conflict_via_from() {
+            let conflict = Conflict::VarValueMismatch {
+                name: "EDITOR".into(),
+                disagreeing_values: vec![
+                    (user_source(), "vim".into()),
+                    (
+                        Source::Package {
+                            name: "helix".into(),
+                        },
+                        "hx".into(),
+                    ),
+                ],
+            };
+            // `#[from]` lets `?` propagate Conflict through ComposeError.
+            let err: ComposeError = conflict.into();
+            assert!(matches!(err, ComposeError::Conflict { .. }));
+        }
+    }
+
+    // =================================================================
+    // Merge-time conflict detection helpers
+    // =================================================================
+
+    mod conflict_helpers {
+        use super::*;
+
+        // ---------------- check_var_mismatches ----------------
+
+        #[test]
+        fn vars_empty_is_ok() {
+            let items: Vec<ProvenancedVar> = vec![];
+            assert!(check_var_mismatches(&items, |v| v.var().name(), |v| v.var().value()).is_ok());
+        }
+
+        #[test]
+        fn vars_distinct_names_ok() {
+            let items = vec![
+                pv_value("EDITOR", "hx", project_source()),
+                pv_value("LANG", "C", user_source()),
+            ];
+            assert!(check_var_mismatches(&items, |v| v.var().name(), |v| v.var().value()).is_ok());
+        }
+
+        #[test]
+        fn vars_same_name_same_value_ok() {
+            // Two contributors agreeing on a var is harmless.
+            let items = vec![
+                pv_value("EDITOR", "hx", project_source()),
+                pv_value("EDITOR", "hx", user_source()),
+            ];
+            assert!(check_var_mismatches(&items, |v| v.var().name(), |v| v.var().value()).is_ok());
+        }
+
+        #[test]
+        fn vars_same_name_different_value_errors() {
+            let items = vec![
+                pv_value(
+                    "EDITOR",
+                    "hx",
+                    Source::Package {
+                        name: "helix".into(),
+                    },
+                ),
+                pv_value("EDITOR", "vim", Source::UserLoadout { name: "dev".into() }),
+            ];
+            let err =
+                check_var_mismatches(&items, |v| v.var().name(), |v| v.var().value()).unwrap_err();
+            match err {
+                Conflict::VarValueMismatch {
+                    name,
+                    disagreeing_values,
+                } => {
+                    assert_eq!(name, "EDITOR");
+                    assert_eq!(disagreeing_values.len(), 2);
+                    let values: Vec<&str> =
+                        disagreeing_values.iter().map(|(_, v)| v.as_str()).collect();
+                    assert_eq!(values, vec!["hx", "vim"]);
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn vars_conflict_keeps_all_contributors_under_that_name() {
+            // Three contributors: two agree on "hx", one says "vim".
+            // The conflict's `disagreeing_values` lists all three so the
+            // user sees the full picture.
+            let items = vec![
+                pv_value(
+                    "EDITOR",
+                    "hx",
+                    Source::Package {
+                        name: "helix".into(),
+                    },
+                ),
+                pv_value("EDITOR", "hx", user_source()),
+                pv_value("LANG", "C", project_source()),
+                pv_value("EDITOR", "vim", Source::UserLoadout { name: "dev".into() }),
+            ];
+            let err =
+                check_var_mismatches(&items, |v| v.var().name(), |v| v.var().value()).unwrap_err();
+            let Conflict::VarValueMismatch {
+                disagreeing_values, ..
+            } = err
+            else {
+                panic!("expected VarValueMismatch");
+            };
+            // Three EDITOR contributors; LANG excluded.
+            assert_eq!(disagreeing_values.len(), 3);
+        }
+
+        // ---------------- check_patch_mismatches ----------------
+
+        #[test]
+        fn patches_distinct_dests_ok() {
+            let items = vec![
+                pp("/etc/foo", "config/foo", project_source()),
+                pp("/etc/bar", "config/bar", user_source()),
+            ];
+            assert!(
+                check_patch_mismatches(
+                    &items,
+                    |p| p.patch().dest().as_sandbox_path(),
+                    |p| p.patch().source(),
+                )
+                .is_ok()
+            );
+        }
+
+        #[test]
+        fn patches_same_dest_same_source_ok() {
+            let items = vec![
+                pp("/etc/foo", "config/foo", project_source()),
+                pp("/etc/foo", "config/foo", user_source()),
+            ];
+            assert!(
+                check_patch_mismatches(
+                    &items,
+                    |p| p.patch().dest().as_sandbox_path(),
+                    |p| p.patch().source(),
+                )
+                .is_ok()
+            );
+        }
+
+        #[test]
+        fn patches_same_dest_different_source_errors() {
+            let items = vec![
+                pp(
+                    "/usr/share/nord.toml",
+                    "config/themes",
+                    Source::Package {
+                        name: "helix".into(),
+                    },
+                ),
+                pp(
+                    "/home/u/nord.toml",
+                    "config/themes",
+                    Source::UserLoadout { name: "dev".into() },
+                ),
+            ];
+            let err = check_patch_mismatches(
+                &items,
+                |p| p.patch().dest().as_sandbox_path(),
+                |p| p.patch().source(),
+            )
+            .unwrap_err();
+            match err {
+                Conflict::PatchSourceMismatch {
+                    dest,
+                    disagreeing_sources,
+                } => {
+                    assert_eq!(dest.as_utf8_path().as_str(), "config/themes");
+                    assert_eq!(disagreeing_sources.len(), 2);
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+
+        // ---------------- dedupe_by_name ----------------
+
+        #[test]
+        fn dedupe_empty_is_noop() {
+            let mut items: Vec<&str> = vec![];
+            dedupe_by_name(&mut items, |s| s);
+            assert!(items.is_empty());
+        }
+
+        #[test]
+        fn dedupe_no_duplicates_unchanged() {
+            let mut items = vec!["helix", "ripgrep", "fd"];
+            dedupe_by_name(&mut items, |s| s);
+            assert_eq!(items, vec!["helix", "ripgrep", "fd"]);
+        }
+
+        #[test]
+        fn dedupe_drops_duplicates_keeping_first_occurrence() {
+            let mut items = vec!["helix", "ripgrep", "helix", "fd", "ripgrep"];
+            dedupe_by_name(&mut items, |s| s);
+            assert_eq!(items, vec!["helix", "ripgrep", "fd"]);
+        }
+
+        /// Sanity check against the real caller shape: same-named
+        /// packages from different sources collapse to the first
+        /// occurrence (source provenance comes from that entry).
+        #[test]
+        fn dedupe_provenanced_packages_keeps_first_source() {
+            let first = ProvenancedPackage::new("helix", project_source());
+            let second =
+                ProvenancedPackage::new("helix", Source::UserLoadout { name: "dev".into() });
+            let third = ProvenancedPackage::new("ripgrep", user_source());
+            let mut items = vec![first.clone(), second, third.clone()];
+            dedupe_by_name(&mut items, ProvenancedPackage::package);
+            // `second` was dropped; provenance on the surviving `helix`
+            // entry is the first contributor's.
+            assert_eq!(items, vec![first, third]);
+        }
+    }
+
+    // =================================================================
+    // Contribution::merge
+    // =================================================================
+
+    mod merge {
+        use super::*;
+        use crate::core::lifecyclehook::{HookScript, LifecycleHook};
+
+        fn pkg(name: &str, source: Source) -> ProvenancedPackage {
+            ProvenancedPackage::new(name, source)
+        }
+
+        fn hook(body: &str, source: Source) -> ProvenancedHook {
+            let lh = LifecycleHook::builder()
+                .with_on_activate(HookScript::Inline(body.into()))
+                .build()
+                .expect("at least one callback set");
+            ProvenancedHook::new(lh, source)
+        }
+
+        fn contribution_with(
+            vars: Vec<ProvenancedVar>,
+            patches: Vec<ProvenancedPatch>,
+            packages: Vec<ProvenancedPackage>,
+            hooks: Vec<ProvenancedHook>,
+        ) -> Contribution {
+            Contribution {
+                vars,
+                patches,
+                packages,
+                lifecycle_hooks: hooks,
+            }
+        }
+
+        #[test]
+        fn empty_merge_is_identity() {
+            let mut left = Contribution::new();
+            left.merge(Contribution::new()).unwrap();
+            assert!(left.vars.is_empty());
+            assert!(left.patches.is_empty());
+            assert!(left.packages.is_empty());
+            assert!(left.lifecycle_hooks.is_empty());
+        }
+
+        // ---------------- vars ----------------
+
+        #[test]
+        fn vars_distinct_names_merge_cleanly() {
+            let mut left = contribution_with(
+                vec![pv_value("EDITOR", "hx", project_source())],
+                vec![],
+                vec![],
+                vec![],
+            );
+            let right = contribution_with(
+                vec![pv_value("LANG", "C", user_source())],
+                vec![],
+                vec![],
+                vec![],
+            );
+            left.merge(right).unwrap();
+            assert_eq!(left.vars.len(), 2);
+        }
+
+        #[test]
+        fn vars_same_name_same_value_both_kept() {
+            // Two contributors agreeing on a var is not a conflict;
+            // both entries survive (Source provenance is preserved).
+            let mut left = contribution_with(
+                vec![pv_value(
+                    "EDITOR",
+                    "hx",
+                    Source::Package {
+                        name: "helix".into(),
+                    },
+                )],
+                vec![],
+                vec![],
+                vec![],
+            );
+            let right = contribution_with(
+                vec![pv_value("EDITOR", "hx", user_source())],
+                vec![],
+                vec![],
+                vec![],
+            );
+            left.merge(right).unwrap();
+            assert_eq!(left.vars.len(), 2);
+        }
+
+        /// merge is now pure aggregation: disagreeing values land
+        /// in `self.vars` and are detected later, post-gate. The
+        /// merge itself succeeds.
+        #[test]
+        fn vars_same_name_different_value_no_longer_errors_at_merge() {
+            let mut left = contribution_with(
+                vec![pv_value(
+                    "EDITOR",
+                    "hx",
+                    Source::Package {
+                        name: "helix".into(),
+                    },
+                )],
+                vec![],
+                vec![],
+                vec![],
+            );
+            let right = contribution_with(
+                vec![pv_value(
+                    "EDITOR",
+                    "vim",
+                    Source::UserLoadout { name: "dev".into() },
+                )],
+                vec![],
+                vec![],
+                vec![],
+            );
+            left.merge(right).unwrap();
+            assert_eq!(left.vars.len(), 2);
+        }
+
+        // ---------------- patches ----------------
+
+        #[test]
+        fn patches_distinct_dests_merge_cleanly() {
+            let mut left = contribution_with(
+                vec![],
+                vec![pp("/etc/foo", "config/foo", project_source())],
+                vec![],
+                vec![],
+            );
+            let right = contribution_with(
+                vec![],
+                vec![pp("/etc/bar", "config/bar", user_source())],
+                vec![],
+                vec![],
+            );
+            left.merge(right).unwrap();
+            assert_eq!(left.patches.len(), 2);
+        }
+
+        /// Same: patches with the same dest but different sources
+        /// land in `self.patches`; conflict detection happens
+        /// later, post-gate.
+        #[test]
+        fn patches_same_dest_different_source_no_longer_errors_at_merge() {
+            let mut left = contribution_with(
+                vec![],
+                vec![pp(
+                    "/usr/share/nord.toml",
+                    "config/themes",
+                    Source::Package {
+                        name: "helix".into(),
+                    },
+                )],
+                vec![],
+                vec![],
+            );
+            let right = contribution_with(
+                vec![],
+                vec![pp(
+                    "/home/u/nord.toml",
+                    "config/themes",
+                    Source::UserLoadout { name: "dev".into() },
+                )],
+                vec![],
+                vec![],
+            );
+            left.merge(right).unwrap();
+            assert_eq!(left.patches.len(), 2);
+        }
+
+        // ---------------- packages ----------------
+
+        #[test]
+        fn packages_dedupe_by_name_across_sides() {
+            let mut left = contribution_with(
+                vec![],
+                vec![],
+                vec![
+                    pkg("helix", project_source()),
+                    pkg("ripgrep", project_source()),
+                ],
+                vec![],
+            );
+            let right = contribution_with(
+                vec![],
+                vec![],
+                vec![pkg("helix", user_source()), pkg("fd", user_source())],
+                vec![],
+            );
+            left.merge(right).unwrap();
+            let names: Vec<&str> = left
+                .packages
+                .iter()
+                .map(ProvenancedPackage::package)
+                .collect();
+            // helix appears once (first-occurrence wins).
+            assert_eq!(names, vec!["helix", "ripgrep", "fd"]);
+        }
+
+        // ---------------- hooks ----------------
+
+        #[test]
+        fn hooks_concatenate_unconditionally() {
+            // Two identical hook scripts are both kept — hooks are
+            // code that runs, no dedupe.
+            let mut left = contribution_with(
+                vec![],
+                vec![],
+                vec![],
+                vec![hook("echo hi", project_source())],
+            );
+            let right =
+                contribution_with(vec![], vec![], vec![], vec![hook("echo hi", user_source())]);
+            left.merge(right).unwrap();
+            assert_eq!(left.lifecycle_hooks.len(), 2);
+        }
+
+        // ---------------- pure aggregation (no conflict check) ----------------
+
+        /// Multiple disagreeing contributions across every domain are
+        /// all accumulated by merge — no error. Conflict detection
+        /// is the job of [`compose_contribution`], post-gate.
+        #[test]
+        fn merge_aggregates_disagreement_without_erroring() {
+            let mut left = contribution_with(
+                vec![pv_value("EDITOR", "hx", project_source())],
+                vec![pp("/etc/a/nord", "config/themes", project_source())],
+                vec![pkg("helix", project_source())],
+                vec![hook("echo a", project_source())],
+            );
+            let right = contribution_with(
+                vec![pv_value("EDITOR", "vim", user_source())],
+                vec![pp("/etc/b/nord", "config/themes", user_source())],
+                vec![pkg("fd", user_source())],
+                vec![hook("echo b", user_source())],
+            );
+            left.merge(right).unwrap();
+            // Both disagreeing values survive; conflict will surface
+            // later (post-gate) in `compose_contribution`.
+            assert_eq!(left.vars.len(), 2);
+            assert_eq!(left.patches.len(), 2);
+        }
+    }
+
+    // =================================================================
+    // compose_contribution — post-gate conflict detection
+    // =================================================================
+
+    mod compose_conflicts {
+        use super::*;
+        use crate::core::hooks::PolicyHooks;
+
+        struct PanicHooks;
+        impl PolicyHooks for PanicHooks {
+            fn on_var_unapproved(
+                &self,
+                _: VarsPolicy,
+                _: &[crate::core::hooks::Unapproved<'_, str>],
+            ) -> crate::core::hooks::HookResult<VarsPolicy> {
+                panic!("hook should not have been invoked")
+            }
+            fn on_patch_unapproved(
+                &self,
+                _: PatchPolicy,
+                _: &[crate::core::hooks::Unapproved<'_, camino::Utf8Path>],
+            ) -> crate::core::hooks::HookResult<PatchPolicy> {
+                panic!("hook should not have been invoked")
+            }
+        }
+
+        /// Two contributors disagreeing on the same var name surface
+        /// post-gate as `ComposeError::Conflict { VarValueMismatch }`.
+        #[test]
+        fn post_gate_var_disagreement_errors() {
+            let mut contribution = Contribution::new();
+            // Both contributors are user-loadout origin so the gate
+            // auto-allows them; both reach the conflict check.
+            contribution.push_var(pv_value(
+                "EDITOR",
+                "hx",
+                Source::UserLoadout {
+                    name: "first".into(),
+                },
+            ));
+            contribution.push_var(pv_value(
+                "EDITOR",
+                "vim",
+                Source::UserLoadout {
+                    name: "second".into(),
+                },
+            ));
+            let policy = UserPolicy::empty();
+            let err = compose_contribution(
+                contribution,
+                &[],
+                policy,
+                Some(&PanicHooks),
+                ComposeOptions::default(),
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ComposeError::Conflict {
+                        source: Conflict::VarValueMismatch { ref name, .. }
+                    } if name == "EDITOR"
+                ),
+                "got: {err:?}",
+            );
+        }
+
+        /// Documented mitigation: adding the var to the `ignore`
+        /// list drops the conflicting contributors during the gate,
+        /// so the post-gate check has nothing to compare and the
+        /// composition succeeds with no `EDITOR` set.
+        #[test]
+        fn ignore_policy_drops_conflicting_contributors_before_check() {
+            let mut contribution = Contribution::new();
+            contribution.push_var(pv_value(
+                "EDITOR",
+                "hx",
+                Source::UserLoadout {
+                    name: "first".into(),
+                },
+            ));
+            contribution.push_var(pv_value(
+                "EDITOR",
+                "vim",
+                Source::UserLoadout {
+                    name: "second".into(),
+                },
+            ));
+            let policy = UserPolicy::empty()
+                .with_vars(VarsPolicy::empty().try_with_ignore(["EDITOR"]).unwrap());
+            let (composition, _policy) = compose_contribution(
+                contribution,
+                &[],
+                policy,
+                Some(&PanicHooks),
+                ComposeOptions::default(),
+                None,
+            )
+            .unwrap();
+            assert!(
+                composition
+                    .vars()
+                    .iter()
+                    .all(|v| v.var().name() != "EDITOR"),
+                "EDITOR should have been ignored",
+            );
+        }
     }
 
     // =================================================================
@@ -1976,10 +2895,77 @@ mod tests {
     mod extend_from_wire {
         use super::*;
         use crate::wire::primitives::{
-            WireLifecycleHook, WirePackageRef, WireProvenancedHook, WireResolvedVar,
-            WireSessionVar, WireSource,
+            WireLifecycleHook, WirePackageRef, WireProvenancedHook, WireResolvedPatch,
+            WireResolvedVar, WireSessionPatch, WireSessionVar, WireSource,
         };
         use crate::wire::request::WireContribution;
+
+        // ---------------- helpers ----------------
+
+        fn dev_loadout() -> WireSource {
+            WireSource::UserLoadout { name: "dev".into() }
+        }
+
+        fn wire_var(name: &str, value: &str) -> WireSessionVar {
+            WireSessionVar {
+                var: WireResolvedVar {
+                    name: name.into(),
+                    value: value.into(),
+                },
+                source: dev_loadout(),
+            }
+        }
+
+        fn wire_patch(host: &str, dest: &str) -> WireSessionPatch {
+            WireSessionPatch {
+                patch: WireResolvedPatch {
+                    host_path: paths::HostAbsPath::try_new(host).unwrap(),
+                    destination: paths::SandboxRelPath::try_new(dest).unwrap(),
+                },
+                source: dev_loadout(),
+            }
+        }
+
+        fn session_var(name: &str, value: &str, source: Source) -> SessionVar {
+            SessionVar::new(
+                ResolvedVar::resolve_with(name.into(), VarValue::specified(value), |_| {
+                    Err(std::env::VarError::NotPresent)
+                })
+                .unwrap(),
+                source,
+            )
+        }
+
+        fn session_patch(host: &str, dest: &str, source: Source) -> SessionPatch {
+            SessionPatch {
+                patch: ResolvedPatch::new(
+                    paths::HostAbsPath::try_new(host).unwrap(),
+                    paths::SandboxRelPath::try_new(dest).unwrap(),
+                ),
+                source,
+            }
+        }
+
+        fn composition_with(vars: Vec<SessionVar>, patches: Vec<SessionPatch>) -> Composition {
+            Composition {
+                vars,
+                patches,
+                packages: Vec::new(),
+                lifecycle_hooks: Vec::new(),
+            }
+        }
+
+        fn wire_with(
+            vars: Vec<WireSessionVar>,
+            patches: Vec<WireSessionPatch>,
+        ) -> WireContribution {
+            WireContribution {
+                vars,
+                patches,
+                requested_packages: vec![],
+                lifecycle_hooks: vec![],
+            }
+        }
 
         /// A wire contribution carrying a malformed lifecycle hook (all
         /// three callbacks empty) must error without partially extending
@@ -2017,6 +3003,197 @@ mod tests {
                 "got: {err:?}",
             );
             assert_eq!(after, before, "Composition mutated despite error");
+        }
+
+        // ---------------- cross-process conflict detection ----------------
+
+        /// Daemon-side `EDITOR=hx` meets a wire `EDITOR=hx` from the
+        /// client. Same value → no conflict; both entries survive.
+        #[test]
+        fn same_var_same_value_across_boundary_keeps_both() {
+            let mut composition = composition_with(
+                vec![session_var(
+                    "EDITOR",
+                    "hx",
+                    Source::Package {
+                        name: "helix".into(),
+                    },
+                )],
+                vec![],
+            );
+            let wire = wire_with(vec![wire_var("EDITOR", "hx")], vec![]);
+            composition.extend_from_wire(wire).unwrap();
+            assert_eq!(composition.vars.len(), 2);
+        }
+
+        /// Patch-side parity for `same_var_same_value_across_boundary_keeps_both`:
+        /// same dest + same `host_path` on both sides → no conflict,
+        /// both entries survive.
+        #[test]
+        fn same_patch_same_source_across_boundary_keeps_both() {
+            let mut composition = composition_with(
+                vec![],
+                vec![session_patch(
+                    "/usr/share/nord.toml",
+                    "config/themes",
+                    Source::Package {
+                        name: "helix".into(),
+                    },
+                )],
+            );
+            let wire = wire_with(
+                vec![],
+                vec![wire_patch("/usr/share/nord.toml", "config/themes")],
+            );
+            composition.extend_from_wire(wire).unwrap();
+            assert_eq!(composition.patches.len(), 2);
+        }
+
+        /// A `WireContribution` carrying two vars with the same name
+        /// and different values trips the conflict check even with no
+        /// daemon-side contribution. The check runs over the chained
+        /// iterator, so wire-vs-wire disagreement is caught.
+        #[test]
+        fn wire_self_var_conflict_is_caught() {
+            let mut composition = Composition::default();
+            let snapshot = composition.clone();
+            let wire = wire_with(
+                vec![wire_var("EDITOR", "hx"), wire_var("EDITOR", "vim")],
+                vec![],
+            );
+            let err = composition.extend_from_wire(wire).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ComposeError::Conflict {
+                        source: Conflict::VarValueMismatch { .. }
+                    }
+                ),
+                "got: {err:?}",
+            );
+            assert_eq!(composition, snapshot);
+        }
+
+        /// Daemon `EDITOR=hx` vs wire `EDITOR=vim` → `Conflict::VarValueMismatch`,
+        /// wrapped in `ComposeError::Conflict`.
+        #[test]
+        fn var_value_mismatch_across_boundary_errors_atomically() {
+            let mut composition = composition_with(
+                vec![session_var(
+                    "EDITOR",
+                    "hx",
+                    Source::Package {
+                        name: "helix".into(),
+                    },
+                )],
+                vec![],
+            );
+            let snapshot = composition.clone();
+            // Wire also carries a hook + package that would normally
+            // land — none of them should appear after the failed call.
+            let wire = WireContribution {
+                vars: vec![wire_var("EDITOR", "vim")],
+                patches: vec![],
+                requested_packages: vec![WirePackageRef {
+                    name: "ripgrep".into(),
+                    source: dev_loadout(),
+                }],
+                lifecycle_hooks: vec![],
+            };
+            let err = composition.extend_from_wire(wire).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ComposeError::Conflict {
+                        source: Conflict::VarValueMismatch { ref name, .. }
+                    } if name == "EDITOR"
+                ),
+                "got: {err:?}",
+            );
+            // No partial mutation: vars, packages, hooks all unchanged.
+            assert_eq!(composition, snapshot);
+        }
+
+        /// Patch dest collision across the boundary → `Conflict::PatchSourceMismatch`.
+        /// Var check passes but patch check fails — vars must NOT have
+        /// been pre-extended.
+        #[test]
+        fn patch_source_mismatch_after_var_check_passes_still_atomic() {
+            let mut composition = composition_with(
+                vec![session_var(
+                    "EDITOR",
+                    "hx",
+                    Source::Package {
+                        name: "helix".into(),
+                    },
+                )],
+                vec![session_patch(
+                    "/usr/share/nord.toml",
+                    "config/themes",
+                    Source::Package {
+                        name: "helix".into(),
+                    },
+                )],
+            );
+            let snapshot = composition.clone();
+            let wire = wire_with(
+                // Distinct name → var check passes.
+                vec![wire_var("LANG", "C")],
+                // Same dest, different host_path → patch check fails.
+                vec![wire_patch("/home/u/nord.toml", "config/themes")],
+            );
+            let err = composition.extend_from_wire(wire).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ComposeError::Conflict {
+                        source: Conflict::PatchSourceMismatch { .. }
+                    }
+                ),
+                "got: {err:?}",
+            );
+            // Crucially: vars were NOT pre-extended despite passing
+            // their own check.
+            assert_eq!(composition, snapshot);
+        }
+
+        /// Same package on both sides → one entry post-merge.
+        #[test]
+        fn packages_dedupe_across_boundary() {
+            let mut composition = Composition {
+                vars: vec![],
+                patches: vec![],
+                packages: vec![ProvenancedPackage::new(
+                    "helix",
+                    Source::Package {
+                        name: "helix".into(),
+                    },
+                )],
+                lifecycle_hooks: vec![],
+            };
+            let wire = WireContribution {
+                vars: vec![],
+                patches: vec![],
+                requested_packages: vec![
+                    WirePackageRef {
+                        name: "helix".into(),
+                        source: dev_loadout(),
+                    },
+                    WirePackageRef {
+                        name: "ripgrep".into(),
+                        source: dev_loadout(),
+                    },
+                ],
+                lifecycle_hooks: vec![],
+            };
+            composition.extend_from_wire(wire).unwrap();
+            let names: Vec<&str> = composition
+                .packages
+                .iter()
+                .map(ProvenancedPackage::package)
+                .collect();
+            // helix appears once (daemon side wins); ripgrep added.
+            assert_eq!(names, vec!["helix", "ripgrep"]);
         }
     }
 }

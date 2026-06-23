@@ -70,10 +70,9 @@ impl SessionComposer {
     /// Returns any error the contributor surfaces from [`Composable::contribute`].
     pub fn add(&mut self, c: impl Composable) -> Result<(), Error> {
         let incoming = c.contribute(&*self.env)?;
-        // Merge on a clone so a `Conflict` leaves `self.contribution`
-        // untouched. See `UserComposer::add` for details.
-        let merged = self.contribution.clone().merge(incoming)?;
-        self.contribution = merged;
+        // `merge` is internally atomic — on `Err`, `self.contribution`
+        // is untouched.
+        self.contribution.merge(incoming)?;
         Ok(())
     }
 

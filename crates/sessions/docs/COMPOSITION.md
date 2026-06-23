@@ -96,10 +96,16 @@ correlate by `id`, not slice position.
 ### Phase 4 — Daemon assembles and hands off
 
 The daemon applies the verdicts: allowed items enter the
-`Composition`, denied items abort the session. The final
-`Composition` is handed to the apply layer, which builds the
-sandbox, materializes vars, copies patched files, and installs
-lifecycle hooks.
+`Composition`, denied items abort the session. The client's
+already-gated wire contribution is then merged in via
+`Composition::extend_from_wire`, which runs the same conflict
+checks as `Contribution::merge` (see the merge invariant
+below) — a cross-process disagreement (e.g. the daemon's
+package set declares `EDITOR=hx` and the client's loadout
+declares `EDITOR=vim`) surfaces here as
+`ComposeError::Conflict`. The final `Composition` is handed to
+the apply layer, which builds the sandbox, materializes vars,
+copies patched files, and installs lifecycle hooks.
 
 `Composition`'s fields: `vars: Vec<SessionVar>`, `patches:
 Vec<SessionPatch>`, `packages: Vec<ProvenancedPackage>`,
@@ -266,16 +272,42 @@ overload:
   `PatchDest` is always relative to the sandbox user's home; `~`
   and absolute paths are rejected at construction. Patterns retain
   their `~` form in returned policies, so save/load is lossless.
-- **`Contribution::merge` is pure aggregation today.** Two
-  contributors pushing the same var name both survive into the
-  `Composition`. Conflict resolution (precedence, dedup,
-  error-on-conflict) will live in this one internal method when it
-  lands; the merge site is intentionally one place.
+- **Conflict detection is post-gate.** Per-domain rules:
+  - **Vars**: same name + same resolved value → both kept (no
+    conflict); same name + different values → `Conflict::VarValueMismatch`.
+  - **Patches**: same destination + same source → both kept;
+    same destination + different sources → `Conflict::PatchSourceMismatch`.
+  - **Packages**: deduplicated by name (set semantics, no value
+    to disagree on).
+  - **Lifecycle hooks**: concatenated unconditionally (hooks are
+    code that runs; two identical scripts run twice).
+
+  Checks run *after* the policy gate has filtered each side —
+  inside `compose_contribution` on the survivors of
+  `gate_vars`/`gate_patches`, and inside
+  `Composition::extend_from_wire` on the chained union of the
+  already-gated daemon side and the already-gated wire payload.
+  `Contribution::merge` is pure aggregation; running checks there
+  would fire before `ignore` could take effect.
+
+  Conflicts are fatal today. The user mitigates by adding the
+  conflicting var name to their policy's `ignore` list (or, for
+  patches, a pattern matching the conflicting source paths) —
+  matched items are dropped during the gate, so the post-gate
+  check has nothing to compare. Interactive resolution (replace
+  fatal-on-conflict with a hook the user can answer) is not
+  implemented; the `Result`-returning merge shape is the place it
+  would land.
 - **Internal invariants panic, not error.** `compute_dest` panics on
   precondition violation. These are bug signals, not recoverable.
 - **Terminating failure modes:** `Denied` (explicit policy reject),
-  `Aborted` (hook returned `Abort`), `HookContract` (application
-  bug — wrong decision count, or `UseRule` to a still-undecidable
+  `Aborted` (hook returned `Abort`), `Conflict` (two contributors
+  disagree on a var value or patch source — see the post-gate
+  detection invariant above; surfaces as `ComposeError::Conflict`
+  from both `compose_contribution` and the cross-process daemon
+  merge in `Composition::extend_from_wire`), `HookContract`
+  (application bug —
+  wrong decision count, or `UseRule` to a still-undecidable
   item), `HookRequired` (non-user-origin item reached the daemon
   composer with no hook to prompt — placeholder until Phase 2
   routing lands), `PatchWalk` (IO-level filesystem walk failures),
