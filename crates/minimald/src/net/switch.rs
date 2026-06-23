@@ -186,7 +186,10 @@ pub async fn move_tap_into_netns(
     lease: PtaskLease,
     subnet: SwitchSubnet,
 ) -> io::Result<()> {
-    for argv in tap_netns_commands(tap, netns_pid, lease, subnet) {
+    for (index, argv) in tap_netns_commands(tap, netns_pid, lease, subnet)
+        .into_iter()
+        .enumerate()
+    {
         let (program, rest) = argv
             .split_first()
             .expect("tap_netns_commands never yields an empty argv");
@@ -195,8 +198,15 @@ pub async fn move_tap_into_netns(
             .status()
             .await?;
         if !status.success() {
+            // Command 0 moves the tap into the PTask namespace; the rest
+            // configure it there, so name the phase the failing command is in.
+            let phase = if index == 0 {
+                "moving PTask tap into its namespace"
+            } else {
+                "configuring PTask tap"
+            };
             return Err(io::Error::other(format!(
-                "configuring PTask tap failed (`{}` exited with {status})",
+                "{phase} failed (`{}` exited with {status})",
                 argv.join(" ")
             )));
         }
