@@ -9,7 +9,8 @@ use sessions::{
     SessionId,
     store::{DiskLoader, Loader, SessionKey, SessionObject},
 };
-use tokio::sync::{mpsc, oneshot};
+use std::sync::Arc;
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 /// A short summary of the metadata of a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +69,9 @@ pub struct Manager<L: Loader = DiskLoader> {
 
     minimal_state_dir: DaemonAbsPath,
     minimal_cache_dir: DaemonAbsPath,
+    /// The daemon-scoped gvproxy switch, handed to each session it starts so an
+    /// `OwnIp` PTask attaches to the one per-host switch (R1.4/R1.5/R1.6).
+    net_switch: Arc<Mutex<crate::net::GvproxySwitch>>,
 }
 
 impl Manager {
@@ -76,6 +80,7 @@ impl Manager {
     pub async fn init(
         minimal_state_dir: DaemonAbsPath,
         minimal_cache_dir: DaemonAbsPath,
+        net_switch: Arc<Mutex<crate::net::GvproxySwitch>>,
     ) -> Result<ManagerHandle, std::io::Error> {
         let l = DiskLoader::new(minimal_state_dir.clone())?;
         let running = BTreeMap::new();
@@ -86,6 +91,7 @@ impl Manager {
             store: l,
             minimal_state_dir,
             minimal_cache_dir,
+            net_switch,
         };
 
         tokio::spawn(mngr.mainloop());
@@ -166,6 +172,7 @@ impl<L: Loader> Manager<L> {
                                         self.minimal_state_dir.clone(),
                                         self.minimal_cache_dir.clone(),
                                         self.store.get(&k)?,
+                                        Arc::clone(&self.net_switch),
                                     )
                                     .await
                                     .expect("TODO handle error");
@@ -332,7 +339,14 @@ mod tests {
     async fn manager() -> (TempDir, TempDir, ManagerHandle) {
         let state = TempDir::new().unwrap();
         let cache = TempDir::new().unwrap();
-        let mngr = Manager::init(daemon_dir(&state), daemon_dir(&cache))
+        // These tests never start an `OwnIp` launch (they use the mock
+        // launcher), so the switch is never spawned; a placeholder binary path
+        // is sufficient.
+        let switch = Arc::new(Mutex::new(crate::net::GvproxySwitch::new(
+            "/nonexistent/gvproxy",
+            state.path().join("gvproxy"),
+        )));
+        let mngr = Manager::init(daemon_dir(&state), daemon_dir(&cache), switch)
             .await
             .unwrap();
         (state, cache, mngr)

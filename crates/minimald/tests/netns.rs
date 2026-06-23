@@ -7,6 +7,14 @@
 //!   host, each with a tap bridged onto the shared gvproxy switch, can open a
 //!   TCP connection to each other over their switch addresses.
 //!
+//! UC6 drives the **production** switch-attach wiring rather than a hand-rolled
+//! `ip netns` sequence: each PTask's namespace is created by the same
+//! `CLONE_NEWNET` `unshare` that `sandbox2::new_container` performs for `OwnIp`,
+//! identified by the holder process's PID exactly as the live launcher
+//! identifies a sandbox child's netns, and the tap is moved+configured by the
+//! production [`minimald::net::switch::tap_netns_commands`] (the same commands
+//! `SandboxLauncher` runs, here wrapped in `sudo` for the unprivileged runner).
+//!
 //! Both tests are `#[ignore]` and additionally early-return unless
 //! `MINIMALD_NETNS_TEST` is set, and read the gvproxy binary from `GVPROXY_BIN`.
 //! They run only in `.github/workflows/ci-netns.yml`, which provisions a
@@ -21,7 +29,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::Duration;
 
-use minimald::net::switch::{attach_to_switch, open_tap};
+use minimald::net::switch::{attach_to_switch, open_tap, tap_netns_commands};
 use minimald::net::{GvproxySwitch, PtaskLease, SwitchSubnet};
 
 /// Whether the gate env var is set; when absent both proofs early-return so the
@@ -137,12 +145,13 @@ async fn netns_uc6_ownip_ptask_to_ptask() {
     // MACs. A fixed sleep is flaky on slow CI runners; retrying up to a deadline
     // is deterministic.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let a_pid = a.pid().to_string();
     let client = loop {
         let out = sudo(&[
-            "ip",
-            "netns",
-            "exec",
-            a.ns(),
+            "nsenter",
+            "-t",
+            &a_pid,
+            "-n",
             "timeout",
             "2",
             "bash",
@@ -171,10 +180,17 @@ async fn netns_uc6_ownip_ptask_to_ptask() {
     );
 }
 
-/// One provisioned `OwnIp` PTask: a named network namespace, a tap bridged onto
-/// the switch by a relay, and the switch address configured inside the netns.
+/// One provisioned `OwnIp` PTask: a PID-identified network namespace (held by a
+/// `sleep` process in a fresh `CLONE_NEWNET` namespace, exactly as the live
+/// launcher targets a sandbox child's netns by PID), a tap bridged onto the
+/// switch by a relay, and the switch address configured inside the netns by the
+/// production [`tap_netns_commands`].
 struct Ptask {
-    ns: String,
+    /// PID of the process holding the PTask's network namespace
+    /// (`/proc/<pid>/ns/net`). Killing it tears the namespace down.
+    netns_pid: u32,
+    /// The `sudo unshare --net …` wrapper process, reaped on teardown.
+    holder: std::process::Child,
     tap: String,
     lease: PtaskLease,
     // Holds the relay alive; taking it (in `teardown`) detaches the tap from
@@ -184,14 +200,19 @@ struct Ptask {
 
 impl Ptask {
     async fn provision(
-        ns: &str,
+        name: &str,
         lease: PtaskLease,
         subnet: SwitchSubnet,
         api_sock: &std::path::Path,
     ) -> Self {
-        let tap = format!("tap-{ns}");
-        let _ = sudo(&["ip", "netns", "del", ns]);
+        let tap = format!("tap-{name}");
         let _ = sudo(&["ip", "link", "del", &tap]);
+
+        // Create the PTask's network namespace the way the production path does:
+        // a process that `unshare`s `CLONE_NEWNET` (the same syscall
+        // `sandbox2::new_container` issues for OwnIp) and then lingers, so its
+        // PID identifies `/proc/<pid>/ns/net` for the move/config below.
+        let (netns_pid, holder) = spawn_netns_holder();
 
         // SAFETY: getuid() reads the calling user's real uid; it has no side
         // effects and cannot fail.
@@ -207,46 +228,37 @@ impl Ptask {
             ],
         );
         // Open the host-side data-plane fd; the relay reads/writes frames here.
+        // The fd keeps working after the interface moves namespaces below.
         let fd = open_tap(&tap).expect("open tap fd");
 
-        // Move the interface into the PTask namespace and configure its switch
-        // address there (static config, per the gvproxy spike's Option B). The
-        // host-side fd keeps working after the interface moves namespaces.
-        sudo_ok("create netns", &["ip", "netns", "add", ns]);
-        sudo_ok(
-            "move tap into netns",
-            &["ip", "link", "set", &tap, "netns", ns],
-        );
-        let mac = lease.mac.to_string();
-        let cidr = format!("{}/{}", lease.ip, 16);
-        let gw = subnet.gateway().to_string();
-        run_in_ns(ns, &["ip", "link", "set", &tap, "address", &mac]);
-        run_in_ns(ns, &["ip", "addr", "add", &cidr, "dev", &tap]);
-        run_in_ns(ns, &["ip", "link", "set", &tap, "up"]);
-        run_in_ns(ns, &["ip", "link", "set", "lo", "up"]);
-        // Same-subnet PTask-to-PTask needs no default route, but add it so the
-        // namespace mirrors a real OwnIp PTask.
-        let _ = sudo(&[
-            "ip", "netns", "exec", ns, "ip", "route", "add", "default", "via", &gw,
-        ]);
+        // Drive the PRODUCTION move/configure commands (move the tap into the
+        // PTask's netns by PID, set its MAC/address/route and bring it and `lo`
+        // up there) — the exact argv `SandboxLauncher` execs, here run under
+        // `sudo` because this runner is unprivileged.
+        for argv in tap_netns_commands(&tap, netns_pid, lease, subnet) {
+            let strs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            sudo_ok("configure PTask tap", &strs);
+        }
 
         let relay = attach_to_switch(fd, api_sock)
             .await
             .expect("attach tap to switch");
 
         Self {
-            ns: ns.to_string(),
+            netns_pid,
+            holder,
             tap,
             lease,
             relay: Some(relay),
         }
     }
 
-    fn ns(&self) -> &str {
-        &self.ns
+    fn pid(&self) -> u32 {
+        self.netns_pid
     }
 
-    /// Spawns a one-shot TCP listener bound to this PTask's switch address.
+    /// Spawns a one-shot TCP listener bound to this PTask's switch address,
+    /// inside the PTask's netns (entered by PID via `nsenter`).
     fn spawn_listener(&self, port: u16) -> std::process::Child {
         let prog = format!(
             "import socket\n\
@@ -259,9 +271,10 @@ impl Ptask {
              c.close()\n",
             ip = self.lease.ip,
         );
+        let pid = self.netns_pid.to_string();
         Command::new("sudo")
             .args([
-                "ip", "netns", "exec", &self.ns, "timeout", "25", "python3", "-c", &prog,
+                "nsenter", "-t", &pid, "-n", "timeout", "25", "python3", "-c", &prog,
             ])
             .spawn()
             .expect("spawn listener")
@@ -269,15 +282,35 @@ impl Ptask {
 
     fn teardown(&mut self) {
         // Detach from the switch first (stops the relay tasks, closes the tap
-        // fd), then remove the namespace and any lingering interface.
+        // fd), then kill the namespace holder (which destroys the netns and the
+        // tap inside it) and remove any interface left in the host namespace.
         self.relay.take();
-        let _ = sudo(&["ip", "netns", "del", &self.ns]);
+        let _ = sudo(&["kill", &self.netns_pid.to_string()]);
+        let _ = self.holder.kill();
+        let _ = self.holder.wait();
         let _ = sudo(&["ip", "link", "del", &self.tap]);
     }
 }
 
-fn run_in_ns(ns: &str, args: &[&str]) {
-    let mut full = vec!["ip", "netns", "exec", ns];
-    full.extend_from_slice(args);
-    sudo_ok("configure netns", &full);
+/// Spawns a long-lived process in a fresh network namespace (the same
+/// `CLONE_NEWNET` `sandbox2::new_container` unshares for `OwnIp`/`NoNet`) and
+/// returns its host PID plus the wrapper handle. `/proc/<pid>/ns/net` is the
+/// PTask netns the production launcher targets.
+fn spawn_netns_holder() -> (u32, std::process::Child) {
+    use std::io::BufRead;
+
+    let mut child = Command::new("sudo")
+        .args(["unshare", "--net", "bash", "-c", "echo $$; exec sleep 600"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn netns holder");
+    let stdout = child.stdout.as_mut().expect("netns holder stdout");
+    let mut line = String::new();
+    std::io::BufReader::new(stdout)
+        .read_line(&mut line)
+        .expect("read netns holder pid");
+    // `echo $$` then `exec sleep` keeps the same PID, so this is the netns
+    // holder's host PID.
+    let netns_pid: u32 = line.trim().parse().expect("parse netns holder pid");
+    (netns_pid, child)
 }

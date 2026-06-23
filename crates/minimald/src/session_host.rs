@@ -575,12 +575,115 @@ pub(crate) struct SandboxLauncher {
     #[allow(dead_code)]
     pub(crate) session: SessionHandle,
     pub(crate) network_mode: NetworkMode,
+    /// The shared per-host gvproxy switch, used to attach this launch when it
+    /// runs in [`NetworkMode::OwnIp`] (R1.5). Ignored for `HostNet`/`NoNet`.
+    pub(crate) net_switch: std::sync::Arc<tokio::sync::Mutex<crate::net::GvproxySwitch>>,
+}
+
+/// Holds an `OwnIp` PTask's switch attachment for the session's lifetime.
+///
+/// Dropping it tears down the data-plane relay (detaching the tap) and schedules
+/// a [`detach`](crate::net::GvproxySwitch::detach) on the shared switch, which
+/// decrements its refcount and stops gvproxy once the last `OwnIp` PTask leaves.
+///
+/// Because that `detach` is scheduled on the tokio runtime (see the `Drop`
+/// impl), correct shutdown requires that every `OwnIpAttachment` is dropped —
+/// i.e. all sessions are drained — *before* the runtime is stopped. If the
+/// runtime is torn down first, a pending `detach` never runs and the switch
+/// refcount stays elevated, so gvproxy is only reaped when the daemon process
+/// itself exits.
+#[cfg(not(test))]
+pub(crate) struct OwnIpAttachment {
+    /// Held only for its `Drop`, which aborts the relay tasks; never read.
+    _relay: crate::net::switch::SwitchRelay,
+    /// The shared switch, locked on drop to detach this PTask.
+    switch: std::sync::Arc<tokio::sync::Mutex<crate::net::GvproxySwitch>>,
+}
+
+#[cfg(not(test))]
+impl Drop for OwnIpAttachment {
+    fn drop(&mut self) {
+        // `detach` is async and `Drop` cannot await, so schedule it on the
+        // current runtime. The session host always drops within the daemon's
+        // tokio context; if somehow not, log rather than block.
+        let switch = std::sync::Arc::clone(&self.switch);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    if let Err(e) = switch.lock().await.detach().await {
+                        tracing::warn!(error = %e, "detaching OwnIp PTask from switch on session end");
+                    }
+                });
+            }
+            Err(_) => {
+                tracing::warn!("no tokio runtime at OwnIp guard drop; switch left attached");
+            }
+        }
+    }
+}
+
+/// Attaches an `OwnIp` PTask (identified by its sandbox process's netns-holding
+/// PID) to the shared gvproxy switch: allocate a lease and ensure gvproxy is up,
+/// open a host-side tap, move it into the PTask's network namespace and
+/// configure its switch address there, then start the frame relay. All
+/// `minimald::net` calls live here (the `minimald` side); `sandbox2` only
+/// unshared the namespace and surfaced the PID (no dependency cycle).
+#[cfg(not(test))]
+async fn attach_own_ip(
+    switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::GvproxySwitch>>,
+    netns_pid: u32,
+) -> io::Result<OwnIpAttachment> {
+    use crate::net::switch::{attach_to_switch, move_tap_into_netns, open_tap};
+
+    // Allocate a lease and ensure gvproxy is running, snapshotting the control
+    // socket and subnet under one lock; the slow tap/relay work runs unlocked so
+    // concurrent attaches don't serialize on the namespace plumbing.
+    let (lease, sock, subnet) = {
+        let mut s = switch.lock().await;
+        let attach = s
+            .attach()
+            .await
+            .map_err(|e| io::Error::other(format!("attaching OwnIp PTask to switch: {e}")))?;
+        // gvproxy's unexpected-exit closes the control socket, which ends the
+        // relay's switch-side read on its own, so the relay self-terminates; we
+        // do not additionally watch `attach.exit_signal` here.
+        (attach.lease, s.control_socket(), s.subnet())
+    };
+
+    // A locally-administered tap name unique within the switch /16 (its low two
+    // octets distinguish every PTask address) and within the 15-char `IFNAMSIZ`
+    // limit (`mtapNNN_NNN` is at most 11 chars).
+    let o = lease.ip.octets();
+    let tap = format!("mtap{}_{}", o[2], o[3]);
+
+    // On any failure after the switch attach succeeded, roll the attach back so
+    // gvproxy's refcount stays accurate (a leaked count would keep it running).
+    let relay = match async {
+        let tap_fd = open_tap(&tap)?;
+        move_tap_into_netns(&tap, netns_pid, lease, subnet).await?;
+        attach_to_switch(tap_fd, &sock).await
+    }
+    .await
+    {
+        Ok(relay) => relay,
+        Err(e) => {
+            let _ = switch.lock().await.detach().await;
+            return Err(e);
+        }
+    };
+
+    Ok(OwnIpAttachment {
+        _relay: relay,
+        switch: std::sync::Arc::clone(switch),
+    })
 }
 
 #[cfg(not(test))]
 impl SessionLauncher for SandboxLauncher {
     type Process = SandboxProcess;
-    type Guard = crate::env::Env;
+    // The session env plus, for an `OwnIp` launch, the switch attachment held
+    // for the session lifetime (its `Drop` detaches the PTask from the switch).
+    type Guard = (crate::env::Env, Option<OwnIpAttachment>);
 
     async fn launch(
         self,
@@ -588,7 +691,7 @@ impl SessionLauncher for SandboxLauncher {
         username: String,
         paths: SessionPaths,
         sz: WinSize,
-    ) -> io::Result<Launched<SandboxProcess, crate::env::Env>> {
+    ) -> io::Result<Launched<SandboxProcess, Self::Guard>> {
         let ctx = self.ctx;
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
         // graph construction) — run it on the blocking pool so it
@@ -636,17 +739,64 @@ impl SessionLauncher for SandboxLauncher {
         let (master, slave) = pty.into_fds();
         command.stderr(hakoniwa::Stdio::from(slave));
 
-        let process = command
+        let mut process = command
             .spawn()
             .map_err(|e| io::Error::other(format!("exec failed: {}", e)))?;
         // `command`/`container` no longer borrow `env`, so it can be moved into
         // the host to keep its backing files alive.
         drop(container);
 
+        // For an `OwnIp` PTask, wire its freshly-unshared network namespace onto
+        // the per-host gvproxy switch. `sandbox2` created the empty namespace;
+        // the launched `hakoniwa::Child`'s PID (`id()`) holds it
+        // (`/proc/<pid>/ns/net`), so the attach targets it from the `minimald`
+        // side. `HostNet`/`NoNet` skip this entirely.
+        //
+        // Until this attach returns, the PTask's namespace is empty (`lo` is
+        // down and no tap exists): `sandbox2` unshared `CLONE_NEWNET` but has
+        // not yet been handed an interface. A shell PTask never probes the
+        // network in this window — the SSH layer only dispatches commands after
+        // `Launched` is returned — but a future non-shell PTask that touches
+        // the network before its first channel message could see transient
+        // `ENETUNREACH` until the tap is in place.
+        let own_ip = if matches!(self.network_mode, NetworkMode::OwnIp) {
+            match attach_own_ip(&self.net_switch, process.id()).await {
+                Ok(attachment) => Some(attachment),
+                Err(e) => {
+                    // The attach failed, so this launch is aborting. A
+                    // `hakoniwa::Child` does not terminate when dropped — it
+                    // would orphan the sandbox process (the same hazard the
+                    // `kill_on_drop(true)` calls in `exec.rs`/`net/mod.rs` guard
+                    // against) — so kill and reap it explicitly before
+                    // propagating the error.
+                    // `kill` and `wait` are independent: when `kill` fails with
+                    // `ESRCH` because the process already exited during the
+                    // attach window, the child still needs reaping, so `wait`
+                    // must run regardless of `kill`'s result (the standard
+                    // `SIGKILL`-then-`waitpid` idiom).
+                    if let Err(kill_err) = process.kill() {
+                        tracing::warn!(
+                            error = %kill_err,
+                            "killing sandbox process after OwnIp attach failure"
+                        );
+                    }
+                    if let Err(wait_err) = process.wait() {
+                        tracing::warn!(
+                            error = %wait_err,
+                            "reaping sandbox process after OwnIp attach failure"
+                        );
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Launched {
             master,
             process: SandboxProcess(process),
-            guard: env,
+            guard: (env, own_ip),
         })
     }
 }
