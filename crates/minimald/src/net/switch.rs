@@ -180,6 +180,25 @@ pub fn tap_netns_commands(
 ///
 /// Returns an error if `ip`/`nsenter` cannot be spawned or any command exits
 /// non-zero, naming the failing command line.
+/// Trusted directories (and the `PATH` handed to the children) searched for the
+/// privileged `ip`/`nsenter` binaries, ordered most- to least-specific. Using a
+/// fixed list instead of the inherited `PATH` is what keeps a tampered `PATH`
+/// from shadowing them when they exec with `CAP_NET_ADMIN`.
+const TRUSTED_EXEC_PATH: &str = "/usr/sbin:/sbin:/usr/bin:/bin";
+
+/// Resolves `program` to an absolute path under [`TRUSTED_EXEC_PATH`]. Falls
+/// back to the bare name if it is in none of those directories (an unusual
+/// layout still works, just without the hardening).
+fn trusted_program(program: &str) -> String {
+    for dir in TRUSTED_EXEC_PATH.split(':') {
+        let candidate = std::path::Path::new(dir).join(program);
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    program.to_string()
+}
+
 pub async fn move_tap_into_netns(
     tap: &str,
     netns_pid: u32,
@@ -193,8 +212,15 @@ pub async fn move_tap_into_netns(
         let (program, rest) = argv
             .split_first()
             .expect("tap_netns_commands never yields an empty argv");
-        let status = tokio::process::Command::new(program)
+        // These run with `CAP_NET_ADMIN` in the host namespace, so resolve the
+        // binary against a fixed trusted directory list rather than an inherited
+        // `PATH` (a malicious `ip`/`nsenter` shadow placed early in `PATH` would
+        // otherwise execute at that capability). The pinned `PATH` covers the
+        // inner `ip` that `nsenter -n` execs inside the PTask namespace, which
+        // resolves against this child's environment.
+        let status = tokio::process::Command::new(trusted_program(program))
             .args(rest)
+            .env("PATH", TRUSTED_EXEC_PATH)
             .status()
             .await?;
         if !status.success() {
