@@ -45,10 +45,10 @@
 //!
 //! - **`FileSet` itself** stores patterns as written. No expansion at
 //!   construction or matching time.
-//! - **The session resolver** ([`Composer::resolve`](crate::client::composer::Composer::resolve))
-//!   expands leading `~` in patch *source* patterns and in
-//!   [`PatchPolicy`](crate::core::policy::PatchPolicy) patterns at the start of resolution, against
-//!   `dirs::home_dir` (or a `Composer::with_home(...)` override).
+//! - **The composer** (see [`crate::core::compose`]) expands leading
+//!   `~` in patch *source* patterns and in
+//!   [`PatchPolicy`](crate::core::policy::PatchPolicy) patterns at the
+//!   start of the patch gate, against the composer's `HOME` env lookup.
 //!   Patterns retain their `~` form in returned policies for
 //!   round-trippability.
 //! - **[`PatchDest`] needs no expansion.** Every destination is
@@ -561,6 +561,12 @@ impl ResolvedVar {
         &self.value
     }
 
+    /// Consume the [`ResolvedVar`] and return `(name, value)`.
+    #[must_use]
+    pub fn into_parts(self) -> (String, String) {
+        (self.name, self.value)
+    }
+
     /// Resolve a variable against an arbitrary environment-lookup function.
     /// The thread-able shape lets tests pin every branch without touching
     /// the process environment.
@@ -622,6 +628,15 @@ impl TryFrom<LenientVarEntry> for ResolvedVar {
     fn try_from(entry: LenientVarEntry) -> Result<Self, Self::Error> {
         let (name, value) = entry.into_parts();
         Self::resolve(name.into_inner(), value)
+    }
+}
+
+impl From<crate::wire::primitives::WireResolvedVar> for ResolvedVar {
+    fn from(v: crate::wire::primitives::WireResolvedVar) -> Self {
+        Self {
+            name: v.name,
+            value: v.value,
+        }
     }
 }
 
@@ -928,8 +943,8 @@ impl<'de> serde::Deserialize<'de> for PatchDest {
 /// directory) where its content should land.
 ///
 /// `source` is the *raw, unexpanded* path string straight from the wire
-/// — it may contain `~/` or `$VAR` / `${VAR}` references. Resolution
-/// against the session's resolved variables happens later (see
+/// — it may contain `~/` or `$VAR` / `${VAR}` references. Expansion
+/// against the session's gated variables happens later (see
 /// [`crate::core::expansion::expand_source`]); attempting to parse it as a
 /// glob directly would silently match a literal `$VAR` directory name.
 ///
@@ -1044,14 +1059,6 @@ impl Patches {
         Self(patches)
     }
 
-    /// Append a patch and return the modified collection (builder style).
-    #[must_use]
-    pub fn with_patch(self, patch: Patch) -> Self {
-        let mut new = self;
-        new.0.push(patch);
-        new
-    }
-
     /// Append a patch in place.
     pub fn push(&mut self, patch: Patch) {
         self.0.push(patch);
@@ -1138,6 +1145,11 @@ impl ResolvedPatch {
     pub fn destination(&self) -> &SandboxRelPath {
         &self.destination
     }
+
+    /// Consume the [`ResolvedPatch`] and return `(host_path, destination)`.
+    pub fn into_parts(self) -> (HostAbsPath, SandboxRelPath) {
+        (self.host_path, self.destination)
+    }
 }
 
 impl core::fmt::Display for ResolvedPatch {
@@ -1148,6 +1160,15 @@ impl core::fmt::Display for ResolvedPatch {
             self.host_path.as_str(),
             self.destination.as_str(),
         )
+    }
+}
+
+impl From<crate::wire::primitives::WireResolvedPatch> for ResolvedPatch {
+    fn from(p: crate::wire::primitives::WireResolvedPatch) -> Self {
+        Self {
+            host_path: p.host_path,
+            destination: p.destination,
+        }
     }
 }
 
@@ -1587,7 +1608,8 @@ mod tests {
         let make = |s: &str| Patch::new(s, PatchDest::try_new(s).unwrap());
 
         let collected: Patches = ["a", "b"].into_iter().map(make).collect();
-        let mut built = Patches::empty().with_patch(make("a"));
+        let mut built = Patches::empty();
+        built.push(make("a"));
         built.push(make("b"));
         assert_eq!(collected, built);
         assert_eq!(collected.len(), 2);
