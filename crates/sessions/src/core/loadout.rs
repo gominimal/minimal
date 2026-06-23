@@ -12,10 +12,10 @@
 //!
 //! # `dest` paths are inside the sandbox; `source` paths are on the host.
 //! # `~`-expansion is split by realm:
-//! #   - `source` `~` is expanded at gate time against the host home
-//! #     (via the composer's `HOME` env lookup —
-//! #     `std::env::var("HOME")` by default).
-//! #   - `dest` `~` is left unexpanded by the gate. `PatchDest` is
+//! #   - `source` `~` is expanded at *session-resolution* time against
+//! #     the host home (via the Composer's home lookup —
+//! #     dirs::home_dir by default).
+//! #   - `dest` `~` is left unexpanded by the resolver. `PatchDest` is
 //! #     validated as sandbox-home-relative; any expansion of a leading
 //! #     `~` happens in the sandbox runtime against the sandbox home,
 //! #     not here.
@@ -174,9 +174,11 @@ impl Loadout {
 
     /// Append a patch.
     #[must_use]
-    pub fn with_patch(mut self, patch: Patch) -> Self {
-        self.patches.push(patch);
-        self
+    pub fn with_patch(self, patch: Patch) -> Self {
+        Self {
+            patches: self.patches.with_patch(patch),
+            ..self
+        }
     }
 
     /// Append a lifecycle hook.
@@ -241,8 +243,8 @@ impl Loadout {
     }
 }
 
-impl crate::core::compose::Composable for Loadout {
-    /// Materialize the loadout as a [`Contribution`](crate::core::compose::Contribution),
+impl crate::client::composer::Composable for Loadout {
+    /// Materialize the loadout as a [`Contribution`](crate::client::composer::Contribution),
     /// tagging every primitive with [`Source::UserLoadout`].
     ///
     /// Inherited / default-bearing var values are resolved via `env`
@@ -251,9 +253,9 @@ impl crate::core::compose::Composable for Loadout {
     /// [`Source::UserLoadout`]: crate::core::source::Source::UserLoadout
     fn contribute(
         self,
-        env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
-    ) -> Result<crate::core::compose::Contribution, crate::core::compose::Error> {
-        use crate::core::compose::Contribution;
+        env: crate::client::composer::EnvLookup<'_>,
+    ) -> Result<crate::client::composer::Contribution, crate::client::composer::Error> {
+        use crate::client::composer::Contribution;
         use crate::core::primitives::ResolvedVar;
         use crate::core::source::{
             ProvenancedHook, ProvenancedPackage, ProvenancedPatch, ProvenancedVar, Source,

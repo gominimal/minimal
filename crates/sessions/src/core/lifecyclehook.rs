@@ -39,7 +39,7 @@ pub enum Error {
 /// on_activate = { type = "inline",   value = "echo hi"   }
 /// on_failure  = { type = "external", value = "./run.sh"  }
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "lowercase")]
 pub enum HookScript {
     /// Script body stored inline.
@@ -109,7 +109,7 @@ impl HookScript {
 /// // Deserializing an empty hook fails:
 /// assert!(toml::from_str::<LifecycleHook>("").is_err());
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "LifecycleHookBuilder", into = "LifecycleHookBuilder")]
 pub struct LifecycleHook {
     description: Option<String>,
@@ -141,25 +141,6 @@ impl LifecycleHook {
     #[must_use]
     pub fn on_failure(&self) -> Option<&HookScript> {
         self.on_failure.as_ref()
-    }
-
-    /// Consume the [`LifecycleHook`] and return
-    /// `(description, on_activate, on_destroy, on_failure)`.
-    #[must_use]
-    pub fn into_parts(
-        self,
-    ) -> (
-        Option<String>,
-        Option<HookScript>,
-        Option<HookScript>,
-        Option<HookScript>,
-    ) {
-        (
-            self.description,
-            self.on_activate,
-            self.on_destroy,
-            self.on_failure,
-        )
     }
 }
 
@@ -241,38 +222,6 @@ impl From<LifecycleHook> for LifecycleHookBuilder {
             on_destroy: value.on_destroy,
             on_failure: value.on_failure,
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Wire → domain conversions
-// ---------------------------------------------------------------------------
-
-impl From<crate::wire::primitives::WireHookScript> for HookScript {
-    fn from(s: crate::wire::primitives::WireHookScript) -> Self {
-        match s {
-            crate::wire::primitives::WireHookScript::Inline { body } => Self::Inline(body),
-            crate::wire::primitives::WireHookScript::External { path } => Self::External(path),
-        }
-    }
-}
-
-/// Fallible because the wire form may have all three callbacks
-/// absent, which the builder rejects.
-impl TryFrom<crate::wire::primitives::WireLifecycleHook> for LifecycleHook {
-    type Error = Error;
-    fn try_from(h: crate::wire::primitives::WireLifecycleHook) -> Result<Self, Self::Error> {
-        let mut builder = Self::builder();
-        if let Some(s) = h.on_activate {
-            builder = builder.with_on_activate(s.into());
-        }
-        if let Some(s) = h.on_destroy {
-            builder = builder.with_on_destroy(s.into());
-        }
-        if let Some(s) = h.on_failure {
-            builder = builder.with_on_failure(s.into());
-        }
-        builder.build()
     }
 }
 

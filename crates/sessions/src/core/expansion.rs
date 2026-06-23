@@ -84,7 +84,7 @@ pub enum ExpandError {
 
     /// The fully-substituted pattern is not absolute (doesn't start
     /// with `/`). Patch sources and policy patterns must resolve to
-    /// absolute paths so the gate can drive a filesystem walk and
+    /// absolute paths so the resolver can drive a filesystem walk and
     /// produce reproducible policy decisions. Relative patterns
     /// would silently depend on the process CWD, which is brittle
     /// and almost never what the user intends.
@@ -711,7 +711,7 @@ mod tests {
 
     /// Conversely, if `HOME` is relative the tilde expansion produces
     /// a relative pattern and is rejected. This is defensive — the
-    /// vars gate should reject non-absolute HOME values upstream,
+    /// vars resolver should reject non-absolute HOME values upstream,
     /// but the absoluteness check here catches the case.
     #[test]
     fn tilde_with_relative_home_is_rejected() {

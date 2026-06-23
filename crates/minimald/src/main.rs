@@ -311,6 +311,17 @@ async fn async_main() -> Result<(), MainError> {
     // If we got this far we need to launch minimald.
     if !cli.listen_args().unwrap().vsock {
         // standard path, listening on UDS socket
+
+        // DM2 (native-Linux host): probe that the system resolver synthesizes
+        // `*.localhost` so PTask hostnames (Unit 3) resolve. Registration is
+        // rootless under the `*.localhost` model (spike #485), so this is a
+        // detection-only probe that warns with a remedy if it is unavailable
+        // (R3.4). Run off the async worker since `getaddrinfo` is blocking.
+        let _ = tokio::task::spawn_blocking(|| {
+            minimald::net::dns::probe_resolver(minimald::net::dns::system_resolver)
+        })
+        .await;
+
         if let Err(e) = std::fs::remove_file(cli.listen_on())
             && e.kind() != std::io::ErrorKind::NotFound
         {

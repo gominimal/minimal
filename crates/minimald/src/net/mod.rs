@@ -16,6 +16,7 @@
 //! Covers R1.4 (gvproxy child lifecycle), R1.6 (per-host IP allocation with no
 //! reuse), and R1.8 (structured tracing for every switch lifecycle event).
 
+pub mod dns;
 pub mod switch;
 
 use std::fmt;

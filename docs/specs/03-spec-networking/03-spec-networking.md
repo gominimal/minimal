@@ -242,7 +242,7 @@ DNS integration), new hostname manager module, host-side DNS configuration path
 **Functional Requirements:**
 
 - **R3.1**: `minimald` shall register a DNS hostname for each `OwnIp` PTask on
-  launch. The hostname format shall be `<session-name>.<host-id>.min.local`
+  launch. The hostname format shall be `<session-name>.<host-id>.localhost`
   (where `<host-id>` is a stable short name for the `minimald` instance,
   configurable). The hostname shall resolve to the PTask's gvproxy switch IP
   from processes on the same host. The hostname shall be deregistered when the
@@ -252,8 +252,11 @@ DNS integration), new hostname manager module, host-side DNS configuration path
   to an IP address when connecting to a `minimald` (UC2c).
 - **R3.3**: A browser on the same host shall reach a webserver inside an `OwnIp`
   PTask by its hostname (R3.1) without memorizing an IP (UC2a). The request
-  routes through the gvproxy published port on `127.0.0.1`. The specific DNS
-  resolution mechanism is decided in Open Questions (item 1).
+  routes through the gvproxy published port on `127.0.0.1`. The DNS resolution
+  mechanism is `*.localhost` + a host-side proxy (Open Question 1, resolved by
+  spike #485): the system resolver synthesizes every `*.localhost` name to
+  loopback statically, and the host-side proxy routes each request to the right
+  PTask by its `Host:` header.
 - **R3.4**: DNS hostname registration shall require no root privilege per-invocation.
   If the mechanism requires a one-time install step (e.g. a system resolver
   configuration), `minimald` shall detect whether the step has been performed and
@@ -263,7 +266,7 @@ DNS integration), new hostname manager module, host-side DNS configuration path
   structured `tracing` event with fields: `session_id`, `hostname`, `ip`,
   `action` (`registered` / `deregistered`).
 - **R3.6**: `minimald` shall register a DNS hostname for each `HostNet` PTask
-  on launch, in the same format as R3.1 (`<session-name>.<host-id>.min.local`).
+  on launch, in the same format as R3.1 (`<session-name>.<host-id>.localhost`).
   The hostname shall resolve to `127.0.0.1` for local-only `minimald`
   configurations, or to the host's configured network interface address for DM5
   (network-accessible) configurations. The hostname shall be deregistered when
@@ -276,10 +279,10 @@ DNS integration), new hostname manager module, host-side DNS configuration path
    via the system resolver (`getaddrinfo`), asserts it resolves to the expected
    gvproxy switch IP, then confirms the hostname no longer resolves after the
    PTask exits — demonstrates R3.1 registration lifecycle.
-2. **CLI:** `curl http://<session-name>.<host-id>.min.local/` from the local host
+2. **CLI:** `curl http://<session-name>.<host-id>.localhost/` from the local host
    returns HTTP 200 from a webserver running inside an own-IP PTask — demonstrates
    UC2a local browser access.
-3. **CLI:** `curl http://<session-name>.<host-id>.min.local:<port>/` from the
+3. **CLI:** `curl http://<session-name>.<host-id>.localhost:<port>/` from the
    local host returns HTTP 200 from a webserver running inside a `HostNet` PTask
    (hostname resolves to `127.0.0.1`) — demonstrates UC2 hostname-driven access
    for host-net PTask services (R3.6).
@@ -350,7 +353,7 @@ management)
    network namespaces, WireGuard mesh configured, asserts that a TCP connect from
    a PTask on instance A to a PTask on instance B (via their switch IPs across the
    mesh tunnel) succeeds — demonstrates UC7 remote PTask-to-PTask.
-2. **CLI:** From a laptop in the mesh, `curl http://<session-name>.<host-id>.min.local/`
+2. **CLI:** From a laptop in the mesh, `curl http://<session-name>.<host-id>.localhost/`
    returns HTTP 200 from a webserver in an own-IP PTask on a remote host, routed
    over the WireGuard tunnel — demonstrates UC2b option A remote mesh access.
 3. **CLI:** `minimal ssh-forward <session> 8080:127.0.0.1:80` with the WireGuard
@@ -389,18 +392,27 @@ PTask-to-PTask) path without additional bridging. The CPU overhead of a shared
 gvproxy is acceptable for a developer-workstation workload
 (informed by `docs/specs/03-spec-networking/networking-with-diagrams.md`).
 
-### DNS resolution: open design decision
+### DNS resolution: `*.localhost` + host-side proxy (decided)
 
-R3.3 requires hostname resolution but does not pin the mechanism. Two rootless
-paths exist:
+R3.3 required a hostname-resolution mechanism. Spike #485 settled it in favour
+of **`*.localhost` + a host-side proxy** over the one-time
+`/etc/resolver`/resolver-config alternative, because it needs no privileged
+write per session and no documented install step beyond an active system
+resolver:
 
-- **`*.localhost` + host-side proxy**: relies on the system resolver supporting
-  wildcard-localhost (guaranteed on macOS; requires NetworkManager or
-  systemd-resolved on Linux). No privileged write needed per-session.
-- **One-time `/etc/resolver` (macOS) or resolver config (Linux)**: requires a
-  documented one-time setup step; simpler per-session implementation.
+- The system resolver synthesizes every `*.localhost` name to a loopback
+  address statically (guaranteed on macOS; provided by systemd-resolved or
+  NetworkManager on Linux). `minimald` writes nothing to the resolver per
+  session; it only probes at startup that the synthesis is available and warns
+  with a remediation if it is not (R3.4).
+- Because that synthesis is static and identical for every name, the DNS layer
+  cannot distinguish PTasks. A host-side proxy is the discriminator: it routes
+  each incoming request to the right PTask by its `Host:` header, consulting an
+  in-memory hostname registry `minimald` maintains.
 
-The mechanism is decided in Open Questions item 1 before Unit 3 begins.
+The rejected alternative — a one-time `/etc/resolver` (macOS) or resolver
+config (Linux) — has a simpler per-session path but requires a documented
+privileged setup step, which conflicts with the rootless goal.
 
 ### WireGuard implementation: wireguard-go vs boringtun
 
@@ -448,10 +460,12 @@ access in restricted environments.
 
 ## Open Questions
 
-1. **DNS resolution mechanism** (R3.3, Unit 3): `*.localhost` + host-side proxy
-   vs one-time `/etc/resolver`/resolver-config registration. The `*.localhost`
-   path is fully rootless but requires the system resolver to support wildcard
-   localhost patterns. **Decision needed before Unit 3 implementation begins.**
+1. **DNS resolution mechanism** (R3.3, Unit 3): **Resolved (spike #485):**
+   `*.localhost` + host-side proxy, over one-time
+   `/etc/resolver`/resolver-config registration. The `*.localhost` path is fully
+   rootless; it requires only that the system resolver synthesize wildcard
+   localhost patterns, which `minimald` probes at startup and warns about if
+   absent (R3.4). See the "DNS resolution" design consideration above.
 2. **Egress default policy** (R2.1): The spec defaults absent `egress` to
    allow-all. Confirm with SecOps whether a deny-all default is required for
    compliance; changing the default is a breaking change to existing PTask

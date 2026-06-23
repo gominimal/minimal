@@ -75,7 +75,7 @@ pub struct WireResolvedPatch {
 }
 
 /// A resolved variable + its origin. Mirrors
-/// [`crate::core::compose::SessionVar`].
+/// [`crate::client::composer::SessionVar`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct WireSessionVar {
     /// Resolved variable.
@@ -85,7 +85,7 @@ pub struct WireSessionVar {
 }
 
 /// A resolved patch + its origin. Mirrors
-/// [`crate::core::compose::SessionPatch`].
+/// [`crate::client::composer::SessionPatch`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct WireSessionPatch {
     /// Resolved patch.
@@ -148,8 +148,7 @@ pub struct WirePackageRef {
 }
 
 /// Daemon-issued correlation token for a single pending item. Scoped
-/// to one [`crate::wire::request::ContributionResponse`] — the client
-/// echoes each id back in the corresponding verdict.
+/// to a single `(session_id, round)` pair on the wire.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -158,7 +157,7 @@ pub struct PendingId(u32);
 
 impl PendingId {
     /// Construct from a raw id. The daemon is responsible for
-    /// uniqueness within a [`crate::wire::request::ContributionResponse`].
+    /// uniqueness within a round.
     #[must_use]
     pub fn new(id: u32) -> Self {
         Self(id)
@@ -176,7 +175,7 @@ impl PendingId {
 /// user policy.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct WirePendingVar {
-    /// Correlation id; the client echoes it back on the verdict.
+    /// Correlation id; client echoes it back on the verdict.
     pub id: PendingId,
     /// Variable name.
     pub name: String,
@@ -187,12 +186,12 @@ pub struct WirePendingVar {
     pub source: WireSource,
 }
 
-/// Daemon → Client: a patch from a package or the project that the
-/// client will expand (against its already-gated vars) and run
-/// through user policy.
+/// Daemon → Client: a patch from a package or the project that needs
+/// the client to expand any `$VAR` references (against the client's
+/// already-resolved vars) and run through user policy.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct WirePendingPatch {
-    /// Correlation id; the client echoes it back on the verdict.
+    /// Correlation id; client echoes it back on the verdict.
     pub id: PendingId,
     /// Raw, unexpanded source path expression. Client expands using
     /// its resolved vars + tilde-fallback.
@@ -206,105 +205,6 @@ pub struct WirePendingPatch {
     /// Where it came from.
     pub source: WireSource,
 }
-
-// ---------------------------------------------------------------------------
-// Domain → wire conversions.
-//
-// The wire schema is structurally separate from the local domain types
-// (so it can evolve independently), but the *content* is the same.
-// These `From` impls package a domain `Composition` into the wire form
-// the client ships to the daemon.
-
-impl From<crate::core::source::Source> for WireSource {
-    fn from(s: crate::core::source::Source) -> Self {
-        match s {
-            crate::core::source::Source::UserLoadout { name } => Self::UserLoadout { name },
-            crate::core::source::Source::Project { path } => Self::Project { path },
-            crate::core::source::Source::Package { name } => Self::Package { name },
-        }
-    }
-}
-
-impl From<crate::core::primitives::ResolvedVar> for WireResolvedVar {
-    fn from(v: crate::core::primitives::ResolvedVar) -> Self {
-        let (name, value) = v.into_parts();
-        Self { name, value }
-    }
-}
-
-impl From<crate::core::primitives::ResolvedPatch> for WireResolvedPatch {
-    fn from(p: crate::core::primitives::ResolvedPatch) -> Self {
-        let (host_path, destination) = p.into_parts();
-        Self {
-            host_path,
-            destination,
-        }
-    }
-}
-
-impl From<crate::core::compose::SessionVar> for WireSessionVar {
-    fn from(v: crate::core::compose::SessionVar) -> Self {
-        let (var, source) = v.into_parts();
-        Self {
-            var: var.into(),
-            source: source.into(),
-        }
-    }
-}
-
-impl From<crate::core::compose::SessionPatch> for WireSessionPatch {
-    fn from(p: crate::core::compose::SessionPatch) -> Self {
-        let (patch, source) = p.into_parts();
-        Self {
-            patch: patch.into(),
-            source: source.into(),
-        }
-    }
-}
-
-impl From<crate::core::lifecyclehook::HookScript> for WireHookScript {
-    fn from(s: crate::core::lifecyclehook::HookScript) -> Self {
-        match s {
-            crate::core::lifecyclehook::HookScript::Inline(body) => Self::Inline { body },
-            crate::core::lifecyclehook::HookScript::External(path) => Self::External { path },
-        }
-    }
-}
-
-impl From<crate::core::lifecyclehook::LifecycleHook> for WireLifecycleHook {
-    fn from(h: crate::core::lifecyclehook::LifecycleHook) -> Self {
-        let (_description, on_activate, on_destroy, on_failure) = h.into_parts();
-        Self {
-            on_activate: on_activate.map(Into::into),
-            on_destroy: on_destroy.map(Into::into),
-            on_failure: on_failure.map(Into::into),
-        }
-    }
-}
-
-impl From<crate::core::source::ProvenancedHook> for WireProvenancedHook {
-    fn from(h: crate::core::source::ProvenancedHook) -> Self {
-        let (hook, source) = h.into_parts();
-        Self {
-            hook: hook.into(),
-            source: source.into(),
-        }
-    }
-}
-
-impl From<crate::core::source::ProvenancedPackage> for WirePackageRef {
-    fn from(p: crate::core::source::ProvenancedPackage) -> Self {
-        let (name, source) = p.into_parts();
-        Self {
-            name,
-            source: source.into(),
-        }
-    }
-}
-
-// Wire → domain conversions live alongside each domain type — see
-// `core::primitives`, `core::source`, `core::lifecyclehook`, and
-// `core::compose`.
 
 #[cfg(test)]
 mod tests {

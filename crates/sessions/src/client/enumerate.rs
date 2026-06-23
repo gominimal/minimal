@@ -4,7 +4,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 
 use paths::{HostAbsPath, SandboxRelPath};
 
-use crate::core::compose::ComposeError;
+use crate::client::composer::ResolveError;
 use crate::core::primitives::{FileSet, PatchDest, PatchError};
 use crate::core::source::{Provenanced, Source};
 
@@ -16,7 +16,7 @@ use crate::core::source::{Provenanced, Source};
 /// set AND the walker traversed an actual symlink. In every other case
 /// the link is implicitly the target, and `link_path` is `None`.
 ///
-/// Both paths are realmed [`HostAbsPath`] — the gate upholds the
+/// Both paths are realmed [`HostAbsPath`] — the resolver upholds the
 /// absoluteness invariant via the
 /// [`ExpandError::NotAbsolute`](crate::core::expansion::ExpandError::NotAbsolute)
 /// gate at expansion time, and `target_path` is also canonical (via
@@ -87,12 +87,12 @@ pub(crate) struct ExpandedProvenancedPatch {
 /// All errors across every patch are accumulated — a permission-denied
 /// subtree under one patch doesn't hide an unwalkable pattern in
 /// another. If any error occurred, they surface together as
-/// [`ComposeError::PatchWalk`]; otherwise the file list is returned
+/// [`ResolveError::PatchWalk`]; otherwise the file list is returned
 /// cleanly.
 pub(crate) fn enumerate_patch_files(
     items: Vec<ExpandedProvenancedPatch>,
     follow_symlinks: bool,
-) -> Result<Vec<PatchFile>, ComposeError> {
+) -> Result<Vec<PatchFile>, ResolveError> {
     let mut out = Vec::new();
     let mut accumulated_errors = Vec::new();
     for pp in items {
@@ -178,7 +178,7 @@ pub(crate) fn enumerate_patch_files(
     if accumulated_errors.is_empty() {
         return Ok(out);
     }
-    Err(ComposeError::PatchWalk {
+    Err(ResolveError::PatchWalk {
         sources: accumulated_errors,
     })
 }
@@ -216,7 +216,7 @@ pub(crate) fn canonicalize_utf8(path: &Utf8Path) -> Result<Utf8PathBuf, PatchErr
 ///
 /// # Invariants (panic conditions)
 ///
-/// Both panics describe internal contracts that
+/// Both panics describe resolver-internal contracts that
 /// `enumerate_patch_files` is responsible for upholding. They should
 /// be unreachable in normal operation; if one fires, it indicates a
 /// bug in this crate.
@@ -237,7 +237,9 @@ pub(crate) fn compute_dest(
         dest_root.to_path_buf()
     } else {
         let suffix = source_path.strip_prefix(root_path).unwrap_or_else(|_| {
-            panic!("compose invariant: source path {source_path} is outside walk root {root_path}")
+            panic!(
+                "resolver invariant: source path {source_path} is outside walk root {root_path}",
+            )
         });
         if dest_root.as_str().is_empty() {
             suffix.to_path_buf()
@@ -246,7 +248,7 @@ pub(crate) fn compute_dest(
         }
     };
     SandboxRelPath::try_new(joined)
-        .expect("compose invariant: dest_root and suffix are both relative")
+        .expect("resolver invariant: dest_root and suffix are both relative")
 }
 
 // =====================================================================
@@ -278,7 +280,7 @@ mod tests {
     }
 
     /// Regression for component-boundary strip — `/etc/xdg` must
-    /// not match `/etc/xdgfoo/bar`. Compose invariant; we panic
+    /// not match `/etc/xdgfoo/bar`. Resolver invariant; we panic
     /// rather than produce a garbage dest.
     #[test]
     #[should_panic(expected = "outside walk root")]
@@ -289,7 +291,7 @@ mod tests {
     }
 
     // =================================================================
-    // FileSet::resolve direct (unit, not via the gate)
+    // FileSet::resolve direct (unit, not via resolver)
     // =================================================================
 
     #[test]

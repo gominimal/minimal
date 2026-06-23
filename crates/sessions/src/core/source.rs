@@ -1,9 +1,9 @@
 //! Provenance: which source contributed a primitive.
 //!
 //! [`Source`] describes the origin (user loadout / project / package) of
-//! every item that flows through the composer. The [`Provenanced`] trait
+//! every item that flows through the resolver. The [`Provenanced`] trait
 //! is what makes policy `check` methods source-aware; each `ProvenancedX`
-//! wrapper pairs a primitive with its origin so the composer can carry
+//! wrapper pairs a primitive with its origin so the resolver can carry
 //! both through together.
 
 use core::fmt;
@@ -13,9 +13,9 @@ use paths::HostPath;
 use crate::core::primitives::{Patch, ResolvedVar};
 
 /// Where a contribution came from — the provenance attached to every
-/// item that flows through the composer.
+/// item that flows through the resolver.
 ///
-/// `Source` is what makes the origin-aware allow step possible
+/// `Source` is what makes the user-origin bypass possible
 /// ([`VarsPolicy::check`](crate::core::policy::VarsPolicy::check) /
 /// [`PatchPolicy::check`](crate::core::policy::PatchPolicy::check) inspect
 /// this) and what error messages name when an item is rejected.
@@ -44,7 +44,7 @@ impl fmt::Display for Source {
 
 /// Trait for types that know which [`Source`] contributed them.
 ///
-/// The composer takes `T: Provenanced` so policy `check` methods can
+/// The resolver takes `T: Provenanced` so policy `check` methods can
 /// query the source without the caller having to thread it through
 /// alongside the item.
 pub trait Provenanced {
@@ -52,7 +52,7 @@ pub trait Provenanced {
     fn source(&self) -> &Source;
 }
 
-/// A [`ResolvedVar`] tagged with its [`Source`] for the composer.
+/// A [`ResolvedVar`] tagged with its [`Source`] for the resolver.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProvenancedVar {
     var: ResolvedVar,
@@ -73,7 +73,7 @@ impl ProvenancedVar {
         &self.var
     }
 
-    /// Consume and return the inner var + source. Used by the composer
+    /// Consume and return the inner var + source. Used by the resolver
     /// to destructure during the move-out phase.
     #[must_use]
     pub fn into_parts(self) -> (ResolvedVar, Source) {
@@ -87,7 +87,7 @@ impl Provenanced for ProvenancedVar {
     }
 }
 
-/// A [`Patch`] tagged with its [`Source`] for the composer.
+/// A [`Patch`] tagged with its [`Source`] for the resolver.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProvenancedPatch {
     patch: Patch,
@@ -109,7 +109,7 @@ impl ProvenancedPatch {
     }
 
     /// Consume and return the inner patch + source. Used by the
-    /// composer to destructure during the move-out phase.
+    /// resolver to destructure during the move-out phase.
     #[must_use]
     pub fn into_parts(self) -> (Patch, Source) {
         (self.patch, self.source)
@@ -145,12 +145,6 @@ impl ProvenancedPackage {
     pub fn package(&self) -> &str {
         &self.package
     }
-
-    /// Consume the [`ProvenancedPackage`] and return `(package, source)`.
-    #[must_use]
-    pub fn into_parts(self) -> (String, Source) {
-        (self.package, self.source)
-    }
 }
 
 impl Provenanced for ProvenancedPackage {
@@ -165,7 +159,7 @@ impl Provenanced for ProvenancedPackage {
 /// Lifecycle hooks run inside the sandbox (or its equivalent isolated
 /// environment), so they don't go through the policy gate — they
 /// pass through resolution unchanged.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct ProvenancedHook {
     hook: crate::core::lifecyclehook::LifecycleHook,
     source: Source,
@@ -184,46 +178,10 @@ impl ProvenancedHook {
     pub fn hook(&self) -> &crate::core::lifecyclehook::LifecycleHook {
         &self.hook
     }
-
-    /// Consume the [`ProvenancedHook`] and return `(hook, source)`.
-    #[must_use]
-    pub fn into_parts(self) -> (crate::core::lifecyclehook::LifecycleHook, Source) {
-        (self.hook, self.source)
-    }
 }
 
 impl Provenanced for ProvenancedHook {
     fn source(&self) -> &Source {
         &self.source
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Wire → domain conversions
-// ---------------------------------------------------------------------------
-
-impl From<crate::wire::primitives::WireSource> for Source {
-    fn from(s: crate::wire::primitives::WireSource) -> Self {
-        match s {
-            crate::wire::primitives::WireSource::UserLoadout { name } => Self::UserLoadout { name },
-            crate::wire::primitives::WireSource::Project { path } => Self::Project { path },
-            crate::wire::primitives::WireSource::Package { name } => Self::Package { name },
-        }
-    }
-}
-
-impl From<crate::wire::primitives::WirePackageRef> for ProvenancedPackage {
-    fn from(p: crate::wire::primitives::WirePackageRef) -> Self {
-        Self::new(p.name, p.source.into())
-    }
-}
-
-/// Fallible because the inner wire `LifecycleHook` may have all three
-/// callbacks absent, which the domain type rejects.
-impl TryFrom<crate::wire::primitives::WireProvenancedHook> for ProvenancedHook {
-    type Error = crate::core::lifecyclehook::Error;
-    fn try_from(h: crate::wire::primitives::WireProvenancedHook) -> Result<Self, Self::Error> {
-        let hook: crate::core::lifecyclehook::LifecycleHook = h.hook.try_into()?;
-        Ok(Self::new(hook, h.source.into()))
     }
 }

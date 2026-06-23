@@ -1,6 +1,6 @@
 //! Wire-form error envelope.
 //!
-//! Rich local error types — [`ComposeError`], `PatchError`, `VarError`,
+//! Rich local error types — [`ResolveError`], `PatchError`, `VarError`,
 //! `ExpandError` — stay local. They carry source chains, IO errors,
 //! and other non-serializable detail. Anything that needs to cross the
 //! RPC boundary collapses to [`WireError`] with a string summary.
@@ -8,11 +8,10 @@
 //! Conversions live here so the boundary is the only place a rich
 //! error is degraded.
 //!
-//! [`ComposeError`]: crate::core::compose::ComposeError
+//! [`ResolveError`]: crate::client::composer::ResolveError
 
 /// Errors the daemon may send back to the client (or vice versa) in
 /// response to a wire-form request.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WireError {
@@ -49,22 +48,13 @@ pub enum WireError {
     },
 }
 
-impl From<crate::core::compose::ComposeError> for WireError {
-    /// Collapse a rich local compose error to the wire envelope. The
+impl From<crate::client::composer::ResolveError> for WireError {
+    /// Collapse a rich local resolve error to the wire envelope. The
     /// `Display` summary is used; the source chain is dropped at the
     /// boundary.
-    ///
-    /// `InvalidWireItem` — the one variant that represents bad client
-    /// input rather than a daemon-internal problem — maps to
-    /// [`WireError::InvalidContribution`]. Everything else collapses
-    /// to [`WireError::Internal`].
-    fn from(e: crate::core::compose::ComposeError) -> Self {
-        let message = e.to_string();
-        match e {
-            crate::core::compose::ComposeError::InvalidWireItem { .. } => {
-                Self::InvalidContribution { message }
-            }
-            _ => Self::Internal { message },
+    fn from(e: crate::client::composer::ResolveError) -> Self {
+        Self::Internal {
+            message: e.to_string(),
         }
     }
 }
@@ -129,30 +119,17 @@ mod tests {
         );
     }
 
-    /// `From<ComposeError>` collapses most variants to `Internal`
-    /// with the local error's `Display` text.
+    /// `From<ResolveError>` collapses to `Internal` with the local
+    /// error's `Display` text. Verifies the conversion exists and
+    /// doesn't accidentally expand the wire schema with structured
+    /// fields.
     #[test]
-    fn from_compose_error_collapses_to_internal() {
-        let local = crate::core::compose::ComposeError::Aborted;
+    fn from_resolve_error_collapses_to_internal() {
+        let local = crate::client::composer::ResolveError::Aborted;
         let wire: WireError = local.into();
         assert!(
             matches!(wire, WireError::Internal { .. }),
             "expected Internal, got: {wire:?}",
-        );
-    }
-
-    /// `InvalidWireItem` represents bad client input and maps to
-    /// `InvalidContribution`, not `Internal`.
-    #[test]
-    fn from_compose_error_invalid_wire_item_maps_to_invalid_contribution() {
-        let local = crate::core::compose::ComposeError::InvalidWireItem {
-            what: "lifecycle hook with no callbacks",
-            context: "empty hook".into(),
-        };
-        let wire: WireError = local.into();
-        assert!(
-            matches!(wire, WireError::InvalidContribution { .. }),
-            "expected InvalidContribution, got: {wire:?}",
         );
     }
 }
