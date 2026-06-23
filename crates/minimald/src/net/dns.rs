@@ -170,10 +170,30 @@ impl HostnameRegistry {
     /// is case-insensitive, matching how a real `Host:` header arrives.
     #[must_use]
     pub fn resolve(&self, host_header: &str) -> Option<IpAddr> {
-        let host = host_header.split(':').next().unwrap_or(host_header);
+        let host = host_component(host_header);
         self.by_host
             .get(&Hostname(host.to_ascii_lowercase()))
             .copied()
+    }
+}
+
+/// Extracts the host of a `Host:` header, stripping an optional `:port` suffix.
+///
+/// Handles both the common `name:port` form and the bracketed IPv6 literal
+/// form (`[::1]:8080`), where the port follows the closing bracket rather than
+/// the first colon. The registry only ever holds `*.localhost` names, so an
+/// IPv6 literal never routes; parsing it correctly keeps a naive split-on-first-
+/// colon from silently truncating `[::1]` to `[`.
+fn host_component(host_header: &str) -> &str {
+    if host_header.starts_with('[') {
+        // IPv6 literal: the host is everything up to and including the closing
+        // bracket; any `:port` follows it.
+        host_header
+            .find(']')
+            .map_or(host_header, |close| &host_header[..=close])
+    } else {
+        // `name` or `name:port`: the host ends at the first colon.
+        host_header.split(':').next().unwrap_or(host_header)
     }
 }
 
@@ -288,6 +308,21 @@ mod tests {
             .expect("hostname was registered");
         assert_eq!(removed.as_str(), "myservice.dev.localhost");
         assert_eq!(reg.resolve("myservice.dev.localhost"), None);
+    }
+
+    /// Port stripping handles both the common `name:port` form and the
+    /// bracketed IPv6 literal form, where the port follows the closing bracket.
+    /// The registry never holds an IPv6 literal, so this guards the parse from
+    /// silently truncating `[::1]` to `[` at the first colon.
+    #[test]
+    fn host_component_strips_port_including_bracketed_ipv6() {
+        assert_eq!(host_component("svc.dev.localhost"), "svc.dev.localhost");
+        assert_eq!(
+            host_component("svc.dev.localhost:8080"),
+            "svc.dev.localhost"
+        );
+        assert_eq!(host_component("[::1]:8080"), "[::1]");
+        assert_eq!(host_component("[::1]"), "[::1]");
     }
 
     /// Deregistering a session that was never registered is a silent no-op, so
