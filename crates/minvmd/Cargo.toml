@@ -16,16 +16,19 @@ serde_json.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Shares minimald's portable RPC wire types: `NetworkMode` / `IpProto` drive the
+# VM network mode and VM-wide egress policy (minimald itself is Linux-only and
+# cannot be imported here, but the wire-types crate is portable).
+minimald-rpc.workspace = true
+# Async gvproxy switch supervision in `net`: the background exit-detection task
+# and the async `stop()` teardown run on the tokio runtime the networking layer
+# mandates (no blocking I/O in async context).
+tokio.workspace = true
 
 [dev-dependencies]
 serial_test.workspace = true
 tempfile.workspace = true
 # Session e2e test (minimald_session_e2e): a russh client over the bridge.
 russh.workspace = true
-tokio.workspace = true
 sessions.workspace = true
 paths.workspace = true
-# Shares minimald's RPC wire types so the test encodes/decodes through the
-# same definitions the server uses (minimald itself is Linux-only and cannot
-# be imported into this macOS test, but the wire-types crate is portable).
-minimald-rpc.workspace = true

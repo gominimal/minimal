@@ -1,15 +1,20 @@
 //! VM configuration builder.
 //!
 //! [`VmConfig`] collects the parameters needed to configure a libkrun context
-//! (vcpus, RAM, kernel, initramfs, root disk). No network device is added in
-//! v0.1; gvproxy/TSI integration is tracked in #160.
+//! (vcpus, RAM, kernel, initramfs, root disk, network mode). The network mode
+//! selects how the VM attaches to the per-host gvproxy switch supervised by
+//! [`crate::net`] (R1.4, R1.5).
 
 use std::path::PathBuf;
+
+use minimald_rpc::NetworkMode;
 
 /// Configuration parameters for a single microVM.
 ///
 /// Build with [`VmConfig::new`] and apply to a libkrun
-/// [`Context`][crate::krun::Context] with [`VmConfig::apply`].
+/// [`Context`][crate::krun::Context] with [`VmConfig::apply`]. The network mode
+/// defaults to [`NetworkMode::HostNet`]; override it with
+/// [`VmConfig::with_network_mode`].
 #[derive(Debug, Clone)]
 pub struct VmConfig {
     /// Number of virtual CPUs.
@@ -25,6 +30,10 @@ pub struct VmConfig {
     /// `/init` (minimald as pid-1), instead of booting a block-device root. This
     /// is how minimald is shipped as pid-1 without baking it into the rootfs.
     pub initramfs: PathBuf,
+    /// How this VM attaches to the per-host gvproxy switch (R1.5). Defaults to
+    /// [`NetworkMode::HostNet`]; an `OwnIp` VM is wired to the switch as a
+    /// client via the per-PTask vsock shuttle.
+    pub network_mode: NetworkMode,
 }
 
 impl VmConfig {
@@ -43,7 +52,15 @@ impl VmConfig {
             kernel_path,
             rootfs_path,
             initramfs,
+            network_mode: NetworkMode::default(),
         }
+    }
+
+    /// Set the VM network mode (R1.5), consuming and returning `self`.
+    #[must_use]
+    pub fn with_network_mode(mut self, network_mode: NetworkMode) -> Self {
+        self.network_mode = network_mode;
+        self
     }
 
     /// Apply this configuration to an existing libkrun [`Context`][crate::krun::Context].
@@ -71,7 +88,12 @@ impl VmConfig {
             crate::krun::DiskFormat::Raw,
             true,
         )?;
-        // R2.5: no network device in v0.1.
+        // Network attachment (R1.5): the VM joins the per-host gvproxy switch
+        // supervised by `crate::net` according to `network_mode`. The libkrun
+        // device wiring (tap fd handed to gvproxy over the per-PTask vsock
+        // shuttle) is driven by the switch handle, not configured here; record
+        // the selected mode so a stuck boot can be diagnosed.
+        tracing::debug!(network_mode = ?self.network_mode, "VM network mode selected");
 
         // R3.1: register the host UDS bridge (listen=true). libkrun listens on
         // the host UDS and bridges each accepted connection to the guest process
@@ -111,6 +133,31 @@ mod tests {
         assert_eq!(cfg.kernel_path, PathBuf::from("/boot/Image.gz"));
         assert_eq!(cfg.rootfs_path, PathBuf::from("/var/lib/rootfs.img"));
         assert_eq!(cfg.initramfs, PathBuf::from("/var/lib/initramfs.cpio"));
+    }
+
+    #[test]
+    fn network_mode_defaults_to_host_net() {
+        let cfg = VmConfig::new(
+            1,
+            256,
+            PathBuf::from("/k"),
+            PathBuf::from("/r"),
+            PathBuf::from("/i"),
+        );
+        assert_eq!(cfg.network_mode, NetworkMode::HostNet);
+    }
+
+    #[test]
+    fn with_network_mode_overrides_default() {
+        let cfg = VmConfig::new(
+            1,
+            256,
+            PathBuf::from("/k"),
+            PathBuf::from("/r"),
+            PathBuf::from("/i"),
+        )
+        .with_network_mode(NetworkMode::OwnIp);
+        assert_eq!(cfg.network_mode, NetworkMode::OwnIp);
     }
 
     #[test]
