@@ -467,8 +467,14 @@ impl PendingVar {
                 VarError::ResolutionFailure { name, source } => {
                     ComposeError::VarResolution { name, source }
                 }
-                // `resolve_with` only ever emits `ResolutionFailure`.
-                other => unreachable!("ResolvedVar::resolve_with returned {other:?}"),
+                // `resolve_with` only documents `ResolutionFailure` for
+                // resolution input, but `VarError` is `#[non_exhaustive]`
+                // — fall back to a recoverable error instead of panicking
+                // if a new variant ever leaks through.
+                other => ComposeError::InvalidWireItem {
+                    what: "pending var resolution",
+                    context: format!("{other}"),
+                },
             },
         )?;
         Ok(Self {
