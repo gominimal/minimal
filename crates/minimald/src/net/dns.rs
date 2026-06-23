@@ -28,6 +28,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
 
+use sessions::SessionId;
+
 /// The DNS suffix every PTask hostname carries (see the module docs).
 pub const LOCALHOST_SUFFIX: &str = "localhost";
 
@@ -66,6 +68,16 @@ impl fmt::Display for Hostname {
     }
 }
 
+/// A live registration: the hostname minted for a session, plus the stable
+/// `SessionId` carried in its R3.5 tracing events. The id is captured at
+/// registration so `deregister` (keyed by the mutable session name) emits the
+/// same stable identifier the `registered` event did.
+#[derive(Debug, Clone)]
+struct Registration {
+    id: SessionId,
+    hostname: Hostname,
+}
+
 /// An in-memory registry of live PTask hostnames, owned by the sessions manager
 /// (one per `minimald`). It maps each live PTask's hostname to the address a
 /// host-side proxy routes its requests to, and tracks the reverse (session →
@@ -76,8 +88,8 @@ pub struct HostnameRegistry {
     host_id: String,
     /// hostname → the address a host-side proxy routes its requests to.
     by_host: HashMap<Hostname, IpAddr>,
-    /// session name → its registered hostname, for withdrawal on exit.
-    by_session: HashMap<String, Hostname>,
+    /// session name → its live registration, for withdrawal on exit.
+    by_session: HashMap<String, Registration>,
 }
 
 impl HostnameRegistry {
@@ -92,13 +104,27 @@ impl HostnameRegistry {
     }
 
     /// Registers `session_name`'s hostname, routing it to `target`, and returns
-    /// the hostname. Emits the R3.5 `registered` tracing event.
-    pub fn register(&mut self, session_name: &str, target: IpAddr) -> Hostname {
+    /// the hostname. Emits the R3.5 `registered` tracing event. `session_id` is
+    /// the stable, unique identifier carried in that event for log correlation;
+    /// `session_name` is the registry key (mutable, and reusable after the
+    /// session exits), so both are emitted.
+    pub fn register(
+        &mut self,
+        session_id: SessionId,
+        session_name: &str,
+        target: IpAddr,
+    ) -> Hostname {
         let hostname = Hostname::for_ptask(session_name, &self.host_id);
-        self.by_session
-            .insert(session_name.to_string(), hostname.clone());
+        self.by_session.insert(
+            session_name.to_string(),
+            Registration {
+                id: session_id,
+                hostname: hostname.clone(),
+            },
+        );
         self.by_host.insert(hostname.clone(), target);
         tracing::info!(
+            session_id = %session_id,
             session_name,
             hostname = %hostname,
             ip = %target,
@@ -109,21 +135,26 @@ impl HostnameRegistry {
     }
 
     /// Registers a `HostNet` PTask, routing its hostname to `127.0.0.1` (R3.6).
-    pub fn register_host_net(&mut self, session_name: &str) -> Hostname {
-        self.register(session_name, LOOPBACK)
+    pub fn register_host_net(&mut self, session_id: SessionId, session_name: &str) -> Hostname {
+        self.register(session_id, session_name, LOOPBACK)
     }
 
     /// Withdraws `session_name`'s hostname, returning it if one was registered.
     /// Emits the R3.5 `deregistered` tracing event only when an entry is
     /// actually removed, so calling it for an unregistered session is a silent
-    /// no-op.
+    /// no-op. The event carries the same stable `session_id` the matching
+    /// `registered` event did, and formats `ip` with `Display` to match it.
     pub fn deregister(&mut self, session_name: &str) -> Option<Hostname> {
-        let hostname = self.by_session.remove(session_name)?;
-        let ip = self.by_host.remove(&hostname);
+        let Registration { id, hostname } = self.by_session.remove(session_name)?;
+        let ip = self
+            .by_host
+            .remove(&hostname)
+            .expect("by_host is kept in sync with by_session by register");
         tracing::info!(
+            session_id = %id,
             session_name,
             hostname = %hostname,
-            ip = ?ip,
+            ip = %ip,
             action = "deregistered",
             "deregistered PTask hostname"
         );
@@ -241,7 +272,7 @@ mod tests {
     fn host_net_registration_routes_by_host_header_then_withdraws() {
         let mut reg = HostnameRegistry::new("dev");
 
-        let hostname = reg.register_host_net("myservice");
+        let hostname = reg.register_host_net(SessionId::nil(), "myservice");
         assert_eq!(hostname.as_str(), "myservice.dev.localhost");
 
         // The host-side proxy routes a request by its `Host:` header to the PTask

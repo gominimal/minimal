@@ -263,10 +263,11 @@ DNS integration), new hostname manager module, host-side DNS configuration path
   emit a `tracing::warn!` with a human-readable remediation instruction when the
   setup is incomplete.
 - **R3.5**: All hostname registration and deregistration events shall emit a
-  structured `tracing` event with fields: `session_name`, `hostname`, `ip`,
-  `action` (`registered` / `deregistered`). The hostname registry is keyed by
-  the session name (per the hostname-manager architecture), so the identifying
-  field carried by the event is `session_name`.
+  structured `tracing` event with fields: `session_id`, `session_name`,
+  `hostname`, `ip`, `action` (`registered` / `deregistered`). `session_id` is
+  the stable, unique identifier for log correlation; `session_name` is the
+  hostname-registry key (per the hostname-manager architecture), which is
+  mutable and reusable, so both are carried.
 - **R3.6**: `minimald` shall register a DNS hostname for each `HostNet` PTask
   on launch, in the same format as R3.1 (`<session-name>.<host-id>.localhost`).
   The hostname shall resolve to `127.0.0.1` for local-only `minimald`

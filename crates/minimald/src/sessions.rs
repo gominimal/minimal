@@ -195,10 +195,12 @@ impl<L: Loader> Manager<L> {
                                     // Register a `HostNet` PTask's hostname on
                                     // launch (R3.6); it routes to loopback.
                                     // `OwnIp` registration is deferred to #542.
+                                    // Capture the id and name before `obj` is
+                                    // moved into `Session::run`.
                                     #[cfg(target_os = "linux")]
-                                    let host_net_name = (obj.record().network
+                                    let host_net_reg = (obj.record().network
                                         == sessions::NetworkMode::HostNet)
-                                        .then(|| registry_name(obj.record()));
+                                        .then(|| (obj.record().id, registry_name(obj.record())));
                                     let h = Session::run(
                                         self.minimal_state_dir.clone(),
                                         self.minimal_cache_dir.clone(),
@@ -208,8 +210,8 @@ impl<L: Loader> Manager<L> {
                                     .await
                                     .expect("TODO handle error");
                                     #[cfg(target_os = "linux")]
-                                    if let Some(name) = host_net_name {
-                                        self.hostnames.register_host_net(&name);
+                                    if let Some((id, name)) = host_net_reg {
+                                        self.hostnames.register_host_net(id, &name);
                                     }
                                     self.running.insert(k, h.clone());
                                     h
@@ -258,12 +260,10 @@ impl<L: Loader> Manager<L> {
                             format!("no session with ID `{}`", id.as_ref()),
                         )
                     })?;
-                    // Withdraw the PTask hostname before the record is removed
-                    // (R3.5). Derive the name from the record up front, letting a
-                    // read error propagate (the `delete` below would fail on the
-                    // same error), so the hostname is never leaked by a silently
-                    // dropped `Err`. `deregister` is a no-op for a session that
-                    // never registered one, so it is called unconditionally.
+                    // Derive the hostname registry key from the record up front,
+                    // letting a read error propagate before anything is torn
+                    // down. `deregister` is a no-op for a session that never
+                    // registered one, so it is called unconditionally.
                     #[cfg(target_os = "linux")]
                     let host_net_name = registry_name(self.store.get(&k)?.record());
                     // Stop the live session first (killing its host and waiting
@@ -272,9 +272,13 @@ impl<L: Loader> Manager<L> {
                     if let Some(hnd) = self.running.remove(&k) {
                         hnd.destroy().await;
                     }
-                    self.store.delete(&k)?;
+                    // Withdraw the PTask hostname (R3.5) before the fallible
+                    // on-disk delete, so a `delete` failure leaves a stale
+                    // on-disk record (repairable on restart) but never a stale
+                    // routing entry pointing at a destroyed session.
                     #[cfg(target_os = "linux")]
                     self.hostnames.deregister(&host_net_name);
+                    self.store.delete(&k)?;
                     Ok(())
                 })
                 .await
