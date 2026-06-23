@@ -19,6 +19,7 @@
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -35,6 +36,12 @@ const DEFAULT_UPSTREAM_PORT: u16 = 80;
 /// Largest request head (request line + headers) the proxy buffers before
 /// routing. A head exceeding this is rejected rather than buffered unbounded.
 const MAX_HEAD: usize = 8 * 1024;
+
+/// How long the proxy waits for a client to finish sending its request head
+/// before abandoning the connection with a `408`. Bounds idle connections that
+/// open the socket but never send the `\r\n\r\n` end-of-head marker, so a slow
+/// or stalled client cannot tie up a connection task indefinitely.
+const HEAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The host-side lookup the proxy performs for each request: a `Host:`-header
 /// host (with any `:port` already stripped) to the address its requests forward
@@ -81,6 +88,15 @@ impl<T: HostRoute> Router<T> {
     /// Routes an HTTP authority to its upstream socket address, or `None` if no
     /// live PTask owns the host. The authority's optional `:port` selects the
     /// upstream port; absent, [`DEFAULT_UPSTREAM_PORT`] is used.
+    ///
+    /// The registry gates on the host, not the port: the upstream port comes
+    /// entirely from the client-supplied authority, so a registered `HostNet`
+    /// hostname can be routed to `127.0.0.1:<any-port>`. That is an accepted
+    /// limitation of the current single-user threat model — the networking spec
+    /// scopes `minimald` to a single tenant per host and defers multi-tenant
+    /// policy isolation (including per-PTask loopback port restriction) to a
+    /// follow-up. Where mutually-untrusted PTasks share loopback, this is a
+    /// loopback-SSRF surface that the follow-up must close.
     #[must_use]
     pub fn route(&self, authority: &str) -> Option<SocketAddr> {
         let (host, port) = split_authority(authority);
@@ -105,14 +121,19 @@ fn split_authority(authority: &str) -> (&str, Option<u16>) {
 /// returns `None`: the proxy is unavailable and PTask hostnames will not route
 /// until the address is free. This is the daemon-startup reachability check that
 /// supersedes the former systemd-resolved probe (R3.4).
+///
+/// The returned listener is the caller's to either serve (via [`serve`]) or
+/// drop. The success event therefore reports the address as `reachable` rather
+/// than `listening`: binding proves the address is free, but a caller that drops
+/// the listener (the current startup check does) is not yet accepting requests.
 pub async fn bind_listener(addr: SocketAddr) -> Option<TcpListener> {
     match TcpListener::bind(addr).await {
         Ok(listener) => {
             tracing::info!(
                 component = "dns-proxy",
                 %addr,
-                status = "listening",
-                "host-side egress proxy listener bound"
+                status = "reachable",
+                "host-side egress proxy listen address is bindable"
             );
             Some(listener)
         }
@@ -173,7 +194,12 @@ async fn handle_connection<T: HostRoute>(
     mut client: TcpStream,
     router: &Router<T>,
 ) -> io::Result<()> {
-    let head = read_head(&mut client).await?;
+    // Bound the head read so a client that connects but never sends a complete
+    // head cannot occupy this task indefinitely.
+    let head = match tokio::time::timeout(HEAD_READ_TIMEOUT, read_head(&mut client)).await {
+        Ok(result) => result?,
+        Err(_elapsed) => return write_status(&mut client, "408 Request Timeout").await,
+    };
     let Some(request) = parse_request(&head) else {
         return write_status(&mut client, "400 Bad Request").await;
     };
@@ -462,5 +488,62 @@ mod tests {
             parse_request(b"GET / HTTP/1.1\r\nHost: web.dev.localhost:8080\r\n\r\n").unwrap();
         assert!(matches!(forward.kind, RequestKind::Forward));
         assert_eq!(forward.authority, "web.dev.localhost:8080");
+    }
+
+    /// A forward request from an `HTTP_PROXY`-configured client carries an
+    /// absolute-form request target (`GET http://web.dev.localhost/path HTTP/1.1`).
+    /// The proxy routes it by `Host:` header and replays the buffered head
+    /// verbatim, so the upstream receives the absolute-form request line
+    /// unchanged — RFC 9112 requires an origin server to accept it. Complements
+    /// `host_header_routes_through_proxy_then_not_found_after_deregister`, which
+    /// only exercises an origin-form (`GET /`) target.
+    #[tokio::test]
+    async fn forward_proxy_replays_absolute_form_target_to_upstream() {
+        // A backend that records the request head it received, then answers 200.
+        let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let backend_port = backend.local_addr().unwrap().port();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_bg = Arc::clone(&received);
+        tokio::spawn(async move {
+            let (mut sock, _) = backend.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let n = sock.read(&mut buf).await.unwrap();
+            received_bg.lock().unwrap().extend_from_slice(&buf[..n]);
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        });
+
+        let mut reg = HostnameRegistry::new("dev");
+        reg.register_host_net(SessionId::nil(), "web");
+        let router = Router::new(Arc::new(reg));
+
+        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(serve(proxy, router));
+
+        let request_line = format!("GET http://web.dev.localhost:{backend_port}/path HTTP/1.1");
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client
+            .write_all(
+                format!("{request_line}\r\nHost: web.dev.localhost:{backend_port}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&response).contains("200 OK"),
+            "expected the absolute-form request to route, got: {}",
+            String::from_utf8_lossy(&response)
+        );
+
+        // The upstream saw the absolute-form request line replayed verbatim.
+        let upstream_head = String::from_utf8(received.lock().unwrap().clone()).unwrap();
+        assert!(
+            upstream_head.starts_with(&request_line),
+            "expected absolute-form target replayed to upstream, got: {upstream_head}"
+        );
     }
 }
