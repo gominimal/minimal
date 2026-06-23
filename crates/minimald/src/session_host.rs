@@ -585,6 +585,13 @@ pub(crate) struct SandboxLauncher {
 /// Dropping it tears down the data-plane relay (detaching the tap) and schedules
 /// a [`detach`](crate::net::GvproxySwitch::detach) on the shared switch, which
 /// decrements its refcount and stops gvproxy once the last `OwnIp` PTask leaves.
+///
+/// Because that `detach` is scheduled on the tokio runtime (see the `Drop`
+/// impl), correct shutdown requires that every `OwnIpAttachment` is dropped —
+/// i.e. all sessions are drained — *before* the runtime is stopped. If the
+/// runtime is torn down first, a pending `detach` never runs and the switch
+/// refcount stays elevated, so gvproxy is only reaped when the daemon process
+/// itself exits.
 #[cfg(not(test))]
 pub(crate) struct OwnIpAttachment {
     /// Held only for its `Drop`, which aborts the relay tasks; never read.
@@ -732,7 +739,7 @@ impl SessionLauncher for SandboxLauncher {
         let (master, slave) = pty.into_fds();
         command.stderr(hakoniwa::Stdio::from(slave));
 
-        let process = command
+        let mut process = command
             .spawn()
             .map_err(|e| io::Error::other(format!("exec failed: {}", e)))?;
         // `command`/`container` no longer borrow `env`, so it can be moved into
@@ -744,8 +751,38 @@ impl SessionLauncher for SandboxLauncher {
         // the launched `hakoniwa::Child`'s PID (`id()`) holds it
         // (`/proc/<pid>/ns/net`), so the attach targets it from the `minimald`
         // side. `HostNet`/`NoNet` skip this entirely.
+        //
+        // Until this attach returns, the PTask's namespace is empty (`lo` is
+        // down and no tap exists): `sandbox2` unshared `CLONE_NEWNET` but has
+        // not yet been handed an interface. A shell PTask never probes the
+        // network in this window — the SSH layer only dispatches commands after
+        // `Launched` is returned — but a future non-shell PTask that touches
+        // the network before its first channel message could see transient
+        // `ENETUNREACH` until the tap is in place.
         let own_ip = if matches!(self.network_mode, NetworkMode::OwnIp) {
-            Some(attach_own_ip(&self.net_switch, process.id()).await?)
+            match attach_own_ip(&self.net_switch, process.id()).await {
+                Ok(attachment) => Some(attachment),
+                Err(e) => {
+                    // The attach failed, so this launch is aborting. A
+                    // `hakoniwa::Child` does not terminate when dropped — it
+                    // would orphan the sandbox process (the same hazard the
+                    // `kill_on_drop(true)` calls in `exec.rs`/`net/mod.rs` guard
+                    // against) — so kill and reap it explicitly before
+                    // propagating the error.
+                    if let Err(kill_err) = process.kill() {
+                        tracing::warn!(
+                            error = %kill_err,
+                            "killing sandbox process after OwnIp attach failure"
+                        );
+                    } else if let Err(wait_err) = process.wait() {
+                        tracing::warn!(
+                            error = %wait_err,
+                            "reaping sandbox process after OwnIp attach failure"
+                        );
+                    }
+                    return Err(e);
+                }
+            }
         } else {
             None
         };
