@@ -26,7 +26,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 
-use super::DEFAULT_MTU;
+use super::{DEFAULT_MTU, PtaskLease, SwitchSubnet};
 
 /// `ioctl` request number for `TUNSETIFF` (set the tap/tun interface a fd backs).
 ///
@@ -113,6 +113,95 @@ pub fn open_tap(name: &str) -> io::Result<OwnedFd> {
         return Err(io::Error::last_os_error());
     }
     Ok(tap)
+}
+
+/// The `ip`/`nsenter` command lines that move an opened tap into the network
+/// namespace of `netns_pid` and configure it there as an `OwnIp` PTask's switch
+/// interface (set the lease MAC, assign the lease address within `subnet`, bring
+/// the interface and loopback up, install a default route via the switch
+/// gateway).
+///
+/// Each command is returned as an argv vector rather than executed, so the two
+/// callers can run them under the privileges they have: the daemon
+/// ([`move_tap_into_netns`]) execs them directly with `CAP_NET_ADMIN`, while the
+/// unprivileged `ci-netns.yml` proof wraps each in `sudo`. Single-sourcing the
+/// command construction keeps the proof driving the same wiring the daemon does.
+///
+/// The namespace is identified by PID, addressing `/proc/<pid>/ns/net` — the
+/// namespace `sandbox2` unshared for the PTask, surfaced to the launcher via the
+/// `hakoniwa::Child`'s PID.
+#[must_use]
+pub fn tap_netns_commands(
+    tap: &str,
+    netns_pid: u32,
+    lease: PtaskLease,
+    subnet: SwitchSubnet,
+) -> Vec<Vec<String>> {
+    let pid = netns_pid.to_string();
+    let mac = lease.mac.to_string();
+    let cidr = format!("{}/{}", lease.ip, subnet.prefix());
+    let gw = subnet.gateway().to_string();
+
+    // Enter the PTask's net namespace (by PID) to run an `ip` subcommand there.
+    let nsenter = |args: &[&str]| -> Vec<String> {
+        ["nsenter", "-t", &pid, "-n"]
+            .into_iter()
+            .chain(args.iter().copied())
+            .map(str::to_string)
+            .collect()
+    };
+
+    vec![
+        // Move the interface into the PTask's namespace (run in the host ns).
+        ["ip", "link", "set", tap, "netns", &pid]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        // Configure it inside that namespace, mirroring the gvproxy spike's
+        // static-lease recipe.
+        nsenter(&["ip", "link", "set", tap, "address", &mac]),
+        nsenter(&["ip", "addr", "add", &cidr, "dev", tap]),
+        nsenter(&["ip", "link", "set", tap, "up"]),
+        nsenter(&["ip", "link", "set", "lo", "up"]),
+        nsenter(&["ip", "route", "add", "default", "via", &gw]),
+    ]
+}
+
+/// Moves the opened tap `tap` into the PTask network namespace held by
+/// `netns_pid` and configures its switch address there, by execing the
+/// [`tap_netns_commands`] directly. The host-side tap fd keeps working after the
+/// interface moves namespaces, which is what [`attach_to_switch`] relays on.
+///
+/// Run on the `minimald` (daemon) side; requires `CAP_NET_ADMIN` in the host
+/// namespace. `sandbox2` never calls this — it only unshares the namespace and
+/// surfaces the PID (no dependency cycle).
+///
+/// # Errors
+///
+/// Returns an error if `ip`/`nsenter` cannot be spawned or any command exits
+/// non-zero, naming the failing command line.
+pub async fn move_tap_into_netns(
+    tap: &str,
+    netns_pid: u32,
+    lease: PtaskLease,
+    subnet: SwitchSubnet,
+) -> io::Result<()> {
+    for argv in tap_netns_commands(tap, netns_pid, lease, subnet) {
+        let (program, rest) = argv
+            .split_first()
+            .expect("tap_netns_commands never yields an empty argv");
+        let status = tokio::process::Command::new(program)
+            .args(rest)
+            .status()
+            .await?;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "configuring PTask tap failed (`{}` exited with {status})",
+                argv.join(" ")
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Sets `O_NONBLOCK` on `fd` so the tap device can be epoll-driven via
@@ -295,5 +384,44 @@ mod tests {
     fn open_tap_rejects_an_overlong_name() {
         let err = open_tap("this-name-is-way-too-long").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn tap_netns_commands_move_then_configure_by_pid() {
+        use std::net::Ipv4Addr;
+
+        let lease = PtaskLease {
+            ip: Ipv4Addr::new(100, 64, 0, 2),
+            mac: super::super::MacAddr::for_switch_ip(Ipv4Addr::new(100, 64, 0, 2)),
+        };
+        let cmds = tap_netns_commands("mtap0_2", 4321, lease, SwitchSubnet::default());
+
+        // First the interface is moved into the PTask's namespace by PID; every
+        // later command enters that namespace via `nsenter -t <pid> -n`.
+        assert_eq!(cmds[0], ["ip", "link", "set", "mtap0_2", "netns", "4321"]);
+        assert!(
+            cmds[1..]
+                .iter()
+                .all(|c| c[..4] == ["nsenter", "-t", "4321", "-n"])
+        );
+
+        // The lease's address is configured as CIDR with the subnet prefix, and
+        // the default route points at the switch gateway.
+        let joined: Vec<String> = cmds.iter().map(|c| c.join(" ")).collect();
+        assert!(
+            joined
+                .iter()
+                .any(|c| c.ends_with("ip addr add 100.64.0.2/16 dev mtap0_2"))
+        );
+        assert!(
+            joined
+                .iter()
+                .any(|c| c.ends_with("ip route add default via 100.64.0.1"))
+        );
+        assert!(
+            joined
+                .iter()
+                .any(|c| c.contains(&format!("address {}", lease.mac)))
+        );
     }
 }

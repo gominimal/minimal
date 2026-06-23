@@ -298,6 +298,7 @@ async fn async_main() -> Result<(), MainError> {
         },
         minimal_state_dir: cli.minimal_state_dir(),
         minimal_cache_dir: cli.minimal_cache_dir(),
+        gvproxy_bin: None,
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     russh::keys::known_hosts::learn_known_hosts_path(

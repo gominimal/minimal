@@ -161,6 +161,13 @@ impl SwitchSubnet {
         }
     }
 
+    /// The prefix length (the `/N` of the subnet), used to render a PTask's
+    /// address as CIDR when configuring its tap.
+    #[must_use]
+    pub fn prefix(self) -> u8 {
+        self.prefix
+    }
+
     /// The network address (host bits zeroed).
     #[must_use]
     pub fn network(self) -> Ipv4Addr {
@@ -368,6 +375,13 @@ impl GvproxySwitch {
     #[must_use]
     pub fn control_socket(&self) -> PathBuf {
         self.state_dir.join("gvproxy-api.sock")
+    }
+
+    /// The subnet this switch hands PTask addresses out of. The launcher needs
+    /// it to render a lease's CIDR and the gateway when configuring a tap.
+    #[must_use]
+    pub fn subnet(&self) -> SwitchSubnet {
+        self.allocator.subnet()
     }
 
     fn config_path(&self) -> PathBuf {

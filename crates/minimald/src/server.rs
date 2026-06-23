@@ -28,15 +28,32 @@ pub enum HostKey {
     },
 }
 
+/// Default install path for the gvproxy ("gvisor-tap-vsock") switch binary,
+/// used when [`Config::gvproxy_bin`] is unset. The `GVPROXY_BIN` env var is
+/// scoped to the `#[ignore]` netns proof and is never consulted by the daemon.
+const DEFAULT_GVPROXY_BIN: &str = "/usr/lib/minimal/bin/gvproxy";
+
 /// Global Configuration for the minimald server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub host_key: HostKey,
     pub minimal_state_dir: DaemonAbsPath,
     pub minimal_cache_dir: DaemonAbsPath,
+    /// Path to the gvproxy binary backing the per-host `OwnIp` switch. Defaults
+    /// to [`DEFAULT_GVPROXY_BIN`] when unset.
+    #[serde(default)]
+    pub gvproxy_bin: Option<PathBuf>,
 }
 
 impl Config {
+    /// Resolves the configured gvproxy binary path, falling back to the fixed
+    /// install path when unset.
+    fn gvproxy_bin_path(&self) -> PathBuf {
+        self.gvproxy_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_GVPROXY_BIN))
+    }
+
     /// Returns the SSH host key to use.
     ///
     /// For [`HostKey`] variant `OnDisk{ create_on_missing: true, ..}`,
@@ -83,9 +100,20 @@ impl ServerState {
     pub async fn new(config: Config) -> Result<Self, std::io::Error> {
         let minimal_state_dir = config.minimal_state_dir.clone();
         let minimal_cache_dir = config.minimal_cache_dir.clone();
+        // Construct the per-host switch once, here at daemon scope, so a single
+        // gvproxy runs for the host and a single allocator never reuses an
+        // address for the daemon's lifetime (R1.4/R1.6). Its config/socket/pid
+        // live under a dedicated subdir of the daemon state dir. The shared
+        // `Arc` is the single source of truth, injected into every per-launch
+        // `SandboxLauncher` through the sessions manager.
+        let net_switch = Arc::new(Mutex::new(crate::net::GvproxySwitch::new(
+            config.gvproxy_bin_path(),
+            minimal_state_dir.as_utf8_path().join("gvproxy"),
+        )));
         Ok(Self {
+            sessions: sessions::Manager::init(minimal_state_dir, minimal_cache_dir, net_switch)
+                .await?,
             config,
-            sessions: sessions::Manager::init(minimal_state_dir, minimal_cache_dir).await?,
             host_key: None,
         })
     }

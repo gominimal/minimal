@@ -481,15 +481,21 @@ impl<C: Channel> Sandbox<C> {
 
         // Network isolation (R1.4/R1.7). `HostNet` keeps the host/VM network
         // namespace (the current default). `NoNet` and `OwnIp` both run in a
-        // fresh network namespace: a `NoNet` PTask is left with only a down
-        // `lo`, so every egress attempt fails with `ENETUNREACH` (UC1); an
-        // `OwnIp` PTask additionally gets a tap device + gvproxy switch relay
-        // wired up by `minimald::net` once its namespace exists. Unlike the
-        // cgroup-setup fallback above (which degrades resource *accounting*),
-        // this is a *security* boundary: if a caller asks for `NoNet`/`OwnIp`
-        // but this host cannot create a network namespace, we fail closed
-        // rather than silently hand back full host networking, which would
-        // void the isolation the mode promises (spec R1.2).
+        // fresh network namespace, created identically here: a `NoNet` PTask is
+        // left with only a down `lo`, so every egress attempt fails with
+        // `ENETUNREACH` (UC1); an `OwnIp` PTask is given a tap device + gvproxy
+        // switch relay afterwards, but `sandbox2` does NOT do that wiring (it
+        // would be a dependency cycle: `minimald` depends on `sandbox2`, not the
+        // reverse, and `sandbox2` never references `minimald::net`). `sandbox2`'s
+        // only role for `OwnIp` is to unshare this namespace; the launched
+        // process's PID (`hakoniwa::Child::id()`, whose `/proc/<pid>/ns/net` is
+        // this namespace) is surfaced to the `minimald` session launcher, which
+        // moves a tap into it and attaches it to the host gvproxy switch (R1.5).
+        // Unlike the cgroup-setup fallback above (which degrades resource
+        // *accounting*), this is a *security* boundary: if a caller asks for
+        // `NoNet`/`OwnIp` but this host cannot create a network namespace, we
+        // fail closed rather than silently hand back full host networking, which
+        // would void the isolation the mode promises (spec R1.2).
         if isolates_network(self.config.network_mode) {
             if network_namespaces_available() {
                 container.unshare(hakoniwa::Namespace::Network);

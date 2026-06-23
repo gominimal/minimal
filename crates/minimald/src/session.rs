@@ -8,7 +8,8 @@ use russh::{Channel, server::Msg};
 use sessions::{Record, store::SessionObject};
 use std::fmt::{self};
 use std::ops::ControlFlow;
-use tokio::sync::{mpsc, oneshot};
+use std::sync::Arc;
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 /// An error that occurred when attaching to a running session/its-shell.
@@ -66,6 +67,14 @@ pub struct Session<S: SessionObject> {
     minimal_cache_dir: DaemonAbsPath,
     session: S,
 
+    /// The daemon-scoped gvproxy switch, injected into each `SandboxLauncher`
+    /// this session mints so an `OwnIp` PTask attaches to the one per-host
+    /// switch (R1.5). Read only by the production `session_launcher`
+    /// (`cfg(not(test))`); the `cfg(test)` mock launcher ignores it, so the
+    /// unused-field lint is silenced under test rather than threaded through.
+    #[cfg_attr(test, allow(dead_code))]
+    net_switch: Arc<Mutex<crate::net::GvproxySwitch>>,
+
     /// The running host, if minted, paired with the `JoinHandle` of its runtime
     /// loop so teardown can be awaited on destroy.
     host: Option<(
@@ -80,6 +89,7 @@ impl<S: SessionObject> Session<S> {
         minimal_state_dir: DaemonAbsPath,
         minimal_cache_dir: DaemonAbsPath,
         session: S,
+        net_switch: Arc<Mutex<crate::net::GvproxySwitch>>,
     ) -> Result<SessionHandle, std::io::Error> {
         std::fs::create_dir_all(session.workspace_path())?;
         std::fs::create_dir_all(session.home_path())?;
@@ -92,6 +102,7 @@ impl<S: SessionObject> Session<S> {
             session,
             minimal_state_dir,
             minimal_cache_dir,
+            net_switch,
         };
 
         tokio::spawn(mngr.mainloop());
@@ -234,6 +245,7 @@ impl<S: SessionObject> Session<S> {
         Ok(session_host::SandboxLauncher {
             ctx: self.context().map_err(AttachError::ContextCreationFailed)?,
             network_mode: self.session.record().network,
+            net_switch: Arc::clone(&self.net_switch),
             session,
         })
     }
