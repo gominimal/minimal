@@ -170,6 +170,16 @@ pub enum PolicyError {
     /// when #553's egress-enforcement layer parses it.
     #[error("egress allow_subnets entry {cidr:?} is not a valid CIDR prefix")]
     InvalidSubnet { cidr: String },
+    /// An ingress `dynamic_allowed_range` was given with its lower bound above
+    /// its upper bound (e.g. `(8443, 8000)`). The range is inclusive, so a
+    /// reversed pair describes no ports; rejected at launch so the misconfig is
+    /// named where it can be fixed, rather than persisting on the `Record` until
+    /// #553's dynamic-port-mapping layer consumes it.
+    #[error(
+        "ingress dynamic_allowed_range lower bound {lo} exceeds upper bound \
+         {hi}; the range is inclusive — set lo <= hi"
+    )]
+    InvalidDynamicRange { lo: u16, hi: u16 },
 }
 
 /// Whether `s` is a syntactically valid CIDR prefix (`<addr>/<prefix-len>`) for
@@ -273,7 +283,9 @@ impl Record {
     /// transport gvproxy's forwarder cannot expose, or
     /// [`PolicyError::PrivilegedPort`] for one that publishes a host port below
     /// 1024. For an `OwnIp` `PTask`, returns [`PolicyError::InvalidSubnet`] when
-    /// an egress `allow_subnets` entry is not a valid CIDR prefix.
+    /// an egress `allow_subnets` entry is not a valid CIDR prefix, or
+    /// [`PolicyError::InvalidDynamicRange`] when the ingress
+    /// `dynamic_allowed_range` lower bound exceeds its upper bound.
     pub fn validate_policy(&self) -> Result<(), PolicyError> {
         // gvproxy's static forwarder only exposes TCP and UDP, so an ingress
         // mapping with any other transport is a configuration error wherever it
@@ -316,6 +328,19 @@ impl Record {
                 .find(|cidr| !is_valid_cidr(cidr))
             {
                 return Err(PolicyError::InvalidSubnet { cidr: bad.clone() });
+            }
+            // A reversed dynamic range (lo > hi) describes no ports under the
+            // inclusive semantics, so reject it at launch rather than letting a
+            // misconfig persist on the Record until #553's dynamic port-mapping
+            // layer consumes it.
+            if let Some((lo, hi)) = self
+                .policy
+                .ingress
+                .as_ref()
+                .and_then(|ingress| ingress.dynamic_allowed_range)
+                && lo > hi
+            {
+                return Err(PolicyError::InvalidDynamicRange { lo, hi });
             }
             return Ok(());
         }
@@ -542,6 +567,37 @@ mod tests {
         };
         let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(Some(egress), None));
         assert!(record.validate_policy().is_ok());
+    }
+
+    #[test]
+    fn reversed_dynamic_range_is_rejected_on_own_ip() {
+        // A dynamic_allowed_range whose lower bound exceeds its upper bound
+        // describes no ports under the inclusive semantics, so it is rejected at
+        // launch rather than being stored verbatim and surfacing only when
+        // #553's dynamic port-mapping layer consumes it.
+        let ingress = IngressPolicy {
+            port_mappings: vec![],
+            dynamic_allowed_range: Some((8443, 8000)),
+        };
+        let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
+        assert_eq!(
+            record.validate_policy(),
+            Err(PolicyError::InvalidDynamicRange { lo: 8443, hi: 8000 })
+        );
+    }
+
+    #[test]
+    fn ordered_dynamic_range_is_accepted_on_own_ip() {
+        // A well-ordered range passes; equal bounds are the single-port boundary
+        // case and are likewise accepted under the inclusive semantics.
+        for range in [(8000, 8443), (9000, 9000)] {
+            let ingress = IngressPolicy {
+                port_mappings: vec![],
+                dynamic_allowed_range: Some(range),
+            };
+            let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
+            assert!(record.validate_policy().is_ok());
+        }
     }
 
     #[test]
