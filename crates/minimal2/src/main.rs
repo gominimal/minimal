@@ -112,9 +112,69 @@ struct ActivateArgs {
     /// Project path to activate (defaults to current directory)
     #[arg(default_value = ".")]
     path: String,
+    /// Network mode: no-net, host-net (default), or own-ip.
+    #[arg(long, value_enum, default_value_t = CliNetworkMode::HostNet)]
+    network: CliNetworkMode,
+    /// Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp|udp, default
+    /// tcp). Repeatable. Requires `--network own-ip`.
+    #[arg(long = "ingress", value_name = "EXT:INT[/PROTO]")]
+    ingress: Vec<String>,
     /// Automatically attach after creation
     #[arg(long)]
     attach: bool,
+}
+
+/// CLI surface for [`sessions::NetworkMode`]. A local `ValueEnum` keeps the
+/// `sessions` crate free of a clap dependency.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum CliNetworkMode {
+    NoNet,
+    HostNet,
+    OwnIp,
+}
+
+impl From<CliNetworkMode> for sessions::NetworkMode {
+    fn from(m: CliNetworkMode) -> Self {
+        match m {
+            CliNetworkMode::NoNet => sessions::NetworkMode::NoNet,
+            CliNetworkMode::HostNet => sessions::NetworkMode::HostNet,
+            CliNetworkMode::OwnIp => sessions::NetworkMode::OwnIp,
+        }
+    }
+}
+
+/// Parse an `--ingress EXT:INT[/PROTO]` spec into a [`sessions::PortMapping`].
+/// PROTO defaults to tcp; only tcp/udp are accepted (gvproxy's static forwarder
+/// exposes no other transport).
+fn parse_ingress_mapping(spec: &str) -> Result<sessions::PortMapping, String> {
+    let (ports, proto) = match spec.split_once('/') {
+        Some((ports, proto)) => (ports, parse_ingress_proto(proto)?),
+        None => (spec, sessions::IpProto::Tcp),
+    };
+    let (ext, int) = ports
+        .split_once(':')
+        .ok_or_else(|| format!("ingress '{spec}': expected EXT:INT[/PROTO]"))?;
+    let external_port = ext
+        .parse::<u16>()
+        .map_err(|_| format!("ingress '{spec}': invalid external port '{ext}'"))?;
+    let internal_port = int
+        .parse::<u16>()
+        .map_err(|_| format!("ingress '{spec}': invalid internal port '{int}'"))?;
+    Ok(sessions::PortMapping {
+        external_port,
+        internal_port,
+        proto,
+    })
+}
+
+fn parse_ingress_proto(proto: &str) -> Result<sessions::IpProto, String> {
+    match proto.to_ascii_lowercase().as_str() {
+        "tcp" => Ok(sessions::IpProto::Tcp),
+        "udp" => Ok(sessions::IpProto::Udp),
+        other => Err(format!(
+            "ingress: unsupported protocol '{other}' (use tcp or udp)"
+        )),
+    }
 }
 
 #[derive(Debug, Args)]
@@ -327,13 +387,31 @@ async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), ()>
         .or_else(|_| std::env::var("LOGNAME"))
         .ok();
 
+    let mut port_mappings = Vec::with_capacity(args.ingress.len());
+    for spec in &args.ingress {
+        match parse_ingress_mapping(spec) {
+            Ok(mapping) => port_mappings.push(mapping),
+            Err(e) => {
+                eprintln!("{e}");
+                return Err(());
+            }
+        }
+    }
+    let policy = sessions::SessionPolicy {
+        egress: None,
+        ingress: (!port_mappings.is_empty()).then_some(sessions::IngressPolicy {
+            port_mappings,
+            dynamic_allowed_range: None,
+        }),
+    };
+
     let record = sessions::Record {
         id: sessions::SessionId::nil(),
         name: args.name.clone(),
         username,
         project_path: abs_path,
-        network: sessions::NetworkMode::default(),
-        policy: Default::default(),
+        network: args.network.into(),
+        policy,
         attrs: Default::default(),
     };
 
@@ -346,10 +424,13 @@ async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), ()>
         .await
         .map_err(|e| eprintln!("CreateSession RPC failed: {e}"))?;
 
-    let created = match resp.ok() {
-        Some(r) => r,
-        None => {
-            eprintln!("CreateSession returned an error from the daemon");
+    // Surface the daemon's typed policy/network-mode validation error (e.g.
+    // ingress on a non-own-ip session, privileged host port) rather than a
+    // generic failure line.
+    let created = match resp {
+        minimald_rpc::Errorable::Ok(r) => r,
+        minimald_rpc::Errorable::Err { error } => {
+            eprintln!("CreateSession failed: {error}");
             return Err(());
         }
     };
@@ -712,4 +793,32 @@ async fn cmd_login(global: &GlobalArgs, args: LoginArgs) -> Result<(), ()> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ingress_spec_defaults_to_tcp() {
+        let m = parse_ingress_mapping("18080:80").unwrap();
+        assert_eq!(m.external_port, 18080);
+        assert_eq!(m.internal_port, 80);
+        assert_eq!(m.proto, sessions::IpProto::Tcp);
+    }
+
+    #[test]
+    fn ingress_spec_parses_explicit_proto() {
+        let m = parse_ingress_mapping("5353:53/udp").unwrap();
+        assert_eq!(m.external_port, 5353);
+        assert_eq!(m.internal_port, 53);
+        assert_eq!(m.proto, sessions::IpProto::Udp);
+    }
+
+    #[test]
+    fn ingress_spec_rejects_malformed_and_bad_proto() {
+        assert!(parse_ingress_mapping("18080").is_err());
+        assert!(parse_ingress_mapping("notaport:80").is_err());
+        assert!(parse_ingress_mapping("18080:80/icmp").is_err());
+    }
 }
