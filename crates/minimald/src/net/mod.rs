@@ -17,6 +17,7 @@
 //! reuse), and R1.8 (structured tracing for every switch lifecycle event).
 
 pub mod dns;
+pub mod policy;
 pub mod proxy;
 pub mod switch;
 
@@ -57,13 +58,6 @@ const TERM_GRACE: Duration = Duration::from_secs(5);
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum NetError {
-    /// The prefix length is outside the range accepted by [`SwitchSubnet::new`].
-    ///
-    /// Distinct from [`SubnetExhausted`](Self::SubnetExhausted): a prefix that
-    /// puts the subnet outside `8..=29` is a misconfiguration (the prefix was
-    /// never valid), not an exhausted valid subnet.
-    #[error("prefix /{0} is outside the valid range /8..=/29 for a gvproxy switch subnet")]
-    InvalidPrefix(u8),
     /// The configured subnet has no remaining host address to hand out.
     #[error("gvproxy subnet {0} is exhausted; no free PTask address remains")]
     SubnetExhausted(SwitchSubnet),
@@ -142,13 +136,14 @@ impl SwitchSubnet {
     ///
     /// # Errors
     ///
-    /// Returns [`NetError::InvalidPrefix`] for a prefix outside `8..=29`. A
+    /// Returns [`NetError::SubnetExhausted`] for a prefix outside `8..=29`. A
     /// prefix narrower than /29 has no room for the reserved
     /// network/gateway/host-alias/broadcast addresses plus a PTask address. A
     /// prefix wider than /8 lets the high octet vary, which
     /// [`MacAddr::for_switch_ip`] does not fold into the derived MAC, so two
     /// addresses differing only in that octet would collide.
     pub fn new(base: Ipv4Addr, prefix: u8) -> Result<Self, NetError> {
+        let s = Self { base, prefix };
         // Reserve four addresses (network, gateway, host-alias, broadcast): a
         // /29 (8 addresses) leaves four allocatable hosts, a /30 (4) leaves
         // none, so anything narrower than /29 has no room for a PTask. The lower
@@ -156,9 +151,9 @@ impl SwitchSubnet {
         // from the low three octets, so the high octet must be pinned by the
         // prefix (/8 or narrower).
         if !(8..=29).contains(&prefix) {
-            return Err(NetError::InvalidPrefix(prefix));
+            return Err(NetError::SubnetExhausted(s));
         }
-        Ok(Self { base, prefix })
+        Ok(s)
     }
 
     fn mask(self) -> u32 {
@@ -412,7 +407,7 @@ impl GvproxySwitch {
     /// Propagates config-write, spawn, and socket-readiness failures.
     pub async fn attach(&mut self) -> Result<AttachResult, NetError> {
         let lease = self.allocator.allocate()?;
-        self.write_config().await?;
+        self.write_config()?;
         self.ensure_running().await?;
         self.attached += 1;
         tracing::info!(
@@ -440,18 +435,14 @@ impl GvproxySwitch {
         Ok(())
     }
 
-    async fn write_config(&self) -> Result<(), NetError> {
-        tokio::fs::create_dir_all(&self.state_dir)
-            .await
-            .map_err(|source| NetError::WriteConfig {
-                path: self.state_dir.clone(),
-                source,
-            })?;
+    fn write_config(&self) -> Result<(), NetError> {
+        std::fs::create_dir_all(&self.state_dir).map_err(|source| NetError::WriteConfig {
+            path: self.state_dir.clone(),
+            source,
+        })?;
         let path = self.config_path();
         let body = render_gvproxy_config(self.allocator.subnet(), self.allocator.leases());
-        tokio::fs::write(&path, body)
-            .await
-            .map_err(|source| NetError::WriteConfig { path, source })
+        std::fs::write(&path, body).map_err(|source| NetError::WriteConfig { path, source })
     }
 
     /// Spawns gvproxy if it is not already running and waits for its control
@@ -489,7 +480,7 @@ impl GvproxySwitch {
         // cannot be cleared, fail now rather than let `wait_for_socket` mistake
         // the leftover path for a freshly-bound one and report a switch that
         // never actually came up.
-        match tokio::fs::remove_file(&sock).await {
+        match std::fs::remove_file(&sock) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(NetError::Io(e)),
@@ -602,7 +593,7 @@ impl GvproxySwitch {
                 let _ = child.wait().await;
             }
         }
-        let _ = tokio::fs::remove_file(self.control_socket()).await;
+        let _ = std::fs::remove_file(self.control_socket());
         Ok(())
     }
 }
@@ -675,11 +666,9 @@ mod tests {
 
     #[test]
     fn subnet_rejects_overly_narrow_prefix() {
-        // /30 is a misconfiguration (no room for a PTask), not an exhausted
-        // valid subnet — so the distinct InvalidPrefix error is returned.
         assert!(matches!(
             SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 30),
-            Err(NetError::InvalidPrefix(30))
+            Err(NetError::SubnetExhausted(_))
         ));
     }
 
@@ -689,7 +678,7 @@ mod tests {
         // does not cover, so the constructor rejects it to keep MACs unique.
         assert!(matches!(
             SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 7),
-            Err(NetError::InvalidPrefix(7))
+            Err(NetError::SubnetExhausted(_))
         ));
     }
 

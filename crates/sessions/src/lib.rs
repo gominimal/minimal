@@ -42,6 +42,96 @@ pub enum IpProto {
     Icmp,
 }
 
+// ---------------------------------------------------------------------------
+// Networking policy types (Unit 2: egress, ingress, dynamic port mapping).
+//
+// These are the wire types `minimald-rpc` exposes; they live here (and are
+// re-exported up to `minimald-rpc`) so that `Record` — the only live
+// per-session store — can carry the policy configured at launch directly,
+// without a dependency cycle (`minimald-rpc` depends on `sessions`, not the
+// reverse). They are deliberately *not* `#[non_exhaustive]`: they are
+// constructed by literal at the config↔wire mapping sites across crates.
+// ---------------------------------------------------------------------------
+
+/// A single static ingress port mapping for an `OwnIp` `PTask`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortMapping {
+    /// Host-side port that forwards inbound connections into the `PTask`.
+    pub external_port: u16,
+    /// `PTask`-side port that receives forwarded connections.
+    pub internal_port: u16,
+    /// Transport protocol for this mapping.
+    pub proto: IpProto,
+}
+
+/// Effective egress policy for an `OwnIp` `PTask`.
+///
+/// Each field is `None` to mean allow-all for that dimension. Absent `egress`
+/// config on a session is equivalent to all-`None` (allow-all).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct EgressPolicy {
+    /// Allowed destination CIDR prefixes; `None` means allow-all subnets.
+    pub allow_subnets: Option<Vec<String>>,
+    /// Allowed destination DNS hostnames; `None` means allow-all hosts.
+    pub allow_dns_hosts: Option<Vec<String>>,
+    /// Allowed IP protocols; `None` means allow all protocols.
+    pub allow_protocols: Option<Vec<IpProto>>,
+}
+
+/// Effective ingress policy for an `OwnIp` `PTask`.
+///
+/// Default (empty `port_mappings`, no `dynamic_allowed_range`) is deny-all-external.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct IngressPolicy {
+    /// Static port mappings applied at `PTask` launch.
+    pub port_mappings: Vec<PortMapping>,
+    /// Inclusive port range within which dynamic port-mapping requests are
+    /// accepted; `None` means dynamic mapping is disallowed.
+    pub dynamic_allowed_range: Option<(u16, u16)>,
+}
+
+impl IngressPolicy {
+    /// Whether this ingress policy configures any forwarding at all (a static
+    /// mapping or a dynamic range). An empty policy is the deny-all default.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.port_mappings.is_empty() && self.dynamic_allowed_range.is_none()
+    }
+}
+
+/// The networking policy for a session: its egress and ingress configuration.
+///
+/// `None` for a dimension means it was not configured (allow-all egress; the
+/// deny-all-external ingress default). Stored on [`Record`] as the policy
+/// configured at launch and returned verbatim by the `GetSessionPolicy` RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SessionPolicy {
+    /// Egress policy; `None` when no explicit egress config is present.
+    pub egress: Option<EgressPolicy>,
+    /// Ingress policy; `None` when no explicit ingress config is present.
+    pub ingress: Option<IngressPolicy>,
+}
+
+impl SessionPolicy {
+    /// Builds a policy from its egress and ingress halves.
+    #[must_use]
+    pub fn new(egress: Option<EgressPolicy>, ingress: Option<IngressPolicy>) -> Self {
+        Self { egress, ingress }
+    }
+}
+
+/// Why a session's networking policy is incompatible with its network mode.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PolicyError {
+    /// An egress policy was set on a `PTask` that is not [`NetworkMode::OwnIp`].
+    #[error("egress policy is only valid for an own-IP PTask, not {mode:?}")]
+    EgressRequiresOwnIp { mode: NetworkMode },
+    /// An ingress policy was set on a `PTask` that is not [`NetworkMode::OwnIp`].
+    #[error("ingress policy is only valid for an own-IP PTask, not {mode:?}")]
+    IngressRequiresOwnIp { mode: NetworkMode },
+}
+
 /// A session ID, a newtype over a UUID.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionId(Uuid);
@@ -99,6 +189,134 @@ pub struct Record {
     #[serde(default)]
     pub network: NetworkMode,
 
+    /// The networking policy (egress + ingress) configured for this session at
+    /// launch (R2.6). Defaults to an all-`None` policy for sessions that
+    /// predate this field or specify none.
+    #[serde(default)]
+    pub policy: SessionPolicy,
+
     /// Free-form attributes.
     pub attrs: BTreeMap<String, String>,
+}
+
+impl Record {
+    /// Validates that this record's networking policy is compatible with its
+    /// network mode (R2.1/R2.3): egress and ingress are only meaningful for an
+    /// [`NetworkMode::OwnIp`] `PTask`, since `NoNet` has no network and `HostNet`
+    /// shares the host's, neither of which minimald can apply per-session
+    /// policy to. Returns an error naming the first incompatible section.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::EgressRequiresOwnIp`] when an egress policy is set
+    /// on a non-`OwnIp` `PTask`, or [`PolicyError::IngressRequiresOwnIp`] when a
+    /// non-empty ingress policy is.
+    pub fn validate_policy(&self) -> Result<(), PolicyError> {
+        if self.network == NetworkMode::OwnIp {
+            return Ok(());
+        }
+        if self.policy.egress.is_some() {
+            return Err(PolicyError::EgressRequiresOwnIp { mode: self.network });
+        }
+        if self
+            .policy
+            .ingress
+            .as_ref()
+            .is_some_and(|ingress| !ingress.is_empty())
+        {
+            return Err(PolicyError::IngressRequiresOwnIp { mode: self.network });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record_with(network: NetworkMode, policy: SessionPolicy) -> Record {
+        Record {
+            id: SessionId::nil(),
+            name: None,
+            username: None,
+            project_path: HostAbsPath::try_new("/p").unwrap(),
+            network,
+            policy,
+            attrs: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn egress_on_host_net_is_rejected() {
+        // R2.1: an egress section is only valid for an own-IP PTask.
+        let record = record_with(
+            NetworkMode::HostNet,
+            SessionPolicy::new(Some(EgressPolicy::default()), None),
+        );
+        assert_eq!(
+            record.validate_policy(),
+            Err(PolicyError::EgressRequiresOwnIp {
+                mode: NetworkMode::HostNet
+            })
+        );
+    }
+
+    #[test]
+    fn egress_on_no_net_is_rejected() {
+        let record = record_with(
+            NetworkMode::NoNet,
+            SessionPolicy::new(Some(EgressPolicy::default()), None),
+        );
+        assert_eq!(
+            record.validate_policy(),
+            Err(PolicyError::EgressRequiresOwnIp {
+                mode: NetworkMode::NoNet
+            })
+        );
+    }
+
+    #[test]
+    fn ingress_mappings_on_host_net_are_rejected() {
+        let ingress = IngressPolicy {
+            port_mappings: vec![PortMapping {
+                external_port: 18080,
+                internal_port: 80,
+                proto: IpProto::Tcp,
+            }],
+            dynamic_allowed_range: None,
+        };
+        let record = record_with(
+            NetworkMode::HostNet,
+            SessionPolicy::new(None, Some(ingress)),
+        );
+        assert_eq!(
+            record.validate_policy(),
+            Err(PolicyError::IngressRequiresOwnIp {
+                mode: NetworkMode::HostNet
+            })
+        );
+    }
+
+    #[test]
+    fn egress_on_own_ip_is_allowed() {
+        let record = record_with(
+            NetworkMode::OwnIp,
+            SessionPolicy::new(Some(EgressPolicy::default()), None),
+        );
+        assert!(record.validate_policy().is_ok());
+    }
+
+    #[test]
+    fn empty_policy_on_host_net_is_allowed() {
+        // An all-`None` policy (the default) is fine on any mode: it configures
+        // nothing, so there is nothing to reject.
+        let record = record_with(NetworkMode::HostNet, SessionPolicy::default());
+        assert!(record.validate_policy().is_ok());
+        // An empty (deny-all-external) ingress is likewise not a configuration.
+        let record = record_with(
+            NetworkMode::HostNet,
+            SessionPolicy::new(None, Some(IngressPolicy::default())),
+        );
+        assert!(record.validate_policy().is_ok());
+    }
 }

@@ -274,6 +274,7 @@ async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), ()>
         username,
         project_path: abs_path,
         network: sessions::NetworkMode::default(),
+        policy: Default::default(),
         attrs: Default::default(),
     };
 

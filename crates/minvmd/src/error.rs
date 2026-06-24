@@ -38,6 +38,13 @@ pub enum VmError {
     /// An I/O error outside the libkrun FFI boundary (e.g. creating or
     /// checking the socket directory, R3.2).
     Io { source: io::Error },
+
+    /// A VM configuration is not valid for the active deployment model (R2.5):
+    /// `what` names the offending field and `reason` explains why it is rejected.
+    Configuration {
+        what: &'static str,
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for VmError {
@@ -71,6 +78,9 @@ impl fmt::Display for VmError {
             Self::Io { source } => {
                 write!(f, "I/O error: {source}")
             }
+            Self::Configuration { what, reason } => {
+                write!(f, "invalid VM configuration ({what}): {reason}")
+            }
         }
     }
 }
@@ -82,7 +92,8 @@ impl std::error::Error for VmError {
             Self::NulInPath { .. }
             | Self::NulInString { .. }
             | Self::StartEnterReturnedUnexpectedly { .. }
-            | Self::MissingEnv { .. } => None,
+            | Self::MissingEnv { .. }
+            | Self::Configuration { .. } => None,
             Self::Io { source } => Some(source),
         }
     }

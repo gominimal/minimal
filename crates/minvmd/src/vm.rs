@@ -7,7 +7,30 @@
 
 use std::path::PathBuf;
 
-use minimald_rpc::NetworkMode;
+use minimald_rpc::{EgressPolicy, NetworkMode};
+
+use crate::error::VmError;
+
+/// Which of the spec's deployment models (DM1–DM5) a minvmd host runs under.
+///
+/// minvmd manages libkrun VMs, which only exist on DM1/DM3/DM4; DM2 is native
+/// Linux with no VM boundary. The distinction matters for VM-wide egress
+/// (R2.5): a `vm_egress` policy is meaningful only where a VM exists, and is a
+/// configuration error on DM2 (see [`VmConfig::validate_for`]).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeploymentMode {
+    /// macOS + one or more libkrun Linux VMs.
+    Dm1,
+    /// Native Linux, minimald on the host directly (no VM).
+    Dm2,
+    /// Native Linux + one or more Linux VMs.
+    Dm3,
+    /// DM2 + DM3 combined.
+    Dm4,
+    /// Any of the above with a network-accessible, authenticated minimald.
+    Dm5,
+}
 
 /// Configuration parameters for a single microVM.
 ///
@@ -34,6 +57,11 @@ pub struct VmConfig {
     /// [`NetworkMode::HostNet`]; an `OwnIp` VM is wired to the switch as a
     /// client via the per-PTask vsock shuttle.
     pub network_mode: NetworkMode,
+    /// VM-wide egress policy applied to all traffic from this VM, regardless of
+    /// per-PTask mode (R2.5). Only meaningful on a deployment model with a VM
+    /// boundary (DM1/DM3/DM4); rejected on DM2 by [`VmConfig::validate_for`].
+    /// `None` means no VM-wide egress restriction.
+    pub vm_egress: Option<EgressPolicy>,
 }
 
 impl VmConfig {
@@ -53,6 +81,7 @@ impl VmConfig {
             rootfs_path,
             initramfs,
             network_mode: NetworkMode::default(),
+            vm_egress: None,
         }
     }
 
@@ -61,6 +90,36 @@ impl VmConfig {
     pub fn with_network_mode(mut self, network_mode: NetworkMode) -> Self {
         self.network_mode = network_mode;
         self
+    }
+
+    /// Set the VM-wide egress policy (R2.5), consuming and returning `self`.
+    #[must_use]
+    pub fn with_vm_egress(mut self, vm_egress: EgressPolicy) -> Self {
+        self.vm_egress = Some(vm_egress);
+        self
+    }
+
+    /// Validates this config against the active deployment model (R2.5).
+    ///
+    /// `vm_egress` is VM-wide egress, meaningful only where a VM boundary exists
+    /// (DM1/DM3/DM4). On DM2 (native Linux, minimald on the host with no VM) it
+    /// has nothing to apply to and collapses to per-PTask egress (UC3), so a
+    /// `vm_egress` set on DM2 is a configuration error rather than a silent
+    /// no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VmError::Configuration`] when `vm_egress` is set and `mode` is
+    /// [`DeploymentMode::Dm2`].
+    pub fn validate_for(&self, mode: DeploymentMode) -> Result<(), VmError> {
+        if self.vm_egress.is_some() && mode == DeploymentMode::Dm2 {
+            return Err(VmError::Configuration {
+                what: "vm_egress",
+                reason: "VM-wide egress is not applicable on DM2 (native Linux has no VM \
+                         boundary); use per-PTask egress instead",
+            });
+        }
+        Ok(())
     }
 
     /// Whether this VM joins the per-host gvproxy switch as an own-IP client.
@@ -204,6 +263,73 @@ mod tests {
         assert_ne!(VmConfig::tap_name(2), VmConfig::tap_name(3));
         // Kernel IFNAMSIZ is 16 (15 usable chars); the widest u32 must fit.
         assert!(VmConfig::tap_name(u32::MAX).len() < 16);
+    }
+
+    #[test]
+    fn vm_egress_defaults_to_none_and_round_trips() {
+        let cfg = VmConfig::new(
+            1,
+            256,
+            PathBuf::from("/k"),
+            PathBuf::from("/r"),
+            PathBuf::from("/i"),
+        );
+        assert!(cfg.vm_egress.is_none());
+        let cfg = cfg.with_vm_egress(EgressPolicy::default());
+        assert!(cfg.vm_egress.is_some());
+    }
+
+    #[test]
+    fn vm_egress_is_rejected_on_dm2() {
+        // R2.5: VM-wide egress is a configuration error on DM2 (no VM boundary).
+        let cfg = VmConfig::new(
+            1,
+            256,
+            PathBuf::from("/k"),
+            PathBuf::from("/r"),
+            PathBuf::from("/i"),
+        )
+        .with_vm_egress(EgressPolicy::default());
+        let err = cfg.validate_for(DeploymentMode::Dm2).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VmError::Configuration {
+                    what: "vm_egress",
+                    ..
+                }
+            ),
+            "expected a typed configuration error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn vm_egress_is_accepted_on_vm_deployment_models() {
+        let cfg = VmConfig::new(
+            1,
+            256,
+            PathBuf::from("/k"),
+            PathBuf::from("/r"),
+            PathBuf::from("/i"),
+        )
+        .with_vm_egress(EgressPolicy::default());
+        // DM1/DM3/DM4 each have a VM boundary, so vm_egress is valid.
+        assert!(cfg.validate_for(DeploymentMode::Dm1).is_ok());
+        assert!(cfg.validate_for(DeploymentMode::Dm3).is_ok());
+        assert!(cfg.validate_for(DeploymentMode::Dm4).is_ok());
+    }
+
+    #[test]
+    fn absent_vm_egress_is_valid_on_dm2() {
+        // No vm_egress => nothing to reject, even on DM2.
+        let cfg = VmConfig::new(
+            1,
+            256,
+            PathBuf::from("/k"),
+            PathBuf::from("/r"),
+            PathBuf::from("/i"),
+        );
+        assert!(cfg.validate_for(DeploymentMode::Dm2).is_ok());
     }
 
     #[test]

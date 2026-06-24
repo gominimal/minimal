@@ -13,7 +13,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sessions::SessionId;
 
-pub use sessions::{IpProto, NetworkMode};
+pub use sessions::{EgressPolicy, IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy};
 
 pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
 
@@ -279,65 +279,13 @@ impl OneshotSshRpc for SessionAbort {
 
 // ---------------------------------------------------------------------------
 // Networking policy types (Unit 2: egress, ingress, dynamic port mapping).
+//
+// `PortMapping`, `EgressPolicy`, `IngressPolicy`, and `SessionPolicy` are
+// defined in `sessions` and re-exported above, so the only live per-session
+// store (`sessions::Record`) can carry the policy configured at launch without
+// a `sessions` → `minimald-rpc` dependency cycle. The RPC method types below
+// stay here, where the wire contract lives.
 // ---------------------------------------------------------------------------
-
-/// A single static ingress port mapping for an `OwnIp` PTask.
-#[non_exhaustive]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PortMapping {
-    /// Host-side port that forwards inbound connections into the PTask.
-    pub external_port: u16,
-    /// PTask-side port that receives forwarded connections.
-    pub internal_port: u16,
-    /// Transport protocol for this mapping.
-    pub proto: IpProto,
-}
-
-/// Effective egress policy for an `OwnIp` PTask.
-///
-/// Each field is `None` to mean allow-all for that dimension. Absent `egress`
-/// config on a session is equivalent to all-`None` (allow-all).
-#[non_exhaustive]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct EgressPolicy {
-    /// Allowed destination CIDR prefixes; `None` means allow-all subnets.
-    pub allow_subnets: Option<Vec<String>>,
-    /// Allowed destination DNS hostnames; `None` means allow-all hosts.
-    pub allow_dns_hosts: Option<Vec<String>>,
-    /// Allowed IP protocols; `None` means allow all protocols.
-    pub allow_protocols: Option<Vec<IpProto>>,
-}
-
-/// Effective ingress policy for an `OwnIp` PTask.
-///
-/// Default (empty `port_mappings`, no `dynamic_allowed_range`) is deny-all-external.
-#[non_exhaustive]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct IngressPolicy {
-    /// Static port mappings applied at PTask launch.
-    pub port_mappings: Vec<PortMapping>,
-    /// Inclusive port range within which dynamic port-mapping requests are
-    /// accepted; `None` means dynamic mapping is disallowed.
-    pub dynamic_allowed_range: Option<(u16, u16)>,
-}
-
-/// The effective networking policy for a named session, as returned by
-/// [`GetSessionPolicy`].
-#[non_exhaustive]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SessionPolicy {
-    /// Egress policy; `None` when the session is not `OwnIp` or no explicit
-    /// egress config is present (allow-all).
-    pub egress: Option<EgressPolicy>,
-    /// Ingress policy; `None` when the session is not `OwnIp`.
-    pub ingress: Option<IngressPolicy>,
-}
-
-impl SessionPolicy {
-    pub fn new(egress: Option<EgressPolicy>, ingress: Option<IngressPolicy>) -> Self {
-        Self { egress, ingress }
-    }
-}
 
 /// An RPC to read the effective networking policy for a session (R2.6).
 pub struct GetSessionPolicy;

@@ -483,6 +483,7 @@ mod tests {
                     username: None,
                     project_path: HostAbsPath::try_new("/tmp").unwrap(),
                     network: sessions::NetworkMode::default(),
+                    policy: Default::default(),
                     attrs: Default::default(),
                 },
             })
