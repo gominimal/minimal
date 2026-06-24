@@ -113,9 +113,11 @@ impl VmConfig {
     /// # Errors
     ///
     /// Returns [`VmError::Configuration`] when `vm_egress` is set and `mode` is
-    /// [`DeploymentMode::Dm2`] or [`DeploymentMode::Dm5`].
+    /// [`DeploymentMode::Dm2`] or [`DeploymentMode::Dm5`], or
+    /// [`VmError::InvalidEgressSubnet`] when `vm_egress` is accepted for `mode`
+    /// but carries an `allow_subnets` entry that is not a valid CIDR prefix.
     pub fn validate_for(&self, mode: DeploymentMode) -> Result<(), VmError> {
-        if self.vm_egress.is_some() {
+        if let Some(vm_egress) = self.vm_egress.as_ref() {
             let reason = match mode {
                 DeploymentMode::Dm2 => Some(
                     "VM-wide egress is not applicable on DM2 (native Linux has no VM \
@@ -132,6 +134,17 @@ impl VmConfig {
                 return Err(VmError::Configuration {
                     what: "vm_egress",
                     reason,
+                });
+            }
+            // vm_egress is accepted for this mode (a VM boundary exists); validate
+            // that each allow_subnets entry is a syntactically valid CIDR prefix,
+            // mirroring the per-PTask egress check in
+            // `sessions::Record::validate_policy`, so a misconfigured subnet is
+            // named here rather than failing opaquely when #553's enforcement
+            // layer parses it.
+            if let Some(bad) = vm_egress.first_invalid_subnet() {
+                return Err(VmError::InvalidEgressSubnet {
+                    cidr: bad.to_owned(),
                 });
             }
         }
@@ -358,6 +371,83 @@ mod tests {
         assert!(cfg.validate_for(DeploymentMode::Dm1).is_ok());
         assert!(cfg.validate_for(DeploymentMode::Dm3).is_ok());
         assert!(cfg.validate_for(DeploymentMode::Dm4).is_ok());
+    }
+
+    #[test]
+    fn vm_egress_with_invalid_cidr_is_rejected_on_vm_deployment_models() {
+        // vm_egress is accepted on DM1/DM3/DM4, but an allow_subnets entry that is
+        // not a valid CIDR prefix is named at config time, mirroring the per-PTask
+        // egress check, rather than failing opaquely under #553's enforcement.
+        let cfg = VmConfig::new(
+            1,
+            256,
+            PathBuf::from("/k"),
+            PathBuf::from("/r"),
+            PathBuf::from("/i"),
+        )
+        .with_vm_egress(EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".into(), "not-a-cidr".into()]),
+            ..EgressPolicy::default()
+        });
+        for mode in [
+            DeploymentMode::Dm1,
+            DeploymentMode::Dm3,
+            DeploymentMode::Dm4,
+        ] {
+            let err = cfg.validate_for(mode).unwrap_err();
+            assert!(
+                matches!(&err, VmError::InvalidEgressSubnet { cidr } if cidr == "not-a-cidr"),
+                "expected an invalid-egress-subnet error, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vm_egress_with_valid_cidrs_is_accepted_on_vm_deployment_models() {
+        // Both IPv4 and IPv6 CIDR prefixes pass the syntactic check.
+        let cfg = VmConfig::new(
+            1,
+            256,
+            PathBuf::from("/k"),
+            PathBuf::from("/r"),
+            PathBuf::from("/i"),
+        )
+        .with_vm_egress(EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".into(), "fd00::/8".into()]),
+            ..EgressPolicy::default()
+        });
+        assert!(cfg.validate_for(DeploymentMode::Dm1).is_ok());
+        assert!(cfg.validate_for(DeploymentMode::Dm3).is_ok());
+        assert!(cfg.validate_for(DeploymentMode::Dm4).is_ok());
+    }
+
+    #[test]
+    fn vm_egress_with_invalid_cidr_still_rejected_first_by_mode_on_dm2() {
+        // On DM2 the mode rejection fires before the CIDR check, so even an
+        // invalid-CIDR vm_egress surfaces as the Configuration error, not
+        // InvalidEgressSubnet — the mode incompatibility is the dominant fault.
+        let cfg = VmConfig::new(
+            1,
+            256,
+            PathBuf::from("/k"),
+            PathBuf::from("/r"),
+            PathBuf::from("/i"),
+        )
+        .with_vm_egress(EgressPolicy {
+            allow_subnets: Some(vec!["not-a-cidr".into()]),
+            ..EgressPolicy::default()
+        });
+        let err = cfg.validate_for(DeploymentMode::Dm2).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VmError::Configuration {
+                    what: "vm_egress",
+                    ..
+                }
+            ),
+            "expected a mode configuration error, got {err:?}"
+        );
     }
 
     #[test]

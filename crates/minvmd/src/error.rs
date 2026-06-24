@@ -45,6 +45,14 @@ pub enum VmError {
         what: &'static str,
         reason: &'static str,
     },
+
+    /// A `vm_egress` `allow_subnets` entry is not a syntactically valid CIDR
+    /// prefix (R2.5). Validated at config time — mirroring the per-`PTask`
+    /// egress check in `sessions::Record::validate_policy` — so a misconfigured
+    /// subnet is named where it can be fixed, rather than surfacing opaquely
+    /// when #553's egress-enforcement layer parses it. `cidr` is the offending
+    /// entry.
+    InvalidEgressSubnet { cidr: String },
 }
 
 impl fmt::Display for VmError {
@@ -81,6 +89,13 @@ impl fmt::Display for VmError {
             Self::Configuration { what, reason } => {
                 write!(f, "invalid VM configuration ({what}): {reason}")
             }
+            Self::InvalidEgressSubnet { cidr } => {
+                write!(
+                    f,
+                    "invalid VM configuration (vm_egress): allow_subnets entry \
+                     {cidr:?} is not a valid CIDR prefix"
+                )
+            }
         }
     }
 }
@@ -93,7 +108,8 @@ impl std::error::Error for VmError {
             | Self::NulInString { .. }
             | Self::StartEnterReturnedUnexpectedly { .. }
             | Self::MissingEnv { .. }
-            | Self::Configuration { .. } => None,
+            | Self::Configuration { .. }
+            | Self::InvalidEgressSubnet { .. } => None,
             Self::Io { source } => Some(source),
         }
     }

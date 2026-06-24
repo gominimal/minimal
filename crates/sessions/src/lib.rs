@@ -90,6 +90,26 @@ pub struct EgressPolicy {
     pub allow_protocols: Option<Vec<IpProto>>,
 }
 
+impl EgressPolicy {
+    /// Returns the first `allow_subnets` entry that is not a syntactically valid
+    /// CIDR prefix, or `None` when every entry parses (or none are configured).
+    ///
+    /// Used at launch to name a misconfigured destination subnet where it can be
+    /// fixed — by [`Record::validate_policy`] for per-`PTask` egress and by
+    /// `minvmd`'s `VmConfig::validate_for` for VM-wide egress — rather than
+    /// letting an unparseable CIDR surface opaquely when #553's egress-enforcement
+    /// layer parses it.
+    #[must_use]
+    pub fn first_invalid_subnet(&self) -> Option<&str> {
+        self.allow_subnets
+            .as_deref()
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .find(|cidr| !is_valid_cidr(cidr))
+    }
+}
+
 /// Effective ingress policy for an `OwnIp` `PTask`.
 ///
 /// Default (empty `port_mappings`, no `dynamic_allowed_range`) is deny-all-external.
@@ -180,6 +200,18 @@ pub enum PolicyError {
          {hi}; the range is inclusive — set lo <= hi"
     )]
     InvalidDynamicRange { lo: u16, hi: u16 },
+    /// An ingress `dynamic_allowed_range` lower bound is a privileged host port
+    /// (< 1024). The lower bound is the smallest host port a runtime mapping
+    /// request may publish, so the same rootless-privilege constraint that
+    /// rejects a static mapping's privileged `external_port` applies. Rejected at
+    /// launch so the misconfig is named where it can be fixed, rather than
+    /// surfacing opaquely when #553's dynamic-port-mapping layer consumes it.
+    #[error(
+        "ingress dynamic_allowed_range lower bound {lo} is a privileged host \
+         port; minimald refuses to publish host ports below 1024 — set a lower \
+         bound >= 1024"
+    )]
+    PrivilegedDynamicRange { lo: u16 },
 }
 
 /// Whether `s` is a syntactically valid CIDR prefix (`<addr>/<prefix-len>`) for
@@ -283,9 +315,11 @@ impl Record {
     /// transport gvproxy's forwarder cannot expose, or
     /// [`PolicyError::PrivilegedPort`] for one that publishes a host port below
     /// 1024. For an `OwnIp` `PTask`, returns [`PolicyError::InvalidSubnet`] when
-    /// an egress `allow_subnets` entry is not a valid CIDR prefix, or
+    /// an egress `allow_subnets` entry is not a valid CIDR prefix,
     /// [`PolicyError::InvalidDynamicRange`] when the ingress
-    /// `dynamic_allowed_range` lower bound exceeds its upper bound.
+    /// `dynamic_allowed_range` lower bound exceeds its upper bound, or
+    /// [`PolicyError::PrivilegedDynamicRange`] when that lower bound is a
+    /// privileged host port (< 1024).
     pub fn validate_policy(&self) -> Result<(), PolicyError> {
         // gvproxy's static forwarder only exposes TCP and UDP, so an ingress
         // mapping with any other transport is a configuration error wherever it
@@ -322,25 +356,30 @@ impl Record {
                 .policy
                 .egress
                 .as_ref()
-                .and_then(|egress| egress.allow_subnets.as_deref())
-                .into_iter()
-                .flatten()
-                .find(|cidr| !is_valid_cidr(cidr))
+                .and_then(EgressPolicy::first_invalid_subnet)
             {
-                return Err(PolicyError::InvalidSubnet { cidr: bad.clone() });
+                return Err(PolicyError::InvalidSubnet {
+                    cidr: bad.to_owned(),
+                });
             }
             // A reversed dynamic range (lo > hi) describes no ports under the
-            // inclusive semantics, so reject it at launch rather than letting a
-            // misconfig persist on the Record until #553's dynamic port-mapping
-            // layer consumes it.
+            // inclusive semantics, and a privileged lower bound (< 1024) names a
+            // host port the rootless switch cannot publish — the same constraint
+            // the static-mapping privileged-port check enforces. Reject either at
+            // launch rather than letting a misconfig persist on the Record until
+            // #553's dynamic port-mapping layer consumes it.
             if let Some((lo, hi)) = self
                 .policy
                 .ingress
                 .as_ref()
                 .and_then(|ingress| ingress.dynamic_allowed_range)
-                && lo > hi
             {
-                return Err(PolicyError::InvalidDynamicRange { lo, hi });
+                if lo > hi {
+                    return Err(PolicyError::InvalidDynamicRange { lo, hi });
+                }
+                if lo < 1024 {
+                    return Err(PolicyError::PrivilegedDynamicRange { lo });
+                }
             }
             return Ok(());
         }
@@ -584,6 +623,27 @@ mod tests {
             record.validate_policy(),
             Err(PolicyError::InvalidDynamicRange { lo: 8443, hi: 8000 })
         );
+    }
+
+    #[test]
+    fn privileged_dynamic_range_lower_bound_is_rejected_on_own_ip() {
+        // A dynamic_allowed_range whose lower bound is below 1024 names a
+        // privileged host port the rootless switch cannot publish — the same
+        // constraint the static-mapping privileged-port check enforces — so it is
+        // rejected at launch rather than surfacing opaquely when #553's dynamic
+        // port-mapping layer consumes it. The bound is checked after the
+        // reversed-range guard, so a well-ordered but privileged range is caught.
+        for range in [(512u16, 1023u16), (80, 8080)] {
+            let ingress = IngressPolicy {
+                port_mappings: vec![],
+                dynamic_allowed_range: Some(range),
+            };
+            let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
+            assert_eq!(
+                record.validate_policy(),
+                Err(PolicyError::PrivilegedDynamicRange { lo: range.0 })
+            );
+        }
     }
 
     #[test]
