@@ -346,6 +346,54 @@ mod tests {
     }
 
     #[test]
+    fn icmp_ingress_on_host_net_returns_protocol_error_not_mode_error() {
+        // The protocol check precedes the mode check, so an ICMP mapping on a
+        // non-OwnIp PTask surfaces as UnsupportedIngressProtocol rather than
+        // IngressRequiresOwnIp. This test pins that ordering.
+        let ingress = IngressPolicy {
+            port_mappings: vec![PortMapping {
+                external_port: 8080,
+                internal_port: 80,
+                proto: IpProto::Icmp,
+            }],
+            dynamic_allowed_range: None,
+        };
+        assert_eq!(
+            record_with(
+                NetworkMode::HostNet,
+                SessionPolicy::new(None, Some(ingress))
+            )
+            .validate_policy(),
+            Err(PolicyError::UnsupportedIngressProtocol {
+                proto: IpProto::Icmp
+            })
+        );
+    }
+
+    #[test]
+    fn privileged_port_ingress_on_host_net_returns_port_error_not_mode_error() {
+        // The privileged-port check likewise precedes the mode check, so a
+        // host port below 1024 on a non-OwnIp PTask surfaces as PrivilegedPort
+        // rather than IngressRequiresOwnIp. This test pins that ordering.
+        let ingress = IngressPolicy {
+            port_mappings: vec![PortMapping {
+                external_port: 80,
+                internal_port: 8080,
+                proto: IpProto::Tcp,
+            }],
+            dynamic_allowed_range: None,
+        };
+        assert_eq!(
+            record_with(
+                NetworkMode::HostNet,
+                SessionPolicy::new(None, Some(ingress))
+            )
+            .validate_policy(),
+            Err(PolicyError::PrivilegedPort { external_port: 80 })
+        );
+    }
+
+    #[test]
     fn icmp_ingress_mapping_is_rejected_even_on_own_ip() {
         // gvproxy's forwarder only exposes TCP/UDP, so an ICMP mapping is a
         // configuration error even on an OwnIp PTask (where ingress is allowed).
