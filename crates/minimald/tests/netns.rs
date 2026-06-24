@@ -144,7 +144,7 @@ async fn netns_uc6_ownip_ptask_to_ptask() {
     // Retry the connect until the listener is ready and the switch has learned
     // MACs. A fixed sleep is flaky on slow CI runners; retrying up to a deadline
     // is deterministic.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let a_pid = a.pid().to_string();
     let client = loop {
         let out = sudo(&[
@@ -229,7 +229,7 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
     // From the host, connect to 127.0.0.1:EXTERNAL; gvproxy forwards the
     // connection into the PTask's listener over the switch. Retry until the
     // listener is up and the forward is installed.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let reached = loop {
         // Bound each probe with `timeout` so a connect that succeeds but then
         // stalls on the read cannot hang past the overall retry deadline.
