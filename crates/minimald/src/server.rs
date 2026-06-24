@@ -101,6 +101,12 @@ pub struct ServerState {
     /// restart.
     #[cfg(feature = "networking-proxy")]
     pub cert_authority: Arc<crate::net::proxy::CertAuthority>,
+
+    /// The running WireGuard mesh peer, when one is configured (Unit 4). Only
+    /// present under the `networking-wg` feature; the `GetMeshStatus` RPC reads
+    /// it through [`ServerStateHandle::mesh_status`].
+    #[cfg(feature = "networking-wg")]
+    mesh: Option<Arc<crate::net::wg::MeshHandle>>,
 }
 
 impl ServerState {
@@ -132,6 +138,8 @@ impl ServerState {
             host_key: None,
             #[cfg(feature = "networking-proxy")]
             cert_authority,
+            #[cfg(feature = "networking-wg")]
+            mesh: None,
         })
     }
 }
@@ -171,6 +179,28 @@ impl ServerStateHandle {
     #[cfg(feature = "networking-proxy")]
     pub async fn cert_authority(&self) -> Arc<crate::net::proxy::CertAuthority> {
         Arc::clone(&self.0.lock().await.cert_authority)
+    }
+
+    /// Builds the current WireGuard mesh status for the `GetMeshStatus` RPC
+    /// (R4.6). On a build without the `networking-wg` feature, or with no mesh
+    /// configured, this reports `configured = false`.
+    pub async fn mesh_status(&self) -> minimald_rpc::MeshStatus {
+        #[cfg(feature = "networking-wg")]
+        {
+            let s = self.0.lock().await;
+            crate::net::wg::status_response(s.mesh.as_deref())
+        }
+        #[cfg(not(feature = "networking-wg"))]
+        {
+            minimald_rpc::MeshStatus::unconfigured()
+        }
+    }
+
+    /// Installs a running mesh handle. Used by the daemon's mesh-join path and,
+    /// in tests, to stand up a configured mesh for the `GetMeshStatus` RPC.
+    #[cfg(feature = "networking-wg")]
+    pub async fn set_mesh(&self, mesh: Arc<crate::net::wg::MeshHandle>) {
+        self.0.lock().await.mesh = Some(mesh);
     }
 }
 
