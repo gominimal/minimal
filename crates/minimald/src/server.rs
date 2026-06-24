@@ -188,7 +188,14 @@ impl ServerStateHandle {
         #[cfg(feature = "networking-wg")]
         {
             let s = self.0.lock().await;
-            crate::net::wg::status_response(s.mesh.as_deref())
+            // A populated mesh slot is not proof the mesh is live: the pump can
+            // exit on a fatal socket error without clearing the slot, leaving a
+            // frozen, stale snapshot. Treat a dead pump as unconfigured so
+            // `GetMeshStatus` never advertises stale peer state.
+            match s.mesh.as_deref() {
+                Some(mesh) if mesh.is_alive() => crate::net::wg::status_response(Some(mesh)),
+                _ => minimald_rpc::MeshStatus::unconfigured(),
+            }
         }
         #[cfg(not(feature = "networking-wg"))]
         {

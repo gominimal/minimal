@@ -7,7 +7,7 @@
 //! crosses the encrypted tunnel between the namespaces and is decrypted on the
 //! destination peer's tunnel sink.
 //!
-//! It is `#[ignore]` and gated on `MINIMAL_NETNS_TESTS=1`: it needs root (to
+//! It is `#[ignore]` and gated on `MINIMALD_NETNS_TEST=1`: it needs root (to
 //! create namespaces and a veth pair, and to `setns`), so it runs only in the
 //! privileged netns CI lane (`ci-netns.yml`), never in the default
 //! `cargo test` gate. The whole file compiles to nothing unless the
@@ -134,6 +134,18 @@ async fn remote_ptask_packet_crosses_the_mesh_tunnel() {
     }
 
     teardown_namespaces(); // clear any leftovers from a prior run
+
+    // RAII guard: any `expect` between setup and the explicit teardown below can
+    // panic, leaving root-created netns/veth state behind. The guard runs
+    // `teardown_namespaces()` on success, failure, and timeout paths alike.
+    struct NamespaceCleanup;
+    impl Drop for NamespaceCleanup {
+        fn drop(&mut self) {
+            teardown_namespaces();
+        }
+    }
+    let _cleanup = NamespaceCleanup;
+
     setup_namespaces().expect("namespace + veth setup (needs root)");
 
     let a_kp = Keypair::generate();
@@ -203,6 +215,7 @@ async fn remote_ptask_packet_crosses_the_mesh_tunnel() {
         }
     };
 
-    teardown_namespaces();
+    // `_cleanup` tears the namespaces down when it drops at end of scope —
+    // including the panic path of the assertion below.
     result.expect("UC7 packet must cross the mesh tunnel");
 }

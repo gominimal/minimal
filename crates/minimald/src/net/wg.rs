@@ -329,6 +329,15 @@ impl MeshHandle {
         self.status.borrow().clone()
     }
 
+    /// Whether the pump task is still running. The pump `break`s out of its
+    /// loop on a fatal socket error, after which the watch snapshot is frozen
+    /// and stale; callers (e.g. `GetMeshStatus`) use this to report the mesh as
+    /// no longer configured rather than serving dead peer state.
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        !self.pump.is_finished()
+    }
+
     /// Queues an outbound IPv4 packet for encryption and routing to the peer
     /// whose AllowedIPs contain its destination. A packet with no matching peer
     /// is dropped by the pump.
@@ -550,57 +559,77 @@ async fn handle_inbound(
     datagram: &[u8],
     tunnel_sink: &mpsc::Sender<Vec<u8>>,
 ) {
-    let Some(idx) = route_inbound(peers, src) else {
-        // No peer would authenticate this datagram. Log the bare source only —
-        // never a switch IP or PTask name (R4.5: no topology in auth failures).
-        tracing::warn!(remote = %src, "WireGuard datagram from unrecognised source dropped");
-        return;
-    };
-
+    // Try each candidate peer in priority order until one authenticates the
+    // datagram. boringtun returns `TunnResult::Err` when the datagram does not
+    // belong to a peer's session, so a clean `Err` on the first `decapsulate`
+    // is the signal to move to the next candidate; any other result means this
+    // peer owns the datagram and we drive it to completion. Probing this way —
+    // exact endpoint match first, then every endpoint-less peer — lets a
+    // roaming peer (new source address) and any of several endpoint-less peers
+    // still be matched, instead of stopping at the single first candidate. Each
+    // datagram is decapsulated exactly once for the owning peer (the prior
+    // `Err` probes leave no lasting session state and never consume it).
     let mut buf = vec![0u8; MAX_DATAGRAM];
-    let mut result = peers[idx]
-        .tunn
-        .decapsulate(Some(src.ip()), datagram, &mut buf);
-    loop {
-        match result {
-            TunnResult::Done => break,
-            TunnResult::Err(e) => {
-                // An authenticated peer's decode error: log the peer name (it is
-                // already authenticated, so this leaks nothing new) and the
-                // error kind, but no addresses (R4.5).
-                tracing::warn!(peer = %peers[idx].cfg.name, error = ?e, "WireGuard decapsulation error");
-                break;
-            }
-            TunnResult::WriteToNetwork(packet) => {
-                let out = packet.to_vec();
-                // Learn/refresh the peer endpoint from where this arrived.
-                peers[idx].endpoint = Some(src);
-                let _ = socket.send_to(&out, src).await;
-                // Per boringtun: repeat decapsulate with an empty datagram until
-                // Done to flush any further queued network writes.
-                result = peers[idx].tunn.decapsulate(None, &[], &mut buf);
-            }
-            TunnResult::WriteToTunnelV4(packet, _src_ip) => {
-                let pkt = packet.to_vec();
-                let _ = tunnel_sink.send(pkt).await;
-                break;
-            }
-            TunnResult::WriteToTunnelV6(_, _) => break, // IPv4-only mesh (spec non-goal)
+    for idx in route_candidates(peers, src) {
+        let mut result = peers[idx]
+            .tunn
+            .decapsulate(Some(src.ip()), datagram, &mut buf);
+        // The first probe of a non-owning peer returns `Err`: skip to the next
+        // candidate. (A decode error on the *owning* peer is handled in the
+        // drain loop below, where it is logged against the authenticated peer.)
+        if matches!(result, TunnResult::Err(_)) {
+            continue;
         }
+        loop {
+            match result {
+                TunnResult::Done => break,
+                TunnResult::Err(e) => {
+                    // An authenticated peer's decode error: log the peer name (it
+                    // is already authenticated, so this leaks nothing new) and
+                    // the error kind, but no addresses (R4.5).
+                    tracing::warn!(peer = %peers[idx].cfg.name, error = ?e, "WireGuard decapsulation error");
+                    break;
+                }
+                TunnResult::WriteToNetwork(packet) => {
+                    let out = packet.to_vec();
+                    // Learn/refresh the peer endpoint from where this arrived.
+                    peers[idx].endpoint = Some(src);
+                    let _ = socket.send_to(&out, src).await;
+                    // Per boringtun: repeat decapsulate with an empty datagram
+                    // until Done to flush any further queued network writes.
+                    result = peers[idx].tunn.decapsulate(None, &[], &mut buf);
+                }
+                TunnResult::WriteToTunnelV4(packet, _src_ip) => {
+                    let pkt = packet.to_vec();
+                    let _ = tunnel_sink.send(pkt).await;
+                    break;
+                }
+                TunnResult::WriteToTunnelV6(_, _) => break, // IPv4-only mesh (spec non-goal)
+            }
+        }
+        return;
     }
+    // No candidate authenticated this datagram. Log the bare source only —
+    // never a switch IP or PTask name (R4.5: no topology in auth failures).
+    tracing::warn!(remote = %src, "WireGuard datagram from unrecognised source dropped");
 }
 
-/// Picks the peer that should receive an inbound datagram: by a matching
-/// endpoint first, then by trying each peer (handles a roaming initiator whose
-/// endpoint was not preconfigured).
-fn route_inbound(peers: &[PeerRuntime], src: SocketAddr) -> Option<usize> {
+/// The ordered list of peer indices to try for an inbound datagram: the exact
+/// endpoint match first (cheapest, the common case), then every endpoint-less
+/// peer (each a possible roaming initiator whose endpoint was not
+/// preconfigured). With v1 manual config and known endpoints the first entry
+/// almost always authenticates.
+fn route_candidates(peers: &[PeerRuntime], src: SocketAddr) -> Vec<usize> {
+    let mut candidates: Vec<usize> = Vec::new();
     if let Some(i) = peers.iter().position(|p| p.endpoint == Some(src)) {
-        return Some(i);
+        candidates.push(i);
     }
-    // Fall back to the first peer without a fixed endpoint, which may be the
-    // roaming initiator. With v1 manual config and known endpoints this is
-    // rarely hit.
-    peers.iter().position(|p| p.endpoint.is_none())
+    for (i, p) in peers.iter().enumerate() {
+        if p.endpoint.is_none() && !candidates.contains(&i) {
+            candidates.push(i);
+        }
+    }
+    candidates
 }
 
 /// Encrypts one outbound IP packet and sends it to the peer whose AllowedIPs
@@ -813,13 +842,13 @@ mod tests {
         let a_pub = a_kp.public();
         let b_pub = b_kp.public();
 
-        let a_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        // Bind ephemeral ports first by starting both with port 0 is awkward
-        // because each needs the other's port up front. Pick two fixed-but-high
-        // loopback ports unlikely to collide in CI.
-        let a_port = 51_820u16;
-        let b_port = 51_821u16;
-        let _ = a_addr;
+        // Pre-bind two ephemeral loopback sockets so the test never collides with
+        // an occupied port or a parallel run; each peer needs the other's bound
+        // address up front, which `start_with_socket` lets us supply.
+        let a_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let b_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let a_port = a_sock.local_addr().unwrap().port();
+        let b_port = b_sock.local_addr().unwrap().port();
 
         let (a_sink_tx, mut a_sink_rx) = mpsc::channel::<Vec<u8>>(8);
         let (b_sink_tx, mut b_sink_rx) = mpsc::channel::<Vec<u8>>(8);
@@ -847,8 +876,8 @@ mod tests {
             }],
         };
 
-        let a = start(a_cfg, a_sink_tx).await.unwrap();
-        let b = start(b_cfg, b_sink_tx).await.unwrap();
+        let a = start_with_socket(a_cfg, a_sock, a_sink_tx).unwrap();
+        let b = start_with_socket(b_cfg, b_sock, b_sink_tx).unwrap();
 
         // Wait for the handshake to complete (status reports a last-handshake).
         let handshook = timeout(Duration::from_secs(5), async {

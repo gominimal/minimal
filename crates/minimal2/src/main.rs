@@ -608,6 +608,18 @@ async fn cmd_mesh_status(global: &GlobalArgs) -> Result<(), ()> {
 /// Record this machine's enrolment into a remote minimald's mesh (R4.3, v1
 /// manual key exchange) and print the steps to complete the key swap.
 fn cmd_mesh_join(global: &GlobalArgs, args: MeshJoinArgs) -> Result<(), ()> {
+    // Validate the endpoint at the point of entry so a typo never lands a bad
+    // enrolment on disk for a later consumer to choke on. The CLI contract is
+    // `host:port`; require a non-empty host and a parseable u16 port.
+    let Some((host, port)) = args.address.rsplit_once(':') else {
+        eprintln!("mesh join address must be host:port, e.g. mesh.example.com:51820");
+        return Err(());
+    };
+    if host.is_empty() || port.parse::<u16>().is_err() {
+        eprintln!("mesh join address must include a non-empty host and valid port");
+        return Err(());
+    }
+
     let path = mesh_enrolment_path(global)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
