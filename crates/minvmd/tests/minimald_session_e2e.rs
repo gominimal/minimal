@@ -232,6 +232,7 @@ async fn run_session_exec(
                 project_path: paths::HostAbsPath::try_new("/tmp")
                     .map_err(|e| format!("project_path: {e}"))?,
                 network: sessions::NetworkMode::default(),
+                policy: Default::default(),
                 attrs: Default::default(),
             },
         };

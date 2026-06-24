@@ -144,7 +144,7 @@ async fn netns_uc6_ownip_ptask_to_ptask() {
     // Retry the connect until the listener is ready and the switch has learned
     // MACs. A fixed sleep is flaky on slow CI runners; retrying up to a deadline
     // is deterministic.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let a_pid = a.pid().to_string();
     let client = loop {
         let out = sudo(&[
@@ -177,6 +177,105 @@ async fn netns_uc6_ownip_ptask_to_ptask() {
         "PTask A -> PTask B TCP connect failed: status={:?}\nstderr={}",
         client.status.code(),
         String::from_utf8_lossy(&client.stderr),
+    );
+}
+
+/// R2.3 / R2.4-static — a static ingress port mapping applied at launch via
+/// `POST /services/forwarder/expose` on the switch control socket makes a
+/// listener inside an `OwnIp` PTask reachable from the host, and `unexpose` on
+/// exit removes it.
+///
+/// Drives the production [`minimald::net::policy::apply_ingress`] /
+/// [`remove_ingress`](minimald::net::policy::remove_ingress) against a live
+/// gvproxy switch; neither exists on the base branch, so this cannot pass
+/// against an empty PR.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs netns + gvproxy; gated on MINIMALD_NETNS_TEST, run by ci-netns.yml"]
+async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
+    if !gated() {
+        return;
+    }
+    use minimald::net::policy::{apply_ingress, remove_ingress};
+    use sessions::{IngressPolicy, IpProto, PortMapping};
+
+    const INTERNAL: u16 = 80;
+    const EXTERNAL: u16 = 18080;
+
+    let state = tempfile::tempdir().expect("switch state dir");
+    let mut switch = GvproxySwitch::new(gvproxy_bin(), state.path());
+    let subnet = SwitchSubnet::default();
+
+    let minimald::net::AttachResult { lease, .. } = switch.attach().await.expect("attach PTask");
+    let sock = switch.control_socket();
+    let mut ptask = Ptask::provision("ingress", lease, subnet, &sock).await;
+
+    // A listener inside the PTask, bound to its switch address on the internal
+    // port the forward targets.
+    let mut server = ptask.spawn_listener(INTERNAL);
+
+    // Apply the static ingress forward at "launch": host :EXTERNAL -> PTask:INTERNAL.
+    let ingress = IngressPolicy {
+        port_mappings: vec![PortMapping {
+            external_port: EXTERNAL,
+            internal_port: INTERNAL,
+            proto: IpProto::Tcp,
+        }],
+        dynamic_allowed_range: None,
+    };
+    let exposed = apply_ingress(&sock, lease.ip, &ingress)
+        .await
+        .expect("apply ingress");
+
+    // From the host, connect to 127.0.0.1:EXTERNAL; gvproxy forwards the
+    // connection into the PTask's listener over the switch. Retry until the
+    // listener is up and the forward is installed.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let reached = loop {
+        // Bound each probe with `timeout` so a connect that succeeds but then
+        // stalls on the read cannot hang past the overall retry deadline.
+        let out = Command::new("timeout")
+            .args([
+                "2s",
+                "bash",
+                "-c",
+                &format!("exec 3<>/dev/tcp/127.0.0.1/{EXTERNAL}; head -c2 <&3"),
+            ])
+            .output()
+            .expect("spawn host connect");
+        if out.status.success() || tokio::time::Instant::now() >= deadline {
+            break out;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+
+    let _ = server.kill();
+    let _ = server.wait();
+
+    // Remove the forward on exit and confirm it is gone: a fresh host connect to
+    // the same port must now fail.
+    remove_ingress(&sock, &exposed).await;
+    let after_unexpose = Command::new("timeout")
+        .args([
+            "2s",
+            "bash",
+            "-c",
+            &format!("exec 3<>/dev/tcp/127.0.0.1/{EXTERNAL}"),
+        ])
+        .output()
+        .expect("spawn post-unexpose host connect");
+
+    ptask.teardown();
+    switch.stop().await.expect("stop switch");
+
+    assert!(
+        reached.status.success(),
+        "host -> exposed ingress port failed: status={:?}\nstderr={}",
+        reached.status.code(),
+        String::from_utf8_lossy(&reached.stderr),
+    );
+    assert!(
+        !after_unexpose.status.success(),
+        "ingress forward still reachable after unexpose; teardown did not remove it",
     );
 }
 

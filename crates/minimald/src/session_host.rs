@@ -578,6 +578,11 @@ pub(crate) struct SandboxLauncher {
     /// The shared per-host gvproxy switch, used to attach this launch when it
     /// runs in [`NetworkMode::OwnIp`] (R1.5). Ignored for `HostNet`/`NoNet`.
     pub(crate) net_switch: std::sync::Arc<tokio::sync::Mutex<crate::net::GvproxySwitch>>,
+    /// Static ingress port mappings to apply on the switch once this `OwnIp`
+    /// PTask is attached (R2.3/R2.4-static), removed when it exits. `None` (or
+    /// empty) for non-`OwnIp` launches; `session.rs` has already rejected
+    /// ingress configured on any other mode (R2.1).
+    pub(crate) ingress: Option<sessions::IngressPolicy>,
 }
 
 /// Holds an `OwnIp` PTask's switch attachment for the session's lifetime.
@@ -598,18 +603,33 @@ pub(crate) struct OwnIpAttachment {
     _relay: crate::net::switch::SwitchRelay,
     /// The shared switch, locked on drop to detach this PTask.
     switch: std::sync::Arc<tokio::sync::Mutex<crate::net::GvproxySwitch>>,
+    /// gvproxy's control socket, used on drop to remove this PTask's ingress
+    /// forwards before detaching.
+    control_sock: std::path::PathBuf,
+    /// The static ingress forwards exposed for this PTask (R2.3), removed from
+    /// the switch on drop. Empty when no ingress was configured.
+    exposed: Vec<crate::net::policy::ExposedMapping>,
 }
 
 #[cfg(not(test))]
 impl Drop for OwnIpAttachment {
     fn drop(&mut self) {
-        // `detach` is async and `Drop` cannot await, so schedule it on the
-        // current runtime. The session host always drops within the daemon's
-        // tokio context; if somehow not, log rather than block.
+        // `detach` and ingress removal are async and `Drop` cannot await, so
+        // schedule them on the current runtime. The session host always drops
+        // within the daemon's tokio context; if somehow not, log rather than
+        // block.
         let switch = std::sync::Arc::clone(&self.switch);
+        let control_sock = std::mem::take(&mut self.control_sock);
+        let exposed = std::mem::take(&mut self.exposed);
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
+                    // Remove ingress forwards (R2.3 teardown) before detaching:
+                    // detach may stop gvproxy once the last PTask leaves, so the
+                    // unexpose must reach a still-running switch first.
+                    if !exposed.is_empty() {
+                        crate::net::policy::remove_ingress(&control_sock, &exposed).await;
+                    }
                     if let Err(e) = switch.lock().await.detach().await {
                         tracing::warn!(error = %e, "detaching OwnIp PTask from switch on session end");
                     }
@@ -632,6 +652,7 @@ impl Drop for OwnIpAttachment {
 async fn attach_own_ip(
     switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::GvproxySwitch>>,
     netns_pid: u32,
+    ingress: Option<&sessions::IngressPolicy>,
 ) -> io::Result<OwnIpAttachment> {
     use crate::net::switch::{attach_to_switch, move_tap_into_netns, open_tap};
 
@@ -672,9 +693,35 @@ async fn attach_own_ip(
         }
     };
 
+    // R2.3/R2.4-static: with the PTask attached, apply its static ingress
+    // forwards on the switch control socket, retaining handles to remove on
+    // exit. A failure here rolls the whole attach back (drop the relay, then
+    // detach) so a half-configured PTask is never left running.
+    let exposed = match ingress {
+        Some(ingress) if !ingress.port_mappings.is_empty() => {
+            match crate::net::policy::apply_ingress(&sock, lease.ip, ingress).await {
+                Ok(exposed) => exposed,
+                Err(e) => {
+                    drop(relay);
+                    if let Err(det_err) = switch.lock().await.detach().await {
+                        tracing::warn!(
+                            error = %det_err,
+                            ingress_err = %e,
+                            "detaching OwnIp PTask from switch during ingress-apply rollback"
+                        );
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        _ => Vec::new(),
+    };
+
     Ok(OwnIpAttachment {
         _relay: relay,
         switch: std::sync::Arc::clone(switch),
+        control_sock: sock,
+        exposed,
     })
 }
 
@@ -693,6 +740,9 @@ impl SessionLauncher for SandboxLauncher {
         sz: WinSize,
     ) -> io::Result<Launched<SandboxProcess, Self::Guard>> {
         let ctx = self.ctx;
+        // Move the ingress policy out of `self` up front so it can be applied
+        // after the switch attach below (the rest of `self` is consumed first).
+        let ingress = self.ingress;
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
         // graph construction) — run it on the blocking pool so it
         // doesn't stall the async executor.
@@ -760,7 +810,7 @@ impl SessionLauncher for SandboxLauncher {
         // the network before its first channel message could see transient
         // `ENETUNREACH` until the tap is in place.
         let own_ip = if matches!(self.network_mode, NetworkMode::OwnIp) {
-            match attach_own_ip(&self.net_switch, process.id()).await {
+            match attach_own_ip(&self.net_switch, process.id(), ingress.as_ref()).await {
                 Ok(attachment) => Some(attachment),
                 Err(e) => {
                     // The attach failed, so this launch is aborting. A

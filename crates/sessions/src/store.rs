@@ -437,7 +437,19 @@ mod tests {
             name: Some("my-session".to_string()),
             username: Some("alice".to_string()),
             project_path: HostAbsPath::try_new("/home/alice/proj").unwrap(),
-            network: crate::NetworkMode::default(),
+            // An OwnIp session carrying a non-default policy, so the round-trip
+            // tests prove a configured policy — the live source for the
+            // GetSessionPolicy RPC — survives a disk round-trip, not just the
+            // all-`None` default.
+            network: crate::NetworkMode::OwnIp,
+            policy: crate::SessionPolicy::new(
+                Some(crate::EgressPolicy {
+                    allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                    allow_dns_hosts: None,
+                    allow_protocols: None,
+                }),
+                None,
+            ),
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()
                 .collect(),
@@ -459,6 +471,10 @@ mod tests {
         assert_eq!(got.record().username, input.username);
         assert_eq!(got.record().project_path, input.project_path);
         assert_eq!(got.record().attrs, input.attrs);
+        // The configured network mode and policy must survive too: Record.policy
+        // is the authoritative source the GetSessionPolicy RPC reads back.
+        assert_eq!(got.record().network, input.network);
+        assert_eq!(got.record().policy, input.policy);
 
         // Check find_by_id as well.
         assert_eq!(

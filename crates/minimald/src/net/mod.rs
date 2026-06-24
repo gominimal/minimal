@@ -17,6 +17,7 @@
 //! reuse), and R1.8 (structured tracing for every switch lifecycle event).
 
 pub mod dns;
+pub mod policy;
 pub mod proxy;
 pub mod switch;
 
@@ -57,16 +58,17 @@ const TERM_GRACE: Duration = Duration::from_secs(5);
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum NetError {
-    /// The prefix length is outside the range accepted by [`SwitchSubnet::new`].
-    ///
-    /// Distinct from [`SubnetExhausted`](Self::SubnetExhausted): a prefix that
-    /// puts the subnet outside `8..=29` is a misconfiguration (the prefix was
-    /// never valid), not an exhausted valid subnet.
-    #[error("prefix /{0} is outside the valid range /8..=/29 for a gvproxy switch subnet")]
-    InvalidPrefix(u8),
     /// The configured subnet has no remaining host address to hand out.
     #[error("gvproxy subnet {0} is exhausted; no free PTask address remains")]
     SubnetExhausted(SwitchSubnet),
+    /// A subnet was constructed with a prefix outside the supported `8..=29`
+    /// range — a configuration error, distinct from runtime address exhaustion.
+    #[error(
+        "gvproxy subnet prefix /{0} is invalid; must be in 8..=29 (narrower has \
+         no room for a PTask address; wider lets the high octet vary, which the \
+         derived MAC cannot keep collision-free)"
+    )]
+    InvalidPrefix(u8),
     /// Spawning the gvproxy binary failed.
     #[error("spawning gvproxy at {path:?}: {source}")]
     Spawn {
@@ -154,7 +156,8 @@ impl SwitchSubnet {
         // none, so anything narrower than /29 has no room for a PTask. The lower
         // bound keeps MacAddr::for_switch_ip collision-free — it derives the MAC
         // from the low three octets, so the high octet must be pinned by the
-        // prefix (/8 or narrower).
+        // prefix (/8 or narrower). An out-of-range prefix is a misconfiguration,
+        // not runtime exhaustion, so it is reported as InvalidPrefix.
         if !(8..=29).contains(&prefix) {
             return Err(NetError::InvalidPrefix(prefix));
         }
@@ -675,8 +678,6 @@ mod tests {
 
     #[test]
     fn subnet_rejects_overly_narrow_prefix() {
-        // /30 is a misconfiguration (no room for a PTask), not an exhausted
-        // valid subnet — so the distinct InvalidPrefix error is returned.
         assert!(matches!(
             SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 30),
             Err(NetError::InvalidPrefix(30))

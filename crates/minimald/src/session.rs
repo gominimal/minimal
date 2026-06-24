@@ -18,9 +18,19 @@ pub enum AttachError {
     SpawnFailed(std::io::Error),
     NoPty,
     ContextCreationFailed(String),
+    /// The session's networking policy is incompatible with its network mode
+    /// (R2.1): e.g. an egress section on a non-`OwnIp` PTask.
+    InvalidPolicy(sessions::PolicyError),
 }
 
-impl std::error::Error for AttachError {}
+impl std::error::Error for AttachError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            AttachError::InvalidPolicy(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl fmt::Display for AttachError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -30,6 +40,7 @@ impl fmt::Display for AttachError {
             }
             AttachError::NoPty => write!(f, "SSH channel did not configure a PTY"),
             AttachError::SpawnFailed(e) => write!(f, "session spawn: {e}"),
+            AttachError::InvalidPolicy(e) => write!(f, "invalid session policy: {e}"),
         }
     }
 }
@@ -242,10 +253,22 @@ impl<S: SessionObject> Session<S> {
         &mut self,
         session: SessionHandle,
     ) -> Result<session_host::SandboxLauncher, AttachError> {
+        let record = self.session.record();
+        // R2.1: reject a policy that is incompatible with the network mode
+        // (e.g. egress on a non-`OwnIp` PTask) before launching the host.
+        record
+            .validate_policy()
+            .map_err(AttachError::InvalidPolicy)?;
+        let network_mode = record.network;
+        // Only an `OwnIp` PTask attaches to the switch, so ingress forwards are
+        // only carried for that mode; `validate_policy` has already rejected
+        // ingress configured on any other mode.
+        let ingress = record.policy.ingress.clone();
         Ok(session_host::SandboxLauncher {
             ctx: self.context().map_err(AttachError::ContextCreationFailed)?,
-            network_mode: self.session.record().network,
+            network_mode,
             net_switch: Arc::clone(&self.net_switch),
+            ingress,
             session,
         })
     }
@@ -258,6 +281,12 @@ impl<S: SessionObject> Session<S> {
         &mut self,
         _session: SessionHandle,
     ) -> Result<session_host::MockLauncher, AttachError> {
+        // Mirror the production R2.1 gate so test launches reject a
+        // policy/network-mode mismatch the same way production does.
+        self.session
+            .record()
+            .validate_policy()
+            .map_err(AttachError::InvalidPolicy)?;
         Ok(session_host::MockLauncher)
     }
 
@@ -384,6 +413,7 @@ mod tests {
                     username: None,
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: Default::default(),
+                    policy: Default::default(),
                     attrs: Default::default(),
                 },
             })

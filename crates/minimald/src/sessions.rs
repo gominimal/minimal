@@ -226,6 +226,13 @@ impl<L: Loader> Manager<L> {
             // Creates a session using the given record.
             ManagerMessage::CreateSession(record, r) => {
                 r.handle(async {
+                    // R2.1: reject a policy incompatible with the network mode
+                    // (e.g. egress on a non-`OwnIp` PTask) at declaration time,
+                    // so an invalid session is never written to the store
+                    // rather than only failing when a client later attaches.
+                    record
+                        .validate_policy()
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
                     let k = self.store.create(record)?;
                     Ok(*k.id())
                 })
@@ -381,6 +388,7 @@ mod tests {
             username: None,
             project_path: HostAbsPath::try_new("/proj").unwrap(),
             network: sessions::NetworkMode::default(),
+            policy: Default::default(),
             attrs: Default::default(),
         }
     }

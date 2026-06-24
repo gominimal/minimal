@@ -1,9 +1,9 @@
 use minimald_rpc::{
     CreateSession, CreateSessionResponse, DestroySession, DestroySessionResponse, Errorable,
     GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest,
-    GetSessionRecordResponse, GetVersion, GetVersionResponse, IngressPolicy, ListSessions,
-    ListSessionsEntry, ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
-    RenameSessionResponse, SessionPolicy,
+    GetSessionRecordResponse, GetVersion, GetVersionResponse, ListSessions, ListSessionsEntry,
+    ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
+    RenameSessionResponse,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -144,6 +144,12 @@ async fn serve_create_session(s: ServerStateHandle, c: RuChannel<Msg>) {
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
                     error: "A session with that name already exists".to_string(),
                 },
+                // R2.1: a policy/network-mode mismatch is rejected at
+                // declaration time and surfaced as a clean typed error rather
+                // than a transport failure.
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Errorable::Err {
+                    error: e.to_string(),
+                },
                 Err(e) => return Err(ConnectionError::Internal(e.to_string())),
             })
         })
@@ -207,10 +213,9 @@ async fn serve_get_session_policy(s: ServerStateHandle, c: RuChannel<Msg>) {
                 None => Ok(Errorable::Err {
                     error: "no session found".to_string(),
                 }),
-                Some(_) => Ok(Errorable::Ok(SessionPolicy::new(
-                    None,
-                    Some(IngressPolicy::default()),
-                ))),
+                // R2.6: return the policy configured at launch from the live
+                // session record, not a hardcoded default.
+                Some(record) => Ok(Errorable::Ok(record.policy)),
             }
         })
         .await;
@@ -336,10 +341,11 @@ pub async fn handle_ssh_rpc(
 #[cfg(test)]
 mod tests {
     use minimald_rpc::{
-        CreateSession, CreateSessionRequest, DestroySessionRequest, RenameSessionRequest,
+        CreateSession, CreateSessionRequest, DestroySessionRequest, EgressPolicy, GetSessionPolicy,
+        GetSessionPolicyRequest, RenameSessionRequest, SessionPolicy,
     };
     use paths::HostAbsPath;
-    use sessions::SessionId;
+    use sessions::{NetworkMode, SessionId};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
@@ -376,6 +382,7 @@ mod tests {
                     username: None,
                     project_path: HostAbsPath::try_new("/tmp").unwrap(),
                     network: sessions::NetworkMode::default(),
+                    policy: Default::default(),
                     attrs: Default::default(),
                 },
             })
@@ -540,6 +547,7 @@ mod tests {
                     username: None,
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: sessions::NetworkMode::default(),
+                    policy: Default::default(),
                     attrs: Default::default(),
                 },
             })
@@ -573,6 +581,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_session_policy_returns_the_policy_configured_at_launch() {
+        // R2.6: GetSessionPolicy reads the live per-session policy from the
+        // record, not a hardcoded default. Create an `OwnIp` session carrying an
+        // explicit egress policy, then read it back over the RPC.
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let egress = EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            allow_dns_hosts: None,
+            allow_protocols: None,
+        };
+        let created = client
+            .call::<CreateSession>(&CreateSessionRequest {
+                record: sessions::Record {
+                    id: SessionId::nil(),
+                    name: Some("policy-session".to_string()),
+                    username: None,
+                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
+                    network: NetworkMode::OwnIp,
+                    policy: SessionPolicy::new(Some(egress.clone()), None),
+                    attrs: Default::default(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let policy = client
+            .call::<GetSessionPolicy>(&GetSessionPolicyRequest::Id(created.id))
+            .await
+            .unwrap();
+        assert_eq!(policy.egress, Some(egress));
+        // The configured ingress was `None`, and the read reflects that rather
+        // than the old hardcoded `Some(IngressPolicy::default())`.
+        assert_eq!(policy.ingress, None);
+    }
+
+    #[tokio::test]
     async fn create_session_errors_if_name_not_unique() {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
@@ -585,6 +631,7 @@ mod tests {
                     username: None,
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: sessions::NetworkMode::default(),
+                    policy: Default::default(),
                     attrs: Default::default(),
                 },
             })
@@ -602,6 +649,7 @@ mod tests {
                         username: None,
                         project_path: HostAbsPath::try_new("/uwu").unwrap(),
                         network: sessions::NetworkMode::default(),
+                        policy: Default::default(),
                         attrs: Default::default(),
                     },
                 })
@@ -610,6 +658,43 @@ mod tests {
                 error: "A session with that name already exists".to_string()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_policy_incompatible_with_network_mode() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        // R2.1: an egress policy on a non-`OwnIp` PTask is rejected at
+        // declaration time, so the invalid session is never stored.
+        let egress = EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            allow_dns_hosts: None,
+            allow_protocols: None,
+        };
+        let resp = client
+            .call::<CreateSession>(&CreateSessionRequest {
+                record: sessions::Record {
+                    id: SessionId::nil(),
+                    name: Some("bad-policy".to_string()),
+                    username: None,
+                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
+                    network: NetworkMode::HostNet,
+                    policy: SessionPolicy::new(Some(egress), None),
+                    attrs: Default::default(),
+                },
+            })
+            .await;
+        assert_eq!(
+            resp,
+            Errorable::Err {
+                error: "egress policy is only valid for an own-IP PTask, not HostNet".to_string()
+            }
+        );
+
+        // The rejected session left nothing behind in the store.
+        let mngr = server.state.sessions_manager().await;
+        assert!(mngr.list().await.unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -7,7 +7,30 @@
 
 use std::path::PathBuf;
 
-use minimald_rpc::NetworkMode;
+use minimald_rpc::{EgressPolicy, NetworkMode};
+
+use crate::error::VmError;
+
+/// Which of the spec's deployment models (DM1–DM5) a minvmd host runs under.
+///
+/// minvmd manages libkrun VMs, which only exist on DM1/DM3/DM4; DM2 is native
+/// Linux with no VM boundary. The distinction matters for VM-wide egress
+/// (R2.5): a `vm_egress` policy is meaningful only where a VM exists, and is a
+/// configuration error on DM2 (see [`VmConfig::validate_for`]).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeploymentMode {
+    /// macOS + one or more libkrun Linux VMs.
+    Dm1,
+    /// Native Linux, minimald on the host directly (no VM).
+    Dm2,
+    /// Native Linux + one or more Linux VMs.
+    Dm3,
+    /// DM2 + DM3 combined.
+    Dm4,
+    /// Any of the above with a network-accessible, authenticated minimald.
+    Dm5,
+}
 
 /// Configuration parameters for a single microVM.
 ///
@@ -34,6 +57,11 @@ pub struct VmConfig {
     /// [`NetworkMode::HostNet`]; an `OwnIp` VM is wired to the switch as a
     /// client via the per-PTask vsock shuttle.
     pub network_mode: NetworkMode,
+    /// VM-wide egress policy applied to all traffic from this VM, regardless of
+    /// per-PTask mode (R2.5). Only meaningful on a deployment model with a VM
+    /// boundary (DM1/DM3/DM4); rejected on DM2 by [`VmConfig::validate_for`].
+    /// `None` means no VM-wide egress restriction.
+    pub vm_egress: Option<EgressPolicy>,
 }
 
 impl VmConfig {
@@ -53,6 +81,7 @@ impl VmConfig {
             rootfs_path,
             initramfs,
             network_mode: NetworkMode::default(),
+            vm_egress: None,
         }
     }
 
@@ -61,6 +90,65 @@ impl VmConfig {
     pub fn with_network_mode(mut self, network_mode: NetworkMode) -> Self {
         self.network_mode = network_mode;
         self
+    }
+
+    /// Set the VM-wide egress policy (R2.5), consuming and returning `self`.
+    #[must_use]
+    pub fn with_vm_egress(mut self, vm_egress: EgressPolicy) -> Self {
+        self.vm_egress = Some(vm_egress);
+        self
+    }
+
+    /// Validates this config against the active deployment model (R2.5).
+    ///
+    /// `vm_egress` is VM-wide egress, meaningful only where a VM boundary exists
+    /// (DM1/DM3/DM4). On DM2 (native Linux, minimald on the host with no VM) it
+    /// has nothing to apply to and collapses to per-PTask egress (UC3), so a
+    /// `vm_egress` set on DM2 is a configuration error rather than a silent
+    /// no-op. [`DeploymentMode::Dm5`] does not by itself encode an underlying
+    /// model, so it may resolve to DM2 (no VM boundary); `vm_egress` is rejected
+    /// there too — fail closed rather than silently accept a policy that might
+    /// have nothing to enforce it — until the underlying model is resolved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VmError::Configuration`] when `vm_egress` is set and `mode` is
+    /// [`DeploymentMode::Dm2`] or [`DeploymentMode::Dm5`], or
+    /// [`VmError::InvalidEgressSubnet`] when `vm_egress` is accepted for `mode`
+    /// but carries an `allow_subnets` entry that is not a valid CIDR prefix.
+    pub fn validate_for(&self, mode: DeploymentMode) -> Result<(), VmError> {
+        if let Some(vm_egress) = self.vm_egress.as_ref() {
+            let reason = match mode {
+                DeploymentMode::Dm2 => Some(
+                    "VM-wide egress is not applicable on DM2 (native Linux has no VM \
+                     boundary); use per-PTask egress instead",
+                ),
+                DeploymentMode::Dm5 => Some(
+                    "VM-wide egress cannot be applied on DM5 until its underlying \
+                     deployment model is resolved; DM5 does not by itself guarantee a \
+                     VM boundary to enforce it",
+                ),
+                DeploymentMode::Dm1 | DeploymentMode::Dm3 | DeploymentMode::Dm4 => None,
+            };
+            if let Some(reason) = reason {
+                return Err(VmError::Configuration {
+                    what: "vm_egress",
+                    reason,
+                });
+            }
+            // vm_egress is accepted for this mode (a VM boundary exists); validate
+            // that each allow_subnets entry is a syntactically valid CIDR prefix,
+            // mirroring the per-PTask egress check in
+            // `sessions::Record::validate_policy`, so a misconfigured subnet is
+            // named here rather than failing opaquely when #553's enforcement
+            // layer parses it.
+            if let Some(bad) = vm_egress.first_invalid_subnet() {
+                return Err(VmError::InvalidEgressSubnet {
+                    cidr: bad.to_owned(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Whether this VM joins the per-host gvproxy switch as an own-IP client.
@@ -204,6 +292,175 @@ mod tests {
         assert_ne!(VmConfig::tap_name(2), VmConfig::tap_name(3));
         // Kernel IFNAMSIZ is 16 (15 usable chars); the widest u32 must fit.
         assert!(VmConfig::tap_name(u32::MAX).len() < 16);
+    }
+
+    #[test]
+    fn vm_egress_defaults_to_none_and_round_trips() {
+        let cfg = VmConfig::new(
+            1,
+            256,
+            PathBuf::from("/k"),
+            PathBuf::from("/r"),
+            PathBuf::from("/i"),
+        );
+        assert!(cfg.vm_egress.is_none());
+        let cfg = cfg.with_vm_egress(EgressPolicy::default());
+        assert!(cfg.vm_egress.is_some());
+    }
+
+    #[test]
+    fn vm_egress_is_rejected_on_dm2() {
+        // R2.5: VM-wide egress is a configuration error on DM2 (no VM boundary).
+        let cfg = VmConfig::new(
+            1,
+            256,
+            PathBuf::from("/k"),
+            PathBuf::from("/r"),
+            PathBuf::from("/i"),
+        )
+        .with_vm_egress(EgressPolicy::default());
+        let err = cfg.validate_for(DeploymentMode::Dm2).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VmError::Configuration {
+                    what: "vm_egress",
+                    ..
+                }
+            ),
+            "expected a typed configuration error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn vm_egress_is_rejected_on_dm5() {
+        // R2.5 fail-closed: DM5 does not encode a VM boundary, so a VM-wide
+        // egress policy is rejected until the underlying model is resolved.
+        let cfg = VmConfig::new(
+            1,
+            256,
+            PathBuf::from("/k"),
+            PathBuf::from("/r"),
+            PathBuf::from("/i"),
+        )
+        .with_vm_egress(EgressPolicy::default());
+        let err = cfg.validate_for(DeploymentMode::Dm5).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VmError::Configuration {
+                    what: "vm_egress",
+                    ..
+                }
+            ),
+            "expected a typed configuration error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn vm_egress_is_accepted_on_vm_deployment_models() {
+        let cfg = VmConfig::new(
+            1,
+            256,
+            PathBuf::from("/k"),
+            PathBuf::from("/r"),
+            PathBuf::from("/i"),
+        )
+        .with_vm_egress(EgressPolicy::default());
+        // DM1/DM3/DM4 each have a VM boundary, so vm_egress is valid.
+        assert!(cfg.validate_for(DeploymentMode::Dm1).is_ok());
+        assert!(cfg.validate_for(DeploymentMode::Dm3).is_ok());
+        assert!(cfg.validate_for(DeploymentMode::Dm4).is_ok());
+    }
+
+    #[test]
+    fn vm_egress_with_invalid_cidr_is_rejected_on_vm_deployment_models() {
+        // vm_egress is accepted on DM1/DM3/DM4, but an allow_subnets entry that is
+        // not a valid CIDR prefix is named at config time, mirroring the per-PTask
+        // egress check, rather than failing opaquely under #553's enforcement.
+        let cfg = VmConfig::new(
+            1,
+            256,
+            PathBuf::from("/k"),
+            PathBuf::from("/r"),
+            PathBuf::from("/i"),
+        )
+        .with_vm_egress(EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".into(), "not-a-cidr".into()]),
+            ..EgressPolicy::default()
+        });
+        for mode in [
+            DeploymentMode::Dm1,
+            DeploymentMode::Dm3,
+            DeploymentMode::Dm4,
+        ] {
+            let err = cfg.validate_for(mode).unwrap_err();
+            assert!(
+                matches!(&err, VmError::InvalidEgressSubnet { cidr } if cidr == "not-a-cidr"),
+                "expected an invalid-egress-subnet error, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vm_egress_with_valid_cidrs_is_accepted_on_vm_deployment_models() {
+        // Both IPv4 and IPv6 CIDR prefixes pass the syntactic check.
+        let cfg = VmConfig::new(
+            1,
+            256,
+            PathBuf::from("/k"),
+            PathBuf::from("/r"),
+            PathBuf::from("/i"),
+        )
+        .with_vm_egress(EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".into(), "fd00::/8".into()]),
+            ..EgressPolicy::default()
+        });
+        assert!(cfg.validate_for(DeploymentMode::Dm1).is_ok());
+        assert!(cfg.validate_for(DeploymentMode::Dm3).is_ok());
+        assert!(cfg.validate_for(DeploymentMode::Dm4).is_ok());
+    }
+
+    #[test]
+    fn vm_egress_with_invalid_cidr_still_rejected_first_by_mode_on_dm2() {
+        // On DM2 the mode rejection fires before the CIDR check, so even an
+        // invalid-CIDR vm_egress surfaces as the Configuration error, not
+        // InvalidEgressSubnet — the mode incompatibility is the dominant fault.
+        let cfg = VmConfig::new(
+            1,
+            256,
+            PathBuf::from("/k"),
+            PathBuf::from("/r"),
+            PathBuf::from("/i"),
+        )
+        .with_vm_egress(EgressPolicy {
+            allow_subnets: Some(vec!["not-a-cidr".into()]),
+            ..EgressPolicy::default()
+        });
+        let err = cfg.validate_for(DeploymentMode::Dm2).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VmError::Configuration {
+                    what: "vm_egress",
+                    ..
+                }
+            ),
+            "expected a mode configuration error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn absent_vm_egress_is_valid_on_dm2() {
+        // No vm_egress => nothing to reject, even on DM2.
+        let cfg = VmConfig::new(
+            1,
+            256,
+            PathBuf::from("/k"),
+            PathBuf::from("/r"),
+            PathBuf::from("/i"),
+        );
+        assert!(cfg.validate_for(DeploymentMode::Dm2).is_ok());
     }
 
     #[test]
