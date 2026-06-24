@@ -491,26 +491,26 @@ impl russh::server::Handler for ConnectionHandler {
         // Validate the session identified by the SSH username (R4.9). The client
         // passes the session UUID as `-l <uuid>` so the server can confirm the
         // session exists before accepting the forward.
-        if let Some(ref uname) = username {
-            if let Ok(session_id) = SessionId::parse_str(uname) {
-                let mngr = serv.sessions_manager().await;
-                match mngr.get_session(SessionKeyPredicate::Id(session_id)).await {
-                    Ok(Some(_)) => {}
-                    Ok(None) => {
-                        tracing::warn!(
-                            %session_id,
-                            "direct-tcpip rejected: session not found"
-                        );
-                        return Ok(false);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            %session_id,
-                            error = %e,
-                            "direct-tcpip rejected: session lookup failed"
-                        );
-                        return Ok(false);
-                    }
+        if let Some(ref uname) = username
+            && let Ok(session_id) = SessionId::parse_str(uname)
+        {
+            let mngr = serv.sessions_manager().await;
+            match mngr.get_session(SessionKeyPredicate::Id(session_id)).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    tracing::warn!(
+                        %session_id,
+                        "direct-tcpip rejected: session not found"
+                    );
+                    return Ok(false);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        %session_id,
+                        error = %e,
+                        "direct-tcpip rejected: session lookup failed"
+                    );
+                    return Ok(false);
                 }
             }
         }
