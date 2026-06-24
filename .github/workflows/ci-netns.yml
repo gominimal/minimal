@@ -83,3 +83,21 @@ jobs:
         # these tests the filter matches nothing: a green no-op that still compiles
         # the affected crates' test targets.
         run: cargo test -p minimald -p sandbox2 -p minimald-rpc netns -- --include-ignored --nocapture
+      - name: Run WireGuard mesh netns proof (UC7)
+        env:
+          MINIMALD_NETNS_TEST: "1"
+          GVPROXY_BIN: ${{ runner.temp }}/gvproxy
+        # The UC7 two-namespace mesh proof lives in the `networking-wg`-gated
+        # `mesh_uc7.rs` (feature is minimald-only, cannot span the multi-package
+        # command above). Unlike the sudo-per-command UC6 tests, mesh_uc7 binds
+        # sockets inside the namespaces via in-process `setns`, so the test
+        # *binary* must run as root. Build unprivileged, then run the binary
+        # under the runner's passwordless sudo.
+        run: |
+          set -euo pipefail
+          bin=$(cargo test -p minimald --features networking-wg --test mesh_uc7 \
+                  --no-run --message-format=json \
+                | jq -r 'select(.executable != null and (.target.name? == "mesh_uc7")) | .executable' \
+                | tail -1)
+          echo "mesh_uc7 test binary: $bin"
+          sudo -E "$bin" --include-ignored --nocapture

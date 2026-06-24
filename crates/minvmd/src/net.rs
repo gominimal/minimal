@@ -613,12 +613,18 @@ impl GvproxySwitch {
             .await
             .is_err()
         {
-            if !already_claimed {
-                #[cfg(target_os = "linux")]
-                signal_via_pidfd(&self.pidfd, libc::SIGKILL, "SIGKILL");
-                #[cfg(not(target_os = "linux"))]
-                signal_child(self.pid as libc::pid_t, libc::SIGKILL, "SIGKILL");
-            }
+            // Always escalate to SIGKILL on timeout, even when another path
+            // already claimed teardown and sent SIGTERM. If the SIGKILL were
+            // gated on `!already_claimed`, a gvproxy that ignores SIGTERM would
+            // never be killed here and `supervisor.await` below would block
+            // daemon shutdown forever. On Linux the fd-based signal targets the
+            // exact process instance (ESRCH after exit is benign), so this never
+            // lands on a recycled PID — no more dangerous than the SIGTERM
+            // already sent.
+            #[cfg(target_os = "linux")]
+            signal_via_pidfd(&self.pidfd, libc::SIGKILL, "SIGKILL");
+            #[cfg(not(target_os = "linux"))]
+            signal_child(self.pid as libc::pid_t, libc::SIGKILL, "SIGKILL");
             let _ = supervisor.await;
         }
     }
