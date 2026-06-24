@@ -353,35 +353,17 @@ pub async fn handle_ssh_rpc(
 
     // Handle the named RPC (fire-and-forget; join handles are discarded).
     match name {
-        GetVersion::NAME => {
-            spawn(serve_get_version(channel));
-        }
-        ListSessions::NAME => {
-            spawn(serve_list_sessions(s, channel));
-        }
-        GetSessionRecord::NAME => {
-            spawn(serve_get_session_record(s, channel));
-        }
-        CreateSession::NAME => {
-            spawn(serve_create_session(s, channel));
-        }
-        RenameSession::NAME => {
-            spawn(serve_rename_session(s, channel));
-        }
-        DestroySession::NAME => {
-            spawn(serve_destroy_session(s, channel));
-        }
-        GetSessionPolicy::NAME => {
-            spawn(serve_get_session_policy(s, channel));
-        }
-        STREAM_WORKSPACE_FILES => {
-            spawn(serve_stream_workspace_files(s, config, channel));
-        }
+        GetVersion::NAME => drop(spawn(serve_get_version(channel))),
+        ListSessions::NAME => drop(spawn(serve_list_sessions(s, channel))),
+        GetSessionRecord::NAME => drop(spawn(serve_get_session_record(s, channel))),
+        CreateSession::NAME => drop(spawn(serve_create_session(s, channel))),
+        RenameSession::NAME => drop(spawn(serve_rename_session(s, channel))),
+        DestroySession::NAME => drop(spawn(serve_destroy_session(s, channel))),
+        GetSessionPolicy::NAME => drop(spawn(serve_get_session_policy(s, channel))),
+        STREAM_WORKSPACE_FILES => drop(spawn(serve_stream_workspace_files(s, config, channel))),
         IssueClientCert::NAME => {
             #[cfg(feature = "networking-proxy")]
-            {
-                spawn(serve_issue_client_cert(s, channel));
-            }
+            drop(spawn(serve_issue_client_cert(s, channel)));
             #[cfg(not(feature = "networking-proxy"))]
             {
                 tracing::warn!(
