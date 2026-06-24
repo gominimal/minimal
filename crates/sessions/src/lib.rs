@@ -138,6 +138,16 @@ pub enum PolicyError {
          gvproxy's static forwarder supports only TCP and UDP"
     )]
     UnsupportedIngressProtocol { proto: IpProto },
+    /// An ingress port mapping published a host port below 1024. minimald
+    /// refuses to configure gvproxy to publish a privileged host port, since
+    /// binding one requires elevated privilege the rootless switch does not
+    /// hold; choosing a port >= 1024 is the remediation.
+    #[error(
+        "ingress port mapping publishes privileged host port {external_port}; \
+         minimald refuses to publish host ports below 1024 — choose an \
+         external_port >= 1024"
+    )]
+    PrivilegedPort { external_port: u16 },
 }
 
 /// A session ID, a newtype over a UUID.
@@ -218,7 +228,11 @@ impl Record {
     ///
     /// Returns [`PolicyError::EgressRequiresOwnIp`] when an egress policy is set
     /// on a non-`OwnIp` `PTask`, or [`PolicyError::IngressRequiresOwnIp`] when a
-    /// non-empty ingress policy is.
+    /// non-empty ingress policy is. Returns
+    /// [`PolicyError::UnsupportedIngressProtocol`] for an ingress mapping whose
+    /// transport gvproxy's forwarder cannot expose, or
+    /// [`PolicyError::PrivilegedPort`] for one that publishes a host port below
+    /// 1024.
     pub fn validate_policy(&self) -> Result<(), PolicyError> {
         // gvproxy's static forwarder only exposes TCP and UDP, so an ingress
         // mapping with any other transport is a configuration error wherever it
@@ -232,6 +246,19 @@ impl Record {
                 .find(|proto| !matches!(proto, IpProto::Tcp | IpProto::Udp))
         }) {
             return Err(PolicyError::UnsupportedIngressProtocol { proto });
+        }
+        // minimald refuses to publish a privileged host port (< 1024): binding
+        // one needs elevated privilege the rootless switch lacks, so reject it
+        // at validation time with a remediation rather than letting the expose
+        // fail opaquely against gvproxy.
+        if let Some(external_port) = self.policy.ingress.as_ref().and_then(|ingress| {
+            ingress
+                .port_mappings
+                .iter()
+                .map(|mapping| mapping.external_port)
+                .find(|&port| port < 1024)
+        }) {
+            return Err(PolicyError::PrivilegedPort { external_port });
         }
         if self.network == NetworkMode::OwnIp {
             return Ok(());
@@ -337,6 +364,42 @@ mod tests {
                 proto: IpProto::Icmp
             })
         );
+    }
+
+    #[test]
+    fn privileged_external_port_is_rejected_even_on_own_ip() {
+        // The spec's Security Considerations require minimald to refuse to
+        // publish a host port below 1024; that is a configuration error even on
+        // an OwnIp PTask, where ingress is otherwise allowed.
+        let ingress = IngressPolicy {
+            port_mappings: vec![PortMapping {
+                external_port: 80,
+                internal_port: 8080,
+                proto: IpProto::Tcp,
+            }],
+            dynamic_allowed_range: None,
+        };
+        let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
+        assert_eq!(
+            record.validate_policy(),
+            Err(PolicyError::PrivilegedPort { external_port: 80 })
+        );
+    }
+
+    #[test]
+    fn unprivileged_external_port_is_allowed_on_own_ip() {
+        // The boundary value 1024 is allowed: the rule rejects ports *below*
+        // 1024, so 1024 itself is the first acceptable host port.
+        let ingress = IngressPolicy {
+            port_mappings: vec![PortMapping {
+                external_port: 1024,
+                internal_port: 80,
+                proto: IpProto::Tcp,
+            }],
+            dynamic_allowed_range: None,
+        };
+        let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
+        assert!(record.validate_policy().is_ok());
     }
 
     #[test]

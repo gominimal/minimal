@@ -58,9 +58,10 @@ fn protocol_str(proto: IpProto) -> &'static str {
     match proto {
         IpProto::Tcp => "tcp",
         IpProto::Udp => "udp",
-        IpProto::Icmp => "icmp",
-        // `IpProto` is `#[non_exhaustive]`; TCP is the forwarder's default
-        // transport, so an unknown future protocol falls back to it.
+        // gvproxy's forwarder only exposes TCP/UDP, and `Record::validate_policy`
+        // rejects any other protocol before it reaches here. `IpProto` is also
+        // `#[non_exhaustive]`, so TCP — the forwarder's default transport — is the
+        // fallback for ICMP and any unknown future variant.
         _ => "tcp",
     }
 }
