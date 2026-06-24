@@ -42,6 +42,18 @@ pub enum IpProto {
     Icmp,
 }
 
+impl fmt::Display for IpProto {
+    /// Renders the lowercase transport name, matching the `snake_case` serde
+    /// representation so structured log fields agree with the wire format.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+            Self::Icmp => "icmp",
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Networking policy types (Unit 2: egress, ingress, dynamic port mapping).
 //

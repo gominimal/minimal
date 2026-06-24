@@ -315,7 +315,7 @@ impl PolicyWarnLimiter {
                 session_id,
                 %direction,
                 %remote_addr,
-                ?proto,
+                %proto,
                 rule_matched,
                 "network policy violation"
             );
