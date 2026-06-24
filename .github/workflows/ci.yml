@@ -79,6 +79,12 @@ jobs:
         run: cargo fetch --locked
       - name: Run tests
         run: cargo nextest run --workspace
+      - name: Run HTTPS/mTLS proxy tests
+        # The mTLS reverse proxy is behind the non-default `networking-proxy`
+        # feature, so `--workspace` above does not compile or run its proofs
+        # (R4.5 mtls_missing_cert_returns_401_with_no_topology, UC2b
+        # mtls_valid_cert_routes_to_backend). Exercise them explicitly.
+        run: cargo nextest run -p minimald --features networking-proxy
       - name: Run doctests
         run: cargo test --workspace --doc
 
