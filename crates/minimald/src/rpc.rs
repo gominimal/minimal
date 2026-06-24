@@ -1,3 +1,5 @@
+#[cfg(feature = "networking-proxy")]
+use minimald_rpc::IssueClientCertResponse;
 use minimald_rpc::{
     CreateSession, CreateSessionResponse, DestroySession, DestroySessionResponse, Errorable,
     GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest,
@@ -5,8 +7,6 @@ use minimald_rpc::{
     IssueClientCertRequest, ListSessions, ListSessionsEntry, ListSessionsResponse, OneshotSshRpc,
     RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, SessionPolicy,
 };
-#[cfg(feature = "networking-proxy")]
-use minimald_rpc::IssueClientCertResponse;
 use russh::{
     Channel as RuChannel, ChannelId,
     server::{Msg, Session},
