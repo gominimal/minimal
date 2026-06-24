@@ -403,7 +403,14 @@ impl CertAuthority {
     /// Returns an `rcgen::Error` if key-pair or cert generation fails.
     pub fn sign_client_cert(&self, subject_cn: &str) -> Result<(String, String), rcgen::Error> {
         let client_key = rcgen::KeyPair::generate()?;
-        let mut client_params = rcgen::CertificateParams::new(vec![subject_cn.to_string()])?;
+        // The login username can be non-ASCII; rcgen parses SANs as DNS names
+        // and rejects those, which would break `minimal login`. The proxy
+        // authenticates on CA-signed cert presence (not the SAN/CN), so use a
+        // fixed ASCII SAN and carry the username in the subject CN instead.
+        let mut client_params = rcgen::CertificateParams::new(vec!["minimal-client".to_string()])?;
+        let mut client_dn = rcgen::DistinguishedName::new();
+        client_dn.push(rcgen::DnType::CommonName, subject_cn);
+        client_params.distinguished_name = client_dn;
         client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
         let client_cert = client_params.signed_by(&client_key, &self.ca_cert, &self.ca_key)?;
         Ok((client_cert.pem(), client_key.serialize_pem()))
@@ -422,7 +429,14 @@ impl CertAuthority {
         subject_cn: &str,
     ) -> Result<(rustls::pki_types::CertificateDer<'static>, Vec<u8>), rcgen::Error> {
         let client_key = rcgen::KeyPair::generate()?;
-        let mut client_params = rcgen::CertificateParams::new(vec![subject_cn.to_string()])?;
+        // The login username can be non-ASCII; rcgen parses SANs as DNS names
+        // and rejects those, which would break `minimal login`. The proxy
+        // authenticates on CA-signed cert presence (not the SAN/CN), so use a
+        // fixed ASCII SAN and carry the username in the subject CN instead.
+        let mut client_params = rcgen::CertificateParams::new(vec!["minimal-client".to_string()])?;
+        let mut client_dn = rcgen::DistinguishedName::new();
+        client_dn.push(rcgen::DnType::CommonName, subject_cn);
+        client_params.distinguished_name = client_dn;
         client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
         let client_cert = client_params.signed_by(&client_key, &self.ca_cert, &self.ca_key)?;
         let cert_der = rustls::pki_types::CertificateDer::from(client_cert.der().to_vec());
