@@ -144,6 +144,12 @@ async fn serve_create_session(s: ServerStateHandle, c: RuChannel<Msg>) {
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
                     error: "A session with that name already exists".to_string(),
                 },
+                // R2.1: a policy/network-mode mismatch is rejected at
+                // declaration time and surfaced as a clean typed error rather
+                // than a transport failure.
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Errorable::Err {
+                    error: e.to_string(),
+                },
                 Err(e) => return Err(ConnectionError::Internal(e.to_string())),
             })
         })
@@ -652,6 +658,43 @@ mod tests {
                 error: "A session with that name already exists".to_string()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_policy_incompatible_with_network_mode() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        // R2.1: an egress policy on a non-`OwnIp` PTask is rejected at
+        // declaration time, so the invalid session is never stored.
+        let egress = EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            allow_dns_hosts: None,
+            allow_protocols: None,
+        };
+        let resp = client
+            .call::<CreateSession>(&CreateSessionRequest {
+                record: sessions::Record {
+                    id: SessionId::nil(),
+                    name: Some("bad-policy".to_string()),
+                    username: None,
+                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
+                    network: NetworkMode::HostNet,
+                    policy: SessionPolicy::new(Some(egress), None),
+                    attrs: Default::default(),
+                },
+            })
+            .await;
+        assert_eq!(
+            resp,
+            Errorable::Err {
+                error: "egress policy is only valid for an own-IP PTask, not HostNet".to_string()
+            }
+        );
+
+        // The rejected session left nothing behind in the store.
+        let mngr = server.state.sessions_manager().await;
+        assert!(mngr.list().await.unwrap().is_empty());
     }
 
     #[tokio::test]
