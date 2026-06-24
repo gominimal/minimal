@@ -128,8 +128,8 @@ fn bind_in_netns(ns: &str, addr: SocketAddr) -> std::io::Result<std::net::UdpSoc
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires root + two network namespaces; runs in the netns CI lane"]
 async fn remote_ptask_packet_crosses_the_mesh_tunnel() {
-    if std::env::var("MINIMAL_NETNS_TESTS").as_deref() != Ok("1") {
-        eprintln!("skipping: set MINIMAL_NETNS_TESTS=1 (and run as root) to exercise UC7");
+    if std::env::var("MINIMALD_NETNS_TEST").as_deref() != Ok("1") {
+        eprintln!("skipping: set MINIMALD_NETNS_TEST=1 (and run as root) to exercise UC7");
         return;
     }
 

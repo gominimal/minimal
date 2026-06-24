@@ -83,3 +83,13 @@ jobs:
         # these tests the filter matches nothing: a green no-op that still compiles
         # the affected crates' test targets.
         run: cargo test -p minimald -p sandbox2 -p minimald-rpc netns -- --include-ignored --nocapture
+      - name: Run WireGuard mesh netns proof (UC7)
+        env:
+          MINIMALD_NETNS_TEST: "1"
+          GVPROXY_BIN: ${{ runner.temp }}/gvproxy
+        # The UC7 two-namespace mesh proof lives in the `networking-wg`-gated
+        # `mesh_uc7.rs`, so it needs the feature flag and a dedicated invocation
+        # (the feature is minimald-only; it cannot span the multi-package command
+        # above). `--test mesh_uc7` targets the file directly, sidestepping the
+        # `netns`-substring name filter that the test function does not match.
+        run: cargo test -p minimald --features networking-wg --test mesh_uc7 -- --include-ignored --nocapture
