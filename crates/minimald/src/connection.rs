@@ -494,10 +494,7 @@ impl russh::server::Handler for ConnectionHandler {
         if let Some(ref uname) = username {
             if let Ok(session_id) = SessionId::parse_str(uname) {
                 let mngr = serv.sessions_manager().await;
-                match mngr
-                    .get_session(SessionKeyPredicate::Id(session_id))
-                    .await
-                {
+                match mngr.get_session(SessionKeyPredicate::Id(session_id)).await {
                     Ok(Some(_)) => {}
                     Ok(None) => {
                         tracing::warn!(
@@ -557,14 +554,43 @@ impl russh::server::Handler for ConnectionHandler {
         };
 
         // Relay bytes bidirectionally: SSH channel ↔ upstream TCP.
-        tokio::spawn(async move {
-            let mut stream = channel.into_stream();
-            let mut up = upstream;
-            if let Err(e) = tokio::io::copy_bidirectional(&mut stream, &mut up).await {
-                tracing::debug!(error = %e, "direct-tcpip relay ended with error");
-            }
-        });
+        tokio::spawn(relay_streams(channel.into_stream(), upstream));
 
         Ok(true)
+    }
+}
+
+/// Relay bytes bidirectionally between two async streams, logging any relay error.
+async fn relay_streams<A, B>(mut a: A, mut b: B)
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    if let Err(e) = tokio::io::copy_bidirectional(&mut a, &mut b).await {
+        tracing::debug!(error = %e, "direct-tcpip relay ended with error");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn relay_streams_forwards_bytes_bidirectionally() {
+        let (mut client, relay_client) = tokio::io::duplex(4096);
+        let (mut server, relay_server) = tokio::io::duplex(4096);
+
+        tokio::spawn(relay_streams(relay_client, relay_server));
+
+        client.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        server.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+
+        server.write_all(b"world").await.unwrap();
+        let mut buf2 = [0u8; 5];
+        client.read_exact(&mut buf2).await.unwrap();
+        assert_eq!(&buf2, b"world");
     }
 }

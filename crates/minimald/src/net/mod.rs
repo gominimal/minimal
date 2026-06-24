@@ -422,7 +422,7 @@ impl GvproxySwitch {
     /// Propagates config-write, spawn, and socket-readiness failures.
     pub async fn attach(&mut self) -> Result<AttachResult, NetError> {
         let lease = self.allocator.allocate()?;
-        self.write_config()?;
+        self.write_config().await?;
         self.ensure_running().await?;
         self.attached += 1;
         tracing::info!(
@@ -450,14 +450,18 @@ impl GvproxySwitch {
         Ok(())
     }
 
-    fn write_config(&self) -> Result<(), NetError> {
-        std::fs::create_dir_all(&self.state_dir).map_err(|source| NetError::WriteConfig {
-            path: self.state_dir.clone(),
-            source,
-        })?;
+    async fn write_config(&self) -> Result<(), NetError> {
+        tokio::fs::create_dir_all(&self.state_dir)
+            .await
+            .map_err(|source| NetError::WriteConfig {
+                path: self.state_dir.clone(),
+                source,
+            })?;
         let path = self.config_path();
         let body = render_gvproxy_config(self.allocator.subnet(), self.allocator.leases());
-        std::fs::write(&path, body).map_err(|source| NetError::WriteConfig { path, source })
+        tokio::fs::write(&path, body)
+            .await
+            .map_err(|source| NetError::WriteConfig { path, source })
     }
 
     /// Spawns gvproxy if it is not already running and waits for its control
@@ -495,7 +499,7 @@ impl GvproxySwitch {
         // cannot be cleared, fail now rather than let `wait_for_socket` mistake
         // the leftover path for a freshly-bound one and report a switch that
         // never actually came up.
-        match std::fs::remove_file(&sock) {
+        match tokio::fs::remove_file(&sock).await {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(NetError::Io(e)),
@@ -608,7 +612,7 @@ impl GvproxySwitch {
                 let _ = child.wait().await;
             }
         }
-        let _ = std::fs::remove_file(self.control_socket());
+        let _ = tokio::fs::remove_file(self.control_socket()).await;
         Ok(())
     }
 }
