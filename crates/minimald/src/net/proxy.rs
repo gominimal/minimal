@@ -450,12 +450,12 @@ impl CertAuthority {
         let mut root_store = rustls::RootCertStore::empty();
         root_store
             .add(self.ca_cert_der.clone())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
             .allow_unauthenticated()
             .build()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         let server_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
             rustls::pki_types::PrivatePkcs8KeyDer::from(self.server_key_bytes.clone()),
@@ -464,7 +464,7 @@ impl CertAuthority {
         let config = rustls::ServerConfig::builder()
             .with_client_cert_verifier(verifier)
             .with_single_cert(vec![self.server_cert_der.clone()], server_key)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         Ok(Arc::new(config))
     }

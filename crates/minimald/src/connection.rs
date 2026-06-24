@@ -490,28 +490,34 @@ impl russh::server::Handler for ConnectionHandler {
 
         // Validate the session identified by the SSH username (R4.9). The client
         // passes the session UUID as `-l <uuid>` so the server can confirm the
-        // session exists before accepting the forward.
-        if let Some(ref uname) = username
-            && let Ok(session_id) = SessionId::parse_str(uname)
-        {
-            let mngr = serv.sessions_manager().await;
-            match mngr.get_session(SessionKeyPredicate::Id(session_id)).await {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    tracing::warn!(
-                        %session_id,
-                        "direct-tcpip rejected: session not found"
-                    );
-                    return Ok(false);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        %session_id,
-                        error = %e,
-                        "direct-tcpip rejected: session lookup failed"
-                    );
-                    return Ok(false);
-                }
+        // session exists before accepting the forward. Fail closed: a missing
+        // or non-UUID username is rejected so direct-tcpip cannot be used
+        // without a valid session context.
+        let Some(uname) = username.as_deref() else {
+            tracing::warn!("direct-tcpip rejected: no SSH username");
+            return Ok(false);
+        };
+        let Ok(session_id) = SessionId::parse_str(uname) else {
+            tracing::warn!(value = %uname, "direct-tcpip rejected: username not a session UUID");
+            return Ok(false);
+        };
+        let mngr = serv.sessions_manager().await;
+        match mngr.get_session(SessionKeyPredicate::Id(session_id)).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                tracing::warn!(
+                    %session_id,
+                    "direct-tcpip rejected: session not found"
+                );
+                return Ok(false);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    %session_id,
+                    error = %e,
+                    "direct-tcpip rejected: session lookup failed"
+                );
+                return Ok(false);
             }
         }
 
