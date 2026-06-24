@@ -94,6 +94,13 @@ pub struct ServerState {
 
     /// Memoized SSH host key, after first successful load.
     host_key: Option<PrivateKey>,
+
+    /// The daemon's TLS certificate authority, used by the HTTPS proxy and the
+    /// `IssueClientCert` RPC. Generated once on daemon startup and held for the
+    /// daemon's lifetime; clients must call `minimal login` again after a
+    /// restart.
+    #[cfg(feature = "networking-proxy")]
+    pub cert_authority: Arc<crate::net::proxy::CertAuthority>,
 }
 
 impl ServerState {
@@ -110,11 +117,21 @@ impl ServerState {
             config.gvproxy_bin_path(),
             minimal_state_dir.as_utf8_path().join("gvproxy"),
         )));
+
+        // Generate the TLS CA once at daemon startup so the HTTPS proxy and the
+        // IssueClientCert RPC share the same trust anchor for the lifetime of
+        // this daemon process.
+        #[cfg(feature = "networking-proxy")]
+        let cert_authority =
+            Arc::new(crate::net::proxy::CertAuthority::generate().map_err(std::io::Error::other)?);
+
         Ok(Self {
             sessions: sessions::Manager::init(minimal_state_dir, minimal_cache_dir, net_switch)
                 .await?,
             config,
             host_key: None,
+            #[cfg(feature = "networking-proxy")]
+            cert_authority,
         })
     }
 }
@@ -147,6 +164,13 @@ impl ServerStateHandle {
     /// Returns a handle to the sessions manager.
     pub async fn sessions_manager(&self) -> sessions::ManagerHandle {
         self.0.lock().await.sessions.clone()
+    }
+
+    /// Returns the daemon's TLS certificate authority (only with
+    /// `networking-proxy` feature). Used by the `IssueClientCert` RPC handler.
+    #[cfg(feature = "networking-proxy")]
+    pub async fn cert_authority(&self) -> Arc<crate::net::proxy::CertAuthority> {
+        Arc::clone(&self.0.lock().await.cert_authority)
     }
 }
 

@@ -36,6 +36,41 @@ enum Command {
     /// Proxy stdio to a daemon UDS socket (used as an SSH ProxyCommand).
     #[command(hide = true)]
     Proxy(ProxyArgs),
+    /// Forward a local TCP port to a remote address inside a PTask via SSH
+    /// (R4.8, R4.9).
+    ///
+    /// Sets up an SSH `LocalForward` (`-L`) tunnel through the minimald SSH
+    /// server so traffic sent to `<local-port>` on the host is relayed to
+    /// `<remote-host>:<remote-port>` from inside the named PTask's network
+    /// namespace. Useful when WireGuard (`networking-wg` feature) is
+    /// unavailable (e.g., on corporate networks that block UDP).
+    ///
+    /// Examples:
+    ///
+    ///   # Forward host port 18080 to the webserver inside the "dev" session:
+    ///   minimal ssh-forward dev 18080:127.0.0.1:80
+    ///
+    ///   # Then access it from the host:
+    ///   curl http://localhost:18080/
+    #[command(name = "ssh-forward", visible_alias = "forward")]
+    SshForward(SshForwardArgs),
+    /// Obtain an mTLS client certificate from minimald for use with the HTTPS
+    /// reverse proxy (R4.4, R4.5).
+    ///
+    /// Connects to minimald, generates a fresh client certificate signed by
+    /// the daemon's internal CA, and saves the certificate and private key to
+    /// `~/.config/minimal/client.pem` / `~/.config/minimal/client.key`. Also
+    /// saves the CA certificate to `~/.config/minimal/ca.pem` so tools like
+    /// `curl` can trust the HTTPS proxy.
+    ///
+    /// Example:
+    ///
+    ///   minimal login
+    ///   curl --cacert ~/.config/minimal/ca.pem \
+    ///        --cert ~/.config/minimal/client.pem \
+    ///        --key  ~/.config/minimal/client.key \
+    ///        https://localhost:7655/
+    Login(LoginArgs),
     /// Generate shell completion script
     #[command(
         long_about = "Generate a shell tab-completion script for the minimal CLI.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(minimal completions bash)"
@@ -111,6 +146,28 @@ struct ProxyArgs {
     socket: String,
 }
 
+/// Arguments for `minimal ssh-forward`.
+#[derive(Debug, Args)]
+struct SshForwardArgs {
+    /// Session identifier (UUID or session name)
+    session: String,
+    /// Port-forward specification: `<local-port>:<remote-host>:<remote-port>`
+    ///
+    /// Example: `18080:127.0.0.1:80` to forward local port 18080 to port 80
+    /// on the loopback address as seen from inside the session.
+    #[arg(value_name = "LOCAL:REMOTE_HOST:REMOTE_PORT")]
+    forward: String,
+}
+
+/// Arguments for `minimal login`.
+#[derive(Debug, Args)]
+struct LoginArgs {
+    /// Override the directory where client cert files are written
+    /// (default: `~/.config/minimal/`).
+    #[arg(long)]
+    cert_dir: Option<PathBuf>,
+}
+
 #[derive(Debug, clap::Args)]
 struct CompletionsArgs {
     /// The shell type for a CLI completion script should be printed
@@ -142,6 +199,8 @@ async fn main() -> Result<(), ()> {
             command: SessionCommand::Policy(args),
         }) => cmd_session_policy(&cli.global_args, args).await,
         Command::Proxy(args) => cmd_proxy(args).await,
+        Command::SshForward(args) => cmd_ssh_forward(&cli.global_args, args).await,
+        Command::Login(args) => cmd_login(&cli.global_args, args).await,
         Command::Completions(CompletionsArgs { shell }) => {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();
@@ -475,6 +534,182 @@ async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), ()> {
         eprintln!("DestroySession returned an error from the daemon");
         return Err(());
     }
+
+    Ok(())
+}
+
+/// Establish an SSH `LocalForward` tunnel from a local port to a remote
+/// address inside the named PTask's network namespace (R4.8, R4.9).
+///
+/// The forward spec is `<local-port>:<remote-host>:<remote-port>`. The
+/// command shells out to `ssh -L` (the same mechanism as `cmd_attach`).
+/// The `-N` flag keeps the tunnel alive without opening an interactive
+/// shell.
+async fn cmd_ssh_forward(global: &GlobalArgs, args: SshForwardArgs) -> Result<(), ()> {
+    if let Err(e) = autospawn::ensure_minvmd_running() {
+        eprintln!("Failed to ensure minvmd is running: {e}");
+        return Err(());
+    }
+
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref())
+        .map_err(|e| eprintln!("Failed to resolve daemon socket path: {e}"))?;
+
+    // Look up the session to validate it exists and to obtain its UUID for the
+    // server-side auth gate (passed as the SSH username so `direct-tcpip` can
+    // verify the session without a per-channel env handshake).
+    use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
+    let mut daemon_client = client::Client::connect(&sock)
+        .await
+        .map_err(|e| eprintln!("Failed to connect to minimald: {e}"))?;
+
+    let lookup = if let Ok(id) = sessions::SessionId::parse_str(&args.session) {
+        GetSessionRecordRequest::Id(id)
+    } else {
+        GetSessionRecordRequest::Name(args.session.clone())
+    };
+
+    let resp = daemon_client
+        .oneshot_rpc::<GetSessionRecord>(lookup)
+        .await
+        .map_err(|e| eprintln!("GetSessionRecord RPC failed: {e}"))?;
+
+    let record = match resp.record {
+        Some(r) => r,
+        None => {
+            eprintln!("No session found matching '{}'", args.session);
+            return Err(());
+        }
+    };
+
+    // Validate the forward spec format: local:remote_host:remote_port.
+    // We accept either `local_port:host:port` (3 components, last two joined by
+    // the final colon) or the more compact form where host is an IPv4 address.
+    let parts: Vec<&str> = args.forward.splitn(3, ':').collect();
+    if parts.len() != 3 {
+        eprintln!(
+            "invalid forward spec {:?}: expected LOCAL_PORT:REMOTE_HOST:REMOTE_PORT",
+            args.forward
+        );
+        return Err(());
+    }
+    let local_port = parts[0];
+    let remote_host = parts[1];
+    let remote_port = parts[2];
+    let forward_arg = format!("{local_port}:{remote_host}:{remote_port}");
+
+    let exe =
+        std::env::current_exe().map_err(|e| eprintln!("cannot determine current exe: {e}"))?;
+    let proxy_cmd = format!(
+        "{} proxy --socket {}",
+        shell_quote(&exe.display().to_string()),
+        shell_quote(&sock.display().to_string()),
+    );
+
+    let session_id = record.id.to_string();
+    // Use `-N` (no command) so the foreground ssh keeps the tunnel alive after
+    // `exec()` replaces this process. `-o ExitOnForwardFailure=yes` makes ssh
+    // exit immediately if the local port cannot be bound rather than silently
+    // succeeding without a tunnel.
+    let mut ssh = std::process::Command::new("ssh");
+    ssh.args([
+        "-L",
+        &forward_arg,
+        "-N",
+        "-l",
+        &session_id,
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        &format!("ProxyCommand={proxy_cmd}"),
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "local-0",
+    ]);
+
+    // exec() replaces the process, so this call only returns on failure.
+    let err = std::os::unix::process::CommandExt::exec(&mut ssh);
+    eprintln!("failed to exec ssh: {err}");
+    Err(())
+}
+
+/// Obtain an mTLS client certificate from minimald (R4.4).
+///
+/// Calls the `IssueClientCert` RPC, which has minimald generate a key pair,
+/// sign the certificate with its internal CA, and return both. The cert, key,
+/// and CA cert are written to `<cert_dir>/{client.pem,client.key,ca.pem}`.
+async fn cmd_login(global: &GlobalArgs, args: LoginArgs) -> Result<(), ()> {
+    if let Err(e) = autospawn::ensure_minvmd_running() {
+        eprintln!("Failed to ensure minvmd is running: {e}");
+        return Err(());
+    }
+
+    let mut client = connect_daemon(global).await?;
+
+    let subject_cn = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "minimal-client".to_string());
+
+    use minimald_rpc::{IssueClientCert, IssueClientCertRequest};
+    let resp = client
+        .oneshot_rpc::<IssueClientCert>(IssueClientCertRequest { subject_cn })
+        .await
+        .map_err(|e| eprintln!("IssueClientCert RPC failed: {e}"))?;
+
+    let cert_resp = match resp {
+        minimald_rpc::Errorable::Ok(r) => r,
+        minimald_rpc::Errorable::Err { error } => {
+            eprintln!("IssueClientCert failed: {error}");
+            return Err(());
+        }
+    };
+
+    // Determine the cert directory.
+    let cert_dir = match args.cert_dir {
+        Some(d) => d,
+        None => {
+            let config_dir =
+                dirs::config_dir().ok_or_else(|| eprintln!("cannot determine config directory"))?;
+            config_dir.join("minimal")
+        }
+    };
+    std::fs::create_dir_all(&cert_dir)
+        .map_err(|e| eprintln!("cannot create cert dir {}: {e}", cert_dir.display()))?;
+
+    let client_cert_path = cert_dir.join("client.pem");
+    let client_key_path = cert_dir.join("client.key");
+    let ca_cert_path = cert_dir.join("ca.pem");
+
+    std::fs::write(&client_cert_path, cert_resp.cert_pem.as_bytes())
+        .map_err(|e| eprintln!("writing {}: {e}", client_cert_path.display()))?;
+    {
+        use std::io::Write as _;
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut f = opts
+            .open(&client_key_path)
+            .map_err(|e| eprintln!("writing {}: {e}", client_key_path.display()))?;
+        f.write_all(cert_resp.key_pem.as_bytes())
+            .map_err(|e| eprintln!("writing {}: {e}", client_key_path.display()))?;
+    }
+    std::fs::write(&ca_cert_path, cert_resp.ca_cert_pem.as_bytes())
+        .map_err(|e| eprintln!("writing {}: {e}", ca_cert_path.display()))?;
+
+    println!("Saved client certificate to {}", client_cert_path.display());
+    println!("Saved client key to {}", client_key_path.display());
+    println!("Saved CA certificate to {}", ca_cert_path.display());
+    println!();
+    println!(
+        "To use the HTTPS proxy:\n  curl --cacert {} --cert {} --key {} https://localhost:7655/",
+        ca_cert_path.display(),
+        client_cert_path.display(),
+        client_key_path.display(),
+    );
 
     Ok(())
 }

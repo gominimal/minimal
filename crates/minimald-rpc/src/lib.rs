@@ -340,6 +340,43 @@ impl OneshotSshRpc for DynamicPortMap {
     type Response = Errorable<DynamicPortMapResponse>;
 }
 
+// ---------------------------------------------------------------------------
+// mTLS client certificate issuance (R4.4 / `minimal login`).
+// ---------------------------------------------------------------------------
+
+/// An RPC that signs and returns a fresh client certificate for use with the
+/// HTTPS reverse proxy's mTLS authentication (R4.4). The caller supplies a
+/// subject common name; the daemon generates a key pair, signs the certificate
+/// with its internal CA, and returns PEM-encoded certificate and private key.
+/// The CA certificate PEM is also returned so the client can add it to
+/// its trust store.
+pub struct IssueClientCert;
+
+/// Request for the [`IssueClientCert`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueClientCertRequest {
+    /// Subject common name for the client certificate (e.g. the OS username).
+    pub subject_cn: String,
+}
+
+/// Response for the [`IssueClientCert`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IssueClientCertResponse {
+    /// PEM-encoded client certificate signed by the daemon's CA.
+    pub cert_pem: String,
+    /// PEM-encoded PKCS#8 private key matching the certificate.
+    pub key_pem: String,
+    /// PEM-encoded CA certificate, so the client can trust the HTTPS proxy's
+    /// server certificate.
+    pub ca_cert_pem: String,
+}
+
+impl OneshotSshRpc for IssueClientCert {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "IssueClientCert");
+    type Request<'a> = IssueClientCertRequest;
+    type Response = Errorable<IssueClientCertResponse>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
