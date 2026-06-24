@@ -615,8 +615,8 @@ fn cmd_mesh_join(global: &GlobalArgs, args: MeshJoinArgs) -> Result<(), ()> {
         eprintln!("mesh join address must be host:port, e.g. mesh.example.com:51820");
         return Err(());
     };
-    if host.is_empty() || port.parse::<u16>().is_err() {
-        eprintln!("mesh join address must include a non-empty host and valid port");
+    if host.is_empty() || port.parse::<u16>().map(|p| p == 0).unwrap_or(true) {
+        eprintln!("mesh join address must include a non-empty host and a valid non-zero port");
         return Err(());
     }
 
