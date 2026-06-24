@@ -44,6 +44,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+
 use minimald_rpc::IpProto;
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
@@ -334,7 +337,7 @@ impl GvproxyConfig {
         self.write_config(leases)?;
         let child = Command::new(&self.binary).args(self.argv()).spawn()?;
         let (switch, exit) =
-            GvproxySwitch::supervise(child, self.subnet, self.term_timeout, self.switch_socket);
+            GvproxySwitch::supervise(child, self.subnet, self.term_timeout, self.switch_socket)?;
         tracing::info!(
             pid = switch.pid(),
             binary = %self.binary.display(),
@@ -356,9 +359,14 @@ impl GvproxyConfig {
 /// switch IP and never reuses an IP for the lifetime of this handle.
 #[derive(Debug)]
 pub struct GvproxySwitch {
-    /// PID of the supervised gvproxy process. The `Child` itself is owned by the
-    /// supervision task, which is the sole reaper.
+    /// PID of the supervised gvproxy process; used for logging. The `Child`
+    /// itself is owned by the supervision task, which is the sole reaper.
     pid: u32,
+    /// pidfd for the supervised gvproxy process. A pidfd refers to the exact
+    /// process instance — `pidfd_send_signal` returns `ESRCH` after the
+    /// process exits, never landing on a recycled PID.
+    #[cfg(target_os = "linux")]
+    pidfd: Arc<OwnedFd>,
     subnet: SwitchSubnet,
     term_timeout: Duration,
     switch_socket: PathBuf,
@@ -384,21 +392,46 @@ impl GvproxySwitch {
     /// Adopt an already-spawned gvproxy `child` and start its background
     /// supervision task (R1.4 detection half). Must be called within a tokio
     /// runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if `pidfd_open(2)` fails (Linux only).
     pub(crate) fn supervise(
         child: Child,
         subnet: SwitchSubnet,
         term_timeout: Duration,
         switch_socket: PathBuf,
-    ) -> (Self, SwitchExit) {
+    ) -> io::Result<(Self, SwitchExit)> {
         let pid = child
             .id()
             .expect("a freshly spawned child always has a PID before it is awaited");
+        #[cfg(target_os = "linux")]
+        let pidfd = {
+            // SAFETY: syscall(SYS_pidfd_open, pid, 0) is the pidfd_open(2) syscall:
+            // takes a pid_t and flags=0, touches no memory, returns an fd or -1.
+            // Opening the pidfd before the supervision task is spawned guarantees
+            // the child has not yet been reaped by any reaper.
+            let raw = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_open,
+                    pid as libc::c_long,
+                    0i32 as libc::c_long,
+                ) as libc::c_int
+            };
+            if raw < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: raw is a valid file descriptor just returned by pidfd_open.
+            Arc::new(unsafe { OwnedFd::from_raw_fd(raw) })
+        };
         let stopping = Arc::new(AtomicBool::new(false));
         let attached_count = Arc::new(AtomicU32::new(0));
         let (exit_tx, exit_rx) = oneshot::channel();
         let supervisor = tokio::spawn(supervise_switch(child, pid, Arc::clone(&stopping), exit_tx));
         let switch = Self {
             pid,
+            #[cfg(target_os = "linux")]
+            pidfd,
             subnet,
             term_timeout,
             switch_socket,
@@ -407,7 +440,7 @@ impl GvproxySwitch {
             stopping,
             supervisor: Some(supervisor),
         };
-        (switch, SwitchExit { rx: exit_rx })
+        Ok((switch, SwitchExit { rx: exit_rx }))
     }
 
     /// The PID of the supervised gvproxy process.
@@ -489,6 +522,8 @@ impl GvproxySwitch {
             index,
             relay: Some(relay),
             pid: self.pid,
+            #[cfg(target_os = "linux")]
+            pidfd: Arc::clone(&self.pidfd),
             stopping: Arc::clone(&self.stopping),
             attached_count: Arc::clone(&self.attached_count),
         })
@@ -520,6 +555,8 @@ impl GvproxySwitch {
             #[cfg(target_os = "linux")]
             relay: None,
             pid: self.pid,
+            #[cfg(target_os = "linux")]
+            pidfd: Arc::clone(&self.pidfd),
             stopping: Arc::clone(&self.stopping),
             attached_count: Arc::clone(&self.attached_count),
         })
@@ -559,9 +596,11 @@ impl GvproxySwitch {
             // Already stopped.
             return;
         };
-        let pid = self.pid as libc::pid_t;
         if !already_claimed {
-            signal_child(pid, libc::SIGTERM, "SIGTERM");
+            #[cfg(target_os = "linux")]
+            signal_via_pidfd(&self.pidfd, libc::SIGTERM, "SIGTERM");
+            #[cfg(not(target_os = "linux"))]
+            signal_child(self.pid as libc::pid_t, libc::SIGTERM, "SIGTERM");
         }
         // The supervision task completes once it has reaped the child, so
         // awaiting it (bounded by the grace period) is the exit signal.
@@ -570,7 +609,10 @@ impl GvproxySwitch {
             .is_err()
         {
             if !already_claimed {
-                signal_child(pid, libc::SIGKILL, "SIGKILL");
+                #[cfg(target_os = "linux")]
+                signal_via_pidfd(&self.pidfd, libc::SIGKILL, "SIGKILL");
+                #[cfg(not(target_os = "linux"))]
+                signal_child(self.pid as libc::pid_t, libc::SIGKILL, "SIGKILL");
             }
             let _ = supervisor.await;
         }
@@ -595,6 +637,9 @@ impl Drop for GvproxySwitch {
         // makes the claim atomic, mirroring the SIGTERM guard on the last
         // attachment drop.
         if !self.stopping.swap(true, Ordering::AcqRel) {
+            #[cfg(target_os = "linux")]
+            signal_via_pidfd(&self.pidfd, libc::SIGKILL, "SIGKILL");
+            #[cfg(not(target_os = "linux"))]
             signal_child(self.pid as libc::pid_t, libc::SIGKILL, "SIGKILL");
             tracing::debug!(
                 pid = self.pid,
@@ -627,9 +672,12 @@ pub struct PtaskAttachment {
     #[cfg(target_os = "linux")]
     #[allow(dead_code)]
     relay: Option<SwitchRelay>,
-    /// PID of the supervised gvproxy process — needed to deliver SIGTERM when
-    /// the last attachment drops.
+    /// PID of the supervised gvproxy process; used for logging.
     pid: u32,
+    /// pidfd for the supervised gvproxy process, shared with [`GvproxySwitch`].
+    /// Used for recycle-safe signalling via `pidfd_send_signal(2)`.
+    #[cfg(target_os = "linux")]
+    pidfd: Arc<OwnedFd>,
     /// Shared with the parent [`GvproxySwitch`]; set to `true` before
     /// delivering a termination signal so the supervision task classifies the
     /// resulting exit as intentional rather than unexpected.
@@ -654,19 +702,15 @@ impl Drop for PtaskAttachment {
         );
         // Only the drop that flips `stopping` from false → true signals.
         // If `stop()` (or `GvproxySwitch::Drop`) already claimed teardown the
-        // child is reaped and its PID may have been recycled by the OS, so
-        // signalling `self.pid` here could deliver SIGTERM to an unrelated
-        // process. `swap` makes the claim atomic and race-free against a
-        // concurrent stop or drop.
-        //
-        // Residual gap: an *independent* gvproxy crash never sets `stopping`,
-        // so the last drop still signals `self.pid`. The supervision task has
-        // reaped the child by then, leaving a recycled-PID window between that
-        // reap and this drop that the `swap` guard cannot close — it only keys
-        // on an intentional teardown (`stop`/`GvproxySwitch::Drop`) having set
-        // the flag, which a crash does not.
+        // child is already going away, so skip the redundant signal. `swap`
+        // makes the claim atomic and race-free against a concurrent stop or drop.
+        // On an independent gvproxy crash the pidfd path returns ESRCH (the
+        // exact process has exited) rather than risking a recycled PID hit.
         if prev == 1 && !self.stopping.swap(true, Ordering::AcqRel) {
             // Last own-IP PTask detached; terminate the switch (R1.4).
+            #[cfg(target_os = "linux")]
+            signal_via_pidfd(&self.pidfd, libc::SIGTERM, "SIGTERM");
+            #[cfg(not(target_os = "linux"))]
             signal_child(self.pid as libc::pid_t, libc::SIGTERM, "SIGTERM");
             tracing::info!(
                 gvproxy_pid = self.pid,
@@ -769,11 +813,44 @@ async fn supervise_switch(
     }
 }
 
+/// Deliver `signal` to the process referred to by `pidfd` via
+/// `pidfd_send_signal(2)`. A pidfd is bound to the exact process instance
+/// opened at spawn, so this call returns `ESRCH` after the process exits
+/// rather than accidentally targeting a recycled PID. `ESRCH` is silenced
+/// (the process has already exited); other errors are logged via
+/// `tracing::warn!`.
+#[cfg(target_os = "linux")]
+fn signal_via_pidfd(pidfd: &OwnedFd, signal: libc::c_int, signal_name: &str) {
+    // SAFETY: syscall(SYS_pidfd_send_signal, pidfd, sig, 0, 0) is the
+    // pidfd_send_signal(2) syscall with a null siginfo_t (equivalent to kill(2));
+    // it takes machine-word arguments, touches no memory, and returns 0 or -1.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd() as libc::c_long,
+            signal as libc::c_long,
+            0usize as libc::c_long, // null siginfo_t pointer
+            0i32 as libc::c_long,   // flags = 0
+        ) as libc::c_int
+    };
+    if rc != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            tracing::warn!(
+                signal = signal_name,
+                %error,
+                "signal delivery to gvproxy switch failed via pidfd",
+            );
+        }
+    }
+}
+
 /// Deliver `signal` to `pid` best-effort, logging any delivery failure other
 /// than the benign `ESRCH` (the process has already exited — the expected race
 /// during teardown). The result is intentionally not propagated: teardown
 /// cannot recover from a failed signal, but an unexpected errno (e.g. `EPERM`,
 /// `EINVAL`) should be visible in the logs rather than silently swallowed.
+#[cfg(not(target_os = "linux"))]
 fn signal_child(pid: libc::pid_t, signal: libc::c_int, signal_name: &str) {
     // SAFETY: `kill(2)` takes a pid and a signal number and touches no memory.
     let rc = unsafe { libc::kill(pid, signal) };
@@ -1011,6 +1088,7 @@ mod tests {
             Duration::from_secs(2),
             PathBuf::from("/run/minvmd/switch.sock"),
         )
+        .expect("supervise sleep")
     }
 
     /// Wait up to ~2 s for `pid` to be reaped, yielding to the supervision task
@@ -1100,7 +1178,8 @@ mod tests {
             SwitchSubnet::default(),
             Duration::from_secs(2),
             PathBuf::from("/run/minvmd/switch.sock"),
-        );
+        )
+        .expect("supervise true");
 
         let status = tokio::time::timeout(Duration::from_secs(5), exit.recv())
             .await
@@ -1113,6 +1192,59 @@ mod tests {
         // `switch` is kept alive until after the notify so `stopping` stays
         // false while the supervisor classifies the exit.
         drop(switch);
+    }
+
+    /// A pidfd opened before a child is reaped refers to that exact process
+    /// instance. After the child exits and is reaped, `pidfd_send_signal` must
+    /// return `ESRCH` — never silently land on a recycled PID (R1.4 / G2).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidfd_signal_to_reaped_child_returns_esrch() {
+        // Spawn a short-lived child; `true` exits with status 0 immediately.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+
+        // Open the pidfd before reaping so it is bound to this exact process
+        // instance — not the numeric PID that the OS may recycle after reap.
+        // SAFETY: syscall(SYS_pidfd_open, pid, 0) touches no memory and returns an fd or -1.
+        let raw = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_open,
+                pid as libc::c_long,
+                0i32 as libc::c_long,
+            ) as libc::c_int
+        };
+        assert!(
+            raw >= 0,
+            "pidfd_open should succeed for a running/zombie child"
+        );
+        // SAFETY: raw is the valid fd just returned by pidfd_open.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
+
+        // Reap the child; it is now gone from the process table.
+        let status = child.wait().expect("wait");
+        assert!(status.success(), "true must exit 0");
+
+        // Signal via pidfd after reap must return ESRCH — confirming the
+        // pidfd never resolves to a recycled PID.
+        // SAFETY: syscall(SYS_pidfd_send_signal, ...) touches no memory; returns 0 or -1.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd.as_raw_fd() as libc::c_long,
+                libc::SIGTERM as libc::c_long,
+                0usize as libc::c_long,
+                0i32 as libc::c_long,
+            ) as libc::c_int
+        };
+        assert_eq!(rc, -1, "pidfd_send_signal to reaped child must fail");
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "errno must be ESRCH — not a recycled-PID hit",
+        );
     }
 
     #[test]
