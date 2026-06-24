@@ -2,11 +2,11 @@ use minimald_rpc::{
     CreateSession, CreateSessionResponse, DestroySession, DestroySessionResponse, Errorable,
     GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest,
     GetSessionRecordResponse, GetVersion, GetVersionResponse, IngressPolicy, IssueClientCert,
-    ListSessions, ListSessionsEntry, ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX,
-    RenameSession, RenameSessionResponse, SessionPolicy,
+    IssueClientCertRequest, ListSessions, ListSessionsEntry, ListSessionsResponse, OneshotSshRpc,
+    RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, SessionPolicy,
 };
 #[cfg(feature = "networking-proxy")]
-use minimald_rpc::{IssueClientCertRequest, IssueClientCertResponse};
+use minimald_rpc::IssueClientCertResponse;
 use russh::{
     Channel as RuChannel, ChannelId,
     server::{Msg, Session},
@@ -252,6 +252,25 @@ async fn serve_issue_client_cert(s: ServerStateHandle, c: RuChannel<Msg>) {
     }
 }
 
+/// Replies to an `IssueClientCert` request with a readable error when the
+/// `networking-proxy` feature is compiled out, so the client sees "feature not
+/// enabled" instead of an opaque EOF/channel-close on the response stream.
+#[cfg(not(feature = "networking-proxy"))]
+async fn serve_issue_client_cert_unavailable(c: RuChannel<Msg>) {
+    let res = IssueClientCert
+        .handle_channel(c, async |_req: IssueClientCertRequest| {
+            Ok(Errorable::Err {
+                error: "minimald was built without the networking-proxy feature; \
+                        client certificate issuance is unavailable"
+                    .to_string(),
+            })
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", IssueClientCert::NAME, e);
+    }
+}
+
 pub(crate) const STREAM_WORKSPACE_FILES: &str =
     constcat::concat!(RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst");
 
@@ -368,10 +387,10 @@ pub async fn handle_ssh_rpc(
             {
                 tracing::warn!(
                     "IssueClientCert RPC called but the networking-proxy \
-                     feature is not enabled; dropping the request"
+                     feature is not enabled; replying with an error"
                 );
                 drop(s);
-                drop(channel);
+                drop(spawn(serve_issue_client_cert_unavailable(channel)));
             }
         }
         _ => unreachable!(),
