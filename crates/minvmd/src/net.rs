@@ -419,7 +419,12 @@ impl GvproxySwitch {
                 ) as libc::c_int
             };
             if raw < 0 {
-                return Err(io::Error::last_os_error());
+                let err = io::Error::last_os_error();
+                // No supervision task exists yet, so dropping `child` would not
+                // reap it; kill it explicitly to avoid leaking the gvproxy process.
+                let mut child = child;
+                let _ = child.start_kill();
+                return Err(err);
             }
             // SAFETY: raw is a valid file descriptor just returned by pidfd_open.
             Arc::new(unsafe { OwnedFd::from_raw_fd(raw) })
