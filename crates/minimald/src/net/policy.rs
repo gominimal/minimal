@@ -18,8 +18,9 @@
 //! from this Unit is the warning plumbing ([`PolicyWarnLimiter`]); the call
 //! site that fires it on a real dropped frame lands with that enforcement.
 
+use std::fmt;
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -35,7 +36,7 @@ use sessions::{IngressPolicy, IpProto, PortMapping};
 /// forwards to, plus the transport `protocol`.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ExposeRequest {
-    /// Host-side listen address, `host:port` (empty host = all interfaces).
+    /// Host-side listen address, `host:port` (e.g. `127.0.0.1:8080`).
     pub local: String,
     /// PTask-side destination, `ip:port`.
     pub remote: String,
@@ -69,13 +70,14 @@ fn protocol_str(proto: IpProto) -> &'static str {
 /// Builds the [`ExposeRequest`] that forwards `mapping`'s host-side
 /// `external_port` to `ptask_ip:internal_port` on the switch.
 ///
-/// The `local` host is left empty (`:PORT`) so the forward binds all host
-/// interfaces, matching the spike's static-ingress recipe; the `remote` targets
-/// the PTask's allocated switch address.
+/// The `local` host is `127.0.0.1` so the forward binds host loopback only: a
+/// process *on the host* reaches the port (R2.3), while the spec's "no external
+/// exposure by default" keeps it off the LAN. The `remote` targets the PTask's
+/// allocated switch address.
 #[must_use]
 pub fn expose_request(mapping: &PortMapping, ptask_ip: Ipv4Addr) -> ExposeRequest {
     ExposeRequest {
-        local: format!(":{}", mapping.external_port),
+        local: format!("127.0.0.1:{}", mapping.external_port),
         remote: format!("{ptask_ip}:{}", mapping.internal_port),
         protocol: protocol_str(mapping.proto).to_string(),
     }
@@ -225,9 +227,29 @@ fn body_after_headers(response: &[u8]) -> &[u8] {
 /// switch `detach`, leaving the PTask attached and its forwards present.
 const GVPROXY_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Minimum gap between emitted policy-violation warnings (R2.7), so a flood of
-/// dropped frames cannot spam the log at line rate.
-const WARN_MIN_INTERVAL: Duration = Duration::from_secs(1);
+/// Minimum gap between emitted policy-violation warnings: one minute, matching
+/// R2.2's "first drop per PTask per rule per minute" rate-limit window, so a
+/// flood of dropped frames cannot spam the log.
+const WARN_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Which direction a policy violation occurred in, for R2.7's `direction`
+/// structured field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Outbound traffic from the PTask (an egress-policy violation).
+    Egress,
+    /// Inbound traffic to the PTask (an ingress-policy violation).
+    Ingress,
+}
+
+impl fmt::Display for Direction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Egress => "egress",
+            Self::Ingress => "ingress",
+        })
+    }
+}
 
 /// Rate-limited emitter plumbing for policy-violation warnings (R2.7).
 ///
@@ -266,12 +288,28 @@ impl PolicyWarnLimiter {
         }
     }
 
-    /// Emits a rate-limited `tracing::warn!` for a policy violation against
-    /// `session`, describing it with `detail`. Returns whether a warning was
-    /// emitted (vs. suppressed by the rate limit).
-    pub fn warn(&self, session: &str, detail: &str) -> bool {
+    /// Emits a rate-limited `tracing::warn!` for a policy violation, carrying
+    /// R2.7's required structured fields: the `session_id`, the `direction` of
+    /// the offending traffic, the `remote_addr` it was to/from, its `proto`, and
+    /// the `rule_matched`. Returns whether a warning was emitted (vs. suppressed
+    /// by the rate limit).
+    pub fn warn(
+        &self,
+        session_id: &str,
+        direction: Direction,
+        remote_addr: SocketAddr,
+        proto: IpProto,
+        rule_matched: &str,
+    ) -> bool {
         if self.should_warn_at(Instant::now()) {
-            tracing::warn!(session, detail, "network policy violation");
+            tracing::warn!(
+                session_id,
+                %direction,
+                %remote_addr,
+                ?proto,
+                rule_matched,
+                "network policy violation"
+            );
             true
         } else {
             false
@@ -286,14 +324,14 @@ mod tests {
     #[test]
     fn expose_request_maps_host_port_to_ptask_ip() {
         // R2.3/R2.4-static: external_port forwards to the PTask's switch IP on
-        // internal_port; the local host is left blank to bind all interfaces.
+        // internal_port; the local host is loopback so only the host can connect.
         let mapping = PortMapping {
             external_port: 18080,
             internal_port: 80,
             proto: IpProto::Tcp,
         };
         let req = expose_request(&mapping, Ipv4Addr::new(100, 64, 0, 2));
-        assert_eq!(req.local, ":18080");
+        assert_eq!(req.local, "127.0.0.1:18080");
         assert_eq!(req.remote, "100.64.0.2:80");
         assert_eq!(req.protocol, "tcp");
     }
@@ -307,7 +345,7 @@ mod tests {
         };
         let req = expose_request(&mapping, Ipv4Addr::new(100, 64, 0, 7));
         let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"local\":\":5353\""), "got: {json}");
+        assert!(json.contains("\"local\":\"127.0.0.1:5353\""), "got: {json}");
         assert!(json.contains("\"remote\":\"100.64.0.7:53\""), "got: {json}");
         assert!(json.contains("\"protocol\":\"udp\""), "got: {json}");
     }
@@ -335,5 +373,12 @@ mod tests {
         assert!(!limiter.should_warn_at(t0 + Duration::from_millis(10)));
         // Once the interval has elapsed it warns again.
         assert!(limiter.should_warn_at(t0 + WARN_MIN_INTERVAL));
+    }
+
+    #[test]
+    fn direction_renders_the_r2_7_field_values() {
+        // R2.7 spells the `direction` structured field `egress`/`ingress`.
+        assert_eq!(Direction::Egress.to_string(), "egress");
+        assert_eq!(Direction::Ingress.to_string(), "ingress");
     }
 }
