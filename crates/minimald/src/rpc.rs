@@ -3,9 +3,9 @@ use minimald_rpc::IssueClientCertResponse;
 use minimald_rpc::{
     CreateSession, CreateSessionResponse, DestroySession, DestroySessionResponse, Errorable,
     GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest,
-    GetSessionRecordResponse, GetVersion, GetVersionResponse, IngressPolicy, IssueClientCert,
+    GetSessionRecordResponse, GetVersion, GetVersionResponse, IssueClientCert,
     IssueClientCertRequest, ListSessions, ListSessionsEntry, ListSessionsResponse, OneshotSshRpc,
-    RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, SessionPolicy,
+    RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse,
 };
 use russh::{
     Channel as RuChannel, ChannelId,

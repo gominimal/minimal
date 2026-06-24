@@ -58,13 +58,6 @@ const TERM_GRACE: Duration = Duration::from_secs(5);
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum NetError {
-    /// The prefix length is outside the range accepted by [`SwitchSubnet::new`].
-    ///
-    /// Distinct from [`SubnetExhausted`](Self::SubnetExhausted): a prefix that
-    /// puts the subnet outside `8..=29` is a misconfiguration (the prefix was
-    /// never valid), not an exhausted valid subnet.
-    #[error("prefix /{0} is outside the valid range /8..=/29 for a gvproxy switch subnet")]
-    InvalidPrefix(u8),
     /// The configured subnet has no remaining host address to hand out.
     #[error("gvproxy subnet {0} is exhausted; no free PTask address remains")]
     SubnetExhausted(SwitchSubnet),
@@ -685,8 +678,6 @@ mod tests {
 
     #[test]
     fn subnet_rejects_overly_narrow_prefix() {
-        // /30 is a misconfiguration (no room for a PTask), not an exhausted
-        // valid subnet — so the distinct InvalidPrefix error is returned.
         assert!(matches!(
             SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 30),
             Err(NetError::InvalidPrefix(30))
