@@ -281,6 +281,12 @@ impl<S: SessionObject> Session<S> {
         &mut self,
         _session: SessionHandle,
     ) -> Result<session_host::MockLauncher, AttachError> {
+        // Mirror the production R2.1 gate so test launches reject a
+        // policy/network-mode mismatch the same way production does.
+        self.session
+            .record()
+            .validate_policy()
+            .map_err(AttachError::InvalidPolicy)?;
         Ok(session_host::MockLauncher)
     }
 

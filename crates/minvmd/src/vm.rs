@@ -105,19 +105,35 @@ impl VmConfig {
     /// (DM1/DM3/DM4). On DM2 (native Linux, minimald on the host with no VM) it
     /// has nothing to apply to and collapses to per-PTask egress (UC3), so a
     /// `vm_egress` set on DM2 is a configuration error rather than a silent
-    /// no-op.
+    /// no-op. [`DeploymentMode::Dm5`] does not by itself encode an underlying
+    /// model, so it may resolve to DM2 (no VM boundary); `vm_egress` is rejected
+    /// there too — fail closed rather than silently accept a policy that might
+    /// have nothing to enforce it — until the underlying model is resolved.
     ///
     /// # Errors
     ///
     /// Returns [`VmError::Configuration`] when `vm_egress` is set and `mode` is
-    /// [`DeploymentMode::Dm2`].
+    /// [`DeploymentMode::Dm2`] or [`DeploymentMode::Dm5`].
     pub fn validate_for(&self, mode: DeploymentMode) -> Result<(), VmError> {
-        if self.vm_egress.is_some() && mode == DeploymentMode::Dm2 {
-            return Err(VmError::Configuration {
-                what: "vm_egress",
-                reason: "VM-wide egress is not applicable on DM2 (native Linux has no VM \
-                         boundary); use per-PTask egress instead",
-            });
+        if self.vm_egress.is_some() {
+            let reason = match mode {
+                DeploymentMode::Dm2 => Some(
+                    "VM-wide egress is not applicable on DM2 (native Linux has no VM \
+                     boundary); use per-PTask egress instead",
+                ),
+                DeploymentMode::Dm5 => Some(
+                    "VM-wide egress cannot be applied on DM5 until its underlying \
+                     deployment model is resolved; DM5 does not by itself guarantee a \
+                     VM boundary to enforce it",
+                ),
+                DeploymentMode::Dm1 | DeploymentMode::Dm3 | DeploymentMode::Dm4 => None,
+            };
+            if let Some(reason) = reason {
+                return Err(VmError::Configuration {
+                    what: "vm_egress",
+                    reason,
+                });
+            }
         }
         Ok(())
     }
@@ -291,6 +307,31 @@ mod tests {
         )
         .with_vm_egress(EgressPolicy::default());
         let err = cfg.validate_for(DeploymentMode::Dm2).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VmError::Configuration {
+                    what: "vm_egress",
+                    ..
+                }
+            ),
+            "expected a typed configuration error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn vm_egress_is_rejected_on_dm5() {
+        // R2.5 fail-closed: DM5 does not encode a VM boundary, so a VM-wide
+        // egress policy is rejected until the underlying model is resolved.
+        let cfg = VmConfig::new(
+            1,
+            256,
+            PathBuf::from("/k"),
+            PathBuf::from("/r"),
+            PathBuf::from("/i"),
+        )
+        .with_vm_egress(EgressPolicy::default());
+        let err = cfg.validate_for(DeploymentMode::Dm5).unwrap_err();
         assert!(
             matches!(
                 err,

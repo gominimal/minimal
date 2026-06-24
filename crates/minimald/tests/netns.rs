@@ -231,8 +231,12 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
     // listener is up and the forward is installed.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let reached = loop {
-        let out = Command::new("bash")
+        // Bound each probe with `timeout` so a connect that succeeds but then
+        // stalls on the read cannot hang past the overall retry deadline.
+        let out = Command::new("timeout")
             .args([
+                "2s",
+                "bash",
                 "-c",
                 &format!("exec 3<>/dev/tcp/127.0.0.1/{EXTERNAL}; head -c2 <&3"),
             ])
@@ -250,8 +254,13 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
     // Remove the forward on exit and confirm it is gone: a fresh host connect to
     // the same port must now fail.
     remove_ingress(&sock, &exposed).await;
-    let after_unexpose = Command::new("bash")
-        .args(["-c", &format!("exec 3<>/dev/tcp/127.0.0.1/{EXTERNAL}")])
+    let after_unexpose = Command::new("timeout")
+        .args([
+            "2s",
+            "bash",
+            "-c",
+            &format!("exec 3<>/dev/tcp/127.0.0.1/{EXTERNAL}"),
+        ])
         .output()
         .expect("spawn post-unexpose host connect");
 

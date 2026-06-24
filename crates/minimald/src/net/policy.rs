@@ -162,14 +162,26 @@ async fn post_json<T: Serialize>(sock: &Path, path: &str, body: &T) -> io::Resul
     request.extend_from_slice(b"Connection: close\r\n\r\n");
     request.extend_from_slice(&body);
 
-    let mut stream = UnixStream::connect(sock).await?;
-    stream.write_all(&request).await?;
-    // Half-close the write side so an HTTP/1.0 server knows the request is
-    // complete and responds without waiting for more body bytes.
-    stream.shutdown().await?;
+    // Bound the whole exchange: a gvproxy that accepts the socket and then
+    // stalls must not hang the launch or teardown path indefinitely.
+    let response = tokio::time::timeout(GVPROXY_CONTROL_TIMEOUT, async {
+        let mut stream = UnixStream::connect(sock).await?;
+        stream.write_all(&request).await?;
+        // Half-close the write side so an HTTP/1.0 server knows the request is
+        // complete and responds without waiting for more body bytes.
+        stream.shutdown().await?;
 
-    let mut response = Vec::with_capacity(256);
-    stream.read_to_end(&mut response).await?;
+        let mut response = Vec::with_capacity(256);
+        stream.read_to_end(&mut response).await?;
+        Ok::<_, io::Error>(response)
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("gvproxy {path} control request timed out after {GVPROXY_CONTROL_TIMEOUT:?}"),
+        )
+    })??;
 
     let status = parse_status_code(&response)?;
     if (200..300).contains(&status) {
@@ -205,6 +217,12 @@ fn body_after_headers(response: &[u8]) -> &[u8] {
         .position(|w| w == b"\r\n\r\n")
         .map_or(response, |i| &response[i + 4..])
 }
+
+/// Upper bound on a single gvproxy control request (expose/unexpose). The
+/// control socket can accept the connection and then stall or never close;
+/// without a bound, teardown's `remove_ingress` would block forever before the
+/// switch `detach`, leaving the PTask attached and its forwards present.
+const GVPROXY_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Minimum gap between emitted policy-violation warnings (R2.7), so a flood of
 /// dropped frames cannot spam the log at line rate.

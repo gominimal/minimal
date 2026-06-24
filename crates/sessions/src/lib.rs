@@ -130,6 +130,14 @@ pub enum PolicyError {
     /// An ingress policy was set on a `PTask` that is not [`NetworkMode::OwnIp`].
     #[error("ingress policy is only valid for an own-IP PTask, not {mode:?}")]
     IngressRequiresOwnIp { mode: NetworkMode },
+    /// An ingress port mapping used a transport gvproxy's forwarder cannot
+    /// expose. gvproxy only forwards TCP and UDP, so any other protocol (e.g.
+    /// ICMP) must be rejected at validation time rather than silently mapped.
+    #[error(
+        "ingress port mapping uses unsupported protocol {proto:?}; \
+         gvproxy's static forwarder supports only TCP and UDP"
+    )]
+    UnsupportedIngressProtocol { proto: IpProto },
 }
 
 /// A session ID, a newtype over a UUID.
@@ -212,6 +220,19 @@ impl Record {
     /// on a non-`OwnIp` `PTask`, or [`PolicyError::IngressRequiresOwnIp`] when a
     /// non-empty ingress policy is.
     pub fn validate_policy(&self) -> Result<(), PolicyError> {
+        // gvproxy's static forwarder only exposes TCP and UDP, so an ingress
+        // mapping with any other transport is a configuration error wherever it
+        // appears — reject it before the mode check so it never reaches the
+        // forwarder as a silently-defaulted protocol.
+        if let Some(proto) = self.policy.ingress.as_ref().and_then(|ingress| {
+            ingress
+                .port_mappings
+                .iter()
+                .map(|mapping| mapping.proto)
+                .find(|proto| !matches!(proto, IpProto::Tcp | IpProto::Udp))
+        }) {
+            return Err(PolicyError::UnsupportedIngressProtocol { proto });
+        }
         if self.network == NetworkMode::OwnIp {
             return Ok(());
         }
@@ -293,6 +314,27 @@ mod tests {
             record.validate_policy(),
             Err(PolicyError::IngressRequiresOwnIp {
                 mode: NetworkMode::HostNet
+            })
+        );
+    }
+
+    #[test]
+    fn icmp_ingress_mapping_is_rejected_even_on_own_ip() {
+        // gvproxy's forwarder only exposes TCP/UDP, so an ICMP mapping is a
+        // configuration error even on an OwnIp PTask (where ingress is allowed).
+        let ingress = IngressPolicy {
+            port_mappings: vec![PortMapping {
+                external_port: 18080,
+                internal_port: 80,
+                proto: IpProto::Icmp,
+            }],
+            dynamic_allowed_range: None,
+        };
+        let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
+        assert_eq!(
+            record.validate_policy(),
+            Err(PolicyError::UnsupportedIngressProtocol {
+                proto: IpProto::Icmp
             })
         );
     }
