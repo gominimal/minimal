@@ -184,7 +184,14 @@ async fn post_json<T: Serialize>(sock: &Path, path: &str, body: &T) -> io::Resul
         stream.shutdown().await?;
 
         let mut response = Vec::with_capacity(256);
-        stream.read_to_end(&mut response).await?;
+        // Cap the buffered response: gvproxy's forwarder replies are tiny
+        // (`200 OK` with a minimal body), so a stream that keeps sending past
+        // this bound is misbehaving and must not be allowed to grow memory
+        // unbounded for the whole timeout window.
+        (&mut stream)
+            .take(MAX_CONTROL_RESPONSE)
+            .read_to_end(&mut response)
+            .await?;
         Ok::<_, io::Error>(response)
     })
     .await
@@ -235,6 +242,12 @@ fn body_after_headers(response: &[u8]) -> &[u8] {
 /// without a bound, teardown's `remove_ingress` would block forever before the
 /// switch `detach`, leaving the PTask attached and its forwards present.
 const GVPROXY_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Upper bound on bytes buffered from a single gvproxy control response. The
+/// forwarder's replies are a status line plus a tiny body, so 64 KiB is far
+/// above any legitimate response while capping memory if a misbehaving socket
+/// streams without closing inside the [`GVPROXY_CONTROL_TIMEOUT`] window.
+const MAX_CONTROL_RESPONSE: u64 = 64 * 1024;
 
 /// Minimum gap between emitted policy-violation warnings: one minute, matching
 /// R2.2's "first drop per PTask per rule per minute" rate-limit window, so a
