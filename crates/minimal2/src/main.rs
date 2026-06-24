@@ -102,6 +102,11 @@ pub struct GlobalArgs {
     /// Override the base directory used for operations (default: ~/.cache/minimal)
     #[arg(long)]
     minimal_dir: Option<PathBuf>,
+    /// Linux: run minimald inside the minvmd microVM (DM1) instead of natively
+    /// on the host (DM2, the default). No effect on macOS, where minvmd is the
+    /// only backend.
+    #[arg(long, global = true)]
+    minvmd: bool,
 }
 
 #[derive(Debug, Args)]
@@ -212,7 +217,7 @@ async fn main() -> Result<(), ()> {
 
 /// Connect to the daemon, resolving the socket path from global args.
 async fn connect_daemon(global: &GlobalArgs) -> Result<client::Client, ()> {
-    let sock = client::resolve_socket_path(global.minimal_dir.as_deref())
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.minvmd)
         .map_err(|e| eprintln!("Failed to resolve daemon socket path: {e}"))?;
 
     client::Client::connect(&sock)
@@ -245,8 +250,8 @@ async fn cmd_proxy(args: ProxyArgs) -> Result<(), ()> {
 
 /// List sessions via the `ListSessions` RPC.
 async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), ()> {
-    if let Err(e) = autospawn::ensure_minvmd_running() {
-        eprintln!("Failed to ensure minvmd is running: {e}");
+    if let Err(e) = autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref()) {
+        eprintln!("Failed to ensure the minimald daemon is running: {e}");
         return Err(());
     }
 
@@ -310,8 +315,8 @@ async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), ()> {
 
 /// Create a new session via the `CreateSession` RPC.
 async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), ()> {
-    if let Err(e) = autospawn::ensure_minvmd_running() {
-        eprintln!("Failed to ensure minvmd is running: {e}");
+    if let Err(e) = autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref()) {
+        eprintln!("Failed to ensure the minimald daemon is running: {e}");
         return Err(());
     }
 
@@ -377,12 +382,12 @@ fn shell_quote(s: &str) -> String {
 /// shell out to `ssh` — the daemon's shell_request handler mints a PTY-backed
 /// session shell, and ssh handles termios/PTY management for us.
 async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), ()> {
-    if let Err(e) = autospawn::ensure_minvmd_running() {
-        eprintln!("Failed to ensure minvmd is running: {e}");
+    if let Err(e) = autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref()) {
+        eprintln!("Failed to ensure the minimald daemon is running: {e}");
         return Err(());
     }
 
-    let sock = client::resolve_socket_path(global.minimal_dir.as_deref())
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.minvmd)
         .map_err(|e| eprintln!("Failed to resolve daemon socket path: {e}"))?;
 
     // Resolve the session: if it looks like a UUID, query by ID; otherwise by name.
@@ -454,8 +459,8 @@ async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), ()> {
 
 /// Print the effective networking policy for a session as JSON.
 async fn cmd_session_policy(global: &GlobalArgs, args: PolicyArgs) -> Result<(), ()> {
-    if let Err(e) = autospawn::ensure_minvmd_running() {
-        eprintln!("Failed to ensure minvmd is running: {e}");
+    if let Err(e) = autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref()) {
+        eprintln!("Failed to ensure the minimald daemon is running: {e}");
         return Err(());
     }
 
@@ -489,8 +494,8 @@ async fn cmd_session_policy(global: &GlobalArgs, args: PolicyArgs) -> Result<(),
 
 /// Destroy (terminate) a session.
 async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), ()> {
-    if let Err(e) = autospawn::ensure_minvmd_running() {
-        eprintln!("Failed to ensure minvmd is running: {e}");
+    if let Err(e) = autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref()) {
+        eprintln!("Failed to ensure the minimald daemon is running: {e}");
         return Err(());
     }
 
@@ -546,12 +551,12 @@ async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), ()> {
 /// The `-N` flag keeps the tunnel alive without opening an interactive
 /// shell.
 async fn cmd_ssh_forward(global: &GlobalArgs, args: SshForwardArgs) -> Result<(), ()> {
-    if let Err(e) = autospawn::ensure_minvmd_running() {
-        eprintln!("Failed to ensure minvmd is running: {e}");
+    if let Err(e) = autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref()) {
+        eprintln!("Failed to ensure the minimald daemon is running: {e}");
         return Err(());
     }
 
-    let sock = client::resolve_socket_path(global.minimal_dir.as_deref())
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.minvmd)
         .map_err(|e| eprintln!("Failed to resolve daemon socket path: {e}"))?;
 
     // Look up the session to validate it exists and to obtain its UUID for the
@@ -640,8 +645,8 @@ async fn cmd_ssh_forward(global: &GlobalArgs, args: SshForwardArgs) -> Result<()
 /// sign the certificate with its internal CA, and return both. The cert, key,
 /// and CA cert are written to `<cert_dir>/{client.pem,client.key,ca.pem}`.
 async fn cmd_login(global: &GlobalArgs, args: LoginArgs) -> Result<(), ()> {
-    if let Err(e) = autospawn::ensure_minvmd_running() {
-        eprintln!("Failed to ensure minvmd is running: {e}");
+    if let Err(e) = autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref()) {
+        eprintln!("Failed to ensure the minimald daemon is running: {e}");
         return Err(());
     }
 

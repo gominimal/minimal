@@ -139,18 +139,32 @@ impl Client {
 /// socket created by the minvmd host daemon).
 ///
 /// If `--minimal-dir` is set, use `<minimal_dir>/providers/local-0/ssh.sock`
-/// on Linux, or `<minimal_dir>/minimald.sock` on macOS.
+/// on Linux (native), or `<minimal_dir>/minimald.sock` on macOS / Linux+minvmd.
+///
+/// `use_minvmd` selects the backend on Linux: `false` (default) resolves the
+/// native minimald UDS; `true` resolves the minvmd host-UDS bridge. On macOS the
+/// bridge is the only backend, so `use_minvmd` is ignored.
 pub fn resolve_socket_path(
     minimal_dir_override: Option<&std::path::Path>,
+    use_minvmd: bool,
 ) -> std::io::Result<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    let _ = use_minvmd;
     if let Some(dir) = minimal_dir_override {
         #[cfg(target_os = "linux")]
-        return Ok(dir.join("providers/local-0/ssh.sock"));
+        return Ok(if use_minvmd {
+            dir.join("minimald.sock")
+        } else {
+            dir.join("providers/local-0/ssh.sock")
+        });
         #[cfg(target_os = "macos")]
         return Ok(dir.join("minimald.sock"));
     }
     #[cfg(target_os = "linux")]
     {
+        if use_minvmd {
+            return minvmd::sock::resolve_uds_path();
+        }
         let state = dirs::state_dir()
             .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
             .ok_or_else(|| {
@@ -163,4 +177,20 @@ pub fn resolve_socket_path(
     }
     #[cfg(target_os = "macos")]
     minvmd::sock::resolve_uds_path()
+}
+
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod tests {
+    use super::resolve_socket_path;
+    use std::path::Path;
+
+    #[test]
+    fn linux_socket_path_honors_backend_with_override() {
+        let dir = Path::new("/tmp/minimal-test");
+        let native = resolve_socket_path(Some(dir), false).unwrap();
+        let bridged = resolve_socket_path(Some(dir), true).unwrap();
+        assert!(native.ends_with("providers/local-0/ssh.sock"), "{native:?}");
+        assert!(bridged.ends_with("minimald.sock"), "{bridged:?}");
+    }
 }
