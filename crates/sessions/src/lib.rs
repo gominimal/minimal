@@ -87,6 +87,10 @@ pub struct IngressPolicy {
     pub port_mappings: Vec<PortMapping>,
     /// Inclusive port range within which dynamic port-mapping requests are
     /// accepted; `None` means dynamic mapping is disallowed.
+    ///
+    /// Stored on the [`Record`] and returned verbatim by `GetSessionPolicy`,
+    /// but **not yet enforced**: dynamic port-mapping is split to #553. Until
+    /// then a set range is recorded configuration only, with no runtime effect.
     pub dynamic_allowed_range: Option<(u16, u16)>,
 }
 
@@ -148,6 +152,30 @@ pub enum PolicyError {
          external_port >= 1024"
     )]
     PrivilegedPort { external_port: u16 },
+    /// An egress `allow_subnets` entry is not a syntactically valid CIDR prefix
+    /// (e.g. `10.0.0/8` or `not-a-cidr`). Rejected at launch so a misconfigured
+    /// subnet is named where it can be fixed, rather than surfacing opaquely
+    /// when #553's egress-enforcement layer parses it.
+    #[error("egress allow_subnets entry {cidr:?} is not a valid CIDR prefix")]
+    InvalidSubnet { cidr: String },
+}
+
+/// Whether `s` is a syntactically valid CIDR prefix (`<addr>/<prefix-len>`) for
+/// either IPv4 or IPv6. Only the address syntax and the prefix-length range are
+/// checked; host bits below the prefix are permitted, matching how the strings
+/// are written in config.
+fn is_valid_cidr(s: &str) -> bool {
+    let Some((addr, prefix)) = s.split_once('/') else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    match addr.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(_)) => prefix <= 32,
+        Ok(std::net::IpAddr::V6(_)) => prefix <= 128,
+        Err(_) => false,
+    }
 }
 
 /// A session ID, a newtype over a UUID.
@@ -232,7 +260,8 @@ impl Record {
     /// [`PolicyError::UnsupportedIngressProtocol`] for an ingress mapping whose
     /// transport gvproxy's forwarder cannot expose, or
     /// [`PolicyError::PrivilegedPort`] for one that publishes a host port below
-    /// 1024.
+    /// 1024. For an `OwnIp` `PTask`, returns [`PolicyError::InvalidSubnet`] when
+    /// an egress `allow_subnets` entry is not a valid CIDR prefix.
     pub fn validate_policy(&self) -> Result<(), PolicyError> {
         // gvproxy's static forwarder only exposes TCP and UDP, so an ingress
         // mapping with any other transport is a configuration error wherever it
@@ -260,7 +289,22 @@ impl Record {
         }) {
             return Err(PolicyError::PrivilegedPort { external_port });
         }
+        // For an OwnIp PTask egress/ingress are allowed; the only remaining
+        // check is that each egress allow_subnets entry is a syntactically valid
+        // CIDR prefix, so a misconfigured subnet is named at launch rather than
+        // surfacing opaquely when #553's enforcement layer parses it.
         if self.network == NetworkMode::OwnIp {
+            if let Some(bad) = self
+                .policy
+                .egress
+                .as_ref()
+                .and_then(|egress| egress.allow_subnets.as_deref())
+                .into_iter()
+                .flatten()
+                .find(|cidr| !is_valid_cidr(cidr))
+            {
+                return Err(PolicyError::InvalidSubnet { cidr: bad.clone() });
+            }
             return Ok(());
         }
         if self.policy.egress.is_some() {
@@ -456,6 +500,35 @@ mod tests {
             NetworkMode::OwnIp,
             SessionPolicy::new(Some(EgressPolicy::default()), None),
         );
+        assert!(record.validate_policy().is_ok());
+    }
+
+    #[test]
+    fn invalid_egress_subnet_is_rejected_on_own_ip() {
+        // An allow_subnets entry that is not a valid CIDR prefix is rejected at
+        // launch, naming the offending string, rather than being stored verbatim
+        // and surfacing only when #553's enforcement parses it.
+        let egress = EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".into(), "not-a-cidr".into()]),
+            ..EgressPolicy::default()
+        };
+        let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(Some(egress), None));
+        assert_eq!(
+            record.validate_policy(),
+            Err(PolicyError::InvalidSubnet {
+                cidr: "not-a-cidr".into()
+            })
+        );
+    }
+
+    #[test]
+    fn valid_egress_subnets_are_accepted_on_own_ip() {
+        // Both IPv4 and IPv6 CIDR prefixes pass the syntactic check.
+        let egress = EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".into(), "fd00::/8".into()]),
+            ..EgressPolicy::default()
+        };
+        let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(Some(egress), None));
         assert!(record.validate_policy().is_ok());
     }
 

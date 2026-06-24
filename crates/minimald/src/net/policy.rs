@@ -61,9 +61,18 @@ fn protocol_str(proto: IpProto) -> &'static str {
         IpProto::Udp => "udp",
         // gvproxy's forwarder only exposes TCP/UDP, and `Record::validate_policy`
         // rejects any other protocol before it reaches here. `IpProto` is also
-        // `#[non_exhaustive]`, so TCP — the forwarder's default transport — is the
-        // fallback for ICMP and any unknown future variant.
-        _ => "tcp",
+        // `#[non_exhaustive]`, so the `_` arm cannot be eliminated; a
+        // `debug_assert!` surfaces any future caller that bypasses validation in
+        // test runs, while TCP — the forwarder's default transport — stays the
+        // production fallback rather than a silently misrouted request.
+        _ => {
+            debug_assert!(
+                false,
+                "protocol_str reached its fallback with {proto:?}; validate_policy \
+                 must reject every non-TCP/UDP ingress protocol before apply_ingress"
+            );
+            "tcp"
+        }
     }
 }
 
