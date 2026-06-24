@@ -347,8 +347,8 @@ impl OneshotSshRpc for DynamicPortMap {
 /// An RPC that signs and returns a fresh client certificate for use with the
 /// HTTPS reverse proxy's mTLS authentication (R4.4). The caller supplies a
 /// subject common name; the daemon generates a key pair, signs the certificate
-/// with its internal CA, and returns the DER-encoded certificate and private
-/// key. The CA certificate DER is also returned so the client can add it to
+/// with its internal CA, and returns PEM-encoded certificate and private key.
+/// The CA certificate PEM is also returned so the client can add it to
 /// its trust store.
 pub struct IssueClientCert;
 

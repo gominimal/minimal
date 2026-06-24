@@ -475,8 +475,47 @@ impl russh::server::Handler for ConnectionHandler {
              from {originator_address}:{originator_port}"
         );
 
-        if self.0.lock().await.auth != Auth::Local {
+        let (is_local, username, serv) = {
+            let state = self.0.lock().await;
+            (
+                state.auth == Auth::Local,
+                state.ssh_username.clone(),
+                state.serv.clone(),
+            )
+        };
+
+        if !is_local {
             return Ok(false);
+        }
+
+        // Validate the session identified by the SSH username (R4.9). The client
+        // passes the session UUID as `-l <uuid>` so the server can confirm the
+        // session exists before accepting the forward.
+        if let Some(ref uname) = username {
+            if let Ok(session_id) = SessionId::parse_str(uname) {
+                let mngr = serv.sessions_manager().await;
+                match mngr
+                    .get_session(SessionKeyPredicate::Id(session_id))
+                    .await
+                {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        tracing::warn!(
+                            %session_id,
+                            "direct-tcpip rejected: session not found"
+                        );
+                        return Ok(false);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            %session_id,
+                            error = %e,
+                            "direct-tcpip rejected: session lookup failed"
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
         }
 
         let host = host_to_connect.to_string();

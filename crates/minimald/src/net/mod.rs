@@ -58,6 +58,13 @@ const TERM_GRACE: Duration = Duration::from_secs(5);
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum NetError {
+    /// The prefix length is outside the range accepted by [`SwitchSubnet::new`].
+    ///
+    /// Distinct from [`SubnetExhausted`](Self::SubnetExhausted): a prefix that
+    /// puts the subnet outside `8..=29` is a misconfiguration (the prefix was
+    /// never valid), not an exhausted valid subnet.
+    #[error("prefix /{0} is outside the valid range /8..=/29 for a gvproxy switch subnet")]
+    InvalidPrefix(u8),
     /// The configured subnet has no remaining host address to hand out.
     #[error("gvproxy subnet {0} is exhausted; no free PTask address remains")]
     SubnetExhausted(SwitchSubnet),
@@ -144,14 +151,13 @@ impl SwitchSubnet {
     ///
     /// # Errors
     ///
-    /// Returns [`NetError::SubnetExhausted`] for a prefix outside `8..=29`. A
+    /// Returns [`NetError::InvalidPrefix`] for a prefix outside `8..=29`. A
     /// prefix narrower than /29 has no room for the reserved
     /// network/gateway/host-alias/broadcast addresses plus a PTask address. A
     /// prefix wider than /8 lets the high octet vary, which
     /// [`MacAddr::for_switch_ip`] does not fold into the derived MAC, so two
     /// addresses differing only in that octet would collide.
     pub fn new(base: Ipv4Addr, prefix: u8) -> Result<Self, NetError> {
-        let s = Self { base, prefix };
         // Reserve four addresses (network, gateway, host-alias, broadcast): a
         // /29 (8 addresses) leaves four allocatable hosts, a /30 (4) leaves
         // none, so anything narrower than /29 has no room for a PTask. The lower
@@ -160,9 +166,9 @@ impl SwitchSubnet {
         // prefix (/8 or narrower). An out-of-range prefix is a misconfiguration,
         // not runtime exhaustion, so it is reported as InvalidPrefix.
         if !(8..=29).contains(&prefix) {
-            return Err(NetError::SubnetExhausted(s));
+            return Err(NetError::InvalidPrefix(prefix));
         }
-        Ok(s)
+        Ok(Self { base, prefix })
     }
 
     fn mask(self) -> u32 {
@@ -675,9 +681,11 @@ mod tests {
 
     #[test]
     fn subnet_rejects_overly_narrow_prefix() {
+        // /30 is a misconfiguration (no room for a PTask), not an exhausted
+        // valid subnet — so the distinct InvalidPrefix error is returned.
         assert!(matches!(
             SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 30),
-            Err(NetError::SubnetExhausted(_))
+            Err(NetError::InvalidPrefix(30))
         ));
     }
 
@@ -687,7 +695,7 @@ mod tests {
         // does not cover, so the constructor rejects it to keep MACs unique.
         assert!(matches!(
             SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 7),
-            Err(NetError::SubnetExhausted(_))
+            Err(NetError::InvalidPrefix(7))
         ));
     }
 

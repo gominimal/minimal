@@ -554,6 +554,33 @@ async fn cmd_ssh_forward(global: &GlobalArgs, args: SshForwardArgs) -> Result<()
     let sock = client::resolve_socket_path(global.minimal_dir.as_deref())
         .map_err(|e| eprintln!("Failed to resolve daemon socket path: {e}"))?;
 
+    // Look up the session to validate it exists and to obtain its UUID for the
+    // server-side auth gate (passed as the SSH username so `direct-tcpip` can
+    // verify the session without a per-channel env handshake).
+    use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
+    let mut daemon_client = client::Client::connect(&sock)
+        .await
+        .map_err(|e| eprintln!("Failed to connect to minimald: {e}"))?;
+
+    let lookup = if let Ok(id) = sessions::SessionId::parse_str(&args.session) {
+        GetSessionRecordRequest::Id(id)
+    } else {
+        GetSessionRecordRequest::Name(args.session.clone())
+    };
+
+    let resp = daemon_client
+        .oneshot_rpc::<GetSessionRecord>(lookup)
+        .await
+        .map_err(|e| eprintln!("GetSessionRecord RPC failed: {e}"))?;
+
+    let record = match resp.record {
+        Some(r) => r,
+        None => {
+            eprintln!("No session found matching '{}'", args.session);
+            return Err(());
+        }
+    };
+
     // Validate the forward spec format: local:remote_host:remote_port.
     // We accept either `local_port:host:port` (3 components, last two joined by
     // the final colon) or the more compact form where host is an IPv4 address.
@@ -578,14 +605,18 @@ async fn cmd_ssh_forward(global: &GlobalArgs, args: SshForwardArgs) -> Result<()
         shell_quote(&sock.display().to_string()),
     );
 
-    // Use `-N` (no command) and `-f` (background) so the tunnel stays alive.
-    // `-o ExitOnForwardFailure=yes` makes ssh exit immediately if the local
-    // port cannot be bound rather than silently succeeding without a tunnel.
+    let session_id = record.id.to_string();
+    // Use `-N` (no command) so the foreground ssh keeps the tunnel alive after
+    // `exec()` replaces this process. `-o ExitOnForwardFailure=yes` makes ssh
+    // exit immediately if the local port cannot be bound rather than silently
+    // succeeding without a tunnel.
     let mut ssh = std::process::Command::new("ssh");
     ssh.args([
         "-L",
         &forward_arg,
         "-N",
+        "-l",
+        &session_id,
         "-o",
         "ExitOnForwardFailure=yes",
         "-o",
@@ -652,8 +683,20 @@ async fn cmd_login(global: &GlobalArgs, args: LoginArgs) -> Result<(), ()> {
 
     std::fs::write(&client_cert_path, cert_resp.cert_pem.as_bytes())
         .map_err(|e| eprintln!("writing {}: {e}", client_cert_path.display()))?;
-    std::fs::write(&client_key_path, cert_resp.key_pem.as_bytes())
-        .map_err(|e| eprintln!("writing {}: {e}", client_key_path.display()))?;
+    {
+        use std::io::Write as _;
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut f = opts
+            .open(&client_key_path)
+            .map_err(|e| eprintln!("writing {}: {e}", client_key_path.display()))?;
+        f.write_all(cert_resp.key_pem.as_bytes())
+            .map_err(|e| eprintln!("writing {}: {e}", client_key_path.display()))?;
+    }
     std::fs::write(&ca_cert_path, cert_resp.ca_cert_pem.as_bytes())
         .map_err(|e| eprintln!("writing {}: {e}", ca_cert_path.display()))?;
 

@@ -227,7 +227,7 @@ async fn serve_get_session_policy(s: ServerStateHandle, c: RuChannel<Msg>) {
 }
 
 /// Signs a fresh client certificate for the `minimal login` flow and returns
-/// the cert DER, key DER, and CA cert DER so the client can authenticate to
+/// the cert PEM, key PEM, and CA cert PEM so the client can authenticate to
 /// the HTTPS reverse proxy. Only compiled when the `networking-proxy` feature
 /// is enabled.
 #[cfg(feature = "networking-proxy")]
