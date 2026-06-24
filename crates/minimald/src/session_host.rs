@@ -703,7 +703,13 @@ async fn attach_own_ip(
                 Ok(exposed) => exposed,
                 Err(e) => {
                     drop(relay);
-                    let _ = switch.lock().await.detach().await;
+                    if let Err(det_err) = switch.lock().await.detach().await {
+                        tracing::warn!(
+                            error = %det_err,
+                            ingress_err = %e,
+                            "detaching OwnIp PTask from switch during ingress-apply rollback"
+                        );
+                    }
                     return Err(e);
                 }
             }
