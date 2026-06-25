@@ -37,13 +37,18 @@ fn run_vmm() -> Result<()> {
     use anyhow::Context as _;
 
     use crate::cmd::{MARKER_SOCK_ENV, VSOCK_MARKER_PORT};
-    use crate::image::{resolve_initramfs_path, resolve_kernel_path, resolve_rootfs_path};
+    use crate::image::{
+        resolve_cache_path, resolve_initramfs_path, resolve_kernel_path, resolve_rootfs_path,
+    };
     use crate::krun::Context;
     use crate::vm::VmConfig;
 
     let kernel = resolve_kernel_path().context("resolving kernel path")?;
     let rootfs = resolve_rootfs_path().context("resolving rootfs path")?;
     let initramfs = resolve_initramfs_path().context("resolving initramfs path")?;
+    // Optional: a seeded-cache disk attached as /dev/vdb when MINVMD_CACHE_PATH
+    // is set; absent means the guest boots without an offline cache.
+    let cache_path = resolve_cache_path();
     let marker_sock = std::env::var(MARKER_SOCK_ENV).with_context(|| {
         format!("reading {MARKER_SOCK_ENV}: VMM child must be spawned by `minvmd boot`")
     })?;
@@ -54,7 +59,7 @@ fn run_vmm() -> Result<()> {
     // penalty. (Stay below the kernel's CONFIG_NR_CPUS.) The boot command may
     // expose these as flags in a future change. `apply` configures the kernel +
     // initramfs, the ext4 root disk, and the vsock bridge.
-    let cfg = VmConfig::new(2, 1024, kernel, rootfs, initramfs);
+    let cfg = VmConfig::new(2, 1024, kernel, rootfs, initramfs).with_cache_path(cache_path);
     cfg.apply(&mut ctx)
         .context("applying VmConfig to krun context")?;
 

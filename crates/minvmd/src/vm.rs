@@ -53,6 +53,10 @@ pub struct VmConfig {
     /// `/init` (minimald as pid-1), instead of booting a block-device root. This
     /// is how minimald is shipped as pid-1 without baking it into the rootfs.
     pub initramfs: PathBuf,
+    /// Optional seeded-cache ext4 image attached as a second block device
+    /// (`/dev/vdb`); the guest mounts it at its cache dir so session sandboxes
+    /// compose offline. `None` means no cache disk is attached.
+    pub cache_path: Option<PathBuf>,
     /// How this VM attaches to the per-host gvproxy switch (R1.5). Defaults to
     /// [`NetworkMode::HostNet`]; an `OwnIp` VM is wired to the switch as a
     /// client via the per-PTask vsock shuttle.
@@ -82,7 +86,16 @@ impl VmConfig {
             initramfs,
             network_mode: NetworkMode::default(),
             vm_egress: None,
+            cache_path: None,
         }
+    }
+
+    /// Attach a seeded-cache disk image as a second block device, consuming and
+    /// returning `self`. `None` leaves the VM without a cache disk.
+    #[must_use]
+    pub fn with_cache_path(mut self, cache_path: Option<PathBuf>) -> Self {
+        self.cache_path = cache_path;
+        self
     }
 
     /// Set the VM network mode (R1.5), consuming and returning `self`.
@@ -194,6 +207,14 @@ impl VmConfig {
             crate::krun::DiskFormat::Raw,
             true,
         )?;
+        // Optional seeded-cache disk (/dev/vdb): a populated minimal cache the
+        // guest mounts at its cache dir so session sandboxes compose offline.
+        // Read-write (v1) so mctx can create cache subdirs / lockfiles and a
+        // user can add packages within the session; writes persist to the host
+        // image file (fine with a single VM).
+        if let Some(cache_path) = &self.cache_path {
+            ctx.add_disk("cache", cache_path, crate::krun::DiskFormat::Raw, false)?;
+        }
         // Network attachment (R1.5): the VM joins the per-host gvproxy switch
         // supervised by `crate::net` according to `network_mode`. The libkrun
         // device wiring (tap fd handed to gvproxy over the per-PTask vsock

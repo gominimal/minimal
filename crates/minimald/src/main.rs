@@ -181,6 +181,12 @@ pub struct ListenArgs {
     #[arg(long)]
     #[clap(hide = true)]
     mount_rootfs: Option<String>,
+
+    /// Mounts the given device (a seeded minimal cache, ext4) at the guest cache
+    /// dir so session sandboxes compose offline. Applied after `mount_rootfs`.
+    #[arg(long)]
+    #[clap(hide = true)]
+    mount_cache: Option<String>,
 }
 
 /// An error at the top level of minimald.
@@ -234,9 +240,20 @@ async fn async_main() -> Result<(), MainError> {
                 vsock: true,
                 mount_dev: true,
                 mount_rootfs: Some("/dev/vda".to_string()),
+                // Second block device (minvmd attaches the seeded cache here);
+                // mounting a missing device is non-fatal (logged below).
+                mount_cache: Some("/dev/vdb".to_string()),
             }),
             global_args: GlobalArgs {
-                minimal_state_dir: Some(DaemonAbsPath::try_new("/run/minimal").unwrap().into()),
+                // State lives on the SAME filesystem as the cache (the seeded
+                // cache disk mounted at /run/minimal/cache). The session
+                // compose hardlinks package files from `cache/built` into the
+                // sandbox rootfs under `state/...`; hardlinks cannot cross
+                // filesystems, so co-locating state on the cache disk keeps
+                // them cheap (vs. copying the whole closure into RAM/tmpfs).
+                minimal_state_dir: Some(
+                    DaemonAbsPath::try_new("/run/minimal/cache").unwrap().into(),
+                ),
                 minimal_cache_dir: Some(
                     DaemonAbsPath::try_new("/run/minimal/cache").unwrap().into(),
                 ),
@@ -272,6 +289,16 @@ async fn async_main() -> Result<(), MainError> {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
+    }
+
+    // After entering the rootfs, mount the optional seeded-cache disk at the
+    // guest cache dir. A missing/absent disk is non-fatal: the session compose
+    // then falls back to building from scratch (and fails offline as before),
+    // so booting without a cache disk still works.
+    if let Some(cache_dev) = &listen_args.mount_cache
+        && let Err(e) = guest::mount_cache(cache_dev)
+    {
+        tracing::warn!(error = %e, device = %cache_dev, "no seeded cache disk mounted");
     }
 
     if let Err(e) = std::fs::create_dir_all(cli.minimal_state_dir())

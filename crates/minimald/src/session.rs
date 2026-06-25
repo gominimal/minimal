@@ -296,6 +296,10 @@ impl<S: SessionObject> Session<S> {
             .with_repo_dir(wsp.as_utf8_path())
             .with_cache_dir(self.minimal_cache_dir.as_utf8_path())
             .with_state_dir(self.minimal_state_dir.as_utf8_path())
+            // The guest has no network: compose must resolve entirely from the
+            // seeded cache disk. Offline turns a VCS/source cache miss into a
+            // clean `OfflineCacheMiss` instead of a doomed git fetch.
+            .with_offline(true)
             .build()
         {
             Err(e) => Err(mctx::Error::from(e).to_string()),

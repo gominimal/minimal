@@ -109,9 +109,19 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(NEWROOT)?;
     raw_mount(device, NEWROOT, "ext4", libc::MS_RDONLY)?;
     raw_mount("devtmpfs", &format!("{NEWROOT}/dev"), "devtmpfs", 0)?;
+    // devtmpfs provides `/dev/ptmx` but not the `/dev/pts` slave directory, so
+    // `openpty(3)` (interactive session PTY) fails ENOENT without a devpts
+    // mount. Create the mountpoint on the freshly-mounted devtmpfs and mount it.
+    let devpts = format!("{NEWROOT}/dev/pts");
+    let _ = std::fs::create_dir_all(&devpts);
+    raw_mount("devpts", &devpts, "devpts", 0)?;
     raw_mount("proc", &format!("{NEWROOT}/proc"), "proc", 0)?;
     raw_mount("sysfs", &format!("{NEWROOT}/sys"), "sysfs", 0)?;
     raw_mount("tmpfs", &format!("{NEWROOT}/run"), "tmpfs", 0)?;
+    // The rootfs is mounted read-only, but hakoniwa stages its per-container
+    // mount namespace under /tmp (e.g. /tmp/hakoniwa-XXXX); without a writable
+    // /tmp the interactive session sandbox fails to spawn with EROFS.
+    raw_mount("tmpfs", &format!("{NEWROOT}/tmp"), "tmpfs", 0)?;
 
     let to_io = |_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in chroot path");
     let c_newroot = CString::new(NEWROOT).map_err(to_io)?;
@@ -137,6 +147,50 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
     }
 
     tracing::info!(device, "switched to upstream rootfs (pivot_root)");
+    Ok(())
+}
+
+/// Mount the seeded-cache block `device` (ext4, read-write) at the guest cache
+/// dir so session sandboxes compose offline from the pre-built closure.
+///
+/// Must run **after** [`enter_rootfs`] (so the chroot and the `/run` tmpfs are
+/// in place) and **before** the daemon serves. The mountpoint lives on the
+/// `/run` tmpfs, so it is created here. Read-write: mctx creates cache
+/// subdirs / lockfiles, and writes persist to the host image file.
+pub fn mount_cache(device: &str) -> std::io::Result<()> {
+    // Must match `minimal_cache_dir`/`minimal_state_dir` for the microvm init in
+    // `main.rs` (state is co-located here so package hardlinks stay on one fs).
+    const CACHE_DIR: &str = "/run/minimal/cache";
+    std::fs::create_dir_all(CACHE_DIR)?;
+    raw_mount(device, CACHE_DIR, "ext4", 0)?;
+
+    // The cache disk is a reusable, writable seeded artifact that also backs the
+    // daemon's state dir. Reset any runtime state left by a prior boot — keep
+    // only the seeded cache dirs; the host key (providers/), sandboxes, tasks,
+    // and other state are regenerated. Without this a stale/corrupt host key
+    // persisted on the image fails startup (`host_key` only regenerates on a
+    // *missing* key, not a corrupt one).
+    const SEED_KEEP: &[&str] = &["built", "vcs", "lc", "stdlib", "lost+found"];
+    if let Ok(entries) = std::fs::read_dir(CACHE_DIR) {
+        for entry in entries.flatten() {
+            if SEED_KEEP
+                .iter()
+                .any(|k| std::ffi::OsStr::new(k) == entry.file_name())
+            {
+                continue;
+            }
+            let path = entry.path();
+            let r = if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            if let Err(e) = r {
+                tracing::warn!(error = %e, path = %path.display(), "resetting stale cache-disk state");
+            }
+        }
+    }
+    tracing::info!(device, dir = CACHE_DIR, "mounted seeded cache disk");
     Ok(())
 }
 

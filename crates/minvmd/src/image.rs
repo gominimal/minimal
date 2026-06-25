@@ -64,6 +64,21 @@ pub fn resolve_rootfs_path() -> Result<PathBuf, VmError> {
     Ok(PathBuf::from(val))
 }
 
+/// Resolve the optional seeded-cache disk path from `MINVMD_CACHE_PATH`.
+///
+/// This is an ext4 image whose filesystem is a populated minimal cache
+/// (`built/`, `vcs/`, `lc/`, `stdlib/`), attached as a second block device so
+/// the guest can compose session sandboxes offline. Unlike the kernel/rootfs/
+/// initramfs vars, this one is optional: an unset or empty value means no cache
+/// disk is attached (returns `Ok(None)`), so a VM without a seeded cache still
+/// boots.
+pub fn resolve_cache_path() -> Option<PathBuf> {
+    match std::env::var("MINVMD_CACHE_PATH") {
+        Ok(val) if !val.is_empty() => Some(PathBuf::from(val)),
+        _ => None,
+    }
+}
+
 /// Resolve the initramfs path from `MINVMD_INITRAMFS`.
 ///
 /// This is the cpio initramfs whose `/init` is minimald (booted as pid-1).
