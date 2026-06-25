@@ -273,8 +273,8 @@ impl Drop for SwitchRelay {
     }
 }
 
-/// Attaches `tap_fd` to the gvproxy switch listening on `api_sock` and starts
-/// relaying frames between them.
+/// Attaches `tap_fd` to the gvproxy switch listening on `api_sock` (DM2, native
+/// Linux) and starts relaying frames between them.
 ///
 /// Spawns two background tasks — tap→switch and switch→tap — and returns a
 /// [`SwitchRelay`] handle whose lifetime keeps the attachment alive.
@@ -287,7 +287,51 @@ impl Drop for SwitchRelay {
 pub async fn attach_to_switch(tap_fd: OwnedFd, api_sock: &Path) -> io::Result<SwitchRelay> {
     let mut sock = UnixStream::connect(api_sock).await?;
     sock.write_all(CONNECT_REQUEST).await?;
+    let (sock_rx, sock_tx) = sock.into_split();
+    spawn_relay(tap_fd, sock_rx, sock_tx)
+}
 
+/// Attaches `tap_fd` to the **host** gvproxy switch over AF_VSOCK (issue #572,
+/// DM1/3/4) and starts relaying frames between them.
+///
+/// On a libkrun VM the gvproxy switch runs on the host; the guest reaches it by
+/// connecting to `cid` (CID 2 = the host) on `port`, which libkrun bridges to
+/// the host gvproxy `-listen` socket (`minvmd` registers this via
+/// `krun_add_vsock_port2(.., listen = false)`). This is the same HyperKit-framed
+/// raw-L2 relay as [`attach_to_switch`] — the shuttle is *not* a second TCP/IP
+/// stack — so exactly one gVisor stack (the host gvproxy) sits in the path.
+///
+/// # Errors
+///
+/// Returns an error if the vsock connection cannot be established, the connect
+/// request cannot be written, or the tap fd cannot be put into non-blocking
+/// mode for epoll-driven I/O.
+pub async fn attach_to_switch_vsock(
+    tap_fd: OwnedFd,
+    cid: u32,
+    port: u32,
+) -> io::Result<SwitchRelay> {
+    let mut sock =
+        tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(cid, port)).await?;
+    // `VsockStream` has an inherent (blocking, std::io) `write_all` that shadows
+    // the async trait method, so disambiguate to the tokio trait — same hazard
+    // `guest.rs` notes for `shutdown`.
+    AsyncWriteExt::write_all(&mut sock, CONNECT_REQUEST).await?;
+    let (sock_rx, sock_tx) = tokio::io::split(sock);
+    spawn_relay(tap_fd, sock_rx, sock_tx)
+}
+
+/// Wires `tap_fd` into the bidirectional frame relay against an already-connected,
+/// `/connect`-upgraded switch stream split into `sock_rx`/`sock_tx`.
+///
+/// Shared by the DM2 UDS path ([`attach_to_switch`]) and the DM1/3/4 vsock path
+/// ([`attach_to_switch_vsock`]); the relay loops are transport-agnostic
+/// (`AsyncRead`/`AsyncWrite`), so only the connect step differs.
+fn spawn_relay<R, W>(tap_fd: OwnedFd, sock_rx: R, sock_tx: W) -> io::Result<SwitchRelay>
+where
+    R: AsyncReadExt + Unpin + Send + 'static,
+    W: AsyncWriteExt + Unpin + Send + 'static,
+{
     // A tap character device does not support pread/pwrite, so `tokio::fs::File`
     // (which routes through the blocking pool via positional I/O) cannot drive
     // it. Use plain read/write in non-blocking mode with `AsyncFd` for epoll
@@ -298,7 +342,6 @@ pub async fn attach_to_switch(tap_fd: OwnedFd, api_sock: &Path) -> io::Result<Sw
     set_nonblocking(tap_file.as_raw_fd())?;
     let tap = Arc::new(AsyncFd::new(tap_file)?);
 
-    let (sock_rx, sock_tx) = sock.into_split();
     let tap_to_switch = tokio::spawn(relay_tap_to_switch(Arc::clone(&tap), sock_tx));
     let switch_to_tap = tokio::spawn(relay_switch_to_tap(sock_rx, tap));
     Ok(SwitchRelay {

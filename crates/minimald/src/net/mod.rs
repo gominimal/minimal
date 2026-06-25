@@ -53,6 +53,44 @@ pub const DEFAULT_MTU: u16 = 1500;
 /// Stable, locally-administered MAC for the switch gateway.
 pub const GATEWAY_MAC: MacAddr = MacAddr([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd]);
 
+/// AF_VSOCK CID of the host as seen from inside a libkrun guest. Well-known:
+/// `VMADDR_CID_HOST == 2`. The per-PTask shuttle dials this CID to reach the
+/// host gvproxy switch (issue #572, DM1/3/4).
+pub const VSOCK_HOST_CID: u32 = 2;
+
+/// vsock port the per-PTask shuttle connects to on the host to reach the host
+/// gvproxy switch (issue #572). Must match `minvmd`'s
+/// `net::VSOCK_GVPROXY_SHUTTLE_PORT`; libkrun bridges this guest-initiated
+/// connection to the host gvproxy `-listen` socket.
+pub const VSOCK_GVPROXY_SHUTTLE_PORT: u32 = 1024;
+
+/// How the per-host gvproxy switch is reached, selected by deployment model
+/// (issue #572).
+///
+/// On DM2 (native Linux) `minimald` owns gvproxy: it is spawned locally and
+/// PTask taps attach over its `-listen` UNIX socket. On DM1/3/4 (a libkrun VM)
+/// `minvmd` owns the host gvproxy; the in-guest `minimald` does **not** spawn
+/// gvproxy — each PTask tap attaches over an AF_VSOCK shuttle to the host
+/// switch. Keeping the two as an enum (rather than an `Option<sock>` plus a
+/// bool) makes the illegal "spawn locally *and* shuttle to host" state
+/// unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SwitchTransport {
+    /// DM2: `minimald` spawns + owns gvproxy locally; taps attach over its UNIX
+    /// control socket.
+    LocalSpawn,
+    /// DM1/3/4: gvproxy runs on the host (owned by `minvmd`); taps attach over a
+    /// vsock shuttle to `(cid, port)`. `minimald` never spawns gvproxy here.
+    HostShuttle { cid: u32, port: u32 },
+}
+
+impl Default for SwitchTransport {
+    fn default() -> Self {
+        Self::LocalSpawn
+    }
+}
+
 /// How long to wait for gvproxy's control socket to appear after spawn.
 const SOCKET_READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long to wait for gvproxy to exit after `SIGTERM` before escalating to
@@ -354,11 +392,15 @@ pub struct GvproxySwitch {
     allocator: IpAllocator,
     /// Number of attached PTasks; the switch runs while this is non-zero.
     attached: usize,
-    /// The running gvproxy child, if started.
+    /// The running gvproxy child, if started. Always `None` in
+    /// [`SwitchTransport::HostShuttle`] mode (the host owns gvproxy).
     child: Option<Child>,
     /// Signals attached PTasks when gvproxy exits unexpectedly. Replaced
     /// on each unexpected exit so new attachers get a fresh receiver.
     exit_tx: watch::Sender<bool>,
+    /// How PTask taps reach the switch (issue #572): local spawn (DM2) or a
+    /// vsock shuttle to the host gvproxy (DM1/3/4).
+    transport: SwitchTransport,
 }
 
 impl GvproxySwitch {
@@ -384,7 +426,24 @@ impl GvproxySwitch {
             attached: 0,
             child: None,
             exit_tx,
+            transport: SwitchTransport::default(),
         }
+    }
+
+    /// Sets how PTask taps reach the switch (issue #572). The DM2 default is
+    /// [`SwitchTransport::LocalSpawn`]; in a libkrun VM (DM1/3/4) the caller sets
+    /// [`SwitchTransport::HostShuttle`] so this `minimald` attaches taps to the
+    /// host-owned gvproxy over vsock instead of spawning gvproxy in-guest.
+    #[must_use]
+    pub fn with_transport(mut self, transport: SwitchTransport) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    /// How this switch's PTask taps reach the gvproxy switch (issue #572).
+    #[must_use]
+    pub fn transport(&self) -> SwitchTransport {
+        self.transport
     }
 
     /// The control socket path gvproxy listens on (host side only).
@@ -420,8 +479,13 @@ impl GvproxySwitch {
     /// Propagates config-write, spawn, and socket-readiness failures.
     pub async fn attach(&mut self) -> Result<AttachResult, NetError> {
         let lease = self.allocator.allocate()?;
-        self.write_config().await?;
-        self.ensure_running().await?;
+        // DM2 spawns + configures gvproxy locally; DM1/3/4 (HostShuttle) leaves
+        // gvproxy to `minvmd` on the host, so skip the spawn/config steps and
+        // only track the attach count (issue #572).
+        if matches!(self.transport, SwitchTransport::LocalSpawn) {
+            self.write_config().await?;
+            self.ensure_running().await?;
+        }
         self.attached += 1;
         tracing::info!(
             ip = %lease.ip,
@@ -716,5 +780,45 @@ mod tests {
         let cfg = render_gvproxy_config(SwitchSubnet::default(), &[]);
         assert!(cfg.contains("dhcpStaticLeases:"));
         assert!(cfg.contains("{}"));
+    }
+
+    #[test]
+    fn transport_defaults_to_local_spawn() {
+        let switch = GvproxySwitch::new("/usr/bin/gvproxy", "/run/minimal/gvproxy");
+        assert_eq!(switch.transport(), SwitchTransport::LocalSpawn);
+    }
+
+    #[test]
+    fn with_transport_selects_host_shuttle() {
+        let switch = GvproxySwitch::new("/usr/bin/gvproxy", "/run/minimal/gvproxy").with_transport(
+            SwitchTransport::HostShuttle {
+                cid: VSOCK_HOST_CID,
+                port: VSOCK_GVPROXY_SHUTTLE_PORT,
+            },
+        );
+        assert_eq!(
+            switch.transport(),
+            SwitchTransport::HostShuttle { cid: 2, port: 1024 }
+        );
+    }
+
+    #[tokio::test]
+    async fn host_shuttle_attach_allocates_without_spawning_gvproxy() {
+        // In HostShuttle mode `minvmd` owns gvproxy, so `attach` must not try to
+        // spawn the (here nonexistent) binary: it allocates a lease and only
+        // tracks the attach count. A LocalSpawn switch pointed at the same
+        // missing binary would instead fail in `ensure_running`.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut switch =
+            GvproxySwitch::new("/nonexistent/gvproxy-binary", dir.path().join("gvproxy"))
+                .with_transport(SwitchTransport::HostShuttle {
+                    cid: VSOCK_HOST_CID,
+                    port: VSOCK_GVPROXY_SHUTTLE_PORT,
+                });
+
+        let result = switch.attach().await.expect("host-shuttle attach");
+        assert_eq!(result.lease.ip, Ipv4Addr::new(100, 64, 0, 2));
+        // No gvproxy child was spawned; detach just decrements the count.
+        switch.detach().await.expect("detach");
     }
 }

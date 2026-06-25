@@ -654,12 +654,15 @@ async fn attach_own_ip(
     netns_pid: u32,
     ingress: Option<&sessions::IngressPolicy>,
 ) -> io::Result<OwnIpAttachment> {
-    use crate::net::switch::{attach_to_switch, move_tap_into_netns, open_tap};
+    use crate::net::SwitchTransport;
+    use crate::net::switch::{
+        attach_to_switch, attach_to_switch_vsock, move_tap_into_netns, open_tap,
+    };
 
     // Allocate a lease and ensure gvproxy is running, snapshotting the control
-    // socket and subnet under one lock; the slow tap/relay work runs unlocked so
-    // concurrent attaches don't serialize on the namespace plumbing.
-    let (lease, sock, subnet) = {
+    // socket, subnet, and transport under one lock; the slow tap/relay work runs
+    // unlocked so concurrent attaches don't serialize on the namespace plumbing.
+    let (lease, sock, subnet, transport) = {
         let mut s = switch.lock().await;
         let attach = s
             .attach()
@@ -668,7 +671,7 @@ async fn attach_own_ip(
         // gvproxy's unexpected-exit closes the control socket, which ends the
         // relay's switch-side read on its own, so the relay self-terminates; we
         // do not additionally watch `attach.exit_signal` here.
-        (attach.lease, s.control_socket(), s.subnet())
+        (attach.lease, s.control_socket(), s.subnet(), s.transport())
     };
 
     // A locally-administered tap name unique within the switch /16 (its low two
@@ -682,7 +685,16 @@ async fn attach_own_ip(
     let relay = match async {
         let tap_fd = open_tap(&tap)?;
         move_tap_into_netns(&tap, netns_pid, lease, subnet).await?;
-        attach_to_switch(tap_fd, &sock).await
+        // DM2 attaches the tap to the local gvproxy `-listen` socket; DM1/3/4
+        // (HostShuttle) relays the tap's raw frames over vsock to the host
+        // gvproxy `minvmd` owns (issue #572). Both are the same HyperKit-framed
+        // L2 relay — one gVisor stack in the path either way.
+        match transport {
+            SwitchTransport::LocalSpawn => attach_to_switch(tap_fd, &sock).await,
+            SwitchTransport::HostShuttle { cid, port } => {
+                attach_to_switch_vsock(tap_fd, cid, port).await
+            }
+        }
     }
     .await
     {
@@ -697,7 +709,26 @@ async fn attach_own_ip(
     // forwards on the switch control socket, retaining handles to remove on
     // exit. A failure here rolls the whole attach back (drop the relay, then
     // detach) so a half-configured PTask is never left running.
+    //
+    // Issue #572 gap: ingress port-forwards are applied via gvproxy's HTTP API
+    // on its control socket. On DM2 that socket is local; on DM1/3/4
+    // (HostShuttle) gvproxy is on the host and its API is not reachable from the
+    // guest over the frame-only shuttle. Egress (the focus of #572) needs no
+    // such call, so for now ingress on the VM path is skipped with a warning
+    // rather than silently appearing to work — a host-side ingress API path is
+    // follow-up work.
     let exposed = match ingress {
+        Some(ingress)
+            if !ingress.port_mappings.is_empty()
+                && matches!(transport, SwitchTransport::HostShuttle { .. }) =>
+        {
+            tracing::warn!(
+                ip = %lease.ip,
+                "static ingress on a VM (DM1/3/4) own-IP PTask is not yet wired to the \
+                 host gvproxy port-forward API; egress works, ingress is skipped (issue #572)"
+            );
+            Vec::new()
+        }
         Some(ingress) if !ingress.port_mappings.is_empty() => {
             match crate::net::policy::apply_ingress(&sock, lease.ip, ingress).await {
                 Ok(exposed) => exposed,

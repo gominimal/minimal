@@ -299,6 +299,10 @@ async fn async_main() -> Result<(), MainError> {
         minimal_state_dir: cli.minimal_state_dir(),
         minimal_cache_dir: cli.minimal_cache_dir(),
         gvproxy_bin: None,
+        // The vsock listen path is exactly the libkrun-VM (DM1/3/4) case: an
+        // `OwnIp` PTask must attach to the host gvproxy over the vsock shuttle,
+        // not spawn gvproxy in-guest (issue #572). The UDS path is DM2.
+        in_microvm: listen_args.vsock,
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     russh::keys::known_hosts::learn_known_hosts_path(

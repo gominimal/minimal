@@ -43,6 +43,12 @@ pub struct Config {
     /// to [`DEFAULT_GVPROXY_BIN`] when unset.
     #[serde(default)]
     pub gvproxy_bin: Option<PathBuf>,
+    /// Whether this `minimald` runs inside a `minvmd` libkrun VM (DM1/3/4). When
+    /// `true`, `OwnIp` PTasks attach to the **host** gvproxy (owned by `minvmd`)
+    /// over a vsock shuttle instead of spawning gvproxy in-guest (issue #572).
+    /// `false` (DM2, native Linux) keeps the local-spawn + tap relay path.
+    #[serde(default)]
+    pub in_microvm: bool,
 }
 
 impl Config {
@@ -119,10 +125,24 @@ impl ServerState {
         // live under a dedicated subdir of the daemon state dir. The shared
         // `Arc` is the single source of truth, injected into every per-launch
         // `SandboxLauncher` through the sessions manager.
-        let net_switch = Arc::new(Mutex::new(crate::net::GvproxySwitch::new(
-            config.gvproxy_bin_path(),
-            minimal_state_dir.as_utf8_path().join("gvproxy"),
-        )));
+        // DM1/3/4 (in a libkrun VM): attach `OwnIp` PTasks to the host gvproxy
+        // (owned by `minvmd`) over a vsock shuttle. DM2 (native Linux): spawn +
+        // own gvproxy locally (issue #572).
+        let transport = if config.in_microvm {
+            crate::net::SwitchTransport::HostShuttle {
+                cid: crate::net::VSOCK_HOST_CID,
+                port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+            }
+        } else {
+            crate::net::SwitchTransport::LocalSpawn
+        };
+        let net_switch = Arc::new(Mutex::new(
+            crate::net::GvproxySwitch::new(
+                config.gvproxy_bin_path(),
+                minimal_state_dir.as_utf8_path().join("gvproxy"),
+            )
+            .with_transport(transport),
+        ));
 
         // Generate the TLS CA once at daemon startup so the HTTPS proxy and the
         // IssueClientCert RPC share the same trust anchor for the lifetime of
