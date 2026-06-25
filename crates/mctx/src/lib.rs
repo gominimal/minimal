@@ -29,6 +29,9 @@ pub use sandbox2::config::Invocation;
 mod mfile_search_strategy;
 pub use mfile_search_strategy::MFileSearchStrategy;
 
+mod scaffold;
+pub use scaffold::{DEFAULT_PKGS, DEFAULT_PKGS_BRANCH, generate_mfile, scaffold_default_mfile};
+
 pub use env::Env;
 use tokio::sync::Semaphore;
 use toml_edit::{Array, DocumentMut, Item, TableLike, Value};

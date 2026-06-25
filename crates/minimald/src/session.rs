@@ -292,15 +292,21 @@ impl<S: SessionObject> Session<S> {
 
     fn context(&mut self) -> Result<mctx::Context, String> {
         let wsp = self.session.workspace_path();
-        match ConfigBuilder::new()
+        let config = ConfigBuilder::new()
             .with_repo_dir(wsp.as_utf8_path())
             .with_cache_dir(self.minimal_cache_dir.as_utf8_path())
             .with_state_dir(self.minimal_state_dir.as_utf8_path())
             .build()
-        {
-            Err(e) => Err(mctx::Error::from(e).to_string()),
-            Ok(c) => mctx::Context::new(c).map_err(|e| e.to_string()),
+            .map_err(|e| mctx::Error::from(e).to_string())?;
+
+        // An empty session workspace has no minimal.toml, which would make
+        // Context::new fail. Scaffold a default shell one (pinned to the latest
+        // gominimal/pkgs @main commit) so the session can launch.
+        if !wsp.as_utf8_path().join(mfile::MFILE_NAME).exists() {
+            mctx::scaffold_default_mfile(&config, wsp.as_utf8_path()).map_err(|e| e.to_string())?;
         }
+
+        mctx::Context::new(config).map_err(|e| e.to_string())
     }
     fn paths(&self) -> SessionPaths {
         SessionPaths {
