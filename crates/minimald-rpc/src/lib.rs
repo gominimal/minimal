@@ -377,6 +377,106 @@ impl OneshotSshRpc for IssueClientCert {
     type Response = Errorable<IssueClientCertResponse>;
 }
 
+// ---------------------------------------------------------------------------
+// WireGuard mesh status (Unit 4: R4.6).
+//
+// These types are the wire contract for `minimal mesh status` and carry no
+// WireGuard dependency, so they compile in every build regardless of the
+// daemon's `networking-wg` feature. A daemon built without the feature answers
+// with `configured = false`.
+// ---------------------------------------------------------------------------
+
+/// One peer's entry in a [`MeshStatus`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MeshPeerStatus {
+    /// The peer's configured name.
+    pub name: String,
+    /// The peer's WireGuard public key, base64-encoded.
+    pub public_key: String,
+    /// The peer's UDP endpoint (`host:port`), if known.
+    pub endpoint: Option<String>,
+    /// Seconds since the last completed handshake with this peer, or `None` if
+    /// no handshake has completed.
+    pub last_handshake_secs: Option<u64>,
+}
+
+impl MeshPeerStatus {
+    /// Builds a peer status entry. The struct is `#[non_exhaustive]`, so the
+    /// daemon (a different crate) constructs it through this constructor.
+    #[must_use]
+    pub fn new(
+        name: String,
+        public_key: String,
+        endpoint: Option<String>,
+        last_handshake_secs: Option<u64>,
+    ) -> Self {
+        Self {
+            name,
+            public_key,
+            endpoint,
+            last_handshake_secs,
+        }
+    }
+}
+
+/// The current WireGuard mesh state, as returned by [`GetMeshStatus`] (R4.6).
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MeshStatus {
+    /// Whether a WireGuard mesh is configured and running. `false` when the
+    /// daemon was built without the `networking-wg` feature or no mesh config
+    /// is present.
+    pub configured: bool,
+    /// This node's WireGuard public key, base64-encoded; `None` when not
+    /// configured.
+    pub own_public_key: Option<String>,
+    /// The subnets this node advertises to the mesh (subnet-router model),
+    /// rendered as CIDR strings.
+    pub advertised_subnets: Vec<String>,
+    /// The configured peers and their last-handshake state.
+    pub peers: Vec<MeshPeerStatus>,
+}
+
+impl MeshStatus {
+    /// Builds a configured mesh status. The struct is `#[non_exhaustive]`, so
+    /// the daemon constructs it through this constructor.
+    #[must_use]
+    pub fn new(
+        own_public_key: String,
+        advertised_subnets: Vec<String>,
+        peers: Vec<MeshPeerStatus>,
+    ) -> Self {
+        Self {
+            configured: true,
+            own_public_key: Some(own_public_key),
+            advertised_subnets,
+            peers,
+        }
+    }
+
+    /// The status reported when no mesh is configured, or the daemon was built
+    /// without the `networking-wg` feature.
+    #[must_use]
+    pub fn unconfigured() -> Self {
+        Self {
+            configured: false,
+            own_public_key: None,
+            advertised_subnets: Vec::new(),
+            peers: Vec::new(),
+        }
+    }
+}
+
+/// An RPC to read the current WireGuard mesh status (R4.6).
+pub struct GetMeshStatus;
+
+impl OneshotSshRpc for GetMeshStatus {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetMeshStatus");
+    type Request<'a> = ();
+    type Response = MeshStatus;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

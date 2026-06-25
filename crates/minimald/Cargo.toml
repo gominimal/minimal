@@ -8,6 +8,10 @@ publish.workspace = true
 # Enables the B8 HTTPS reverse proxy with mTLS termination (R4.4–R4.7) in front
 # of the shared B5 routing core. Requires the rustls/rcgen/tokio-rustls deps.
 networking-proxy = ["dep:rcgen", "dep:rustls", "dep:tokio-rustls"]
+# WireGuard mesh peer and its CLI/RPC plumbing (Unit 4). Off by default so the
+# default `minimald` build pulls in no WireGuard code and pays no binary-size or
+# startup cost (R4.7); enable with `--features networking-wg`.
+networking-wg = ["dep:boringtun", "dep:base64", "dep:rand_core"]
 
 [dependencies]
 async-compression.workspace = true
@@ -36,6 +40,11 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# WireGuard mesh peer (Unit 4, R4.1/R4.7): compiled only under `networking-wg`.
+base64 = { workspace = true, optional = true }
+boringtun = { workspace = true, optional = true }
+rand_core = { workspace = true, optional = true }
+
 args.workspace = true
 check.workspace = true
 common.workspace = true
@@ -53,6 +62,12 @@ stdlib.workspace = true
 rcgen = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The two-namespace UC7 mesh integration test (`tests/mesh_uc7.rs`) drives a
+# tokio runtime and `setns(2)` directly.
+libc.workspace = true
+tokio.workspace = true
 
 # The guest (initramfs pid-1) boot path is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]
