@@ -156,7 +156,7 @@ pub fn ensure_daemon_running(use_minvmd: bool, minimal_dir: Option<&Path>) -> io
     }
     let sock = crate::client::resolve_socket_path(minimal_dir, false)
         .map_err(|e| io::Error::other(format!("resolving native minimald socket path: {e}")))?;
-    ensure_minimald_running(&sock)
+    ensure_minimald_running(&sock, minimal_dir)
 }
 
 /// On targets without an auto-spawn backend, this is a no-op.
@@ -171,7 +171,7 @@ pub fn ensure_daemon_running(use_minvmd: bool, minimal_dir: Option<&Path>) -> io
 /// (setsid) and only returns once it is listening, so this fail-fasts on a
 /// non-zero exit.
 #[cfg(target_os = "linux")]
-fn ensure_minimald_running(socket_path: &Path) -> io::Result<()> {
+fn ensure_minimald_running(socket_path: &Path, minimal_dir: Option<&Path>) -> io::Result<()> {
     use std::os::unix::net::UnixStream;
 
     if UnixStream::connect(socket_path).is_ok() {
@@ -180,7 +180,15 @@ fn ensure_minimald_running(socket_path: &Path) -> io::Result<()> {
     }
 
     tracing::info!("spawning native minimald run --detach");
-    let output = Command::new("minimald")
+    // Forward the state-dir override so the spawned daemon binds the same socket
+    // `resolve_socket_path` resolved above; otherwise minimald would default to
+    // `$XDG_STATE_HOME/minimal` and the CLI would later connect to the override
+    // socket and fail. minimald's flag is `--minimal-state-dir`.
+    let mut cmd = Command::new("minimald");
+    if let Some(dir) = minimal_dir {
+        cmd.arg("--minimal-state-dir").arg(dir);
+    }
+    let output = cmd
         .args(["run", "--detach", "--instance-num", "0"])
         .output()
         .map_err(|e| io::Error::new(e.kind(), format!("failed to spawn minimald: {e}")))?;

@@ -319,6 +319,15 @@ async fn async_main() -> Result<(), MainError> {
     // wait until the SSH socket is accepting connections, then return so the
     // caller (the `minimal` CLI autospawn) gets a clean ready/timeout result.
     if listen_args.detach {
+        // `spawn_detached` polls `cli.listen_on()` (a UDS) for readiness, but a
+        // `--vsock` child binds the vsock listener instead, so the UDS never
+        // appears and the parent would always hit the 8s timeout while leaving a
+        // detached child running. Reject the combination up front.
+        if listen_args.vsock {
+            return Err(MainError::Other(
+                "--detach is only supported for Unix-socket listeners (not --vsock)".to_string(),
+            ));
+        }
         return spawn_detached(&cli);
     }
 
