@@ -5,7 +5,7 @@ use minimald_rpc::{
     GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
     GetSessionRecordRequest, GetSessionRecordResponse, GetVersion, GetVersionResponse,
     IssueClientCert, IssueClientCertRequest, ListSessions, ListSessionsEntry, ListSessionsResponse,
-    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse,
+    OneshotSshRpc, RenameSession, RenameSessionResponse,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -280,8 +280,7 @@ async fn serve_get_mesh_status(s: ServerStateHandle, c: RuChannel<Msg>) {
     }
 }
 
-pub(crate) const STREAM_WORKSPACE_FILES: &str =
-    constcat::concat!(RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst");
+pub(crate) use minimald_rpc::STREAM_WORKSPACE_FILES;
 
 async fn serve_stream_workspace_files(
     s: ServerStateHandle,

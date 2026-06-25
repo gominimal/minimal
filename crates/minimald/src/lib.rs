@@ -16,9 +16,10 @@ mod sftp;
 #[cfg(test)]
 mod test_harness;
 
-/// Env var that the client must set (via `env_request`) before the SFTP
-/// subsystem request, naming which session the SFTP channel attaches to.
-const MINIMAL_SESSION_ID_ENV: &str = "MINIMAL_SESSION_ID";
+/// Env var that the client must set (via `env_request`) before a
+/// session-scoped subsystem request, naming which session the channel attaches
+/// to. Re-exported from the wire-contract crate so client and server agree.
+pub(crate) use minimald_rpc::MINIMAL_SESSION_ID_ENV;
 
 /// Represents the parameters of a requested PTY.
 #[derive(Debug, Clone)]

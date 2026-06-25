@@ -76,6 +76,7 @@ google-cloud-storage = "1.7"
 hakoniwa = { git = "https://github.com/souk4711/hakoniwa.git", rev = "41ce36e087fa1fcf28d17123042d150e71c09705", features = ["cgroups"] }
 http-body = "1"
 hex = "0.4"
+ignore = "0.4"
 indicatif = "0.18"
 indoc = "^2.0"
 jaq-all = "0.2.0"

@@ -2608,6 +2608,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ignore"
+version = "0.4.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b915661dd01db3f05050265b2477bcc6527b3792388e2749b41623cc592be67d"
+dependencies = [
+ "crossbeam-deque",
+ "globset",
+ "log",
+ "memchr",
+ "regex-automata",
+ "same-file",
+ "walkdir",
+ "winapi-util",
+]
+
+[[package]]
 name = "imbl-sized-chunks"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3464,11 +3480,14 @@ dependencies = [
 name = "minimal2"
 version = "0.0.1"
 dependencies = [
+ "async-compression",
+ "async-tar",
  "camino",
  "chrono",
  "clap",
  "clap_complete",
  "dirs",
+ "ignore",
  "minimald-rpc",
  "minvmd",
  "ot",
@@ -3477,9 +3496,12 @@ dependencies = [
  "serde",
  "serde_json",
  "sessions",
+ "tar",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zstd",
 ]
 
 [[package]]

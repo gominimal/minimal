@@ -434,6 +434,8 @@ async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), ()>
 
     let project_path = std::fs::canonicalize(&args.path)
         .map_err(|e| eprintln!("Cannot resolve project path '{}': {e}", args.path))?;
+    // Retained for the copy-on-activate workspace upload below.
+    let project_dir = project_path.clone();
 
     let utf8_path = camino::Utf8PathBuf::from_path_buf(project_path)
         .map_err(|_| eprintln!("Project path is not valid UTF-8"))?;
@@ -493,6 +495,16 @@ async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), ()>
     };
 
     println!("{}", created.id);
+
+    // Copy-on-activate: stream the project into the session worktree so the
+    // interactive shell (mctx) finds minimal.toml and the project files.
+    if let Err(e) = client
+        .upload_workspace(&created.id.to_string(), &project_dir)
+        .await
+    {
+        eprintln!("Failed to upload workspace to session: {e}");
+        return Err(());
+    }
 
     if args.attach {
         // Chain into attach.

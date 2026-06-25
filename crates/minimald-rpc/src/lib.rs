@@ -17,6 +17,19 @@ pub use sessions::{EgressPolicy, IngressPolicy, IpProto, NetworkMode, PortMappin
 
 pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
 
+/// Channel env-var naming the session a subsystem request operates on. Set on
+/// the SSH channel before requesting a session-scoped subsystem (e.g. the
+/// workspace upload), and read server-side from the channel config.
+pub const MINIMAL_SESSION_ID_ENV: &str = "MINIMAL_SESSION_ID";
+
+/// Subsystem name for streaming a session's workspace as a zstd-compressed tar.
+/// The client opens this subsystem (with [`MINIMAL_SESSION_ID_ENV`] set),
+/// writes the `tar.zst` bytes, and half-closes; the server unpacks them into
+/// the session's workspace directory. Errors come back on the channel's
+/// extended-data (stderr) stream.
+pub const STREAM_WORKSPACE_FILES: &str =
+    constcat::concat!(RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst");
+
 /// Describes a minimal-specific RPC method sent over ssh.
 ///
 /// Oneshot RPCs are not streaming. The trait pairs a subsystem name with its

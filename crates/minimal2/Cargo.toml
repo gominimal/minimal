@@ -5,11 +5,14 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+async-compression.workspace = true
+async-tar.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 camino.workspace = true
 chrono.workspace = true
 dirs.workspace = true
+ignore.workspace = true
 minimald-rpc.workspace = true
 paths.workspace = true
 russh.workspace = true
@@ -22,3 +25,8 @@ tracing-subscriber.workspace = true
 
 minvmd = { path = "../minvmd" }
 ot.workspace = true
+
+[dev-dependencies]
+tar.workspace = true
+tempfile.workspace = true
+zstd.workspace = true
