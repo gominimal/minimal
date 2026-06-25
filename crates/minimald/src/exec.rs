@@ -374,6 +374,245 @@ impl Process for TokioProcess {
     }
 }
 
+/// Production [`Exec`] for a plain `attach --command <cmd>` request: runs the
+/// argv through `/bin/sh -c` *inside the session's PTask sandbox* — a
+/// `sandbox2`/`hakoniwa` container honouring the session's [`NetworkMode`] —
+/// rather than as a bare host process.
+///
+/// The sandbox is built exactly like the interactive shell launcher
+/// ([`crate::session_host::SandboxLauncher::launch`]) via the shared
+/// [`build_session_env`](crate::session_host::build_session_env) helper, so a
+/// command sees the same rootfs and network namespace an interactive attach
+/// would. A fresh sandbox is built per command (there is no persistent PTask to
+/// reuse yet); that is acceptable for the one-shot exec path.
+///
+/// For [`NetworkMode::OwnIp`] the freshly-unshared network namespace is wired
+/// onto the per-host gvproxy switch (the same `attach_own_ip` the launcher
+/// uses), and the resulting attachment is held alongside `env` for the
+/// command's whole lifetime.
+///
+/// The struct is compiled in all configs so its record→sandbox wiring can be
+/// unit-tested; only the [`Exec`] impl (which builds a real sandbox) is gated
+/// to production, since the sandbox package set is unavailable under test.
+// Under test the `Exec` impl below is not compiled, so the fields the producer
+// reads (argv/name/username/ingress/net_switch) look unused; the wiring is
+// still exercised by `plain_command_carries_session_network_mode`.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) struct SandboxedExec {
+    /// The shell command line, run as `/bin/sh -c <argv>`.
+    pub argv: String,
+    /// Display name for the sandbox env (derived from the session record).
+    pub name: String,
+    /// Username for the sandbox env; `None` falls back to the env default.
+    pub username: Option<String>,
+    /// The session's network isolation mode, applied to the sandbox.
+    pub network_mode: sessions::NetworkMode,
+    /// Static ingress port mappings to expose on the switch for an `OwnIp`
+    /// command, removed when it exits. `None`/empty for other modes.
+    pub ingress: Option<sessions::IngressPolicy>,
+    /// The daemon-scoped gvproxy switch, used to attach an `OwnIp` command's
+    /// namespace. Ignored for `HostNet`/`NoNet`.
+    pub net_switch: std::sync::Arc<tokio::sync::Mutex<crate::net::GvproxySwitch>>,
+}
+
+impl SandboxedExec {
+    /// Builds the sandboxed exec config from the target session's record and the
+    /// per-host switch, deriving the env name the way the launcher does and
+    /// carrying the record's network mode + static ingress so the command runs
+    /// under the same policy an interactive attach would.
+    pub(crate) fn from_record(
+        argv: String,
+        record: &sessions::Record,
+        net_switch: std::sync::Arc<tokio::sync::Mutex<crate::net::GvproxySwitch>>,
+    ) -> Self {
+        let name = record.name.clone().unwrap_or_else(|| {
+            record
+                .project_path
+                .file_name()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "session".to_string())
+        });
+        Self {
+            argv,
+            name,
+            username: record.username.clone(),
+            network_mode: record.network,
+            // Ingress is only carried for `OwnIp`; `validate_policy` (run at
+            // create/launch time) rejects it on any other mode.
+            ingress: record.policy.ingress.clone(),
+            net_switch,
+        }
+    }
+}
+
+#[cfg(not(test))]
+impl Exec for SandboxedExec {
+    type Process = HakoniwaProcess;
+
+    fn exec(self, session: SessionHandle) -> BoxStream<'static, io::Result<Self::Process>> {
+        // Same 1-slot pull protocol as `TaskExec`: the producer only spawns the
+        // child once the consumer pulls, and parks afterwards so `env` and the
+        // `OwnIp` switch attachment outlive the running child.
+        let (req_tx, req_rx) = mpsc::channel::<()>(1);
+        let (proc_tx, proc_rx) = mpsc::channel::<io::Result<HakoniwaProcess>>(1);
+
+        tokio::spawn(sandboxed_producer(self, session, req_rx, proc_tx));
+
+        stream::unfold((req_tx, proc_rx), |(req_tx, mut proc_rx)| async move {
+            req_tx.send(()).await.ok()?;
+            let item = proc_rx.recv().await?;
+            Some((item, (req_tx, proc_rx)))
+        })
+        .boxed()
+    }
+}
+
+/// Producer side of [`SandboxedExec::exec`]. Builds the session sandbox, spawns
+/// `/bin/sh -c <argv>` in it with piped stdio, optionally attaches the
+/// namespace to the gvproxy switch for `OwnIp`, then parks until the consumer
+/// drops the stream — keeping `env` (the sandbox rootfs files) and the `OwnIp`
+/// attachment alive for the child's whole lifetime, mirroring the launcher's
+/// `(env, own_ip)` guard ownership.
+#[cfg(not(test))]
+async fn sandboxed_producer(
+    exec: SandboxedExec,
+    session: SessionHandle,
+    mut req_rx: mpsc::Receiver<()>,
+    proc_tx: mpsc::Sender<io::Result<HakoniwaProcess>>,
+) {
+    let outcome: io::Result<()> = async {
+        let ctx = session.context().await.map_err(io::Error::other)?;
+        let paths = session.paths().await;
+
+        // Build the sandbox env exactly like the interactive launcher.
+        let mut env = crate::session_host::build_session_env(
+            ctx,
+            exec.name,
+            exec.username.unwrap_or_else(|| "user".to_string()),
+            paths,
+            exec.network_mode,
+        )
+        .await?;
+
+        // Unlike the interactive shell launcher, this one-shot command runs with
+        // piped (non-PTY) stdio, so the container is NOT made a session leader:
+        // `set_session_leader` acquires a controlling TTY (`TIOCSCTTY`), which
+        // fails with `ENOTTY` on a pipe. The `min run` path (`task_producer`)
+        // omits it for the same reason.
+        let container = env.container()?;
+
+        // Wait for the consumer to ask before spawning the child, so we never
+        // orphan a `hakoniwa::Child` the bridge will never pull.
+        if req_rx.recv().await.is_none() {
+            return Ok(());
+        }
+
+        let is_own_ip = matches!(exec.network_mode, sessions::NetworkMode::OwnIp);
+
+        // `OwnIp` has a startup race: the freshly-unshared netns is empty until
+        // `attach_own_ip` moves a tap into it, but a fast one-shot command can
+        // run and *exit* in that window, invalidating the PID `move_tap_into_
+        // netns` targets ("Invalid netns value"). The interactive shell dodges
+        // this because `bash -l` blocks on its PTY; a piped one-shot command
+        // does not. So for `OwnIp` we gate the user's command behind a one-byte
+        // read from stdin and release it only after the attach completes,
+        // keeping the netns-holding PID alive across the attach. `NoNet`/
+        // `HostNet` need no gate — their namespace is ready at spawn.
+        let argv = if is_own_ip {
+            // `IFS= read -r _` consumes exactly the go-line we write below; the
+            // user command then runs with the remaining (bridge-fed) stdin.
+            format!("IFS= read -r _gate; {}", exec.argv)
+        } else {
+            exec.argv.clone()
+        };
+
+        let mut child = {
+            let mut cmd = env
+                .command(&container, "/bin/sh", ["-c", argv.as_str()])
+                .map_err(|e| io::Error::other(format!("building command failed: {e}")))?;
+            cmd.stdin(hakoniwa::Stdio::piped())
+                .stdout(hakoniwa::Stdio::piped())
+                .stderr(hakoniwa::Stdio::piped());
+            cmd.spawn()
+                .map_err(|e| io::Error::other(format!("command launch failed: {e}")))?
+        };
+        // `command`/`container` no longer borrow `env`.
+        drop(container);
+
+        // For an `OwnIp` command, wire its freshly-unshared netns onto the
+        // per-host switch, exactly as `SandboxLauncher::launch` does. The
+        // attachment guard is held below until the child exits; its `Drop`
+        // detaches the PTask and removes any ingress forwards.
+        let _own_ip = if is_own_ip {
+            match crate::session_host::attach_own_ip(
+                &exec.net_switch,
+                child.id(),
+                exec.ingress.as_ref(),
+            )
+            .await
+            {
+                Ok(attachment) => Some(attachment),
+                Err(e) => {
+                    // The attach failed: this command is aborting. A
+                    // `hakoniwa::Child` is not terminated on drop, so kill and
+                    // reap it explicitly (SIGKILL-then-wait) before propagating,
+                    // mirroring the launcher's failure handling.
+                    if let Err(kill_err) = child.kill() {
+                        tracing::warn!(
+                            error = %kill_err,
+                            "killing sandbox command after OwnIp attach failure"
+                        );
+                    }
+                    if let Err(wait_err) = child.wait() {
+                        tracing::warn!(
+                            error = %wait_err,
+                            "reaping sandbox command after OwnIp attach failure"
+                        );
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+
+        // Release an `OwnIp` command's stdin gate now that the tap is in its
+        // namespace: the prologue's `read` consumes this go-line, then the user
+        // command runs against the now-wired network. The byte sits at the front
+        // of the stdin pipe; the bridge's later writes append after it. Borrow
+        // (don't `take`) the stdin handle so the bridge still owns it.
+        if is_own_ip && let Some(stdin) = child.stdin.as_mut() {
+            use std::io::Write;
+            if let Err(e) = stdin.write_all(b"\n").and_then(|()| stdin.flush()) {
+                tracing::warn!(error = %e, "failed to release OwnIp command stdin gate");
+            }
+        }
+
+        let process = HakoniwaProcess::new(child);
+        if let Err(send_err) = proc_tx.send(Ok(process)).await {
+            // Receiver dropped between our `recv` and our `send`; kill the child
+            // we just spawned so it doesn't outlive its sandbox rootfs.
+            if let Ok(mut proc) = send_err.0 {
+                let _ = proc.start_kill();
+            }
+            return Ok(());
+        }
+
+        // Park until the consumer drops the stream, keeping `env` and the
+        // `OwnIp` attachment alive while the bridge drives the child.
+        let _ = req_rx.recv().await;
+        drop(_own_ip);
+        Ok(())
+    }
+    .await;
+
+    if let Err(err) = outcome
+        && req_rx.recv().await.is_some()
+    {
+        let _ = proc_tx.send(Err(err)).await;
+    }
+}
+
 /// An async task which binds some program execution to an ssh channel.
 ///
 /// The `exec` field carries every parameter the process needs (argv,
@@ -700,23 +939,95 @@ pub(crate) async fn handle_exec(
             };
             exec_task.run(channel).await;
         } else {
-            let paths = session_handle.paths().await;
-            let exec_task = ExecTask {
-                conn,
+            run_plain_command(
                 serv,
-                session: session_handle,
-                channel_id: id,
-                exec: TokioExec {
-                    argv,
-                    cwd: paths.working,
-                    env: config.env_vars,
-                },
-            };
-            exec_task.run(channel).await;
+                conn,
+                session_handle,
+                session_id,
+                id,
+                argv,
+                config,
+                channel,
+            )
+            .await;
         };
     });
 
     Ok(())
+}
+
+/// Runs a plain (non-`min run`, non-git) `attach --command` request.
+///
+/// In production the command runs *inside* the session's PTask sandbox
+/// ([`SandboxedExec`]), honouring the session's [`sessions::NetworkMode`] and
+/// static ingress. Under `cfg(test)` a real sandbox cannot be built (the
+/// package set is unavailable in the unit-test tempdir — the same reason
+/// `session_host` swaps in a mock launcher), so the end-to-end bridge tests run
+/// the command through host `/bin/sh` ([`TokioExec`]) instead; the production
+/// sandbox wiring is covered by the unit test in this module.
+#[cfg(not(test))]
+#[allow(clippy::too_many_arguments)]
+async fn run_plain_command(
+    serv: ServerStateHandle,
+    conn: ConnectionHandle,
+    session_handle: SessionHandle,
+    session_id: SessionId,
+    id: ChannelId,
+    argv: String,
+    _config: ChannelConfig,
+    channel: Channel<Msg>,
+) {
+    let mngr = serv.sessions_manager().await;
+    // Read the session's network mode + static ingress from its record so the
+    // sandbox honours the same policy an interactive attach would; the switch
+    // is the one per-host switch the launcher attaches to.
+    let record = match mngr.get_record(SessionKeyPredicate::Id(session_id)).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            tracing::warn!(%id, "exec: session record vanished before launch");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(%id, error = %e, "exec: failed to read session record");
+            return;
+        }
+    };
+    let net_switch = mngr.net_switch().await;
+    let exec_task = ExecTask {
+        conn,
+        serv,
+        session: session_handle,
+        channel_id: id,
+        exec: SandboxedExec::from_record(argv, &record, net_switch),
+    };
+    exec_task.run(channel).await;
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn run_plain_command(
+    serv: ServerStateHandle,
+    conn: ConnectionHandle,
+    session_handle: SessionHandle,
+    _session_id: SessionId,
+    id: ChannelId,
+    argv: String,
+    config: ChannelConfig,
+    channel: Channel<Msg>,
+) {
+    let paths = session_handle.paths().await;
+    let exec_task = ExecTask {
+        conn,
+        serv,
+        session: session_handle,
+        channel_id: id,
+        exec: TokioExec {
+            argv,
+            cwd: paths.working,
+            env: config.env_vars,
+        },
+    };
+    exec_task.run(channel).await;
 }
 
 async fn handle_git_receive(
@@ -988,6 +1299,51 @@ mod tests {
 
     use super::bridge;
     use super::testing::{MockEndpoints, build_mock, build_mock_seq};
+
+    /// The plain `attach --command` exec path must carry the session record's
+    /// `NetworkMode` (and ingress) into the sandbox config, so the command runs
+    /// in the session's network namespace rather than the host's. This asserts
+    /// the production record→`SandboxedExec` wiring (`from_record`) for each
+    /// mode; the heavier "command actually runs in that namespace" behaviour is
+    /// proven empirically against a live daemon (see the PR's data-plane proof).
+    #[test]
+    fn plain_command_carries_session_network_mode() {
+        use std::sync::Arc;
+
+        use paths::HostAbsPath;
+        use sessions::{NetworkMode, Record, SessionId};
+        use tokio::sync::Mutex;
+
+        let switch = Arc::new(Mutex::new(crate::net::GvproxySwitch::new(
+            "/usr/lib/minimal/bin/gvproxy",
+            "/tmp/exec-test-gvproxy",
+        )));
+
+        let record_with = |network: NetworkMode| Record {
+            id: SessionId::nil(),
+            name: Some("netproj".to_string()),
+            username: Some("alice".to_string()),
+            project_path: HostAbsPath::try_new("/tmp/netproj").unwrap(),
+            network,
+            policy: Default::default(),
+            attrs: Default::default(),
+        };
+
+        for mode in [NetworkMode::NoNet, NetworkMode::HostNet, NetworkMode::OwnIp] {
+            let exec = super::SandboxedExec::from_record(
+                "ip -4 addr".to_string(),
+                &record_with(mode),
+                Arc::clone(&switch),
+            );
+            assert_eq!(
+                exec.network_mode, mode,
+                "exec path must apply the session's network mode",
+            );
+            assert_eq!(exec.name, "netproj");
+            assert_eq!(exec.username.as_deref(), Some("alice"));
+            assert_eq!(exec.argv, "ip -4 addr");
+        }
+    }
 
     /// Bytes flow client→child stdin and child stdout/stderr→client,
     /// and the child's exit code propagates to the bridge's return.

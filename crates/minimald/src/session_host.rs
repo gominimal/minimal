@@ -642,6 +642,56 @@ impl Drop for OwnIpAttachment {
     }
 }
 
+/// Builds the sandbox [`Env`](crate::env::Env) shared by every PTask launch:
+/// the interactive shell ([`SandboxLauncher::launch`]) and the one-shot
+/// `attach --command` exec path ([`crate::exec::SandboxedExec`]). Both run in
+/// the same rootfs (same package set + `PS1`) honouring the session's
+/// [`NetworkMode`], so the env construction lives in one place to keep them
+/// from drifting apart.
+///
+/// `graph_from_all_packages` is CPU-heavy (nickel evaluation, graph
+/// construction), so it runs on the blocking pool rather than stalling the
+/// async executor. The returned `Env` owns the context, graph and the sandbox
+/// files backing the rootfs, so it is `Send + 'static` and can be moved into
+/// the caller's guard slot to keep those files alive for the process's life.
+#[cfg(not(test))]
+pub(crate) async fn build_session_env(
+    ctx: mctx::Context,
+    name: String,
+    username: String,
+    paths: SessionPaths,
+    network_mode: NetworkMode,
+) -> io::Result<crate::env::Env> {
+    let (ctx, graph_result) = tokio::task::spawn_blocking(move || {
+        let mut ctx = ctx;
+        let r = ctx.graph_from_all_packages().map_err(|e| e.to_string());
+        (ctx, r)
+    })
+    .await
+    .map_err(io::Error::other)?;
+    let graph = graph_result.map_err(io::Error::other)?;
+
+    crate::env::Env::build(
+        ctx,
+        graph,
+        crate::env::EnvArgs::new(name, paths.working, paths.home, paths.cache)
+            .with_packages(["base", "bash", "socat", "coreutils", "claude-code"])
+            .with_env_vars(
+                [(
+                    "PS1".to_string(),
+                    EnvVarValue::Value(
+                        r"\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "
+                            .to_string(),
+                    ),
+                )]
+                .into(),
+            )
+            .with_network_mode(network_mode)
+            .with_username(username),
+    )
+    .await
+}
+
 /// Attaches an `OwnIp` PTask (identified by its sandbox process's netns-holding
 /// PID) to the shared gvproxy switch: allocate a lease and ensure gvproxy is up,
 /// open a host-side tap, move it into the PTask's network namespace and
@@ -649,7 +699,7 @@ impl Drop for OwnIpAttachment {
 /// `minimald::net` calls live here (the `minimald` side); `sandbox2` only
 /// unshared the namespace and surfaced the PID (no dependency cycle).
 #[cfg(not(test))]
-async fn attach_own_ip(
+pub(crate) async fn attach_own_ip(
     switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::GvproxySwitch>>,
     netns_pid: u32,
     ingress: Option<&sessions::IngressPolicy>,
@@ -743,41 +793,12 @@ impl SessionLauncher for SandboxLauncher {
         // Move the ingress policy out of `self` up front so it can be applied
         // after the switch attach below (the rest of `self` is consumed first).
         let ingress = self.ingress;
-        // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
-        // graph construction) — run it on the blocking pool so it
-        // doesn't stall the async executor.
-        let (ctx, graph_result) = tokio::task::spawn_blocking(move || {
-            let mut ctx = ctx;
-            let r = ctx.graph_from_all_packages().map_err(|e| e.to_string());
-            (ctx, r)
-        })
-        .await
-        .map_err(io::Error::other)?;
-        let graph = graph_result.map_err(io::Error::other)?;
 
         // The env owns the context, graph and the sandbox files backing the
         // running process's rootfs, so it is `Send + 'static` and can be moved
         // into the host as the guard that keeps those files alive — no leaking
         // or self-referential borrows required.
-        let mut env = crate::env::Env::build(
-            ctx,
-            graph,
-            crate::env::EnvArgs::new(name, paths.working, paths.home, paths.cache)
-                .with_packages(["base", "bash", "socat", "coreutils", "claude-code"])
-                .with_env_vars(
-                    [(
-                        "PS1".to_string(),
-                        EnvVarValue::Value(
-                            r"\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "
-                                .to_string(),
-                        ),
-                    )]
-                    .into(),
-                )
-                .with_network_mode(self.network_mode)
-                .with_username(username),
-        )
-        .await?;
+        let mut env = build_session_env(ctx, name, username, paths, self.network_mode).await?;
 
         let mut container = env.container()?;
         container.set_session_leader();

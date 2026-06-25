@@ -71,6 +71,15 @@ enum ManagerMessage {
     CreateSession(sessions::Record, Responder<SessionId>),
     RenameSession(SessionId, String, Responder<()>),
     DestroySession(SessionId, Responder<()>),
+    /// Hands back a clone of the daemon-scoped gvproxy switch `Arc`, so the
+    /// `attach --command` exec path can attach a one-shot `OwnIp` PTask to the
+    /// same per-host switch the interactive launcher uses (R1.5).
+    ///
+    // Only the production (`cfg(not(test))`) exec path consumes this; under test
+    // the plain-command path runs through host `/bin/sh`, so the variant is
+    // unused there.
+    #[cfg_attr(test, allow(dead_code))]
+    GetNetSwitch(oneshot::Sender<Arc<Mutex<crate::net::GvproxySwitch>>>),
 }
 
 /// Manages session instances, and session state on disk.
@@ -290,6 +299,11 @@ impl<L: Loader> Manager<L> {
                 })
                 .await
             }
+            // Hands back the shared switch `Arc` (a cheap clone) for the exec
+            // path to attach a one-shot `OwnIp` PTask to.
+            ManagerMessage::GetNetSwitch(r) => {
+                let _ = r.send(Arc::clone(&self.net_switch));
+            }
         }
     }
 }
@@ -340,6 +354,22 @@ impl ManagerHandle {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(ManagerMessage::GetSession(pred, send)).await;
+        recv.await.expect("corresponding sessions manager is dead")
+    }
+
+    /// Returns a clone of the daemon-scoped gvproxy switch `Arc`.
+    ///
+    /// The exec path (`attach --command`) uses this to attach a one-shot
+    /// `OwnIp` PTask to the same per-host switch the interactive launcher
+    /// attaches to (R1.5), keeping a single gvproxy and address allocator for
+    /// the host.
+    // Only the production exec path calls this; under test the plain-command
+    // path runs through host `/bin/sh`.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) async fn net_switch(&self) -> Arc<Mutex<crate::net::GvproxySwitch>> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self.0.send(ManagerMessage::GetNetSwitch(send)).await;
         recv.await.expect("corresponding sessions manager is dead")
     }
 
