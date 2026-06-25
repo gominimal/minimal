@@ -2,10 +2,10 @@
 use minimald_rpc::IssueClientCertResponse;
 use minimald_rpc::{
     CreateSession, CreateSessionResponse, DestroySession, DestroySessionResponse, Errorable,
-    GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest,
-    GetSessionRecordResponse, GetVersion, GetVersionResponse, IssueClientCert,
-    IssueClientCertRequest, ListSessions, ListSessionsEntry, ListSessionsResponse, OneshotSshRpc,
-    RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse,
+    GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
+    GetSessionRecordRequest, GetSessionRecordResponse, GetVersion, GetVersionResponse,
+    IssueClientCert, IssueClientCertRequest, ListSessions, ListSessionsEntry, ListSessionsResponse,
+    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -271,6 +271,15 @@ async fn serve_issue_client_cert_unavailable(c: RuChannel<Msg>) {
     }
 }
 
+async fn serve_get_mesh_status(s: ServerStateHandle, c: RuChannel<Msg>) {
+    let res = GetMeshStatus
+        .handle_channel(c, async |_req| Ok(s.mesh_status().await))
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", GetMeshStatus::NAME, e);
+    }
+}
+
 pub(crate) const STREAM_WORKSPACE_FILES: &str =
     constcat::concat!(RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst");
 
@@ -346,6 +355,7 @@ pub async fn handle_ssh_rpc(
         | RenameSession::NAME
         | DestroySession::NAME
         | GetSessionPolicy::NAME
+        | GetMeshStatus::NAME
         | STREAM_WORKSPACE_FILES
         | IssueClientCert::NAME => {
             let mut conn_lock = c.lock().await;
@@ -379,6 +389,7 @@ pub async fn handle_ssh_rpc(
         RenameSession::NAME => drop(spawn(serve_rename_session(s, channel))),
         DestroySession::NAME => drop(spawn(serve_destroy_session(s, channel))),
         GetSessionPolicy::NAME => drop(spawn(serve_get_session_policy(s, channel))),
+        GetMeshStatus::NAME => drop(spawn(serve_get_mesh_status(s, channel))),
         STREAM_WORKSPACE_FILES => drop(spawn(serve_stream_workspace_files(s, config, channel))),
         IssueClientCert::NAME => {
             #[cfg(feature = "networking-proxy")]
@@ -856,5 +867,58 @@ mod tests {
             matches!(resp, Errorable::Err { error } if error.contains("no session with ID")),
             "expected an unknown-id error",
         );
+    }
+
+    #[tokio::test]
+    async fn get_mesh_status_is_unconfigured_by_default() {
+        // Without a mesh installed, the RPC answers cleanly with `configured =
+        // false` rather than erroring (this is also the answer a daemon built
+        // without the `networking-wg` feature gives).
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let resp = client.call::<minimald_rpc::GetMeshStatus>(&()).await;
+
+        assert!(!resp.configured);
+        assert!(resp.own_public_key.is_none());
+        assert!(resp.peers.is_empty());
+    }
+
+    #[cfg(feature = "networking-wg")]
+    #[tokio::test]
+    async fn get_mesh_status_reports_own_key_and_peers() {
+        use crate::net::wg::{Keypair, MeshConfig, PeerConfig};
+
+        let server = TestServer::new().await;
+
+        // Stand up a real mesh peer with one configured peer and install it.
+        let remote = Keypair::generate();
+        let cfg = MeshConfig {
+            keypair: Keypair::generate(),
+            listen_port: 0, // ephemeral; no traffic is sent in this test
+            advertised_subnets: vec!["100.64.0.0/16".parse().unwrap()],
+            peers: vec![PeerConfig {
+                name: "remote".to_string(),
+                public_key: remote.public(),
+                endpoint: None,
+                allowed_ips: vec!["100.65.0.0/16".parse().unwrap()],
+            }],
+        };
+        let (sink_tx, _sink_rx) = tokio::sync::mpsc::channel(1);
+        let mesh = std::sync::Arc::new(crate::net::wg::start(cfg, sink_tx).await.unwrap());
+        let own_pub = mesh.own_public_key().to_base64();
+        server.state.set_mesh(mesh).await;
+
+        let mut client = server.connect().await;
+        let resp = client.call::<minimald_rpc::GetMeshStatus>(&()).await;
+
+        assert!(resp.configured);
+        assert_eq!(resp.own_public_key.as_deref(), Some(own_pub.as_str()));
+        assert_eq!(resp.advertised_subnets, vec!["100.64.0.0/16".to_string()]);
+        assert_eq!(resp.peers.len(), 1);
+        assert_eq!(resp.peers[0].name, "remote");
+        assert_eq!(resp.peers[0].public_key, remote.public().to_base64());
+        // Keep the sink alive until the assertions complete.
+        drop(_sink_rx);
     }
 }

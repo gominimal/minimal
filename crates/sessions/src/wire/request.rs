@@ -242,6 +242,7 @@ mod tests {
             }],
             patches: vec![WirePatchVerdict::Denied {
                 id: PendingId::new(2),
+                host_path: paths::HostAbsPath::try_new("/etc/secret").unwrap(),
             }],
         };
         assert_eq!(round_trip(&v), v);

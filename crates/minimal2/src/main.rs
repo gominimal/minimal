@@ -33,6 +33,8 @@ enum Command {
     Destroy(DestroyArgs),
     /// Session inspection subcommands
     Session(SessionArgs),
+    /// WireGuard mesh: join, leave, and inspect remote-access state
+    Mesh(MeshArgs),
     /// Proxy stdio to a daemon UDS socket (used as an SSH ProxyCommand).
     #[command(hide = true)]
     Proxy(ProxyArgs),
@@ -94,6 +96,56 @@ enum SessionCommand {
 struct PolicyArgs {
     /// Session identifier (UUID or session name)
     session: String,
+}
+
+/// WireGuard mesh subcommands for authenticated remote PTask access (UC7 /
+/// UC2b). The mesh lets a laptop, or another host's PTasks, reach this host's
+/// PTasks over an encrypted tunnel.
+#[derive(Debug, Args)]
+struct MeshArgs {
+    #[command(subcommand)]
+    command: MeshCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum MeshCommand {
+    /// Enrol this machine into a remote minimald's WireGuard mesh
+    ///
+    /// v1 uses manual key exchange: this records the target and prints the
+    /// steps to swap public keys. Once enrolled you can reach the remote
+    /// host's own-IP PTasks by their switch IPs over the tunnel.
+    ///
+    /// Example:
+    ///
+    ///   minimal mesh join mesh.example.com:51820
+    #[command(verbatim_doc_comment)]
+    Join(MeshJoinArgs),
+    /// Leave the WireGuard mesh and drop this machine's local enrolment
+    ///
+    /// Removes the local enrolment record written by `minimal mesh join`.
+    /// Peer entries on the remote minimald must be removed there (manual v1).
+    ///
+    /// Example:
+    ///
+    ///   minimal mesh leave
+    #[command(verbatim_doc_comment)]
+    Leave,
+    /// Show this minimald's mesh status: public key, advertised subnets, peers
+    ///
+    /// Queries the local minimald for its WireGuard public key, the switch
+    /// subnets it advertises to the mesh, and each peer's last handshake.
+    ///
+    /// Example:
+    ///
+    ///   minimal mesh status
+    #[command(verbatim_doc_comment)]
+    Status,
+}
+
+#[derive(Debug, Args)]
+struct MeshJoinArgs {
+    /// Address of the remote minimald exposing the mesh (`host:port`)
+    address: String,
 }
 
 /// Shared arguments all subcommands
@@ -258,6 +310,11 @@ async fn main() -> Result<(), ()> {
         Command::Session(SessionArgs {
             command: SessionCommand::Policy(args),
         }) => cmd_session_policy(&cli.global_args, args).await,
+        Command::Mesh(MeshArgs { command }) => match command {
+            MeshCommand::Status => cmd_mesh_status(&cli.global_args).await,
+            MeshCommand::Join(args) => cmd_mesh_join(&cli.global_args, args),
+            MeshCommand::Leave => cmd_mesh_leave(&cli.global_args),
+        },
         Command::Proxy(args) => cmd_proxy(args).await,
         Command::SshForward(args) => cmd_ssh_forward(&cli.global_args, args).await,
         Command::Login(args) => cmd_login(&cli.global_args, args).await,
@@ -563,6 +620,126 @@ async fn cmd_session_policy(global: &GlobalArgs, args: PolicyArgs) -> Result<(),
         }
         minimald_rpc::Errorable::Err { error } => {
             eprintln!("{error}");
+            Err(())
+        }
+    }
+}
+
+/// The local mesh-enrolment record path. Honors `--minimal-dir`, else falls
+/// back to the user config dir.
+fn mesh_enrolment_path(global: &GlobalArgs) -> Result<PathBuf, ()> {
+    let base = match &global.minimal_dir {
+        Some(dir) => dir.clone(),
+        None => dirs::config_dir()
+            .map(|c| c.join("minimal"))
+            .ok_or_else(|| eprintln!("cannot determine config directory; set --minimal-dir"))?,
+    };
+    Ok(base.join("mesh-enrolment"))
+}
+
+/// Show this minimald's WireGuard mesh status (R4.6): own public key, the
+/// switch subnets it advertises, and each peer's last handshake.
+async fn cmd_mesh_status(global: &GlobalArgs) -> Result<(), ()> {
+    if let Err(e) = autospawn::ensure_minvmd_running() {
+        eprintln!("Failed to ensure minvmd is running: {e}");
+        return Err(());
+    }
+
+    let mut client = connect_daemon(global).await?;
+
+    use minimald_rpc::GetMeshStatus;
+    let resp = client
+        .oneshot_rpc::<GetMeshStatus>(())
+        .await
+        .map_err(|e| eprintln!("GetMeshStatus RPC failed: {e}"))?;
+
+    if !resp.configured {
+        println!("No WireGuard mesh is configured on this minimald.");
+        return Ok(());
+    }
+
+    println!(
+        "public key:  {}",
+        resp.own_public_key.as_deref().unwrap_or("-")
+    );
+    if resp.advertised_subnets.is_empty() {
+        println!("advertised:  (none)");
+    } else {
+        println!("advertised:  {}", resp.advertised_subnets.join(", "));
+    }
+
+    if resp.peers.is_empty() {
+        println!("peers:       (none)");
+        return Ok(());
+    }
+
+    println!("peers:");
+    println!("  {:<20}  {:<46}  LAST HANDSHAKE", "NAME", "PUBLIC KEY");
+    for p in &resp.peers {
+        let handshake = match p.last_handshake_secs {
+            Some(secs) => format!("{secs}s ago"),
+            None => "never".to_string(),
+        };
+        println!("  {:<20}  {:<46}  {handshake}", p.name, p.public_key);
+    }
+
+    Ok(())
+}
+
+/// Record this machine's enrolment into a remote minimald's mesh (R4.3, v1
+/// manual key exchange) and print the steps to complete the key swap.
+fn cmd_mesh_join(global: &GlobalArgs, args: MeshJoinArgs) -> Result<(), ()> {
+    // Validate the endpoint at the point of entry so a typo never lands a bad
+    // enrolment on disk for a later consumer to choke on. The CLI contract is
+    // `host:port`; require a non-empty host and a parseable u16 port.
+    let Some((host, port)) = args.address.rsplit_once(':') else {
+        eprintln!("mesh join address must be host:port, e.g. mesh.example.com:51820");
+        return Err(());
+    };
+    if host.is_empty() || port.parse::<u16>().map(|p| p == 0).unwrap_or(true) {
+        eprintln!("mesh join address must include a non-empty host and a valid non-zero port");
+        return Err(());
+    }
+
+    let path = mesh_enrolment_path(global)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| eprintln!("creating {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&path, format!("{}\n", args.address))
+        .map_err(|e| eprintln!("writing {}: {e}", path.display()))?;
+
+    println!(
+        "Recorded mesh enrolment for {} at {}.",
+        args.address,
+        path.display()
+    );
+    println!();
+    println!("v1 uses manual key exchange. To complete the join:");
+    println!("  1. Run `minimal mesh status` on the remote host to read its public key.");
+    println!("  2. Add this machine's WireGuard public key to the remote minimald's peers.");
+    println!("  3. Add the remote's public key and endpoint to this machine's mesh config.");
+    Ok(())
+}
+
+/// Drop this machine's local mesh enrolment (R4.3). Remote peer entries are
+/// removed on the remote host (manual v1).
+fn cmd_mesh_leave(global: &GlobalArgs) -> Result<(), ()> {
+    let path = mesh_enrolment_path(global)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            println!(
+                "Left the mesh; removed local enrolment at {}.",
+                path.display()
+            );
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("No local mesh enrolment to remove.");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("removing {}: {e}", path.display());
             Err(())
         }
     }

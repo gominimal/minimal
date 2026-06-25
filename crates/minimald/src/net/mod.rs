@@ -21,6 +21,11 @@ pub mod policy;
 pub mod proxy;
 pub mod switch;
 
+// WireGuard mesh peer (Unit 4). Compiled only under `networking-wg` so the
+// default build carries no WireGuard code (R4.7).
+#[cfg(feature = "networking-wg")]
+pub mod wg;
+
 use std::fmt;
 use std::io;
 use std::net::Ipv4Addr;

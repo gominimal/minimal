@@ -85,6 +85,13 @@ jobs:
         # (R4.5 mtls_missing_cert_returns_401_with_no_topology, UC2b
         # mtls_valid_cert_routes_to_backend). Exercise them explicitly.
         run: cargo nextest run -p minimald --features networking-proxy
+      - name: Run WireGuard mesh tests
+        # The WireGuard mesh peer is behind the non-default `networking-wg`
+        # feature, so `--workspace` above does not compile or run its proofs.
+        # Exercise them explicitly (R-WG: two_meshes_handshake_and_relay_a_packet,
+        # rpc get_mesh_status). The `#[ignore]` two-namespace mesh_uc7 proof runs
+        # in the netns lane.
+        run: cargo test -p minimald --features networking-wg
       - name: Run doctests
         run: cargo test --workspace --doc
 

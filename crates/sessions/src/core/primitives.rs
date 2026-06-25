@@ -640,6 +640,18 @@ impl From<crate::wire::primitives::WireResolvedVar> for ResolvedVar {
     }
 }
 
+impl From<crate::wire::primitives::WireVarSpec> for VarValue {
+    fn from(spec: crate::wire::primitives::WireVarSpec) -> Self {
+        match spec {
+            crate::wire::primitives::WireVarSpec::Specified { value } => Self::Specified { value },
+            crate::wire::primitives::WireVarSpec::Inherit => Self::Inherit,
+            crate::wire::primitives::WireVarSpec::InheritWithDefault { default } => {
+                Self::InheritWithDefault { default }
+            }
+        }
+    }
+}
+
 // =====================================================================
 // FileSet
 // =====================================================================

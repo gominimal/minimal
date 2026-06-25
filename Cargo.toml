@@ -49,7 +49,11 @@ codegen-units = 16
 anyhow = "1.0"
 async-compression = { version = "0.4", features = ["tokio", "zstd"] }
 async-tar = { version = "0.6", default-features = false, features = ["runtime-tokio"] }
+base64 = "0.22"
 blake3 = { version = "1", features = ["serde"] }
+# WireGuard mesh peer (Unit 4, behind the `networking-wg` feature). Pure-Rust
+# WireGuard avoids a Go/cgo toolchain dependency (spec Design Considerations).
+boringtun = { version = "0.7", default-features = false }
 bytes = "1.11" # keep in sync with reqwest
 bzip2 = "0.6"
 camino = { version = "1", features = ["serde1"] }
@@ -87,6 +91,9 @@ object = { version = "0.39", default-features = false, features = ["archive", "e
 oci-spec = "0.10"
 path-absolutize = "3.1"
 rand = "0.10"
+# rand_core 0.6 (not 0.10) to match boringtun/x25519-dalek's RNG traits for
+# WireGuard keypair generation (`networking-wg`).
+rand_core = { version = "0.6", features = ["getrandom"] }
 rayon = "1.12"
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
 regex = "1" # keep in sync with nickel-lang-core
