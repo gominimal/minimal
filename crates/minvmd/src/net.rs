@@ -56,6 +56,9 @@ mod relay;
 #[cfg(target_os = "linux")]
 pub use relay::{SwitchRelay, attach_to_switch, open_tap};
 
+mod shuttle;
+pub use shuttle::{VSOCK_GVPROXY_SHUTTLE_PORT, resolve_switch_sock};
+
 /// Default time to wait for gvproxy to exit on SIGTERM before escalating to
 /// SIGKILL.
 pub const DEFAULT_TERM_TIMEOUT: Duration = Duration::from_secs(3);
@@ -878,6 +881,147 @@ fn signal_child(pid: libc::pid_t, signal: libc::c_int, signal_name: &str) {
     }
 }
 
+/// A host gvproxy switch owned by `minvmd`'s synchronous supervisor (issue
+/// #572), running on its own dedicated current-thread tokio runtime.
+///
+/// `minvmd`'s `run`/`boot` supervisor is synchronous, but [`GvproxyConfig::spawn`]
+/// and [`GvproxySwitch::stop`] need a tokio runtime (background exit-detection
+/// and timer-driven teardown). [`HostGvproxy::spawn`] stands up a single-threaded
+/// runtime on a dedicated thread, spawns + supervises gvproxy there, and keeps
+/// the runtime alive for the VM's lifetime. [`HostGvproxy::stop`] (or `Drop`)
+/// tears gvproxy down and joins the thread.
+///
+/// The switch is started with an **empty** static-lease table: the guest's
+/// per-PTask shuttle configures each PTask's switch IP statically (the spike's
+/// static-lease recipe), so `minvmd` does not need to own the per-PTask address
+/// book — gvproxy still provides the subnet gateway and the host-loopback NAT
+/// alias from the config YAML.
+#[derive(Debug)]
+#[must_use = "dropping HostGvproxy stops the host gvproxy switch"]
+pub struct HostGvproxy {
+    /// Channel that tells the runtime thread to stop the switch and exit.
+    stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// The runtime thread; joined on [`stop`](Self::stop) / `Drop`.
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// PID of the spawned gvproxy, surfaced for logging/diagnostics.
+    pid: u32,
+}
+
+impl HostGvproxy {
+    /// Spawn and supervise the host gvproxy switch on a dedicated runtime.
+    ///
+    /// `binary` is the gvproxy binary; `switch_sock` is the host `-listen` UNIX
+    /// socket libkrun bridges the guest shuttle to (see
+    /// [`resolve_switch_sock`]). Blocks only until gvproxy is spawned
+    /// and its PID known; supervision continues on the background runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error if the runtime cannot be built, the config cannot
+    /// be written, or the gvproxy binary cannot be launched.
+    pub fn spawn(binary: PathBuf, switch_sock: PathBuf) -> io::Result<Self> {
+        let config = GvproxyConfig::new(binary, switch_sock);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<u32>>();
+
+        let thread = std::thread::Builder::new()
+            .name("minvmd-gvproxy".into())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                };
+                runtime.block_on(async move {
+                    // Empty lease table: the guest assigns PTask IPs statically.
+                    let (switch, exit) = match config.spawn(&[]) {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e));
+                            return;
+                        }
+                    };
+                    let pid = switch.pid();
+                    if ready_tx.send(Ok(pid)).is_err() {
+                        // Caller went away before learning the PID; tear down.
+                        switch.stop().await;
+                        return;
+                    }
+                    // Wait for either an explicit stop or an unexpected gvproxy
+                    // exit, then tear down cleanly.
+                    tokio::select! {
+                        _ = stop_rx => {
+                            switch.stop().await;
+                        }
+                        status = exit.recv() => {
+                            tracing::error!(
+                                pid,
+                                code = status.and_then(|s| s.code()),
+                                "host gvproxy switch exited unexpectedly",
+                            );
+                            // gvproxy is already gone; drop the handle (no signal).
+                            drop(switch);
+                        }
+                    }
+                });
+            })?;
+
+        match ready_rx.recv() {
+            Ok(Ok(pid)) => Ok(Self {
+                stop_tx: Some(stop_tx),
+                thread: Some(thread),
+                pid,
+            }),
+            Ok(Err(e)) => {
+                let _ = thread.join();
+                Err(e)
+            }
+            // The runtime thread panicked before reporting; surface a clear error.
+            Err(_) => {
+                let _ = thread.join();
+                Err(io::Error::other(
+                    "host gvproxy supervisor thread exited before reporting readiness",
+                ))
+            }
+        }
+    }
+
+    /// The PID of the supervised gvproxy process.
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Stop the switch and join the supervising runtime thread.
+    pub fn stop(mut self) {
+        self.shutdown();
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            // A failed send means the runtime thread already exited (e.g. gvproxy
+            // crashed); nothing more to signal.
+            let _ = stop_tx.send(());
+        }
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            tracing::warn!(pid = self.pid, "host gvproxy supervisor thread panicked");
+        }
+    }
+}
+
+impl Drop for HostGvproxy {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 /// VM-wide egress policy stub (R2.5 / Unit 2), aligned with the per-PTask egress
 /// types: a VM may restrict all of its traffic to the listed subnets, DNS
 /// hosts, and protocols. An empty policy ([`VmEgressPolicy::allow_all`]) imposes
@@ -1256,6 +1400,52 @@ mod tests {
             Some(libc::ESRCH),
             "errno must be ESRCH — not a recycled-PID hit",
         );
+    }
+
+    #[test]
+    fn host_gvproxy_spawns_supervises_and_stops() {
+        // `sleep` stands in for gvproxy: HostGvproxy::spawn only needs a binary
+        // it can launch and read a PID from; the socket is dialed by libkrun in
+        // production, not by this supervisor. Use a temp socket path so no real
+        // file is needed (gvproxy would bind it; sleep ignores its argv).
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let sock = dir.path().join("gvproxy-switch.sock");
+        let gvproxy = HostGvproxy::spawn(PathBuf::from("sleep"), sock).expect("spawn host gvproxy");
+        let pid = gvproxy.pid();
+        assert!(
+            pid_is_alive(pid),
+            "host gvproxy should be alive after spawn"
+        );
+        gvproxy.stop();
+        // stop() signals SIGTERM and joins the supervising runtime thread, which
+        // only returns once gvproxy has been reaped.
+        assert!(
+            !pid_is_alive(pid),
+            "host gvproxy must be stopped after stop()"
+        );
+    }
+
+    #[test]
+    fn host_gvproxy_drop_stops_the_switch() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let sock = dir.path().join("gvproxy-switch.sock");
+        let gvproxy = HostGvproxy::spawn(PathBuf::from("sleep"), sock).expect("spawn host gvproxy");
+        let pid = gvproxy.pid();
+        assert!(pid_is_alive(pid));
+        drop(gvproxy);
+        assert!(
+            !pid_is_alive(pid),
+            "dropping HostGvproxy must stop the switch"
+        );
+    }
+
+    #[test]
+    fn host_gvproxy_spawn_reports_launch_failure() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let sock = dir.path().join("gvproxy-switch.sock");
+        let err = HostGvproxy::spawn(PathBuf::from("/nonexistent/definitely/not/gvproxy"), sock)
+            .expect_err("spawning a missing binary must fail");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]

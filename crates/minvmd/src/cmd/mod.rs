@@ -23,6 +23,23 @@ pub const VSOCK_MARKER_PORT: u32 = 7350;
 /// READY marker from the parent to the VMM child.
 pub const MARKER_SOCK_ENV: &str = "MINVMD_MARKER_SOCK";
 
+/// Environment variable selecting an own-IP VM (issue #572). When set to a
+/// truthy value (`1`/`true`), the supervisor spawns the host gvproxy switch and
+/// the VMM child registers the per-PTask shuttle vsock bridge + sets the VM's
+/// network mode to `OwnIp`. Read by both the parent supervisor (to decide
+/// whether to spawn gvproxy) and the VMM child (to configure the VM), so the two
+/// processes stay consistent. Unset/false ⇒ a `HostNet` VM with no host gvproxy.
+pub const OWN_IP_ENV: &str = "MINVMD_VM_OWN_IP";
+
+/// Whether [`OWN_IP_ENV`] requests an own-IP VM (issue #572).
+#[must_use]
+pub fn own_ip_requested() -> bool {
+    matches!(
+        std::env::var(OWN_IP_ENV).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
 /// Verify the host hypervisor backend is accessible before booting a VM (R2.4).
 ///
 /// On Linux, libkrun drives KVM, which needs a readable `/dev/kvm`. Probe it

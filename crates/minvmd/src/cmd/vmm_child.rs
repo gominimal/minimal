@@ -54,7 +54,14 @@ fn run_vmm() -> Result<()> {
     // penalty. (Stay below the kernel's CONFIG_NR_CPUS.) The boot command may
     // expose these as flags in a future change. `apply` configures the kernel +
     // initramfs, the ext4 root disk, and the vsock bridge.
-    let cfg = VmConfig::new(2, 1024, kernel, rootfs, initramfs);
+    let mut cfg = VmConfig::new(2, 1024, kernel, rootfs, initramfs);
+    // Issue #572: an own-IP VM registers the per-PTask gvproxy shuttle vsock
+    // bridge in `apply`; the host gvproxy is spawned by the parent supervisor.
+    // The env var keeps the parent's gvproxy-spawn decision and this child's VM
+    // config in lock-step.
+    if crate::cmd::own_ip_requested() {
+        cfg = cfg.with_network_mode(minimald_rpc::NetworkMode::OwnIp);
+    }
     cfg.apply(&mut ctx)
         .context("applying VmConfig to krun context")?;
 

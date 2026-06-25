@@ -80,6 +80,25 @@ pub fn resolve_initramfs_path() -> Result<PathBuf, VmError> {
     Ok(PathBuf::from(val))
 }
 
+/// Default install path for the host gvproxy ("gvisor-tap-vsock") binary, used
+/// when `MINVMD_GVPROXY_BIN` is unset. Fetched + SHA-256-verified by
+/// `scripts/fetch-gvproxy.sh` (issue #495).
+pub const DEFAULT_GVPROXY_BIN: &str = "/usr/lib/minimal/bin/gvproxy";
+
+/// Resolve the host gvproxy binary path from `MINVMD_GVPROXY_BIN`, falling back
+/// to [`DEFAULT_GVPROXY_BIN`] when unset or empty.
+///
+/// Unlike the kernel/rootfs/initramfs resolvers this never errors on a missing
+/// env var: gvproxy is only spawned for an own-IP VM (issue #572), so an absent
+/// override is the common case and the fixed install path is the default.
+#[must_use]
+pub fn resolve_gvproxy_path() -> PathBuf {
+    match std::env::var("MINVMD_GVPROXY_BIN") {
+        Ok(val) if !val.is_empty() => PathBuf::from(val),
+        _ => PathBuf::from(DEFAULT_GVPROXY_BIN),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
