@@ -42,14 +42,13 @@ pending item into one `ContributionResponse`, and the client
 batches every verdict into one `ContributionVerdict`.
 
 > **Status note.** The shared gate pipeline (`compose_contribution`,
-> with `gate_vars` + `gate_patches`) exists in `core::compose` and
-> drives Phase 1 today via `UserComposer::compose`. Phases 2–4 are
-> not yet wired: the daemon doesn't yet emit a `ContributionResponse`
-> for unresolved items, and the client doesn't yet have a Phase 3
-> handler that runs the gate to produce a `ContributionVerdict`.
-> `SessionComposer::compose` is a placeholder until those land. The
-> hooks-driven gate code is positioned to run on the client (from the
-> Phase 3 handler), not on the daemon.
+> with `gate_vars` + `gate_patches`) lives in `core::compose`. Phase
+> 1 runs it via `UserComposer::compose` and Phase 3 runs it via
+> `client::handler::handle_response`. Phases 2 and 4 (daemon-side
+> routing) are not yet wired: `SessionComposer::compose` errors with
+> `HookRequired` instead of batching pending items into a
+> `ContributionResponse`, and there is no `SubmitVerdict` handler
+> yet to apply verdicts and assemble the final `Composition`.
 
 ## Phases in detail
 
@@ -77,11 +76,22 @@ items the policy can't decide are collected as
 
 ### Phase 3 — Client gates the pending items
 
-The client receives the `ContributionResponse` and runs the gate
-pipeline over the pending batch: resolves any inherit vars, expands
-patch sources, applies the user policy, and prompts via local
-`PolicyHooks` when needed. Result: one `ContributionVerdict`,
-shipped back to the daemon via `SubmitVerdict`.
+The client receives the `ContributionResponse` and runs
+`client::handler::handle_response` over the pending batch: resolves
+any `Inherit`/`InheritWithDefault` vars against the client env
+(`ResolvedVar::resolve_with`), expands patch sources against the
+already-gated vars from Phase 1 plus anything approved in this
+batch, applies the user policy, and prompts via local `PolicyHooks`
+when the policy can't decide. Result: one `ContributionVerdict`,
+shipped back to the daemon via `SubmitVerdict`. Lifecycle hooks in
+the response are dropped — there's no per-hook policy, so the
+verdict schema has no slot for them; the daemon installs them as
+declared.
+
+**Verdict ordering.** Per-domain verdicts are not in pending-item
+order: items the policy auto-decides are emitted in input order,
+items routed through the hook land at the end. The daemon must
+correlate by `id`, not slice position.
 
 ### Phase 4 — Daemon assembles and hands off
 
@@ -99,10 +109,14 @@ pass through unchanged.
 
 ## The shared client-side gate pipeline
 
-The same pipeline runs in two distinct phases — once in Phase 1 to
-compose loadouts, once in Phase 3 to generate verdicts on the
-daemon's pending items. Patches add a filesystem walk up front;
-vars don't.
+The two phases share `Policy::check`, the hook prompt protocol, and
+the `UseRule` re-check. They differ in what happens once an item is
+`Decided`: Phase 1 (`gate_vars`/`gate_patches` in `core::compose`)
+treats `Denied` as fatal and silently drops `Ignored`; Phase 3
+(`gate_pending_vars`/`gate_pending_patches` in `client::handler`)
+emits a per-item `WireVarVerdict`/`WirePatchVerdict` for every
+outcome — the wire schema requires one verdict per pending id.
+Patches add a filesystem walk up front; vars don't.
 
 ```mermaid
 flowchart TD
@@ -120,7 +134,7 @@ flowchart TD
 
     P1 -->|NeedsApproval| P2
     P1 -->|decided items| P3
-    P1 -.->|"policy.deny matched (Pass 1)"| DE
+    P1 -.->|"policy.deny matched (Phase 1 only;<br/>Phase 3 emits a per-item Denied verdict)"| DE
 
     P2 -->|"Decided{decisions, updated_policy}<br/>install updated_policy if Some"| P3
     P2 -.->|Abort| AE
@@ -140,12 +154,16 @@ Below, in numbered prose:
    (the raw policy is preserved for round-trip).
 2. **Pass 1 — Categorize.** Each item runs through `Policy::check`,
    which steps through:
-   - `ignore` matches? → `Ignored`; drop silently.
-   - `deny` matches? → `Denied`; surface `ComposeError::Denied`
-     regardless of origin.
+   - `ignore` matches? → `Ignored`. Phase 1 drops silently;
+     Phase 3 emits an `Ignored` verdict.
+   - `deny` matches? → `Denied`, regardless of origin. Phase 1
+     surfaces `ComposeError::Denied`; Phase 3 emits a `Denied`
+     verdict.
    - `Source::UserLoadout`? → `Allowed` (auto-pass the allow step;
      the user doesn't need to allow-list their own loadout).
-   - `allow` matches? → `Allowed`; push.
+   - `allow` matches? → `Allowed`. Phase 1 pushes; Phase 3 emits
+     an `Approved` verdict and adds the var to the in-batch
+     expansion context.
    - Otherwise → `NeedsApproval`; defer to Pass 2.
 3. **Pass 2 — Prompt.** Call `hooks.on_*_unapproved(policy_copy,
    &[Unapproved])`. The hook returns either `Abort` (→
@@ -201,9 +219,14 @@ overload:
   `Contribution::merge`. There is no public way to push raw
   primitives — every item must carry a known `Source`.
 - **Env lookup lives on the composer.** Both composers default to
-  `std::env::var`; `with_env(...)` pins a custom closure for tests.
-  Each `add` threads the lookup into `contribute`. The patch gate
-  reads `HOME` via the same closure as tilde fallback.
+  `std::env::var` for the `contribute()` step and accept
+  `with_env(...)` to pin a custom closure for tests. The
+  difference is in patch-source `~` expansion: `UserComposer`
+  passes its `env("HOME")` as the tilde fallback, but
+  `SessionComposer` passes `None` — daemon-side `~/...` patterns
+  must resolve against a `HOME` carried in the client's wire
+  vars, never against the daemon's process env. Phase 3's
+  `handle_response` reads `HOME` from the client env it was given.
 - **Source travels end-to-end.** Every primitive carries its `Source`
   through every gate and into the final `Composition`, so downstream
   layers (audit, inspection commands, error reporting) can attribute
@@ -221,7 +244,9 @@ overload:
   decidable: ignored, denied, or auto-allowed).
 - **Patches fan out before policy check.** A single `Patch` with a
   glob source becomes N `PatchFile`s; each is checked independently.
-  A `Denied` on any one file kills the whole composition.
+  In Phase 1 a `Denied` on any one file aborts the composition;
+  in Phase 3 each file gets its own `WirePatchVerdict` so a Denied
+  doesn't abort, it just rejects that file.
 - **Hook gets narrow policy by value.** The gate hands the hook an
   owned `VarsPolicy` or `PatchPolicy` — never `&mut UserPolicy`. To
   add a rule, the hook returns the modified copy in
@@ -233,11 +258,14 @@ overload:
   made. The daemon doesn't re-gate them.
 - **Source `~` is expanded at gate time; dest has no `~` to expand.**
   Patch source `FileSet` patterns and `PatchPolicy` patterns expand
-  `~` against a resolved `HOME` — loadout-declared session var first,
-  else the composer's `env("HOME")`. `PatchDest` is always relative
-  to the sandbox user's home; `~` and absolute paths are rejected at
-  construction. Patterns retain their `~` form in returned policies,
-  so save/load is lossless.
+  `~` against a resolved `HOME` — a session var named `HOME` first,
+  else the client-side fallback (`UserComposer`'s `env("HOME")` in
+  Phase 1, `handle_response`'s `env("HOME")` in Phase 3). The
+  `SessionComposer` (Phase 2/4 daemon side) has no fallback —
+  daemon `~/...` patterns must resolve from the client's wire vars.
+  `PatchDest` is always relative to the sandbox user's home; `~`
+  and absolute paths are rejected at construction. Patterns retain
+  their `~` form in returned policies, so save/load is lossless.
 - **`Contribution::merge` is pure aggregation today.** Two
   contributors pushing the same var name both survive into the
   `Composition`. Conflict resolution (precedence, dedup,
@@ -248,5 +276,12 @@ overload:
 - **Terminating failure modes:** `Denied` (explicit policy reject),
   `Aborted` (hook returned `Abort`), `HookContract` (application
   bug — wrong decision count, or `UseRule` to a still-undecidable
-  item), `PatchWalk` (IO-level filesystem walk failures),
-  `Expansion` (malformed `$VAR` / `~` pattern, or undefined var).
+  item), `HookRequired` (non-user-origin item reached the daemon
+  composer with no hook to prompt — placeholder until Phase 2
+  routing lands), `PatchWalk` (IO-level filesystem walk failures),
+  `Expansion` (malformed `$VAR` / `~` pattern, or undefined var),
+  `VarResolution` (a Phase 3 pending `Inherit` var couldn't be
+  resolved against the client env), `InvalidPendingPatchDest` (a
+  Phase 3 pending patch destination violates `PatchDest`
+  invariants), `InvalidWireItem` (a wire-form item failed
+  conversion back to its domain type).
