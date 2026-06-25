@@ -158,6 +158,220 @@ pub fn mount_dev() {
     mount_if_absent("/dev", "devtmpfs", "devtmpfs");
 }
 
+/// Brings up egress for the guest **root** netns (where `minimald` itself runs)
+/// by attaching a primary `eth0` tap to the host gvproxy over the vsock shuttle.
+///
+/// This is the daemon-side mirror of the per-PTask switch attachment: the same
+/// host gvproxy, the same `krun_add_vsock_port2(.., listen=false)` shuttle port,
+/// but the tap lives in the root namespace (no netns move) so `minimald` gets a
+/// default route + DNS and can reach the network — e.g. to clone the upstream
+/// `pkgs` repo when scaffolding a session's `minimal.toml`.
+///
+/// Returns the live [`SwitchRelay`]; the caller MUST keep it alive for as long
+/// as egress is needed (dropping it tears the relay down). Best-effort: if the
+/// host gvproxy is not up (the shuttle connect fails) this returns an error and
+/// the caller continues without egress.
+pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::SwitchRelay> {
+    use crate::net::{DEFAULT_SUBNET, VSOCK_GVPROXY_SHUTTLE_PORT, VSOCK_HOST_CID, switch};
+    use std::net::Ipv4Addr;
+
+    const TAP: &str = "eth0";
+    let ip = DEFAULT_SUBNET.daemon_ip();
+    let gateway = DEFAULT_SUBNET.gateway();
+    let cidr = format!("{ip}/{}", DEFAULT_SUBNET.prefix());
+
+    let _ = &cidr; // (kept for log context below)
+
+    // Open the tap in the current (root) netns; the OwnedFd keeps it alive.
+    let tap_fd = switch::open_tap(TAP)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("open_tap({TAP}) [/dev/net/tun]: {e}")))?;
+
+    // Configure the interface directly via ioctls — the generic guest rootfs
+    // ships no `ip`/iproute2 binary, so shelling out is not an option.
+    configure_interface_v4(TAP, ip, DEFAULT_SUBNET.prefix(), Some(gateway))?;
+    // Bring loopback up too (no address/route needed).
+    configure_interface_v4("lo", Ipv4Addr::LOCALHOST, 8, None)?;
+
+    // Point the resolver at gvproxy's gateway, which serves DNS for the switch.
+    // The rootfs is mounted read-only, so write to the writable /run tmpfs and
+    // bind-mount it over /etc/resolv.conf (a bind only changes the mount tree, so
+    // it works over a read-only fs as long as the target path exists).
+    if let Err(e) = install_resolv_conf(gateway) {
+        tracing::warn!(error = %e, "installing /etc/resolv.conf for guest egress (DNS may fail)");
+    }
+
+    // Relay the tap to the host gvproxy over the vsock shuttle (CID 2).
+    let relay = switch::attach_to_switch_vsock(tap_fd, VSOCK_HOST_CID, VSOCK_GVPROXY_SHUTTLE_PORT)
+        .await?;
+    tracing::info!(%cidr, %gateway, "guest root egress up via host gvproxy shuttle");
+    Ok(relay)
+}
+
+/// Installs `/etc/resolv.conf` pointing at `nameserver` on a read-only rootfs by
+/// writing the file to the `/run` tmpfs and bind-mounting it over the target.
+fn install_resolv_conf(nameserver: std::net::Ipv4Addr) -> std::io::Result<()> {
+    std::fs::write("/run/resolv.conf", format!("nameserver {nameserver}\n"))?;
+    let src = c"/run/resolv.conf";
+    let dst = c"/etc/resolv.conf";
+    // SAFETY: bind-mount with valid C paths, MS_BIND, and no fs-type/data.
+    let rc = unsafe {
+        libc::mount(
+            src.as_ptr(),
+            dst.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Assigns `ip`/`prefix` to `ifname`, brings it up, and (when `gateway` is set)
+/// installs a default route via it — all through `AF_INET` ioctls, so it works
+/// in the generic guest rootfs which carries no `ip`/iproute2 binary.
+fn configure_interface_v4(
+    ifname: &str,
+    ip: std::net::Ipv4Addr,
+    prefix: u8,
+    gateway: Option<std::net::Ipv4Addr>,
+) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    // A `struct ifreq` carrying a `sockaddr_in` in the union, padded to the full
+    // 40-byte `ifreq` size the kernel expects.
+    #[repr(C)]
+    struct IfReqAddr {
+        name: [libc::c_char; libc::IFNAMSIZ],
+        addr: libc::sockaddr_in,
+        _pad: [u8; 8],
+    }
+    // The flags variant of `ifreq`.
+    #[repr(C)]
+    struct IfReqFlags {
+        name: [libc::c_char; libc::IFNAMSIZ],
+        flags: libc::c_short,
+        _pad: [u8; 22],
+    }
+
+    let name_buf = |name: &str| -> [libc::c_char; libc::IFNAMSIZ] {
+        let mut buf = [0 as libc::c_char; libc::IFNAMSIZ];
+        for (dst, b) in buf.iter_mut().zip(name.bytes()) {
+            *dst = b as libc::c_char;
+        }
+        buf
+    };
+    let sockaddr_in = |addr: std::net::Ipv4Addr| -> libc::sockaddr_in {
+        // SAFETY: sockaddr_in is plain old data; zeroing then filling is valid.
+        let mut s: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        s.sin_family = libc::AF_INET as libc::sa_family_t;
+        s.sin_addr = libc::in_addr {
+            s_addr: u32::from(addr).to_be(),
+        };
+        s
+    };
+
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd is a fresh, valid, owned socket fd.
+    let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+    let fd = sock.as_raw_fd();
+
+    let ioctl_addr = |req: libc::c_ulong, addr: libc::sockaddr_in| -> std::io::Result<()> {
+        let mut ifr = IfReqAddr {
+            name: name_buf(ifname),
+            addr,
+            _pad: [0; 8],
+        };
+        // SAFETY: fd is open; &mut ifr is a correctly-sized ifreq for an
+        // address-setting ioctl.
+        let rc =
+            unsafe { libc::ioctl(fd, req as _, std::ptr::from_mut(&mut ifr).cast::<libc::c_void>()) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    };
+
+    // Address (skip for the all-loopback case where we only flip flags up; lo
+    // already carries 127.0.0.1, and re-setting it is harmless but we keep it
+    // for the eth0 path which always needs it).
+    if ifname != "lo" {
+        ioctl_addr(libc::SIOCSIFADDR, sockaddr_in(ip))?;
+        let mask = if prefix == 0 {
+            0
+        } else {
+            u32::MAX << (32 - prefix)
+        };
+        ioctl_addr(
+            libc::SIOCSIFNETMASK,
+            sockaddr_in(std::net::Ipv4Addr::from(mask)),
+        )?;
+    }
+
+    // Bring the interface up: read flags, OR in IFF_UP|IFF_RUNNING, write back.
+    let mut flags = IfReqFlags {
+        name: name_buf(ifname),
+        flags: 0,
+        _pad: [0; 22],
+    };
+    // SAFETY: fd open; ifreq sized for the flags ioctls.
+    if unsafe {
+        libc::ioctl(
+            fd,
+            libc::SIOCGIFFLAGS as _,
+            std::ptr::from_mut(&mut flags).cast::<libc::c_void>(),
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    flags.flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+    if unsafe {
+        libc::ioctl(
+            fd,
+            libc::SIOCSIFFLAGS as _,
+            std::ptr::from_mut(&mut flags).cast::<libc::c_void>(),
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Default route via the gateway (0.0.0.0/0 -> gw), if requested.
+    if let Some(gw) = gateway {
+        let as_sockaddr = |a: std::net::Ipv4Addr| -> libc::sockaddr {
+            // SAFETY: sockaddr and sockaddr_in share the leading family field;
+            // rtentry's route addresses are read as sockaddr but populated from
+            // sockaddr_in, the standard SIOCADDRT idiom.
+            unsafe { std::mem::transmute::<libc::sockaddr_in, libc::sockaddr>(sockaddr_in(a)) }
+        };
+        // SAFETY: rtentry is POD; zero then fill the fields SIOCADDRT reads.
+        let mut rt: libc::rtentry = unsafe { std::mem::zeroed() };
+        rt.rt_dst = as_sockaddr(std::net::Ipv4Addr::UNSPECIFIED);
+        rt.rt_genmask = as_sockaddr(std::net::Ipv4Addr::UNSPECIFIED);
+        rt.rt_gateway = as_sockaddr(gw);
+        rt.rt_flags = (libc::RTF_UP | libc::RTF_GATEWAY) as libc::c_ushort;
+        // SAFETY: fd open; &mut rt is a valid rtentry for SIOCADDRT.
+        if unsafe {
+            libc::ioctl(
+                fd,
+                libc::SIOCADDRT as _,
+                std::ptr::from_mut(&mut rt).cast::<libc::c_void>(),
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    Ok(())
+}
+
 /// Mounts `fstype` at `target` unless `target/<sentinel-of-fstype>` already
 /// exists, i.e. unless it already looks mounted. Failures are logged, not
 /// fatal: a pid-1 that can't mount /proc should still try to serve.

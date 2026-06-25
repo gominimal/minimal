@@ -218,23 +218,24 @@ impl VmConfig {
         // new ones queue. Acceptable for v0.1 workloads (<10 concurrent).
         ctx.add_vsock_port2(crate::sock::VSOCK_BRIDGE_PORT, &uds_path, true)?;
 
-        // Issue #572: per-PTask gvproxy shuttle bridge. An own-IP VM's guest
-        // shuttle connects to AF_VSOCK CID 2 (the host) on
+        // gvproxy shuttle bridge (issue #572, extended to the root netns). The
+        // guest connects to AF_VSOCK CID 2 (the host) on
         // VSOCK_GVPROXY_SHUTTLE_PORT; with `listen = false` libkrun dials the
         // host gvproxy `-listen` switch socket and splices the two, carrying raw
-        // L2 frames between the PTask tap and the host gvproxy (the single
-        // gVisor stack). Only registered for an own-IP VM — HostNet/NoNet never
-        // attach to the switch.
-        if self.is_own_ip() {
-            let switch_sock = crate::net::resolve_switch_sock()
-                .map_err(|source| crate::error::VmError::Io { source })?;
-            ctx.add_vsock_port2(crate::net::VSOCK_GVPROXY_SHUTTLE_PORT, &switch_sock, false)?;
-            tracing::info!(
-                port = crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-                switch_sock = %switch_sock.display(),
-                "registered gvproxy shuttle vsock bridge for own-IP VM",
-            );
-        }
+        // L2 frames between a guest tap and the host gvproxy (the single gVisor
+        // stack). Registered for every VM, not just own-IP: the guest's root
+        // netns (the daemon) attaches a primary tap here for egress, and own-IP
+        // PTasks attach further taps as additional clients on the same switch.
+        // If the host gvproxy did not come up, the guest's connect simply fails
+        // and the relay reports no egress — boot is unaffected.
+        let switch_sock = crate::net::resolve_switch_sock()
+            .map_err(|source| crate::error::VmError::Io { source })?;
+        ctx.add_vsock_port2(crate::net::VSOCK_GVPROXY_SHUTTLE_PORT, &switch_sock, false)?;
+        tracing::info!(
+            port = crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+            switch_sock = %switch_sock.display(),
+            "registered gvproxy shuttle vsock bridge",
+        );
         Ok(())
     }
 }

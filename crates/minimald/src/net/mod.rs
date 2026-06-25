@@ -248,16 +248,26 @@ impl SwitchSubnet {
         Ipv4Addr::from(u32::from(self.broadcast()) - 1)
     }
 
+    /// The daemon address (`broadcast - 2`): the guest root netns' primary tap,
+    /// which gives `minimald` itself egress through the host gvproxy (so it can
+    /// fetch upstream packages). Reserved from the top so the PTask range still
+    /// starts at `network + 2` and never collides with it.
+    #[must_use]
+    pub fn daemon_ip(self) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.broadcast()) - 2)
+    }
+
     /// The first address that may be allocated to a PTask (`network + 2`,
     /// i.e. the first host after the gateway).
     fn first_ptask(self) -> u32 {
         u32::from(self.network()) + 2
     }
 
-    /// The last address that may be allocated to a PTask (`broadcast - 2`,
-    /// leaving the host alias at `broadcast - 1` reserved).
+    /// The last address that may be allocated to a PTask (`broadcast - 3`),
+    /// leaving the daemon address at `broadcast - 2` and the host alias at
+    /// `broadcast - 1` reserved.
     fn last_ptask(self) -> u32 {
-        u32::from(self.broadcast()) - 2
+        u32::from(self.broadcast()) - 3
     }
 }
 
@@ -726,8 +736,8 @@ mod tests {
 
     #[test]
     fn allocator_exhausts_a_tiny_subnet() {
-        // /29 => 8 addresses; network, gateway, host-alias, broadcast reserved,
-        // leaving exactly four allocatable hosts (.2 through .5).
+        // /29 => 8 addresses; network, gateway, daemon, host-alias, broadcast
+        // reserved, leaving exactly three allocatable hosts (.2 through .4).
         let subnet = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 29).unwrap();
         let mut a = IpAllocator::new(subnet);
         let got: Vec<_> = std::iter::from_fn(|| a.allocate().ok())
@@ -739,7 +749,6 @@ mod tests {
                 Ipv4Addr::new(10, 0, 0, 2),
                 Ipv4Addr::new(10, 0, 0, 3),
                 Ipv4Addr::new(10, 0, 0, 4),
-                Ipv4Addr::new(10, 0, 0, 5),
             ]
         );
         assert!(matches!(a.allocate(), Err(NetError::SubnetExhausted(_))));

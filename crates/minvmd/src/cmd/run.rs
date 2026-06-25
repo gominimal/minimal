@@ -199,21 +199,38 @@ fn run_foreground() -> Result<()> {
         .set_nonblocking(false)
         .context("setting listener to blocking")?;
 
-    // Issue #572: for an own-IP VM, spawn + supervise the host gvproxy switch
-    // before the VMM child boots, so its `-listen` switch socket exists when
-    // libkrun dials it for the guest shuttle. The handle lives for the VM's
-    // lifetime and stops gvproxy on drop (after the VMM child exits below).
-    let _gvproxy = if crate::cmd::own_ip_requested() {
-        let switch_sock = crate::net::resolve_switch_sock().context("resolving switch socket")?;
-        crate::sock::prepare_socket_dir(&switch_sock).context("preparing switch socket dir")?;
-        crate::sock::remove_stale_socket(&switch_sock).context("removing stale switch socket")?;
-        let binary = crate::image::resolve_gvproxy_path();
-        let gvproxy = crate::net::HostGvproxy::spawn(binary, switch_sock)
-            .context("spawning host gvproxy switch")?;
-        tracing::info!(pid = gvproxy.pid(), "host gvproxy switch up for own-IP VM");
-        Some(gvproxy)
-    } else {
-        None
+    // Spawn + supervise the host gvproxy switch before the VMM child boots, so
+    // its `-listen` switch socket exists when libkrun dials it for the guest
+    // shuttle. The guest's root netns (the daemon) attaches a primary tap for
+    // egress (issue #572 extended), and own-IP PTasks attach further taps; both
+    // are L2 clients on this one switch. The handle lives for the VM's lifetime
+    // and stops gvproxy on drop (after the VMM child exits below).
+    //
+    // Best-effort: when the gvproxy binary is absent (e.g. the boot/session e2e
+    // lanes that exercise only the vsock bridge) we warn and boot without
+    // egress rather than failing the VM — the daemon then has no network, the
+    // pre-existing behaviour.
+    let _gvproxy = match crate::image::resolve_gvproxy_path() {
+        binary if binary.exists() => {
+            let switch_sock =
+                crate::net::resolve_switch_sock().context("resolving switch socket")?;
+            crate::sock::prepare_socket_dir(&switch_sock)
+                .context("preparing switch socket dir")?;
+            crate::sock::remove_stale_socket(&switch_sock)
+                .context("removing stale switch socket")?;
+            let gvproxy = crate::net::HostGvproxy::spawn(binary, switch_sock)
+                .context("spawning host gvproxy switch")?;
+            tracing::info!(pid = gvproxy.pid(), "host gvproxy switch up");
+            Some(gvproxy)
+        }
+        binary => {
+            tracing::warn!(
+                path = %binary.display(),
+                "gvproxy binary not found; booting without guest egress \
+                 (set MINVMD_GVPROXY_BIN to enable networking)"
+            );
+            None
+        }
     };
 
     let exe = std::env::current_exe().context("resolving current executable path")?;

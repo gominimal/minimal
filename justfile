@@ -85,10 +85,12 @@ initramfs:
 
 # Not yet consumed by `minvmd run`; provided for the netns/relay e2e flows.
 
-# Fetch the pinned gvproxy switch binary (own-IP networking switch) into .scratch.
+# Fetch the pinned gvproxy switch binary into .scratch (skips if already present).
 gvproxy:
+    #!/usr/bin/env sh
+    set -eu
     mkdir -p {{scratch}}
-    scripts/fetch-gvproxy.sh {{gvproxy}}
+    [ -x {{gvproxy}} ] || scripts/fetch-gvproxy.sh {{gvproxy}}
 
 # macOS: codesign with the hypervisor entitlement (must be the last thing to
 # touch the binary). Linux: build with the libkrun prefix exported so build.rs
@@ -121,13 +123,16 @@ minimal-cli:
 # dlopen libkrunfw at runtime.
 
 # Bring the full stack up and list sessions.
-up: artifacts initramfs minvmd-build minimal-cli
+up: artifacts gvproxy initramfs minvmd-build minimal-cli
     #!/usr/bin/env sh
     set -eu
     export MINVMD_KERNEL_PATH="{{kernel}}"
     export MINVMD_ROOTFS_PATH="{{rootfs}}"
     export MINVMD_INITRAMFS="{{initramfs}}"
     export MINVMD_BOOT_LOG="{{scratch}}/boot.log"
+    # Host gvproxy switch: minvmd spawns it for guest egress (root netns + own-IP
+    # PTasks). Best-effort — skipped if the binary is absent.
+    export MINVMD_GVPROXY_BIN="{{gvproxy}}"
     export PATH="{{justfile_directory()}}/target/debug:$PATH"
     case "$(uname -s)" in
       Linux) export LD_LIBRARY_PATH="{{krun-prefix}}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;

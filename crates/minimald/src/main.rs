@@ -351,6 +351,20 @@ async fn async_main() -> Result<(), MainError> {
         if let Err(e) = guest::emit_ready_marker().await {
             tracing::warn!(error = %e, "initramfs: READY marker failed");
         }
+
+        // Bring up the daemon's own egress: a primary tap in the root netns
+        // attached to the host gvproxy over the vsock shuttle. Held for the
+        // server's lifetime (dropping `_egress` tears the relay down). Best
+        // effort — if the host gvproxy is absent the daemon serves without
+        // network, the prior behaviour.
+        let _egress = match guest::bring_up_root_egress().await {
+            Ok(relay) => Some(relay),
+            Err(e) => {
+                tracing::warn!(error = %e, "guest root egress unavailable; serving without network");
+                None
+            }
+        };
+
         let port_num = DEFAULT_VSOCK_PORT_BASE + listen_args.instance_num;
         let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port_num))
             .map_err(|e| MainError::IO(e, "binding vsock port"))?;
