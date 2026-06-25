@@ -564,8 +564,8 @@ fn mesh_enrolment_path(global: &GlobalArgs) -> Result<PathBuf, ()> {
 /// Show this minimald's WireGuard mesh status (R4.6): own public key, the
 /// switch subnets it advertises, and each peer's last handshake.
 async fn cmd_mesh_status(global: &GlobalArgs) -> Result<(), ()> {
-    if let Err(e) = autospawn::ensure_minvmd_running() {
-        eprintln!("Failed to ensure minvmd is running: {e}");
+    if let Err(e) = autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref()) {
+        eprintln!("Failed to ensure the minimald daemon is running: {e}");
         return Err(());
     }
 
