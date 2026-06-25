@@ -299,9 +299,11 @@ impl<S: SessionObject> Session<S> {
             .build()
             .map_err(|e| mctx::Error::from(e).to_string())?;
 
-        // An empty session workspace has no minimal.toml, which would make
-        // Context::new fail. Scaffold a default shell one (pinned to the latest
-        // gominimal/pkgs @main commit) so the session can launch.
+        // TEMPORARY (remove with the workspace-upload gap): an empty session
+        // workspace has no minimal.toml, which would make Context::new fail.
+        // Scaffold a default shell one (pinned to the latest gominimal/pkgs
+        // @main commit) so the session can launch. Once sessions receive their
+        // project files this fabrication — and `mctx::scaffold` — goes away.
         if !wsp.as_utf8_path().join(mfile::MFILE_NAME).exists() {
             mctx::scaffold_default_mfile(&config, wsp.as_utf8_path()).map_err(|e| e.to_string())?;
         }

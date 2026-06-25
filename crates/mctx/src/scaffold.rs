@@ -1,10 +1,18 @@
-//! Scaffolding a default `minimal.toml`.
+//! TEMPORARY: scaffolding a default `minimal.toml` for empty session workspaces.
 //!
-//! Shared by `minimal init` and minimald's session bootstrap. [`generate_mfile`]
-//! renders the file contents; [`scaffold_default_mfile`] resolves the latest
-//! upstream commit and writes a default shell-stack file into a directory that
-//! has none (e.g. an empty session workspace), so a [`crate::Context`] can be
-//! built on it.
+//! This is a stop-gap. A session whose workspace has no `minimal.toml` (the
+//! workspace-upload gap) cannot build a [`crate::Context`], so [`minimald`]
+//! writes a default shell-stack one here on first attach. Remove this module
+//! once sessions receive their project files (including a real `minimal.toml`)
+//! and minimald no longer needs to fabricate one.
+//!
+//! [`generate_mfile`] below is a deliberate COPY of
+//! `minimal::cmd_init::generate_mfile` (and its `DEFAULT_PKGS` /
+//! `DEFAULT_PKGS_BRANCH` / `FALLBACK_STACK` constants). It is duplicated rather
+//! than shared on purpose: this whole module is temporary, so keeping it
+//! self-contained means deleting one file removes the workaround cleanly,
+//! without unpicking a refactor of `cmd_init`. Keep the two in sync only if it
+//! is cheap to; otherwise let this copy lag — it is on its way out.
 
 use std::path::{Path, PathBuf};
 
@@ -13,19 +21,46 @@ use common::repo_spec::Repo;
 
 use crate::{Config, Context, Error};
 
-/// Default upstream package source used when scaffolding a `minimal.toml`.
-pub const DEFAULT_PKGS: &str = "https://github.com/gominimal/pkgs";
-/// Branch tracked for [`DEFAULT_PKGS`].
-pub const DEFAULT_PKGS_BRANCH: &str = "main";
-/// Stack used when no project-specific matcher applies.
+/// TEMPORARY (see module docs): default upstream package source.
+const DEFAULT_PKGS: &str = "https://github.com/gominimal/pkgs";
+/// TEMPORARY (see module docs): branch tracked for [`DEFAULT_PKGS`].
+const DEFAULT_PKGS_BRANCH: &str = "main";
+/// TEMPORARY (see module docs): stack used when no matcher applies.
 const FALLBACK_STACK: &str = "shell";
 
-/// Render a `minimal.toml` for the given upstream `origin`.
-///
-/// `matched_stack` is `Some((name, build_packages, runtime_packages))` when a
-/// stack matcher hit during auto-detection; `None` falls back to the `shell`
-/// stack with no extra packages.
-pub fn generate_mfile(
+/// TEMPORARY (see module docs): resolve the latest [`DEFAULT_PKGS_BRANCH`]
+/// commit and write a default shell `minimal.toml` into `repo_dir`, returning
+/// the written path. Used to bootstrap a session workspace that has none.
+pub fn scaffold_default_mfile(
+    config: &Config,
+    repo_dir: impl AsRef<Path>,
+) -> Result<PathBuf, Error> {
+    let (mut vcs, _cache, _stdlib) = Context::sub_setup(config)?;
+    let (_dir, rev) = vcs.checkout_of(
+        DEFAULT_PKGS,
+        checkouts::GitRef::Branch(DEFAULT_PKGS_BRANCH.to_string()),
+    )?;
+
+    let origin = SpecOrigin::Repo(Repo::Git {
+        url: DEFAULT_PKGS.to_string(),
+        rev,
+        tracking: Some(common::repo_spec::GitRef::Branch(
+            DEFAULT_PKGS_BRANCH.to_string(),
+        )),
+    });
+
+    let content = generate_mfile(None, &origin);
+    let path = repo_dir.as_ref().join(mfile::MFILE_NAME);
+    std::fs::write(&path, &content)
+        .map_err(|e| Error::IO("writing scaffolded minimal.toml", path.clone(), e))?;
+    Ok(path)
+}
+
+/// TEMPORARY (see module docs): a verbatim copy of
+/// `minimal::cmd_init::generate_mfile`. Renders a `minimal.toml` for the given
+/// upstream `origin`; `matched_stack` falls back to the `shell` stack here since
+/// minimald does no project auto-detection.
+fn generate_mfile(
     matched_stack: Option<(String, Vec<String>, Vec<String>)>,
     origin: &SpecOrigin,
 ) -> String {
@@ -87,33 +122,4 @@ pub fn generate_mfile(
     content.push_str("packages = [\"base\"]\n");
     content.push_str("exec = \"bash --noprofile -l\"\n");
     content
-}
-
-/// Resolve the latest [`DEFAULT_PKGS_BRANCH`] commit and write a default shell
-/// `minimal.toml` into `repo_dir`, returning the written path.
-///
-/// Used to bootstrap a session whose workspace has no `minimal.toml` yet.
-pub fn scaffold_default_mfile(
-    config: &Config,
-    repo_dir: impl AsRef<Path>,
-) -> Result<PathBuf, Error> {
-    let (mut vcs, _cache, _stdlib) = Context::sub_setup(config)?;
-    let (_dir, rev) = vcs.checkout_of(
-        DEFAULT_PKGS,
-        checkouts::GitRef::Branch(DEFAULT_PKGS_BRANCH.to_string()),
-    )?;
-
-    let origin = SpecOrigin::Repo(Repo::Git {
-        url: DEFAULT_PKGS.to_string(),
-        rev,
-        tracking: Some(common::repo_spec::GitRef::Branch(
-            DEFAULT_PKGS_BRANCH.to_string(),
-        )),
-    });
-
-    let content = generate_mfile(None, &origin);
-    let path = repo_dir.as_ref().join(mfile::MFILE_NAME);
-    std::fs::write(&path, &content)
-        .map_err(|e| Error::IO("writing scaffolded minimal.toml", path.clone(), e))?;
-    Ok(path)
 }
