@@ -181,6 +181,12 @@ pub struct ListenArgs {
     #[arg(long)]
     #[clap(hide = true)]
     mount_rootfs: Option<String>,
+
+    /// Daemonize: spawn minimald in a new session (setsid) and return once the
+    /// SSH socket accepts connections, or an 8s timeout elapses. Used by the
+    /// `minimal` CLI to auto-start a native (DM2) daemon on Linux.
+    #[arg(long, default_value_t = false)]
+    detach: bool,
 }
 
 /// An error at the top level of minimald.
@@ -211,6 +217,56 @@ fn main() -> Result<(), MainError> {
     runtime.block_on(async_main())
 }
 
+/// Re-exec this binary in a new session (`setsid`) with `--detach` stripped, so
+/// the child runs the foreground server fully detached from the caller's
+/// controlling terminal, then poll the SSH socket until it accepts connections.
+/// Mirrors `minvmd run --detach`.
+fn spawn_detached(cli: &Cli) -> Result<(), MainError> {
+    use std::os::unix::process::CommandExt as _;
+    use std::time::{Duration, Instant};
+
+    const DETACH_TIMEOUT_SECS: u64 = 8;
+
+    let exe = std::env::current_exe().map_err(|e| MainError::IO(e, "resolving current exe"))?;
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| a != "--detach")
+        .collect();
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: setsid() is async-signal-safe. In the child it starts a new
+    // session so the daemon outlives the CLI and is unaffected by SIGHUP when
+    // the invoking shell exits.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn()
+        .map_err(|e| MainError::IO(e, "spawning detached minimald"))?;
+
+    let sock = cli.listen_on();
+    let sock_path = std::path::Path::new(sock.as_utf8_path().as_str());
+    let deadline = Instant::now() + Duration::from_secs(DETACH_TIMEOUT_SECS);
+    loop {
+        if std::os::unix::net::UnixStream::connect(sock_path).is_ok() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(MainError::Other(format!(
+                "detached minimald did not start listening on {sock} within {DETACH_TIMEOUT_SECS}s"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 async fn async_main() -> Result<(), MainError> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new("info")
@@ -234,6 +290,7 @@ async fn async_main() -> Result<(), MainError> {
                 vsock: true,
                 mount_dev: true,
                 mount_rootfs: Some("/dev/vda".to_string()),
+                detach: false,
             }),
             global_args: GlobalArgs {
                 minimal_state_dir: Some(DaemonAbsPath::try_new("/run/minimal").unwrap().into()),
@@ -257,6 +314,22 @@ async fn async_main() -> Result<(), MainError> {
     }
 
     let listen_args = cli.listen_args().unwrap();
+
+    // Daemonize before doing any work: re-exec ourselves in a new session and
+    // wait until the SSH socket is accepting connections, then return so the
+    // caller (the `minimal` CLI autospawn) gets a clean ready/timeout result.
+    if listen_args.detach {
+        // `spawn_detached` polls `cli.listen_on()` (a UDS) for readiness, but a
+        // `--vsock` child binds the vsock listener instead, so the UDS never
+        // appears and the parent would always hit the 8s timeout while leaving a
+        // detached child running. Reject the combination up front.
+        if listen_args.vsock {
+            return Err(MainError::Other(
+                "--detach is only supported for Unix-socket listeners (not --vsock)".to_string(),
+            ));
+        }
+        return spawn_detached(&cli);
+    }
 
     // Handle setup specific to operating in a micro-vm.
     use minimald::guest;

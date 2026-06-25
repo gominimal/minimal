@@ -6,6 +6,7 @@
 //! Linux (KVM); on any other target it is a no-op.
 
 use std::io;
+use std::path::Path;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -132,6 +133,73 @@ pub fn ensure_minvmd_running() -> io::Result<()> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn ensure_minvmd_running() -> io::Result<()> {
     tracing::debug!("ensure_minvmd_running is a no-op on this platform");
+    Ok(())
+}
+
+/// Ensure the daemon the CLI will talk to is running, spawning it if needed.
+///
+/// Backend selection:
+/// - macOS: always via minvmd (libkrun/Hypervisor.framework; there is no native
+///   macOS minimald). `use_minvmd`/`minimal_dir` are ignored.
+/// - Linux: native minimald on the host (DM2) by default; the minvmd microVM
+///   (DM1) when `use_minvmd` is set.
+#[cfg(target_os = "macos")]
+pub fn ensure_daemon_running(use_minvmd: bool, minimal_dir: Option<&Path>) -> io::Result<()> {
+    let _ = (use_minvmd, minimal_dir);
+    ensure_minvmd_running()
+}
+
+#[cfg(target_os = "linux")]
+pub fn ensure_daemon_running(use_minvmd: bool, minimal_dir: Option<&Path>) -> io::Result<()> {
+    if use_minvmd {
+        return ensure_minvmd_running();
+    }
+    let sock = crate::client::resolve_socket_path(minimal_dir, false)
+        .map_err(|e| io::Error::other(format!("resolving native minimald socket path: {e}")))?;
+    ensure_minimald_running(&sock, minimal_dir)
+}
+
+/// On targets without an auto-spawn backend, this is a no-op.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn ensure_daemon_running(use_minvmd: bool, minimal_dir: Option<&Path>) -> io::Result<()> {
+    let _ = (use_minvmd, minimal_dir);
+    Ok(())
+}
+
+/// Linux native (DM2): if the SSH socket is not already accepting connections,
+/// spawn `minimald run --detach --instance-num 0`. minimald daemonizes itself
+/// (setsid) and only returns once it is listening, so this fail-fasts on a
+/// non-zero exit.
+#[cfg(target_os = "linux")]
+fn ensure_minimald_running(socket_path: &Path, minimal_dir: Option<&Path>) -> io::Result<()> {
+    use std::os::unix::net::UnixStream;
+
+    if UnixStream::connect(socket_path).is_ok() {
+        tracing::debug!("native minimald already running (socket connectable)");
+        return Ok(());
+    }
+
+    tracing::info!("spawning native minimald run --detach");
+    // Forward the state-dir override so the spawned daemon binds the same socket
+    // `resolve_socket_path` resolved above; otherwise minimald would default to
+    // `$XDG_STATE_HOME/minimal` and the CLI would later connect to the override
+    // socket and fail. minimald's flag is `--minimal-state-dir`.
+    let mut cmd = Command::new("minimald");
+    if let Some(dir) = minimal_dir {
+        cmd.arg("--minimal-state-dir").arg(dir);
+    }
+    let output = cmd
+        .args(["run", "--detach", "--instance-num", "0"])
+        .output()
+        .map_err(|e| io::Error::new(e.kind(), format!("failed to spawn minimald: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(io::Error::other(format!(
+            "minimald run --detach failed: {stderr}"
+        )));
+    }
+    tracing::info!("native minimald spawned successfully");
     Ok(())
 }
 
