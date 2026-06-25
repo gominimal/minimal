@@ -157,6 +157,10 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
 /// in place) and **before** the daemon serves. The mountpoint lives on the
 /// `/run` tmpfs, so it is created here. Read-write: mctx creates cache
 /// subdirs / lockfiles, and writes persist to the host image file.
+///
+/// On each boot the per-boot runtime state is reset by removing `providers/`
+/// (the SSH host key) so a stale persisted key never lingers; the seed dirs
+/// and per-session trees are left untouched (see inline comment).
 pub fn mount_cache(device: &str) -> std::io::Result<()> {
     // Must match `minimal_cache_dir`/`minimal_state_dir` for the microvm init in
     // `main.rs` (state is co-located here so package hardlinks stay on one fs).
@@ -165,29 +169,18 @@ pub fn mount_cache(device: &str) -> std::io::Result<()> {
     raw_mount(device, CACHE_DIR, "ext4", 0)?;
 
     // The cache disk is a reusable, writable seeded artifact that also backs the
-    // daemon's state dir. Reset any runtime state left by a prior boot — keep
-    // only the seeded cache dirs; the host key (providers/), sandboxes, tasks,
-    // and other state are regenerated. Without this a stale/corrupt host key
-    // persisted on the image fails startup (`host_key` only regenerates on a
-    // *missing* key, not a corrupt one).
-    const SEED_KEEP: &[&str] = &["built", "vcs", "lc", "stdlib", "lost+found"];
-    if let Ok(entries) = std::fs::read_dir(CACHE_DIR) {
-        for entry in entries.flatten() {
-            if SEED_KEEP
-                .iter()
-                .any(|k| std::ffi::OsStr::new(k) == entry.file_name())
-            {
-                continue;
-            }
-            let path = entry.path();
-            let r = if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                std::fs::remove_dir_all(&path)
-            } else {
-                std::fs::remove_file(&path)
-            };
-            if let Err(e) = r {
-                tracing::warn!(error = %e, path = %path.display(), "resetting stale cache-disk state");
-            }
+    // daemon's state dir. Reset only the runtime state that must be fresh each
+    // boot — primarily `providers/`, which holds the SSH host key. The daemon
+    // regenerates a missing key on startup, so dropping the dir guarantees a
+    // clean key even if the persisted one is stale. The large per-session
+    // `sandboxes`/`tasks` trees are left in place: stale entries are harmless
+    // (GC is a separate concern) and a boot-time `rm -rf` of them is O(session
+    // state) and walks corrupt directory blocks, blowing the READY timeout.
+    // Seed dirs (built/vcs/lc/stdlib) are untouched. Errors are tolerated.
+    let providers = std::path::Path::new(CACHE_DIR).join("providers");
+    if let Err(e) = std::fs::remove_dir_all(&providers) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(error = %e, path = %providers.display(), "resetting stale cache-disk state");
         }
     }
     tracing::info!(device, dir = CACHE_DIR, "mounted seeded cache disk");

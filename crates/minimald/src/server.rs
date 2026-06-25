@@ -79,6 +79,16 @@ impl Config {
                         Err(KeyError::Io(std::io::ErrorKind::NotFound))
                     }
                 }
+                // A corrupt key on the writable cache disk (e.g. truncated by an
+                // unclean VM shutdown) would otherwise brick boot. When we own
+                // the key (`create_if_missing`), treat a parse failure like a
+                // missing key: regenerate and overwrite a fresh one.
+                Err(e) if *create_if_missing => {
+                    tracing::warn!(error = %e, path = %path.display(), "host key unreadable; regenerating");
+                    let key = PrivateKey::random(&mut safe_rng(), russh::keys::Algorithm::Ed25519)?;
+                    key.write_openssh_file(path, russh::keys::ssh_key::LineEnding::LF)?;
+                    Ok(key)
+                }
                 Err(e) => Err(e),
             },
             HostKey::Raw(r) => Ok(PrivateKey::from_openssh(r.as_bytes())?),
