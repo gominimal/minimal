@@ -71,12 +71,9 @@ impl UserComposer {
     /// or `InheritWithDefault` variables against `env`.
     pub fn add(&mut self, loadout: Loadout) -> Result<(), Error> {
         let incoming = loadout.contribute(&*self.env)?;
-        // Merge on a clone so a `Conflict` leaves `self.contribution`
-        // untouched. Today `Conflict` is uninhabited so the clone is
-        // unused on the error path; it becomes load-bearing when
-        // conflict-detection variants land.
-        let merged = self.contribution.clone().merge(incoming)?;
-        self.contribution = merged;
+        // `merge` is internally atomic — on `Err`, `self.contribution`
+        // is untouched.
+        self.contribution.merge(incoming)?;
         Ok(())
     }
 
