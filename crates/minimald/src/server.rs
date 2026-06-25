@@ -29,8 +29,11 @@ pub enum HostKey {
 }
 
 /// Default install path for the gvproxy ("gvisor-tap-vsock") switch binary,
-/// used when [`Config::gvproxy_bin`] is unset. The `GVPROXY_BIN` env var is
-/// scoped to the `#[ignore]` netns proof and is never consulted by the daemon.
+/// used when [`Config::gvproxy_bin`] is unset. Override it for a dev build with
+/// `minimald run --gvproxy-bin <path>` (e.g. a binary fetched by
+/// `scripts/fetch-gvproxy.sh`) to avoid installing it system-wide. The
+/// `GVPROXY_BIN` env var is scoped to the `#[ignore]` netns proof and is never
+/// consulted by the daemon.
 const DEFAULT_GVPROXY_BIN: &str = "/usr/lib/minimal/bin/gvproxy";
 
 /// Global Configuration for the minimald server.

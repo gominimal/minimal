@@ -181,6 +181,13 @@ pub struct ListenArgs {
     #[arg(long)]
     #[clap(hide = true)]
     mount_rootfs: Option<String>,
+
+    /// Path to the gvproxy ("gvisor-tap-vsock") binary backing the per-host
+    /// `OwnIp` switch. Overrides the fixed install path so a dev build can point
+    /// at a fetched binary (e.g. `scripts/fetch-gvproxy.sh`) without installing
+    /// it system-wide.
+    #[arg(long)]
+    gvproxy_bin: Option<std::path::PathBuf>,
 }
 
 /// An error at the top level of minimald.
@@ -234,6 +241,7 @@ async fn async_main() -> Result<(), MainError> {
                 vsock: true,
                 mount_dev: true,
                 mount_rootfs: Some("/dev/vda".to_string()),
+                gvproxy_bin: None,
             }),
             global_args: GlobalArgs {
                 minimal_state_dir: Some(DaemonAbsPath::try_new("/run/minimal").unwrap().into()),
@@ -298,7 +306,7 @@ async fn async_main() -> Result<(), MainError> {
         },
         minimal_state_dir: cli.minimal_state_dir(),
         minimal_cache_dir: cli.minimal_cache_dir(),
-        gvproxy_bin: None,
+        gvproxy_bin: listen_args.gvproxy_bin.clone(),
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     russh::keys::known_hosts::learn_known_hosts_path(
