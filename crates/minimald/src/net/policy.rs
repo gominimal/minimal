@@ -180,11 +180,7 @@ pub async fn remove_ingress(control: &ControlChannel, exposed: &[ExposedMapping]
 /// here are ordinary request/response. HTTP/1.0 with `Connection: close` keeps
 /// the exchange to one write + read-to-EOF, with no need to parse chunked or
 /// keep-alive framing.
-async fn post_json<T: Serialize>(
-    control: &ControlChannel,
-    path: &str,
-    body: &T,
-) -> io::Result<()> {
+async fn post_json<T: Serialize>(control: &ControlChannel, path: &str, body: &T) -> io::Result<()> {
     let body = serde_json::to_vec(body).map_err(io::Error::other)?;
     let mut request = Vec::with_capacity(128 + body.len());
     request.extend_from_slice(format!("POST {path} HTTP/1.0\r\n").as_bytes());
