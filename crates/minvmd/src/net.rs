@@ -49,7 +49,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use minimald_rpc::IpProto;
 // gvproxy-switch primitives live in the shared `switch` crate. Re-exported so
 // `minvmd::net::{SwitchSubnet, MacAddr, …}` keeps working.
-pub use switch::{MacAddr, SwitchSubnet, render_gvproxy_config};
+pub use switch::{DEFAULT_MTU, MacAddr, SwitchSubnet, render_gvproxy_config};
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 
