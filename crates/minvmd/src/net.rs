@@ -35,7 +35,6 @@
 //! run within a tokio runtime (the async networking layer the spec mandates),
 //! so neither blocks a worker thread during teardown.
 
-use std::fmt;
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -48,6 +47,9 @@ use std::time::Duration;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 
 use minimald_rpc::IpProto;
+// gvproxy-switch primitives live in the shared `switch` crate. Re-exported so
+// `minvmd::net::{SwitchSubnet, MacAddr, …}` keeps working.
+pub use switch::{MacAddr, SwitchSubnet, render_gvproxy_config};
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 
@@ -62,167 +64,6 @@ pub use shuttle::{VSOCK_GVPROXY_SHUTTLE_PORT, resolve_switch_sock};
 /// Default time to wait for gvproxy to exit on SIGTERM before escalating to
 /// SIGKILL.
 pub const DEFAULT_TERM_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// MTU advertised to the switch and the tap devices. gvproxy's own default.
-pub const DEFAULT_MTU: u16 = 1500;
-
-/// Stable, locally-administered MAC for the switch gateway.
-pub const GATEWAY_MAC: MacAddr = MacAddr([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd]);
-
-/// Error returned when [`SwitchSubnet::new`] is called with a prefix that
-/// would make every [`SwitchSubnet::host`] call return `None`.
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum SwitchSubnetError {
-    /// The prefix is outside the range that allows at least one host address.
-    ///
-    /// Valid range: `1..=30`. A prefix of `0` overflows the host-bit shift;
-    /// a prefix of `31` or `32` leaves no integer index where
-    /// [`SwitchSubnet::host`] returns `Some`; a prefix above `32` is not
-    /// a valid IPv4 prefix length.
-    #[error("prefix /{0} is invalid for a gvproxy subnet (valid: /1..=/30)")]
-    InvalidPrefix(u8),
-}
-
-/// The IPv4 subnet the gvproxy switch hands out to own-IP PTasks.
-///
-/// Defaults to the RFC-6598 shared-address range `100.64.0.0/16`. Index 0 is the
-/// network address and the final address is the broadcast address; index 1 is
-/// reserved for the switch gateway, so client IPs are allocated from index 2 up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SwitchSubnet {
-    base: Ipv4Addr,
-    prefix: u8,
-}
-
-impl Default for SwitchSubnet {
-    fn default() -> Self {
-        Self {
-            base: Ipv4Addr::new(100, 64, 0, 0),
-            prefix: 16,
-        }
-    }
-}
-
-impl fmt::Display for SwitchSubnet {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}", self.base, self.prefix)
-    }
-}
-
-impl SwitchSubnet {
-    /// Construct a subnet from its network base address and prefix length.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SwitchSubnetError::InvalidPrefix`] for a prefix outside
-    /// `1..=30`. A prefix of `0` makes every [`host`](Self::host) call return
-    /// `None` via shift overflow; a prefix of `31` or `32` leaves no integer
-    /// index where `host` returns `Some`.
-    pub fn new(base: Ipv4Addr, prefix: u8) -> Result<Self, SwitchSubnetError> {
-        if !(1..=30).contains(&prefix) {
-            return Err(SwitchSubnetError::InvalidPrefix(prefix));
-        }
-        Ok(Self { base, prefix })
-    }
-
-    /// The gateway address the switch itself answers on (index 1).
-    #[must_use]
-    pub fn gateway(&self) -> Option<Ipv4Addr> {
-        self.host(1)
-    }
-
-    /// The host-alias address gvproxy NATs to the host loopback so a PTask can
-    /// reach host services (the last usable address). `None` for a
-    /// subnet too small to carry one.
-    #[must_use]
-    pub fn host_alias(&self) -> Option<Ipv4Addr> {
-        let span = 1u32.checked_shl(u32::from(32 - self.prefix.min(32)))?;
-        // broadcast - 1 (span - 2 from the base); reuse `host` for the bounds.
-        self.host(span.checked_sub(2)?)
-    }
-
-    /// The host address at `index` within the subnet, or `None` when `index`
-    /// falls outside the usable host range (network, broadcast, or beyond the
-    /// subnet span).
-    #[must_use]
-    pub fn host(&self, index: u32) -> Option<Ipv4Addr> {
-        // Total addresses in the subnet; a /0 or out-of-range prefix yields None.
-        let span = 1u32.checked_shl(u32::from(32 - self.prefix.min(32)))?;
-        // Exclude the network address (0) and the broadcast address (span - 1).
-        if index == 0 || index >= span.checked_sub(1)? {
-            return None;
-        }
-        let addr = u32::from(self.base).checked_add(index)?;
-        Some(Ipv4Addr::from(addr))
-    }
-}
-
-/// A 48-bit Ethernet MAC address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MacAddr(pub [u8; 6]);
-
-impl fmt::Display for MacAddr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let [a, b, c, d, e, g] = self.0;
-        write!(f, "{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{g:02x}")
-    }
-}
-
-impl MacAddr {
-    /// Derives a stable, locally-administered unicast MAC for a switch IP.
-    ///
-    /// Uses the QEMU OUI `52:54:00` (locally administered) followed by the low
-    /// three octets of the address. Within a single `/16` (or narrower) switch
-    /// subnet the low three octets are unique, so the derived MAC is
-    /// collision-free and deterministic — `minvmd` can pre-seed gvproxy's
-    /// static-lease table without round-tripping through DHCP.
-    #[must_use]
-    pub fn for_switch_ip(ip: Ipv4Addr) -> Self {
-        let o = ip.octets();
-        Self([0x52, 0x54, 0x00, o[1], o[2], o[3]])
-    }
-}
-
-/// Renders the gvproxy `-config` YAML for the given subnet and static leases.
-///
-/// gvproxy v0.8.9 has no `-subnet` CLI flag: the subnet, gateway, NAT alias, and
-/// DHCP static leases are all expressed through a `-config` YAML file (see the
-/// spike). `minvmd` owns the allocation table and writes it here before every
-/// (re)start so the switch's static leases match `minvmd`'s address book.
-///
-/// gvproxy reads this file only at spawn time, so a rewrite triggered by a later
-/// attach takes effect only on the next switch (re)start. That is intentional:
-/// an `OwnIp` PTask configures its switch address statically (the spike's
-/// static-lease recipe) rather than via DHCP, so `dhcpStaticLeases` is a
-/// startup-time seed, not a live source a running gvproxy must re-read.
-#[must_use]
-pub fn render_gvproxy_config(subnet: SwitchSubnet, leases: &[(Ipv4Addr, MacAddr)]) -> String {
-    let mut s = String::with_capacity(256 + leases.len() * 48);
-    s.push_str("stack:\n");
-    s.push_str(&format!("  mtu: {DEFAULT_MTU}\n"));
-    s.push_str(&format!("  subnet: \"{subnet}\"\n"));
-    if let Some(gateway) = subnet.gateway() {
-        s.push_str(&format!("  gatewayIP: \"{gateway}\"\n"));
-    }
-    s.push_str(&format!("  gatewayMacAddress: \"{GATEWAY_MAC}\"\n"));
-    if let Some(alias) = subnet.host_alias() {
-        s.push_str("  nat:\n");
-        s.push_str(&format!("    \"{alias}\": \"127.0.0.1\"\n"));
-        s.push_str("  gatewayVirtualIPs:\n");
-        s.push_str(&format!("    - \"{alias}\"\n"));
-    }
-    s.push_str("  dhcpStaticLeases:\n");
-    if leases.is_empty() {
-        // gvproxy accepts an empty map; keep the key present for clarity.
-        s.push_str("    {}\n");
-    } else {
-        for (ip, mac) in leases {
-            s.push_str(&format!("    \"{ip}\": \"{mac}\"\n"));
-        }
-    }
-    s
-}
 
 /// Builder for the per-host gvproxy switch process.
 #[derive(Debug, Clone)]
@@ -865,82 +706,6 @@ mod tests {
         // signal 0 probes for existence without delivering a signal.
         // SAFETY: kill(pid, 0) touches no memory and only reports liveness.
         unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-    }
-
-    #[test]
-    fn default_subnet_is_rfc6598_slash16() {
-        let net = SwitchSubnet::default();
-        assert_eq!(net.gateway(), Some(Ipv4Addr::new(100, 64, 0, 1)));
-        // First client IP (index 2) and a high host within /16.
-        assert_eq!(net.host(2), Some(Ipv4Addr::new(100, 64, 0, 2)));
-        assert_eq!(net.host(258), Some(Ipv4Addr::new(100, 64, 1, 2)));
-        // Host alias is the second-from-last usable address.
-        assert_eq!(net.host_alias(), Some(Ipv4Addr::new(100, 64, 255, 254)));
-        assert_eq!(net.to_string(), "100.64.0.0/16");
-    }
-
-    #[test]
-    fn subnet_rejects_network_and_broadcast() {
-        let net = SwitchSubnet::default();
-        assert_eq!(net.host(0), None, "network address is not a host");
-        // /16 broadcast is index 65535 (span - 1).
-        assert_eq!(net.host(65535), None, "broadcast address is not a host");
-        assert_eq!(net.host(65534), Some(Ipv4Addr::new(100, 64, 255, 254)));
-    }
-
-    #[test]
-    fn mac_is_derived_deterministically_from_ip() {
-        // 52:54:00 OUI followed by the low three octets of 100.64.0.2 in hex.
-        let ip = Ipv4Addr::new(100, 64, 0, 2);
-        assert_eq!(MacAddr::for_switch_ip(ip).to_string(), "52:54:00:40:00:02");
-        assert_eq!(MacAddr::for_switch_ip(ip), MacAddr::for_switch_ip(ip));
-    }
-
-    #[test]
-    fn subnet_new_rejects_zero_prefix() {
-        assert!(
-            matches!(
-                SwitchSubnet::new(Ipv4Addr::new(100, 64, 0, 0), 0),
-                Err(SwitchSubnetError::InvalidPrefix(0))
-            ),
-            "prefix /0 makes host() always return None via shift overflow",
-        );
-    }
-
-    #[test]
-    fn subnet_new_rejects_prefix_31() {
-        // /31 has span=2, span-1=1; every host() index satisfies index>=1 → None.
-        assert!(matches!(
-            SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 31),
-            Err(SwitchSubnetError::InvalidPrefix(31))
-        ));
-    }
-
-    #[test]
-    fn subnet_new_rejects_prefix_32() {
-        // /32 has span=1, span-1=0; host(0) is the network address → None, so
-        // every host() call returns None — the pathology the validation guards.
-        assert!(matches!(
-            SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 32),
-            Err(SwitchSubnetError::InvalidPrefix(32))
-        ));
-    }
-
-    #[test]
-    fn subnet_new_rejects_prefix_above_32() {
-        assert!(matches!(
-            SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 33),
-            Err(SwitchSubnetError::InvalidPrefix(33))
-        ));
-    }
-
-    #[test]
-    fn subnet_new_accepts_valid_prefixes() {
-        // /1 (widest valid) and /30 (narrowest valid — gateway at index 1 fits).
-        assert!(SwitchSubnet::new(Ipv4Addr::new(128, 0, 0, 0), 1).is_ok());
-        assert!(SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 30).is_ok());
-        let net = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 30).unwrap();
-        assert_eq!(net.gateway(), Some(Ipv4Addr::new(10, 0, 0, 1)));
     }
 
     #[test]

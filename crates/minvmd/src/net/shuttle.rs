@@ -36,8 +36,9 @@ use std::path::PathBuf;
 /// Distinct from [`crate::cmd::VSOCK_MARKER_PORT`] (7350, READY marker) and
 /// [`crate::sock::VSOCK_BRIDGE_PORT`] (2222, minimald SSH bridge). libkrun
 /// bridges this port to the host gvproxy `-listen` UNIX socket via
-/// `krun_add_vsock_port2(.., listen = false)`.
-pub const VSOCK_GVPROXY_SHUTTLE_PORT: u32 = 1024;
+/// `krun_add_vsock_port2(.., listen = false)`. Shared with `minimald` via the
+/// `switch` crate so the guest and host agree on the port.
+pub use switch::VSOCK_GVPROXY_SHUTTLE_PORT;
 
 /// Resolve the host UNIX socket path the gvproxy switch listens on.
 ///
