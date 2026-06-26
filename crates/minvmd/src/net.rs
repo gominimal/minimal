@@ -3,11 +3,11 @@
 //!
 //! On DM1/DM3/DM4 a libkrun VM runs `minimald`; `minvmd` supervises exactly one
 //! gvproxy process per host VM ([`GvproxySupervisor`]) that serves every own-IP
-//! PTask as a switch client. A PTask attaches by provisioning a tap device in
-//! its network namespace and running an async TAP↔gvproxy-socket relay
-//! ([`GvproxySupervisor::attach_ptask`], R1.5); it is assigned a unique IP from the
-//! switch subnet, which is seeded into gvproxy's `dhcpStaticLeases` via the
-//! `-config` YAML.
+//! PTask as a switch client. `minvmd` owns the gvproxy **process** lifecycle
+//! only; the in-guest `minimald` performs the per-PTask attach (R1.5) — a tap in
+//! the PTask netns plus an async TAP↔gvproxy relay over the vsock shuttle — and
+//! assigns IPs from the switch subnet. The host switch starts with an empty
+//! `dhcpStaticLeases` table; the guest assigns PTask IPs statically.
 //!
 //! The gvproxy v0.8.9 spike (`docs/spikes/2026-06-21-gvproxy-attachment.md`)
 //! established that the attachment is **not** an SCM_RIGHTS fd-pass. Instead
@@ -41,7 +41,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
@@ -342,12 +342,8 @@ impl GvproxyConfig {
     ) -> io::Result<(GvproxySupervisor, SwitchExit)> {
         self.write_config(leases)?;
         let child = Command::new(&self.binary).args(self.argv()).spawn()?;
-        let (switch, exit) = GvproxySupervisor::supervise(
-            child,
-            self.subnet,
-            self.term_timeout,
-            self.switch_socket,
-        )?;
+        let (switch, exit) =
+            GvproxySupervisor::supervise(child, self.term_timeout, self.switch_socket)?;
         tracing::info!(
             pid = switch.pid(),
             binary = %self.binary.display(),
@@ -364,9 +360,7 @@ impl GvproxyConfig {
 /// Call [`stop`](GvproxySupervisor::stop) for an orderly async teardown
 /// (SIGTERM → grace → SIGKILL, driven on the tokio timer). Dropping the handle
 /// is a best-effort fallback that SIGKILLs the process without blocking; the
-/// background supervision task reaps it. Each own-IP PTask is attached with
-/// [`attach_ptask`](GvproxySupervisor::attach_ptask), which assigns it the next free
-/// switch IP and never reuses an IP for the lifetime of this handle.
+/// background supervision task reaps it.
 #[derive(Debug)]
 pub struct GvproxySupervisor {
     /// PID of the supervised gvproxy process; used for logging. The `Child`
@@ -377,17 +371,8 @@ pub struct GvproxySupervisor {
     /// process exits, never landing on a recycled PID.
     #[cfg(target_os = "linux")]
     pidfd: Arc<OwnedFd>,
-    subnet: SwitchSubnet,
     term_timeout: Duration,
     switch_socket: PathBuf,
-    /// Next switch-client index to assign; starts at 2 (1 is the gateway).
-    next_index: u32,
-    /// Number of currently-attached PTasks. Incremented by [`attach_ptask`]
-    /// and decremented (via RAII Drop) when a [`PtaskAttachment`] is dropped.
-    /// The switch terminates automatically when this reaches zero (R1.4).
-    ///
-    /// [`attach_ptask`]: GvproxySupervisor::attach_ptask
-    attached_count: Arc<AtomicU32>,
     /// Set before any intentional teardown so the supervision task classifies
     /// the resulting child exit as a clean stop rather than an unexpected crash.
     stopping: Arc<AtomicBool>,
@@ -408,7 +393,6 @@ impl GvproxySupervisor {
     /// Returns an I/O error if `pidfd_open(2)` fails (Linux only).
     pub(crate) fn supervise(
         child: Child,
-        subnet: SwitchSubnet,
         term_timeout: Duration,
         switch_socket: PathBuf,
     ) -> io::Result<(Self, SwitchExit)> {
@@ -440,18 +424,14 @@ impl GvproxySupervisor {
             Arc::new(unsafe { OwnedFd::from_raw_fd(raw) })
         };
         let stopping = Arc::new(AtomicBool::new(false));
-        let attached_count = Arc::new(AtomicU32::new(0));
         let (exit_tx, exit_rx) = oneshot::channel();
         let supervisor = tokio::spawn(supervise_switch(child, pid, Arc::clone(&stopping), exit_tx));
         let switch = Self {
             pid,
             #[cfg(target_os = "linux")]
             pidfd,
-            subnet,
             term_timeout,
             switch_socket,
-            next_index: 2,
-            attached_count,
             stopping,
             supervisor: Some(supervisor),
         };
@@ -470,127 +450,6 @@ impl GvproxySupervisor {
         &self.switch_socket
     }
 
-    /// Allocate the next free switch IP without provisioning a tap or relay.
-    ///
-    /// Returns the assigned IP and its derived MAC, or `None` when the subnet is
-    /// exhausted. Used by [`attach_ptask`](Self::attach_ptask) and by callers
-    /// that only need an address (e.g. seeding the `-config` lease table).
-    fn allocate_ip(&mut self) -> Option<(Ipv4Addr, MacAddr)> {
-        let switch_ip = self.subnet.host(self.next_index)?;
-        // Never hand out the NAT host-alias address (gvproxy maps it to the host
-        // loopback); reserving it keeps the "never allocated" invariant true.
-        if Some(switch_ip) == self.subnet.host_alias() {
-            return None;
-        }
-        self.next_index += 1;
-        Some((switch_ip, MacAddr::for_switch_ip(switch_ip)))
-    }
-
-    /// Attach an own-IP PTask as a switch client (R1.5), assigning it the next
-    /// free IP from the switch subnet, provisioning a tap device named
-    /// `tap_name`, and starting the async TAP↔gvproxy relay. `label` identifies
-    /// the PTask in the emitted tracing event (R1.8).
-    ///
-    /// The returned [`PtaskAttachment`] owns the relay handle: dropping it (or
-    /// calling [`detach_ptask`](Self::detach_ptask)) tears the relay down and
-    /// detaches the PTask. The caller is responsible for moving the tap
-    /// interface into the PTask's netns and configuring its MAC/IP/route there
-    /// (the spike's static-lease recipe) between this call and any traffic.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`io::ErrorKind::AddrNotAvailable`] when the subnet is exhausted,
-    /// or the underlying I/O error if the tap cannot be opened or the relay
-    /// cannot connect to the switch socket.
-    #[cfg(target_os = "linux")]
-    pub async fn attach_ptask(
-        &mut self,
-        label: impl Into<String>,
-        tap_name: &str,
-    ) -> io::Result<PtaskAttachment> {
-        let (switch_ip, mac) = self.allocate_ip().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                "gvproxy switch subnet exhausted; no free PTask address remains",
-            )
-        })?;
-        let index = self.next_index - 1;
-        let label = label.into();
-
-        let tap = open_tap(tap_name)?;
-        let relay = attach_to_switch(tap, &self.switch_socket).await?;
-
-        let prev = self.attached_count.fetch_add(1, Ordering::AcqRel);
-        tracing::info!(
-            ptask = %label,
-            switch_ip = %switch_ip,
-            mac = %mac,
-            tap = %tap_name,
-            gvproxy_pid = self.pid,
-            attached = prev + 1,
-            "PTask attached to gvproxy switch",
-        );
-        Ok(PtaskAttachment {
-            label,
-            switch_ip,
-            mac,
-            index,
-            relay: Some(relay),
-            pid: self.pid,
-            #[cfg(target_os = "linux")]
-            pidfd: Arc::clone(&self.pidfd),
-            stopping: Arc::clone(&self.stopping),
-            attached_count: Arc::clone(&self.attached_count),
-        })
-    }
-
-    /// Allocate a switch IP + MAC for a PTask without opening a tap or relay.
-    ///
-    /// This is the portable subset of [`attach_ptask`](Self::attach_ptask) used
-    /// by the lease-table seeding path and by non-Linux builds (where tap
-    /// provisioning is unavailable). Returns `None` when the subnet is exhausted.
-    pub fn allocate_ptask(&mut self, label: impl Into<String>) -> Option<PtaskAttachment> {
-        let (switch_ip, mac) = self.allocate_ip()?;
-        let index = self.next_index - 1;
-        let prev = self.attached_count.fetch_add(1, Ordering::AcqRel);
-        let label = label.into();
-        tracing::info!(
-            ptask = %label,
-            switch_ip = %switch_ip,
-            mac = %mac,
-            gvproxy_pid = self.pid,
-            attached = prev + 1,
-            "PTask attached to gvproxy switch",
-        );
-        Some(PtaskAttachment {
-            label,
-            switch_ip,
-            mac,
-            index,
-            #[cfg(target_os = "linux")]
-            relay: None,
-            pid: self.pid,
-            #[cfg(target_os = "linux")]
-            pidfd: Arc::clone(&self.pidfd),
-            stopping: Arc::clone(&self.stopping),
-            attached_count: Arc::clone(&self.attached_count),
-        })
-    }
-
-    /// Detach a previously attached PTask from the switch (R1.8). Consumes the
-    /// attachment; the RAII [`Drop`] impl decrements the count and terminates
-    /// the switch if this was the last attached PTask (R1.4).
-    ///
-    /// The IP is retired for this handle's lifetime so a later PTask never
-    /// inherits a still-cached peer's address (R1.6 intent).
-    ///
-    /// This is exactly equivalent to dropping the attachment; it touches no
-    /// switch state, so it takes `&self` and is callable through a shared
-    /// borrow.
-    pub fn detach_ptask(&self, attachment: PtaskAttachment) {
-        drop(attachment);
-    }
-
     /// Tear the switch down cleanly (R1.4): deliver SIGTERM, wait up to
     /// `term_timeout` for gvproxy to exit, then escalate to SIGKILL.
     ///
@@ -601,11 +460,11 @@ impl GvproxySupervisor {
     pub async fn stop(mut self) {
         // Mark the exit intentional *before* signalling so the supervision task
         // classifies the resulting `wait()` as a clean stop, not a crash. Use
-        // `swap` (not `store`) so this is symmetric with the guards on
-        // `GvproxySupervisor::Drop` and the last-detach `PtaskAttachment::Drop`: if a
-        // last-detach drop already claimed teardown and sent SIGTERM, the child
-        // may already be reaped and its PID recycled, so `stop()` must not
-        // re-signal `pid` — it only awaits the supervisor for the exit.
+        // `swap` (not `store`) so this is symmetric with the guard on
+        // `GvproxySupervisor::Drop`: if a drop already claimed teardown and sent
+        // SIGKILL, the child may already be reaped and its PID recycled, so
+        // `stop()` must not re-signal `pid` — it only awaits the supervisor for
+        // the exit.
         let already_claimed = self.stopping.swap(true, Ordering::AcqRel);
         let Some(mut supervisor) = self.supervisor.take() else {
             // Already stopped.
@@ -651,12 +510,10 @@ impl Drop for GvproxySupervisor {
         // task to reap the child. No blocking poll runs here (the async
         // `stop()` is the path that waits for a graceful SIGTERM exit).
         //
-        // Only SIGKILL if this drop is the first to claim teardown. If a
-        // `PtaskAttachment::Drop` (or anything else) already flipped `stopping`
-        // the child is reaped and its PID may have been recycled, so an
-        // unconditional SIGKILL could land on an unrelated process. `swap`
-        // makes the claim atomic, mirroring the SIGTERM guard on the last
-        // attachment drop.
+        // Only SIGKILL if this drop is the first to claim teardown. If `stop()`
+        // (or anything else) already flipped `stopping` the child is reaped and
+        // its PID may have been recycled, so an unconditional SIGKILL could land
+        // on an unrelated process. `swap` makes the claim atomic.
         if !self.stopping.swap(true, Ordering::AcqRel) {
             #[cfg(target_os = "linux")]
             signal_via_pidfd(&self.pidfd, libc::SIGKILL, "SIGKILL");
@@ -667,110 +524,6 @@ impl Drop for GvproxySupervisor {
                 "gvproxy switch dropped without stop(); SIGKILL sent, reap deferred to supervisor",
             );
         }
-    }
-}
-
-/// A PTask's attachment to the gvproxy switch: the assigned IP/MAC, the client
-/// index it was allocated at, and (on Linux, for a full attach) the relay handle
-/// whose lifetime keeps the tap↔switch bridge alive.
-///
-/// This is an RAII handle: dropping it decrements the shared attached-PTask
-/// counter and, when the count reaches zero, delivers `SIGTERM` to the gvproxy
-/// switch so it tears down when the last own-IP PTask exits (R1.4). Every drop
-/// path logs the detach; [`GvproxySupervisor::detach_ptask`] is just a named way to
-/// drop it at a chosen point and is equivalent to an implicit scope-exit drop.
-#[must_use = "dropping PtaskAttachment decrements the attached count and may terminate the switch"]
-#[derive(Debug)]
-pub struct PtaskAttachment {
-    label: String,
-    switch_ip: Ipv4Addr,
-    mac: MacAddr,
-    index: u32,
-    /// The running TAP↔switch relay; `None` for an allocate-only attachment
-    /// ([`GvproxySupervisor::allocate_ptask`]). Held purely for its RAII lifetime —
-    /// dropping it aborts the relay tasks and detaches the PTask — so it is never
-    /// read directly.
-    #[cfg(target_os = "linux")]
-    #[allow(dead_code)]
-    relay: Option<SwitchRelay>,
-    /// PID of the supervised gvproxy process; used for logging.
-    pid: u32,
-    /// pidfd for the supervised gvproxy process, shared with [`GvproxySupervisor`].
-    /// Used for recycle-safe signalling via `pidfd_send_signal(2)`.
-    #[cfg(target_os = "linux")]
-    pidfd: Arc<OwnedFd>,
-    /// Shared with the parent [`GvproxySupervisor`]; set to `true` before
-    /// delivering a termination signal so the supervision task classifies the
-    /// resulting exit as intentional rather than unexpected.
-    stopping: Arc<AtomicBool>,
-    /// Live attachment counter shared with the parent [`GvproxySupervisor`].
-    attached_count: Arc<AtomicU32>,
-}
-
-impl Drop for PtaskAttachment {
-    fn drop(&mut self) {
-        let prev = self.attached_count.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(
-            prev > 0,
-            "attached_count underflowed — PtaskAttachment dropped more times than it was attached",
-        );
-        tracing::info!(
-            ptask = %self.label,
-            switch_ip = %self.switch_ip,
-            gvproxy_pid = self.pid,
-            attached = prev.saturating_sub(1),
-            "PTask detached from gvproxy switch",
-        );
-        // Only the drop that flips `stopping` from false → true signals.
-        // If `stop()` (or `GvproxySupervisor::Drop`) already claimed teardown the
-        // child is already going away, so skip the redundant signal. `swap`
-        // makes the claim atomic and race-free against a concurrent stop or drop.
-        // On an independent gvproxy crash the pidfd path returns ESRCH (the
-        // exact process has exited) rather than risking a recycled PID hit.
-        if prev == 1 && !self.stopping.swap(true, Ordering::AcqRel) {
-            // Last own-IP PTask detached; terminate the switch (R1.4).
-            #[cfg(target_os = "linux")]
-            signal_via_pidfd(&self.pidfd, libc::SIGTERM, "SIGTERM");
-            #[cfg(not(target_os = "linux"))]
-            signal_child(self.pid as libc::pid_t, libc::SIGTERM, "SIGTERM");
-            tracing::info!(
-                gvproxy_pid = self.pid,
-                "last own-IP PTask detached; SIGTERM sent to gvproxy switch",
-            );
-        }
-    }
-}
-
-impl PtaskAttachment {
-    /// The PTask label this attachment was created for.
-    #[must_use]
-    pub fn label(&self) -> &str {
-        &self.label
-    }
-
-    /// The IP assigned to this PTask on the switch subnet.
-    #[must_use]
-    pub fn switch_ip(&self) -> Ipv4Addr {
-        self.switch_ip
-    }
-
-    /// The MAC derived from this PTask's switch IP (its `dhcpStaticLeases` key).
-    #[must_use]
-    pub fn mac(&self) -> MacAddr {
-        self.mac
-    }
-
-    /// The switch-client index this PTask was allocated at.
-    #[must_use]
-    pub fn index(&self) -> u32 {
-        self.index
-    }
-
-    /// The `(ip, mac)` static-lease entry for this PTask, for seeding gvproxy's
-    /// `dhcpStaticLeases`.
-    #[must_use]
-    pub fn lease(&self) -> (Ipv4Addr, MacAddr) {
-        (self.switch_ip, self.mac)
     }
 }
 
@@ -1246,7 +999,6 @@ mod tests {
     fn supervise_sleep() -> (GvproxySupervisor, SwitchExit) {
         GvproxySupervisor::supervise(
             spawn_sleep(),
-            SwitchSubnet::default(),
             Duration::from_secs(2),
             PathBuf::from("/run/minvmd/switch.sock"),
         )
@@ -1263,45 +1015,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         false
-    }
-
-    #[tokio::test]
-    async fn allocate_assigns_unique_sequential_ips() {
-        let (mut switch, _exit) = supervise_sleep();
-
-        let a = switch.allocate_ptask("ptask-a").expect("allocate a");
-        let b = switch.allocate_ptask("ptask-b").expect("allocate b");
-
-        assert_eq!(a.switch_ip(), Ipv4Addr::new(100, 64, 0, 2));
-        assert_eq!(b.switch_ip(), Ipv4Addr::new(100, 64, 0, 3));
-        assert_ne!(a.switch_ip(), b.switch_ip(), "IPs must be unique");
-        assert_eq!(a.mac(), MacAddr::for_switch_ip(a.switch_ip()));
-        // Detach a; b is dropped at end of scope.
-        switch.detach_ptask(a);
-        switch.stop().await;
-    }
-
-    #[tokio::test]
-    async fn last_ptask_detach_terminates_switch() {
-        // Dropping the final PtaskAttachment should SIGTERM the switch and the
-        // supervision task should classify it as an intentional stop (R1.4).
-        let (mut switch, _exit) = supervise_sleep();
-        let pid = switch.pid();
-
-        let a = switch.allocate_ptask("ptask-a").expect("allocate");
-        assert!(pid_is_alive(pid), "switch should be alive with one PTask");
-
-        // Explicitly detach (consuming the attachment): count hits zero → SIGTERM.
-        switch.detach_ptask(a);
-        assert!(
-            await_reaped(pid).await,
-            "switch must be terminated after the last PTask detaches",
-        );
-        // The last detach already SIGTERM'd the switch and claimed `stopping`,
-        // so consuming it here just drops the supervisor JoinHandle: the
-        // guarded `GvproxySupervisor::Drop` sees `stopping` set and skips its
-        // SIGKILL rather than signalling the now-reaped (possibly recycled) PID.
-        drop(switch);
     }
 
     #[tokio::test]
@@ -1337,7 +1050,6 @@ mod tests {
         // channel (R1.4 detection half).
         let (switch, exit) = GvproxySupervisor::supervise(
             Command::new("true").spawn().expect("spawn true"),
-            SwitchSubnet::default(),
             Duration::from_secs(2),
             PathBuf::from("/run/minvmd/switch.sock"),
         )
