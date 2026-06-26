@@ -34,10 +34,12 @@ pub const OWN_IP_ENV: &str = "MINVMD_VM_OWN_IP";
 /// Whether [`OWN_IP_ENV`] requests an own-IP VM.
 #[must_use]
 pub fn own_ip_requested() -> bool {
-    matches!(
-        std::env::var(OWN_IP_ENV).as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE")
-    )
+    std::env::var(OWN_IP_ENV).is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 /// Verify the host hypervisor backend is accessible before booting a VM (R2.4).
