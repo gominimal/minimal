@@ -380,16 +380,29 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     let registry = state.sessions_manager().await.hostnames();
+    // DM1 (in-VM): bind 0.0.0.0 so the listener comes up regardless of whether
+    // eth0 has finished coming up, then publish the port on the host loopback via
+    // the gvproxy forwarder. DM2: bind host loopback directly, no host-expose.
     let bind_base: IpAddr = if in_microvm {
-        crate::net::DEFAULT_SUBNET.daemon_ip().into()
+        Ipv4Addr::UNSPECIFIED.into()
     } else {
         Ipv4Addr::LOCALHOST.into()
     };
 
     // B5 egress/DNS proxy (:7654), always.
     let egress_addr = SocketAddr::new(bind_base, proxy::EGRESS_PROXY_PORT);
-    if let Some(listener) = proxy::bind_listener(egress_addr).await {
-        tokio::spawn(proxy::serve(listener, Router::new(registry.clone())));
+    if proxy::bind_listener(egress_addr)
+        .await
+        .map(|listener| tokio::spawn(proxy::serve(listener, Router::new(registry.clone()))))
+        .is_some()
+        && in_microvm
+    {
+        // Only publish a port whose listener actually bound.
+        expose_proxy_on_host(
+            crate::net::DEFAULT_SUBNET.daemon_ip(),
+            proxy::EGRESS_PROXY_PORT,
+        )
+        .await;
     }
 
     // B8 mTLS reverse proxy (:7655), under the networking-proxy feature.
@@ -398,27 +411,29 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
         let https_addr = SocketAddr::new(bind_base, proxy::HTTPS_PROXY_PORT);
         match state.cert_authority().await.build_server_config() {
             Ok(tls_config) => {
-                if let Some(listener) = proxy::bind_listener(https_addr).await {
-                    tokio::spawn(proxy::serve_https(
-                        listener,
-                        Router::new(registry.clone()),
-                        tls_config,
-                    ));
+                if proxy::bind_listener(https_addr)
+                    .await
+                    .map(|listener| {
+                        tokio::spawn(proxy::serve_https(
+                            listener,
+                            Router::new(registry.clone()),
+                            tls_config,
+                        ))
+                    })
+                    .is_some()
+                    && in_microvm
+                {
+                    expose_proxy_on_host(
+                        crate::net::DEFAULT_SUBNET.daemon_ip(),
+                        proxy::HTTPS_PROXY_PORT,
+                    )
+                    .await;
                 }
             }
             Err(error) => {
                 tracing::warn!(%error, "could not build TLS config for the mTLS reverse proxy");
             }
         }
-    }
-
-    // DM1: the proxies bind the guest switch IP, so publish them on the host's
-    // loopback via the host gvproxy forwarder. DM2 already binds host loopback.
-    if in_microvm {
-        let daemon_ip = crate::net::DEFAULT_SUBNET.daemon_ip();
-        expose_proxy_on_host(daemon_ip, proxy::EGRESS_PROXY_PORT).await;
-        #[cfg(feature = "networking-proxy")]
-        expose_proxy_on_host(daemon_ip, proxy::HTTPS_PROXY_PORT).await;
     }
 }
 
