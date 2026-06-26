@@ -728,20 +728,6 @@ impl<C: Channel> Sandbox<C> {
         container.command_inner(self, &program, args, env_vars)
     }
 
-    /// Phase B: wire the launched process's network namespace per the configured
-    /// [`Network`]. `netns_pid` is the launched process holding
-    /// `/proc/<pid>/ns/net` (the unshared netns from [`new_container`]).
-    ///
-    /// No-op for the built-in modes and when no custom [`Network`] is set.
-    /// Teardown is explicit via the returned [`NetGuard`] — call its
-    /// [`teardown`](NetGuard::teardown) when the sandbox is finished.
-    pub async fn attach_network(&self, netns_pid: u32) -> Result<Box<dyn NetGuard>, NetworkError> {
-        match self.config.network.as_deref() {
-            Some(net) => net.attach(netns_pid).await,
-            None => Ok(network::noop_guard()),
-        }
-    }
-
     pub async fn run<W1, W2>(
         &mut self,
         invocations: Vec<Invocation>,
@@ -786,6 +772,20 @@ impl<C: Channel> Sandbox<C> {
             let mut child = cmd
                 .spawn()
                 .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
+
+            // Apply the configured per-sandbox network to this invocation's
+            // freshly-unshared netns (own-IP switch attach). No-op for
+            // HostNet/NoNet and when no custom `Network` is set, so existing
+            // build/task consumers are unaffected — this is what lets tasks, not
+            // just minimald sessions, get networking through the abstraction.
+            // Torn down explicitly once the invocation completes (both arms).
+            // Borrow only the `Network` (which is `Send + Sync`) across the await,
+            // not the whole `Sandbox<C>`, so this doesn't impose `C: Sync` on the
+            // run future.
+            let net_guard = match self.config.network.as_deref() {
+                Some(net) => net.attach(child.id()).await.map_err(Error::Network)?,
+                None => network::noop_guard(),
+            };
 
             // Take pipes from the child so threads can stream them into the stdout/stderr
             // files, as well as to the caller-provided writers if applicable.
@@ -917,8 +917,9 @@ impl<C: Channel> Sandbox<C> {
                         self.stderr = f;
                     }
 
-                    // Reap the child process.
+                    // Reap the child process, then tear down its network.
                     let _ = child.wait();
+                    net_guard.teardown().await;
                     return Err(Error::Execution(ExecutionError::Cancelled));
                 }
                 (stdout_fwd_res, stderr_fwd_res) = async { tokio::join!(stdout_fwd, stderr_fwd) } => {
@@ -941,6 +942,9 @@ impl<C: Channel> Sandbox<C> {
                     let status = child
                         .wait()
                         .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
+
+                    // The invocation's process has exited; tear down its network.
+                    net_guard.teardown().await;
 
                     if !status.success() {
                         let stderr_str = String::from_utf8_lossy(&stderr_tail).into_owned();
