@@ -223,11 +223,14 @@ async fn async_main() -> Result<(), MainError> {
         .with(filter)
         .init();
 
-    // Install the process-default rustls CryptoProvider before anything builds a
-    // rustls config. rustls 0.23 panics ("no process-level CryptoProvider") the
-    // first time one is needed otherwise — e.g. when a session build reaches the
-    // remote-cache HTTPS client, which is off the proxy's own install path. Ring
-    // matches the proxy's choice; idempotent (the proxy's later install no-ops).
+    // With `networking-proxy` on, both the `ring` (workspace rustls) and the
+    // `aws-lc-rs` (google-cloud) providers are compiled in, so rustls cannot
+    // auto-pick one and panics ("no process-level CryptoProvider") the first time
+    // a config is built — e.g. when a session build reaches the remote-cache
+    // HTTPS client, off the proxy's own install path. Install ring explicitly
+    // here (idempotent; the proxy's later install no-ops). Without
+    // networking-proxy only one provider is present and rustls auto-installs it.
+    #[cfg(feature = "networking-proxy")]
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Use hardcoded configuration if we are the init process (`argv[0] == "/init"`), which
