@@ -10,6 +10,8 @@ use sessions::{
     store::{DiskLoader, Loader, SessionKey, SessionObject},
 };
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::RwLock;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 /// A short summary of the metadata of a session.
@@ -88,11 +90,14 @@ pub struct Manager<L: Loader = DiskLoader> {
     /// `OwnIp` PTask attaches to the one per-host switch (R1.4/R1.5/R1.6).
     net_switch: Arc<Mutex<crate::net::GvproxySwitch>>,
 
-    /// In-memory PTask hostname registry (Unit 3, DM2). Owned directly because
-    /// the manager is an actor with exclusive `&mut self` access, so no lock is
-    /// needed. `HostNet` PTasks register on launch and withdraw on teardown.
+    /// In-memory PTask hostname registry (Unit 3). Shared behind an `Arc<RwLock>`
+    /// so the daemon's host-side proxies ([`crate::net::proxy`]) can resolve a
+    /// `Host:` header without routing through the actor mainloop, while the
+    /// manager still mutates it under `&mut self`. The lock is only ever held for
+    /// a synchronous register/deregister/resolve, never across an `.await`.
+    /// `HostNet` PTasks register on launch and withdraw on teardown.
     #[cfg(target_os = "linux")]
-    hostnames: crate::net::dns::HostnameRegistry,
+    hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
 }
 
 impl Manager {
@@ -106,6 +111,13 @@ impl Manager {
         let l = DiskLoader::new(minimal_state_dir.clone())?;
         let running = BTreeMap::new();
         let (sender, receiver) = mpsc::channel(8);
+        // Shared so the host-side proxies can resolve `Host:` headers directly;
+        // a clone is held by both the actor (which mutates it) and the handle
+        // (which hands it to the proxies via `hostnames()`).
+        #[cfg(target_os = "linux")]
+        let hostnames = Arc::new(RwLock::new(crate::net::dns::HostnameRegistry::new(
+            crate::net::dns::DEFAULT_HOST_ID,
+        )));
         let mngr = Self {
             receiver,
             running,
@@ -114,11 +126,15 @@ impl Manager {
             minimal_cache_dir,
             net_switch,
             #[cfg(target_os = "linux")]
-            hostnames: crate::net::dns::HostnameRegistry::new(crate::net::dns::DEFAULT_HOST_ID),
+            hostnames: Arc::clone(&hostnames),
         };
 
         tokio::spawn(mngr.mainloop());
-        Ok(ManagerHandle(sender))
+        Ok(ManagerHandle {
+            sender,
+            #[cfg(target_os = "linux")]
+            hostnames,
+        })
     }
 }
 
@@ -211,7 +227,10 @@ impl<L: Loader> Manager<L> {
                                     .expect("TODO handle error");
                                     #[cfg(target_os = "linux")]
                                     if let Some((id, name)) = host_net_reg {
-                                        self.hostnames.register_host_net(id, &name);
+                                        self.hostnames
+                                            .write()
+                                            .expect("hostname registry lock poisoned")
+                                            .register_host_net(id, &name);
                                     }
                                     self.running.insert(k, h.clone());
                                     h
@@ -284,7 +303,10 @@ impl<L: Loader> Manager<L> {
                     // on-disk record (repairable on restart) but never a stale
                     // routing entry pointing at a destroyed session.
                     #[cfg(target_os = "linux")]
-                    self.hostnames.deregister(&host_net_name);
+                    self.hostnames
+                        .write()
+                        .expect("hostname registry lock poisoned")
+                        .deregister(&host_net_name);
                     self.store.delete(&k)?;
                     Ok(())
                 })
@@ -296,14 +318,30 @@ impl<L: Loader> Manager<L> {
 
 /// The handle to the session manager.
 #[derive(Debug, Clone)]
-pub struct ManagerHandle(mpsc::Sender<ManagerMessage>);
+pub struct ManagerHandle {
+    sender: mpsc::Sender<ManagerMessage>,
+    /// A clone of the actor's shared PTask hostname registry, handed to the
+    /// host-side proxies so they resolve `Host:` headers without a round-trip
+    /// through the actor mainloop.
+    #[cfg(target_os = "linux")]
+    hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+}
 
 impl ManagerHandle {
+    /// Returns a shared handle to the in-memory PTask hostname registry, for the
+    /// daemon's host-side proxies ([`crate::net::proxy`]) to route by `Host:`
+    /// header.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn hostnames(&self) -> Arc<RwLock<crate::net::dns::HostnameRegistry>> {
+        Arc::clone(&self.hostnames)
+    }
+
     /// Lists the sessions known to this (minimald) instance.
     pub async fn list(&self) -> Result<Vec<SessionInfo>, SessionsError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(ManagerMessage::List(send)).await;
+        let _ = self.sender.send(ManagerMessage::List(send)).await;
         recv.await.expect("corresponding sessions manager is dead")
     }
 
@@ -314,7 +352,10 @@ impl ManagerHandle {
     ) -> Result<Option<sessions::Record>, SessionsError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(ManagerMessage::GetRecord(pred, send)).await;
+        let _ = self
+            .sender
+            .send(ManagerMessage::GetRecord(pred, send))
+            .await;
         recv.await.expect("corresponding sessions manager is dead")
     }
 
@@ -326,7 +367,7 @@ impl ManagerHandle {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
-            .0
+            .sender
             .send(ManagerMessage::CreateSession(record, send))
             .await;
         recv.await.expect("corresponding sessions manager is dead")
@@ -339,7 +380,10 @@ impl ManagerHandle {
     ) -> Result<Option<SessionHandle>, SessionsError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(ManagerMessage::GetSession(pred, send)).await;
+        let _ = self
+            .sender
+            .send(ManagerMessage::GetSession(pred, send))
+            .await;
         recv.await.expect("corresponding sessions manager is dead")
     }
 
@@ -352,7 +396,7 @@ impl ManagerHandle {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
-            .0
+            .sender
             .send(ManagerMessage::RenameSession(id, new_name, send))
             .await;
         recv.await.expect("corresponding sessions manager is dead")
@@ -365,7 +409,10 @@ impl ManagerHandle {
     pub async fn destroy_session(&self, id: SessionId) -> Result<(), SessionsError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(ManagerMessage::DestroySession(id, send)).await;
+        let _ = self
+            .sender
+            .send(ManagerMessage::DestroySession(id, send))
+            .await;
         recv.await.expect("corresponding sessions manager is dead")
     }
 }

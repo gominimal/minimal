@@ -296,7 +296,19 @@ impl Server {
     /// Launches minimald, accepting connections on the given listener and
     /// driving an SSH session over each until the listener errors.
     pub async fn run<L: Listener>(config: Config, listener: L) -> Result<(), std::io::Error> {
+        // `config` is moved into the state below; capture the deployment-model
+        // flag the proxy startup needs first.
+        #[cfg(target_os = "linux")]
+        let in_microvm = config.in_microvm;
         let state = ServerStateHandle::new(config).await?;
+
+        // Start minimald's two host-side proxies (B5 egress :7654, B8 mTLS
+        // :7655) for the server's lifetime and, in a microVM (DM1), publish them
+        // on the macOS host loopback. minimald is Linux-only, and the PTask
+        // hostname registry they route against only exists on Linux.
+        #[cfg(target_os = "linux")]
+        start_host_proxies(&state, in_microvm).await;
+
         let russh_config = build_russh_config(&state)
             .await
             .map_err(std::io::Error::other)?;
@@ -350,4 +362,88 @@ async fn build_russh_config(
         nodelay: true,
         ..Default::default()
     }))
+}
+
+/// Binds and serves minimald's two host-side proxies for the daemon's lifetime
+/// and, in a microVM (DM1), publishes them on the macOS host loopback.
+///
+/// Both proxies route by `Host:` header through the sessions manager's shared
+/// PTask hostname registry. In a microVM they bind the daemon's switch IP
+/// ([`DEFAULT_SUBNET`](crate::net::DEFAULT_SUBNET)`.daemon_ip()`) so the host
+/// gvproxy forward can reach them; on native Linux (DM2) they bind host loopback
+/// directly. A bind failure warns and is skipped — the daemon keeps serving. The
+/// serve loops run on detached tasks; this returns once the listeners are bound
+/// and (DM1) exposed.
+#[cfg(target_os = "linux")]
+async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
+    use crate::net::proxy::{self, Router};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let registry = state.sessions_manager().await.hostnames();
+    let bind_base: IpAddr = if in_microvm {
+        crate::net::DEFAULT_SUBNET.daemon_ip().into()
+    } else {
+        Ipv4Addr::LOCALHOST.into()
+    };
+
+    // B5 egress/DNS proxy (:7654), always.
+    let egress_addr = SocketAddr::new(bind_base, proxy::EGRESS_PROXY_PORT);
+    if let Some(listener) = proxy::bind_listener(egress_addr).await {
+        tokio::spawn(proxy::serve(listener, Router::new(registry.clone())));
+    }
+
+    // B8 mTLS reverse proxy (:7655), under the networking-proxy feature.
+    #[cfg(feature = "networking-proxy")]
+    {
+        let https_addr = SocketAddr::new(bind_base, proxy::HTTPS_PROXY_PORT);
+        match state.cert_authority().await.build_server_config() {
+            Ok(tls_config) => {
+                if let Some(listener) = proxy::bind_listener(https_addr).await {
+                    tokio::spawn(proxy::serve_https(
+                        listener,
+                        Router::new(registry.clone()),
+                        tls_config,
+                    ));
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not build TLS config for the mTLS reverse proxy");
+            }
+        }
+    }
+
+    // DM1: the proxies bind the guest switch IP, so publish them on the host's
+    // loopback via the host gvproxy forwarder. DM2 already binds host loopback.
+    if in_microvm {
+        let daemon_ip = crate::net::DEFAULT_SUBNET.daemon_ip();
+        expose_proxy_on_host(daemon_ip, proxy::EGRESS_PROXY_PORT).await;
+        #[cfg(feature = "networking-proxy")]
+        expose_proxy_on_host(daemon_ip, proxy::HTTPS_PROXY_PORT).await;
+    }
+}
+
+/// Publishes a guest-side proxy bound on `daemon_ip:port` onto the macOS host's
+/// loopback (`127.0.0.1:port`) via the host gvproxy forwarder, reached over the
+/// vsock shuttle (DM1). Best-effort: warns and returns on failure, since the
+/// host gvproxy may be absent.
+#[cfg(target_os = "linux")]
+async fn expose_proxy_on_host(daemon_ip: std::net::Ipv4Addr, port: u16) {
+    use crate::net::policy::{ControlChannel, ExposeRequest, post_json};
+
+    let control = ControlChannel::Vsock {
+        cid: crate::net::VSOCK_HOST_CID,
+        port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+    };
+    let request = ExposeRequest {
+        local: format!("127.0.0.1:{port}"),
+        remote: format!("{daemon_ip}:{port}"),
+        protocol: "tcp".to_string(),
+    };
+    if let Err(error) = post_json(&control, "/services/forwarder/expose", &request).await {
+        tracing::warn!(
+            %port,
+            %error,
+            "could not publish host-side proxy on the host loopback via gvproxy forwarder"
+        );
+    }
 }
