@@ -163,6 +163,32 @@ both can run simultaneously — they are independent daemons on independent
 sockets. If neither is running, the TUI auto-spawns the default provider
 (reusing `autospawn::ensure_daemon_running`).
 
+### Sidebar row indicators
+
+Each session row in the sidebar carries a small indicator strip to the
+right of the network mode. The indicator is computed from
+`RunningSessionAttrs` on each refresh tick (and in a future streaming
+model, updated immediately on push).
+
+| Indicator | Glyph | Meaning | Heuristic |
+|---|---|---|---|
+| **Active** | `◐◑◒◓` (cycling) | Session produced stdout recently | `last_stdout` within 5s |
+| **Waiting** | `○` | Session read stdin recently but no stdout since | `last_stdin` within 5s, `last_stdout` older than 5s or absent |
+| **Bell** | `●` | Unacknowledged audible or visual bell | `audible_bell.last` or `visual_bell.last` more recent than the last time this session was focused in the TUI |
+| **Idle** | (blank) | No recent activity | Neither of the above |
+
+The `●` bell is client-side state: when the user focuses a session, the
+TUI records "bells seen up to now" in the model. If a new bell arrives
+with a later timestamp, the `●` lights up. When the user focuses the
+session again, it clears. No daemon change needed.
+
+The `○` / spinner distinction is a heuristic, not a daemon signal. The
+daemon records `last_stdin` (user typed something) and `last_stdout`
+(session wrote something). If the user typed recently but nothing came
+back, we infer the session is waiting — `cat`, `python` REPL, a
+password prompt, etc. This can misfire (e.g. a slow command between
+keystroke and output) but is right often enough to be useful.
+
 ### Last-session memory
 
 A tiny JSON state file at `$XDG_STATE_HOME/minimal/dash-state.json` stores:
@@ -431,14 +457,21 @@ However, the daemon-side flow is not yet wired — `SessionComposer::compose`
 errors with `HookRequired` instead of batching pending items
 (`COMPOSITION.md:44-51`). This is blocked on daemon-side work.
 
-### F4: Streaming screen updates
+### F4: Streaming session events
 
-The Preview tab polls `GetSessionScreen` on a refresh tick. A streaming
-`WatchSessionScreen` RPC could push incremental screen updates using the
-same `version()`/`changed()` pattern the `ot` crate uses
-(`crates/ot/src/lib.rs:69-94`): the daemon bumps a version counter on every
-screen mutation and the client awaits `changed()` then re-snapshots. This
-reduces polling latency without a full ANSI streaming protocol.
+The TUI polls `ListSessions` and `GetSessionScreen` on a refresh tick.
+A streaming `WatchSessions` RPC could push events in real time — title
+changes, bell events, stdin/stdout activity, create/destroy lifecycle
+— using the same `version()`/`changed()` pattern the `ot` crate uses
+(`crates/ot/src/lib.rs:69-94`). The daemon already captures every event
+in the `Host` actor (`SetTitleCallback`, `AudibleBellCallback`,
+`VisualBellCallback`, `stdout_last`, `stdin_last` at
+`session_host.rs:1060-1094`). A long-lived streaming channel would
+eliminate polling latency, enable immediate sidebar indicator updates
+(spinner → `○` transitions visible in real time), and reduce wasted
+RPCs. The current `OneshotSshRpc` contract would need a `StreamingSshRpc`
+counterpart. This also subsumes a per-session `WatchSessionScreen` for
+the Preview tab — the same stream carries screen-change events.
 
 ### F5: Customizable keybindings
 
