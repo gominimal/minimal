@@ -217,10 +217,25 @@ fn run_foreground() -> Result<()> {
             crate::sock::prepare_socket_dir(&switch_sock).context("preparing switch socket dir")?;
             crate::sock::remove_stale_socket(&switch_sock)
                 .context("removing stale switch socket")?;
-            let gvproxy = crate::net::HostGvproxy::spawn(binary, switch_sock)
-                .context("spawning host gvproxy switch")?;
-            tracing::info!(pid = gvproxy.pid(), "host gvproxy switch up");
-            Some(gvproxy)
+            match crate::net::HostGvproxy::spawn(binary, switch_sock) {
+                Ok(gvproxy) => {
+                    tracing::info!(pid = gvproxy.pid(), "host gvproxy switch up");
+                    Some(gvproxy)
+                }
+                // An own-IP VM cannot work without the switch: fail loudly. A
+                // non-own-IP boot tolerates it (same as a missing binary below).
+                Err(error) if crate::cmd::own_ip_requested() => {
+                    return Err(error).context("spawning host gvproxy switch");
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "failed to spawn host gvproxy switch; booting without \
+                         guest egress"
+                    );
+                    None
+                }
+            }
         }
         binary if crate::cmd::own_ip_requested() => {
             // An own-IP VM cannot work without the switch: fail loudly rather
