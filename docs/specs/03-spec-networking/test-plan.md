@@ -75,7 +75,7 @@ $M activate -n tc1 --network no-net .
 #   getent hosts github.com   -> fails
 $M destroy tc1
 ```
-Expect: isolated. Status today: **BLOCKED (hakoniwa-125)**.
+Expect: isolated. Status today: **PASS** (only `lo`; in-sandbox curl fails, no route or DNS).
 
 ## TC1b — host-net egress (positive control)
 ```bash
@@ -83,7 +83,7 @@ $M activate -n tc1b --network host-net .
 # in the interactive shell: curl http://example.com -> 200 ; getent hosts github.com -> resolves
 $M destroy tc1b
 ```
-Status today: **BLOCKED (hakoniwa-125)**.
+Status today: **PASS** (in-sandbox curl returns 200; DNS resolves).
 
 ## TC2 — UC6 OwnIp egress + same-host peer
 Two own-ip sessions; both via the full session path.
@@ -96,7 +96,7 @@ $M activate -n peer --network own-ip .
 # demo shell: curl http://$PIP:9000/  -> PEER_REACHED
 $M destroy demo peer
 ```
-Status today: **BLOCKED (hakoniwa-125)**.
+Status today: **BLOCKED (own-ip backend: guest rootfs lacks `ip`/`nsenter`)**.
 
 ## TC3 — UC2 managed DNS via host proxy :7654
 Server in-sandbox; host resolves by hostname through the proxy.
@@ -106,7 +106,7 @@ $M activate -n web --network own-ip .
 # host:      curl -x http://127.0.0.1:7654 http://web.local.min.internal/   -> 200 WEB_OK
 $M destroy web
 ```
-Status today: **BLOCKED** (hakoniwa-125 for the in-session server; host loopback :7654 not wired).
+Status today: **BLOCKED** (own-ip backend: guest rootfs lacks `ip`/`nsenter` for the in-session server; host loopback :7654 not wired).
 
 ## TC4 — UC4 static ingress 18080:80
 ```bash
@@ -116,7 +116,7 @@ $M session policy tc4          # shows the mapping (CLI-only, works today)
 # host:      curl http://127.0.0.1:18080/   -> 200 INGRESS_OK
 $M destroy tc4
 ```
-Status today: policy round-trip **PASS**; data path **BLOCKED** (hakoniwa-125 + ingress applies on the sandboxed attach + host loopback not wired).
+Status today: policy round-trip **PASS**; data path **BLOCKED** (own-ip backend: guest rootfs lacks `ip`/`nsenter` + ingress applies on the sandboxed attach + host loopback not wired).
 
 ## TC5 — policy validation (CLI-only; expect rejections)
 No session is launched, so no attach is involved.
@@ -146,7 +146,7 @@ $M activate -n tc7 --network own-ip .
 # host (no cert):curl -k https://localhost:7655/   -> 401
 $M destroy tc7
 ```
-Status today: `login` **PASS** (correct macOS cert path); proxy legs **BLOCKED** (hakoniwa-125 + :7655 not started/exposed in-VM).
+Status today: `login` **PASS** (correct macOS cert path); proxy legs **BLOCKED** (own-ip backend: guest rootfs lacks `ip`/`nsenter` + :7655 not started/exposed in-VM).
 
 ## TC8 — ssh-forward
 ```bash
@@ -156,7 +156,7 @@ $M activate -n dev --network own-ip --ingress 18080:80 .
 #       curl http://localhost:18080/   -> 200 FORWARD_OK
 $M destroy dev
 ```
-Status today: **BLOCKED** (hakoniwa-125 for the in-session server).
+Status today: **BLOCKED** (own-ip backend: guest rootfs lacks `ip`/`nsenter` for the in-session server).
 
 ## TC9 — UC7 WireGuard mesh (CLI surface)
 Data path is Linux-netns-only; here only the CLI surface.
@@ -169,5 +169,5 @@ Status today: **PASS** (CLI surface).
 
 ---
 
-Executable companion: `net-test-plan.sh` (same dir) — bash + a single `expect`
+Executable companion: `test-plan.sh` (same dir) — bash + a single `expect`
 driver, idempotent cleanup, PASS/FAIL/BLOCKED banners, zero `attach -c`.

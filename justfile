@@ -26,7 +26,7 @@ minimal     := justfile_directory() / "target/debug/minimal2"
 # Build a release `minvmd` and code-sign it with the hypervisor entitlement.
 codesign-minvmd:
     cargo build -p minvmd --release
-    codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - {{minvmd-bin}}
+    codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - {{justfile_directory()}}/target/release/minvmd
 
 # ── minimal2 → minvmd → minimald bring-up (macOS/HVF or Linux/KVM) ───────────
 #

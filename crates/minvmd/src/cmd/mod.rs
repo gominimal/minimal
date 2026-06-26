@@ -23,8 +23,8 @@ pub const VSOCK_MARKER_PORT: u32 = 7350;
 /// READY marker from the parent to the VMM child.
 pub const MARKER_SOCK_ENV: &str = "MINVMD_MARKER_SOCK";
 
-/// Environment variable selecting an own-IP VM. When set to a
-/// truthy value (`1`/`true`), the supervisor spawns the host gvproxy switch and
+/// Environment variable selecting an own-IP VM. When set to a truthy value
+/// (`1`/`true`/`yes`/`on`, case-insensitive), the supervisor spawns the host gvproxy switch and
 /// the VMM child registers the per-PTask shuttle vsock bridge + sets the VM's
 /// network mode to `OwnIp`. Read by both the parent supervisor (to decide
 /// whether to spawn gvproxy) and the VMM child (to configure the VM), so the two

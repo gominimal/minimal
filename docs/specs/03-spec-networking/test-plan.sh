@@ -31,6 +31,18 @@ command -v expect >/dev/null || { echo "FATAL: expect not found"; exit 1; }
 banner() { printf '\n########## %s ##########\n' "$*"; }
 destroy() { for s in "$@"; do "$M" destroy "$s" >/dev/null 2>&1; done; }
 
+# Best-effort cleanup on ANY exit (success, error, or interrupt): tear down every
+# session the plan can create and kill any backgrounded job (the TC8 ssh-forward),
+# so an early exit never leaves running sessions or a stray port-forward behind.
+ALL_SESSIONS="bad1 bad2 bad3 demo dev peer tc1 tc1b tc4 tc6 tc7 web"
+cleanup() {
+  local pids
+  pids="$(jobs -p)"
+  [ -n "$pids" ] && kill $pids 2>/dev/null
+  destroy $ALL_SESSIONS
+}
+trap cleanup EXIT INT TERM
+
 # run_in_session <sess> <bash-script>
 # Opens the interactive sandbox shell, runs the script, prints everything between
 # __RIS_BEGIN__ and __RIS_END__:<rc>. Pure full-session-path; no attach -c.
