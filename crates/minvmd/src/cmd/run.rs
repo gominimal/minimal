@@ -214,8 +214,7 @@ fn run_foreground() -> Result<()> {
         binary if binary.exists() => {
             let switch_sock =
                 crate::net::resolve_switch_sock().context("resolving switch socket")?;
-            crate::sock::prepare_socket_dir(&switch_sock)
-                .context("preparing switch socket dir")?;
+            crate::sock::prepare_socket_dir(&switch_sock).context("preparing switch socket dir")?;
             crate::sock::remove_stale_socket(&switch_sock)
                 .context("removing stale switch socket")?;
             let gvproxy = crate::net::HostGvproxy::spawn(binary, switch_sock)
