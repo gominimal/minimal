@@ -304,8 +304,16 @@ impl<S: SessionObject> Session<S> {
         // Scaffold a default shell one (pinned to the latest gominimal/pkgs
         // @main commit) so the session can launch. Once sessions receive their
         // project files this fabrication — and `mctx::scaffold` — goes away.
+        //
+        // The scaffold does a blocking network git clone, and this runs inside
+        // the async session-actor task, so fence it with `block_in_place` to move
+        // other futures off this worker thread for its duration rather than
+        // stalling them. (minimald uses the multi-thread runtime; see main.rs.)
         if !wsp.as_utf8_path().join(mfile::MFILE_NAME).exists() {
-            mctx::scaffold_default_mfile(&config, wsp.as_utf8_path()).map_err(|e| e.to_string())?;
+            tokio::task::block_in_place(|| {
+                mctx::scaffold_default_mfile(&config, wsp.as_utf8_path())
+            })
+            .map_err(|e| e.to_string())?;
         }
 
         mctx::Context::new(config).map_err(|e| e.to_string())
