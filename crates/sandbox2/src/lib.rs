@@ -14,7 +14,7 @@ pub mod config;
 use config::Config;
 pub use config::NetworkMode;
 pub mod network;
-pub use network::{HostNet, NetGuard, Network, NetworkError, NoNet};
+pub use network::{AttachFuture, HostNet, NetGuard, Network, NetworkError, NoNet};
 use std::fs::{self, Permissions};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;

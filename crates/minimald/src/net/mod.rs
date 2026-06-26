@@ -21,6 +21,11 @@ pub mod policy;
 pub mod proxy;
 pub mod switch;
 
+// The own-IP `sandbox2::Network` impl. Gated like the session-host attach path
+// it replaces: the real (non-test) launcher wires it; the mock launcher does not.
+#[cfg(not(test))]
+pub(crate) mod gvproxy_network;
+
 // WireGuard mesh peer (Unit 4). Compiled only under `networking-wg` so the
 // default build carries no WireGuard code (R4.7).
 #[cfg(feature = "networking-wg")]
