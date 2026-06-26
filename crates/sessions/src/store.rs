@@ -89,6 +89,11 @@ pub trait Loader {
     /// Deletes the session with the given key, dropping its index entries and
     /// removing its on-disk directory tree (record, workspace, home, cache).
     ///
+    /// Crash-safe: if the daemon dies mid-call, the next [`Self::open`]-style
+    /// constructor (e.g. [`DiskLoader::new`]) reaps the half-deleted session
+    /// dir, so a missing index entry is the only persistent visible effect of a
+    /// successful or partial delete.
+    ///
     /// # Errors
     ///
     /// Returns an I/O error if the record cannot be read or the index cannot be
@@ -204,6 +209,82 @@ impl Index {
     }
 }
 
+/// Pass B's per-entry decision about an index entry's record.
+///
+/// `Skip` is for transient I/O errors (e.g. `EACCES`, `EIO`) — the
+/// record may exist and be readable on a future startup. `DropMissing`
+/// is reserved for `NotFound` and unparseable records, which are
+/// definitive.
+enum ReconcileFix {
+    DropMissing,
+    Skip {
+        reason: std::io::Error,
+    },
+    UpdateName {
+        old_name: Option<String>,
+        new_name: Option<String>,
+    },
+}
+
+/// Prefix used for delete-tombstone marker files. A tombstone for
+/// session short `XYZ` lives at `sessions/.deleting-XYZ` — *outside*
+/// the doomed session dir, so `remove_dir_all` cannot race the
+/// marker's existence.
+const TOMBSTONE_PREFIX: &str = ".deleting-";
+
+/// Build the tombstone marker file name for a given short.
+fn tombstone_name(short: &str) -> String {
+    format!("{TOMBSTONE_PREFIX}{short}")
+}
+
+/// Read `record_file` and compare its name against `index_name` to
+/// decide what pass B should do with this index entry. Returns `None`
+/// when the record exists, parses, and agrees with the index.
+fn classify_record_for_reconcile(
+    record_file: &camino::Utf8Path,
+    index_name: Option<String>,
+) -> Option<ReconcileFix> {
+    let file = match std::fs::File::open(record_file) {
+        Ok(f) => f,
+        Err(e) if e.kind() == NotFound => return Some(ReconcileFix::DropMissing),
+        // Transient I/O failure: leave the entry alone, retry next startup.
+        Err(reason) => return Some(ReconcileFix::Skip { reason }),
+    };
+    // Parse failure on a present file means a corrupt record. Treat as
+    // missing — the index is more useful entry-less than pointing at
+    // unreadable content, and a future repair can hand-restore.
+    let Ok(record) = serde_json::from_reader::<_, Record>(file) else {
+        return Some(ReconcileFix::DropMissing);
+    };
+    if record.name == index_name {
+        return None;
+    }
+    Some(ReconcileFix::UpdateName {
+        old_name: index_name,
+        new_name: record.name,
+    })
+}
+
+/// Enumerate the immediate session subdirectories under `sessions_dir`.
+/// Missing dir is treated as empty (the parent `DiskLoader::new` has
+/// already ensured the dir exists, but a race during init is harmless).
+fn enumerate_session_dirs(
+    sessions_dir: &camino::Utf8Path,
+) -> Result<Vec<(String, std::path::PathBuf)>, std::io::Error> {
+    match std::fs::read_dir(sessions_dir) {
+        Ok(rd) => Ok(rd
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                Some((name, e.path()))
+            })
+            .collect()),
+        Err(e) if e.kind() == NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
 /// A loader of session state based on <minimal-state-dir>/sessions.
 ///
 /// ./index.json maps short directory names to session UUIDs. Typically
@@ -222,6 +303,34 @@ impl DiskLoader {
     /// Opens (or initializes) a disk-backed session store rooted at
     /// `<minimal_dir>/sessions`.
     ///
+    /// **Self-healing.** On open, walks the sessions directory and
+    /// reconciles index state with the on-disk record state in three
+    /// passes:
+    ///
+    /// 1. **Tombstone reap.** For each `.deleting-<short>` marker
+    ///    file in `sessions/` (written by [`Loader::delete`] before
+    ///    it touches the index), the corresponding session dir is
+    ///    fully removed and the marker is removed last. Any index
+    ///    entry pointing at the short is dropped. Storing the marker
+    ///    outside the session dir means `remove_dir_all` cannot
+    ///    race the marker's existence — the marker survives crashes
+    ///    until self-heal drives the reap to completion.
+    /// 2. **Index reconciliation against records.** For each
+    ///    surviving index entry, the corresponding `record.json` is
+    ///    the source of truth. Missing/unparseable records cause the
+    ///    index entry to be dropped; records whose `name` differs
+    ///    from the index's name (e.g. a crash mid-`rename`) cause
+    ///    the index's name mapping to be updated.
+    /// 3. **Orphan re-index.** Session directories whose `record.json`
+    ///    parses but whose short name isn't in the index are re-added.
+    ///    If the orphan's name collides with an existing index entry,
+    ///    the orphan is left alone (logged as a warning) so the
+    ///    operator can triage it manually.
+    ///
+    /// This makes [`Loader::create`], [`Loader::rename`], and
+    /// [`Loader::delete`] tolerate a daemon crash at any point: the
+    /// next `new` converges to a consistent state.
+    ///
     /// # Errors
     ///
     /// Returns an I/O error if the sessions directory cannot be created or
@@ -235,7 +344,218 @@ impl DiskLoader {
             Index::default()
         };
 
-        Ok(Self { minimal_dir, index })
+        let mut this = Self { minimal_dir, index };
+        if this.self_heal()? {
+            this.flush_index()?;
+        }
+        Ok(this)
+    }
+
+    /// Reconcile in-memory index state with on-disk record state.
+    /// Returns `true` if any change was made (caller should flush).
+    fn self_heal(&mut self) -> Result<bool, std::io::Error> {
+        let sessions_dir = self.minimal_dir.as_utf8_path().join("sessions");
+
+        let mut changed = false;
+        let reaped = self.heal_reap_tombstones(&sessions_dir, &mut changed)?;
+        // Enumerate session dirs *after* pass A so the orphan re-index in
+        // pass C doesn't see dirs we just removed.
+        let session_dirs = enumerate_session_dirs(&sessions_dir)?;
+        self.heal_reconcile_index(&sessions_dir, &mut changed);
+        self.heal_reindex_orphans(&session_dirs, &reaped, &mut changed);
+        Ok(changed)
+    }
+
+    /// Pass A: reap any session dir whose external `.deleting-<short>`
+    /// tombstone is present in `sessions_dir`. Removes the dir,
+    /// then the marker (so a retry on a subsequent crash converges).
+    /// Drops any matching index entry. Returns the set of shorts
+    /// successfully reaped so pass C skips them.
+    fn heal_reap_tombstones(
+        &mut self,
+        sessions_dir: &camino::Utf8Path,
+        changed: &mut bool,
+    ) -> Result<std::collections::HashSet<String>, std::io::Error> {
+        let mut reaped = std::collections::HashSet::new();
+        let entries = match std::fs::read_dir(sessions_dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == NotFound => return Ok(reaped),
+            Err(e) => return Err(e),
+        };
+        for entry in entries.filter_map(Result::ok) {
+            // Tombstones are always regular files. Skipping non-files
+            // here means a hand-created directory like `.deleting-foo`
+            // doesn't get processed (which would warn-loop forever on
+            // the `remove_file` of a directory).
+            if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                continue;
+            }
+            let Ok(fname) = entry.file_name().into_string() else {
+                continue;
+            };
+            let Some(short) = fname.strip_prefix(TOMBSTONE_PREFIX) else {
+                continue;
+            };
+            let short = short.to_owned();
+            let doomed_dir = sessions_dir.join(&short);
+            tracing::info!(short = %short, "reaping tombstoned session dir");
+            match std::fs::remove_dir_all(doomed_dir.as_std_path()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == NotFound => {}
+                Err(e) => {
+                    tracing::warn!(
+                        short = %short,
+                        error = %e,
+                        "failed to reap tombstoned session dir; leaving marker for next startup",
+                    );
+                    continue;
+                }
+            }
+            // Remove the tombstone marker last so a crash above leaves
+            // the marker on disk for the next startup to retry.
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == NotFound => {}
+                Err(e) => {
+                    tracing::warn!(
+                        short = %short,
+                        error = %e,
+                        "failed to remove tombstone marker; leaving for next startup",
+                    );
+                    // Don't claim the short as reaped — the dir is gone
+                    // but the marker still drives a future reap attempt.
+                    continue;
+                }
+            }
+            reaped.insert(short.clone());
+            // An index entry may linger if delete crashed before flushing
+            // the index. The record is gone, so look up the name from the
+            // current in-memory index.
+            if let Some(id) = self.index.short_to_id.get(&short).copied() {
+                let name = self.index.name_by_id(&id).cloned();
+                self.index.remove(&short, name.as_deref());
+                *changed = true;
+            }
+        }
+        Ok(reaped)
+    }
+
+    /// Pass B: reconcile each index entry against its record.json.
+    /// The record is the source of truth — drop entries whose record
+    /// is missing/unparseable; update name mappings when the record's
+    /// `name` differs from the index's name for that id (rename-crash
+    /// recovery).
+    fn heal_reconcile_index(&mut self, sessions_dir: &camino::Utf8Path, changed: &mut bool) {
+        let fixes: Vec<(String, SessionId, ReconcileFix)> = self
+            .index
+            .iter()
+            .filter_map(|(short, id)| {
+                let record_file = sessions_dir.join(short).join("record.json");
+                let fix = classify_record_for_reconcile(
+                    &record_file,
+                    self.index.name_by_id(id).cloned(),
+                )?;
+                Some((short.clone(), *id, fix))
+            })
+            .collect();
+        for (short, id, fix) in fixes {
+            match fix {
+                ReconcileFix::DropMissing => {
+                    tracing::info!(
+                        short = %short,
+                        id = %id,
+                        "dropping dangling index entry (record.json missing or unparseable)",
+                    );
+                    let name = self.index.name_by_id(&id).cloned();
+                    self.index.remove(&short, name.as_deref());
+                    *changed = true;
+                }
+                ReconcileFix::Skip { reason } => {
+                    // The record may be readable on a future startup;
+                    // leave the index entry alone for now.
+                    tracing::warn!(
+                        short = %short,
+                        id = %id,
+                        error = %reason,
+                        "could not read record.json for reconcile; leaving index entry as-is",
+                    );
+                }
+                ReconcileFix::UpdateName { old_name, new_name } => {
+                    tracing::info!(
+                        short = %short,
+                        id = %id,
+                        old_name = ?old_name,
+                        new_name = ?new_name,
+                        "reconciling index entry's name with record.json (rename-crash recovery)",
+                    );
+                    if let Some(old) = &old_name {
+                        self.index.name_to_id.remove(old);
+                    }
+                    if let Some(new) = new_name {
+                        self.index.name_to_id.insert(new, id);
+                    }
+                    *changed = true;
+                }
+            }
+        }
+    }
+
+    /// Pass C: re-index orphan records (record.json present, no index
+    /// entry, not already reaped). Orphans whose `name` collides with
+    /// an existing index entry are skipped and logged.
+    fn heal_reindex_orphans(
+        &mut self,
+        session_dirs: &[(String, std::path::PathBuf)],
+        reaped: &std::collections::HashSet<String>,
+        changed: &mut bool,
+    ) {
+        for (short, path) in session_dirs {
+            if reaped.contains(short) || self.index.short_to_id.contains_key(short) {
+                continue;
+            }
+            let record_file = path.join("record.json");
+            let record: Record = match std::fs::File::open(&record_file)
+                .and_then(|f| serde_json::from_reader(f).map_err(std::io::Error::from))
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        short = %short,
+                        error = %e,
+                        "found orphan session dir but record.json is missing or unparseable; \
+                         leaving for manual triage",
+                    );
+                    continue;
+                }
+            };
+            if self.index.short_by_id(&record.id).is_some() {
+                tracing::warn!(
+                    short = %short,
+                    id = %record.id,
+                    "orphan record's id collides with an existing index entry; \
+                     leaving orphan unindexed for manual triage",
+                );
+                continue;
+            }
+            if let Some(name) = &record.name
+                && self.index.name_to_id.contains_key(name)
+            {
+                tracing::warn!(
+                    short = %short,
+                    name = %name,
+                    "orphan record's name collides with an existing index entry; \
+                     leaving orphan unindexed for manual triage",
+                );
+                continue;
+            }
+            tracing::info!(
+                short = %short,
+                id = %record.id,
+                "re-indexing orphan session record",
+            );
+            self.index.insert(short.clone(), record.id, record.name);
+            *changed = true;
+        }
     }
 
     /// Writes the in-memory index back to disk.
@@ -399,6 +719,22 @@ impl Loader for DiskLoader {
         // could never be scrubbed.
         let name = self.index.name_by_id(key.id()).cloned();
 
+        let sessions_root = self.minimal_dir.as_utf8_path().join("sessions");
+        let session_dir = sessions_root.join(&short);
+        let tombstone = sessions_root.join(tombstone_name(&short));
+
+        // Write a tombstone marker into the *parent* (sessions/) dir before
+        // doing anything else. Putting it outside the session dir means
+        // `remove_dir_all` below can't race the marker's existence — the
+        // marker survives until we explicitly remove it last. This lets
+        // `DiskLoader::new` distinguish a crashed-mid-delete dir (reap it,
+        // even if `remove_dir_all` partially completed) from a
+        // crashed-mid-create orphan record (re-index it).
+        //
+        // A NotFound here would mean `sessions_root` itself is gone, which
+        // is a loader-invariant violation; let it propagate.
+        std::fs::write(&tombstone, b"")?;
+
         // Drop the index entries and flush before touching the filesystem: the
         // index is the source of truth for `keys()`, so removing it first means
         // a crash mid-delete can only ever orphan a directory (invisible and
@@ -406,14 +742,16 @@ impl Loader for DiskLoader {
         self.index.remove(&short, name.as_deref());
         self.flush_index()?;
 
-        let session_dir = self
-            .minimal_dir
-            .as_utf8_path()
-            .join("sessions")
-            .join(&short);
         match std::fs::remove_dir_all(&session_dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == NotFound => {}
+            Err(e) => return Err(e),
+        }
+
+        // Tombstone removed last: any prior crash leaves it on disk for
+        // `DiskLoader::new` to re-drive the reap idempotently.
+        match std::fs::remove_file(&tombstone) {
             Ok(()) => Ok(()),
-            // A missing tree is fine — the session is gone either way.
             Err(e) if e.kind() == NotFound => Ok(()),
             Err(e) => Err(e),
         }
@@ -732,5 +1070,347 @@ mod tests {
             Some("now-named")
         );
         assert_eq!(loader.find_by_name("now-named").unwrap(), Some(key));
+    }
+
+    // =================================================================
+    // self-heal on DiskLoader::new
+    // =================================================================
+    //
+    // Each crash scenario is simulated by direct filesystem
+    // manipulation — we never go through the Loader API to corrupt
+    // state, because the API guarantees consistency. We're testing
+    // the on-disk recovery.
+
+    fn short_of(key: &DiskSessionKey) -> String {
+        key.dir_key.to_string()
+    }
+
+    fn session_dir_path(loader_root: &DaemonAbsPath, short: &str) -> std::path::PathBuf {
+        loader_root
+            .as_utf8_path()
+            .join("sessions")
+            .join(short)
+            .as_std_path()
+            .to_path_buf()
+    }
+
+    fn read_index_bytes(loader_root: &DaemonAbsPath) -> Vec<u8> {
+        let p = loader_root.as_utf8_path().join("sessions/index.json");
+        std::fs::read(p.as_std_path()).unwrap()
+    }
+
+    fn tombstone_path(loader_root: &DaemonAbsPath, short: &str) -> std::path::PathBuf {
+        loader_root
+            .as_utf8_path()
+            .join("sessions")
+            .join(tombstone_name(short))
+            .as_std_path()
+            .to_path_buf()
+    }
+
+    #[test]
+    fn self_heal_on_clean_state_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        loader.create(sample_record()).unwrap();
+        drop(loader);
+
+        let before = read_index_bytes(&root);
+        // Re-opening over a consistent state must not touch index.json.
+        let _ = DiskLoader::new(root.clone()).unwrap();
+        let after = read_index_bytes(&root);
+        assert_eq!(before, after, "index.json was rewritten on a clean state");
+    }
+
+    #[test]
+    fn self_heal_reaps_tombstoned_dir() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let short = short_of(&key);
+        let id = *key.id();
+        drop(loader);
+
+        // Simulate a crash mid-delete: tombstone present (in the
+        // *parent* sessions dir, not inside the session dir),
+        // index entry still there, dir still there.
+        let dir = session_dir_path(&root, &short);
+        let marker = tombstone_path(&root, &short);
+        std::fs::write(&marker, b"").unwrap();
+
+        let loader = DiskLoader::new(root).unwrap();
+        assert!(!dir.exists(), "tombstoned dir should have been reaped");
+        assert!(
+            !marker.exists(),
+            "tombstone marker should have been removed"
+        );
+        assert_eq!(loader.find_by_id(&id).unwrap(), None);
+    }
+
+    #[test]
+    fn self_heal_drops_dangling_index_entry() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let short = short_of(&key);
+        let id = *key.id();
+        drop(loader);
+
+        // Simulate a half-deleted session WITHOUT a tombstone: the
+        // session dir was removed but the index entry remained
+        // (e.g. someone hand-deleted the dir).
+        std::fs::remove_dir_all(session_dir_path(&root, &short)).unwrap();
+
+        let loader = DiskLoader::new(root).unwrap();
+        assert_eq!(loader.find_by_id(&id).unwrap(), None);
+        assert_eq!(loader.find_by_name("my-session").unwrap(), None);
+    }
+
+    #[test]
+    fn self_heal_reindexes_orphan_record() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let short = short_of(&key);
+        let id = *key.id();
+        drop(loader);
+
+        // Simulate a crash mid-create: record.json on disk, but the
+        // index doesn't know about it. We rewrite the index to a
+        // default empty Index.
+        let sessions_dir = root.as_utf8_path().join("sessions");
+        let empty = serde_json::to_vec(&Index::default()).unwrap();
+        std::fs::write(sessions_dir.join("index.json").as_std_path(), empty).unwrap();
+
+        let loader = DiskLoader::new(root).unwrap();
+        // The orphan was re-indexed: it's reachable by id and name.
+        let key2 = loader.find_by_id(&id).unwrap().expect("re-indexed");
+        assert_eq!(short_of(&key2), short);
+        assert_eq!(loader.find_by_name("my-session").unwrap(), Some(key2),);
+    }
+
+    #[test]
+    fn self_heal_skips_orphan_with_name_collision() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        // First session: created normally, claims "my-session".
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let a_key = loader.create(sample_record()).unwrap();
+        let a_id = *a_key.id();
+        drop(loader);
+
+        // Manually plant an orphan session in a sibling dir that ALSO
+        // claims name = "my-session", with a distinct id so the shorts
+        // don't collide.
+        let orphan_short = "00000";
+        let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
+        std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
+        let mut orphan_record = sample_record();
+        orphan_record.id = SessionId(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        let record_file = orphan_dir.join("record.json");
+        let buf = serde_json::to_vec(&orphan_record).unwrap();
+        std::fs::write(record_file.as_std_path(), buf).unwrap();
+
+        let loader = DiskLoader::new(root.clone()).unwrap();
+        // The original (indexed) session still resolves; the orphan is
+        // not in the index.
+        assert_eq!(loader.find_by_id(&a_id).unwrap(), Some(a_key));
+        assert_eq!(loader.find_by_id(&orphan_record.id).unwrap(), None);
+        // The orphan dir is left on disk for manual triage.
+        assert!(
+            session_dir_path(&root, orphan_short).exists(),
+            "orphan dir should be preserved for triage",
+        );
+    }
+
+    #[test]
+    fn self_heal_recovers_from_rename_crash() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let short = short_of(&key);
+        drop(loader);
+
+        // Simulate a crash mid-rename: record.json has the NEW name,
+        // index.json still has the OLD name.
+        let dir = session_dir_path(&root, &short);
+        let record_file = dir.join("record.json");
+        let buf = std::fs::read(&record_file).unwrap();
+        let mut record: Record = serde_json::from_slice(&buf).unwrap();
+        record.name = Some("after-rename".to_string());
+        std::fs::write(&record_file, serde_json::to_vec(&record).unwrap()).unwrap();
+
+        let loader = DiskLoader::new(root).unwrap();
+        // The index is reconciled: the new name resolves, the old one
+        // does not.
+        let resolved = loader.find_by_name("after-rename").unwrap();
+        assert!(resolved.is_some(), "new name should resolve");
+        assert_eq!(loader.find_by_name("my-session").unwrap(), None);
+    }
+
+    #[test]
+    fn self_heal_handles_tombstone_with_lingering_index_entry() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let short = short_of(&key);
+        let id = *key.id();
+        drop(loader);
+
+        // Crash mid-delete BEFORE the index flush: tombstone on disk
+        // (in the parent sessions dir), index entry still present,
+        // dir intact.
+        let dir = session_dir_path(&root, &short);
+        std::fs::write(tombstone_path(&root, &short), b"").unwrap();
+
+        let loader = DiskLoader::new(root.clone()).unwrap();
+        // Pass A reaps the dir AND clears the index entry; pass B has
+        // nothing to do for this short.
+        assert!(!dir.exists(), "dir should be reaped");
+        assert_eq!(loader.find_by_id(&id).unwrap(), None);
+        assert_eq!(loader.find_by_name("my-session").unwrap(), None);
+    }
+
+    /// Simulates `remove_dir_all` having partially completed before a
+    /// crash: with the *external* tombstone design, the marker is in
+    /// the parent dir and `remove_dir_all` never touches it. Even if
+    /// `record.json` (the file that would otherwise let pass C
+    /// re-index the dir as an orphan) is still on disk, the marker
+    /// drives a deterministic reap.
+    #[test]
+    fn self_heal_reaps_even_when_record_still_present_during_partial_remove() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let short = short_of(&key);
+        let id = *key.id();
+        drop(loader);
+
+        // Drop the index entry to simulate "delete had flushed the
+        // index" — but DO leave the dir + record.json on disk to
+        // simulate "remove_dir_all crashed mid-walk". The external
+        // tombstone is also present.
+        let sessions_dir = root.as_utf8_path().join("sessions");
+        let empty = serde_json::to_vec(&Index::default()).unwrap();
+        std::fs::write(sessions_dir.join("index.json").as_std_path(), empty).unwrap();
+        let dir = session_dir_path(&root, &short);
+        std::fs::write(tombstone_path(&root, &short), b"").unwrap();
+        assert!(
+            dir.join("record.json").exists(),
+            "record.json should still be present (simulating partial remove_dir_all)",
+        );
+
+        let loader = DiskLoader::new(root).unwrap();
+        // Pass A reaps the dir even though record.json was still there.
+        // Pass C is consequently not tempted to "undelete" the orphan.
+        assert!(!dir.exists(), "dir should be reaped");
+        assert_eq!(loader.find_by_id(&id).unwrap(), None);
+        assert_eq!(loader.find_by_name("my-session").unwrap(), None);
+    }
+
+    /// Regression guard for the marker location: `delete()` must put
+    /// the tombstone in the *parent* sessions/ dir (so it survives
+    /// `remove_dir_all`). After a successful delete, the marker must
+    /// be cleaned up too.
+    #[test]
+    fn delete_writes_external_tombstone_and_cleans_it_up() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let short = short_of(&key);
+        let marker = tombstone_path(&root, &short);
+        let inside = session_dir_path(&root, &short).join(".deleting");
+
+        loader.delete(&key).unwrap();
+
+        // After a successful delete, neither location should have a
+        // marker — the external one was removed at the end of delete,
+        // and the internal one was never written.
+        assert!(!marker.exists(), "external tombstone should be cleaned up");
+        assert!(
+            !inside.exists(),
+            "no tombstone should ever be placed inside the session dir",
+        );
+    }
+
+    /// Pass A's `NotFound` branch: a tombstone for a short whose session
+    /// dir is already gone (e.g. someone hand-deleted it after the
+    /// marker was written but before self-heal ran).
+    #[test]
+    fn self_heal_reaps_orphan_tombstone_without_session_dir() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        // Manually plant a tombstone marker pointing at a short that
+        // doesn't exist as a dir.
+        let _ = DiskLoader::new(root.clone()).unwrap();
+        let marker = tombstone_path(&root, "ghost");
+        std::fs::write(&marker, b"").unwrap();
+        assert!(
+            !session_dir_path(&root, "ghost").exists(),
+            "test setup: ghost session dir must not exist",
+        );
+
+        let _loader = DiskLoader::new(root).unwrap();
+        assert!(
+            !marker.exists(),
+            "orphan tombstone should be cleaned up by self-heal",
+        );
+    }
+
+    /// Self-heal must reap every tombstone in one pass, not just the
+    /// first one it encounters.
+    #[test]
+    fn self_heal_reaps_multiple_tombstones_in_one_pass() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key_a = loader.create(sample_record()).unwrap();
+        let key_b = loader
+            .create({
+                let mut r = sample_record();
+                r.name = Some("other".into());
+                r
+            })
+            .unwrap();
+        drop(loader);
+
+        let marker_a = tombstone_path(&root, &short_of(&key_a));
+        let marker_b = tombstone_path(&root, &short_of(&key_b));
+        std::fs::write(&marker_a, b"").unwrap();
+        std::fs::write(&marker_b, b"").unwrap();
+
+        let loader = DiskLoader::new(root.clone()).unwrap();
+
+        assert!(!marker_a.exists(), "marker A should be cleaned up");
+        assert!(!marker_b.exists(), "marker B should be cleaned up");
+        assert!(
+            !session_dir_path(&root, &short_of(&key_a)).exists(),
+            "session A dir should be reaped",
+        );
+        assert!(
+            !session_dir_path(&root, &short_of(&key_b)).exists(),
+            "session B dir should be reaped",
+        );
+        assert_eq!(loader.find_by_id(key_a.id()).unwrap(), None);
+        assert_eq!(loader.find_by_id(key_b.id()).unwrap(), None);
     }
 }
