@@ -783,7 +783,18 @@ impl<C: Channel> Sandbox<C> {
             // not the whole `Sandbox<C>`, so this doesn't impose `C: Sync` on the
             // run future.
             let net_guard = match self.config.network.as_deref() {
-                Some(net) => net.attach(child.id()).await.map_err(Error::Network)?,
+                Some(net) => match net.attach(child.id()).await {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        // Attach failed after spawn: kill+reap the child so it
+                        // doesn't outlive its sandbox (a `hakoniwa::Child` does
+                        // not terminate on drop). `wait` runs regardless of
+                        // `kill` (the process may have already exited).
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(Error::Network(e));
+                    }
+                },
                 None => network::noop_guard(),
             };
 
@@ -923,40 +934,49 @@ impl<C: Channel> Sandbox<C> {
                     return Err(Error::Execution(ExecutionError::Cancelled));
                 }
                 (stdout_fwd_res, stderr_fwd_res) = async { tokio::join!(stdout_fwd, stderr_fwd) } => {
-                    // Collect results from the reader threads.
-                    let (stdout_file, stdout_tail) = stdout_thread
-                        .join()
-                        .expect("stdout reader thread panicked")?;
-                    let (stderr_file, stderr_tail) = stderr_thread
-                        .join()
-                        .expect("stderr reader thread panicked")?;
+                    // Compute the invocation outcome with a closure so every
+                    // failure path (reader-thread error, async writer error, wait
+                    // error, non-zero exit) funnels through one point; then tear
+                    // the network down unconditionally *before* propagating, so a
+                    // switch attachment is never leaked on an error return.
+                    let outcome: Result<(), Error> = (|| {
+                        let (stdout_file, stdout_tail) = stdout_thread
+                            .join()
+                            .expect("stdout reader thread panicked")?;
+                        let (stderr_file, stderr_tail) = stderr_thread
+                            .join()
+                            .expect("stderr reader thread panicked")?;
 
-                    self.stdout = stdout_file;
-                    self.stderr = stderr_file;
+                        self.stdout = stdout_file;
+                        self.stderr = stderr_file;
 
-                    // Propagate any async writer errors.
-                    stdout_fwd_res?;
-                    stderr_fwd_res?;
+                        // Propagate any async writer errors.
+                        stdout_fwd_res?;
+                        stderr_fwd_res?;
 
-                    // The pipes are drained, so the child should have exited.
-                    let status = child
-                        .wait()
-                        .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
+                        // The pipes are drained, so the child should have exited.
+                        let status = child
+                            .wait()
+                            .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
 
-                    // The invocation's process has exited; tear down its network.
+                        if !status.success() {
+                            let stderr_str = String::from_utf8_lossy(&stderr_tail).into_owned();
+                            let stdout_str = String::from_utf8_lossy(&stdout_tail).into_owned();
+                            return Err(Error::Execution(ExecutionError::InvocationFailed {
+                                idx: i,
+                                code: status.code,
+                                reason: status.reason.clone(),
+                                stderr: stderr_str,
+                                stdout: stdout_str,
+                            }));
+                        }
+                        Ok(())
+                    })();
+
+                    // The invocation's process has exited; tear down its network
+                    // before propagating any error.
                     net_guard.teardown().await;
-
-                    if !status.success() {
-                        let stderr_str = String::from_utf8_lossy(&stderr_tail).into_owned();
-                        let stdout_str = String::from_utf8_lossy(&stdout_tail).into_owned();
-                        return Err(Error::Execution(ExecutionError::InvocationFailed {
-                            idx: i,
-                            code: status.code,
-                            reason: status.reason.clone(),
-                            stderr: stderr_str,
-                            stdout: stdout_str,
-                        }));
-                    }
+                    outcome?;
                 }
             }
         }
