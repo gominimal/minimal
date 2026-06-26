@@ -30,7 +30,7 @@ const BOOT_MARKER_PORT: u32 = 7350;
 ///
 /// Factored out of [`emit_ready_marker`] so tests can exercise the format
 /// with an in-memory writer instead of a live vsock connection.
-pub async fn write_ready_beacon<W: tokio::io::AsyncWrite + Unpin>(
+pub(crate) async fn write_ready_beacon<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     pubkey: &PublicKey,
 ) -> std::io::Result<()> {
