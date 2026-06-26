@@ -53,15 +53,13 @@ SSH client finds it before the first connection attempt.
 
 ### Unit 1 — Beacon enrichment (minimald, guest side)
 
-**R1.1** — `emit_ready_marker()` in `minimald/src/guest.rs` accepts a
-`&russh::keys::ssh_key::PublicKey` parameter and emits two lines:
-`READY\n<openssh-pubkey>\n`, where the public key is serialized in OpenSSH
-authorized_keys format via `PublicKey::to_openssh()`.
+**R1.1** — The beacon emission is extended from one line to two: `READY\n`
+followed by the SSH host public key in OpenSSH authorized_keys format on a
+second line, terminated by `\n`.
 
-**R1.2** — In the vsock boot path of `minimald/src/main.rs`, the call to
-`emit_ready_marker()` is passed the SSH host public key obtained from
-`config.host_key()?.public_key()`. The key is resolved from the `Config` struct
-earlier in `async_main()`; no redundant key load is introduced.
+**R1.2** — In the vsock boot path, the beacon emitter receives the SSH host
+public key already loaded from the host configuration; no redundant key load
+is introduced.
 
 **Proof artifacts**:
 
@@ -73,32 +71,20 @@ earlier in `async_main()`; no redundant key load is introduced.
 
 ### Unit 2 — Key reception and known_hosts write (minvmd, host side)
 
-**R2.1** — Both `minvmd boot` (`minvmd/src/cmd/boot.rs::run_boot`) and the
-`minvmd run` supervisor (`minvmd/src/cmd/run.rs::run_foreground`) read a second
+**R2.1** — Both `minvmd boot` and the `minvmd run` supervisor read a second
 line from the beacon connection immediately after validating `READY`.
 
-**R2.2** — The second line is trimmed and parsed as a public key with
-`russh::keys::ssh_key::PublicKey::from_openssh()`. If parsing succeeds,
-`minvmd` calls:
-
-```
-russh::keys::known_hosts::learn_known_hosts_path(
-    "local-0",
-    22,
-    &pubkey,
-    &known_hosts_path,
-)
-```
-
-where `known_hosts_path` is
-`dirs::state_dir().unwrap_or(…).join("minimal/providers/local-0/known_hosts")`.
+**R2.2** — If the second beacon line contains a valid SSH public key, `minvmd`
+records it in `known_hosts` at
+`$XDG_STATE_HOME/minimal/providers/local-0/known_hosts` for hostname `local-0`
+at port 22, using the same known-hosts API path already used by the native
+(non-VM) `minimald` flow.
 
 **R2.3** — If the second line is absent, empty, or fails to parse as an SSH
-public key, `minvmd` logs `tracing::warn!` and proceeds; the boot is not
-aborted.
+public key, `minvmd` logs a warning and proceeds; the boot is not aborted.
 
-**R2.4** — `minvmd` calls `std::fs::create_dir_all` on the
-`providers/local-0/` directory hierarchy before writing `known_hosts`.
+**R2.4** — The `providers/local-0/` directory hierarchy is created before
+writing `known_hosts`.
 
 **R2.5** — `russh` is promoted from `[dev-dependencies]` to `[dependencies]`
 in `minvmd/Cargo.toml` so the production code can call
