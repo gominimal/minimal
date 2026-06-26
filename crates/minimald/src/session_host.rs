@@ -1068,14 +1068,9 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
     pub async fn mainloop(mut self) -> Result<i32, std::io::Error> {
         loop {
             if let Some(exit_code) = self.process.try_wait()? {
-                // A clean exit (0 = EOF / `exit`) is routine; only a non-zero
-                // code is worth a warning (e.g. 127 = dynamic-link/exec failure
-                // → closure not fully materialized).
-                if exit_code == 0 {
-                    tracing::debug!(exit_code, "session process exited");
-                } else {
-                    tracing::warn!(exit_code, "session process exited non-zero");
-                }
+                // `try_wait` already warns on a non-zero exit with the richer
+                // hakoniwa diagnostics; keep this routine and unconditional.
+                tracing::debug!(exit_code, "session process exited");
                 return Ok(exit_code);
             }
 
