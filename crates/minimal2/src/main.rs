@@ -575,8 +575,18 @@ async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), ()> {
         "StrictHostKeyChecking=no",
         "-o",
         "UserKnownHostsFile=/dev/null",
-        "local-0",
     ]);
+
+    // The interactive path opens the in-sandbox session shell via the daemon's
+    // `shell_request`, which requires a PTY. Force one with `-tt` so the shell
+    // works even when our stdin is not a tty (e.g. driven from a script for
+    // automated networking tests); without it ssh skips the PTY and the daemon
+    // rejects the shell. The `--command` path is a non-interactive exec and
+    // needs no PTY.
+    if args.command.is_none() {
+        ssh.arg("-tt");
+    }
+    ssh.arg("local-0");
 
     // If a command was provided, pass it to ssh (non-interactive exec).
     // Otherwise, ssh opens an interactive shell via shell_request.

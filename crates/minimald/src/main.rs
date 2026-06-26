@@ -223,6 +223,13 @@ async fn async_main() -> Result<(), MainError> {
         .with(filter)
         .init();
 
+    // Install the process-default rustls CryptoProvider before anything builds a
+    // rustls config. rustls 0.23 panics ("no process-level CryptoProvider") the
+    // first time one is needed otherwise — e.g. when a session build reaches the
+    // remote-cache HTTPS client, which is off the proxy's own install path. Ring
+    // matches the proxy's choice; idempotent (the proxy's later install no-ops).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Use hardcoded configuration if we are the init process (`argv[0] == "/init"`), which
     // would indicate we are operating in a single-purpose micro-vm.
     //

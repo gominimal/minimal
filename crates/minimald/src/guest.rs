@@ -112,6 +112,10 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
     raw_mount("proc", &format!("{NEWROOT}/proc"), "proc", 0)?;
     raw_mount("sysfs", &format!("{NEWROOT}/sys"), "sysfs", 0)?;
     raw_mount("tmpfs", &format!("{NEWROOT}/run"), "tmpfs", 0)?;
+    // The upstream rootfs is mounted read-only, but `/tmp` must be writable: the
+    // remote-cache staging (`tempfile`, default `/tmp`) and much else assume it.
+    // Without this a session build fails with EROFS fetching its packages.
+    raw_mount("tmpfs", &format!("{NEWROOT}/tmp"), "tmpfs", 0)?;
 
     let to_io = |_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in chroot path");
     let c_newroot = CString::new(NEWROOT).map_err(to_io)?;

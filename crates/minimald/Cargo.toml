@@ -7,7 +7,7 @@ publish.workspace = true
 [features]
 # Enables the B8 HTTPS reverse proxy with mTLS termination (R4.4–R4.7) in front
 # of the shared B5 routing core. Requires the rustls/rcgen/tokio-rustls deps.
-networking-proxy = ["dep:rcgen", "dep:rustls", "dep:tokio-rustls"]
+networking-proxy = ["dep:rcgen", "dep:tokio-rustls"]
 # WireGuard mesh peer and its CLI/RPC plumbing (Unit 4). Off by default so the
 # default `minimald` build pulls in no WireGuard code and pays no binary-size or
 # startup cost (R4.7); enable with `--features networking-wg`.
@@ -60,7 +60,12 @@ sessions.workspace = true
 stdlib.workspace = true
 
 rcgen = { workspace = true, optional = true }
-rustls = { workspace = true, optional = true }
+# Not optional: rustls is always linked via the remote-cache HTTPS client
+# (reqwest), and minimald installs its process-default CryptoProvider at startup
+# (see main.rs) so any rustls user — the remote cache during a session build, or
+# the proxy — has one. Without it rustls panics ("no process-level
+# CryptoProvider") the first time that client is built.
+rustls = { workspace = true }
 tokio-rustls = { workspace = true, optional = true }
 
 [dev-dependencies]

@@ -395,7 +395,15 @@ impl SessionHandle {
                 config,
             ))
             .await;
-        recv.await.expect("corresponding session is dead")
+        // A dead session actor (it panicked or was dropped mid-attach) drops the
+        // reply sender. Surface that as an attach error rather than panicking the
+        // daemon worker — the SSH layer reports it to the client and closes.
+        match recv.await {
+            Ok(result) => result,
+            Err(_) => Err(AttachError::SpawnFailed(std::io::Error::other(
+                "session actor terminated before the attach completed",
+            ))),
+        }
     }
 }
 
