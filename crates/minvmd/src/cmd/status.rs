@@ -88,15 +88,16 @@ fn lifecycle_state_str(lc: Lifecycle) -> &'static str {
 }
 
 fn print_json(state: &State, uptime_seconds: Option<u64>) -> Result<()> {
-    // Constant vcpus and ram_mib reflect the VmConfig::new(2, 1024, ..) values
-    // used by the VMM child. A future change that stores these in state.toml can
-    // remove these literals.
+    // vcpus is the constant the VMM child uses; ram_mib mirrors the same
+    // env-overridable resolution (`crate::cmd::vm_ram_mib()`) so `status`
+    // reports the size the next boot would use. A future change that stores
+    // these in state.toml can report the live VM's actual values.
     let json = serde_json::json!({
         "state": lifecycle_state_str(state.lifecycle),
         "vmm_pid": state.vmm_pid,
         "uptime_seconds": uptime_seconds,
         "vcpus": 2u8,
-        "ram_mib": 1024u32,
+        "ram_mib": crate::cmd::vm_ram_mib(),
     });
     println!("{json}");
     Ok(())

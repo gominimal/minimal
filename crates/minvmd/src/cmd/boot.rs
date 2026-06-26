@@ -94,8 +94,10 @@ fn run_boot(foreground: bool) -> Result<()> {
     let vmm_pid_path = state_dir.vmm_pid_path();
     std::fs::write(&vmm_pid_path, format!("{child_pid}\n")).context("writing vmm.pid")?;
 
-    // Wait for the READY marker from the guest (R2.4): up to 5 s.
-    const READY_TIMEOUT: Duration = Duration::from_secs(5);
+    // Wait for the READY marker from the guest (R2.4). The wait is
+    // env-configurable (`MINVMD_READY_TIMEOUT_SECS`): a cold multi-GiB VM can
+    // take ~20s+ to reach userspace, so a fixed 5s was too short.
+    let ready_timeout: Duration = crate::cmd::ready_timeout();
 
     // Run the accept loop in a separate thread so we can apply a wall-clock
     // timeout without platform-specific socket options.
@@ -121,7 +123,7 @@ fn run_boot(foreground: bool) -> Result<()> {
         let _ = std::fs::remove_file(&sock_path_clone);
     });
 
-    match rx.recv_timeout(READY_TIMEOUT) {
+    match rx.recv_timeout(ready_timeout) {
         Ok(Ok(())) => {
             println!("vm-up");
             // R3.2: by the time READY arrives, libkrun has created and is
@@ -160,7 +162,11 @@ fn run_boot(foreground: bool) -> Result<()> {
             let _ = child.wait();
             let _ = std::fs::remove_file(&vmm_pid_path);
             let _ = std::fs::remove_file(&marker_sock_path);
-            bail!("boot timed out waiting for READY marker after 5 s");
+            bail!(
+                "boot timed out waiting for READY marker after {} s (raise {} to wait longer)",
+                ready_timeout.as_secs(),
+                crate::cmd::READY_TIMEOUT_ENV,
+            );
         }
     }
 

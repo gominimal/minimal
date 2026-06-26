@@ -298,8 +298,10 @@ fn run_foreground() -> Result<()> {
             .context("writing Starting state with vmm_pid")?;
     }
 
-    // Wait up to 5 s for the guest to write `READY\n` on the marker socket.
-    const READY_TIMEOUT: Duration = Duration::from_secs(5);
+    // Wait for the guest to write `READY\n` on the marker socket. The wait is
+    // env-configurable (`MINVMD_READY_TIMEOUT_SECS`): a cold multi-GiB VM can
+    // take ~20s+ to reach userspace, so a fixed 5s was too short.
+    let ready_timeout: Duration = crate::cmd::ready_timeout();
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let sock_clone = marker_sock_path.clone();
     std::thread::spawn(move || {
@@ -322,11 +324,13 @@ fn run_foreground() -> Result<()> {
         let _ = std::fs::remove_file(&sock_clone);
     });
 
-    let boot_result = match rx.recv_timeout(READY_TIMEOUT) {
+    let boot_result = match rx.recv_timeout(ready_timeout) {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(anyhow::anyhow!("boot failed: {e}")),
         Err(_) => Err(anyhow::anyhow!(
-            "boot timed out waiting for READY marker after 5 s"
+            "boot timed out waiting for READY marker after {} s (raise {} to wait longer)",
+            ready_timeout.as_secs(),
+            crate::cmd::READY_TIMEOUT_ENV,
         )),
     };
 

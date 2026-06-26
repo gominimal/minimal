@@ -42,6 +42,64 @@ pub fn own_ip_requested() -> bool {
     })
 }
 
+/// Environment variable overriding the [`DEFAULT_READY_TIMEOUT_SECS`] wait for
+/// the guest `READY` marker.
+pub const READY_TIMEOUT_ENV: &str = "MINVMD_READY_TIMEOUT_SECS";
+
+/// Default seconds `boot`/`run` wait for the guest to write its `READY` marker
+/// (R2.4). A cold boot of a multi-GiB VM on the generic guest kernel — early
+/// kernel bring-up, a large driver-probe phase, then the in-VM minimald init
+/// (mount, pivot_root, networking) — was observed at ~22–28s and is slower
+/// under host load, so the default carries generous margin. Override with
+/// [`READY_TIMEOUT_ENV`] for slower hosts, or to fail faster on fast ones.
+pub const DEFAULT_READY_TIMEOUT_SECS: u64 = 60;
+
+/// The READY-marker wait, overridable via [`READY_TIMEOUT_ENV`]. A non-numeric,
+/// empty, or zero value falls back to [`DEFAULT_READY_TIMEOUT_SECS`] — a zero
+/// wait would make `recv_timeout` return instantly and every boot "time out".
+#[must_use]
+pub fn ready_timeout() -> std::time::Duration {
+    let secs = std::env::var(READY_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .unwrap_or(DEFAULT_READY_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Environment variable overriding the [`DEFAULT_VM_RAM_MIB`] guest RAM size.
+pub const VM_RAM_MIB_ENV: &str = "MINVMD_VM_RAM_MIB";
+
+/// Default guest RAM in MiB. 512 MiB is the floor to reach userspace; the extra
+/// headroom feeds the in-VM session build, whose package cache lives on a tmpfs
+/// (`/run/minimal/cache`) sized from RAM (1024 MiB overflowed `StorageFull`
+/// unpacking large packages) — a stop-gap until the seeded cache disk lands.
+///
+/// The default is **arch-conditional** because libkrun boots a same-arch guest,
+/// so the minvmd binary's `target_arch` is the guest's arch. On x86_64 a guest
+/// sized at 4096 MiB straddles the 32-bit MMIO/PCI hole (~3–4 GiB), which
+/// mis-places the initramfs so the kernel finds no `/init` and panics in
+/// `prepare_namespace` ("VFS: cannot open root device"). aarch64 has no such low
+/// hole. So x86_64 defaults to a hole-safe 2048 MiB (CI-proven) and aarch64 to
+/// 4096; either can be raised via [`VM_RAM_MIB_ENV`] (x86_64 to a hole-safe size,
+/// i.e. ≤3072 or ≥6144).
+#[cfg(target_arch = "x86_64")]
+pub const DEFAULT_VM_RAM_MIB: u32 = 2048;
+/// See the x86_64 variant for the full rationale (the MMIO-hole caveat).
+#[cfg(not(target_arch = "x86_64"))]
+pub const DEFAULT_VM_RAM_MIB: u32 = 4096;
+
+/// The guest RAM size in MiB, overridable via [`VM_RAM_MIB_ENV`]. A non-numeric,
+/// empty, or zero value falls back to [`DEFAULT_VM_RAM_MIB`].
+#[must_use]
+pub fn vm_ram_mib() -> u32 {
+    std::env::var(VM_RAM_MIB_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&mib| mib > 0)
+        .unwrap_or(DEFAULT_VM_RAM_MIB)
+}
+
 /// Verify the host hypervisor backend is accessible before booting a VM (R2.4).
 ///
 /// On Linux, libkrun drives KVM, which needs a readable `/dev/kvm`. Probe it
