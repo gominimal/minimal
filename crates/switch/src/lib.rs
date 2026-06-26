@@ -86,6 +86,12 @@ impl SwitchSubnet {
         if !(8..=29).contains(&prefix) {
             return Err(InvalidPrefix(prefix));
         }
+        // Canonicalize: zero the host bits so two subnets with the same network
+        // compare equal regardless of host bits in `base` (Display and all
+        // address math already normalize through `network()`). `prefix` is in
+        // 8..=29, so the shift never overflows.
+        let mask = u32::MAX << (32 - prefix);
+        let base = Ipv4Addr::from(u32::from(base) & mask);
         Ok(Self { base, prefix })
     }
 
@@ -236,6 +242,15 @@ mod tests {
             Err(InvalidPrefix(30))
         );
         assert!(SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 29).is_ok());
+    }
+
+    #[test]
+    fn new_canonicalizes_host_bits_in_base() {
+        // Equal networks compare equal regardless of host bits in `base`.
+        let a = SwitchSubnet::new(Ipv4Addr::new(10, 1, 2, 3), 16).unwrap();
+        let b = SwitchSubnet::new(Ipv4Addr::new(10, 1, 0, 0), 16).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.network(), Ipv4Addr::new(10, 1, 0, 0));
     }
 
     #[test]
