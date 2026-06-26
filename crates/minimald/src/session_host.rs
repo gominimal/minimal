@@ -57,12 +57,21 @@ impl From<&RequestedPty> for WinSize {
     ///
     /// SSH carries sizes as `u32`; terminal dimensions never exceed `u16`, so
     /// out-of-range values are clamped rather than wrapped.
+    ///
+    /// A client may request a `0`-valued row or column count (some attach
+    /// clients do not probe their terminal before the PTY request). A zero
+    /// dimension produces a `0`-cell grid, which panics the vt100 screen on the
+    /// first cell write, so zero is replaced by a conventional terminal default
+    /// (24 rows × 80 cols). The size is corrected by a `window_change` once the
+    /// client learns its real dimensions.
     fn from(pty: &RequestedPty) -> Self {
         let (cols, rows) = pty.char_sizes;
         let (xpixel, ypixel) = pty.pixel_sizes;
+        let rows = rows.min(u16::MAX as u32) as u16;
+        let cols = cols.min(u16::MAX as u32) as u16;
         Self {
-            rows: rows.min(u16::MAX as u32) as u16,
-            cols: cols.min(u16::MAX as u32) as u16,
+            rows: if rows == 0 { 24 } else { rows },
+            cols: if cols == 0 { 80 } else { cols },
             xpixel: xpixel.min(u16::MAX as u32) as u16,
             ypixel: ypixel.min(u16::MAX as u32) as u16,
         }
@@ -546,14 +555,36 @@ impl SessionProcess for SandboxProcess {
     fn try_wait(&mut self) -> io::Result<Option<i32>> {
         self.0
             .try_wait()
-            .map(|status| status.map(|s| s.code))
+            .map(|status| {
+                status.map(|s| {
+                    if s.code != 0 {
+                        tracing::warn!(
+                            code = s.code,
+                            exit_code = ?s.exit_code,
+                            reason = %s.reason,
+                            "DIAG hakoniwa container/process exited non-zero"
+                        );
+                    }
+                    s.code
+                })
+            })
             .map_err(|e| io::Error::other(format!("wait failed: {e}")))
     }
 
     fn wait(&mut self) -> io::Result<i32> {
         self.0
             .wait()
-            .map(|s| s.code)
+            .map(|s| {
+                if s.code != 0 {
+                    tracing::warn!(
+                        code = s.code,
+                        exit_code = ?s.exit_code,
+                        reason = %s.reason,
+                        "DIAG hakoniwa container/process exited non-zero"
+                    );
+                }
+                s.code
+            })
             .map_err(|e| io::Error::other(format!("wait failed: {e}")))
     }
 

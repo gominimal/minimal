@@ -149,10 +149,41 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
         }
     }
 
-    let to_io = |_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in chroot path");
-    let c_newroot = CString::new(NEWROOT).map_err(to_io)?;
-    // SAFETY: `chroot(2)` with a valid C string for the new root.
-    if unsafe { libc::chroot(c_newroot.as_ptr()) } != 0 {
+    // Transition into the new root the `switch_root(8)` way — mount-move it over
+    // `/` then `chroot(".")` — rather than a bare `chroot(NEWROOT)`.
+    //
+    // A bare chroot leaves pid-1's root directory pointing at `/newroot` while
+    // the mount-namespace root stays the initramfs. The kernel then refuses
+    // `unshare(CLONE_NEWUSER)` with EPERM for any process in such a "chroot
+    // environment" (user_namespaces(7): the caller's root must match the mount
+    // namespace root). Every sandbox build does exactly that unshare via
+    // hakoniwa, so it died with code 125 ("Operation not permitted") in-guest
+    // while working natively (DM2 minimald is not chrooted). `pivot_root(2)`
+    // can't be used here because the source root is the initramfs rootfs, which
+    // the kernel forbids moving; `MS_MOVE` of the new root onto `/` is the
+    // canonical initramfs hand-off and makes the new root the namespace root, so
+    // the chroot below no longer constitutes a "chroot environment".
+    std::env::set_current_dir(NEWROOT)?;
+    let c_newroot = CString::new(NEWROOT).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in newroot path")
+    })?;
+    let c_slash = c"/";
+    // SAFETY: `mount(2)` MS_MOVE with valid C strings for source/target, no
+    // fs-type or data; relocates the `/newroot` mount onto `/`.
+    if unsafe {
+        libc::mount(
+            c_newroot.as_ptr(),
+            c_slash.as_ptr(),
+            std::ptr::null(),
+            libc::MS_MOVE,
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `chroot(2)` onto ".", the just-moved new root (now mounted at `/`).
+    if unsafe { libc::chroot(c".".as_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
     std::env::set_current_dir("/")?;
@@ -219,8 +250,9 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
     let _ = &cidr; // (kept for log context below)
 
     // Open the tap in the current (root) netns; the OwnedFd keeps it alive.
-    let tap_fd = switch::open_tap(TAP)
-        .map_err(|e| std::io::Error::new(e.kind(), format!("open_tap({TAP}) [/dev/net/tun]: {e}")))?;
+    let tap_fd = switch::open_tap(TAP).map_err(|e| {
+        std::io::Error::new(e.kind(), format!("open_tap({TAP}) [/dev/net/tun]: {e}"))
+    })?;
 
     // Configure the interface directly via ioctls — the generic guest rootfs
     // ships no `ip`/iproute2 binary, so shelling out is not an option.
@@ -237,8 +269,8 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
     }
 
     // Relay the tap to the host gvproxy over the vsock shuttle (CID 2).
-    let relay = switch::attach_to_switch_vsock(tap_fd, VSOCK_HOST_CID, VSOCK_GVPROXY_SHUTTLE_PORT)
-        .await?;
+    let relay =
+        switch::attach_to_switch_vsock(tap_fd, VSOCK_HOST_CID, VSOCK_GVPROXY_SHUTTLE_PORT).await?;
     tracing::info!(%cidr, %gateway, "guest root egress up via host gvproxy shuttle");
     Ok(relay)
 }
@@ -325,8 +357,13 @@ fn configure_interface_v4(
         };
         // SAFETY: fd is open; &mut ifr is a correctly-sized ifreq for an
         // address-setting ioctl.
-        let rc =
-            unsafe { libc::ioctl(fd, req as _, std::ptr::from_mut(&mut ifr).cast::<libc::c_void>()) };
+        let rc = unsafe {
+            libc::ioctl(
+                fd,
+                req as _,
+                std::ptr::from_mut(&mut ifr).cast::<libc::c_void>(),
+            )
+        };
         if rc < 0 {
             return Err(std::io::Error::last_os_error());
         }
