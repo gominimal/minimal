@@ -64,7 +64,6 @@ enum SessionMessage {
     GetHostAttrs(oneshot::Sender<Option<HostAttrs>>),
     RefreshRecord(Record),
     Destroy(oneshot::Sender<()>),
-    #[cfg(test)]
     GetRecord(oneshot::Sender<Record>),
 }
 
@@ -162,7 +161,6 @@ impl<S: SessionObject> Session<S> {
                 let _ = r.send(());
                 return ControlFlow::Break(());
             }
-            #[cfg(test)]
             SessionMessage::GetRecord(r) => {
                 let _ = r.send(self.session.record().clone());
             }
@@ -306,13 +304,24 @@ impl<S: SessionObject> Session<S> {
         // project files this fabrication — and `mctx::scaffold` — goes away.
         //
         // The scaffold does a blocking network git clone, and this runs inside
-        // the async session-actor task, so fence it with `block_in_place` to move
-        // other futures off this worker thread for its duration rather than
-        // stalling them. (minimald uses the multi-thread runtime; see main.rs.)
+        // the async session-actor task. On the daemon's multi-thread runtime
+        // (see main.rs) fence it with `block_in_place` so other futures move off
+        // this worker for its duration. `block_in_place` *panics* on a
+        // current-thread runtime (e.g. a `#[tokio::test]` with no explicit
+        // flavor) or with no runtime at all, so fall back to a plain blocking
+        // call there — a brief stall, acceptable for this temporary,
+        // once-per-empty-workspace scaffold.
         if !wsp.as_utf8_path().join(mfile::MFILE_NAME).exists() {
-            tokio::task::block_in_place(|| {
-                mctx::scaffold_default_mfile(&config, wsp.as_utf8_path())
-            })
+            let scaffold = || mctx::scaffold_default_mfile(&config, wsp.as_utf8_path());
+            let on_multi_thread = matches!(
+                tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
+                Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+            );
+            if on_multi_thread {
+                tokio::task::block_in_place(scaffold)
+            } else {
+                scaffold()
+            }
             .map_err(|e| e.to_string())?;
         }
 
@@ -355,11 +364,9 @@ impl SessionHandle {
         recv.await.expect("corresponding session is dead")
     }
 
-    /// Returns the session record currently held by the live session actor.
-    ///
-    /// This reads the actor's in-memory copy, not the on-disk record, so
-    /// tests can assert that updates have propagated into the running session.
-    #[cfg(test)]
+    /// Returns the session record currently held by the live session actor
+    /// (the in-memory copy, not the on-disk record). Used by the task-exec path
+    /// to read the session's network mode, and by tests to assert propagation.
     pub(crate) async fn record(&self) -> Record {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.

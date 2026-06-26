@@ -20,6 +20,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -45,6 +46,11 @@ const IFNAMSIZ: usize = 16;
 /// The HTTP request that upgrades a control-socket connection into a raw frame
 /// stream. gvproxy hijacks the connection and writes no response.
 const CONNECT_REQUEST: &[u8] = b"POST /connect HTTP/1.0\r\nHost: localhost\r\n\r\n";
+
+/// Bound the host-shuttle vsock connect + `/connect` upgrade so an unresponsive
+/// or absent host gvproxy fails the `OwnIp` attach fast instead of stalling
+/// guest-egress / session bring-up indefinitely.
+const VSOCK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `struct ifreq` reduced to the two fields `TUNSETIFF` reads, padded to the
 /// kernel's `sizeof(struct ifreq)` (40 bytes on every LP64 Linux target) so the
@@ -311,12 +317,27 @@ pub async fn attach_to_switch_vsock(
     cid: u32,
     port: u32,
 ) -> io::Result<SwitchRelay> {
-    let mut sock =
-        tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(cid, port)).await?;
-    // `VsockStream` has an inherent (blocking, std::io) `write_all` that shadows
-    // the async trait method, so disambiguate to the tokio trait — same hazard
-    // `guest.rs` notes for `shutdown`.
-    AsyncWriteExt::write_all(&mut sock, CONNECT_REQUEST).await?;
+    // Bound the connect + `/connect` upgrade: a wedged or absent host gvproxy
+    // must fail the attach fast, not stall OwnIp bring-up forever.
+    let sock = tokio::time::timeout(VSOCK_CONNECT_TIMEOUT, async {
+        let mut sock =
+            tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(cid, port)).await?;
+        // `VsockStream` has an inherent (blocking, std::io) `write_all` that
+        // shadows the async trait method, so disambiguate to the tokio trait —
+        // same hazard `guest.rs` notes for `shutdown`.
+        AsyncWriteExt::write_all(&mut sock, CONNECT_REQUEST).await?;
+        Ok::<_, io::Error>(sock)
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "vsock connect/upgrade to host gvproxy (cid {cid} port {port}) \
+                 timed out after {VSOCK_CONNECT_TIMEOUT:?}"
+            ),
+        )
+    })??;
     let (sock_rx, sock_tx) = tokio::io::split(sock);
     spawn_relay(tap_fd, sock_rx, sock_tx)
 }

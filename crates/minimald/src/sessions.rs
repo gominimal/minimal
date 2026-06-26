@@ -266,9 +266,37 @@ impl<L: Loader> Manager<L> {
                             format!("no session with ID `{}`", id.as_ref()),
                         )),
                         Some(k) => {
+                            // Snapshot the live HostNet route (id + pre-rename
+                            // name) before the rename mutates the record. Only a
+                            // running session has a route (registered on launch).
+                            #[cfg(target_os = "linux")]
+                            let relink: Option<(SessionId, String)> =
+                                if self.running.contains_key(&k) {
+                                    let rec = self.store.get(&k)?;
+                                    (rec.record().network == sessions::NetworkMode::HostNet)
+                                        .then(|| (rec.record().id, registry_name(rec.record())))
+                                } else {
+                                    None
+                                };
+
                             self.store.rename(&k, new_name.clone())?;
                             if let Some(hnd) = self.running.get(&k) {
                                 hnd.apply_record(self.store.get(&k)?.record().clone()).await;
+                            }
+
+                            // Follow the rename in the hostname registry so
+                            // `<new>.local.min.internal` routes and the old name
+                            // stops (R3.6) — otherwise the route is stranded
+                            // under the launch name.
+                            #[cfg(target_os = "linux")]
+                            if let Some((id, old_name)) = relink {
+                                let new_reg = registry_name(self.store.get(&k)?.record());
+                                let mut reg = self
+                                    .hostnames
+                                    .write()
+                                    .expect("hostname registry lock poisoned");
+                                reg.deregister(&old_name);
+                                reg.register_host_net(id, &new_reg);
                             }
                             Ok(())
                         }
