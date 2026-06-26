@@ -62,6 +62,7 @@ pub struct UnexposeRequest {
 /// (`minvmd` maps the shuttle port to it via `krun_add_vsock_port2`), so the
 /// forwarder verbs ride the same channel as the L2 `POST /connect` relay.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ControlChannel {
     /// Local unix control socket (DM2).
     Unix(std::path::PathBuf),
