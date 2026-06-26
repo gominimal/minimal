@@ -73,21 +73,16 @@ pub const VSOCK_GVPROXY_SHUTTLE_PORT: u32 = 1024;
 /// switch. Keeping the two as an enum (rather than an `Option<sock>` plus a
 /// bool) makes the illegal "spawn locally *and* shuttle to host" state
 /// unrepresentable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum SwitchTransport {
     /// DM2: `minimald` spawns + owns gvproxy locally; taps attach over its UNIX
     /// control socket.
+    #[default]
     LocalSpawn,
     /// DM1/3/4: gvproxy runs on the host (owned by `minvmd`); taps attach over a
     /// vsock shuttle to `(cid, port)`. `minimald` never spawns gvproxy here.
     HostShuttle { cid: u32, port: u32 },
-}
-
-impl Default for SwitchTransport {
-    fn default() -> Self {
-        Self::LocalSpawn
-    }
 }
 
 /// How long to wait for gvproxy's control socket to appear after spawn.
