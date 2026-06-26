@@ -65,6 +65,35 @@ pub use shuttle::{VSOCK_GVPROXY_SHUTTLE_PORT, resolve_switch_sock};
 /// SIGKILL.
 pub const DEFAULT_TERM_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long to wait for gvproxy to bind its `-listen` switch socket after spawn
+/// before reporting the host switch ready (or failing the bring-up).
+const SWITCH_SOCKET_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Poll-connect `sock` until gvproxy's `-listen` socket accepts a connection or
+/// `timeout` elapses. A gvproxy that exits during startup never binds the
+/// socket, so a timeout here means the switch is not usable — surfaced as an
+/// error rather than reporting a dead switch as ready.
+async fn wait_for_switch_socket(sock: &Path, timeout: Duration) -> io::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match tokio::net::UnixStream::connect(sock).await {
+            Ok(_) => return Ok(()),
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "gvproxy switch socket {} did not appear within {timeout:?}: {e}",
+                        sock.display()
+                    ),
+                ));
+            }
+        }
+    }
+}
+
 /// Builder for the per-host gvproxy switch process.
 #[derive(Debug, Clone)]
 pub struct GvproxyConfig {
@@ -548,6 +577,17 @@ impl HostGvproxy {
                         }
                     };
                     let pid = switch.pid();
+                    // Wait for gvproxy to bind its `-listen` switch socket before
+                    // reporting ready, so a caller never treats a switch that died
+                    // during startup (or never bound) as network-ready. A dead
+                    // gvproxy never binds, so the timeout surfaces it as an error.
+                    let sock = switch.switch_socket().to_path_buf();
+                    if let Err(e) = wait_for_switch_socket(&sock, SWITCH_SOCKET_READY_TIMEOUT).await
+                    {
+                        switch.stop().await;
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
                     if ready_tx.send(Ok(pid)).is_err() {
                         // Caller went away before learning the PID; tear down.
                         switch.stop().await;
@@ -889,11 +929,13 @@ mod tests {
     #[test]
     fn host_gvproxy_spawns_supervises_and_stops() {
         // `sleep` stands in for gvproxy: HostGvproxy::spawn only needs a binary
-        // it can launch and read a PID from; the socket is dialed by libkrun in
-        // production, not by this supervisor. Use a temp socket path so no real
-        // file is needed (gvproxy would bind it; sleep ignores its argv).
+        // it can launch and read a PID from. Real gvproxy binds the `-listen`
+        // switch socket, which the supervisor now probes for readiness before
+        // reporting ready, so bind a stand-in listener here (sleep ignores argv).
         let dir = tempfile::TempDir::new().expect("tempdir");
         let sock = dir.path().join("gvproxy-switch.sock");
+        let _switch_listener =
+            std::os::unix::net::UnixListener::bind(&sock).expect("bind stand-in switch socket");
         let gvproxy = HostGvproxy::spawn(PathBuf::from("sleep"), sock).expect("spawn host gvproxy");
         let pid = gvproxy.pid();
         assert!(
@@ -913,6 +955,8 @@ mod tests {
     fn host_gvproxy_drop_stops_the_switch() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let sock = dir.path().join("gvproxy-switch.sock");
+        let _switch_listener =
+            std::os::unix::net::UnixListener::bind(&sock).expect("bind stand-in switch socket");
         let gvproxy = HostGvproxy::spawn(PathBuf::from("sleep"), sock).expect("spawn host gvproxy");
         let pid = gvproxy.pid();
         assert!(pid_is_alive(pid));
