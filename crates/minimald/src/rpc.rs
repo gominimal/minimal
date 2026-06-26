@@ -455,6 +455,7 @@ mod tests {
                     project_path: HostAbsPath::try_new("/tmp").unwrap(),
                     network: sessions::NetworkMode::default(),
                     policy: Default::default(),
+                    status: Default::default(),
                     attrs: Default::default(),
                 },
             })
@@ -620,6 +621,7 @@ mod tests {
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: sessions::NetworkMode::default(),
                     policy: Default::default(),
+                    status: Default::default(),
                     attrs: Default::default(),
                 },
             })
@@ -674,6 +676,7 @@ mod tests {
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: NetworkMode::OwnIp,
                     policy: SessionPolicy::new(Some(egress.clone()), None),
+                    status: Default::default(),
                     attrs: Default::default(),
                 },
             })
@@ -704,6 +707,7 @@ mod tests {
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: sessions::NetworkMode::default(),
                     policy: Default::default(),
+                    status: Default::default(),
                     attrs: Default::default(),
                 },
             })
@@ -722,6 +726,7 @@ mod tests {
                         project_path: HostAbsPath::try_new("/uwu").unwrap(),
                         network: sessions::NetworkMode::default(),
                         policy: Default::default(),
+                        status: Default::default(),
                         attrs: Default::default(),
                     },
                 })
@@ -753,6 +758,7 @@ mod tests {
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: NetworkMode::HostNet,
                     policy: SessionPolicy::new(Some(egress), None),
+                    status: Default::default(),
                     attrs: Default::default(),
                 },
             })

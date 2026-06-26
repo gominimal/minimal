@@ -264,8 +264,34 @@ impl fmt::Display for SessionId {
     }
 }
 
+/// Lifecycle status of a [`Record`].
+///
+/// `Draft` covers a session whose composition is still in flight —
+/// an id has been allocated and a stub record persisted, but the
+/// composition pipeline hasn't yet produced a finalized
+/// `Composition`. `Active` is the finalized, ready-to-use state.
+///
+/// Defaults to `Active` so on-disk records predating this field
+/// (which were always finalized at create time) deserialize
+/// correctly.
+///
+/// The store layer doesn't enforce transitions between states — it
+/// records the status verbatim. State-machine rules (e.g. "only
+/// the composition pipeline can promote `Draft` → `Active`") live
+/// in the manager actor.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    /// Composition is in flight; the record is a stub awaiting the
+    /// `SubmitVerdict` round-trip to finalize.
+    Draft,
+    /// Composition complete; the record is ready to apply.
+    #[default]
+    Active,
+}
+
 /// The on-disk row/record pertaining to a session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     /// Unique ID describing this session.
     #[serde(default = "SessionId::nil")]
@@ -294,6 +320,12 @@ pub struct Record {
     /// predate this field or specify none.
     #[serde(default)]
     pub policy: SessionPolicy,
+
+    /// Lifecycle status. Defaults to [`SessionStatus::Active`] for
+    /// on-disk records predating this field — those records were
+    /// always finalized at create time.
+    #[serde(default)]
+    pub status: SessionStatus,
 
     /// Free-form attributes.
     pub attrs: BTreeMap<String, String>,
@@ -410,6 +442,7 @@ mod tests {
             project_path: HostAbsPath::try_new("/p").unwrap(),
             network,
             policy,
+            status: SessionStatus::default(),
             attrs: BTreeMap::new(),
         }
     }
@@ -672,5 +705,28 @@ mod tests {
             SessionPolicy::new(None, Some(IngressPolicy::default())),
         );
         assert!(record.validate_policy().is_ok());
+    }
+
+    /// On-disk records that predate the `status` field must
+    /// deserialize as `Active`. This guarantees existing session
+    /// stores keep working after the schema change.
+    #[test]
+    fn record_without_status_field_deserializes_as_active() {
+        // Build a JSON document deliberately missing the `status`
+        // field, with the rest of the fields set to plausible values.
+        let raw = serde_json::json!({
+            "id": SessionId::nil(),
+            "name": null,
+            "username": null,
+            "project_path": "/p",
+            "attrs": {},
+        });
+        let parsed: Record = serde_json::from_value(raw).expect("deserialize");
+        assert_eq!(parsed.status, SessionStatus::Active);
+    }
+
+    #[test]
+    fn session_status_default_is_active() {
+        assert_eq!(SessionStatus::default(), SessionStatus::Active);
     }
 }

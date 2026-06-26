@@ -77,13 +77,36 @@ pub trait Loader {
     /// cannot be written.
     fn create(&mut self, record: Record) -> Result<Self::Key, std::io::Error>;
 
+    /// Overwrites the session at `key` with the given record.
+    ///
+    /// The record's `id` must match `key.id()` — id is the primary
+    /// key, never changes after [`Self::create`]. Other fields
+    /// (`name`, `status`, `policy`, `attrs`, …) are written verbatim;
+    /// the store does not enforce state-machine transitions (e.g.
+    /// `Draft` → `Active`), that policy belongs in higher layers.
+    ///
+    /// If `record.name` differs from the on-disk name, the name
+    /// index is remapped; a name collision with a *different* session
+    /// surfaces as `AlreadyExists`.
+    ///
+    /// # Errors
+    ///
+    /// - `InvalidInput` if `record.id != key.id()`.
+    /// - `AlreadyExists` if `record.name` is taken by a different session.
+    /// - Other I/O errors from writing the record or flushing the index.
+    fn save(&mut self, key: &Self::Key, record: &Record) -> Result<(), std::io::Error>;
+
     /// Renames the session with the given key.
+    ///
+    /// Sugar for `get` → mutate `name` → [`Self::save`]; see `save`
+    /// for the underlying write semantics.
     ///
     /// # Errors
     ///
     /// Returns an I/O error if the session directory, record, or index
     /// cannot be written.
-    /// `AlreadyExists` is returned if a session with that name already exists.
+    /// `AlreadyExists` is returned if a *different* session already has the
+    /// requested name; renaming to the session's current name is a no-op.
     fn rename(&mut self, key: &Self::Key, new_name: String) -> Result<(), std::io::Error>;
 
     /// Deletes the session with the given key, dropping its index entries and
@@ -716,29 +739,70 @@ impl Loader for DiskLoader {
         })
     }
 
-    fn rename(&mut self, key: &Self::Key, new_name: String) -> Result<(), std::io::Error> {
-        if self.index.find_by_name(&new_name).is_some() {
+    fn save(&mut self, key: &Self::Key, record: &Record) -> Result<(), std::io::Error> {
+        // The id is the primary key — `save` overwrites the row, it
+        // doesn't move it. Mismatched ids would corrupt the index.
+        if record.id != *key.id() {
             return Err(std::io::Error::new(
-                AlreadyExists,
-                format!("a session with the name `{new_name}` already exists"),
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "save: record id {} does not match key id {}",
+                    record.id,
+                    key.id(),
+                ),
             ));
         }
 
-        let mut obj = self.get(key)?;
-        let short = obj.key.dir_key.to_string();
-        let old_name = obj.record.name.clone();
+        let short = key.dir_key.to_string();
+        let id = *key.id();
 
-        obj.record.name = Some(new_name.clone());
-        self.write_record(&short, &obj.record)?;
-
-        // Only mutate in-memory index after disk writes succeed
-        if let Some(old_name) = &old_name {
-            self.index.name_to_id.remove(old_name);
+        // Refuse to save against a key the index has dropped — a
+        // stale key from before a delete would otherwise resurrect
+        // the session by re-creating the dir + record.json and
+        // re-inserting into name_to_id below.
+        if !self.index.short_to_id.contains_key(&short) {
+            return Err(std::io::Error::new(
+                NotFound,
+                format!("no session with key short `{short}` is present in the index"),
+            ));
         }
-        self.index.name_to_id.insert(new_name, obj.record.id);
-        self.flush_index()?;
+
+        let old_name = self.index.name_by_id(&id).cloned();
+        let new_name = record.name.clone();
+
+        // Collision check: if the new name belongs to a *different*
+        // session, refuse. Same-id same-name is a no-op, not a collision.
+        if let Some(name) = &new_name
+            && let Some(other_id) = self.index.find_by_name(name).copied()
+            && other_id != id
+        {
+            return Err(std::io::Error::new(
+                AlreadyExists,
+                format!("a session with the name `{name}` already exists"),
+            ));
+        }
+
+        // Atomic record write (temp + renameat2).
+        self.write_record(&short, record)?;
+
+        // Only mutate the in-memory index after the on-disk write succeeds.
+        if old_name != new_name {
+            if let Some(old) = &old_name {
+                self.index.name_to_id.remove(old);
+            }
+            if let Some(new) = new_name {
+                self.index.name_to_id.insert(new, id);
+            }
+            self.flush_index()?;
+        }
 
         Ok(())
+    }
+
+    fn rename(&mut self, key: &Self::Key, new_name: String) -> Result<(), std::io::Error> {
+        let mut record = self.get(key)?.record;
+        record.name = Some(new_name);
+        self.save(key, &record)
     }
 
     fn delete(&mut self, key: &Self::Key) -> Result<(), std::io::Error> {
@@ -791,6 +855,7 @@ impl Loader for DiskLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SessionStatus;
     use paths::HostAbsPath;
     use std::{collections::BTreeSet, io::ErrorKind};
     use tempfile::TempDir;
@@ -818,6 +883,7 @@ mod tests {
                 }),
                 None,
             ),
+            status: SessionStatus::default(),
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()
                 .collect(),
@@ -1100,6 +1166,164 @@ mod tests {
             Some("now-named")
         );
         assert_eq!(loader.find_by_name("now-named").unwrap(), Some(key));
+    }
+
+    // =================================================================
+    // Loader::save
+    // =================================================================
+
+    #[test]
+    fn save_overwrites_existing_record() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        let mut updated = loader.get(&key).unwrap().record().clone();
+        updated.attrs.insert("color".into(), "red".into());
+        updated.username = Some("bob".into());
+
+        loader.save(&key, &updated).unwrap();
+
+        let reread = loader.get(&key).unwrap();
+        assert_eq!(
+            reread.record().attrs.get("color").map(String::as_str),
+            Some("red")
+        );
+        assert_eq!(reread.record().username.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn save_promotes_draft_to_active() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader
+            .create({
+                let mut r = sample_record();
+                r.status = SessionStatus::Draft;
+                r
+            })
+            .unwrap();
+        let mut promoted = loader.get(&key).unwrap().record().clone();
+        promoted.status = SessionStatus::Active;
+        loader.save(&key, &promoted).unwrap();
+
+        assert_eq!(
+            loader.get(&key).unwrap().record().status,
+            SessionStatus::Active,
+        );
+    }
+
+    #[test]
+    fn save_can_change_name_and_updates_index() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        let mut updated = loader.get(&key).unwrap().record().clone();
+        updated.name = Some("renamed".into());
+        loader.save(&key, &updated).unwrap();
+
+        assert_eq!(loader.find_by_name("renamed").unwrap(), Some(key.clone()));
+        assert_eq!(loader.find_by_name("my-session").unwrap(), None);
+    }
+
+    #[test]
+    fn save_rejects_id_change() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        // Snapshot the whole stored record so a future refactor that
+        // accidentally moves a side effect above the id check would
+        // be caught — not just the id field.
+        let before = loader.get(&key).unwrap().record().clone();
+
+        let mut tampered = before.clone();
+        tampered.id = SessionId(uuid::Uuid::from_u128(0xCAFE_BABE));
+        tampered.username = Some("intruder".into());
+
+        let err = loader.save(&key, &tampered).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+
+        let after = loader.get(&key).unwrap().record().clone();
+        assert_eq!(after, before, "failed save must not mutate any field");
+    }
+
+    #[test]
+    fn save_rejects_name_collision() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let first = loader.create(sample_record()).unwrap();
+        let second = loader
+            .create({
+                let mut r = sample_record();
+                r.name = Some("other".into());
+                r
+            })
+            .unwrap();
+
+        // Try to save `first` claiming "other" — already taken by `second`.
+        let mut conflict = loader.get(&first).unwrap().record().clone();
+        conflict.name = Some("other".into());
+        let err = loader.save(&first, &conflict).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+
+        // Index untouched.
+        assert_eq!(loader.find_by_name("my-session").unwrap(), Some(first));
+        assert_eq!(loader.find_by_name("other").unwrap(), Some(second));
+    }
+
+    /// Saving a record whose name equals the current on-disk name is a
+    /// no-op for the index — not a self-collision. This is the same
+    /// reason `find_by_name(current).is_some()` isn't a valid
+    /// collision check.
+    #[test]
+    fn save_with_same_name_is_not_a_collision() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        let record = loader.get(&key).unwrap().record().clone();
+        loader.save(&key, &record).unwrap();
+
+        assert_eq!(loader.find_by_name("my-session").unwrap(), Some(key));
+    }
+
+    /// Saving against a stale key — for a session that's been
+    /// deleted — must refuse, not resurrect the session by
+    /// re-creating its on-disk dir + record.json.
+    #[test]
+    fn save_against_stale_key_after_delete_errors_with_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        let record = loader.get(&key).unwrap().record().clone();
+        loader.delete(&key).unwrap();
+
+        let err = loader.save(&key, &record).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        // No resurrection: id still unknown to the loader.
+        assert_eq!(loader.find_by_id(key.id()).unwrap(), None);
+    }
+
+    /// Saving a record with `name = None` removes the name mapping
+    /// without disturbing the short index.
+    #[test]
+    fn save_can_clear_name() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        let mut anonymized = loader.get(&key).unwrap().record().clone();
+        anonymized.name = None;
+        loader.save(&key, &anonymized).unwrap();
+
+        assert_eq!(loader.find_by_name("my-session").unwrap(), None);
+        // Session still reachable by id.
+        assert_eq!(loader.find_by_id(key.id()).unwrap(), Some(key));
     }
 
     // =================================================================
