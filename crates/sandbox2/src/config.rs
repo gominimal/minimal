@@ -1,3 +1,4 @@
+use crate::network::Network;
 use crate::{Error, Sandbox};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -126,7 +127,17 @@ pub struct Config {
     /// Synthesize DNS config.
     pub setup_dns_config: bool,
     /// The network isolation mode for this sandbox.
+    ///
+    /// Used only when [`network`](Self::network) is `None` (the built-in
+    /// `HostNet`/`NoNet` path). A custom [`Network`] takes precedence.
     pub network_mode: NetworkMode,
+    /// A custom per-sandbox [`Network`], if injected via
+    /// [`with_network`](Self::with_network). When set it overrides
+    /// [`network_mode`](Self::network_mode), and decides both netns isolation and
+    /// any post-spawn wiring (e.g. an own-IP gvproxy switch attach). Keeping the
+    /// wiring behind this trait is what lets tasks and sessions share one
+    /// networking path instead of it living only in the minimald session host.
+    pub network: Option<Box<dyn Network>>,
 
     /// The hostname to set in the environment, if any.
     pub hostname: Option<String>,
@@ -165,6 +176,7 @@ impl Config {
             name: name.into(),
             setup_dns_config: true,
             network_mode: NetworkMode::HostNet,
+            network: None,
             env_vars: HashMap::with_capacity(12),
             hostname: None,
             username: None,
@@ -249,9 +261,19 @@ impl Config {
         self.rootfs.insert(file);
         self
     }
-    /// Sets the network isolation mode for this sandbox.
+    /// Sets the network isolation mode for this sandbox (built-in
+    /// `HostNet`/`NoNet` path). Ignored if a custom [`Network`] is set via
+    /// [`with_network`](Self::with_network).
     pub fn with_network_mode(mut self, mode: NetworkMode) -> Self {
         self.network_mode = mode;
+        self
+    }
+    /// Sets a custom per-sandbox [`Network`], overriding
+    /// [`with_network_mode`](Self::with_network_mode). Use this for modes that
+    /// need post-spawn wiring (e.g. own-IP gvproxy switch attach), supplied by
+    /// the consumer so the wiring lives behind one abstraction for every sandbox.
+    pub fn with_network(mut self, network: Box<dyn Network>) -> Self {
+        self.network = Some(network);
         self
     }
     /// Sets whether DNS should be configured.

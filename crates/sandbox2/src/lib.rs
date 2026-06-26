@@ -13,6 +13,8 @@
 pub mod config;
 use config::Config;
 pub use config::NetworkMode;
+pub mod network;
+pub use network::{HostNet, NetGuard, Network, NetworkError, NoNet};
 use std::fs::{self, Permissions};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -496,7 +498,14 @@ impl<C: Channel> Sandbox<C> {
         // `NoNet`/`OwnIp` but this host cannot create a network namespace, we
         // fail closed rather than silently hand back full host networking, which
         // would void the isolation the mode promises (spec R1.2).
-        if isolates_network(self.config.network_mode) {
+        // A custom `Network` decides isolation; otherwise fall back to the
+        // built-in `network_mode` mapping. Phase-B wiring (own-IP tap/switch) is
+        // applied post-spawn via `attach_network`, never here.
+        let isolate = match self.config.network.as_deref() {
+            Some(net) => net.isolate_netns(),
+            None => isolates_network(self.config.network_mode),
+        };
+        if isolate {
             if network_namespaces_available() {
                 container.unshare(hakoniwa::Namespace::Network);
             } else {
@@ -717,6 +726,20 @@ impl<C: Channel> Sandbox<C> {
         }
 
         container.command_inner(self, &program, args, env_vars)
+    }
+
+    /// Phase B: wire the launched process's network namespace per the configured
+    /// [`Network`]. `netns_pid` is the launched process holding
+    /// `/proc/<pid>/ns/net` (the unshared netns from [`new_container`]).
+    ///
+    /// No-op for the built-in modes and when no custom [`Network`] is set.
+    /// Teardown is explicit via the returned [`NetGuard`] — call its
+    /// [`teardown`](NetGuard::teardown) when the sandbox is finished.
+    pub async fn attach_network(&self, netns_pid: u32) -> Result<Box<dyn NetGuard>, NetworkError> {
+        match self.config.network.as_deref() {
+            Some(net) => net.attach(netns_pid).await,
+            None => Ok(network::noop_guard()),
+        }
     }
 
     pub async fn run<W1, W2>(
