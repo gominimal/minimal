@@ -109,6 +109,19 @@ jobs:
     timeout-minutes: 45
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
+      - name: Free Disk Space
+        # Static release build of the full workspace; the cargo target dir
+        # is the largest in any of the linux jobs. `remove_tool_cache: true`
+        # is safe even without a `dtolnay/rust-toolchain` step — the
+        # pre-installed Rust toolchain on ubuntu-latest lives in
+        # `~/.rustup` + `~/.cargo`, not `/opt/hostedtoolcache`, so
+        # `rustup target add` below still resolves.
+        uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
       - uses: actions/checkout@v6
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
