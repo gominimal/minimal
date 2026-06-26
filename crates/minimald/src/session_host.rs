@@ -805,7 +805,10 @@ impl SessionLauncher for SandboxLauncher {
         container.set_session_leader();
 
         let pty = Pty::open(sz)?;
-        let mut command = env.command(&container, "/bin/bash", ["--noprofile", "-l"])?;
+        // The `bash` package installs to `/usr/bin/bash` (--prefix=/usr) and the
+        // generic rootfs has no `/bin/bash`, so exec the absolute path that
+        // exists rather than `/bin/bash` (which fails with ENOENT).
+        let mut command = env.command(&container, "/usr/bin/bash", ["--noprofile", "-l"])?;
         command.stdin(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
         command.stdout(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
         let (master, slave) = pty.into_fds();

@@ -49,12 +49,14 @@ fn run_vmm() -> Result<()> {
     })?;
 
     let mut ctx = Context::create().context("krun_create_ctx")?;
-    // 2 vCPU / 1024 MiB: 512 MiB is the practical floor to reach userspace;
-    // 1024 MiB is cheap headroom under Hypervisor.framework with no boot
-    // penalty. (Stay below the kernel's CONFIG_NR_CPUS.) The boot command may
-    // expose these as flags in a future change. `apply` configures the kernel +
-    // initramfs, the ext4 root disk, and the vsock bridge.
-    let mut cfg = VmConfig::new(2, 1024, kernel, rootfs, initramfs);
+    // 2 vCPU / 4096 MiB. 512 MiB is the floor to reach userspace; the extra
+    // memory is headroom for the in-VM session build, whose package cache lives
+    // on a tmpfs (`/run/minimal/cache`) sized from RAM — 1024 MiB overflowed
+    // (StorageFull) unpacking large packages like claude-code. This is a stop-gap
+    // until the persistent seeded cache disk (/dev/vdb) lands. (Stay below the
+    // kernel's CONFIG_NR_CPUS.) `apply` configures the kernel + initramfs, the
+    // ext4 root disk, and the vsock bridge.
+    let mut cfg = VmConfig::new(2, 4096, kernel, rootfs, initramfs);
     // Issue #572: an own-IP VM registers the per-PTask gvproxy shuttle vsock
     // bridge in `apply`; the host gvproxy is spawned by the parent supervisor.
     // The env var keeps the parent's gvproxy-spawn decision and this child's VM
