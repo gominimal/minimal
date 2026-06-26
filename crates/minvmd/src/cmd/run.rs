@@ -223,7 +223,18 @@ fn run_foreground() -> Result<()> {
             tracing::info!(pid = gvproxy.pid(), "host gvproxy switch up");
             Some(gvproxy)
         }
+        binary if crate::cmd::own_ip_requested() => {
+            // An own-IP VM cannot work without the switch: fail loudly rather
+            // than booting a session that silently has no network.
+            bail!(
+                "own-IP VM requested but the gvproxy binary was not found at {}; \
+                 set MINVMD_GVPROXY_BIN to the gvproxy binary",
+                binary.display()
+            );
+        }
         binary => {
+            // Non-own-IP boots (e.g. the boot/session e2e lanes) tolerate a
+            // missing gvproxy: warn and boot without guest egress.
             tracing::warn!(
                 path = %binary.display(),
                 "gvproxy binary not found; booting without guest egress \
