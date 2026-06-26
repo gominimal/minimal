@@ -27,11 +27,12 @@ switch.workspace = true
 # and the async `stop()` teardown run on the tokio runtime the networking layer
 # mandates (no blocking I/O in async context).
 tokio.workspace = true
+# Production beacon-reading code calls russh::keys::known_hosts::learn_known_hosts_path
+# and russh::keys::ssh_key::PublicKey::from_openssh (R2.5).
+russh.workspace = true
 
 [dev-dependencies]
 serial_test.workspace = true
 tempfile.workspace = true
-# Session e2e test (minimald_session_e2e): a russh client over the bridge.
-russh.workspace = true
 sessions.workspace = true
 paths.workspace = true

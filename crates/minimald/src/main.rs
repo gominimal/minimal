@@ -347,7 +347,7 @@ async fn async_main() -> Result<(), MainError> {
     {
         tracing::warn!(error = %e, "no rootfs disk; initramfs READY-only");
         guest::mount_pseudo_filesystems();
-        let _ = guest::emit_ready_marker().await;
+        let _ = guest::emit_simple_ready_marker().await;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
@@ -384,10 +384,12 @@ async fn async_main() -> Result<(), MainError> {
         in_microvm: listen_args.vsock,
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
+    // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.
+    let host_private_key = config.host_key()?;
     russh::keys::known_hosts::learn_known_hosts_path(
         &format!("local-{}", cli.instance_num()),
         22,
-        config.host_key()?.public_key(),
+        host_private_key.public_key(),
         sub_path!(cli.client_instance_dir(), "known_hosts").as_utf8_path(),
     )?;
 
@@ -424,7 +426,7 @@ async fn async_main() -> Result<(), MainError> {
             .map_err(|e| MainError::IO(e, "serving on UDS"))
     } else {
         // micro-vm path, listen on vsock
-        if let Err(e) = guest::emit_ready_marker().await {
+        if let Err(e) = guest::emit_ready_marker(host_private_key.public_key()).await {
             tracing::warn!(error = %e, "initramfs: READY marker failed");
         }
 

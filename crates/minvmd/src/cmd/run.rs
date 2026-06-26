@@ -118,7 +118,7 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
 /// the VMM child exits.
 #[cfg(minvmd_libkrun)]
 fn run_foreground() -> Result<()> {
-    use std::io::{BufRead as _, BufReader, Read as _};
+    use std::io::{BufReader, Read as _};
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -302,6 +302,7 @@ fn run_foreground() -> Result<()> {
     // env-configurable (`MINVMD_READY_TIMEOUT_SECS`): a cold multi-GiB VM can
     // take ~20s+ to reach userspace, so a fixed 5s was too short.
     let ready_timeout: Duration = crate::cmd::ready_timeout();
+    let known_hosts_path = crate::cmd::default_vm_known_hosts_path();
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let sock_clone = marker_sock_path.clone();
     std::thread::spawn(move || {
@@ -310,15 +311,7 @@ fn run_foreground() -> Result<()> {
                 .accept()
                 .map_err(|e| format!("accept on READY-marker socket: {e}"))?;
             let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            reader
-                .read_line(&mut line)
-                .map_err(|e| format!("reading READY marker: {e}"))?;
-            let trimmed = line.trim();
-            if trimmed != "READY" {
-                return Err(format!("expected READY on marker socket, got {trimmed:?}"));
-            }
-            Ok(())
+            crate::cmd::read_ready_beacon(&mut reader, &known_hosts_path)
         })();
         let _ = tx.send(result);
         let _ = std::fs::remove_file(&sock_clone);
