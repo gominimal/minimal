@@ -48,30 +48,7 @@ pub async fn write_ready_beacon<W: tokio::io::AsyncWrite + Unpin>(
 /// after boot, so connection attempts are retried with a short backoff before
 /// giving up.
 pub async fn emit_ready_marker(pubkey: &PublicKey) -> std::io::Result<()> {
-    const MAX_ATTEMPTS: u32 = 50;
-    const BACKOFF: Duration = Duration::from_millis(100);
-
-    let addr = VsockAddr::new(VMADDR_CID_HOST, BOOT_MARKER_PORT);
-    let mut last_err = None;
-    for attempt in 1..=MAX_ATTEMPTS {
-        match VsockStream::connect(addr).await {
-            Ok(mut stream) => {
-                write_ready_beacon(&mut stream, pubkey).await?;
-                AsyncWriteExt::shutdown(&mut stream).await?;
-                tracing::info!(attempt, "emitted boot READY marker");
-                return Ok(());
-            }
-            Err(e) => {
-                tracing::debug!(attempt, error = %e, "vsock not ready, retrying");
-                last_err = Some(e);
-                tokio::time::sleep(BACKOFF).await;
-            }
-        }
-    }
-
-    Err(last_err.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::TimedOut, "vsock never became available")
-    }))
+    emit_marker(Some(pubkey)).await
 }
 
 /// Emits the one-shot boot marker to the host (simple form: no host key).
@@ -80,6 +57,10 @@ pub async fn emit_ready_marker(pubkey: &PublicKey) -> std::io::Result<()> {
 /// and no SSH server is running. The host-side beacon reader handles a missing
 /// second line gracefully (R2.3).
 pub async fn emit_simple_ready_marker() -> std::io::Result<()> {
+    emit_marker(None).await
+}
+
+async fn emit_marker(pubkey: Option<&PublicKey>) -> std::io::Result<()> {
     const MAX_ATTEMPTS: u32 = 50;
     const BACKOFF: Duration = Duration::from_millis(100);
 
@@ -88,9 +69,16 @@ pub async fn emit_simple_ready_marker() -> std::io::Result<()> {
     for attempt in 1..=MAX_ATTEMPTS {
         match VsockStream::connect(addr).await {
             Ok(mut stream) => {
-                stream.write_all(b"READY\n").await?;
+                match pubkey {
+                    Some(pk) => write_ready_beacon(&mut stream, pk).await?,
+                    None => stream.write_all(b"READY\n").await?,
+                }
                 AsyncWriteExt::shutdown(&mut stream).await?;
-                tracing::info!(attempt, "emitted boot READY marker (simple)");
+                tracing::info!(
+                    attempt,
+                    simple = pubkey.is_none(),
+                    "emitted boot READY marker"
+                );
                 return Ok(());
             }
             Err(e) => {
