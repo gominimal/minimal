@@ -30,7 +30,7 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 use minimald::net::switch::{attach_to_switch, open_tap, tap_netns_commands};
-use minimald::net::{GvproxySwitch, PtaskLease, SwitchSubnet};
+use minimald::net::{PtaskLease, SwitchClient, SwitchSubnet};
 
 /// Whether the gate env var is set; when absent both proofs early-return so the
 /// default `cargo test` run (and this sandbox) never attempts privileged netns
@@ -110,7 +110,7 @@ async fn netns_uc1_nonet_refuses_egress() {
 
 /// UC6 — two `OwnIp` PTasks talk to each other over the gvproxy switch.
 ///
-/// Drives the real switch lifecycle ([`GvproxySwitch`]), address allocation,
+/// Drives the real switch lifecycle ([`SwitchClient`]), address allocation,
 /// tap creation ([`open_tap`]) and switch relay ([`attach_to_switch`]); none of
 /// these exist on the base branch, so the proof cannot pass against an empty PR.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -121,7 +121,7 @@ async fn netns_uc6_ownip_ptask_to_ptask() {
     }
     let state = tempfile::tempdir().expect("switch state dir");
 
-    let mut switch = GvproxySwitch::new(gvproxy_bin(), state.path());
+    let mut switch = SwitchClient::new(gvproxy_bin(), state.path());
     let subnet = SwitchSubnet::default();
 
     // Attach two PTasks; each gets a unique, never-reused switch address plus an
@@ -202,7 +202,7 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
     const EXTERNAL: u16 = 18080;
 
     let state = tempfile::tempdir().expect("switch state dir");
-    let mut switch = GvproxySwitch::new(gvproxy_bin(), state.path());
+    let mut switch = SwitchClient::new(gvproxy_bin(), state.path());
     let subnet = SwitchSubnet::default();
 
     let minimald::net::AttachResult { lease, .. } = switch.attach().await.expect("attach PTask");

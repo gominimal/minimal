@@ -272,7 +272,7 @@ pub struct PtaskLease {
     pub mac: MacAddr,
 }
 
-/// Returned by [`GvproxySwitch::attach`].
+/// Returned by [`SwitchClient::attach`].
 pub struct AttachResult {
     /// The allocated IP/MAC for this PTask's tap device.
     pub lease: PtaskLease,
@@ -351,7 +351,7 @@ impl IpAllocator {
 /// book.
 ///
 /// gvproxy reads this file only at spawn time, so a rewrite triggered by a
-/// later [`attach`](GvproxySwitch::attach) takes effect only on the next switch
+/// later [`attach`](SwitchClient::attach) takes effect only on the next switch
 /// (re)start. That is intentional: an `OwnIp` PTask configures its switch
 /// address statically (the spike's static-lease recipe) rather than via DHCP,
 /// so `dhcpStaticLeases` is a startup-time seed, not a live source a running
@@ -387,7 +387,7 @@ pub fn render_gvproxy_config(subnet: SwitchSubnet, leases: &[PtaskLease]) -> Str
 /// detach. Teardown follows the same `SIGTERM` → grace → `SIGKILL` escalation
 /// the vmm child uses.
 #[derive(Debug)]
-pub struct GvproxySwitch {
+pub struct SwitchClient {
     /// Path to the pinned gvproxy binary (see `scripts/fetch-gvproxy.sh`).
     binary: PathBuf,
     /// Directory for the generated config, control socket, and pid file.
@@ -407,7 +407,7 @@ pub struct GvproxySwitch {
     transport: SwitchTransport,
 }
 
-impl GvproxySwitch {
+impl SwitchClient {
     /// Builds a switch supervisor. Does not spawn anything; the first
     /// [`attach`](Self::attach) starts gvproxy.
     #[must_use]
@@ -787,13 +787,13 @@ mod tests {
 
     #[test]
     fn transport_defaults_to_local_spawn() {
-        let switch = GvproxySwitch::new("/usr/bin/gvproxy", "/run/minimal/gvproxy");
+        let switch = SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy");
         assert_eq!(switch.transport(), SwitchTransport::LocalSpawn);
     }
 
     #[test]
     fn with_transport_selects_host_shuttle() {
-        let switch = GvproxySwitch::new("/usr/bin/gvproxy", "/run/minimal/gvproxy").with_transport(
+        let switch = SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy").with_transport(
             SwitchTransport::HostShuttle {
                 cid: VSOCK_HOST_CID,
                 port: VSOCK_GVPROXY_SHUTTLE_PORT,
@@ -813,7 +813,7 @@ mod tests {
         // missing binary would instead fail in `ensure_running`.
         let dir = tempfile::TempDir::new().expect("tempdir");
         let mut switch =
-            GvproxySwitch::new("/nonexistent/gvproxy-binary", dir.path().join("gvproxy"))
+            SwitchClient::new("/nonexistent/gvproxy-binary", dir.path().join("gvproxy"))
                 .with_transport(SwitchTransport::HostShuttle {
                     cid: VSOCK_HOST_CID,
                     port: VSOCK_GVPROXY_SHUTTLE_PORT,

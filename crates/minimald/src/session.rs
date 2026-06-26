@@ -84,7 +84,7 @@ pub struct Session<S: SessionObject> {
     /// (`cfg(not(test))`); the `cfg(test)` mock launcher ignores it, so the
     /// unused-field lint is silenced under test rather than threaded through.
     #[cfg_attr(test, allow(dead_code))]
-    net_switch: Arc<Mutex<crate::net::GvproxySwitch>>,
+    net_switch: Arc<Mutex<crate::net::SwitchClient>>,
 
     /// The running host, if minted, paired with the `JoinHandle` of its runtime
     /// loop so teardown can be awaited on destroy.
@@ -100,7 +100,7 @@ impl<S: SessionObject> Session<S> {
         minimal_state_dir: DaemonAbsPath,
         minimal_cache_dir: DaemonAbsPath,
         session: S,
-        net_switch: Arc<Mutex<crate::net::GvproxySwitch>>,
+        net_switch: Arc<Mutex<crate::net::SwitchClient>>,
     ) -> Result<SessionHandle, std::io::Error> {
         std::fs::create_dir_all(session.workspace_path())?;
         std::fs::create_dir_all(session.home_path())?;

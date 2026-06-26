@@ -608,7 +608,7 @@ pub(crate) struct SandboxLauncher {
     pub(crate) network_mode: NetworkMode,
     /// The shared per-host gvproxy switch, used to attach this launch when it
     /// runs in [`NetworkMode::OwnIp`] (R1.5). Ignored for `HostNet`/`NoNet`.
-    pub(crate) net_switch: std::sync::Arc<tokio::sync::Mutex<crate::net::GvproxySwitch>>,
+    pub(crate) net_switch: std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
     /// Static ingress port mappings to apply on the switch once this `OwnIp`
     /// PTask is attached (R2.3/R2.4-static), removed when it exits. `None` (or
     /// empty) for non-`OwnIp` launches; `session.rs` has already rejected
@@ -619,7 +619,7 @@ pub(crate) struct SandboxLauncher {
 /// Holds an `OwnIp` PTask's switch attachment for the session's lifetime.
 ///
 /// Dropping it tears down the data-plane relay (detaching the tap) and schedules
-/// a [`detach`](crate::net::GvproxySwitch::detach) on the shared switch, which
+/// a [`detach`](crate::net::SwitchClient::detach) on the shared switch, which
 /// decrements its refcount and stops gvproxy once the last `OwnIp` PTask leaves.
 ///
 /// Because that `detach` is scheduled on the tokio runtime (see the `Drop`
@@ -633,7 +633,7 @@ pub(crate) struct OwnIpAttachment {
     /// Held only for its `Drop`, which aborts the relay tasks; never read.
     _relay: crate::net::switch::SwitchRelay,
     /// The shared switch, locked on drop to detach this PTask.
-    switch: std::sync::Arc<tokio::sync::Mutex<crate::net::GvproxySwitch>>,
+    switch: std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
     /// gvproxy's control channel (local socket on DM2, host vsock on DM1/3/4),
     /// used on drop to remove this PTask's ingress forwards before detaching.
     control: crate::net::policy::ControlChannel,
@@ -681,7 +681,7 @@ impl Drop for OwnIpAttachment {
 /// unshared the namespace and surfaced the PID (no dependency cycle).
 #[cfg(not(test))]
 async fn attach_own_ip(
-    switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::GvproxySwitch>>,
+    switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
     netns_pid: u32,
     ingress: Option<&sessions::IngressPolicy>,
 ) -> io::Result<OwnIpAttachment> {

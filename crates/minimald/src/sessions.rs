@@ -88,7 +88,7 @@ pub struct Manager<L: Loader = DiskLoader> {
     minimal_cache_dir: DaemonAbsPath,
     /// The daemon-scoped gvproxy switch, handed to each session it starts so an
     /// `OwnIp` PTask attaches to the one per-host switch (R1.4/R1.5/R1.6).
-    net_switch: Arc<Mutex<crate::net::GvproxySwitch>>,
+    net_switch: Arc<Mutex<crate::net::SwitchClient>>,
 
     /// In-memory PTask hostname registry (Unit 3). Shared behind an `Arc<RwLock>`
     /// so the daemon's host-side proxies ([`crate::net::proxy`]) can resolve a
@@ -106,7 +106,7 @@ impl Manager {
     pub async fn init(
         minimal_state_dir: DaemonAbsPath,
         minimal_cache_dir: DaemonAbsPath,
-        net_switch: Arc<Mutex<crate::net::GvproxySwitch>>,
+        net_switch: Arc<Mutex<crate::net::SwitchClient>>,
     ) -> Result<ManagerHandle, std::io::Error> {
         let l = DiskLoader::new(minimal_state_dir.clone())?;
         let running = BTreeMap::new();
@@ -446,7 +446,7 @@ mod tests {
         // These tests never start an `OwnIp` launch (they use the mock
         // launcher), so the switch is never spawned; a placeholder binary path
         // is sufficient.
-        let switch = Arc::new(Mutex::new(crate::net::GvproxySwitch::new(
+        let switch = Arc::new(Mutex::new(crate::net::SwitchClient::new(
             "/nonexistent/gvproxy",
             state.path().join("gvproxy"),
         )));

@@ -2,10 +2,10 @@
 //! `minvmd` (R1.4, R1.5, R1.8).
 //!
 //! On DM1/DM3/DM4 a libkrun VM runs `minimald`; `minvmd` supervises exactly one
-//! gvproxy process per host VM ([`GvproxySwitch`]) that serves every own-IP
+//! gvproxy process per host VM ([`GvproxySupervisor`]) that serves every own-IP
 //! PTask as a switch client. A PTask attaches by provisioning a tap device in
 //! its network namespace and running an async TAP↔gvproxy-socket relay
-//! ([`GvproxySwitch::attach_ptask`], R1.5); it is assigned a unique IP from the
+//! ([`GvproxySupervisor::attach_ptask`], R1.5); it is assigned a unique IP from the
 //! switch subnet, which is seeded into gvproxy's `dhcpStaticLeases` via the
 //! `-config` YAML.
 //!
@@ -24,14 +24,14 @@
 //!    HyperKit protocol).
 //!
 //! The supervisor tears gvproxy down with the same SIGTERM → timeout → SIGKILL
-//! sequence the vmm child uses ([`GvproxySwitch::stop`], R1.4) and runs a
+//! sequence the vmm child uses ([`GvproxySupervisor::stop`], R1.4) and runs a
 //! background tokio task that detects an unexpected gvproxy exit, emits a
 //! `tracing::error!`, and fires the [`SwitchExit`] notification returned from
 //! [`GvproxyConfig::spawn`] (R1.4 detection half). Every switch lifecycle event
 //! — spawn, stop, attach (with assigned IP), detach — is emitted as a structured
 //! `tracing` event (R1.8). This module contains no `println!`/`eprintln!`.
 //!
-//! Supervision is async: [`GvproxyConfig::spawn`] and [`GvproxySwitch::stop`]
+//! Supervision is async: [`GvproxyConfig::spawn`] and [`GvproxySupervisor::stop`]
 //! run within a tokio runtime (the async networking layer the spec mandates),
 //! so neither blocks a worker thread during teardown.
 
@@ -336,11 +336,18 @@ impl GvproxyConfig {
     ///
     /// Returns the I/O error if the config cannot be written or the gvproxy
     /// binary cannot be launched.
-    pub fn spawn(self, leases: &[(Ipv4Addr, MacAddr)]) -> io::Result<(GvproxySwitch, SwitchExit)> {
+    pub fn spawn(
+        self,
+        leases: &[(Ipv4Addr, MacAddr)],
+    ) -> io::Result<(GvproxySupervisor, SwitchExit)> {
         self.write_config(leases)?;
         let child = Command::new(&self.binary).args(self.argv()).spawn()?;
-        let (switch, exit) =
-            GvproxySwitch::supervise(child, self.subnet, self.term_timeout, self.switch_socket)?;
+        let (switch, exit) = GvproxySupervisor::supervise(
+            child,
+            self.subnet,
+            self.term_timeout,
+            self.switch_socket,
+        )?;
         tracing::info!(
             pid = switch.pid(),
             binary = %self.binary.display(),
@@ -354,14 +361,14 @@ impl GvproxyConfig {
 
 /// A running, supervised gvproxy switch.
 ///
-/// Call [`stop`](GvproxySwitch::stop) for an orderly async teardown
+/// Call [`stop`](GvproxySupervisor::stop) for an orderly async teardown
 /// (SIGTERM → grace → SIGKILL, driven on the tokio timer). Dropping the handle
 /// is a best-effort fallback that SIGKILLs the process without blocking; the
 /// background supervision task reaps it. Each own-IP PTask is attached with
-/// [`attach_ptask`](GvproxySwitch::attach_ptask), which assigns it the next free
+/// [`attach_ptask`](GvproxySupervisor::attach_ptask), which assigns it the next free
 /// switch IP and never reuses an IP for the lifetime of this handle.
 #[derive(Debug)]
-pub struct GvproxySwitch {
+pub struct GvproxySupervisor {
     /// PID of the supervised gvproxy process; used for logging. The `Child`
     /// itself is owned by the supervision task, which is the sole reaper.
     pid: u32,
@@ -379,7 +386,7 @@ pub struct GvproxySwitch {
     /// and decremented (via RAII Drop) when a [`PtaskAttachment`] is dropped.
     /// The switch terminates automatically when this reaches zero (R1.4).
     ///
-    /// [`attach_ptask`]: GvproxySwitch::attach_ptask
+    /// [`attach_ptask`]: GvproxySupervisor::attach_ptask
     attached_count: Arc<AtomicU32>,
     /// Set before any intentional teardown so the supervision task classifies
     /// the resulting child exit as a clean stop rather than an unexpected crash.
@@ -387,11 +394,11 @@ pub struct GvproxySwitch {
     /// Handle to the background supervision task; `None` once [`stop`] has
     /// consumed it.
     ///
-    /// [`stop`]: GvproxySwitch::stop
+    /// [`stop`]: GvproxySupervisor::stop
     supervisor: Option<tokio::task::JoinHandle<()>>,
 }
 
-impl GvproxySwitch {
+impl GvproxySupervisor {
     /// Adopt an already-spawned gvproxy `child` and start its background
     /// supervision task (R1.4 detection half). Must be called within a tokio
     /// runtime.
@@ -595,7 +602,7 @@ impl GvproxySwitch {
         // Mark the exit intentional *before* signalling so the supervision task
         // classifies the resulting `wait()` as a clean stop, not a crash. Use
         // `swap` (not `store`) so this is symmetric with the guards on
-        // `GvproxySwitch::Drop` and the last-detach `PtaskAttachment::Drop`: if a
+        // `GvproxySupervisor::Drop` and the last-detach `PtaskAttachment::Drop`: if a
         // last-detach drop already claimed teardown and sent SIGTERM, the child
         // may already be reaped and its PID recycled, so `stop()` must not
         // re-signal `pid` — it only awaits the supervisor for the exit.
@@ -633,7 +640,7 @@ impl GvproxySwitch {
     }
 }
 
-impl Drop for GvproxySwitch {
+impl Drop for GvproxySupervisor {
     fn drop(&mut self) {
         // `stop()` already consumed the supervisor and tore the switch down.
         let Some(_supervisor) = self.supervisor.take() else {
@@ -670,7 +677,7 @@ impl Drop for GvproxySwitch {
 /// This is an RAII handle: dropping it decrements the shared attached-PTask
 /// counter and, when the count reaches zero, delivers `SIGTERM` to the gvproxy
 /// switch so it tears down when the last own-IP PTask exits (R1.4). Every drop
-/// path logs the detach; [`GvproxySwitch::detach_ptask`] is just a named way to
+/// path logs the detach; [`GvproxySupervisor::detach_ptask`] is just a named way to
 /// drop it at a chosen point and is equivalent to an implicit scope-exit drop.
 #[must_use = "dropping PtaskAttachment decrements the attached count and may terminate the switch"]
 #[derive(Debug)]
@@ -680,7 +687,7 @@ pub struct PtaskAttachment {
     mac: MacAddr,
     index: u32,
     /// The running TAP↔switch relay; `None` for an allocate-only attachment
-    /// ([`GvproxySwitch::allocate_ptask`]). Held purely for its RAII lifetime —
+    /// ([`GvproxySupervisor::allocate_ptask`]). Held purely for its RAII lifetime —
     /// dropping it aborts the relay tasks and detaches the PTask — so it is never
     /// read directly.
     #[cfg(target_os = "linux")]
@@ -688,15 +695,15 @@ pub struct PtaskAttachment {
     relay: Option<SwitchRelay>,
     /// PID of the supervised gvproxy process; used for logging.
     pid: u32,
-    /// pidfd for the supervised gvproxy process, shared with [`GvproxySwitch`].
+    /// pidfd for the supervised gvproxy process, shared with [`GvproxySupervisor`].
     /// Used for recycle-safe signalling via `pidfd_send_signal(2)`.
     #[cfg(target_os = "linux")]
     pidfd: Arc<OwnedFd>,
-    /// Shared with the parent [`GvproxySwitch`]; set to `true` before
+    /// Shared with the parent [`GvproxySupervisor`]; set to `true` before
     /// delivering a termination signal so the supervision task classifies the
     /// resulting exit as intentional rather than unexpected.
     stopping: Arc<AtomicBool>,
-    /// Live attachment counter shared with the parent [`GvproxySwitch`].
+    /// Live attachment counter shared with the parent [`GvproxySupervisor`].
     attached_count: Arc<AtomicU32>,
 }
 
@@ -715,7 +722,7 @@ impl Drop for PtaskAttachment {
             "PTask detached from gvproxy switch",
         );
         // Only the drop that flips `stopping` from false → true signals.
-        // If `stop()` (or `GvproxySwitch::Drop`) already claimed teardown the
+        // If `stop()` (or `GvproxySupervisor::Drop`) already claimed teardown the
         // child is already going away, so skip the redundant signal. `swap`
         // makes the claim atomic and race-free against a concurrent stop or drop.
         // On an independent gvproxy crash the pidfd path returns ESRCH (the
@@ -768,7 +775,7 @@ impl PtaskAttachment {
 }
 
 /// Notification that the supervised gvproxy switch exited **unexpectedly** —
-/// i.e. not via [`GvproxySwitch::stop`] or `Drop` (R1.4 detection half).
+/// i.e. not via [`GvproxySupervisor::stop`] or `Drop` (R1.4 detection half).
 /// Returned from [`GvproxyConfig::spawn`]; await it to react to an unplanned
 /// gvproxy death.
 ///
@@ -785,7 +792,7 @@ impl SwitchExit {
     /// the gvproxy [`ExitStatus`] when the switch exits unexpectedly.
     ///
     /// `None` means the notify channel closed without a value, which covers two
-    /// cases: an intentional teardown via [`GvproxySwitch::stop`] or `Drop`, and
+    /// cases: an intentional teardown via [`GvproxySupervisor::stop`] or `Drop`, and
     /// the rare supervision failure where `child.wait()` itself errored (no
     /// `ExitStatus` exists to report — that path is logged via `tracing::error!`
     /// in [`supervise_switch`]). A caller that must distinguish the two relies on
@@ -885,7 +892,7 @@ fn signal_child(pid: libc::pid_t, signal: libc::c_int, signal_name: &str) {
 /// its own dedicated current-thread tokio runtime.
 ///
 /// `minvmd`'s `run`/`boot` supervisor is synchronous, but [`GvproxyConfig::spawn`]
-/// and [`GvproxySwitch::stop`] need a tokio runtime (background exit-detection
+/// and [`GvproxySupervisor::stop`] need a tokio runtime (background exit-detection
 /// and timer-driven teardown). [`HostGvproxy::spawn`] stands up a single-threaded
 /// runtime on a dedicated thread, spawns + supervises gvproxy there, and keeps
 /// the runtime alive for the VM's lifetime. [`HostGvproxy::stop`] (or `Drop`)
@@ -1236,8 +1243,8 @@ mod tests {
         assert!(body.contains("100.64.0.0/16"));
     }
 
-    fn supervise_sleep() -> (GvproxySwitch, SwitchExit) {
-        GvproxySwitch::supervise(
+    fn supervise_sleep() -> (GvproxySupervisor, SwitchExit) {
+        GvproxySupervisor::supervise(
             spawn_sleep(),
             SwitchSubnet::default(),
             Duration::from_secs(2),
@@ -1292,7 +1299,7 @@ mod tests {
         );
         // The last detach already SIGTERM'd the switch and claimed `stopping`,
         // so consuming it here just drops the supervisor JoinHandle: the
-        // guarded `GvproxySwitch::Drop` sees `stopping` set and skips its
+        // guarded `GvproxySupervisor::Drop` sees `stopping` set and skips its
         // SIGKILL rather than signalling the now-reaped (possibly recycled) PID.
         drop(switch);
     }
@@ -1328,7 +1335,7 @@ mod tests {
         // A child that exits on its own — no stop()/drop — is an unexpected
         // exit: the supervisor emits tracing::error! and fires the notify
         // channel (R1.4 detection half).
-        let (switch, exit) = GvproxySwitch::supervise(
+        let (switch, exit) = GvproxySupervisor::supervise(
             Command::new("true").spawn().expect("spawn true"),
             SwitchSubnet::default(),
             Duration::from_secs(2),

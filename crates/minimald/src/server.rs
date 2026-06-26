@@ -137,7 +137,7 @@ impl ServerState {
             crate::net::SwitchTransport::LocalSpawn
         };
         let net_switch = Arc::new(Mutex::new(
-            crate::net::GvproxySwitch::new(
+            crate::net::SwitchClient::new(
                 config.gvproxy_bin_path(),
                 minimal_state_dir.as_utf8_path().join("gvproxy"),
             )
