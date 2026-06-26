@@ -195,7 +195,7 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
     if !gated() {
         return;
     }
-    use minimald::net::policy::{apply_ingress, remove_ingress};
+    use minimald::net::policy::{ControlChannel, apply_ingress, remove_ingress};
     use sessions::{IngressPolicy, IpProto, PortMapping};
 
     const INTERNAL: u16 = 80;
@@ -222,7 +222,8 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
         }],
         dynamic_allowed_range: None,
     };
-    let exposed = apply_ingress(&sock, lease.ip, &ingress)
+    let control = ControlChannel::Unix(sock.clone());
+    let exposed = apply_ingress(&control, lease.ip, &ingress)
         .await
         .expect("apply ingress");
 
@@ -253,7 +254,7 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
 
     // Remove the forward on exit and confirm it is gone: a fresh host connect to
     // the same port must now fail.
-    remove_ingress(&sock, &exposed).await;
+    remove_ingress(&control, &exposed).await;
     let after_unexpose = Command::new("timeout")
         .args([
             "2s",
