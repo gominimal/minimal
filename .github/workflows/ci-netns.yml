@@ -51,6 +51,16 @@ jobs:
     runs-on: ubuntu-latest # x86_64; unprivileged userns + sudo for netns/tap
     timeout-minutes: 30
     steps:
+      - name: Free Disk Space
+        # Headroom for the cargo target dir + rust-cache restore. Builds
+        # `minimald` + `sandbox2` + `minimald-rpc` test binaries plus the
+        # WG-gated mesh proof binary; the rust-cache restore alone pulls
+        # multi-GB of cached `target/`.
+        uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
