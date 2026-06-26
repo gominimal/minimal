@@ -15,6 +15,10 @@ use sessions::SessionId;
 
 pub use sessions::{EgressPolicy, IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy};
 
+/// Shared gvproxy-switch primitives (subnet arithmetic, MAC derivation, wire
+/// constants, `-config` rendering) used by both `minimald` and `minvmd`.
+pub mod switch;
+
 pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
 
 /// Describes a minimal-specific RPC method sent over ssh.
