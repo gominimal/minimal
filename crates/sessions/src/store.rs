@@ -89,10 +89,10 @@ pub trait Loader {
     /// Deletes the session with the given key, dropping its index entries and
     /// removing its on-disk directory tree (record, workspace, home, cache).
     ///
-    /// Crash-safe: if the daemon dies mid-call, the next [`Self::open`]-style
-    /// constructor (e.g. [`DiskLoader::new`]) reaps the half-deleted session
-    /// dir, so a missing index entry is the only persistent visible effect of a
-    /// successful or partial delete.
+    /// Crash-safe: if the daemon dies mid-call, the next loader open
+    /// (e.g. [`DiskLoader::new`]) reaps the half-deleted session dir,
+    /// so a missing index entry is the only persistent visible effect
+    /// of a successful or partial delete.
     ///
     /// # Errors
     ///
@@ -237,6 +237,18 @@ fn tombstone_name(short: &str) -> String {
     format!("{TOMBSTONE_PREFIX}{short}")
 }
 
+/// True when `short` matches the format `DiskLoader::create` produces:
+/// exactly 5 lowercase hex characters. Used by tombstone reaping to
+/// refuse to act on `.deleting-` (empty), `.deleting-..`, or any other
+/// hand-crafted marker that could redirect `remove_dir_all` outside
+/// the intended session dir.
+fn is_valid_short(short: &str) -> bool {
+    short.len() == 5
+        && short
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Read `record_file` and compare its name against `index_name` to
 /// decide what pass B should do with this index entry. Returns `None`
 /// when the record exists, parses, and agrees with the index.
@@ -250,11 +262,13 @@ fn classify_record_for_reconcile(
         // Transient I/O failure: leave the entry alone, retry next startup.
         Err(reason) => return Some(ReconcileFix::Skip { reason }),
     };
-    // Parse failure on a present file means a corrupt record. Treat as
-    // missing — the index is more useful entry-less than pointing at
-    // unreadable content, and a future repair can hand-restore.
-    let Ok(record) = serde_json::from_reader::<_, Record>(file) else {
-        return Some(ReconcileFix::DropMissing);
+    // Distinguish I/O failure (transient — skip, retry next startup) from
+    // syntactic/data corruption (definitive — DropMissing so the index
+    // doesn't keep pointing at unreadable content).
+    let record: Record = match serde_json::from_reader(file) {
+        Ok(r) => r,
+        Err(e) if e.is_io() => return Some(ReconcileFix::Skip { reason: e.into() }),
+        Err(_) => return Some(ReconcileFix::DropMissing),
     };
     if record.name == index_name {
         return None;
@@ -396,7 +410,24 @@ impl DiskLoader {
             let Some(short) = fname.strip_prefix(TOMBSTONE_PREFIX) else {
                 continue;
             };
+            // Refuse to act on hand-crafted markers whose suffix doesn't
+            // match the create()-produced short format. Without this,
+            // `.deleting-` (empty), `.deleting-..`, etc. would redirect
+            // `remove_dir_all` to the parent or sessions dir itself.
+            if !is_valid_short(short) {
+                tracing::warn!(
+                    short = %short,
+                    "tombstone marker with malformed short suffix; refusing to act on it",
+                );
+                continue;
+            }
             let short = short.to_owned();
+            // Record the short as tombstoned *before* any cleanup attempt.
+            // Pass C consults this set to decide whether to re-index, so
+            // even if `remove_dir_all` fails this cycle, the still-present
+            // `record.json` won't be silently "undeleted" by pass C.
+            // Failure paths below preserve this state.
+            reaped.insert(short.clone());
             let doomed_dir = sessions_dir.join(&short);
             tracing::info!(short = %short, "reaping tombstoned session dir");
             match std::fs::remove_dir_all(doomed_dir.as_std_path()) {
@@ -408,6 +439,7 @@ impl DiskLoader {
                         error = %e,
                         "failed to reap tombstoned session dir; leaving marker for next startup",
                     );
+                    // `reaped` already has this short — pass C will skip it.
                     continue;
                 }
             }
@@ -422,12 +454,10 @@ impl DiskLoader {
                         error = %e,
                         "failed to remove tombstone marker; leaving for next startup",
                     );
-                    // Don't claim the short as reaped — the dir is gone
-                    // but the marker still drives a future reap attempt.
+                    // `reaped` already has this short — pass C will skip it.
                     continue;
                 }
             }
-            reaped.insert(short.clone());
             // An index entry may linger if delete crashed before flushing
             // the index. The record is gone, so look up the name from the
             // current in-memory index.
@@ -1209,9 +1239,12 @@ mod tests {
         drop(loader);
 
         // Manually plant an orphan session in a sibling dir that ALSO
-        // claims name = "my-session", with a distinct id so the shorts
-        // don't collide.
-        let orphan_short = "00000";
+        // claims name = "my-session", with a distinct id so the ids
+        // don't collide. The short is intentionally NOT in the format
+        // `create()` produces (5 lowercase hex chars), so the test
+        // can never collide with the real session's dir even on an
+        // unlucky UUIDv7 suffix.
+        let orphan_short = "zzzzz";
         let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
         std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
         let mut orphan_record = sample_record();
@@ -1359,13 +1392,16 @@ mod tests {
         let root = loader_dir(&tmp);
 
         // Manually plant a tombstone marker pointing at a short that
-        // doesn't exist as a dir.
+        // doesn't exist as a dir. The short matches the
+        // create()-produced format (5 lowercase hex) so `is_valid_short`
+        // accepts it.
         let _ = DiskLoader::new(root.clone()).unwrap();
-        let marker = tombstone_path(&root, "ghost");
+        let orphan_short = "abcde";
+        let marker = tombstone_path(&root, orphan_short);
         std::fs::write(&marker, b"").unwrap();
         assert!(
-            !session_dir_path(&root, "ghost").exists(),
-            "test setup: ghost session dir must not exist",
+            !session_dir_path(&root, orphan_short).exists(),
+            "test setup: orphan session dir must not exist",
         );
 
         let _loader = DiskLoader::new(root).unwrap();
