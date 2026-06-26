@@ -55,17 +55,16 @@ pub const GATEWAY_MAC: MacAddr = MacAddr([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd]);
 
 /// AF_VSOCK CID of the host as seen from inside a libkrun guest. Well-known:
 /// `VMADDR_CID_HOST == 2`. The per-PTask shuttle dials this CID to reach the
-/// host gvproxy switch (issue #572, DM1/3/4).
+/// host gvproxy switch (DM1/3/4).
 pub const VSOCK_HOST_CID: u32 = 2;
 
 /// vsock port the per-PTask shuttle connects to on the host to reach the host
-/// gvproxy switch (issue #572). Must match `minvmd`'s
+/// gvproxy switch. Must match `minvmd`'s
 /// `net::VSOCK_GVPROXY_SHUTTLE_PORT`; libkrun bridges this guest-initiated
 /// connection to the host gvproxy `-listen` socket.
 pub const VSOCK_GVPROXY_SHUTTLE_PORT: u32 = 1024;
 
-/// How the per-host gvproxy switch is reached, selected by deployment model
-/// (issue #572).
+/// How the per-host gvproxy switch is reached, selected by deployment model.
 ///
 /// On DM2 (native Linux) `minimald` owns gvproxy: it is spawned locally and
 /// PTask taps attach over its `-listen` UNIX socket. On DM1/3/4 (a libkrun VM)
@@ -408,7 +407,7 @@ pub struct GvproxySwitch {
     /// Signals attached PTasks when gvproxy exits unexpectedly. Replaced
     /// on each unexpected exit so new attachers get a fresh receiver.
     exit_tx: watch::Sender<bool>,
-    /// How PTask taps reach the switch (issue #572): local spawn (DM2) or a
+    /// How PTask taps reach the switch: local spawn (DM2) or a
     /// vsock shuttle to the host gvproxy (DM1/3/4).
     transport: SwitchTransport,
 }
@@ -440,7 +439,7 @@ impl GvproxySwitch {
         }
     }
 
-    /// Sets how PTask taps reach the switch (issue #572). The DM2 default is
+    /// Sets how PTask taps reach the switch. The DM2 default is
     /// [`SwitchTransport::LocalSpawn`]; in a libkrun VM (DM1/3/4) the caller sets
     /// [`SwitchTransport::HostShuttle`] so this `minimald` attaches taps to the
     /// host-owned gvproxy over vsock instead of spawning gvproxy in-guest.
@@ -450,7 +449,7 @@ impl GvproxySwitch {
         self
     }
 
-    /// How this switch's PTask taps reach the gvproxy switch (issue #572).
+    /// How this switch's PTask taps reach the gvproxy switch.
     #[must_use]
     pub fn transport(&self) -> SwitchTransport {
         self.transport
@@ -491,7 +490,7 @@ impl GvproxySwitch {
         let lease = self.allocator.allocate()?;
         // DM2 spawns + configures gvproxy locally; DM1/3/4 (HostShuttle) leaves
         // gvproxy to `minvmd` on the host, so skip the spawn/config steps and
-        // only track the attach count (issue #572).
+        // only track the attach count.
         if matches!(self.transport, SwitchTransport::LocalSpawn) {
             self.write_config().await?;
             self.ensure_running().await?;

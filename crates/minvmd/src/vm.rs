@@ -218,7 +218,7 @@ impl VmConfig {
         // new ones queue. Acceptable for v0.1 workloads (<10 concurrent).
         ctx.add_vsock_port2(crate::sock::VSOCK_BRIDGE_PORT, &uds_path, true)?;
 
-        // gvproxy shuttle bridge (issue #572, extended to the root netns). The
+        // gvproxy shuttle bridge (extended to the root netns). The
         // guest connects to AF_VSOCK CID 2 (the host) on
         // VSOCK_GVPROXY_SHUTTLE_PORT; with `listen = false` libkrun dials the
         // host gvproxy `-listen` switch socket and splices the two, carrying raw

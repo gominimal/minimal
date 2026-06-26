@@ -881,8 +881,8 @@ fn signal_child(pid: libc::pid_t, signal: libc::c_int, signal_name: &str) {
     }
 }
 
-/// A host gvproxy switch owned by `minvmd`'s synchronous supervisor (issue
-/// #572), running on its own dedicated current-thread tokio runtime.
+/// A host gvproxy switch owned by `minvmd`'s synchronous supervisor, running on
+/// its own dedicated current-thread tokio runtime.
 ///
 /// `minvmd`'s `run`/`boot` supervisor is synchronous, but [`GvproxyConfig::spawn`]
 /// and [`GvproxySwitch::stop`] need a tokio runtime (background exit-detection

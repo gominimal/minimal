@@ -89,7 +89,7 @@ pub const DEFAULT_GVPROXY_BIN: &str = "/usr/lib/minimal/bin/gvproxy";
 /// to [`DEFAULT_GVPROXY_BIN`] when unset or empty.
 ///
 /// Unlike the kernel/rootfs/initramfs resolvers this never errors on a missing
-/// env var: gvproxy is only spawned for an own-IP VM (issue #572), so an absent
+/// env var: gvproxy is only spawned for an own-IP VM, so an absent
 /// override is the common case and the fixed install path is the default.
 #[must_use]
 pub fn resolve_gvproxy_path() -> PathBuf {

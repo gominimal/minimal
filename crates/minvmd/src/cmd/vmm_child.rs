@@ -57,7 +57,7 @@ fn run_vmm() -> Result<()> {
     // kernel's CONFIG_NR_CPUS.) `apply` configures the kernel + initramfs, the
     // ext4 root disk, and the vsock bridge.
     let mut cfg = VmConfig::new(2, 4096, kernel, rootfs, initramfs);
-    // Issue #572: an own-IP VM registers the per-PTask gvproxy shuttle vsock
+    // An own-IP VM registers the per-PTask gvproxy shuttle vsock
     // bridge in `apply`; the host gvproxy is spawned by the parent supervisor.
     // The env var keeps the parent's gvproxy-spawn decision and this child's VM
     // config in lock-step.

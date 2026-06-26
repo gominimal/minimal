@@ -45,7 +45,7 @@ pub struct Config {
     pub gvproxy_bin: Option<PathBuf>,
     /// Whether this `minimald` runs inside a `minvmd` libkrun VM (DM1/3/4). When
     /// `true`, `OwnIp` PTasks attach to the **host** gvproxy (owned by `minvmd`)
-    /// over a vsock shuttle instead of spawning gvproxy in-guest (issue #572).
+    /// over a vsock shuttle instead of spawning gvproxy in-guest.
     /// `false` (DM2, native Linux) keeps the local-spawn + tap relay path.
     #[serde(default)]
     pub in_microvm: bool,
@@ -127,7 +127,7 @@ impl ServerState {
         // `SandboxLauncher` through the sessions manager.
         // DM1/3/4 (in a libkrun VM): attach `OwnIp` PTasks to the host gvproxy
         // (owned by `minvmd`) over a vsock shuttle. DM2 (native Linux): spawn +
-        // own gvproxy locally (issue #572).
+        // own gvproxy locally.
         let transport = if config.in_microvm {
             crate::net::SwitchTransport::HostShuttle {
                 cid: crate::net::VSOCK_HOST_CID,

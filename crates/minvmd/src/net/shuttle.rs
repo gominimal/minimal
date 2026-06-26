@@ -1,4 +1,4 @@
-//! Host↔guest plumbing for the per-PTask gvproxy vsock shuttle (issue #572).
+//! Host↔guest plumbing for the per-PTask gvproxy vsock shuttle.
 //!
 //! On DM1/DM3/DM4 (a libkrun VM) gvproxy runs on the **host**, supervised by
 //! `minvmd`, and listens on a host UNIX socket (the `-listen` switch socket; see
@@ -31,7 +31,7 @@ use std::io;
 use std::path::PathBuf;
 
 /// vsock port the per-PTask guest shuttle connects to (AF_VSOCK CID 2 = host)
-/// to reach the host gvproxy switch (issue #572).
+/// to reach the host gvproxy switch.
 ///
 /// Distinct from [`crate::cmd::VSOCK_MARKER_PORT`] (7350, READY marker) and
 /// [`crate::sock::VSOCK_BRIDGE_PORT`] (2222, minimald SSH bridge). libkrun

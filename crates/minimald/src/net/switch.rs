@@ -291,8 +291,8 @@ pub async fn attach_to_switch(tap_fd: OwnedFd, api_sock: &Path) -> io::Result<Sw
     spawn_relay(tap_fd, sock_rx, sock_tx)
 }
 
-/// Attaches `tap_fd` to the **host** gvproxy switch over AF_VSOCK (issue #572,
-/// DM1/3/4) and starts relaying frames between them.
+/// Attaches `tap_fd` to the **host** gvproxy switch over AF_VSOCK (DM1/3/4) and
+/// starts relaying frames between them.
 ///
 /// On a libkrun VM the gvproxy switch runs on the host; the guest reaches it by
 /// connecting to `cid` (CID 2 = the host) on `port`, which libkrun bridges to

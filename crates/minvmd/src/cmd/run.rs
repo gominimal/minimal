@@ -202,7 +202,7 @@ fn run_foreground() -> Result<()> {
     // Spawn + supervise the host gvproxy switch before the VMM child boots, so
     // its `-listen` switch socket exists when libkrun dials it for the guest
     // shuttle. The guest's root netns (the daemon) attaches a primary tap for
-    // egress (issue #572 extended), and own-IP PTasks attach further taps; both
+    // egress, and own-IP PTasks attach further taps; both
     // are L2 clients on this one switch. The handle lives for the VM's lifetime
     // and stops gvproxy on drop (after the VMM child exits below).
     //

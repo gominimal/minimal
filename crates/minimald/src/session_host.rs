@@ -718,7 +718,7 @@ async fn attach_own_ip(
         move_tap_into_netns(&tap, netns_pid, lease, subnet).await?;
         // DM2 attaches the tap to the local gvproxy `-listen` socket; DM1/3/4
         // (HostShuttle) relays the tap's raw frames over vsock to the host
-        // gvproxy `minvmd` owns (issue #572). Both are the same HyperKit-framed
+        // gvproxy `minvmd` owns. Both are the same HyperKit-framed
         // L2 relay — one gVisor stack in the path either way.
         match transport {
             SwitchTransport::LocalSpawn => attach_to_switch(tap_fd, &sock).await,

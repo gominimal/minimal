@@ -23,7 +23,7 @@ pub const VSOCK_MARKER_PORT: u32 = 7350;
 /// READY marker from the parent to the VMM child.
 pub const MARKER_SOCK_ENV: &str = "MINVMD_MARKER_SOCK";
 
-/// Environment variable selecting an own-IP VM (issue #572). When set to a
+/// Environment variable selecting an own-IP VM. When set to a
 /// truthy value (`1`/`true`), the supervisor spawns the host gvproxy switch and
 /// the VMM child registers the per-PTask shuttle vsock bridge + sets the VM's
 /// network mode to `OwnIp`. Read by both the parent supervisor (to decide
@@ -31,7 +31,7 @@ pub const MARKER_SOCK_ENV: &str = "MINVMD_MARKER_SOCK";
 /// processes stay consistent. Unset/false ⇒ a `HostNet` VM with no host gvproxy.
 pub const OWN_IP_ENV: &str = "MINVMD_VM_OWN_IP";
 
-/// Whether [`OWN_IP_ENV`] requests an own-IP VM (issue #572).
+/// Whether [`OWN_IP_ENV`] requests an own-IP VM.
 #[must_use]
 pub fn own_ip_requested() -> bool {
     matches!(
