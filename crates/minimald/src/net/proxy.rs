@@ -75,7 +75,14 @@ impl HostRoute for HostnameRegistry {
 // against the same table the manager registers PTasks into.
 impl HostRoute for std::sync::RwLock<HostnameRegistry> {
     fn resolve_host(&self, host: &str) -> Option<IpAddr> {
-        self.read().ok()?.resolve(host)
+        // Recover from a poisoned lock rather than mapping it to `None`: the
+        // registry is two HashMaps with no cross-field invariant a panicked
+        // writer could half-break, and silently returning `None` would make
+        // every `*.min.internal` request 502 forever with no signal.
+        match self.read() {
+            Ok(guard) => guard.resolve(host),
+            Err(poisoned) => poisoned.into_inner().resolve(host),
+        }
     }
 }
 
