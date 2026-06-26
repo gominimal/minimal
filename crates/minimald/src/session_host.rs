@@ -603,9 +603,9 @@ pub(crate) struct OwnIpAttachment {
     _relay: crate::net::switch::SwitchRelay,
     /// The shared switch, locked on drop to detach this PTask.
     switch: std::sync::Arc<tokio::sync::Mutex<crate::net::GvproxySwitch>>,
-    /// gvproxy's control socket, used on drop to remove this PTask's ingress
-    /// forwards before detaching.
-    control_sock: std::path::PathBuf,
+    /// gvproxy's control channel (local socket on DM2, host vsock on DM1/3/4),
+    /// used on drop to remove this PTask's ingress forwards before detaching.
+    control: crate::net::policy::ControlChannel,
     /// The static ingress forwards exposed for this PTask (R2.3), removed from
     /// the switch on drop. Empty when no ingress was configured.
     exposed: Vec<crate::net::policy::ExposedMapping>,
@@ -619,7 +619,7 @@ impl Drop for OwnIpAttachment {
         // within the daemon's tokio context; if somehow not, log rather than
         // block.
         let switch = std::sync::Arc::clone(&self.switch);
-        let control_sock = std::mem::take(&mut self.control_sock);
+        let control = self.control.clone();
         let exposed = std::mem::take(&mut self.exposed);
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
@@ -628,7 +628,7 @@ impl Drop for OwnIpAttachment {
                     // detach may stop gvproxy once the last PTask leaves, so the
                     // unexpose must reach a still-running switch first.
                     if !exposed.is_empty() {
-                        crate::net::policy::remove_ingress(&control_sock, &exposed).await;
+                        crate::net::policy::remove_ingress(&control, &exposed).await;
                     }
                     if let Err(e) = switch.lock().await.detach().await {
                         tracing::warn!(error = %e, "detaching OwnIp PTask from switch on session end");
@@ -705,32 +705,23 @@ async fn attach_own_ip(
         }
     };
 
-    // R2.3/R2.4-static: with the PTask attached, apply its static ingress
-    // forwards on the switch control socket, retaining handles to remove on
-    // exit. A failure here rolls the whole attach back (drop the relay, then
-    // detach) so a half-configured PTask is never left running.
-    //
-    // Issue #572 gap: ingress port-forwards are applied via gvproxy's HTTP API
-    // on its control socket. On DM2 that socket is local; on DM1/3/4
-    // (HostShuttle) gvproxy is on the host and its API is not reachable from the
-    // guest over the frame-only shuttle. Egress (the focus of #572) needs no
-    // such call, so for now ingress on the VM path is skipped with a warning
-    // rather than silently appearing to work — a host-side ingress API path is
-    // follow-up work.
-    let exposed = match ingress {
-        Some(ingress)
-            if !ingress.port_mappings.is_empty()
-                && matches!(transport, SwitchTransport::HostShuttle { .. }) =>
-        {
-            tracing::warn!(
-                ip = %lease.ip,
-                "static ingress on a VM (DM1/3/4) own-IP PTask is not yet wired to the \
-                 host gvproxy port-forward API; egress works, ingress is skipped (issue #572)"
-            );
-            Vec::new()
+    // The control channel for the forwarder API: the local socket on DM2, the
+    // host gvproxy over the same vsock shuttle port on DM1/3/4 (the `-listen`
+    // socket serves `/services/forwarder/*` alongside the `/connect` relay).
+    let control = match transport {
+        SwitchTransport::LocalSpawn => crate::net::policy::ControlChannel::Unix(sock),
+        SwitchTransport::HostShuttle { cid, port } => {
+            crate::net::policy::ControlChannel::Vsock { cid, port }
         }
+    };
+
+    // R2.3/R2.4-static: with the PTask attached, apply its static ingress
+    // forwards via gvproxy's forwarder API, retaining handles to remove on exit.
+    // A failure here rolls the whole attach back (drop the relay, then detach)
+    // so a half-configured PTask is never left running.
+    let exposed = match ingress {
         Some(ingress) if !ingress.port_mappings.is_empty() => {
-            match crate::net::policy::apply_ingress(&sock, lease.ip, ingress).await {
+            match crate::net::policy::apply_ingress(&control, lease.ip, ingress).await {
                 Ok(exposed) => exposed,
                 Err(e) => {
                     drop(relay);
@@ -751,7 +742,7 @@ async fn attach_own_ip(
     Ok(OwnIpAttachment {
         _relay: relay,
         switch: std::sync::Arc::clone(switch),
-        control_sock: sock,
+        control,
         exposed,
     })
 }
