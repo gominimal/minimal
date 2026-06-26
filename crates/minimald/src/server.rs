@@ -393,7 +393,14 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
     let egress_addr = SocketAddr::new(bind_base, proxy::EGRESS_PROXY_PORT);
     if proxy::bind_listener(egress_addr)
         .await
-        .map(|listener| tokio::spawn(proxy::serve(listener, Router::new(registry.clone()))))
+        .map(|listener| {
+            let router = Router::new(registry.clone());
+            tokio::spawn(async move {
+                if let Err(error) = proxy::serve(listener, router).await {
+                    tracing::error!(%error, "egress proxy accept loop exited");
+                }
+            })
+        })
         .is_some()
         && in_microvm
     {
@@ -414,11 +421,14 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
                 if proxy::bind_listener(https_addr)
                     .await
                     .map(|listener| {
-                        tokio::spawn(proxy::serve_https(
-                            listener,
-                            Router::new(registry.clone()),
-                            tls_config,
-                        ))
+                        let router = Router::new(registry.clone());
+                        tokio::spawn(async move {
+                            if let Err(error) =
+                                proxy::serve_https(listener, router, tls_config).await
+                            {
+                                tracing::error!(%error, "mTLS proxy accept loop exited");
+                            }
+                        })
                     })
                     .is_some()
                     && in_microvm
