@@ -116,6 +116,13 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
     // remote-cache staging (`tempfile`, default `/tmp`) and much else assume it.
     // Without this a session build fails with EROFS fetching its packages.
     raw_mount("tmpfs", &format!("{NEWROOT}/tmp"), "tmpfs", 0)?;
+    // devpts for PTYs: the session shell's server-side `Pty::open` does
+    // `posix_openpt` then opens `/dev/pts/N`, which ENOENTs without devpts
+    // mounted. Best-effort — a pty failure must not turn boot into READY-only.
+    let _ = std::fs::create_dir_all(format!("{NEWROOT}/dev/pts"));
+    if let Err(e) = raw_mount("devpts", &format!("{NEWROOT}/dev/pts"), "devpts", 0) {
+        tracing::warn!(error = %e, "mounting devpts; interactive PTY sessions may fail");
+    }
 
     let to_io = |_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in chroot path");
     let c_newroot = CString::new(NEWROOT).map_err(to_io)?;
