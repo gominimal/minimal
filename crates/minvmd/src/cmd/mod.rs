@@ -160,6 +160,7 @@ pub(crate) fn default_vm_known_hosts_path() -> std::path::PathBuf {
                 .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
                 .join(".local/state")
         })
+        // TODO: pass instance_num through once multi-instance is needed
         .join("minimal/providers/local-0/known_hosts")
 }
 
@@ -212,6 +213,7 @@ pub(crate) fn read_ready_beacon(
                         tracing::warn!(error = %e, "failed to parse SSH host key from beacon");
                     }
                     Ok(pubkey) => {
+                        // TODO: pass instance_num through once multi-instance is needed
                         match russh::keys::known_hosts::learn_known_hosts_path(
                             "local-0",
                             22,
