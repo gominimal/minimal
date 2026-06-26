@@ -116,12 +116,37 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
     // remote-cache staging (`tempfile`, default `/tmp`) and much else assume it.
     // Without this a session build fails with EROFS fetching its packages.
     raw_mount("tmpfs", &format!("{NEWROOT}/tmp"), "tmpfs", 0)?;
-    // devpts for PTYs: the session shell's server-side `Pty::open` does
-    // `posix_openpt` then opens `/dev/pts/N`, which ENOENTs without devpts
-    // mounted. Best-effort — a pty failure must not turn boot into READY-only.
+    // devpts for PTYs. The session shell's server-side `Pty::open` does
+    // `posix_openpt` (opens /dev/ptmx) then opens the matching /dev/pts/N slave.
+    // The devtmpfs /dev/ptmx and a plain devpts mount can resolve to DIFFERENT
+    // devpts instances, so the master and slave never connect and the pty errors
+    // immediately (EIO) — bash then exits at once. This is the minvmd-only break
+    // (native DM2 works because the host sets devpts up). Mount devpts with an
+    // accessible ptmx and repoint /dev/ptmx at it so both ends share one
+    // instance. Best-effort — a pty failure must not turn boot into READY-only.
     let _ = std::fs::create_dir_all(format!("{NEWROOT}/dev/pts"));
-    if let Err(e) = raw_mount("devpts", &format!("{NEWROOT}/dev/pts"), "devpts", 0) {
-        tracing::warn!(error = %e, "mounting devpts; interactive PTY sessions may fail");
+    let pts_target = CString::new(format!("{NEWROOT}/dev/pts")).expect("no NUL in /dev/pts path");
+    // SAFETY: mount(2) with valid C strings; `data` carries devpts options and
+    // is read for the duration of the call.
+    let rc = unsafe {
+        libc::mount(
+            c"devpts".as_ptr(),
+            pts_target.as_ptr(),
+            c"devpts".as_ptr(),
+            0,
+            c"ptmxmode=0666".as_ptr().cast(),
+        )
+    };
+    if rc != 0 {
+        tracing::warn!(error = %std::io::Error::last_os_error(), "mounting devpts; interactive PTY sessions may fail");
+    } else {
+        // Repoint /dev/ptmx (a devtmpfs node) at this instance's ptmx so
+        // `posix_openpt` and `/dev/pts/N` land in the same devpts instance.
+        let ptmx = format!("{NEWROOT}/dev/ptmx");
+        let _ = std::fs::remove_file(&ptmx);
+        if let Err(e) = std::os::unix::fs::symlink("pts/ptmx", &ptmx) {
+            tracing::warn!(error = %e, "linking /dev/ptmx -> pts/ptmx; interactive PTY sessions may fail");
+        }
     }
 
     let to_io = |_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in chroot path");

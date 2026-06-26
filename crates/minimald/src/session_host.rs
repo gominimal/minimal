@@ -1037,11 +1037,17 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
     pub async fn mainloop(mut self) -> Result<i32, std::io::Error> {
         loop {
             if let Some(exit_code) = self.process.try_wait()? {
+                // DIAGNOSTIC: a session shell that exits immediately (e.g. 127 =
+                // dynamic-link/exec failure → closure not fully materialized;
+                // 0 = clean EOF) shows up here before any pty I/O.
+                tracing::warn!(exit_code, "session process exited");
                 return Ok(exit_code);
             }
 
             if self.step().await.is_err() {
-                return self.process.wait();
+                let code = self.process.wait();
+                tracing::warn!(?code, "session process reaped after pty/step error");
+                return code;
             }
         }
     }
