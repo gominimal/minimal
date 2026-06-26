@@ -47,12 +47,12 @@ existing `minimal2` SSH client transport (`client.rs`) for all RPCs.
 │ / st_                           │ │ project  ~/src/api        net   OwnIp          │
 │ ────                            │ │ user     chroma           idle  12s            │
 │ ▼ host  minimald v0.1  ●        │ │ title    vim: src/api/main.rs                  │
-│   ▸ api-staging    OwnIp    ●   │ │ bells    ●2 (last 3m)                         │
-│     (unnamed)      Host          │ ├─ Preview (live screen snapshot) ───────────────┤
-│ ▼ vm    minvmd kvm     ●         │ │ $ cargo run                                    │
-│     bench          NoNet         │ │    Compiling minimal v0.1 (1457 deps)…         │
+│   ▸ api-staging    OwnIp    ●   │ │ bells    ●2 (last 3m)                          │
+│     (unnamed)      Host         │ ├─ Preview (live screen snapshot) ───────────────┤
+│ ▼ vm    minvmd kvm     ●        │ │ $ cargo run                                    │
+│     bench          NoNet        │ │    Compiling minimal v0.1 (1457 deps)…         │
 │                                 │ │    Finished `dev` profile in 3m 04s            │
-│                                 │ │ $ ▏                                           │
+│                                 │ │ $ ▏                                            │
 └─────────────────────────────────┘ └────────────────────────────────────────────────┘
  ↑↓ move · / filter · tab switch · d destroy · r rename · n new · q quit
 ```
