@@ -225,17 +225,15 @@ async fn run_session_exec(
             .map_err(|e| format!("request_subsystem: {e}"))?;
 
         let req = CreateSessionRequest {
-            record: sessions::Record {
-                id: sessions::SessionId::nil(),
+            config: minimald_rpc::SessionConfig {
                 name: Some("minvmd-e2e".to_string()),
-                username: None,
                 project_path: paths::HostAbsPath::try_new("/tmp")
                     .map_err(|e| format!("project_path: {e}"))?,
                 network: sessions::NetworkMode::default(),
                 policy: Default::default(),
-                status: Default::default(),
                 attrs: Default::default(),
             },
+            contribution: Default::default(),
         };
         let body = serde_json::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
 
@@ -252,9 +250,17 @@ async fn run_session_exec(
             .map_err(|e| format!("read response: {e}"))?;
         let resp: <CreateSession as OneshotSshRpc>::Response =
             serde_json::from_slice(&resp_buf).map_err(|e| format!("decode response: {e}"))?;
-        resp.ok()
-            .ok_or_else(|| "CreateSession returned an error".to_string())?
-            .id
+        let created = resp
+            .ok()
+            .ok_or_else(|| "CreateSession returned an error".to_string())?;
+        match created {
+            minimald_rpc::CreateSessionResponse::Ready { id } => id,
+            minimald_rpc::CreateSessionResponse::Pending { .. } => {
+                return Err("CreateSession returned Pending; \
+                            e2e test only handles Ready"
+                    .to_string());
+            }
+        }
     };
 
     // Exec the command in that session.

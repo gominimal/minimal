@@ -324,3 +324,36 @@ impl russh::client::Handler for TestClientHandler {
         Ok(true)
     }
 }
+
+// ---------------------------------------------------------------------------
+// CreateSession test helpers
+// ---------------------------------------------------------------------------
+
+/// Build a `CreateSessionRequest` with sensible defaults for tests
+/// that only care about `name` and `project_path`.
+pub(crate) fn create_session_req(name: &str, project: &str) -> minimald_rpc::CreateSessionRequest {
+    minimald_rpc::CreateSessionRequest {
+        config: minimald_rpc::SessionConfig {
+            name: Some(name.to_string()),
+            project_path: paths::HostAbsPath::try_new(project).unwrap(),
+            network: sessions::NetworkMode::default(),
+            policy: Default::default(),
+            attrs: Default::default(),
+        },
+        contribution: Default::default(),
+    }
+}
+
+/// Unwrap the `Ready` arm of a [`minimald_rpc::CreateSessionResponse`].
+/// The only arm reachable in tests today — `Pending` is unreachable
+/// until daemon Phase 2 routing lands. Avoids dumping the full
+/// `Pending` payload in the panic message so test output stays focused
+/// on the variant mismatch.
+pub(crate) fn unwrap_ready(resp: minimald_rpc::CreateSessionResponse) -> sessions::SessionId {
+    match resp {
+        minimald_rpc::CreateSessionResponse::Ready { id } => id,
+        minimald_rpc::CreateSessionResponse::Pending { .. } => {
+            panic!("expected Ready variant, got Pending")
+        }
+    }
+}

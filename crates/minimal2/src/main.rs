@@ -445,10 +445,6 @@ async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), ()>
     let abs_path = paths::HostAbsPath::try_new(utf8_path)
         .map_err(|e| eprintln!("Invalid project path: {e}"))?;
 
-    let username = std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .ok();
-
     let mut port_mappings = Vec::with_capacity(args.ingress.len());
     for spec in &args.ingress {
         match parse_ingress_mapping(spec) {
@@ -467,21 +463,23 @@ async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), ()>
         }),
     };
 
-    let record = sessions::Record {
-        id: sessions::SessionId::nil(),
+    // The daemon sources `username` from the authenticated SSH
+    // connection context; the client doesn't send it.
+    let config = minimald_rpc::SessionConfig {
         name: args.name.clone(),
-        username,
         project_path: abs_path,
         network: args.network.into(),
         policy,
-        status: Default::default(),
         attrs: Default::default(),
     };
 
     let mut client = connect_daemon(global).await?;
 
     use minimald_rpc::{CreateSession, CreateSessionRequest};
-    let req = CreateSessionRequest { record };
+    let req = CreateSessionRequest {
+        config,
+        contribution: Default::default(),
+    };
     let resp = client
         .oneshot_rpc::<CreateSession>(req)
         .await
@@ -497,13 +495,26 @@ async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), ()>
             return Err(());
         }
     };
+    // Today the daemon only ever produces `Ready` (the empty-
+    // contribution fast path). `Pending` lights up when Phase 2
+    // routing lands.
+    let id = match created {
+        minimald_rpc::CreateSessionResponse::Ready { id } => id,
+        minimald_rpc::CreateSessionResponse::Pending { .. } => {
+            eprintln!(
+                "CreateSession returned Pending, but the composition pipeline \
+                 is not wired in this client yet",
+            );
+            return Err(());
+        }
+    };
 
-    println!("{}", created.id);
+    println!("{id}");
 
     if args.attach {
         // Chain into attach.
         let attach_args = AttachArgs {
-            session: created.id.to_string(),
+            session: id.to_string(),
             command: None,
         };
         return cmd_attach(global, attach_args).await;

@@ -62,7 +62,13 @@ runs the **shared client-side gate pipeline** (described below).
 User-origin items auto-pass the `allow` step but still hit `deny`
 and `ignore`, so the gate completes without prompts (every outcome
 is decidable). The output is a `WireContribution`, shipped to the
-daemon inside a `SessionCreateRequest`.
+daemon inside `minimald_rpc::CreateSessionRequest { config,
+contribution }`. The `config` half carries the out-of-band session
+fields (`name`, `project_path`, `network`, `policy`, `attrs`);
+internal callers that don't go through the composition pipeline
+(sftp, exec, session-recovery) supply `WireContribution::default()`
+for the contribution half and the daemon takes the empty-
+contribution fast path described in Phase 4.
 
 ### Phase 2 — Daemon collects and emits pending items
 
@@ -106,6 +112,25 @@ declares `EDITOR=vim`) surfaces here as
 `ComposeError::Conflict`. The final `Composition` is handed to
 the apply layer, which builds the sandbox, materializes vars,
 copies patched files, and installs lifecycle hooks.
+
+**Response shape.** The daemon returns
+`CreateSessionResponse::Ready { id }` when no items need user
+gating (today's only path, including the empty-contribution fast
+path used by internal callers) or
+`CreateSessionResponse::Pending { id, response }` when items need
+user-side gating. The `id` is allocated before the response
+returns, so file uploads (when that subsystem lands) can target
+the session as soon as the client receives either variant. Today
+only `Ready` is reachable; `Pending` is wire-defined for the
+daemon-side Phase 2 routing that will land in a future change.
+
+**Empty-contribution fast path.** When the client sends
+`WireContribution::default()` the daemon skips Phase 2 entirely:
+no project/package contributions are collected, no pending items
+are emitted, no `Composition::extend_from_wire` merge runs. The
+record is persisted as `Active` and returned via `Ready` in one
+round-trip. This is the only path exercised by internal callers
+today (sftp, exec, session-recovery).
 
 `Composition`'s fields: `vars: Vec<SessionVar>`, `patches:
 Vec<SessionPatch>`, `packages: Vec<ProvenancedPackage>`,
