@@ -224,11 +224,16 @@ pub struct CreateSessionRequest {
 
 /// The response for a [`CreateSession`] RPC.
 ///
-/// `Ready` is the only variant exercised today; `Pending` is
-/// reserved for when daemon-side Phase 2 routing lands and the
-/// daemon can ask the client to gate items that need approval.
-/// Defining both up front locks the wire shape so adding the
-/// Pending path later doesn't break callers.
+/// Both variants are part of the Phase 2 flow and reachable on the
+/// wire: `Ready` when the daemon's composer finalizes in one shot,
+/// `Pending` when it collects items the client must gate before
+/// composition completes (the client follows up via `SubmitVerdict`).
+///
+/// In practice today every caller still takes the `Ready` path — no
+/// daemon-side contributors (project / package `Composable`s) are
+/// wired into the manager yet, so the composer never has anything to
+/// route back for gating. `Pending` lights up automatically once
+/// those contributors land.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CreateSessionResponse {

@@ -91,13 +91,14 @@ verbatim) and draws items from project- and package-level
   `ComposeOutcome::Ready(composition)`.
 - **Pending path.** If the daemon collected any vars or patches,
   the composer routes every one of them back to the client as
-  pending items —
-  the daemon never runs user policy, so no daemon-origin item is
-  ever auto-decided. The pending items + the daemon-collected
-  packages and lifecycle hooks (which have no per-item verdict
-  slot) ride in a `ContributionResponse`; the daemon also retains
-  a `PendingComposeState` so Phase 4 can finalize after the
-  verdict comes back.
+  pending items — the daemon never runs user policy, so no
+  daemon-origin item is ever auto-decided. The `ContributionResponse`
+  carries the pending vars and patches plus a copy of the
+  daemon-collected lifecycle hooks (for client-side audit; hooks
+  have no per-item verdict slot). **Packages never appear on the
+  wire** — the response schema has no slot for them; they stay in
+  the daemon's `PendingComposeState` alongside the hooks so Phase 4
+  can finalize after the verdict comes back.
 
 ### Phase 3 — Client gates the pending items
 
@@ -134,14 +135,17 @@ copies patched files, and installs lifecycle hooks.
 
 **Response shape.** The daemon returns
 `CreateSessionResponse::Ready { id }` when no items need user
-gating (today's only path, including the empty-contribution fast
-path used by internal callers) or
+gating or
 `CreateSessionResponse::Pending { id, response }` when items need
 user-side gating. The `id` is allocated before the response
 returns, so file uploads (when that subsystem lands) can target
 the session as soon as the client receives either variant. Today
-only `Ready` is reachable; `Pending` is wire-defined for the
-daemon-side Phase 2 routing that will land in a future change.
+`Ready` is the only variant that reaches the wire: the composer
+already produces `ComposeOutcome::Pending` on paper, but the
+manager's `CreateSession` handler rejects that outcome with
+`InvalidInput` because the resume path (`SubmitVerdict` + apply
+consumption of the finalized `Composition`) isn't yet wired.
+`Pending` becomes wire-reachable when that path lands.
 
 **Empty-contribution fast path.** When the client sends
 `WireContribution::default()` the daemon skips Phase 2 entirely:

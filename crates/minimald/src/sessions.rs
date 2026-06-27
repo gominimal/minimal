@@ -80,9 +80,12 @@ struct CreateSessionMsg {
     /// Authenticated SSH username, supplied by the RPC handler from
     /// the SSH connection context (never the client).
     username: Option<String>,
-    /// Client-side Phase 1 contribution. Today the handler rejects
-    /// anything other than the default; the composition pipeline will
-    /// consume it when Phase 2 lands.
+    /// Client-side Phase 1 contribution. Fed into `SessionComposer`
+    /// in the handler: the composer either finalizes a `Composition`
+    /// (persist Active, ship `Ready { id }`) or routes items back to
+    /// the client for gating (persist Pending, stash state, ship
+    /// `Pending { id, response }`). A cross-process merge conflict
+    /// or malformed wire item surfaces as `InvalidInput`.
     contribution: WireContribution,
     responder: Responder<minimald_rpc::CreateSessionResponse>,
 }
@@ -326,7 +329,31 @@ impl<L: Loader> Manager<L> {
                         // it anyway.
                         let composer = SessionComposer::new(contribution);
                         match composer.compose(SessionId::nil(), ComposeOptions::default()) {
-                            Ok(ComposeOutcome::Ready(_composition)) => {}
+                            Ok(ComposeOutcome::Ready(composition)) => {
+                                // The composition carries the merged
+                                // vars / patches / packages / lifecycle
+                                // hooks the composer produced. There is
+                                // no apply layer yet — the on-disk
+                                // Record below stores only the
+                                // out-of-band `SessionConfig`, so a
+                                // non-empty composition would be
+                                // silently discarded. Reject rather
+                                // than lose the client's contribution.
+                                // Fast path (empty client contribution,
+                                // no daemon contributors) still passes.
+                                if !composition.vars().is_empty()
+                                    || !composition.patches().is_empty()
+                                    || !composition.packages().is_empty()
+                                    || !composition.lifecycle_hooks().is_empty()
+                                {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidInput,
+                                        "CreateSession composed a non-empty \
+                                         Composition, but the apply layer that \
+                                         would consume it is not wired yet",
+                                    ));
+                                }
+                            }
                             Ok(ComposeOutcome::Pending { .. }) => {
                                 // Unreachable today: no daemon-side
                                 // contributors are wired in, so the
@@ -773,13 +800,14 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 
-    /// A non-empty `WireContribution` from the client is accepted —
-    /// the daemon-side composer cross-process-merges it into an
-    /// empty `Composition` (no daemon contributors are wired today)
-    /// and the session persists `Active`. Was previously rejected
-    /// pre-Step 6 to prevent silent data loss; now flows through.
+    /// A non-empty `WireContribution` from the client is rejected —
+    /// the composer would produce a non-empty `Composition`, and
+    /// there is no apply layer yet to consume it. Accepting would
+    /// silently discard the client's contribution while the on-disk
+    /// Record only carries the out-of-band `SessionConfig`.
+    /// Prevents the silent data loss until apply plumbing lands.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn create_session_accepts_client_contribution() {
+    async fn create_session_rejects_non_empty_client_contribution() {
         use sessions::core::source::Source;
         use sessions::wire::primitives::{WireResolvedVar, WireSessionVar, WireSource};
 
@@ -795,13 +823,10 @@ mod tests {
             }),
         });
 
-        let resp = mngr
+        let err = mngr
             .create_session(sample_config(), None, contribution)
             .await
-            .expect("non-empty contribution should succeed via SessionComposer");
-        assert!(matches!(
-            resp,
-            minimald_rpc::CreateSessionResponse::Ready { .. }
-        ));
+            .expect_err("non-empty composition should be rejected until apply plumbing lands");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 }
