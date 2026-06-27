@@ -28,6 +28,15 @@ case "$(uname -s)" in
 esac
 command -v expect >/dev/null || { echo "FATAL: expect not found"; exit 1; }
 
+# Per-step wall-clock guard. A flaky own-ip attach (intermittent vsock
+# missed-wakeup) can wedge an `expect` block with no internal bound; cap every
+# step so one hang can't stall the whole plan. macOS ships `gtimeout` (coreutils),
+# Linux ships `timeout`; degrade to no guard if neither exists.
+STEP_TIMEOUT="${STEP_TIMEOUT:-360}"
+if command -v gtimeout >/dev/null; then TO="gtimeout $STEP_TIMEOUT"
+elif command -v timeout >/dev/null; then TO="timeout $STEP_TIMEOUT"
+else TO=""; fi
+
 banner() { printf '\n########## %s ##########\n' "$*"; }
 destroy() { for s in "$@"; do "$M" destroy "$s" >/dev/null 2>&1; done; }
 
@@ -48,7 +57,7 @@ trap cleanup EXIT INT TERM
 # __RIS_BEGIN__ and __RIS_END__:<rc>. Pure full-session-path; no attach -c.
 run_in_session() {
   local sess="$1" script="$2"
-  RIS_SESS="$sess" RIS_SCRIPT="$script" RIS_TO="$ATTACH_TIMEOUT" RIS_M="$M" expect <<'EXP'
+  RIS_SESS="$sess" RIS_SCRIPT="$script" RIS_TO="$ATTACH_TIMEOUT" RIS_M="$M" $TO expect <<'EXP'
 set sess   $env(RIS_SESS)
 set script $env(RIS_SCRIPT)
 set m      $env(RIS_M)
@@ -117,7 +126,7 @@ session_out demo 'curl --max-time 8 -sS -o /dev/null -w "HTTP=%{http_code}\n" ht
 echo "-- peer<-demo over the switch: socat listener in peer, curl from demo --"
 # peer: start a listener and keep the session open; read its switch IP; then
 # from a second demo session connect to it. Done in one expect with two spawns.
-RIS_M="$M" PEER=peer DEMO=demo RIS_TO="$ATTACH_TIMEOUT" expect <<'EXP' 2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\r//g' | grep -aE 'PEER_IP=|PEER_REACHED|TC2_'
+RIS_M="$M" PEER=peer DEMO=demo RIS_TO="$ATTACH_TIMEOUT" $TO expect <<'EXP' 2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\r//g' | grep -aE 'PEER_IP=|PEER_REACHED|TC2_'
 set m $env(RIS_M); set to $env(RIS_TO); set timeout $to
 proc ready {id} { for {set i 0} {$i<90} {incr i} { send -i $id "echo __R__\r"; expect { -i $id -timeout 4 "__R__\r\n" {return 1} timeout {} } }; return 0 }
 # peer session
@@ -140,7 +149,7 @@ banner "TC3 — UC2 managed DNS via host proxy :7654 (server in-sandbox, host cu
 destroy web
 "$M" activate -n web --network own-ip . >/dev/null 2>&1
 # Start an http server INSIDE the session and keep it alive while the host curls.
-RIS_M="$M" SESS=web RIS_TO="$ATTACH_TIMEOUT" expect <<'EXP' 2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\r//g' | grep -aE 'TC3_'
+RIS_M="$M" SESS=web RIS_TO="$ATTACH_TIMEOUT" $TO expect <<'EXP' 2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\r//g' | grep -aE 'TC3_'
 set m $env(RIS_M); set timeout $env(RIS_TO)
 proc ready {} { for {set i 0} {$i<90} {incr i} { send "echo __R__\r"; expect { -timeout 4 "__R__\r\n" {return 1} timeout {} } }; return 0 }
 spawn $m attach $env(SESS); ready
@@ -158,7 +167,7 @@ banner "TC4 — UC4 static ingress 18080:80 (server in-sandbox, host curls)"
 destroy tc4
 "$M" activate -n tc4 --network own-ip --ingress 18080:80 . >/dev/null 2>&1
 "$M" session policy tc4
-RIS_M="$M" SESS=tc4 RIS_TO="$ATTACH_TIMEOUT" expect <<'EXP' 2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\r//g' | grep -aE 'TC4_'
+RIS_M="$M" SESS=tc4 RIS_TO="$ATTACH_TIMEOUT" $TO expect <<'EXP' 2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\r//g' | grep -aE 'TC4_'
 set m $env(RIS_M); set timeout $env(RIS_TO)
 proc ready {} { for {set i 0} {$i<90} {incr i} { send "echo __R__\r"; expect { -timeout 4 "__R__\r\n" {return 1} timeout {} } }; return 0 }
 spawn $m attach $env(SESS); ready
@@ -190,7 +199,7 @@ banner "TC7 — UC2b mTLS reverse proxy :7655 (backend in-sandbox, host curls)"
 ls -l "$CERT_DIR/" 2>&1 | tail -4
 destroy tc7
 "$M" activate -n tc7 --network own-ip . >/dev/null 2>&1
-RIS_M="$M" SESS=tc7 CERTDIR="$CERT_DIR" RIS_TO="$ATTACH_TIMEOUT" expect <<'EXP' 2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\r//g' | grep -aE 'TC7_'
+RIS_M="$M" SESS=tc7 CERTDIR="$CERT_DIR" RIS_TO="$ATTACH_TIMEOUT" $TO expect <<'EXP' 2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\r//g' | grep -aE 'TC7_'
 set m $env(RIS_M); set timeout $env(RIS_TO); set cd $env(CERTDIR)
 proc ready {} { for {set i 0} {$i<90} {incr i} { send "echo __R__\r"; expect { -timeout 4 "__R__\r\n" {return 1} timeout {} } }; return 0 }
 spawn $m attach $env(SESS); ready
@@ -208,7 +217,7 @@ destroy tc7
 banner "TC8 — ssh-forward (server in-sandbox, host curls through the forward)"
 destroy dev
 "$M" activate -n dev --network own-ip --ingress 18080:80 . >/dev/null 2>&1
-RIS_M="$M" SESS=dev RIS_TO="$ATTACH_TIMEOUT" expect <<'EXP' 2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\r//g' | grep -aE 'TC8_'
+RIS_M="$M" SESS=dev RIS_TO="$ATTACH_TIMEOUT" $TO expect <<'EXP' 2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\r//g' | grep -aE 'TC8_'
 set m $env(RIS_M); set timeout $env(RIS_TO)
 proc ready {} { for {set i 0} {$i<90} {incr i} { send "echo __R__\r"; expect { -timeout 4 "__R__\r\n" {return 1} timeout {} } }; return 0 }
 spawn $m attach $env(SESS); ready
