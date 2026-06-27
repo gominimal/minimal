@@ -21,7 +21,7 @@
 //!   binary.
 
 // The DM1 relay proof needs `/dev/net/tun` + netns (Linux) on top of libkrun.
-// `attach_ptask` itself is Linux-only, so gate the whole test on both.
+// `open_tap`/`attach_to_switch` are Linux-only, so gate the whole test on both.
 #![cfg(all(minvmd_libkrun, target_os = "linux"))]
 
 use serial_test::serial;
@@ -90,7 +90,7 @@ async fn run_relay_proof() {
     use std::time::Duration;
 
     use minimald_rpc::NetworkMode;
-    use minvmd::net::{GvproxyConfig, SwitchSubnet};
+    use minvmd::net::{GvproxyConfig, SwitchSubnet, attach_to_switch, open_tap};
     use minvmd::vm::VmConfig;
 
     let state_dir = tempfile::TempDir::new().expect("isolated state dir");
@@ -102,10 +102,10 @@ async fn run_relay_proof() {
     //    PTask's static lease up front so DHCP/static config inside the netns
     //    resolves deterministically.
     let subnet = SwitchSubnet::default();
-    let first_ip = subnet.host(2).expect("first PTask IP");
+    let first_ip = Ipv4Addr::from(subnet.first_ptask());
     let first_mac = minvmd::net::MacAddr::for_switch_ip(first_ip);
     let cfg = GvproxyConfig::new(gvproxy_bin, switch_sock.clone()).with_subnet(subnet);
-    let (mut switch, _exit) = cfg
+    let (switch, _exit) = cfg
         .spawn(&[(first_ip, first_mac)])
         .expect("spawn gvproxy switch");
 
@@ -130,27 +130,29 @@ async fn run_relay_proof() {
     let tap_name = VmConfig::tap_name(2);
     let netns = format!("ptask-{tap_name}");
 
-    // 3. Create the PTask network namespace up front. `attach_ptask` opens the
-    //    tap in the host namespace and starts the relay; the tap interface is
-    //    then moved into this netns and statically configured there (the
-    //    gvproxy spike's Option B static-lease recipe — gvproxy does the lease
-    //    seeding, but the netns side still has to apply the address). The
+    // 3. Create the PTask network namespace up front. `open_tap` opens the tap
+    //    in the host namespace and `attach_to_switch` starts the relay; the tap
+    //    interface is then moved into this netns and statically configured there
+    //    (the gvproxy spike's Option B static-lease recipe — gvproxy does the
+    //    lease seeding, but the netns side still has to apply the address). The
     //    host-side relay fd keeps working after the interface changes
     //    namespaces.
     let _ = Command::new("ip").args(["netns", "del", &netns]).output();
     ip_ok("create netns", &["netns", "add", &netns]);
 
-    // 4. Provision the tap + start the async TAP↔gvproxy relay. The attach
-    //    allocates the first switch IP (index 2) and returns a handle whose
-    //    lifetime owns the relay task.
-    let attachment = switch
-        .attach_ptask("vsock-e2e", &tap_name)
+    // 4. Provision the tap + start the async TAP↔gvproxy relay. `open_tap`
+    //    creates the interface in the host namespace; `attach_to_switch` takes
+    //    ownership of the fd and spawns the bidirectional relay, returning a
+    //    handle whose lifetime owns the relay tasks (dropping it tears them down
+    //    and closes the tap). The PTask uses the first-PTask lease seeded into
+    //    gvproxy above (index 2).
+    let tap_fd = open_tap(&tap_name).expect("open tap in host netns");
+    let _relay = attach_to_switch(tap_fd, &switch_sock)
         .await
         .expect("attach OwnIp PTask to gvproxy switch");
 
-    // 5. Assert the assigned IP is on the 100.64.0.0/16 switch subnet.
-    let ip = attachment.switch_ip();
-    assert_eq!(ip, first_ip, "first PTask must get index-2 switch IP");
+    // 5. Assert the seeded PTask IP is on the 100.64.0.0/16 switch subnet.
+    let ip = first_ip;
     assert_eq!(
         ip.octets()[0..2],
         [100, 64],
@@ -161,9 +163,9 @@ async fn run_relay_proof() {
     //    there (static config, mirroring the minimald UC6 netns proof). The MAC
     //    must match the `dhcpStaticLeases` key gvproxy was seeded with so the
     //    switch routes the lease's IP to this port.
-    let mac = attachment.mac().to_string();
+    let mac = first_mac.to_string();
     let cidr = format!("{ip}/16");
-    let gateway: Ipv4Addr = subnet.gateway().expect("switch gateway");
+    let gateway: Ipv4Addr = subnet.gateway();
     let gw = gateway.to_string();
     ip_ok(
         "move tap into netns",
@@ -217,10 +219,9 @@ async fn run_relay_proof() {
         "PTask must reach the switch gateway {gateway} via the relay (frames must traverse the switch)"
     );
 
-    // 8. Teardown: detach the PTask (drops the relay, closing the tap fd and
-    //    removing the moved interface with it), then drop the netns and stop the
-    //    switch.
-    switch.detach_ptask(attachment);
+    // 8. Teardown: drop the relay (closes the tap fd and removes the moved
+    //    interface with it), then drop the netns and stop the switch.
+    drop(_relay);
     let _ = Command::new("ip").args(["netns", "del", &netns]).output();
     switch.stop().await;
 }
