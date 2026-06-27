@@ -123,12 +123,21 @@ pub enum AbortReason {
     },
 }
 
-/// Daemon's reply to a session-creation RPC: either the batch of
-/// pending items needing client-side gating, or a protocol-level
-/// fault the transport layer didn't catch.
+/// Daemon's reply to a session-creation RPC: a terminal "session
+/// ready" signal, the next batch of pending items needing
+/// client-side gating, or a protocol-level fault the transport layer
+/// didn't catch.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionStep {
+    /// Composition complete; the session record has been promoted to
+    /// [`Active`](crate::SessionStatus::Active) and is ready to use.
+    /// Terminal — the client doesn't follow up after receiving this.
+    Active {
+        /// Daemon-assigned session id. Matches the id returned by
+        /// the originating `CreateSessionResponse::Pending`.
+        id: SessionId,
+    },
     /// Pending items awaiting client verdicts.
     Response {
         /// The pending-items payload.
@@ -286,7 +295,8 @@ mod tests {
     }
 
     #[test]
-    fn session_step_round_trips_both_variants() {
+    fn session_step_round_trips_all_variants() {
+        let active = SessionStep::Active { id: session_id() };
         let response = SessionStep::Response {
             response: ContributionResponse {
                 session_id: session_id(),
@@ -298,6 +308,7 @@ mod tests {
         let fault = SessionStep::Fault {
             error: WireError::UnknownSessionId,
         };
+        assert_eq!(round_trip(&active), active);
         assert_eq!(round_trip(&response), response);
         assert_eq!(round_trip(&fault), fault);
     }

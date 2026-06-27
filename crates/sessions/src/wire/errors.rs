@@ -39,6 +39,19 @@ pub enum WireError {
     /// before this message arrived.
     #[error("unknown session id")]
     UnknownSessionId,
+    /// The operation isn't valid for the session's current state —
+    /// for example, attempting to attach an SSH channel to a session
+    /// still in `Pending` composition, or submitting a verdict for a
+    /// session that's already been promoted to `Active`. Distinct
+    /// from [`Self::UnknownSessionId`] (the id exists; the state
+    /// doesn't permit this operation).
+    #[error("wrong session state: {what}")]
+    WrongState {
+        /// Short human-readable description of why the operation
+        /// isn't valid in the current state. Used by clients for log
+        /// surfaces; not parsed.
+        what: String,
+    },
     /// Anything else — daemon-internal bug, transient infrastructure
     /// failure, etc. Clients should surface as a generic failure and
     /// not retry blindly.
@@ -92,6 +105,9 @@ mod tests {
                 supported: 1,
             },
             WireError::UnknownSessionId,
+            WireError::WrongState {
+                what: "session is pending; cannot exec".into(),
+            },
             WireError::Internal {
                 message: "fs walk failed".into(),
             },

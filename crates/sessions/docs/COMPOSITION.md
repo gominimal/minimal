@@ -121,31 +121,69 @@ correlate by `id`, not slice position.
 
 ### Phase 4 — Daemon assembles and hands off
 
-The daemon applies the verdicts: allowed items enter the
-`Composition`, denied items abort the session. The client's
-already-gated wire contribution is then merged in via
-`Composition::extend_from_wire`, which runs the same conflict
-checks as `Contribution::merge` (see the merge invariant
-below) — a cross-process disagreement (e.g. the daemon's
-package set declares `EDITOR=hx` and the client's loadout
-declares `EDITOR=vim`) surfaces here as
-`ComposeError::Conflict`. The final `Composition` is handed to
-the apply layer, which builds the sandbox, materializes vars,
-copies patched files, and installs lifecycle hooks.
+**Ready path.** On `ComposeOutcome::Ready`, the daemon already
+holds a finalized `Composition` (built directly inside
+`SessionComposer::compose`). The record persists as `Active` in
+one write, `CreateSessionResponse::Ready { id }` ships, and the
+flow is done.
+
+**Pending path.** On `ComposeOutcome::Pending`, the daemon
+persists the record as `SessionStatus::Pending` (which
+allocates the real id), stashes the matching
+`PendingComposeState` in-memory keyed by that id, overwrites the
+placeholder `session_id` on the `ContributionResponse`, and ships
+`CreateSessionResponse::Pending { id, response }`. The client
+then runs Phase 3 and sends a `ContributionVerdict` over the
+`SubmitVerdict` RPC. The daemon's `SubmitVerdict` handler:
+
+1. Pops the matching stash entry (missing → `WireError::UnknownSessionId`).
+2. Runs `resume_from_verdict`: per-item verdicts walked,
+   `Approved` items take the verdict's value + the stashed source
+   provenance, `Ignored` items drop silently, `Denied` items
+   surface as `ComposeError::Denied` (project- or package-declared
+   items the user policy rejected — the session can't finalize
+   in a state inconsistent with what was declared).
+3. Merges the stashed `client_contribution` via
+   `Composition::extend_from_wire` — same cross-process conflict
+   checks as the Ready path.
+4. Promotes the record `Pending → Active` via `store.save`.
+5. Replies with `SessionStep::Active { id }`.
+
+**Resume stash is in-memory only.** Daemon restart loses the
+stash. Any `SessionStatus::Pending` record on disk after restart
+is unresumable, so the daemon reaps it at startup
+(`Manager::reap_orphan_pending`) and the would-be-resuming client
+receives `WireError::UnknownSessionId` on its next
+`SubmitVerdict`. Survival across restarts is a separate concern.
+
+**Final assembly.** Whichever path produced the `Composition`,
+the apply layer takes over: builds the sandbox, materializes
+vars, copies patched files, installs lifecycle hooks. (Today the
+finalized `Composition` is dropped — apply isn't yet consuming
+it; the on-disk record carries enough state for the existing
+session-host stack.)
 
 **Response shape.** The daemon returns
-`CreateSessionResponse::Ready { id }` when no items need user
-gating or
-`CreateSessionResponse::Pending { id, response }` when items need
-user-side gating. The `id` is allocated before the response
-returns, so file uploads (when that subsystem lands) can target
-the session as soon as the client receives either variant. Today
-`Ready` is the only variant that reaches the wire: the composer
-already produces `ComposeOutcome::Pending` on paper, but the
-manager's `CreateSession` handler rejects that outcome with
-`InvalidInput` because the resume path (`SubmitVerdict` + apply
-consumption of the finalized `Composition`) isn't yet wired.
-`Pending` becomes wire-reachable when that path lands.
+`CreateSessionResponse::Ready { id }` (composition finalized in
+one shot) or `CreateSessionResponse::Pending { id, response }`
+(client must gate before the session activates). The `id` is
+allocated before either response returns, so file uploads (when
+that subsystem lands) can target the session as soon as the
+client receives either variant.
+
+**Ready-path silent-drop guard.** No apply layer yet consumes the
+finalized `Composition` on the Ready path. Until that lands, the
+manager rejects a non-empty `Composition` with `InvalidInput`
+rather than silently discard the client's contribution — the
+empty-composition fast path (no daemon contributors, empty client
+contribution) still succeeds.
+
+**State guards.** A session in `SessionStatus::Pending` is not
+attachable: the manager's `GetSession` handler returns `None` for
+non-`Active` records, so exec/sftp surface as channel failures.
+Metadata-only RPCs (`GetSessionRecord`, `ListSessions`,
+`RenameSession`, `DestroySession`) keep working over a Pending
+session.
 
 **Empty-contribution fast path.** When the client sends
 `WireContribution::default()` the daemon skips Phase 2 entirely:
