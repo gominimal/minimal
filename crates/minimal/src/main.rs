@@ -465,6 +465,13 @@ impl sessions::core::hooks::PolicyHooks for AbortOnUnapproved {
 /// over the [`SubmitVerdict`] RPC; unwraps the daemon's terminal
 /// [`SessionStep::Active`] reply to the finalized session id.
 ///
+/// If Phase 3 gating fails (user cancels, policy hook aborts, var
+/// resolution fails, etc.), the client owes the daemon an
+/// `AbortSession` — otherwise the on-disk `Pending` record and its
+/// stash slot leak until daemon restart. Fires it as a
+/// fire-and-report step: the abort's own failure is logged but
+/// doesn't override the original gating error surfaced to the user.
+///
 /// [`UserPolicy::default`]: sessions::core::policy::UserPolicy::default
 /// [`SubmitVerdict`]: minimald_rpc::SubmitVerdict
 async fn drive_pending_to_active(
@@ -477,16 +484,26 @@ async fn drive_pending_to_active(
     use sessions::core::policy::UserPolicy;
     use sessions::wire::request::SessionStep;
 
+    // Capture the session id before consuming `response` — we need it
+    // to send AbortSession on any Phase 3 failure below.
+    let session_id = response.session_id;
+
     let hooks = AbortOnUnapproved;
-    let verdict = handle_response(
+    let verdict = match handle_response(
         response,
         &[],
         UserPolicy::default(),
         &hooks,
         ComposeOptions::default(),
         &|name| std::env::var(name),
-    )
-    .map_err(|e| eprintln!("Composition gating failed: {e}"))?;
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Composition gating failed: {e}");
+            send_abort(client, session_id).await;
+            return Err(());
+        }
+    };
 
     let resp = client
         .oneshot_rpc::<SubmitVerdict>(verdict)
@@ -501,18 +518,34 @@ async fn drive_pending_to_active(
     };
     match step {
         SessionStep::Active { id } => Ok(id),
-        SessionStep::Response { .. } => {
-            // The daemon's terminal reply today is always Active
-            // (single-round flow). Multi-round Response would be a
-            // future extension and the client isn't wired for it.
-            eprintln!(
-                "SubmitVerdict returned a follow-up Response, which this client cannot drive"
-            );
-            Err(())
-        }
         SessionStep::Fault { error } => {
+            // `Fault` means the daemon already tore down its side
+            // (`resume_from_verdict` failure destroys the record;
+            // `UnknownSessionId`/`WrongState` means there was nothing
+            // for us to abort). No AbortSession needed here.
             eprintln!("SubmitVerdict faulted: {error}");
             Err(())
+        }
+    }
+}
+
+/// Fire an `AbortSession` at the daemon for a `Pending` session the
+/// client has decided not to finalize. A best-effort teardown: if
+/// the abort itself fails (network, daemon crash, or a state race)
+/// we log and move on — the daemon's startup reap pass is the
+/// backstop for the leaked `Pending` record.
+async fn send_abort(client: &mut client::Client, session_id: sessions::SessionId) {
+    use minimald_rpc::AbortSession;
+    match client
+        .oneshot_rpc::<AbortSession>(minimald_rpc::AbortSessionRequest { id: session_id })
+        .await
+    {
+        Ok(minimald_rpc::Errorable::Ok(_)) => {}
+        Ok(minimald_rpc::Errorable::Err { error }) => {
+            eprintln!("AbortSession failed: {error}");
+        }
+        Err(e) => {
+            eprintln!("AbortSession RPC failed: {e}");
         }
     }
 }

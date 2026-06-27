@@ -331,34 +331,16 @@ impl OneshotSshRpc for Shutdown {
     type Response = ShutdownResponse;
 }
 
-// ---------------------------------------------------------------------------
-// Session-creation flow (multi-round contribution composition).
-//
-// Distinct from the simpler [`CreateSession`] above: that one takes a
-// fully-formed [`sessions::Record`]; the flow below composes the record
-// by walking client contributions and daemon-side closures across one or
-// more rounds. Each call returns a [`SessionStep`]: either the next round
-// of pending items or a protocol-level fault.
-//
-// TODO: these three RPCs are the building blocks for what is eventually
-// going to subsume `CreateSession` — once the multi-round flow lands on
-// the daemon, the terminal `SessionStep` will assemble a `sessions::Record`
-// and the single-shot `CreateSession` becomes redundant. Keeping them
-// separate for now so the existing `CreateSession` callers stay working
-// while the contribution flow is built out.
-
-/// An RPC to open a new session and receive the first round of items
-/// the client must resolve.
-pub struct SessionCreate;
-
-impl OneshotSshRpc for SessionCreate {
-    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "SessionCreate");
-    type Request<'a> = sessions::wire::request::SessionCreateRequest;
-    type Response = Errorable<sessions::wire::request::SessionStep>;
-}
-
-/// An RPC to submit the client's verdicts for one round and receive the
-/// next round (or a `complete` signal in [`sessions::wire::request::ContributionResponse`]).
+/// Resume a `Pending` session with the client's per-item
+/// [`ContributionVerdict`]. Terminal — the daemon promotes the
+/// record `Pending → Active` and replies with
+/// [`SessionStep::Active`](sessions::wire::request::SessionStep::Active).
+/// A `Fault` reply carries a structured
+/// [`WireError`](sessions::wire::errors::WireError) —
+/// `UnknownSessionId` for a verdict against no stashed session,
+/// `WrongState` if the record isn't `Pending`, or an
+/// `InvalidContribution` / `Internal` reflecting a failed
+/// `resume_from_verdict`.
 pub struct SubmitVerdict;
 
 impl OneshotSshRpc for SubmitVerdict {
@@ -367,13 +349,33 @@ impl OneshotSshRpc for SubmitVerdict {
     type Response = Errorable<sessions::wire::request::SessionStep>;
 }
 
-/// An RPC to abort an in-flight session-creation flow.
-pub struct SessionAbort;
+/// Abort a `Pending` session before its `SubmitVerdict`.
+///
+/// Called by the client when its Phase 3 gating produces no verdict —
+/// user cancelled at a prompt, policy hooks returned `Abort`, or an
+/// upstream resolution / expansion failed. Drops the daemon's stash
+/// entry and deletes the on-disk `Pending` record so the session name
+/// is freed and the stash slot isn't burned.
+///
+/// Refuses non-`Pending` records: an unknown id or a record already
+/// promoted to `Active` (destroy that via [`DestroySession`]) surfaces
+/// as an `Errorable::Err`.
+pub struct AbortSession;
 
-impl OneshotSshRpc for SessionAbort {
-    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "SessionAbort");
-    type Request<'a> = sessions::wire::request::Abort;
-    type Response = Errorable<()>;
+/// The request for an [`AbortSession`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbortSessionRequest {
+    pub id: SessionId,
+}
+
+/// The response for an [`AbortSession`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AbortSessionResponse;
+
+impl OneshotSshRpc for AbortSession {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "AbortSession");
+    type Request<'a> = AbortSessionRequest;
+    type Response = Errorable<AbortSessionResponse>;
 }
 
 // ---------------------------------------------------------------------------

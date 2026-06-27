@@ -1,12 +1,12 @@
 #[cfg(feature = "networking-proxy")]
 use minimald_rpc::IssueClientCertResponse;
 use minimald_rpc::{
-    CreateSession, DestroySession, DestroySessionResponse, Errorable, GetMeshStatus,
-    GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest,
-    GetSessionRecordResponse, GetVersion, GetVersionResponse, IssueClientCert,
-    IssueClientCertRequest, ListSessions, ListSessionsEntry, ListSessionsResponse, OneshotSshRpc,
-    RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, Shutdown, ShutdownRequest,
-    ShutdownResponse, SubmitVerdict,
+    AbortSession, AbortSessionResponse, CreateSession, DestroySession, DestroySessionResponse,
+    Errorable, GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
+    GetSessionRecordRequest, GetSessionRecordResponse, GetVersion, GetVersionResponse,
+    IssueClientCert, IssueClientCertRequest, ListSessions, ListSessionsEntry, ListSessionsResponse,
+    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, Shutdown,
+    ShutdownRequest, ShutdownResponse, SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -261,6 +261,26 @@ async fn serve_shutdown(s: ServerStateHandle, c: RuChannel<Msg>) {
     }
 }
 
+/// `AbortSession`: drop a `Pending` session's stash entry and delete
+/// its on-disk record. See the manager arm for the actor-side rules
+/// (refuses `Active` records and unknown ids).
+async fn serve_abort_session(s: ServerStateHandle, c: RuChannel<Msg>) {
+    let res = AbortSession
+        .handle_channel(c, async |req| {
+            let res = s.sessions_manager().await.abort_session(req.id).await;
+            match res {
+                Ok(()) => Ok(Errorable::Ok(AbortSessionResponse)),
+                Err(e) => Ok(Errorable::Err {
+                    error: e.to_string(),
+                }),
+            }
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", AbortSession::NAME, e);
+    }
+}
+
 async fn serve_get_session_policy(s: ServerStateHandle, c: RuChannel<Msg>) {
     let res = GetSessionPolicy
         .handle_channel(c, async |req| {
@@ -421,6 +441,7 @@ pub async fn handle_ssh_rpc(
         | RenameSession::NAME
         | DestroySession::NAME
         | Shutdown::NAME
+        | AbortSession::NAME
         | GetSessionPolicy::NAME
         | GetMeshStatus::NAME
         | STREAM_WORKSPACE_FILES
@@ -458,6 +479,7 @@ pub async fn handle_ssh_rpc(
         RenameSession::NAME => drop(spawn(serve_rename_session(s, channel))),
         DestroySession::NAME => drop(spawn(serve_destroy_session(s, channel))),
         Shutdown::NAME => drop(spawn(serve_shutdown(s, channel))),
+        AbortSession::NAME => drop(spawn(serve_abort_session(s, channel))),
         GetSessionPolicy::NAME => drop(spawn(serve_get_session_policy(s, channel))),
         GetMeshStatus::NAME => drop(spawn(serve_get_mesh_status(s, channel))),
         STREAM_WORKSPACE_FILES => drop(spawn(serve_stream_workspace_files(s, config, channel))),
