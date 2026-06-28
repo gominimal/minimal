@@ -22,7 +22,8 @@ use crate::core::source::{
 };
 use crate::wire::policy::{WirePatchVerdict, WireVarVerdict};
 use crate::wire::primitives::{
-    PendingId, WirePendingVar, WireResolvedVar, WireSessionPatch, WireSessionVar,
+    PendingId, WirePendingPatch, WirePendingVar, WireProvenancedHook, WireResolvedVar,
+    WireSessionPatch, WireSessionVar, WireVarSpec,
 };
 
 /// Errors produced while a [`Composable`] materializes its
@@ -354,6 +355,17 @@ impl Contribution {
         dedupe_by_name(&mut self.packages, ProvenancedPackage::package);
         self.lifecycle_hooks.extend(other.lifecycle_hooks);
         Ok(())
+    }
+
+    /// True when no items have been contributed across any domain.
+    /// Used by daemon-side composers to take the empty-contribution
+    /// fast path (no pending items to ship back to the client).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.vars.is_empty()
+            && self.patches.is_empty()
+            && self.packages.is_empty()
+            && self.lifecycle_hooks.is_empty()
     }
 
     /// All vars contributed so far.
@@ -952,6 +964,30 @@ impl Composition {
         self.lifecycle_hooks.extend(incoming_hooks);
         Ok(())
     }
+
+    /// Construct a [`Composition`] pre-populated with daemon-side
+    /// pass-through items (packages and lifecycle hooks — neither
+    /// has a per-item user-policy gate).
+    ///
+    /// Used by the daemon-side composer on the all-decided fast
+    /// path: vars and patches don't appear here because anything
+    /// that would have needed the client's verdict routes through
+    /// [`ComposeOutcome::Pending`] instead. Packages are deduped by
+    /// name (same rule [`Contribution::merge`] applies).
+    ///
+    /// [`ComposeOutcome::Pending`]: crate::daemon::composer::ComposeOutcome::Pending
+    pub(crate) fn from_daemon_passthrough(
+        mut packages: Vec<ProvenancedPackage>,
+        lifecycle_hooks: Vec<ProvenancedHook>,
+    ) -> Self {
+        dedupe_by_name(&mut packages, ProvenancedPackage::package);
+        Self {
+            vars: Vec::new(),
+            patches: Vec::new(),
+            packages,
+            lifecycle_hooks,
+        }
+    }
 }
 
 /// Configuration for the compose pipeline.
@@ -1343,6 +1379,103 @@ pub(crate) fn compose_contribution(
         lifecycle_hooks,
     };
     Ok((composition, final_policy))
+}
+
+/// Output of [`contribution_to_pending`]: the daemon-collected vars,
+/// patches, and lifecycle hooks in their daemon→client wire shape.
+///
+/// Packages are deliberately not included — the wire schema's
+/// [`ContributionResponse`] has no slot for them, and the daemon
+/// stashes them separately for Phase 4 to install. Lifecycle hooks
+/// have no per-item verdict on the wire either, but the response
+/// does carry a copy for client-side audit, so they're included here.
+///
+/// [`ContributionResponse`]: crate::wire::request::ContributionResponse
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct WirePending {
+    /// Pending vars (id-tagged for verdict correlation).
+    pub(crate) vars: Vec<WirePendingVar>,
+    /// Pending patches (id-tagged for verdict correlation).
+    pub(crate) patches: Vec<WirePendingPatch>,
+    /// Lifecycle hooks (no per-item verdict — pass-through to the
+    /// daemon's apply layer; see [`ContributionResponse::lifecycle_hooks`]).
+    ///
+    /// [`ContributionResponse::lifecycle_hooks`]: crate::wire::request::ContributionResponse::lifecycle_hooks
+    pub(crate) lifecycle_hooks: Vec<WireProvenancedHook>,
+}
+
+/// Convert daemon-collected vars, patches, and lifecycle hooks into
+/// their wire pending shape. Pure: no policy is consulted (the daemon
+/// never runs user policy), no env is touched (clients resolve
+/// `Inherit` shapes).
+///
+/// Every var and patch becomes a pending item with a fresh
+/// `PendingId` so the client's verdict can correlate per-item.
+/// Lifecycle hooks pass through unchanged — there's no per-item
+/// policy gate for them, the wire response just carries them for
+/// audit and the daemon installs the originals from its stash.
+///
+/// Packages aren't transformed here. The wire response has no
+/// packages slot, so daemon-collected packages stay in domain
+/// shape on the daemon-side stash; callers extract them off the
+/// `Contribution` separately before calling this.
+///
+/// Ids are assigned by position within each domain. Two items in
+/// different domains may share the integer; correlation is per
+/// `(domain, id)` from the daemon's perspective.
+///
+/// # Panics
+///
+/// Panics if a single domain holds more than `u32::MAX + 1` items,
+/// which the wire schema's [`PendingId`] cannot represent. In
+/// practice no daemon-collected contribution gets near that bound.
+pub(crate) fn contribution_to_pending(
+    vars: Vec<ProvenancedVar>,
+    patches: Vec<ProvenancedPatch>,
+    lifecycle_hooks: Vec<ProvenancedHook>,
+) -> WirePending {
+    let vars: Vec<WirePendingVar> = vars
+        .into_iter()
+        .enumerate()
+        .map(|(i, pv)| {
+            let (resolved, source) = pv.into_parts();
+            let (name, value) = resolved.into_parts();
+            WirePendingVar {
+                // Items reach this transform already resolved (the
+                // composer's input is `ResolvedVar`); ship as a
+                // `Specified` spec so the client treats the value
+                // verbatim instead of re-resolving against its env.
+                id: PendingId::new(u32::try_from(i).expect("pending var index fits in u32")),
+                name,
+                spec: WireVarSpec::Specified { value },
+                source: source.into(),
+            }
+        })
+        .collect();
+
+    let patches: Vec<WirePendingPatch> = patches
+        .into_iter()
+        .enumerate()
+        .map(|(i, pp)| {
+            let (patch, source) = pp.into_parts();
+            WirePendingPatch {
+                id: PendingId::new(u32::try_from(i).expect("pending patch index fits in u32")),
+                source_pattern: patch.source().to_string(),
+                destination: patch.dest().as_sandbox_path().clone(),
+                description: None,
+                source: source.into(),
+            }
+        })
+        .collect();
+
+    let lifecycle_hooks: Vec<WireProvenancedHook> =
+        lifecycle_hooks.into_iter().map(Into::into).collect();
+
+    WirePending {
+        vars,
+        patches,
+        lifecycle_hooks,
+    }
 }
 
 // =====================================================================

@@ -7,6 +7,8 @@ use crate::{
 use paths::DaemonAbsPath;
 use sessions::{
     SessionId,
+    core::compose::ComposeOptions,
+    daemon::composer::{ComposeOutcome, SessionComposer},
     store::{DiskLoader, Loader, SessionKey, SessionObject},
     wire::request::WireContribution,
 };
@@ -306,29 +308,56 @@ impl<L: Loader> Manager<L> {
                             ));
                         }
 
-                        // Until daemon-side Phase 2 routing lands, the only
-                        // valid contribution is the empty default. Silently
-                        // dropping a non-empty contribution would let clients
-                        // believe their composed vars/patches/packages/hooks
-                        // were honored — they would not be. Reject explicitly
-                        // so the failure surfaces at the call site instead
-                        // of as missing items in the assembled session.
+                        // Drive Phase 2 via `SessionComposer`. The daemon
+                        // doesn't add any project/package contributors yet,
+                        // so on the all-decided path the composer just
+                        // cross-process-merges the client's wire
+                        // contribution into an empty `Composition`.
                         //
-                        // TODO(composition): when Phase 2 lands, the
-                        // composition pipeline consumes this field instead.
-                        // The seam is here: replace this check with the
-                        // partition + ContributionResponse flow.
-                        if contribution != WireContribution::default() {
-                            return Err(SessionsError::new(
-                                std::io::ErrorKind::InvalidInput,
-                                "non-empty WireContribution is not supported \
-                                 by this daemon — daemon-side composition \
-                                 (Phase 2) is not wired yet",
-                            ));
+                        // The `session_id` parameter on `compose` is only
+                        // observed on the `Pending` outcome (it goes on
+                        // the response so the client can correlate a
+                        // future `SubmitVerdict`). The `Ready` outcome
+                        // ignores it. We pass `nil` because the manager
+                        // doesn't allocate the id until `store.create`
+                        // below — and the `Pending` outcome is unreachable
+                        // today since no daemon-side contributors are
+                        // wired in. The defensive guard below catches
+                        // it anyway.
+                        let composer = SessionComposer::new(contribution);
+                        match composer.compose(SessionId::nil(), ComposeOptions::default()) {
+                            Ok(ComposeOutcome::Ready(_composition)) => {}
+                            Ok(ComposeOutcome::Pending { .. }) => {
+                                // Unreachable today: no daemon-side
+                                // contributors are wired in, so the
+                                // composer can never collect a var or
+                                // patch that would need the client to
+                                // gate. Defensive guard for when that
+                                // changes — once the `SubmitVerdict`
+                                // handler exists, this branch will
+                                // persist a Draft and return Pending.
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "CreateSession produced a Pending outcome, \
+                                     but the daemon cannot yet resume from a \
+                                     client verdict",
+                                ));
+                            }
+                            Err(e) => {
+                                // Cross-process conflict or wire-shape
+                                // failure during merge. Both are
+                                // declaration-time bugs — surface as
+                                // InvalidInput.
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    e.to_string(),
+                                ));
+                            }
                         }
+
                         // Assemble the on-disk Record from out-of-band config
                         // + the SSH-supplied username. Persists `Active`
-                        // immediately on the empty-contribution fast path.
+                        // immediately on the all-decided path.
                         let record = sessions::Record {
                             id: SessionId::nil(),
                             name: config.name,
@@ -744,12 +773,13 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 
-    /// A non-empty `WireContribution` must be refused with
-    /// `InvalidInput` until daemon-side Phase 2 routing lands.
-    /// Silently dropping it would let clients believe their
-    /// composed items were honored.
+    /// A non-empty `WireContribution` from the client is accepted —
+    /// the daemon-side composer cross-process-merges it into an
+    /// empty `Composition` (no daemon contributors are wired today)
+    /// and the session persists `Active`. Was previously rejected
+    /// pre-Step 6 to prevent silent data loss; now flows through.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn create_session_rejects_non_empty_contribution() {
+    async fn create_session_accepts_client_contribution() {
         use sessions::core::source::Source;
         use sessions::wire::primitives::{WireResolvedVar, WireSessionVar, WireSource};
 
@@ -765,10 +795,13 @@ mod tests {
             }),
         });
 
-        let err = mngr
+        let resp = mngr
             .create_session(sample_config(), None, contribution)
             .await
-            .expect_err("non-empty contribution must be rejected today");
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            .expect("non-empty contribution should succeed via SessionComposer");
+        assert!(matches!(
+            resp,
+            minimald_rpc::CreateSessionResponse::Ready { .. }
+        ));
     }
 }
