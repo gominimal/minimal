@@ -187,6 +187,12 @@ pub struct ListenArgs {
     /// `minimal` CLI to auto-start a native (DM2) daemon on Linux.
     #[arg(long, default_value_t = false)]
     detach: bool,
+
+    /// Path to the gvproxy ("gvisor-tap-vsock") binary backing the per-host
+    /// `OwnIp` switch. Defaults to the fixed system install path when unset;
+    /// point it at a local build to run own-IP (DM2) without a system install.
+    #[arg(long)]
+    gvproxy_bin: Option<std::path::PathBuf>,
 }
 
 /// An error at the top level of minimald.
@@ -204,6 +210,26 @@ impl From<russh::keys::ssh_key::Error> for MainError {
 impl From<russh::keys::Error> for MainError {
     fn from(value: russh::keys::Error) -> Self {
         Self::Other(format!("ssh key: {value}"))
+    }
+}
+
+/// Reset the process "dumpable" flag to 1 (see the call site for why). Process-
+/// wide and inherited across `fork`, so calling it once before any sandbox is
+/// spawned suffices. Linux-only; a no-op elsewhere.
+fn restore_sandbox_dumpable() {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `prctl(PR_SET_DUMPABLE, 1)` takes no pointers and only sets the
+        // calling process's dumpable flag to a valid value (1 = SUID_DUMP_USER).
+        // It cannot fail for this argument, but we log rather than panic if it
+        // somehow does, since a wrong dumpable state only degrades DM2 own-IP.
+        let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
+        if rc != 0 {
+            tracing::warn!(
+                error = %std::io::Error::last_os_error(),
+                "failed to set PR_SET_DUMPABLE; setcap'd host-native sandboxes may fail"
+            );
+        }
     }
 }
 
@@ -279,6 +305,18 @@ async fn async_main() -> Result<(), MainError> {
         .with(filter)
         .init();
 
+    // Restore the "dumpable" flag so sandbox children can set up their user
+    // namespace. When minimald is granted file capabilities (DM2: an unprivileged
+    // host-native daemon `setcap`'d for own-IP tap/netns setup), gaining caps at
+    // `execve` sets the process dumpable flag to `SUID_DUMP_ROOT`, which makes
+    // `/proc/<pid>/{uid_map,gid_map,setgroups}` owned by root. A forked sandbox
+    // (hakoniwa) inherits that flag and then fails to write its *own*
+    // `/proc/self/uid_map` as the unprivileged real user — `EPERM` — breaking
+    // every session, own-IP or not. Resetting dumpable to 1 re-owns those files
+    // to the real uid so the unprivileged single-id self-mapping is permitted
+    // again. A no-op (already 1) when minimald holds no file capabilities.
+    restore_sandbox_dumpable();
+
     // With `networking-proxy` on, both the `ring` (workspace rustls) and the
     // `aws-lc-rs` (google-cloud) providers are compiled in, so rustls cannot
     // auto-pick one and panics ("no process-level CryptoProvider") the first time
@@ -301,6 +339,9 @@ async fn async_main() -> Result<(), MainError> {
                 mount_dev: true,
                 mount_rootfs: Some("/dev/vda".to_string()),
                 detach: false,
+                // In-VM (DM1/3/4) the PTask attaches to the host gvproxy over the
+                // vsock shuttle, so no in-guest gvproxy binary path is needed.
+                gvproxy_bin: None,
             }),
             global_args: GlobalArgs {
                 minimal_state_dir: Some(DaemonAbsPath::try_new("/run/minimal").unwrap().into()),
@@ -381,7 +422,7 @@ async fn async_main() -> Result<(), MainError> {
         },
         minimal_state_dir: cli.minimal_state_dir(),
         minimal_cache_dir: cli.minimal_cache_dir(),
-        gvproxy_bin: None,
+        gvproxy_bin: listen_args.gvproxy_bin.clone(),
         // The vsock listen path is exactly the libkrun-VM (DM1/3/4) case: an
         // `OwnIp` PTask must attach to the host gvproxy over the vsock shuttle,
         // not spawn gvproxy in-guest. The UDS path is DM2.

@@ -246,6 +246,261 @@ pub async fn move_tap_into_netns(
     Ok(())
 }
 
+/// Opens and configures the PTask switch tap **inside** the PTask's network
+/// namespace, entirely in-process — no privileged `ip`/`nsenter` child
+/// processes.
+///
+/// [`move_tap_into_netns`] execs `ip`/`nsenter`; those children inherit the
+/// daemon's *real* credentials, not a `setcap`'d effective-only capability. That
+/// works when the daemon is root (a DM1/3/4 VM) but fails on an unprivileged
+/// host-native DM2 daemon (the `ip` child has no `CAP_NET_ADMIN`). This path
+/// instead [`setns(2)`](libc::setns)es a throwaway thread into the PTask's net
+/// namespace and does the tap creation + configuration there with the same raw
+/// ioctls `guest.rs` uses, so the daemon's *own* `CAP_NET_ADMIN` (tap/ioctls) and
+/// `CAP_SYS_ADMIN` (`setns`) suffice — grant them on a host-native DM2 daemon via
+/// `setcap cap_net_admin,cap_sys_admin+ep`; a VM daemon is already root.
+///
+/// The interface lives in the PTask netns; the returned fd (valid across
+/// namespaces) is what the switch relay drives.
+///
+/// # Errors
+///
+/// Returns the underlying error if entering the namespace, opening/creating the
+/// tap, or any configuration ioctl fails (`EPERM` without the capabilities).
+pub async fn open_tap_in_netns(
+    name: &str,
+    ns_fd: OwnedFd,
+    lease: PtaskLease,
+    subnet: SwitchSubnet,
+) -> io::Result<OwnedFd> {
+    // `ns_fd` is a handle to the PTask net namespace, captured by the caller the
+    // instant the namespace existed — an exited process's `/proc/<pid>/ns/net`
+    // vanishes (the namespaces are released before reap), and the just-spawned
+    // PTask can exit before the gvproxy-spawning switch attach completes, so the
+    // namespace must be pinned by fd up front, not re-opened here by PID.
+    let name = name.to_owned();
+    // `setns` rebinds the *calling thread's* net namespace, so it must run on a
+    // throwaway OS thread — never a tokio worker/blocking-pool thread, which is
+    // reused for unrelated work and would silently keep the foreign netns. The
+    // scoped thread does the `setns` and exits (reverting the change); the
+    // `spawn_blocking` thread that hosts the scope never `setns`es, so the pool
+    // stays clean. The join keeps the blocking work off the async executor.
+    match tokio::task::spawn_blocking(move || -> io::Result<OwnedFd> {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| open_tap_in_netns_blocking(&name, ns_fd, &lease, subnet))
+                .join()
+                .map_err(|_| io::Error::other("tap-setup thread panicked"))?
+        })
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => Err(io::Error::other(format!("tap-setup task failed: {e}"))),
+    }
+}
+
+/// Opens a handle to the net namespace at `/proc/<netns_pid>/ns/net`. Holding the
+/// returned fd keeps the namespace alive even after its process exits, so the
+/// caller should open it the instant the PTask is spawned (before any slow work)
+/// to win the race against a short-lived PTask process.
+pub fn open_netns_fd(netns_pid: u32) -> io::Result<OwnedFd> {
+    let path = std::ffi::CString::new(format!("/proc/{netns_pid}/ns/net"))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: open() with a valid NUL-terminated path returns a new fd or -1.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::new(
+            io::Error::last_os_error().kind(),
+            format!(
+                "opening PTask netns /proc/{netns_pid}/ns/net: {}",
+                io::Error::last_os_error()
+            ),
+        ));
+    }
+    // SAFETY: fresh, valid, owned netns fd from open().
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Blocking body of [`open_tap_in_netns`], run on a dedicated thread that
+/// `setns`'es into the PTask net namespace (via the pre-opened `ns_fd`) — every
+/// operation here then happens in that namespace.
+fn open_tap_in_netns_blocking(
+    name: &str,
+    ns_fd: OwnedFd,
+    lease: &PtaskLease,
+    subnet: SwitchSubnet,
+) -> io::Result<OwnedFd> {
+    // SAFETY: `ns_fd` is an open netns fd; `CLONE_NEWNET` joins that net
+    // namespace for this thread. Requires `CAP_SYS_ADMIN`.
+    if unsafe { libc::setns(ns_fd.as_raw_fd(), libc::CLONE_NEWNET) } < 0 {
+        return Err(io::Error::new(
+            io::Error::last_os_error().kind(),
+            format!("setns into PTask netns: {}", io::Error::last_os_error()),
+        ));
+    }
+    // `TUNSETIFF` creates the tap in the *current* netns — now the PTask's.
+    let tap = open_tap(name)
+        .map_err(|e| io::Error::new(e.kind(), format!("creating tap {name} in netns: {e}")))?;
+    configure_switch_interface(name, lease, subnet)
+        .map_err(|e| io::Error::new(e.kind(), format!("configuring tap {name} in netns: {e}")))?;
+    set_nonblocking(tap.as_raw_fd())?;
+    Ok(tap)
+}
+
+/// Configures the switch tap `ifname` in the current (PTask) net namespace: the
+/// lease MAC, the lease address within `subnet`, the interface and loopback up,
+/// and a default route via the switch gateway — the in-process equivalent of the
+/// `ip`/`nsenter` recipe in [`tap_netns_commands`]. Mirrors `guest.rs`'s ioctl
+/// interface setup. IPv4-only, matching the `100.64/10` switch subnet.
+fn configure_switch_interface(
+    ifname: &str,
+    lease: &PtaskLease,
+    subnet: SwitchSubnet,
+) -> io::Result<()> {
+    // `ARPHRD_ETHER`: the L2 type for the `SIOCSIFHWADDR` MAC set.
+    const ARPHRD_ETHER: u16 = 1;
+
+    // The three `ifreq` variants the ioctls below read/write, each padded to the
+    // kernel's 40-byte `sizeof(struct ifreq)`.
+    #[repr(C)]
+    struct IfReqHwaddr {
+        name: [libc::c_char; IFNAMSIZ],
+        hwaddr: libc::sockaddr,
+        _pad: [u8; 8],
+    }
+    #[repr(C)]
+    struct IfReqAddr {
+        name: [libc::c_char; IFNAMSIZ],
+        addr: libc::sockaddr_in,
+        _pad: [u8; 8],
+    }
+    #[repr(C)]
+    struct IfReqFlags {
+        name: [libc::c_char; IFNAMSIZ],
+        flags: libc::c_short,
+        _pad: [u8; 22],
+    }
+
+    let name_buf = |name: &str| -> [libc::c_char; IFNAMSIZ] {
+        let mut buf = [0 as libc::c_char; IFNAMSIZ];
+        for (dst, b) in buf.iter_mut().zip(name.bytes()) {
+            *dst = b as libc::c_char;
+        }
+        buf
+    };
+    let sockaddr_in = |addr: std::net::Ipv4Addr| -> libc::sockaddr_in {
+        // SAFETY: `sockaddr_in` is plain old data; zero then fill the fields.
+        let mut s: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        s.sin_family = libc::AF_INET as libc::sa_family_t;
+        s.sin_addr = libc::in_addr {
+            s_addr: u32::from(addr).to_be(),
+        };
+        s
+    };
+
+    // SAFETY: socket() returns a new fd or -1.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fresh, valid, owned socket fd; closed on drop.
+    let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+    let fd = sock.as_raw_fd();
+
+    let ioctl = |req: libc::c_ulong, ptr: *mut libc::c_void| -> io::Result<()> {
+        // SAFETY: `fd` is an open AF_INET socket; `ptr` is a correctly-sized
+        // `ifreq`/`rtentry` the kernel reads for `req`.
+        let rc = unsafe { libc::ioctl(fd, req as libc::Ioctl, ptr) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    };
+
+    // 1. MAC, while the interface is still down (SIOCSIFHWADDR).
+    let mut hw = IfReqHwaddr {
+        name: name_buf(ifname),
+        // SAFETY: `sockaddr` is POD; zero then fill family + the 6 MAC bytes.
+        hwaddr: unsafe { std::mem::zeroed() },
+        _pad: [0; 8],
+    };
+    hw.hwaddr.sa_family = ARPHRD_ETHER as libc::sa_family_t;
+    for (dst, &b) in hw.hwaddr.sa_data.iter_mut().zip(lease.mac.0.iter()) {
+        *dst = b as libc::c_char;
+    }
+    ioctl(
+        libc::SIOCSIFHWADDR,
+        std::ptr::from_mut(&mut hw).cast::<libc::c_void>(),
+    )?;
+
+    // 2. Address + netmask (SIOCSIFADDR / SIOCSIFNETMASK).
+    let mut addr = IfReqAddr {
+        name: name_buf(ifname),
+        addr: sockaddr_in(lease.ip),
+        _pad: [0; 8],
+    };
+    ioctl(
+        libc::SIOCSIFADDR,
+        std::ptr::from_mut(&mut addr).cast::<libc::c_void>(),
+    )?;
+    let prefix = subnet.prefix();
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    let mut nm = IfReqAddr {
+        name: name_buf(ifname),
+        addr: sockaddr_in(std::net::Ipv4Addr::from(mask)),
+        _pad: [0; 8],
+    };
+    ioctl(
+        libc::SIOCSIFNETMASK,
+        std::ptr::from_mut(&mut nm).cast::<libc::c_void>(),
+    )?;
+
+    // 3. Bring the tap up, then loopback (read flags, OR in IFF_UP|IFF_RUNNING).
+    let bring_up = |iface: &str| -> io::Result<()> {
+        let mut fl = IfReqFlags {
+            name: name_buf(iface),
+            flags: 0,
+            _pad: [0; 22],
+        };
+        ioctl(
+            libc::SIOCGIFFLAGS,
+            std::ptr::from_mut(&mut fl).cast::<libc::c_void>(),
+        )?;
+        fl.flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+        ioctl(
+            libc::SIOCSIFFLAGS,
+            std::ptr::from_mut(&mut fl).cast::<libc::c_void>(),
+        )
+    };
+    bring_up(ifname)?;
+    bring_up("lo")?;
+
+    // 4. Default route via the switch gateway (0.0.0.0/0 -> gw), SIOCADDRT.
+    let as_sockaddr = |a: std::net::Ipv4Addr| -> libc::sockaddr {
+        // SAFETY: `sockaddr` and `sockaddr_in` share the leading family field;
+        // populating rtentry's `sockaddr` route addresses from `sockaddr_in` is
+        // the standard SIOCADDRT idiom (mirrors `guest.rs`).
+        unsafe { std::mem::transmute::<libc::sockaddr_in, libc::sockaddr>(sockaddr_in(a)) }
+    };
+    // SAFETY: `rtentry` is POD; zero then fill the fields SIOCADDRT reads.
+    let mut rt: libc::rtentry = unsafe { std::mem::zeroed() };
+    rt.rt_dst = as_sockaddr(std::net::Ipv4Addr::UNSPECIFIED);
+    rt.rt_genmask = as_sockaddr(std::net::Ipv4Addr::UNSPECIFIED);
+    rt.rt_gateway = as_sockaddr(subnet.gateway());
+    rt.rt_flags = (libc::RTF_UP | libc::RTF_GATEWAY) as libc::c_ushort;
+    ioctl(
+        libc::SIOCADDRT,
+        std::ptr::from_mut(&mut rt).cast::<libc::c_void>(),
+    )?;
+
+    Ok(())
+}
+
 /// Sets `O_NONBLOCK` on `fd` so the tap device can be epoll-driven via
 /// [`AsyncFd`]. `std::fs::File` has no `set_nonblocking`, so this goes through
 /// `fcntl` directly.

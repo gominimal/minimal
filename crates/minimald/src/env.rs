@@ -244,6 +244,15 @@ impl Env {
             .with_state_dir(args.state_base_dir.as_utf8_path())
             .with_env_vars(pkg_env_vars.into_iter())
             .with_network_mode(args.network_mode)
+            // An own-IP sandbox runs in its own netns, where the synthesized
+            // `/etc/resolv.conf` (the host's `127.0.0.53` systemd-resolved stub)
+            // is unreachable. Point it at gvproxy's switch gateway, which serves
+            // DNS for the subnet and is already the PTask's default route. Other
+            // modes share the host netns and keep the host-derived resolver.
+            .with_dns_nameserver(match args.network_mode {
+                NetworkMode::OwnIp => Some(crate::net::DEFAULT_SUBNET.gateway()),
+                _ => None,
+            })
             .with_hostname(args.name.clone())
             .with_username(args.username.unwrap_or_else(|| "user".to_string()));
 

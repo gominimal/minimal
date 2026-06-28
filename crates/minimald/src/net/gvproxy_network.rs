@@ -55,6 +55,17 @@ impl Network for GvproxyNetwork {
         true
     }
 
+    fn nameserver(&self) -> Option<std::net::Ipv4Addr> {
+        // An own-IP PTask lives in a fresh netns where the host's stub resolver
+        // (`127.0.0.53`, baked into the synth rootfs) is dead, so DNS fails even
+        // though egress-by-IP works. gvproxy serves DNS at the switch gateway and
+        // the PTask's default route already points there, so resolve via it.
+        // Synchronous and lock-free by construction: the gateway is fixed by the
+        // daemon's `DEFAULT_SUBNET`, so there is no need to lock the async
+        // `SwitchClient` (a `tokio::sync::Mutex`) from this sync trait method.
+        Some(crate::net::DEFAULT_SUBNET.gateway())
+    }
+
     fn attach(&self, netns_pid: u32) -> AttachFuture<'_> {
         Box::pin(async move {
             let guard = attach_own_ip(&self.switch, netns_pid, self.ingress.as_ref())
@@ -115,8 +126,16 @@ async fn attach_own_ip(
 ) -> io::Result<OwnIpGuard> {
     use crate::net::SwitchTransport;
     use crate::net::switch::{
-        attach_to_switch, attach_to_switch_vsock, move_tap_into_netns, open_tap,
+        attach_to_switch, attach_to_switch_vsock, move_tap_into_netns, open_netns_fd, open_tap,
+        open_tap_in_netns,
     };
+
+    // Pin the PTask net namespace immediately, before the (gvproxy-spawning)
+    // switch attach: the just-spawned PTask process can exit during that window,
+    // and an exited process's `/proc/<pid>/ns/net` vanishes. Holding an fd keeps
+    // the namespace alive so the in-process (DM2) tap setup can still enter it.
+    // Cheap and harmless on the DM1/3/4 path (it drops the fd and uses the PID).
+    let netns = open_netns_fd(netns_pid)?;
 
     // Allocate a lease and ensure gvproxy is running, snapshotting the control
     // socket, subnet, and transport under one lock; the slow tap/relay work runs
@@ -142,8 +161,18 @@ async fn attach_own_ip(
     // On any failure after the switch attach succeeded, roll the attach back so
     // gvproxy's refcount stays accurate (a leaked count would keep it running).
     let relay = match async {
-        let tap_fd = open_tap(&tap)?;
-        move_tap_into_netns(&tap, netns_pid, lease, subnet).await?;
+        // Set up the PTask tap in its namespace. DM2 (LocalSpawn, a host-native
+        // daemon that may be unprivileged + `setcap`'d) does it in-process so no
+        // privileged `ip`/`nsenter` child is needed; DM1/3/4 (HostShuttle, a
+        // root-in-VM daemon) keep the proven `ip`/`nsenter` path.
+        let tap_fd = match transport {
+            SwitchTransport::LocalSpawn => open_tap_in_netns(&tap, netns, lease, subnet).await?,
+            SwitchTransport::HostShuttle { .. } => {
+                let tap_fd = open_tap(&tap)?;
+                move_tap_into_netns(&tap, netns_pid, lease, subnet).await?;
+                tap_fd
+            }
+        };
         // DM2 attaches the tap to the local gvproxy `-listen` socket; DM1/3/4
         // (HostShuttle) relays the tap's raw frames over vsock to the host
         // gvproxy `minvmd` owns. Both are the same HyperKit-framed L2 relay —

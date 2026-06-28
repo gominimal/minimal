@@ -674,6 +674,27 @@ impl<C: Channel> Sandbox<C> {
             container.unshare(hakoniwa::Namespace::Uts);
             container.hostname(hn);
         }
+
+        // When the network supplies its own resolver (own-IP: the sandbox runs in
+        // a fresh netns where the synth rootfs's host stub resolver `127.0.0.53`
+        // is unreachable), point `/etc/resolv.conf` at it — gvproxy serves DNS at
+        // the switch gateway. Written to the rootfs before spawn, like
+        // `/etc/hostname` above: hakoniwa binds `/etc` read-only from
+        // `<rootfs>/etc`, so an in-sandbox write would hit a read-only fs.
+        // Overwrites unconditionally — `synth_dns_config` already populated this
+        // file with the host resolver, so a create-only guard would leave it.
+        if let Some(ns) = self
+            .config
+            .network
+            .as_deref()
+            .and_then(|n| n.nameserver())
+            .or(self.config.dns_nameserver)
+        {
+            let etc_resolv = self.rootfs().join("etc").join("resolv.conf");
+            std::fs::write(&etc_resolv, format!("nameserver {ns}\n"))
+                .map_err(|e| Error::IO("writing /etc/resolv.conf", etc_resolv.clone(), e))?;
+        }
+
         if let Some(s) = &self.config.cpu_weight
             && booted_with_systemd()
         {
