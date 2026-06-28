@@ -73,6 +73,29 @@ pub struct EnvArgs {
     network_mode: NetworkMode,
     own_ip_tap: Option<sandbox2::config::OwnIpTap>,
     own_ip_dns: Option<std::net::Ipv4Addr>,
+    /// When true, [`Env::build`] consumes the `env_vars` and
+    /// `fs_mappings` produced by [`SetupForPackages`] and merges
+    /// caller-supplied overrides on top — the legacy behavior.
+    ///
+    /// When false, [`Env::build`] does NOT touch `SetupForPackages`
+    /// output for those two fields, and the caller must have
+    /// gathered them via the composition pipeline and passed them
+    /// through `env_vars` / `patches`. `state_dirs` is derived
+    /// from `env_vars` values shaped `/state/<prefix>` on that
+    /// path.
+    ///
+    /// Defaults to `true` so `EnvArgs::new` matches the legacy
+    /// task-run semantics. Session launches call
+    /// [`Self::without_package_attr_wiring`] so package
+    /// contributions to the sandbox flow exclusively through the
+    /// composer and are subject to [`PatchPolicy`] / [`VarsPolicy`]
+    /// user gating. Task-run (via `mctx::env::Env`) is a separate
+    /// [`Env::build`] impl and keeps the legacy path unchanged.
+    ///
+    /// [`SetupForPackages`]: graph::SetupForPackages
+    /// [`PatchPolicy`]: sessions::core::policy::PatchPolicy
+    /// [`VarsPolicy`]: sessions::core::policy::VarsPolicy
+    include_package_attr_wiring: bool,
 }
 
 impl EnvArgs {
@@ -97,7 +120,28 @@ impl EnvArgs {
             network_mode: NetworkMode::HostNet,
             own_ip_tap: None,
             own_ip_dns: None,
+            include_package_attr_wiring: true,
         }
+    }
+
+    /// Opts this env out of consuming `env_vars` and `fs_mappings`
+    /// from [`SetupForPackages`]. The caller is responsible for
+    /// producing equivalent items via the composer and passing them
+    /// through `.with_resolved_env_vars` / `.with_patches`.
+    /// `state_dirs` is derived from `env_vars` values shaped
+    /// `/state/<prefix>` rather than the direct
+    /// [`SetupForPackages`] output.
+    ///
+    /// Set by session launches so package contributions to the
+    /// sandbox flow exclusively through composition and are gated
+    /// by user policy. Leave unset for task-run and any other
+    /// caller that wants the legacy un-gated wiring.
+    ///
+    /// [`SetupForPackages`]: graph::SetupForPackages
+    #[must_use]
+    pub fn without_package_attr_wiring(mut self) -> Self {
+        self.include_package_attr_wiring = false;
+        self
     }
 
     /// Sets the packages (by name) that should be available in the environment.
@@ -123,6 +167,29 @@ impl EnvArgs {
     #[must_use]
     pub fn with_env_vars(mut self, env_vars: HashMap<String, EnvVarValue>) -> Self {
         self.env_vars = Some(env_vars);
+        self
+    }
+
+    /// Sets environment variables where every value is already
+    /// resolved to a string (no [`EnvVarValue::Inherit`] variant
+    /// possible). Wraps each internally as [`EnvVarValue::Value`].
+    ///
+    /// Used at boundaries where the caller has post-gate values —
+    /// e.g. a [`sessions::core::compose::Composition`]'s
+    /// [`SessionVar`]s — and doesn't want to spell
+    /// `EnvVarValue::Value(...)` at every insert. Semantics are
+    /// identical to `.with_env_vars` with all-`Value` entries;
+    /// this is purely an ergonomics shortcut.
+    ///
+    /// [`SessionVar`]: sessions::core::compose::SessionVar
+    #[must_use]
+    pub fn with_resolved_env_vars(mut self, env_vars: HashMap<String, String>) -> Self {
+        self.env_vars = Some(
+            env_vars
+                .into_iter()
+                .map(|(k, v)| (k, EnvVarValue::Value(v)))
+                .collect(),
+        );
         self
     }
 
@@ -182,6 +249,48 @@ pub struct Env {
     _temp_dirs: Vec<TempDir>,
 }
 
+/// On the composition path (session launches without
+/// `SetupForPackages`), derive the set of state-dir prefixes to
+/// create by scanning resolved env-var values for the
+/// `/state/<prefix>` shape.
+///
+/// The composition can carry env vars from three sources
+/// ([`Loadout`], [`ProjectComposable`], [`PackageComposable`]), and
+/// any of them could contain a value shaped `/state/*` by
+/// coincidence rather than as state-wiring intent. This helper
+/// treats every `/state/<single-component>` value as a state-dir
+/// request — over-triggering slightly (creating a spurious empty
+/// dir when a var happens to look like this) is harmless, while
+/// under-triggering would leave the process without the directory
+/// it needs to write to.
+///
+/// Multi-component values (`/state/foo/bar`) are dropped: we can't
+/// tell whether a user meant a nested state dir or coincidentally
+/// wrote a `/state/`-prefixed path (e.g. a URL fragment).
+/// [`PackageComposable`] — the only source that can legitimately
+/// produce nested state-wiring — validates single-component at
+/// extraction (see
+/// `sessions::composables::extract_state_wiring`), so it will
+/// never emit a multi-component value here.
+///
+/// Blanks (empty prefix after strip) are silently ignored — they
+/// can only arise from a value that's literally `/state/`, and
+/// creating `state_base_dir/` itself is nonsense.
+///
+/// [`Loadout`]: sessions::core::loadout::Loadout
+/// [`ProjectComposable`]: mfile::ProjectComposable
+/// [`PackageComposable`]: mfile::PackageComposable
+fn state_dirs_from_env_vars(
+    env_vars: &HashMap<String, String>,
+) -> std::collections::HashSet<String> {
+    env_vars
+        .values()
+        .filter_map(|v| v.strip_prefix("/state/"))
+        .filter(|p| !p.is_empty() && !p.contains('/'))
+        .map(str::to_owned)
+        .collect()
+}
+
 impl Env {
     /// Builds a runtime environment, consuming the context and graph.
     ///
@@ -224,13 +333,34 @@ impl Env {
         }
 
         // Collect the package-derived wiring and merge caller-supplied overrides.
-        let SetupForPackages {
-            fs_mappings: mut patch,
-            needs_dns: _,
-            needs_internet: _,
-            state_dirs,
-            env_vars: mut pkg_env_vars,
-        } = SetupForPackages::build(&graph, transitives.keys()).map_err(std::io::Error::other)?;
+        //
+        // On the composition path (session launches, which set
+        // `include_package_attr_wiring = false` via
+        // `EnvArgs::without_package_attr_wiring`), the caller has
+        // already funneled
+        // package `env_state_wiring` vars and `env_dir/file_mappings`
+        // patches through the composer — so we skip
+        // `SetupForPackages`'s output for those and rely entirely on
+        // `args.patches` / `args.env_vars`. `needs_dns` /
+        // `needs_internet` are still derived from the graph either
+        // way (nothing about them is user-gate-able).
+        let (mut patch, legacy_state_dirs, mut pkg_env_vars) = if args.include_package_attr_wiring {
+            let SetupForPackages {
+                fs_mappings,
+                needs_dns: _,
+                needs_internet: _,
+                state_dirs,
+                env_vars,
+            } = SetupForPackages::build(&graph, transitives.keys())
+                .map_err(std::io::Error::other)?;
+            (fs_mappings, state_dirs, env_vars)
+        } else {
+            (
+                EnvPatches::default(),
+                std::collections::HashSet::<String>::new(),
+                HashMap::new(),
+            )
+        };
 
         if let Some(p) = &args.patches {
             patch.union(p);
@@ -246,6 +376,19 @@ impl Env {
                 pkg_env_vars.insert(k.clone(), value);
             }
         }
+
+        // Composition path: state_dirs come from the resolved
+        // env-var values shaped `/state/<prefix>`. Matches what
+        // `SetupForPackages` produces for `env_state_wiring` and
+        // means a session that has been correctly gated (e.g. a
+        // `deny` policy on some GOCACHE env var) also skips creating
+        // its state dir — no orphaned `/state` slot for a var the
+        // session doesn't actually have.
+        let state_dirs: std::collections::HashSet<String> = if args.include_package_attr_wiring {
+            legacy_state_dirs
+        } else {
+            state_dirs_from_env_vars(&pkg_env_vars)
+        };
 
         let rootfs_dirs = transitives
             .keys()
@@ -1028,5 +1171,45 @@ mod tests {
             lines.iter().any(|l| l.contains("uroot")),
             "expected 'uroot' in search results, got: {lines:?}"
         );
+    }
+
+    /// A resolved env var shaped `/state/<prefix>` seeds a state
+    /// dir named `<prefix>`; non-`/state/` values are ignored. This
+    /// is the isolated composition-branch derivation the parity
+    /// test does not exercise via `Env::build` (which requires a
+    /// full graph + built packages), pulled out into a helper so
+    /// it can be unit-tested directly.
+    #[test]
+    fn state_dirs_from_env_vars_extracts_single_component_prefixes() {
+        let env = HashMap::from([
+            ("GOCACHE".to_string(), "/state/gocache".to_string()),
+            ("GOMODCACHE".to_string(), "/state/gomodcache".to_string()),
+            ("HOME".to_string(), "/home/user".to_string()),
+            ("PS1".to_string(), r"\u@\h $ ".to_string()),
+        ]);
+        let out = state_dirs_from_env_vars(&env);
+        assert_eq!(out.len(), 2);
+        assert!(out.contains("gocache"));
+        assert!(out.contains("gomodcache"));
+    }
+
+    /// A value that's literally `/state/` (no prefix component) is
+    /// ignored — creating `state_base_dir/` itself is nonsense.
+    #[test]
+    fn state_dirs_from_env_vars_ignores_bare_state() {
+        let env = HashMap::from([("WEIRD".to_string(), "/state/".to_string())]);
+        assert!(state_dirs_from_env_vars(&env).is_empty());
+    }
+
+    /// A multi-component prefix that leaked past the extractor
+    /// (which should have already rejected it) is silently dropped
+    /// here — the extractor is the layer that surfaces the error
+    /// to the client. This helper is the last line of defense but
+    /// its concern is producing a valid single-component set, not
+    /// diagnosing bad ones.
+    #[test]
+    fn state_dirs_from_env_vars_silently_drops_multi_component() {
+        let env = HashMap::from([("WEIRD".to_string(), "/state/foo/bar".to_string())]);
+        assert!(state_dirs_from_env_vars(&env).is_empty());
     }
 }

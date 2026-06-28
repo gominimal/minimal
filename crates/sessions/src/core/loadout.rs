@@ -253,36 +253,18 @@ impl crate::core::compose::Composable for Loadout {
         self,
         env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
     ) -> Result<crate::core::compose::Contribution, crate::core::compose::Error> {
-        use crate::core::compose::Contribution;
-        use crate::core::primitives::ResolvedVar;
-        use crate::core::source::{
-            ProvenancedHook, ProvenancedPackage, ProvenancedPatch, ProvenancedVar, Source,
-        };
-
-        let source = Source::UserLoadout {
+        let source = crate::core::source::Source::UserLoadout {
             name: self.name.into_inner(),
         };
-        let mut c = Contribution::new();
-
-        for (name, value) in self.vars {
-            let resolved = ResolvedVar::resolve_with(name.into_inner(), value, env)?;
-            c.push_var(ProvenancedVar::new(resolved, source.clone()));
-        }
-        for entry in self.vars_lenient {
-            let (name, value) = entry.into_parts();
-            let resolved = ResolvedVar::resolve_with(name.into_inner(), value, env)?;
-            c.push_var(ProvenancedVar::new(resolved, source.clone()));
-        }
-        for patch in self.patches {
-            c.push_patch(ProvenancedPatch::new(patch, source.clone()));
-        }
-        for pkg in self.packages {
-            c.push_package(ProvenancedPackage::new(pkg, source.clone()));
-        }
-        for hook in self.lifecycle_hooks {
-            c.push_hook(ProvenancedHook::new(hook, source.clone()));
-        }
-        Ok(c)
+        crate::core::compose::contribute_primitives(
+            &source,
+            self.packages,
+            self.vars,
+            self.vars_lenient,
+            self.patches,
+            self.lifecycle_hooks,
+            env,
+        )
     }
 }
 

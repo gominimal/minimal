@@ -7,7 +7,7 @@ use mctx::ConfigBuilder;
 use ot::OpTracker;
 use paths::DaemonAbsPath;
 use russh::{Channel, server::Msg};
-use sessions::{Record, store::SessionObject};
+use sessions::{Record, core::compose::Composition, store::SessionObject};
 use std::fmt::{self};
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -99,15 +99,86 @@ pub struct Session<S: SessionObject> {
     /// fetches/builds report into it; the channel renderer paints it onto the
     /// SSH channel while a host is being minted.
     tracker: OpTracker,
+
+    /// The finalized [`Composition`] this session was created with, if
+    /// the daemon still has it in memory.
+    ///
+    /// Populated when [`Manager::CreateSession`] hands the composition
+    /// through [`Session::run`] on the Ready path (or when
+    /// [`SubmitVerdict`] resumes a Pending record). `None` after a
+    /// daemon restart: the composition isn't persisted, so a session
+    /// spawned from disk post-restart runs without one.
+    ///
+    /// Consumed by [`Self::session_launcher`] on production launches:
+    /// packages get unioned with the baseline set, vars merged over
+    /// the baseline `PS1`. Patch and lifecycle-hook contributions are
+    /// still ignored — patch application needs the file-upload path,
+    /// and lifecycle hooks need in-sandbox exec plumbing, neither of
+    /// which is wired yet.
+    ///
+    /// Wrapped in [`Arc`] so re-attaches (`session_launcher` runs on
+    /// every attach) bump the refcount rather than deep-cloning the
+    /// whole [`Composition`] — for a session with lots of
+    /// composition-sourced vars/packages that clone would grow
+    /// linearly and get repeated per attach.
+    ///
+    /// The `cfg(test)` mock launcher doesn't read it, hence the
+    /// per-mode annotation.
+    ///
+    /// [`Manager::CreateSession`]: crate::sessions::Manager
+    /// [`SubmitVerdict`]: crate::sessions::Manager
+    #[cfg_attr(test, allow(dead_code))]
+    composition: Option<Arc<Composition>>,
+
+    /// Lazily-built [`mctx::Context`] rooted at this session's
+    /// workspace, cached across [`Self::context`] calls so repeated
+    /// attach / task-exec paths don't rebuild the daemon setup and
+    /// re-parse the workspace mfile.
+    ///
+    /// Populated on the first `context()` call: the scaffold pass
+    /// runs, [`mctx::Context::new`] builds
+    /// [`DaemonContext`] + parses the workspace mfile, and the
+    /// result lands here. Subsequent calls clone the cached value
+    /// (an [`Arc`] bump on the daemon state plus a shallow mfile
+    /// clone).
+    ///
+    /// **Note**: this deliberately does NOT reuse the Manager's
+    /// shared [`Arc`]`<`[`DaemonContext`]`>`. Each session builds
+    /// its own [`DaemonContext`] because the per-session
+    /// [`OpTracker`] (`tracker` above) has to reach downstream
+    /// operations, and [`OpTracker`] lives on
+    /// [`mctx::Config`] which lives inside [`DaemonContext`].
+    /// Until [`OpTracker`] moves out of [`mctx::Config`], sharing
+    /// the daemon `Arc` would silently propagate the daemon-level
+    /// tracker into every session, losing the per-session progress
+    /// scoping the SSH channel renderer relies on.
+    ///
+    /// The workspace mfile is treated as stable for the actor's
+    /// lifetime; if a caller mutates it in-band, the actor is
+    /// tearing down anyway and the stale cache is moot. A future
+    /// invalidation path (e.g. task #226-adjacent refresh) can
+    /// clear this by setting `None`.
+    ///
+    /// [`DaemonContext`]: mctx::DaemonContext
+    /// [`OpTracker`]: ot::OpTracker
+    context: Option<mctx::Context>,
 }
 
 impl<S: SessionObject> Session<S> {
     /// Launches the actor for the given session.
+    ///
+    /// `composition` is the daemon's Phase 2 output for this session,
+    /// carried in memory from `Manager::CreateSession` (or the
+    /// `SubmitVerdict` handler that promotes a Pending record). `None`
+    /// when the session was minted before the composables pipeline
+    /// existed, or when the actor is spawned from disk after a daemon
+    /// restart — both cases are graceful degradations.
     pub async fn run(
         minimal_state_dir: DaemonAbsPath,
         minimal_cache_dir: DaemonAbsPath,
         session: S,
         net_switch: Arc<Mutex<crate::net::SwitchClient>>,
+        composition: Option<Arc<Composition>>,
     ) -> Result<SessionHandle, std::io::Error> {
         std::fs::create_dir_all(session.workspace_path())?;
         std::fs::create_dir_all(session.home_path())?;
@@ -122,6 +193,8 @@ impl<S: SessionObject> Session<S> {
             minimal_cache_dir,
             net_switch,
             tracker: OpTracker::new_root(),
+            composition,
+            context: None,
         };
 
         tokio::spawn(mngr.mainloop());
@@ -294,6 +367,7 @@ impl<S: SessionObject> Session<S> {
             net_switch: Arc::clone(&self.net_switch),
             ingress,
             session,
+            composition: self.composition.clone(),
         })
     }
 
@@ -314,7 +388,26 @@ impl<S: SessionObject> Session<S> {
         Ok(session_host::MockLauncher)
     }
 
+    /// Return this session's workspace-rooted [`mctx::Context`],
+    /// building it lazily the first time and cloning the cached
+    /// value on every subsequent call. The scaffold pass and mfile
+    /// parse happen once per actor lifetime.
     fn context(&mut self) -> Result<mctx::Context, String> {
+        if let Some(ctx) = &self.context {
+            return Ok(ctx.clone());
+        }
+        let ctx = self.build_context()?;
+        self.context = Some(ctx.clone());
+        Ok(ctx)
+    }
+
+    /// Do the actual context construction: scaffold a default
+    /// workspace mfile if missing, then run [`mctx::Context::new`]
+    /// against a session-rooted [`Config`]. Called at most once per
+    /// actor lifetime by [`Self::context`].
+    ///
+    /// [`Config`]: mctx::Config
+    fn build_context(&self) -> Result<mctx::Context, String> {
         let wsp = self.session.workspace_path();
         let config = ConfigBuilder::new()
             .with_repo_dir(wsp.as_utf8_path())

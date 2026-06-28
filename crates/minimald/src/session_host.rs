@@ -6,12 +6,12 @@
 //! The [`Host`] struct holds the running state of an active session.
 
 use either::Either;
-#[cfg(not(test))]
-use mfile::EnvVarValue;
 use russh::Channel;
 use russh::server::Msg;
 #[cfg(not(test))]
 use sandbox2::Network;
+#[cfg(not(test))]
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::io::{Read, Write};
@@ -625,6 +625,20 @@ pub(crate) struct SandboxLauncher {
     /// empty) for non-`OwnIp` launches; `session.rs` has already rejected
     /// ingress configured on any other mode (R2.1).
     pub(crate) ingress: Option<sessions::IngressPolicy>,
+    /// The finalized [`Composition`] this session was created with, if
+    /// still in memory on the manager. Packages and vars from all three
+    /// sources (client loadout, project `[session]` block, package
+    /// composables) get merged with the launcher's baselines below.
+    /// Patches and lifecycle hooks live on this too but aren't consumed
+    /// yet — the file-upload and in-sandbox exec plumbing they need
+    /// hasn't landed.
+    ///
+    /// Shared with the [`Session`](crate::session::Session) actor via
+    /// [`Arc`] so each attach bumps the refcount rather than
+    /// deep-cloning the whole [`Composition`].
+    ///
+    /// [`Composition`]: sessions::core::compose::Composition
+    pub(crate) composition: Option<std::sync::Arc<sessions::core::compose::Composition>>,
 }
 
 /// Rolls back a native-own-IP phase-1 switch attach if the launch is abandoned
@@ -692,6 +706,7 @@ impl SessionLauncher for SandboxLauncher {
         let ingress = self.ingress;
         let network_mode = self.network_mode;
         let net_switch = self.net_switch;
+        let composition = self.composition;
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
         // graph construction) — run it on the blocking pool so it
         // doesn't stall the async executor.
@@ -752,6 +767,57 @@ impl SessionLauncher for SandboxLauncher {
             armed: true,
         });
 
+        // Package + env-var union of the launcher baseline and every
+        // contribution the composer collected. Packages: baseline set
+        // (required for a usable interactive shell) unioned with
+        // everything the composition asks for, dedup-preserving-order
+        // so the base packages install first. Env vars: baseline
+        // `PS1` first, composition vars overwrite on the same key.
+        //
+        // Baseline is intentionally minimal: `base` for the shell,
+        // `coreutils` for `ls`/`cat`/etc, and `socat` for the
+        // in-sandbox `min` helper's UDS relay to the daemon. `bash`
+        // is unconditionally added as a helper dep by
+        // `crate::env::Env::build`, so listing it here would just
+        // duplicate the entry — `socat` is added there too but is
+        // named explicitly so the baseline reads as self-contained.
+        //
+        // Both maps carry only resolved values, so the composition-
+        // vars merge doesn't need `EnvVarValue::Value(...)` at
+        // each insert: `EnvArgs::with_resolved_env_vars` wraps once
+        // at the boundary. Composition patches and lifecycle hooks
+        // are not applied yet (the file-upload path and in-sandbox
+        // exec plumbing that they need aren't wired), so they pass
+        // through this stage untouched.
+        let baseline_packages = ["base", "coreutils", "socat"];
+        // A shadow set tracks membership so the composition-union
+        // pass below stays O(n) instead of the naive
+        // `Vec::contains` per iteration (see clippy's O(n²) hint).
+        // Two `String` allocs per baseline entry (one for the vec,
+        // one for the set) — intrinsic given both need owned
+        // strings and `String::clone` is a deep copy. Trivial cost
+        // for a three-element baseline.
+        let mut packages: Vec<String> =
+            baseline_packages.iter().map(|s| (*s).to_string()).collect();
+        let mut package_set: std::collections::HashSet<String> =
+            baseline_packages.iter().map(|s| (*s).to_string()).collect();
+        let mut env_vars: HashMap<String, String> = HashMap::from([(
+            "PS1".to_string(),
+            r"\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ ".to_string(),
+        )]);
+        if let Some(comp) = &composition {
+            for p in comp.packages() {
+                let name = p.package();
+                if package_set.insert(name.to_string()) {
+                    packages.push(name.to_string());
+                }
+            }
+            for v in comp.vars() {
+                let var = v.var();
+                env_vars.insert(var.name().to_string(), var.value().to_string());
+            }
+        }
+
         // Build the env + container and spawn the process. Any failure here (env
         // build, container build, spawn) leaves no process to reap; the phase-1
         // attach, if any, is rolled back by `attach_guard` on the `Err` return.
@@ -763,17 +829,14 @@ impl SessionLauncher for SandboxLauncher {
                 ctx,
                 graph,
                 crate::env::EnvArgs::new(name, paths.working, paths.home, paths.cache)
-                    .with_packages(["base", "bash", "socat", "coreutils", "claude-code"])
-                    .with_env_vars(
-                        [(
-                            "PS1".to_string(),
-                            EnvVarValue::Value(
-                                r"\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "
-                                    .to_string(),
-                            ),
-                        )]
-                        .into(),
-                    )
+                    .with_packages(packages)
+                    .with_resolved_env_vars(env_vars)
+                    // Session envs source package attrs (env_state_wiring,
+                    // env_dir/file_mappings) exclusively through the
+                    // composer so they're subject to user policy. Task-run
+                    // uses a different `Env::build` (mctx::env::Env) and
+                    // keeps the legacy un-gated wiring for now.
+                    .without_package_attr_wiring()
                     .with_network_mode(network_mode)
                     .with_own_ip_tap(own_ip_tap)
                     .with_own_ip_dns(own_ip_dns)

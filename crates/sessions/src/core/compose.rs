@@ -435,6 +435,67 @@ pub trait Composable {
     ) -> Result<Contribution, Error>;
 }
 
+/// Build a [`Contribution`] from a loadout-shaped primitive set
+/// (packages, strict vars, lenient vars, patches, lifecycle hooks)
+/// against a single [`Source`], resolving each var against `env`.
+///
+/// Shared by [`crate::core::loadout::Loadout`]'s and every project /
+/// package composable's `contribute` — the only per-source
+/// difference is the [`Source`] tag stamped on every produced item,
+/// so lifting the loop bodies into one helper prevents the impls
+/// from drifting when a new primitive lands.
+///
+/// Positional args over a named struct because wrapping five fields
+/// in a `Primitives`-shaped struct at every callsite (only to
+/// immediately destructure inside the fn) is pure ceremony given
+/// the shape isn't otherwise reused. If a sixth primitive lands,
+/// this signature grows and every caller breaks compile-time —
+/// the intended way to spot missed updates.
+///
+/// # Errors
+///
+/// See [`Composable::contribute`] — the same
+/// [`ResolvedVar::resolve_with`](crate::core::primitives::ResolvedVar::resolve_with)
+/// failure modes propagate.
+pub fn contribute_primitives(
+    source: &crate::core::source::Source,
+    packages: Vec<String>,
+    vars: std::collections::BTreeMap<
+        crate::core::primitives::StrictVarName,
+        crate::core::primitives::VarValue,
+    >,
+    vars_lenient: Vec<crate::core::primitives::LenientVarEntry>,
+    patches: crate::core::primitives::Patches,
+    lifecycle_hooks: Vec<crate::core::lifecyclehook::LifecycleHook>,
+    env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<Contribution, Error> {
+    use crate::core::primitives::ResolvedVar;
+    use crate::core::source::{
+        ProvenancedHook, ProvenancedPackage, ProvenancedPatch, ProvenancedVar,
+    };
+
+    let mut c = Contribution::new();
+    for (name, value) in vars {
+        let resolved = ResolvedVar::resolve_with(name.into_inner(), value, env)?;
+        c.push_var(ProvenancedVar::new(resolved, source.clone()));
+    }
+    for entry in vars_lenient {
+        let (name, value) = entry.into_parts();
+        let resolved = ResolvedVar::resolve_with(name.into_inner(), value, env)?;
+        c.push_var(ProvenancedVar::new(resolved, source.clone()));
+    }
+    for patch in patches {
+        c.push_patch(ProvenancedPatch::new(patch, source.clone()));
+    }
+    for pkg in packages {
+        c.push_package(ProvenancedPackage::new(pkg, source.clone()));
+    }
+    for hook in lifecycle_hooks {
+        c.push_hook(ProvenancedHook::new(hook, source.clone()));
+    }
+    Ok(c)
+}
+
 // =====================================================================
 // Composition: deciding what survives the user's policy
 // =====================================================================

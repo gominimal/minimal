@@ -180,7 +180,7 @@ pub async fn cmd_run_by_spec(
     trace!("cmd_run_by_spec");
     super::enforce_science_mode()?;
 
-    let (mut vcs, cache, stdlib_dir) = Context::sub_setup(&config)?;
+    let (mut vcs, cache, stdlib_dir) = mctx::DaemonContext::sub_setup(&config)?;
 
     // We let the upstream omit locked_commit, in which case we fetch the latest
     // and use that.
