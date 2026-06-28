@@ -47,12 +47,16 @@ batches every verdict into one `ContributionVerdict`.
 > `client::handler::handle_response`. Phase 2 (daemon-side routing)
 > lives in `SessionComposer::compose` and produces a
 > `ComposeOutcome::Ready` or `ComposeOutcome::Pending`. Phase 4 is
-> partially wired — the `Ready` outcome is consumed (the manager
-> persists the session and returns `CreateSessionResponse::Ready`),
-> but `Pending` outcomes are still rejected with `InvalidInput`
-> because the `SubmitVerdict` handler hasn't landed yet. No daemon-
-> side project/package contributors are wired in either, so every
-> caller still hits the all-decided path today.
+> wired end-to-end: `Ready` outcomes persist an `Active` record and
+> return `CreateSessionResponse::Ready`, and `Pending` outcomes
+> persist a `Pending` record + stash a `PendingComposeState`,
+> returning `CreateSessionResponse::Pending`. The client then ships
+> a verdict via `SubmitVerdict`, which the daemon resumes via
+> `resume_from_verdict` and promotes the record to `Active`. See
+> the Phase 4 section below for the full state-machine and error
+> shapes. No daemon-side project/package contributors are wired in
+> yet, so in practice every caller still hits the all-decided
+> `Ready` path today.
 
 ## Phases in detail
 

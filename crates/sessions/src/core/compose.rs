@@ -959,16 +959,7 @@ impl Composition {
         // Run conflict checks against the chained union before
         // touching `self`. `Conflict` propagates through
         // `ComposeError::Conflict` via the `#[from]` impl.
-        check_var_mismatches(
-            self.vars.iter().chain(incoming_vars.iter()),
-            |v| v.var().name(),
-            |v| v.var().value(),
-        )?;
-        check_patch_mismatches(
-            self.patches.iter().chain(incoming_patches.iter()),
-            |p| p.patch().destination(),
-            |p| p.patch().host_path().as_str(),
-        )?;
+        self.check_incoming_conflicts(&incoming_vars, &incoming_patches)?;
 
         // Checks passed — commit.
         self.vars.extend(incoming_vars);
@@ -1023,18 +1014,31 @@ impl Composition {
         vars: Vec<SessionVar>,
         patches: Vec<SessionPatch>,
     ) -> Result<(), ComposeError> {
+        self.check_incoming_conflicts(&vars, &patches)?;
+        self.vars.extend(vars);
+        self.patches.extend(patches);
+        Ok(())
+    }
+
+    /// Run the cross-set var- and patch-mismatch checks against the
+    /// union of `self` and the incoming items. Shared by
+    /// [`Self::extend_from_wire`] and [`Self::extend_with`] so both
+    /// atomic-precheck paths run the exact same conflict semantics.
+    fn check_incoming_conflicts(
+        &self,
+        incoming_vars: &[SessionVar],
+        incoming_patches: &[SessionPatch],
+    ) -> Result<(), ComposeError> {
         check_var_mismatches(
-            self.vars.iter().chain(vars.iter()),
+            self.vars.iter().chain(incoming_vars.iter()),
             |v| v.var().name(),
             |v| v.var().value(),
         )?;
         check_patch_mismatches(
-            self.patches.iter().chain(patches.iter()),
+            self.patches.iter().chain(incoming_patches.iter()),
             |p| p.patch().destination(),
             |p| p.patch().host_path().as_str(),
         )?;
-        self.vars.extend(vars);
-        self.patches.extend(patches);
         Ok(())
     }
 }
