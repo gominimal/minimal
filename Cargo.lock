@@ -3556,7 +3556,6 @@ dependencies = [
  "bytes",
  "camino",
  "check",
- "chrono",
  "clap",
  "clap_complete",
  "common",
