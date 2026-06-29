@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 publish.workspace = true
 
 [dev-dependencies]
-mockall = "0.14"
+mockall = "0.15"
 tokio = { workspace = true, features = ["test-util"] }
 
 [dependencies]
