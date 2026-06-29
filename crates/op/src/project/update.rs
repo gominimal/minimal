@@ -36,8 +36,6 @@ pub struct UpdateReport {
     pub upstream: Option<RevChange>,
     /// Any sideload pins that moved.
     pub sideloads: Vec<RevChange>,
-    /// Whether a legacy `[harness]` table was migrated to `[stack]`.
-    pub migrated_harness: bool,
 }
 
 impl ProjectOp for UpdateProject {
@@ -108,11 +106,8 @@ impl ProjectOp for UpdateProject {
 
         let mut report = UpdateReport::default();
 
-        // If theres a minimal file on disk, and:
-        //  - theres at least one new rev, or
-        //  - we need to migrate the 'harness' name to 'stack'
-        //
-        // write the revs to the minimal file.
+        // If theres a minimal file on disk with at least one new rev, write the
+        // revs to the minimal file.
         let Some(p) = mfile_path else {
             return Ok(report);
         };
@@ -123,16 +118,7 @@ impl ProjectOp for UpdateProject {
             .parse::<DocumentMut>()
             .map_err(|e| Error::Other(anyhow::Error::from(e)))?;
 
-        // TODO: Remove after June 2026.
-        if let Some(t) = doc.remove("harness") {
-            doc.insert("stack", t);
-            report.migrated_harness = true;
-        }
-
-        if new_up_rev.is_some()
-            || sideload_updates.iter().any(|u| u.is_some())
-            || report.migrated_harness
-        {
+        if new_up_rev.is_some() || sideload_updates.iter().any(|u| u.is_some()) {
             if let Some(new_rev) = new_up_rev {
                 doc["upstream"]["locked_commit"] = value(new_rev.clone());
                 // `new_up_rev` is only set when the upstream has a tracking branch.

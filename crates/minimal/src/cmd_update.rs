@@ -9,9 +9,6 @@ pub async fn cmd_update(_args: UpdateArgs, ctx: &mut Context) -> Result<(), Erro
     let mut env = ctx.project_setup();
     let report = UpdateProject.run(&mut env)?;
 
-    if report.migrated_harness {
-        println!("Renamed `[harness]` to its new name `[stack]`");
-    }
     if let Some(c) = &report.upstream {
         println!(
             "Upstream {}:{} updated from {} to {}",
