@@ -279,6 +279,16 @@ async fn async_main() -> Result<(), MainError> {
         .with(filter)
         .init();
 
+    // With `networking-proxy` on, both the `ring` (workspace rustls) and the
+    // `aws-lc-rs` (google-cloud) providers are compiled in, so rustls cannot
+    // auto-pick one and panics ("no process-level CryptoProvider") the first time
+    // a config is built — e.g. when a session build reaches the remote-cache
+    // HTTPS client, off the proxy's own install path. Install ring explicitly
+    // here (idempotent; the proxy's later install no-ops). Without
+    // networking-proxy only one provider is present and rustls auto-installs it.
+    #[cfg(feature = "networking-proxy")]
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Use hardcoded configuration if we are the init process (`argv[0] == "/init"`), which
     // would indicate we are operating in a single-purpose micro-vm.
     //
@@ -372,6 +382,10 @@ async fn async_main() -> Result<(), MainError> {
         minimal_state_dir: cli.minimal_state_dir(),
         minimal_cache_dir: cli.minimal_cache_dir(),
         gvproxy_bin: None,
+        // The vsock listen path is exactly the libkrun-VM (DM1/3/4) case: an
+        // `OwnIp` PTask must attach to the host gvproxy over the vsock shuttle,
+        // not spawn gvproxy in-guest. The UDS path is DM2.
+        in_microvm: listen_args.vsock,
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     russh::keys::known_hosts::learn_known_hosts_path(
@@ -383,14 +397,11 @@ async fn async_main() -> Result<(), MainError> {
 
     // If we got this far we need to launch minimald.
     if !cli.listen_args().unwrap().vsock {
-        // standard path, listening on UDS socket
-
-        // DM2 (native-Linux host): bind the B5 host-side egress proxy listener
-        // as a startup reachability check. PTask `*.min.internal` hostnames (Unit 3)
-        // are resolved host-side and routed by `Host:` header through this proxy;
-        // the host resolver is never consulted. A bind failure warns with a
-        // remedy (this supersedes the former R3.4 systemd-resolved probe).
-        let _ = minimald::net::proxy::bind_listener(minimald::net::proxy::DEFAULT_PROXY_ADDR).await;
+        // standard path, listening on UDS socket.
+        //
+        // The B5 host-side egress proxy (:7654) and B8 mTLS reverse proxy
+        // (:7655) are bound and served by `Server::run` for both DM2 (here) and
+        // DM1 (the vsock path below), so no separate startup bind happens here.
 
         if let Err(e) = std::fs::remove_file(cli.listen_on())
             && e.kind() != std::io::ErrorKind::NotFound
@@ -420,6 +431,20 @@ async fn async_main() -> Result<(), MainError> {
         if let Err(e) = guest::emit_ready_marker().await {
             tracing::warn!(error = %e, "initramfs: READY marker failed");
         }
+
+        // Bring up the daemon's own egress: a primary tap in the root netns
+        // attached to the host gvproxy over the vsock shuttle. Held for the
+        // server's lifetime (dropping `_egress` tears the relay down). Best
+        // effort — if the host gvproxy is absent the daemon serves without
+        // network, the prior behaviour.
+        let _egress = match guest::bring_up_root_egress().await {
+            Ok(relay) => Some(relay),
+            Err(e) => {
+                tracing::warn!(error = %e, "guest root egress unavailable; serving without network");
+                None
+            }
+        };
+
         let port_num = DEFAULT_VSOCK_PORT_BASE + listen_args.instance_num;
         let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port_num))
             .map_err(|e| MainError::IO(e, "binding vsock port"))?;

@@ -56,6 +56,7 @@ impl TestServer {
             minimal_state_dir: state_dir,
             minimal_cache_dir: cache_dir,
             gvproxy_bin: None,
+            in_microvm: false,
         };
         let state = ServerStateHandle::new(config).await.unwrap();
 

@@ -10,6 +10,8 @@ use either::Either;
 use mfile::EnvVarValue;
 use russh::Channel;
 use russh::server::Msg;
+#[cfg(not(test))]
+use sandbox2::Network;
 use std::future::Future;
 use std::io;
 use std::io::{Read, Write};
@@ -57,12 +59,21 @@ impl From<&RequestedPty> for WinSize {
     ///
     /// SSH carries sizes as `u32`; terminal dimensions never exceed `u16`, so
     /// out-of-range values are clamped rather than wrapped.
+    ///
+    /// A client may request a `0`-valued row or column count (some attach
+    /// clients do not probe their terminal before the PTY request). A zero
+    /// dimension produces a `0`-cell grid, which panics the vt100 screen on the
+    /// first cell write, so zero is replaced by a conventional terminal default
+    /// (24 rows × 80 cols). The size is corrected by a `window_change` once the
+    /// client learns its real dimensions.
     fn from(pty: &RequestedPty) -> Self {
         let (cols, rows) = pty.char_sizes;
         let (xpixel, ypixel) = pty.pixel_sizes;
+        let rows = rows.min(u16::MAX as u32) as u16;
+        let cols = cols.min(u16::MAX as u32) as u16;
         Self {
-            rows: rows.min(u16::MAX as u32) as u16,
-            cols: cols.min(u16::MAX as u32) as u16,
+            rows: if rows == 0 { 24 } else { rows },
+            cols: if cols == 0 { 80 } else { cols },
             xpixel: xpixel.min(u16::MAX as u32) as u16,
             ypixel: ypixel.min(u16::MAX as u32) as u16,
         }
@@ -361,6 +372,10 @@ pub(crate) struct Launched<P, G> {
     process: P,
     /// Kept alive for the session; see [`SessionLauncher::Guard`].
     guard: G,
+    /// The per-sandbox network attachment (own-IP switch wiring), if any. Torn
+    /// down explicitly via [`sandbox2::NetGuard::teardown`] at session end.
+    /// `None` for `HostNet`/`NoNet` and for the mock launcher.
+    net_guard: Option<Box<dyn sandbox2::NetGuard>>,
 }
 
 /// Actor messages to a [`Host`].
@@ -528,6 +543,11 @@ pub(crate) struct Host<P: SessionProcess, G: Send + 'static> {
     // (<buffer>, <number of bytes from buffer already written>)
     stdin_buf: Option<(bytes::Bytes, usize)>,
 
+    // The per-sandbox network attachment (own-IP switch wiring), if any. Torn
+    // down explicitly in `mainloop` when the session ends, before `_guard` (and
+    // thus the sandbox files) is dropped. `None` for `HostNet`/`NoNet` and tests.
+    net_guard: Option<Box<dyn sandbox2::NetGuard>>,
+
     // Keeps launcher-owned resources (the session's `Env`, which owns the
     // sandbox files backing the running process's rootfs along with the context
     // and graph) alive for as long as this host (and thus the session process)
@@ -546,14 +566,36 @@ impl SessionProcess for SandboxProcess {
     fn try_wait(&mut self) -> io::Result<Option<i32>> {
         self.0
             .try_wait()
-            .map(|status| status.map(|s| s.code))
+            .map(|status| {
+                status.map(|s| {
+                    if s.code != 0 {
+                        tracing::warn!(
+                            code = s.code,
+                            exit_code = ?s.exit_code,
+                            reason = %s.reason,
+                            "DIAG hakoniwa container/process exited non-zero"
+                        );
+                    }
+                    s.code
+                })
+            })
             .map_err(|e| io::Error::other(format!("wait failed: {e}")))
     }
 
     fn wait(&mut self) -> io::Result<i32> {
         self.0
             .wait()
-            .map(|s| s.code)
+            .map(|s| {
+                if s.code != 0 {
+                    tracing::warn!(
+                        code = s.code,
+                        exit_code = ?s.exit_code,
+                        reason = %s.reason,
+                        "DIAG hakoniwa container/process exited non-zero"
+                    );
+                }
+                s.code
+            })
             .map_err(|e| io::Error::other(format!("wait failed: {e}")))
     }
 
@@ -577,7 +619,7 @@ pub(crate) struct SandboxLauncher {
     pub(crate) network_mode: NetworkMode,
     /// The shared per-host gvproxy switch, used to attach this launch when it
     /// runs in [`NetworkMode::OwnIp`] (R1.5). Ignored for `HostNet`/`NoNet`.
-    pub(crate) net_switch: std::sync::Arc<tokio::sync::Mutex<crate::net::GvproxySwitch>>,
+    pub(crate) net_switch: std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
     /// Static ingress port mappings to apply on the switch once this `OwnIp`
     /// PTask is attached (R2.3/R2.4-static), removed when it exits. `None` (or
     /// empty) for non-`OwnIp` launches; `session.rs` has already rejected
@@ -585,152 +627,14 @@ pub(crate) struct SandboxLauncher {
     pub(crate) ingress: Option<sessions::IngressPolicy>,
 }
 
-/// Holds an `OwnIp` PTask's switch attachment for the session's lifetime.
-///
-/// Dropping it tears down the data-plane relay (detaching the tap) and schedules
-/// a [`detach`](crate::net::GvproxySwitch::detach) on the shared switch, which
-/// decrements its refcount and stops gvproxy once the last `OwnIp` PTask leaves.
-///
-/// Because that `detach` is scheduled on the tokio runtime (see the `Drop`
-/// impl), correct shutdown requires that every `OwnIpAttachment` is dropped —
-/// i.e. all sessions are drained — *before* the runtime is stopped. If the
-/// runtime is torn down first, a pending `detach` never runs and the switch
-/// refcount stays elevated, so gvproxy is only reaped when the daemon process
-/// itself exits.
-#[cfg(not(test))]
-pub(crate) struct OwnIpAttachment {
-    /// Held only for its `Drop`, which aborts the relay tasks; never read.
-    _relay: crate::net::switch::SwitchRelay,
-    /// The shared switch, locked on drop to detach this PTask.
-    switch: std::sync::Arc<tokio::sync::Mutex<crate::net::GvproxySwitch>>,
-    /// gvproxy's control socket, used on drop to remove this PTask's ingress
-    /// forwards before detaching.
-    control_sock: std::path::PathBuf,
-    /// The static ingress forwards exposed for this PTask (R2.3), removed from
-    /// the switch on drop. Empty when no ingress was configured.
-    exposed: Vec<crate::net::policy::ExposedMapping>,
-}
-
-#[cfg(not(test))]
-impl Drop for OwnIpAttachment {
-    fn drop(&mut self) {
-        // `detach` and ingress removal are async and `Drop` cannot await, so
-        // schedule them on the current runtime. The session host always drops
-        // within the daemon's tokio context; if somehow not, log rather than
-        // block.
-        let switch = std::sync::Arc::clone(&self.switch);
-        let control_sock = std::mem::take(&mut self.control_sock);
-        let exposed = std::mem::take(&mut self.exposed);
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async move {
-                    // Remove ingress forwards (R2.3 teardown) before detaching:
-                    // detach may stop gvproxy once the last PTask leaves, so the
-                    // unexpose must reach a still-running switch first.
-                    if !exposed.is_empty() {
-                        crate::net::policy::remove_ingress(&control_sock, &exposed).await;
-                    }
-                    if let Err(e) = switch.lock().await.detach().await {
-                        tracing::warn!(error = %e, "detaching OwnIp PTask from switch on session end");
-                    }
-                });
-            }
-            Err(_) => {
-                tracing::warn!("no tokio runtime at OwnIp guard drop; switch left attached");
-            }
-        }
-    }
-}
-
-/// Attaches an `OwnIp` PTask (identified by its sandbox process's netns-holding
-/// PID) to the shared gvproxy switch: allocate a lease and ensure gvproxy is up,
-/// open a host-side tap, move it into the PTask's network namespace and
-/// configure its switch address there, then start the frame relay. All
-/// `minimald::net` calls live here (the `minimald` side); `sandbox2` only
-/// unshared the namespace and surfaced the PID (no dependency cycle).
-#[cfg(not(test))]
-async fn attach_own_ip(
-    switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::GvproxySwitch>>,
-    netns_pid: u32,
-    ingress: Option<&sessions::IngressPolicy>,
-) -> io::Result<OwnIpAttachment> {
-    use crate::net::switch::{attach_to_switch, move_tap_into_netns, open_tap};
-
-    // Allocate a lease and ensure gvproxy is running, snapshotting the control
-    // socket and subnet under one lock; the slow tap/relay work runs unlocked so
-    // concurrent attaches don't serialize on the namespace plumbing.
-    let (lease, sock, subnet) = {
-        let mut s = switch.lock().await;
-        let attach = s
-            .attach()
-            .await
-            .map_err(|e| io::Error::other(format!("attaching OwnIp PTask to switch: {e}")))?;
-        // gvproxy's unexpected-exit closes the control socket, which ends the
-        // relay's switch-side read on its own, so the relay self-terminates; we
-        // do not additionally watch `attach.exit_signal` here.
-        (attach.lease, s.control_socket(), s.subnet())
-    };
-
-    // A locally-administered tap name unique within the switch /16 (its low two
-    // octets distinguish every PTask address) and within the 15-char `IFNAMSIZ`
-    // limit (`mtapNNN_NNN` is at most 11 chars).
-    let o = lease.ip.octets();
-    let tap = format!("mtap{}_{}", o[2], o[3]);
-
-    // On any failure after the switch attach succeeded, roll the attach back so
-    // gvproxy's refcount stays accurate (a leaked count would keep it running).
-    let relay = match async {
-        let tap_fd = open_tap(&tap)?;
-        move_tap_into_netns(&tap, netns_pid, lease, subnet).await?;
-        attach_to_switch(tap_fd, &sock).await
-    }
-    .await
-    {
-        Ok(relay) => relay,
-        Err(e) => {
-            let _ = switch.lock().await.detach().await;
-            return Err(e);
-        }
-    };
-
-    // R2.3/R2.4-static: with the PTask attached, apply its static ingress
-    // forwards on the switch control socket, retaining handles to remove on
-    // exit. A failure here rolls the whole attach back (drop the relay, then
-    // detach) so a half-configured PTask is never left running.
-    let exposed = match ingress {
-        Some(ingress) if !ingress.port_mappings.is_empty() => {
-            match crate::net::policy::apply_ingress(&sock, lease.ip, ingress).await {
-                Ok(exposed) => exposed,
-                Err(e) => {
-                    drop(relay);
-                    if let Err(det_err) = switch.lock().await.detach().await {
-                        tracing::warn!(
-                            error = %det_err,
-                            ingress_err = %e,
-                            "detaching OwnIp PTask from switch during ingress-apply rollback"
-                        );
-                    }
-                    return Err(e);
-                }
-            }
-        }
-        _ => Vec::new(),
-    };
-
-    Ok(OwnIpAttachment {
-        _relay: relay,
-        switch: std::sync::Arc::clone(switch),
-        control_sock: sock,
-        exposed,
-    })
-}
-
 #[cfg(not(test))]
 impl SessionLauncher for SandboxLauncher {
     type Process = SandboxProcess;
-    // The session env plus, for an `OwnIp` launch, the switch attachment held
-    // for the session lifetime (its `Drop` detaches the PTask from the switch).
-    type Guard = (crate::env::Env, Option<OwnIpAttachment>);
+    // The session env, kept alive for the session's lifetime (it owns the
+    // sandbox files backing the running process's rootfs). The own-IP switch
+    // attachment, when present, travels separately as `Launched::net_guard` and
+    // is torn down explicitly at session end.
+    type Guard = crate::env::Env;
 
     async fn launch(
         self,
@@ -779,11 +683,18 @@ impl SessionLauncher for SandboxLauncher {
         )
         .await?;
 
-        let mut container = env.container()?;
+        let mut container = env
+            .container()
+            .map_err(|e| io::Error::other(format!("container build: {e}")))?;
         container.set_session_leader();
 
-        let pty = Pty::open(sz)?;
-        let mut command = env.command(&container, "/bin/bash", ["--noprofile", "-l"])?;
+        let pty = Pty::open(sz).map_err(|e| io::Error::other(format!("pty open: {e}")))?;
+        // The `bash` package installs to `/usr/bin/bash` (--prefix=/usr) and the
+        // generic rootfs has no `/bin/bash`, so exec the absolute path that
+        // exists rather than `/bin/bash` (which fails with ENOENT).
+        let mut command = env
+            .command(&container, "/usr/bin/bash", ["--noprofile", "-l"])
+            .map_err(|e| io::Error::other(format!("build command: {e}")))?;
         command.stdin(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
         command.stdout(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
         let (master, slave) = pty.into_fds();
@@ -809,44 +720,54 @@ impl SessionLauncher for SandboxLauncher {
         // `Launched` is returned — but a future non-shell PTask that touches
         // the network before its first channel message could see transient
         // `ENETUNREACH` until the tap is in place.
-        let own_ip = if matches!(self.network_mode, NetworkMode::OwnIp) {
-            match attach_own_ip(&self.net_switch, process.id(), ingress.as_ref()).await {
-                Ok(attachment) => Some(attachment),
-                Err(e) => {
-                    // The attach failed, so this launch is aborting. A
-                    // `hakoniwa::Child` does not terminate when dropped — it
-                    // would orphan the sandbox process (the same hazard the
-                    // `kill_on_drop(true)` calls in `exec.rs`/`net/mod.rs` guard
-                    // against) — so kill and reap it explicitly before
-                    // propagating the error.
-                    // `kill` and `wait` are independent: when `kill` fails with
-                    // `ESRCH` because the process already exited during the
-                    // attach window, the child still needs reaping, so `wait`
-                    // must run regardless of `kill`'s result (the standard
-                    // `SIGKILL`-then-`waitpid` idiom).
-                    if let Err(kill_err) = process.kill() {
-                        tracing::warn!(
-                            error = %kill_err,
-                            "killing sandbox process after OwnIp attach failure"
-                        );
+        let net_guard: Option<Box<dyn sandbox2::NetGuard>> =
+            if matches!(self.network_mode, NetworkMode::OwnIp) {
+                // The own-IP switch wiring now lives behind the sandbox2 `Network`
+                // abstraction (`GvproxyNetwork`), shared with the task path, rather
+                // than inline here. `sandbox2` created the empty namespace; this
+                // attaches the launched process's netns to the per-host switch.
+                let network = crate::net::gvproxy_network::GvproxyNetwork::new(
+                    std::sync::Arc::clone(&self.net_switch),
+                    ingress,
+                );
+                match network.attach(process.id()).await {
+                    Ok(guard) => Some(guard),
+                    Err(e) => {
+                        // The attach failed, so this launch is aborting. A
+                        // `hakoniwa::Child` does not terminate when dropped — it
+                        // would orphan the sandbox process (the same hazard the
+                        // `kill_on_drop(true)` calls in `exec.rs`/`net/mod.rs` guard
+                        // against) — so kill and reap it explicitly before
+                        // propagating the error.
+                        // `kill` and `wait` are independent: when `kill` fails with
+                        // `ESRCH` because the process already exited during the
+                        // attach window, the child still needs reaping, so `wait`
+                        // must run regardless of `kill`'s result (the standard
+                        // `SIGKILL`-then-`waitpid` idiom).
+                        if let Err(kill_err) = process.kill() {
+                            tracing::warn!(
+                                error = %kill_err,
+                                "killing sandbox process after OwnIp attach failure"
+                            );
+                        }
+                        if let Err(wait_err) = process.wait() {
+                            tracing::warn!(
+                                error = %wait_err,
+                                "reaping sandbox process after OwnIp attach failure"
+                            );
+                        }
+                        return Err(io::Error::other(e));
                     }
-                    if let Err(wait_err) = process.wait() {
-                        tracing::warn!(
-                            error = %wait_err,
-                            "reaping sandbox process after OwnIp attach failure"
-                        );
-                    }
-                    return Err(e);
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         Ok(Launched {
             master,
             process: SandboxProcess(process),
-            guard: (env, own_ip),
+            guard: env,
+            net_guard,
         })
     }
 }
@@ -918,6 +839,7 @@ impl SessionLauncher for MockLauncher {
             master,
             process: MockProcess(process),
             guard: (),
+            net_guard: None,
         })
     }
 }
@@ -963,6 +885,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             master,
             process,
             guard,
+            net_guard,
         } = launcher.launch(name, username, paths, sz).await?;
 
         let (sender, receiver) = mpsc::channel(8);
@@ -995,6 +918,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             remote_rx,
             stdout_buf: vec![0u8; 8 * 1024],
             stdin_buf: None,
+            net_guard,
             _guard: guard,
         };
 
@@ -1006,15 +930,33 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
     }
 
     pub async fn mainloop(mut self) -> Result<i32, std::io::Error> {
-        loop {
-            if let Some(exit_code) = self.process.try_wait()? {
-                return Ok(exit_code);
+        let result = loop {
+            match self.process.try_wait() {
+                Ok(Some(exit_code)) => {
+                    // `try_wait` already warns on a non-zero exit with the richer
+                    // hakoniwa diagnostics; keep this routine and unconditional.
+                    tracing::debug!(exit_code, "session process exited");
+                    break Ok(exit_code);
+                }
+                Ok(None) => {}
+                Err(e) => break Err(e),
             }
 
             if self.step().await.is_err() {
-                return self.process.wait();
+                let code = self.process.wait();
+                tracing::warn!(?code, "session process reaped after pty/step error");
+                break code;
             }
+        };
+
+        // Tear down the per-sandbox network attachment explicitly (own-IP switch
+        // detach + ingress removal) on this live runtime, before `_guard` drops
+        // the sandbox files. No-op for `HostNet`/`NoNet` and the mock launcher.
+        if let Some(net_guard) = self.net_guard.take() {
+            net_guard.teardown().await;
         }
+
+        result
     }
 
     /// Notifies the attached binding (if any) that the pty master has errored,

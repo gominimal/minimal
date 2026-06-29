@@ -18,8 +18,31 @@ use std::time::{Duration, Instant};
 use minvmd::lifecycle::Lifecycle;
 
 /// Default timeout in seconds to wait for the UDS when spawning minvmd (R4.5).
+///
+/// A cold VM boot (kernel bring-up + the in-VM minimald init: mount,
+/// pivot_root, networking) was observed at ~22–28s before the bridge socket
+/// accepts, and is slower under host load, so the default carries margin above
+/// minvmd's own READY wait. This is an upper bound — the spawn returns as soon
+/// as the UDS is ready — so it only costs time on a genuinely slow/failed boot.
+/// Override with [`SPAWN_TIMEOUT_ENV`].
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-const DEFAULT_SPAWN_TIMEOUT_SECS: u64 = 8;
+const DEFAULT_SPAWN_TIMEOUT_SECS: u64 = 75;
+
+/// Environment variable overriding [`DEFAULT_SPAWN_TIMEOUT_SECS`].
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const SPAWN_TIMEOUT_ENV: &str = "MINIMAL_SPAWN_TIMEOUT_SECS";
+
+/// The minvmd UDS-readiness wait, overridable via [`SPAWN_TIMEOUT_ENV`]. A
+/// non-numeric, empty, or zero value falls back to [`DEFAULT_SPAWN_TIMEOUT_SECS`]
+/// — a zero timeout would give the boot no readiness window.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn spawn_timeout_secs() -> u64 {
+    std::env::var(SPAWN_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .unwrap_or(DEFAULT_SPAWN_TIMEOUT_SECS)
+}
 
 /// Poll interval while waiting for a shutting-down minvmd to reach a terminal
 /// state before deciding whether to spawn.
@@ -105,15 +128,13 @@ pub fn ensure_minvmd_running() -> io::Result<()> {
     }
 
     // Not running; spawn minvmd run --detach with timeout (R4.5).
-    tracing::info!(
-        "spawning minvmd run --detach with timeout {}",
-        DEFAULT_SPAWN_TIMEOUT_SECS
-    );
+    let timeout_secs = spawn_timeout_secs();
+    tracing::info!("spawning minvmd run --detach with timeout {timeout_secs}");
     let output = Command::new("minvmd")
         .arg("run")
         .arg("--detach")
         .arg("--timeout")
-        .arg(DEFAULT_SPAWN_TIMEOUT_SECS.to_string())
+        .arg(timeout_secs.to_string())
         .output()
         .map_err(|e| io::Error::new(e.kind(), format!("failed to spawn minvmd: {}", e)))?;
 

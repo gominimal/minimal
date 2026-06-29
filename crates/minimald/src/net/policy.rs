@@ -21,13 +21,13 @@
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tokio_vsock::{VsockAddr, VsockStream};
 
 use sessions::{IngressPolicy, IpProto, PortMapping};
 
@@ -52,6 +52,23 @@ pub struct UnexposeRequest {
     pub local: String,
     /// The transport protocol the forward was exposed with.
     pub protocol: String,
+}
+
+/// How minimald reaches gvproxy's control socket to drive the forwarder API.
+///
+/// On DM2 the gvproxy `minimald` spawned is local, so the control socket is a
+/// unix path. On DM1/3/4 gvproxy runs on the host (`minvmd` owns it); the guest
+/// reaches the same `-listen` control socket over the per-host vsock shuttle
+/// (`minvmd` maps the shuttle port to it via `krun_add_vsock_port2`), so the
+/// forwarder verbs ride the same channel as the L2 `POST /connect` relay.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum ControlChannel {
+    /// Local unix control socket (DM2).
+    Unix(std::path::PathBuf),
+    /// Host gvproxy reached over vsock (DM1/3/4): `cid` = host (2), `port` = the
+    /// shuttle port `minvmd` bridged to the gvproxy control socket.
+    Vsock { cid: u32, port: u32 },
 }
 
 /// gvproxy's wire spelling of an [`IpProto`] in a forwarder request.
@@ -113,14 +130,14 @@ pub struct ExposedMapping {
 ///
 /// Returns the I/O error from the first failing `expose` call (after rollback).
 pub async fn apply_ingress(
-    control_sock: &Path,
+    control: &ControlChannel,
     ptask_ip: Ipv4Addr,
     ingress: &IngressPolicy,
 ) -> io::Result<Vec<ExposedMapping>> {
     let mut exposed: Vec<ExposedMapping> = Vec::with_capacity(ingress.port_mappings.len());
     for mapping in &ingress.port_mappings {
         let req = expose_request(mapping, ptask_ip);
-        match post_json(control_sock, "/services/forwarder/expose", &req).await {
+        match post_json(control, "/services/forwarder/expose", &req).await {
             Ok(()) => exposed.push(ExposedMapping {
                 local: req.local,
                 protocol: req.protocol,
@@ -128,7 +145,7 @@ pub async fn apply_ingress(
             Err(e) => {
                 // Roll back what we managed to expose so a half-applied policy
                 // does not leave dangling forwards on the shared switch.
-                remove_ingress(control_sock, &exposed).await;
+                remove_ingress(control, &exposed).await;
                 return Err(e);
             }
         }
@@ -140,13 +157,13 @@ pub async fn apply_ingress(
 /// teardown on PTask exit). Best-effort: a failed unexpose is logged and the
 /// rest still attempted, since teardown runs on the session-end path where there
 /// is no caller left to propagate to.
-pub async fn remove_ingress(control_sock: &Path, exposed: &[ExposedMapping]) {
+pub async fn remove_ingress(control: &ControlChannel, exposed: &[ExposedMapping]) {
     for mapping in exposed {
         let req = UnexposeRequest {
             local: mapping.local.clone(),
             protocol: mapping.protocol.clone(),
         };
-        if let Err(e) = post_json(control_sock, "/services/forwarder/unexpose", &req).await {
+        if let Err(e) = post_json(control, "/services/forwarder/unexpose", &req).await {
             tracing::warn!(
                 local = %mapping.local,
                 error = %e,
@@ -164,7 +181,11 @@ pub async fn remove_ingress(control_sock: &Path, exposed: &[ExposedMapping]) {
 /// here are ordinary request/response. HTTP/1.0 with `Connection: close` keeps
 /// the exchange to one write + read-to-EOF, with no need to parse chunked or
 /// keep-alive framing.
-async fn post_json<T: Serialize>(sock: &Path, path: &str, body: &T) -> io::Result<()> {
+pub(crate) async fn post_json<T: Serialize>(
+    control: &ControlChannel,
+    path: &str,
+    body: &T,
+) -> io::Result<()> {
     let body = serde_json::to_vec(body).map_err(io::Error::other)?;
     let mut request = Vec::with_capacity(128 + body.len());
     request.extend_from_slice(format!("POST {path} HTTP/1.0\r\n").as_bytes());
@@ -175,24 +196,19 @@ async fn post_json<T: Serialize>(sock: &Path, path: &str, body: &T) -> io::Resul
     request.extend_from_slice(&body);
 
     // Bound the whole exchange: a gvproxy that accepts the socket and then
-    // stalls must not hang the launch or teardown path indefinitely.
+    // stalls must not hang the launch or teardown path indefinitely. The control
+    // socket is local (DM2) or the host gvproxy over vsock (DM1/3/4); both speak
+    // the same HTTP/1.0 request/response on a fresh connection.
     let response = tokio::time::timeout(GVPROXY_CONTROL_TIMEOUT, async {
-        let mut stream = UnixStream::connect(sock).await?;
-        stream.write_all(&request).await?;
-        // Half-close the write side so an HTTP/1.0 server knows the request is
-        // complete and responds without waiting for more body bytes.
-        stream.shutdown().await?;
-
-        let mut response = Vec::with_capacity(256);
-        // Cap the buffered response: gvproxy's forwarder replies are tiny
-        // (`200 OK` with a minimal body), so a stream that keeps sending past
-        // this bound is misbehaving and must not be allowed to grow memory
-        // unbounded for the whole timeout window.
-        (&mut stream)
-            .take(MAX_CONTROL_RESPONSE)
-            .read_to_end(&mut response)
-            .await?;
-        Ok::<_, io::Error>(response)
+        match control {
+            ControlChannel::Unix(sock) => {
+                exchange(UnixStream::connect(sock).await?, &request).await
+            }
+            ControlChannel::Vsock { cid, port } => {
+                let stream = VsockStream::connect(VsockAddr::new(*cid, *port)).await?;
+                exchange(stream, &request).await
+            }
+        }
     })
     .await
     .map_err(|_| {
@@ -211,6 +227,28 @@ async fn post_json<T: Serialize>(sock: &Path, path: &str, body: &T) -> io::Resul
             String::from_utf8_lossy(body_after_headers(&response))
         )))
     }
+}
+
+/// Writes `request` to a freshly-connected control stream, half-closes the write
+/// side (so an HTTP/1.0 server responds without waiting for more body), and reads
+/// the (bounded) response. Transport-agnostic so the unix (DM2) and vsock
+/// (DM1/3/4) control channels share one exchange.
+async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    request: &[u8],
+) -> io::Result<Vec<u8>> {
+    stream.write_all(request).await?;
+    stream.shutdown().await?;
+
+    let mut response = Vec::with_capacity(256);
+    // Cap the buffered response: gvproxy's forwarder replies are tiny (`200 OK`
+    // with a minimal body), so a stream that keeps sending past this bound is
+    // misbehaving and must not be allowed to grow memory unbounded.
+    (&mut stream)
+        .take(MAX_CONTROL_RESPONSE)
+        .read_to_end(&mut response)
+        .await?;
+    Ok(response)
 }
 
 /// Parses the numeric status code from an HTTP response's status line

@@ -282,6 +282,7 @@ impl From<sandbox2::Error> for Error {
                 "internal: file {} mapped to rootfs",
                 p.display()
             )),
+            sandbox2::Error::Network(e) => Self::Other(anyhow::anyhow!(e.to_string())),
         }
     }
 }

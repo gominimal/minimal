@@ -24,6 +24,7 @@ members = [
     "crates/sandbox2",
     "crates/sessions",
     "crates/stdlib",
+    "crates/switch",
 ]
 resolver = "3"
 
@@ -159,5 +160,6 @@ remote-proto = { version = "0.0.1", path = "crates/remote-proto" }
 remote-client = { version = "0.0.1", path = "crates/remote-client" }
 sandbox2 = { version = "0.0.1", path = "crates/sandbox2" }
 sessions = { version = "0.0.1", path = "crates/sessions" }
+switch = { version = "0.0.1", path = "crates/switch" }
 
 stdlib = { version = "0.0.16", path = "crates/stdlib" }

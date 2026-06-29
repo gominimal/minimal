@@ -3522,6 +3522,7 @@ dependencies = [
  "serde_json",
  "sessions",
  "stdlib",
+ "switch",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -3570,6 +3571,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sessions",
+ "switch",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -5923,6 +5925,10 @@ name = "supports-unicode"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7401a30af6cb5818bb64852270bb722533397edcfc7344954a38f420819ece2"
+
+[[package]]
+name = "switch"
+version = "0.0.1"
 
 [[package]]
 name = "syn"

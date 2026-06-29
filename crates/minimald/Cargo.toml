@@ -57,6 +57,7 @@ ot.workspace = true
 paths.workspace = true
 sandbox2.workspace = true
 sessions.workspace = true
+switch.workspace = true
 stdlib.workspace = true
 
 rcgen = { workspace = true, optional = true }

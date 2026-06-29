@@ -66,7 +66,6 @@ enum SessionMessage {
     GetHostAttrs(oneshot::Sender<Option<HostAttrs>>),
     RefreshRecord(Record),
     Destroy(oneshot::Sender<()>),
-    #[cfg(test)]
     GetRecord(oneshot::Sender<Record>),
 }
 
@@ -86,7 +85,7 @@ pub struct Session<S: SessionObject> {
     /// (`cfg(not(test))`); the `cfg(test)` mock launcher ignores it, so the
     /// unused-field lint is silenced under test rather than threaded through.
     #[cfg_attr(test, allow(dead_code))]
-    net_switch: Arc<Mutex<crate::net::GvproxySwitch>>,
+    net_switch: Arc<Mutex<crate::net::SwitchClient>>,
 
     /// The running host, if minted, paired with the `JoinHandle` of its runtime
     /// loop so teardown can be awaited on destroy.
@@ -108,7 +107,7 @@ impl<S: SessionObject> Session<S> {
         minimal_state_dir: DaemonAbsPath,
         minimal_cache_dir: DaemonAbsPath,
         session: S,
-        net_switch: Arc<Mutex<crate::net::GvproxySwitch>>,
+        net_switch: Arc<Mutex<crate::net::SwitchClient>>,
     ) -> Result<SessionHandle, std::io::Error> {
         std::fs::create_dir_all(session.workspace_path())?;
         std::fs::create_dir_all(session.home_path())?;
@@ -171,7 +170,6 @@ impl<S: SessionObject> Session<S> {
                 let _ = r.send(());
                 return ControlFlow::Break(());
             }
-            #[cfg(test)]
             SessionMessage::GetRecord(r) => {
                 let _ = r.send(self.session.record().clone());
             }
@@ -318,7 +316,7 @@ impl<S: SessionObject> Session<S> {
 
     fn context(&mut self) -> Result<mctx::Context, String> {
         let wsp = self.session.workspace_path();
-        match ConfigBuilder::new()
+        let config = ConfigBuilder::new()
             .with_repo_dir(wsp.as_utf8_path())
             .with_cache_dir(self.minimal_cache_dir.as_utf8_path())
             .with_state_dir(self.minimal_state_dir.as_utf8_path())
@@ -328,10 +326,37 @@ impl<S: SessionObject> Session<S> {
             // surface on the same tracker even though only a mint renders it.
             .with_operation_tracker(self.tracker.clone())
             .build()
-        {
-            Err(e) => Err(mctx::Error::from(e).to_string()),
-            Ok(c) => mctx::Context::new(c).map_err(|e| e.to_string()),
+            .map_err(|e| mctx::Error::from(e).to_string())?;
+
+        // TEMPORARY (remove with the workspace-upload gap): an empty session
+        // workspace has no minimal.toml, which would make Context::new fail.
+        // Scaffold a default shell one (pinned to the latest gominimal/pkgs
+        // @main commit) so the session can launch. Once sessions receive their
+        // project files this fabrication — and `mctx::scaffold` — goes away.
+        //
+        // The scaffold does a blocking network git clone, and this runs inside
+        // the async session-actor task. On the daemon's multi-thread runtime
+        // (see main.rs) fence it with `block_in_place` so other futures move off
+        // this worker for its duration. `block_in_place` *panics* on a
+        // current-thread runtime (e.g. a `#[tokio::test]` with no explicit
+        // flavor) or with no runtime at all, so fall back to a plain blocking
+        // call there — a brief stall, acceptable for this temporary,
+        // once-per-empty-workspace scaffold.
+        if !wsp.as_utf8_path().join(mfile::MFILE_NAME).exists() {
+            let scaffold = || mctx::scaffold_default_mfile(&config, wsp.as_utf8_path());
+            let on_multi_thread = matches!(
+                tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
+                Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+            );
+            if on_multi_thread {
+                tokio::task::block_in_place(scaffold)
+            } else {
+                scaffold()
+            }
+            .map_err(|e| e.to_string())?;
         }
+
+        mctx::Context::new(config).map_err(|e| e.to_string())
     }
     fn paths(&self) -> SessionPaths {
         SessionPaths {
@@ -370,11 +395,9 @@ impl SessionHandle {
         recv.await.expect("corresponding session is dead")
     }
 
-    /// Returns the session record currently held by the live session actor.
-    ///
-    /// This reads the actor's in-memory copy, not the on-disk record, so
-    /// tests can assert that updates have propagated into the running session.
-    #[cfg(test)]
+    /// Returns the session record currently held by the live session actor
+    /// (the in-memory copy, not the on-disk record). Used by the task-exec path
+    /// to read the session's network mode, and by tests to assert propagation.
     pub(crate) async fn record(&self) -> Record {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
@@ -418,7 +441,15 @@ impl SessionHandle {
                 config,
             ))
             .await;
-        recv.await.expect("corresponding session is dead")
+        // A dead session actor (it panicked or was dropped mid-attach) drops the
+        // reply sender. Surface that as an attach error rather than panicking the
+        // daemon worker — the SSH layer reports it to the client and closes.
+        match recv.await {
+            Ok(result) => result,
+            Err(_) => Err(AttachError::SpawnFailed(std::io::Error::other(
+                "session actor terminated before the attach completed",
+            ))),
+        }
     }
 }
 

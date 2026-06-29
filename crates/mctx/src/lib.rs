@@ -29,6 +29,11 @@ pub use sandbox2::config::Invocation;
 mod mfile_search_strategy;
 pub use mfile_search_strategy::MFileSearchStrategy;
 
+// TEMPORARY: default-`minimal.toml` scaffolding for empty session workspaces.
+// See `scaffold.rs`; remove with the workspace-upload gap.
+mod scaffold;
+pub use scaffold::scaffold_default_mfile;
+
 pub use env::Env;
 use tokio::sync::Semaphore;
 use toml_edit::{Array, DocumentMut, Item, TableLike, Value};
@@ -627,6 +632,9 @@ impl Context {
 
     /// Constructs an environment from which executions can be run, based on the given parameters.
     #[allow(clippy::too_many_arguments)]
+    /// Builds an [`env::Env`] with the default `HostNet` sandbox network. Use
+    /// [`make_env_with_network`](Self::make_env_with_network) to run the sandbox
+    /// in another [`sandbox2::NetworkMode`] (e.g. a `NoNet`/`OwnIp` PTask).
     pub async fn make_env<'a, S: PackageSelection>(
         &'a mut self,
         name: &'a str,
@@ -636,6 +644,35 @@ impl Context {
         patches: Option<&'a EnvPatches>,
         env_vars: Option<&'a HashMap<String, EnvVarValue>>,
         packages: S,
+    ) -> Result<env::Env<'a>, Error> {
+        self.make_env_with_network(
+            name,
+            graph,
+            wd,
+            state_key,
+            patches,
+            env_vars,
+            packages,
+            sandbox2::NetworkMode::HostNet,
+        )
+        .await
+    }
+
+    /// Like [`make_env`](Self::make_env) but runs the sandbox in the given
+    /// [`sandbox2::NetworkMode`], so callers (e.g. the minimald task-exec path)
+    /// can give a task the same network isolation as its session rather than
+    /// always `HostNet`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn make_env_with_network<'a, S: PackageSelection>(
+        &'a mut self,
+        name: &'a str,
+        graph: &'a mut Graph,
+        wd: Option<PathBuf>,
+        state_key: Option<&String>,
+        patches: Option<&'a EnvPatches>,
+        env_vars: Option<&'a HashMap<String, EnvVarValue>>,
+        packages: S,
+        network_mode: sandbox2::NetworkMode,
     ) -> Result<env::Env<'a>, Error> {
         let mfile = self.minimal_file();
 
@@ -708,7 +745,7 @@ impl Context {
                 patches,
                 env_vars,
                 hostname: Some(name.to_string()),
-                override_network_mode: Some(sandbox2::NetworkMode::HostNet),
+                override_network_mode: Some(network_mode),
                 ot: self.config.ot.clone(),
             },
         )

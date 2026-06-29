@@ -26,9 +26,17 @@ use tokio::net::{TcpListener, TcpStream};
 
 use super::dns::HostnameRegistry;
 
+/// Port the B5 host-side egress/DNS proxy listens on (TC3). Clients reach it
+/// via `HTTP(S)_PROXY`.
+pub const EGRESS_PROXY_PORT: u16 = 7654;
+
+/// Port the B8 mTLS reverse proxy listens on (TC7).
+pub const HTTPS_PROXY_PORT: u16 = 7655;
+
 /// Default address the egress proxy listens on: loopback, where every
 /// `*.min.internal` name is reachable. Clients reach it via `HTTP(S)_PROXY`.
-pub const DEFAULT_PROXY_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7654);
+pub const DEFAULT_PROXY_ADDR: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), EGRESS_PROXY_PORT);
 
 /// Upstream port used when a routed authority carries no explicit `:port`.
 const DEFAULT_UPSTREAM_PORT: u16 = 80;
@@ -58,6 +66,23 @@ pub trait HostRoute: Send + Sync + 'static {
 impl HostRoute for HostnameRegistry {
     fn resolve_host(&self, host: &str) -> Option<IpAddr> {
         self.resolve(host)
+    }
+}
+
+// The daemon shares its live registry behind an `RwLock` (the sessions manager
+// mutates it under `&mut self`; the proxy only reads it, synchronously, with no
+// `.await` held). This lets `Router::new(Arc<RwLock<HostnameRegistry>>)` route
+// against the same table the manager registers PTasks into.
+impl HostRoute for std::sync::RwLock<HostnameRegistry> {
+    fn resolve_host(&self, host: &str) -> Option<IpAddr> {
+        // Recover from a poisoned lock rather than mapping it to `None`: the
+        // registry is two HashMaps with no cross-field invariant a panicked
+        // writer could half-break, and silently returning `None` would make
+        // every `*.min.internal` request 502 forever with no signal.
+        match self.read() {
+            Ok(guard) => guard.resolve(host),
+            Err(poisoned) => poisoned.into_inner().resolve(host),
+        }
     }
 }
 
@@ -597,20 +622,6 @@ mod tests {
         }
     }
 
-    /// A registry behind an `RwLock` so a test can mutate it while the proxy
-    /// serves. The proxy only ever reads it (synchronously, no `.await` held),
-    /// so a plain `RwLock` is the right shared-read primitive.
-    struct Shared(RwLock<HostnameRegistry>);
-
-    impl HostRoute for Shared {
-        fn resolve_host(&self, host: &str) -> Option<IpAddr> {
-            self.0
-                .read()
-                .expect("registry lock is never held across a panic")
-                .resolve(host)
-        }
-    }
-
     /// Spawns a one-shot loopback backend that answers every connection with a
     /// fixed `200 OK` and closes, returning the port it listens on.
     async fn spawn_backend() -> u16 {
@@ -653,9 +664,8 @@ mod tests {
 
         // `myservice.dev.min.internal` → 127.0.0.1 (HostNet, R3.6); the client's
         // `:port` selects the upstream port, so it reaches the backend.
-        let shared = Arc::new(Shared(RwLock::new(HostnameRegistry::new("dev"))));
+        let shared = Arc::new(RwLock::new(HostnameRegistry::new("dev")));
         shared
-            .0
             .write()
             .unwrap()
             .register_host_net(SessionId::nil(), "myservice");
@@ -674,7 +684,7 @@ mod tests {
 
         // After the session exits the route is withdrawn: the proxy no longer
         // forwards the hostname.
-        shared.0.write().unwrap().deregister("myservice");
+        shared.write().unwrap().deregister("myservice");
         let not_found = proxy_get(proxy_addr, &authority).await;
         assert!(
             not_found.contains("502 Bad Gateway"),

@@ -21,6 +21,8 @@ tracing-subscriber.workspace = true
 # VM network mode and VM-wide egress policy (minimald itself is Linux-only and
 # cannot be imported here, but the wire-types crate is portable).
 minimald-rpc.workspace = true
+# Shared gvproxy-switch primitives (subnet/MAC/`-config` rendering) used by `net`.
+switch.workspace = true
 # Async gvproxy switch supervision in `net`: the background exit-detection task
 # and the async `stop()` teardown run on the tokio runtime the networking layer
 # mandates (no blocking I/O in async context).

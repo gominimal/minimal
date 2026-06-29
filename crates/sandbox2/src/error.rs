@@ -7,6 +7,9 @@ pub enum Error {
     IO(&'static str, PathBuf, std::io::Error),
     HardlinkFailed(common::HardlinkError),
     MappedFile(PathBuf),
+    /// Post-spawn network wiring ([`Network::attach`](crate::Network::attach))
+    /// failed (e.g. an own-IP switch attach).
+    Network(crate::network::NetworkError),
 }
 
 impl fmt::Display for Error {
@@ -25,6 +28,7 @@ impl fmt::Display for Error {
                     path.display()
                 )
             }
+            Self::Network(e) => write!(f, "{}", e),
         }
     }
 }
@@ -37,6 +41,7 @@ impl std::error::Error for Error {
             Self::HardlinkFailed(e) => e.source(),
             Self::IO(_, _, err) => Some(err),
             Self::MappedFile(_) => None,
+            Self::Network(e) => Some(e),
         }
     }
 }

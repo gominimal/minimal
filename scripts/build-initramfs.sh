@@ -6,11 +6,16 @@
 #
 # Uses `cross` (Docker) for the musl toolchain. Linux host with Docker.
 #
+# Set FEATURES to a comma-separated cargo feature list to compile the guest
+# minimald with extra features (e.g. FEATURES=networking-proxy,networking-wg for
+# the HTTPS reverse proxy and WireGuard mesh peer). Empty by default.
+#
 # Usage: scripts/build-initramfs.sh <dest-cpio> [rust-target]
 set -eu
 
 DEST="${1:?usage: build-initramfs.sh <dest-cpio> [rust-target]}"
 TARGET="${2:-aarch64-unknown-linux-musl}"
+FEATURES="${FEATURES:-}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -18,7 +23,11 @@ cd "$ROOT"
 command -v cross >/dev/null || cargo install cross --locked
 # The `initramfs` profile drops the release LTO + codegen-units=1 (which the
 # guest binary doesn't need) to compile much faster.
-cross build -p minimald --profile initramfs --target "$TARGET"
+if [ -n "$FEATURES" ]; then
+  cross build -p minimald --profile initramfs --target "$TARGET" --features "$FEATURES"
+else
+  cross build -p minimald --profile initramfs --target "$TARGET"
+fi
 BIN="$ROOT/target/$TARGET/initramfs/minimald"
 [ -x "$BIN" ] || { echo "minimald not built at $BIN" >&2; exit 1; }
 

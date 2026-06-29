@@ -199,6 +199,65 @@ fn run_foreground() -> Result<()> {
         .set_nonblocking(false)
         .context("setting listener to blocking")?;
 
+    // Spawn + supervise the host gvproxy switch before the VMM child boots, so
+    // its `-listen` switch socket exists when libkrun dials it for the guest
+    // shuttle. The guest's root netns (the daemon) attaches a primary tap for
+    // egress, and own-IP PTasks attach further taps; both
+    // are L2 clients on this one switch. The handle lives for the VM's lifetime
+    // and stops gvproxy on drop (after the VMM child exits below).
+    //
+    // Best-effort: when the gvproxy binary is absent (e.g. the boot/session e2e
+    // lanes that exercise only the vsock bridge) we warn and boot without
+    // egress rather than failing the VM — the daemon then has no network, the
+    // pre-existing behaviour.
+    let _gvproxy = match crate::image::resolve_gvproxy_path() {
+        binary if binary.exists() => {
+            let switch_sock =
+                crate::net::resolve_switch_sock().context("resolving switch socket")?;
+            crate::sock::prepare_socket_dir(&switch_sock).context("preparing switch socket dir")?;
+            crate::sock::remove_stale_socket(&switch_sock)
+                .context("removing stale switch socket")?;
+            match crate::net::HostGvproxy::spawn(binary, switch_sock) {
+                Ok(gvproxy) => {
+                    tracing::info!(pid = gvproxy.pid(), "host gvproxy switch up");
+                    Some(gvproxy)
+                }
+                // An own-IP VM cannot work without the switch: fail loudly. A
+                // non-own-IP boot tolerates it (same as a missing binary below).
+                Err(error) if crate::cmd::own_ip_requested() => {
+                    return Err(error).context("spawning host gvproxy switch");
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "failed to spawn host gvproxy switch; booting without \
+                         guest egress"
+                    );
+                    None
+                }
+            }
+        }
+        binary if crate::cmd::own_ip_requested() => {
+            // An own-IP VM cannot work without the switch: fail loudly rather
+            // than booting a session that silently has no network.
+            bail!(
+                "own-IP VM requested but the gvproxy binary was not found at {}; \
+                 set MINVMD_GVPROXY_BIN to the gvproxy binary",
+                binary.display()
+            );
+        }
+        binary => {
+            // Non-own-IP boots (e.g. the boot/session e2e lanes) tolerate a
+            // missing gvproxy: warn and boot without guest egress.
+            tracing::warn!(
+                path = %binary.display(),
+                "gvproxy binary not found; booting without guest egress \
+                 (set MINVMD_GVPROXY_BIN to enable networking)"
+            );
+            None
+        }
+    };
+
     let exe = std::env::current_exe().context("resolving current executable path")?;
     let mut child = std::process::Command::new(&exe)
         .arg("__krun-vmm")
@@ -239,8 +298,10 @@ fn run_foreground() -> Result<()> {
             .context("writing Starting state with vmm_pid")?;
     }
 
-    // Wait up to 5 s for the guest to write `READY\n` on the marker socket.
-    const READY_TIMEOUT: Duration = Duration::from_secs(5);
+    // Wait for the guest to write `READY\n` on the marker socket. The wait is
+    // env-configurable (`MINVMD_READY_TIMEOUT_SECS`): a cold multi-GiB VM can
+    // take ~20s+ to reach userspace, so a fixed 5s was too short.
+    let ready_timeout: Duration = crate::cmd::ready_timeout();
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let sock_clone = marker_sock_path.clone();
     std::thread::spawn(move || {
@@ -263,11 +324,13 @@ fn run_foreground() -> Result<()> {
         let _ = std::fs::remove_file(&sock_clone);
     });
 
-    let boot_result = match rx.recv_timeout(READY_TIMEOUT) {
+    let boot_result = match rx.recv_timeout(ready_timeout) {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(anyhow::anyhow!("boot failed: {e}")),
         Err(_) => Err(anyhow::anyhow!(
-            "boot timed out waiting for READY marker after 5 s"
+            "boot timed out waiting for READY marker after {} s (raise {} to wait longer)",
+            ready_timeout.as_secs(),
+            crate::cmd::READY_TIMEOUT_ENV,
         )),
     };
 

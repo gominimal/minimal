@@ -147,8 +147,25 @@ async fn task_producer(
             .task(graph, &exec.task)
             .map_err(|e| io::Error::other(e.to_string()))?
             .ok_or_else(|| io::Error::other(format!("No such task: {}", exec.task)))?;
+        // A task inherits its session's network isolation, through the same
+        // sandbox2 `Network` seam the interactive session uses, rather than the
+        // old hardcoded `HostNet` (which leaked host egress to a no-net
+        // session's tasks). `NoNet`/`HostNet` are fully handled by sandbox2's
+        // netns decision. `OwnIp` additionally needs the per-PTask tap/switch
+        // attach (as `attach_own_ip` does for sessions); wiring that into the
+        // task-exec producer/consumer is a follow-up (and is blocked by the
+        // guest rootfs lacking `ip`/`nsenter`), so an `OwnIp` session's task
+        // falls back to `HostNet` here instead of running in an empty,
+        // egress-less netns.
+        let network_mode = match session.record().await.network {
+            m @ (sandbox2::NetworkMode::HostNet | sandbox2::NetworkMode::NoNet) => m,
+            // OwnIp falls back to HostNet (the per-PTask tap/switch attach for the
+            // task producer is a follow-up); `NetworkMode` is #[non_exhaustive],
+            // so any future mode also takes the safe HostNet default.
+            _ => sandbox2::NetworkMode::HostNet,
+        };
         let mut env = ctx
-            .make_env(
+            .make_env_with_network(
                 &exec.task,
                 &mut graph,
                 None,
@@ -156,6 +173,7 @@ async fn task_producer(
                 Some(&task.patch),
                 Some(&task.vars),
                 task.packages.clone(),
+                network_mode,
             )
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;

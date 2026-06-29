@@ -43,6 +43,12 @@ pub struct Config {
     /// to [`DEFAULT_GVPROXY_BIN`] when unset.
     #[serde(default)]
     pub gvproxy_bin: Option<PathBuf>,
+    /// Whether this `minimald` runs inside a `minvmd` libkrun VM (DM1/3/4). When
+    /// `true`, `OwnIp` PTasks attach to the **host** gvproxy (owned by `minvmd`)
+    /// over a vsock shuttle instead of spawning gvproxy in-guest.
+    /// `false` (DM2, native Linux) keeps the local-spawn + tap relay path.
+    #[serde(default)]
+    pub in_microvm: bool,
 }
 
 impl Config {
@@ -119,10 +125,24 @@ impl ServerState {
         // live under a dedicated subdir of the daemon state dir. The shared
         // `Arc` is the single source of truth, injected into every per-launch
         // `SandboxLauncher` through the sessions manager.
-        let net_switch = Arc::new(Mutex::new(crate::net::GvproxySwitch::new(
-            config.gvproxy_bin_path(),
-            minimal_state_dir.as_utf8_path().join("gvproxy"),
-        )));
+        // DM1/3/4 (in a libkrun VM): attach `OwnIp` PTasks to the host gvproxy
+        // (owned by `minvmd`) over a vsock shuttle. DM2 (native Linux): spawn +
+        // own gvproxy locally.
+        let transport = if config.in_microvm {
+            crate::net::SwitchTransport::HostShuttle {
+                cid: crate::net::VSOCK_HOST_CID,
+                port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+            }
+        } else {
+            crate::net::SwitchTransport::LocalSpawn
+        };
+        let net_switch = Arc::new(Mutex::new(
+            crate::net::SwitchClient::new(
+                config.gvproxy_bin_path(),
+                minimal_state_dir.as_utf8_path().join("gvproxy"),
+            )
+            .with_transport(transport),
+        ));
 
         // Generate the TLS CA once at daemon startup so the HTTPS proxy and the
         // IssueClientCert RPC share the same trust anchor for the lifetime of
@@ -276,7 +296,19 @@ impl Server {
     /// Launches minimald, accepting connections on the given listener and
     /// driving an SSH session over each until the listener errors.
     pub async fn run<L: Listener>(config: Config, listener: L) -> Result<(), std::io::Error> {
+        // `config` is moved into the state below; capture the deployment-model
+        // flag the proxy startup needs first.
+        #[cfg(target_os = "linux")]
+        let in_microvm = config.in_microvm;
         let state = ServerStateHandle::new(config).await?;
+
+        // Start minimald's two host-side proxies (B5 egress :7654, B8 mTLS
+        // :7655) for the server's lifetime and, in a microVM (DM1), publish them
+        // on the macOS host loopback. minimald is Linux-only, and the PTask
+        // hostname registry they route against only exists on Linux.
+        #[cfg(target_os = "linux")]
+        start_host_proxies(&state, in_microvm).await;
+
         let russh_config = build_russh_config(&state)
             .await
             .map_err(std::io::Error::other)?;
@@ -330,4 +362,113 @@ async fn build_russh_config(
         nodelay: true,
         ..Default::default()
     }))
+}
+
+/// Binds and serves minimald's two host-side proxies for the daemon's lifetime
+/// and, in a microVM (DM1), publishes them on the macOS host loopback.
+///
+/// Both proxies route by `Host:` header through the sessions manager's shared
+/// PTask hostname registry. In a microVM they bind the daemon's switch IP
+/// ([`DEFAULT_SUBNET`](crate::net::DEFAULT_SUBNET)`.daemon_ip()`) so the host
+/// gvproxy forward can reach them; on native Linux (DM2) they bind host loopback
+/// directly. A bind failure warns and is skipped — the daemon keeps serving. The
+/// serve loops run on detached tasks; this returns once the listeners are bound
+/// and (DM1) exposed.
+#[cfg(target_os = "linux")]
+async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
+    use crate::net::proxy::{self, Router};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let registry = state.sessions_manager().await.hostnames();
+    // DM1 (in-VM): bind 0.0.0.0 so the listener comes up regardless of whether
+    // eth0 has finished coming up, then publish the port on the host loopback via
+    // the gvproxy forwarder. DM2: bind host loopback directly, no host-expose.
+    let bind_base: IpAddr = if in_microvm {
+        Ipv4Addr::UNSPECIFIED.into()
+    } else {
+        Ipv4Addr::LOCALHOST.into()
+    };
+
+    // B5 egress/DNS proxy (:7654), always.
+    let egress_addr = SocketAddr::new(bind_base, proxy::EGRESS_PROXY_PORT);
+    if proxy::bind_listener(egress_addr)
+        .await
+        .map(|listener| {
+            let router = Router::new(registry.clone());
+            tokio::spawn(async move {
+                if let Err(error) = proxy::serve(listener, router).await {
+                    tracing::error!(%error, "egress proxy accept loop exited");
+                }
+            })
+        })
+        .is_some()
+        && in_microvm
+    {
+        // Only publish a port whose listener actually bound.
+        expose_proxy_on_host(
+            crate::net::DEFAULT_SUBNET.daemon_ip(),
+            proxy::EGRESS_PROXY_PORT,
+        )
+        .await;
+    }
+
+    // B8 mTLS reverse proxy (:7655), under the networking-proxy feature.
+    #[cfg(feature = "networking-proxy")]
+    {
+        let https_addr = SocketAddr::new(bind_base, proxy::HTTPS_PROXY_PORT);
+        match state.cert_authority().await.build_server_config() {
+            Ok(tls_config) => {
+                if proxy::bind_listener(https_addr)
+                    .await
+                    .map(|listener| {
+                        let router = Router::new(registry.clone());
+                        tokio::spawn(async move {
+                            if let Err(error) =
+                                proxy::serve_https(listener, router, tls_config).await
+                            {
+                                tracing::error!(%error, "mTLS proxy accept loop exited");
+                            }
+                        })
+                    })
+                    .is_some()
+                    && in_microvm
+                {
+                    expose_proxy_on_host(
+                        crate::net::DEFAULT_SUBNET.daemon_ip(),
+                        proxy::HTTPS_PROXY_PORT,
+                    )
+                    .await;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not build TLS config for the mTLS reverse proxy");
+            }
+        }
+    }
+}
+
+/// Publishes a guest-side proxy bound on `daemon_ip:port` onto the macOS host's
+/// loopback (`127.0.0.1:port`) via the host gvproxy forwarder, reached over the
+/// vsock shuttle (DM1). Best-effort: warns and returns on failure, since the
+/// host gvproxy may be absent.
+#[cfg(target_os = "linux")]
+async fn expose_proxy_on_host(daemon_ip: std::net::Ipv4Addr, port: u16) {
+    use crate::net::policy::{ControlChannel, ExposeRequest, post_json};
+
+    let control = ControlChannel::Vsock {
+        cid: crate::net::VSOCK_HOST_CID,
+        port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+    };
+    let request = ExposeRequest {
+        local: format!("127.0.0.1:{port}"),
+        remote: format!("{daemon_ip}:{port}"),
+        protocol: "tcp".to_string(),
+    };
+    if let Err(error) = post_json(&control, "/services/forwarder/expose", &request).await {
+        tracing::warn!(
+            %port,
+            %error,
+            "could not publish host-side proxy on the host loopback via gvproxy forwarder"
+        );
+    }
 }

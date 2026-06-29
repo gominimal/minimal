@@ -13,6 +13,8 @@
 pub mod config;
 use config::Config;
 pub use config::NetworkMode;
+pub mod network;
+pub use network::{AttachFuture, HostNet, NetGuard, Network, NetworkError, NoNet};
 use std::fs::{self, Permissions};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -496,7 +498,14 @@ impl<C: Channel> Sandbox<C> {
         // `NoNet`/`OwnIp` but this host cannot create a network namespace, we
         // fail closed rather than silently hand back full host networking, which
         // would void the isolation the mode promises (spec R1.2).
-        if isolates_network(self.config.network_mode) {
+        // A custom `Network` decides isolation; otherwise fall back to the
+        // built-in `network_mode` mapping. Phase-B wiring (own-IP tap/switch) is
+        // applied post-spawn via `attach_network`, never here.
+        let isolate = match self.config.network.as_deref() {
+            Some(net) => net.isolate_netns(),
+            None => isolates_network(self.config.network_mode),
+        };
+        if isolate {
             if network_namespaces_available() {
                 container.unshare(hakoniwa::Namespace::Network);
             } else {
@@ -764,6 +773,31 @@ impl<C: Channel> Sandbox<C> {
                 .spawn()
                 .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
 
+            // Apply the configured per-sandbox network to this invocation's
+            // freshly-unshared netns (own-IP switch attach). No-op for
+            // HostNet/NoNet and when no custom `Network` is set, so existing
+            // build/task consumers are unaffected — this is what lets tasks, not
+            // just minimald sessions, get networking through the abstraction.
+            // Torn down explicitly once the invocation completes (both arms).
+            // Borrow only the `Network` (which is `Send + Sync`) across the await,
+            // not the whole `Sandbox<C>`, so this doesn't impose `C: Sync` on the
+            // run future.
+            let net_guard = match self.config.network.as_deref() {
+                Some(net) => match net.attach(child.id()).await {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        // Attach failed after spawn: kill+reap the child so it
+                        // doesn't outlive its sandbox (a `hakoniwa::Child` does
+                        // not terminate on drop). `wait` runs regardless of
+                        // `kill` (the process may have already exited).
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(Error::Network(e));
+                    }
+                },
+                None => network::noop_guard(),
+            };
+
             // Take pipes from the child so threads can stream them into the stdout/stderr
             // files, as well as to the caller-provided writers if applicable.
             let child_stdout = child.stdout.take();
@@ -894,42 +928,55 @@ impl<C: Channel> Sandbox<C> {
                         self.stderr = f;
                     }
 
-                    // Reap the child process.
+                    // Reap the child process, then tear down its network.
                     let _ = child.wait();
+                    net_guard.teardown().await;
                     return Err(Error::Execution(ExecutionError::Cancelled));
                 }
                 (stdout_fwd_res, stderr_fwd_res) = async { tokio::join!(stdout_fwd, stderr_fwd) } => {
-                    // Collect results from the reader threads.
-                    let (stdout_file, stdout_tail) = stdout_thread
-                        .join()
-                        .expect("stdout reader thread panicked")?;
-                    let (stderr_file, stderr_tail) = stderr_thread
-                        .join()
-                        .expect("stderr reader thread panicked")?;
+                    // Compute the invocation outcome with a closure so every
+                    // failure path (reader-thread error, async writer error, wait
+                    // error, non-zero exit) funnels through one point; then tear
+                    // the network down unconditionally *before* propagating, so a
+                    // switch attachment is never leaked on an error return.
+                    let outcome: Result<(), Error> = (|| {
+                        let (stdout_file, stdout_tail) = stdout_thread
+                            .join()
+                            .expect("stdout reader thread panicked")?;
+                        let (stderr_file, stderr_tail) = stderr_thread
+                            .join()
+                            .expect("stderr reader thread panicked")?;
 
-                    self.stdout = stdout_file;
-                    self.stderr = stderr_file;
+                        self.stdout = stdout_file;
+                        self.stderr = stderr_file;
 
-                    // Propagate any async writer errors.
-                    stdout_fwd_res?;
-                    stderr_fwd_res?;
+                        // Propagate any async writer errors.
+                        stdout_fwd_res?;
+                        stderr_fwd_res?;
 
-                    // The pipes are drained, so the child should have exited.
-                    let status = child
-                        .wait()
-                        .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
+                        // The pipes are drained, so the child should have exited.
+                        let status = child
+                            .wait()
+                            .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
 
-                    if !status.success() {
-                        let stderr_str = String::from_utf8_lossy(&stderr_tail).into_owned();
-                        let stdout_str = String::from_utf8_lossy(&stdout_tail).into_owned();
-                        return Err(Error::Execution(ExecutionError::InvocationFailed {
-                            idx: i,
-                            code: status.code,
-                            reason: status.reason.clone(),
-                            stderr: stderr_str,
-                            stdout: stdout_str,
-                        }));
-                    }
+                        if !status.success() {
+                            let stderr_str = String::from_utf8_lossy(&stderr_tail).into_owned();
+                            let stdout_str = String::from_utf8_lossy(&stdout_tail).into_owned();
+                            return Err(Error::Execution(ExecutionError::InvocationFailed {
+                                idx: i,
+                                code: status.code,
+                                reason: status.reason.clone(),
+                                stderr: stderr_str,
+                                stdout: stdout_str,
+                            }));
+                        }
+                        Ok(())
+                    })();
+
+                    // The invocation's process has exited; tear down its network
+                    // before propagating any error.
+                    net_guard.teardown().await;
+                    outcome?;
                 }
             }
         }
