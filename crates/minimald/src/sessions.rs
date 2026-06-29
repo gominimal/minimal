@@ -464,6 +464,7 @@ mod tests {
             project_path: HostAbsPath::try_new("/proj").unwrap(),
             network: sessions::NetworkMode::default(),
             policy: Default::default(),
+            status: Default::default(),
             attrs: Default::default(),
         }
     }

@@ -476,6 +476,7 @@ mod tests {
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: Default::default(),
                     policy: Default::default(),
+                    status: Default::default(),
                     attrs: Default::default(),
                 },
             })

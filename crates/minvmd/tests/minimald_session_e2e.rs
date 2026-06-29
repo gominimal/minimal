@@ -233,6 +233,7 @@ async fn run_session_exec(
                     .map_err(|e| format!("project_path: {e}"))?,
                 network: sessions::NetworkMode::default(),
                 policy: Default::default(),
+                status: Default::default(),
                 attrs: Default::default(),
             },
         };

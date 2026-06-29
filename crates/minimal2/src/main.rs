@@ -474,6 +474,7 @@ async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), ()>
         project_path: abs_path,
         network: args.network.into(),
         policy,
+        status: Default::default(),
         attrs: Default::default(),
     };
 
