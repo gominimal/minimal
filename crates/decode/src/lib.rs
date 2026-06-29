@@ -34,7 +34,7 @@ pub use profiles::Profile;
 mod decl_tests;
 pub use decl_tests::Test;
 mod stacks;
-pub use stacks::{Stack, StackMatcher};
+pub use stacks::{PackageMatcherPredicate, Stack, StackMatcher};
 
 // Increment for any big change to the format of build specs / stacks, so that hash
 // keys get invalidated.

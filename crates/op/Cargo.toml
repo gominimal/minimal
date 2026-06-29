@@ -25,6 +25,7 @@ shlex.workspace = true
 size.workspace = true
 tar.workspace = true
 tempfile.workspace = true
+toml_edit.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
