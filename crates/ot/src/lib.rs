@@ -7,12 +7,12 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 #[cfg(feature = "indicatif")]
 mod indicatif_shim;
 #[cfg(feature = "indicatif")]
-pub use indicatif_shim::{IndicatifShim, StdoutWriter, render_to_stderr};
+pub use indicatif_shim::{IndicatifShim, StdoutWriter, render_operations_while, render_to_stderr};
 
 #[derive(Debug, Clone)]
 pub enum CheckKind {
@@ -65,26 +65,34 @@ pub struct Progress {
 ///
 /// Created once per root (see [`OpTracker::new_root`]) and cloned into each
 /// child so the whole tree shares one change counter and wakeup primitive.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct RootShared {
-    /// Bumped on every mutation anywhere in the tree. The source of truth a
-    /// driver polls to decide whether a repaint is due.
-    version: AtomicU64,
-    /// Wakeup for the tree's driver awaiting the next change. A tree has a
-    /// single consumer (one renderer per root), so `notify_one` is used: a
-    /// mutation that races ahead of the driver leaves a stored permit rather
-    /// than being lost, and `version` reconciles coalesced bumps.
-    notify: Notify,
+    /// Monotonic change counter, bumped on every mutation anywhere in the tree,
+    /// carried as the value of a [`watch`] channel. `watch` supports any number
+    /// of independent receivers (one per renderer/driver), each woken on change
+    /// and tracking its own last-seen version — so multiple drivers (e.g. a CLI
+    /// stderr renderer plus a logger, or two terminals attached to one daemon
+    /// session) can observe the same root without missed wakeups.
+    version: watch::Sender<u64>,
     /// Allocator for [`OpId`]s within this tree.
     next_id: AtomicU64,
 }
 
+impl Default for RootShared {
+    fn default() -> Self {
+        // The initial receiver is dropped; drivers obtain their own via
+        // `Sender::subscribe`, which works even with no live receivers.
+        Self {
+            version: watch::channel(0).0,
+            next_id: AtomicU64::new(0),
+        }
+    }
+}
+
 impl RootShared {
-    /// Records a mutation: bump the version and wake the driver (or leave a
-    /// permit if it is not currently parked).
+    /// Records a mutation: bump the version, waking every subscribed driver.
     fn bump(&self) {
-        self.version.fetch_add(1, Ordering::Relaxed);
-        self.notify.notify_one();
+        self.version.send_modify(|v| *v += 1);
     }
 
     /// Allocates the next unique [`OpId`] for this tree (root is `0`).
@@ -263,24 +271,20 @@ impl OpTracker {
     /// Returns the tree's current change version. Increases on every mutation
     /// anywhere in the tree; a driver polls this to decide whether to repaint.
     pub fn version(&self) -> u64 {
-        self.inner
-            .lock()
-            .unwrap()
-            .shared
-            .version
-            .load(Ordering::Relaxed)
+        *self.inner.lock().unwrap().shared.version.borrow()
     }
 
-    /// Awaits the next change anywhere in the tree.
+    /// Subscribes to changes anywhere in the tree, returning a [`watch`]
+    /// receiver carrying the change [`version`](Self::version).
     ///
-    /// [`version`](Self::version) is the source of truth; pair the two. The
-    /// tree assumes a single consumer (one renderer per root): a mutation that
-    /// races ahead of an un-parked driver leaves a stored permit, so the next
-    /// `changed()` returns immediately rather than missing the update. Drivers
-    /// render, read the version, `await changed()`, then re-check the version.
-    pub async fn changed(&self) {
-        let shared = self.inner.lock().unwrap().shared.clone();
-        shared.notify.notified().await;
+    /// Each driver owns its own receiver and tracks its own last-seen version,
+    /// so any number of drivers can observe the same root concurrently. The
+    /// typical loop renders, then `rx.changed().await` (which also returns
+    /// immediately if the version advanced since the last `borrow_and_update`),
+    /// then re-snapshots. `changed()` resolves to `Err` once the tree is
+    /// dropped, giving drivers a clean exit.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.inner.lock().unwrap().shared.version.subscribe()
     }
 }
 
@@ -550,15 +554,38 @@ mod tests {
     async fn changed_wakes_on_mutation() {
         let root = OpTracker::new_root();
         let child = root.new_child();
-        let waiter = root.clone();
-        // Register the wait, then mutate from another task; the notify must wake.
-        let h = tokio::spawn(async move { waiter.changed().await });
+        let mut rx = root.subscribe();
+        // Register the wait, then mutate from another task; the watch must wake.
+        let h = tokio::spawn(async move { rx.changed().await });
         // Yield so the spawned task reaches the await point before we notify.
         tokio::task::yield_now().await;
         child.set_op(Operation::PackageBuild { name: "x".into() });
         tokio::time::timeout(Duration::from_secs(1), h)
             .await
             .expect("changed() should wake within timeout")
-            .expect("waiter task should not panic");
+            .expect("waiter task should not panic")
+            .expect("watch sender should be alive");
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_watchers_both_wake_on_mutation() {
+        // The multi-consumer guarantee `watch` buys us over `notify_one`: a
+        // single mutation wakes *every* subscribed driver, not just one.
+        let root = OpTracker::new_root();
+        let child = root.new_child();
+        let mut rx1 = root.subscribe();
+        let mut rx2 = root.subscribe();
+        let h1 = tokio::spawn(async move { rx1.changed().await });
+        let h2 = tokio::spawn(async move { rx2.changed().await });
+        // Yield so both watchers are parked before the mutation lands.
+        tokio::task::yield_now().await;
+        child.set_op(Operation::PackageBuild { name: "x".into() });
+        for h in [h1, h2] {
+            tokio::time::timeout(Duration::from_secs(1), h)
+                .await
+                .expect("both watchers should wake within timeout")
+                .expect("watcher task should not panic")
+                .expect("watch sender should be alive");
+        }
     }
 }

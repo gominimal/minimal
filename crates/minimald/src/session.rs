@@ -1,8 +1,10 @@
+use crate::channel_progress::ChannelProgress;
 use crate::{
     ChannelConfig,
     session_host::{self, HostAttrs, WinSize},
 };
 use mctx::ConfigBuilder;
+use ot::OpTracker;
 use paths::DaemonAbsPath;
 use russh::{Channel, server::Msg};
 use sessions::{Record, store::SessionObject};
@@ -92,6 +94,12 @@ pub struct Session<S: SessionObject> {
         session_host::HostHandle,
         JoinHandle<Result<i32, std::io::Error>>,
     )>,
+
+    /// The root of this session's operation tree. Created once for the session
+    /// and wired into the context each launch builds against, so package
+    /// fetches/builds report into it; the channel renderer paints it onto the
+    /// SSH channel while a host is being minted.
+    tracker: OpTracker,
 }
 
 impl<S: SessionObject> Session<S> {
@@ -114,6 +122,7 @@ impl<S: SessionObject> Session<S> {
             minimal_state_dir,
             minimal_cache_dir,
             net_switch,
+            tracker: OpTracker::new_root(),
         };
 
         tokio::spawn(mngr.mainloop());
@@ -231,17 +240,34 @@ impl<S: SessionObject> Session<S> {
             }
         };
 
+        // The launcher's context reports into this session's operation tree (see
+        // `context`). Render that tree onto the channel for the duration of the
+        // launch (graph build + package builds + sandbox assembly), then take
+        // the channel back. The host is spawned without a channel so the
+        // renderer has exclusive use of it while building; once the bars are
+        // cleared we attach the channel to the now-running host.
         let launcher = self.session_launcher(session_hnd)?;
-        let h = Box::pin(session_host::Host::spawn(
-            launcher,
-            name,
-            conn_username,
-            self.paths(),
-            sz,
-            Some(channel),
-        ))
-        .await
-        .map_err(AttachError::SpawnFailed)?;
+        let progress = ChannelProgress::new(channel, self.tracker.clone(), (sz.cols, sz.rows));
+        let (channel, spawned) = progress
+            .run(Box::pin(session_host::Host::spawn(
+                launcher,
+                name,
+                conn_username,
+                self.paths(),
+                sz,
+                None,
+            )))
+            .await;
+        let h = spawned.map_err(AttachError::SpawnFailed)?;
+
+        // Wire the channel to the freshly launched host. A failure here means
+        // the host died in the window between launch and attach; surface it as
+        // a spawn failure rather than leaving a dead, channel-less host.
+        h.0.attach(channel, sz).await.map_err(|_| {
+            AttachError::SpawnFailed(std::io::Error::other(
+                "session host exited before its channel could attach",
+            ))
+        })?;
         self.host = Some(h);
         Ok(())
     }
@@ -296,6 +322,11 @@ impl<S: SessionObject> Session<S> {
             .with_repo_dir(wsp.as_utf8_path())
             .with_cache_dir(self.minimal_cache_dir.as_utf8_path())
             .with_state_dir(self.minimal_state_dir.as_utf8_path())
+            // Every context this session builds reports into its operation tree.
+            // The host-mint path renders that tree onto the SSH channel; the
+            // task-exec path (via `MakeContext`) also feeds it, so task builds
+            // surface on the same tracker even though only a mint renders it.
+            .with_operation_tracker(self.tracker.clone())
             .build()
         {
             Err(e) => Err(mctx::Error::from(e).to_string()),
