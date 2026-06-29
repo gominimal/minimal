@@ -359,10 +359,9 @@ pub struct CertAuthority {
     pub server_cert_der: rustls::pki_types::CertificateDer<'static>,
     /// Raw PKCS#8 bytes of the server's private key.
     server_key_bytes: Vec<u8>,
-    /// The rcgen CA certificate, kept for signing client certificates.
-    ca_cert: rcgen::Certificate,
-    /// The rcgen CA key pair, kept for signing client certificates.
-    ca_key: rcgen::KeyPair,
+    /// The CA issuer (parameters plus key pair), kept for signing server and
+    /// client certificates.
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
 }
 
 #[cfg(feature = "networking-proxy")]
@@ -397,11 +396,13 @@ impl CertAuthority {
         let ca_cert = ca_params.self_signed(&ca_key)?;
         let ca_cert_der = rustls::pki_types::CertificateDer::from(ca_cert.der().to_vec());
         let ca_cert_pem = ca_cert.pem();
+        // Retain the CA as an issuer so it can sign server and client certs.
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
 
         // Server certificate signed by the CA.
         let server_key = rcgen::KeyPair::generate()?;
         let server_params = rcgen::CertificateParams::new(vec!["localhost".to_string()])?;
-        let server_cert = server_params.signed_by(&server_key, &ca_cert, &ca_key)?;
+        let server_cert = server_params.signed_by(&server_key, &issuer)?;
         let server_cert_der = rustls::pki_types::CertificateDer::from(server_cert.der().to_vec());
         let server_key_bytes = server_key.serialize_der();
 
@@ -410,8 +411,7 @@ impl CertAuthority {
             ca_cert_pem,
             server_cert_der,
             server_key_bytes,
-            ca_cert,
-            ca_key,
+            issuer,
         })
     }
 
@@ -437,7 +437,7 @@ impl CertAuthority {
         client_dn.push(rcgen::DnType::CommonName, subject_cn);
         client_params.distinguished_name = client_dn;
         client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-        let client_cert = client_params.signed_by(&client_key, &self.ca_cert, &self.ca_key)?;
+        let client_cert = client_params.signed_by(&client_key, &self.issuer)?;
         Ok((client_cert.pem(), client_key.serialize_pem()))
     }
 
@@ -463,7 +463,7 @@ impl CertAuthority {
         client_dn.push(rcgen::DnType::CommonName, subject_cn);
         client_params.distinguished_name = client_dn;
         client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-        let client_cert = client_params.signed_by(&client_key, &self.ca_cert, &self.ca_key)?;
+        let client_cert = client_params.signed_by(&client_key, &self.issuer)?;
         let cert_der = rustls::pki_types::CertificateDer::from(client_cert.der().to_vec());
         let key_bytes = client_key.serialize_der();
         Ok((cert_der, key_bytes))
