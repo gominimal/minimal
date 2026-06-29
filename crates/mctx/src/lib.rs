@@ -34,6 +34,9 @@ pub use mfile_search_strategy::MFileSearchStrategy;
 mod scaffold;
 pub use scaffold::scaffold_default_mfile;
 
+mod project_setup;
+pub use project_setup::ProjectSetup;
+
 pub use env::Env;
 use tokio::sync::Semaphore;
 use toml_edit::{Array, DocumentMut, Item, TableLike, Value};
@@ -299,6 +302,18 @@ impl Context {
     /// to be used after the minimal file has been mutated.
     pub fn cloned_reinit(&self) -> Result<Self, Error> {
         Self::new(self.config.clone())
+    }
+
+    /// Builds a [`ProjectSetup`] from this context, for running project-setup
+    /// operations (e.g. [`op::UpdateProject`]) that refresh the `minimal.toml`.
+    pub fn project_setup(&self) -> ProjectSetup {
+        ProjectSetup::from_parts(
+            self.config.clone(),
+            self.vcs.clone(),
+            self.stdlib_dir.clone(),
+            self.mfile.clone(),
+            self.repo_dir().to_path_buf(),
+        )
     }
 
     /// Returns a handle to the local cache.

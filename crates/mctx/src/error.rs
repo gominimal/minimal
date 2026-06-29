@@ -217,6 +217,16 @@ impl From<graph::Error> for Error {
     }
 }
 
+impl From<op::Error> for Error {
+    fn from(value: op::Error) -> Self {
+        match value {
+            op::Error::IO(e) => Self::IO("op", PathBuf::new(), e),
+            op::Error::Plan(graph, e) => Self::Plan(Box::new((graph, e))),
+            other => Self::Other(anyhow::anyhow!("{}", other)),
+        }
+    }
+}
+
 impl From<super::ConfigError> for Error {
     fn from(value: super::ConfigError) -> Self {
         Error::Config(value)
