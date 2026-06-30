@@ -46,7 +46,7 @@ session path from #374.
 isolation over namespace isolation) is treated as an open question (see Open
 Questions below). For this spec, VM isolation on Linux requires manually
 running `minvmd run --detach` before using `minimal`; the auto-spawn path in
-`minimal2` stays a no-op on Linux. The full selection surface — per-session
+`minimal` stays a no-op on Linux. The full selection surface — per-session
 flag, loadout field, or policy — is deferred to a follow-up under #396.
 
 ## Introduction/Overview
@@ -262,7 +262,7 @@ establish the Linux/KVM baseline.
 
 ## Non-Goals
 
-- **Selection surface / auto-spawn on Linux.** `minimal2`'s
+- **Selection surface / auto-spawn on Linux.** `minimal`'s
   `ensure_minvmd_running()` on Linux remains a no-op in this spec. A user
   opts into VM isolation by running `minvmd run --detach` manually. The
   per-session flag, loadout field, or policy mechanism is deferred to a
@@ -314,7 +314,7 @@ runners provisioned via the infrastructure team use the configured path.
 models Linux as a coexistence scenario: `minimald` (direct namespace provider)
 and `minvmd` (VM provider) each expose their own UDS; `minimal` discovers both.
 This spec realizes the `minvmd` side of the Linux deployment diagram without
-changing the `minimal`/`minimal2` discovery logic.
+changing the `minimal`/`minimal` discovery logic.
 
 ## Repository Standards
 

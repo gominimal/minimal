@@ -3479,51 +3479,6 @@ dependencies = [
 
 [[package]]
 name = "minimal"
-version = "0.4.1"
-dependencies = [
- "anyhow",
- "args",
- "blake3",
- "check",
- "checkouts",
- "clap",
- "clap_complete",
- "codespan-reporting",
- "common",
- "decode",
- "dirs",
- "futures",
- "graph",
- "lcache",
- "mctx",
- "mfile",
- "nickel-lang-core",
- "op",
- "orchestrator",
- "ot",
- "petgraph",
- "rayon",
- "rcache",
- "remote-client",
- "serde",
- "serde_json",
- "serial_test",
- "smallvec",
- "tokio",
- "tokio-util",
- "toml_edit",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "minimal-lexical"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
-
-[[package]]
-name = "minimal2"
 version = "0.0.1"
 dependencies = [
  "camino",
@@ -3543,6 +3498,12 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "minimal-lexical"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "minimald"
@@ -3651,6 +3612,45 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mip"
+version = "0.4.1"
+dependencies = [
+ "anyhow",
+ "args",
+ "blake3",
+ "check",
+ "checkouts",
+ "clap",
+ "clap_complete",
+ "codespan-reporting",
+ "common",
+ "decode",
+ "dirs",
+ "futures",
+ "graph",
+ "lcache",
+ "mctx",
+ "mfile",
+ "nickel-lang-core",
+ "op",
+ "orchestrator",
+ "ot",
+ "petgraph",
+ "rayon",
+ "rcache",
+ "remote-client",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "smallvec",
+ "tokio",
+ "tokio-util",
+ "toml_edit",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

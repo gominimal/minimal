@@ -2,7 +2,7 @@
 # minimald Networking Epic (#478) — CLI test plan, executable form.
 #
 # RULE: never use `attach -c`. Every per-session networking assertion runs INSIDE
-# the sandbox via the full interactive session path (`minimal2 attach <sess>`),
+# the sandbox via the full interactive session path (`minimal attach <sess>`),
 # driven with a real PTY via expect. attach -c / the exec path runs on the daemon
 # host in the guest ROOT netns and bypasses the sandbox, so it cannot prove a
 # session's isolation or own-ip behaviour.
@@ -18,9 +18,9 @@
 # In-session tools: sh bash curl getent coreutils socat. NOT present: ip nc wget python.
 # Switch-IP discovery therefore uses /proc/net/fib_trie, not `ip`.
 set -u
-M="$PWD/target/debug/minimal2"
+M="$PWD/target/debug/minimal"
 ATTACH_TIMEOUT=180     # first attach builds the sandbox; be generous
-# mTLS client-cert dir written by `minimal2 login` (dirs crate): macOS uses
+# mTLS client-cert dir written by `minimal login` (dirs crate): macOS uses
 # Application Support, Linux/XDG uses ~/.config.
 case "$(uname -s)" in
   Darwin) CERT_DIR="$HOME/Library/Application Support/minimal" ;;

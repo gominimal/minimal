@@ -1,290 +1,303 @@
 name: CI
 
 on:
-  push:
-    branches: ["main"]
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
-      - "LICENSE"
-  pull_request:
-    branches: ["main"]
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
-      - "LICENSE"
-  workflow_dispatch:
+    push:
+        branches: ["main"]
+        paths-ignore:
+            - "**.md"
+            - "docs/**"
+            - "LICENSE"
+    pull_request:
+        branches: ["main"]
+        paths-ignore:
+            - "**.md"
+            - "docs/**"
+            - "LICENSE"
+    workflow_dispatch:
 
 env:
-  CARGO_TERM_COLOR: always
+    CARGO_TERM_COLOR: always
 
 # Cancel an in-progress run when a newer commit is pushed to the same ref.
 # main is excluded so release/promote on main never get cancelled mid-flight.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    group: ci-${{ github.ref }}
+    cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
-  contents: write
+    contents: write
 
 jobs:
-  fmt:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-      - name: Run rustfmt
-        run: cargo fmt --all -- --check
+    fmt:
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            - uses: actions/checkout@v6
+            - name: Run rustfmt
+              run: cargo fmt --all -- --check
 
-  clippy:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Free Disk Space
-        uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
-        with:
-          remove_android: true
-          remove_dotnet: true
-          remove_haskell: true
-          remove_tool_cache: true
-      - uses: actions/checkout@v6
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
-      - name: Run Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+    clippy:
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        steps:
+            - name: Free Disk Space
+              uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
+              with:
+                  remove_android: true
+                  remove_dotnet: true
+                  remove_haskell: true
+                  remove_tool_cache: true
+            - uses: actions/checkout@v6
+            - name: Install protoc
+              run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+            - name: Cache cargo registry and build artifacts
+              uses: Swatinem/rust-cache@v2
+            - name: Run Clippy
+              run: cargo clippy --workspace --all-targets -- -D warnings
 
-  test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    steps:
-      - name: Free Disk Space
-        uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
-        with:
-          remove_android: true
-          remove_dotnet: true
-          remove_haskell: true
-          remove_tool_cache: true
-      - uses: actions/checkout@v6
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
-      - name: Install nextest
-        uses: taiki-e/install-action@v2
-        with:
-          tool: nextest
-      - name: Check Cargo.lock is up-to-date
-        run: cargo fetch --locked
-      - name: Run tests
-        run: cargo nextest run --workspace
-      - name: Run HTTPS/mTLS proxy tests
-        # The mTLS reverse proxy is behind the non-default `networking-proxy`
-        # feature, so `--workspace` above does not compile or run its proofs
-        # (R4.5 mtls_missing_cert_returns_401_with_no_topology, UC2b
-        # mtls_valid_cert_routes_to_backend). Exercise them explicitly.
-        run: cargo nextest run -p minimald --features networking-proxy
-      - name: Run WireGuard mesh tests
-        # The WireGuard mesh peer is behind the non-default `networking-wg`
-        # feature, so `--workspace` above does not compile or run its proofs.
-        # Exercise them explicitly (R-WG: two_meshes_handshake_and_relay_a_packet,
-        # rpc get_mesh_status). The `#[ignore]` two-namespace mesh_uc7 proof runs
-        # in the netns lane.
-        run: cargo test -p minimald --features networking-wg
-      - name: Run doctests
-        run: cargo test --workspace --doc
+    test:
+        runs-on: ubuntu-latest
+        timeout-minutes: 40
+        steps:
+            - name: Free Disk Space
+              uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
+              with:
+                  remove_android: true
+                  remove_dotnet: true
+                  remove_haskell: true
+                  remove_tool_cache: true
+            - uses: actions/checkout@v6
+            - name: Install protoc
+              run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+            - name: Cache cargo registry and build artifacts
+              uses: Swatinem/rust-cache@v2
+            - name: Install nextest
+              uses: taiki-e/install-action@v2
+              with:
+                  tool: nextest
+            - name: Check Cargo.lock is up-to-date
+              run: cargo fetch --locked
+            - name: Run tests
+              run: cargo nextest run --workspace
+            - name: Run HTTPS/mTLS proxy tests
+              # The mTLS reverse proxy is behind the non-default `networking-proxy`
+              # feature, so `--workspace` above does not compile or run its proofs
+              # (R4.5 mtls_missing_cert_returns_401_with_no_topology, UC2b
+              # mtls_valid_cert_routes_to_backend). Exercise them explicitly.
+              run: cargo nextest run -p minimald --features networking-proxy
+            - name: Run WireGuard mesh tests
+              # The WireGuard mesh peer is behind the non-default `networking-wg`
+              # feature, so `--workspace` above does not compile or run its proofs.
+              # Exercise them explicitly (R-WG: two_meshes_handshake_and_relay_a_packet,
+              # rpc get_mesh_status). The `#[ignore]` two-namespace mesh_uc7 proof runs
+              # in the netns lane.
+              run: cargo test -p minimald --features networking-wg
+            - name: Run doctests
+              run: cargo test --workspace --doc
 
-  dogfood:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/setup-minimal
-      - name: Smoke-test `minimal run`
-        run: minimal run build-smoke
+    dogfood:
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        steps:
+            - uses: actions/checkout@v6
+            - uses: ./.github/actions/setup-minimal
+            - name: Smoke-test `minimal run`
+              run: minimal run build-smoke
 
-  build-release-amd64:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    steps:
-      - name: Free Disk Space
-        # Static release build of the full workspace; the cargo target dir
-        # is the largest in any of the linux jobs. `remove_tool_cache: true`
-        # is safe even without a `dtolnay/rust-toolchain` step — the
-        # pre-installed Rust toolchain on ubuntu-latest lives in
-        # `~/.rustup` + `~/.cargo`, not `/opt/hostedtoolcache`, so
-        # `rustup target add` below still resolves.
-        uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
-        with:
-          remove_android: true
-          remove_dotnet: true
-          remove_haskell: true
-          remove_tool_cache: true
-      - uses: actions/checkout@v6
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
-      - name: Add Rust target
-        run: rustup target add x86_64-unknown-linux-musl
-      - name: Configure musl linker
-        run: |
-          echo '' >> .cargo/config.toml
-          echo '[target.x86_64-unknown-linux-musl]' >> .cargo/config.toml
-          echo 'linker = "musl-gcc"' >> .cargo/config.toml
-      - uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-amd64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-amd64-cargo-release-
-      - name: Build static release binary
-        run: cargo build --release --package minimal --target x86_64-unknown-linux-musl
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: minimal-linux-amd64
-          path: target/x86_64-unknown-linux-musl/release/minimal
-          retention-days: 7
+    build-release-linux-amd64:
+        runs-on: ubuntu-latest
+        timeout-minutes: 45
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        steps:
+            - name: Free Disk Space
+              # Static release build of the full workspace; the cargo target dir
+              # is the largest in any of the linux jobs. `remove_tool_cache: true`
+              # is safe even without a `dtolnay/rust-toolchain` step — the
+              # pre-installed Rust toolchain on ubuntu-latest lives in
+              # `~/.rustup` + `~/.cargo`, not `/opt/hostedtoolcache`, so
+              # `rustup target add` below still resolves.
+              uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
+              with:
+                  remove_android: true
+                  remove_dotnet: true
+                  remove_haskell: true
+                  remove_tool_cache: true
+            - uses: actions/checkout@v6
+            - name: Install dependencies
+              run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
+            - name: Add Rust target
+              run: rustup target add x86_64-unknown-linux-musl
+            - name: Configure musl linker
+              run: |
+                  echo '' >> .cargo/config.toml
+                  echo '[target.x86_64-unknown-linux-musl]' >> .cargo/config.toml
+                  echo 'linker = "musl-gcc"' >> .cargo/config.toml
+            - uses: actions/cache@v5
+              with:
+                  path: |
+                      ~/.cargo/bin/
+                      ~/.cargo/registry/index/
+                      ~/.cargo/registry/cache/
+                      ~/.cargo/git/db/
+                      target/
+                  key: ${{ runner.os }}-amd64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+                  restore-keys: ${{ runner.os }}-amd64-cargo-release-
+            - name: Build static release binaries
+              run: |
+                  cargo build --release --target x86_64-unknown-linux-musl \
+                     --package mip \
+                     --package minimal \
+                     --package minimald
+            - name: Upload binary (mip)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: mip-linux-amd64
+                  path: target/x86_64-unknown-linux-musl/release/mip
+                  retention-days: 7
+            - name: Upload binary (minimal)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minimal-linux-amd64
+                  path: target/x86_64-unknown-linux-musl/release/minimal
+                  retention-days: 7
+            - name: Upload binary (minimald)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minimald-linux-amd64
+                  path: target/x86_64-unknown-linux-musl/release/minimald
+                  retention-days: 7
 
-  build-release-arm64:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    steps:
-      - uses: actions/checkout@v6
-      - name: Install cross
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
-      - uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-arm64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-arm64-cargo-release-
-      - name: Build static release binary
-        run: cross build --release --package minimal --target aarch64-unknown-linux-musl
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: minimal-linux-arm64
-          path: target/aarch64-unknown-linux-musl/release/minimal
-          retention-days: 7
+    build-release-linux-arm64:
+        runs-on: ubuntu-latest
+        timeout-minutes: 45
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        steps:
+            - uses: actions/checkout@v6
+            - name: Install cross
+              uses: taiki-e/install-action@v2
+              with:
+                  tool: cross
+            - uses: actions/cache@v5
+              with:
+                  path: |
+                      ~/.cargo/bin/
+                      ~/.cargo/registry/index/
+                      ~/.cargo/registry/cache/
+                      ~/.cargo/git/db/
+                      target/
+                  key: ${{ runner.os }}-arm64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+                  restore-keys: ${{ runner.os }}-arm64-cargo-release-
+            - name: Build static release binaries
+              run: |
+                  cross build --release \
+                     --package mip \
+                     --package minimal \
+                     --package minimald \
+                     --target aarch64-unknown-linux-musl
+            - name: Upload binary (mip)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: mip-linux-arm64
+                  path: target/aarch64-unknown-linux-musl/release/mip
+                  retention-days: 7
+            - name: Upload binary (minimal)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minimal-linux-arm64
+                  path: target/aarch64-unknown-linux-musl/release/minimal
+                  retention-days: 7
+            - name: Upload binary (minimald)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minimald-linux-arm64
+                  path: target/aarch64-unknown-linux-musl/release/minimald
+                  retention-days: 7
 
-  cargo-deny:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-      - uses: EmbarkStudios/cargo-deny-action@v2
+    cargo-deny:
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            - uses: actions/checkout@v6
+            - uses: EmbarkStudios/cargo-deny-action@v2
 
-  release:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    needs: [ci-success, build-release-amd64, build-release-arm64]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    permissions:
-      contents: write
-      id-token: write
-    steps:
-      - uses: actions/checkout@v6
-      - name: Download amd64 binary
-        uses: actions/download-artifact@v8
-        with:
-          name: minimal-linux-amd64
-          path: artifacts/amd64
-      - name: Download arm64 binary
-        uses: actions/download-artifact@v8
-        with:
-          name: minimal-linux-arm64
-          path: artifacts/arm64
-      - name: Generate release info
-        id: release_info
-        run: |
-          SHORT_SHA=$(git rev-parse --short HEAD)
-          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
-          echo "tag=release-$SHORT_SHA" >> $GITHUB_OUTPUT
-          echo "name=minimal-$SHORT_SHA" >> $GITHUB_OUTPUT
-      - name: Prepare release assets
-        run: |
-          cp artifacts/amd64/minimal minimal-linux-amd64
-          cp artifacts/arm64/minimal minimal-linux-arm64
-          cp artifacts/amd64/minimal minimal
-          chmod +x minimal-linux-* minimal
-      - name: Create Release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "${{ steps.release_info.outputs.tag }}" \
-            minimal \
-            minimal-linux-amd64 \
-            minimal-linux-arm64 \
-            --repo="${GITHUB_REPOSITORY}" \
-            --title="${{ steps.release_info.outputs.name }}"
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v3
-        with:
-          project_id: "289724348228"
-          workload_identity_provider: "projects/289724348228/locations/global/workloadIdentityPools/github/providers/gominimal"
-      - name: Generate completions
-        run: |
-          chmod +x artifacts/amd64/minimal
-          mkdir -p completions/{bash,zsh,fish}
-          artifacts/amd64/minimal completions bash > completions/bash/minimal 2>/dev/null || true
-          artifacts/amd64/minimal completions zsh > completions/zsh/_minimal 2>/dev/null || true
-          artifacts/amd64/minimal completions fish > completions/fish/minimal.fish 2>/dev/null || true
-      - name: Package and upload CLI archives to GCS
-        run: |
-          SHA=$(git rev-parse --short HEAD)
+    release:
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        needs:
+            [ci-success, build-release-linux-amd64, build-release-linux-arm64]
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        permissions:
+            contents: write
+            id-token: write
+        steps:
+            - uses: actions/checkout@v6
+            - name: Generate release info
+              id: release_info
+              run: |
+                  SHORT_SHA=$(git rev-parse --short=8 HEAD)
+                  echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+                  echo "tag=release-$SHORT_SHA" >> $GITHUB_OUTPUT
+                  echo "name=minimal-$SHORT_SHA" >> $GITHUB_OUTPUT
+            - name: Download artifacts
+              uses: actions/download-artifact@v8
+              with:
+                  pattern: "*-linux-*"
+                  path: artifacts/
+            - name: Make binaries executable
+              run: chmod +x artifacts/*-{linux,macos}-*
+            - name: Generate completions
+              run: |
+                  mkdir -p artifacts/completions/{bash,zsh,fish}
+                  artifacts/mip-linux-amd64 completions bash > artifacts/completions/bash/mip 2>/dev/null || true
+                  artifacts/mip-linux-amd64 completions zsh  > artifacts/completions/zsh/_mip 2>/dev/null || true
+                  artifacts/mip-linux-amd64 completions fish > artifacts/completions/fish/mip.fish 2>/dev/null || true
+                  artifacts/minimal-linux-amd64 completions bash > artifacts/completions/bash/minimal 2>/dev/null || true
+                  artifacts/minimal-linux-amd64 completions zsh  > artifacts/completions/zsh/_minimal 2>/dev/null || true
+                  artifacts/minimal-linux-amd64 completions fish > artifacts/completions/fish/minimal.fish 2>/dev/null || true
+                  artifacts/minimald-linux-amd64 completions bash > artifacts/completions/bash/minimald 2>/dev/null || true
+                  artifacts/minimald-linux-amd64 completions zsh  > artifacts/completions/zsh/_minimald 2>/dev/null || true
+                  artifacts/minimald-linux-amd64 completions fish > artifacts/completions/fish/minimald.fish 2>/dev/null || true
+            - name: Create Release
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  cd artifacts/
+                  gh release create "${{ steps.release_info.outputs.tag }}" \
+                    $(ls) \
+                    --repo="${GITHUB_REPOSITORY}" \
+                    --title="${{ steps.release_info.outputs.name }}"
+            - name: Authenticate to Google Cloud
+              uses: google-github-actions/auth@v3
+              with:
+                  project_id: "289724348228"
+                  workload_identity_provider: "projects/289724348228/locations/global/workloadIdentityPools/github/providers/gominimal"
+            - name: Package and upload archive to GCS
+              run: |
+                  SHA=$(git rev-parse --short=8 HEAD)
+                  tar --zstd -cf "minimalone-${SHA}.tar.zst" -C artifacts .
 
-          # amd64-linux
-          mkdir -p pkg-amd64/bin
-          cp artifacts/amd64/minimal pkg-amd64/bin/
-          chmod +x pkg-amd64/bin/minimal
-          cp -r completions pkg-amd64/
-          tar --zstd -cf "cli-amd64-linux-${SHA}.tar.zst" -C pkg-amd64 .
+                  gcloud storage cp \
+                    --cache-control="public, max-age=31536000, immutable" \
+                    "minimalone-${SHA}.tar.zst" gs://minimal-shim/archives/
 
-          # arm64-linux (completions are text, same for both arches)
-          mkdir -p pkg-arm64/bin
-          cp artifacts/arm64/minimal pkg-arm64/bin/
-          chmod +x pkg-arm64/bin/minimal
-          cp -r completions pkg-arm64/
-          tar --zstd -cf "cli-arm64-linux-${SHA}.tar.zst" -C pkg-arm64 .
+    minimal-check:
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            - uses: actions/checkout@v6
+            - uses: ./.github/actions/setup-minimal
+            - name: Check
+              run: minimal --no-fetch check
 
-          gcloud storage cp \
-            --cache-control="public, max-age=31536000, immutable" \
-            "cli-amd64-linux-${SHA}.tar.zst" gs://minimal-shim/archives/
-          gcloud storage cp \
-            --cache-control="public, max-age=31536000, immutable" \
-            "cli-arm64-linux-${SHA}.tar.zst" gs://minimal-shim/archives/
-
-  minimal-check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/setup-minimal
-      - name: Check
-        run: minimal --no-fetch check
-
-  # Single required status check for branch protection. Stays green only when
-  # every gating job below succeeds.
-  ci-success:
-    if: always()
-    needs: [fmt, clippy, test, dogfood, cargo-deny, minimal-check]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Verify all gating jobs succeeded
-        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
-        run: exit 1
-      - run: echo "All CI gates passed"
+    # Single required status check for branch protection. Stays green only when
+    # every gating job below succeeds.
+    ci-success:
+        if: always()
+        needs: [fmt, clippy, test, dogfood, cargo-deny, minimal-check]
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            - name: Verify all gating jobs succeeded
+              if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+              run: exit 1
+            - run: echo "All CI gates passed"

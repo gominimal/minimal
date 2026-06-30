@@ -38,15 +38,15 @@ cd "$ROOT"
 
 # Build the CLI from source (debug: this drives a cache fetch, so CLI CPU is not
 # the bottleneck). Incremental, so a second invocation in the same job is cheap.
-cargo build -p minimal
-MINIMAL="$ROOT/target/debug/minimal"
+cargo build -p mip
+MIP="$ROOT/target/debug/mip"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 # Materialize the libkrun OCI image (cache fetch keyed by the pinned commit).
 IMG="$WORK/libkrun-oci.tar"
-"$MINIMAL" materialize --output "$IMG" --arch "$ARCH" libkrun
+"$MIP" materialize --output "$IMG" --arch "$ARCH" libkrun
 
 # Unpack the OCI layout and replay its layers (in manifest order) into a rootfs.
 # The image is a standard OCI archive: index.json -> manifest blob -> gzipped

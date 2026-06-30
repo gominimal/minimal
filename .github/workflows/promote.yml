@@ -1,274 +1,229 @@
 name: promote-cli
 
 on:
-  workflow_dispatch:
-    inputs:
-      sha:
-        description: "Short SHA to promote (leave empty for latest in bucket)"
-        required: false
-        type: string
-      platforms:
-        description: "Comma-separated platform list or 'all'"
-        required: false
-        default: "amd64-linux,arm64-linux"
-        type: string
-      dry_run:
-        description: "Dry run — open issue + wait for approval but skip the GCS write"
-        required: false
-        type: boolean
-        default: false
+    workflow_dispatch:
+        inputs:
+            sha:
+                description: "Short SHA to promote (leave empty for latest in bucket)"
+                required: false
+                type: string
+            platforms:
+                description: "Comma-separated platform list or 'all'"
+                required: false
+                default: "amd64-linux,arm64-linux"
+                type: string
+            dry_run:
+                description: "Dry run — open issue + wait for approval but skip the GCS write"
+                required: false
+                type: boolean
+                default: false
 
 env:
-  # Single source of truth for the gate's approver allowlist.
-  # Comma-separated, no spaces (the polling step splits on `,`).
-  APPROVERS: bryan-minimal,evanspearman,jessie-minimal,jtnkminimal,Max-minimal,mitodrummer,msample,norrietaylor,twitchyliquid64
+    # Single source of truth for the gate's approver allowlist.
+    # Comma-separated, no spaces (the polling step splits on `,`).
+    APPROVERS: bryan-minimal,evanspearman,jessie-minimal,jtnkminimal,Max-minimal,mitodrummer,msample,norrietaylor,twitchyliquid64
 
 jobs:
-  gate:
-    runs-on: ubuntu-latest
-    permissions:
-      issues: write
-    # 6h matches the GitHub-hosted runner hard limit. A higher value is
-    # misleading — `ubuntu-latest` jobs are killed at 6h regardless.
-    timeout-minutes: 360
-    outputs:
-      issue_url: ${{ steps.issue.outputs.url }}
-    steps:
-      - name: Open approval issue
-        id: issue
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          WORKFLOW: ${{ github.workflow }}
-          RUN_NUMBER: ${{ github.run_number }}
-          # triggering_actor (NOT actor) — actor is frozen on rerun, so a rerun
-          # by a different user would still let the original initiator self-approve.
-          ACTOR: ${{ github.triggering_actor }}
-          SERVER_URL: ${{ github.server_url }}
-          RUN_ID: ${{ github.run_id }}
-          SHA_INPUT: ${{ inputs.sha }}
-          PLATFORMS_INPUT: ${{ inputs.platforms }}
-          DRY_RUN: ${{ inputs.dry_run }}
-        run: |
-          set -euo pipefail
-          BODY="**Repo:** \`${REPO}\`
-          **Workflow:** \`${WORKFLOW}\`
-          **Requested by:** @${ACTOR}
-          **Run:** ${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}
-          **SHA input:** \`${SHA_INPUT:-<latest>}\`
-          **Platforms:** \`${PLATFORMS_INPUT}\`
-          **Dry run:** \`${DRY_RUN}\`
+    gate:
+        runs-on: ubuntu-latest
+        permissions:
+            issues: write
+        # 6h matches the GitHub-hosted runner hard limit. A higher value is
+        # misleading — `ubuntu-latest` jobs are killed at 6h regardless.
+        timeout-minutes: 360
+        outputs:
+            issue_url: ${{ steps.issue.outputs.url }}
+        steps:
+            - name: Open approval issue
+              id: issue
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  REPO: ${{ github.repository }}
+                  WORKFLOW: ${{ github.workflow }}
+                  RUN_NUMBER: ${{ github.run_number }}
+                  # triggering_actor (NOT actor) — actor is frozen on rerun, so a rerun
+                  # by a different user would still let the original initiator self-approve.
+                  ACTOR: ${{ github.triggering_actor }}
+                  SERVER_URL: ${{ github.server_url }}
+                  RUN_ID: ${{ github.run_id }}
+                  SHA_INPUT: ${{ inputs.sha }}
+                  PLATFORMS_INPUT: ${{ inputs.platforms }}
+                  DRY_RUN: ${{ inputs.dry_run }}
+              run: |
+                  set -euo pipefail
+                  BODY="**Repo:** \`${REPO}\`
+                  **Workflow:** \`${WORKFLOW}\`
+                  **Requested by:** @${ACTOR}
+                  **Run:** ${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}
+                  **SHA input:** \`${SHA_INPUT:-<latest>}\`
+                  **Platforms:** \`${PLATFORMS_INPUT}\`
+                  **Dry run:** \`${DRY_RUN}\`
 
-          Comment **\`approved\`** to proceed or **\`denied\`** to cancel.
-          Closing this issue without an approval comment counts as denial.
+                  Comment **\`approved\`** to proceed or **\`denied\`** to cancel.
+                  Closing this issue without an approval comment counts as denial.
 
-          Approver list (initiator excluded at runtime):
-          ${APPROVERS//,/, }"
+                  Approver list (initiator excluded at runtime):
+                  ${APPROVERS//,/, }"
 
-          URL=$(gh issue create \
-            --repo "$REPO" \
-            --title "Promotion approval required: ${WORKFLOW} run ${RUN_NUMBER}" \
-            --label "promotion-approval" \
-            --body "$BODY")
-          NUM="${URL##*/}"
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
-          echo "number=$NUM" >> "$GITHUB_OUTPUT"
-          echo "Opened approval issue: $URL"
+                  URL=$(gh issue create \
+                    --repo "$REPO" \
+                    --title "Promotion approval required: ${WORKFLOW} run ${RUN_NUMBER}" \
+                    --label "promotion-approval" \
+                    --body "$BODY")
+                  NUM="${URL##*/}"
+                  echo "url=$URL" >> "$GITHUB_OUTPUT"
+                  echo "number=$NUM" >> "$GITHUB_OUTPUT"
+                  echo "Opened approval issue: $URL"
 
-      - name: Notify Slack — approval required
-        continue-on-error: true
-        timeout-minutes: 5
-        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
-        with:
-          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
-          webhook-type: incoming-webhook
-          payload: |
-            {
-              "text": "*Promotion approval required:* `${{ github.repository }}`\nRequested by: ${{ github.triggering_actor }}\nApprove here: ${{ steps.issue.outputs.url }}\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            }
+            - name: Notify Slack — approval required
+              continue-on-error: true
+              timeout-minutes: 5
+              uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+              with:
+                  webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+                  webhook-type: incoming-webhook
+                  payload: |
+                      {
+                        "text": "*Promotion approval required:* `${{ github.repository }}`\nRequested by: ${{ github.triggering_actor }}\nApprove here: ${{ steps.issue.outputs.url }}\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                      }
 
-      - name: Wait for approver decision
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
-          REPO: ${{ github.repository }}
-          # triggering_actor reflects the user who triggered THIS run (incl. reruns),
-          # so rerunning the workflow as a different user correctly excludes them.
-          INITIATOR: ${{ github.triggering_actor }}
-          POLL_INTERVAL: "30"
-        run: |
-          set -euo pipefail
+            - name: Wait for approver decision
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+                  REPO: ${{ github.repository }}
+                  # triggering_actor reflects the user who triggered THIS run (incl. reruns),
+                  # so rerunning the workflow as a different user correctly excludes them.
+                  INITIATOR: ${{ github.triggering_actor }}
+                  POLL_INTERVAL: "30"
+              run: |
+                  set -euo pipefail
 
-          INITIATOR_LC=$(printf '%s' "$INITIATOR" | tr '[:upper:]' '[:lower:]')
-          ALLOWED_JSON=$(printf '%s' "$APPROVERS" | tr ',' '\n' \
-            | tr '[:upper:]' '[:lower:]' \
-            | grep -vx "$INITIATOR_LC" \
-            | jq -R . | jq -s .)
+                  INITIATOR_LC=$(printf '%s' "$INITIATOR" | tr '[:upper:]' '[:lower:]')
+                  ALLOWED_JSON=$(printf '%s' "$APPROVERS" | tr ',' '\n' \
+                    | tr '[:upper:]' '[:lower:]' \
+                    | grep -vx "$INITIATOR_LC" \
+                    | jq -R . | jq -s .)
 
-          echo "Polling issue #${ISSUE_NUMBER}. Allowed approvers (initiator ${INITIATOR} excluded):"
-          echo "$ALLOWED_JSON" | jq -r '.[]'
+                  echo "Polling issue #${ISSUE_NUMBER}. Allowed approvers (initiator ${INITIATOR} excluded):"
+                  echo "$ALLOWED_JSON" | jq -r '.[]'
 
-          while true; do
-            STATE=$(gh api "repos/${REPO}/issues/${ISSUE_NUMBER}" --jq '.state')
+                  while true; do
+                    STATE=$(gh api "repos/${REPO}/issues/${ISSUE_NUMBER}" --jq '.state')
 
-            DECISION=$(gh api --paginate "repos/${REPO}/issues/${ISSUE_NUMBER}/comments?per_page=100" \
-              | jq -s 'add // []' \
-              | jq -c --argjson allowed "$ALLOWED_JSON" '
-                  map(select(.user.login | ascii_downcase as $u | $allowed | index($u)))
-                  | sort_by(.created_at)
-                  | map(
-                      (.body | ascii_downcase | gsub("[[:space:]]"; "")) as $b
-                      | if   ($b | test("^(approved|approve|lgtm)$"))      then {decision: "approved", user: .user.login}
-                        elif ($b | test("^(denied|deny|reject|rejected)$")) then {decision: "denied",   user: .user.login}
-                        else empty end
-                    )
-                  | first // empty')
+                    DECISION=$(gh api --paginate "repos/${REPO}/issues/${ISSUE_NUMBER}/comments?per_page=100" \
+                      | jq -s 'add // []' \
+                      | jq -c --argjson allowed "$ALLOWED_JSON" '
+                          map(select(.user.login | ascii_downcase as $u | $allowed | index($u)))
+                          | sort_by(.created_at)
+                          | map(
+                              (.body | ascii_downcase | gsub("[[:space:]]"; "")) as $b
+                              | if   ($b | test("^(approved|approve|lgtm)$"))      then {decision: "approved", user: .user.login}
+                                elif ($b | test("^(denied|deny|reject|rejected)$")) then {decision: "denied",   user: .user.login}
+                                else empty end
+                            )
+                          | first // empty')
 
-            if [ -n "$DECISION" ] && [ "$DECISION" != "null" ]; then
-              DEC=$(echo "$DECISION" | jq -r '.decision')
-              USR=$(echo "$DECISION" | jq -r '.user')
-              if [ "$DEC" = "approved" ]; then
-                echo "Approved by @${USR}."
-                gh issue close "$ISSUE_NUMBER" --repo "$REPO" --comment "Approved by @${USR}. Proceeding." || true
-                exit 0
-              else
-                echo "Denied by @${USR}."
-                gh issue close "$ISSUE_NUMBER" --repo "$REPO" --comment "Denied by @${USR}. Cancelling promotion." || true
-                exit 1
-              fi
-            fi
+                    if [ -n "$DECISION" ] && [ "$DECISION" != "null" ]; then
+                      DEC=$(echo "$DECISION" | jq -r '.decision')
+                      USR=$(echo "$DECISION" | jq -r '.user')
+                      if [ "$DEC" = "approved" ]; then
+                        echo "Approved by @${USR}."
+                        gh issue close "$ISSUE_NUMBER" --repo "$REPO" --comment "Approved by @${USR}. Proceeding." || true
+                        exit 0
+                      else
+                        echo "Denied by @${USR}."
+                        gh issue close "$ISSUE_NUMBER" --repo "$REPO" --comment "Denied by @${USR}. Cancelling promotion." || true
+                        exit 1
+                      fi
+                    fi
 
-            if [ "$STATE" = "closed" ]; then
-              echo "Issue closed without an approval comment — treating as denial."
-              exit 1
-            fi
+                    if [ "$STATE" = "closed" ]; then
+                      echo "Issue closed without an approval comment — treating as denial."
+                      exit 1
+                    fi
 
-            sleep "$POLL_INTERVAL"
-          done
+                    sleep "$POLL_INTERVAL"
+                  done
 
-  promote:
-    needs: gate
-    runs-on: ubuntu-latest
-    permissions:
-      contents: "read"
-      id-token: "write"
-    steps:
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v3
-        with:
-          project_id: "289724348228"
-          workload_identity_provider: "projects/289724348228/locations/global/workloadIdentityPools/github/providers/gominimal"
+    promote:
+        needs: gate
+        runs-on: ubuntu-latest
+        permissions:
+            contents: "read"
+            id-token: "write"
+        steps:
+            - name: Authenticate to Google Cloud
+              uses: google-github-actions/auth@v3
+              with:
+                  project_id: "289724348228"
+                  workload_identity_provider: "projects/289724348228/locations/global/workloadIdentityPools/github/providers/gominimal"
 
-      - name: Promote CLI version
-        id: promote
-        env:
-          DRY_RUN: ${{ inputs.dry_run }}
-          # Pass dispatch inputs via env (NOT inline ${{ inputs.* }} in `run:`)
-          # to avoid shell template injection — see GitHub's hardening guide.
-          INPUT_SHA: ${{ inputs.sha }}
-          INPUT_PLATFORMS: ${{ inputs.platforms }}
-        run: |
-          # Trim leading/trailing whitespace; users often paste SHAs with stray spaces.
-          SHA="$(printf '%s' "$INPUT_SHA" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-          PLATFORMS="$(printf '%s' "$INPUT_PLATFORMS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            - name: Promote CLI version
+              id: promote
+              env:
+                  DRY_RUN: ${{ inputs.dry_run }}
+                  # Pass dispatch inputs via env (NOT inline ${{ inputs.* }} in `run:`)
+                  # to avoid shell template injection — see GitHub's hardening guide.
+                  INPUT_SHA: ${{ inputs.sha }}
+                  INPUT_PLATFORMS: ${{ inputs.platforms }}
+              run: |
+                  # Trim leading/trailing whitespace; users often paste SHAs with stray spaces.
+                  SHA="$(printf '%s' "$INPUT_SHA" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+                  PLATFORMS="$(printf '%s' "$INPUT_PLATFORMS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
 
-          if [ "$PLATFORMS" = "all" ]; then
-            PLATFORMS="amd64-linux,arm64-linux"
-          fi
+                  if [ "$PLATFORMS" = "all" ]; then
+                    PLATFORMS="amd64-linux,arm64-linux"
+                  fi
 
-          if [ -z "$SHA" ]; then
-            echo "No SHA provided, finding latest CLI archive in bucket..."
-            LATEST=$(gcloud storage ls -l "gs://minimal-shim/archives/cli-amd64-linux-*.tar.zst" \
-              | grep -v "^TOTAL:" \
-              | sort -k2 \
-              | tail -1 \
-              | awk '{print $NF}')
-            if [ -z "$LATEST" ]; then
-              echo "ERROR: No CLI archives found in bucket"
-              exit 1
-            fi
-            # Extract SHA: archives/cli-amd64-linux-<sha>.tar.zst → <sha>
-            SHA="$(basename "$LATEST" | sed 's/^cli-amd64-linux-//;s/\.tar\.zst$//')"
-            echo "Latest SHA: ${SHA}"
-          fi
+                  if [ -z "$SHA" ]; then
+                    echo "No SHA provided, finding latest archive in bucket..."
+                    LATEST=$(gcloud storage ls -l "gs://minimal-shim/archives/minimalone-*.tar.zst" \
+                      | grep -v "^TOTAL:" \
+                      | sort -k2 \
+                      | tail -1 \
+                      | awk '{print $NF}')
+                    if [ -z "$LATEST" ]; then
+                      echo "ERROR: No archive found in bucket"
+                      exit 1
+                    fi
+                    # Extract SHA: archives/minimalone-<sha>.tar.zst → <sha>
+                    SHA="$(basename "$LATEST" | sed 's/^minimalone-//;s/\.tar\.zst$//')"
+                    echo "Latest SHA: ${SHA}"
+                  fi
 
-          IFS=',' read -ra PLATFORM_LIST <<< "$PLATFORMS"
-          for plat in "${PLATFORM_LIST[@]}"; do
-            plat="$(echo "$plat" | tr -d ' ')"
-            echo "Checking cli-${plat}-${SHA}.tar.zst exists..."
-            if ! gcloud storage ls "gs://minimal-shim/archives/cli-${plat}-${SHA}.tar.zst" > /dev/null 2>&1; then
-              echo "ERROR: cli-${plat}-${SHA}.tar.zst not found in bucket"
-              exit 1
-            fi
-          done
+                  # TODO: implement minimal-one-specific promotion process!!
 
-          for plat in "${PLATFORM_LIST[@]}"; do
-            plat="$(echo "$plat" | tr -d ' ')"
-            echo "Promoting CLI to ${SHA} for ${plat}..."
-            echo "{\"version\":\"${SHA}\"}" > "cli-${plat}.json"
-            if [ "$DRY_RUN" = "true" ]; then
-              echo "[dry-run] would: gcloud storage cp --cache-control=max-age=300 cli-${plat}.json gs://minimal-shim/config/cli-${plat}.json"
-              echo "[dry-run] config payload:"
-              cat "cli-${plat}.json"
-            else
-              gcloud storage cp \
-                --cache-control="max-age=300" \
-                "cli-${plat}.json" \
-                "gs://minimal-shim/config/cli-${plat}.json"
-            fi
-          done
+                  # Export resolved SHA for the docs-rebuild dispatch step below.
+                  echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
 
-          if [ "$DRY_RUN" = "true" ]; then
-            echo "[dry-run] CLI would have been promoted to ${SHA} for platforms: ${PLATFORMS}"
-          else
-            echo "CLI promoted to ${SHA} for platforms: ${PLATFORMS}"
-          fi
+            # Mint a short-lived token scoped to gominimal/docs via the
+            # gominimal-aw-bot GitHub App (org standard — App tokens over PATs, see
+            # gominimal/min-aw ADR-0002). The default GITHUB_TOKEN cannot dispatch
+            # other repos; this token carries the App's contents:write permission
+            # narrowed to the docs repo only.
+            - name: Mint docs-repo token (gominimal-aw-bot)
+              id: docs-token
+              if: ${{ inputs.dry_run != true }}
+              uses: actions/create-github-app-token@v3
+              with:
+                  app-id: ${{ vars.AW_BOT_APP_ID }}
+                  private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
+                  owner: gominimal
+                  repositories: docs
 
-          # Pin reference docs to the promoted SHA so docs.minimal.dev/reference
-          # tracks the promoted CLI version rather than docs-repo main. The docs
-          # build reads this pointer to decide which minimal SHA to fetch
-          # docs/reference/*.md from.
-          echo "{\"version\":\"${SHA}\"}" > docs.json
-          if [ "$DRY_RUN" = "true" ]; then
-            echo "[dry-run] would: gcloud storage cp --cache-control=max-age=300 docs.json gs://minimal-shim/config/docs.json"
-          else
-            gcloud storage cp \
-              --cache-control="max-age=300" \
-              docs.json \
-              gs://minimal-shim/config/docs.json
-            echo "Reference docs pinned to ${SHA}"
-          fi
-
-          # Export resolved SHA for the docs-rebuild dispatch step below.
-          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
-
-      # Mint a short-lived token scoped to gominimal/docs via the
-      # gominimal-aw-bot GitHub App (org standard — App tokens over PATs, see
-      # gominimal/min-aw ADR-0002). The default GITHUB_TOKEN cannot dispatch
-      # other repos; this token carries the App's contents:write permission
-      # narrowed to the docs repo only.
-      - name: Mint docs-repo token (gominimal-aw-bot)
-        id: docs-token
-        if: ${{ inputs.dry_run != true }}
-        uses: actions/create-github-app-token@v3
-        with:
-          app-id: ${{ vars.AW_BOT_APP_ID }}
-          private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
-          owner: gominimal
-          repositories: docs
-
-      - name: Trigger docs rebuild
-        env:
-          GH_TOKEN: ${{ steps.docs-token.outputs.token }}
-          DRY_RUN: ${{ inputs.dry_run }}
-          SHA: ${{ steps.promote.outputs.sha }}
-        run: |
-          set -euo pipefail
-          if [ "$DRY_RUN" = "true" ]; then
-            echo "[dry-run] would dispatch reference-docs-promoted to gominimal/docs for ${SHA}"
-          else
-            gh api repos/gominimal/docs/dispatches \
-              -f event_type=reference-docs-promoted \
-              -F "client_payload[sha]=${SHA}"
-            echo "Dispatched reference-docs-promoted to gominimal/docs for ${SHA}"
-          fi
+            - name: Trigger docs rebuild
+              env:
+                  GH_TOKEN: ${{ steps.docs-token.outputs.token }}
+                  DRY_RUN: ${{ inputs.dry_run }}
+                  SHA: ${{ steps.promote.outputs.sha }}
+              run: |
+                  set -euo pipefail
+                  if [ "$DRY_RUN" = "true" ]; then
+                    echo "[dry-run] would dispatch reference-docs-promoted to gominimal/docs for ${SHA}"
+                  else
+                    gh api repos/gominimal/docs/dispatches \
+                      -f event_type=reference-docs-promoted \
+                      -F "client_payload[sha]=${SHA}"
+                    echo "Dispatched reference-docs-promoted to gominimal/docs for ${SHA}"
+                  fi
