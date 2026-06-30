@@ -1,11 +1,11 @@
 #[cfg(feature = "networking-proxy")]
 use minimald_rpc::IssueClientCertResponse;
 use minimald_rpc::{
-    CreateSession, CreateSessionResponse, DestroySession, DestroySessionResponse, Errorable,
-    GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
-    GetSessionRecordRequest, GetSessionRecordResponse, GetVersion, GetVersionResponse,
-    IssueClientCert, IssueClientCertRequest, ListSessions, ListSessionsEntry, ListSessionsResponse,
-    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse,
+    CreateSession, DestroySession, DestroySessionResponse, Errorable, GetMeshStatus,
+    GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest,
+    GetSessionRecordResponse, GetVersion, GetVersionResponse, IssueClientCert,
+    IssueClientCertRequest, ListSessions, ListSessionsEntry, ListSessionsResponse, OneshotSshRpc,
+    RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -136,24 +136,33 @@ async fn serve_get_session_record(s: ServerStateHandle, c: RuChannel<Msg>) {
     }
 }
 
-async fn serve_create_session(s: ServerStateHandle, c: RuChannel<Msg>) {
+async fn serve_create_session(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+    ssh_username: Option<String>,
+) {
     let res = CreateSession
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
 
-            Ok(match mngr.create_session(req.record).await {
-                Ok(id) => Errorable::Ok(CreateSessionResponse { id }),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
-                    error: "A session with that name already exists".to_string(),
+            Ok(
+                match mngr
+                    .create_session(req.config, ssh_username, req.contribution)
+                    .await
+                {
+                    Ok(resp) => Errorable::Ok(resp),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
+                        error: "A session with that name already exists".to_string(),
+                    },
+                    // R2.1: a policy/network-mode mismatch is rejected at
+                    // declaration time and surfaced as a clean typed error rather
+                    // than a transport failure.
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Errorable::Err {
+                        error: e.to_string(),
+                    },
+                    Err(e) => return Err(ConnectionError::Internal(e.to_string())),
                 },
-                // R2.1: a policy/network-mode mismatch is rejected at
-                // declaration time and surfaced as a clean typed error rather
-                // than a transport failure.
-                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Errorable::Err {
-                    error: e.to_string(),
-                },
-                Err(e) => return Err(ConnectionError::Internal(e.to_string())),
-            })
+            )
         })
         .await;
     if let Err(e) = res {
@@ -347,6 +356,9 @@ pub async fn handle_ssh_rpc(
     session: &mut Session,
 ) -> Result<(), ConnectionError> {
     // Take the channel from connection state if its a known RPC.
+    // `ssh_username` is read out under the same lock so `serve_*`
+    // handlers that need the authenticated user (CreateSession) don't
+    // have to re-lock.
     let res = match name {
         GetVersion::NAME
         | ListSessions::NAME
@@ -366,17 +378,18 @@ pub async fn handle_ssh_rpc(
                 }
                 Some((channel, config)) => (channel, config),
             };
+            let ssh_username = conn_lock.ssh_username.clone();
             drop(conn_lock);
             session.channel_success(id)?;
-            Some(c_hnd)
+            Some((c_hnd, ssh_username))
         }
         _ => {
             session.channel_failure(id)?;
             None
         }
     };
-    let (channel, config) = match res {
-        Some((channel, config)) => (channel, config),
+    let ((channel, config), ssh_username) = match res {
+        Some(v) => v,
         None => return Ok(()),
     };
 
@@ -385,7 +398,7 @@ pub async fn handle_ssh_rpc(
         GetVersion::NAME => drop(spawn(serve_get_version(channel))),
         ListSessions::NAME => drop(spawn(serve_list_sessions(s, channel))),
         GetSessionRecord::NAME => drop(spawn(serve_get_session_record(s, channel))),
-        CreateSession::NAME => drop(spawn(serve_create_session(s, channel))),
+        CreateSession::NAME => drop(spawn(serve_create_session(s, channel, ssh_username))),
         RenameSession::NAME => drop(spawn(serve_rename_session(s, channel))),
         DestroySession::NAME => drop(spawn(serve_destroy_session(s, channel))),
         GetSessionPolicy::NAME => drop(spawn(serve_get_session_policy(s, channel))),
@@ -444,24 +457,16 @@ mod tests {
         encoder.into_inner()
     }
 
+    use crate::test_harness::{create_session_req as req, unwrap_ready};
+
     /// Creates a session through the public RPC and returns its id.
     async fn fresh_session(client: &mut TestClient) -> SessionId {
-        client
-            .call::<CreateSession>(&CreateSessionRequest {
-                record: sessions::Record {
-                    id: SessionId::nil(),
-                    name: Some("stream-test".to_string()),
-                    username: None,
-                    project_path: HostAbsPath::try_new("/tmp").unwrap(),
-                    network: sessions::NetworkMode::default(),
-                    policy: Default::default(),
-                    status: Default::default(),
-                    attrs: Default::default(),
-                },
-            })
-            .await
-            .unwrap()
-            .id
+        unwrap_ready(
+            client
+                .call::<CreateSession>(&req("stream-test", "/tmp"))
+                .await
+                .unwrap(),
+        )
     }
 
     #[tokio::test]
@@ -612,28 +617,18 @@ mod tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
 
-        let create_session = client
-            .call::<CreateSession>(&CreateSessionRequest {
-                record: sessions::Record {
-                    id: SessionId::nil(),
-                    name: Some("my session".to_string()),
-                    username: None,
-                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                    network: sessions::NetworkMode::default(),
-                    policy: Default::default(),
-                    status: Default::default(),
-                    attrs: Default::default(),
-                },
-            })
-            .await
-            .unwrap();
-
-        assert!(create_session.id != SessionId::nil());
+        let id = unwrap_ready(
+            client
+                .call::<CreateSession>(&req("my session", "/uwu"))
+                .await
+                .unwrap(),
+        );
+        assert!(id != SessionId::nil());
 
         let get_session = client
-            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(create_session.id))
+            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(id))
             .await;
-        assert_eq!(get_session.record.as_ref().unwrap().id, create_session.id);
+        assert_eq!(get_session.record.as_ref().unwrap().id, id);
         assert_eq!(
             get_session.record.as_ref().unwrap().name,
             Some("my session".to_string())
@@ -647,7 +642,7 @@ mod tests {
         assert_eq!(
             list_sessions.sessions,
             vec![ListSessionsEntry {
-                id: create_session.id,
+                id,
                 name: Some("my session".to_string()),
                 attrs: None,
             }]
@@ -667,24 +662,24 @@ mod tests {
             allow_dns_hosts: None,
             allow_protocols: None,
         };
-        let created = client
-            .call::<CreateSession>(&CreateSessionRequest {
-                record: sessions::Record {
-                    id: SessionId::nil(),
-                    name: Some("policy-session".to_string()),
-                    username: None,
-                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                    network: NetworkMode::OwnIp,
-                    policy: SessionPolicy::new(Some(egress.clone()), None),
-                    status: Default::default(),
-                    attrs: Default::default(),
-                },
-            })
-            .await
-            .unwrap();
+        let created_id = unwrap_ready(
+            client
+                .call::<CreateSession>(&CreateSessionRequest {
+                    config: minimald_rpc::SessionConfig {
+                        name: Some("policy-session".to_string()),
+                        project_path: HostAbsPath::try_new("/uwu").unwrap(),
+                        network: NetworkMode::OwnIp,
+                        policy: SessionPolicy::new(Some(egress.clone()), None),
+                        attrs: Default::default(),
+                    },
+                    contribution: Default::default(),
+                })
+                .await
+                .unwrap(),
+        );
 
         let policy = client
-            .call::<GetSessionPolicy>(&GetSessionPolicyRequest::Id(created.id))
+            .call::<GetSessionPolicy>(&GetSessionPolicyRequest::Id(created_id))
             .await
             .unwrap();
         assert_eq!(policy.egress, Some(egress));
@@ -698,38 +693,17 @@ mod tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
 
-        let create_session = client
-            .call::<CreateSession>(&CreateSessionRequest {
-                record: sessions::Record {
-                    id: SessionId::nil(),
-                    name: Some("my session".to_string()),
-                    username: None,
-                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                    network: sessions::NetworkMode::default(),
-                    policy: Default::default(),
-                    status: Default::default(),
-                    attrs: Default::default(),
-                },
-            })
-            .await
-            .unwrap();
-
-        assert!(create_session.id != SessionId::nil());
+        let id = unwrap_ready(
+            client
+                .call::<CreateSession>(&req("my session", "/uwu"))
+                .await
+                .unwrap(),
+        );
+        assert!(id != SessionId::nil());
 
         assert_eq!(
             client
-                .call::<CreateSession>(&CreateSessionRequest {
-                    record: sessions::Record {
-                        id: SessionId::nil(),
-                        name: Some("my session".to_string()),
-                        username: None,
-                        project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                        network: sessions::NetworkMode::default(),
-                        policy: Default::default(),
-                        status: Default::default(),
-                        attrs: Default::default(),
-                    },
-                })
+                .call::<CreateSession>(&req("my session", "/uwu"))
                 .await,
             Errorable::Err {
                 error: "A session with that name already exists".to_string()
@@ -751,16 +725,14 @@ mod tests {
         };
         let resp = client
             .call::<CreateSession>(&CreateSessionRequest {
-                record: sessions::Record {
-                    id: SessionId::nil(),
+                config: minimald_rpc::SessionConfig {
                     name: Some("bad-policy".to_string()),
-                    username: None,
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: NetworkMode::HostNet,
                     policy: SessionPolicy::new(Some(egress), None),
-                    status: Default::default(),
                     attrs: Default::default(),
                 },
+                contribution: Default::default(),
             })
             .await;
         assert_eq!(

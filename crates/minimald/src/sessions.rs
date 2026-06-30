@@ -8,6 +8,7 @@ use paths::DaemonAbsPath;
 use sessions::{
     SessionId,
     store::{DiskLoader, Loader, SessionKey, SessionObject},
+    wire::request::WireContribution,
 };
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
@@ -48,6 +49,7 @@ fn registry_name(record: &sessions::Record) -> String {
 }
 
 /// Encapsulates the return channel for messages back from the actor.
+#[derive(Debug)]
 struct Responder<T>(oneshot::Sender<Result<T, SessionsError>>);
 
 impl<T> Responder<T> {
@@ -66,11 +68,28 @@ impl<T> Responder<T> {
     }
 }
 
+/// CreateSession payload — boxed so it doesn't dominate
+/// `ManagerMessage`'s size (the variant carries a full session
+/// config + an optional contribution; other variants are just a
+/// few words).
+#[derive(Debug)]
+struct CreateSessionMsg {
+    config: minimald_rpc::SessionConfig,
+    /// Authenticated SSH username, supplied by the RPC handler from
+    /// the SSH connection context (never the client).
+    username: Option<String>,
+    /// Client-side Phase 1 contribution. Today the handler rejects
+    /// anything other than the default; the composition pipeline will
+    /// consume it when Phase 2 lands.
+    contribution: WireContribution,
+    responder: Responder<minimald_rpc::CreateSessionResponse>,
+}
+
 enum ManagerMessage {
     List(Responder<Vec<SessionInfo>>),
     GetRecord(SessionKeyPredicate, Responder<Option<sessions::Record>>),
     GetSession(SessionKeyPredicate, Responder<Option<SessionHandle>>),
-    CreateSession(sessions::Record, Responder<SessionId>),
+    CreateSession(Box<CreateSessionMsg>),
     RenameSession(SessionId, String, Responder<()>),
     DestroySession(SessionId, Responder<()>),
 }
@@ -242,20 +261,62 @@ impl<L: Loader> Manager<L> {
                 })
                 .await;
             }
-            // Creates a session using the given record.
-            ManagerMessage::CreateSession(record, r) => {
-                r.handle(async {
-                    // R2.1: reject a policy incompatible with the network mode
-                    // (e.g. egress on a non-`OwnIp` PTask) at declaration time,
-                    // so an invalid session is never written to the store
-                    // rather than only failing when a client later attaches.
-                    record
-                        .validate_policy()
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-                    let k = self.store.create(record)?;
-                    Ok(*k.id())
-                })
-                .await;
+            // Creates a session from a config + (optional) client wire
+            // contribution.
+            ManagerMessage::CreateSession(msg) => {
+                let CreateSessionMsg {
+                    config,
+                    username,
+                    contribution,
+                    responder,
+                } = *msg;
+                responder
+                    .handle(async {
+                        // Until daemon-side Phase 2 routing lands, the only
+                        // valid contribution is the empty default. Silently
+                        // dropping a non-empty contribution would let clients
+                        // believe their composed vars/patches/packages/hooks
+                        // were honored — they would not be. Reject explicitly
+                        // so the failure surfaces at the call site instead
+                        // of as missing items in the assembled session.
+                        //
+                        // TODO(composition): when Phase 2 lands, the
+                        // composition pipeline consumes this field instead.
+                        // The seam is here: replace this check with the
+                        // partition + ContributionResponse flow.
+                        if contribution != WireContribution::default() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "non-empty WireContribution is not supported \
+                                 by this daemon — daemon-side composition \
+                                 (Phase 2) is not wired yet",
+                            ));
+                        }
+                        // Assemble the on-disk Record from out-of-band config
+                        // + the SSH-supplied username. Persists `Active`
+                        // immediately on the empty-contribution fast path.
+                        let record = sessions::Record {
+                            id: SessionId::nil(),
+                            name: config.name,
+                            username,
+                            project_path: config.project_path,
+                            network: config.network,
+                            policy: config.policy,
+                            status: sessions::SessionStatus::Active,
+                            attrs: config.attrs,
+                        };
+                        // R2.1: reject a policy incompatible with the network
+                        // mode (e.g. egress on a non-`OwnIp` PTask) at
+                        // declaration time, so an invalid session is never
+                        // written to the store rather than only failing when
+                        // a client later attaches.
+                        record.validate_policy().map_err(|e| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
+                        })?;
+                        let k = self.store.create(record)?;
+                        Ok(minimald_rpc::CreateSessionResponse::Ready { id: *k.id() })
+                    })
+                    .await;
             }
             // Renames an existing session with the given ID.
             ManagerMessage::RenameSession(id, new_name, r) => {
@@ -387,16 +448,26 @@ impl ManagerHandle {
         recv.await.expect("corresponding sessions manager is dead")
     }
 
-    /// Creates a session based on the given record.
+    /// Creates a session from the given config + client wire
+    /// contribution. `username` is the authenticated SSH user from
+    /// the connection context; pass `None` for non-SSH callers (e.g.
+    /// in-process daemon callers and tests).
     pub async fn create_session(
         &self,
-        record: sessions::Record,
-    ) -> Result<SessionId, SessionsError> {
+        config: minimald_rpc::SessionConfig,
+        username: Option<String>,
+        contribution: WireContribution,
+    ) -> Result<minimald_rpc::CreateSessionResponse, SessionsError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
             .sender
-            .send(ManagerMessage::CreateSession(record, send))
+            .send(ManagerMessage::CreateSession(Box::new(CreateSessionMsg {
+                config,
+                username,
+                contribution,
+                responder: send,
+            })))
             .await;
         recv.await.expect("corresponding sessions manager is dead")
     }
@@ -456,17 +527,24 @@ mod tests {
         DaemonAbsPath::try_new(tmp.path().to_str().unwrap()).unwrap()
     }
 
-    fn sample_record() -> sessions::Record {
-        sessions::Record {
-            id: SessionId::nil(),
+    fn sample_config() -> minimald_rpc::SessionConfig {
+        minimald_rpc::SessionConfig {
             name: Some("doomed".to_string()),
-            username: None,
             project_path: HostAbsPath::try_new("/proj").unwrap(),
             network: sessions::NetworkMode::default(),
             policy: Default::default(),
-            status: Default::default(),
             attrs: Default::default(),
         }
+    }
+
+    /// Test helper: send via the in-process manager actor (not RPC),
+    /// then unwrap the `Ready` arm via the shared test_harness helper.
+    async fn create_and_unwrap_id(mngr: &ManagerHandle) -> SessionId {
+        crate::test_harness::unwrap_ready(
+            mngr.create_session(sample_config(), None, WireContribution::default())
+                .await
+                .unwrap(),
+        )
     }
 
     async fn manager() -> (TempDir, TempDir, ManagerHandle) {
@@ -490,7 +568,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn destroy_removes_a_non_running_session() {
         let (_state, _cache, mngr) = manager().await;
-        let id = mngr.create_session(sample_record()).await.unwrap();
+        let id = create_and_unwrap_id(&mngr).await;
 
         mngr.destroy_session(id).await.unwrap();
 
@@ -503,7 +581,7 @@ mod tests {
         );
         assert!(mngr.list().await.unwrap().is_empty());
         // The name index entry was dropped, so the name can be taken again.
-        mngr.create_session(sample_record()).await.unwrap();
+        let _ = create_and_unwrap_id(&mngr).await;
     }
 
     /// Destroying a session that has been brought up (its actor is running, but
@@ -511,7 +589,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn destroy_tears_down_a_running_session() {
         let (_state, _cache, mngr) = manager().await;
-        let id = mngr.create_session(sample_record()).await.unwrap();
+        let id = create_and_unwrap_id(&mngr).await;
 
         // Bring the session actor up (populating the running map) without
         // attaching a host.
@@ -550,5 +628,33 @@ mod tests {
             .await
             .expect_err("destroying an unknown id should error");
         assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    /// A non-empty `WireContribution` must be refused with
+    /// `InvalidInput` until daemon-side Phase 2 routing lands.
+    /// Silently dropping it would let clients believe their
+    /// composed items were honored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_session_rejects_non_empty_contribution() {
+        use sessions::core::source::Source;
+        use sessions::wire::primitives::{WireResolvedVar, WireSessionVar, WireSource};
+
+        let (_state, _cache, mngr) = manager().await;
+        let mut contribution = WireContribution::default();
+        contribution.vars.push(WireSessionVar {
+            var: WireResolvedVar {
+                name: "EDITOR".into(),
+                value: "hx".into(),
+            },
+            source: WireSource::from(Source::UserLoadout {
+                name: "test".into(),
+            }),
+        });
+
+        let err = mngr
+            .create_session(sample_config(), None, contribution)
+            .await
+            .expect_err("non-empty contribution must be rejected today");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 }

@@ -3600,6 +3600,7 @@ version = "0.0.1"
 dependencies = [
  "chrono",
  "constcat",
+ "paths",
  "serde",
  "serde_json",
  "sessions",

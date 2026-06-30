@@ -457,32 +457,21 @@ impl SessionHandle {
 mod tests {
     use std::time::Duration;
 
-    use paths::HostAbsPath;
     use russh::ChannelMsg;
     use sessions::SessionId;
 
-    use minimald_rpc::{CreateSession, CreateSessionRequest};
+    use minimald_rpc::CreateSession;
 
-    use crate::test_harness::{TestClient, TestServer};
+    use crate::test_harness::{TestClient, TestServer, create_session_req, unwrap_ready};
 
     /// Creates a fresh session on the server and returns its id.
     async fn create_session(client: &mut TestClient) -> SessionId {
-        client
-            .call::<CreateSession>(&CreateSessionRequest {
-                record: sessions::Record {
-                    id: SessionId::nil(),
-                    name: Some("shell-test".to_string()),
-                    username: None,
-                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                    network: Default::default(),
-                    policy: Default::default(),
-                    status: Default::default(),
-                    attrs: Default::default(),
-                },
-            })
-            .await
-            .unwrap()
-            .id
+        unwrap_ready(
+            client
+                .call::<CreateSession>(&create_session_req("shell-test", "/uwu"))
+                .await
+                .unwrap(),
+        )
     }
 
     /// Drives the full SSH path into the session host with the mock launcher:

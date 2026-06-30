@@ -279,6 +279,16 @@ impl fmt::Display for SessionId {
 /// records the status verbatim. State-machine rules (e.g. "only
 /// the composition pipeline can promote `Draft` → `Active`") live
 /// in the manager actor.
+///
+/// **Forward compatibility.** This enum is binary today but will
+/// grow at least one intermediate variant when file uploads land —
+/// uploads need a "session id is valid, uploads are accepted, but
+/// the session isn't user-connectable yet" state. Code branching on
+/// status should prefer `match` arms over `status == Active`
+/// equality so the compiler points at every site when the new
+/// variant arrives. `#[non_exhaustive]` will be added at the same
+/// time; we omit it today because every match site is in-tree and
+/// the extra noise buys nothing yet.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {

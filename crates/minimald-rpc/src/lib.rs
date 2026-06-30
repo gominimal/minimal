@@ -172,19 +172,81 @@ impl OneshotSshRpc for GetSessionRecord {
     type Response = GetSessionRecordResponse;
 }
 
-/// An RPC to create a new session based on the given record.
+/// An RPC to create a new session.
+///
+/// Carries two parts: a [`SessionConfig`] (everything that doesn't
+/// fit in a [`WireContribution`] — name, network, policy, attrs)
+/// plus the client's Phase 1 [`WireContribution`]. Callers that
+/// don't go through the composition pipeline (sftp / exec /
+/// session-recovery) send `WireContribution::default()`.
 pub struct CreateSession;
 
+/// Session configuration that lives outside the composable
+/// [`WireContribution`] — the user-supplied `name`, the project
+/// path the session is built from, the network isolation mode, the
+/// per-session networking policy, and free-form attrs.
+///
+/// `username` is deliberately *not* here: it comes from the SSH
+/// connection context on the daemon side, never from the caller.
+/// `id` and `status` are also out: id is allocated by the store,
+/// status is managed by the manager actor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionConfig {
+    /// User-supplied name. `None` is anonymous; the daemon may render
+    /// a short display name (e.g. `<user>-<project>-<uuid-suffix>`).
+    pub name: Option<String>,
+    /// Absolute host path the session is built from.
+    pub project_path: paths::HostAbsPath,
+    /// Network isolation mode.
+    #[serde(default)]
+    pub network: NetworkMode,
+    /// Per-session networking policy (egress + ingress).
+    #[serde(default)]
+    pub policy: SessionPolicy,
+    /// Free-form attributes (typed by the caller).
+    #[serde(default)]
+    pub attrs: std::collections::BTreeMap<String, String>,
+}
+
 /// The request for a [`CreateSession`] RPC.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateSessionRequest {
-    pub record: sessions::Record,
+    /// Out-of-band session config.
+    pub config: SessionConfig,
+    /// Client-side Phase 1 contribution. Defaulted (empty) by
+    /// internal callers that aren't composing a session — e.g. sftp,
+    /// exec, session-recovery — so the daemon takes the empty-
+    /// contribution fast path and returns [`CreateSessionResponse::Ready`]
+    /// immediately.
+    #[serde(default)]
+    pub contribution: sessions::wire::request::WireContribution,
 }
 
 /// The response for a [`CreateSession`] RPC.
+///
+/// `Ready` is the only variant exercised today; `Pending` is
+/// reserved for when daemon-side Phase 2 routing lands and the
+/// daemon can ask the client to gate items that need approval.
+/// Defining both up front locks the wire shape so adding the
+/// Pending path later doesn't break callers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CreateSessionResponse {
-    pub id: SessionId,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CreateSessionResponse {
+    /// No items need user gating. The session id is the finalized
+    /// session — callers can immediately use it.
+    Ready {
+        /// Daemon-assigned session id.
+        id: SessionId,
+    },
+    /// Items need client-side gating. The session id is allocated
+    /// and the session is persisted (status reflects "in flight").
+    /// Client follows up with `SubmitVerdict` carrying the same id.
+    Pending {
+        /// Daemon-assigned session id; also embedded in `response`.
+        id: SessionId,
+        /// Pending items the client must gate.
+        response: sessions::wire::request::ContributionResponse,
+    },
 }
 
 impl OneshotSshRpc for CreateSession {
@@ -480,6 +542,7 @@ impl OneshotSshRpc for GetMeshStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sessions::wire::request::{ContributionResponse, WireContribution};
 
     #[test]
     fn policy_types_are_present_and_serializable() {
@@ -519,5 +582,73 @@ mod tests {
             json.contains("\"dynamic_allowed_range\":null"),
             "got: {json}"
         );
+    }
+
+    fn round_trip<T>(value: &T) -> T
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let json = serde_json::to_string(value).expect("serialize");
+        serde_json::from_str(&json).expect("deserialize")
+    }
+
+    #[test]
+    fn create_session_request_round_trips_with_explicit_contribution() {
+        let req = CreateSessionRequest {
+            config: SessionConfig {
+                name: Some("my-session".into()),
+                project_path: paths::HostAbsPath::try_new("/home/u/proj").unwrap(),
+                network: NetworkMode::OwnIp,
+                policy: SessionPolicy::default(),
+                attrs: [("color".to_string(), "blue".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+            contribution: WireContribution::default(),
+        };
+        assert_eq!(round_trip(&req), req);
+    }
+
+    #[test]
+    fn create_session_request_accepts_missing_contribution_field() {
+        // Wire payload from an internal caller that doesn't know about
+        // the composition pipeline: only `config` is set.
+        let raw = serde_json::json!({
+            "config": {
+                "name": null,
+                "project_path": "/proj",
+                "network": "host_net",
+                "policy": { "egress": null, "ingress": null },
+                "attrs": {},
+            },
+        });
+        let req: CreateSessionRequest = serde_json::from_value(raw).expect("deserialize");
+        assert_eq!(req.contribution, WireContribution::default());
+    }
+
+    #[test]
+    fn create_session_response_ready_round_trips() {
+        let id = SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let resp = CreateSessionResponse::Ready { id };
+        assert_eq!(round_trip(&resp), resp);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""kind":"ready""#), "got: {json}");
+    }
+
+    #[test]
+    fn create_session_response_pending_round_trips() {
+        let id = SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let resp = CreateSessionResponse::Pending {
+            id,
+            response: ContributionResponse {
+                session_id: id,
+                vars: vec![],
+                patches: vec![],
+                lifecycle_hooks: vec![],
+            },
+        };
+        assert_eq!(round_trip(&resp), resp);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""kind":"pending""#), "got: {json}");
     }
 }

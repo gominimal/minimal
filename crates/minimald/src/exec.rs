@@ -1220,35 +1220,24 @@ mod tests {
         //! Tests that exercise the full ssh-exec stack against a real
         //! `TestServer`: russh transport, `ConnectionHandler` dispatch,
         //! `handle_exec`, and a real `/bin/sh -c` child.
-        use paths::HostAbsPath;
         use sessions::SessionId;
 
-        use minimald_rpc::{CreateSession, CreateSessionRequest};
+        use minimald_rpc::CreateSession;
 
         use crate::MINIMAL_SESSION_ID_ENV;
         use crate::sessions::SessionKeyPredicate;
-        use crate::test_harness::{TestClient, TestServer};
+        use crate::test_harness::{TestClient, TestServer, create_session_req, unwrap_ready};
 
         /// Creates a fresh session through the public CreateSession RPC
         /// and returns its id, mirroring how a real client sets up state
         /// before running commands against the session.
         async fn fresh_session(client: &mut TestClient) -> SessionId {
-            client
-                .call::<CreateSession>(&CreateSessionRequest {
-                    record: sessions::Record {
-                        id: SessionId::nil(),
-                        name: Some("exec-test".to_string()),
-                        username: None,
-                        project_path: HostAbsPath::try_new("/tmp").unwrap(),
-                        network: sessions::NetworkMode::default(),
-                        policy: Default::default(),
-                        status: Default::default(),
-                        attrs: Default::default(),
-                    },
-                })
-                .await
-                .unwrap()
-                .id
+            unwrap_ready(
+                client
+                    .call::<CreateSession>(&create_session_req("exec-test", "/tmp"))
+                    .await
+                    .unwrap(),
+            )
         }
 
         #[tokio::test]
