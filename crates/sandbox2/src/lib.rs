@@ -524,6 +524,18 @@ impl<C: Channel> Sandbox<C> {
         // gvproxy switch. `network()` does not imply the netns unshare, so it must
         // follow the `unshare(Namespace::Network)` above (which `isolate` did).
         if let Some(tap) = self.config.own_ip_tap {
+            // The tap only makes sense in an unshared netns: RustSlirp enters the
+            // sandbox's own network namespace to build it, and hakoniwa skips the
+            // setup entirely (leaving no tap fd) unless `Namespace::Network` was
+            // unshared. Configuring it against a shared netns would silently no-op,
+            // so reject the combination rather than hand back a sandbox with no tap.
+            if !isolate {
+                return Err(Error::Execution(
+                    ExecutionError::NetworkIsolationUnavailable {
+                        mode: self.config.network_mode,
+                    },
+                ));
+            }
             container.network(
                 hakoniwa::RustSlirp::default()
                     // L2: the gvproxy relay is HyperKit-framed Ethernet, not L3.
@@ -696,23 +708,20 @@ impl<C: Channel> Sandbox<C> {
             container.hostname(hn);
         }
 
-        // When the network supplies its own resolver (own-IP: the sandbox runs in
-        // a fresh netns where the synth rootfs's host stub resolver `127.0.0.53`
-        // is unreachable), point `/etc/resolv.conf` at it — gvproxy serves DNS at
-        // the switch gateway. Written to the rootfs before spawn, like
-        // `/etc/hostname` above: hakoniwa binds `/etc` read-only from
-        // `<rootfs>/etc`, so an in-sandbox write would hit a read-only fs.
-        // Overwrites unconditionally — `synth_dns_config` already populated this
-        // file with the host resolver, so a create-only guard would leave it.
-        if let Some(ns) = self
-            .config
-            .network
-            .as_deref()
-            .and_then(|n| n.nameserver())
-            .or(self.config.dns_nameserver)
-        {
+        // An own-IP sandbox runs in a fresh netns where the synth rootfs's host
+        // stub resolver (`127.0.0.53`) is unreachable, so point `/etc/resolv.conf`
+        // at the switch gateway instead — gvproxy answers DNS there, and it is
+        // already the tap's next-hop route. Sourcing it from the same
+        // `own_ip_tap.gateway` that configures the tap keeps the resolver and the
+        // route provably consistent (one live value, not two derivations).
+        // Written to the rootfs before spawn, like `/etc/hostname` above:
+        // hakoniwa binds `/etc` read-only from `<rootfs>/etc`, so an in-sandbox
+        // write would hit a read-only fs. Overwrites unconditionally —
+        // `synth_dns_config` already populated it with the host resolver, so a
+        // create-only guard would leave the (dead) host stub in place.
+        if let Some(tap) = self.config.own_ip_tap {
             let etc_resolv = self.rootfs().join("etc").join("resolv.conf");
-            std::fs::write(&etc_resolv, format!("nameserver {ns}\n"))
+            std::fs::write(&etc_resolv, format!("nameserver {}\n", tap.gateway))
                 .map_err(|e| Error::IO("writing /etc/resolv.conf", etc_resolv.clone(), e))?;
         }
 

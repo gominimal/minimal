@@ -58,17 +58,6 @@ impl Network for GvproxyNetwork {
         true
     }
 
-    fn nameserver(&self) -> Option<std::net::Ipv4Addr> {
-        // An own-IP PTask lives in a fresh netns where the host's stub resolver
-        // (`127.0.0.53`, baked into the synth rootfs) is dead, so DNS fails even
-        // though egress-by-IP works. gvproxy serves DNS at the switch gateway and
-        // the PTask's default route already points there, so resolve via it.
-        // Synchronous and lock-free by construction: the gateway is fixed by the
-        // daemon's `DEFAULT_SUBNET`, so there is no need to lock the async
-        // `SwitchClient` (a `tokio::sync::Mutex`) from this sync trait method.
-        Some(crate::net::DEFAULT_SUBNET.gateway())
-    }
-
     fn attach(&self, netns_pid: u32) -> AttachFuture<'_> {
         Box::pin(async move {
             let guard = attach_own_ip(&self.switch, netns_pid, self.ingress.as_ref())
@@ -182,8 +171,16 @@ async fn attach_own_ip(
 
     // The forwarder API reaches the host gvproxy over the same vsock shuttle port
     // (the `-listen` socket serves `/services/forwarder/*` alongside `/connect`).
+    // This path owns its own rollback (no session-host guard), so detach if the
+    // ingress-applying tail fails.
     let control = ControlChannel::Vsock { cid, port };
-    finish_own_ip_attach(switch, relay, control, lease.ip, ingress).await
+    match finish_own_ip_attach(switch, relay, control, lease.ip, ingress).await {
+        Ok(guard) => Ok(guard),
+        Err(e) => {
+            let _ = switch.lock().await.detach().await;
+            Err(e)
+        }
+    }
 }
 
 /// Completes a native (DM2/`LocalSpawn`) own-IP attach: relay the in-namespace
@@ -203,21 +200,20 @@ pub(crate) async fn complete_local_own_ip_attach(
     lease_ip: Ipv4Addr,
     ingress: Option<&sessions::IngressPolicy>,
 ) -> io::Result<OwnIpGuard> {
-    let relay = match crate::net::switch::attach_to_switch(tap_fd, &sock).await {
-        Ok(relay) => relay,
-        Err(e) => {
-            let _ = switch.lock().await.detach().await;
-            return Err(e);
-        }
-    };
+    // Rollback of the pre-spawn phase-1 attach is owned by the session host's
+    // launch guard (which also covers a cancelled launch), so a failure here just
+    // propagates — detaching would double-decrement gvproxy's attach count.
+    let relay = crate::net::switch::attach_to_switch(tap_fd, &sock).await?;
     let control = ControlChannel::Unix(sock);
     finish_own_ip_attach(switch, relay, control, lease_ip, ingress).await
 }
 
 /// Shared tail of both own-IP attach paths: apply static ingress forwards (R2.3)
-/// over `control`, then build the [`OwnIpGuard`]. A failure here rolls the whole
-/// attach back — drop the relay, then detach — so a half-configured PTask is
-/// never left running.
+/// over `control`, then build the [`OwnIpGuard`]. On an ingress failure the relay
+/// is dropped (closing the switch-side connection), but the attach-count rollback
+/// is left to the caller — `attach_own_ip` (HostShuttle) detaches inline, while
+/// the LocalSpawn path defers to the session host's launch guard so the refcount
+/// is never double-decremented.
 async fn finish_own_ip_attach(
     switch: &Arc<Mutex<SwitchClient>>,
     relay: SwitchRelay,
@@ -231,13 +227,6 @@ async fn finish_own_ip_attach(
                 Ok(exposed) => exposed,
                 Err(e) => {
                     drop(relay);
-                    if let Err(det_err) = switch.lock().await.detach().await {
-                        tracing::warn!(
-                            error = %det_err,
-                            ingress_err = %e,
-                            "detaching OwnIp PTask from switch during ingress-apply rollback"
-                        );
-                    }
                     return Err(e);
                 }
             }

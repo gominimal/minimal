@@ -61,20 +61,6 @@ pub trait Network: Send + Sync + std::fmt::Debug {
         let _ = netns_pid;
         Box::pin(std::future::ready(Ok(noop_guard())))
     }
-
-    /// Phase A (pre-spawn): the IPv4 nameserver the sandbox's `/etc/resolv.conf`
-    /// should point at, or `None` to keep the host-derived resolver.
-    ///
-    /// A netns-isolating mode (own-IP) inherits no working resolver: the
-    /// synthesized `/etc/resolv.conf` names the host's systemd-resolved stub
-    /// (`127.0.0.53`), which is unreachable inside the fresh netns. Such a mode
-    /// returns a resolver reachable from *inside* the namespace (gvproxy serves
-    /// DNS at the switch gateway), which the sandbox builder writes into the
-    /// rootfs before spawn. The default keeps the host resolver — correct for the
-    /// shared-netns modes ([`HostNet`], [`NoNet`]).
-    fn nameserver(&self) -> Option<std::net::Ipv4Addr> {
-        None
-    }
 }
 
 /// Reverses per-sandbox network wiring. Teardown is **explicit** — call

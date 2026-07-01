@@ -627,6 +627,49 @@ pub(crate) struct SandboxLauncher {
     pub(crate) ingress: Option<sessions::IngressPolicy>,
 }
 
+/// Rolls back a native-own-IP phase-1 switch attach if the launch is abandoned
+/// before the attach is handed off to an [`OwnIpGuard`].
+///
+/// Phase 1 (`SwitchClient::attach`) bumps gvproxy's attach count before the slow
+/// env build + spawn, so an early `Err` return *or* a dropped/cancelled launch
+/// future (e.g. the client disconnects mid-build) would otherwise leak the count
+/// and keep gvproxy running. The existing `Err` arms are covered, but `Drop` is
+/// what catches cancellation. `SwitchClient::detach` is async and `Drop` cannot
+/// await, so an armed drop spawns the detach on the current runtime; on the
+/// success path the guard is disarmed and `OwnIpGuard` owns teardown instead.
+#[cfg(not(test))]
+struct PhaseOneAttachGuard {
+    switch: std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
+    armed: bool,
+}
+
+#[cfg(not(test))]
+impl PhaseOneAttachGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(not(test))]
+impl Drop for PhaseOneAttachGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let switch = std::sync::Arc::clone(&self.switch);
+        // Detach off the current runtime — `Drop` cannot `.await`. If no runtime
+        // is running (the daemon is shutting down) the refcount no longer matters,
+        // so a failed spawn is harmless.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(e) = switch.lock().await.detach().await {
+                    tracing::warn!(error = %e, "detaching OwnIp PTask after launch was abandoned");
+                }
+            });
+        }
+    }
+}
+
 #[cfg(not(test))]
 impl SessionLauncher for SandboxLauncher {
     type Process = SandboxProcess;
@@ -700,10 +743,19 @@ impl SessionLauncher for SandboxLauncher {
             local_own_ip = Some((attach.lease.ip, sock));
         }
 
+        // Guard the phase-1 attach for the whole window until it is handed to an
+        // `OwnIpGuard`: an early `Err` return *or* a cancelled launch future now
+        // rolls the gvproxy attach count back (see `PhaseOneAttachGuard`). Armed
+        // only on the LocalSpawn path that did a pre-spawn attach; disarmed on the
+        // success handoff below.
+        let mut attach_guard = local_own_ip.as_ref().map(|_| PhaseOneAttachGuard {
+            switch: std::sync::Arc::clone(&net_switch),
+            armed: true,
+        });
+
         // Build the env + container and spawn the process. Any failure here (env
-        // build, container build, spawn) leaves no process to reap — but if phase
-        // 1 already leased + ref-counted the switch, that must be rolled back so
-        // gvproxy's attach count stays accurate, handled at the `Err` arm below.
+        // build, container build, spawn) leaves no process to reap; the phase-1
+        // attach, if any, is rolled back by `attach_guard` on the `Err` return.
         let build_and_spawn = async {
             // The env owns the context, graph and the sandbox files backing the
             // running process's rootfs, so it is `Send + 'static` and can be moved
@@ -757,13 +809,10 @@ impl SessionLauncher for SandboxLauncher {
         .await;
 
         let (env, master, mut process) = match build_and_spawn {
+            // `attach_guard` (if armed) rolls the phase-1 attach back on this
+            // `Err` return when it drops.
             Ok(parts) => parts,
-            Err(e) => {
-                if local_own_ip.is_some() {
-                    let _ = net_switch.lock().await.detach().await;
-                }
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         };
 
         // Reap a sandbox process whose own-IP attach failed. A `hakoniwa::Child`
@@ -792,10 +841,10 @@ impl SessionLauncher for SandboxLauncher {
             if let Some((lease_ip, sock)) = local_own_ip {
                 // hakoniwa hands us ownership of the tap fd (its `Child` has no
                 // `Drop`, so it never closes it); a missing fd means the in-VM
-                // RustSlirp setup did not run — roll the phase-1 attach back.
+                // RustSlirp setup did not run — `attach_guard` rolls the phase-1
+                // attach back on the `Err` return.
                 let Some(raw) = process.rustslirp_tapfd else {
                     reap(&mut process);
-                    let _ = net_switch.lock().await.detach().await;
                     return Err(io::Error::other(
                         "own-IP sandbox produced no in-namespace tap fd",
                     ));
@@ -813,9 +862,17 @@ impl SessionLauncher for SandboxLauncher {
                 )
                 .await
                 {
-                    // `complete_local_own_ip_attach` rolls its own attach back on
-                    // failure, so only the process needs reaping here.
-                    Ok(guard) => Some(Box::new(guard) as Box<dyn sandbox2::NetGuard>),
+                    Ok(guard) => {
+                        // Ownership of the attach now lives in `OwnIpGuard`, which
+                        // detaches at session end — disarm so the guard doesn't
+                        // also roll it back.
+                        if let Some(g) = attach_guard.as_mut() {
+                            g.disarm();
+                        }
+                        Some(Box::new(guard) as Box<dyn sandbox2::NetGuard>)
+                    }
+                    // `complete_local_own_ip_attach` leaves rollback to
+                    // `attach_guard` (this `Err` return), so only reap the process.
                     Err(e) => {
                         reap(&mut process);
                         return Err(io::Error::other(e));

@@ -164,13 +164,6 @@ pub struct Config {
     /// (rootless), and the tap fd is surfaced via `Child.rustslirp_tapfd`. `None`
     /// keeps the host/VM behaviour (no in-namespace tap).
     pub own_ip_tap: Option<OwnIpTap>,
-    /// An explicit IPv4 nameserver to write into the sandbox's `/etc/resolv.conf`,
-    /// overriding the host-derived synth resolver. Set for netns-isolated modes
-    /// ([`NetworkMode::OwnIp`]) whose isolated namespace cannot reach the host
-    /// stub resolver (`127.0.0.53`); the consumer supplies the in-namespace
-    /// resolver (gvproxy's switch gateway). A custom [`Network`]'s
-    /// [`nameserver`](Network::nameserver) takes precedence when both are set.
-    pub dns_nameserver: Option<std::net::Ipv4Addr>,
 
     /// The hostname to set in the environment, if any.
     pub hostname: Option<String>,
@@ -211,7 +204,6 @@ impl Config {
             network_mode: NetworkMode::HostNet,
             network: None,
             own_ip_tap: None,
-            dns_nameserver: None,
             env_vars: HashMap::with_capacity(12),
             hostname: None,
             username: None,
@@ -309,15 +301,6 @@ impl Config {
     /// the consumer so the wiring lives behind one abstraction for every sandbox.
     pub fn with_network(mut self, network: Box<dyn Network>) -> Self {
         self.network = Some(network);
-        self
-    }
-    /// Sets an explicit nameserver for the sandbox's `/etc/resolv.conf`. Used by
-    /// the netns-isolated ([`NetworkMode::OwnIp`]) path, where the synth host
-    /// resolver is unreachable; pass the in-namespace resolver (the switch
-    /// gateway). `None` keeps the host-derived resolver. A custom [`Network`]'s
-    /// [`nameserver`](Network::nameserver) takes precedence when both are set.
-    pub fn with_dns_nameserver(mut self, nameserver: Option<std::net::Ipv4Addr>) -> Self {
-        self.dns_nameserver = nameserver;
         self
     }
     /// Sets the own-IP user-mode tap parameters (native/DM2 own-IP). When set,
