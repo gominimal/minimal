@@ -148,23 +148,33 @@ jobs:
                      --package mip \
                      --package minimal \
                      --package minimald
+            - name: Rename binaries with platform suffix
+              # download-artifact merge-multiple flattens every artifact into one
+              # directory using each file's basename, so the uploaded files must
+              # already carry a unique platform-suffixed name to avoid amd64/arm64
+              # collisions and to match the paths used by the release job.
+              run: |
+                  cd target/x86_64-unknown-linux-musl/release
+                  mv mip mip-linux-amd64
+                  mv minimal minimal-linux-amd64
+                  mv minimald minimald-linux-amd64
             - name: Upload binary (mip)
               uses: actions/upload-artifact@v7
               with:
                   name: mip-linux-amd64
-                  path: target/x86_64-unknown-linux-musl/release/mip
+                  path: target/x86_64-unknown-linux-musl/release/mip-linux-amd64
                   retention-days: 7
             - name: Upload binary (minimal)
               uses: actions/upload-artifact@v7
               with:
                   name: minimal-linux-amd64
-                  path: target/x86_64-unknown-linux-musl/release/minimal
+                  path: target/x86_64-unknown-linux-musl/release/minimal-linux-amd64
                   retention-days: 7
             - name: Upload binary (minimald)
               uses: actions/upload-artifact@v7
               with:
                   name: minimald-linux-amd64
-                  path: target/x86_64-unknown-linux-musl/release/minimald
+                  path: target/x86_64-unknown-linux-musl/release/minimald-linux-amd64
                   retention-days: 7
 
     build-release-linux-arm64:
@@ -188,37 +198,45 @@ jobs:
                   key: ${{ runner.os }}-arm64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
                   restore-keys: ${{ runner.os }}-arm64-cargo-release-
             - name: Build static minimal binary
+              # Rename with a platform suffix so download-artifact's merge-multiple
+              # flatten does not collide with the amd64 build's basename.
               run: |
                   cross build --release \
                      --package minimal \
                      --target aarch64-unknown-linux-musl
+                  mv target/aarch64-unknown-linux-musl/release/minimal \
+                     target/aarch64-unknown-linux-musl/release/minimal-linux-arm64
             - name: Upload binary (minimal)
               uses: actions/upload-artifact@v7
               with:
                   name: minimal-linux-arm64
-                  path: target/aarch64-unknown-linux-musl/release/minimal
+                  path: target/aarch64-unknown-linux-musl/release/minimal-linux-arm64
                   retention-days: 7
             - name: Build static mip binary
               run: |
                   cross build --release \
                      --package mip \
                      --target aarch64-unknown-linux-musl
+                  mv target/aarch64-unknown-linux-musl/release/mip \
+                     target/aarch64-unknown-linux-musl/release/mip-linux-arm64
             - name: Upload binary (mip)
               uses: actions/upload-artifact@v7
               with:
                   name: mip-linux-arm64
-                  path: target/aarch64-unknown-linux-musl/release/mip
+                  path: target/aarch64-unknown-linux-musl/release/mip-linux-arm64
                   retention-days: 7
             - name: Build static minimald binary
               run: |
                   cross build --release \
                      --package minimald \
                      --target aarch64-unknown-linux-musl
+                  mv target/aarch64-unknown-linux-musl/release/minimald \
+                     target/aarch64-unknown-linux-musl/release/minimald-linux-arm64
             - name: Upload binary (minimald)
               uses: actions/upload-artifact@v7
               with:
                   name: minimald-linux-arm64
-                  path: target/aarch64-unknown-linux-musl/release/minimald
+                  path: target/aarch64-unknown-linux-musl/release/minimald-linux-arm64
                   retention-days: 7
 
     cargo-deny:
@@ -251,29 +269,21 @@ jobs:
               with:
                   pattern: "*-*-*"
                   path: artifacts/
+                  merge-multiple: true
             - name: Make binaries executable
               run: chmod +x artifacts/*-*-*
             - name: Generate completions
               run: |
                   mkdir -p artifacts/completions/{bash,zsh,fish}
-                  artifacts/mip-linux-amd64 completions bash > artifacts/completions/bash/mip 2>/dev/null || true
-                  artifacts/mip-linux-amd64 completions zsh  > artifacts/completions/zsh/_mip 2>/dev/null || true
-                  artifacts/mip-linux-amd64 completions fish > artifacts/completions/fish/mip.fish 2>/dev/null || true
-                  artifacts/minimal-linux-amd64 completions bash > artifacts/completions/bash/minimal 2>/dev/null || true
-                  artifacts/minimal-linux-amd64 completions zsh  > artifacts/completions/zsh/_minimal 2>/dev/null || true
-                  artifacts/minimal-linux-amd64 completions fish > artifacts/completions/fish/minimal.fish 2>/dev/null || true
-                  artifacts/minimald-linux-amd64 completions bash > artifacts/completions/bash/minimald 2>/dev/null || true
-                  artifacts/minimald-linux-amd64 completions zsh  > artifacts/completions/zsh/_minimald 2>/dev/null || true
-                  artifacts/minimald-linux-amd64 completions fish > artifacts/completions/fish/minimald.fish 2>/dev/null || true
-            - name: Create Release
-              env:
-                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-              run: |
-                  cd artifacts/
-                  gh release create "${{ steps.release_info.outputs.tag }}" \
-                    $(ls) \
-                    --repo="${GITHUB_REPOSITORY}" \
-                    --title="${{ steps.release_info.outputs.name }}"
+                  artifacts/mip-linux-amd64 completions bash > artifacts/completions/bash/mip
+                  artifacts/mip-linux-amd64 completions zsh  > artifacts/completions/zsh/_mip
+                  artifacts/mip-linux-amd64 completions fish > artifacts/completions/fish/mip.fish
+                  artifacts/minimal-linux-amd64 completions bash > artifacts/completions/bash/minimal
+                  artifacts/minimal-linux-amd64 completions zsh  > artifacts/completions/zsh/_minimal
+                  artifacts/minimal-linux-amd64 completions fish > artifacts/completions/fish/minimal.fish
+                  artifacts/minimald-linux-amd64 completions bash > artifacts/completions/bash/minimald
+                  artifacts/minimald-linux-amd64 completions zsh  > artifacts/completions/zsh/_minimald
+                  artifacts/minimald-linux-amd64 completions fish > artifacts/completions/fish/minimald.fish
             - name: Authenticate to Google Cloud
               uses: google-github-actions/auth@v3
               with:
@@ -287,6 +297,16 @@ jobs:
                   gcloud storage cp \
                     --cache-control="public, max-age=31536000, immutable" \
                     "minimalone-${SHA}.tar.zst" gs://minimal-shim/archives/
+            - name: Create Release
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  tar -C artifacts/completions -czf artifacts/completions.tar.gz .
+                  cd artifacts/
+                  gh release create "${{ steps.release_info.outputs.tag }}" \
+                    $(find . -maxdepth 1 -type f) \
+                    --repo="${GITHUB_REPOSITORY}" \
+                    --title="${{ steps.release_info.outputs.name }}"
 
     minimal-check:
         runs-on: ubuntu-latest
