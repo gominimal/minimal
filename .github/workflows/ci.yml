@@ -32,7 +32,7 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 10
         steps:
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@v7
             - name: Run rustfmt
               run: cargo fmt --all -- --check
 
@@ -47,7 +47,7 @@ jobs:
                   remove_dotnet: true
                   remove_haskell: true
                   remove_tool_cache: true
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@v7
             - name: Install protoc
               run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
             - name: Cache cargo registry and build artifacts
@@ -66,7 +66,7 @@ jobs:
                   remove_dotnet: true
                   remove_haskell: true
                   remove_tool_cache: true
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@v7
             - name: Install protoc
               run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
             - name: Cache cargo registry and build artifacts
@@ -99,7 +99,7 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 20
         steps:
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@v7
             - uses: ./.github/actions/setup-minimal
             - name: Smoke-test `minimal run`
               run: minimal run build-smoke
@@ -122,7 +122,7 @@ jobs:
                   remove_dotnet: true
                   remove_haskell: true
                   remove_tool_cache: true
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@v7
             - name: Install dependencies
               run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
             - name: Add Rust target
@@ -132,7 +132,7 @@ jobs:
                   echo '' >> .cargo/config.toml
                   echo '[target.x86_64-unknown-linux-musl]' >> .cargo/config.toml
                   echo 'linker = "musl-gcc"' >> .cargo/config.toml
-            - uses: actions/cache@v5
+            - uses: actions/cache@v6
               with:
                   path: |
                       ~/.cargo/bin/
@@ -182,12 +182,12 @@ jobs:
         timeout-minutes: 90
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         steps:
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@v7
             - name: Install cross
               uses: taiki-e/install-action@v2
               with:
                   tool: cross
-            - uses: actions/cache@v5
+            - uses: actions/cache@v6
               with:
                   path: |
                       ~/.cargo/bin/
@@ -243,7 +243,7 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 10
         steps:
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@v7
             - uses: EmbarkStudios/cargo-deny-action@v2
 
     release:
@@ -256,7 +256,7 @@ jobs:
             contents: write
             id-token: write
         steps:
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@v7
             - name: Generate release info
               id: release_info
               run: |
@@ -312,7 +312,7 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 10
         steps:
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@v7
             - uses: ./.github/actions/setup-minimal
             - name: Check
               run: minimal --no-fetch check
