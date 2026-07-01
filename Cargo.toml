@@ -78,13 +78,12 @@ generational-arena = {version = "0.2", features = ["serde"] }
 google-cloud-gax = "1.13"
 google-cloud-auth = "1.5"
 google-cloud-storage = "1.7"
-# Pinned to the gominimal fork of souk4711/hakoniwa for the RustSlirp
-# `gateway()` next-hop-route support (`RustSlirpGateway::IfaceWithAddr`) that
-# own-IP egress needs. (The rustslirp feature's tun-rs 2.8.3 -> c2rust-bitfields
-# 0.22 -> proc-macro2 =1.0.103 pin is accommodated by holding clap at 4.5; see
-# the clap note above.) Repoint to upstream hakoniwa once the gateway support
-# lands there.
-hakoniwa = { git = "https://github.com/gominimal/hakoniwa.git", rev = "44969f29201c47bfad41f8942d5afe89c3ea398c", features = ["cgroups", "rustslirp"] }
+# Pinned to upstream souk4711/hakoniwa for the RustSlirp `gateway()`
+# next-hop-route support (`RustSlirpGateway::IfaceWithAddr`) that own-IP egress
+# needs. (The rustslirp feature's tun-rs 2.8.3 -> c2rust-bitfields 0.22 ->
+# proc-macro2 =1.0.103 pin is accommodated by holding clap at 4.5; see the clap
+# note above.) Move to a crates.io release once one carrying this is published.
+hakoniwa = { git = "https://github.com/souk4711/hakoniwa.git", rev = "bc0abab1b5ac91bb2dcf285ccd1b1beeb80a8f42", features = ["cgroups", "rustslirp"] }
 http-body = "1"
 hex = "0.4"
 indicatif = "0.18"

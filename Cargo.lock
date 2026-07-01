@@ -2303,7 +2303,7 @@ dependencies = [
 [[package]]
 name = "hakoniwa"
 version = "1.7.1"
-source = "git+https://github.com/gominimal/hakoniwa.git?rev=44969f29201c47bfad41f8942d5afe89c3ea398c#44969f29201c47bfad41f8942d5afe89c3ea398c"
+source = "git+https://github.com/souk4711/hakoniwa.git?rev=bc0abab1b5ac91bb2dcf285ccd1b1beeb80a8f42#bc0abab1b5ac91bb2dcf285ccd1b1beeb80a8f42"
 dependencies = [
  "bitflags",
  "caps",
