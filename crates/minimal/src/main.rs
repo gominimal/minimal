@@ -38,6 +38,11 @@ enum Command {
     /// Proxy stdio to a daemon UDS socket (used as an SSH ProxyCommand).
     #[command(hide = true)]
     Proxy(ProxyArgs),
+    /// Hold the attach-establishment lock briefly, then exit. Internal: spawned
+    /// by `attach` to serialize concurrent session handshakes around the libkrun
+    /// vsock concurrency bug (#588). Prints `ok` once the lock is held.
+    #[command(hide = true)]
+    AttachLock(AttachLockArgs),
     /// Forward a local TCP port to a remote address inside a PTask via SSH
     /// (R4.8, R4.9).
     ///
@@ -263,6 +268,18 @@ struct ProxyArgs {
     socket: String,
 }
 
+/// Arguments for the internal `attach-lock` helper.
+#[derive(Debug, Args)]
+struct AttachLockArgs {
+    /// Path to the establishment lock file to hold.
+    #[arg(long)]
+    lock_path: PathBuf,
+    /// Milliseconds to hold the lock after acquiring it (the establishment
+    /// window during which a concurrent attach must not race the handshake).
+    #[arg(long)]
+    window_ms: u64,
+}
+
 /// Arguments for `minimal ssh-forward`.
 #[derive(Debug, Args)]
 struct SshForwardArgs {
@@ -321,6 +338,7 @@ async fn main() -> Result<(), ()> {
             MeshCommand::Leave => cmd_mesh_leave(&cli.global_args),
         },
         Command::Proxy(args) => cmd_proxy(args).await,
+        Command::AttachLock(args) => cmd_attach_lock(args),
         Command::SshForward(args) => cmd_ssh_forward(&cli.global_args, args).await,
         Command::Login(args) => cmd_login(&cli.global_args, args).await,
         Command::Completions(CompletionsArgs { shell }) => {
@@ -576,6 +594,47 @@ async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), ()> {
     // depend on socat or nc being installed.
     let exe =
         std::env::current_exe().map_err(|e| eprintln!("cannot determine current exe: {e}"))?;
+
+    // Serialize attach establishment to dodge the libkrun vsock concurrency bug
+    // (#588): concurrent session handshakes racing through the host→guest muxer
+    // can leave one wedged. A short-lived detached holder takes an exclusive
+    // `flock` for the establishment window; we wait until it reports the lock is
+    // held, then exec ssh. A concurrent attach blocks on the same lock until this
+    // window elapses, so handshakes don't overlap. Best-effort: if the helper
+    // can't spawn we proceed unserialized rather than block the attach.
+    let window_ms: u64 = std::env::var("MINIMAL_ATTACH_ESTABLISH_WINDOW_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4000);
+    if window_ms > 0 {
+        let lock_path = sock
+            .parent()
+            .map(|p| p.join(".attach-establish.lock"))
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/.minimal-attach-establish.lock"));
+        match std::process::Command::new(&exe)
+            .arg("attach-lock")
+            .arg("--lock-path")
+            .arg(&lock_path)
+            .arg("--window-ms")
+            .arg(window_ms.to_string())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(mut child) => {
+                // Block until the holder reports `ok` (lock acquired) or dies.
+                if let Some(mut out) = child.stdout.take() {
+                    use std::io::Read;
+                    let mut buf = [0u8; 3];
+                    let _ = out.read(&mut buf);
+                }
+                // Leave the holder running detached; it releases after the window.
+            }
+            Err(e) => {
+                tracing::warn!("attach-lock helper failed to spawn ({e}); attaching unserialized");
+            }
+        }
+    }
+
     let proxy_cmd = format!(
         "{} proxy --socket {}",
         shell_quote(&exe.display().to_string()),
@@ -615,6 +674,53 @@ async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), ()> {
     // exec() only returns on failure
     eprintln!("failed to exec ssh: {err}");
     Err(())
+}
+
+/// Internal helper spawned by `cmd_attach`: hold an exclusive establishment lock
+/// for a bounded window, then exit (releasing it).
+///
+/// Works around the libkrun vsock concurrency bug (#588) where concurrent session
+/// handshakes racing through the host→guest muxer can leave one wedged. By holding
+/// this lock for the establishment window, concurrent attaches serialize their
+/// handshakes (the next blocks until the current window elapses) instead of
+/// racing. Prints `ok` to stdout once the lock is held so the parent can exec
+/// ssh, then keeps holding it in the background until the window expires.
+///
+/// Uses a blocking `flock(LOCK_EX)` — the same primitive `lcache` uses for its
+/// read-tracker, minus `LOCK_NB` so a contender waits rather than failing. flock
+/// works on Darwin (BSD) and Linux alike, and the lock is tied to the open file
+/// description, so it releases when this process exits.
+fn cmd_attach_lock(args: AttachLockArgs) -> Result<(), ()> {
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false) // the file is only a flock target; never written
+        .open(&args.lock_path)
+        .map_err(|e| eprintln!("attach-lock: open {}: {e}", args.lock_path.display()))?;
+
+    // Block until the exclusive lock is held; a concurrent holder releases it
+    // when its own window elapses (and on process exit).
+    // SAFETY: `file` owns a valid open fd for the duration of this call.
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if ret != 0 {
+        eprintln!(
+            "attach-lock: flock {}: {}",
+            args.lock_path.display(),
+            std::io::Error::last_os_error()
+        );
+        return Err(());
+    }
+
+    // Signal the parent that establishment may proceed.
+    println!("ok");
+    let _ = std::io::stdout().flush();
+
+    std::thread::sleep(std::time::Duration::from_millis(args.window_ms));
+    // `file` drops here, closing the fd and releasing the flock.
+    Ok(())
 }
 
 /// Print the effective networking policy for a session as JSON.

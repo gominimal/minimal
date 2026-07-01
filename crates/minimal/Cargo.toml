@@ -10,6 +10,7 @@ clap_complete.workspace = true
 camino.workspace = true
 chrono.workspace = true
 dirs.workspace = true
+libc.workspace = true
 minimald-rpc.workspace = true
 paths.workspace = true
 russh.workspace = true

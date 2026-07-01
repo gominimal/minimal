@@ -3486,6 +3486,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "dirs",
+ "libc",
  "minimald-rpc",
  "minvmd",
  "ot",
