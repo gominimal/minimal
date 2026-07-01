@@ -89,9 +89,9 @@ The existing codebase already implements this: `lib.rs` gates `pub mod
 krun` on `target_os = "macos"`, and `build.rs` only emits link directives
 on macOS.
 
-### Auto-spawn from `minimal2`
+### Auto-spawn from `minimal`
 
-On macOS, `crates/minimal2` checks `state.toml` before connecting to the
+On macOS, `crates/minimal` checks `state.toml` before connecting to the
 provider UDS. If no `minvmd` is running, it spawns
 `minvmd run --detach` and waits (with timeout, default 8 s) for the UDS to
 accept connections. On Linux this path is a no-op — `minimald` runs
@@ -125,7 +125,7 @@ is the guest-initiated variant.
 `fd-lock` — file-descriptor-based advisory locking for `lifecycle.lock`.
 Workspace-pinned in `Cargo.toml`.
 
-### Changes to `crates/minimal2`
+### Changes to `crates/minimal`
 
 A `#[cfg(target_os = "macos")]` block in `src/main.rs` adds the
 auto-spawn check: read `state.toml`, conditionally spawn

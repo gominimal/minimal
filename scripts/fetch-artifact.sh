@@ -35,9 +35,9 @@ cd "$ROOT"
 
 # Build the CLI from source (debug: this drives a cache fetch, so CLI CPU is not
 # the bottleneck). Incremental, so a second invocation in the same job is cheap.
-cargo build -p minimal
-MINIMAL="$ROOT/target/debug/minimal"
+cargo build -p mip
+MIP="$ROOT/target/debug/mip"
 
 mkdir -p "$(dirname "$DEST")"
-"$MINIMAL" materialize --output "$DEST" --arch "$ARCH" "$OUTPUT"
+"$MIP" materialize --output "$DEST" --arch "$ARCH" "$OUTPUT"
 echo "fetched $OUTPUT -> $DEST ($(wc -c < "$DEST" | tr -d ' ') bytes)"

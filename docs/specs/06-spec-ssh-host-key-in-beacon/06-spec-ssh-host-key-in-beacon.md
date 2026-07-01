@@ -107,7 +107,7 @@ in `minvmd/Cargo.toml` so the production code can call
   instance 0 per the hardcoded `is_minimal_microvm()` config).
 - Rotating or re-verifying the key across reboots (`learn_known_hosts_path`
   is idempotent for the same key and updates the entry on key change).
-- Updating `MinimalClientHandler::check_server_key` in `minimal2/src/client.rs`
+- Updating `MinimalClientHandler::check_server_key` in `minimal/src/client.rs`
   (the internal RPC client already accepts any key unconditionally; this spec
   targets user-facing SSH warnings on first connect).
 

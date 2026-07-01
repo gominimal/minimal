@@ -5,7 +5,7 @@ interactive session path. **`attach -c` is never used** — that exec path runs 
 the daemon host in the guest **root** netns and bypasses the sandbox, so it can
 never prove a session's isolation or own-ip behaviour.
 
-Run from the repo root with the daemon up. `M=target/debug/minimal2`.
+Run from the repo root with the daemon up. `M=target/debug/minimal`.
 
 **Portability:** targets the minvmd VM deployment (DM1) — macOS/HVF and Linux/KVM
 are identical (the sandbox guest is Linux on every host; the CLI, `expect`, and
@@ -17,7 +17,7 @@ proxies bind host loopback directly (no gvproxy host-expose).
 
 ## Environment & driver
 
-- **The full session path:** `minimal2 attach <sess>` (no `-c`) opens an
+- **The full session path:** `minimal attach <sess>` (no `-c`) opens an
   interactive PTY shell — `shell_request` → `SandboxLauncher` → a hakoniwa
   sandbox running `bash --noprofile -l` with the session's `NetworkMode`.
   Commands typed there run in the sandbox netns. This is the only faithful path.
@@ -152,7 +152,7 @@ Status today: `login` **PASS** (correct macOS cert path); proxy legs **BLOCKED**
 ```bash
 $M activate -n dev --network own-ip --ingress 18080:80 .
 # dev shell: socat TCP-LISTEN:80,reuseaddr,fork SYSTEM:'printf "HTTP/1.0 200 OK\r\n\r\nFORWARD_OK"' &  (keep attached)
-# host: minimal2 ssh-forward dev 18080:127.0.0.1:80 &
+# host: minimal ssh-forward dev 18080:127.0.0.1:80 &
 #       curl http://localhost:18080/   -> 200 FORWARD_OK
 $M destroy dev
 ```

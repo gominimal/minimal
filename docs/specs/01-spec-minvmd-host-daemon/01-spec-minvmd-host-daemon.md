@@ -265,7 +265,7 @@ auto-spawns it; subsequent calls reuse; `minvmd status` introspects;
 
 **Affected areas:** `crates/minvmd/src/cmd/{run,status,stop}.rs` (new),
 `crates/minvmd/src/state.rs` (new), `crates/minvmd/src/lifecycle.rs`
-(new), `crates/minimal2/src/main.rs` (extend)
+(new), `crates/minimal/src/main.rs` (extend)
 
 **Functional Requirements:**
 
@@ -288,7 +288,7 @@ auto-spawns it; subsequent calls reuse; `minvmd status` introspects;
   SIGKILL on timeout, then remove `vmm.pid` and reset `state.toml` to
   `Stopped`. The command shall be idempotent.
   (translated from plan: step R4.4)
-- **R4.5**: On macOS and Linux, `crates/minimal2` shall check `state.toml`
+- **R4.5**: On macOS and Linux, `crates/minimal` shall check `state.toml`
   before connecting to the UDS; if no `minvmd` is running it shall spawn
   `minvmd run --detach` and wait (with timeout) for the UDS. On targets
   with no minvmd backend this path shall be a no-op. (translated from
@@ -433,8 +433,8 @@ hold under this model.
 - **State file format** — TOML with serde; one file per VM (in v0.1,
   only `default`). Lifecycle enum is
   `NotProvisioned | Stopped | Starting | Running | Stopping`.
-- **Auto-spawn from `minimal2`** — implementation lives in
-  `crates/minimal2/src/autospawn.rs`, gated
+- **Auto-spawn from `minimal`** — implementation lives in
+  `crates/minimal/src/autospawn.rs`, gated
   `#[cfg(any(target_os = "macos", target_os = "linux"))]` and invoked from
   `main.rs`. Enabled on both macOS and Linux.
 

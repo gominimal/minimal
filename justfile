@@ -17,7 +17,7 @@ rootfs      := scratch / "rootfs.img"
 initramfs   := scratch / "initramfs.cpio"
 gvproxy     := scratch / "gvproxy"
 minvmd-bin  := justfile_directory() / "target/debug/minvmd"
-minimal     := justfile_directory() / "target/debug/minimal2"
+minimal     := justfile_directory() / "target/debug/minimal"
 
 # Re-run any time the entitlements file or binary changes. Ad-hoc signing
 # (`-s -`) requires no Apple Developer membership; the binary only runs on the
@@ -28,7 +28,7 @@ codesign-minvmd:
     cargo build -p minvmd --release
     codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - {{justfile_directory()}}/target/release/minvmd
 
-# ── minimal2 → minvmd → minimald bring-up (macOS/HVF or Linux/KVM) ───────────
+# ── minimal → minvmd → minimald bring-up (macOS/HVF or Linux/KVM) ───────────
 #
 # `just up` brings the whole stack up with full guest networking:
 #   1. materialize the guest kernel + generic rootfs into .scratch
@@ -113,9 +113,9 @@ minvmd-build: libkrun
       *) echo "unsupported host $(uname -s)" >&2; exit 1 ;;
     esac
 
-# Build the `minimal` CLI (minimal2 crate).
+# Build the `minimal` CLI (minimal crate).
 minimal-cli:
-    cargo build -p minimal2
+    cargo build -p minimal
 
 # minimal auto-spawns `minvmd run --detach`, so minvmd must be on PATH and the
 # MINVMD_* artifact paths exported; both are set here and inherited by the

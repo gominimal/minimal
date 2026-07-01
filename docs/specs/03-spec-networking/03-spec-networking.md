@@ -311,7 +311,7 @@ where WireGuard is blocked.
 **Affected areas:** `crates/minimald/` (new `wg` module: wireguard-go/boringtun
 peer lifecycle, subnet-router advertisement; new `proxy` module: HTTPS TLS
 termination, mTLS/OIDC auth, reverse-proxy to gvproxy switch),
-`crates/minimal2/` (new `mesh` subcommand: CLI peer join/leave, peer-key
+`crates/minimal/` (new `mesh` subcommand: CLI peer join/leave, peer-key
 management)
 
 **Functional Requirements:**
@@ -462,7 +462,7 @@ access in restricted environments.
   code; structured `tracing` fields, not interpolated strings.
 - Commit messages: Conventional Commits (`docs/commit-conventions.md`); imperative
   mood, lower-case, no trailing period; `feat(minimald):`, `feat(minvmd):`,
-  `feat(minimal2):` scopes.
+  `feat(minimal):` scopes.
 - Rust coding standards (`docs/rust-coding-standards.md`): functional over
   imperative; cheapest reference (`&str`, `&Path`); make illegal states
   unrepresentable; typed errors (`thiserror`) in library crates, `anyhow` at
@@ -549,6 +549,6 @@ access in restricted environments.
 | Check | Command |
 |---|---|
 | Lint | `cargo clippy --allow-dirty --fix --all-targets -- -D warnings` |
-| Build | `cargo build -p minimald -p minvmd -p minimal2` |
-| Unit + integration | `cargo test -p minimald -p minvmd -p minimal2` |
+| Build | `cargo build -p minimald -p minvmd -p minimal` |
+| Unit + integration | `cargo test -p minimald -p minvmd -p minimal` |
 | Full (hardware) | `cargo test -- --include-ignored` (requires `/dev/kvm`) |
