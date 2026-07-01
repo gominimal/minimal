@@ -249,10 +249,10 @@ jobs:
             - name: Download artifacts
               uses: actions/download-artifact@v8
               with:
-                  pattern: "*-linux-*"
+                  pattern: "*-*-*"
                   path: artifacts/
             - name: Make binaries executable
-              run: chmod +x artifacts/*-{linux,macos}-*
+              run: chmod +x artifacts/*-*-*
             - name: Generate completions
               run: |
                   mkdir -p artifacts/completions/{bash,zsh,fish}
