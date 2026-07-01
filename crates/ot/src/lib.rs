@@ -154,6 +154,21 @@ impl TrackerInner {
     }
 }
 
+impl Drop for TrackerInner {
+    /// A node disappearing is itself a change the renderer must observe: it has
+    /// to re-snapshot and drop the bar for any operation whose node was dropped
+    /// without an explicit [`set_done`](OpTracker::set_done) — e.g. an early `?`
+    /// return, or a completed operation that simply went out of scope. The
+    /// renderer only repaints on a version bump, so without this wake an
+    /// orphaned spinner would keep animating (via indicatif's steady-tick
+    /// thread) until some unrelated mutation happened to wake it. `shared`
+    /// outlives this body — it is a field, dropped only after `drop` returns —
+    /// so the bump is sound.
+    fn drop(&mut self) {
+        self.shared.bump();
+    }
+}
+
 /// A node in the operation tree, potentially describing an operation.
 ///
 /// Nodes may have a parent (unless they are the root) or children.
@@ -548,6 +563,43 @@ mod tests {
             .set_op(Operation::PackageBuild { name: "x".into() });
         assert!(r1.version() > 0);
         assert_eq!(r2.version(), 0, "mutating one tree must not touch another");
+    }
+
+    #[test]
+    fn dropping_a_node_bumps_version() {
+        // A node vanishing is a change a renderer must see (to clear its bar),
+        // even when the operation was never explicitly marked done.
+        let root = OpTracker::new_root();
+        let child = root.new_child();
+        child.set_op(Operation::ExtractPkg { name: "p".into() });
+        let before = root.version();
+        drop(child);
+        assert!(
+            root.version() > before,
+            "dropping a node must bump the version"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_wakes_on_node_drop() {
+        // The renderer only repaints on a wake; dropping an op node without
+        // set_done() must still wake it so it can clear the orphaned bar.
+        let root = OpTracker::new_root();
+        let child = root.new_child();
+        child.set_op(Operation::Check {
+            kind: CheckKind::CheckPackages,
+            name: "p".into(),
+        });
+        let mut rx = root.subscribe();
+        rx.borrow_and_update();
+        let h = tokio::spawn(async move { rx.changed().await });
+        tokio::task::yield_now().await;
+        drop(child);
+        tokio::time::timeout(Duration::from_secs(1), h)
+            .await
+            .expect("changed() should wake on node drop")
+            .expect("waiter task should not panic")
+            .expect("watch sender should be alive");
     }
 
     #[tokio::test]
