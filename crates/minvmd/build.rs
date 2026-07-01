@@ -5,6 +5,17 @@
 //! Without that cfg the crate compiles to a runtime-bailing stub and never
 //! links libkrun.
 //!
+//! The rpath always includes a binary-relative entry (`$ORIGIN` /
+//! `@loader_path`) so a relocated release binary finds libkrun's shared objects
+//! shipped next to it. The absolute libkrun prefix is also recorded, except for
+//! a Linux `--release` build (its prefix is an ephemeral build path that must
+//! not leak). A macOS release keeps the prefix because it is the stable Homebrew
+//! lib dir (`/opt/homebrew/lib`), letting the shipped binary resolve
+//! libkrun.dylib on any target that has `brew install slp/krun/libkrun`. On
+//! Linux the standard system lib dirs ([`LINUX_LIB_DIRS`]) are added too, so a
+//! target with a system-installed libkrun resolves it without bundling. See
+//! [`emit_rpaths`] for the full ordering.
+//!
 //! - **macOS**: libkrun is always linked (Hypervisor.framework backend). The
 //!   prefix defaults to `/opt/homebrew/lib` (the Homebrew tap install location);
 //!   override with `LIBKRUN_PREFIX`.
@@ -16,6 +27,20 @@
 //! - **Other targets**: stub only; never links libkrun.
 
 use std::path::Path;
+
+/// Standard system directories that may hold `libkrun.so` on Linux. Used both to
+/// detect libkrun at build time (`find_libkrun_prefix`) and to seed a release
+/// binary's rpath, so a target with a system-installed libkrun resolves it (and
+/// its `libkrunfw.so.5` sibling, via the loader's default search) without any
+/// bundling. Entries that don't exist on a given host are skipped harmlessly by
+/// both the build-time scan and the runtime loader.
+const LINUX_LIB_DIRS: &[&str] = &[
+    "/usr/local/lib",
+    "/usr/lib",
+    "/usr/lib64",
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib/aarch64-linux-gnu",
+];
 
 fn main() {
     println!("cargo:rerun-if-env-changed=LIBKRUN_PREFIX");
@@ -39,9 +64,54 @@ fn main() {
 
     if let Some(prefix) = prefix {
         println!("cargo:rustc-link-search=native={prefix}");
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{prefix}");
+        emit_rpaths(&target_os, &prefix);
         println!("cargo::rustc-cfg=minvmd_libkrun");
     }
+}
+
+/// Record the runtime library search paths (rpath) baked into the binary. The
+/// dynamic loader tries them in the order emitted here.
+fn emit_rpaths(target_os: &str, prefix: &str) {
+    let is_release = std::env::var("PROFILE").as_deref() == Ok("release");
+
+    // 1. Absolute `{prefix}` — recorded EXCEPT for a Linux `--release` build:
+    //   - Non-release (dev + every e2e CI run use `target/debug/minvmd`): resolve
+    //     libkrun where it was materialized, no LD_LIBRARY_PATH needed.
+    //   - macOS release: KEEP it. On Apple Silicon the prefix is the canonical
+    //     Homebrew lib dir (`/opt/homebrew/lib`) — a stable system path identical
+    //     on any target with `brew install slp/krun/libkrun`, so the shipped binary
+    //     resolves libkrun.dylib directly with no bundling. dyld consults this
+    //     rpath when the dylib's install name is `@rpath/...`, and ignores it
+    //     harmlessly when the install name is already absolute.
+    //   - Linux release: DROP it — the prefix is an ephemeral build path (e.g.
+    //     `$HOME/.krun`) that must not leak into the artifact; entries 2 and 3
+    //     below cover that binary instead.
+    if !is_release || target_os == "macos" {
+        rpath(prefix);
+    }
+
+    // 2. Binary-relative (`$ORIGIN` on Linux, `@loader_path` on macOS) — lets a
+    //    RELOCATED binary find libkrun's shared objects shipped alongside it. It
+    //    reaches the linker as a literal argv token (no shell expansion here), so
+    //    it is recorded verbatim.
+    rpath(if target_os == "macos" {
+        "@loader_path"
+    } else {
+        "$ORIGIN"
+    });
+
+    // 3. Standard system lib dirs on Linux — lets a target with a system-installed
+    //    libkrun resolve it without bundling (the counterpart to macOS reusing the
+    //    Homebrew prefix in entry 1). Stable absolute paths, so safe in a release
+    //    artifact; nonexistent dirs are skipped by the loader.
+    if target_os == "linux" {
+        LINUX_LIB_DIRS.iter().for_each(|dir| rpath(dir));
+    }
+}
+
+/// Emit a single rpath entry via the linker.
+fn rpath(path: &str) {
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{path}");
 }
 
 /// Locate the directory holding `libkrun.so` on Linux.
@@ -56,15 +126,7 @@ fn find_libkrun_prefix() -> Option<String> {
         return Some(prefix);
     }
 
-    const CANDIDATES: &[&str] = &[
-        "/usr/local/lib",
-        "/usr/lib",
-        "/usr/lib64",
-        "/usr/lib/x86_64-linux-gnu",
-        "/usr/lib/aarch64-linux-gnu",
-    ];
-
-    CANDIDATES
+    LINUX_LIB_DIRS
         .iter()
         .find(|dir| dir_has_libkrun(dir))
         .map(|dir| (*dir).to_string())

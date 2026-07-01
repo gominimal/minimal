@@ -106,7 +106,7 @@ jobs:
 
     build-release-linux-amd64:
         runs-on: ubuntu-latest
-        timeout-minutes: 45
+        timeout-minutes: 60
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         steps:
             - name: Free Disk Space
@@ -176,6 +176,29 @@ jobs:
                   name: minimald-linux-amd64
                   path: target/x86_64-unknown-linux-musl/release/minimald-linux-amd64
                   retention-days: 7
+            - name: Materialize libkrun prefix (upstream package)
+              # minvmd links libkrun's KVM backend dynamically, so unlike the three
+              # binaries above it can't join the static-musl cross build — it needs a
+              # native glibc build against a real libkrun. Materialize libkrun (a cache
+              # fetch keyed by the pinned upstream commit, NOT a from-source build) into
+              # a flat prefix that minvmd's build.rs link-searches + rpaths against.
+              run: ./scripts/fetch-libkrun.sh "$HOME/.krun" x86_64
+            - name: Build native minvmd binary
+              # Native host target (x86_64-unknown-linux-gnu), NOT musl: the binary
+              # links libkrun.so (and libkrunfw.so.5 is dlopen'd at runtime), so unlike
+              # the three above it is not self-contained — running it still needs those
+              # .so's reachable via rpath/LD_LIBRARY_PATH. LIBKRUN_PREFIX drives the
+              # build.rs link search and the `minvmd_libkrun` cfg (real, non-stub impl).
+              run: |
+                  LIBKRUN_PREFIX="$HOME/.krun" \
+                    cargo build --release -p minvmd --bin minvmd
+                  mv target/release/minvmd target/release/minvmd-linux-amd64
+            - name: Upload binary (minvmd)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minvmd-linux-amd64
+                  path: target/release/minvmd-linux-amd64
+                  retention-days: 7
 
     build-release-linux-arm64:
         runs-on: ubuntu-latest
@@ -239,6 +262,53 @@ jobs:
                   path: target/aarch64-unknown-linux-musl/release/minimald-linux-arm64
                   retention-days: 7
 
+    build-release-macos-arm64:
+        # Self-hosted Apple Silicon runner. minvmd links libkrun (Hypervisor.framework
+        # backend) via `#[link(name = "krun")]` and builds the real (non-stub) impl
+        # only on macOS against a provisioned libkrun — it can't join the static-musl
+        # cross builds above, so it's built natively here (mirrors ci-macos.yml's
+        # build-macos). Gated on RUN_MACOS_CI like the other macOS jobs so it's skipped
+        # while the single self-hosted runner is offline — a skip here also skips
+        # `release`, which needs it.
+        runs-on: [self-hosted, macOS, ARM64]
+        timeout-minutes: 45
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.RUN_MACOS_CI != 'false'
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  # Don't leave git credentials on the persistent self-hosted runner.
+                  persist-credentials: false
+            - name: Toolchain
+              uses: dtolnay/rust-toolchain@stable
+            - name: Provision libkrun (slp/krun tap)
+              # Self-install libkrun so the job doesn't depend on hand-provisioned
+              # runner state. Idempotent (a no-op when already present).
+              run: brew install slp/krun/libkrun
+            - name: Verify libkrun is available
+              run: |
+                  if [ ! -f /opt/homebrew/lib/libkrun.dylib ]; then
+                    echo "::error::libkrun.dylib not found under /opt/homebrew/lib. Provision the runner with: brew install slp/krun/libkrun" >&2
+                    exit 1
+                  fi
+            - name: Build release minvmd binary
+              run: cargo build --release -p minvmd --bin minvmd
+            - name: Codesign minvmd (hypervisor entitlement, R1.4)
+              # Codesigning must be the LAST thing to touch the binary: any later relink
+              # (a stray cargo build/test) drops the ad-hoc signature and
+              # krun_start_enter then fails with EINVAL. Renaming + uploading below
+              # preserve the embedded signature (they don't rewrite the Mach-O).
+              run: codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/release/minvmd
+            - name: Rename binary with platform suffix
+              # download-artifact merge-multiple flattens on basename, so the uploaded
+              # file must already carry the platform-suffixed name the release job expects.
+              run: mv target/release/minvmd target/release/minvmd-macos-arm64
+            - name: Upload binary (minvmd)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minvmd-macos-arm64
+                  path: target/release/minvmd-macos-arm64
+                  retention-days: 7
+
     cargo-deny:
         runs-on: ubuntu-latest
         timeout-minutes: 10
@@ -250,7 +320,12 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 30
         needs:
-            [ci-success, build-release-linux-amd64, build-release-linux-arm64]
+            [
+                ci-success,
+                build-release-linux-amd64,
+                build-release-linux-arm64,
+                build-release-macos-arm64,
+            ]
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         permissions:
             contents: write
