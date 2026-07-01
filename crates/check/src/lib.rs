@@ -589,6 +589,7 @@ async fn check_package(
         let ctx = ctx.clone();
         let pkg = pkg.clone();
         let span = tracing::Span::current();
+        let check_op = check_op.clone();
 
         tokio::task::spawn_blocking(move || {
             let _enter = span.enter();
@@ -615,6 +616,8 @@ async fn check_package(
     };
 
     out.extend(file_based_results);
+
+    check_op.set_done();
 
     Ok(out)
 }

@@ -283,6 +283,8 @@ impl<B: FetchBackend> RemoteCache<B> {
         )
         .map_err(Error::ArchiveError)?;
 
+        materialize_op.set_done();
+
         Ok((Instant::now().duration_since(start), cache_hnd))
     }
 }
