@@ -39,10 +39,14 @@ if [ "${FORCE_CROSS:-0}" != "1" ] \
    && rustup target list --installed 2>/dev/null | grep -qx "$TARGET" \
    && command -v "$MUSL_CC" >/dev/null 2>&1; then
   # Native same-arch static-musl build. cargo derives the linker override var
-  # from the target triple (uppercased, non-alphanumerics -> `_`).
+  # from the target triple (uppercased, non-alphanumerics -> `_`); cc-rs (used by
+  # ring's build script to compile its C/asm) reads `CC_<triple>` with the triple
+  # lower-cased and dashes -> `_`. Set both so the musl toolchain is used for the
+  # link *and* for any C compiled into the guest binary.
   LINKER_VAR="CARGO_TARGET_$(echo "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER"
-  echo "build-initramfs: native musl build ($TARGET, linker $MUSL_CC)" >&2
-  env "$LINKER_VAR=$MUSL_CC" cargo "$@"
+  CC_VAR="CC_$(echo "$TARGET" | tr '-' '_')"
+  echo "build-initramfs: native musl build ($TARGET, cc/linker $MUSL_CC)" >&2
+  env "$LINKER_VAR=$MUSL_CC" "$CC_VAR=$MUSL_CC" cargo "$@"
 else
   echo "build-initramfs: cross build ($TARGET)" >&2
   command -v cross >/dev/null || cargo install cross --locked
