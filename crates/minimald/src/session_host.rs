@@ -704,43 +704,42 @@ impl SessionLauncher for SandboxLauncher {
         .map_err(io::Error::other)?;
         let graph = graph_result.map_err(io::Error::other)?;
 
-        // Phase 1 (pre-spawn): a native (DM2/`LocalSpawn`) own-IP PTask must
-        // allocate its lease and ensure gvproxy is up *now*, because hakoniwa
-        // builds the tap (and assigns its address) inside the sandbox namespace
-        // before the process is spawned. We snapshot the lease IP + control
-        // socket for the post-spawn relay, and the tap params for the sandbox to
-        // configure. DM1/3/4 (`HostShuttle`, root-in-VM) instead keep the
-        // post-spawn open-tap-then-move-into-netns path and allocate their lease
-        // there, so `own_ip_tap`/`local_own_ip` stay `None` for them.
+        // Phase 1 (pre-spawn): for own-IP, snapshot the switch's DNS server from
+        // its live subnet (needed by *every* own-IP sandbox — both transports).
+        // A native (DM2/`LocalSpawn`) PTask must additionally allocate its lease
+        // and ensure gvproxy is up *now*, because hakoniwa builds the tap (and
+        // assigns its address) inside the sandbox namespace before the process is
+        // spawned; we snapshot the lease IP + control socket for the post-spawn
+        // relay and the tap params for the sandbox to configure. DM1/3/4
+        // (`HostShuttle`, root-in-VM) keep the post-spawn open-tap-then-move-into-
+        // netns path and allocate their lease there, so `own_ip_tap`/
+        // `local_own_ip` stay `None` — but `own_ip_dns` is still set for them.
         let mut local_own_ip: Option<(std::net::Ipv4Addr, std::path::PathBuf)> = None;
         let mut own_ip_tap: Option<sandbox2::config::OwnIpTap> = None;
-        if matches!(network_mode, NetworkMode::OwnIp)
-            && matches!(
-                net_switch.lock().await.transport(),
-                crate::net::SwitchTransport::LocalSpawn
-            )
-        {
+        let mut own_ip_dns: Option<std::net::Ipv4Addr> = None;
+        if matches!(network_mode, NetworkMode::OwnIp) {
             let mut s = net_switch.lock().await;
-            let attach = s
-                .attach()
-                .await
-                .map_err(|e| io::Error::other(format!("attaching OwnIp PTask to switch: {e}")))?;
             let subnet = s.subnet();
-            let sock = s.control_socket();
-            drop(s);
-            let prefix = subnet.prefix();
-            let mask = if prefix == 0 {
-                0
-            } else {
-                u32::MAX << (32 - prefix)
-            };
-            own_ip_tap = Some(sandbox2::config::OwnIpTap {
-                address: attach.lease.ip,
-                netmask: std::net::Ipv4Addr::from(mask),
-                gateway: subnet.gateway(),
-                mtu: crate::net::DEFAULT_MTU,
-            });
-            local_own_ip = Some((attach.lease.ip, sock));
+            own_ip_dns = Some(subnet.dns_server());
+            if matches!(s.transport(), crate::net::SwitchTransport::LocalSpawn) {
+                let attach = s.attach().await.map_err(|e| {
+                    io::Error::other(format!("attaching OwnIp PTask to switch: {e}"))
+                })?;
+                let sock = s.control_socket();
+                let prefix = subnet.prefix();
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - prefix)
+                };
+                own_ip_tap = Some(sandbox2::config::OwnIpTap {
+                    address: attach.lease.ip,
+                    netmask: std::net::Ipv4Addr::from(mask),
+                    gateway: subnet.gateway(),
+                    mtu: crate::net::DEFAULT_MTU,
+                });
+                local_own_ip = Some((attach.lease.ip, sock));
+            }
         }
 
         // Guard the phase-1 attach for the whole window until it is handed to an
@@ -777,6 +776,7 @@ impl SessionLauncher for SandboxLauncher {
                     )
                     .with_network_mode(network_mode)
                     .with_own_ip_tap(own_ip_tap)
+                    .with_own_ip_dns(own_ip_dns)
                     .with_username(username),
             )
             .await?;

@@ -710,18 +710,18 @@ impl<C: Channel> Sandbox<C> {
 
         // An own-IP sandbox runs in a fresh netns where the synth rootfs's host
         // stub resolver (`127.0.0.53`) is unreachable, so point `/etc/resolv.conf`
-        // at the switch gateway instead — gvproxy answers DNS there, and it is
-        // already the tap's next-hop route. Sourcing it from the same
-        // `own_ip_tap.gateway` that configures the tap keeps the resolver and the
-        // route provably consistent (one live value, not two derivations).
-        // Written to the rootfs before spawn, like `/etc/hostname` above:
-        // hakoniwa binds `/etc` read-only from `<rootfs>/etc`, so an in-sandbox
-        // write would hit a read-only fs. Overwrites unconditionally —
-        // `synth_dns_config` already populated it with the host resolver, so a
-        // create-only guard would leave the (dead) host stub in place.
-        if let Some(tap) = self.config.own_ip_tap {
+        // at the switch's DNS server (gvproxy, at the gateway) instead. Sourced
+        // from `own_ip_dns` — set for *every* own-IP sandbox, both the DM2 tap
+        // path and the DM1/3/4 shuttle path (which has no `own_ip_tap`) — so DNS
+        // is not tied to tap params. Written to the rootfs before spawn, like
+        // `/etc/hostname` above: hakoniwa binds `/etc` read-only from
+        // `<rootfs>/etc`, so an in-sandbox write would hit a read-only fs.
+        // Overwrites unconditionally — `synth_dns_config` already populated it
+        // with the host resolver, so a create-only guard would leave the (dead)
+        // host stub in place.
+        if let Some(dns) = self.config.own_ip_dns {
             let etc_resolv = self.rootfs().join("etc").join("resolv.conf");
-            std::fs::write(&etc_resolv, format!("nameserver {}\n", tap.gateway))
+            std::fs::write(&etc_resolv, format!("nameserver {dns}\n"))
                 .map_err(|e| Error::IO("writing /etc/resolv.conf", etc_resolv.clone(), e))?;
         }
 

@@ -164,6 +164,13 @@ pub struct Config {
     /// (rootless), and the tap fd is surfaced via `Child.rustslirp_tapfd`. `None`
     /// keeps the host/VM behaviour (no in-namespace tap).
     pub own_ip_tap: Option<OwnIpTap>,
+    /// The DNS server for an own-IP sandbox's `/etc/resolv.conf`, overriding the
+    /// synth rootfs's host stub resolver (unreachable in the fresh netns). Set for
+    /// **every** own-IP sandbox — both the native (DM2) tap path (which also sets
+    /// [`own_ip_tap`](Self::own_ip_tap)) and the in-VM (DM1/3/4) shuttle path
+    /// (which does not) — so DNS is not tied to the presence of tap params.
+    /// `None` keeps the host-derived resolver.
+    pub own_ip_dns: Option<std::net::Ipv4Addr>,
 
     /// The hostname to set in the environment, if any.
     pub hostname: Option<String>,
@@ -204,6 +211,7 @@ impl Config {
             network_mode: NetworkMode::HostNet,
             network: None,
             own_ip_tap: None,
+            own_ip_dns: None,
             env_vars: HashMap::with_capacity(12),
             hostname: None,
             username: None,
@@ -309,6 +317,14 @@ impl Config {
     /// host/VM behaviour.
     pub fn with_own_ip_tap(mut self, tap: Option<OwnIpTap>) -> Self {
         self.own_ip_tap = tap;
+        self
+    }
+    /// Sets the own-IP DNS server for `/etc/resolv.conf` (the switch gateway).
+    /// Set for every own-IP sandbox, independent of [`own_ip_tap`](Self::own_ip_tap),
+    /// so both the DM2 tap path and the DM1/3/4 shuttle path get a working
+    /// resolver. `None` keeps the host-derived resolver.
+    pub fn with_own_ip_dns(mut self, dns: Option<std::net::Ipv4Addr>) -> Self {
+        self.own_ip_dns = dns;
         self
     }
     /// Sets whether DNS should be configured.
