@@ -159,7 +159,8 @@ clean:
 #      native-Linux + VM equivalent over KVM).
 # DM2: native Linux, a host-native `minimald` (no VM), reachable over UDS at
 #      providers/local-0/ssh.sock — the same path the `minimal` CLI dials, so no
-#      bridge is needed. Own-IP works rootless (setcap'd daemon, in-process tap).
+#      bridge is needed. Own-IP is rootless (hakoniwa RustSlirp builds the tap
+#      inside the sandbox's own user+net namespace — no setcap).
 # DM3: native Linux + one Linux VM (minimald as initramfs pid-1 in libkrun). The
 #      Linux CLI dials providers/local-0/ssh.sock, but minvmd bridges the guest
 #      at $XDG_RUNTIME_DIR/minimal/minimald.sock, so `dm3` symlinks the former to
@@ -210,7 +211,7 @@ dm3: artifacts gvproxy initramfs minvmd-build minimal-cli
       if "{{minimal}}" ls; then ok=1; break; fi
       sleep 2
     done
-    [ "$ok" = 1 ] || { echo "DM3: minimal2 ls failed after retries" >&2; exit 1; }
+    [ "$ok" = 1 ] || { echo "DM3: minimal ls failed after retries" >&2; exit 1; }
 
 # DM2 — native Linux, host-native minimald (no VM) over UDS. Runs minimald under
 # a dedicated state dir; the CLI reaches it with `--minimal-dir`, which (via the
@@ -223,16 +224,9 @@ dm2: minimald-build minimal-cli gvproxy
     pidf="{{scratch}}/dm2-minimald.pid"
     bin="{{justfile_directory()}}/target/debug/minimald"
     mkdir -p "$dir"
-    # Own-IP on a host-native daemon needs CAP_NET_ADMIN+CAP_SYS_ADMIN (effective)
-    # to set up each PTask's tap inside its netns in-process (no privileged child
-    # processes). `cargo build` strips file caps, so (re)apply on every bring-up.
-    # The daemon resets PR_SET_DUMPABLE at startup so holding these caps does not
-    # break sandbox user-namespace (uid_map) setup. Best-effort: without the caps,
-    # plain (HostNet) sessions still work but own-IP attach fails with EPERM.
-    if ! sudo -n setcap cap_net_admin,cap_sys_admin=ep "$bin" 2>/dev/null; then
-      echo "DM2: could not setcap minimald (needs passwordless sudo); own-IP will" >&2
-      echo "     EPERM. Run: sudo setcap cap_net_admin,cap_sys_admin=ep $bin" >&2
-    fi
+    # Own-IP is rootless: hakoniwa's RustSlirp builds each PTask's tap inside the
+    # sandbox's own user+net namespace, so the daemon needs no `setcap` / elevated
+    # privilege. (It does need an unprivileged-user-namespace-capable host.)
     if [ -S "$sock" ] && [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; then
       echo "DM2 minimald already up: $sock"
     else

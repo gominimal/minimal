@@ -213,26 +213,6 @@ impl From<russh::keys::Error> for MainError {
     }
 }
 
-/// Reset the process "dumpable" flag to 1 (see the call site for why). Process-
-/// wide and inherited across `fork`, so calling it once before any sandbox is
-/// spawned suffices. Linux-only; a no-op elsewhere.
-fn restore_sandbox_dumpable() {
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: `prctl(PR_SET_DUMPABLE, 1)` takes no pointers and only sets the
-        // calling process's dumpable flag to a valid value (1 = SUID_DUMP_USER).
-        // It cannot fail for this argument, but we log rather than panic if it
-        // somehow does, since a wrong dumpable state only degrades DM2 own-IP.
-        let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
-        if rc != 0 {
-            tracing::warn!(
-                error = %std::io::Error::last_os_error(),
-                "failed to set PR_SET_DUMPABLE; setcap'd host-native sandboxes may fail"
-            );
-        }
-    }
-}
-
 fn main() -> Result<(), MainError> {
     let runtime = Builder::new_multi_thread()
         .thread_name("minimald-worker")
@@ -304,18 +284,6 @@ async fn async_main() -> Result<(), MainError> {
         .with(fmt::layer().with_writer(ot::StdoutWriter::new))
         .with(filter)
         .init();
-
-    // Restore the "dumpable" flag so sandbox children can set up their user
-    // namespace. When minimald is granted file capabilities (DM2: an unprivileged
-    // host-native daemon `setcap`'d for own-IP tap/netns setup), gaining caps at
-    // `execve` sets the process dumpable flag to `SUID_DUMP_ROOT`, which makes
-    // `/proc/<pid>/{uid_map,gid_map,setgroups}` owned by root. A forked sandbox
-    // (hakoniwa) inherits that flag and then fails to write its *own*
-    // `/proc/self/uid_map` as the unprivileged real user — `EPERM` — breaking
-    // every session, own-IP or not. Resetting dumpable to 1 re-owns those files
-    // to the real uid so the unprivileged single-id self-mapping is permitted
-    // again. A no-op (already 1) when minimald holds no file capabilities.
-    restore_sandbox_dumpable();
 
     // With `networking-proxy` on, both the `ring` (workspace rustls) and the
     // `aws-lc-rs` (google-cloud) providers are compiled in, so rustls cannot

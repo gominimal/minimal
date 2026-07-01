@@ -517,6 +517,27 @@ impl<C: Channel> Sandbox<C> {
             }
         }
 
+        // Own-IP (native/DM2): have hakoniwa create + configure the TAP inside the
+        // sandbox's user+net namespace (rootless — it enters the namespace as its
+        // container-root and needs no host `CAP_NET_ADMIN`). The tap fd comes back
+        // out post-spawn via `Child.rustslirp_tapfd` for the caller to relay to the
+        // gvproxy switch. `network()` does not imply the netns unshare, so it must
+        // follow the `unshare(Namespace::Network)` above (which `isolate` did).
+        if let Some(tap) = self.config.own_ip_tap {
+            container.network(
+                hakoniwa::RustSlirp::default()
+                    // L2: the gvproxy relay is HyperKit-framed Ethernet, not L3.
+                    .mode(hakoniwa::RustSlirpMode::TAP)
+                    .address(tap.address)
+                    .netmask(tap.netmask)
+                    // Next-hop default route (`0.0.0.0/0 via gateway`); gvproxy is a
+                    // real gateway and does not proxy-ARP, so an on-link route fails.
+                    .gateway(hakoniwa::RustSlirpGateway::IfaceWithAddr(tap.gateway))
+                    .mtu(tap.mtu)
+                    .clone(),
+            );
+        }
+
         let rec = BindOpts {
             recursive: true,
             read_only: false,

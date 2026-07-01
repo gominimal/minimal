@@ -71,6 +71,7 @@ pub struct EnvArgs {
     env_vars: Option<HashMap<String, EnvVarValue>>,
     ot: Option<OpTracker>,
     network_mode: NetworkMode,
+    own_ip_tap: Option<sandbox2::config::OwnIpTap>,
 }
 
 impl EnvArgs {
@@ -93,6 +94,7 @@ impl EnvArgs {
             env_vars: None,
             ot: None,
             network_mode: NetworkMode::HostNet,
+            own_ip_tap: None,
         }
     }
 
@@ -140,6 +142,16 @@ impl EnvArgs {
     #[must_use]
     pub fn with_network_mode(mut self, mode: NetworkMode) -> Self {
         self.network_mode = mode;
+        self
+    }
+
+    /// Sets the own-IP user-mode tap parameters (native/DM2 own-IP). When set,
+    /// the sandbox's TAP is created + configured in-namespace by hakoniwa
+    /// (rootless) and the caller relays its fd to the switch. `None` keeps the
+    /// host/VM behaviour.
+    #[must_use]
+    pub fn with_own_ip_tap(mut self, tap: Option<sandbox2::config::OwnIpTap>) -> Self {
+        self.own_ip_tap = tap;
         self
     }
 }
@@ -253,6 +265,10 @@ impl Env {
                 NetworkMode::OwnIp => Some(crate::net::DEFAULT_SUBNET.gateway()),
                 _ => None,
             })
+            // Own-IP/native (DM2): hakoniwa builds the tap in-namespace (rootless).
+            // `None` for host/VM modes and for the DM1/3/4 vsock-shuttle path,
+            // which keeps the privileged open-tap-then-move-into-netns wiring.
+            .with_own_ip_tap(args.own_ip_tap)
             .with_hostname(args.name.clone())
             .with_username(args.username.unwrap_or_else(|| "user".to_string()));
 

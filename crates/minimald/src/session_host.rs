@@ -647,6 +647,8 @@ impl SessionLauncher for SandboxLauncher {
         // Move the ingress policy out of `self` up front so it can be applied
         // after the switch attach below (the rest of `self` is consumed first).
         let ingress = self.ingress;
+        let network_mode = self.network_mode;
+        let net_switch = self.net_switch;
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
         // graph construction) — run it on the blocking pool so it
         // doesn't stall the async executor.
@@ -659,103 +661,175 @@ impl SessionLauncher for SandboxLauncher {
         .map_err(io::Error::other)?;
         let graph = graph_result.map_err(io::Error::other)?;
 
-        // The env owns the context, graph and the sandbox files backing the
-        // running process's rootfs, so it is `Send + 'static` and can be moved
-        // into the host as the guard that keeps those files alive — no leaking
-        // or self-referential borrows required.
-        let mut env = crate::env::Env::build(
-            ctx,
-            graph,
-            crate::env::EnvArgs::new(name, paths.working, paths.home, paths.cache)
-                .with_packages(["base", "bash", "socat", "coreutils", "claude-code"])
-                .with_env_vars(
-                    [(
-                        "PS1".to_string(),
-                        EnvVarValue::Value(
-                            r"\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "
-                                .to_string(),
-                        ),
-                    )]
-                    .into(),
-                )
-                .with_network_mode(self.network_mode)
-                .with_username(username),
-        )
-        .await?;
+        // Phase 1 (pre-spawn): a native (DM2/`LocalSpawn`) own-IP PTask must
+        // allocate its lease and ensure gvproxy is up *now*, because hakoniwa
+        // builds the tap (and assigns its address) inside the sandbox namespace
+        // before the process is spawned. We snapshot the lease IP + control
+        // socket for the post-spawn relay, and the tap params for the sandbox to
+        // configure. DM1/3/4 (`HostShuttle`, root-in-VM) instead keep the
+        // post-spawn open-tap-then-move-into-netns path and allocate their lease
+        // there, so `own_ip_tap`/`local_own_ip` stay `None` for them.
+        let mut local_own_ip: Option<(std::net::Ipv4Addr, std::path::PathBuf)> = None;
+        let mut own_ip_tap: Option<sandbox2::config::OwnIpTap> = None;
+        if matches!(network_mode, NetworkMode::OwnIp)
+            && matches!(
+                net_switch.lock().await.transport(),
+                crate::net::SwitchTransport::LocalSpawn
+            )
+        {
+            let mut s = net_switch.lock().await;
+            let attach = s
+                .attach()
+                .await
+                .map_err(|e| io::Error::other(format!("attaching OwnIp PTask to switch: {e}")))?;
+            let subnet = s.subnet();
+            let sock = s.control_socket();
+            drop(s);
+            let prefix = subnet.prefix();
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            own_ip_tap = Some(sandbox2::config::OwnIpTap {
+                address: attach.lease.ip,
+                netmask: std::net::Ipv4Addr::from(mask),
+                gateway: subnet.gateway(),
+                mtu: crate::net::DEFAULT_MTU,
+            });
+            local_own_ip = Some((attach.lease.ip, sock));
+        }
 
-        let mut container = env
-            .container()
-            .map_err(|e| io::Error::other(format!("container build: {e}")))?;
-        container.set_session_leader();
+        // Build the env + container and spawn the process. Any failure here (env
+        // build, container build, spawn) leaves no process to reap — but if phase
+        // 1 already leased + ref-counted the switch, that must be rolled back so
+        // gvproxy's attach count stays accurate, handled at the `Err` arm below.
+        let build_and_spawn = async {
+            // The env owns the context, graph and the sandbox files backing the
+            // running process's rootfs, so it is `Send + 'static` and can be moved
+            // into the host as the guard that keeps those files alive.
+            let mut env = crate::env::Env::build(
+                ctx,
+                graph,
+                crate::env::EnvArgs::new(name, paths.working, paths.home, paths.cache)
+                    .with_packages(["base", "bash", "socat", "coreutils", "claude-code"])
+                    .with_env_vars(
+                        [(
+                            "PS1".to_string(),
+                            EnvVarValue::Value(
+                                r"\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "
+                                    .to_string(),
+                            ),
+                        )]
+                        .into(),
+                    )
+                    .with_network_mode(network_mode)
+                    .with_own_ip_tap(own_ip_tap)
+                    .with_username(username),
+            )
+            .await?;
 
-        let pty = Pty::open(sz).map_err(|e| io::Error::other(format!("pty open: {e}")))?;
-        // The `bash` package installs to `/usr/bin/bash` (--prefix=/usr) and the
-        // generic rootfs has no `/bin/bash`, so exec the absolute path that
-        // exists rather than `/bin/bash` (which fails with ENOENT).
-        let mut command = env
-            .command(&container, "/usr/bin/bash", ["--noprofile", "-l"])
-            .map_err(|e| io::Error::other(format!("build command: {e}")))?;
-        command.stdin(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
-        command.stdout(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
-        let (master, slave) = pty.into_fds();
-        command.stderr(hakoniwa::Stdio::from(slave));
+            let mut container = env
+                .container()
+                .map_err(|e| io::Error::other(format!("container build: {e}")))?;
+            container.set_session_leader();
 
-        let mut process = command
-            .spawn()
-            .map_err(|e| io::Error::other(format!("exec failed: {}", e)))?;
-        // `command`/`container` no longer borrow `env`, so it can be moved into
-        // the host to keep its backing files alive.
-        drop(container);
+            let pty = Pty::open(sz).map_err(|e| io::Error::other(format!("pty open: {e}")))?;
+            // The `bash` package installs to `/usr/bin/bash` (--prefix=/usr) and
+            // the generic rootfs has no `/bin/bash`, so exec the absolute path
+            // that exists rather than `/bin/bash` (which fails with ENOENT).
+            let mut command = env
+                .command(&container, "/usr/bin/bash", ["--noprofile", "-l"])
+                .map_err(|e| io::Error::other(format!("build command: {e}")))?;
+            command.stdin(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
+            command.stdout(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
+            let (master, slave) = pty.into_fds();
+            command.stderr(hakoniwa::Stdio::from(slave));
 
-        // For an `OwnIp` PTask, wire its freshly-unshared network namespace onto
-        // the per-host gvproxy switch. `sandbox2` created the empty namespace;
-        // the launched `hakoniwa::Child`'s PID (`id()`) holds it
-        // (`/proc/<pid>/ns/net`), so the attach targets it from the `minimald`
-        // side. `HostNet`/`NoNet` skip this entirely.
+            let process = command
+                .spawn()
+                .map_err(|e| io::Error::other(format!("exec failed: {e}")))?;
+            // `command`/`container` no longer borrow `env`, so it can be moved
+            // into the host to keep its backing files alive.
+            drop(container);
+            Ok::<_, io::Error>((env, master, process))
+        }
+        .await;
+
+        let (env, master, mut process) = match build_and_spawn {
+            Ok(parts) => parts,
+            Err(e) => {
+                if local_own_ip.is_some() {
+                    let _ = net_switch.lock().await.detach().await;
+                }
+                return Err(e);
+            }
+        };
+
+        // Reap a sandbox process whose own-IP attach failed. A `hakoniwa::Child`
+        // does not terminate when dropped — it would orphan the sandbox process —
+        // so kill and reap it explicitly. `kill` and `wait` are independent: when
+        // `kill` fails with `ESRCH` because the process already exited during the
+        // attach window, the child still needs reaping, so `wait` runs regardless.
+        let reap = |process: &mut hakoniwa::Child| {
+            if let Err(kill_err) = process.kill() {
+                tracing::warn!(error = %kill_err, "killing sandbox process after OwnIp attach failure");
+            }
+            if let Err(wait_err) = process.wait() {
+                tracing::warn!(error = %wait_err, "reaping sandbox process after OwnIp attach failure");
+            }
+        };
+
+        // Phase 2 (post-spawn): wire the freshly-unshared netns onto the switch.
+        // Native (DM2): hakoniwa already built + configured the tap in-namespace
+        // (rootless), so we only relay its fd. DM1/3/4: the post-spawn open-tap +
+        // move-into-netns + vsock relay behind the `GvproxyNetwork` abstraction.
         //
-        // Until this attach returns, the PTask's namespace is empty (`lo` is
-        // down and no tap exists): `sandbox2` unshared `CLONE_NEWNET` but has
-        // not yet been handed an interface. A shell PTask never probes the
-        // network in this window — the SSH layer only dispatches commands after
-        // `Launched` is returned — but a future non-shell PTask that touches
-        // the network before its first channel message could see transient
-        // `ENETUNREACH` until the tap is in place.
+        // Until this returns, an own-IP PTask's egress isn't up yet, but a shell
+        // PTask never probes the network in this window (the SSH layer dispatches
+        // commands only after `Launched` is returned).
         let net_guard: Option<Box<dyn sandbox2::NetGuard>> =
-            if matches!(self.network_mode, NetworkMode::OwnIp) {
-                // The own-IP switch wiring now lives behind the sandbox2 `Network`
-                // abstraction (`GvproxyNetwork`), shared with the task path, rather
-                // than inline here. `sandbox2` created the empty namespace; this
-                // attaches the launched process's netns to the per-host switch.
+            if let Some((lease_ip, sock)) = local_own_ip {
+                // hakoniwa hands us ownership of the tap fd (its `Child` has no
+                // `Drop`, so it never closes it); a missing fd means the in-VM
+                // RustSlirp setup did not run — roll the phase-1 attach back.
+                let Some(raw) = process.rustslirp_tapfd else {
+                    reap(&mut process);
+                    let _ = net_switch.lock().await.detach().await;
+                    return Err(io::Error::other(
+                        "own-IP sandbox produced no in-namespace tap fd",
+                    ));
+                };
+                // SAFETY: `raw` is a live, owned tap fd handed out exactly once by
+                // hakoniwa; wrapping it transfers ownership to the relay, which
+                // closes it on teardown.
+                let tap_fd = unsafe { OwnedFd::from_raw_fd(raw) };
+                match crate::net::gvproxy_network::complete_local_own_ip_attach(
+                    &net_switch,
+                    tap_fd,
+                    sock,
+                    lease_ip,
+                    ingress.as_ref(),
+                )
+                .await
+                {
+                    // `complete_local_own_ip_attach` rolls its own attach back on
+                    // failure, so only the process needs reaping here.
+                    Ok(guard) => Some(Box::new(guard) as Box<dyn sandbox2::NetGuard>),
+                    Err(e) => {
+                        reap(&mut process);
+                        return Err(io::Error::other(e));
+                    }
+                }
+            } else if matches!(network_mode, NetworkMode::OwnIp) {
                 let network = crate::net::gvproxy_network::GvproxyNetwork::new(
-                    std::sync::Arc::clone(&self.net_switch),
+                    std::sync::Arc::clone(&net_switch),
                     ingress,
                 );
                 match network.attach(process.id()).await {
                     Ok(guard) => Some(guard),
                     Err(e) => {
-                        // The attach failed, so this launch is aborting. A
-                        // `hakoniwa::Child` does not terminate when dropped — it
-                        // would orphan the sandbox process (the same hazard the
-                        // `kill_on_drop(true)` calls in `exec.rs`/`net/mod.rs` guard
-                        // against) — so kill and reap it explicitly before
-                        // propagating the error.
-                        // `kill` and `wait` are independent: when `kill` fails with
-                        // `ESRCH` because the process already exited during the
-                        // attach window, the child still needs reaping, so `wait`
-                        // must run regardless of `kill`'s result (the standard
-                        // `SIGKILL`-then-`waitpid` idiom).
-                        if let Err(kill_err) = process.kill() {
-                            tracing::warn!(
-                                error = %kill_err,
-                                "killing sandbox process after OwnIp attach failure"
-                            );
-                        }
-                        if let Err(wait_err) = process.wait() {
-                            tracing::warn!(
-                                error = %wait_err,
-                                "reaping sandbox process after OwnIp attach failure"
-                            );
-                        }
+                        reap(&mut process);
                         return Err(io::Error::other(e));
                     }
                 }
