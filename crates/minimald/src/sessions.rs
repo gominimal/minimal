@@ -92,6 +92,7 @@ enum ManagerMessage {
     CreateSession(Box<CreateSessionMsg>),
     RenameSession(SessionId, String, Responder<()>),
     DestroySession(SessionId, Responder<()>),
+    Shutdown(bool, Responder<Result<(), ()>>),
 }
 
 /// Manages session instances, and session state on disk.
@@ -99,6 +100,7 @@ enum ManagerMessage {
 /// Follows the actor pattern.
 #[derive(Debug)]
 pub struct Manager<L: Loader = DiskLoader> {
+    in_shutdown: bool,
     receiver: mpsc::Receiver<ManagerMessage>,
     running: BTreeMap<L::Key, SessionHandle>,
     store: L,
@@ -138,6 +140,7 @@ impl Manager {
             crate::net::dns::DEFAULT_HOST_ID,
         )));
         let mngr = Self {
+            in_shutdown: false,
             receiver,
             running,
             store: l,
@@ -219,6 +222,12 @@ impl<L: Loader> Manager<L> {
             // If the session is known but not running, it is started.
             ManagerMessage::GetSession(pred, r) => {
                 r.handle(async {
+                    if self.in_shutdown {
+                        return Err(SessionsError::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            "in shutdown",
+                        ));
+                    }
                     match self.key_for(&pred)? {
                         None => Ok(None),
                         Some(k) => {
@@ -272,6 +281,13 @@ impl<L: Loader> Manager<L> {
                 } = *msg;
                 responder
                     .handle(async {
+                        if self.in_shutdown {
+                            return Err(SessionsError::new(
+                                std::io::ErrorKind::ConnectionRefused,
+                                "in shutdown",
+                            ));
+                        }
+
                         // Until daemon-side Phase 2 routing lands, the only
                         // valid contribution is the empty default. Silently
                         // dropping a non-empty contribution would let clients
@@ -285,7 +301,7 @@ impl<L: Loader> Manager<L> {
                         // The seam is here: replace this check with the
                         // partition + ContributionResponse flow.
                         if contribution != WireContribution::default() {
-                            return Err(std::io::Error::new(
+                            return Err(SessionsError::new(
                                 std::io::ErrorKind::InvalidInput,
                                 "non-empty WireContribution is not supported \
                                  by this daemon — daemon-side composition \
@@ -321,6 +337,12 @@ impl<L: Loader> Manager<L> {
             // Renames an existing session with the given ID.
             ManagerMessage::RenameSession(id, new_name, r) => {
                 r.handle(async {
+                    if self.in_shutdown {
+                        return Err(SessionsError::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            "in shutdown",
+                        ));
+                    }
                     match self.store.find_by_id(&id)? {
                         None => Err(std::io::Error::new(
                             NotFound,
@@ -369,6 +391,12 @@ impl<L: Loader> Manager<L> {
             // any), then removes its on-disk record.
             ManagerMessage::DestroySession(id, r) => {
                 r.handle(async {
+                    if self.in_shutdown {
+                        return Err(SessionsError::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            "in shutdown",
+                        ));
+                    }
                     let k = self.store.find_by_id(&id)?.ok_or_else(|| {
                         std::io::Error::new(
                             NotFound,
@@ -398,6 +426,47 @@ impl<L: Loader> Manager<L> {
                         .deregister(&host_net_name);
                     self.store.delete(&k)?;
                     Ok(())
+                })
+                .await
+            }
+            ManagerMessage::Shutdown(force, r) => {
+                r.handle(async {
+                    // Sessions are live but force not given, send false to signal
+                    // we didnt shutdown and continue.
+                    if !self.running.is_empty() && !force {
+                        return Ok(Err(()));
+                    }
+
+                    self.in_shutdown = true;
+                    // Withdraw the PTask hostnames (R3.5) for every live session
+                    // before tearing them down, mirroring DestroySession, so the
+                    // shutdown drain never leaves stale routing entries pointing
+                    // at destroyed sessions. Names are derived up front via
+                    // synchronous store reads so the registry lock is never held
+                    // across `destroy().await`. `deregister` is a no-op for a
+                    // session that never registered a hostname.
+                    #[cfg(target_os = "linux")]
+                    {
+                        let names: Vec<String> = self
+                            .running
+                            .keys()
+                            .filter_map(|k| self.store.get(k).ok())
+                            .map(|obj| registry_name(obj.record()))
+                            .collect();
+                        let mut reg = self
+                            .hostnames
+                            .write()
+                            .expect("hostname registry lock poisoned");
+                        for name in &names {
+                            reg.deregister(name);
+                        }
+                    }
+                    // Stop live sessions
+                    for hnd in self.running.values() {
+                        hnd.destroy().await;
+                    }
+                    self.running.clear();
+                    Ok(Ok(()))
                 })
                 .await
             }
@@ -513,6 +582,20 @@ impl ManagerHandle {
             .send(ManagerMessage::DestroySession(id, send))
             .await;
         recv.await.expect("corresponding sessions manager is dead")
+    }
+
+    /// Shuts down all sessions for process termination. If force is true, live sessions are killed.
+    /// If force is false but there are live sessions, an error is returned.
+    pub async fn shutdown(&self, force: bool) -> Result<(), ()> {
+        let (send, recv) = Responder::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .sender
+            .send(ManagerMessage::Shutdown(force, send))
+            .await;
+        recv.await
+            .expect("corresponding sessions manager is dead")
+            .expect("no SessionError expected from shutdown msg")
     }
 }
 

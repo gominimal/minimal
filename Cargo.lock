@@ -3549,6 +3549,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tokio-vsock",
  "tracing",
  "tracing-subscriber",
