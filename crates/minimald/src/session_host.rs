@@ -1522,4 +1522,179 @@ mod tests {
             "mainloop should return the reaped exit status, got: {outcome:?}",
         );
     }
+
+    /// A [`sandbox2::NetGuard`] that records whether its teardown ran, so a test
+    /// can assert the session's network is released exactly when the shell
+    /// process ends — and left up while it is merely detached.
+    struct RecordingNetGuard {
+        torn_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl sandbox2::NetGuard for RecordingNetGuard {
+        fn teardown(
+            self: Box<Self>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            self.torn_down
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {})
+        }
+    }
+
+    /// Like [`MockLauncher`], but attaches a [`RecordingNetGuard`] so a test can
+    /// observe network teardown. The shared `torn_down` flag lets the test assert
+    /// when the network is released relative to detach vs. exit.
+    struct MockLauncherWithNet {
+        torn_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl SessionLauncher for MockLauncherWithNet {
+        type Process = MockProcess;
+        type Guard = ();
+
+        async fn launch(
+            self,
+            _name: String,
+            _username: String,
+            _paths: SessionPaths,
+            sz: WinSize,
+        ) -> std::io::Result<Launched<MockProcess, ()>> {
+            let pty = Pty::open(sz)?;
+            let script = format!(
+                r#"while read line; do [ "$line" = {MOCK_EXIT_LINE} ] && exit 0; printf 'got:%s\n' "$line"; done"#
+            );
+            let mut command = std::process::Command::new("/bin/sh");
+            command.arg("-c").arg(&script);
+            command.stdin(std::process::Stdio::from(pty.dup_slave_fd()?));
+            command.stdout(std::process::Stdio::from(pty.dup_slave_fd()?));
+            let (master, slave) = pty.into_fds();
+            command.stderr(std::process::Stdio::from(slave));
+            let process = command.spawn()?;
+            Ok(Launched {
+                master,
+                process: MockProcess(process),
+                guard: (),
+                net_guard: Some(Box::new(RecordingNetGuard {
+                    torn_down: self.torn_down,
+                })),
+            })
+        }
+    }
+
+    fn test_paths() -> SessionPaths {
+        SessionPaths {
+            working: DaemonAbsPath::root(),
+            cache: DaemonAbsPath::root(),
+            home: DaemonAbsPath::root(),
+        }
+    }
+
+    /// The load-bearing half of "detach != exit": when the shell process exits,
+    /// the session network is torn down. Pins the teardown in `mainloop` so a
+    /// refactor cannot silently leave a lease/switch attachment leaked after exit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exit_releases_the_network() {
+        let torn_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (host, _handle) = Host::build(
+            MockLauncherWithNet {
+                torn_down: torn_down.clone(),
+            },
+            "test-session".to_string(),
+            "user".to_string(),
+            test_paths(),
+            DEFAULT_SIZE,
+            None,
+        )
+        .await
+        .expect("failed to build host");
+        let stdin = host.remote_tx.clone();
+        let task = tokio::spawn(host.mainloop());
+
+        // While the shell is alive the network must stay up.
+        assert!(
+            !torn_down.load(std::sync::atomic::Ordering::SeqCst),
+            "network must not be torn down while the shell is running",
+        );
+
+        // Make the shell exit; the network must then be released.
+        stdin
+            .send(Either::Left(bytes::Bytes::from(
+                format!("{MOCK_EXIT_LINE}\n").into_bytes(),
+            )))
+            .await
+            .expect("failed to send exit line");
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("mainloop should terminate after the shell exits")
+            .expect("host task should not panic during teardown")
+            .expect("mainloop should return the reaped exit status");
+        assert!(
+            torn_down.load(std::sync::atomic::Ordering::SeqCst),
+            "network must be torn down once the shell exits",
+        );
+    }
+
+    /// The other half of "detach != exit": a ctrl-w (detach) keystroke is
+    /// swallowed as a detach signal — never forwarded to the shell — and does not
+    /// end the session or release the network. The shell keeps running (a later
+    /// line still round-trips) and only an explicit kill/exit releases the network.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detach_keystroke_holds_the_session_and_network() {
+        let torn_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (host, handle) = Host::build(
+            MockLauncherWithNet {
+                torn_down: torn_down.clone(),
+            },
+            "test-session".to_string(),
+            "user".to_string(),
+            test_paths(),
+            DEFAULT_SIZE,
+            None,
+        )
+        .await
+        .expect("failed to build host");
+        let stdin = host.remote_tx.clone();
+        let task = tokio::spawn(host.mainloop());
+
+        // A bare ctrl-w (0x17) is the detach chord. It must be consumed as a
+        // detach signal rather than written to the pty.
+        stdin
+            .send(Either::Left(bytes::Bytes::from(vec![0x17])))
+            .await
+            .expect("failed to send ctrl-w");
+
+        // The shell survived the detach: a normal line still echoes back, which
+        // stamps stdout activity. (If ctrl-w had been forwarded or had killed the
+        // process, no echo would ever arrive.)
+        stdin
+            .send(Either::Left(bytes::Bytes::from(b"ping\n".to_vec())))
+            .await
+            .expect("failed to send line after detach");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let attrs = handle.get_attrs().await.unwrap();
+                if attrs.stdout_last.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("echo should arrive, proving the shell survived the detach keystroke");
+        assert!(
+            !torn_down.load(std::sync::atomic::Ordering::SeqCst),
+            "detach must not tear down the network while the shell is still running",
+        );
+
+        // Only now, on an explicit kill (destroy), is the network released.
+        handle.kill().await.expect("kill should reach the host");
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("mainloop should terminate after kill")
+            .expect("host task should not panic during teardown")
+            .expect("mainloop should return the reaped exit status");
+        assert!(
+            torn_down.load(std::sync::atomic::Ordering::SeqCst),
+            "kill/destroy must release the network",
+        );
+    }
 }
