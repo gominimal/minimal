@@ -165,15 +165,10 @@ pub fn resolve_socket_path(
         if use_minvmd {
             return minvmd::sock::resolve_uds_path();
         }
-        let state = dirs::state_dir()
-            .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "cannot determine state directory; set --minimal-dir",
-                )
-            })?;
-        Ok(state.join("minimal/providers/local-0/ssh.sock"))
+        Ok(paths::minimal_state_dir()
+            .as_utf8_path()
+            .as_std_path()
+            .join("providers/local-0/ssh.sock"))
     }
     #[cfg(target_os = "macos")]
     minvmd::sock::resolve_uds_path()
