@@ -71,6 +71,8 @@ pub struct EnvArgs {
     env_vars: Option<HashMap<String, EnvVarValue>>,
     ot: Option<OpTracker>,
     network_mode: NetworkMode,
+    own_ip_tap: Option<sandbox2::config::OwnIpTap>,
+    own_ip_dns: Option<std::net::Ipv4Addr>,
 }
 
 impl EnvArgs {
@@ -93,6 +95,8 @@ impl EnvArgs {
             env_vars: None,
             ot: None,
             network_mode: NetworkMode::HostNet,
+            own_ip_tap: None,
+            own_ip_dns: None,
         }
     }
 
@@ -140,6 +144,25 @@ impl EnvArgs {
     #[must_use]
     pub fn with_network_mode(mut self, mode: NetworkMode) -> Self {
         self.network_mode = mode;
+        self
+    }
+
+    /// Sets the own-IP user-mode tap parameters (native/DM2 own-IP). When set,
+    /// the sandbox's TAP is created + configured in-namespace by hakoniwa
+    /// (rootless) and the caller relays its fd to the switch. `None` keeps the
+    /// host/VM behaviour.
+    #[must_use]
+    pub fn with_own_ip_tap(mut self, tap: Option<sandbox2::config::OwnIpTap>) -> Self {
+        self.own_ip_tap = tap;
+        self
+    }
+
+    /// Sets the own-IP DNS server for the sandbox's `/etc/resolv.conf` (the
+    /// switch gateway). Set for every own-IP sandbox, independent of the tap
+    /// params, so both the DM2 and DM1/3/4 own-IP paths get a working resolver.
+    #[must_use]
+    pub fn with_own_ip_dns(mut self, dns: Option<std::net::Ipv4Addr>) -> Self {
+        self.own_ip_dns = dns;
         self
     }
 }
@@ -244,6 +267,13 @@ impl Env {
             .with_state_dir(args.state_base_dir.as_utf8_path())
             .with_env_vars(pkg_env_vars.into_iter())
             .with_network_mode(args.network_mode)
+            // Own-IP tap params drive hakoniwa's in-namespace (rootless) tap on
+            // the native DM2 path; `None` for host/VM modes and the DM1/3/4
+            // vsock-shuttle path (which keeps the privileged move-into-netns
+            // wiring). The DNS server is set separately for *every* own-IP
+            // sandbox so both paths get a working resolver.
+            .with_own_ip_tap(args.own_ip_tap)
+            .with_own_ip_dns(args.own_ip_dns)
             .with_hostname(args.name.clone())
             .with_username(args.username.unwrap_or_else(|| "user".to_string()));
 

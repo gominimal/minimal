@@ -227,15 +227,27 @@ impl<L: Loader> Manager<L> {
                                 None => {
                                     // Not running, start it!
                                     let obj = self.store.get(&k)?;
-                                    // Register a `HostNet` PTask's hostname on
-                                    // launch (R3.6); it routes to loopback.
-                                    // `OwnIp` registration is deferred to #542.
-                                    // Capture the id and name before `obj` is
-                                    // moved into `Session::run`.
+                                    // Register a PTask's hostname on launch so it
+                                    // routes host-side (R3.1/R3.6). Both HostNet and
+                                    // OwnIp resolve to loopback: a HostNet PTask's
+                                    // listeners are on host loopback; an OwnIp PTask
+                                    // is reached through a gvproxy-published loopback
+                                    // port (#542, the published-loopback model). A
+                                    // NoNet PTask exposes no services, so it is not
+                                    // registered. Capture id + name + mode before
+                                    // `obj` moves into `Session::run`.
                                     #[cfg(target_os = "linux")]
-                                    let host_net_reg = (obj.record().network
-                                        == sessions::NetworkMode::HostNet)
-                                        .then(|| (obj.record().id, registry_name(obj.record())));
+                                    let ptask_reg = {
+                                        let net = obj.record().network;
+                                        matches!(
+                                            net,
+                                            sessions::NetworkMode::HostNet
+                                                | sessions::NetworkMode::OwnIp
+                                        )
+                                        .then(|| {
+                                            (obj.record().id, registry_name(obj.record()), net)
+                                        })
+                                    };
                                     let h = Session::run(
                                         self.minimal_state_dir.clone(),
                                         self.minimal_cache_dir.clone(),
@@ -245,11 +257,17 @@ impl<L: Loader> Manager<L> {
                                     .await
                                     .expect("TODO handle error");
                                     #[cfg(target_os = "linux")]
-                                    if let Some((id, name)) = host_net_reg {
-                                        self.hostnames
+                                    if let Some((id, name, net)) = ptask_reg {
+                                        let mut reg = self
+                                            .hostnames
                                             .write()
-                                            .expect("hostname registry lock poisoned")
-                                            .register_host_net(id, &name);
+                                            .expect("hostname registry lock poisoned");
+                                        match net {
+                                            sessions::NetworkMode::OwnIp => {
+                                                reg.register_own_ip(id, &name)
+                                            }
+                                            _ => reg.register_host_net(id, &name),
+                                        };
                                     }
                                     self.running.insert(k, h.clone());
                                     h
@@ -327,18 +345,26 @@ impl<L: Loader> Manager<L> {
                             format!("no session with ID `{}`", id.as_ref()),
                         )),
                         Some(k) => {
-                            // Snapshot the live HostNet route (id + pre-rename
-                            // name) before the rename mutates the record. Only a
-                            // running session has a route (registered on launch).
+                            // Snapshot the live route (id + pre-rename name + mode)
+                            // before the rename mutates the record. Only a running
+                            // session has a route (registered on launch), and both
+                            // HostNet and OwnIp carry one (R3.1/R3.6).
                             #[cfg(target_os = "linux")]
-                            let relink: Option<(SessionId, String)> =
-                                if self.running.contains_key(&k) {
-                                    let rec = self.store.get(&k)?;
-                                    (rec.record().network == sessions::NetworkMode::HostNet)
-                                        .then(|| (rec.record().id, registry_name(rec.record())))
-                                } else {
-                                    None
-                                };
+                            let relink: Option<(
+                                SessionId,
+                                String,
+                                sessions::NetworkMode,
+                            )> = if self.running.contains_key(&k) {
+                                let rec = self.store.get(&k)?;
+                                let net = rec.record().network;
+                                matches!(
+                                    net,
+                                    sessions::NetworkMode::HostNet | sessions::NetworkMode::OwnIp
+                                )
+                                .then(|| (rec.record().id, registry_name(rec.record()), net))
+                            } else {
+                                None
+                            };
 
                             self.store.rename(&k, new_name.clone())?;
                             if let Some(hnd) = self.running.get(&k) {
@@ -350,14 +376,19 @@ impl<L: Loader> Manager<L> {
                             // stops (R3.6) — otherwise the route is stranded
                             // under the launch name.
                             #[cfg(target_os = "linux")]
-                            if let Some((id, old_name)) = relink {
+                            if let Some((id, old_name, net)) = relink {
                                 let new_reg = registry_name(self.store.get(&k)?.record());
                                 let mut reg = self
                                     .hostnames
                                     .write()
                                     .expect("hostname registry lock poisoned");
                                 reg.deregister(&old_name);
-                                reg.register_host_net(id, &new_reg);
+                                match net {
+                                    sessions::NetworkMode::OwnIp => {
+                                        reg.register_own_ip(id, &new_reg)
+                                    }
+                                    _ => reg.register_host_net(id, &new_reg),
+                                };
                             }
                             Ok(())
                         }

@@ -187,6 +187,12 @@ pub struct ListenArgs {
     /// `minimal` CLI to auto-start a native (DM2) daemon on Linux.
     #[arg(long, default_value_t = false)]
     detach: bool,
+
+    /// Path to the gvproxy ("gvisor-tap-vsock") binary backing the per-host
+    /// `OwnIp` switch. Defaults to the fixed system install path when unset;
+    /// point it at a local build to run own-IP (DM2) without a system install.
+    #[arg(long)]
+    gvproxy_bin: Option<std::path::PathBuf>,
 }
 
 /// An error at the top level of minimald.
@@ -301,6 +307,9 @@ async fn async_main() -> Result<(), MainError> {
                 mount_dev: true,
                 mount_rootfs: Some("/dev/vda".to_string()),
                 detach: false,
+                // In-VM (DM1/3/4) the PTask attaches to the host gvproxy over the
+                // vsock shuttle, so no in-guest gvproxy binary path is needed.
+                gvproxy_bin: None,
             }),
             global_args: GlobalArgs {
                 minimal_state_dir: Some(DaemonAbsPath::try_new("/run/minimal").unwrap().into()),
@@ -381,7 +390,7 @@ async fn async_main() -> Result<(), MainError> {
         },
         minimal_state_dir: cli.minimal_state_dir(),
         minimal_cache_dir: cli.minimal_cache_dir(),
-        gvproxy_bin: None,
+        gvproxy_bin: listen_args.gvproxy_bin.clone(),
         // The vsock listen path is exactly the libkrun-VM (DM1/3/4) case: an
         // `OwnIp` PTask must attach to the host gvproxy over the vsock shuttle,
         // not spawn gvproxy in-guest. The UDS path is DM2.

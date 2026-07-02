@@ -748,6 +748,23 @@ mod tests {
         unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
 
+    /// Path to a stand-in "gvproxy" that stays alive regardless of the argv
+    /// [`HostGvproxy::spawn`] hands it (`-config … -listen … -ssh-port -1`).
+    ///
+    /// A bare `sleep` misparses those flags and exits within ~1 ms, which races
+    /// the supervisor's background reaper against the `pid_is_alive` assertions —
+    /// a CI flake on slow/contended runners. Real gvproxy runs until signalled,
+    /// so the stand-in must too: this script `exec`s a long sleep, ignoring its
+    /// arguments, making the liveness and teardown assertions deterministic.
+    fn stayalive_gvproxy(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("stayalive-gvproxy.sh");
+        std::fs::write(&path, "#!/bin/sh\nexec sleep 1000\n").expect("write stand-in gvproxy");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod stand-in gvproxy");
+        path
+    }
+
     #[test]
     fn argv_listens_on_switch_socket() {
         let cfg = GvproxyConfig::new(
@@ -928,15 +945,17 @@ mod tests {
 
     #[test]
     fn host_gvproxy_spawns_supervises_and_stops() {
-        // `sleep` stands in for gvproxy: HostGvproxy::spawn only needs a binary
-        // it can launch and read a PID from. Real gvproxy binds the `-listen`
-        // switch socket, which the supervisor now probes for readiness before
-        // reporting ready, so bind a stand-in listener here (sleep ignores argv).
+        // A stay-alive script stands in for gvproxy: HostGvproxy::spawn only
+        // needs a binary it can launch, read a PID from, and later signal. Real
+        // gvproxy binds the `-listen` switch socket, which the supervisor now
+        // probes for readiness before reporting ready, so bind a stand-in
+        // listener here (the script ignores the gvproxy argv it is handed).
         let dir = tempfile::TempDir::new().expect("tempdir");
         let sock = dir.path().join("gvproxy-switch.sock");
         let _switch_listener =
             std::os::unix::net::UnixListener::bind(&sock).expect("bind stand-in switch socket");
-        let gvproxy = HostGvproxy::spawn(PathBuf::from("sleep"), sock).expect("spawn host gvproxy");
+        let gvproxy =
+            HostGvproxy::spawn(stayalive_gvproxy(dir.path()), sock).expect("spawn host gvproxy");
         let pid = gvproxy.pid();
         assert!(
             pid_is_alive(pid),
@@ -957,7 +976,8 @@ mod tests {
         let sock = dir.path().join("gvproxy-switch.sock");
         let _switch_listener =
             std::os::unix::net::UnixListener::bind(&sock).expect("bind stand-in switch socket");
-        let gvproxy = HostGvproxy::spawn(PathBuf::from("sleep"), sock).expect("spawn host gvproxy");
+        let gvproxy =
+            HostGvproxy::spawn(stayalive_gvproxy(dir.path()), sock).expect("spawn host gvproxy");
         let pid = gvproxy.pid();
         assert!(pid_is_alive(pid));
         drop(gvproxy);

@@ -103,6 +103,27 @@ impl WdSetup {
     }
 }
 
+/// Parameters for an own-IP user-mode (RustSlirp) tap.
+///
+/// When set on an own-IP sandbox, hakoniwa creates and configures a TAP device
+/// *inside* the sandbox's user+network namespace (rootless — no host
+/// `CAP_NET_ADMIN`), assigning the address/netmask and a default route via the
+/// gateway, and surfaces the tap fd as [`hakoniwa::Child::rustslirp_tapfd`] for
+/// the caller to relay to the gvproxy switch. Replaces the privileged
+/// open-tap-then-move-into-netns path on the native (DM2) deployment.
+#[derive(Debug, Clone, Copy)]
+pub struct OwnIpTap {
+    /// The PTask's switch address, assigned to the tap in-namespace.
+    pub address: std::net::Ipv4Addr,
+    /// The switch subnet netmask (e.g. `255.255.0.0` for a `/16`).
+    pub netmask: std::net::Ipv4Addr,
+    /// The switch gateway, installed as the next-hop default route
+    /// (`0.0.0.0/0 via gateway`) — gvproxy answers DNS and routes egress there.
+    pub gateway: std::net::Ipv4Addr,
+    /// The tap MTU; must match the relay's frame buffer (`DEFAULT_MTU`).
+    pub mtu: u16,
+}
+
 /// Describes the setup of a sandbox.
 #[derive(Debug)]
 pub struct Config {
@@ -138,6 +159,18 @@ pub struct Config {
     /// wiring behind this trait is what lets tasks and sessions share one
     /// networking path instead of it living only in the minimald session host.
     pub network: Option<Box<dyn Network>>,
+    /// Own-IP user-mode tap parameters. When `Some` (native/DM2 own-IP), the
+    /// sandbox's TAP is created + configured inside its namespace by hakoniwa
+    /// (rootless), and the tap fd is surfaced via `Child.rustslirp_tapfd`. `None`
+    /// keeps the host/VM behaviour (no in-namespace tap).
+    pub own_ip_tap: Option<OwnIpTap>,
+    /// The DNS server for an own-IP sandbox's `/etc/resolv.conf`, overriding the
+    /// synth rootfs's host stub resolver (unreachable in the fresh netns). Set for
+    /// **every** own-IP sandbox — both the native (DM2) tap path (which also sets
+    /// [`own_ip_tap`](Self::own_ip_tap)) and the in-VM (DM1/3/4) shuttle path
+    /// (which does not) — so DNS is not tied to the presence of tap params.
+    /// `None` keeps the host-derived resolver.
+    pub own_ip_dns: Option<std::net::Ipv4Addr>,
 
     /// The hostname to set in the environment, if any.
     pub hostname: Option<String>,
@@ -177,6 +210,8 @@ impl Config {
             setup_dns_config: true,
             network_mode: NetworkMode::HostNet,
             network: None,
+            own_ip_tap: None,
+            own_ip_dns: None,
             env_vars: HashMap::with_capacity(12),
             hostname: None,
             username: None,
@@ -274,6 +309,22 @@ impl Config {
     /// the consumer so the wiring lives behind one abstraction for every sandbox.
     pub fn with_network(mut self, network: Box<dyn Network>) -> Self {
         self.network = Some(network);
+        self
+    }
+    /// Sets the own-IP user-mode tap parameters (native/DM2 own-IP). When set,
+    /// hakoniwa builds the tap inside the sandbox namespace (rootless) and the
+    /// caller relays `Child.rustslirp_tapfd` to the switch. `None` keeps the
+    /// host/VM behaviour.
+    pub fn with_own_ip_tap(mut self, tap: Option<OwnIpTap>) -> Self {
+        self.own_ip_tap = tap;
+        self
+    }
+    /// Sets the own-IP DNS server for `/etc/resolv.conf` (the switch gateway).
+    /// Set for every own-IP sandbox, independent of [`own_ip_tap`](Self::own_ip_tap),
+    /// so both the DM2 tap path and the DM1/3/4 shuttle path get a working
+    /// resolver. `None` keeps the host-derived resolver.
+    pub fn with_own_ip_dns(mut self, dns: Option<std::net::Ipv4Addr>) -> Self {
+        self.own_ip_dns = dns;
         self
     }
     /// Sets whether DNS should be configured.

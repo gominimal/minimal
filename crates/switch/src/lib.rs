@@ -128,6 +128,16 @@ impl SwitchSubnet {
         Ipv4Addr::from(u32::from(self.network()) + 1)
     }
 
+    /// The DNS server for the switch. gvproxy answers DNS on the gateway
+    /// (`render_gvproxy_config` sets `gatewayIP`), so an own-IP PTask — whose
+    /// fresh netns cannot reach the host's `127.0.0.53` stub resolver — resolves
+    /// via the gateway. The single source of truth for "own-IP DNS lives at the
+    /// gateway", consumed by both the sandbox resolv.conf and the in-VM guest.
+    #[must_use]
+    pub fn dns_server(self) -> Ipv4Addr {
+        self.gateway()
+    }
+
     /// The host alias address (`broadcast - 1`): a virtual IP that gvproxy NATs
     /// to the host loopback so a PTask can reach host services. Reserved, never
     /// handed to a PTask.

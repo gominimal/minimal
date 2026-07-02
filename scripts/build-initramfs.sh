@@ -4,7 +4,11 @@
 # `/init` (= minimald) as pid-1; minimald mounts the generic guest rootfs
 # (/dev/vda) and chroots into it. No minimald is baked into the rootfs.
 #
-# Uses `cross` (Docker) for the musl toolchain. Linux host with Docker.
+# Toolchain selection (auto-detected): when the host arch matches the target
+# arch and a native static-musl toolchain is present (the `*-linux-musl` rustup
+# target plus a matching `*-linux-musl-gcc` linker), build natively — same-arch
+# musl needs no container. Otherwise fall back to `cross` (Docker) for the musl
+# toolchain. Set FORCE_CROSS=1 to always use `cross`.
 #
 # Set FEATURES to a comma-separated cargo feature list to compile the guest
 # minimald with extra features (e.g. FEATURES=networking-proxy,networking-wg for
@@ -20,13 +24,33 @@ FEATURES="${FEATURES:-}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-command -v cross >/dev/null || cargo install cross --locked
-# The `initramfs` profile drops the release LTO + codegen-units=1 (which the
-# guest binary doesn't need) to compile much faster.
-if [ -n "$FEATURES" ]; then
-  cross build -p minimald --profile initramfs --target "$TARGET" --features "$FEATURES"
+# Compile flags shared by both toolchains. The `initramfs` profile drops the
+# release LTO + codegen-units=1 (which the guest binary doesn't need) to compile
+# much faster.
+set -- build -p minimald --profile initramfs --target "$TARGET"
+[ -n "$FEATURES" ] && set -- "$@" --features "$FEATURES"
+
+HOST_ARCH="$(uname -m)"
+TARGET_ARCH="${TARGET%%-*}"
+MUSL_CC="${TARGET_ARCH}-linux-musl-gcc"
+
+if [ "${FORCE_CROSS:-0}" != "1" ] \
+   && [ "$HOST_ARCH" = "$TARGET_ARCH" ] \
+   && rustup target list --installed 2>/dev/null | grep -qx "$TARGET" \
+   && command -v "$MUSL_CC" >/dev/null 2>&1; then
+  # Native same-arch static-musl build. cargo derives the linker override var
+  # from the target triple (uppercased, non-alphanumerics -> `_`); cc-rs (used by
+  # ring's build script to compile its C/asm) reads `CC_<triple>` with the triple
+  # lower-cased and dashes -> `_`. Set both so the musl toolchain is used for the
+  # link *and* for any C compiled into the guest binary.
+  LINKER_VAR="CARGO_TARGET_$(echo "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER"
+  CC_VAR="CC_$(echo "$TARGET" | tr '-' '_')"
+  echo "build-initramfs: native musl build ($TARGET, cc/linker $MUSL_CC)" >&2
+  env "$LINKER_VAR=$MUSL_CC" "$CC_VAR=$MUSL_CC" cargo "$@"
 else
-  cross build -p minimald --profile initramfs --target "$TARGET"
+  echo "build-initramfs: cross build ($TARGET)" >&2
+  command -v cross >/dev/null || cargo install cross --locked
+  cross "$@"
 fi
 BIN="$ROOT/target/$TARGET/initramfs/minimald"
 [ -x "$BIN" ] || { echo "minimald not built at $BIN" >&2; exit 1; }

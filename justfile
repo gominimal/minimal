@@ -151,3 +151,106 @@ stop:
 # scratchpad — do NOT blow the whole directory away).
 clean:
     rm -f {{kernel}} {{rootfs}} {{initramfs}} {{gvproxy}} {{scratch}}/boot.log
+
+# ── DM1 / DM2 / DM3 deployment-model bring-up ────────────────────────────────
+#
+# DM1: macOS (Apple Silicon) host + Linux VM(s) over Hypervisor.framework. This
+#      is the `up` path on macOS; on Linux it is a clean SKIP (use `dm3` for the
+#      native-Linux + VM equivalent over KVM).
+# DM2: native Linux, a host-native `minimald` (no VM), reachable over UDS at
+#      providers/local-0/ssh.sock — the same path the `minimal` CLI dials, so no
+#      bridge is needed. Own-IP is rootless (hakoniwa RustSlirp builds the tap
+#      inside the sandbox's own user+net namespace — no setcap).
+# DM3: native Linux + one Linux VM (minimald as initramfs pid-1 in libkrun). The
+#      Linux CLI dials providers/local-0/ssh.sock, but minvmd bridges the guest
+#      at $XDG_RUNTIME_DIR/minimal/minimald.sock, so `dm3` symlinks the former to
+#      the latter. Run under `sg kvm` if the shell lacks the kvm group.
+
+# DM1 — macOS host + Linux VM over Hypervisor.framework (the `up` path on macOS).
+dm1:
+    #!/usr/bin/env sh
+    set -eu
+    case "$(uname -s)" in
+      Darwin) ;;
+      *) echo "DM1 needs macOS (Hypervisor.framework). SKIP on $(uname -s); use 'just dm3' for native Linux + VM over KVM." ; exit 0 ;;
+    esac
+    echo "DM1 (macOS + Linux VM over HVF): bringing the stack up."
+    just up
+
+# Build a host-native (glibc) minimald WITH the networking features, for DM2.
+minimald-build:
+    cargo build -p minimald --features {{features}}
+
+# DM3 — native Linux + one Linux VM. Boots the VM, then bridges the CLI socket.
+dm3: artifacts gvproxy initramfs minvmd-build minimal-cli
+    #!/usr/bin/env sh
+    set -eu
+    [ -e /dev/kvm ] || { echo "DM3 needs /dev/kvm (KVM host)"; exit 1; }
+    [ -w /dev/kvm ] || { echo "DM3: /dev/kvm not writable here; retry: sg kvm -c 'just dm3'"; exit 1; }
+    export MINVMD_KERNEL_PATH="{{kernel}}" MINVMD_ROOTFS_PATH="{{rootfs}}"
+    export MINVMD_INITRAMFS="{{initramfs}}" MINVMD_BOOT_LOG="{{scratch}}/boot.log"
+    export MINVMD_GVPROXY_BIN="{{gvproxy}}"
+    export PATH="{{justfile_directory()}}/target/debug:$PATH"
+    export LD_LIBRARY_PATH="{{krun-prefix}}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    # Boot the VM explicitly (the CLI's autospawn would also work, but booting
+    # here keeps the F1 bridge ordering clear). The configurable READY/UDS
+    # timeouts cover the ~20-30s cold boot.
+    "{{minvmd-bin}}" run --detach --timeout 75
+    # F1 bridge: the Linux CLI dials <state>/providers/local-0/ssh.sock, but the
+    # guest is reached via minvmd's <runtime>/minimal/minimald.sock — link them.
+    runtime="${XDG_RUNTIME_DIR:-$HOME/.minimal/local}"
+    state="${XDG_STATE_HOME:-$HOME/.local/state}"
+    cli="$state/minimal/providers/local-0/ssh.sock"
+    mkdir -p "$(dirname "$cli")"
+    ln -sf "$runtime/minimal/minimald.sock" "$cli"
+    echo "DM3 up: VM booted; CLI socket bridged -> $runtime/minimal/minimald.sock"
+    # The guest SSH server can reset the very first connect right after boot, so
+    # retry briefly rather than fail the recipe on that one-shot race.
+    ok=0
+    for _ in $(seq 1 5); do
+      if "{{minimal}}" ls; then ok=1; break; fi
+      sleep 2
+    done
+    [ "$ok" = 1 ] || { echo "DM3: minimal ls failed after retries" >&2; exit 1; }
+
+# DM2 — native Linux, host-native minimald (no VM) over UDS. Runs minimald under
+# a dedicated state dir; the CLI reaches it with `--minimal-dir`, which (via the
+# autospawn gate) connects directly instead of booting a VM.
+dm2: minimald-build minimal-cli gvproxy
+    #!/usr/bin/env sh
+    set -eu
+    dir="{{scratch}}/dm2-state"
+    sock="$dir/providers/local-0/ssh.sock"
+    pidf="{{scratch}}/dm2-minimald.pid"
+    bin="{{justfile_directory()}}/target/debug/minimald"
+    mkdir -p "$dir"
+    # Own-IP is rootless: hakoniwa's RustSlirp builds each PTask's tap inside the
+    # sandbox's own user+net namespace, so the daemon needs no `setcap` / elevated
+    # privilege. (It does need an unprivileged-user-namespace-capable host.)
+    if [ -S "$sock" ] && [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; then
+      echo "DM2 minimald already up: $sock"
+    else
+      # --gvproxy-bin points the per-host OwnIp switch at the pinned local gvproxy,
+      # so no system install (/usr/lib/minimal/bin/gvproxy) is required.
+      setsid "$bin" \
+        --minimal-state-dir "$dir" --minimal-cache-dir "$dir/cache" \
+        run --instance-num 0 --gvproxy-bin "{{gvproxy}}" > {{scratch}}/dm2-minimald.log 2>&1 &
+      echo $! > "$pidf"
+      for _ in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.1; done
+    fi
+    [ -S "$sock" ] || { echo "DM2 minimald failed to bind $sock; see {{scratch}}/dm2-minimald.log" >&2; exit 1; }
+    echo "DM2 up: host-native minimald at $sock (pid $(cat "$pidf"))"
+    echo "  own-IP: {{minimal}} --minimal-dir $dir activate -n net1 --network own-ip . && \\"
+    echo "          {{minimal}} --minimal-dir $dir attach net1   # curl http://example.com -> 200"
+    "{{minimal}}" --minimal-dir "$dir" ls
+
+# Stop the DM2 host-native minimald.
+dm2-down:
+    #!/usr/bin/env sh
+    set -eu
+    pidf="{{scratch}}/dm2-minimald.pid"
+    [ -f "$pidf" ] || { echo "no DM2 minimald running"; exit 0; }
+    pid="$(cat "$pidf")"; kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    kill -9 "$pid" 2>/dev/null || true; rm -f "$pidf"
+    echo "DM2 minimald stopped (pid $pid)"

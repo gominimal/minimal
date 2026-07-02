@@ -260,11 +260,11 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
     // Bring loopback up too (no address/route needed).
     configure_interface_v4("lo", Ipv4Addr::LOCALHOST, 8, None)?;
 
-    // Point the resolver at gvproxy's gateway, which serves DNS for the switch.
+    // Point the resolver at the switch's DNS server (gvproxy, at the gateway).
     // The rootfs is mounted read-only, so write to the writable /run tmpfs and
     // bind-mount it over /etc/resolv.conf (a bind only changes the mount tree, so
     // it works over a read-only fs as long as the target path exists).
-    if let Err(e) = install_resolv_conf(gateway) {
+    if let Err(e) = install_resolv_conf(DEFAULT_SUBNET.dns_server()) {
         tracing::warn!(error = %e, "installing /etc/resolv.conf for guest egress (DNS may fail)");
     }
 

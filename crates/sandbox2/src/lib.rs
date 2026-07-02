@@ -517,6 +517,39 @@ impl<C: Channel> Sandbox<C> {
             }
         }
 
+        // Own-IP (native/DM2): have hakoniwa create + configure the TAP inside the
+        // sandbox's user+net namespace (rootless — it enters the namespace as its
+        // container-root and needs no host `CAP_NET_ADMIN`). The tap fd comes back
+        // out post-spawn via `Child.rustslirp_tapfd` for the caller to relay to the
+        // gvproxy switch. `network()` does not imply the netns unshare, so it must
+        // follow the `unshare(Namespace::Network)` above (which `isolate` did).
+        if let Some(tap) = self.config.own_ip_tap {
+            // The tap only makes sense in an unshared netns: RustSlirp enters the
+            // sandbox's own network namespace to build it, and hakoniwa skips the
+            // setup entirely (leaving no tap fd) unless `Namespace::Network` was
+            // unshared. Configuring it against a shared netns would silently no-op,
+            // so reject the combination rather than hand back a sandbox with no tap.
+            if !isolate {
+                return Err(Error::Execution(
+                    ExecutionError::NetworkIsolationUnavailable {
+                        mode: self.config.network_mode,
+                    },
+                ));
+            }
+            container.network(
+                hakoniwa::RustSlirp::default()
+                    // L2: the gvproxy relay is HyperKit-framed Ethernet, not L3.
+                    .mode(hakoniwa::RustSlirpMode::TAP)
+                    .address(tap.address)
+                    .netmask(tap.netmask)
+                    // Next-hop default route (`0.0.0.0/0 via gateway`); gvproxy is a
+                    // real gateway and does not proxy-ARP, so an on-link route fails.
+                    .gateway(hakoniwa::RustSlirpGateway::IfaceWithAddr(tap.gateway))
+                    .mtu(tap.mtu)
+                    .clone(),
+            );
+        }
+
         let rec = BindOpts {
             recursive: true,
             read_only: false,
@@ -674,6 +707,24 @@ impl<C: Channel> Sandbox<C> {
             container.unshare(hakoniwa::Namespace::Uts);
             container.hostname(hn);
         }
+
+        // An own-IP sandbox runs in a fresh netns where the synth rootfs's host
+        // stub resolver (`127.0.0.53`) is unreachable, so point `/etc/resolv.conf`
+        // at the switch's DNS server (gvproxy, at the gateway) instead. Sourced
+        // from `own_ip_dns` — set for *every* own-IP sandbox, both the DM2 tap
+        // path and the DM1/3/4 shuttle path (which has no `own_ip_tap`) — so DNS
+        // is not tied to tap params. Written to the rootfs before spawn, like
+        // `/etc/hostname` above: hakoniwa binds `/etc` read-only from
+        // `<rootfs>/etc`, so an in-sandbox write would hit a read-only fs.
+        // Overwrites unconditionally — `synth_dns_config` already populated it
+        // with the host resolver, so a create-only guard would leave the (dead)
+        // host stub in place.
+        if let Some(dns) = self.config.own_ip_dns {
+            let etc_resolv = self.rootfs().join("etc").join("resolv.conf");
+            std::fs::write(&etc_resolv, format!("nameserver {dns}\n"))
+                .map_err(|e| Error::IO("writing /etc/resolv.conf", etc_resolv.clone(), e))?;
+        }
+
         if let Some(s) = &self.config.cpu_weight
             && booted_with_systemd()
         {

@@ -244,9 +244,12 @@ DNS integration), new hostname manager module, host-side DNS configuration path
 - **R3.1**: `minimald` shall register a DNS hostname for each `OwnIp` PTask on
   launch. The hostname format shall be `<session-name>.<host-id>.min.internal`
   (where `<host-id>` is a stable short name for the `minimald` instance,
-  configurable). The hostname shall resolve to the PTask's gvproxy switch IP
-  from processes on the same host. The hostname shall be deregistered when the
-  session exits.
+  configurable). The hostname shall resolve to `127.0.0.1` from processes on the
+  same host; the PTask's service is reached through a gvproxy-**published
+  loopback port** (its forwarder binds `127.0.0.1:<external>` → `lease:<internal>`,
+  per R2.3), so the daemon is never on the switch (the DM2 topology in
+  `networking-with-diagrams.md`). The client selects the published external port.
+  The hostname shall be deregistered when the session exits.
 - **R3.2**: Network-accessible `minimald` instances (DM5) shall be reachable by
   a configured DNS hostname. The `minimal` CLI shall accept a hostname in addition
   to an IP address when connecting to a `minimald` (UC2c).
@@ -255,10 +258,12 @@ DNS integration), new hostname manager module, host-side DNS configuration path
   resolution mechanism is `*.min.internal` + a **host-side egress proxy** (Open
   Question 1, B5): resolution and routing both stay host-side. A client points
   `HTTP(S)_PROXY` (or a PAC file) at the proxy, which routes each request to the
-  right PTask by its `Host:` header through an in-memory registry — a `HostNet`
-  PTask to `127.0.0.1`, an `OwnIp` PTask to its gvproxy switch IP. The host
-  resolver is never consulted, so `*.min.internal` is an opaque label the proxy maps
-  internally and the mechanism requires no systemd.
+  right PTask by its `Host:` header through an in-memory registry — both a
+  `HostNet` and an `OwnIp` PTask to `127.0.0.1` (a `HostNet` PTask's listeners are
+  on host loopback; an `OwnIp` PTask is reached through its gvproxy-published
+  loopback port, R2.3/R3.1), with the client-supplied port selecting the target.
+  The host resolver is never consulted, so `*.min.internal` is an opaque label the
+  proxy maps internally and the mechanism requires no systemd.
 - **R3.4**: DNS hostname registration and routing shall require no root privilege
   and no host-resolver configuration. On startup `minimald` shall perform a
   reachability check on the egress-proxy listener and emit a `tracing::warn!`
@@ -288,9 +293,10 @@ DNS integration), new hostname manager module, host-side DNS configuration path
    proxy returns a gateway error rather than a stale route. No
    `getaddrinfo`/host-resolver dependency — the proxy contract is asserted
    directly — demonstrating the R3.1/R3.6 registration lifecycle.
-2. **CLI:** `curl http://<session-name>.<host-id>.min.internal/` from the local host
-   returns HTTP 200 from a webserver running inside an own-IP PTask — demonstrates
-   UC2a local browser access.
+2. **CLI:** with an own-IP PTask that publishes a port (ingress `<external>:<internal>`,
+   R2.3), `curl -x http://127.0.0.1:7654 http://<session-name>.<host-id>.min.internal:<external>/`
+   from the local host returns HTTP 200 from a webserver running inside the PTask —
+   demonstrates UC2a local browser access (hostname → published loopback port).
 3. **CLI:** `curl http://<session-name>.<host-id>.min.internal:<port>/` from the
    local host returns HTTP 200 from a webserver running inside a `HostNet` PTask
    (hostname resolves to `127.0.0.1`) — demonstrates UC2 hostname-driven access
@@ -335,7 +341,8 @@ management)
 - **R4.4**: `minimald` shall expose an HTTPS reverse proxy on a configurable
   port. The proxy terminates TLS (self-signed CA or ACME cert per Open Questions
   item 5), authenticates with mTLS (client cert from `minimal login`) or OIDC
-  redirect, and reverse-proxies to the target PTask via the gvproxy switch.
+  redirect, and reverse-proxies to the target PTask through its gvproxy-published
+  loopback port (R3.1/R3.3 routing; the daemon is not on the switch).
   Only HTTP and WebSocket traffic is proxied; raw TCP/UDP is not available via
   this path (UC2b option B).
 - **R4.5**: Authentication failures (invalid cert, failed OIDC, unrecognised peer)
