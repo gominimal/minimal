@@ -692,25 +692,28 @@ mod tests {
         );
     }
 
-    /// Proof artifact 2 (OwnIp routing): a registered `OwnIp` PTask routes
-    /// through to its gvproxy switch IP. This is the routing-core contract the
-    /// proxy reaches via the switch relay; the privileged netns leg defers to
-    /// `ci-netns.yml`.
+    /// Proof artifact 2 (OwnIp routing): under the published-loopback model a
+    /// registered `OwnIp` PTask routes to `127.0.0.1` (its gvproxy-published
+    /// forwarder port), not to the switch IP — the daemon is never on the switch
+    /// (`networking-with-diagrams.md` DM2 topology). The client selects the
+    /// published external port in the authority.
     #[test]
-    fn own_ip_routes_to_its_switch_ip() {
-        let switch_ip = IpAddr::V4(Ipv4Addr::new(100, 64, 0, 5));
+    fn own_ip_routes_to_its_published_loopback_port() {
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let mut reg = HostnameRegistry::new("dev");
-        reg.register(SessionId::nil(), "web", switch_ip);
+        reg.register_own_ip(SessionId::nil(), "web");
         let router = Router::new(Arc::new(reg));
 
+        // The published external port (e.g. an ingress 18080:8080 forward) is
+        // carried in the authority and reached on loopback.
         assert_eq!(
-            router.route("web.dev.min.internal:8080"),
-            Some(SocketAddr::new(switch_ip, 8080))
+            router.route("web.dev.min.internal:18080"),
+            Some(SocketAddr::new(loopback, 18080))
         );
         // Absent an explicit port the default upstream port is used.
         assert_eq!(
             router.route("web.dev.min.internal"),
-            Some(SocketAddr::new(switch_ip, DEFAULT_UPSTREAM_PORT))
+            Some(SocketAddr::new(loopback, DEFAULT_UPSTREAM_PORT))
         );
         // An unregistered host does not route.
         assert_eq!(router.route("ghost.dev.min.internal"), None);

@@ -16,10 +16,14 @@
 //! microVM (libkrun) runtimes never resolve anything, and the TLD choice is
 //! irrelevant to correctness.
 //!
-//! `HostNet` PTasks register to `127.0.0.1` (R3.6); `OwnIp` PTasks register to
-//! their gvproxy switch IP (R3.1), which the proxy reaches through the switch
-//! relay. [`HostnameRegistry::register`] takes the target address, so both modes
-//! are the same registry call with a different target.
+//! Both `HostNet` (R3.6) and `OwnIp` (R3.1) PTasks register to `127.0.0.1`: a
+//! `HostNet` PTask's listeners are on host loopback directly, and an `OwnIp`
+//! PTask is reached through a gvproxy-**published loopback port** (its forwarder
+//! API binds `127.0.0.1:<external>` → `lease:<internal>`), so the daemon is never
+//! on the switch (the DM2 topology in `networking-with-diagrams.md`). The client
+//! selects the published external port; the registry gates only on the host.
+//! [`HostnameRegistry::register`] takes the target address, so both modes are the
+//! same registry call with the same `127.0.0.1` target.
 //!
 //! Covers R3.5 (structured register/deregister tracing) and R3.6 (`HostNet`
 //! registration). The former systemd-resolved startup probe (R3.4) is removed by
@@ -137,6 +141,18 @@ impl HostnameRegistry {
         self.register(session_id, session_name, LOOPBACK)
     }
 
+    /// Registers an `OwnIp` PTask, routing its hostname to `127.0.0.1` (R3.1).
+    ///
+    /// Under the published-loopback model (see the module docs) an `OwnIp` PTask's
+    /// service is reached through a gvproxy-published loopback port
+    /// (`127.0.0.1:<external>` → `lease:<internal>`), so — like a `HostNet` PTask
+    /// — its hostname resolves to loopback and the daemon never touches the
+    /// switch. The client selects the published external port; the registry gates
+    /// only on the host.
+    pub fn register_own_ip(&mut self, session_id: SessionId, session_name: &str) -> Hostname {
+        self.register(session_id, session_name, LOOPBACK)
+    }
+
     /// Withdraws `session_name`'s hostname, returning it if one was registered.
     /// Emits the R3.5 `deregistered` tracing event only when an entry is
     /// actually removed, so calling it for an unregistered session is a silent
@@ -228,6 +244,29 @@ mod tests {
             .expect("hostname was registered");
         assert_eq!(removed.as_str(), "myservice.dev.min.internal");
         assert_eq!(reg.resolve("myservice.dev.min.internal"), None);
+    }
+
+    /// Under the published-loopback model an `OwnIp` PTask registers to
+    /// `127.0.0.1` (R3.1) — the same target as a `HostNet` PTask — because it is
+    /// reached through a gvproxy-published loopback port, not the switch IP. The
+    /// client then uses the published external port in the authority.
+    #[test]
+    fn own_ip_registration_routes_to_loopback() {
+        let mut reg = HostnameRegistry::new("dev");
+        let hostname = reg.register_own_ip(SessionId::nil(), "web");
+        assert_eq!(hostname.as_str(), "web.dev.min.internal");
+
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert_eq!(reg.resolve("web.dev.min.internal"), Some(loopback));
+        // The published external port is carried in the authority; the registry
+        // gates on the host only.
+        assert_eq!(reg.resolve("web.dev.min.internal:18080"), Some(loopback));
+
+        assert_eq!(
+            reg.deregister("web").map(|h| h.as_str().to_string()),
+            Some("web.dev.min.internal".to_string())
+        );
+        assert_eq!(reg.resolve("web.dev.min.internal"), None);
     }
 
     /// Port stripping handles both the common `name:port` form and the
