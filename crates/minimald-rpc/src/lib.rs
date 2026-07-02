@@ -294,6 +294,38 @@ impl OneshotSshRpc for DestroySession {
     type Response = Errorable<DestroySessionResponse>;
 }
 
+/// An RPC asking the daemon to shut down its session manager so the process
+/// can terminate gracefully.
+pub struct Shutdown;
+
+/// The request for a [`Shutdown`] RPC.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShutdownRequest {
+    /// When `true`, live sessions are destroyed and the daemon shuts down
+    /// regardless. When `false`, the daemon refuses to shut down if any
+    /// session is still live, answering with [`ShutdownResponse::SessionsLive`].
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// The response for a [`Shutdown`] RPC.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ShutdownResponse {
+    /// The daemon accepted the request: the session manager is shutting down
+    /// and rejecting further work.
+    ShuttingDown,
+    /// The daemon refused: live sessions exist and `force` was not set. No
+    /// state changed; the caller may retry with `force = true`.
+    SessionsLive,
+}
+
+impl OneshotSshRpc for Shutdown {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "Shutdown");
+    type Request<'a> = ShutdownRequest;
+    type Response = ShutdownResponse;
+}
+
 // ---------------------------------------------------------------------------
 // Session-creation flow (multi-round contribution composition).
 //

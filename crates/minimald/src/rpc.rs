@@ -5,7 +5,8 @@ use minimald_rpc::{
     GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest,
     GetSessionRecordResponse, GetVersion, GetVersionResponse, IssueClientCert,
     IssueClientCertRequest, ListSessions, ListSessionsEntry, ListSessionsResponse, OneshotSshRpc,
-    RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse,
+    RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, Shutdown, ShutdownRequest,
+    ShutdownResponse,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -208,6 +209,28 @@ async fn serve_destroy_session(s: ServerStateHandle, c: RuChannel<Msg>) {
     }
 }
 
+async fn serve_shutdown(s: ServerStateHandle, c: RuChannel<Msg>) {
+    let res = Shutdown
+        .handle_channel(c, async |req: ShutdownRequest| {
+            let mngr = s.sessions_manager().await;
+            Ok(match mngr.shutdown(req.force).await {
+                Ok(()) => {
+                    // Manager is down; tell the accept loop to stop and drain
+                    // so the process can exit. Firing before the response is
+                    // written is safe: the drain waits out the grace period,
+                    // so this reply still flushes to the client.
+                    s.trigger_shutdown().await;
+                    ShutdownResponse::ShuttingDown
+                }
+                Err(()) => ShutdownResponse::SessionsLive,
+            })
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", Shutdown::NAME, e);
+    }
+}
+
 async fn serve_get_session_policy(s: ServerStateHandle, c: RuChannel<Msg>) {
     let res = GetSessionPolicy
         .handle_channel(c, async |req| {
@@ -366,6 +389,7 @@ pub async fn handle_ssh_rpc(
         | CreateSession::NAME
         | RenameSession::NAME
         | DestroySession::NAME
+        | Shutdown::NAME
         | GetSessionPolicy::NAME
         | GetMeshStatus::NAME
         | STREAM_WORKSPACE_FILES
@@ -401,6 +425,7 @@ pub async fn handle_ssh_rpc(
         CreateSession::NAME => drop(spawn(serve_create_session(s, channel, ssh_username))),
         RenameSession::NAME => drop(spawn(serve_rename_session(s, channel))),
         DestroySession::NAME => drop(spawn(serve_destroy_session(s, channel))),
+        Shutdown::NAME => drop(spawn(serve_shutdown(s, channel))),
         GetSessionPolicy::NAME => drop(spawn(serve_get_session_policy(s, channel))),
         GetMeshStatus::NAME => drop(spawn(serve_get_mesh_status(s, channel))),
         STREAM_WORKSPACE_FILES => drop(spawn(serve_stream_workspace_files(s, config, channel))),
@@ -427,7 +452,8 @@ pub async fn handle_ssh_rpc(
 mod tests {
     use minimald_rpc::{
         CreateSession, CreateSessionRequest, DestroySessionRequest, EgressPolicy, GetSessionPolicy,
-        GetSessionPolicyRequest, RenameSessionRequest, SessionPolicy,
+        GetSessionPolicyRequest, RenameSessionRequest, SessionPolicy, Shutdown, ShutdownRequest,
+        ShutdownResponse,
     };
     use paths::HostAbsPath;
     use sessions::{NetworkMode, SessionId};
@@ -844,6 +870,95 @@ mod tests {
         assert!(
             matches!(resp, Errorable::Err { error } if error.contains("no session with ID")),
             "expected an unknown-id error",
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_shutting_down_when_no_sessions_are_live() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let resp = client
+            .call::<Shutdown>(&ShutdownRequest { force: false })
+            .await;
+        assert_eq!(resp, ShutdownResponse::ShuttingDown);
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_further_session_work_once_shut_down() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let resp = client
+            .call::<Shutdown>(&ShutdownRequest { force: false })
+            .await;
+        assert_eq!(resp, ShutdownResponse::ShuttingDown);
+
+        // After shutdown the manager refuses to bring sessions up, so even a
+        // lookup for a well-formed id is rejected rather than answered.
+        let mngr = server.state.sessions_manager().await;
+        assert!(
+            mngr.get_session(SessionKeyPredicate::Id(SessionId::nil()))
+                .await
+                .is_err(),
+            "manager should reject session work while shutting down",
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_without_force_refuses_while_a_session_is_live() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        // A persisted session isn't "live" until it's brought up; do so, so the
+        // manager has a running actor that an unforced shutdown must protect.
+        let mngr = server.state.sessions_manager().await;
+        mngr.get_session(SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("freshly-created session should be retrievable");
+
+        let resp = client
+            .call::<Shutdown>(&ShutdownRequest { force: false })
+            .await;
+        assert_eq!(resp, ShutdownResponse::SessionsLive);
+
+        // The refusal left the daemon fully operational: the live session is
+        // still reachable and no shutdown flag was latched.
+        assert!(
+            mngr.get_session(SessionKeyPredicate::Id(session_id))
+                .await
+                .unwrap()
+                .is_some(),
+            "an unforced, refused shutdown must not tear down live sessions",
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_with_force_tears_down_live_sessions() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let mngr = server.state.sessions_manager().await;
+        mngr.get_session(SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("freshly-created session should be retrievable");
+
+        // `force` overrides the live-session guard: the daemon shuts down...
+        let resp = client
+            .call::<Shutdown>(&ShutdownRequest { force: true })
+            .await;
+        assert_eq!(resp, ShutdownResponse::ShuttingDown);
+
+        // ...and, being in shutdown, refuses to hand out sessions afterwards.
+        assert!(
+            mngr.get_session(SessionKeyPredicate::Id(session_id))
+                .await
+                .is_err(),
+            "a forced shutdown should leave the manager rejecting session work",
         );
     }
 

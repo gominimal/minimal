@@ -8,6 +8,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 use crate::connection::Connection;
 use crate::sessions;
@@ -98,6 +99,11 @@ pub struct ServerState {
     config: Config,
     sessions: sessions::ManagerHandle,
 
+    /// Fired by the `Shutdown` RPC handler once the session manager has been
+    /// torn down, telling [`Server::run`]'s accept loop to stop accepting,
+    /// drain in-flight connections, and return so the process can exit.
+    shutdown: CancellationToken,
+
     /// Memoized SSH host key, after first successful load.
     host_key: Option<PrivateKey>,
 
@@ -155,6 +161,7 @@ impl ServerState {
             sessions: sessions::Manager::init(minimal_state_dir, minimal_cache_dir, net_switch)
                 .await?,
             config,
+            shutdown: CancellationToken::new(),
             host_key: None,
             #[cfg(feature = "networking-proxy")]
             cert_authority,
@@ -192,6 +199,19 @@ impl ServerStateHandle {
     /// Returns a handle to the sessions manager.
     pub async fn sessions_manager(&self) -> sessions::ManagerHandle {
         self.0.lock().await.sessions.clone()
+    }
+
+    /// Returns a clone of the server shutdown token. [`Server::run`]'s accept
+    /// loop awaits [`CancellationToken::cancelled`] on it to leave the loop.
+    pub(crate) async fn shutdown_token(&self) -> CancellationToken {
+        self.0.lock().await.shutdown.clone()
+    }
+
+    /// Signals [`Server::run`] to stop accepting connections and drain. Called
+    /// by the `Shutdown` RPC handler after the session manager has shut down.
+    /// Idempotent: repeated calls (e.g. two `Shutdown` RPCs) are harmless.
+    pub(crate) async fn trigger_shutdown(&self) {
+        self.0.lock().await.shutdown.cancel();
     }
 
     /// Returns the daemon's TLS certificate authority (only with
@@ -288,6 +308,12 @@ impl Listener for tokio_vsock::VsockListener {
     }
 }
 
+/// How long [`Server::run`] waits for in-flight connections to drain after a
+/// [`Shutdown`](minimald_rpc::Shutdown) RPC before aborting the stragglers. The
+/// shutdown-initiating client's own connection stays open until it disconnects,
+/// so an unbounded wait could hang the process; this bounds it.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// A listening minimald server.
 #[derive(Debug)]
 pub struct Server;
@@ -313,6 +339,9 @@ impl Server {
             .await
             .map_err(std::io::Error::other)?;
         let mut session_set = JoinSet::new();
+        // Fired by the `Shutdown` RPC handler once the session manager is torn
+        // down; ends the accept loop below so the daemon can exit gracefully.
+        let shutdown = state.shutdown_token().await;
 
         loop {
             // Drain any completed sessions to prevent unbounded growth.
@@ -322,7 +351,13 @@ impl Server {
                 }
             }
 
-            let (stream, peer) = listener.accept().await?;
+            // A pending shutdown wins over a ready accept (`biased`), so we
+            // never take on a new connection once shutdown has been requested.
+            let (stream, peer) = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => break,
+                accepted = listener.accept() => accepted?,
+            };
             tracing::info!(?peer, transport = L::TRANSPORT, "accepted connection");
             let (_conn_hnd, session_fut) = match Connection::from_stream(
                 stream,
@@ -349,6 +384,38 @@ impl Server {
                 }
             });
         }
+
+        // Shutdown requested: stop accepting (done — loop exited) and drain
+        // in-flight connections. The initiating client's own connection stays
+        // open until it disconnects, so bound the wait: after `SHUTDOWN_GRACE`,
+        // abort whatever is left so `run` always returns and the process exits.
+        tracing::info!(
+            live = session_set.len(),
+            "draining connections for shutdown"
+        );
+        let grace = tokio::time::sleep(SHUTDOWN_GRACE);
+        tokio::pin!(grace);
+        loop {
+            tokio::select! {
+                res = session_set.join_next() => match res {
+                    None => break,
+                    Some(Err(e)) => {
+                        tracing::warn!(error = %e, "session task panicked while draining")
+                    }
+                    Some(Ok(())) => {}
+                },
+                () = &mut grace => {
+                    tracing::warn!(
+                        live = session_set.len(),
+                        "shutdown grace elapsed; aborting remaining connections"
+                    );
+                    session_set.abort_all();
+                    while session_set.join_next().await.is_some() {}
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -470,5 +537,86 @@ async fn expose_proxy_on_host(daemon_ip: std::net::Ipv4Addr, port: u16) {
             %error,
             "could not publish host-side proxy on the host loopback via gvproxy forwarder"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use camino::Utf8PathBuf;
+    use minimald_rpc::{Shutdown, ShutdownRequest, ShutdownResponse};
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::test_harness::connect_uds;
+
+    /// A `Config` backed by a fresh tempdir, mirroring `TestServer::new`.
+    fn test_config(dir: &TempDir) -> Config {
+        let path = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        Config {
+            host_key: HostKey::Ephemeral,
+            minimal_state_dir: DaemonAbsPath::try_new(path.clone()).unwrap(),
+            minimal_cache_dir: DaemonAbsPath::try_new(path).unwrap(),
+            gvproxy_bin: None,
+            in_microvm: false,
+        }
+    }
+
+    /// Binds a UDS in `dir` and spawns `Server::run` against it, returning the
+    /// run task's join handle alongside the socket path clients dial.
+    fn spawn_server(
+        dir: &TempDir,
+    ) -> (
+        tokio::task::JoinHandle<Result<(), std::io::Error>>,
+        std::path::PathBuf,
+    ) {
+        let sock = dir.path().join("minimald.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let run = tokio::spawn(Server::run(test_config(dir), listener));
+        (run, sock)
+    }
+
+    #[tokio::test]
+    async fn shutdown_rpc_drives_run_to_return_once_the_client_disconnects() {
+        let dir = TempDir::new().unwrap();
+        let (run, sock) = spawn_server(&dir);
+
+        {
+            let mut client = connect_uds(&sock).await;
+            let resp = client
+                .call::<Shutdown>(&ShutdownRequest { force: false })
+                .await;
+            assert_eq!(resp, ShutdownResponse::ShuttingDown);
+            // Dropping `client` closes the connection, so the drain sees the
+            // last in-flight session finish and `run` returns without waiting
+            // out the grace period.
+        }
+
+        let res = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("run should return promptly once the client disconnects");
+        assert!(res.unwrap().is_ok(), "run should return Ok after shutdown");
+    }
+
+    #[tokio::test]
+    async fn shutdown_rpc_returns_even_if_the_initiating_client_lingers() {
+        let dir = TempDir::new().unwrap();
+        let (run, sock) = spawn_server(&dir);
+
+        // Keep the client — and thus its connection — open past the shutdown.
+        // The drain can't complete gracefully, so the grace period must elapse
+        // and abort the straggler, guaranteeing `run` still returns.
+        let mut client = connect_uds(&sock).await;
+        let resp = client
+            .call::<Shutdown>(&ShutdownRequest { force: false })
+            .await;
+        assert_eq!(resp, ShutdownResponse::ShuttingDown);
+
+        let res = tokio::time::timeout(SHUTDOWN_GRACE + Duration::from_secs(3), run)
+            .await
+            .expect("run must return after the grace period aborts lingering connections");
+        assert!(res.unwrap().is_ok(), "run should return Ok after shutdown");
+        drop(client);
     }
 }

@@ -138,6 +138,24 @@ impl TestServer {
     }
 }
 
+/// Dials an already-listening minimald UDS and returns an authenticated
+/// [`TestClient`].
+///
+/// Unlike [`TestServer::connect`], which bridges an in-memory pair straight
+/// into `Connection::from_stream`, this drives a real `UnixStream` against a
+/// server's `UnixListener` — so it exercises the actual `Server::run` accept
+/// loop, which is what the shutdown-drain tests need.
+pub(crate) async fn connect_uds(sock: &Path) -> TestClient {
+    let stream = UnixStream::connect(sock).await.unwrap();
+    let client_config = Arc::new(russh::client::Config::default());
+    let mut handle = russh::client::connect_stream(client_config, stream, TestClientHandler)
+        .await
+        .unwrap();
+    let auth = handle.authenticate_none("test").await.unwrap();
+    assert!(auth.success(), "auth_none should succeed on local UDS");
+    TestClient { handle }
+}
+
 /// An authenticated client connection against a [`TestServer`].
 pub(crate) struct TestClient {
     handle: russh::client::Handle<TestClientHandler>,
