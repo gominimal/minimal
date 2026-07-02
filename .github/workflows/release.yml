@@ -1,0 +1,311 @@
+name: Release
+
+on:
+    workflow_dispatch:
+
+env:
+    CARGO_TERM_COLOR: always
+
+# Serialize release runs so two manual dispatches can't race to cut a release
+# from different commits at the same time.
+concurrency:
+    group: release-${{ github.ref }}
+    cancel-in-progress: false
+
+permissions:
+    contents: read
+
+jobs:
+    test:
+        runs-on: ubuntu-latest
+        timeout-minutes: 40
+        steps:
+            - uses: actions/checkout@v7
+            - name: Run core workspace tests
+              uses: ./.github/actions/core-tests
+            - name: Run HTTPS/mTLS proxy tests
+              # The mTLS reverse proxy is behind the non-default `networking-proxy`
+              # feature, so the core-tests `--workspace` run does not compile or run
+              # its proofs (R4.5 mtls_missing_cert_returns_401_with_no_topology, UC2b
+              # mtls_valid_cert_routes_to_backend). Exercise them explicitly.
+              run: cargo nextest run -p minimald --features networking-proxy
+            - name: Run WireGuard mesh tests
+              # The WireGuard mesh peer is behind the non-default `networking-wg`
+              # feature, so the core-tests `--workspace` run does not compile or run
+              # its proofs. Exercise them explicitly (R-WG:
+              # two_meshes_handshake_and_relay_a_packet, rpc get_mesh_status). The
+              # `#[ignore]` two-namespace mesh_uc7 proof runs in the netns lane.
+              run: cargo test -p minimald --features networking-wg
+
+    build-release-linux-amd64:
+        runs-on: ubuntu-latest
+        timeout-minutes: 60
+        steps:
+            - name: Free Disk Space
+              # Static release build of the full workspace; the cargo target dir
+              # is the largest in any of the linux jobs. `remove_tool_cache: true`
+              # is safe even without a `dtolnay/rust-toolchain` step — the
+              # pre-installed Rust toolchain on ubuntu-latest lives in
+              # `~/.rustup` + `~/.cargo`, not `/opt/hostedtoolcache`, so
+              # `rustup target add` below still resolves.
+              uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
+              with:
+                  remove_android: true
+                  remove_dotnet: true
+                  remove_haskell: true
+                  remove_tool_cache: true
+            - uses: actions/checkout@v7
+            - name: Install dependencies
+              run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
+            - name: Add Rust target
+              run: rustup target add x86_64-unknown-linux-musl
+            - name: Configure musl linker
+              run: |
+                  echo '' >> .cargo/config.toml
+                  echo '[target.x86_64-unknown-linux-musl]' >> .cargo/config.toml
+                  echo 'linker = "musl-gcc"' >> .cargo/config.toml
+            - uses: actions/cache@v6
+              with:
+                  path: |
+                      ~/.cargo/bin/
+                      ~/.cargo/registry/index/
+                      ~/.cargo/registry/cache/
+                      ~/.cargo/git/db/
+                      target/
+                  key: ${{ runner.os }}-amd64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+                  restore-keys: ${{ runner.os }}-amd64-cargo-release-
+            - name: Build static release binaries
+              run: |
+                  cargo build --release --target x86_64-unknown-linux-musl \
+                     --package mip \
+                     --package minimal \
+                     --package minimald
+            - name: Rename binaries with platform suffix
+              # download-artifact merge-multiple flattens every artifact into one
+              # directory using each file's basename, so the uploaded files must
+              # already carry a unique platform-suffixed name to avoid amd64/arm64
+              # collisions and to match the paths used by the release job.
+              run: |
+                  cd target/x86_64-unknown-linux-musl/release
+                  mv mip mip-linux-amd64
+                  mv minimal minimal-linux-amd64
+                  mv minimald minimald-linux-amd64
+            - name: Upload binary (mip)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: mip-linux-amd64
+                  path: target/x86_64-unknown-linux-musl/release/mip-linux-amd64
+                  retention-days: 7
+            - name: Upload binary (minimal)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minimal-linux-amd64
+                  path: target/x86_64-unknown-linux-musl/release/minimal-linux-amd64
+                  retention-days: 7
+            - name: Upload binary (minimald)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minimald-linux-amd64
+                  path: target/x86_64-unknown-linux-musl/release/minimald-linux-amd64
+                  retention-days: 7
+            - name: Materialize libkrun prefix (upstream package)
+              # minvmd links libkrun's KVM backend dynamically, so unlike the three
+              # binaries above it can't join the static-musl cross build — it needs a
+              # native glibc build against a real libkrun. Materialize libkrun (a cache
+              # fetch keyed by the pinned upstream commit, NOT a from-source build) into
+              # a flat prefix that minvmd's build.rs link-searches + rpaths against.
+              run: ./scripts/fetch-libkrun.sh "$HOME/.krun" x86_64
+            - name: Build native minvmd binary
+              # Native host target (x86_64-unknown-linux-gnu), NOT musl: the binary
+              # links libkrun.so (and libkrunfw.so.5 is dlopen'd at runtime), so unlike
+              # the three above it is not self-contained — running it still needs those
+              # .so's reachable via rpath/LD_LIBRARY_PATH. LIBKRUN_PREFIX drives the
+              # build.rs link search and the `minvmd_libkrun` cfg (real, non-stub impl).
+              run: |
+                  LIBKRUN_PREFIX="$HOME/.krun" \
+                    cargo build --release -p minvmd --bin minvmd
+                  mv target/release/minvmd target/release/minvmd-linux-amd64
+            - name: Upload binary (minvmd)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minvmd-linux-amd64
+                  path: target/release/minvmd-linux-amd64
+                  retention-days: 7
+
+    build-release-linux-arm64:
+        runs-on: ubuntu-latest
+        timeout-minutes: 90
+        steps:
+            - uses: actions/checkout@v7
+            - name: Install cross
+              uses: taiki-e/install-action@v2
+              with:
+                  tool: cross
+            - uses: actions/cache@v6
+              with:
+                  path: |
+                      ~/.cargo/bin/
+                      ~/.cargo/registry/index/
+                      ~/.cargo/registry/cache/
+                      ~/.cargo/git/db/
+                      target/
+                  key: ${{ runner.os }}-arm64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+                  restore-keys: ${{ runner.os }}-arm64-cargo-release-
+            - name: Build static minimal binary
+              # Rename with a platform suffix so download-artifact's merge-multiple
+              # flatten does not collide with the amd64 build's basename.
+              run: |
+                  cross build --release \
+                     --package minimal \
+                     --target aarch64-unknown-linux-musl
+                  mv target/aarch64-unknown-linux-musl/release/minimal \
+                     target/aarch64-unknown-linux-musl/release/minimal-linux-arm64
+            - name: Upload binary (minimal)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minimal-linux-arm64
+                  path: target/aarch64-unknown-linux-musl/release/minimal-linux-arm64
+                  retention-days: 7
+            - name: Build static mip binary
+              run: |
+                  cross build --release \
+                     --package mip \
+                     --target aarch64-unknown-linux-musl
+                  mv target/aarch64-unknown-linux-musl/release/mip \
+                     target/aarch64-unknown-linux-musl/release/mip-linux-arm64
+            - name: Upload binary (mip)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: mip-linux-arm64
+                  path: target/aarch64-unknown-linux-musl/release/mip-linux-arm64
+                  retention-days: 7
+            - name: Build static minimald binary
+              run: |
+                  cross build --release \
+                     --package minimald \
+                     --target aarch64-unknown-linux-musl
+                  mv target/aarch64-unknown-linux-musl/release/minimald \
+                     target/aarch64-unknown-linux-musl/release/minimald-linux-arm64
+            - name: Upload binary (minimald)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minimald-linux-arm64
+                  path: target/aarch64-unknown-linux-musl/release/minimald-linux-arm64
+                  retention-days: 7
+
+    build-release-macos-arm64:
+        # Self-hosted Apple Silicon runner. minvmd links libkrun (Hypervisor.framework
+        # backend) via `#[link(name = "krun")]` and builds the real (non-stub) impl
+        # only on macOS against a provisioned libkrun — it can't join the static-musl
+        # cross builds above, so it's built natively here (mirrors ci-macos.yml's
+        # build-macos). Gated on RUN_MACOS_CI so it's skipped while the single
+        # self-hosted runner is offline — a skip here also skips `release`, which
+        # needs it.
+        runs-on: [self-hosted, macOS, ARM64]
+        timeout-minutes: 45
+        if: vars.RUN_MACOS_CI != 'false'
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  # Don't leave git credentials on the persistent self-hosted runner.
+                  persist-credentials: false
+            - name: Toolchain
+              uses: dtolnay/rust-toolchain@stable
+            - name: Provision libkrun (slp/krun tap)
+              # Self-install libkrun so the job doesn't depend on hand-provisioned
+              # runner state. Idempotent (a no-op when already present).
+              run: brew install slp/krun/libkrun
+            - name: Verify libkrun is available
+              run: |
+                  if [ ! -f /opt/homebrew/lib/libkrun.dylib ]; then
+                    echo "::error::libkrun.dylib not found under /opt/homebrew/lib. Provision the runner with: brew install slp/krun/libkrun" >&2
+                    exit 1
+                  fi
+            - name: Build release minvmd binary
+              run: cargo build --release -p minvmd --bin minvmd
+            - name: Build release minimal binary
+              run: cargo build --release -p minimal --bin minimal
+            - name: Rename binaries with platform suffix
+              # download-artifact merge-multiple flattens on basename, so the uploaded
+              # file must already carry the platform-suffixed name the release job expects.
+              run: |
+                  mv target/release/minvmd target/release/minvmd-macos-arm64
+                  mv target/release/minimal target/release/minimal-macos-arm64
+            - name: Upload binary (minvmd)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minvmd-macos-arm64
+                  path: target/release/minvmd-macos-arm64
+                  retention-days: 7
+            - name: Upload binary (minimal)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minimal-macos-arm64
+                  path: target/release/minimal-macos-arm64
+                  retention-days: 7
+
+    release:
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        needs:
+            [
+                test,
+                build-release-linux-amd64,
+                build-release-linux-arm64,
+                build-release-macos-arm64,
+            ]
+        permissions:
+            contents: write
+            id-token: write
+        steps:
+            - uses: actions/checkout@v7
+            - name: Generate release info
+              id: release_info
+              run: |
+                  SHORT_SHA=$(git rev-parse --short=8 HEAD)
+                  echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+                  echo "tag=release-$SHORT_SHA" >> $GITHUB_OUTPUT
+                  echo "name=minimal-$SHORT_SHA" >> $GITHUB_OUTPUT
+            - name: Download artifacts
+              uses: actions/download-artifact@v8
+              with:
+                  pattern: "*-*-*"
+                  path: artifacts/
+                  merge-multiple: true
+            - name: Make binaries executable
+              run: chmod +x artifacts/*-*-*
+            - name: Generate completions
+              run: |
+                  mkdir -p artifacts/completions/{bash,zsh,fish}
+                  artifacts/mip-linux-amd64 completions bash > artifacts/completions/bash/mip
+                  artifacts/mip-linux-amd64 completions zsh  > artifacts/completions/zsh/_mip
+                  artifacts/mip-linux-amd64 completions fish > artifacts/completions/fish/mip.fish
+                  artifacts/minimal-linux-amd64 completions bash > artifacts/completions/bash/minimal
+                  artifacts/minimal-linux-amd64 completions zsh  > artifacts/completions/zsh/_minimal
+                  artifacts/minimal-linux-amd64 completions fish > artifacts/completions/fish/minimal.fish
+                  artifacts/minimald-linux-amd64 completions bash > artifacts/completions/bash/minimald
+                  artifacts/minimald-linux-amd64 completions zsh  > artifacts/completions/zsh/_minimald
+                  artifacts/minimald-linux-amd64 completions fish > artifacts/completions/fish/minimald.fish
+            - name: Authenticate to Google Cloud
+              uses: google-github-actions/auth@v3
+              with:
+                  project_id: "289724348228"
+                  workload_identity_provider: "projects/289724348228/locations/global/workloadIdentityPools/github/providers/gominimal"
+            - name: Package and upload archive to GCS
+              run: |
+                  SHA=$(git rev-parse --short=8 HEAD)
+                  tar --zstd -cf "minimalone-${SHA}.tar.zst" -C artifacts .
+
+                  gcloud storage cp \
+                    --cache-control="public, max-age=31536000, immutable" \
+                    "minimalone-${SHA}.tar.zst" gs://minimal-shim/archives/
+            - name: Create Release
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  tar -C artifacts/completions -czf artifacts/completions.tar.gz .
+                  cd artifacts/
+                  gh release create "${{ steps.release_info.outputs.tag }}" \
+                    $(find . -maxdepth 1 -type f) \
+                    --repo="${GITHUB_REPOSITORY}" \
+                    --title="${{ steps.release_info.outputs.name }}"
