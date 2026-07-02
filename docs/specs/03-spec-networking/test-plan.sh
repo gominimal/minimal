@@ -7,6 +7,17 @@
 # host in the guest ROOT netns and bypasses the sandbox, so it cannot prove a
 # session's isolation or own-ip behaviour.
 #
+# RULE: one pty per process. Every concurrently-live session gets its OWN OS
+# process draining its OWN pty (one `run_in_session`/expect per session,
+# backgrounded). NEVER drive two `attach` sessions from a single expect via two
+# spawn ids read one-at-a-time: `attach` exec's `ssh -tt`, whose pty has a fixed
+# ~16KB kernel buffer. While the one process drains session A, session B's ssh
+# keeps writing shell-setup into B's pty; nobody reads it, it fills, ssh blocks on
+# write, and B's RequestShell never reaches the daemon. boot.log then shows a
+# second attach that "wedged" — but it is the client starving its own pty, not a
+# server-side hang. Warm each session once before any timed/concurrent trial so
+# the first-attach sandbox build (up to ATTACH_TIMEOUT) doesn't mask the signal.
+#
 # PORTABILITY: targets the minvmd VM deployment (DM1) — macOS/HVF and Linux/KVM
 # are identical (the sandbox guest is Linux on every host; the CLI + expect + host
 # curls are the same). The only host-specific bit is the mTLS cert dir (CERT_DIR
@@ -62,6 +73,9 @@ set sess   $env(RIS_SESS)
 set script $env(RIS_SCRIPT)
 set m      $env(RIS_M)
 set timeout $env(RIS_TO)
+# Line-buffer stdout so a per-step SIGKILL (gtimeout) can't discard a verdict
+# still sitting in expect's block buffer when it writes to a pipe.
+fconfigure stdout -buffering line
 log_user 0
 spawn $m attach $sess
 # Readiness: poll a marker until the in-sandbox bash echoes it back. Absorbs the
@@ -124,25 +138,27 @@ destroy demo peer
 echo "-- demo egress (in-sandbox, via shuttle): expect 200 --"
 session_out demo 'curl --max-time 8 -sS -o /dev/null -w "HTTP=%{http_code}\n" http://example.com'
 echo "-- peer<-demo over the switch: socat listener in peer, curl from demo --"
-# peer: start a listener and keep the session open; read its switch IP; then
-# from a second demo session connect to it. Done in one expect with two spawns.
-RIS_M="$M" PEER=peer DEMO=demo RIS_TO="$ATTACH_TIMEOUT" $TO expect <<'EXP' 2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\r//g' | grep -aE 'PEER_IP=|PEER_REACHED|TC2_'
-set m $env(RIS_M); set to $env(RIS_TO); set timeout $to
-proc ready {id} { for {set i 0} {$i<90} {incr i} { send -i $id "echo __R__\r"; expect { -i $id -timeout 4 "__R__\r\n" {return 1} timeout {} } }; return 0 }
-# peer session
-spawn $m attach $env(PEER); set peer $spawn_id; ready $peer
-send -i $peer "stty -echo; PS1=''\r"
-send -i $peer "PIP=\$(grep -oE '100\\.64\\.\[0-9\]+\\.\[0-9\]+' /proc/net/fib_trie | grep -v '\\.0\$' | head -1); echo PEER_IP=\$PIP\r"
-expect -i $peer -timeout 15 -re "PEER_IP=(100\\.64\\.\[0-9.\]+)" { set pip $expect_out(1,string) }
-send -i $peer "socat TCP-LISTEN:9000,reuseaddr,fork SYSTEM:'printf PEER_REACHED' &\r"
-after 1500
-# demo session connects to peer ip
-spawn $m attach $env(DEMO); set demo $spawn_id; ready $demo
-send -i $demo "stty -echo; PS1=''\r"
-send -i $demo "curl --max-time 6 -sS http://$pip:9000/ ; echo TC2_RC=\$?\r"
-expect -i $demo -timeout 20 "TC2_RC=" {}
-send -i $demo "exit\r"; send -i $peer "exit\r"
-EXP
+# CONCURRENCY RULE (see header): peer and demo are live at the same time, so each
+# runs in its OWN process/pty — NOT one expect multiplexing two spawn ids. The
+# peer listener is a backgrounded `run_in_session`; demo dials it from a separate
+# `session_out`. Reading peer's switch IP first also warms peer's sandbox, so the
+# timed listener trial isn't racing a cold first-attach build.
+peer_ip="$(session_out peer 'grep -oE "100\.64\.[0-9]+\.[0-9]+" /proc/net/fib_trie | grep -v "\.0$" | head -1' | grep -aoE '100\.64\.[0-9]+\.[0-9]+' | head -1)"
+echo "peer switch IP: ${peer_ip:-UNKNOWN}"
+# peer listener: its own process/pty, backgrounded. socat runs in the background;
+# the `sleep` keeps the session (hence its pty, drained by this process) alive
+# while demo connects. Killed once demo is done.
+run_in_session peer 'socat TCP-LISTEN:9000,reuseaddr,fork SYSTEM:"printf PEER_REACHED" & sleep 45' >/dev/null 2>&1 &
+peer_job=$!
+sleep 3   # give the backgrounded listener process time to attach + bind
+if [ -n "$peer_ip" ]; then
+  # Retry inside the sandbox so listener-bind latency (the peer attach + socat
+  # startup) can't cause a false negative — poll for up to ~12s.
+  session_out demo "for i in \$(seq 1 12); do curl --max-time 3 -sS http://$peer_ip:9000/ && break; sleep 1; done; echo TC2_RC=\$?"
+else
+  echo "TC2_RC=peer-ip-unavailable"
+fi
+kill "$peer_job" 2>/dev/null; wait "$peer_job" 2>/dev/null
 destroy demo peer
 
 banner "TC3 — UC2 managed DNS via host proxy :7654 (server in-sandbox, host curls)"
@@ -151,6 +167,7 @@ destroy web
 # Start an http server INSIDE the session and keep it alive while the host curls.
 RIS_M="$M" SESS=web RIS_TO="$ATTACH_TIMEOUT" $TO expect <<'EXP' 2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\r//g' | grep -aE 'TC3_'
 set m $env(RIS_M); set timeout $env(RIS_TO)
+fconfigure stdout -buffering line
 proc ready {} { for {set i 0} {$i<90} {incr i} { send "echo __R__\r"; expect { -timeout 4 "__R__\r\n" {return 1} timeout {} } }; return 0 }
 spawn $m attach $env(SESS); ready
 send "stty -echo; PS1=''\r"
@@ -169,6 +186,7 @@ destroy tc4
 "$M" session policy tc4
 RIS_M="$M" SESS=tc4 RIS_TO="$ATTACH_TIMEOUT" $TO expect <<'EXP' 2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\r//g' | grep -aE 'TC4_'
 set m $env(RIS_M); set timeout $env(RIS_TO)
+fconfigure stdout -buffering line
 proc ready {} { for {set i 0} {$i<90} {incr i} { send "echo __R__\r"; expect { -timeout 4 "__R__\r\n" {return 1} timeout {} } }; return 0 }
 spawn $m attach $env(SESS); ready
 send "stty -echo; PS1=''\r"
@@ -201,6 +219,7 @@ destroy tc7
 "$M" activate -n tc7 --network own-ip . >/dev/null 2>&1
 RIS_M="$M" SESS=tc7 CERTDIR="$CERT_DIR" RIS_TO="$ATTACH_TIMEOUT" $TO expect <<'EXP' 2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\r//g' | grep -aE 'TC7_'
 set m $env(RIS_M); set timeout $env(RIS_TO); set cd $env(CERTDIR)
+fconfigure stdout -buffering line
 proc ready {} { for {set i 0} {$i<90} {incr i} { send "echo __R__\r"; expect { -timeout 4 "__R__\r\n" {return 1} timeout {} } }; return 0 }
 spawn $m attach $env(SESS); ready
 send "stty -echo; PS1=''\r"
@@ -219,6 +238,7 @@ destroy dev
 "$M" activate -n dev --network own-ip --ingress 18080:80 . >/dev/null 2>&1
 RIS_M="$M" SESS=dev RIS_TO="$ATTACH_TIMEOUT" $TO expect <<'EXP' 2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\r//g' | grep -aE 'TC8_'
 set m $env(RIS_M); set timeout $env(RIS_TO)
+fconfigure stdout -buffering line
 proc ready {} { for {set i 0} {$i<90} {incr i} { send "echo __R__\r"; expect { -timeout 4 "__R__\r\n" {return 1} timeout {} } }; return 0 }
 spawn $m attach $env(SESS); ready
 send "stty -echo; PS1=''\r"
