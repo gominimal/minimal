@@ -153,10 +153,14 @@ peer_job=$!
 sleep 3   # give the backgrounded listener process time to attach + bind
 if [ -n "$peer_ip" ]; then
   # Retry inside the sandbox so listener-bind latency (the peer attach + socat
-  # startup) can't cause a false negative — poll for up to ~12s.
-  session_out demo "for i in \$(seq 1 12); do curl --max-time 3 -sS http://$peer_ip:9000/ && break; sleep 1; done; echo TC2_RC=\$?"
+  # startup) can't cause a false negative — poll for up to ~12s. Track success in
+  # an explicit flag (a trailing `$?` would just be the loop's `sleep`, always 0),
+  # and assert on the response BODY: socat's `printf PEER_REACHED` is a raw
+  # (HTTP/0.9) reply, so curl's exit status is unreliable — `--http0.9` lets curl
+  # surface the body, which we grep for the actual proof of reachability.
+  session_out demo "reached=NO; for i in \$(seq 1 12); do if curl --max-time 3 -sS --http0.9 http://$peer_ip:9000/ 2>/dev/null | grep -q PEER_REACHED; then reached=YES; break; fi; sleep 1; done; echo TC2_PEER=\$reached"
 else
-  echo "TC2_RC=peer-ip-unavailable"
+  echo "TC2_PEER=peer-ip-unavailable"
 fi
 kill "$peer_job" 2>/dev/null; wait "$peer_job" 2>/dev/null
 destroy demo peer
