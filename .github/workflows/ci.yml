@@ -292,21 +292,25 @@ jobs:
                   fi
             - name: Build release minvmd binary
               run: cargo build --release -p minvmd --bin minvmd
-            - name: Codesign minvmd (hypervisor entitlement, R1.4)
-              # Codesigning must be the LAST thing to touch the binary: any later relink
-              # (a stray cargo build/test) drops the ad-hoc signature and
-              # krun_start_enter then fails with EINVAL. Renaming + uploading below
-              # preserve the embedded signature (they don't rewrite the Mach-O).
-              run: codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/release/minvmd
-            - name: Rename binary with platform suffix
+            - name: Build release minimal binary
+              run: cargo build --release -p minimal --bin minimal
+            - name: Rename binaries with platform suffix
               # download-artifact merge-multiple flattens on basename, so the uploaded
               # file must already carry the platform-suffixed name the release job expects.
-              run: mv target/release/minvmd target/release/minvmd-macos-arm64
+              run: |
+                  mv target/release/minvmd target/release/minvmd-macos-arm64
+                  mv target/release/minimal target/release/minimal-macos-arm64
             - name: Upload binary (minvmd)
               uses: actions/upload-artifact@v7
               with:
                   name: minvmd-macos-arm64
                   path: target/release/minvmd-macos-arm64
+                  retention-days: 7
+            - name: Upload binary (minimal)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minimal-macos-arm64
+                  path: target/release/minimal-macos-arm64
                   retention-days: 7
 
     cargo-deny:
