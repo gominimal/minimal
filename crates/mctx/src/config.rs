@@ -153,29 +153,17 @@ impl ConfigBuilder {
                 .num_parallel_builds
                 .unwrap_or_else(common::default_parallelism),
 
-            // TODO: Update default to
-            //
-            // dirs::state_dir()
-            //  .unwrap_or_else(|| dirs::home_dir().unwrap().join(".local/state"))
-            //  .join("minimal")
-            //
-            // Once Minimal One is the primary surface.
             minimal_state_dir: self.minimal_state_dir.unwrap_or_else(|| {
-                dirs::cache_dir()
-                    .unwrap_or_else(|| PathBuf::from("~/.cache"))
-                    .join("minimal")
+                paths::minimal_state_dir()
+                    .as_utf8_path()
+                    .as_std_path()
+                    .to_path_buf()
             }),
-            // TODO: Update default to
-            //
-            // dirs::cache_dir()
-            //  .unwrap_or_else(|| dirs::home_dir().unwrap().join(".local/cache"))
-            //  .join("minimal")
-            //
-            // Once Minimal One is the primary surface.
             minimal_cache_dir: self.minimal_cache_dir.unwrap_or_else(|| {
-                dirs::cache_dir()
-                    .unwrap_or_else(|| PathBuf::from("~/.cache"))
-                    .join("minimal")
+                paths::minimal_cache_dir()
+                    .as_utf8_path()
+                    .as_std_path()
+                    .to_path_buf()
             }),
             stdlib_dir: self.stdlib_dir,
             repo_dir: self.repo_dir,

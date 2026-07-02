@@ -3421,7 +3421,6 @@ dependencies = [
  "checkouts",
  "codespan-reporting",
  "common",
- "dirs",
  "futures",
  "google-cloud-auth",
  "google-cloud-storage",
@@ -3433,6 +3432,7 @@ dependencies = [
  "op",
  "orchestrator",
  "ot",
+ "paths",
  "rcache",
  "sandbox2",
  "serial_test",
@@ -3589,7 +3589,6 @@ dependencies = [
  "clap_complete",
  "common",
  "constcat",
- "dirs",
  "either",
  "futures",
  "graph",
@@ -4393,6 +4392,7 @@ name = "paths"
 version = "0.0.1"
 dependencies = [
  "camino",
+ "dirs",
  "serde",
  "thiserror 2.0.18",
  "toml",

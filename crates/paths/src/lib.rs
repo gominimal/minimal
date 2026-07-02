@@ -116,6 +116,50 @@ pub type DaemonPath = EitherPath<Daemon>;
 /// [`RelPath::<ConfigRelative>::bind_to_host`].
 pub type ConfigRelPath = RelPath<ConfigRelative>;
 
+/// Returns minimal's default cache directory, `<cache>/minimal`.
+///
+/// The base is the platform cache directory (e.g. `$XDG_CACHE_HOME` or
+/// `~/.cache` on Linux), falling back to `~/.cache` when it cannot be
+/// determined.
+///
+/// # Panics
+///
+/// Panics if neither a cache directory nor a home directory can be resolved,
+/// or if the resulting path is not valid UTF-8.
+pub fn minimal_cache_dir() -> DaemonAbsPath {
+    default_dir(dirs::cache_dir, ".cache")
+}
+
+/// Returns minimal's default state directory, `<state>/minimal`.
+///
+/// The base is the platform state directory (e.g. `$XDG_STATE_HOME` or
+/// `~/.local/state` on Linux), falling back to `~/.local/state` when it cannot
+/// be determined.
+///
+/// # Panics
+///
+/// Panics if neither a state directory nor a home directory can be resolved,
+/// or if the resulting path is not valid UTF-8.
+pub fn minimal_state_dir() -> DaemonAbsPath {
+    default_dir(dirs::state_dir, ".local/state")
+}
+
+/// Computes `<base>/minimal`, where `base` comes from `base_dir` or, failing
+/// that, `~/<home_fallback>`.
+fn default_dir(
+    base_dir: impl FnOnce() -> Option<std::path::PathBuf>,
+    home_fallback: &str,
+) -> DaemonAbsPath {
+    let base = base_dir().unwrap_or_else(|| {
+        dirs::home_dir()
+            .expect("could not determine home directory")
+            .join(home_fallback)
+    });
+    let path = Utf8PathBuf::from_path_buf(base.join("minimal"))
+        .expect("default directory path is not valid UTF-8");
+    DaemonAbsPath::try_new(path).expect("default directory path is not absolute")
+}
+
 /// Errors produced when constructing a path.
 #[non_exhaustive]
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]

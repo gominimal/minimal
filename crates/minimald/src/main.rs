@@ -1,7 +1,6 @@
 //! The minimal daemon, an SSH server which hosts sessions and
 //! task/sandbox executions within them.
 
-use camino::Utf8PathBuf;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use paths::{CwdRelative, Daemon, DaemonAbsPath, DaemonRelPath, sub_path};
@@ -35,16 +34,10 @@ impl Cli {
     /// based on command-line arguments.
     pub fn minimal_state_dir(&self) -> DaemonAbsPath {
         match &self.global_args.minimal_state_dir {
-            Some(p) => p.resolve().unwrap(),
-            None => DaemonAbsPath::try_new(
-                Utf8PathBuf::from_path_buf(
-                    dirs::state_dir()
-                        .unwrap_or_else(|| dirs::home_dir().unwrap().join(".local/state"))
-                        .join("minimal"),
-                )
-                .unwrap(),
-            )
-            .unwrap(),
+            Some(p) => p
+                .resolve()
+                .expect("could not resolve --minimal-state-dir against the current directory"),
+            None => paths::minimal_state_dir(),
         }
     }
 
@@ -52,16 +45,10 @@ impl Cli {
     /// based on command-line arguments.
     pub fn minimal_cache_dir(&self) -> DaemonAbsPath {
         match &self.global_args.minimal_cache_dir {
-            Some(p) => p.resolve().unwrap(),
-            None => DaemonAbsPath::try_new(
-                Utf8PathBuf::from_path_buf(
-                    dirs::cache_dir()
-                        .unwrap_or_else(|| dirs::home_dir().unwrap().join(".local/cache"))
-                        .join("minimal"),
-                )
-                .unwrap(),
-            )
-            .unwrap(),
+            Some(p) => p
+                .resolve()
+                .expect("could not resolve --minimal-cache-dir against the current directory"),
+            None => paths::minimal_cache_dir(),
         }
     }
 
