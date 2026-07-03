@@ -114,6 +114,11 @@ jobs:
               # native glibc build against a real libkrun. Materialize libkrun (a cache
               # fetch keyed by the pinned upstream commit, NOT a from-source build) into
               # a flat prefix that minvmd's build.rs link-searches + rpaths against.
+              #
+              # Reuse the static mip built above (MIP=) instead of letting the script
+              # compile a second, debug mip just to drive this cache fetch.
+              env:
+                  MIP: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/mip-linux-amd64
               run: ./scripts/fetch-libkrun.sh "$HOME/.krun" x86_64
             - name: Build native minvmd binary
               # Native host target (x86_64-unknown-linux-gnu), NOT musl: the binary
@@ -244,34 +249,25 @@ jobs:
                   path: target/release/minimal-macos-arm64
                   retention-days: 7
 
-    build-release-guest-artifacts:
-        # Guest microVM artifacts shipped in the release: the raw guest kernel
-        # Image, the ext4 rootfs image, the initramfs (minimald as pid-1 /init),
-        # and the pinned gvproxy switch binary. These are already produced
-        # piecemeal in the CI lanes (ci-macos.yml, ci-linux-kvm.yml,
-        # ci-gvproxy.yml); this job gathers them into the release.
+    fetch-release-guest-artifacts:
+        # Fetched guest microVM artifacts shipped in the release: the raw guest
+        # kernel Image, the ext4 rootfs image, and the pinned gvproxy switch
+        # binary. These are already produced piecemeal in the CI lanes
+        # (ci-macos.yml, ci-linux-kvm.yml, ci-gvproxy.yml); this job gathers them
+        # into the release. The initramfs is packed separately in
+        # build-release-initramfs, which reuses the minimald-linux-* binaries.
         #
         # None require the target host's arch to produce: the kernel and rootfs are
         # cache pulls keyed by the pinned upstream commit (fetch-artifact.sh pulls
-        # any guest arch on an x86_64 runner), the initramfs cross-compiles minimald
-        # to static musl for the target arch, and gvproxy is a pin-verified download
-        # of the upstream release binary. So a single x86_64 runner emits both the
-        # amd64 and arm64 variants, covering every release host
+        # any guest arch on an x86_64 runner), and gvproxy is a pin-verified
+        # download of the upstream release binary. So a single x86_64 runner emits
+        # both the amd64 and arm64 variants, covering every release host
         # (linux-amd64/arm64, macos-arm64). Files are arch-suffixed so
         # download-artifact's merge-multiple basename-flatten in the release job
         # doesn't collide.
         runs-on: ubuntu-latest
-        timeout-minutes: 45
+        timeout-minutes: 35
         steps:
-            - name: Free Disk Space
-              # Two cross (Docker) initramfs builds plus the CLI build that drives
-              # the rootfs cache pulls; reclaim the tool cache for headroom.
-              uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
-              with:
-                  remove_android: true
-                  remove_dotnet: true
-                  remove_haskell: true
-                  remove_tool_cache: true
             - uses: actions/checkout@v7
               with:
                   persist-credentials: false
@@ -281,15 +277,11 @@ jobs:
               # protoc + libprotobuf-dev: the `mip` CLI build that drives the rootfs
               # cache pull (the well-known protos live in libprotobuf-dev, only a
               # `recommends` of protobuf-compiler, so name it under
-              # --no-install-recommends). cpio: packs the initramfs.
+              # --no-install-recommends).
               run: |
                   sudo apt-get update
                   sudo apt-get install -y --no-install-recommends \
-                    protobuf-compiler libprotobuf-dev cpio
-            - name: Install cross
-              uses: taiki-e/install-action@v2
-              with:
-                  tool: cross
+                    protobuf-compiler libprotobuf-dev
             - uses: actions/cache@v6
               with:
                   path: |
@@ -300,10 +292,9 @@ jobs:
                       target/
                   key: ${{ runner.os }}-guest-artifacts-release-${{ hashFiles('**/Cargo.lock') }}
                   restore-keys: ${{ runner.os }}-guest-artifacts-release-
-            # NOTE: fetch-artifact.sh takes the kernel-style arch (x86_64/aarch64)
-            # and build-initramfs.sh takes a rust target triple; only the emitted
-            # file/artifact names use the amd64/arm64 suffixes the release binaries
-            # already use.
+            # NOTE: fetch-artifact.sh takes the kernel-style arch (x86_64/aarch64);
+            # only the emitted file/artifact names use the amd64/arm64 suffixes the
+            # release binaries already use.
             - name: Materialize guest kernel (raw Image, amd64)
               run: ./scripts/fetch-artifact.sh virtio-kernel "$RUNNER_TEMP/vmlinuz-amd64" x86_64
             - name: Materialize guest kernel (raw Image, arm64)
@@ -312,10 +303,6 @@ jobs:
               run: ./scripts/fetch-artifact.sh minvmd-rootfs "$RUNNER_TEMP/rootfs-amd64.img" x86_64
             - name: Materialize guest rootfs (ext4 image, arm64)
               run: ./scripts/fetch-artifact.sh minvmd-rootfs "$RUNNER_TEMP/rootfs-arm64.img" aarch64
-            - name: Build guest initramfs (amd64)
-              run: ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs-amd64.cpio" x86_64-unknown-linux-musl
-            - name: Build guest initramfs (arm64)
-              run: ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs-arm64.cpio" aarch64-unknown-linux-musl
             - name: Fetch pinned gvproxy (linux-amd64)
               run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy-linux-amd64" gvproxy-linux-amd64
             - name: Fetch pinned gvproxy (linux-arm64)
@@ -350,20 +337,6 @@ jobs:
                   path: ${{ runner.temp }}/rootfs-arm64.img
                   if-no-files-found: error
                   retention-days: 7
-            - name: Upload initramfs (amd64)
-              uses: actions/upload-artifact@v7
-              with:
-                  name: minimald-initramfs-amd64
-                  path: ${{ runner.temp }}/initramfs-amd64.cpio
-                  if-no-files-found: error
-                  retention-days: 7
-            - name: Upload initramfs (arm64)
-              uses: actions/upload-artifact@v7
-              with:
-                  name: minimald-initramfs-arm64
-                  path: ${{ runner.temp }}/initramfs-arm64.cpio
-                  if-no-files-found: error
-                  retention-days: 7
             - name: Upload gvproxy (linux-amd64)
               uses: actions/upload-artifact@v7
               with:
@@ -386,6 +359,58 @@ jobs:
                   if-no-files-found: error
                   retention-days: 7
 
+    build-release-initramfs:
+        # Pack the guest initramfs (minimald as pid-1 /init) from the SAME static
+        # musl minimald binaries the build-release-linux-* jobs already built and
+        # ship, instead of recompiling minimald just for the initramfs. Downloads
+        # those artifacts and stamps each into a newc cpio via build-initramfs.sh's
+        # MINIMALD_BIN mode (no cargo/cross toolchain needed — just cpio). Files are
+        # arch-suffixed to match the amd64/arm64 naming and avoid a
+        # merge-multiple basename collision in the release job.
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        needs: [build-release-linux-amd64, build-release-linux-arm64]
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
+            - name: Install cpio
+              run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cpio
+            - name: Download minimald (amd64)
+              uses: actions/download-artifact@v8
+              with:
+                  name: minimald-linux-amd64
+                  path: prebuilt
+            - name: Download minimald (arm64)
+              uses: actions/download-artifact@v8
+              with:
+                  name: minimald-linux-arm64
+                  path: prebuilt
+            - name: Pack initramfs (amd64)
+              run: |
+                  chmod +x prebuilt/minimald-linux-amd64
+                  MINIMALD_BIN="$PWD/prebuilt/minimald-linux-amd64" \
+                    ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs-amd64.cpio"
+            - name: Pack initramfs (arm64)
+              run: |
+                  chmod +x prebuilt/minimald-linux-arm64
+                  MINIMALD_BIN="$PWD/prebuilt/minimald-linux-arm64" \
+                    ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs-arm64.cpio"
+            - name: Upload initramfs (amd64)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minimald-initramfs-amd64
+                  path: ${{ runner.temp }}/initramfs-amd64.cpio
+                  if-no-files-found: error
+                  retention-days: 7
+            - name: Upload initramfs (arm64)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minimald-initramfs-arm64
+                  path: ${{ runner.temp }}/initramfs-arm64.cpio
+                  if-no-files-found: error
+                  retention-days: 7
+
     release:
         runs-on: ubuntu-latest
         timeout-minutes: 30
@@ -395,7 +420,8 @@ jobs:
                 build-release-linux-amd64,
                 build-release-linux-arm64,
                 build-release-macos-arm64,
-                build-release-guest-artifacts,
+                fetch-release-guest-artifacts,
+                build-release-initramfs,
             ]
         permissions:
             contents: write
