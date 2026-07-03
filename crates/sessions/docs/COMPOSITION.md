@@ -44,11 +44,15 @@ batches every verdict into one `ContributionVerdict`.
 > **Status note.** The shared gate pipeline (`compose_contribution`,
 > with `gate_vars` + `gate_patches`) lives in `core::compose`. Phase
 > 1 runs it via `UserComposer::compose` and Phase 3 runs it via
-> `client::handler::handle_response`. Phases 2 and 4 (daemon-side
-> routing) are not yet wired: `SessionComposer::compose` errors with
-> `HookRequired` instead of batching pending items into a
-> `ContributionResponse`, and there is no `SubmitVerdict` handler
-> yet to apply verdicts and assemble the final `Composition`.
+> `client::handler::handle_response`. Phase 2 (daemon-side routing)
+> lives in `SessionComposer::compose` and produces a
+> `ComposeOutcome::Ready` or `ComposeOutcome::Pending`. Phase 4 is
+> partially wired — the `Ready` outcome is consumed (the manager
+> persists the session and returns `CreateSessionResponse::Ready`),
+> but `Pending` outcomes are still rejected with `InvalidInput`
+> because the `SubmitVerdict` handler hasn't landed yet. No daemon-
+> side project/package contributors are wired in either, so every
+> caller still hits the all-decided path today.
 
 ## Phases in detail
 
@@ -74,11 +78,27 @@ contribution fast path described in Phase 4.
 
 The daemon receives the `WireContribution` (already gated, trusted
 verbatim) and draws items from project- and package-level
-`Composable`s into a `Contribution`. Items decidable from the
-user's existing policy go straight into the building `Composition`;
-items the policy can't decide are collected as
-`WirePendingVar`/`WirePendingPatch` and emitted in one
-`ContributionResponse`.
+`Composable`s into a `Contribution` via `SessionComposer::add`.
+`SessionComposer::compose` then drives the routing:
+
+- **All-decided fast path.** If the daemon collected no vars and
+  no patches (today's only path — no project/package contributors
+  are wired into the manager yet), the composer assembles a
+  `Composition` directly: daemon-collected packages and lifecycle
+  hooks pass through (neither has a per-item verdict slot in the
+  wire schema), and the client's already-gated wire contribution
+  is merged in via `Composition::extend_from_wire`. Returns
+  `ComposeOutcome::Ready(composition)`.
+- **Pending path.** If the daemon collected any vars or patches,
+  the composer routes every one of them back to the client as
+  pending items — the daemon never runs user policy, so no
+  daemon-origin item is ever auto-decided. The `ContributionResponse`
+  carries the pending vars and patches plus a copy of the
+  daemon-collected lifecycle hooks (for client-side audit; hooks
+  have no per-item verdict slot). **Packages never appear on the
+  wire** — the response schema has no slot for them; they stay in
+  the daemon's `PendingComposeState` alongside the hooks so Phase 4
+  can finalize after the verdict comes back.
 
 ### Phase 3 — Client gates the pending items
 
@@ -115,14 +135,17 @@ copies patched files, and installs lifecycle hooks.
 
 **Response shape.** The daemon returns
 `CreateSessionResponse::Ready { id }` when no items need user
-gating (today's only path, including the empty-contribution fast
-path used by internal callers) or
+gating or
 `CreateSessionResponse::Pending { id, response }` when items need
 user-side gating. The `id` is allocated before the response
 returns, so file uploads (when that subsystem lands) can target
 the session as soon as the client receives either variant. Today
-only `Ready` is reachable; `Pending` is wire-defined for the
-daemon-side Phase 2 routing that will land in a future change.
+`Ready` is the only variant that reaches the wire: the composer
+already produces `ComposeOutcome::Pending` on paper, but the
+manager's `CreateSession` handler rejects that outcome with
+`InvalidInput` because the resume path (`SubmitVerdict` + apply
+consumption of the finalized `Composition`) isn't yet wired.
+`Pending` becomes wire-reachable when that path lands.
 
 **Empty-contribution fast path.** When the client sends
 `WireContribution::default()` the daemon skips Phase 2 entirely:
@@ -333,9 +356,12 @@ overload:
   merge in `Composition::extend_from_wire`), `HookContract`
   (application bug —
   wrong decision count, or `UseRule` to a still-undecidable
-  item), `HookRequired` (non-user-origin item reached the daemon
-  composer with no hook to prompt — placeholder until Phase 2
-  routing lands), `PatchWalk` (IO-level filesystem walk failures),
+  item), `HookRequired` (non-user-origin item reached a
+  legacy `core::compose` path with no hook to prompt — Phase 2
+  now routes such items through `SessionComposer::compose`
+  instead; this remains for the per-side
+  `compose_contribution` codepath), `PatchWalk` (IO-level
+  filesystem walk failures),
   `Expansion` (malformed `$VAR` / `~` pattern, or undefined var),
   `VarResolution` (a Phase 3 pending `Inherit` var couldn't be
   resolved against the client env), `InvalidPendingPatchDest` (a

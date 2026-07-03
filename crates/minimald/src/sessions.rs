@@ -7,6 +7,8 @@ use crate::{
 use paths::DaemonAbsPath;
 use sessions::{
     SessionId,
+    core::compose::ComposeOptions,
+    daemon::composer::{ComposeOutcome, SessionComposer},
     store::{DiskLoader, Loader, SessionKey, SessionObject},
     wire::request::WireContribution,
 };
@@ -78,9 +80,12 @@ struct CreateSessionMsg {
     /// Authenticated SSH username, supplied by the RPC handler from
     /// the SSH connection context (never the client).
     username: Option<String>,
-    /// Client-side Phase 1 contribution. Today the handler rejects
-    /// anything other than the default; the composition pipeline will
-    /// consume it when Phase 2 lands.
+    /// Client-side Phase 1 contribution. Fed into `SessionComposer`
+    /// in the handler: the composer either finalizes a `Composition`
+    /// (persist Active, ship `Ready { id }`) or routes items back to
+    /// the client for gating (persist Pending, stash state, ship
+    /// `Pending { id, response }`). A cross-process merge conflict
+    /// or malformed wire item surfaces as `InvalidInput`.
     contribution: WireContribution,
     responder: Responder<minimald_rpc::CreateSessionResponse>,
 }
@@ -306,29 +311,80 @@ impl<L: Loader> Manager<L> {
                             ));
                         }
 
-                        // Until daemon-side Phase 2 routing lands, the only
-                        // valid contribution is the empty default. Silently
-                        // dropping a non-empty contribution would let clients
-                        // believe their composed vars/patches/packages/hooks
-                        // were honored — they would not be. Reject explicitly
-                        // so the failure surfaces at the call site instead
-                        // of as missing items in the assembled session.
+                        // Drive Phase 2 via `SessionComposer`. The daemon
+                        // doesn't add any project/package contributors yet,
+                        // so on the all-decided path the composer just
+                        // cross-process-merges the client's wire
+                        // contribution into an empty `Composition`.
                         //
-                        // TODO(composition): when Phase 2 lands, the
-                        // composition pipeline consumes this field instead.
-                        // The seam is here: replace this check with the
-                        // partition + ContributionResponse flow.
-                        if contribution != WireContribution::default() {
-                            return Err(SessionsError::new(
-                                std::io::ErrorKind::InvalidInput,
-                                "non-empty WireContribution is not supported \
-                                 by this daemon — daemon-side composition \
-                                 (Phase 2) is not wired yet",
-                            ));
+                        // The `session_id` parameter on `compose` is only
+                        // observed on the `Pending` outcome (it goes on
+                        // the response so the client can correlate a
+                        // future `SubmitVerdict`). The `Ready` outcome
+                        // ignores it. We pass `nil` because the manager
+                        // doesn't allocate the id until `store.create`
+                        // below — and the `Pending` outcome is unreachable
+                        // today since no daemon-side contributors are
+                        // wired in. The defensive guard below catches
+                        // it anyway.
+                        let composer = SessionComposer::new(contribution);
+                        match composer.compose(SessionId::nil(), ComposeOptions::default()) {
+                            Ok(ComposeOutcome::Ready(composition)) => {
+                                // The composition carries the merged
+                                // vars / patches / packages / lifecycle
+                                // hooks the composer produced. There is
+                                // no apply layer yet — the on-disk
+                                // Record below stores only the
+                                // out-of-band `SessionConfig`, so a
+                                // non-empty composition would be
+                                // silently discarded. Reject rather
+                                // than lose the client's contribution.
+                                // Fast path (empty client contribution,
+                                // no daemon contributors) still passes.
+                                if !composition.vars().is_empty()
+                                    || !composition.patches().is_empty()
+                                    || !composition.packages().is_empty()
+                                    || !composition.lifecycle_hooks().is_empty()
+                                {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidInput,
+                                        "CreateSession composed a non-empty \
+                                         Composition, but the apply layer that \
+                                         would consume it is not wired yet",
+                                    ));
+                                }
+                            }
+                            Ok(ComposeOutcome::Pending { .. }) => {
+                                // Unreachable today: no daemon-side
+                                // contributors are wired in, so the
+                                // composer can never collect a var or
+                                // patch that would need the client to
+                                // gate. Defensive guard for when that
+                                // changes — once the `SubmitVerdict`
+                                // handler exists, this branch will
+                                // persist a Draft and return Pending.
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "CreateSession produced a Pending outcome, \
+                                     but the daemon cannot yet resume from a \
+                                     client verdict",
+                                ));
+                            }
+                            Err(e) => {
+                                // Cross-process conflict or wire-shape
+                                // failure during merge. Both are
+                                // declaration-time bugs — surface as
+                                // InvalidInput.
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    e.to_string(),
+                                ));
+                            }
                         }
+
                         // Assemble the on-disk Record from out-of-band config
                         // + the SSH-supplied username. Persists `Active`
-                        // immediately on the empty-contribution fast path.
+                        // immediately on the all-decided path.
                         let record = sessions::Record {
                             id: SessionId::nil(),
                             name: config.name,
@@ -744,12 +800,14 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 
-    /// A non-empty `WireContribution` must be refused with
-    /// `InvalidInput` until daemon-side Phase 2 routing lands.
-    /// Silently dropping it would let clients believe their
-    /// composed items were honored.
+    /// A non-empty `WireContribution` from the client is rejected —
+    /// the composer would produce a non-empty `Composition`, and
+    /// there is no apply layer yet to consume it. Accepting would
+    /// silently discard the client's contribution while the on-disk
+    /// Record only carries the out-of-band `SessionConfig`.
+    /// Prevents the silent data loss until apply plumbing lands.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn create_session_rejects_non_empty_contribution() {
+    async fn create_session_rejects_non_empty_client_contribution() {
         use sessions::core::source::Source;
         use sessions::wire::primitives::{WireResolvedVar, WireSessionVar, WireSource};
 
@@ -768,7 +826,7 @@ mod tests {
         let err = mngr
             .create_session(sample_config(), None, contribution)
             .await
-            .expect_err("non-empty contribution must be rejected today");
+            .expect_err("non-empty composition should be rejected until apply plumbing lands");
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 }

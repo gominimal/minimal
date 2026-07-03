@@ -224,9 +224,17 @@ async fn run_session_exec(
             .await
             .map_err(|e| format!("request_subsystem: {e}"))?;
 
+        // Unique name per invocation — minimald dedups sessions by
+        // name, so the outer retry loop would otherwise collide on
+        // `AlreadyExists` after any prior attempt persisted a record.
+        // Matches the convention in `crates/minvmd/examples/exec.rs`.
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
         let req = CreateSessionRequest {
             config: minimald_rpc::SessionConfig {
-                name: Some("minvmd-e2e".to_string()),
+                name: Some(format!("minvmd-e2e-{uniq:x}")),
                 project_path: paths::HostAbsPath::try_new("/tmp")
                     .map_err(|e| format!("project_path: {e}"))?,
                 network: sessions::NetworkMode::default(),
