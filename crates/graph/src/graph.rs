@@ -211,6 +211,74 @@ impl Graph {
         reachable
     }
 
+    /// The CYCLE-BROKEN transitive dependency set of `toplevel`, for recording
+    /// as in-toto `resolvedDependencies` under CHAIN_ENFORCE.
+    ///
+    /// [`transitive_specs_of`](Self::transitive_specs_of) returns the RAW
+    /// build+runtime closure and IGNORES `replace_on_cycle` (honored only by the
+    /// planner). On a bootstrap graph whose rungs import a from-source userland
+    /// that loops back through the cycle-broken toolchain, that raw set is
+    /// mutually-referential (spec A lists B and B lists A, plus a self-reference)
+    /// — which the signer's chain walk rejects as an attestation cycle.
+    ///
+    /// This returns the closure with every *cyclic peer* of `toplevel` — a
+    /// dependency `D` from which `toplevel` is itself reachable (so `D` and
+    /// `toplevel` sit on a common dependency cycle) — replaced by `D`'s declared
+    /// `replace_on_cycle` breaker (a pure prebuilt bootstrap leaf the signer
+    /// terminates on). `toplevel` itself is never included (a build is not its
+    /// own dependency; this also drops the self-reference the raw walk emits when
+    /// `toplevel` sits on a cycle).
+    ///
+    /// GLOBAL acyclicity: a recorded, non-substituted edge `toplevel -> D` exists
+    /// only when `D` does NOT reach `toplevel`, whereas a dependency edge always
+    /// means `toplevel` reaches `D`. A cycle in the union of all such per-rung
+    /// records would require a node both to reach and to not-reach another — a
+    /// contradiction. So when every rung records this way, the union of all
+    /// envelopes is a DAG rooted above the prebuilt breaker leaves.
+    ///
+    /// Deterministic: a pure function of graph topology + `replace_on_cycle`,
+    /// independent of any cache. Output sorted by spec hash.
+    ///
+    /// `Err` lists every cyclic peer that declares NO breaker: its cyclic edge
+    /// cannot be represented acyclically, so the caller must fail shut rather
+    /// than emit a known cycle.
+    pub fn cycle_broken_deps_of(
+        &self,
+        toplevel: &BuildSpecRef,
+    ) -> Result<Vec<BuildSpecRef>, Vec<BuildSpecRef>> {
+        let mut out: Vec<BuildSpecRef> = Vec::new();
+        let mut unbreakable: Vec<BuildSpecRef> = Vec::new();
+        for dep in self.transitive_specs_of(toplevel) {
+            if dep == *toplevel {
+                continue; // self-reference: a build is never its own dependency
+            }
+            // `dep` is a cyclic peer of `toplevel` iff `toplevel` is reachable
+            // from it (they sit on a common dependency cycle).
+            let reaches_toplevel = self
+                .transitive_specs_of(&dep)
+                .iter()
+                .any(|reached| reached == toplevel);
+            if !reaches_toplevel {
+                out.push(dep); // genuinely acyclic dep — record as-is
+            } else if let Some(breaker) = self.get(&dep).and_then(|s| s.replace_on_cycle) {
+                out.push(breaker); // record the prebuilt breaker leaf instead
+            } else {
+                unbreakable.push(dep); // cyclic peer with no breaker — fail shut
+            }
+        }
+        // Deterministic content-based order (SpecHash is not Ord; its blake3
+        // hash bytes are). sort_by_cached_key hashes each spec once, not per
+        // comparison.
+        if !unbreakable.is_empty() {
+            unbreakable.sort_by_cached_key(|b| *self.spec_hash(b).0.as_bytes());
+            unbreakable.dedup();
+            return Err(unbreakable);
+        }
+        out.sort_by_cached_key(|b| *self.spec_hash(b).0.as_bytes());
+        out.dedup();
+        Ok(out)
+    }
+
     fn collect_transitive_buildspecs(
         &self,
         bsr: &BuildSpecRef,
@@ -465,6 +533,73 @@ mod tests {
     use super::*;
     use decode::Layer;
     use indoc::indoc;
+
+    /// #14 D1: a package on a build cycle must record its cyclic peer's
+    /// `replace_on_cycle` breaker (a prebuilt leaf), NOT the from-source peer
+    /// (which re-creates the cycle the signer rejects) and NOT itself.
+    #[test]
+    fn cycle_broken_deps_substitutes_breaker_and_drops_self() {
+        // a <-> b cycle, b carries a breaker; c <-> d cycle with NO breaker.
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+                let {BuildSpec, ..} = import \"minimal.ncl\" in
+                let rec
+                    a = { name = \"a\", build_deps = [ b ], cmd = \"\" } | BuildSpec,
+                    b = {
+                        name = \"b\",
+                        build_deps = [ a ],
+                        replace_on_cycle = { name = \"b-prebuilt\", build_deps = [], cmd = \"\" } | BuildSpec,
+                        cmd = \"\",
+                    } | BuildSpec,
+                    c = { name = \"c\", build_deps = [ d ], cmd = \"\" } | BuildSpec,
+                    d = { name = \"d\", build_deps = [ c ], cmd = \"\" } | BuildSpec,
+                in
+                [a, b, c, d]
+                "
+            }
+            .to_string(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+        let g = Graph::new().ingest(layer).unwrap();
+        let names = |refs: &[BuildSpecRef]| -> Vec<String> {
+            refs.iter().map(|r| g.get(r).unwrap().name.clone()).collect()
+        };
+
+        // a's RAW closure is mutually-referential: contains peer b AND self-ref a.
+        let a = *g.by_name("a").unwrap();
+        let raw = names(&g.transitive_specs_of(&a));
+        assert!(
+            raw.contains(&"b".to_string()) && raw.contains(&"a".to_string()),
+            "raw closure should be cyclic (peer + self-ref): {raw:?}"
+        );
+
+        // cycle_broken: b substituted by its breaker; no from-source b, no self a.
+        let broken = names(
+            &g.cycle_broken_deps_of(&a)
+                .expect("a's cycle is breakable via b's replace_on_cycle"),
+        );
+        assert!(
+            !broken.contains(&"b".to_string()),
+            "the from-source cyclic peer must be substituted, not recorded (the trap): {broken:?}"
+        );
+        assert!(!broken.contains(&"a".to_string()), "no self-reference: {broken:?}");
+        assert!(
+            broken.contains(&"b-prebuilt".to_string()),
+            "the prebuilt breaker must be recorded: {broken:?}"
+        );
+
+        // c <-> d has no breaker => fail shut (Err), never a silent cycle.
+        let c = *g.by_name("c").unwrap();
+        let err = names(
+            &g.cycle_broken_deps_of(&c)
+                .expect_err("c's cycle has no breaker => must fail shut"),
+        );
+        assert!(err.contains(&"d".to_string()), "unbreakable peer must be reported: {err:?}");
+    }
 
     #[test]
     fn transitive_specs_of() {
