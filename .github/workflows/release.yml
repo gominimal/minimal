@@ -114,6 +114,11 @@ jobs:
               # native glibc build against a real libkrun. Materialize libkrun (a cache
               # fetch keyed by the pinned upstream commit, NOT a from-source build) into
               # a flat prefix that minvmd's build.rs link-searches + rpaths against.
+              #
+              # Reuse the static mip built above (MIP=) instead of letting the script
+              # compile a second, debug mip just to drive this cache fetch.
+              env:
+                  MIP: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/mip-linux-amd64
               run: ./scripts/fetch-libkrun.sh "$HOME/.krun" x86_64
             - name: Build native minvmd binary
               # Native host target (x86_64-unknown-linux-gnu), NOT musl: the binary
