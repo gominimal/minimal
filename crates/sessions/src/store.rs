@@ -83,7 +83,7 @@ pub trait Loader {
     /// key, never changes after [`Self::create`]. Other fields
     /// (`name`, `status`, `policy`, `attrs`, …) are written verbatim;
     /// the store does not enforce state-machine transitions (e.g.
-    /// `Draft` → `Active`), that policy belongs in higher layers.
+    /// `Pending` → `Active`), that policy belongs in higher layers.
     ///
     /// If `record.name` differs from the on-disk name, the name
     /// index is remapped; a name collision with a *different* session
@@ -1208,14 +1208,14 @@ mod tests {
     }
 
     #[test]
-    fn save_promotes_draft_to_active() {
+    fn save_promotes_pending_to_active() {
         let tmp = TempDir::new().unwrap();
         let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
 
         let key = loader
             .create({
                 let mut r = sample_record();
-                r.status = SessionStatus::Draft;
+                r.status = SessionStatus::Pending;
                 r
             })
             .unwrap();

@@ -8,9 +8,9 @@ use paths::DaemonAbsPath;
 use sessions::{
     SessionId,
     core::compose::ComposeOptions,
-    daemon::composer::{ComposeOutcome, SessionComposer},
+    daemon::composer::{ComposeOutcome, PendingComposeState, SessionComposer, resume_from_verdict},
     store::{DiskLoader, Loader, SessionKey, SessionObject},
-    wire::request::WireContribution,
+    wire::request::{ContributionVerdict, SessionStep, WireContribution},
 };
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
@@ -50,6 +50,37 @@ fn registry_name(record: &sessions::Record) -> String {
     }
 }
 
+/// Assemble a [`sessions::Record`] from the out-of-band session
+/// config and the SSH-supplied username, then validate its policy.
+/// Returns `Err(io::InvalidInput)` if the policy is incompatible
+/// with the network mode (R2.1) — so an invalid session is never
+/// written to the store. The `id` field is left as `nil`; the store
+/// allocates the real id at `create` time.
+///
+/// Shared by the `Ready` and `Pending` branches of the
+/// `CreateSession` handler so both paths persist the same record
+/// shape, differing only in their initial `status`.
+fn build_record(
+    config: minimald_rpc::SessionConfig,
+    username: Option<String>,
+    status: sessions::SessionStatus,
+) -> Result<sessions::Record, std::io::Error> {
+    let record = sessions::Record {
+        id: SessionId::nil(),
+        name: config.name,
+        username,
+        project_path: config.project_path,
+        network: config.network,
+        policy: config.policy,
+        status,
+        attrs: config.attrs,
+    };
+    record
+        .validate_policy()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    Ok(record)
+}
+
 /// Encapsulates the return channel for messages back from the actor.
 #[derive(Debug)]
 struct Responder<T>(oneshot::Sender<Result<T, SessionsError>>);
@@ -69,6 +100,20 @@ impl<T> Responder<T> {
         let _ = self.0.send(fut.await);
     }
 }
+
+/// Maximum number of in-flight `Pending` sessions the manager will
+/// stash before refusing further `CreateSession` requests that
+/// produce a [`ComposeOutcome::Pending`].
+///
+/// Each entry holds a [`PendingComposeState`] (a few KB of vectors,
+/// the client's wire contribution, and the by-id pending stash). A
+/// misbehaving or abandoned client could otherwise call
+/// `CreateSession` repeatedly without ever sending `SubmitVerdict`,
+/// growing the stash without bound; the cap exists as a backstop.
+///
+/// `Ready` outcomes never consume stash capacity, so this bound
+/// only matters once daemon-side contributors are wired in.
+const MAX_PENDING_SESSIONS: usize = 1024;
 
 /// CreateSession payload — boxed so it doesn't dominate
 /// `ManagerMessage`'s size (the variant carries a full session
@@ -90,11 +135,23 @@ struct CreateSessionMsg {
     responder: Responder<minimald_rpc::CreateSessionResponse>,
 }
 
+/// SubmitVerdict payload — boxed for the same size-balance reason as
+/// [`CreateSessionMsg`]. Carries the client's per-item decisions for
+/// a `Pending` session id; the handler pops the matching stash from
+/// `Manager::pending`, calls [`resume_from_verdict`], promotes the
+/// record `Pending → Active`, and replies with [`SessionStep::Active`].
+#[derive(Debug)]
+struct SubmitVerdictMsg {
+    verdict: ContributionVerdict,
+    responder: Responder<SessionStep>,
+}
+
 enum ManagerMessage {
     List(Responder<Vec<SessionInfo>>),
     GetRecord(SessionKeyPredicate, Responder<Option<sessions::Record>>),
     GetSession(SessionKeyPredicate, Responder<Option<SessionHandle>>),
     CreateSession(Box<CreateSessionMsg>),
+    SubmitVerdict(Box<SubmitVerdictMsg>),
     RenameSession(SessionId, String, Responder<()>),
     DestroySession(SessionId, Responder<()>),
     Shutdown(bool, Responder<Result<(), ()>>),
@@ -109,6 +166,15 @@ pub struct Manager<L: Loader = DiskLoader> {
     receiver: mpsc::Receiver<ManagerMessage>,
     running: BTreeMap<L::Key, SessionHandle>,
     store: L,
+
+    /// Per-session stash for in-flight `CreateSession` flows that
+    /// reached [`ComposeOutcome::Pending`]. Keyed by the daemon's
+    /// allocated [`SessionId`]; the matching `SubmitVerdict` pops
+    /// the entry and finalizes. The stash is in-memory only — if
+    /// the daemon restarts mid-flow the on-disk
+    /// `SessionStatus::Pending` record loses its match and is
+    /// reaped by [`Manager::reap_orphan_pending`] at startup.
+    pending: BTreeMap<SessionId, PendingComposeState>,
 
     minimal_state_dir: DaemonAbsPath,
     minimal_cache_dir: DaemonAbsPath,
@@ -134,7 +200,11 @@ impl Manager {
         minimal_cache_dir: DaemonAbsPath,
         net_switch: Arc<Mutex<crate::net::SwitchClient>>,
     ) -> Result<ManagerHandle, std::io::Error> {
-        let l = DiskLoader::new(minimal_state_dir.clone())?;
+        let mut l = DiskLoader::new(minimal_state_dir.clone())?;
+        // Reap any on-disk `SessionStatus::Pending` records left over
+        // from a previous daemon process — the in-memory stash that
+        // would have let them resume is gone, so they're unresumable.
+        Self::reap_orphan_pending(&mut l)?;
         let running = BTreeMap::new();
         let (sender, receiver) = mpsc::channel(8);
         // Shared so the host-side proxies can resolve `Host:` headers directly;
@@ -149,6 +219,7 @@ impl Manager {
             receiver,
             running,
             store: l,
+            pending: BTreeMap::new(),
             minimal_state_dir,
             minimal_cache_dir,
             net_switch,
@@ -171,6 +242,34 @@ impl<L: Loader> Manager<L> {
             SessionKeyPredicate::Id(id) => self.store.find_by_id(id),
             SessionKeyPredicate::Name(name) => self.store.find_by_name(name),
         }
+    }
+
+    /// Delete any on-disk record whose status is
+    /// [`sessions::SessionStatus::Pending`]. Run once at startup —
+    /// the matching in-memory `PendingComposeState` lives only on
+    /// the previous daemon process, so a `Pending` record post-restart
+    /// has no path to `Active` and a client waiting on `SubmitVerdict`
+    /// would hang. Cheap correctness floor; daemon-restart-survives-
+    /// pending is a separate concern.
+    fn reap_orphan_pending(store: &mut L) -> Result<(), std::io::Error> {
+        let mut reaped = 0u64;
+        let keys: Vec<L::Key> = store.keys().collect();
+        for k in keys {
+            let obj = store.get(&k)?;
+            if obj.record().status == sessions::SessionStatus::Pending {
+                let id = obj.record().id;
+                store.delete(&k)?;
+                tracing::info!(
+                    session_id = %id,
+                    "reaped orphan Pending session on startup",
+                );
+                reaped += 1;
+            }
+        }
+        if reaped > 0 {
+            tracing::info!(count = reaped, "orphan Pending reap complete");
+        }
+        Ok(())
     }
 
     /// The async task which handles interactions with the
@@ -225,6 +324,15 @@ impl<L: Loader> Manager<L> {
             // Gets the session actor corresponding to the predicate.
             //
             // If the session is known but not running, it is started.
+            //
+            // `SessionStatus::Pending` records are filtered out here —
+            // they have no composed `Composition` yet, so spinning up
+            // the session host would attach a client to a half-built
+            // session. The filter returns `None` (caller sees the
+            // same shape as "unknown id") and logs the reason at info
+            // level. exec/sftp call sites surface the `None` as a
+            // channel failure, which is the correct user-facing
+            // behavior in either case.
             ManagerMessage::GetSession(pred, r) => {
                 r.handle(async {
                     if self.in_shutdown {
@@ -236,6 +344,15 @@ impl<L: Loader> Manager<L> {
                     match self.key_for(&pred)? {
                         None => Ok(None),
                         Some(k) => {
+                            let obj = self.store.get(&k)?;
+                            if obj.record().status != sessions::SessionStatus::Active {
+                                tracing::info!(
+                                    session_id = %obj.record().id,
+                                    status = ?obj.record().status,
+                                    "refused GetSession on non-Active session",
+                                );
+                                return Ok(None);
+                            }
                             let session_handle = match self.running.get(&k) {
                                 Some(h) => h.clone(),
                                 None => {
@@ -302,45 +419,47 @@ impl<L: Loader> Manager<L> {
                     contribution,
                     responder,
                 } = *msg;
+                // Capture `in_shutdown` by value before we take
+                // `&mut self` borrows below — the async move needs
+                // to see it without holding a `self` reference.
+                let in_shutdown = self.in_shutdown;
+                let outcome = SessionComposer::new(contribution)
+                    .compose(SessionId::nil(), ComposeOptions::default());
+                let pending = &mut self.pending;
+                let store = &mut self.store;
                 responder
-                    .handle(async {
-                        if self.in_shutdown {
+                    .handle(async move {
+                        if in_shutdown {
                             return Err(SessionsError::new(
                                 std::io::ErrorKind::ConnectionRefused,
                                 "in shutdown",
                             ));
                         }
-
-                        // Drive Phase 2 via `SessionComposer`. The daemon
-                        // doesn't add any project/package contributors yet,
-                        // so on the all-decided path the composer just
-                        // cross-process-merges the client's wire
-                        // contribution into an empty `Composition`.
+                        // Phase 2: branch on the composer outcome.
                         //
-                        // The `session_id` parameter on `compose` is only
-                        // observed on the `Pending` outcome (it goes on
-                        // the response so the client can correlate a
-                        // future `SubmitVerdict`). The `Ready` outcome
-                        // ignores it. We pass `nil` because the manager
-                        // doesn't allocate the id until `store.create`
-                        // below — and the `Pending` outcome is unreachable
-                        // today since no daemon-side contributors are
-                        // wired in. The defensive guard below catches
-                        // it anyway.
-                        let composer = SessionComposer::new(contribution);
-                        match composer.compose(SessionId::nil(), ComposeOptions::default()) {
+                        // `Ready` — composition is complete; persist
+                        // the record as `Active` in one write and ship
+                        // `CreateSessionResponse::Ready { id }`. Guard
+                        // against silent data loss: no apply layer
+                        // yet consumes the `Composition`, so a
+                        // non-empty one would be discarded. Reject
+                        // until apply plumbing lands — the fast path
+                        // (empty client contribution, no daemon
+                        // contributors) still passes.
+                        //
+                        // `Pending` — the client must gate items
+                        // before composition completes. Allocate the
+                        // id by persisting the record as `Pending`,
+                        // stash the daemon-side resume state under
+                        // that id, overwrite the placeholder
+                        // `session_id` on the wire response, and ship
+                        // `CreateSessionResponse::Pending { id, response }`.
+                        //
+                        // `Err` — a cross-process merge conflict or a
+                        // malformed wire item. Both are
+                        // declaration-time bugs — `InvalidInput`.
+                        match outcome {
                             Ok(ComposeOutcome::Ready(composition)) => {
-                                // The composition carries the merged
-                                // vars / patches / packages / lifecycle
-                                // hooks the composer produced. There is
-                                // no apply layer yet — the on-disk
-                                // Record below stores only the
-                                // out-of-band `SessionConfig`, so a
-                                // non-empty composition would be
-                                // silently discarded. Reject rather
-                                // than lose the client's contribution.
-                                // Fast path (empty client contribution,
-                                // no daemon contributors) still passes.
                                 if !composition.vars().is_empty()
                                     || !composition.patches().is_empty()
                                     || !composition.packages().is_empty()
@@ -353,58 +472,145 @@ impl<L: Loader> Manager<L> {
                                          would consume it is not wired yet",
                                     ));
                                 }
+                                let record = build_record(
+                                    config,
+                                    username,
+                                    sessions::SessionStatus::Active,
+                                )?;
+                                let k = store.create(record)?;
+                                Ok(minimald_rpc::CreateSessionResponse::Ready { id: *k.id() })
                             }
-                            Ok(ComposeOutcome::Pending { .. }) => {
-                                // Unreachable today: no daemon-side
-                                // contributors are wired in, so the
-                                // composer can never collect a var or
-                                // patch that would need the client to
-                                // gate. Defensive guard for when that
-                                // changes — once the `SubmitVerdict`
-                                // handler exists, this branch will
-                                // persist a Draft and return Pending.
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidInput,
-                                    "CreateSession produced a Pending outcome, \
-                                     but the daemon cannot yet resume from a \
-                                     client verdict",
-                                ));
+                            Ok(ComposeOutcome::Pending {
+                                mut response,
+                                state,
+                            }) => {
+                                // Bound the in-memory stash. Check
+                                // before `store.create` so a refusal
+                                // doesn't leave a half-allocated record
+                                // on disk that the next daemon restart
+                                // would have to reap.
+                                if pending.len() >= MAX_PENDING_SESSIONS {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::ResourceBusy,
+                                        format!(
+                                            "daemon pending-session stash is full \
+                                             (cap {MAX_PENDING_SESSIONS}); the daemon \
+                                             will accept new sessions as in-flight ones \
+                                             finalize or are aborted",
+                                        ),
+                                    ));
+                                }
+                                let record = build_record(
+                                    config,
+                                    username,
+                                    sessions::SessionStatus::Pending,
+                                )?;
+                                let k = store.create(record)?;
+                                let id = *k.id();
+                                response.session_id = id;
+                                pending.insert(id, state);
+                                Ok(minimald_rpc::CreateSessionResponse::Pending { id, response })
                             }
-                            Err(e) => {
-                                // Cross-process conflict or wire-shape
-                                // failure during merge. Both are
-                                // declaration-time bugs — surface as
-                                // InvalidInput.
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidInput,
-                                    e.to_string(),
-                                ));
-                            }
+                            Err(e) => Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                e.to_string(),
+                            )),
                         }
-
-                        // Assemble the on-disk Record from out-of-band config
-                        // + the SSH-supplied username. Persists `Active`
-                        // immediately on the all-decided path.
-                        let record = sessions::Record {
-                            id: SessionId::nil(),
-                            name: config.name,
-                            username,
-                            project_path: config.project_path,
-                            network: config.network,
-                            policy: config.policy,
-                            status: sessions::SessionStatus::Active,
-                            attrs: config.attrs,
+                    })
+                    .await;
+            }
+            // Resume a `Pending` session with the client's verdict.
+            // Pops the matching `PendingComposeState` from the stash,
+            // resumes composition, promotes the record `Pending →
+            // Active`, and replies with `SessionStep::Active { id }`.
+            // A verdict for an id with no stash → `UnknownSessionId`;
+            // a record present but already `Active` (or otherwise not
+            // `Pending`) → `WrongState`.
+            ManagerMessage::SubmitVerdict(msg) => {
+                let SubmitVerdictMsg { verdict, responder } = *msg;
+                let session_id = verdict.session_id;
+                // Capture by value; async move can't hold `self`.
+                let in_shutdown = self.in_shutdown;
+                // Only pop the stash if we're actually going to resume —
+                // otherwise a shutdown-refused verdict would drop the
+                // stash entry without cleanup.
+                let stash_hit = if in_shutdown {
+                    None
+                } else {
+                    self.pending.remove(&session_id)
+                };
+                let store = &mut self.store;
+                responder
+                    .handle(async move {
+                        if in_shutdown {
+                            return Err(SessionsError::new(
+                                std::io::ErrorKind::ConnectionRefused,
+                                "in shutdown",
+                            ));
+                        }
+                        let state = match stash_hit {
+                            Some(s) => s,
+                            None => {
+                                return Ok(SessionStep::Fault {
+                                    error: sessions::wire::errors::WireError::UnknownSessionId,
+                                });
+                            }
                         };
-                        // R2.1: reject a policy incompatible with the network
-                        // mode (e.g. egress on a non-`OwnIp` PTask) at
-                        // declaration time, so an invalid session is never
-                        // written to the store rather than only failing when
-                        // a client later attaches.
-                        record.validate_policy().map_err(|e| {
-                            std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
-                        })?;
-                        let k = self.store.create(record)?;
-                        Ok(minimald_rpc::CreateSessionResponse::Ready { id: *k.id() })
+                        // Run Phase 4 resume. A verdict that the
+                        // composer can't apply (mismatched
+                        // PendingIds, denied items, etc.) maps to a
+                        // `Fault` via `WireError::from(ComposeError)`.
+                        // The resumed composition is dropped today:
+                        // session activation doesn't yet consume it.
+                        let _composition = match resume_from_verdict(state, verdict) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                // Verdict couldn't be applied — the
+                                // session is dead. Destroy the
+                                // matching on-disk Pending record so
+                                // the name is freed, `list()` doesn't
+                                // show a phantom entry, and the next
+                                // reap pass has nothing to clean up.
+                                // A delete failure here is logged but
+                                // doesn't override the verdict-level
+                                // error returned to the client.
+                                if let Some(k) = store.find_by_id(&session_id)?
+                                    && let Err(del_err) = store.delete(&k)
+                                {
+                                    tracing::warn!(
+                                        session_id = %session_id,
+                                        error = %del_err,
+                                        "failed to delete Pending record after \
+                                         resume failure; record will be reaped on \
+                                         next daemon restart",
+                                    );
+                                }
+                                return Ok(SessionStep::Fault { error: e.into() });
+                            }
+                        };
+                        // Promote the on-disk record `Pending →
+                        // Active`. A mid-flight delete or a status
+                        // already past `Pending` is degenerate but
+                        // surfaces as a structured `WrongState`.
+                        let k = match store.find_by_id(&session_id)? {
+                            Some(k) => k,
+                            None => {
+                                return Ok(SessionStep::Fault {
+                                    error: sessions::wire::errors::WireError::UnknownSessionId,
+                                });
+                            }
+                        };
+                        let mut record = store.get(&k)?.record().clone();
+                        if record.status != sessions::SessionStatus::Pending {
+                            return Ok(SessionStep::Fault {
+                                error: sessions::wire::errors::WireError::WrongState {
+                                    what: format!("expected Pending, found {:?}", record.status,),
+                                },
+                            });
+                        }
+                        record.status = sessions::SessionStatus::Active;
+                        store.save(&k, &record)?;
+                        Ok(SessionStep::Active { id: session_id })
                     })
                     .await;
             }
@@ -628,6 +834,26 @@ impl ManagerHandle {
         recv.await.expect("corresponding sessions manager is dead")
     }
 
+    /// Submit a client verdict against a `Pending` session. On
+    /// success the daemon promotes the record to `Active` and replies
+    /// with [`SessionStep::Active`]. A verdict against an unknown id
+    /// or a non-`Pending` record surfaces as a [`SessionStep::Fault`]
+    /// — see the SubmitVerdict handler arm in [`Self::mainloop`].
+    pub async fn submit_verdict(
+        &self,
+        verdict: ContributionVerdict,
+    ) -> Result<SessionStep, SessionsError> {
+        let (send, recv) = Responder::channel();
+        let _ = self
+            .sender
+            .send(ManagerMessage::SubmitVerdict(Box::new(SubmitVerdictMsg {
+                verdict,
+                responder: send,
+            })))
+            .await;
+        recv.await.expect("corresponding sessions manager is dead")
+    }
+
     /// Gets a handle to the session corresponding with the given predicate.
     pub async fn get_session(
         &self,
@@ -828,5 +1054,81 @@ mod tests {
             .await
             .expect_err("non-empty composition should be rejected until apply plumbing lands");
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    /// `reap_orphan_pending` deletes `Pending` records on disk —
+    /// they have no in-memory stash post-restart and can't be
+    /// resumed. `Active` records pass through untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reap_orphan_pending_deletes_pending_records() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(daemon_dir(&tmp)).unwrap();
+
+        let pending_key = loader
+            .create(sessions::Record {
+                id: SessionId::nil(),
+                name: Some("pending".into()),
+                username: None,
+                project_path: HostAbsPath::try_new("/p").unwrap(),
+                network: sessions::NetworkMode::default(),
+                policy: Default::default(),
+                status: sessions::SessionStatus::Pending,
+                attrs: Default::default(),
+            })
+            .unwrap();
+        let active_key = loader
+            .create(sessions::Record {
+                id: SessionId::nil(),
+                name: Some("active".into()),
+                username: None,
+                project_path: HostAbsPath::try_new("/p2").unwrap(),
+                network: sessions::NetworkMode::default(),
+                policy: Default::default(),
+                status: sessions::SessionStatus::Active,
+                attrs: Default::default(),
+            })
+            .unwrap();
+
+        let pending_id = *pending_key.id();
+        let active_id = *active_key.id();
+        Manager::<DiskLoader>::reap_orphan_pending(&mut loader).unwrap();
+
+        assert!(
+            loader.find_by_id(&pending_id).unwrap().is_none(),
+            "the Pending record should be reaped from the index",
+        );
+        let active_key_again = loader
+            .find_by_id(&active_id)
+            .unwrap()
+            .expect("Active record's index entry should remain");
+        assert_eq!(
+            loader.get(&active_key_again).unwrap().record().status,
+            sessions::SessionStatus::Active,
+            "the Active record should remain",
+        );
+    }
+
+    /// `SubmitVerdict` for an id with no stash entry → terminal
+    /// `Fault::UnknownSessionId`. The stash is the single source of
+    /// truth for in-flight sessions; a verdict for an id that was
+    /// never `Pending` (or has already been resumed) reads as
+    /// "unknown" to the daemon.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_verdict_unknown_id_returns_unknown_session_id() {
+        let (_state, _cache, mngr) = manager().await;
+        let step = mngr
+            .submit_verdict(ContributionVerdict {
+                session_id: SessionId::nil(),
+                vars: vec![],
+                patches: vec![],
+            })
+            .await
+            .expect("actor reply should succeed");
+        match step {
+            SessionStep::Fault {
+                error: sessions::wire::errors::WireError::UnknownSessionId,
+            } => {}
+            other => panic!("expected Fault::UnknownSessionId, got {other:?}"),
+        }
     }
 }

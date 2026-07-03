@@ -430,6 +430,93 @@ async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), ()> {
     Ok(())
 }
 
+/// [`PolicyHooks`] impl that aborts on every unapproved item.
+///
+/// `minimal2` has no interactive prompt yet, so anything the user's
+/// policy can't auto-decide bubbles into here, and we treat that as
+/// "abort the session creation, surface a clear error." The user can
+/// widen their policy (`allow`/`ignore`) to admit specific items once
+/// the policy-config story lands.
+struct AbortOnUnapproved;
+
+impl sessions::core::hooks::PolicyHooks for AbortOnUnapproved {
+    fn on_var_unapproved(
+        &self,
+        _policy: sessions::core::policy::VarsPolicy,
+        _items: &[sessions::core::hooks::Unapproved<'_, str>],
+    ) -> sessions::core::hooks::HookResult<sessions::core::policy::VarsPolicy> {
+        sessions::core::hooks::HookResult::Abort
+    }
+
+    fn on_patch_unapproved(
+        &self,
+        _policy: sessions::core::policy::PatchPolicy,
+        _items: &[sessions::core::hooks::Unapproved<'_, camino::Utf8Path>],
+    ) -> sessions::core::hooks::HookResult<sessions::core::policy::PatchPolicy> {
+        sessions::core::hooks::HookResult::Abort
+    }
+}
+
+/// Phase 3 + final SubmitVerdict round-trip for a `Pending` session.
+///
+/// Runs `handle_response` over the daemon's `ContributionResponse`
+/// with [`UserPolicy::default`] (today's empty policy — see
+/// [`AbortOnUnapproved`]); sends the resulting [`ContributionVerdict`]
+/// over the [`SubmitVerdict`] RPC; unwraps the daemon's terminal
+/// [`SessionStep::Active`] reply to the finalized session id.
+///
+/// [`UserPolicy::default`]: sessions::core::policy::UserPolicy::default
+/// [`SubmitVerdict`]: minimald_rpc::SubmitVerdict
+async fn drive_pending_to_active(
+    client: &mut client::Client,
+    response: sessions::wire::request::ContributionResponse,
+) -> Result<sessions::SessionId, ()> {
+    use minimald_rpc::SubmitVerdict;
+    use sessions::client::handler::handle_response;
+    use sessions::core::compose::ComposeOptions;
+    use sessions::core::policy::UserPolicy;
+    use sessions::wire::request::SessionStep;
+
+    let hooks = AbortOnUnapproved;
+    let verdict = handle_response(
+        response,
+        &[],
+        UserPolicy::default(),
+        &hooks,
+        ComposeOptions::default(),
+        &|name| std::env::var(name),
+    )
+    .map_err(|e| eprintln!("Composition gating failed: {e}"))?;
+
+    let resp = client
+        .oneshot_rpc::<SubmitVerdict>(verdict)
+        .await
+        .map_err(|e| eprintln!("SubmitVerdict RPC failed: {e}"))?;
+    let step = match resp {
+        minimald_rpc::Errorable::Ok(s) => s,
+        minimald_rpc::Errorable::Err { error } => {
+            eprintln!("SubmitVerdict failed: {error}");
+            return Err(());
+        }
+    };
+    match step {
+        SessionStep::Active { id } => Ok(id),
+        SessionStep::Response { .. } => {
+            // The daemon's terminal reply today is always Active
+            // (single-round flow). Multi-round Response would be a
+            // future extension and the client isn't wired for it.
+            eprintln!(
+                "SubmitVerdict returned a follow-up Response, which this client cannot drive"
+            );
+            Err(())
+        }
+        SessionStep::Fault { error } => {
+            eprintln!("SubmitVerdict faulted: {error}");
+            Err(())
+        }
+    }
+}
+
 /// Create a new session via the `CreateSession` RPC.
 async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), ()> {
     if let Err(e) = autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref()) {
@@ -495,17 +582,15 @@ async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), ()>
             return Err(());
         }
     };
-    // Today the daemon only ever produces `Ready` (the empty-
-    // contribution fast path). `Pending` lights up when Phase 2
-    // routing lands.
+    // The daemon may finalize immediately (`Ready`) or ask the
+    // client to gate items first (`Pending`). On `Pending`: run
+    // Phase 3 (`handle_response`) against the user's policy, then
+    // send the resulting verdict over `SubmitVerdict` and wait for
+    // the daemon's terminal `SessionStep::Active`.
     let id = match created {
         minimald_rpc::CreateSessionResponse::Ready { id } => id,
-        minimald_rpc::CreateSessionResponse::Pending { .. } => {
-            eprintln!(
-                "CreateSession returned Pending, but the composition pipeline \
-                 is not wired in this client yet",
-            );
-            return Err(());
+        minimald_rpc::CreateSessionResponse::Pending { id: _, response } => {
+            drive_pending_to_active(&mut client, response).await?
         }
     };
 

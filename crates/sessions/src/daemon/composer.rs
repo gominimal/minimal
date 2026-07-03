@@ -2,13 +2,20 @@
 //! project and package contributions, and produces a final
 //! [`Composition`].
 
+use std::collections::BTreeMap;
+
 use crate::SessionId;
 use crate::core::compose::{
-    Composable, ComposeError, ComposeOptions, Composition, Contribution, Error, StoredEnv,
-    contribution_to_pending, default_env,
+    Composable, ComposeError, ComposeOptions, Composition, Contribution, Error, SessionPatch,
+    SessionVar, StoredEnv, contribution_to_pending, default_env,
 };
-use crate::core::source::{ProvenancedHook, ProvenancedPackage};
-use crate::wire::request::{ContributionResponse, WireContribution};
+use crate::core::primitives::ResolvedPatch;
+use crate::core::source::{
+    Provenanced, ProvenancedHook, ProvenancedPackage, ProvenancedPatch, ProvenancedVar, Source,
+};
+use crate::wire::policy::{WirePatchVerdict, WireVarVerdict};
+use crate::wire::primitives::PendingId;
+use crate::wire::request::{ContributionResponse, ContributionVerdict, WireContribution};
 
 /// Daemon-side state that survives a `Pending` outcome and feeds
 /// into Phase 4 once the client's verdict comes back.
@@ -30,6 +37,16 @@ pub struct PendingComposeState {
     /// response for client-side audit; the daemon also retains this
     /// copy for Phase 4 install.
     pub daemon_lifecycle_hooks: Vec<ProvenancedHook>,
+    /// Original daemon-collected vars keyed by the [`PendingId`] the
+    /// wire response shipped. [`resume_from_verdict`] looks each one
+    /// up to attach provenance to the verdict-approved value — the
+    /// wire verdict only carries the resolved name/value pair, not
+    /// the source.
+    pub pending_vars: BTreeMap<PendingId, ProvenancedVar>,
+    /// Original daemon-collected patches keyed by [`PendingId`]. The
+    /// wire verdict only carries the resolved `host_path`; the
+    /// destination and source provenance come from the stash entry.
+    pub pending_patches: BTreeMap<PendingId, ProvenancedPatch>,
     /// Client's already-gated wire contribution, untouched.
     pub client_contribution: WireContribution,
 }
@@ -223,23 +240,254 @@ impl SessionComposer {
         // client for gating. Lifecycle hooks ride in the response
         // for audit; a separate copy is retained on the stash for
         // Phase 4 to install. Packages aren't on the wire at all —
-        // they only live on the stash.
-        let pending = contribution_to_pending(vars, patches, lifecycle_hooks.clone());
+        // they only live on the stash. Vars and patches are stashed
+        // by `PendingId` so `resume_from_verdict` can reattach
+        // provenance to whatever the client approves.
+        let transform = contribution_to_pending(vars, patches, lifecycle_hooks.clone());
         let response = ContributionResponse {
             session_id,
-            vars: pending.vars,
-            patches: pending.patches,
-            lifecycle_hooks: pending.lifecycle_hooks,
+            vars: transform.wire.vars,
+            patches: transform.wire.patches,
+            lifecycle_hooks: transform.wire.lifecycle_hooks,
         };
         Ok(ComposeOutcome::Pending {
             response,
             state: PendingComposeState {
                 daemon_packages: packages,
                 daemon_lifecycle_hooks: lifecycle_hooks,
+                pending_vars: transform.pending_vars,
+                pending_patches: transform.pending_patches,
                 client_contribution: client,
             },
         })
     }
+}
+
+/// Phase 4: assemble the final [`Composition`] from a daemon-side
+/// stash plus the client's verdict.
+///
+/// **Where this fits in the pipeline.** The daemon called
+/// [`SessionComposer::compose`] and got back
+/// [`ComposeOutcome::Pending`]; it stashed the
+/// [`PendingComposeState`] and shipped the [`ContributionResponse`]
+/// to the client. The client ran Phase 3 (`client::handler::handle_response`),
+/// produced a [`ContributionVerdict`], and sent it back. This function
+/// closes the loop: it walks the verdict, reattaches provenance from
+/// the stash, and merges everything into a finalized `Composition`.
+///
+/// **What it does, per verdict variant.**
+///
+/// - [`WireVarVerdict::Approved`] / [`WirePatchVerdict::Approved`]:
+///   include in the assembled composition. The verdict carries the
+///   client-resolved value (var) or matched file path (patch); the
+///   stash supplies source provenance the wire schema doesn't carry.
+/// - [`WireVarVerdict::Ignored`] / [`WirePatchVerdict::Ignored`]:
+///   silently dropped per the user policy's `ignore` rule.
+/// - [`WireVarVerdict::Denied`] / [`WirePatchVerdict::Denied`]:
+///   abort the resume with [`ComposeError::Denied`]. A `Denied`
+///   verdict means the user policy explicitly rejected a
+///   project- or package-declared item — finalizing would produce a
+///   session inconsistent with what was declared.
+///
+/// **Determinism.** This function reads no env and consults no
+/// policy. The values and decisions arrive embedded in the verdict;
+/// resume is pure type-shape assembly.
+///
+/// # Errors
+///
+/// - [`ComposeError::InvalidWireItem`] if the verdict references a
+///   `PendingId` that wasn't in the stash, or omits one that was.
+/// - [`ComposeError::Denied`] if any verdict entry is `Denied`.
+/// - [`ComposeError::Conflict`] / [`ComposeError::InvalidWireItem`]
+///   from `extend_from_wire` while merging the client's already-gated
+///   wire contribution back in.
+pub fn resume_from_verdict(
+    state: PendingComposeState,
+    verdict: ContributionVerdict,
+) -> Result<Composition, ComposeError> {
+    let PendingComposeState {
+        daemon_packages,
+        daemon_lifecycle_hooks,
+        pending_vars,
+        pending_patches,
+        client_contribution,
+    } = state;
+
+    let mut composition =
+        Composition::from_daemon_passthrough(daemon_packages, daemon_lifecycle_hooks);
+
+    let accepted_vars = apply_var_verdicts(pending_vars, verdict.vars)?;
+    let accepted_patches = apply_patch_verdicts(&pending_patches, verdict.patches)?;
+    composition.extend_with(accepted_vars, accepted_patches)?;
+    composition.extend_from_wire(client_contribution)?;
+    Ok(composition)
+}
+
+/// Walk the var verdict, draining `pending_vars` as items are
+/// addressed. Returns the [`SessionVar`]s that survived (Approved
+/// items reattached to their stashed source) or surfaces a structured
+/// error for: missing/unknown `PendingId`s, omitted stash entries,
+/// or a `Denied` verdict (which terminates the resume).
+fn apply_var_verdicts(
+    mut pending_vars: BTreeMap<PendingId, ProvenancedVar>,
+    var_verdicts: Vec<WireVarVerdict>,
+) -> Result<Vec<SessionVar>, ComposeError> {
+    // Snapshot every stashed var's source before walking the
+    // verdict. The walk drains `pending_vars` via `take_pending`,
+    // so a duplicate-id verdict (Approved then Denied for the same
+    // id, or two Denieds for the same id) would otherwise see an
+    // already-drained stash and need to fall back to a placeholder
+    // for the `Denied` provenance. The snapshot makes the lookup
+    // order-independent and lets a duplicate id surface as a
+    // structured `InvalidWireItem` instead.
+    let pending_var_sources: BTreeMap<PendingId, Source> = pending_vars
+        .iter()
+        .map(|(id, pv)| (*id, pv.source().clone()))
+        .collect();
+
+    let mut accepted: Vec<SessionVar> = Vec::new();
+    for v in var_verdicts {
+        match v {
+            WireVarVerdict::Approved { id, value } => {
+                let pv = take_pending(&mut pending_vars, id, "var")?;
+                // The verdict's `value` is the client-resolved
+                // (possibly user-edited at prompt) value; the
+                // stashed `pv` supplies the source the wire schema
+                // doesn't echo.
+                let (_, source) = pv.into_parts();
+                accepted.push(SessionVar::new(value.into(), source));
+            }
+            WireVarVerdict::Ignored { id, name: _ } => {
+                take_pending(&mut pending_vars, id, "var")?;
+            }
+            WireVarVerdict::Denied { id, name } => {
+                let from =
+                    pending_var_sources
+                        .get(&id)
+                        .cloned()
+                        .ok_or(ComposeError::InvalidWireItem {
+                            what: "verdict references unknown pending var id",
+                            context: format!("denied var id {id:?} (`{name}`)"),
+                        })?;
+                return Err(ComposeError::Denied { what: name, from });
+            }
+        }
+    }
+    if let Some((id, pv)) = pending_vars.into_iter().next() {
+        return Err(ComposeError::InvalidWireItem {
+            what: "verdict missing entry for pending var",
+            context: format!("pending id {id:?} (`{}`)", pv.var().name()),
+        });
+    }
+    Ok(accepted)
+}
+
+/// Walk the patch verdict against the stash without consuming
+/// entries — a single stashed `PendingId` backs many verdicts (one
+/// per glob match). Returns the [`SessionPatch`]es that survived or
+/// surfaces a structured error for: duplicate `(id, host_path)`
+/// entries, missing/unknown `PendingId`s, stash entries the verdict
+/// never mentioned, or a `Denied` verdict.
+fn apply_patch_verdicts(
+    pending_patches: &BTreeMap<PendingId, ProvenancedPatch>,
+    patch_verdicts: Vec<WirePatchVerdict>,
+) -> Result<Vec<SessionPatch>, ComposeError> {
+    let mut accepted: Vec<SessionPatch> = Vec::new();
+    let mut touched_ids: std::collections::BTreeSet<PendingId> = std::collections::BTreeSet::new();
+    // Verdicts are deduped by `(PendingId, host_path)` — a client
+    // bug that submits two decisions for the same matched file
+    // (e.g. Approved then Ignored) would otherwise silently land
+    // one of them in the composition; instead, the duplicate
+    // surfaces as a structured error.
+    let mut seen_entries: std::collections::BTreeSet<(PendingId, paths::HostAbsPath)> =
+        std::collections::BTreeSet::new();
+    for p in patch_verdicts {
+        let (id, host_path_for_dedupe) = match &p {
+            WirePatchVerdict::Approved { id, host_path }
+            | WirePatchVerdict::Ignored { id, host_path }
+            | WirePatchVerdict::Denied { id, host_path } => (*id, host_path.clone()),
+        };
+        if !seen_entries.insert((id, host_path_for_dedupe.clone())) {
+            return Err(ComposeError::InvalidWireItem {
+                what: "verdict contains duplicate patch entry",
+                context: format!(
+                    "pending id {id:?}, host_path `{}`",
+                    host_path_for_dedupe.as_str(),
+                ),
+            });
+        }
+
+        match p {
+            WirePatchVerdict::Approved { id, host_path } => {
+                let pp = lookup_patch(pending_patches, id)?;
+                touched_ids.insert(id);
+                let destination = pp.patch().dest().as_sandbox_path().clone();
+                let source = pp.source().clone();
+                accepted.push(SessionPatch::new(
+                    ResolvedPatch::new(host_path, destination),
+                    source,
+                ));
+            }
+            WirePatchVerdict::Ignored { id, host_path: _ } => {
+                lookup_patch(pending_patches, id)?;
+                touched_ids.insert(id);
+            }
+            WirePatchVerdict::Denied { id, host_path } => {
+                let pp = lookup_patch(pending_patches, id)?;
+                let from = pp.source().clone();
+                return Err(ComposeError::Denied {
+                    what: host_path.as_str().to_string(),
+                    from,
+                });
+            }
+        }
+    }
+    // Every stashed pending patch must have been mentioned at least
+    // once by the verdict — a glob that matched zero files on the
+    // client should still emit an `Ignored` entry per file, or, if
+    // truly zero, a synthetic `Ignored { id, host_path: <glob> }`.
+    // The client today does this; missing means a malformed verdict.
+    if let Some((id, pp)) = pending_patches
+        .iter()
+        .find(|(id, _)| !touched_ids.contains(id))
+    {
+        return Err(ComposeError::InvalidWireItem {
+            what: "verdict missing entry for pending patch",
+            context: format!(
+                "pending id {id:?} (source pattern `{}`)",
+                pp.patch().source(),
+            ),
+        });
+    }
+    Ok(accepted)
+}
+
+/// Pop a stashed pending item by id, returning a structured error if
+/// the verdict referenced an id that isn't on the stash. Shared by
+/// the var branches of [`resume_from_verdict`].
+fn take_pending<T>(
+    map: &mut BTreeMap<PendingId, T>,
+    id: PendingId,
+    domain: &'static str,
+) -> Result<T, ComposeError> {
+    map.remove(&id).ok_or(ComposeError::InvalidWireItem {
+        what: "verdict references unknown pending id",
+        context: format!("{domain} id {id:?}"),
+    })
+}
+
+/// Look up a stashed pending patch by id without consuming the entry —
+/// a single stashed [`ProvenancedPatch`] backs many wire verdicts (one
+/// per expanded glob match), so the stash entry must outlive any single
+/// lookup. Returns a structured error if the id isn't on the stash.
+fn lookup_patch(
+    map: &BTreeMap<PendingId, ProvenancedPatch>,
+    id: PendingId,
+) -> Result<&ProvenancedPatch, ComposeError> {
+    map.get(&id).ok_or(ComposeError::InvalidWireItem {
+        what: "verdict references unknown pending patch id",
+        context: format!("pending id {id:?}"),
+    })
 }
 
 #[cfg(test)]
@@ -393,6 +641,229 @@ mod tests {
         assert_eq!(res.packages().len(), 1);
         assert_eq!(res.packages()[0].package(), "ripgrep");
         assert_eq!(res.lifecycle_hooks().len(), 1);
+    }
+
+    // ============================================================
+    // resume_from_verdict
+    // ============================================================
+
+    /// Build a `PendingComposeState` with a single daemon-collected
+    /// `PROJECT_VAR` keyed at `PendingId(0)`. Mirrors what
+    /// `SessionComposer::compose` would have stashed.
+    fn stash_with_one_var(value: &str) -> (PendingComposeState, SessionId) {
+        use crate::core::primitives::{ResolvedVar, VarValue};
+        let id = SessionId::parse_str("00000000-0000-0000-0000-000000000042").unwrap();
+        let resolved =
+            ResolvedVar::resolve_with("PROJECT_VAR".into(), VarValue::specified(value), |_| {
+                Err(std::env::VarError::NotPresent)
+            })
+            .unwrap();
+        let pv = ProvenancedVar::new(
+            resolved,
+            Source::Project {
+                path: paths::HostPath::new("/proj"),
+            },
+        );
+        let mut pending_vars = BTreeMap::new();
+        pending_vars.insert(PendingId::new(0), pv);
+        let state = PendingComposeState {
+            daemon_packages: Vec::new(),
+            daemon_lifecycle_hooks: Vec::new(),
+            pending_vars,
+            pending_patches: BTreeMap::new(),
+            client_contribution: WireContribution::default(),
+        };
+        (state, id)
+    }
+
+    /// An `Approved` verdict lands the var on the `Composition` with
+    /// the verdict's value and the stashed source — provenance is
+    /// reattached.
+    #[test]
+    fn resume_from_verdict_keeps_approved_var() {
+        let (state, id) = stash_with_one_var("from-project");
+        let verdict = ContributionVerdict {
+            session_id: id,
+            vars: vec![WireVarVerdict::Approved {
+                id: PendingId::new(0),
+                value: WireResolvedVar {
+                    name: "PROJECT_VAR".into(),
+                    value: "approved-value".into(),
+                },
+            }],
+            patches: vec![],
+        };
+        let comp = resume_from_verdict(state, verdict).unwrap();
+        assert_eq!(comp.vars().len(), 1);
+        assert_eq!(comp.vars()[0].var().name(), "PROJECT_VAR");
+        assert_eq!(comp.vars()[0].var().value(), "approved-value");
+        assert!(matches!(comp.vars()[0].source(), Source::Project { .. },));
+    }
+
+    /// An `Ignored` verdict drops the item silently.
+    #[test]
+    fn resume_from_verdict_drops_ignored_var() {
+        let (state, id) = stash_with_one_var("v");
+        let verdict = ContributionVerdict {
+            session_id: id,
+            vars: vec![WireVarVerdict::Ignored {
+                id: PendingId::new(0),
+                name: "PROJECT_VAR".into(),
+            }],
+            patches: vec![],
+        };
+        let comp = resume_from_verdict(state, verdict).unwrap();
+        assert!(comp.vars().is_empty());
+    }
+
+    /// A `Denied` verdict aborts with `ComposeError::Denied`.
+    #[test]
+    fn resume_from_verdict_denied_var_aborts() {
+        let (state, id) = stash_with_one_var("v");
+        let verdict = ContributionVerdict {
+            session_id: id,
+            vars: vec![WireVarVerdict::Denied {
+                id: PendingId::new(0),
+                name: "PROJECT_VAR".into(),
+            }],
+            patches: vec![],
+        };
+        let err = resume_from_verdict(state, verdict).unwrap_err();
+        match err {
+            ComposeError::Denied { what, from } => {
+                assert_eq!(what, "PROJECT_VAR");
+                assert!(matches!(from, Source::Project { .. }));
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    /// A verdict referencing a `PendingId` the stash doesn't have →
+    /// `InvalidWireItem`. Catches mis-correlated verdicts.
+    #[test]
+    fn resume_from_verdict_unknown_pending_id_errors() {
+        let (state, id) = stash_with_one_var("v");
+        let verdict = ContributionVerdict {
+            session_id: id,
+            vars: vec![WireVarVerdict::Approved {
+                id: PendingId::new(99),
+                value: WireResolvedVar {
+                    name: "PROJECT_VAR".into(),
+                    value: "v".into(),
+                },
+            }],
+            patches: vec![],
+        };
+        let err = resume_from_verdict(state, verdict).unwrap_err();
+        assert!(
+            matches!(err, ComposeError::InvalidWireItem { what, .. } if what.contains("unknown")),
+            "expected InvalidWireItem(unknown), got {err:?}",
+        );
+    }
+
+    /// A verdict that omits an entry the stash holds → `InvalidWireItem`.
+    /// Catches under-specified verdicts that would leave items
+    /// silently in limbo.
+    #[test]
+    fn resume_from_verdict_missing_entry_errors() {
+        let (state, id) = stash_with_one_var("v");
+        let verdict = ContributionVerdict {
+            session_id: id,
+            vars: vec![],
+            patches: vec![],
+        };
+        let err = resume_from_verdict(state, verdict).unwrap_err();
+        assert!(
+            matches!(err, ComposeError::InvalidWireItem { what, .. } if what.contains("missing")),
+            "expected InvalidWireItem(missing), got {err:?}",
+        );
+    }
+
+    /// A stash with zero pending items + an empty verdict still
+    /// works — the path is degenerate (the composer wouldn't have
+    /// produced a Pending outcome from no pending items) but the
+    /// fn shouldn't error.
+    #[test]
+    fn resume_from_verdict_empty_inputs_yields_empty_composition() {
+        let state = PendingComposeState {
+            daemon_packages: Vec::new(),
+            daemon_lifecycle_hooks: Vec::new(),
+            pending_vars: BTreeMap::new(),
+            pending_patches: BTreeMap::new(),
+            client_contribution: WireContribution::default(),
+        };
+        let verdict = ContributionVerdict {
+            session_id: SessionId::nil(),
+            vars: vec![],
+            patches: vec![],
+        };
+        let comp = resume_from_verdict(state, verdict).unwrap();
+        assert!(comp.vars().is_empty());
+        assert!(comp.patches().is_empty());
+        assert!(comp.packages().is_empty());
+        assert!(comp.lifecycle_hooks().is_empty());
+    }
+
+    /// Daemon-stashed packages and lifecycle hooks pass through the
+    /// resume into the assembled `Composition` (they have no
+    /// per-item verdict and are never on the wire round-trip).
+    #[test]
+    fn resume_from_verdict_passes_through_packages_and_hooks() {
+        use crate::core::lifecyclehook::{HookScript, LifecycleHook};
+        let src = Source::Project {
+            path: paths::HostPath::new("/proj"),
+        };
+        let hook = LifecycleHook::builder()
+            .with_on_activate(HookScript::inline("echo hi"))
+            .build()
+            .unwrap();
+        let state = PendingComposeState {
+            daemon_packages: vec![ProvenancedPackage::new("ripgrep", src.clone())],
+            daemon_lifecycle_hooks: vec![ProvenancedHook::new(hook, src)],
+            pending_vars: BTreeMap::new(),
+            pending_patches: BTreeMap::new(),
+            client_contribution: WireContribution::default(),
+        };
+        let verdict = ContributionVerdict {
+            session_id: SessionId::nil(),
+            vars: vec![],
+            patches: vec![],
+        };
+        let comp = resume_from_verdict(state, verdict).unwrap();
+        assert_eq!(comp.packages().len(), 1);
+        assert_eq!(comp.packages()[0].package(), "ripgrep");
+        assert_eq!(comp.lifecycle_hooks().len(), 1);
+    }
+
+    /// The client's stashed wire contribution merges in on top of
+    /// the verdict-derived vars/patches.
+    #[test]
+    fn resume_from_verdict_merges_client_wire_contribution() {
+        let client = WireContribution {
+            vars: vec![WireSessionVar {
+                var: WireResolvedVar {
+                    name: "EDITOR".into(),
+                    value: "hx".into(),
+                },
+                source: WireSource::UserLoadout { name: "dev".into() },
+            }],
+            ..Default::default()
+        };
+        let state = PendingComposeState {
+            daemon_packages: Vec::new(),
+            daemon_lifecycle_hooks: Vec::new(),
+            pending_vars: BTreeMap::new(),
+            pending_patches: BTreeMap::new(),
+            client_contribution: client,
+        };
+        let verdict = ContributionVerdict {
+            session_id: SessionId::nil(),
+            vars: vec![],
+            patches: vec![],
+        };
+        let comp = resume_from_verdict(state, verdict).unwrap();
+        assert_eq!(comp.vars().len(), 1);
+        assert_eq!(comp.vars()[0].var().name(), "EDITOR");
     }
 
     /// Client-contributed vars survive into the merged composition.
