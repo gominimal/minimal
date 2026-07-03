@@ -601,6 +601,77 @@ mod tests {
         assert!(err.contains(&"d".to_string()), "unbreakable peer must be reported: {err:?}");
     }
 
+    /// #14 D2 (durable mirror-slot ownership, cross-language contract): the
+    /// signer's leaf-owns-slot ranker (signer/main.go `mirrorSlotWinner`)
+    /// keys on resolvedDependencies COUNT — a non-CHAIN_ENFORCE production
+    /// leaf emits ZERO deps, so it always outranks a CHAIN_ENFORCE rung
+    /// (which records this non-empty cycle-broken closure). This test pins
+    /// the graph-level source of that asymmetry: a pure leaf's cycle-broken
+    /// closure is EMPTY, while a rung on a breakable cycle is NON-empty. If
+    /// this ever regressed (a leaf recording phantom deps), the signer could
+    /// no longer distinguish leaf from rung by count.
+    #[test]
+    fn leaf_records_empty_closure_rung_records_nonempty() {
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+                let {BuildSpec, ..} = import \"minimal.ncl\" in
+                let rec
+                    leaf = { name = \"leaf\", build_deps = [], cmd = \"\" } | BuildSpec,
+                    a = { name = \"a\", build_deps = [ b ], cmd = \"\" } | BuildSpec,
+                    b = {
+                        name = \"b\",
+                        build_deps = [ a ],
+                        replace_on_cycle = { name = \"b-prebuilt\", build_deps = [], cmd = \"\" } | BuildSpec,
+                        cmd = \"\",
+                    } | BuildSpec,
+                in
+                [leaf, a, b]
+                "
+            }
+            .to_string(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+        let g = Graph::new().ingest(layer).unwrap();
+
+        // Leaf (no deps) => empty closure => the depCount-0 "leaf" shape the
+        // signer's ranker gives slot ownership to.
+        let leaf = *g.by_name("leaf").unwrap();
+        let leaf_closure = g
+            .cycle_broken_deps_of(&leaf)
+            .expect("a leaf has no cycle to break");
+        assert!(
+            leaf_closure.is_empty(),
+            "a production leaf must record ZERO resolvedDependencies (got {} — the signer's \
+             leaf-owns-slot precedence would break): {:?}",
+            leaf_closure.len(),
+            leaf_closure
+                .iter()
+                .map(|r| g.get(r).unwrap().name.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // Rung on a breakable cycle => non-empty closure => depCount >= 1,
+        // strictly outranked by the leaf above (cannot evict it).
+        let a = *g.by_name("a").unwrap();
+        let rung_closure = g
+            .cycle_broken_deps_of(&a)
+            .expect("a's cycle is breakable via b's replace_on_cycle");
+        assert!(
+            !rung_closure.is_empty(),
+            "a CHAIN_ENFORCE rung on a cycle must record a non-empty closure"
+        );
+        assert!(
+            rung_closure.len() > leaf_closure.len(),
+            "rung closure ({}) must exceed leaf closure ({}) so depCount distinguishes them",
+            rung_closure.len(),
+            leaf_closure.len()
+        );
+    }
+
     #[test]
     fn transitive_specs_of() {
         let layer = Layer::new_for_test(
