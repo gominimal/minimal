@@ -113,6 +113,35 @@ impl Default for Graph {
     }
 }
 
+/// A failure of [`Graph::cycle_broken_deps_of`]. Every variant is fail-shut:
+/// emitting a record despite it would either contain a known dependency
+/// cycle or violate an invariant the signer's attestation-chain walk relies
+/// on. The machine-checked counterexamples motivating the two breaker
+/// variants live in `formal/Formal/CycleBroken.lean`
+/// (`finding_toplevel_recorded_via_breaker`,
+/// `finding_breaker_nonterminal_cycle`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CycleBreakError {
+    /// Cyclic peers of the toplevel that declare NO `replace_on_cycle`
+    /// breaker: their cyclic edge cannot be represented acyclically.
+    /// Sorted by spec hash and deduped.
+    Unbreakable(Vec<BuildSpecRef>),
+    /// A cyclic peer (`peer`) declares a breaker that IS the toplevel
+    /// itself. Substituting it would record the toplevel inside its own
+    /// provenance — the SELF-REF trust bug reintroduced through the breaker
+    /// channel (the `gBreakerAliasesTop` witness).
+    BreakerAliasesToplevel { peer: BuildSpecRef },
+    /// A cyclic peer (`peer`) declares a breaker that itself sits on a
+    /// dependency cycle (it appears in its own transitive closure) —
+    /// breaker-terminality (axiom A2 of the global-DAG theorem) violated.
+    /// With such a breaker the union of per-rung records genuinely cycles
+    /// (the `gSelfBreaker` witness).
+    BreakerOnCycle {
+        peer: BuildSpecRef,
+        breaker: BuildSpecRef,
+    },
+}
+
 impl Graph {
     /// Constructs an empty dependency graph targeting the host system.
     pub fn new() -> Self {
@@ -200,6 +229,14 @@ impl Graph {
             .map(|(index, spec)| (BuildSpecRef(index), spec))
     }
 
+    /// Returns whether the given build-spec sits on a dependency cycle
+    /// through itself, i.e. it appears in its own transitive closure.
+    /// (`collect_transitive_buildspecs` never pre-seeds `seen` with the
+    /// root, so the root is reachable only via a genuine cycle.)
+    fn on_own_cycle(&self, bsr: &BuildSpecRef) -> bool {
+        self.transitive_specs_of(bsr).contains(bsr)
+    }
+
     /// Returns the unique set of transitive build-spec dependencies of the given toplevel.
     ///
     /// Dependencies of a build-spec are its build dependencies and its runtime dependencies.
@@ -239,15 +276,33 @@ impl Graph {
     /// Deterministic: a pure function of graph topology + `replace_on_cycle`,
     /// independent of any cache. Output sorted by spec hash.
     ///
-    /// `Err` lists every cyclic peer that declares NO breaker: its cyclic edge
-    /// cannot be represented acyclically, so the caller must fail shut rather
-    /// than emit a known cycle.
+    /// Two invariants the global-DAG argument depends on are ENFORCED here
+    /// (fail shut, distinct [`CycleBreakError`] variants — both were
+    /// previously assumed-by-convention only; see
+    /// `formal/Formal/CycleBroken.lean` for the machine-checked
+    /// counterexamples showing each is necessary):
+    ///
+    /// * A breaker must not ALIAS the toplevel itself
+    ///   ([`CycleBreakError::BreakerAliasesToplevel`]): pushing it would put
+    ///   the toplevel inside its own record — the self-reference trust bug
+    ///   reintroduced through the breaker channel (`gBreakerAliasesTop`).
+    /// * A breaker must be TERMINAL, i.e. not itself sit on a dependency
+    ///   cycle ([`CycleBreakError::BreakerOnCycle`]): with a non-terminal
+    ///   breaker the union of per-rung records contains a genuine cycle
+    ///   (`gSelfBreaker` / axiom A2 of the acyclicity theorem).
+    ///
+    /// `Err(Unbreakable)` lists every cyclic peer that declares NO breaker:
+    /// its cyclic edge cannot be represented acyclically, so the caller must
+    /// fail shut rather than emit a known cycle.
     pub fn cycle_broken_deps_of(
         &self,
         toplevel: &BuildSpecRef,
-    ) -> Result<Vec<BuildSpecRef>, Vec<BuildSpecRef>> {
+    ) -> Result<Vec<BuildSpecRef>, CycleBreakError> {
         let mut out: Vec<BuildSpecRef> = Vec::new();
         let mut unbreakable: Vec<BuildSpecRef> = Vec::new();
+        // A2 memo: the same breaker is typically declared by many cyclic
+        // peers; compute its closure once.
+        let mut breaker_cyclic: HashMap<BuildSpecRef, bool> = HashMap::new();
         for dep in self.transitive_specs_of(toplevel) {
             if dep == *toplevel {
                 continue; // self-reference: a build is never its own dependency
@@ -261,6 +316,19 @@ impl Graph {
             if !reaches_toplevel {
                 out.push(dep); // genuinely acyclic dep — record as-is
             } else if let Some(breaker) = self.get(&dep).and_then(|s| s.replace_on_cycle) {
+                if breaker == *toplevel {
+                    // F7: the breaker IS the toplevel — recording it would
+                    // emit `toplevel ∈ record(toplevel)` (SELF-REF).
+                    return Err(CycleBreakError::BreakerAliasesToplevel { peer: dep });
+                }
+                let on_cycle = *breaker_cyclic
+                    .entry(breaker)
+                    .or_insert_with(|| self.on_own_cycle(&breaker));
+                if on_cycle {
+                    // F8 / axiom A2: a breaker on a cycle is not a terminal
+                    // leaf; substituting it re-emits a representable cycle.
+                    return Err(CycleBreakError::BreakerOnCycle { peer: dep, breaker });
+                }
                 out.push(breaker); // record the prebuilt breaker leaf instead
             } else {
                 unbreakable.push(dep); // cyclic peer with no breaker — fail shut
@@ -272,7 +340,7 @@ impl Graph {
         if !unbreakable.is_empty() {
             unbreakable.sort_by_cached_key(|b| *self.spec_hash(b).0.as_bytes());
             unbreakable.dedup();
-            return Err(unbreakable);
+            return Err(CycleBreakError::Unbreakable(unbreakable));
         }
         out.sort_by_cached_key(|b| *self.spec_hash(b).0.as_bytes());
         out.dedup();
@@ -594,11 +662,153 @@ mod tests {
 
         // c <-> d has no breaker => fail shut (Err), never a silent cycle.
         let c = *g.by_name("c").unwrap();
-        let err = names(
-            &g.cycle_broken_deps_of(&c)
-                .expect_err("c's cycle has no breaker => must fail shut"),
-        );
+        let err = g
+            .cycle_broken_deps_of(&c)
+            .expect_err("c's cycle has no breaker => must fail shut");
+        let CycleBreakError::Unbreakable(unbreakable) = err else {
+            panic!("expected Unbreakable, got {err:?}");
+        };
+        let err = names(&unbreakable);
         assert!(err.contains(&"d".to_string()), "unbreakable peer must be reported: {err:?}");
+    }
+
+    /// F7 (SELF-REF via the breaker channel): a cyclic peer whose
+    /// `replace_on_cycle` breaker ALIASES the toplevel must fail shut with a
+    /// distinct error, never record the toplevel inside its own provenance.
+    /// This reproduces the machine-checked witness `gBreakerAliasesTop` in
+    /// `formal/Formal/CycleBroken.lean` (`cycleBrokenDepsOf
+    /// gBreakerAliasesTop 3 0 = Ok [0]` before this check existed).
+    #[test]
+    fn breaker_aliasing_toplevel_fails_shut() {
+        // a <-> b cycle; b's declared breaker IS a (node 0 <-> 1 with
+        // breaker(1) = 0 in the Lean model).
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+                let {BuildSpec, ..} = import \"minimal.ncl\" in
+                let rec
+                    a = { name = \"a\", build_deps = [ b ], cmd = \"\" } | BuildSpec,
+                    b = {
+                        name = \"b\",
+                        build_deps = [ a ],
+                        replace_on_cycle = a,
+                        cmd = \"\",
+                    } | BuildSpec,
+                in
+                [a, b]
+                "
+            }
+            .to_string(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+        let g = Graph::new().ingest(layer).unwrap();
+        let a = *g.by_name("a").unwrap();
+        let b = *g.by_name("b").unwrap();
+
+        // The Lean witness: without the check, record(a) = [a].
+        let err = g
+            .cycle_broken_deps_of(&a)
+            .expect_err("breaker aliasing the toplevel must fail shut");
+        assert_eq!(
+            err,
+            CycleBreakError::BreakerAliasesToplevel { peer: b },
+            "must be the distinct aliasing error naming the offending peer"
+        );
+
+        // Sanity (matches the Lean model's second example): from b's side the
+        // cycle is breaker-less (a declares none) => plain Unbreakable.
+        let err = g
+            .cycle_broken_deps_of(&b)
+            .expect_err("b's cyclic peer a declares no breaker");
+        assert_eq!(err, CycleBreakError::Unbreakable(vec![a]));
+    }
+
+    /// F8 (axiom A2, breaker-terminality): a breaker that itself sits on a
+    /// dependency cycle must be rejected — with such breakers the union of
+    /// per-rung records genuinely cycles (`finding_breaker_nonterminal_cycle`
+    /// / `gSelfBreaker` in `formal/Formal/CycleBroken.lean`).
+    #[test]
+    fn breaker_on_cycle_fails_shut() {
+        // a <-> b cycle broken (allegedly) by c — but c sits on its own
+        // c <-> d cycle, so it is not a terminal leaf.
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+                let {BuildSpec, ..} = import \"minimal.ncl\" in
+                let rec
+                    a = { name = \"a\", build_deps = [ b ], cmd = \"\" } | BuildSpec,
+                    b = {
+                        name = \"b\",
+                        build_deps = [ a ],
+                        replace_on_cycle = c,
+                        cmd = \"\",
+                    } | BuildSpec,
+                    c = { name = \"c\", build_deps = [ d ], cmd = \"\" } | BuildSpec,
+                    d = { name = \"d\", build_deps = [ c ], cmd = \"\" } | BuildSpec,
+                in
+                [a, b, c, d]
+                "
+            }
+            .to_string(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+        let g = Graph::new().ingest(layer).unwrap();
+        let a = *g.by_name("a").unwrap();
+        let b = *g.by_name("b").unwrap();
+        let c = *g.by_name("c").unwrap();
+
+        let err = g
+            .cycle_broken_deps_of(&a)
+            .expect_err("a non-terminal breaker must fail shut");
+        assert_eq!(
+            err,
+            CycleBreakError::BreakerOnCycle { peer: b, breaker: c },
+            "must be the distinct terminality error naming peer + breaker"
+        );
+    }
+
+    /// F8, the self-breaker shape (the exact `gSelfBreaker` witness): a
+    /// cyclic peer declaring ITSELF as its breaker is a special case of a
+    /// non-terminal breaker and must fail shut, not silently re-record the
+    /// from-source cyclic peer.
+    #[test]
+    fn self_breaker_fails_shut() {
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+                let {BuildSpec, ..} = import \"minimal.ncl\" in
+                let rec
+                    a = { name = \"a\", build_deps = [ b ], cmd = \"\" } | BuildSpec,
+                    b = {
+                        name = \"b\",
+                        build_deps = [ a ],
+                        replace_on_cycle = b,
+                        cmd = \"\",
+                    } | BuildSpec,
+                in
+                [a, b]
+                "
+            }
+            .to_string(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+        let g = Graph::new().ingest(layer).unwrap();
+        let a = *g.by_name("a").unwrap();
+        let b = *g.by_name("b").unwrap();
+
+        let err = g
+            .cycle_broken_deps_of(&a)
+            .expect_err("a self-breaker on a cycle must fail shut");
+        assert_eq!(err, CycleBreakError::BreakerOnCycle { peer: b, breaker: b });
     }
 
     /// #14 D2 (durable mirror-slot ownership, cross-language contract): the

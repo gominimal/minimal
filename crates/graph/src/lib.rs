@@ -183,7 +183,7 @@ mod env_setup;
 pub use env_setup::SetupForPackages;
 
 mod graph;
-pub use graph::Graph;
+pub use graph::{CycleBreakError, Graph};
 
 mod loader;
 pub use loader::{ChainLoader, LayerCache, LayerCacheDir, SourceProvider};
