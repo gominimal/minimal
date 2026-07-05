@@ -606,6 +606,27 @@ impl<C: Channel> Sandbox<C> {
             cmd.stdout(hakoniwa::Stdio::MakePipe);
             tracing::debug!("Executing: {} {}", &exec.executable, exec.args.join(" "));
 
+            // OPT-IN (env MINIMAL_SANDBOX_NO_ASLR=1): disable ASLR for the sandboxed build. mes-m2
+            // (the M2-Planet-built Mes interpreter that compiles tcc.c in the hex0 bootstrap ladder)
+            // has an ASLR-layout-dependent GC-arena bug that SIGSEGVs ~50% of runs ("the lottery").
+            // personality(ADDR_NO_RANDOMIZE) on this thread is inherited by hakoniwa's clone()'d child
+            // and survives its execve, so mes-m2 gets a deterministic address-space layout -> the
+            // lottery vanishes (sweep-proven: ASLR-off = deterministic PASS). Default behavior is
+            // unchanged (ASLR on) unless the flag is set; ASLR provides no security in a hermetic
+            // build sandbox and ASLR-off is strictly better for reproducibility. Set per-spawn
+            // (idempotent) so it always lands on the spawning thread regardless of tokio scheduling.
+            #[cfg(target_os = "linux")]
+            if std::env::var_os("MINIMAL_SANDBOX_NO_ASLR").is_some() {
+                unsafe {
+                    let cur = libc::personality(0xffff_ffff);
+                    if cur != -1 {
+                        let _ = libc::personality(
+                            cur as libc::c_ulong | libc::ADDR_NO_RANDOMIZE as libc::c_ulong,
+                        );
+                    }
+                }
+            }
+
             let mut child = cmd
                 .spawn()
                 .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
