@@ -57,8 +57,16 @@ use crate::wire::request::{ContributionResponse, ContributionVerdict};
 ///
 /// See [`ComposeError`]. In particular:
 /// - [`ComposeError::Aborted`] when a hook returns
-///   [`HookResult::Abort`]; the caller should send a `SessionAbort`
-///   RPC with [`AbortReason::UserCancelled`](crate::wire::request::AbortReason::UserCancelled).
+///   [`HookResult::Abort`]. The caller should surface the abort to
+///   the user, skip `SubmitVerdict`, and instead send `AbortSession`
+///   (`minimald_rpc::AbortSession`) so the daemon drops its stash
+///   entry and deletes the on-disk `Pending` record. Without that,
+///   the record and stash slot leak until the next daemon restart:
+///   the in-memory stash is cleared by the restart itself, and the
+///   on-disk record is cleared by `reap_orphan_pending` at startup.
+///   The stash is bounded by `MAX_PENDING_SESSIONS`; further
+///   `CreateSession` requests that would produce a Pending outcome
+///   are refused with `ResourceBusy` once the cap is reached.
 /// - [`ComposeError::VarResolution`] when an `Inherit`-shaped
 ///   pending var can't be resolved against the env.
 /// - [`ComposeError::Expansion`] / [`ComposeError::PatchWalk`] for

@@ -28,11 +28,12 @@ sequenceDiagram
     Note over C: Loadout → Contribution (Loadout::contribute, resolve vars, tag provenance)
     Note over C: Contribution → Composition (UserComposer::compose runs the policy gate)
     Note over C: Composition → WireContribution (composition_to_wire)
-    C->>D: SessionCreate carrying WireContribution
+    C->>D: CreateSession carrying WireContribution
     Note over D: Phase 2 — collect project + package contributions, collect pending items
-    D-->>C: SessionStep::Response carrying ContributionResponse
+    D-->>C: CreateSessionResponse::Pending carrying ContributionResponse
     Note over C: Phase 3 — policy gate pending items, produce verdicts
     C->>D: SubmitVerdict carrying ContributionVerdict
+    D-->>C: SessionStep::Active { id }
     Note over D: Phase 4 — apply verdicts, assemble Composition, hand to apply layer
 ```
 

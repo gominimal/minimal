@@ -154,6 +154,7 @@ enum ManagerMessage {
     SubmitVerdict(Box<SubmitVerdictMsg>),
     RenameSession(SessionId, String, Responder<()>),
     DestroySession(SessionId, Responder<()>),
+    AbortSession(SessionId, Responder<()>),
     Shutdown(bool, Responder<Result<(), ()>>),
 }
 
@@ -680,6 +681,44 @@ impl<L: Loader> Manager<L> {
                 })
                 .await
             }
+            // Abort a `Pending` session: drop its stash entry and
+            // delete the on-disk record. Refuses `Active` (use
+            // `DestroySession`) or unknown ids. Never touches
+            // `running`: a Pending record can't be running.
+            ManagerMessage::AbortSession(id, r) => {
+                r.handle(async {
+                    if self.in_shutdown {
+                        return Err(SessionsError::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            "in shutdown",
+                        ));
+                    }
+                    let k = self.store.find_by_id(&id)?.ok_or_else(|| {
+                        std::io::Error::new(
+                            NotFound,
+                            format!("no session with ID `{}`", id.as_ref()),
+                        )
+                    })?;
+                    let record = self.store.get(&k)?.record().clone();
+                    if record.status != sessions::SessionStatus::Pending {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "cannot abort session `{}`: status is {:?}, expected Pending",
+                                id.as_ref(),
+                                record.status,
+                            ),
+                        ));
+                    }
+                    // Stash may be absent (post-restart orphan reached
+                    // us before the reap pass, or the pending path was
+                    // never populated). Delete the record either way.
+                    self.pending.remove(&id);
+                    self.store.delete(&k)?;
+                    Ok(())
+                })
+                .await
+            }
             // Destroys a session: tears down its running host and actor (if
             // any), then removes its on-disk record.
             ManagerMessage::DestroySession(id, r) => {
@@ -897,6 +936,23 @@ impl ManagerHandle {
         recv.await.expect("corresponding sessions manager is dead")
     }
 
+    /// Aborts a `Pending` session: drops the daemon's stash entry and
+    /// deletes the on-disk record. Used by the client when its
+    /// Phase 3 gating produces no verdict (e.g. user cancelled at a
+    /// prompt).
+    ///
+    /// `NotFound` if the id is unknown; `InvalidInput` if the record
+    /// exists but its status isn't `Pending`
+    /// (use [`Self::destroy_session`] on an `Active` session).
+    pub async fn abort_session(&self, id: SessionId) -> Result<(), SessionsError> {
+        let (send, recv) = Responder::channel();
+        let _ = self
+            .sender
+            .send(ManagerMessage::AbortSession(id, send))
+            .await;
+        recv.await.expect("corresponding sessions manager is dead")
+    }
+
     /// Shuts down all sessions for process termination. If force is true, live sessions are killed.
     /// If force is false but there are live sessions, an error is returned.
     pub async fn shutdown(&self, force: bool) -> Result<(), ()> {
@@ -1105,6 +1161,42 @@ mod tests {
             loader.get(&active_key_again).unwrap().record().status,
             sessions::SessionStatus::Active,
             "the Active record should remain",
+        );
+    }
+
+    /// `AbortSession` on an unknown id → `NotFound`, mirrors
+    /// `DestroySession`'s error shape so clients can uniformly
+    /// handle "no such session".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_unknown_id_errors() {
+        let (_state, _cache, mngr) = manager().await;
+        let err = mngr
+            .abort_session(SessionId::nil())
+            .await
+            .expect_err("aborting an unknown id should error");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    /// `AbortSession` refuses `Active` records — abort is for
+    /// `Pending` only; `DestroySession` handles `Active`. Guards
+    /// against a client accidentally tearing down a running session
+    /// via the wrong RPC.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_refuses_active_session() {
+        let (_state, _cache, mngr) = manager().await;
+        let id = create_and_unwrap_id(&mngr).await;
+        let err = mngr
+            .abort_session(id)
+            .await
+            .expect_err("aborting an Active session should error");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // Record is untouched.
+        assert!(
+            mngr.get_record(SessionKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .is_some(),
+            "the Active record should survive a refused abort"
         );
     }
 
