@@ -116,7 +116,7 @@ prost = "0.14"
 prost-build = "0.14"
 prost-types = "0.14"
 resolv-conf = "0.7"
-russh = "0.61"
+russh = "0.62"
 russh-sftp = "2.1"
 serde_json = { version = "1.0" }
 serial_test = "3"
