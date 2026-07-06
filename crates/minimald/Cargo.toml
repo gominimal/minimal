@@ -12,6 +12,11 @@ networking-proxy = ["dep:rcgen", "dep:rustls", "dep:tokio-rustls"]
 # default `minimald` build pulls in no WireGuard code and pays no binary-size or
 # startup cost (R4.7); enable with `--features networking-wg`.
 networking-wg = ["dep:boringtun", "dep:base64", "dep:rand_core"]
+# Exposes the in-process test harness (TestServer/TestClient) so external
+# crates — notably `minimal`'s integration tests — can spin up a real
+# minimald server over an in-memory or UDS transport without a separate
+# binary. No production code should depend on this.
+test-support = []
 
 [dependencies]
 async-compression.workspace = true
