@@ -1,0 +1,73 @@
+name: CI shell installer
+
+# Static-analyses and tests the curl|sh fallback installer
+# (docs/specs/07-spec-installer). The installer targets strict POSIX sh, so this
+# gate enforces its Verification section: shellcheck --shell=sh with no warnings
+# (§1), and the unit-test harness run under dash and — critically — macOS's
+# frozen /bin/sh (§2/§3), where the installer takes its BSD mktemp and `shasum`
+# (no sha256sum) code paths. No network: the harness stubs the bucket.
+on:
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "scripts/install.sh"
+      - "scripts/install_test.sh"
+      - ".github/workflows/ci-shell-installer.yml"
+  push:
+    branches: ["main"]
+    paths:
+      - "scripts/install.sh"
+      - "scripts/install_test.sh"
+      - ".github/workflows/ci-shell-installer.yml"
+  workflow_dispatch:
+
+# Cancel superseded runs on a branch; never cancel a run on main.
+concurrency:
+  group: ci-shell-installer-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: shellcheck --shell=sh (no warnings)
+        # shellcheck is preinstalled on the ubuntu-latest runner image.
+        run: shellcheck --shell=sh scripts/install.sh scripts/install_test.sh
+
+  test:
+    name: test (${{ matrix.os }} / ${{ matrix.shell }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      # One shell/OS lane failing should not mask the others' results.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            shell: sh # dash-backed /bin/sh on Ubuntu
+          - os: ubuntu-latest
+            shell: dash # explicit dash conformance (spec Verification §2)
+          - os: macos-latest
+            shell: sh # macOS frozen bash 3.2 as /bin/sh
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run installer test harness under ${{ matrix.shell }}
+        run: SH='${{ matrix.shell }}' '${{ matrix.shell }}' scripts/install_test.sh
+
+  # Single stable status for branch protection: green only when shellcheck and
+  # every test lane succeed (the matrix lanes have dynamic names).
+  ci-shell-installer-success:
+    if: always()
+    needs: [shellcheck, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify all gating jobs succeeded
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      - run: echo "installer shellcheck + tests passed"

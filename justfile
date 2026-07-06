@@ -152,6 +152,25 @@ stop:
 clean:
     rm -f {{kernel}} {{rootfs}} {{initramfs}} {{gvproxy}} {{scratch}}/boot.log
 
+# Run the curl|sh installer's test harness under every POSIX sh available. The
+# installer targets strict POSIX sh, so dash conformance is checked alongside sh
+# (spec docs/specs/07-spec-installer, Verification §2); shellcheck --shell=sh is
+# run when present.
+test-installer:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v shellcheck >/dev/null 2>&1; then
+        echo "== shellcheck --shell=sh =="
+        shellcheck --shell=sh scripts/install.sh scripts/install_test.sh
+    else
+        echo "== shellcheck not found, skipping static check =="
+    fi
+    for sh in sh dash; do
+        command -v "$sh" >/dev/null 2>&1 || { echo "== $sh not found, skipping =="; continue; }
+        echo "== running install_test.sh under $sh =="
+        SH="$sh" "$sh" scripts/install_test.sh
+    done
+
 # ── DM1 / DM2 / DM3 deployment-model bring-up ────────────────────────────────
 #
 # DM1: macOS (Apple Silicon) host + Linux VM(s) over Hypervisor.framework. This
