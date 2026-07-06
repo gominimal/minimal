@@ -1,6 +1,6 @@
 use russh::{
     Channel as RuChannel, ChannelId,
-    server::{Config as RuConfig, Msg, RunningSession, Session},
+    server::{ChannelOpenHandle, Config as RuConfig, Msg, RunningSession, Session},
 };
 use sessions::SessionId;
 use std::{
@@ -277,17 +277,22 @@ impl russh::server::Handler for ConnectionHandler {
     async fn channel_open_session(
         &mut self,
         c: RuChannel<Msg>,
+        reply: ChannelOpenHandle,
         _: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         let mut s = self.0.lock().await;
         if s.auth != Auth::Local {
-            return Ok(false); // indicate failure
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await; // indicate failure
+            return Ok(());
         }
 
         protocol_trace!("Minting session channel with id {}", c.id());
         s.channels.insert(c.id(), Channel::new_session(c.id(), c));
 
-        Ok(true) // indicate success
+        reply.accept().await; // indicate success
+        Ok(())
     }
 
     async fn env_request(
@@ -468,8 +473,9 @@ impl russh::server::Handler for ConnectionHandler {
         port_to_connect: u32,
         originator_address: &str,
         originator_port: u32,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         protocol_trace!(
             "Got channel_open_direct_tcpip: {host_to_connect}:{port_to_connect} \
              from {originator_address}:{originator_port}"
@@ -485,7 +491,10 @@ impl russh::server::Handler for ConnectionHandler {
         };
 
         if !is_local {
-            return Ok(false);
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
         }
 
         // Validate the session identified by the SSH username (R4.9). The client
@@ -495,11 +504,17 @@ impl russh::server::Handler for ConnectionHandler {
         // without a valid session context.
         let Some(uname) = username.as_deref() else {
             tracing::warn!("direct-tcpip rejected: no SSH username");
-            return Ok(false);
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
         };
         let Ok(session_id) = SessionId::parse_str(uname) else {
             tracing::warn!(value = %uname, "direct-tcpip rejected: username not a session UUID");
-            return Ok(false);
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
         };
         let mngr = serv.sessions_manager().await;
         match mngr.get_session(SessionKeyPredicate::Id(session_id)).await {
@@ -509,7 +524,10 @@ impl russh::server::Handler for ConnectionHandler {
                     %session_id,
                     "direct-tcpip rejected: session not found"
                 );
-                return Ok(false);
+                reply
+                    .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
+                return Ok(());
             }
             Err(e) => {
                 tracing::warn!(
@@ -517,7 +535,10 @@ impl russh::server::Handler for ConnectionHandler {
                     error = %e,
                     "direct-tcpip rejected: session lookup failed"
                 );
-                return Ok(false);
+                reply
+                    .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
+                return Ok(());
             }
         }
 
@@ -526,7 +547,8 @@ impl russh::server::Handler for ConnectionHandler {
             Ok(p) => p,
             Err(_) => {
                 tracing::warn!(port = port_to_connect, "direct-tcpip: port out of range");
-                return Ok(false);
+                reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                return Ok(());
             }
         };
 
@@ -547,7 +569,8 @@ impl russh::server::Handler for ConnectionHandler {
                     %error,
                     "direct-tcpip: could not connect to target"
                 );
-                return Ok(false);
+                reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                return Ok(());
             }
             Err(_) => {
                 tracing::warn!(
@@ -555,14 +578,17 @@ impl russh::server::Handler for ConnectionHandler {
                     port,
                     "direct-tcpip: connection to target timed out"
                 );
-                return Ok(false);
+                reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                return Ok(());
             }
         };
+
+        reply.accept().await;
 
         // Relay bytes bidirectionally: SSH channel ↔ upstream TCP.
         tokio::spawn(relay_streams(channel.into_stream(), upstream));
 
-        Ok(true)
+        Ok(())
     }
 }
 
