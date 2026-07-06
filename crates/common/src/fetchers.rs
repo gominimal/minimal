@@ -264,3 +264,254 @@ impl FetchBackend for Storage {
         req.send().map(Ok)
     }
 }
+
+// --- Runtime-selectable backend --------------------------------------------
+//
+// The remote-cache *reader* needs to target either the GCS bucket (default) or
+// a plain-HTTPS mirror (e.g. a Cloudflare R2 custom domain, to avoid GCS egress
+// cost) chosen at runtime from config. Rather than thread a backend type
+// parameter through every consumer of `RemoteCache`, `AnyBackend` selects the
+// backend at construction and forwards each call to the chosen one. Writers
+// keep using the concrete `Storage` backend (compare-and-swap needs GCS
+// object generations, which plain HTTPS doesn't expose).
+
+/// A [FetchUrl] over either a GCS bucket URL or a plain HTTPS URL.
+#[derive(Clone, Debug)]
+pub enum AnyUrl {
+    Https(ReqwestUrl),
+    Gcs(GcsUrl),
+}
+
+/// Join error for [AnyUrl].
+#[derive(Debug)]
+pub enum AnyJoinError {
+    Https(url::ParseError),
+    Gcs(()),
+}
+
+impl FetchUrl for AnyUrl {
+    type JoinError = AnyJoinError;
+
+    fn join(&self, input: &str) -> Result<Self, Self::JoinError> {
+        match self {
+            AnyUrl::Https(u) => u
+                .join(input)
+                .map(AnyUrl::Https)
+                .map_err(AnyJoinError::Https),
+            AnyUrl::Gcs(u) => u.join(input).map(AnyUrl::Gcs).map_err(AnyJoinError::Gcs),
+        }
+    }
+
+    fn filename(&self) -> String {
+        match self {
+            AnyUrl::Https(u) => u.filename(),
+            AnyUrl::Gcs(u) => u.filename(),
+        }
+    }
+}
+
+/// A [FetchResponse] from either backend.
+#[derive(Debug)]
+pub enum AnyResponse {
+    Https(Response),
+    Gcs(Result<google_cloud_storage::read_object::ReadObjectResponse, GcsError>),
+}
+
+/// Error from an [AnyResponse] (or from constructing an [AnyBackend]).
+#[derive(Debug)]
+pub enum AnyRespError {
+    Https(ReqwestError),
+    Gcs(GcsError),
+    /// The configured plain-HTTPS read URL could not be parsed.
+    InvalidUrl(url::ParseError),
+}
+
+impl FetchResponse for AnyResponse {
+    type Error = AnyRespError;
+
+    fn error_for_status(self) -> Result<Self, Self::Error> {
+        match self {
+            AnyResponse::Https(r) => FetchResponse::error_for_status(r)
+                .map(AnyResponse::Https)
+                .map_err(AnyRespError::Https),
+            AnyResponse::Gcs(r) => FetchResponse::error_for_status(r)
+                .map(AnyResponse::Gcs)
+                .map_err(AnyRespError::Gcs),
+        }
+    }
+
+    fn is_success(&self) -> bool {
+        match self {
+            AnyResponse::Https(r) => FetchResponse::is_success(r),
+            AnyResponse::Gcs(r) => FetchResponse::is_success(r),
+        }
+    }
+
+    fn status_code(&self) -> usize {
+        match self {
+            AnyResponse::Https(r) => FetchResponse::status_code(r),
+            AnyResponse::Gcs(r) => FetchResponse::status_code(r),
+        }
+    }
+
+    fn content_length(&self) -> Option<u64> {
+        match self {
+            AnyResponse::Https(r) => FetchResponse::content_length(r),
+            AnyResponse::Gcs(r) => FetchResponse::content_length(r),
+        }
+    }
+
+    async fn bytes(self) -> Result<Bytes, Self::Error> {
+        match self {
+            AnyResponse::Https(r) => FetchResponse::bytes(r).await.map_err(AnyRespError::Https),
+            AnyResponse::Gcs(r) => FetchResponse::bytes(r).await.map_err(AnyRespError::Gcs),
+        }
+    }
+
+    async fn chunk(&mut self) -> Result<Option<Bytes>, Self::Error> {
+        match self {
+            AnyResponse::Https(r) => FetchResponse::chunk(r).await.map_err(AnyRespError::Https),
+            AnyResponse::Gcs(r) => FetchResponse::chunk(r).await.map_err(AnyRespError::Gcs),
+        }
+    }
+
+    fn generation(&self) -> Option<i64> {
+        match self {
+            AnyResponse::Https(r) => FetchResponse::generation(r),
+            AnyResponse::Gcs(r) => FetchResponse::generation(r),
+        }
+    }
+}
+
+/// A request for either backend.
+#[derive(Debug)]
+pub enum AnyRequest {
+    Https(Request),
+    Gcs(google_cloud_storage::builder::storage::ReadObject),
+}
+
+/// A [FetchBackend] that is either the GCS client or a reqwest HTTPS client,
+/// selected at construction. See the module note above.
+#[derive(Clone, Debug)]
+pub enum AnyBackend {
+    Https(Client),
+    Gcs(Storage),
+}
+
+impl FetchBackend for AnyBackend {
+    type Url = AnyUrl;
+    type Request = AnyRequest;
+    type Response = AnyResponse;
+
+    fn get(
+        &self,
+        url: Self::Url,
+    ) -> Result<Self::Request, <Self::Response as FetchResponse>::Error> {
+        match (self, url) {
+            (AnyBackend::Https(c), AnyUrl::Https(u)) => FetchBackend::get(c, u)
+                .map(AnyRequest::Https)
+                .map_err(AnyRespError::Https),
+            (AnyBackend::Gcs(s), AnyUrl::Gcs(u)) => FetchBackend::get(s, u)
+                .map(AnyRequest::Gcs)
+                .map_err(AnyRespError::Gcs),
+            // A RemoteCache is always built with a matching backend+url pair
+            // (see RemoteCache::new_any_*), so a mismatch is a construction bug.
+            _ => unreachable!("AnyBackend: url does not match backend variant"),
+        }
+    }
+
+    async fn execute(
+        &self,
+        req: Self::Request,
+    ) -> Result<Self::Response, <Self::Response as FetchResponse>::Error> {
+        match (self, req) {
+            (AnyBackend::Https(c), AnyRequest::Https(r)) => FetchBackend::execute(c, r)
+                .await
+                .map(AnyResponse::Https)
+                .map_err(AnyRespError::Https),
+            (AnyBackend::Gcs(s), AnyRequest::Gcs(r)) => FetchBackend::execute(s, r)
+                .await
+                .map(AnyResponse::Gcs)
+                .map_err(AnyRespError::Gcs),
+            _ => unreachable!("AnyBackend: request does not match backend variant"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod any_backend_tests {
+    use super::*;
+
+    fn https(base: &str) -> AnyUrl {
+        AnyUrl::Https(ReqwestUrl::try_from(base).unwrap())
+    }
+    fn gcs(object: &str) -> AnyUrl {
+        AnyUrl::Gcs(GcsUrl {
+            bucket: "projects/_/buckets/b".into(),
+            object: object.into(),
+        })
+    }
+
+    #[test]
+    fn any_url_https_join_appends_segment() {
+        let joined = https("https://cache.example.com/")
+            .join("index.shisha")
+            .unwrap();
+        match &joined {
+            AnyUrl::Https(u) => assert_eq!(u.0.as_str(), "https://cache.example.com/index.shisha"),
+            other => panic!("expected Https, got {other:?}"),
+        }
+        assert_eq!(joined.filename(), "index.shisha");
+    }
+
+    #[test]
+    fn any_url_https_join_requires_trailing_slash() {
+        // Footgun: without a trailing slash on the base, Url::join replaces the
+        // last path segment instead of appending under it. This is exactly why
+        // the R2 / mirror base URL must end in `/`.
+        let no_slash = https("https://cache.example.com/prefix")
+            .join("a.zst")
+            .unwrap();
+        match &no_slash {
+            AnyUrl::Https(u) => assert_eq!(u.0.as_str(), "https://cache.example.com/a.zst"),
+            other => panic!("expected Https, got {other:?}"),
+        }
+        let with_slash = https("https://cache.example.com/prefix/")
+            .join("a.zst")
+            .unwrap();
+        match &with_slash {
+            AnyUrl::Https(u) => assert_eq!(u.0.as_str(), "https://cache.example.com/prefix/a.zst"),
+            other => panic!("expected Https, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn any_url_gcs_join_and_filename() {
+        let joined = gcs("").join("abc.zst").unwrap();
+        match &joined {
+            AnyUrl::Gcs(u) => assert_eq!(u.object, "abc.zst"),
+            other => panic!("expected Gcs, got {other:?}"),
+        }
+        assert_eq!(joined.filename(), "abc.zst");
+        // A nested join uses `/` separators; filename() returns the last segment.
+        assert_eq!(gcs("dir").join("file.zst").unwrap().filename(), "file.zst");
+    }
+
+    #[test]
+    fn any_backend_get_dispatches_to_https() {
+        let backend = AnyBackend::Https(Client::new());
+        let req = backend
+            .get(https("https://cache.example.com/index.shisha"))
+            .unwrap();
+        assert!(matches!(req, AnyRequest::Https(_)));
+    }
+
+    #[test]
+    #[should_panic(expected = "does not match backend")]
+    fn any_backend_get_rejects_url_backend_mismatch() {
+        // An HTTPS backend handed a GCS url is a construction bug -> panic,
+        // never a silent wrong fetch.
+        let backend = AnyBackend::Https(Client::new());
+        let _ = backend.get(gcs("o"));
+    }
+}

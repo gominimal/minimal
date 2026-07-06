@@ -10,6 +10,7 @@ use std::{
 
 use anyhow::anyhow;
 use checkouts::{Manager as VcsManager, ManagerHandle as VcsManagerHandle};
+use common::fetchers::{AnyBackend, AnyRespError};
 use common::{SpecOrigin, Target};
 use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
 use lcache::CacheBinProvider;
@@ -386,29 +387,40 @@ impl Context {
         &self,
         auth: bool,
         force_fresh: bool,
-    ) -> Result<RemoteCache<GcsStorage>, RemoteError<GcsError>> {
+    ) -> Result<RemoteCache<AnyBackend>, RemoteError<AnyRespError>> {
         let start = SystemTime::now();
-        let backend = if auth {
-            GcsStorage::builder().build().await.unwrap()
+        let index_dir = if force_fresh {
+            None
         } else {
-            GcsStorage::builder()
-                .with_credentials(google_cloud_auth::credentials::anonymous::Builder::new().build())
-                .build()
-                .await
-                .unwrap()
+            Some(self.config.index_dir())
         };
 
-        let res = RemoteCache::new_with_gcs_bucket(
-            backend,
-            self.config.remote_cache_bucket(),
-            if force_fresh {
-                None
+        // When a read URL is configured (e.g. a Cloudflare R2 custom domain via
+        // MINIMAL_REMOTE_CACHE_URL), fetch artifacts over plain HTTPS to avoid
+        // GCS egress cost; otherwise read through the GCS client (the default,
+        // unchanged). Writes always use GCS regardless (see remote_cache_writer).
+        let res = if let Some(url) = self.config.remote_cache_read_url() {
+            RemoteCache::new_any_https(url, index_dir, self.config.ot.clone()).await
+        } else {
+            let backend = if auth {
+                GcsStorage::builder().build().await.unwrap()
             } else {
-                Some(self.config.index_dir())
-            },
-            self.config.ot.clone(),
-        )
-        .await;
+                GcsStorage::builder()
+                    .with_credentials(
+                        google_cloud_auth::credentials::anonymous::Builder::new().build(),
+                    )
+                    .build()
+                    .await
+                    .unwrap()
+            };
+            RemoteCache::new_any_gcs(
+                backend,
+                self.config.remote_cache_bucket(),
+                index_dir,
+                self.config.ot.clone(),
+            )
+            .await
+        };
         tracing::trace!("remote cache init took {:?}", start.elapsed());
         res
     }

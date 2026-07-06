@@ -41,6 +41,17 @@ impl std::error::Error for ConfigError {
 /// via [ConfigBuilder::with_remote_cache_bucket].
 pub const DEFAULT_REMOTE_CACHE_BUCKET: &str = "minimal-staging-cache";
 
+/// Resolves the remote-cache reader URL override: a non-empty explicit builder
+/// value wins; otherwise a non-empty `MINIMAL_REMOTE_CACHE_URL`; else `None`
+/// (reads go through the GCS client). Empty / whitespace-only values in either
+/// source are treated as unset. Pure so the precedence is unit-testable without
+/// touching process env.
+fn resolve_remote_cache_read_url(builder: Option<String>, env: Option<String>) -> Option<String> {
+    builder
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| env.filter(|s| !s.trim().is_empty()))
+}
+
 /// Builder for [Config].
 #[derive(Debug, Default, Clone)]
 pub struct ConfigBuilder {
@@ -57,6 +68,7 @@ pub struct ConfigBuilder {
     vcs_manager: Option<ManagerHandle>,
     ot: Option<OpTracker>,
     remote_cache_bucket: Option<String>,
+    remote_cache_read_url: Option<String>,
 }
 
 impl ConfigBuilder {
@@ -133,6 +145,17 @@ impl ConfigBuilder {
         self.remote_cache_bucket = Some(bucket);
         self
     }
+    /// Override the base URL the remote cache *reader* fetches from, bypassing
+    /// the GCS client in favour of plain unauthenticated HTTPS GETs. Point this
+    /// at an S3-compatible mirror (e.g. a Cloudflare R2 custom domain) to avoid
+    /// GCS egress cost. The URL MUST end in `/`. Takes precedence over the
+    /// `MINIMAL_REMOTE_CACHE_URL` environment variable; when neither is set,
+    /// reads go through the GCS client against the configured bucket. The
+    /// *writer* is unaffected (writes always use GCS).
+    pub fn with_remote_cache_read_url(mut self, url: String) -> Self {
+        self.remote_cache_read_url = Some(url);
+        self
+    }
 }
 
 impl ConfigBuilder {
@@ -144,6 +167,14 @@ impl ConfigBuilder {
         if remote_cache_bucket.trim().is_empty() {
             return Err(ConfigError::InvalidRemoteCacheBucket(remote_cache_bucket));
         }
+
+        // An explicit builder value wins; otherwise honour the
+        // `MINIMAL_REMOTE_CACHE_URL` env var, so CI / deployments can repoint
+        // cache reads at an R2 mirror without a code change.
+        let remote_cache_read_url = resolve_remote_cache_read_url(
+            self.remote_cache_read_url,
+            std::env::var("MINIMAL_REMOTE_CACHE_URL").ok(),
+        );
 
         Ok(Config {
             no_cache: self.no_cache.unwrap_or(false),
@@ -170,6 +201,7 @@ impl ConfigBuilder {
             vcs_manager: self.vcs_manager,
             ot: self.ot,
             remote_cache_bucket,
+            remote_cache_read_url,
         })
     }
 }
@@ -190,6 +222,7 @@ impl Config {
             vcs_manager: self.vcs_manager,
             ot: self.ot,
             remote_cache_bucket: Some(self.remote_cache_bucket),
+            remote_cache_read_url: self.remote_cache_read_url,
         }
     }
 }
@@ -224,6 +257,10 @@ pub struct Config {
     /// defaults to [DEFAULT_REMOTE_CACHE_BUCKET] when the builder did
     /// not specify one.
     remote_cache_bucket: String,
+    /// Optional base URL for the remote cache *reader* — plain HTTPS instead of
+    /// the GCS client (e.g. a Cloudflare R2 mirror). `None` reads via GCS. See
+    /// [ConfigBuilder::with_remote_cache_read_url].
+    remote_cache_read_url: Option<String>,
 }
 
 impl Config {
@@ -264,6 +301,12 @@ impl Config {
     /// Returns the GCS bucket name for the remote cache.
     pub fn remote_cache_bucket(&self) -> &str {
         &self.remote_cache_bucket
+    }
+    /// Returns the remote-cache *reader* base URL override (plain HTTPS), if set
+    /// via the builder or `MINIMAL_REMOTE_CACHE_URL`. `None` reads via the GCS
+    /// client against [Self::remote_cache_bucket].
+    pub fn remote_cache_read_url(&self) -> Option<&str> {
+        self.remote_cache_read_url.as_deref()
     }
 
     pub(crate) fn built_cache_dir(&self) -> PathBuf {
@@ -330,5 +373,65 @@ mod tests {
             .build()
             .unwrap_err();
         assert!(matches!(err, ConfigError::InvalidRemoteCacheBucket(_)));
+    }
+
+    #[test]
+    fn read_url_none_when_neither_set() {
+        assert_eq!(resolve_remote_cache_read_url(None, None), None);
+    }
+
+    #[test]
+    fn read_url_builder_wins_over_env() {
+        assert_eq!(
+            resolve_remote_cache_read_url(
+                Some("https://builder/".into()),
+                Some("https://env/".into())
+            ),
+            Some("https://builder/".to_string())
+        );
+    }
+
+    #[test]
+    fn read_url_falls_back_to_env() {
+        assert_eq!(
+            resolve_remote_cache_read_url(None, Some("https://env/".into())),
+            Some("https://env/".to_string())
+        );
+    }
+
+    #[test]
+    fn read_url_ignores_empty_and_whitespace() {
+        // Empty/whitespace builder value falls through to a non-empty env var.
+        assert_eq!(
+            resolve_remote_cache_read_url(Some("  ".into()), Some("https://env/".into())),
+            Some("https://env/".to_string())
+        );
+        // Empty/whitespace in both -> None (read via GCS).
+        assert_eq!(
+            resolve_remote_cache_read_url(Some(String::new()), None),
+            None
+        );
+        assert_eq!(
+            resolve_remote_cache_read_url(None, Some("\t\n".into())),
+            None
+        );
+        assert_eq!(
+            resolve_remote_cache_read_url(Some("".into()), Some(" ".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn read_url_builder_round_trips_through_config() {
+        // The builder value is non-empty, so it wins regardless of any ambient
+        // MINIMAL_REMOTE_CACHE_URL in the test process -> no env flakiness.
+        let cfg = ConfigBuilder::new()
+            .with_remote_cache_read_url("https://cache.example.com/".into())
+            .build()
+            .unwrap();
+        assert_eq!(
+            cfg.remote_cache_read_url(),
+            Some("https://cache.example.com/")
+        );
     }
 }

@@ -5,9 +5,9 @@ use crate::{
     SharedHandle, StateHandle,
 };
 use common::SpecHash;
+use common::fetchers::AnyBackend;
 use either::Either;
 use futures::channel::mpsc;
-use google_cloud_storage::client::Storage as GcsStorage;
 use graph::{BinProvider, BuildSpecRef, Graph, SubsetInput};
 use lcache::{Cache, CacheErr, DirCacheEntry, EntryMeta, LocalDir, MetaInner, PendingDir};
 use op::{Runnable, SourceFetcher};
@@ -131,7 +131,7 @@ impl Drop for SinkWriter {
 pub struct LocalBackend<SF: SourceFetcher + 'static> {
     pub(crate) sf: SF,
     pub(crate) output_base: PathBuf,
-    pub(crate) remote_cache: Option<RemoteCache<GcsStorage>>,
+    pub(crate) remote_cache: Option<RemoteCache<AnyBackend>>,
     pub(crate) build_semaphore: Semaphore,
     pub(crate) num_concurrent_builds: usize,
     pub(crate) log_sink: Option<mpsc::UnboundedSender<BuildEvent>>,
@@ -389,7 +389,7 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
     #[allow(clippy::too_many_arguments)]
     pub fn new_orchestrator(
         output_base: PathBuf,
-        remote_cache: Option<RemoteCache<GcsStorage>>,
+        remote_cache: Option<RemoteCache<AnyBackend>>,
         sf: SF,
         num_concurrent_builds: usize,
         graph: Graph,

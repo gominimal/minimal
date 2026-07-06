@@ -131,6 +131,45 @@ impl RemoteCache<Storage> {
     }
 }
 
+impl RemoteCache<AnyBackend> {
+    /// Reader over a plain-HTTPS base URL — a public GCS bucket URL
+    /// (`https://storage.googleapis.com/<bucket>/`) or an S3-compatible mirror
+    /// such as a Cloudflare R2 custom domain (to avoid GCS egress cost).
+    /// Objects are fetched with unauthenticated GETs, so they must be publicly
+    /// readable. `url` MUST end in `/`, or [`url::Url::join`] drops its last
+    /// path segment when resolving object names against it.
+    #[tracing::instrument(skip_all, fields(url = %url), err)]
+    pub async fn new_any_https(
+        url: &str,
+        index_dir: Option<PathBuf>,
+        ot: Option<OpTracker>,
+    ) -> Result<Self, Error<AnyRespError>> {
+        let parsed = reqwest::Url::parse(url).map_err(AnyRespError::InvalidUrl)?;
+        let client = Client::builder()
+            .user_agent("minimal/remote-cache")
+            .build()
+            .map_err(AnyRespError::Https)?;
+        let base = AnyUrl::Https(ReqwestUrl::from(parsed));
+        Self::new(AnyBackend::Https(client), base, index_dir, ot).await
+    }
+
+    /// Reader over the GCS client + bucket — the default read path, preserving
+    /// the exact behaviour of [`RemoteCache::new_with_gcs_bucket`].
+    #[tracing::instrument(skip_all, fields(bucket_id = %bucket_id), err)]
+    pub async fn new_any_gcs(
+        storage: Storage,
+        bucket_id: &str,
+        index_dir: Option<PathBuf>,
+        ot: Option<OpTracker>,
+    ) -> Result<Self, Error<AnyRespError>> {
+        let base = AnyUrl::Gcs(GcsUrl {
+            bucket: format!("projects/_/buckets/{bucket_id}"),
+            object: String::new(),
+        });
+        Self::new(AnyBackend::Gcs(storage), base, index_dir, ot).await
+    }
+}
+
 impl<B: FetchBackend> RemoteCache<B> {
     /// Creates a new remote cache based on the given backend and URL.
     pub async fn new(
@@ -178,7 +217,9 @@ impl<B: FetchBackend> RemoteCache<B> {
         let index = match index_resp.status_code() {
             404 => RemoteIndex::default(),
             _ => {
-                fetch_op.set_length(index_resp.content_length().unwrap());
+                // Progress total only; a plain-HTTPS backend may omit
+                // Content-Length (chunked transfer), so don't panic on None.
+                fetch_op.set_length(index_resp.content_length().unwrap_or(0));
 
                 let mut buffer =
                     Vec::with_capacity(index_resp.content_length().unwrap_or(1024 * 1024) as usize);
@@ -249,7 +290,8 @@ impl<B: FetchBackend> RemoteCache<B> {
 
         // Fetch the remote archive into a temporary file and seek to the beginning for decoding.
         let mut resp = self.backend.execute(req).await?;
-        materialize_op.set_length(resp.content_length().unwrap());
+        // Progress total only; tolerate a missing Content-Length (see above).
+        materialize_op.set_length(resp.content_length().unwrap_or(0));
 
         let mut w = common::Tee::new(
             tempfile::tempfile().map_err(Error::IO)?,
@@ -436,5 +478,75 @@ mod tests {
         // Present spec hash -> its indexed sha256; absent -> None.
         assert_eq!(rc.sha256(&spec_hash), Some(sha256));
         assert_eq!(rc.sha256(&SpecHash::from_bytes([0x11; 32])), None);
+    }
+
+    /// A throwaway single-purpose HTTP/1.1 server that answers `GET
+    /// /index.shisha` with `index` (200) or 404s it when `index` is `None`, and
+    /// 404s everything else. Returns the base URL (with the required trailing
+    /// `/`). Used to exercise the real reqwest transport behind
+    /// `AnyBackend::Https` end-to-end (not a mock backend).
+    fn serve_index(index: Option<Vec<u8>>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let req = String::from_utf8_lossy(&buf);
+                let wants_index = req.starts_with("GET /index.shisha ");
+                let (status, body): (&str, &[u8]) = match (&index, wants_index) {
+                    (Some(bytes), true) => ("200 OK", bytes),
+                    _ => ("404 Not Found", b""),
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    #[tokio::test]
+    async fn new_any_https_fetches_and_parses_index_over_real_http() {
+        let spec_hash = SpecHash::from_bytes([0x07; 32]);
+        let sha256: [u8; 32] = [0x42; 32];
+        let mut index = RemoteIndex::default();
+        index.extend(std::iter::once((spec_hash.clone(), sha256)));
+        let mut index_bytes = Vec::new();
+        index.write_to(&mut index_bytes).unwrap();
+
+        let base = serve_index(Some(index_bytes));
+
+        // Reads the index over real HTTPS-shaped transport (AnyBackend::Https ->
+        // reqwest get/execute/chunk/content_length), then parses it.
+        let rc = RemoteCache::new_any_https(&base, None, None).await.unwrap();
+        assert_eq!(rc.sha256(&spec_hash), Some(sha256));
+        assert_eq!(rc.sha256(&SpecHash::from_bytes([0x99; 32])), None);
+    }
+
+    #[tokio::test]
+    async fn new_any_https_treats_404_index_as_empty() {
+        // A 404 on the index must yield an empty (not errored) cache, matching
+        // the GCS path — a fresh bucket/mirror has no index yet.
+        let base = serve_index(None);
+        let rc = RemoteCache::new_any_https(&base, None, None).await.unwrap();
+        assert_eq!(rc.sha256(&SpecHash::from_bytes([0x07; 32])), None);
+    }
+
+    #[tokio::test]
+    async fn new_any_https_rejects_malformed_url() {
+        let err = RemoteCache::new_any_https("not a url", None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Backend(AnyRespError::InvalidUrl(_))),
+            "expected InvalidUrl, got {err:?}"
+        );
     }
 }
