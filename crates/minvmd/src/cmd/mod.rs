@@ -170,12 +170,15 @@ pub(crate) fn default_vm_known_hosts_path() -> std::path::PathBuf {
 /// and known_hosts write errors are logged as warnings and do not abort boot
 /// (R2.3).
 #[cfg(any(minvmd_libkrun, test))]
-pub(crate) fn read_ready_beacon(
-    reader: &mut impl std::io::BufRead,
+pub(crate) fn read_ready_beacon<R: std::io::BufRead>(
+    reader: &mut R,
     known_hosts_path: &std::path::Path,
 ) -> Result<(), String> {
+    use std::io::BufRead;
     let mut line = String::new();
-    reader
+    // Use UFCS so Rust resolves `Self = &mut R` (not `R`) in the function-call
+    // context, producing Take<&mut R> without a move out of the mutable reference.
+    std::io::Read::take(reader.by_ref(), 32)
         .read_line(&mut line)
         .map_err(|e| format!("reading READY marker: {e}"))?;
     let trimmed = line.trim();
@@ -184,8 +187,10 @@ pub(crate) fn read_ready_beacon(
     }
 
     // Try to read the optional second line: SSH host public key (R2.1).
+    // Cap the read at 4097 bytes so the allocation ceiling is enforced at the
+    // I/O layer rather than after the fact.
     let mut pubkey_line = String::new();
-    match reader.read_line(&mut pubkey_line) {
+    match std::io::Read::take(reader.by_ref(), 4097).read_line(&mut pubkey_line) {
         Err(e) => {
             tracing::debug!(error = %e, "failed to read pubkey line from beacon; skipping");
         }
@@ -306,6 +311,24 @@ mod beacon_tests {
         assert!(
             !known_hosts_path.exists(),
             "no known_hosts should be written when pubkey line is absent"
+        );
+    }
+
+    #[test]
+    fn read_ready_beacon_rejects_oversized_pubkey_line() {
+        // A pubkey line longer than 4096 bytes must be skipped gracefully
+        // without writing known_hosts.
+        let oversized = "x".repeat(5000);
+        let beacon = format!("READY\n{oversized}\n");
+        let mut reader = Cursor::new(beacon.into_bytes());
+        let tmp = tempfile::tempdir().unwrap();
+        let known_hosts_path = tmp.path().join("known_hosts");
+
+        read_ready_beacon(&mut reader, &known_hosts_path)
+            .expect("must not fail on oversized pubkey (graceful skip)");
+        assert!(
+            !known_hosts_path.exists(),
+            "no known_hosts should be written when pubkey line is too long"
         );
     }
 
