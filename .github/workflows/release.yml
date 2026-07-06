@@ -517,6 +517,17 @@ jobs:
                     --artifacts-dir artifacts \
                     --version "${{ steps.release_info.outputs.short_sha }}" \
                     --bucket gs://minimal-one
+            - name: Stage the installer script into the versioned folder
+              # Keep a version-pinned copy of the curl|sh installer next to the
+              # components it reads, so each version's install path is immutable
+              # and self-contained. Same immutable cache header as the other
+              # versions/<sha>/ artifacts. Done before the channel advances so the
+              # versioned folder is complete when anything points at it.
+              run: |
+                  gcloud storage cp \
+                    --cache-control="public, max-age=31536000, immutable" \
+                    scripts/install.sh \
+                    "gs://minimal-one/versions/${{ steps.release_info.outputs.short_sha }}/install.sh"
             - name: Point unstable channel at this release
               # `unstable` auto-advances to every fresh build — it is the
               # bleeding-edge channel, so no approval gate. Promotion to `stable`
