@@ -478,3 +478,51 @@ jobs:
                     $(find . -maxdepth 1 -type f) \
                     --repo="${GITHUB_REPOSITORY}" \
                     --title="${{ steps.release_info.outputs.name }}"
+
+    stage-installer:
+        # Publish the release into gs://minimal-one in the layout the curl|bash
+        # installer reads (docs/specs/07-spec-installer). It re-fetches the same
+        # build artifacts and touches only gs://minimal-one.
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        needs: [release]
+        permissions:
+            contents: read
+            id-token: write
+        steps:
+            - uses: actions/checkout@v7
+            - name: Generate release info
+              id: release_info
+              run: |
+                  SHORT_SHA=$(git rev-parse --short=8 HEAD)
+                  echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+            - name: Download artifacts
+              uses: actions/download-artifact@v8
+              with:
+                  pattern: "*-*-*"
+                  path: artifacts/
+                  merge-multiple: true
+            - name: Authenticate to Google Cloud (installer bucket)
+              # Distinct project + workload-identity pool from the release job's
+              # minimal-shim auth; this one grants write to gs://minimal-one.
+              uses: google-github-actions/auth@v3
+              with:
+                  project_id: "524228262772"
+                  workload_identity_provider: "projects/524228262772/locations/global/workloadIdentityPools/github/providers/gominimal"
+            - name: Stage release into installer bucket
+              # Upload versions/<sha>/{components,<artifacts>}. Inert on its own:
+              # changes nothing users receive until a channel points at it.
+              run: |
+                  scripts/stage-release.sh \
+                    --artifacts-dir artifacts \
+                    --version "${{ steps.release_info.outputs.short_sha }}" \
+                    --bucket gs://minimal-one
+            - name: Point unstable channel at this release
+              # `unstable` auto-advances to every fresh build — it is the
+              # bleeding-edge channel, so no approval gate. Promotion to `stable`
+              # is the manual, gated promote-cli workflow.
+              run: |
+                  scripts/set-channel.sh \
+                    --channel unstable \
+                    --version "${{ steps.release_info.outputs.short_sha }}" \
+                    --bucket gs://minimal-one
