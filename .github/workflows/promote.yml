@@ -4,14 +4,17 @@ on:
     workflow_dispatch:
         inputs:
             sha:
-                description: "Short SHA to promote (leave empty for latest in bucket)"
+                description: "Staged version (short SHA) to promote (leave empty for latest staged in bucket)"
                 required: false
                 type: string
-            platforms:
-                description: "Comma-separated platform list or 'all'"
-                required: false
-                default: "amd64-linux,arm64-linux"
-                type: string
+            target:
+                description: "Channel to point at the version"
+                required: true
+                default: "stable"
+                type: choice
+                options:
+                    - stable
+                    - unstable
             dry_run:
                 description: "Dry run — open issue + wait for approval but skip the GCS write"
                 required: false
@@ -47,7 +50,7 @@ jobs:
                   SERVER_URL: ${{ github.server_url }}
                   RUN_ID: ${{ github.run_id }}
                   SHA_INPUT: ${{ inputs.sha }}
-                  PLATFORMS_INPUT: ${{ inputs.platforms }}
+                  TARGET_INPUT: ${{ inputs.target }}
                   DRY_RUN: ${{ inputs.dry_run }}
               run: |
                   set -euo pipefail
@@ -55,8 +58,8 @@ jobs:
                   **Workflow:** \`${WORKFLOW}\`
                   **Requested by:** @${ACTOR}
                   **Run:** ${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}
-                  **SHA input:** \`${SHA_INPUT:-<latest>}\`
-                  **Platforms:** \`${PLATFORMS_INPUT}\`
+                  **SHA input:** \`${SHA_INPUT:-<latest staged>}\`
+                  **Target channel:** \`${TARGET_INPUT}\`
                   **Dry run:** \`${DRY_RUN}\`
 
                   Comment **\`approved\`** to proceed or **\`denied\`** to cancel.
@@ -153,46 +156,57 @@ jobs:
             contents: "read"
             id-token: "write"
         steps:
+            - uses: actions/checkout@v7
             - name: Authenticate to Google Cloud
               uses: google-github-actions/auth@v3
               with:
-                  project_id: "289724348228"
-                  workload_identity_provider: "projects/289724348228/locations/global/workloadIdentityPools/github/providers/gominimal"
+                  project_id: "524228262772"
+                  workload_identity_provider: "projects/524228262772/locations/global/workloadIdentityPools/github/providers/gominimal"
 
-            - name: Promote CLI version
+            - name: Point channel at staged version
               id: promote
               env:
                   DRY_RUN: ${{ inputs.dry_run }}
                   # Pass dispatch inputs via env (NOT inline ${{ inputs.* }} in `run:`)
                   # to avoid shell template injection — see GitHub's hardening guide.
                   INPUT_SHA: ${{ inputs.sha }}
-                  INPUT_PLATFORMS: ${{ inputs.platforms }}
+                  INPUT_TARGET: ${{ inputs.target }}
               run: |
+                  set -euo pipefail
                   # Trim leading/trailing whitespace; users often paste SHAs with stray spaces.
                   SHA="$(printf '%s' "$INPUT_SHA" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-                  PLATFORMS="$(printf '%s' "$INPUT_PLATFORMS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-
-                  if [ "$PLATFORMS" = "all" ]; then
-                    PLATFORMS="amd64-linux,arm64-linux"
-                  fi
+                  TARGET="$(printf '%s' "$INPUT_TARGET" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
 
                   if [ -z "$SHA" ]; then
-                    echo "No SHA provided, finding latest archive in bucket..."
-                    LATEST=$(gcloud storage ls -l "gs://minimal-shim/archives/minimalone-*.tar.zst" \
+                    echo "No SHA provided; finding the most recently staged version in gs://minimal-one..."
+                    # Each staged version has a versions/<sha>/components manifest;
+                    # sort those by creation time (col 2 of `ls -l`) and take the newest.
+                    # `|| true`: on an empty match `gcloud` errors and/or the
+                    # `grep -v` emits nothing (exit 1), which under `pipefail`
+                    # would abort via `set -e` before the emptiness check below.
+                    LATEST=$(gcloud storage ls -l "gs://minimal-one/versions/*/components" \
                       | grep -v "^TOTAL:" \
                       | sort -k2 \
                       | tail -1 \
-                      | awk '{print $NF}')
+                      | awk '{print $NF}' || true)
                     if [ -z "$LATEST" ]; then
-                      echo "ERROR: No archive found in bucket"
+                      echo "ERROR: no staged versions found under gs://minimal-one/versions/"
                       exit 1
                     fi
-                    # Extract SHA: archives/minimalone-<sha>.tar.zst → <sha>
-                    SHA="$(basename "$LATEST" | sed 's/^minimalone-//;s/\.tar\.zst$//')"
-                    echo "Latest SHA: ${SHA}"
+                    # gs://minimal-one/versions/<sha>/components → <sha>
+                    SHA="$(basename "$(dirname "$LATEST")")"
+                    echo "Latest staged SHA: ${SHA}"
                   fi
 
-                  # TODO: implement minimal-one-specific promotion process!!
+                  # set-channel.sh verifies the version is actually staged before it
+                  # flips the pointer, and validates the target/version charset.
+                  DRY_FLAG=""
+                  [ "$DRY_RUN" = "true" ] && DRY_FLAG="--dry-run"
+                  scripts/set-channel.sh \
+                    --channel "$TARGET" \
+                    --version "$SHA" \
+                    --bucket gs://minimal-one \
+                    $DRY_FLAG
 
                   # Export resolved SHA for the docs-rebuild dispatch step below.
                   echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
