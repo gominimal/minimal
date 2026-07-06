@@ -4,15 +4,16 @@ use std::{
 };
 
 use checkouts::ManagerHandle;
+use common::fetchers::{AnyUrl, GcsUrl, ReqwestUrl};
 use ot::OpTracker;
 
 /// The errors possible in configuration or building a configuration.
 #[derive(Debug)]
 pub enum ConfigError {
     IO(&'static str, PathBuf, std::io::Error),
-    /// Configured remote cache bucket name is empty or whitespace-only.
+    /// Configured remote cache location (`remote_cache_url`) is empty or unparseable.
     /// Carries the offending value for diagnostics.
-    InvalidRemoteCacheBucket(String),
+    InvalidRemoteCacheUrl(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -21,8 +22,8 @@ impl fmt::Display for ConfigError {
             ConfigError::IO(ctx, path, e) => {
                 write!(f, "{} I/O error at path {}: {}", ctx, path.display(), e)
             }
-            ConfigError::InvalidRemoteCacheBucket(bucket) => {
-                write!(f, "invalid remote cache bucket: {:?}", bucket)
+            ConfigError::InvalidRemoteCacheUrl(url) => {
+                write!(f, "invalid remote_cache_url: {:?}", url)
             }
         }
     }
@@ -32,14 +33,42 @@ impl std::error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ConfigError::IO(_, _, e) => Some(e),
-            ConfigError::InvalidRemoteCacheBucket(_) => None,
+            ConfigError::InvalidRemoteCacheUrl(_) => None,
         }
     }
 }
 
-/// Default GCS bucket name used when the caller does not configure one
-/// via [ConfigBuilder::with_remote_cache_bucket].
+/// Default remote cache location when none is configured — the shared GCS
+/// bucket. A bare name (no scheme) is treated as a GCS bucket.
 pub const DEFAULT_REMOTE_CACHE_BUCKET: &str = "minimal-staging-cache";
+
+/// Parses a remote-cache location string into (a) the resolved [`AnyUrl`] a
+/// reader fetches from and (b) the GCS bucket name a *writer* would use
+/// (`None` for an HTTPS mirror — you can't write to a read mirror). Accepted:
+/// `https://…` / `http://…` → an HTTPS mirror; `gs://bucket[/…]` or a bare
+/// `bucket` name → the GCS bucket. Pure, so it's unit-testable.
+fn parse_remote_cache_url(raw: &str) -> Result<(AnyUrl, Option<String>), ConfigError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(ConfigError::InvalidRemoteCacheUrl(raw.to_string()));
+    }
+    if raw.starts_with("https://") || raw.starts_with("http://") {
+        let url = ReqwestUrl::try_from(raw)
+            .map_err(|_| ConfigError::InvalidRemoteCacheUrl(raw.to_string()))?;
+        return Ok((AnyUrl::Https(url), None));
+    }
+    // gs://bucket[/path] or a bare bucket name -> GCS.
+    let bucket = raw.strip_prefix("gs://").unwrap_or(raw);
+    let bucket = bucket.split('/').next().unwrap_or("");
+    if bucket.is_empty() {
+        return Err(ConfigError::InvalidRemoteCacheUrl(raw.to_string()));
+    }
+    let any = AnyUrl::Gcs(GcsUrl {
+        bucket: format!("projects/_/buckets/{bucket}"),
+        object: String::new(),
+    });
+    Ok((any, Some(bucket.to_string())))
+}
 
 /// Builder for [Config].
 #[derive(Debug, Default, Clone)]
@@ -56,7 +85,7 @@ pub struct ConfigBuilder {
 
     vcs_manager: Option<ManagerHandle>,
     ot: Option<OpTracker>,
-    remote_cache_bucket: Option<String>,
+    remote_cache_url: Option<String>,
 }
 
 impl ConfigBuilder {
@@ -127,10 +156,16 @@ impl ConfigBuilder {
         self.ot = Some(ot);
         self
     }
-    /// Override the GCS bucket name used by the remote cache reader and
-    /// writer. Defaults to [DEFAULT_REMOTE_CACHE_BUCKET] when unset.
-    pub fn with_remote_cache_bucket(mut self, bucket: String) -> Self {
-        self.remote_cache_bucket = Some(bucket);
+    /// Override where the remote cache lives. One value serves both reader and
+    /// writer: a `gs://bucket` (or bare bucket name) uses the GCS client;
+    /// an `https://…` value reads over plain unauthenticated HTTPS (e.g. a
+    /// Cloudflare R2 custom domain, to avoid GCS egress cost) — an HTTPS value
+    /// is read-only (writes require a `gs://` bucket). Defaults to
+    /// [DEFAULT_REMOTE_CACHE_BUCKET]. For read-only consumers, the
+    /// `MINIMAL_REMOTE_CACHE_URL` env var overrides the *reader* only (the
+    /// writer still uses this value). An HTTPS value MUST end in `/`.
+    pub fn with_remote_cache_url(mut self, url: String) -> Self {
+        self.remote_cache_url = Some(url);
         self
     }
 }
@@ -138,12 +173,22 @@ impl ConfigBuilder {
 impl ConfigBuilder {
     /// Constructs a config object using the given builder.
     pub fn build(self) -> Result<Config, ConfigError> {
-        let remote_cache_bucket = self
-            .remote_cache_bucket
+        // The one configured cache location (default: the shared GCS bucket).
+        let remote_cache_url = self
+            .remote_cache_url
             .unwrap_or_else(|| DEFAULT_REMOTE_CACHE_BUCKET.to_string());
-        if remote_cache_bucket.trim().is_empty() {
-            return Err(ConfigError::InvalidRemoteCacheBucket(remote_cache_bucket));
-        }
+        // The writer always uses the configured location's GCS bucket (`None`
+        // when it's an HTTPS mirror -> writes error, since you can't write to a
+        // read mirror). This also validates the configured value.
+        let (_, remote_cache_write_bucket) = parse_remote_cache_url(&remote_cache_url)?;
+        // Reads honour the `MINIMAL_REMOTE_CACHE_URL` env override (for read-only
+        // consumers pointing at an R2 mirror to avoid GCS egress); otherwise the
+        // configured location.
+        let read_raw = std::env::var("MINIMAL_REMOTE_CACHE_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| remote_cache_url.clone());
+        let (remote_cache_read, _) = parse_remote_cache_url(&read_raw)?;
 
         Ok(Config {
             no_cache: self.no_cache.unwrap_or(false),
@@ -169,7 +214,9 @@ impl ConfigBuilder {
             repo_dir: self.repo_dir,
             vcs_manager: self.vcs_manager,
             ot: self.ot,
-            remote_cache_bucket,
+            remote_cache_url,
+            remote_cache_read,
+            remote_cache_write_bucket,
         })
     }
 }
@@ -189,7 +236,7 @@ impl Config {
             repo_dir: self.repo_dir,
             vcs_manager: self.vcs_manager,
             ot: self.ot,
-            remote_cache_bucket: Some(self.remote_cache_bucket),
+            remote_cache_url: Some(self.remote_cache_url),
         }
     }
 }
@@ -220,10 +267,15 @@ pub struct Config {
     vcs_manager: Option<ManagerHandle>,
     /// The [OpTracker] to use instead of the root.
     pub(crate) ot: Option<OpTracker>,
-    /// GCS bucket name for the remote cache reader/writer. Always set —
-    /// defaults to [DEFAULT_REMOTE_CACHE_BUCKET] when the builder did
-    /// not specify one.
-    remote_cache_bucket: String,
+    /// The one configured cache location (raw), retained for round-tripping via
+    /// [Self::into_builder]. See [ConfigBuilder::with_remote_cache_url].
+    remote_cache_url: String,
+    /// The resolved location the *reader* fetches from (GCS bucket or HTTPS
+    /// mirror), honouring the `MINIMAL_REMOTE_CACHE_URL` env override.
+    remote_cache_read: AnyUrl,
+    /// The GCS bucket a *writer* uses; `None` when the configured location is an
+    /// HTTPS mirror (writes then error — you can't write to a read mirror).
+    remote_cache_write_bucket: Option<String>,
 }
 
 impl Config {
@@ -261,9 +313,16 @@ impl Config {
     pub fn num_parallel_builds(&self) -> usize {
         self.num_parallel_builds
     }
-    /// Returns the GCS bucket name for the remote cache.
-    pub fn remote_cache_bucket(&self) -> &str {
-        &self.remote_cache_bucket
+    /// The resolved location the remote-cache *reader* fetches artifacts from —
+    /// a GCS bucket or an HTTPS mirror — ready to hand to the cache backend.
+    /// Honours the `MINIMAL_REMOTE_CACHE_URL` env override.
+    pub fn remote_cache_url(&self) -> AnyUrl {
+        self.remote_cache_read.clone()
+    }
+    /// The GCS bucket the remote-cache *writer* uploads to; `None` when the
+    /// configured location is an HTTPS read mirror (writes then error).
+    pub fn remote_cache_write_bucket(&self) -> Option<&str> {
+        self.remote_cache_write_bucket.as_deref()
     }
 
     pub(crate) fn built_cache_dir(&self) -> PathBuf {
@@ -300,35 +359,87 @@ mod tests {
     use super::*;
 
     #[test]
-    fn remote_cache_bucket_defaults_when_unset() {
-        let cfg = ConfigBuilder::new().build().unwrap();
-        assert_eq!(cfg.remote_cache_bucket(), DEFAULT_REMOTE_CACHE_BUCKET);
+    fn parse_bare_bucket_is_gcs() {
+        let (url, wb) = parse_remote_cache_url("my-bucket").unwrap();
+        assert!(matches!(url, AnyUrl::Gcs(ref g) if g.bucket == "projects/_/buckets/my-bucket"));
+        assert_eq!(wb.as_deref(), Some("my-bucket"));
     }
 
     #[test]
-    fn remote_cache_bucket_honors_override() {
+    fn parse_gs_scheme_is_gcs() {
+        let (url, wb) = parse_remote_cache_url("gs://b/ignored/path").unwrap();
+        assert!(matches!(url, AnyUrl::Gcs(ref g) if g.bucket == "projects/_/buckets/b"));
+        assert_eq!(wb.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn parse_https_is_mirror_with_no_write_bucket() {
+        let (url, wb) = parse_remote_cache_url("https://cache.example.com/").unwrap();
+        assert!(matches!(url, AnyUrl::Https(_)));
+        assert_eq!(wb, None);
+    }
+
+    #[test]
+    fn parse_rejects_empty_and_bad_url() {
+        for bad in ["", "   ", "https://"] {
+            assert!(
+                matches!(
+                    parse_remote_cache_url(bad).unwrap_err(),
+                    ConfigError::InvalidRemoteCacheUrl(_)
+                ),
+                "expected error for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_config_writer_uses_default_bucket() {
+        // write bucket is derived from the configured value (not the env
+        // override), so this is free of MINIMAL_REMOTE_CACHE_URL flakiness.
+        let cfg = ConfigBuilder::new().build().unwrap();
+        assert_eq!(
+            cfg.remote_cache_write_bucket(),
+            Some(DEFAULT_REMOTE_CACHE_BUCKET)
+        );
+    }
+
+    #[test]
+    fn builder_gs_value_sets_reader_and_writer() {
         let cfg = ConfigBuilder::new()
-            .with_remote_cache_bucket("my-bucket".into())
+            .with_remote_cache_url("gs://my-bucket".into())
             .build()
             .unwrap();
-        assert_eq!(cfg.remote_cache_bucket(), "my-bucket");
+        assert_eq!(cfg.remote_cache_write_bucket(), Some("my-bucket"));
+        // Guard the reader assertion: a non-empty MINIMAL_REMOTE_CACHE_URL in
+        // the test process would override the reader.
+        if std::env::var("MINIMAL_REMOTE_CACHE_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .is_none()
+        {
+            assert!(matches!(
+                cfg.remote_cache_url(),
+                AnyUrl::Gcs(g) if g.bucket == "projects/_/buckets/my-bucket"
+            ));
+        }
     }
 
     #[test]
-    fn remote_cache_bucket_rejects_empty() {
-        let err = ConfigBuilder::new()
-            .with_remote_cache_bucket(String::new())
+    fn builder_https_value_is_read_only() {
+        let cfg = ConfigBuilder::new()
+            .with_remote_cache_url("https://cache.example.com/".into())
             .build()
-            .unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidRemoteCacheBucket(_)));
+            .unwrap();
+        // HTTPS location -> the writer has no bucket (writes will error).
+        assert_eq!(cfg.remote_cache_write_bucket(), None);
     }
 
     #[test]
-    fn remote_cache_bucket_rejects_whitespace_only() {
+    fn builder_rejects_empty() {
         let err = ConfigBuilder::new()
-            .with_remote_cache_bucket("   \t\n".into())
+            .with_remote_cache_url(String::new())
             .build()
             .unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidRemoteCacheBucket(_)));
+        assert!(matches!(err, ConfigError::InvalidRemoteCacheUrl(_)));
     }
 }
