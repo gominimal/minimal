@@ -166,7 +166,7 @@ impl RemoteCache<AnyBackend> {
             bucket: format!("projects/_/buckets/{bucket_id}"),
             object: String::new(),
         });
-        Self::new(AnyBackend::Gcs(storage), base, index_dir, ot).await
+        Self::new(AnyBackend::Gcs(Box::new(storage)), base, index_dir, ot).await
     }
 }
 

@@ -383,19 +383,22 @@ impl FetchResponse for AnyResponse {
     }
 }
 
-/// A request for either backend.
+/// A request for either backend. Both variants are boxed so the enum stays
+/// small regardless of which backend's request type is larger
+/// (clippy::large_enum_variant); a request is a transient per-fetch value.
 #[derive(Debug)]
 pub enum AnyRequest {
-    Https(Request),
-    Gcs(google_cloud_storage::builder::storage::ReadObject),
+    Https(Box<Request>),
+    Gcs(Box<google_cloud_storage::builder::storage::ReadObject>),
 }
 
 /// A [FetchBackend] that is either the GCS client or a reqwest HTTPS client,
-/// selected at construction. See the module note above.
+/// selected at construction. See the module note above. The GCS `Storage`
+/// handle is boxed (it's far larger than a reqwest `Client`).
 #[derive(Clone, Debug)]
 pub enum AnyBackend {
     Https(Client),
-    Gcs(Storage),
+    Gcs(Box<Storage>),
 }
 
 impl FetchBackend for AnyBackend {
@@ -409,10 +412,10 @@ impl FetchBackend for AnyBackend {
     ) -> Result<Self::Request, <Self::Response as FetchResponse>::Error> {
         match (self, url) {
             (AnyBackend::Https(c), AnyUrl::Https(u)) => FetchBackend::get(c, u)
-                .map(AnyRequest::Https)
+                .map(|r| AnyRequest::Https(Box::new(r)))
                 .map_err(AnyRespError::Https),
-            (AnyBackend::Gcs(s), AnyUrl::Gcs(u)) => FetchBackend::get(s, u)
-                .map(AnyRequest::Gcs)
+            (AnyBackend::Gcs(s), AnyUrl::Gcs(u)) => FetchBackend::get(&**s, u)
+                .map(|r| AnyRequest::Gcs(Box::new(r)))
                 .map_err(AnyRespError::Gcs),
             // A RemoteCache is always built with a matching backend+url pair
             // (see RemoteCache::new_any_*), so a mismatch is a construction bug.
@@ -425,11 +428,11 @@ impl FetchBackend for AnyBackend {
         req: Self::Request,
     ) -> Result<Self::Response, <Self::Response as FetchResponse>::Error> {
         match (self, req) {
-            (AnyBackend::Https(c), AnyRequest::Https(r)) => FetchBackend::execute(c, r)
+            (AnyBackend::Https(c), AnyRequest::Https(r)) => FetchBackend::execute(c, *r)
                 .await
                 .map(AnyResponse::Https)
                 .map_err(AnyRespError::Https),
-            (AnyBackend::Gcs(s), AnyRequest::Gcs(r)) => FetchBackend::execute(s, r)
+            (AnyBackend::Gcs(s), AnyRequest::Gcs(r)) => FetchBackend::execute(&**s, *r)
                 .await
                 .map(AnyResponse::Gcs)
                 .map_err(AnyRespError::Gcs),
