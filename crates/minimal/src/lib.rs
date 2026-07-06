@@ -33,6 +33,8 @@ pub enum Command {
     Attach(AttachArgs),
     /// Destroy (terminate) a session
     Destroy(DestroyArgs),
+    /// Shut down the minimald daemon
+    Stop(StopArgs),
     /// Session inspection subcommands
     Session(SessionArgs),
     /// WireGuard mesh: join, leave, and inspect remote-access state
@@ -276,6 +278,13 @@ pub struct DestroyArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct StopArgs {
+    /// Force shutdown even if active sessions exist
+    #[arg(long, short, default_value_t = false)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct RenameArgs {
     /// Session identifier (UUID or session name)
     pub session: String,
@@ -359,6 +368,7 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
         Command::Activate(args) => cmd_activate(&cli.global_args, args).await,
         Command::Attach(args) => cmd_attach(&cli.global_args, args).await,
         Command::Destroy(args) => cmd_destroy(&cli.global_args, args).await,
+        Command::Stop(args) => cmd_stop(&cli.global_args, args).await,
         Command::Session(SessionArgs {
             command: SessionCommand::Policy(args),
         }) => cmd_session_policy(&cli.global_args, args).await,
@@ -980,6 +990,27 @@ pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), a
     Ok(())
 }
 
+/// Shut down the minimald daemon via the `Shutdown` RPC.
+pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow::Error> {
+    let mut client = connect_daemon(global).await?;
+
+    use minimald_rpc::{Shutdown, ShutdownRequest, ShutdownResponse};
+    let resp = client
+        .oneshot_rpc::<Shutdown>(ShutdownRequest { force: args.force })
+        .await
+        .context("Shutdown RPC failed")?;
+
+    match resp {
+        ShutdownResponse::ShuttingDown => {
+            println!("Daemon is shutting down.");
+            Ok(())
+        }
+        ShutdownResponse::SessionsLive => {
+            bail!("daemon has active sessions; pass --force to shut down anyway")
+        }
+    }
+}
+
 /// Rename an existing session via the `RenameSession` RPC.
 ///
 /// Resolves the session by UUID or name (like `destroy`), then issues
@@ -1229,10 +1260,10 @@ pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::E
     eprintln!("Created {}", plan.toml_path.display());
     eprintln!();
     eprintln!("Next steps:");
-    eprintln!("  minimal2 update      # pin package versions");
-    eprintln!("  minimal2 activate .  # create a session");
+    eprintln!("  minimal update      # pin package versions");
+    eprintln!("  minimal activate .  # create a session");
     if plan.matched {
-        eprintln!("  minimal2 attach      # attach to the session");
+        eprintln!("  minimal attach      # attach to the session");
     }
 
     Ok(())
@@ -1316,7 +1347,7 @@ pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mc
 /// not autospawn the daemon — it is a lightweight diagnostic that should
 /// report versions without starting a VM.
 pub async fn cmd_version(global: &GlobalArgs) -> Result<(), anyhow::Error> {
-    println!("Client: minimal2 {}", env!("LONG_VERSION"));
+    println!("Client: minimal {}", env!("LONG_VERSION"));
 
     let sock = match client::resolve_socket_path(global.minimal_dir.as_deref(), global.minvmd) {
         Ok(p) => p,

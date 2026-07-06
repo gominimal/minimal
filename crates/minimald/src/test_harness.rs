@@ -136,6 +136,17 @@ impl TestServer {
             }
         });
     }
+
+    /// Bring a session up (make it "live") by looking it up in the
+    /// sessions manager. A persisted session is not "live" until
+    /// `get_session` is called, which starts the session actor.
+    pub async fn bring_session_up(&self, session_id: sessions::SessionId) {
+        let mngr = self.state.sessions_manager().await;
+        mngr.get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("session should be retrievable");
+    }
 }
 
 /// Dials an already-listening minimald UDS and returns an authenticated
@@ -189,10 +200,7 @@ impl TestClient {
     /// Sets `MINIMAL_SESSION_ID` on the channel (the env-var contract the
     /// server uses to scope the SFTP subsystem to a session), then requests
     /// the `sftp` subsystem and hands the channel stream to the SFTP client.
-    pub async fn open_sftp(
-        &mut self,
-        session_id: SessionId,
-    ) -> russh_sftp::client::SftpSession {
+    pub async fn open_sftp(&mut self, session_id: SessionId) -> russh_sftp::client::SftpSession {
         let channel = self.handle.channel_open_session().await.unwrap();
         channel
             .set_env(true, "MINIMAL_SESSION_ID", session_id.to_string())

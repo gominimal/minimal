@@ -201,6 +201,33 @@ async fn destroy_unknown_session_fails() {
     assert!(result.is_err());
 }
 
+// --- stop ---
+
+#[tokio::test]
+async fn stop_succeeds_when_no_sessions() {
+    let (_daemon, args) = setup().await;
+    cmd_stop(&args, StopArgs { force: false }).await.unwrap();
+}
+
+#[tokio::test]
+async fn stop_refuses_with_live_session() {
+    let (daemon, args) = setup().await;
+    let session_id = create_session(&daemon, "active").await;
+    daemon.server.bring_session_up(session_id).await;
+
+    let result = cmd_stop(&args, StopArgs { force: false }).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn stop_force_succeeds_with_live_session() {
+    let (daemon, args) = setup().await;
+    let session_id = create_session(&daemon, "active").await;
+    daemon.server.bring_session_up(session_id).await;
+
+    cmd_stop(&args, StopArgs { force: true }).await.unwrap();
+}
+
 // --- rename ---
 
 #[tokio::test]
