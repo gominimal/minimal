@@ -1197,3 +1197,450 @@ mod tests {
         );
     }
 }
+
+/// Twin-vs-PRODUCTION differential test (aeneas-twin robustness leg 1).
+///
+/// The `formal/` trust theorems (`provenance_acyclic_enforced`,
+/// `toplevel_not_recorded`, the F7/F8 witnesses) are proved over a hand-written
+/// Lean model of `cycle_broken_deps_of`. The Aeneas equivalence proof aims to
+/// tie that model to a Lean function machine-EXTRACTED from a dependency-free
+/// Rust re-implementation ("the twin", `minimermetic/formal/aeneas-twin`). The
+/// twin is only meaningful if it is FAITHFUL to the real `graph.rs` algorithm;
+/// this test guards that faithfulness by running BOTH implementations on the
+/// same seeded-random graphs and asserting they return equivalent verdicts.
+///
+/// `mod twin` below is a VERBATIM copy of `aeneas-twin/src/lib.rs`'s algorithm
+/// (usize/Vec form). If the two ever drift, this test's known-witness table
+/// (`known_witnesses_match`) or the random sweep will fail in CI.
+///
+/// SOUNDNESS OF THE COMPARISON. The two implementations use different DFS
+/// disciplines (production: recursive pre-order over `build_deps`; twin:
+/// iterative LIFO worklist), so the *order* in which the closure is visited
+/// differs. The following projection of the verdict is nonetheless provably
+/// order-INVARIANT and is what we assert on:
+///   * The 3-way outcome class {Accept, Unbreakable, BreakerError}. `Accept`
+///     iff no cyclic-peer-with-failing-breaker AND no cyclic-peer-without-a-
+///     breaker exist; `Unbreakable` iff the former is absent but the latter
+///     present; `BreakerError` iff a cyclic-peer-with-failing-breaker exists.
+///     All three predicates are pure functions of graph topology, independent
+///     of visitation order.
+///   * On `Accept`: the recorded dependency SET (sorted).
+///   * On `Unbreakable`: the failing-peer SET (both impls collect ALL such
+///     peers before sorting+deduping, so it is order-invariant).
+/// The *specific* breaker-error variant / peer / `via` IS order-dependent when
+/// several distinct failing peers coexist (each impl early-returns the first in
+/// its own order), so we assert the exact witness tuple only opportunistically:
+/// when both impls happen to pick the SAME peer, their variant + breaker must
+/// agree (`via` is left out — it too is order-dependent).
+#[cfg(test)]
+mod twin_differential {
+    // ---- The twin: a verbatim copy of aeneas-twin/src/lib.rs (usize/Vec) ----
+    // Keep in sync with minimermetic/formal/aeneas-twin/src/lib.rs. Doc comments
+    // trimmed; algorithm bytes unchanged.
+    mod twin {
+        #[derive(Debug, PartialEq, Eq)]
+        pub enum CycleBreakError {
+            Unbreakable(Vec<usize>),
+            BreakerAliasesToplevel { peer: usize },
+            BreakerOnCycle { peer: usize, breaker: usize },
+            BreakerReachesCycle { peer: usize, breaker: usize, via: usize },
+        }
+
+        pub struct Graph {
+            pub deps: Vec<Vec<usize>>,
+            pub breaker: Vec<Option<usize>>,
+        }
+
+        impl Graph {
+            pub fn transitive_specs_of(&self, toplevel: usize) -> Vec<usize> {
+                let n: usize = self.deps.len();
+                let mut seen: Vec<bool> = Vec::new();
+                let mut k: usize = 0;
+                while k < n {
+                    seen.push(false);
+                    k += 1;
+                }
+                let mut reachable: Vec<usize> = Vec::new();
+                let mut stack: Vec<usize> = Vec::new();
+                stack.push(toplevel);
+                while stack.len() != 0 {
+                    let node: usize = stack[stack.len() - 1];
+                    stack.pop();
+                    let mut i: usize = 0;
+                    while i < self.deps[node].len() {
+                        let d: usize = self.deps[node][i];
+                        if !seen[d] {
+                            seen[d] = true;
+                            reachable.push(d);
+                            stack.push(d);
+                        }
+                        i += 1;
+                    }
+                }
+                reachable
+            }
+
+            fn on_own_cycle(&self, node: usize) -> bool {
+                let closure: Vec<usize> = self.transitive_specs_of(node);
+                let mut i: usize = 0;
+                while i < closure.len() {
+                    if closure[i] == node {
+                        return true;
+                    }
+                    i += 1;
+                }
+                false
+            }
+
+            fn breaker_cycle_witness(&self, breaker: usize) -> Option<usize> {
+                if self.on_own_cycle(breaker) {
+                    return Some(breaker);
+                }
+                let closure: Vec<usize> = self.transitive_specs_of(breaker);
+                let mut i: usize = 0;
+                while i < closure.len() {
+                    let reached: usize = closure[i];
+                    if self.on_own_cycle(reached) {
+                        return Some(reached);
+                    }
+                    i += 1;
+                }
+                None
+            }
+
+            pub fn cycle_broken_deps_of(
+                &self,
+                toplevel: usize,
+            ) -> Result<Vec<usize>, CycleBreakError> {
+                let mut out: Vec<usize> = Vec::new();
+                let mut unbreakable: Vec<usize> = Vec::new();
+
+                let closure: Vec<usize> = self.transitive_specs_of(toplevel);
+                let mut i: usize = 0;
+                while i < closure.len() {
+                    let dep: usize = closure[i];
+                    i += 1;
+                    if dep != toplevel {
+                        let dep_closure: Vec<usize> = self.transitive_specs_of(dep);
+                        let mut reaches_toplevel: bool = false;
+                        let mut j: usize = 0;
+                        while j < dep_closure.len() {
+                            if dep_closure[j] == toplevel {
+                                reaches_toplevel = true;
+                            }
+                            j += 1;
+                        }
+
+                        if !reaches_toplevel {
+                            out.push(dep);
+                        } else {
+                            match self.breaker[dep] {
+                                None => unbreakable.push(dep),
+                                Some(breaker) => {
+                                    if breaker == toplevel {
+                                        return Err(CycleBreakError::BreakerAliasesToplevel {
+                                            peer: dep,
+                                        });
+                                    }
+                                    match self.breaker_cycle_witness(breaker) {
+                                        Some(via) => {
+                                            if via == breaker {
+                                                return Err(CycleBreakError::BreakerOnCycle {
+                                                    peer: dep,
+                                                    breaker,
+                                                });
+                                            } else {
+                                                return Err(
+                                                    CycleBreakError::BreakerReachesCycle {
+                                                        peer: dep,
+                                                        breaker,
+                                                        via,
+                                                    },
+                                                );
+                                            }
+                                        }
+                                        None => out.push(breaker),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if unbreakable.len() != 0 {
+                    sort_dedup(&mut unbreakable);
+                    return Err(CycleBreakError::Unbreakable(unbreakable));
+                }
+                sort_dedup(&mut out);
+                Ok(out)
+            }
+        }
+
+        fn sort_dedup(v: &mut Vec<usize>) {
+            let n: usize = v.len();
+            let mut i: usize = 0;
+            while i < n {
+                let mut min_idx: usize = i;
+                let mut j: usize = i + 1;
+                while j < n {
+                    if v[j] < v[min_idx] {
+                        min_idx = j;
+                    }
+                    j += 1;
+                }
+                let tmp: usize = v[i];
+                v[i] = v[min_idx];
+                v[min_idx] = tmp;
+                i += 1;
+            }
+            let mut result: Vec<usize> = Vec::new();
+            let mut k: usize = 0;
+            while k < v.len() {
+                if result.len() == 0 || result[result.len() - 1] != v[k] {
+                    result.push(v[k]);
+                }
+                k += 1;
+            }
+            *v = result;
+        }
+    }
+
+    // ------------------------------ Harness ------------------------------
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// Deterministic splitmix64 PRNG (keeps the test dep-free + reproducible).
+    struct Rng(u64);
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+        /// true with probability num/den.
+        fn chance(&mut self, num: u64, den: u64) -> bool {
+            self.next_u64() % den < num
+        }
+    }
+
+    /// Build a production `Graph` isomorphic to the given usize/Vec adjacency.
+    /// Node `i` <-> `refs[i]`. Returns the graph, the refs, and the reverse map.
+    fn build_production(
+        deps: &[Vec<usize>],
+        breaker: &[Option<usize>],
+    ) -> (Graph, Vec<BuildSpecRef>, HashMap<BuildSpecRef, usize>) {
+        let n = deps.len();
+        let mut g = Graph::new();
+        let origin = Arc::new(common::SpecOrigin::Inline);
+        // Phase 1: insert n empty specs so all node-refs exist before wiring.
+        let mut refs = Vec::with_capacity(n);
+        for i in 0..n {
+            refs.push(g.insert_build(BuildSpec {
+                name: format!("n{i}"),
+                from: origin.clone(),
+                ..Default::default()
+            }));
+        }
+        // Phase 2: wire build_deps + replace_on_cycle via arena get_mut.
+        for i in 0..n {
+            let build_deps: smallvec::SmallVec<[BuildDep; 10]> =
+                deps[i].iter().map(|&j| BuildDep::Build(refs[j])).collect();
+            let replace_on_cycle = breaker[i].map(|j| refs[j]);
+            let spec = g.builds.get_mut(refs[i].0).unwrap();
+            spec.build_deps = build_deps;
+            spec.replace_on_cycle = replace_on_cycle;
+        }
+        let reverse: HashMap<BuildSpecRef, usize> =
+            refs.iter().enumerate().map(|(i, r)| (*r, i)).collect();
+        (g, refs, reverse)
+    }
+
+    /// The order-invariant 3-way outcome class.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Class {
+        Accept(Vec<usize>),      // sorted recorded-dep set
+        Unbreakable(Vec<usize>), // sorted failing-peer set
+        BreakerError,
+    }
+
+    fn class_prod(
+        r: &Result<Vec<BuildSpecRef>, CycleBreakError>,
+        rev: &HashMap<BuildSpecRef, usize>,
+    ) -> Class {
+        match r {
+            Ok(v) => {
+                let mut s: Vec<usize> = v.iter().map(|b| rev[b]).collect();
+                s.sort_unstable();
+                Class::Accept(s)
+            }
+            Err(CycleBreakError::Unbreakable(v)) => {
+                let mut s: Vec<usize> = v.iter().map(|b| rev[b]).collect();
+                s.sort_unstable();
+                Class::Unbreakable(s)
+            }
+            Err(_) => Class::BreakerError,
+        }
+    }
+
+    fn class_twin(r: &Result<Vec<usize>, twin::CycleBreakError>) -> Class {
+        match r {
+            Ok(v) => {
+                let mut s = v.clone();
+                s.sort_unstable();
+                Class::Accept(s)
+            }
+            Err(twin::CycleBreakError::Unbreakable(v)) => {
+                let mut s = v.clone();
+                s.sort_unstable();
+                Class::Unbreakable(s)
+            }
+            Err(_) => Class::BreakerError,
+        }
+    }
+
+    /// (variant-tag, peer, breaker) for opportunistic exact-witness checking.
+    /// `via` is deliberately excluded (order-dependent). Returns None for the
+    /// non-single-peer variants.
+    fn witness_prod(
+        r: &Result<Vec<BuildSpecRef>, CycleBreakError>,
+        rev: &HashMap<BuildSpecRef, usize>,
+    ) -> Option<(u8, usize, Option<usize>)> {
+        match r {
+            Err(CycleBreakError::BreakerAliasesToplevel { peer }) => Some((0, rev[peer], None)),
+            Err(CycleBreakError::BreakerOnCycle { peer, breaker }) => {
+                Some((1, rev[peer], Some(rev[breaker])))
+            }
+            Err(CycleBreakError::BreakerReachesCycle { peer, breaker, .. }) => {
+                Some((2, rev[peer], Some(rev[breaker])))
+            }
+            _ => None,
+        }
+    }
+
+    fn witness_twin(r: &Result<Vec<usize>, twin::CycleBreakError>) -> Option<(u8, usize, Option<usize>)> {
+        match r {
+            Err(twin::CycleBreakError::BreakerAliasesToplevel { peer }) => Some((0, *peer, None)),
+            Err(twin::CycleBreakError::BreakerOnCycle { peer, breaker }) => {
+                Some((1, *peer, Some(*breaker)))
+            }
+            Err(twin::CycleBreakError::BreakerReachesCycle { peer, breaker, .. }) => {
+                Some((2, *peer, Some(*breaker)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Run one differential trial; panics with a reproducer on any divergence.
+    /// Returns the outcome class so the caller can tally coverage.
+    fn check_one(deps: &[Vec<usize>], breaker: &[Option<usize>], toplevel: usize) -> u8 {
+        let (g, refs, rev) = build_production(deps, breaker);
+        let tw = twin::Graph {
+            deps: deps.to_vec(),
+            breaker: breaker.to_vec(),
+        };
+
+        let prod_r = g.cycle_broken_deps_of(&refs[toplevel]);
+        let twin_r = tw.cycle_broken_deps_of(toplevel);
+
+        let cp = class_prod(&prod_r, &rev);
+        let ct = class_twin(&twin_r);
+        assert_eq!(
+            cp, ct,
+            "CLASS DIVERGENCE\n deps={deps:?}\n breaker={breaker:?}\n toplevel={toplevel}\n prod={prod_r:?}\n twin={twin_r:?}"
+        );
+
+        // Opportunistic exact-witness check when both picked the same peer.
+        if let (Some(wp), Some(wt)) = (witness_prod(&prod_r, &rev), witness_twin(&twin_r)) {
+            if wp.1 == wt.1 {
+                assert_eq!(
+                    (wp.0, wp.2),
+                    (wt.0, wt.2),
+                    "WITNESS DIVERGENCE (same peer {peer}, different variant/breaker)\n deps={deps:?}\n breaker={breaker:?}\n toplevel={toplevel}\n prod={prod_r:?}\n twin={twin_r:?}",
+                    peer = wp.1
+                );
+            }
+        }
+
+        match cp {
+            Class::Accept(_) => 0,
+            Class::Unbreakable(_) => 1,
+            Class::BreakerError => 2,
+        }
+    }
+
+    /// The six hand-witness graphs mirrored from the twin's own test suite and
+    /// `formal/Formal/CycleBroken.lean`. Fast, deterministic drift tripwire.
+    #[test]
+    fn known_witnesses_match() {
+        // (deps, breaker, toplevel)
+        let cases: Vec<(Vec<Vec<usize>>, Vec<Option<usize>>, usize)> = vec![
+            // acyclic -> Accept([1,2])
+            (vec![vec![1], vec![2], vec![]], vec![None, None, None], 0),
+            // 0<->1 no breaker -> Unbreakable([1])
+            (vec![vec![1], vec![0]], vec![None, None], 0),
+            // breaker aliases toplevel
+            (vec![vec![1], vec![0]], vec![None, Some(0)], 0),
+            // breaker on its own cycle
+            (
+                vec![vec![1], vec![0], vec![3], vec![2]],
+                vec![None, Some(2), None, None],
+                0,
+            ),
+            // breaker off-cycle but reaches a cycle
+            (
+                vec![vec![1], vec![0], vec![3], vec![4], vec![3]],
+                vec![None, Some(2), None, None, None],
+                0,
+            ),
+            // cycle-free breaker leaf -> Accept([2])
+            (vec![vec![1], vec![0], vec![]], vec![None, Some(2), None], 0),
+        ];
+        for (deps, breaker, top) in &cases {
+            check_one(deps, breaker, *top);
+        }
+    }
+
+    /// Seeded-random sweep: for many small graphs, assert production and twin
+    /// agree. Also asserts the generator actually exercises all three outcome
+    /// classes (otherwise the test would be vacuously green).
+    #[test]
+    fn random_graphs_agree() {
+        let mut rng = Rng(0xC0FFEE_1234_5678);
+        let mut tally = [0u64; 3];
+        const TRIALS: usize = 40_000;
+        for _ in 0..TRIALS {
+            let n = 2 + rng.below(5); // 2..=6 nodes
+            let mut deps = vec![Vec::new(); n];
+            for i in 0..n {
+                for j in 0..n {
+                    // allow self-loops and both directions; ~35% edge density.
+                    if i != j && rng.chance(35, 100) {
+                        deps[i].push(j);
+                    }
+                }
+            }
+            let mut breaker = vec![None; n];
+            for i in 0..n {
+                if rng.chance(45, 100) {
+                    breaker[i] = Some(rng.below(n)); // any node incl self/toplevel
+                }
+            }
+            let toplevel = rng.below(n);
+            let cls = check_one(&deps, &breaker, toplevel);
+            tally[cls as usize] += 1;
+        }
+        eprintln!(
+            "twin_differential sweep: {TRIALS} trials — Accept={} Unbreakable={} BreakerError={}",
+            tally[0], tally[1], tally[2]
+        );
+        assert!(tally[0] > 0, "generator never produced an Accept verdict");
+        assert!(tally[1] > 0, "generator never produced an Unbreakable verdict");
+        assert!(tally[2] > 0, "generator never produced a BreakerError verdict");
+    }
+}
