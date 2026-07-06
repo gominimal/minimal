@@ -132,12 +132,36 @@ impl RemoteCache<Storage> {
 }
 
 impl RemoteCache<AnyBackend> {
-    /// Reader over a plain-HTTPS base URL — a public GCS bucket URL
-    /// (`https://storage.googleapis.com/<bucket>/`) or an S3-compatible mirror
-    /// such as a Cloudflare R2 custom domain (to avoid GCS egress cost).
-    /// Objects are fetched with unauthenticated GETs, so they must be publicly
-    /// readable. `url` MUST end in `/`, or [`url::Url::join`] drops its last
-    /// path segment when resolving object names against it.
+    /// Reader from an already-resolved [`AnyUrl`] — the "where to get artifacts"
+    /// location. For a GCS url the caller supplies the (authed or anonymous)
+    /// `Storage` client; for an HTTPS url a reqwest client is built internally
+    /// and `gcs_storage` is ignored. Objects on the HTTPS path are fetched with
+    /// unauthenticated GETs, so the mirror must serve them publicly.
+    pub async fn new_any(
+        url: AnyUrl,
+        gcs_storage: Option<Storage>,
+        index_dir: Option<PathBuf>,
+        ot: Option<OpTracker>,
+    ) -> Result<Self, Error<AnyRespError>> {
+        let backend = match &url {
+            AnyUrl::Gcs(_) => AnyBackend::Gcs(Box::new(
+                gcs_storage.expect("new_any: a GCS url requires a Storage client"),
+            )),
+            AnyUrl::Https(_) => {
+                let client = Client::builder()
+                    .user_agent("minimal/remote-cache")
+                    .build()
+                    .map_err(AnyRespError::Https)?;
+                AnyBackend::Https(client)
+            }
+        };
+        Self::new(backend, url, index_dir, ot).await
+    }
+
+    /// Convenience reader over a plain-HTTPS base-URL string (public GCS bucket
+    /// URL, or an S3-compatible mirror such as a Cloudflare R2 custom domain).
+    /// `url` MUST end in `/`, or [`url::Url::join`] drops its last path segment
+    /// when resolving object names against it.
     #[tracing::instrument(skip_all, fields(url = %url), err)]
     pub async fn new_any_https(
         url: &str,
@@ -145,28 +169,7 @@ impl RemoteCache<AnyBackend> {
         ot: Option<OpTracker>,
     ) -> Result<Self, Error<AnyRespError>> {
         let parsed = reqwest::Url::parse(url).map_err(AnyRespError::InvalidUrl)?;
-        let client = Client::builder()
-            .user_agent("minimal/remote-cache")
-            .build()
-            .map_err(AnyRespError::Https)?;
-        let base = AnyUrl::Https(ReqwestUrl::from(parsed));
-        Self::new(AnyBackend::Https(client), base, index_dir, ot).await
-    }
-
-    /// Reader over the GCS client + bucket — the default read path, preserving
-    /// the exact behaviour of [`RemoteCache::new_with_gcs_bucket`].
-    #[tracing::instrument(skip_all, fields(bucket_id = %bucket_id), err)]
-    pub async fn new_any_gcs(
-        storage: Storage,
-        bucket_id: &str,
-        index_dir: Option<PathBuf>,
-        ot: Option<OpTracker>,
-    ) -> Result<Self, Error<AnyRespError>> {
-        let base = AnyUrl::Gcs(GcsUrl {
-            bucket: format!("projects/_/buckets/{bucket_id}"),
-            object: String::new(),
-        });
-        Self::new(AnyBackend::Gcs(Box::new(storage)), base, index_dir, ot).await
+        Self::new_any(AnyUrl::Https(ReqwestUrl::from(parsed)), None, index_dir, ot).await
     }
 }
 

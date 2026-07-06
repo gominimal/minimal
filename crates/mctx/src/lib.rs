@@ -10,9 +10,9 @@ use std::{
 
 use anyhow::anyhow;
 use checkouts::{Manager as VcsManager, ManagerHandle as VcsManagerHandle};
-use common::fetchers::{AnyBackend, AnyRespError};
+use common::fetchers::{AnyBackend, AnyRespError, AnyUrl};
 use common::{SpecOrigin, Target};
-use google_cloud_storage::{Error as GcsError, client::Storage as GcsStorage};
+use google_cloud_storage::client::Storage as GcsStorage;
 use lcache::CacheBinProvider;
 use ot::OpTracker;
 use rcache::{Error as RemoteError, RemoteBinProvider, RemoteCache, RemoteCacheWriter};
@@ -382,7 +382,15 @@ impl Context {
         &self.mfile
     }
 
-    /// Builds and returns a remote cache with default configurations.
+    /// Builds and returns a remote cache reader for the configured cache
+    /// location. [Config] has already resolved where artifacts come from — a GCS
+    /// bucket (the default) or an HTTPS mirror (honouring
+    /// `MINIMAL_REMOTE_CACHE_URL`) — so this just wires up the matching backend.
+    ///
+    /// `auth` selects authenticated vs. anonymous GCS access (the buildbot / mip
+    /// upload path reads authed; anonymous CI reads use the public path). It's
+    /// ignored for an HTTPS mirror, whose objects are fetched with unauthenticated
+    /// public GETs.
     pub async fn remote_cache(
         &self,
         auth: bool,
@@ -395,13 +403,13 @@ impl Context {
             Some(self.config.index_dir())
         };
 
-        // When a read URL is configured (e.g. a Cloudflare R2 custom domain via
-        // MINIMAL_REMOTE_CACHE_URL), fetch artifacts over plain HTTPS to avoid
-        // GCS egress cost; otherwise read through the GCS client (the default,
-        // unchanged). Writes always use GCS regardless (see remote_cache_writer).
-        let res = if let Some(url) = self.config.remote_cache_read_url() {
-            RemoteCache::new_any_https(url, index_dir, self.config.ot.clone()).await
-        } else {
+        // A GCS location needs a Storage client (authed or anonymous per `auth`);
+        // an HTTPS mirror (e.g. a Cloudflare R2 custom domain) needs none —
+        // new_any builds a reqwest client internally. Note it's reading from R2
+        // that avoids GCS egress cost: an https:// URL still pointed at GCS would
+        // egress just the same.
+        let url = self.config.remote_cache_url();
+        let gcs_storage = if matches!(url, AnyUrl::Gcs(_)) {
             let backend = if auth {
                 GcsStorage::builder().build().await.unwrap()
             } else {
@@ -413,14 +421,11 @@ impl Context {
                     .await
                     .unwrap()
             };
-            RemoteCache::new_any_gcs(
-                backend,
-                self.config.remote_cache_bucket(),
-                index_dir,
-                self.config.ot.clone(),
-            )
-            .await
+            Some(backend)
+        } else {
+            None
         };
+        let res = RemoteCache::new_any(url, gcs_storage, index_dir, self.config.ot.clone()).await;
         tracing::trace!("remote cache init took {:?}", start.elapsed());
         res
     }
@@ -429,17 +434,23 @@ impl Context {
     /// access and always fetches the index fresh (no local-cache fast path) —
     /// the writer's compare-and-swap on commit requires the GCS generation
     /// it observed, which a stale local index can't provide.
-    pub async fn remote_cache_writer(&self) -> Result<RemoteCacheWriter, RemoteError<GcsError>> {
+    ///
+    /// Errors if the cache is configured as an HTTPS read mirror: a mirror (e.g.
+    /// R2 via a custom domain) has no writable bucket, so there's nowhere to
+    /// upload. Writes require a `gs://` bucket location.
+    pub async fn remote_cache_writer(&self) -> anyhow::Result<RemoteCacheWriter> {
         let start = SystemTime::now();
+        let bucket = self.config.remote_cache_write_bucket().ok_or_else(|| {
+            anyhow!(
+                "remote cache is configured as an HTTPS read mirror; writes \
+                 require a gs:// bucket — set the cache location to a gs:// URL \
+                 or a bare bucket name"
+            )
+        })?;
         let backend = GcsStorage::builder().build().await.unwrap();
-        let res = RemoteCacheWriter::new(
-            backend,
-            self.config.remote_cache_bucket(),
-            self.config.ot.clone(),
-        )
-        .await;
+        let res = RemoteCacheWriter::new(backend, bucket, self.config.ot.clone()).await?;
         tracing::trace!("remote cache writer init took {:?}", start.elapsed());
-        res
+        Ok(res)
     }
     pub async fn remote_storage(&self) -> Result<common::RemoteStorage, Error> {
         let start = SystemTime::now();
