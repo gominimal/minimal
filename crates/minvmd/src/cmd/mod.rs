@@ -157,9 +157,15 @@ pub(crate) fn default_vm_known_hosts_path() -> std::path::PathBuf {
     dirs::state_dir()
         .unwrap_or_else(|| {
             dirs::home_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        "XDG_STATE_HOME and HOME both unset; known_hosts falls back to /tmp"
+                    );
+                    std::path::PathBuf::from("/tmp")
+                })
                 .join(".local/state")
         })
+        // TODO: pass instance_num through once multi-instance is needed
         .join("minimal/providers/local-0/known_hosts")
 }
 
@@ -198,11 +204,11 @@ pub(crate) fn read_ready_beacon<R: std::io::BufRead>(
             tracing::debug!("no pubkey line in ready beacon");
         }
         Ok(_) => {
-            if pubkey_line.len() > 4096 {
-                tracing::warn!(len = pubkey_line.len(), "pubkey line too long; skipping");
+            let key_str = pubkey_line.trim();
+            if key_str.len() > 4096 {
+                tracing::warn!(len = key_str.len(), "pubkey line too long; skipping");
                 return Ok(());
             }
-            let key_str = pubkey_line.trim();
             if !key_str.is_empty() {
                 // R2.4: create the directory hierarchy before writing.
                 if let Some(parent) = known_hosts_path.parent()
@@ -222,6 +228,7 @@ pub(crate) fn read_ready_beacon<R: std::io::BufRead>(
                     }
                     Ok(pubkey) => {
                         match russh::keys::known_hosts::learn_known_hosts_path(
+                            // TODO: pass instance_num through once multi-instance is needed
                             "local-0",
                             22,
                             &pubkey,
