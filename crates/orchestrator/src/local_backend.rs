@@ -14,7 +14,6 @@ use op::{Runnable, SourceFetcher};
 use ot::OpTracker;
 use rcache::RemoteCache;
 use tokio::sync::Semaphore;
-use tokio::task::spawn_blocking;
 
 use crate::Error;
 
@@ -183,7 +182,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
         };
 
         let shared_hnd2 = shared_hnd.clone();
-        let artifact = spawn_blocking(async move || {
+        let artifact = async move {
             let shared = shared_hnd2.inner().read().await;
             let permit = shared
                 .backend
@@ -242,9 +241,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
             drop(permit);
             drop(shared);
             res
-        })
-        .await
-        .unwrap()
+        }
         .await?;
 
         {
@@ -281,7 +278,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
         }
 
         let shared_hnd2 = shared_hnd.clone();
-        spawn_blocking(async move || {
+        async move {
             let shared = shared_hnd2.inner().read().await;
             let sema = shared.fetch_semaphore.acquire().await;
             let res = if let Some(remote_cache) = shared.backend.remote_cache.as_ref() {
@@ -320,9 +317,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
             drop(sema);
             drop(shared);
             res
-        })
-        .await
-        .unwrap()
+        }
         .await
     }
 
@@ -355,7 +350,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
 
         let shared_hnd2 = shared_hnd.clone();
         let subset2 = subset.clone();
-        let pending_dir = spawn_blocking(async move || {
+        let pending_dir = async move {
             let shared = shared_hnd2.inner().read().await;
             let res = op::SubsetBuild {
                 from_dir: Some(build_dir),
@@ -370,9 +365,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
             .await;
             drop(shared);
             res
-        })
-        .await
-        .unwrap()
+        }
         .await?;
 
         let shared = shared_hnd.inner().read().await;

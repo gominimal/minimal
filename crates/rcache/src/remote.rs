@@ -275,12 +275,20 @@ impl<B: FetchBackend> RemoteCache<B> {
             name: span_name.to_string(),
         });
         let cache_hnd = cache.write_dir(spec_hash).map_err(Error::Cache)?;
-        archive::extract_compressed_tar(
-            tar_file,
-            archive::Compression::Zstd,
-            cache_hnd.path(),
-            None,
-        )
+        // Decompression is synchronous and CPU-bound; run it on the blocking
+        // pool so the async worker stays free. Besides honouring the
+        // no-blocking-in-async rule, this yield point is what lets the progress
+        // renderer task be scheduled between `set_op(ExtractPkg)` and
+        // `set_done()`. Without it the extract runs to completion inline, the two
+        // bracketing version bumps coalesce in the watch channel, and the
+        // renderer never observes the ExtractPkg state — so the extract spinner
+        // is never drawn.
+        let dest = cache_hnd.path().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            archive::extract_compressed_tar(tar_file, archive::Compression::Zstd, &dest, None)
+        })
+        .await
+        .expect("extract task is awaited immediately and never cancelled")
         .map_err(Error::ArchiveError)?;
 
         materialize_op.set_done();

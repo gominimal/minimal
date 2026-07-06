@@ -471,6 +471,12 @@ impl<C: Channel> Sandbox<C> {
         Ok(())
     }
 
+    /// Builds the hakoniwa [`Container`] for this sandbox.
+    ///
+    /// Spawning this container (`Command::spawn`) does a bare in-process `fork()`
+    /// on the calling thread and arms `PR_SET_PDEATHSIG(SIGKILL)`, tying the
+    /// child's lifetime to that thread. See [`run_with_cancel`](Self::run_with_cancel)
+    /// for the thread-affinity constraints this imposes on callers.
     pub fn new_container(&self) -> Result<Container, Error> {
         let mut container = hakoniwa::Container::new();
         container
@@ -779,6 +785,10 @@ impl<C: Channel> Sandbox<C> {
         container.command_inner(self, &program, args, env_vars)
     }
 
+    /// Runs the invocations in the sandbox to completion.
+    ///
+    /// Delegates to [`run_with_cancel`](Self::run_with_cancel) — see its docs for
+    /// the important thread-affinity constraint on the sandbox container.
     pub async fn run<W1, W2>(
         &mut self,
         invocations: Vec<Invocation>,
@@ -798,6 +808,34 @@ impl<C: Channel> Sandbox<C> {
         .await
     }
 
+    /// Runs the invocations in the sandbox, killing the container if `cancel`
+    /// fires.
+    ///
+    /// # Thread-affinity footgun (hakoniwa `PR_SET_PDEATHSIG`)
+    ///
+    /// This forks the sandbox container **in-process, on the calling thread**
+    /// (via [`new_container`](Self::new_container) → hakoniwa's `Command::spawn`,
+    /// a bare `fork()`). The forked container arms `PR_SET_PDEATHSIG(SIGKILL)`
+    /// ("die with parent") — and on Linux that signal is delivered when the
+    /// **parent *thread*** terminates, not the parent *process*. Nothing ever
+    /// clears it, so the container stays bound to the exact thread that forked it
+    /// for its whole life.
+    ///
+    /// Consequences for callers:
+    ///
+    /// * The forking thread MUST outlive the container. This future is fine on a
+    ///   normal multi-thread runtime worker (they're stable), but the container
+    ///   dies with a spurious SIGKILL — surfacing as `InvocationFailed` — if that
+    ///   thread is retired while the container runs.
+    /// * NEVER drive this under [`tokio::task::block_in_place`]: it churns/retires
+    ///   worker threads, which SIGKILLs containers forked on them — including
+    ///   those of *unrelated* concurrent builds.
+    /// * NEVER run this on a [`tokio::task::spawn_blocking`] pool thread: those
+    ///   are reaped after an idle keep-alive, again killing the container.
+    ///
+    /// By contrast, purely-synchronous work that forks no container (e.g. staging
+    /// the rootfs in `Sandbox::new`) carries none of this and could be offloaded
+    /// to the blocking pool if it ever became hot enough to matter.
     pub async fn run_with_cancel<W1, W2>(
         &mut self,
         invocations: Vec<Invocation>,
