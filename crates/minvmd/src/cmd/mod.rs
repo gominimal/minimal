@@ -289,6 +289,10 @@ mod beacon_tests {
             contents.contains("local-0"),
             "known_hosts must contain 'local-0', got: {contents:?}"
         );
+        assert!(
+            contents.contains(&openssh),
+            "known_hosts must contain the beacon public key, got: {contents:?}"
+        );
     }
 
     #[test]
