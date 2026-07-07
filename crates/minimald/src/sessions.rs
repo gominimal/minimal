@@ -460,22 +460,33 @@ impl<L: Loader> Manager<L> {
                                             (obj.record().id, registry_name(obj.record()), net)
                                         })
                                     };
-                                    // Hand over the finalized
-                                    // composition, if it's still in the
-                                    // manager's stash. Absent after a
-                                    // daemon restart — the actor spawns
-                                    // without one, and the record is
-                                    // still usable.
-                                    let composition = self.compositions.remove(&obj.record().id);
-                                    // A spawn failure at this point (only I/O
-                                    // failures on `mkdir` of the workspace /
-                                    // home / cache dirs today) means the
-                                    // session can't be brought up — surface
-                                    // as an `io::Error` to the client rather
-                                    // than panicking the actor. Leaves the
-                                    // record on disk; the next GetSession
-                                    // retries the same setup and either
-                                    // succeeds or errors identically.
+                                    // Hand over the finalized composition,
+                                    // if it's still in the manager's stash.
+                                    // Absent after a daemon restart — the
+                                    // actor spawns without one, and the
+                                    // record is still usable.
+                                    //
+                                    // Clone the `Arc` rather than draining
+                                    // now, so that a `Session::run` failure
+                                    // below leaves the stash intact: the
+                                    // next `GetSession` retry will still
+                                    // see the composition and run
+                                    // identically. Drain happens only on
+                                    // the success path just after the
+                                    // spawn returns.
+                                    let session_id = obj.record().id;
+                                    let composition = self.compositions.get(&session_id).cloned();
+                                    // A spawn failure at this point (only
+                                    // I/O failures on `mkdir` of the
+                                    // workspace / home / cache dirs today)
+                                    // means the session can't be brought
+                                    // up — surface as an `io::Error` to
+                                    // the client rather than panicking the
+                                    // actor. Leaves the record on disk and
+                                    // the composition in the stash; the
+                                    // next GetSession retries the same
+                                    // setup and either succeeds or errors
+                                    // identically.
                                     let h = Session::run(
                                         self.minimal_state_dir.clone(),
                                         self.minimal_cache_dir.clone(),
@@ -484,6 +495,12 @@ impl<L: Loader> Manager<L> {
                                         composition,
                                     )
                                     .await?;
+                                    // Spawn succeeded — safe to drain the
+                                    // stash. If the entry is already gone
+                                    // (post-restart spawn with a `None`
+                                    // composition), the remove is a
+                                    // no-op.
+                                    self.compositions.remove(&session_id);
                                     #[cfg(target_os = "linux")]
                                     if let Some((id, name, net)) = ptask_reg {
                                         let mut reg = self

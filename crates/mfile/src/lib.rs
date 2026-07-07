@@ -402,7 +402,11 @@ pub struct Session {
     pub extra: HashMap<String, toml::Value>,
 }
 
-impl Eq for Session {}
+// No `impl Eq for Session`: the `extra: HashMap<String, toml::Value>`
+// field means we can't honestly promise reflexivity, because
+// `toml::Value::Float(NaN)` participates in `PartialEq` but breaks
+// `x == x`. `Session` stays `PartialEq` only; no downstream API
+// requires `Eq`.
 
 impl Session {
     /// Returns true iff no primitive-carrying field on the session

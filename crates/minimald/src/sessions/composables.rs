@@ -116,13 +116,20 @@ fn extract_state_wiring(b: &graph::BuildSpec) -> Result<Vec<mfile::StateWiring>,
 }
 
 /// The string form of the nickel enum tag `'Credential` as it
-/// appears after `decode`'s AttrValue conversion. Extracted as a
-/// constant so a future change to how `decode` renders enum tags
-/// (angle-brackets, hash prefix, etc.) breaks compilation via
-/// `TODO(schema-stability)` grep rather than silently letting
-/// credential mappings flow into the sandbox.
+/// appears after `decode`'s AttrValue conversion. Compared as a
+/// plain string at runtime in [`extract_fs_mapping_paths`], so if
+/// `decode::AttrValue::EnumTag` ever changes its rendering
+/// (angle-brackets, hash prefix, etc.) the check here silently
+/// stops matching — credential mappings would then flow through
+/// unfiltered.
+///
+/// The actual regression guard is the
+/// `credential_class_fs_mappings_are_filtered_out` test in this
+/// module, which asserts a `'Credential`-tagged mapping is dropped.
+/// If `decode`'s enum-tag rendering changes, that test will fail
+/// and this constant is where to update.
 // TODO(schema-stability): keep in sync with `decode::AttrValue::EnumTag`
-// rendering. If that ever changes, this constant is where to update.
+// rendering.
 const CREDENTIAL_CLASS_TAG: &str = "Credential";
 
 fn extract_fs_mapping_paths(b: &graph::BuildSpec) -> Vec<String> {
