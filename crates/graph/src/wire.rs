@@ -610,7 +610,10 @@ fn materialize_local_file(
         .checked_add(header_len)
         .filter(|&end| end <= payload.len())
         .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "local file header exceeds payload")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "local file header exceeds payload",
+            )
         })?;
     let file_header: LocalFileHeader = serde_json::from_slice(&payload[pos..header_end])?;
     let data_start = header_end;
@@ -618,7 +621,10 @@ fn materialize_local_file(
         .checked_add(file_header.data_len as usize)
         .filter(|&end| end <= payload.len())
         .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "local file data exceeds payload")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "local file data exceeds payload",
+            )
         })?;
     let file_data = &payload[data_start..data_end];
 
