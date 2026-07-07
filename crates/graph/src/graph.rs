@@ -408,9 +408,71 @@ impl Graph {
         &self.supply_chain
     }
 
+    /// Builds an arbitrary graph and asserts it survives a wire round-trip:
+    /// `from_bytes(to_bytes(g))` must preserve every spec (name + spec-hash)
+    /// and the top-level count. The in-crate entry point for the
+    /// `graph_roundtrip` fuzz target (graphs aren't hand-constructible from
+    /// outside the crate, so this lives here).
+    #[cfg(feature = "fuzzing")]
+    #[doc(hidden)]
+    pub fn fuzz_roundtrip(data: &[u8]) {
+        use arbitrary::Unstructured;
+        let mut u = Unstructured::new(data);
+        let Ok(n) = u.int_in_range::<usize>(0..=64) else {
+            return;
+        };
+        let mut graph = Graph::new();
+        let mut refs = Vec::with_capacity(n);
+        for i in 0..n {
+            // Unique names keep `by_name` unambiguous for the differential.
+            let bsr = graph.insert_build(BuildSpec {
+                name: format!("s{i}"),
+                ..Default::default()
+            });
+            refs.push(bsr);
+        }
+        // An arbitrary subset become top-levels (exercises ref remapping).
+        let mut tops = Vec::new();
+        for &r in &refs {
+            if u.arbitrary().unwrap_or(false) {
+                tops.push(r);
+            }
+        }
+        graph.top_levels = tops;
+
+        let Ok(bytes) = graph.to_bytes() else {
+            return;
+        };
+        let restored = Graph::from_bytes(&bytes).expect("a valid graph failed to decode");
+        assert_eq!(
+            graph.len(),
+            restored.len(),
+            "spec count changed across round-trip"
+        );
+        assert_eq!(
+            graph.top_levels.len(),
+            restored.top_levels.len(),
+            "top-level count changed across round-trip"
+        );
+        for (bsr, spec) in graph.iter() {
+            let r = restored
+                .by_name(&spec.name)
+                .expect("spec missing after round-trip");
+            assert_eq!(
+                graph.spec_hash(&bsr),
+                restored.spec_hash(r),
+                "spec_hash mismatch for {} across round-trip",
+                spec.name
+            );
+        }
+    }
+
     /// Inserts a build spec into the arena and registers it by name.
     /// Returns the [`BuildSpecRef`] for the inserted spec.
-    #[cfg(test)]
+    ///
+    /// Test/fuzzing-only: production graphs are built by the decoder via
+    /// [`Graph::from_parts`].
+    #[cfg(any(test, feature = "fuzzing"))]
     pub(crate) fn insert_build(&mut self, spec: BuildSpec) -> BuildSpecRef {
         let name = spec.name.clone();
         let idx = self.builds.insert(spec);

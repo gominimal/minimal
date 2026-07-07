@@ -15,10 +15,18 @@ libfuzzer-sys = "0.4"
 
 [dependencies.graph]
 path = ".."
+features = ["fuzzing"]
 
 [[bin]]
 name = "graph_from_bytes"
 path = "fuzz_targets/graph_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "graph_roundtrip"
+path = "fuzz_targets/graph_roundtrip.rs"
 test = false
 doc = false
 bench = false

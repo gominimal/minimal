@@ -48,6 +48,7 @@ codegen-units = 16
 
 [workspace.dependencies]
 anyhow = "1.0"
+arbitrary = "1"
 async-compression = { version = "0.4", features = ["tokio", "zstd"] }
 async-tar = { version = "0.6", default-features = false, features = ["runtime-tokio"] }
 base64 = "0.22"
