@@ -37,6 +37,26 @@ const TAG_STACK: u8 = 0x06;
 const TAG_SUPPLY_CHAIN: u8 = 0x07;
 const TAG_FOOTER: u8 = 0xFF;
 
+/// Upper bound on a single framed record's payload length. A malformed stream
+/// can declare an arbitrary varint length; without this cap the decoder would
+/// `vec![0u8; len]` and abort the process on a multi-gigabyte allocation from a
+/// few bytes of input. 512 MiB comfortably exceeds any real build-spec or
+/// inlined local-file record.
+const MAX_RECORD_LEN: u64 = 512 * 1024 * 1024;
+
+/// Rejects a framed record whose declared length exceeds [`MAX_RECORD_LEN`], so
+/// a malformed varint cannot drive an unbounded `vec![0u8; len]` allocation.
+/// Shared by the sync and async readers to keep them in lock-step.
+fn check_record_len(len: u64) -> Result<(), WireError> {
+    if len > MAX_RECORD_LEN {
+        return Err(WireError::RecordTooLarge {
+            len,
+            max: MAX_RECORD_LEN,
+        });
+    }
+    Ok(())
+}
+
 // ── WireError ────────────────────────────────────────────────────────────────
 
 /// Errors that can occur during wire-format (de)serialization.
@@ -50,6 +70,7 @@ pub enum WireError {
     ChecksumMismatch,
     UnsupportedVersion(u32),
     FileHashMismatch { filename: String },
+    RecordTooLarge { len: u64, max: u64 },
 }
 
 impl From<io::Error> for WireError {
@@ -80,6 +101,9 @@ impl fmt::Display for WireError {
             Self::UnsupportedVersion(v) => write!(f, "unsupported stream version {v}"),
             Self::FileHashMismatch { filename } => {
                 write!(f, "blake3 hash mismatch for file {filename:?}")
+            }
+            Self::RecordTooLarge { len, max } => {
+                write!(f, "record length {len} exceeds maximum {max}")
             }
         }
     }
@@ -399,6 +423,7 @@ impl<R: Read> GraphReader<R> {
         };
 
         // Read payload
+        check_record_len(len)?;
         let mut payload = vec![0u8; len as usize];
         self.reader.read_exact(&mut payload)?;
 
@@ -854,6 +879,7 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
             result
         };
 
+        check_record_len(len)?;
         let mut payload = vec![0u8; len as usize];
         self.reader.read_exact(&mut payload).await?;
 
@@ -1024,6 +1050,19 @@ mod tests {
         assert!(td.is_none());
         assert_eq!(restored.len(), 0);
         assert!(restored.top_levels.is_empty());
+    }
+
+    #[test]
+    fn oversized_record_length_is_rejected_not_allocated() {
+        // Regression for a fuzzer-found OOM: a 6-byte input whose first record
+        // declares a ~2.8 GiB payload used to reach `vec![0u8; len]` and abort
+        // the process. It must now surface as a clean WireError instead.
+        let malicious = [0x03, 0xad, 0xad, 0xad, 0xad, 0x0a];
+        let err = Graph::from_bytes(&malicious).unwrap_err();
+        assert!(
+            matches!(err, WireError::RecordTooLarge { .. }),
+            "expected RecordTooLarge, got {err:?}"
+        );
     }
 
     #[test]
