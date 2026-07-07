@@ -36,6 +36,7 @@ impl TestDaemon {
         GlobalArgs {
             repo_dir: None,
             minimal_dir: Some(self.temp.path().to_path_buf()),
+            config_dir: None,
             minvmd: false,
         }
     }
