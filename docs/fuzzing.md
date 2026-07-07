@@ -33,6 +33,8 @@ nightly/sanitizer build doesn't perturb the main workspace).
 |---|---|---|---|---|
 | `graph_from_bytes` | `crates/graph/fuzz` | `Graph::from_bytes` — the build-graph wire format shipped over the remote-execution channel | NET | any |
 | `remote_index_from_reader` | `crates/rcache/fuzz` | `RemoteIndex::from_reader` — the remote-cache binary index fetched over GCS/HTTPS | NET | **Linux only** |
+| `spec_hash_from_hex` | `crates/common/fuzz` | `SpecHash::from_hex` — blake3 hex from cache keys / wire payloads | NET | any |
+| `target_from_str` | `crates/common/fuzz` | `Target::from_str` — hand-written `<arch>/<os>` parser | OWN | any |
 
 `remote_index_from_reader` builds only on Linux: `rcache` depends on `lcache`,
 which uses `common::renameat2` (a Linux-only syscall wrapper). This is one more
