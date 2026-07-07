@@ -37,6 +37,32 @@ const TAG_STACK: u8 = 0x06;
 const TAG_SUPPLY_CHAIN: u8 = 0x07;
 const TAG_FOOTER: u8 = 0xFF;
 
+/// Upper bound on a single framed record's payload length. A malformed stream
+/// can declare an arbitrary varint length; without this cap the decoder would
+/// `vec![0u8; len]` and abort the process on a multi-gigabyte allocation from a
+/// few bytes of input. 512 MiB comfortably exceeds any real build-spec or
+/// inlined local-file record.
+const MAX_RECORD_LEN: u64 = 512 * 1024 * 1024;
+
+/// Upper bound on the arena/map capacity pre-sized from the header's
+/// (untrusted) `build_count`. The collections still grow to hold every spec
+/// actually decoded; this only stops a malformed count from pre-allocating
+/// gigabytes before a single spec record is read.
+const MAX_PREALLOC_BUILDS: usize = 4096;
+
+/// Rejects a framed record whose declared length exceeds [`MAX_RECORD_LEN`], so
+/// a malformed varint cannot drive an unbounded `vec![0u8; len]` allocation.
+/// Shared by the sync and async readers to keep them in lock-step.
+fn check_record_len(len: u64) -> Result<(), WireError> {
+    if len > MAX_RECORD_LEN {
+        return Err(WireError::RecordTooLarge {
+            len,
+            max: MAX_RECORD_LEN,
+        });
+    }
+    Ok(())
+}
+
 // ── WireError ────────────────────────────────────────────────────────────────
 
 /// Errors that can occur during wire-format (de)serialization.
@@ -50,6 +76,7 @@ pub enum WireError {
     ChecksumMismatch,
     UnsupportedVersion(u32),
     FileHashMismatch { filename: String },
+    RecordTooLarge { len: u64, max: u64 },
 }
 
 impl From<io::Error> for WireError {
@@ -80,6 +107,9 @@ impl fmt::Display for WireError {
             Self::UnsupportedVersion(v) => write!(f, "unsupported stream version {v}"),
             Self::FileHashMismatch { filename } => {
                 write!(f, "blake3 hash mismatch for file {filename:?}")
+            }
+            Self::RecordTooLarge { len, max } => {
+                write!(f, "record length {len} exceeds maximum {max}")
             }
         }
     }
@@ -399,6 +429,7 @@ impl<R: Read> GraphReader<R> {
         };
 
         // Read payload
+        check_record_len(len)?;
         let mut payload = vec![0u8; len as usize];
         self.reader.read_exact(&mut payload)?;
 
@@ -432,8 +463,9 @@ impl<R: Read> GraphReader<R> {
         }
         let target = header.target.unwrap_or_default();
 
-        let mut arena: Arena<BuildSpec> = Arena::with_capacity(header.build_count);
-        let mut remap: HashMap<Index, BuildSpecRef> = HashMap::with_capacity(header.build_count);
+        let prealloc = header.build_count.min(MAX_PREALLOC_BUILDS);
+        let mut arena: Arena<BuildSpec> = Arena::with_capacity(prealloc);
+        let mut remap: HashMap<Index, BuildSpecRef> = HashMap::with_capacity(prealloc);
         let mut temp_dir: Option<tempfile::TempDir> = None;
         let mut file_counter: usize = 0;
 
@@ -854,6 +886,7 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
             result
         };
 
+        check_record_len(len)?;
         let mut payload = vec![0u8; len as usize];
         self.reader.read_exact(&mut payload).await?;
 
@@ -881,8 +914,9 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
         }
         let target = header.target.unwrap_or_default();
 
-        let mut arena: Arena<BuildSpec> = Arena::with_capacity(header.build_count);
-        let mut remap: HashMap<Index, BuildSpecRef> = HashMap::with_capacity(header.build_count);
+        let prealloc = header.build_count.min(MAX_PREALLOC_BUILDS);
+        let mut arena: Arena<BuildSpec> = Arena::with_capacity(prealloc);
+        let mut remap: HashMap<Index, BuildSpecRef> = HashMap::with_capacity(prealloc);
         let mut temp_dir: Option<tempfile::TempDir> = None;
         let mut file_counter: usize = 0;
 
@@ -1024,6 +1058,33 @@ mod tests {
         assert!(td.is_none());
         assert_eq!(restored.len(), 0);
         assert!(restored.top_levels.is_empty());
+    }
+
+    #[test]
+    fn oversized_build_count_is_not_preallocated() {
+        // Regression for a second fuzzer-found OOM: a 35-byte input whose
+        // header declares build_count ~97M drove Arena/HashMap::with_capacity
+        // to a ~280 GiB allocation. The count is now a capped hint, so decode
+        // proceeds and fails cleanly on the truncated stream instead of OOMing.
+        let malicious = [
+            0x01, 0x12, 0x5b, 0x31, 0x0d, 0x0d, 0x0d, 0x2c, 0x39, 0x37, 0x35, 0x32, 0x34, 0x32,
+            0x30, 0x37, 0x5d, 0x0d, 0x0a, 0x0d, 0x06, 0x0d, 0x27, 0x0d, 0xff, 0xff, 0xff, 0x0d,
+            0x0d, 0xff, 0xff, 0xff, 0xff, 0xff, 0x8a,
+        ];
+        assert!(Graph::from_bytes(&malicious).is_err());
+    }
+
+    #[test]
+    fn oversized_record_length_is_rejected_not_allocated() {
+        // Regression for a fuzzer-found OOM: a 6-byte input whose first record
+        // declares a ~2.8 GiB payload used to reach `vec![0u8; len]` and abort
+        // the process. It must now surface as a clean WireError instead.
+        let malicious = [0x03, 0xad, 0xad, 0xad, 0xad, 0x0a];
+        let err = Graph::from_bytes(&malicious).unwrap_err();
+        assert!(
+            matches!(err, WireError::RecordTooLarge { .. }),
+            "expected RecordTooLarge, got {err:?}"
+        );
     }
 
     #[test]
