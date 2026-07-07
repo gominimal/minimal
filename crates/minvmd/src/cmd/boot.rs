@@ -34,7 +34,7 @@ pub fn run(foreground: bool) -> Result<()> {
 
 #[cfg(minvmd_libkrun)]
 fn run_boot(foreground: bool) -> Result<()> {
-    use std::io::{BufRead, BufReader};
+    use std::io::BufReader;
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -99,6 +99,8 @@ fn run_boot(foreground: bool) -> Result<()> {
     // take ~20s+ to reach userspace, so a fixed 5s was too short.
     let ready_timeout: Duration = crate::cmd::ready_timeout();
 
+    let known_hosts_path = crate::cmd::default_vm_known_hosts_path();
+
     // Run the accept loop in a separate thread so we can apply a wall-clock
     // timeout without platform-specific socket options.
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -109,15 +111,7 @@ fn run_boot(foreground: bool) -> Result<()> {
                 .accept()
                 .map_err(|e| format!("accept on READY-marker socket: {e}"))?;
             let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            reader
-                .read_line(&mut line)
-                .map_err(|e| format!("reading READY marker: {e}"))?;
-            let trimmed = line.trim();
-            if trimmed != "READY" {
-                return Err(format!("expected READY on marker socket, got {trimmed:?}"));
-            }
-            Ok(())
+            crate::cmd::read_ready_beacon(&mut reader, &known_hosts_path)
         })();
         let _ = tx.send(result);
         let _ = std::fs::remove_file(&sock_path_clone);
