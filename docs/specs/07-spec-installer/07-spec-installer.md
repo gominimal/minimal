@@ -204,6 +204,18 @@ already exists **and** its on-disk SHA-256 equals the manifest `sha256`, the
 component is skipped with no download. The on-disk file — not any recorded
 state — is the source of truth for "already installed".
 
+A macOS `bin` file is the one exception: it is ad-hoc code-signed after download
+(R5.4 / Security), which rewrites the Mach-O so its installed bytes no longer
+equal the manifest `sha256`. To keep reruns cheap there, the installer also skips
+a component whose on-disk hash equals the **installed hash it recorded last run
+for the same manifest `sha256`** (R6.1). Keying on the manifest hash is
+load-bearing: a new release changes `sha256`, so the recorded row no longer
+matches the current `want` and the (now stale) signed file is re-downloaded
+instead of being wrongly judged up to date — the signed bytes would otherwise
+still equal the old recorded installed hash forever. The record is only ever a
+positive-match optimization; a deleted or tampered file matches nothing and is
+reinstalled.
+
 **R5.2** — Otherwise the artifact is downloaded from `<BUCKET>/<src>` to a
 temp sibling **in the destination directory** (`<dest>.tmp.$$`), so the final
 rename is same-filesystem and atomic.
@@ -237,13 +249,22 @@ mv -f "$target.tmp.$$" "$target"
   download-count stub).
 - **Test**: A manifest whose `sha256` disagrees with the served artifact exits
   non-zero and leaves no file (and no `.tmp.` file) at the destination.
+- **Test** (macOS staleness): after a signed-`bin` install, a rerun against the
+  *same* manifest performs zero downloads and no re-sign, but a rerun against a
+  manifest whose `sha256` for that component *changed* re-downloads and re-signs
+  it — the recorded installed hash does not mask a new release.
 
 ### Unit 6 — Install record and PATH advisory
 
 **R6.1** — After a successful run the installer writes a record of what it
-installed to `<state>/installed` — the resolved `(component, dest, sha256)`
-rows for this platform. The record enables future uninstall and surfaces
-prefix drift if `XDG_*` variables change between runs.
+installed to `<state>/installed` — the resolved
+`(component, dest, manifest-sha256, installed-sha256)` rows for this platform,
+tab-delimited. `manifest-sha256` is the artifact's `sha256` from the manifest;
+`installed-sha256` is the SHA-256 of the bytes actually on disk, which equals
+`manifest-sha256` except for a macOS-signed `bin` file. Pairing the two is what
+lets the R5.1 signed-file skip stay correct across releases (skip only while the
+manifest still wants that artifact). The record also enables uninstall (Units
+7–8) and surfaces prefix drift if `XDG_*` variables change between runs.
 
 **R6.2** — If the resolved `bin` directory is not on `$PATH`, the installer
 prints an advisory telling the user to add it — it does **not** silently edit
@@ -258,8 +279,10 @@ any shell rc file.
 
 ## Non-Goals
 
-- **Uninstall.** The install record (R6.1) is written to enable it later; the
-  uninstall command itself is out of scope.
+- **Uninstall.** ~~The install record (R6.1) is written to enable it later; the
+  uninstall command itself is out of scope.~~ Now specified below — see
+  [Uninstaller](#uninstaller). The install record (R6.1) is the sole authority
+  for what to remove.
 - **Multi-file / archive components.** v1 handles `kind = file` single files only.
   The `kind` column reserves room for archive kinds without a format break.
 - **Signing/verification beyond TLS + SHA-256.** See Security Considerations for
@@ -360,3 +383,221 @@ architecture record; design rationale is captured above.
    the current `stable` binaries into temp prefixes; a second run performs zero
    downloads; corrupting one on-disk binary makes the next run re-fetch only that
    component.
+
+---
+
+# Uninstaller
+
+## Context
+
+The installer places files (R5) and, after each successful run, records exactly
+what it placed: `<state>/installed` holds one **tab-delimited** row per installed
+component variant, `component<TAB>dest<TAB>manifest-hash<TAB>installed-hash`, where
+`dest` is the **absolute** on-disk path and `installed-hash` is the SHA-256 of the
+bytes actually written there (R6.1). On macOS that hash is the *post-signing*
+digest of an ad-hoc-signed `bin` file, which deliberately diverges from the
+manifest `sha256` (see R5.1 and `install.sh`'s signing note). Uninstall reads only
+`dest` and `installed-hash`; the `manifest-hash` column is for the installer's
+rerun skip check (R5.1) and is unused here.
+
+That record is a complete, self-contained inventory of the installer's
+footprint. An uninstaller does not need the network, the bucket, the manifest, or
+even to know which version is installed: it walks the record and undoes it. This
+mirrors the installer's guiding principle — **the recorded/on-disk hash is the
+oracle** — applied in reverse: only remove a file the installer wrote and that is
+still byte-for-byte what it wrote.
+
+## Introduction/Overview
+
+Uninstall is a **mode of the same `install.sh` script**, entered with
+`--uninstall` as the first argument, so there is one published URL and one script
+to maintain and the two modes share environment probing (SHA-256 tool, prefix
+resolution) and the path-safety discipline. It is offline: no downloader is
+required or invoked.
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL <URL>/install.sh | sh -s -- --uninstall
+# or, if the script is already on disk:
+sh install.sh --uninstall [--dry-run] [--force] [--purge]
+```
+
+For each recorded component the uninstaller re-hashes the file at `dest` and,
+**only if it matches the recorded `installed-hash`**, removes it; a file that is
+missing is counted and skipped, and a file whose bytes have changed is left in
+place (the user edited or replaced it) unless `--force` is given. It then removes
+the record itself and prunes now-empty `minimal`-owned directories. The operation
+is idempotent: a second `--uninstall` finds no record and is a clean no-op.
+
+## Goals
+
+1. A single `… | sh -s -- --uninstall` removes every file the installer placed
+   for this host, using only the local install record — no network, no bucket,
+   no manifest.
+2. It never deletes a file the installer did not write, and never a file the user
+   has since modified or replaced (unless `--force`).
+3. It is idempotent and safe to interrupt: a partial or repeated run never errors
+   out and never removes something outside the recorded footprint.
+4. `--dry-run` shows precisely what would be removed without touching anything.
+
+## User Stories
+
+- **As a user who wants minimal gone**, I run the documented `--uninstall` line
+  and every binary and data file the installer placed is removed, with a summary
+  of what went and what was kept.
+- **As a user who hand-patched a binary**, I run `--uninstall` and my modified
+  file is reported as *kept* (its hash no longer matches the record), not silently
+  deleted.
+- **As a user reclaiming disk**, I add `--purge` to also delete the `minimal`
+  data/state/cache trees, not just the recorded files.
+
+## Demoable Units of Work
+
+### Unit 7 — Uninstall dispatch and record walk
+
+**R7.1** — When the first argument is `--uninstall`, the script enters uninstall
+mode **before** target validation (R2.1) — `--uninstall` otherwise passes the
+target charset and would be fetched as a bogus target. In this mode the downloader
+probe (R1.1) is skipped/made lazy: an uninstall must succeed on a host with no
+`curl`/`wget`. The SHA-256 tool (R1.2), platform probe (R1.3), and prefix
+resolution (R4.1) are still required. `--uninstall` is mutually exclusive with a
+target argument.
+
+**R7.2** — The record is located at `<state>/installed` via the same
+`resolve_prefix state` used to write it (R6.1), so an `XDG_STATE_HOME` set at
+uninstall time resolves identically. If the record is absent, the uninstaller
+prints "nothing to uninstall (no install record at …)" and exits **0** — absence
+is success, not an error.
+
+**R7.3** — Each record row is parsed with tab as the field separator
+(`awk -F'\t'` / `read -r … <TAB>`), never default whitespace splitting, because a
+`dest` under a `$HOME` containing spaces is legal. Taking `dest` and
+`installed-hash` from each `(component, dest, manifest-hash, installed-hash)` row:
+
+- `dest` **absent** → counted as *already removed*, skipped.
+- `dest` is **not a regular file** (a symlink or directory now occupies the
+  path) → left in place with a warning; the installer only ever writes regular
+  files, so something else owns this path.
+- `dest` present, a regular file, and `sha256(dest) == installed-hash` → removed.
+- `dest` present but `sha256(dest) != installed-hash` → the file was modified or
+  replaced since install; **left in place** with a warning by default, removed
+  only under `--force`.
+
+**R7.4** — The comparison is against the recorded `installed-hash`, **not** the
+manifest `sha256` (which the uninstaller does not have offline). This is what
+lets a macOS ad-hoc-signed `bin` file — whose on-disk bytes diverge from the
+manifest — still match and be recognized as ours.
+
+**Proof artifacts**:
+
+- **Test**: After an install into temp prefixes, `--uninstall` removes every
+  recorded file and reports the count; the destinations no longer exist.
+- **Test**: A recorded file whose bytes are altered before `--uninstall` is
+  **kept** (reported as modified) and removed only when `--force` is added.
+- **Test**: A record listing a `dest` that has already been deleted causes
+  `--uninstall` to exit 0, counting it as already-removed, with no error.
+
+### Unit 8 — Record teardown, directory pruning, and purge
+
+**R8.1** — After the walk, the record file is removed **only if the footprint is
+fully gone** — every recorded file removed or already absent. If anything was
+kept (a modified file under R7.3, or a foreign path), the record is **retained**
+so a later `--force` or manual cleanup still has the inventory to work from;
+re-running is idempotent because already-removed rows re-classify as
+already-absent. Teardown happens after the walk (not before) for the same reason:
+an interrupted run leaves the inventory intact for the retry. Then each
+`minimal`-owned directory that the installer may have created is removed **only
+if empty**, via `rmdir` (never `rm -rf`): the `data`, `state`, and `cache`
+prefixes resolve to `.../minimal` subdirectories the installer owns, and the
+`bin` prefix (`~/.local/bin`) is shared with other tools so it is `rmdir`ed only
+when empty and otherwise left untouched. Pruning failures (a non-empty dir) are
+ignored, not fatal.
+
+**R8.2** — `--purge` additionally removes the `minimal`-owned trees in full —
+the resolved `data`, `state`, and `cache` directories and everything under them
+(build cache included) — because those live at fixed `.../minimal` paths the tool
+owns exclusively. `--purge` never touches the shared `bin` directory beyond the
+empty-`rmdir` of R8.1, and never removes individual files outside those
+`minimal`-owned roots.
+
+**R8.3** — `--dry-run` (accepted in uninstall mode) prints each planned removal
+and prune, prefixed to make it unmistakable, and touches nothing — no file
+removed, record left intact. It composes with `--force`/`--purge` to preview
+their effect.
+
+**R8.4** — The run prints a summary: counts of *removed*, *already-absent*,
+*kept (modified)*, and *kept (not a regular file)*, plus which directories were
+pruned. A run that kept files because they were modified still exits **0** (it did
+what was asked); only an unexpected internal failure is non-zero.
+
+**Proof artifacts**:
+
+- **Test**: After `--uninstall`, `<state>/installed` is gone and an emptied
+  `data`/`state` dir is `rmdir`ed, while a `bin` dir still holding an unrelated
+  file is left in place.
+- **Test**: `--dry-run` against a populated record removes nothing and leaves the
+  record; a subsequent plain `--uninstall` then removes everything.
+- **Test**: With a stray build artifact under the `cache` prefix, plain
+  `--uninstall` leaves the cache tree; `--purge` removes it.
+
+## Non-Goals (uninstaller)
+
+- **Reconstructing the footprint from the manifest.** The local record is the
+  only authority. If it is missing, uninstall is a no-op — the uninstaller never
+  fetches a manifest and deletes by guessing which paths *would have* been
+  written, which could clobber unrelated files at those paths.
+- **Removing PATH edits.** The installer never edits shell rc files (R6.2), so
+  there is nothing of that kind to undo.
+- **Cross-prefix drift recovery.** If `XDG_*`/`MINIMAL_BIN` differ between install
+  and uninstall, the record's **absolute** `dest` paths are still removed
+  correctly, but directory pruning (R8.1) targets the *currently* resolved
+  prefixes; a stale, differently-resolved empty dir may remain. Surfacing that is
+  out of scope.
+
+## Design Considerations (uninstaller)
+
+**Why a mode of `install.sh`, not a separate script.** One published URL, one
+script to keep POSIX-clean and shellcheck-green, and direct reuse of
+`resolve_prefix`, the SHA-256 wrapper, and the path-safety `case`s. The cost is a
+small dispatch at the top of `main`; the alternative — a second script — would
+duplicate all of environment probing and drift out of sync.
+
+**Hash-verify before delete.** The symmetric counterpart to the install skip
+oracle (R5.1). Removing only files whose current bytes equal what we recorded
+writing means a user who replaced a binary with their own build, or whose file
+was touched by another tool, never loses data to `--uninstall`. `--force` exists
+for the "I know, remove it anyway" case.
+
+**Record deleted last.** Files are removed first, the record last, so an
+interrupted run can be re-run: rows already removed re-classify as
+*already-absent* (R7.3) and the run completes. Deleting the record first would
+strand any not-yet-removed files with no inventory to find them by.
+
+**`rmdir`, never `rm -rf`, for shared paths.** `~/.local/bin` holds other tools'
+binaries; an empty-only `rmdir` can never take them. Full-tree deletion is gated
+behind explicit `--purge` and confined to the `.../minimal` roots the tool owns.
+
+## Security Considerations (uninstaller)
+
+- **Trust boundary is the local record.** The record lives in the user's own
+  `state` dir and lists absolute paths the installer itself wrote through the
+  validated `resolve_prefix` + subpath checks (R4). The uninstaller does not
+  re-derive paths from any network input. As defense in depth it still refuses to
+  remove a `dest` that is not a regular file (R7.3), so a symlink swapped in at a
+  recorded path is not followed into deleting something else.
+- **No privilege escalation.** Like the installer, uninstall runs as the user and
+  writes only under user-owned prefixes; it never invokes `sudo`.
+- **`--force`/`--purge` are opt-in.** The destructive behaviors (removing modified
+  files; deleting whole `minimal` trees) require an explicit flag; the default is
+  the conservative, hash-verified removal of the exact recorded footprint.
+
+## Verification (uninstaller)
+
+1. **Static/conformance**: the same `shellcheck --shell=sh` and `dash` CI gates
+   cover the added uninstall path.
+2. **Unit tests** (Units 7–8): dispatch and record-absent no-op; hash-verified
+   removal; modified-file keep vs `--force`; already-absent idempotency;
+   non-regular-file refusal; record teardown and empty-dir pruning; `--dry-run`
+   removing nothing; `--purge` clearing the owned trees.
+3. **End-to-end**: `install` into temp prefixes, then `--uninstall` leaves the
+   prefixes free of every recorded file and removes the record; a second
+   `--uninstall` is a clean no-op exiting 0.
