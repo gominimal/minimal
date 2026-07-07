@@ -328,23 +328,14 @@ impl Contribution {
         self.lifecycle_hooks.push(h);
     }
 
-    /// Merge `other` into `self` in place. Used by composers to
-    /// accumulate per-source contributions into one bucket.
-    ///
-    /// Pure aggregation: concatenates vars/patches/hooks and dedupes
-    /// packages. Disagreement *between* contributors (same var, two
-    /// values; same patch dest, two sources) is **not** detected
-    /// here — it would fire before the policy gate runs, making the
-    /// user's `ignore` rule incapable of dropping the offending
-    /// items. Conflict detection happens post-gate in
-    /// [`compose_contribution`] so ignored items are filtered out
-    /// first; only post-gate survivors get compared.
+    /// Merge `other` into `self`: concatenate vars/patches/hooks and
+    /// dedupe packages. Cross-contributor conflicts are detected
+    /// post-gate in [`compose_contribution`], not here.
     ///
     /// # Errors
     ///
-    /// `Result` shape preserved as a placeholder: a future
-    /// interactive resolution hook could legitimately fail here.
-    /// Today the body is infallible.
+    /// Infallible today; `Result` shape kept for a future
+    /// interactive resolution hook.
     #[allow(
         clippy::unnecessary_wraps,
         reason = "Result shape reserved for future interactive resolution"
@@ -658,21 +649,15 @@ impl<E: fmt::Display> fmt::Display for DisplayJoin<'_, E> {
 pub struct SessionVar(ProvenancedVar);
 
 impl SessionVar {
-    /// Direct construction. Crate-internal because outside callers
-    /// should obtain `SessionVar`s by going through the gate (e.g.
-    /// `UserComposer::compose`) or reconstructing one from a
-    /// [`WireSessionVar`] via the `From` impl — both of which
-    /// guarantee provenance is
-    /// truthful. `pub(crate)` exposes it for in-crate handlers (e.g.
-    /// `client::handler`) that build session vars from already-gated
-    /// wire payloads.
+    /// Direct construction. Crate-internal so external callers can
+    /// only obtain a `SessionVar` via the gate or from a
+    /// [`WireSessionVar`] — both post-gate by construction.
     #[must_use]
     pub(crate) fn new(var: ResolvedVar, source: Source) -> Self {
         Self(ProvenancedVar::new(var, source))
     }
 
-    /// Lift a [`ProvenancedVar`] that has passed the gate into a
-    /// `SessionVar`. Zero-cost (no allocation, no clone).
+    /// Lift a gated [`ProvenancedVar`] into a `SessionVar`.
     #[must_use]
     pub(crate) fn from_provenanced(pv: ProvenancedVar) -> Self {
         Self(pv)
@@ -720,14 +705,9 @@ pub struct SessionPatch {
 }
 
 impl SessionPatch {
-    /// Direct construction. Crate-internal because outside callers
-    /// should obtain `SessionPatch`s by going through the gate or by
-    /// reconstructing one from a [`WireSessionPatch`] via the `From`
-    /// impl — both of which guarantee provenance is truthful.
-    /// `pub(crate)` exposes it for in-crate handlers (e.g.
-    /// `daemon::composer::resume_from_verdict`) that build session
-    /// patches from already-gated verdict payloads + stashed source
-    /// provenance.
+    /// Direct construction. Crate-internal so external callers can
+    /// only obtain a `SessionPatch` via the gate or from a
+    /// [`WireSessionPatch`] — both post-gate by construction.
     #[must_use]
     pub(crate) fn new(patch: ResolvedPatch, source: Source) -> Self {
         Self { patch, source }
@@ -1031,17 +1011,9 @@ impl Composition {
         Ok(())
     }
 
-    /// Construct a [`Composition`] pre-populated with daemon-side
+    /// Construct a [`Composition`] pre-populated with daemon
     /// pass-through items (packages and lifecycle hooks — neither
-    /// has a per-item user-policy gate).
-    ///
-    /// Used by the daemon-side composer on the all-decided fast
-    /// path: vars and patches don't appear here because anything
-    /// that would have needed the client's verdict routes through
-    /// [`ComposeOutcome::Pending`] instead. Packages are deduped by
-    /// name (same rule [`Contribution::merge`] applies).
-    ///
-    /// [`ComposeOutcome::Pending`]: crate::daemon::composer::ComposeOutcome::Pending
+    /// has a per-item gate). Packages are deduped by name.
     pub(crate) fn from_daemon_passthrough(
         mut packages: Vec<ProvenancedPackage>,
         lifecycle_hooks: Vec<ProvenancedHook>,
@@ -1055,16 +1027,9 @@ impl Composition {
         }
     }
 
-    /// Append already-gated domain-typed vars and patches. Used by
-    /// [`resume_from_verdict`] to land items reassembled from a
-    /// client verdict (the verdict carries domain values, not wire
-    /// shapes, after the source provenance is rejoined from the
-    /// daemon stash).
-    ///
-    /// Atomic: conflict checks run against the chained union before
-    /// any mutation; on `Err`, `self` is untouched.
-    ///
-    /// [`resume_from_verdict`]: crate::daemon::composer::resume_from_verdict
+    /// Append already-gated vars and patches. Atomic: conflict
+    /// checks run against the union before any mutation; on `Err`,
+    /// `self` is untouched.
     ///
     /// # Errors
     ///
@@ -1120,18 +1085,11 @@ pub struct ComposeOptions {
 // Per-domain gating
 // =====================================================================
 
-/// Invoke a var-domain hook on a batch of unapproved items. The
-/// hook gets `policy` cloned (it can't mutate the caller's directly);
-/// on success the caller gets back `(decisions, policy)` where
-/// `policy` is the hook's `updated_policy` if it returned one, else
-/// the original. Decision count is validated; mismatches return
-/// `HookContract`.
-///
-/// Lifts the boilerplate (call hook, handle `Abort`, fold in
-/// `updated_policy`, validate decision count) shared by [`gate_vars`]
-/// (Phase 1 of `docs/COMPOSITION.md`) and
-/// [`handle_response`](crate::client::handler::handle_response)
-/// (Phase 3).
+/// Invoke a var-domain hook on a batch of unapproved items. Returns
+/// `(decisions, policy)` where `policy` is the hook's
+/// `updated_policy` if provided, else the original. Validates
+/// decision count against `view.len()`; a mismatch returns
+/// [`ComposeError::HookContract`].
 pub(crate) fn prompt_var_hook(
     hooks: &dyn PolicyHooks,
     policy: VarsPolicy,
@@ -1495,78 +1453,38 @@ pub(crate) fn compose_contribution(
     Ok((composition, final_policy))
 }
 
-/// Output of [`contribution_to_pending`]: the daemon-collected vars,
-/// patches, and lifecycle hooks in their daemon→client wire shape,
-/// **plus** the original domain items keyed by their assigned
-/// [`PendingId`] for the daemon-side stash to hand back to
-/// [`resume_from_verdict`].
+/// Output of [`contribution_to_pending`]: daemon-collected items in
+/// their wire shape, plus the daemon-side stash keyed by
+/// [`PendingId`] so [`resume_from_verdict`] can rehydrate provenance
+/// from the verdict.
 ///
-/// Packages aren't carried on the wire — the schema's
-/// [`ContributionResponse`] has no slot for them — and the daemon
-/// stashes them separately. Lifecycle hooks have no per-item verdict
-/// either, but the response does carry them for client-side audit.
-///
-/// [`ContributionResponse`]: crate::wire::request::ContributionResponse
 /// [`resume_from_verdict`]: crate::daemon::composer::resume_from_verdict
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PendingTransform {
-    /// Wire-shaped pending payload destined for [`ContributionResponse`].
-    ///
-    /// [`ContributionResponse`]: crate::wire::request::ContributionResponse
     pub(crate) wire: WirePending,
-    /// Daemon-side stash: original [`ProvenancedVar`]s keyed by the
-    /// [`PendingId`] they were assigned in `wire.vars`. The verdict
-    /// only carries the resolved value; the source comes from here.
     pub(crate) pending_vars: BTreeMap<PendingId, ProvenancedVar>,
-    /// Daemon-side stash: original [`ProvenancedPatch`]s keyed by
-    /// [`PendingId`]. The verdict only carries the resolved
-    /// `host_path` per file; destination + source come from here.
     pub(crate) pending_patches: BTreeMap<PendingId, ProvenancedPatch>,
 }
 
 /// Wire-shaped pending payload — the subset of [`PendingTransform`]
-/// that crosses the RPC boundary. Carried as a field inside
-/// `PendingTransform` so the daemon-side stash can be built from one
-/// canonical traversal.
+/// that crosses the RPC boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct WirePending {
-    /// Pending vars (id-tagged for verdict correlation).
     pub(crate) vars: Vec<WirePendingVar>,
-    /// Pending patches (id-tagged for verdict correlation).
     pub(crate) patches: Vec<WirePendingPatch>,
-    /// Lifecycle hooks (no per-item verdict — pass-through to the
-    /// daemon's apply layer; see [`ContributionResponse::lifecycle_hooks`]).
-    ///
-    /// [`ContributionResponse::lifecycle_hooks`]: crate::wire::request::ContributionResponse::lifecycle_hooks
     pub(crate) lifecycle_hooks: Vec<WireProvenancedHook>,
 }
 
 /// Convert daemon-collected vars, patches, and lifecycle hooks into
-/// their wire pending shape **and** the matching daemon-side stash
-/// keyed by [`PendingId`]. Pure: no policy consulted, no env touched.
+/// their wire pending shape plus a per-item [`PendingId`] stash.
+/// Pure: no policy consulted, no env touched.
 ///
-/// Every var and patch becomes a pending item with a fresh
-/// [`PendingId`] so the client's verdict can correlate per-item.
-/// Lifecycle hooks pass through unchanged on the wire and aren't
-/// stashed — there's no per-item policy gate and the daemon's own
-/// original copy already lives in [`PendingComposeState::daemon_lifecycle_hooks`].
-///
-/// Packages aren't transformed here. The wire response has no
-/// packages slot, so daemon-collected packages stay in domain
-/// shape on the daemon-side stash; callers extract them off the
-/// `Contribution` separately before calling this.
-///
-/// Ids are assigned by position within each domain. Two items in
-/// different domains may share the integer; correlation is per
-/// `(domain, id)` from the daemon's perspective.
-///
-/// [`PendingComposeState::daemon_lifecycle_hooks`]: crate::daemon::composer::PendingComposeState::daemon_lifecycle_hooks
+/// Ids are assigned by position within each domain; correlation is
+/// per `(domain, id)`.
 ///
 /// # Panics
 ///
-/// Panics if a single domain holds more than `u32::MAX + 1` items,
-/// which the wire schema's [`PendingId`] cannot represent. In
-/// practice no daemon-collected contribution gets near that bound.
+/// If a single domain holds more than `u32::MAX + 1` items.
 pub(crate) fn contribution_to_pending(
     vars: Vec<ProvenancedVar>,
     patches: Vec<ProvenancedPatch>,

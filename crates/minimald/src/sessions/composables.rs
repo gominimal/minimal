@@ -43,31 +43,13 @@ struct PackageAttrs {
     fs_mapping_paths: Vec<String>,
 }
 
-/// Pull the three runtime-env attrs off a package's
-/// `BuildSpec.attrs`, producing the domain-typed pieces
-/// [`mfile::PackageComposable`] takes:
+/// Read the runtime-env attrs off a package's `BuildSpec.attrs`
+/// into domain-typed pieces for [`mfile::PackageComposable`].
 ///
-/// - `env_state_wiring` → [`mfile::StateWiring`] per entry.
-/// - `env_dir_mappings` + `env_file_mappings` → one `String` per
-///   entry, holding the mapping's `path` (used verbatim as both
-///   source and dest — dir vs file doesn't matter under copy
-///   semantics).
-///
-/// Filters applied at extraction:
-/// - `class = 'Credential` mappings are dropped. The future secrets
-///   strategy will route them through a separate channel; for now
-///   they simply don't reach the sandbox via this path (which is
-///   a regression vs the pre-composition `SetupForPackages` behavior
-///   that treated them identically to `'State` — see
-///   `TODO(secrets)` below).
-/// - `read_only` is ignored: minimal copies rather than mounts, so
-///   the flag has no meaning today.
-///
-/// Malformed entries (wrong AttrValue shape, missing fields) are
-/// silently skipped; the strictness bar for these attrs lives with
-/// the nickel schema, not here. Both `env_state_wiring` and the
-/// two mapping attrs accept either a list or a single-map form on
-/// the wire.
+/// Credential-class mappings are dropped (see `TODO(secrets)`);
+/// `read_only` is ignored (minimal is copy-based). Malformed
+/// entries are silently skipped — the nickel schema is the
+/// authority on shape.
 fn extract_package_attrs(b: &graph::BuildSpec) -> Result<PackageAttrs, std::io::Error> {
     Ok(PackageAttrs {
         state_wiring: extract_state_wiring(b)?,
@@ -188,9 +170,8 @@ fn extract_fs_mapping_paths(b: &graph::BuildSpec) -> Vec<String> {
         .collect()
 }
 
-/// Normalize the "either a list-of-maps or a single map" shape both
-/// `env_state_wiring` and the fs-mapping attrs accept on the wire
-/// into a single slice of entry AttrValues.
+/// Normalize the list-or-single-map wire shape into a slice of
+/// entry `AttrValue`s.
 fn attr_entries(v: &graph::AttrValue) -> Vec<&graph::AttrValue> {
     match v {
         graph::AttrValue::List(l) => l.iter().collect(),
@@ -225,26 +206,11 @@ pub(crate) enum ProjectResolution {
     Full(mctx::Context, Box<graph::Graph>),
 }
 
-/// Parse the client's project `minimal.toml` and resolve its graph
-/// at `CreateSession` time.
-///
-/// mfile-parse errors are split:
-/// - `NotFound` → [`ProjectResolution::NoMFile`], logged at debug.
-///   Both "the directory has no `minimal.toml`" and DM1's "daemon
-///   can't see the host path" produce this — neither is
-///   operator-actionable on the daemon.
-/// - Anything else (malformed TOML, permission denied, schema
-///   error, conflicting layouts) is a client-side declaration bug
-///   surfaced to the client as `InvalidInput`.
-///
-/// Graph-resolve failures are silenced ([`ProjectResolution::MFileOnly`])
-/// because they can be transient (upstream unreachable, layer
-/// cache churn) and the project-scoped composables are still
-/// valuable on their own.
-///
-/// Runs synchronously on the caller's stack (typically the manager
-/// mainloop). Graph resolution is CPU-bound on cold-cache; if it
-/// starts starving other messages, wrap in `spawn_blocking`.
+/// Parse the client's project `minimal.toml` and resolve its graph.
+/// A missing mfile yields [`ProjectResolution::NoMFile`]; a
+/// graph-resolve failure yields [`ProjectResolution::MFileOnly`]
+/// (transient failures shouldn't sink the whole compose). Other
+/// mfile errors are returned as `InvalidInput`.
 pub(crate) fn resolve_project_ctx_and_graph(
     daemon_ctx: &Arc<mctx::DaemonContext>,
     project_path: &paths::HostAbsPath,
@@ -281,18 +247,10 @@ pub(crate) fn resolve_project_ctx_and_graph(
     }
 }
 
-/// Fold every stack-declared env var into `session`'s vars maps,
-/// respecting the "session-declared wins" rule: if a name is
-/// already present, the stack contribution is dropped. Names that
-/// pass strict POSIX validation land in `vars`; names that only
-/// pass lenient (Linux-permissive) validation land in
-/// `vars_lenient`; names that fail both are warned and skipped.
-///
-/// `stack_name` appears only in the warning log. `build_env_vars`
-/// is anything iterable over `(&String, &EnvVarValue)`; callers pass
-/// a reference to the `IndexMap` on `graph::Stack::build_env_vars`
-/// but the helper stays generic over container to keep the
-/// `nickel_lang_core::term::IndexMap` type out of `minimald`.
+/// Fold stack-declared env vars into `session`, dropping any that
+/// already have a session-declared entry. Strict-POSIX names land
+/// in `vars`, lenient names in `vars_lenient`, anything else is
+/// warned and skipped. `stack_name` appears only in that warning.
 fn fold_stack_vars_into_session<'a, I>(
     session: &mut mfile::Session,
     stack_name: &str,
@@ -330,34 +288,19 @@ fn fold_stack_vars_into_session<'a, I>(
 }
 
 /// Build the daemon-side composables for this session:
-/// - [`mfile::ProjectComposable`], if the project's mfile has any
-///   session-scoped material to contribute. Bundles:
-///   - the explicit `[session]` block, if present,
-///   - `[stack] build_packages` + `[stack] runtime_packages` from
-///     the project's mfile (user additions),
-///   - the referenced graph-level [`graph::Stack`]'s own
-///     `build_packages` + `runtime_packages` + `build_env_vars`
-///     (stack-inherited defaults) — only on
-///     [`ProjectResolution::Full`]; on [`ProjectResolution::MFileOnly`]
-///     the graph didn't resolve so we can't reach the Stack
-///     definition, and the composable falls back to the mfile-only
-///     material.
-///
-///   Session-declared entries always win over stack-inherited ones
-///   for the same name.
+/// - A [`mfile::ProjectComposable`] unioning `[session]`, `[stack]`
+///   additions, and the graph-level [`graph::Stack`]'s own
+///   packages/env-vars. Session-declared entries win on conflict.
+///   Graph-Stack material is only available on
+///   [`ProjectResolution::Full`].
 /// - One [`mfile::PackageComposable`] per package in the transitive
 ///   runtime closure of `(client requested_packages ∪ project
-///   session-scoped packages)` that *contributes something*, i.e.
-///   has a non-empty `env_state_wiring` or non-empty fs mappings.
-///   Packages in the closure that would produce an empty
-///   contribution are filtered out — the composer only sees
-///   packages that actually add an entry.
+///   packages)` that contributes at least one `env_state_wiring` or
+///   fs-mapping entry.
 ///
-/// Closure computation is a pure filter over the graph — no I/O,
-/// no re-parse. A BSR-resolution failure (client asked for a
-/// package the project's graph doesn't know) is logged at debug and
-/// yields an empty package-composables list; the client's package
-/// request itself still lands via the wire contribution.
+/// BSR-resolution failures are logged at debug and yield an empty
+/// package-composables list; the client's wire contribution still
+/// lands.
 pub(crate) fn build_composables(
     project_path: &paths::HostAbsPath,
     resolution: &ProjectResolution,

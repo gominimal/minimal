@@ -8,22 +8,11 @@ use crate::core::compose::ComposeError;
 use crate::core::primitives::{FileSet, PatchDest, PatchError};
 use crate::core::source::{Provenanced, Source};
 
-/// Per-file entry derived from a [`Patch`] after its source [`FileSet`]
-/// is walked.
-///
-/// `link_path` is `Some` only when symlink resolution produced a
-/// distinct path from `target_path` — i.e. `follow_symlinks: true` was
-/// set AND the walker traversed an actual symlink. In every other case
-/// the link is implicitly the target, and `link_path` is `None`.
-///
-/// Both paths are realmed [`HostAbsPath`] — the gate upholds the
-/// absoluteness invariant via the
-/// [`ExpandError::NotAbsolute`](crate::core::expansion::ExpandError::NotAbsolute)
-/// gate at expansion time, and `target_path` is also canonical (via
-/// [`std::fs::canonicalize`]).
-///
-/// Policy matching runs against both when both are present — a deny
-/// on either wins.
+/// Per-file entry derived from a [`Patch`] after its source
+/// [`FileSet`] is walked. `link_path` is `Some` only when symlink
+/// resolution produced a distinct path (i.e. `follow_symlinks: true`
+/// and the walker traversed a symlink). Policy matching runs
+/// against both when present; deny on either wins.
 ///
 /// [`Patch`]: crate::core::primitives::Patch
 /// [`FileSet`]: crate::core::primitives::FileSet

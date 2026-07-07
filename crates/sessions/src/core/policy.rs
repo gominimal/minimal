@@ -347,33 +347,21 @@ impl VarsPolicy {
 // PatchPolicy
 // =====================================================================
 
-/// Policy gating which patches are honored.
-///
-/// Patches are checked **per source file** after the patch's
-/// [`FileSet`] is walked on the host filesystem. Each enumerated source
-/// path runs through this policy; the patch's `dest` is *not* matched.
+/// Policy gating which patches are honored, checked per source file
+/// after the patch's [`FileSet`] is walked. The patch's `dest` is
+/// not matched; only the enumerated source paths are.
 ///
 /// - **User-origin patches** (from a [`Loadout`]): `ignore` drops,
-///   `deny` rejects, otherwise auto-allowed. The user doesn't need
-///   to `allow`-list their own loadout patches.
+///   `deny` rejects, otherwise auto-allowed.
 /// - **Project- and Package-origin patches**: `ignore` drops, `deny`
-///   rejects, then `allow` must match or the file routes to a
+///   rejects, then `allow` must match — otherwise routes to a
 ///   prompt via [`PolicyHooks`](crate::core::hooks::PolicyHooks).
 ///
-/// Precedence: `ignore` first (silent), then `deny` (reject), then
-/// origin-aware `allow`. Anything not matched by any of those
-/// (project/package origin) prompts.
-///
-/// # `~/` and `$VAR` expansion
-///
-/// Policy patterns are stored as raw strings, so they may contain
-/// `~/` prefixes or `$VAR` / `${VAR}` references. Expansion happens
-/// at session-construction time, against the session's resolved
-/// variables (see
-/// [`crate::core::expansion::expand_source`]). Patterns retain their raw
-/// form in the policy returned from
-/// the composition pipeline (see [`crate::core::compose`]), so the
-/// policy round-trips losslessly across save / load.
+/// Precedence: `ignore` first, then `deny`, then origin-aware
+/// `allow`. Patterns may contain `~/` or `$VAR`; expansion happens
+/// at session construction (see [`crate::core::expansion`]) and
+/// stored patterns retain their raw form so the policy round-trips
+/// losslessly.
 ///
 /// [`Loadout`]: crate::core::loadout::Loadout
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -609,21 +597,9 @@ pub struct ExpandedPatchPolicy {
 }
 
 impl ExpandedPatchPolicy {
-    /// Construct an `ExpandedPatchPolicy` directly from already-expanded
-    /// pattern lists.
-    ///
-    /// This constructor is `pub(crate)` because the only legitimate
-    /// way to produce an [`ExpandedPatchPolicy`] from outside this
-    /// crate is via [`PatchPolicy::expand_with`] — the
-    /// type's whole job is to be the validated-and-expanded form of a
-    /// raw policy. Exposing a public constructor (or `with_*` setters)
-    /// would let callers smuggle arbitrary `FileSet`s past the
-    /// expansion step and bypass the round-trip guarantee documented
-    /// on [`PatchPolicy`].
-    ///
-    /// Order is positional. Inside this crate the only caller is
-    /// `expand_with`, which threads each list explicitly; if more
-    /// callers appear, switch back to a builder.
+    /// Construct an `ExpandedPatchPolicy` from already-expanded
+    /// lists. Crate-internal so external callers must go through
+    /// [`PatchPolicy::expand_with`] and can't bypass expansion.
     pub(crate) fn from_expanded(
         allow: Vec<FileSet>,
         deny: Vec<FileSet>,

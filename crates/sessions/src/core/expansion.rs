@@ -101,16 +101,9 @@ pub enum ExpandError {
 /// Expand `raw` against `resolved_vars` and parse the result as a
 /// [`FileSet`].
 ///
-/// `home_fallback` is consulted **only for the tilde prefix** (`~` or
-/// `~/...`) when `HOME` is not in `resolved_vars`. Explicit `$HOME`
-/// and `${HOME}` references stay strict — they require an explicit
-/// `HOME` declaration in the loadout, no fallback.
-///
-/// The asymmetry is deliberate. Tilde is path syntax that users
-/// reasonably expect to "just work" — requiring every loadout to
-/// declare `HOME = { inherit = true }` to use `~/foo` is friction
-/// for no clear benefit. `$HOME` and `${HOME}` are explicit
-/// references and stay declaration-required.
+/// `home_fallback` applies only to the `~` / `~/…` prefix when
+/// `HOME` isn't in `resolved_vars`. Explicit `$HOME` / `${HOME}`
+/// references stay strict.
 ///
 /// # Errors
 ///
@@ -118,10 +111,8 @@ pub enum ExpandError {
 ///
 /// # Panics
 ///
-/// Cannot panic in practice. The body contains one `expect` covering
-/// a logically unreachable case — the loop guard `i < bytes.len()`
-/// guarantees the next character exists. The `expect` is there to
-/// document the invariant, not because it can fire.
+/// Cannot panic in practice; the loop's bounds guarantee the inner
+/// `expect` never fires.
 pub fn expand_source(
     raw: &str,
     resolved_vars: &(impl VarLookup + ?Sized),

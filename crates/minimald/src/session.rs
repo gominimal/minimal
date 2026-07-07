@@ -100,64 +100,25 @@ pub struct Session<S: SessionObject> {
     /// SSH channel while a host is being minted.
     tracker: OpTracker,
 
-    /// The finalized [`Composition`] this session was created with, if
-    /// the daemon still has it in memory.
+    /// The finalized [`Composition`] this session was created with.
+    /// `None` after a daemon restart — the composition isn't
+    /// persisted, and the launcher falls back to its baseline set
+    /// in that case.
     ///
-    /// Populated when [`Manager::CreateSession`] hands the composition
-    /// through [`Session::run`] on the Ready path (or when
-    /// [`SubmitVerdict`] resumes a Pending record). `None` after a
-    /// daemon restart: the composition isn't persisted, so a session
-    /// spawned from disk post-restart runs without one.
-    ///
-    /// Consumed by [`Self::session_launcher`] on production launches:
-    /// packages get unioned with the baseline set, vars merged over
-    /// the baseline `PS1`. Patch and lifecycle-hook contributions are
-    /// still ignored — patch application needs the file-upload path,
-    /// and lifecycle hooks need in-sandbox exec plumbing, neither of
-    /// which is wired yet.
-    ///
-    /// Wrapped in [`Arc`] so re-attaches (`session_launcher` runs on
-    /// every attach) bump the refcount rather than deep-cloning the
-    /// whole [`Composition`] — for a session with lots of
-    /// composition-sourced vars/packages that clone would grow
-    /// linearly and get repeated per attach.
-    ///
-    /// The `cfg(test)` mock launcher doesn't read it, hence the
-    /// per-mode annotation.
-    ///
-    /// [`Manager::CreateSession`]: crate::sessions::Manager
-    /// [`SubmitVerdict`]: crate::sessions::Manager
+    /// The launcher currently consumes only the composition's
+    /// packages and vars. Patches (need file-upload plumbing) and
+    /// lifecycle hooks (need in-sandbox exec plumbing) are held
+    /// here but not yet applied.
     #[cfg_attr(test, allow(dead_code))]
     composition: Option<Arc<Composition>>,
 
     /// Lazily-built [`mctx::Context`] rooted at this session's
-    /// workspace, cached across [`Self::context`] calls so repeated
-    /// attach / task-exec paths don't rebuild the daemon setup and
+    /// workspace, cached so repeated attach / task-exec paths don't
     /// re-parse the workspace mfile.
     ///
-    /// Populated on the first `context()` call: the scaffold pass
-    /// runs, [`mctx::Context::new`] builds
-    /// [`DaemonContext`] + parses the workspace mfile, and the
-    /// result lands here. Subsequent calls clone the cached value
-    /// (an [`Arc`] bump on the daemon state plus a shallow mfile
-    /// clone).
-    ///
-    /// **Note**: this deliberately does NOT reuse the Manager's
-    /// shared [`Arc`]`<`[`DaemonContext`]`>`. Each session builds
-    /// its own [`DaemonContext`] because the per-session
-    /// [`OpTracker`] (`tracker` above) has to reach downstream
-    /// operations, and [`OpTracker`] lives on
-    /// [`mctx::Config`] which lives inside [`DaemonContext`].
-    /// Until [`OpTracker`] moves out of [`mctx::Config`], sharing
-    /// the daemon `Arc` would silently propagate the daemon-level
-    /// tracker into every session, losing the per-session progress
-    /// scoping the SSH channel renderer relies on.
-    ///
-    /// The workspace mfile is treated as stable for the actor's
-    /// lifetime; if a caller mutates it in-band, the actor is
-    /// tearing down anyway and the stale cache is moot. A future
-    /// invalidation path (e.g. task #226-adjacent refresh) can
-    /// clear this by setting `None`.
+    /// Each session builds its own [`DaemonContext`] (rather than
+    /// sharing the Manager's `Arc`) so the per-session
+    /// [`OpTracker`] on [`mctx::Config`] stays scoped correctly.
     ///
     /// [`DaemonContext`]: mctx::DaemonContext
     /// [`OpTracker`]: ot::OpTracker
@@ -421,20 +382,15 @@ impl<S: SessionObject> Session<S> {
             .build()
             .map_err(|e| mctx::Error::from(e).to_string())?;
 
-        // TEMPORARY (remove with the workspace-upload gap): an empty session
-        // workspace has no minimal.toml, which would make Context::new fail.
-        // Scaffold a default shell one (pinned to the latest gominimal/pkgs
-        // @main commit) so the session can launch. Once sessions receive their
-        // project files this fabrication — and `mctx::scaffold` — goes away.
+        // TEMPORARY: scaffold a default `minimal.toml` if the
+        // workspace has none, so `Context::new` below can succeed.
+        // Delete this block (and `mctx::scaffold`) once sessions
+        // receive their project files via the workspace-upload path.
         //
-        // The scaffold does a blocking network git clone, and this runs inside
-        // the async session-actor task. On the daemon's multi-thread runtime
-        // (see main.rs) fence it with `block_in_place` so other futures move off
-        // this worker for its duration. `block_in_place` *panics* on a
-        // current-thread runtime (e.g. a `#[tokio::test]` with no explicit
-        // flavor) or with no runtime at all, so fall back to a plain blocking
-        // call there — a brief stall, acceptable for this temporary,
-        // once-per-empty-workspace scaffold.
+        // The scaffold performs a blocking network git clone. On a
+        // multi-thread runtime, `block_in_place` moves other futures
+        // off this worker for the duration; on a current-thread
+        // runtime it panics, so fall back to a plain blocking call.
         if !wsp.as_utf8_path().join(mfile::MFILE_NAME).exists() {
             let scaffold = || mctx::scaffold_default_mfile(&config, wsp.as_utf8_path());
             let on_multi_thread = matches!(

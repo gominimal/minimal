@@ -198,37 +198,18 @@ pub struct Manager<L: Loader = DiskLoader> {
     /// reaped by [`Manager::reap_orphan_pending`] at startup.
     pending: BTreeMap<SessionId, PendingComposeState>,
 
-    /// Per-session stash of finalized [`Composition`]s awaiting their
-    /// [`Session`] actor. Populated by the `CreateSession` Ready
-    /// branch and the `SubmitVerdict` handler right after the record
-    /// lands in the store; drained by the [`GetSession`] spawn path,
-    /// which hands the entry to [`Session::run`] before the first
-    /// attach.
+    /// Per-session stash of finalized [`Composition`]s awaiting
+    /// their `Session` actor. Populated on `CreateSession` / post-
+    /// verdict, drained on first `GetSession`. In-memory only; a
+    /// daemon restart drops the stash and post-restart spawns fall
+    /// back to the launcher's baseline.
     ///
-    /// In-memory only — a daemon restart drops the stash, so an
-    /// Active record whose actor spawns post-restart runs with
-    /// `composition: None`. That degrades gracefully: the sandbox
-    /// launcher (see [`crate::session_host::SandboxLauncher`]) merges
-    /// composition packages/vars over its baseline when the
-    /// composition is present, and falls back to the baseline
-    /// alone when it isn't. Patches and lifecycle hooks in the
-    /// composition are still unconsumed pending file-upload / in-
-    /// sandbox exec plumbing.
-    ///
-    /// Growth is bounded by the number of Active-but-unattached
-    /// sessions: [`GetSession`] drains the entry, [`DestroySession`]
-    /// and [`AbortSession`] drop it defensively. Without those two
-    /// drains a create-and-forget client (activate without attach,
-    /// then destroy) would leak indefinitely, which is why both
-    /// paths call `compositions.remove(&id)`.
-    ///
-    /// Held behind [`Arc`] so the drain-to-actor hop and any
-    /// subsequent per-attach hop stay refcount bumps rather than
-    /// deep clones of the whole [`Composition`].
+    /// `DestroySession` / `AbortSession` also drain the stash
+    /// defensively — without those drains a client that activates
+    /// then destroys without ever attaching would leak an entry per
+    /// cycle.
     ///
     /// [`Composition`]: sessions::core::compose::Composition
-    /// [`Session`]: crate::session::Session
-    /// [`Session::run`]: crate::session::Session::run
     compositions: BTreeMap<SessionId, Arc<sessions::core::compose::Composition>>,
 
     /// Daemon-scoped mctx state (config, stdlib_dir, vcs, cache) shared
@@ -263,9 +244,6 @@ impl Manager {
         net_switch: Arc<Mutex<crate::net::SwitchClient>>,
     ) -> Result<ManagerHandle, std::io::Error> {
         let mut l = DiskLoader::new(minimal_state_dir.clone())?;
-        // Reap any on-disk `SessionStatus::Pending` records left over
-        // from a previous daemon process — the in-memory stash that
-        // would have let them resume is gone, so they're unresumable.
         Self::reap_orphan_pending(&mut l)?;
 
         // Build the daemon-scoped mctx state once at startup. Each
@@ -325,13 +303,9 @@ impl<L: Loader> Manager<L> {
         }
     }
 
-    /// Delete any on-disk record whose status is
-    /// [`sessions::SessionStatus::Pending`]. Run once at startup —
-    /// the matching in-memory `PendingComposeState` lives only on
-    /// the previous daemon process, so a `Pending` record post-restart
-    /// has no path to `Active` and a client waiting on `SubmitVerdict`
-    /// would hang. Cheap correctness floor; daemon-restart-survives-
-    /// pending is a separate concern.
+    /// Delete any on-disk `Pending` records at startup. Their
+    /// in-memory `PendingComposeState` didn't survive the restart,
+    /// so they can never transition to `Active`.
     fn reap_orphan_pending(store: &mut L) -> Result<(), std::io::Error> {
         let mut reaped = 0u64;
         let keys: Vec<L::Key> = store.keys().collect();
@@ -402,18 +376,10 @@ impl<L: Loader> Manager<L> {
                 })
                 .await;
             }
-            // Gets the session actor corresponding to the predicate.
-            //
-            // If the session is known but not running, it is started.
-            //
-            // `SessionStatus::Pending` records are filtered out here —
-            // they have no composed `Composition` yet, so spinning up
-            // the session host would attach a client to a half-built
-            // session. The filter returns `None` (caller sees the
-            // same shape as "unknown id") and logs the reason at info
-            // level. exec/sftp call sites surface the `None` as a
-            // channel failure, which is the correct user-facing
-            // behavior in either case.
+            // Get the session actor for the predicate, starting it
+            // if the session is known but not running. `Pending`
+            // records return `None` (they have no `Composition`
+            // yet, so attaching would give a half-built session).
             ManagerMessage::GetSession(pred, r) => {
                 r.handle(async {
                     if self.in_shutdown {
@@ -524,22 +490,9 @@ impl<L: Loader> Manager<L> {
                 })
                 .await;
             }
-            // Creates a session from a config + (optional) client wire
-            // contribution. The daemon-side of Phase 2 lives in the
-            // three free helpers above:
-            //   - `resolve_project_ctx_and_graph` parses the client's
-            //     project mfile and resolves its graph. A missing
-            //     mfile is silent; a malformed mfile is an `Err`
-            //     surfaced to the client as `InvalidInput`.
-            //   - `build_composables` derives the `ProjectComposable`
-            //     (if the mfile has a `[session]` block) and one
-            //     `PackageComposable` per package in the transitive
-            //     runtime closure of the requested top-levels.
-            //   - `run_composer` drives `SessionComposer::add` +
-            //     `compose`, pre-mapping every failure to
-            //     `InvalidInput`.
-            // Each is unit-testable in isolation without spinning the
-            // full manager mainloop.
+            // Create a session: resolve the project, build the
+            // composables, and drive the composer. Failures pre-mapped
+            // to `InvalidInput`.
             ManagerMessage::CreateSession(msg) => {
                 let CreateSessionMsg {
                     config,

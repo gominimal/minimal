@@ -55,17 +55,9 @@ pub struct WinSize {
 }
 
 impl From<&RequestedPty> for WinSize {
-    /// Extracts the terminal dimensions, ignoring `term` and modes.
-    ///
-    /// SSH carries sizes as `u32`; terminal dimensions never exceed `u16`, so
-    /// out-of-range values are clamped rather than wrapped.
-    ///
-    /// A client may request a `0`-valued row or column count (some attach
-    /// clients do not probe their terminal before the PTY request). A zero
-    /// dimension produces a `0`-cell grid, which panics the vt100 screen on the
-    /// first cell write, so zero is replaced by a conventional terminal default
-    /// (24 rows × 80 cols). The size is corrected by a `window_change` once the
-    /// client learns its real dimensions.
+    /// Extracts the terminal dimensions, clamping SSH's `u32` to
+    /// `u16` and replacing any zero dimension with a 24×80 default
+    /// (avoids a vt100 panic on unprobed clients).
     fn from(pty: &RequestedPty) -> Self {
         let (cols, rows) = pty.char_sizes;
         let (xpixel, ypixel) = pty.pixel_sizes;
@@ -163,12 +155,9 @@ impl Pty {
     }
 }
 
-/// Duplicates an `OwnedFd` into a new, independent close-on-exec `OwnedFd`.
-///
-/// Uses `F_DUPFD_CLOEXEC` rather than `dup(2)` so the duplicate is born
-/// close-on-exec — otherwise a slave dup awaiting a `spawn` could be inherited
-/// by an unrelated child `fork`ed concurrently and keep the pty open past our
-/// own child's exit.
+/// Duplicate `fd` into a new close-on-exec `OwnedFd` via
+/// `F_DUPFD_CLOEXEC`, so a concurrent `fork` can't inherit and hold
+/// the pty open past our child's exit.
 fn dup_fd(fd: &OwnedFd) -> io::Result<OwnedFd> {
     let raw = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if raw < 0 {
@@ -338,14 +327,10 @@ pub(crate) trait SessionProcess: Send + 'static {
     fn kill(&mut self) -> io::Result<()>;
 }
 
-/// Opens a PTY of the requested size, launches the session process wired to the
-/// slave side, and yields the master side plus a handle to the process.
-///
-/// This is the seam between the generic [`Host`] runtime and the backend that
-/// actually creates a process (building the context/graph/env/container and the
-/// launch command). The launcher owns PTY creation because the slave side is
-/// consumed differently per backend — duplicated into the process's
-/// stdin/stdout/stderr for the real sandbox, or retained for a test double.
+/// Opens a PTY of the requested size, launches the session process
+/// wired to the slave side, and yields the master side plus a
+/// handle to the process. The seam between the generic [`Host`]
+/// runtime and the process-creation backend.
 pub(crate) trait SessionLauncher {
     /// The running-process handle this launcher produces.
     type Process: SessionProcess;
@@ -611,33 +596,18 @@ impl SessionProcess for SandboxProcess {
 #[cfg(not(test))]
 pub(crate) struct SandboxLauncher {
     pub(crate) ctx: mctx::Context,
-    // The session this host belongs to. Not yet read, but retained so the
-    // launcher carries the full session identity for future use (and to mirror
-    // the prior `Host::spawn` signature).
     #[allow(dead_code)]
     pub(crate) session: SessionHandle,
     pub(crate) network_mode: NetworkMode,
-    /// The shared per-host gvproxy switch, used to attach this launch when it
-    /// runs in [`NetworkMode::OwnIp`] (R1.5). Ignored for `HostNet`/`NoNet`.
+    /// Shared per-host gvproxy switch. Used only for
+    /// [`NetworkMode::OwnIp`] launches.
     pub(crate) net_switch: std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
-    /// Static ingress port mappings to apply on the switch once this `OwnIp`
-    /// PTask is attached (R2.3/R2.4-static), removed when it exits. `None` (or
-    /// empty) for non-`OwnIp` launches; `session.rs` has already rejected
-    /// ingress configured on any other mode (R2.1).
+    /// Static ingress port mappings applied on the switch once this
+    /// `OwnIp` PTask attaches, removed on exit. `None` for other
+    /// network modes.
     pub(crate) ingress: Option<sessions::IngressPolicy>,
-    /// The finalized [`Composition`] this session was created with, if
-    /// still in memory on the manager. Packages and vars from all three
-    /// sources (client loadout, project `[session]` block, package
-    /// composables) get merged with the launcher's baselines below.
-    /// Patches and lifecycle hooks live on this too but aren't consumed
-    /// yet — the file-upload and in-sandbox exec plumbing they need
-    /// hasn't landed.
-    ///
-    /// Shared with the [`Session`](crate::session::Session) actor via
-    /// [`Arc`] so each attach bumps the refcount rather than
-    /// deep-cloning the whole [`Composition`].
-    ///
-    /// [`Composition`]: sessions::core::compose::Composition
+    /// Composition to merge into the launcher's baseline packages and
+    /// vars. Patches and lifecycle hooks are ignored today.
     pub(crate) composition: Option<std::sync::Arc<sessions::core::compose::Composition>>,
 }
 

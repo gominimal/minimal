@@ -3,22 +3,14 @@
 //!
 //! # Example: helix + zellij with the user's dotfiles
 //!
-//! Top-level keys (`packages`, `patches`) come first because every key
-//! following a `[section]` header in TOML is scoped to that section
-//! until the next header; an empty line is *not* a scope reset.
+//! `dest` paths are inside the sandbox; `source` paths are on the
+//! host. Leading `~` in `source` expands at gate time against the
+//! host home; leading `~` in `dest` expands inside the sandbox at
+//! runtime.
 //!
 //! ```toml
 //! packages = ["helix", "zellij"]
 //!
-//! # `dest` paths are inside the sandbox; `source` paths are on the host.
-//! # `~`-expansion is split by realm:
-//! #   - `source` `~` is expanded at gate time against the host home
-//! #     (via the composer's `HOME` env lookup —
-//! #     `std::env::var("HOME")` by default).
-//! #   - `dest` `~` is left unexpanded by the gate. `PatchDest` is
-//! #     validated as sandbox-home-relative; any expansion of a leading
-//! #     `~` happens in the sandbox runtime against the sandbox home,
-//! #     not here.
 //! patches = [
 //!     # Helix: single config files plus a themes directory.
 //!     { dest = "~/.config/helix/config.toml",

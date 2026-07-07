@@ -73,28 +73,13 @@ pub struct EnvArgs {
     network_mode: NetworkMode,
     own_ip_tap: Option<sandbox2::config::OwnIpTap>,
     own_ip_dns: Option<std::net::Ipv4Addr>,
-    /// When true, [`Env::build`] consumes the `env_vars` and
-    /// `fs_mappings` produced by [`SetupForPackages`] and merges
-    /// caller-supplied overrides on top — the legacy behavior.
-    ///
-    /// When false, [`Env::build`] does NOT touch `SetupForPackages`
-    /// output for those two fields, and the caller must have
-    /// gathered them via the composition pipeline and passed them
-    /// through `env_vars` / `patches`. `state_dirs` is derived
-    /// from `env_vars` values shaped `/state/<prefix>` on that
-    /// path.
-    ///
-    /// Defaults to `true` so `EnvArgs::new` matches the legacy
-    /// task-run semantics. Session launches call
-    /// [`Self::without_package_attr_wiring`] so package
-    /// contributions to the sandbox flow exclusively through the
-    /// composer and are subject to [`PatchPolicy`] / [`VarsPolicy`]
-    /// user gating. Task-run (via `mctx::env::Env`) is a separate
-    /// [`Env::build`] impl and keeps the legacy path unchanged.
+    /// When true (default), [`Env::build`] consumes package
+    /// [`SetupForPackages`] output for `env_vars`/`fs_mappings`.
+    /// When false, the caller supplies both via `env_vars` /
+    /// `patches` and `state_dirs` is derived from resolved values
+    /// shaped `/state/<prefix>`.
     ///
     /// [`SetupForPackages`]: graph::SetupForPackages
-    /// [`PatchPolicy`]: sessions::core::policy::PatchPolicy
-    /// [`VarsPolicy`]: sessions::core::policy::VarsPolicy
     include_package_attr_wiring: bool,
 }
 
@@ -124,20 +109,10 @@ impl EnvArgs {
         }
     }
 
-    /// Opts this env out of consuming `env_vars` and `fs_mappings`
-    /// from [`SetupForPackages`]. The caller is responsible for
-    /// producing equivalent items via the composer and passing them
-    /// through `.with_resolved_env_vars` / `.with_patches`.
-    /// `state_dirs` is derived from `env_vars` values shaped
-    /// `/state/<prefix>` rather than the direct
-    /// [`SetupForPackages`] output.
-    ///
-    /// Set by session launches so package contributions to the
-    /// sandbox flow exclusively through composition and are gated
-    /// by user policy. Leave unset for task-run and any other
-    /// caller that wants the legacy un-gated wiring.
-    ///
-    /// [`SetupForPackages`]: graph::SetupForPackages
+    /// Opts out of consuming `env_vars` / `fs_mappings` from
+    /// `SetupForPackages`. Callers on this path must funnel package
+    /// contributions through `.with_resolved_env_vars` /
+    /// `.with_patches` themselves.
     #[must_use]
     pub fn without_package_attr_wiring(mut self) -> Self {
         self.include_package_attr_wiring = false;
@@ -170,18 +145,9 @@ impl EnvArgs {
         self
     }
 
-    /// Sets environment variables where every value is already
-    /// resolved to a string (no [`EnvVarValue::Inherit`] variant
-    /// possible). Wraps each internally as [`EnvVarValue::Value`].
-    ///
-    /// Used at boundaries where the caller has post-gate values —
-    /// e.g. a [`sessions::core::compose::Composition`]'s
-    /// [`SessionVar`]s — and doesn't want to spell
-    /// `EnvVarValue::Value(...)` at every insert. Semantics are
-    /// identical to `.with_env_vars` with all-`Value` entries;
-    /// this is purely an ergonomics shortcut.
-    ///
-    /// [`SessionVar`]: sessions::core::compose::SessionVar
+    /// Set environment variables from already-resolved values,
+    /// wrapping each as [`EnvVarValue::Value`]. Ergonomic shortcut
+    /// over `.with_env_vars` for callers with post-gate values.
     #[must_use]
     pub fn with_resolved_env_vars(mut self, env_vars: HashMap<String, String>) -> Self {
         self.env_vars = Some(
@@ -249,37 +215,10 @@ pub struct Env {
     _temp_dirs: Vec<TempDir>,
 }
 
-/// On the composition path (session launches without
-/// `SetupForPackages`), derive the set of state-dir prefixes to
-/// create by scanning resolved env-var values for the
-/// `/state/<prefix>` shape.
-///
-/// The composition can carry env vars from three sources
-/// ([`Loadout`], [`ProjectComposable`], [`PackageComposable`]), and
-/// any of them could contain a value shaped `/state/*` by
-/// coincidence rather than as state-wiring intent. This helper
-/// treats every `/state/<single-component>` value as a state-dir
-/// request — over-triggering slightly (creating a spurious empty
-/// dir when a var happens to look like this) is harmless, while
-/// under-triggering would leave the process without the directory
-/// it needs to write to.
-///
-/// Multi-component values (`/state/foo/bar`) are dropped: we can't
-/// tell whether a user meant a nested state dir or coincidentally
-/// wrote a `/state/`-prefixed path (e.g. a URL fragment).
-/// [`PackageComposable`] — the only source that can legitimately
-/// produce nested state-wiring — validates single-component at
-/// extraction (see
-/// `sessions::composables::extract_state_wiring`), so it will
-/// never emit a multi-component value here.
-///
-/// Blanks (empty prefix after strip) are silently ignored — they
-/// can only arise from a value that's literally `/state/`, and
-/// creating `state_base_dir/` itself is nonsense.
-///
-/// [`Loadout`]: sessions::core::loadout::Loadout
-/// [`ProjectComposable`]: mfile::ProjectComposable
-/// [`PackageComposable`]: mfile::PackageComposable
+/// Derive the composition-path state-dir set by picking up any
+/// resolved env-var value shaped `/state/<single-component>`.
+/// Multi-component and empty prefixes are dropped — they can't be
+/// distinguished from coincidental `/state/`-prefixed values.
 fn state_dirs_from_env_vars(
     env_vars: &HashMap<String, String>,
 ) -> std::collections::HashSet<String> {
@@ -292,12 +231,10 @@ fn state_dirs_from_env_vars(
 }
 
 impl Env {
-    /// Builds a runtime environment, consuming the context and graph.
-    ///
-    /// This resolves the requested packages (always pulling in `bash` and
-    /// `socat` for the `min` helper), ensures they are built locally, assembles
-    /// the sandbox rootfs, installs the `min` helper, and spawns the command
-    /// channel actor with the context and graph moved into it.
+    /// Build a runtime environment. Resolves and locally builds the
+    /// requested packages (plus `bash`/`socat` for the `min`
+    /// helper), assembles the rootfs, and spawns the command
+    /// channel actor.
     pub async fn build(mut ctx: Context, mut graph: Graph, args: EnvArgs) -> std::io::Result<Self> {
         // Resolve the requested package names to top-levels, then ensure the
         // helper's dependencies (`bash`, `socat`) are present.
@@ -332,18 +269,14 @@ impl Env {
                 .map_err(err_to_io)?;
         }
 
-        // Collect the package-derived wiring and merge caller-supplied overrides.
-        //
-        // On the composition path (session launches, which set
-        // `include_package_attr_wiring = false` via
-        // `EnvArgs::without_package_attr_wiring`), the caller has
-        // already funneled
-        // package `env_state_wiring` vars and `env_dir/file_mappings`
-        // patches through the composer — so we skip
-        // `SetupForPackages`'s output for those and rely entirely on
-        // `args.patches` / `args.env_vars`. `needs_dns` /
-        // `needs_internet` are still derived from the graph either
-        // way (nothing about them is user-gate-able).
+        // Collect the package-derived wiring and merge caller-supplied
+        // overrides. On the composition path the caller funnels
+        // `env_state_wiring` and fs mappings through their own args,
+        // so we skip `SetupForPackages`'s output for those fields.
+        // `needs_dns` / `needs_internet` are ignored on either
+        // branch — they aren't user-gate-able, so if we add a new
+        // `SetupForPackages` field make sure to route it through
+        // the same branch as `env_vars`/`fs_mappings`, not with these.
         let (mut patch, legacy_state_dirs, mut pkg_env_vars) = if args.include_package_attr_wiring {
             let SetupForPackages {
                 fs_mappings,
@@ -410,11 +343,8 @@ impl Env {
             .with_state_dir(args.state_base_dir.as_utf8_path())
             .with_env_vars(pkg_env_vars.into_iter())
             .with_network_mode(args.network_mode)
-            // Own-IP tap params drive hakoniwa's in-namespace (rootless) tap on
-            // the native DM2 path; `None` for host/VM modes and the DM1/3/4
-            // vsock-shuttle path (which keeps the privileged move-into-netns
-            // wiring). The DNS server is set separately for *every* own-IP
-            // sandbox so both paths get a working resolver.
+            // Own-IP tap params are `None` for host/VM modes and the
+            // vsock-shuttle path. DNS is set on every own-IP sandbox.
             .with_own_ip_tap(args.own_ip_tap)
             .with_own_ip_dns(args.own_ip_dns)
             .with_hostname(args.name.clone())

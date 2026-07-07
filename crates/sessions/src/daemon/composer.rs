@@ -17,76 +17,46 @@ use crate::wire::policy::{WirePatchVerdict, WireVarVerdict};
 use crate::wire::primitives::PendingId;
 use crate::wire::request::{ContributionResponse, ContributionVerdict, WireContribution};
 
-/// Daemon-side state that survives a `Pending` outcome and feeds
-/// into Phase 4 once the client's verdict comes back.
-///
-/// Packages and lifecycle hooks have no per-item verdict (the wire
-/// schema doesn't carry verdicts for them), so the daemon retains
-/// its own copy here. `client_contribution` is the client's
-/// already-gated wire contribution, untouched — Phase 4 calls
-/// [`Composition::extend_from_wire`] on it after the verdict
-/// resolves the pending vars/patches.
-///
-/// [`Composition::extend_from_wire`]: crate::core::compose::Composition::extend_from_wire
+/// Daemon-side state retained across a `Pending` outcome. Fed back
+/// into [`resume_from_verdict`] once the client's verdict returns
+/// to reattach provenance the wire schema doesn't carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingComposeState {
-    /// Daemon-collected packages. The wire response has no slot for
-    /// them; the daemon installs them when Phase 4 finalizes.
+    /// Daemon-collected packages (no per-item wire verdict).
     pub daemon_packages: Vec<ProvenancedPackage>,
-    /// Daemon-collected lifecycle hooks. A copy goes in the wire
-    /// response for client-side audit; the daemon also retains this
-    /// copy for Phase 4 install.
+    /// Daemon-collected lifecycle hooks (no per-item wire verdict).
     pub daemon_lifecycle_hooks: Vec<ProvenancedHook>,
-    /// Original daemon-collected vars keyed by the [`PendingId`] the
-    /// wire response shipped. [`resume_from_verdict`] looks each one
-    /// up to attach provenance to the verdict-approved value — the
-    /// wire verdict only carries the resolved name/value pair, not
-    /// the source.
+    /// Daemon-collected vars keyed by the [`PendingId`] shipped on
+    /// the wire response. Supplies source provenance the verdict
+    /// omits.
     pub pending_vars: BTreeMap<PendingId, ProvenancedVar>,
-    /// Original daemon-collected patches keyed by [`PendingId`]. The
-    /// wire verdict only carries the resolved `host_path`; the
-    /// destination and source provenance come from the stash entry.
+    /// Daemon-collected patches keyed by [`PendingId`]. Supplies
+    /// destination and source provenance the verdict omits.
     pub pending_patches: BTreeMap<PendingId, ProvenancedPatch>,
     /// Client's already-gated wire contribution, untouched.
     pub client_contribution: WireContribution,
 }
 
-/// Output of [`SessionComposer::compose`].
-///
-/// `Ready` fires when the daemon collected no vars and no patches —
-/// the only two domains with a per-item user-policy gate. Packages
-/// and lifecycle hooks pass through on this path. Today every
-/// internal caller hits the narrower case where the daemon
-/// collected nothing at all. `Pending` fires when the daemon
-/// collected a var or patch the client must gate.
+/// Output of [`SessionComposer::compose`]. `Ready` when the daemon
+/// collected no items needing a per-item user gate (vars, patches);
+/// `Pending` when the client must supply a verdict before the
+/// composition can finalize via [`resume_from_verdict`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposeOutcome {
-    /// All items decided; the assembled Composition is ready to apply.
+    /// All items decided; the assembled composition is ready.
     Ready(Composition),
     /// The client must gate `response.vars` and `response.patches`
-    /// before composition completes. `state` is the daemon-side
-    /// stash Phase 4 will need to finalize.
+    /// before composition completes; hand `state` back to
+    /// [`resume_from_verdict`] once the verdict returns.
     Pending {
-        /// Wire payload the daemon ships back to the client.
         response: ContributionResponse,
-        /// Daemon-side state retained for Phase 4. Not on the wire.
         state: PendingComposeState,
     },
 }
 
 /// Accumulator for daemon-side contributions (project + packages),
-/// joined with the client's already-gated wire contribution.
-///
-/// [`Self::compose`] returns [`ComposeOutcome::Ready`] when the
-/// daemon collected no vars and no patches — the only two domains
-/// with a per-item user-policy gate. Daemon-collected packages and
-/// lifecycle hooks pass through on that path (the all-decided fast
-/// path runs the cross-process merge via
-/// [`Composition::extend_from_wire`] and finalizes). It returns
-/// [`ComposeOutcome::Pending`] when the daemon collected a var or
-/// patch that needs the client's verdict — the daemon never runs
-/// user policy, so Pending items are routed back to the client
-/// for Phase 3 gating.
+/// joined with the client's already-gated wire contribution to
+/// produce a [`ComposeOutcome`].
 pub struct SessionComposer {
     client: WireContribution,
     contribution: Contribution,
@@ -160,54 +130,22 @@ impl SessionComposer {
         Ok(())
     }
 
-    /// Drive Phase 2: produce either a finalized [`Composition`] or a
-    /// [`ContributionResponse`] for the client to gate.
+    /// Produce a finalized [`Composition`], or a
+    /// [`ContributionResponse`] the client must gate before
+    /// resuming via `SubmitVerdict`.
     ///
-    /// **The daemon never runs user policy.** This method routes any
-    /// daemon-collected var or patch back to the client as a pending
-    /// item — the client applies its `policy` and `PolicyHooks` in
-    /// Phase 3, and a future `SubmitVerdict` handler resumes from
-    /// the returned [`PendingComposeState`].
+    /// The daemon never runs user policy. Any daemon-collected var
+    /// or patch is routed back to the client as a pending item; a
+    /// daemon contribution carrying only packages and/or lifecycle
+    /// hooks (which have no per-item gate) is installed as-is and
+    /// merged with the client's already-gated wire contribution.
     ///
-    /// The branching is on `vars + patches` — those are the only
-    /// items with a per-item policy gate. A daemon contribution
-    /// that only carries packages and/or lifecycle hooks takes the
-    /// all-decided path: packages and hooks have no verdict slot in
-    /// the wire schema, the daemon installs them as declared. On
-    /// that path the daemon-collected packages and hooks land in
-    /// the assembled `Composition` and are merged with the client's
-    /// already-gated wire contribution via
-    /// [`Composition::extend_from_wire`].
-    ///
-    /// When the daemon collected nothing (today's only path — every
-    /// internal caller sends `WireContribution::default()`), the
-    /// fast-path body collapses to a single `extend_from_wire` call
-    /// against an empty `Composition`.
-    ///
-    /// **Compared to the pre-Phase-2 single-shot path**, the new
-    /// signature drops the `UserPolicy` parameter the old `compose`
-    /// took — the daemon never runs user policy, so threading it
-    /// here was always misleading. For the empty-contribution case
-    /// (which is what every existing caller exercises today), the
-    /// observable behavior is byte-equivalent.
-    ///
-    /// `session_id` is the daemon-allocated id; it goes on the
-    /// `Pending` response so the client can correlate a future
-    /// `SubmitVerdict`. It's accepted as a parameter rather than
-    /// generated here because the manager allocates ids at
-    /// `Loader::create` time.
-    ///
-    /// `_options` is reserved for the future composition pipeline
-    /// (e.g. symlink-following on patch walks). Today's daemon-side
-    /// path doesn't run the gate, so the parameter is ignored;
-    /// kept on the signature so the call site is forward-compatible.
+    /// `session_id` correlates a future `SubmitVerdict` back to
+    /// this compose call.
     ///
     /// # Errors
     ///
-    /// See [`ComposeError`]. The daemon path produces
-    /// [`ComposeError::InvalidWireItem`] (from wire→domain
-    /// conversion in `extend_from_wire`) or [`ComposeError::Conflict`]
-    /// (cross-process disagreement) on the all-decided branch.
+    /// See [`ComposeError`].
     pub fn compose(
         self,
         session_id: SessionId,
@@ -263,44 +201,26 @@ impl SessionComposer {
     }
 }
 
-/// Phase 4: assemble the final [`Composition`] from a daemon-side
-/// stash plus the client's verdict.
+/// Assemble a finalized [`Composition`] from the daemon's stashed
+/// [`PendingComposeState`] and the client's [`ContributionVerdict`].
+/// Pure: no env, no policy — every value and decision arrives on
+/// the verdict.
 ///
-/// **Where this fits in the pipeline.** The daemon called
-/// [`SessionComposer::compose`] and got back
-/// [`ComposeOutcome::Pending`]; it stashed the
-/// [`PendingComposeState`] and shipped the [`ContributionResponse`]
-/// to the client. The client ran Phase 3 (`client::handler::handle_response`),
-/// produced a [`ContributionVerdict`], and sent it back. This function
-/// closes the loop: it walks the verdict, reattaches provenance from
-/// the stash, and merges everything into a finalized `Composition`.
-///
-/// **What it does, per verdict variant.**
-///
-/// - [`WireVarVerdict::Approved`] / [`WirePatchVerdict::Approved`]:
-///   include in the assembled composition. The verdict carries the
-///   client-resolved value (var) or matched file path (patch); the
-///   stash supplies source provenance the wire schema doesn't carry.
-/// - [`WireVarVerdict::Ignored`] / [`WirePatchVerdict::Ignored`]:
-///   silently dropped per the user policy's `ignore` rule.
-/// - [`WireVarVerdict::Denied`] / [`WirePatchVerdict::Denied`]:
-///   abort the resume with [`ComposeError::Denied`]. A `Denied`
-///   verdict means the user policy explicitly rejected a
-///   project- or package-declared item — finalizing would produce a
-///   session inconsistent with what was declared.
-///
-/// **Determinism.** This function reads no env and consults no
-/// policy. The values and decisions arrive embedded in the verdict;
-/// resume is pure type-shape assembly.
+/// `Approved` items are included; `Ignored` items are dropped; a
+/// single `Denied` aborts the whole resume with
+/// [`ComposeError::Denied`], because a project- or package-declared
+/// item the user explicitly rejected can't be silently dropped —
+/// the resulting session would be inconsistent with what its
+/// sources declared.
 ///
 /// # Errors
 ///
 /// - [`ComposeError::InvalidWireItem`] if the verdict references a
-///   `PendingId` that wasn't in the stash, or omits one that was.
-/// - [`ComposeError::Denied`] if any verdict entry is `Denied`.
+///   [`PendingId`] absent from the stash, or omits one that was
+///   pending.
+/// - [`ComposeError::Denied`] if any entry is `Denied`.
 /// - [`ComposeError::Conflict`] / [`ComposeError::InvalidWireItem`]
-///   from `extend_from_wire` while merging the client's already-gated
-///   wire contribution back in.
+///   from merging the client's wire contribution.
 pub fn resume_from_verdict(
     state: PendingComposeState,
     verdict: ContributionVerdict,
