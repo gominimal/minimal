@@ -73,8 +73,7 @@ impl ProvenancedVar {
         &self.var
     }
 
-    /// Consume and return the inner var + source. Used by the composer
-    /// to destructure during the move-out phase.
+    /// Consume and return the inner var and source.
     #[must_use]
     pub fn into_parts(self) -> (ResolvedVar, Source) {
         (self.var, self.source)
@@ -108,8 +107,7 @@ impl ProvenancedPatch {
         &self.patch
     }
 
-    /// Consume and return the inner patch + source. Used by the
-    /// composer to destructure during the move-out phase.
+    /// Consume and return the inner patch and source.
     #[must_use]
     pub fn into_parts(self) -> (Patch, Source) {
         (self.patch, self.source)

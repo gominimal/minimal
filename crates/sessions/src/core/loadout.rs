@@ -3,22 +3,14 @@
 //!
 //! # Example: helix + zellij with the user's dotfiles
 //!
-//! Top-level keys (`packages`, `patches`) come first because every key
-//! following a `[section]` header in TOML is scoped to that section
-//! until the next header; an empty line is *not* a scope reset.
+//! `dest` paths are inside the sandbox; `source` paths are on the
+//! host. Leading `~` in `source` expands at gate time against the
+//! host home; leading `~` in `dest` expands inside the sandbox at
+//! runtime.
 //!
 //! ```toml
 //! packages = ["helix", "zellij"]
 //!
-//! # `dest` paths are inside the sandbox; `source` paths are on the host.
-//! # `~`-expansion is split by realm:
-//! #   - `source` `~` is expanded at gate time against the host home
-//! #     (via the composer's `HOME` env lookup —
-//! #     `std::env::var("HOME")` by default).
-//! #   - `dest` `~` is left unexpanded by the gate. `PatchDest` is
-//! #     validated as sandbox-home-relative; any expansion of a leading
-//! #     `~` happens in the sandbox runtime against the sandbox home,
-//! #     not here.
 //! patches = [
 //!     # Helix: single config files plus a themes directory.
 //!     { dest = "~/.config/helix/config.toml",
@@ -253,36 +245,18 @@ impl crate::core::compose::Composable for Loadout {
         self,
         env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
     ) -> Result<crate::core::compose::Contribution, crate::core::compose::Error> {
-        use crate::core::compose::Contribution;
-        use crate::core::primitives::ResolvedVar;
-        use crate::core::source::{
-            ProvenancedHook, ProvenancedPackage, ProvenancedPatch, ProvenancedVar, Source,
-        };
-
-        let source = Source::UserLoadout {
+        let source = crate::core::source::Source::UserLoadout {
             name: self.name.into_inner(),
         };
-        let mut c = Contribution::new();
-
-        for (name, value) in self.vars {
-            let resolved = ResolvedVar::resolve_with(name.into_inner(), value, env)?;
-            c.push_var(ProvenancedVar::new(resolved, source.clone()));
-        }
-        for entry in self.vars_lenient {
-            let (name, value) = entry.into_parts();
-            let resolved = ResolvedVar::resolve_with(name.into_inner(), value, env)?;
-            c.push_var(ProvenancedVar::new(resolved, source.clone()));
-        }
-        for patch in self.patches {
-            c.push_patch(ProvenancedPatch::new(patch, source.clone()));
-        }
-        for pkg in self.packages {
-            c.push_package(ProvenancedPackage::new(pkg, source.clone()));
-        }
-        for hook in self.lifecycle_hooks {
-            c.push_hook(ProvenancedHook::new(hook, source.clone()));
-        }
-        Ok(c)
+        crate::core::compose::contribute_primitives(
+            &source,
+            self.packages,
+            self.vars,
+            self.vars_lenient,
+            self.patches,
+            self.lifecycle_hooks,
+            env,
+        )
     }
 }
 

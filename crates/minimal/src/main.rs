@@ -430,30 +430,75 @@ async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), ()> {
     Ok(())
 }
 
-/// [`PolicyHooks`] impl that aborts on every unapproved item.
+/// Default policy hook for `minimal activate`: auto-approves any
+/// item whose provenance is [`Source::Project`] or
+/// [`Source::Package`], and aborts on anything else.
 ///
-/// `minimal2` has no interactive prompt yet, so anything the user's
-/// policy can't auto-decide bubbles into here, and we treat that as
-/// "abort the session creation, surface a clear error." The user can
-/// widen their policy (`allow`/`ignore`) to admit specific items once
-/// the policy-config story lands.
-struct AbortOnUnapproved;
+/// Rationale: items reaching a hook are those the base
+/// [`UserPolicy`] couldn't auto-decide — with today's `Source`
+/// palette, that's exclusively project- and package-level
+/// contributions. Both come from the mfile / graph the user
+/// activated against, so activating the project implicitly
+/// consents to what it declares. A future [`Source`] variant we
+/// don't recognize hits the safe path (`Abort`) rather than
+/// getting silently allowed.
+///
+/// Once `minimal activate` grows a real `--policy` / `--allow`
+/// interface, this hook stays as the default when no explicit
+/// policy is provided.
+///
+/// [`Source::Project`]: sessions::core::source::Source::Project
+/// [`Source::Package`]: sessions::core::source::Source::Package
+/// [`UserPolicy`]: sessions::core::policy::UserPolicy
+struct ApproveProjectAndPackage;
 
-impl sessions::core::hooks::PolicyHooks for AbortOnUnapproved {
+/// Return per-item [`AllowOnce`] decisions when every source in
+/// `sources` is a trusted daemon-side origin ([`Source::Project`]
+/// or [`Source::Package`]). `None` on any other source, which the
+/// caller maps to [`HookResult::Abort`].
+///
+/// [`AllowOnce`]: sessions::core::decision::ItemDecision::AllowOnce
+/// [`Source::Project`]: sessions::core::source::Source::Project
+/// [`Source::Package`]: sessions::core::source::Source::Package
+/// [`HookResult::Abort`]: sessions::core::hooks::HookResult::Abort
+fn decisions_for_trusted_sources<'a, I>(
+    sources: I,
+) -> Option<Vec<sessions::core::decision::ItemDecision>>
+where
+    I: IntoIterator<Item = &'a sessions::core::source::Source>,
+{
+    let mut decisions = Vec::new();
+    for source in sources {
+        match source {
+            sessions::core::source::Source::Project { .. }
+            | sessions::core::source::Source::Package { .. } => {
+                decisions.push(sessions::core::decision::ItemDecision::AllowOnce);
+            }
+            _ => return None,
+        }
+    }
+    Some(decisions)
+}
+
+impl sessions::core::hooks::PolicyHooks for ApproveProjectAndPackage {
     fn on_var_unapproved(
         &self,
         _policy: sessions::core::policy::VarsPolicy,
-        _items: &[sessions::core::hooks::Unapproved<'_, str>],
+        items: &[sessions::core::hooks::Unapproved<'_, str>],
     ) -> sessions::core::hooks::HookResult<sessions::core::policy::VarsPolicy> {
-        sessions::core::hooks::HookResult::Abort
+        decisions_for_trusted_sources(items.iter().map(|u| u.source()))
+            .map(sessions::core::hooks::HookResult::decided)
+            .unwrap_or(sessions::core::hooks::HookResult::Abort)
     }
 
     fn on_patch_unapproved(
         &self,
         _policy: sessions::core::policy::PatchPolicy,
-        _items: &[sessions::core::hooks::Unapproved<'_, camino::Utf8Path>],
+        items: &[sessions::core::hooks::Unapproved<'_, camino::Utf8Path>],
     ) -> sessions::core::hooks::HookResult<sessions::core::policy::PatchPolicy> {
-        sessions::core::hooks::HookResult::Abort
+        decisions_for_trusted_sources(items.iter().map(|u| u.source()))
+            .map(sessions::core::hooks::HookResult::decided)
+            .unwrap_or(sessions::core::hooks::HookResult::Abort)
     }
 }
 
@@ -461,7 +506,7 @@ impl sessions::core::hooks::PolicyHooks for AbortOnUnapproved {
 ///
 /// Runs `handle_response` over the daemon's `ContributionResponse`
 /// with [`UserPolicy::default`] (today's empty policy — see
-/// [`AbortOnUnapproved`]); sends the resulting [`ContributionVerdict`]
+/// [`ApproveProjectAndPackage`]); sends the resulting [`ContributionVerdict`]
 /// over the [`SubmitVerdict`] RPC; unwraps the daemon's terminal
 /// [`SessionStep::Active`] reply to the finalized session id.
 ///
@@ -488,7 +533,7 @@ async fn drive_pending_to_active(
     // to send AbortSession on any Phase 3 failure below.
     let session_id = response.session_id;
 
-    let hooks = AbortOnUnapproved;
+    let hooks = ApproveProjectAndPackage;
     let verdict = match handle_response(
         response,
         &[],
@@ -1142,5 +1187,92 @@ mod tests {
         assert!(parse_ingress_mapping("18080").is_err());
         assert!(parse_ingress_mapping("notaport:80").is_err());
         assert!(parse_ingress_mapping("18080:80/icmp").is_err());
+    }
+
+    /// All-Project sources → one `AllowOnce` per item. Baseline
+    /// happy path for the client's default hook.
+    #[test]
+    fn decisions_for_trusted_sources_allows_all_project() {
+        let sources = [
+            sessions::core::source::Source::Project {
+                path: paths::HostPath::new("/proj"),
+            },
+            sessions::core::source::Source::Project {
+                path: paths::HostPath::new("/proj"),
+            },
+        ];
+        let d =
+            decisions_for_trusted_sources(sources.iter()).expect("all Project → Some decisions");
+        assert_eq!(d.len(), 2);
+        assert!(
+            d.iter()
+                .all(|x| matches!(x, sessions::core::decision::ItemDecision::AllowOnce))
+        );
+    }
+
+    /// All-Package sources → same as Project. Same posture: the
+    /// package came from the mfile / graph the user activated
+    /// against, so activation implicitly consents.
+    #[test]
+    fn decisions_for_trusted_sources_allows_all_package() {
+        let sources = [
+            sessions::core::source::Source::Package {
+                name: "go".to_string(),
+            },
+            sessions::core::source::Source::Package {
+                name: "postgres".to_string(),
+            },
+        ];
+        let d =
+            decisions_for_trusted_sources(sources.iter()).expect("all Package → Some decisions");
+        assert_eq!(d.len(), 2);
+    }
+
+    /// A mix of trusted sources still allows; the helper is
+    /// per-item and doesn't care whether the item is a Project or
+    /// Package one.
+    #[test]
+    fn decisions_for_trusted_sources_allows_mixed_project_and_package() {
+        let sources = [
+            sessions::core::source::Source::Project {
+                path: paths::HostPath::new("/proj"),
+            },
+            sessions::core::source::Source::Package {
+                name: "go".to_string(),
+            },
+        ];
+        let d = decisions_for_trusted_sources(sources.iter())
+            .expect("Project+Package → Some decisions");
+        assert_eq!(d.len(), 2);
+    }
+
+    /// A single UserLoadout-origin item mixed in aborts the whole
+    /// batch. `UserLoadout` items shouldn't reach a hook — user
+    /// items auto-decide against the base `UserPolicy` — so seeing
+    /// one here is a caller bug and we abort defensively.
+    #[test]
+    fn decisions_for_trusted_sources_aborts_on_user_loadout() {
+        let sources = [
+            sessions::core::source::Source::Project {
+                path: paths::HostPath::new("/proj"),
+            },
+            sessions::core::source::Source::UserLoadout {
+                name: "dev".to_string(),
+            },
+        ];
+        assert!(
+            decisions_for_trusted_sources(sources.iter()).is_none(),
+            "any UserLoadout source in the batch → None → Abort",
+        );
+    }
+
+    /// An empty source list is `Some(vec![])`. `HookResult::decided(vec![])`
+    /// is the shape the gate expects on the (unusual but legal) empty-
+    /// batch call.
+    #[test]
+    fn decisions_for_trusted_sources_empty_yields_empty_decisions() {
+        let sources: [sessions::core::source::Source; 0] = [];
+        let d = decisions_for_trusted_sources(sources.iter()).expect("empty → Some(empty)");
+        assert!(d.is_empty());
     }
 }

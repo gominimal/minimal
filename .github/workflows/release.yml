@@ -228,6 +228,12 @@ jobs:
                   fi
             - name: Build release minvmd binary
               run: cargo build --release -p minvmd --bin minvmd
+            - name: Print libkrun load command (informational)
+              # Show the name+path minvmd records for libkrun. For the shipped
+              # bin/libkrun.dylib (next to minvmd) to resolve via @loader_path, this
+              # must be an @rpath entry whose basename matches the staged dylib's
+              # install name (see build-libkrun-macos-arm64). Non-gating.
+              run: otool -L target/release/minvmd | grep -i krun || true
             - name: Build release minimal binary
               run: cargo build --release -p minimal --bin minimal
             - name: Rename binaries with platform suffix
@@ -247,6 +253,73 @@ jobs:
               with:
                   name: minimal-macos-arm64
                   path: target/release/minimal-macos-arm64
+                  retention-days: 7
+
+    build-libkrun-macos-arm64:
+        # Build a TRIMMED libkrun.dylib from source to SHIP in the release, so
+        # macOS users don't have to `brew install` it themselves. GitHub-hosted
+        # macos-latest is Apple Silicon (arm64).
+        runs-on: macos-latest
+        timeout-minutes: 45
+        env:
+            # Pin to the libkrun the slp/krun tap currently ships, so the dylib we
+            # ship matches the ABI the macOS CI lanes build and test against.
+            LIBKRUN_REF: v1.19.4
+        steps:
+            - name: Checkout libkrun (${{ env.LIBKRUN_REF }})
+              uses: actions/checkout@v7
+              with:
+                  repository: containers/libkrun
+                  ref: ${{ env.LIBKRUN_REF }}
+                  persist-credentials: false
+            - name: Toolchain
+              uses: dtolnay/rust-toolchain@stable
+            - name: Build trimmed libkrun (blk + net; no gpu, no init-blob)
+              # Direct cargo build — no Makefile, no env, no lld/xz/sysroot.
+              #   -p libkrun            scope to the libkrun crate, so the
+              #                         src/input & src/display workspace members
+              #                         (whose bindgen build scripts need libclang)
+              #                         are never built.
+              #   --no-default-features drop `init-blob`, whose build script
+              #                         cross-compiles a Linux init — the ONLY reason
+              #                         the Makefile needs lld + a Debian sysroot.
+              #                         minvmd supplies its own initramfs, so
+              #                         libkrun's bundled init is unused. (This is
+              #                         exactly the Makefile's INIT_BLOB=0 config.)
+              #   --features blk,net    blk = rootfs disk (krun_add_disk2),
+              #                         net = virtio-net. No gpu => no libepoxy/
+              #                         virglrenderer. Hypervisor.framework is linked
+              #                         automatically by src/vmm/build.rs.
+              # Output: target/release/libkrun.dylib (install_name libkrun.1.dylib,
+              # set by src/libkrun/build.rs).
+              run: cargo build --release -p libkrun --no-default-features --features blk,net
+            - name: Stage the dylib and assert it is self-contained
+              # A trimmed build must link only system libraries. Any /opt/homebrew or
+              # /usr/local reference means a dependency leaked (e.g. a stray GPU lib)
+              # and the dylib would fail to load on a machine without Homebrew — fail
+              # loudly rather than ship an unloadable artifact. `otool -D` prints the
+              # install name for cross-checking against minvmd's recorded load
+              # command (see the minvmd macOS job); informational.
+              run: |
+                  dylib=target/release/libkrun.dylib
+                  echo "otool -L $dylib"; otool -L "$dylib"
+                  echo "otool -D $dylib (install name):"; otool -D "$dylib"
+                  if otool -L "$dylib" | grep -E '/opt/homebrew|/usr/local'; then
+                    echo "::error::trimmed libkrun links a non-system (Homebrew) dylib; see otool -L above" >&2
+                    exit 1
+                  fi
+                  cp "$dylib" "$RUNNER_TEMP/libkrun-macos-arm64.dylib"
+            - name: Ad-hoc codesign
+              # cargo leaves the dylib ad-hoc/unsigned; arm64 macOS refuses to load a
+              # dylib with an invalid signature. Match the installer's self-sign of
+              # shipped bin/ files.
+              run: codesign --sign - --force "$RUNNER_TEMP/libkrun-macos-arm64.dylib"
+            - name: Upload libkrun dylib
+              uses: actions/upload-artifact@v7
+              with:
+                  name: libkrun-macos-arm64
+                  path: ${{ runner.temp }}/libkrun-macos-arm64.dylib
+                  if-no-files-found: error
                   retention-days: 7
 
     fetch-release-guest-artifacts:
@@ -420,6 +493,7 @@ jobs:
                 build-release-linux-amd64,
                 build-release-linux-arm64,
                 build-release-macos-arm64,
+                build-libkrun-macos-arm64,
                 fetch-release-guest-artifacts,
                 build-release-initramfs,
             ]

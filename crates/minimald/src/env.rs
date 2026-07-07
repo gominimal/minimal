@@ -73,6 +73,14 @@ pub struct EnvArgs {
     network_mode: NetworkMode,
     own_ip_tap: Option<sandbox2::config::OwnIpTap>,
     own_ip_dns: Option<std::net::Ipv4Addr>,
+    /// When true (default), [`Env::build`] consumes package
+    /// [`SetupForPackages`] output for `env_vars`/`fs_mappings`.
+    /// When false, the caller supplies both via `env_vars` /
+    /// `patches` and `state_dirs` is derived from resolved values
+    /// shaped `/state/<prefix>`.
+    ///
+    /// [`SetupForPackages`]: graph::SetupForPackages
+    include_package_attr_wiring: bool,
 }
 
 impl EnvArgs {
@@ -97,7 +105,18 @@ impl EnvArgs {
             network_mode: NetworkMode::HostNet,
             own_ip_tap: None,
             own_ip_dns: None,
+            include_package_attr_wiring: true,
         }
+    }
+
+    /// Opts out of consuming `env_vars` / `fs_mappings` from
+    /// `SetupForPackages`. Callers on this path must funnel package
+    /// contributions through `.with_resolved_env_vars` /
+    /// `.with_patches` themselves.
+    #[must_use]
+    pub fn without_package_attr_wiring(mut self) -> Self {
+        self.include_package_attr_wiring = false;
+        self
     }
 
     /// Sets the packages (by name) that should be available in the environment.
@@ -123,6 +142,20 @@ impl EnvArgs {
     #[must_use]
     pub fn with_env_vars(mut self, env_vars: HashMap<String, EnvVarValue>) -> Self {
         self.env_vars = Some(env_vars);
+        self
+    }
+
+    /// Set environment variables from already-resolved values,
+    /// wrapping each as [`EnvVarValue::Value`]. Ergonomic shortcut
+    /// over `.with_env_vars` for callers with post-gate values.
+    #[must_use]
+    pub fn with_resolved_env_vars(mut self, env_vars: HashMap<String, String>) -> Self {
+        self.env_vars = Some(
+            env_vars
+                .into_iter()
+                .map(|(k, v)| (k, EnvVarValue::Value(v)))
+                .collect(),
+        );
         self
     }
 
@@ -182,13 +215,26 @@ pub struct Env {
     _temp_dirs: Vec<TempDir>,
 }
 
+/// Derive the composition-path state-dir set by picking up any
+/// resolved env-var value shaped `/state/<single-component>`.
+/// Multi-component and empty prefixes are dropped — they can't be
+/// distinguished from coincidental `/state/`-prefixed values.
+fn state_dirs_from_env_vars(
+    env_vars: &HashMap<String, String>,
+) -> std::collections::HashSet<String> {
+    env_vars
+        .values()
+        .filter_map(|v| v.strip_prefix("/state/"))
+        .filter(|p| !p.is_empty() && !p.contains('/'))
+        .map(str::to_owned)
+        .collect()
+}
+
 impl Env {
-    /// Builds a runtime environment, consuming the context and graph.
-    ///
-    /// This resolves the requested packages (always pulling in `bash` and
-    /// `socat` for the `min` helper), ensures they are built locally, assembles
-    /// the sandbox rootfs, installs the `min` helper, and spawns the command
-    /// channel actor with the context and graph moved into it.
+    /// Build a runtime environment. Resolves and locally builds the
+    /// requested packages (plus `bash`/`socat` for the `min`
+    /// helper), assembles the rootfs, and spawns the command
+    /// channel actor.
     pub async fn build(mut ctx: Context, mut graph: Graph, args: EnvArgs) -> std::io::Result<Self> {
         // Resolve the requested package names to top-levels, then ensure the
         // helper's dependencies (`bash`, `socat`) are present.
@@ -223,14 +269,31 @@ impl Env {
                 .map_err(err_to_io)?;
         }
 
-        // Collect the package-derived wiring and merge caller-supplied overrides.
-        let SetupForPackages {
-            fs_mappings: mut patch,
-            needs_dns: _,
-            needs_internet: _,
-            state_dirs,
-            env_vars: mut pkg_env_vars,
-        } = SetupForPackages::build(&graph, transitives.keys()).map_err(std::io::Error::other)?;
+        // Collect the package-derived wiring and merge caller-supplied
+        // overrides. On the composition path the caller funnels
+        // `env_state_wiring` and fs mappings through their own args,
+        // so we skip `SetupForPackages`'s output for those fields.
+        // `needs_dns` / `needs_internet` are ignored on either
+        // branch — they aren't user-gate-able, so if we add a new
+        // `SetupForPackages` field make sure to route it through
+        // the same branch as `env_vars`/`fs_mappings`, not with these.
+        let (mut patch, legacy_state_dirs, mut pkg_env_vars) = if args.include_package_attr_wiring {
+            let SetupForPackages {
+                fs_mappings,
+                needs_dns: _,
+                needs_internet: _,
+                state_dirs,
+                env_vars,
+            } = SetupForPackages::build(&graph, transitives.keys())
+                .map_err(std::io::Error::other)?;
+            (fs_mappings, state_dirs, env_vars)
+        } else {
+            (
+                EnvPatches::default(),
+                std::collections::HashSet::<String>::new(),
+                HashMap::new(),
+            )
+        };
 
         if let Some(p) = &args.patches {
             patch.union(p);
@@ -246,6 +309,19 @@ impl Env {
                 pkg_env_vars.insert(k.clone(), value);
             }
         }
+
+        // Composition path: state_dirs come from the resolved
+        // env-var values shaped `/state/<prefix>`. Matches what
+        // `SetupForPackages` produces for `env_state_wiring` and
+        // means a session that has been correctly gated (e.g. a
+        // `deny` policy on some GOCACHE env var) also skips creating
+        // its state dir — no orphaned `/state` slot for a var the
+        // session doesn't actually have.
+        let state_dirs: std::collections::HashSet<String> = if args.include_package_attr_wiring {
+            legacy_state_dirs
+        } else {
+            state_dirs_from_env_vars(&pkg_env_vars)
+        };
 
         let rootfs_dirs = transitives
             .keys()
@@ -267,11 +343,8 @@ impl Env {
             .with_state_dir(args.state_base_dir.as_utf8_path())
             .with_env_vars(pkg_env_vars.into_iter())
             .with_network_mode(args.network_mode)
-            // Own-IP tap params drive hakoniwa's in-namespace (rootless) tap on
-            // the native DM2 path; `None` for host/VM modes and the DM1/3/4
-            // vsock-shuttle path (which keeps the privileged move-into-netns
-            // wiring). The DNS server is set separately for *every* own-IP
-            // sandbox so both paths get a working resolver.
+            // Own-IP tap params are `None` for host/VM modes and the
+            // vsock-shuttle path. DNS is set on every own-IP sandbox.
             .with_own_ip_tap(args.own_ip_tap)
             .with_own_ip_dns(args.own_ip_dns)
             .with_hostname(args.name.clone())
@@ -1028,5 +1101,45 @@ mod tests {
             lines.iter().any(|l| l.contains("uroot")),
             "expected 'uroot' in search results, got: {lines:?}"
         );
+    }
+
+    /// A resolved env var shaped `/state/<prefix>` seeds a state
+    /// dir named `<prefix>`; non-`/state/` values are ignored. This
+    /// is the isolated composition-branch derivation the parity
+    /// test does not exercise via `Env::build` (which requires a
+    /// full graph + built packages), pulled out into a helper so
+    /// it can be unit-tested directly.
+    #[test]
+    fn state_dirs_from_env_vars_extracts_single_component_prefixes() {
+        let env = HashMap::from([
+            ("GOCACHE".to_string(), "/state/gocache".to_string()),
+            ("GOMODCACHE".to_string(), "/state/gomodcache".to_string()),
+            ("HOME".to_string(), "/home/user".to_string()),
+            ("PS1".to_string(), r"\u@\h $ ".to_string()),
+        ]);
+        let out = state_dirs_from_env_vars(&env);
+        assert_eq!(out.len(), 2);
+        assert!(out.contains("gocache"));
+        assert!(out.contains("gomodcache"));
+    }
+
+    /// A value that's literally `/state/` (no prefix component) is
+    /// ignored — creating `state_base_dir/` itself is nonsense.
+    #[test]
+    fn state_dirs_from_env_vars_ignores_bare_state() {
+        let env = HashMap::from([("WEIRD".to_string(), "/state/".to_string())]);
+        assert!(state_dirs_from_env_vars(&env).is_empty());
+    }
+
+    /// A multi-component prefix that leaked past the extractor
+    /// (which should have already rejected it) is silently dropped
+    /// here — the extractor is the layer that surfaces the error
+    /// to the client. This helper is the last line of defense but
+    /// its concern is producing a valid single-component set, not
+    /// diagnosing bad ones.
+    #[test]
+    fn state_dirs_from_env_vars_silently_drops_multi_component() {
+        let env = HashMap::from([("WEIRD".to_string(), "/state/foo/bar".to_string())]);
+        assert!(state_dirs_from_env_vars(&env).is_empty());
     }
 }

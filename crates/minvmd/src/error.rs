@@ -35,6 +35,11 @@ pub enum VmError {
     /// A required environment variable was unset or empty.
     MissingEnv { var: &'static str },
 
+    /// A required image could not be located: the override env var was unset or
+    /// empty, and no file exists at the default install location. `var` names
+    /// the override; `default` is the path that was checked.
+    MissingImage { var: &'static str, default: PathBuf },
+
     /// An I/O error outside the libkrun FFI boundary (e.g. creating or
     /// checking the socket directory, R3.2).
     Io { source: io::Error },
@@ -83,6 +88,13 @@ impl fmt::Display for VmError {
             Self::MissingEnv { var } => {
                 write!(f, "required environment variable {var} is unset or empty")
             }
+            Self::MissingImage { var, default } => {
+                write!(
+                    f,
+                    "{var} is unset and no file exists at the default location {}",
+                    default.display()
+                )
+            }
             Self::Io { source } => {
                 write!(f, "I/O error: {source}")
             }
@@ -108,6 +120,7 @@ impl std::error::Error for VmError {
             | Self::NulInString { .. }
             | Self::StartEnterReturnedUnexpectedly { .. }
             | Self::MissingEnv { .. }
+            | Self::MissingImage { .. }
             | Self::Configuration { .. }
             | Self::InvalidEgressSubnet { .. } => None,
             Self::Io { source } => Some(source),
