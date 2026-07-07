@@ -7,6 +7,10 @@ mod remote_writer;
 pub use remote_writer::RemoteCacheWriter;
 
 mod remote_index;
+// Exposed for the fuzz harness (crates/rcache/fuzz); not part of the intended
+// public API.
+#[doc(hidden)]
+pub use remote_index::RemoteIndex;
 
 /// An adapter that lets you use a [RemoteCache] as a [graph::BinProvider].
 #[derive(Debug, Clone)]
