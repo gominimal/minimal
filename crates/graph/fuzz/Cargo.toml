@@ -1,0 +1,26 @@
+# Standalone fuzz workspace for the `graph` crate. It declares its own
+# `[workspace]` so cargo-fuzz's nightly/sanitizer build does not perturb the
+# main workspace, and is excluded from the root `members` list.
+[package]
+name = "graph-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.graph]
+path = ".."
+
+[[bin]]
+name = "graph_from_bytes"
+path = "fuzz_targets/graph_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
