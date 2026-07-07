@@ -193,7 +193,8 @@ trees on a shared writable ext4 volume. Introduces the host provisioner, the
 
 - **R1.4**: `crates/minvmd/src/vm.rs` shall call `ctx.add_disk_with_sync` after
   the existing `ctx.add_disk("root", ...)` call to attach the writable volume as
-  `"data"` at `read_only=false, direct_io=false, sync_mode=true`. The volume
+  `"data"` at `read_only=false`, with `direct_io` and `sync_mode` resolved from
+  the tunables in R1.9 (default `sync_mode=true, direct_io=false`). The volume
   path is resolved by calling `BlankRawProvisioner::ensure(vm_id, size)` before
   constructing the `Context`. `vm_id` is derived from the state directory path
   (a stable per-VM identifier). The volume path is stored in `VmConfig` or
@@ -229,6 +230,19 @@ trees on a shared writable ext4 volume. Introduces the host provisioner, the
   or removed. This is a best-effort requirement: if baseline memory pressure is
   observed in CI, a higher value is acceptable.
 
+- **R1.9**: The `sync_mode` and `direct_io` flags passed to `add_disk_with_sync`
+  (R1.4) shall not be hardcoded. `crates/minvmd/src/vm.rs` shall read them from
+  `MINVMD_DISK_SYNC` (default `true`) and `MINVMD_DISK_DIRECT_IO` (default
+  `false`), matching the `MINVMD_VOLUME_BYTES` override pattern (R1.3). The
+  defaults preserve the durability posture argued in Design Considerations
+  (`sync_mode=true` bounds the crash data-loss window; `direct_io=false` is
+  correct for guest ext4). The knobs exist so the throughput cost of that posture
+  can be measured (Proof Artifact 4) rather than assumed, and tuned per platform
+  without a rebuild. Note the coupling this exposes: cache writes (rebuildable,
+  loss-tolerant) and session writes (user data, must survive) share one volume,
+  so a single `sync_mode` pays session-grade durability cost for cache I/O;
+  splitting that is out of scope here and tracked as an open question.
+
 **Proof Artifacts:**
 
 1. **Test:** An integration test (`crates/minvmd/tests/` or `crates/minimald/tests/`)
@@ -238,6 +252,25 @@ trees on a shared writable ext4 volume. Introduces the host provisioner, the
 2. **CLI:** `minvmd boot --foreground` on macOS/HVF starts the VM, the guest
    mounts `/dev/vdb`, and the READY marker arrives — confirms the second disk is
    attached, formatted, and mounted before the guest signals readiness.
+3. **Test (sparse-raw gate):** A test on macOS/APFS provisions the volume,
+   records host block usage (`stat` `st_blocks`, not `st_size`), then inside the
+   guest (a) writes N GiB into the mounted volume and asserts host `st_blocks`
+   grew by ≈N GiB — confirming **allocate-on-write** sparsity; and (b) deletes
+   that data, runs `fstrim /var/lib/minimal`, and records whether host
+   `st_blocks` falls back — characterizing **reclaim-on-discard** through
+   libkrun's virtio-blk. This is a **decision gate**, not a pass/fail assertion:
+   allocate-on-write is required (fail the sprint if the host allocates the full
+   `MINVMD_VOLUME_BYTES` up front); reclaim-on-discard is observed and recorded.
+   If reclaim does not work, the test asserts the documented fallback holds —
+   the image is bounded by its high-water mark ≤ `MINVMD_VOLUME_BYTES` and the
+   default size is set accordingly — and the result is the trigger to reopen the
+   qcow2 evaluation (#647). Answers the sparsity question raised in review.
+4. **Test (sync/direct_io throughput):** A build-heavy workload (compose a large
+   package, e.g. claude-code) runs under each `MINVMD_DISK_SYNC` ×
+   `MINVMD_DISK_DIRECT_IO` combination (R1.9); wall-clock and host fsync cost are
+   recorded. This does not gate merge — it produces the measurement Tom asked for
+   so the default posture is chosen from data, and surfaces the per-platform
+   tuning if `sync_mode=true` proves prohibitively slow on APFS.
 
 ---
 
@@ -416,8 +449,11 @@ the host-side mapping from session id to volume image.
 - **Phase 2 (host-FS reflink CoW) and Phase 3 (single writable root).** Deferred.
   The `VolumeProvisioner` seam (R1.3) and guest superblock-detection (R1.5) keep
   Phase 2 a pure host-side swap with no guest/boot-path change.
-- **qcow2 overlays.** No `Qcow2` variant is added to `DiskFormat`; no qcow2
-  overlay-creation path is added. Deferred per #648.
+- **qcow2 data disk or backing-file overlays.** No `Qcow2` variant is added to
+  `DiskFormat`; no qcow2 overlay-creation path is added. Deferred per the
+  #583 scope narrowing (RAW two-disk = Phase 1) and #647/#648. Rationale for
+  holding RAW against the qcow2 alternatives raised in review is in Design
+  Considerations ("Sparse-raw provisioning, and why not qcow2").
 - **Multi-VM session routing** beyond maintaining the index (R3.4, R3.5). Full
   `attach`/`activate` dispatch to the owning VM is #311 scope.
 - **Non-VM (hakoniwa) sandbox path.** The `EXDEV` root cause applies there too
@@ -433,6 +469,46 @@ the host-side mapping from session id to volume image.
 Keeping the base rootfs read-only and shared avoids per-VM image divergence and
 simplifies rootfs upgrades (clone the new base, migrate state — no `qemu-img
 rebase` risk). The writable volume is the only entity that varies per VM.
+
+### Sparse-raw provisioning, and why not qcow2
+
+The writable volume is a sparse RAW file: `ftruncate`/`fallocate(KEEP_SIZE)` to
+`MINVMD_VOLUME_BYTES`, host allocates blocks only as the guest writes them.
+Sparsity has two independent behaviours, treated separately (Proof Artifact 3):
+
+- **Allocate-on-write** is required and expected to hold — APFS (`ftruncate`) and
+  Linux (`fallocate KEEP_SIZE`) both back the file lazily, so the host never pays
+  the full 32 GiB up front. If a platform allocates eagerly, that is a
+  sprint-blocking failure.
+- **Reclaim-on-delete** is *not* assumed. ext4 frees blocks internally, but the
+  RAW backing file only shrinks if the guest issues discard (`-o discard` /
+  `fstrim`), libkrun's virtio-blk forwards UNMAP as `fallocate(PUNCH_HOLE)`, and
+  the host FS punches holes — a chain that is unverified here. Proof Artifact 3
+  measures it. If it works, images stay near live-data size; if it does not, the
+  image is bounded by its high-water mark ≤ `MINVMD_VOLUME_BYTES` and the default
+  is sized for that ceiling. Broken reclaim under heavy build/GC churn is the
+  documented trigger to reopen the qcow2 evaluation (#647).
+
+Two qcow2 alternatives were raised in review and are deferred, not dismissed:
+
+- **qcow2 data disk (self-sparse, compactable).** qcow2 stores only allocated
+  clusters and can be compacted offline without the guest-discard chain — a
+  cleaner space-reclamation story than RAW. Cost: it needs a `Qcow2`
+  `DiskFormat` variant plus verification that the pinned macOS libkrun block
+  backend actually drives qcow2, and it adds a metadata-corruption layer on hard
+  kill (repair = `qemu-img check -r` on top of ext4 fsck). RAW carries neither
+  risk and is already supported.
+- **qcow2 base + per-VM overlay (backing file).** Attaching only the overlay
+  collapses the model to a single writable root — this is Phase 3 topology, and
+  it depends on libkrun honouring qcow2 *backing files*, the exact verification
+  gate #647 flagged. It is also the weakest crash-safety story: the overlay's
+  qcow2 metadata must survive hard kill on top of the guest journal, so the
+  Unit 2 `syncfs`+unmount quiesce alone would not be sufficient. It remains the
+  natural substrate for snapshot lineage (#648) if that work is revived.
+
+The decision gate is Proof Artifact 3: RAW ships if allocate-on-write holds and
+reclaim is either functional or bounded acceptably; a failing reclaim result is
+what reopens qcow2 — with measurement, not assertion.
 
 ### Guest-side mkfs vs host-side mkfs
 
@@ -506,6 +582,13 @@ staging directory is adjacent to the live worktree on the same volume, making
    session lifecycle events from the guest to the host. Is there already a planned
    shape for this in the #311 scope, or should this spec define it from scratch?
 
+4. **Durability granularity vs. the single volume.** Cache (rebuildable) and
+   sessions (user data) share one volume and therefore one `sync_mode` (R1.9). If
+   Proof Artifact 4 shows `sync_mode=true` is prohibitively slow on APFS, do we
+   want `sync_mode=false` (accept losing the cache on hard crash, keep sessions
+   safe by other means), or is per-subtree durability worth splitting the volume
+   later? Not in scope for this sprint; the R1.9 knob keeps the option open.
+
 ## Technical Considerations
 
 - **ext4 superblock magic (`0x53EF`)** is at bytes 56–57 of the superblock, which
@@ -540,6 +623,8 @@ staging directory is adjacent to the live worktree on the same volume, making
 |------|-----|-----------|----------------------|
 | R1 | R1.4, R1.5, R1.6 | Test | In-VM build that hardlinks from cache into sandbox staging exits 0 (no `EXDEV`) |
 | R1 | R1.5 | CLI | `minvmd boot --foreground` on macOS/HVF: VM reaches READY with `/dev/vdb` mounted |
+| R1 | R1.3, R1.4 | Test (gate) | Host `st_blocks` grows ≈N GiB on N-GiB guest write (allocate-on-write required); reclaim after `fstrim` recorded, else image bounded ≤ `MINVMD_VOLUME_BYTES` |
+| R1 | R1.9 | Test (measure) | Build workload timed across `MINVMD_DISK_SYNC` × `MINVMD_DISK_DIRECT_IO`; default posture chosen from data |
 | R2 | R2.3, R2.1 | Test | `minvmd stop` on a running VM → host can mount volume image with clean ext4 journal |
 | R2 | R2.4, R2.5 | Test | VM boot with missing/corrupt `/dev/vdb` produces no `READY` marker within boot timeout |
 | R3 | R3.1 | Test | Corrupt `sessions/index.json` → `minimald` reaches READY; sessions recovered from `record.json` |
