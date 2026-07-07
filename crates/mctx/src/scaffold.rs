@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use common::SpecOrigin;
 use common::repo_spec::Repo;
 
-use crate::{Config, Context, Error};
+use crate::{Config, DaemonContext, Error};
 
 /// TEMPORARY (see module docs): default upstream package source.
 const DEFAULT_PKGS: &str = "https://github.com/gominimal/pkgs";
@@ -35,7 +35,7 @@ pub fn scaffold_default_mfile(
     config: &Config,
     repo_dir: impl AsRef<Path>,
 ) -> Result<PathBuf, Error> {
-    let (mut vcs, _cache, _stdlib) = Context::sub_setup(config)?;
+    let (mut vcs, _cache, _stdlib) = DaemonContext::sub_setup(config)?;
     let (_dir, rev) = vcs.checkout_of(
         DEFAULT_PKGS,
         checkouts::GitRef::Branch(DEFAULT_PKGS_BRANCH.to_string()),

@@ -39,12 +39,9 @@ pub enum WireError {
     /// before this message arrived.
     #[error("unknown session id")]
     UnknownSessionId,
-    /// The operation isn't valid for the session's current state —
-    /// for example, attempting to attach an SSH channel to a session
-    /// still in `Pending` composition, or submitting a verdict for a
-    /// session that's already been promoted to `Active`. Distinct
-    /// from [`Self::UnknownSessionId`] (the id exists; the state
-    /// doesn't permit this operation).
+    /// The session id exists but its current state doesn't permit
+    /// this operation (e.g. attaching before composition finalizes,
+    /// or submitting a verdict for an already-`Active` session).
     #[error("wrong session state: {what}")]
     WrongState {
         /// Short human-readable description of why the operation

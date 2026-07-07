@@ -176,11 +176,17 @@ impl<BP: BinProvider> BinProvider for MaskingBinProvider<BP> {
 
 mod builds;
 pub use builds::{
-    BuildDep, BuildOutput, BuildSpec, RuntimeDep, SourceFetch, SourceInput, SpecTest, SubsetInput,
+    AttrValue, BuildDep, BuildOutput, BuildSpec, RuntimeDep, SourceFetch, SourceInput, SpecTest,
+    SubsetInput,
 };
 
 mod env_setup;
 pub use env_setup::SetupForPackages;
+
+// Re-exported so downstream crates can inspect the `Stack` a
+// `Graph::stack(name)` lookup returns without pulling in `decode`
+// directly.
+pub use decode::Stack;
 
 mod graph;
 pub use graph::Graph;

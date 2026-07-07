@@ -7,8 +7,7 @@ use crate::{
 use paths::DaemonAbsPath;
 use sessions::{
     SessionId,
-    core::compose::ComposeOptions,
-    daemon::composer::{ComposeOutcome, PendingComposeState, SessionComposer, resume_from_verdict},
+    daemon::composer::{ComposeOutcome, PendingComposeState, resume_from_verdict},
     store::{DiskLoader, Loader, SessionKey, SessionObject},
     wire::request::{ContributionVerdict, SessionStep, WireContribution},
 };
@@ -16,6 +15,11 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::RwLock;
 use tokio::sync::{Mutex, mpsc, oneshot};
+
+mod composables;
+#[cfg(test)]
+use composables::ProjectResolution;
+use composables::{build_composables, resolve_project_ctx_and_graph, run_composer};
 
 /// A short summary of the metadata of a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +160,23 @@ enum ManagerMessage {
     DestroySession(SessionId, Responder<()>),
     AbortSession(SessionId, Responder<()>),
     Shutdown(bool, Responder<Result<(), ()>>),
+    /// Test-only inspection: reply with the current size of the
+    /// `compositions` stash. Used to assert stash lifecycle
+    /// transitions (insert on Ready → drain on GetSession →
+    /// cleanup on Destroy/Abort) without exposing the internal
+    /// map to production callers.
+    #[cfg(test)]
+    CompositionsLen(Responder<usize>),
+    /// Test-only inspection: reply with an [`Arc`] clone of the
+    /// stashed [`Composition`] for a given [`SessionId`], or `None`
+    /// if absent. Used to assert that composables actually reached
+    /// the composition with the expected contents (packages, vars),
+    /// not just that a stash entry exists.
+    #[cfg(test)]
+    PeekComposition(
+        SessionId,
+        Responder<Option<Arc<sessions::core::compose::Composition>>>,
+    ),
 }
 
 /// Manages session instances, and session state on disk.
@@ -176,6 +197,26 @@ pub struct Manager<L: Loader = DiskLoader> {
     /// `SessionStatus::Pending` record loses its match and is
     /// reaped by [`Manager::reap_orphan_pending`] at startup.
     pending: BTreeMap<SessionId, PendingComposeState>,
+
+    /// Per-session stash of finalized [`Composition`]s awaiting
+    /// their `Session` actor. Populated on `CreateSession` / post-
+    /// verdict, drained on first `GetSession`. In-memory only; a
+    /// daemon restart drops the stash and post-restart spawns fall
+    /// back to the launcher's baseline.
+    ///
+    /// `DestroySession` / `AbortSession` also drain the stash
+    /// defensively — without those drains a client that activates
+    /// then destroys without ever attaching would leak an entry per
+    /// cycle.
+    ///
+    /// [`Composition`]: sessions::core::compose::Composition
+    compositions: BTreeMap<SessionId, Arc<sessions::core::compose::Composition>>,
+
+    /// Daemon-scoped mctx state (config, stdlib_dir, vcs, cache) shared
+    /// with each per-session `mctx::Context` the manager builds at
+    /// `CreateSession` time. Held behind `Arc` so the daemon-level
+    /// setup work runs once per process rather than per session.
+    daemon_ctx: Arc<mctx::DaemonContext>,
 
     minimal_state_dir: DaemonAbsPath,
     minimal_cache_dir: DaemonAbsPath,
@@ -199,13 +240,28 @@ impl Manager {
     pub async fn init(
         minimal_state_dir: DaemonAbsPath,
         minimal_cache_dir: DaemonAbsPath,
+        mctx_config: mctx::Config,
         net_switch: Arc<Mutex<crate::net::SwitchClient>>,
     ) -> Result<ManagerHandle, std::io::Error> {
         let mut l = DiskLoader::new(minimal_state_dir.clone())?;
-        // Reap any on-disk `SessionStatus::Pending` records left over
-        // from a previous daemon process — the in-memory stash that
-        // would have let them resume is gone, so they're unresumable.
         Self::reap_orphan_pending(&mut l)?;
+
+        // Build the daemon-scoped mctx state once at startup. Each
+        // `CreateSession` will build a per-session `Context` on top of
+        // this via `Context::from_daemon` rather than repeating the
+        // setup (dir upsert / VCS init / cache init / stdlib
+        // materialization) per session. The caller supplies the
+        // `mctx::Config` so daemon-level flags (offline, num-parallel-
+        // builds, stdlib override, remote cache bucket) propagate.
+        // `mctx::Error` isn't `Send + Sync` (it carries nickel-language
+        // `Rc`s), so we can't preserve the source chain across the
+        // `io::Error` boundary. Stringify and move on; this only fires
+        // at daemon startup, at which point failure aborts the process.
+        let daemon_ctx = Arc::new(
+            mctx::DaemonContext::init(mctx_config)
+                .map_err(|e| std::io::Error::other(format!("mctx daemon init: {e}")))?,
+        );
+
         let running = BTreeMap::new();
         let (sender, receiver) = mpsc::channel(8);
         // Shared so the host-side proxies can resolve `Host:` headers directly;
@@ -221,6 +277,8 @@ impl Manager {
             running,
             store: l,
             pending: BTreeMap::new(),
+            compositions: BTreeMap::new(),
+            daemon_ctx,
             minimal_state_dir,
             minimal_cache_dir,
             net_switch,
@@ -245,13 +303,9 @@ impl<L: Loader> Manager<L> {
         }
     }
 
-    /// Delete any on-disk record whose status is
-    /// [`sessions::SessionStatus::Pending`]. Run once at startup —
-    /// the matching in-memory `PendingComposeState` lives only on
-    /// the previous daemon process, so a `Pending` record post-restart
-    /// has no path to `Active` and a client waiting on `SubmitVerdict`
-    /// would hang. Cheap correctness floor; daemon-restart-survives-
-    /// pending is a separate concern.
+    /// Delete any on-disk `Pending` records at startup. Their
+    /// in-memory `PendingComposeState` didn't survive the restart,
+    /// so they can never transition to `Active`.
     fn reap_orphan_pending(store: &mut L) -> Result<(), std::io::Error> {
         let mut reaped = 0u64;
         let keys: Vec<L::Key> = store.keys().collect();
@@ -322,18 +376,10 @@ impl<L: Loader> Manager<L> {
                 })
                 .await;
             }
-            // Gets the session actor corresponding to the predicate.
-            //
-            // If the session is known but not running, it is started.
-            //
-            // `SessionStatus::Pending` records are filtered out here —
-            // they have no composed `Composition` yet, so spinning up
-            // the session host would attach a client to a half-built
-            // session. The filter returns `None` (caller sees the
-            // same shape as "unknown id") and logs the reason at info
-            // level. exec/sftp call sites surface the `None` as a
-            // channel failure, which is the correct user-facing
-            // behavior in either case.
+            // Get the session actor for the predicate, starting it
+            // if the session is known but not running. `Pending`
+            // records return `None` (they have no `Composition`
+            // yet, so attaching would give a half-built session).
             ManagerMessage::GetSession(pred, r) => {
                 r.handle(async {
                     if self.in_shutdown {
@@ -380,14 +426,47 @@ impl<L: Loader> Manager<L> {
                                             (obj.record().id, registry_name(obj.record()), net)
                                         })
                                     };
+                                    // Hand over the finalized composition,
+                                    // if it's still in the manager's stash.
+                                    // Absent after a daemon restart — the
+                                    // actor spawns without one, and the
+                                    // record is still usable.
+                                    //
+                                    // Clone the `Arc` rather than draining
+                                    // now, so that a `Session::run` failure
+                                    // below leaves the stash intact: the
+                                    // next `GetSession` retry will still
+                                    // see the composition and run
+                                    // identically. Drain happens only on
+                                    // the success path just after the
+                                    // spawn returns.
+                                    let session_id = obj.record().id;
+                                    let composition = self.compositions.get(&session_id).cloned();
+                                    // A spawn failure at this point (only
+                                    // I/O failures on `mkdir` of the
+                                    // workspace / home / cache dirs today)
+                                    // means the session can't be brought
+                                    // up — surface as an `io::Error` to
+                                    // the client rather than panicking the
+                                    // actor. Leaves the record on disk and
+                                    // the composition in the stash; the
+                                    // next GetSession retries the same
+                                    // setup and either succeeds or errors
+                                    // identically.
                                     let h = Session::run(
                                         self.minimal_state_dir.clone(),
                                         self.minimal_cache_dir.clone(),
                                         obj,
                                         Arc::clone(&self.net_switch),
+                                        composition,
                                     )
-                                    .await
-                                    .expect("TODO handle error");
+                                    .await?;
+                                    // Spawn succeeded — safe to drain the
+                                    // stash. If the entry is already gone
+                                    // (post-restart spawn with a `None`
+                                    // composition), the remove is a
+                                    // no-op.
+                                    self.compositions.remove(&session_id);
                                     #[cfg(target_os = "linux")]
                                     if let Some((id, name, net)) = ptask_reg {
                                         let mut reg = self
@@ -411,8 +490,9 @@ impl<L: Loader> Manager<L> {
                 })
                 .await;
             }
-            // Creates a session from a config + (optional) client wire
-            // contribution.
+            // Create a session: resolve the project, build the
+            // composables, and drive the composer. Failures pre-mapped
+            // to `InvalidInput`.
             ManagerMessage::CreateSession(msg) => {
                 let CreateSessionMsg {
                     config,
@@ -424,9 +504,15 @@ impl<L: Loader> Manager<L> {
                 // `&mut self` borrows below — the async move needs
                 // to see it without holding a `self` reference.
                 let in_shutdown = self.in_shutdown;
-                let outcome = SessionComposer::new(contribution)
-                    .compose(SessionId::nil(), ComposeOptions::default());
+
+                let outcome = resolve_project_ctx_and_graph(&self.daemon_ctx, &config.project_path)
+                    .and_then(|resolution| {
+                        let (project_composable, package_composables) =
+                            build_composables(&config.project_path, &resolution, &contribution)?;
+                        run_composer(contribution, project_composable, package_composables)
+                    });
                 let pending = &mut self.pending;
+                let compositions = &mut self.compositions;
                 let store = &mut self.store;
                 responder
                     .handle(async move {
@@ -439,14 +525,11 @@ impl<L: Loader> Manager<L> {
                         // Phase 2: branch on the composer outcome.
                         //
                         // `Ready` — composition is complete; persist
-                        // the record as `Active` in one write and ship
-                        // `CreateSessionResponse::Ready { id }`. Guard
-                        // against silent data loss: no apply layer
-                        // yet consumes the `Composition`, so a
-                        // non-empty one would be discarded. Reject
-                        // until apply plumbing lands — the fast path
-                        // (empty client contribution, no daemon
-                        // contributors) still passes.
+                        // the record as `Active`, stash the
+                        // [`Composition`] against its allocated id so
+                        // the [`Session`] actor picks it up on its
+                        // first spawn, and ship
+                        // `CreateSessionResponse::Ready { id }`.
                         //
                         // `Pending` — the client must gate items
                         // before composition completes. Allocate the
@@ -456,30 +539,24 @@ impl<L: Loader> Manager<L> {
                         // `session_id` on the wire response, and ship
                         // `CreateSessionResponse::Pending { id, response }`.
                         //
-                        // `Err` — a cross-process merge conflict or a
-                        // malformed wire item. Both are
-                        // declaration-time bugs — `InvalidInput`.
+                        // `Err` — a composable failed to contribute
+                        // (e.g. an `Inherit`-shaped project var the
+                        // daemon couldn't resolve; malformed package
+                        // state_wiring), a cross-process merge
+                        // conflict, or a malformed wire item. All are
+                        // pre-mapped to [`std::io::ErrorKind::InvalidInput`]
+                        // at the call site above.
                         match outcome {
                             Ok(ComposeOutcome::Ready(composition)) => {
-                                if !composition.vars().is_empty()
-                                    || !composition.patches().is_empty()
-                                    || !composition.packages().is_empty()
-                                    || !composition.lifecycle_hooks().is_empty()
-                                {
-                                    return Err(std::io::Error::new(
-                                        std::io::ErrorKind::InvalidInput,
-                                        "CreateSession composed a non-empty \
-                                         Composition, but the apply layer that \
-                                         would consume it is not wired yet",
-                                    ));
-                                }
                                 let record = build_record(
                                     config,
                                     username,
                                     sessions::SessionStatus::Active,
                                 )?;
                                 let k = store.create(record)?;
-                                Ok(minimald_rpc::CreateSessionResponse::Ready { id: *k.id() })
+                                let id = *k.id();
+                                compositions.insert(id, Arc::new(composition));
+                                Ok(minimald_rpc::CreateSessionResponse::Ready { id })
                             }
                             Ok(ComposeOutcome::Pending {
                                 mut response,
@@ -512,10 +589,7 @@ impl<L: Loader> Manager<L> {
                                 pending.insert(id, state);
                                 Ok(minimald_rpc::CreateSessionResponse::Pending { id, response })
                             }
-                            Err(e) => Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                e.to_string(),
-                            )),
+                            Err(e) => Err(e),
                         }
                     })
                     .await;
@@ -541,6 +615,7 @@ impl<L: Loader> Manager<L> {
                     self.pending.remove(&session_id)
                 };
                 let store = &mut self.store;
+                let compositions = &mut self.compositions;
                 responder
                     .handle(async move {
                         if in_shutdown {
@@ -561,9 +636,11 @@ impl<L: Loader> Manager<L> {
                         // composer can't apply (mismatched
                         // PendingIds, denied items, etc.) maps to a
                         // `Fault` via `WireError::from(ComposeError)`.
-                        // The resumed composition is dropped today:
-                        // session activation doesn't yet consume it.
-                        let _composition = match resume_from_verdict(state, verdict) {
+                        // On success the composition lands in the
+                        // manager's stash so the Session actor picks
+                        // it up on its first spawn (same path as the
+                        // `CreateSession` Ready branch).
+                        let composition = match resume_from_verdict(state, verdict) {
                             Ok(c) => c,
                             Err(e) => {
                                 // Verdict couldn't be applied — the
@@ -611,6 +688,7 @@ impl<L: Loader> Manager<L> {
                         }
                         record.status = sessions::SessionStatus::Active;
                         store.save(&k, &record)?;
+                        compositions.insert(session_id, Arc::new(composition));
                         Ok(SessionStep::Active { id: session_id })
                     })
                     .await;
@@ -714,6 +792,11 @@ impl<L: Loader> Manager<L> {
                     // us before the reap pass, or the pending path was
                     // never populated). Delete the record either way.
                     self.pending.remove(&id);
+                    // Called for symmetry with `DestroySession`.
+                    // `compositions` is only populated on the Ready
+                    // (post-Active) path, so a Pending abort always
+                    // finds nothing here; the call is a no-op today.
+                    self.compositions.remove(&id);
                     self.store.delete(&k)?;
                     Ok(())
                 })
@@ -741,6 +824,12 @@ impl<L: Loader> Manager<L> {
                     // registered one, so it is called unconditionally.
                     #[cfg(target_os = "linux")]
                     let host_net_name = registry_name(self.store.get(&k)?.record());
+                    // Drain the composition stash before teardown. A
+                    // session that never advanced to `GetSession`
+                    // (created + destroyed without an attach) would
+                    // otherwise leak its `Composition` in the
+                    // manager's in-memory map until daemon shutdown.
+                    self.compositions.remove(&id);
                     // Stop the live session first (killing its host and waiting
                     // for the sandbox to be released) so the on-disk tree is
                     // free to remove.
@@ -798,9 +887,26 @@ impl<L: Loader> Manager<L> {
                         hnd.destroy().await;
                     }
                     self.running.clear();
+                    // Drop any stashed compositions for symmetry with
+                    // `running.clear()`. The process is exiting, so
+                    // the map dies with it either way; the explicit
+                    // clear documents the intent and future-proofs
+                    // against a not-yet-existing "restart in place"
+                    // flow.
+                    self.compositions.clear();
                     Ok(Ok(()))
                 })
                 .await
+            }
+            #[cfg(test)]
+            ManagerMessage::CompositionsLen(r) => {
+                let n = self.compositions.len();
+                r.handle(async move { Ok(n) }).await;
+            }
+            #[cfg(test)]
+            ManagerMessage::PeekComposition(id, r) => {
+                let comp = self.compositions.get(&id).cloned();
+                r.handle(async move { Ok(comp) }).await;
             }
         }
     }
@@ -966,6 +1072,42 @@ impl ManagerHandle {
             .expect("corresponding sessions manager is dead")
             .expect("no SessionError expected from shutdown msg")
     }
+
+    /// Test-only inspection of the manager's in-memory
+    /// `compositions` stash. Used to assert stash lifecycle
+    /// transitions (insert on Ready → drain on GetSession →
+    /// cleanup on Destroy/Abort). Not exposed to production
+    /// callers.
+    #[cfg(test)]
+    pub async fn compositions_len(&self) -> usize {
+        let (send, recv) = Responder::channel();
+        let _ = self
+            .sender
+            .send(ManagerMessage::CompositionsLen(send))
+            .await;
+        recv.await
+            .expect("corresponding sessions manager is dead")
+            .expect("infallible")
+    }
+
+    /// Test-only peek at a stashed [`Composition`] by session id.
+    /// Bumps the refcount rather than draining the entry, so the
+    /// caller can assert on contents without disturbing the
+    /// lifecycle.
+    #[cfg(test)]
+    pub async fn peek_composition(
+        &self,
+        id: SessionId,
+    ) -> Option<Arc<sessions::core::compose::Composition>> {
+        let (send, recv) = Responder::channel();
+        let _ = self
+            .sender
+            .send(ManagerMessage::PeekComposition(id, send))
+            .await;
+        recv.await
+            .expect("corresponding sessions manager is dead")
+            .expect("infallible")
+    }
 }
 
 #[cfg(test)]
@@ -1009,7 +1151,14 @@ mod tests {
             "/nonexistent/gvproxy",
             state.path().join("gvproxy"),
         )));
-        let mngr = Manager::init(daemon_dir(&state), daemon_dir(&cache), switch)
+        // Tests use per-TempDir cache/state dirs so they don't pollute the
+        // shared daemon paths a real invocation would touch.
+        let mctx_config = mctx::ConfigBuilder::new()
+            .with_cache_dir(cache.path())
+            .with_state_dir(state.path())
+            .build()
+            .unwrap();
+        let mngr = Manager::init(daemon_dir(&state), daemon_dir(&cache), mctx_config, switch)
             .await
             .unwrap();
         (state, cache, mngr)
@@ -1082,14 +1231,19 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 
-    /// A non-empty `WireContribution` from the client is rejected —
-    /// the composer would produce a non-empty `Composition`, and
-    /// there is no apply layer yet to consume it. Accepting would
-    /// silently discard the client's contribution while the on-disk
-    /// Record only carries the out-of-band `SessionConfig`.
-    /// Prevents the silent data loss until apply plumbing lands.
+    /// A non-empty `WireContribution` from the client is accepted:
+    /// the composer produces a non-empty [`Composition`], the
+    /// [`Manager`] stashes it against the allocated session id, and
+    /// the record persists as `Active`. The stashed composition is
+    /// handed to the [`Session`] actor the first time
+    /// [`GetSession`] spawns it.
+    ///
+    /// Replaces an earlier test that asserted the opposite while
+    /// no apply layer existed to consume the composition; that
+    /// silent-data-loss guard is gone now that the manager keeps
+    /// the composition against a live actor.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn create_session_rejects_non_empty_client_contribution() {
+    async fn create_session_accepts_non_empty_client_contribution() {
         use sessions::core::source::Source;
         use sessions::wire::primitives::{WireResolvedVar, WireSessionVar, WireSource};
 
@@ -1105,11 +1259,14 @@ mod tests {
             }),
         });
 
-        let err = mngr
+        let resp = mngr
             .create_session(sample_config(), None, contribution)
             .await
-            .expect_err("non-empty composition should be rejected until apply plumbing lands");
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            .expect("non-empty composition should now finalize as Active");
+        assert!(matches!(
+            resp,
+            minimald_rpc::CreateSessionResponse::Ready { .. }
+        ));
     }
 
     /// `reap_orphan_pending` deletes `Pending` records on disk —
@@ -1221,6 +1378,335 @@ mod tests {
                 error: sessions::wire::errors::WireError::UnknownSessionId,
             } => {}
             other => panic!("expected Fault::UnknownSessionId, got {other:?}"),
+        }
+    }
+
+    /// `CreateSession` against a `project_path` that has a real
+    /// `minimal.toml` shouldn't error out — the mfile parse
+    /// succeeds and graph resolution is attempted; both feed
+    /// nowhere (yet), and the session persists `Active` on the
+    /// empty-contribution fast path.
+    ///
+    /// The graph-resolution outcome isn't observed by the test —
+    /// depending on how `Graph::new_from_chain` handles a bare
+    /// `minimal.toml` in a scratch dir, it may return an empty
+    /// graph or an error. Either branch must leave `CreateSession`
+    /// returning `Ready`; that's the invariant guarded here.
+    /// Guards against a regression where the mfile parse or graph
+    /// pipeline breaks creation for real projects. Once composition
+    /// consumes the parsed mfile + graph, this test evolves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_session_with_real_project_mfile_succeeds() {
+        use std::io::Write;
+
+        // Set up a temp project directory with a minimal `minimal.toml`.
+        let project = TempDir::new().unwrap();
+        let mfile_path = project.path().join(mfile::MFILE_NAME);
+        let mut f = std::fs::File::create(&mfile_path).unwrap();
+        writeln!(f, "[stack]\nuse = \"empty\"").unwrap();
+        drop(f);
+
+        let (_state, _cache, mngr) = manager().await;
+        let mut config = sample_config();
+        config.project_path = HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+
+        let resp = mngr
+            .create_session(config, None, WireContribution::default())
+            .await
+            .expect("create with valid project mfile should succeed");
+        assert!(matches!(
+            resp,
+            minimald_rpc::CreateSessionResponse::Ready { .. }
+        ));
+    }
+
+    /// `CreateSession` against a `project_path` with no `minimal.toml`
+    /// still succeeds — the parse fails silently (debug log), the
+    /// graph resolve is short-circuited (no `Context` to resolve
+    /// against), no project contribution lands, and the
+    /// empty-contribution fast path completes as before. Guards the
+    /// DM1 / empty-workspace path against regressions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_session_with_missing_mfile_still_succeeds() {
+        let empty_project = TempDir::new().unwrap();
+        let (_state, _cache, mngr) = manager().await;
+        let mut config = sample_config();
+        config.project_path = HostAbsPath::try_new(empty_project.path().to_str().unwrap()).unwrap();
+
+        let resp = mngr
+            .create_session(config, None, WireContribution::default())
+            .await
+            .expect("create with missing mfile should still succeed");
+        assert!(matches!(
+            resp,
+            minimald_rpc::CreateSessionResponse::Ready { .. }
+        ));
+    }
+
+    /// A `[session]` block that contributes a package is picked up
+    /// by [`ProjectComposable`] and lands in the composition. With
+    /// the non-empty-composition guard gone, the record now
+    /// persists as `Active` and the composition lands in the
+    /// manager's per-session stash for the [`Session`] actor to
+    /// pick up.
+    ///
+    /// Uses a package contribution rather than a var so no
+    /// env-resolution (or graph presence) is needed — the test
+    /// stays a pure-parse exercise regardless of stdlib config.
+    ///
+    /// [`ProjectComposable`]: mfile::ProjectComposable
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn project_composable_contribution_reaches_composer() {
+        use std::io::Write;
+
+        let project = TempDir::new().unwrap();
+        let mfile_path = project.path().join(mfile::MFILE_NAME);
+        let mut f = std::fs::File::create(&mfile_path).unwrap();
+        writeln!(f, "[session]\npackages = [\"rustc\"]").unwrap();
+        drop(f);
+
+        let (_state, _cache, mngr) = manager().await;
+        let mut config = sample_config();
+        config.project_path = HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+
+        let resp = mngr
+            .create_session(config, None, WireContribution::default())
+            .await
+            .expect(
+                "project composable contributes a package; \
+                 without the non-empty-composition guard, the \
+                 session finalizes as Active",
+            );
+        assert!(matches!(
+            resp,
+            minimald_rpc::CreateSessionResponse::Ready { .. }
+        ));
+    }
+
+    /// A Ready CreateSession stashes the composition against the
+    /// allocated id — `compositions_len` bumps by exactly one.
+    /// Baseline for the drain-and-cleanup tests below.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compositions_stash_populated_on_ready() {
+        let (_state, _cache, mngr) = manager().await;
+        assert_eq!(mngr.compositions_len().await, 0);
+        let _id = create_and_unwrap_id(&mngr).await;
+        assert_eq!(mngr.compositions_len().await, 1);
+    }
+
+    /// `GetSession` on an Active record drains its composition out
+    /// of the stash and hands it to `Session::run`. The next
+    /// `compositions_len` reads zero — the entry was moved, not
+    /// cloned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compositions_stash_drained_on_first_spawn() {
+        let (_state, _cache, mngr) = manager().await;
+        let id = create_and_unwrap_id(&mngr).await;
+        assert_eq!(mngr.compositions_len().await, 1);
+        let _handle = mngr
+            .get_session(SessionKeyPredicate::Id(id))
+            .await
+            .expect("get_session succeeds")
+            .expect("session resolves");
+        assert_eq!(mngr.compositions_len().await, 0);
+    }
+
+    /// `DestroySession` on a session that was never spawned via
+    /// `GetSession` still drops its composition — the entry would
+    /// otherwise leak because the spawn path never ran to drain
+    /// it. Regression guard for the create-and-forget-then-destroy
+    /// case.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compositions_stash_drained_on_destroy_before_spawn() {
+        let (_state, _cache, mngr) = manager().await;
+        let id = create_and_unwrap_id(&mngr).await;
+        assert_eq!(mngr.compositions_len().await, 1);
+        mngr.destroy_session(id).await.expect("destroy succeeds");
+        assert_eq!(mngr.compositions_len().await, 0);
+    }
+
+    /// The stashed [`Composition`] actually carries the project
+    /// composable's packages — not just an entry-shaped placeholder.
+    /// Guards against a `run_composer` refactor that would produce
+    /// a well-shaped-but-empty composition and silently pass the
+    /// existing lifecycle tests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stashed_composition_carries_project_packages() {
+        use std::io::Write;
+
+        let project = TempDir::new().unwrap();
+        let mfile_path = project.path().join(mfile::MFILE_NAME);
+        let mut f = std::fs::File::create(&mfile_path).unwrap();
+        writeln!(f, "[session]\npackages = [\"ripgrep\", \"jq\"]").unwrap();
+        drop(f);
+
+        let (_state, _cache, mngr) = manager().await;
+        let mut config = sample_config();
+        config.project_path = HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+
+        let resp = mngr
+            .create_session(config, None, WireContribution::default())
+            .await
+            .expect("create with project mfile should succeed");
+        let id = match resp {
+            minimald_rpc::CreateSessionResponse::Ready { id } => id,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+
+        let comp = mngr
+            .peek_composition(id)
+            .await
+            .expect("stashed composition should be present");
+        let package_names: std::collections::BTreeSet<&str> =
+            comp.packages().iter().map(|p| p.package()).collect();
+        assert!(
+            package_names.contains("ripgrep"),
+            "ripgrep should be in composition packages, got {package_names:?}"
+        );
+        assert!(
+            package_names.contains("jq"),
+            "jq should be in composition packages, got {package_names:?}"
+        );
+    }
+
+    /// `[stack] build_packages` and `runtime_packages` land in the
+    /// composition alongside any `[session] packages`, so a project
+    /// declaring stack extras (or having no `[session]` block at
+    /// all) still gets those packages into its sessions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stashed_composition_includes_stack_packages() {
+        use std::io::Write;
+
+        let project = TempDir::new().unwrap();
+        let mfile_path = project.path().join(mfile::MFILE_NAME);
+        let mut f = std::fs::File::create(&mfile_path).unwrap();
+        writeln!(
+            f,
+            "[stack]\n\
+             use = \"shell\"\n\
+             build_packages = [\"cmake\"]\n\
+             runtime_packages = [\"postgres\"]\n"
+        )
+        .unwrap();
+        drop(f);
+
+        let (_state, _cache, mngr) = manager().await;
+        let mut config = sample_config();
+        config.project_path = HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+
+        let resp = mngr
+            .create_session(config, None, WireContribution::default())
+            .await
+            .expect("create with stack-only mfile should succeed");
+        let id = match resp {
+            minimald_rpc::CreateSessionResponse::Ready { id } => id,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+
+        let comp = mngr
+            .peek_composition(id)
+            .await
+            .expect("stashed composition should be present");
+        let package_names: std::collections::BTreeSet<&str> =
+            comp.packages().iter().map(|p| p.package()).collect();
+        assert!(
+            package_names.contains("cmake"),
+            "stack build_packages should reach the composition, got {package_names:?}"
+        );
+        assert!(
+            package_names.contains("postgres"),
+            "stack runtime_packages should reach the composition, got {package_names:?}"
+        );
+    }
+
+    /// [`build_composables`] with a [`ProjectResolution::NoMFile`]
+    /// yields no composables regardless of the wire contribution.
+    /// The wire contribution isn't discarded by the composer — it
+    /// still lands via `SessionComposer::new(contribution)`; this
+    /// helper is only responsible for daemon-side additions.
+    #[test]
+    fn build_composables_no_mfile_yields_nothing() {
+        use sessions::wire::primitives::{WirePackageRef, WireSource};
+
+        let path = HostAbsPath::try_new("/proj").unwrap();
+        let mut contribution = WireContribution::default();
+        contribution.requested_packages.push(WirePackageRef {
+            name: "helix".into(),
+            source: WireSource::UserLoadout {
+                name: "test".into(),
+            },
+        });
+        let (project, packages) =
+            build_composables(&path, &ProjectResolution::NoMFile, &contribution).unwrap();
+        assert!(project.is_none(), "NoMFile → no ProjectComposable");
+        assert!(packages.is_empty(), "NoMFile → no PackageComposables");
+    }
+
+    /// [`build_composables`] with an [`ProjectResolution::MFileOnly`]
+    /// carrying a `[session]` block produces a [`ProjectComposable`];
+    /// package composables stay empty because the graph is absent.
+    /// The MFileOnly path exercises the "graph resolve failed but
+    /// project still declares packages" branch — project packages
+    /// don't get their own PackageComposables, they just wait for
+    /// the composer to see them via the ProjectComposable's
+    /// contribution.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn build_composables_mfile_only_yields_project_composable_and_no_packages() {
+        use std::io::Write;
+
+        let project = TempDir::new().unwrap();
+        let mfile_path = project.path().join(mfile::MFILE_NAME);
+        let mut f = std::fs::File::create(&mfile_path).unwrap();
+        writeln!(f, "[session]\npackages = [\"cargo\"]").unwrap();
+        drop(f);
+
+        // Build a `Context` directly (no graph); the manager sets
+        // the same shape internally on the MFileOnly branch.
+        let cache = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let mctx_config = mctx::ConfigBuilder::new()
+            .with_cache_dir(cache.path())
+            .with_state_dir(state.path())
+            .build()
+            .unwrap();
+        let daemon = std::sync::Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
+        let mfile = mctx::MFileSearchStrategy::Override(project.path().to_path_buf())
+            .find_mfile()
+            .unwrap();
+        let ctx = mctx::Context::from_daemon(daemon, mfile);
+
+        let path = HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+        let (project_composable, packages) = build_composables(
+            &path,
+            &ProjectResolution::MFileOnly(ctx),
+            &WireContribution::default(),
+        )
+        .unwrap();
+        assert!(
+            project_composable.is_some(),
+            "MFileOnly with [session] block → ProjectComposable present",
+        );
+        assert!(
+            packages.is_empty(),
+            "MFileOnly → no PackageComposables (no graph to walk)",
+        );
+    }
+
+    /// [`run_composer`] with an empty client contribution and no
+    /// daemon-side composables produces a Ready outcome with an
+    /// empty [`Composition`]. Baseline for the composer wiring.
+    #[test]
+    fn run_composer_empty_inputs_yield_ready_empty() {
+        let outcome =
+            run_composer(WireContribution::default(), None, Vec::new()).expect("no failures");
+        match outcome {
+            ComposeOutcome::Ready(composition) => {
+                assert!(composition.packages().is_empty());
+                assert!(composition.vars().is_empty());
+                assert!(composition.patches().is_empty());
+                assert!(composition.lifecycle_hooks().is_empty());
+            }
+            other => panic!("expected Ready, got {other:?}"),
         }
     }
 }

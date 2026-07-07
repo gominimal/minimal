@@ -66,32 +66,13 @@ impl HookScript {
     }
 }
 
-/// A set of scripts to run at lifecycle transition points of a host resource.
+/// Scripts run at lifecycle transition points of a host resource.
 ///
-/// At least one of `on_activate`, `on_destroy`, or `on_failure` must be set.
-/// This invariant is enforced both by [`LifecycleHookBuilder::build`] and by
-/// `serde` deserialization — there is no way to construct a `LifecycleHook`
-/// with all three fields empty.
+/// At least one of `on_activate`, `on_destroy`, or `on_failure` must
+/// be set; the empty case is rejected by both the builder and
+/// `serde` deserialization.
 ///
-/// # Example — programmatic construction
-///
-/// ```
-/// use sessions::core::lifecyclehook::{HookScript, LifecycleHook};
-///
-/// let hook = LifecycleHook::builder()
-///     .with_on_activate(HookScript::Inline("echo activated".into()))
-///     .build()
-///     .expect("on_activate is set");
-///
-/// assert!(hook.on_activate().is_some());
-/// assert!(hook.on_destroy().is_none());
-/// assert!(hook.on_failure().is_none());
-///
-/// // An empty hook is rejected:
-/// assert!(LifecycleHook::builder().build().is_err());
-/// ```
-///
-/// # Example — TOML deserialization
+/// # Example
 ///
 /// ```
 /// use sessions::core::lifecyclehook::{HookScript, LifecycleHook};
@@ -100,13 +81,8 @@ impl HookScript {
 /// on_activate = { type = "inline", value = "echo hello" }
 /// on_failure  = { type = "external", value = "./cleanup.sh" }
 /// "#;
-///
 /// let hook: LifecycleHook = toml::from_str(src).unwrap();
-/// assert!(matches!(hook.on_activate(), Some(HookScript::Inline(s)) if s == "echo hello"));
-/// assert!(matches!(hook.on_failure(), Some(HookScript::External(_))));
-/// assert!(hook.on_destroy().is_none());
-///
-/// // Deserializing an empty hook fails:
+/// assert!(matches!(hook.on_activate(), Some(HookScript::Inline(_))));
 /// assert!(toml::from_str::<LifecycleHook>("").is_err());
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

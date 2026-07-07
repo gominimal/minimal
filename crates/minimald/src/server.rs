@@ -157,9 +157,24 @@ impl ServerState {
         let cert_authority =
             Arc::new(crate::net::proxy::CertAuthority::generate().map_err(std::io::Error::other)?);
 
+        // Build a daemon-scoped mctx config from what the daemon
+        // knows today (dirs). Additional flags (offline, stdlib
+        // override, num-parallel-builds) will thread through from
+        // the CLI as follow-up work; today the defaults hold.
+        let mctx_config = mctx::ConfigBuilder::new()
+            .with_cache_dir(minimal_cache_dir.as_utf8_path())
+            .with_state_dir(minimal_state_dir.as_utf8_path())
+            .build()
+            .map_err(|e| std::io::Error::other(format!("mctx config: {e}")))?;
+
         Ok(Self {
-            sessions: sessions::Manager::init(minimal_state_dir, minimal_cache_dir, net_switch)
-                .await?,
+            sessions: sessions::Manager::init(
+                minimal_state_dir,
+                minimal_cache_dir,
+                mctx_config,
+                net_switch,
+            )
+            .await?,
             config,
             shutdown: CancellationToken::new(),
             host_key: None,

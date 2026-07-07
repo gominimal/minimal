@@ -7,7 +7,7 @@ use common::Target;
 use graph::Graph;
 use mfile::LinkConfig;
 
-use crate::{Config, Context, Error, MFileSearchStrategy};
+use crate::{Config, DaemonContext, Error, MFileSearchStrategy};
 
 /// The environment project-setup operations ([`op::InitProject`],
 /// [`op::UpdateProject`]) run against.
@@ -26,7 +26,7 @@ impl ProjectSetup {
     /// Builds an environment for `init`, loading a `minimal.toml` if one is
     /// already present (the user may be re-initializing).
     pub fn for_init(config: Config) -> Result<Self, Error> {
-        let (vcs, _cache, stdlib_dir) = Context::sub_setup(&config)?;
+        let (vcs, _cache, stdlib_dir) = DaemonContext::sub_setup(&config)?;
         let strategy = match config.repo_dir_override() {
             Some(path) => MFileSearchStrategy::Override(path.to_path_buf()),
             None => MFileSearchStrategy::CurrentDirOnly,

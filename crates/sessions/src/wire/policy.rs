@@ -8,14 +8,9 @@
 
 use super::primitives::{PendingId, WireResolvedVar};
 
-/// The client's decision about one pending variable.
-///
-/// Every variant exposes the variable name — directly on `Denied`
-/// and `Ignored`, nested in `value` on `Approved`. This mirrors
-/// [`WirePatchVerdict`], which carries `host_path` on every
-/// variant. The daemon can correlate by `id` alone, but the
-/// redundant name lets logs and audit records be self-describing
-/// without joining against the original pending batch.
+/// The client's decision about one pending variable. Every variant
+/// carries the variable name so logs and audit records are
+/// self-describing without joining against the pending batch.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WireVarVerdict {

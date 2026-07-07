@@ -326,13 +326,10 @@ impl FromStr for LenientVarName {
     }
 }
 
-/// One entry in the lenient-vars array form.
-///
-/// Used by [`crate::core::loadout::Loadout`] as the wire-form representation
-/// of a single non-POSIX variable. The map form (`vars = { ... }`) can't
-/// carry the strict/lenient distinction in its keys, so lenient names
-/// require a separate array (`[[vars_lenient]]`); each element is one
-/// of these.
+/// One entry in a `[[vars_lenient]]` array — a non-POSIX variable
+/// name paired with its value. The map form (`vars = { ... }`)
+/// can't carry the strict/lenient distinction in its keys, hence
+/// the separate array form.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LenientVarEntry {
     name: LenientVarName,
@@ -1128,10 +1125,6 @@ impl IntoIterator for Patches {
 /// A single patch's resolved endpoints: where the file lives on the
 /// host, and where it lands inside the sandbox (relative to the
 /// sandbox user's home directory).
-///
-/// The field is `host_path` (not `source`) so it doesn't collide with
-/// [`Provenanced::source`](crate::core::source::Provenanced::source) when
-/// accessed via `SessionPatch::patch().host_path()`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResolvedPatch {
     host_path: HostAbsPath,
