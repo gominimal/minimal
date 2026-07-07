@@ -603,9 +603,23 @@ fn materialize_local_file(
     let header_len = decode_varint(&mut cursor)? as usize;
     let pos = cursor.position() as usize;
 
-    let file_header: LocalFileHeader = serde_json::from_slice(&payload[pos..pos + header_len])?;
-    let data_start = pos + header_len;
-    let data_end = data_start + file_header.data_len as usize;
+    // Every offset below is attacker-controlled (the varint header_len and the
+    // JSON data_len); validate each slice stays within `payload` so a malformed
+    // record returns an error instead of panicking on an out-of-bounds slice.
+    let header_end = pos
+        .checked_add(header_len)
+        .filter(|&end| end <= payload.len())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "local file header exceeds payload")
+        })?;
+    let file_header: LocalFileHeader = serde_json::from_slice(&payload[pos..header_end])?;
+    let data_start = header_end;
+    let data_end = data_start
+        .checked_add(file_header.data_len as usize)
+        .filter(|&end| end <= payload.len())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "local file data exceeds payload")
+        })?;
     let file_data = &payload[data_start..data_end];
 
     // Verify hash
@@ -629,6 +643,21 @@ fn materialize_local_file(
     let subdir = td.path().join(file_counter.to_string());
     std::fs::create_dir_all(&subdir)?;
     *file_counter += 1;
+    // The filename is wire-controlled; reject absolute paths and `..`/root
+    // components so it cannot escape the per-file subdir.
+    let fname = std::path::Path::new(&file_header.filename);
+    if fname.is_absolute()
+        || fname.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "unsafe local file name").into());
+    }
     let dest = subdir.join(&file_header.filename);
     std::fs::write(&dest, file_data)?;
     std::fs::set_permissions(
@@ -1134,6 +1163,37 @@ mod tests {
 
         // Top-levels length preserved
         assert_eq!(restored.top_levels.len(), 1);
+    }
+
+    #[test]
+    fn local_file_header_length_is_bounds_checked() {
+        // Regression for a fuzzer-found panic: header_len claims more bytes than
+        // the payload holds, which used to slice out of bounds.
+        let mut payload = Vec::new();
+        encode_varint(200, &mut payload);
+        payload.extend_from_slice(b"{}");
+        let mut td = None;
+        let mut counter = 0;
+        assert!(materialize_local_file(&payload, &mut td, &mut counter, None).is_err());
+    }
+
+    #[test]
+    fn local_file_name_traversal_is_rejected() {
+        let data = b"x";
+        let header = serde_json::to_vec(&LocalFileHeader {
+            filename: "../escape".into(),
+            file_hash: blake3::hash(data),
+            data_len: data.len() as u64,
+            file_mode: 0o644,
+        })
+        .unwrap();
+        let mut payload = Vec::new();
+        encode_varint(header.len() as u64, &mut payload);
+        payload.extend_from_slice(&header);
+        payload.extend_from_slice(data);
+        let mut td = None;
+        let mut counter = 0;
+        assert!(materialize_local_file(&payload, &mut td, &mut counter, None).is_err());
     }
 
     #[test]
