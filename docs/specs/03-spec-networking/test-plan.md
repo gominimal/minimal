@@ -225,8 +225,8 @@ listener remains), confirming G-N1 observably rather than accepting it.
 
 Historical note (unchanged): host→guest reachability uses the published-loopback
 model — the daemon is **not** on the switch; host→PTask goes through a
-gvproxy-published loopback port (`127.0.0.1:<external>` → `lease:<internal>`),
-#542 landed the hostname → `127.0.0.1` registration, and the `:7654`/`:7655`
+gvproxy-published loopback port (`127.0.0.1:<external>` → `lease:<internal>`), #542
+landed the hostname → `127.0.0.1` registration, and the `:7654`/`:7655`
 proxies route by `Host:` header to the published port (spec R3.1/R3.3/R4.4).
 
 ---
@@ -371,8 +371,8 @@ the test target's subnet) constrains **all** traffic from the VM:
 acceptance/rejection per DM (`crates/minvmd/src/vm.rs:119-150`, unit-tested),
 but no runtime surface populates it — `minvmd` reads only
 `MINVMD_KERNEL_PATH`/`MINVMD_ROOTFS_PATH`/`MINVMD_INITRAMFS`/`MINVMD_MARKER_SOCK`
-(`crates/minvmd/src/cmd/vmm_child.rs:8-10`), and enforcement is pending the
-#553 layer (referenced in `vm.rs`). Activates when a config surface
+(`crates/minvmd/src/cmd/vmm_child.rs:8-10`), and enforcement is pending
+the #553 layer (referenced in `vm.rs`). Activates when a config surface
 (env/flag/VM-spec file) lands.
 
 ## TC13 — UC3 per-PTask egress (R2.1/R2.2) — BLOCKED(G-N4)

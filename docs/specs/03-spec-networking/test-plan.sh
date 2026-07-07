@@ -119,6 +119,10 @@ cleanup() {
   pids="$(jobs -p)"
   [ -n "$pids" ] && kill $pids 2>/dev/null
   destroy $ALL_SESSIONS
+  # DM4 runs a SECOND daemon (native, --minimal-dir $DM2_DIR) for TC15; the
+  # destroy above only reaches the primary (mcli/MARGS) daemon, so also sweep
+  # tc15b against the secondary daemon on abnormal exit.
+  [ "$DM" = dm4 ] && "$M" --minimal-dir "$DM2_DIR" destroy tc15b >/dev/null 2>&1
   rm -rf "$SCRATCH"
 }
 trap cleanup EXIT INT TERM
@@ -321,7 +325,7 @@ destroy dev
 mcli activate -n dev --network own-ip --ingress 18080:8080 . >/dev/null 2>&1
 session_hold dev "socat TCP-LISTEN:8080,reuseaddr,fork \"SYSTEM:printf 'HTTP/1.0 200 OK\r\n\r\nFORWARD_OK'\" & sleep 1; echo SERVER_UP" "$SCRATCH/dev.log" "${RANDOM}${RANDOM}"
 hold_wait "$SCRATCH/dev.log" "SERVER_UP"
-mcli ssh-forward dev 18080:127.0.0.1:8080 >/tmp/fwd.log 2>&1 &
+mcli ssh-forward dev 18080:127.0.0.1:8080 >"$SCRATCH/fwd.log" 2>&1 &
 fwd_pid=$!
 sleep 3
 echo "-- host -> localhost:18080 (through the ssh-forward) --"
