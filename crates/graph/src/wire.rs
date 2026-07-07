@@ -44,6 +44,12 @@ const TAG_FOOTER: u8 = 0xFF;
 /// inlined local-file record.
 const MAX_RECORD_LEN: u64 = 512 * 1024 * 1024;
 
+/// Upper bound on the arena/map capacity pre-sized from the header's
+/// (untrusted) `build_count`. The collections still grow to hold every spec
+/// actually decoded; this only stops a malformed count from pre-allocating
+/// gigabytes before a single spec record is read.
+const MAX_PREALLOC_BUILDS: usize = 4096;
+
 /// Rejects a framed record whose declared length exceeds [`MAX_RECORD_LEN`], so
 /// a malformed varint cannot drive an unbounded `vec![0u8; len]` allocation.
 /// Shared by the sync and async readers to keep them in lock-step.
@@ -457,8 +463,9 @@ impl<R: Read> GraphReader<R> {
         }
         let target = header.target.unwrap_or_default();
 
-        let mut arena: Arena<BuildSpec> = Arena::with_capacity(header.build_count);
-        let mut remap: HashMap<Index, BuildSpecRef> = HashMap::with_capacity(header.build_count);
+        let prealloc = header.build_count.min(MAX_PREALLOC_BUILDS);
+        let mut arena: Arena<BuildSpec> = Arena::with_capacity(prealloc);
+        let mut remap: HashMap<Index, BuildSpecRef> = HashMap::with_capacity(prealloc);
         let mut temp_dir: Option<tempfile::TempDir> = None;
         let mut file_counter: usize = 0;
 
@@ -907,8 +914,9 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
         }
         let target = header.target.unwrap_or_default();
 
-        let mut arena: Arena<BuildSpec> = Arena::with_capacity(header.build_count);
-        let mut remap: HashMap<Index, BuildSpecRef> = HashMap::with_capacity(header.build_count);
+        let prealloc = header.build_count.min(MAX_PREALLOC_BUILDS);
+        let mut arena: Arena<BuildSpec> = Arena::with_capacity(prealloc);
+        let mut remap: HashMap<Index, BuildSpecRef> = HashMap::with_capacity(prealloc);
         let mut temp_dir: Option<tempfile::TempDir> = None;
         let mut file_counter: usize = 0;
 
@@ -1050,6 +1058,20 @@ mod tests {
         assert!(td.is_none());
         assert_eq!(restored.len(), 0);
         assert!(restored.top_levels.is_empty());
+    }
+
+    #[test]
+    fn oversized_build_count_is_not_preallocated() {
+        // Regression for a second fuzzer-found OOM: a 35-byte input whose
+        // header declares build_count ~97M drove Arena/HashMap::with_capacity
+        // to a ~280 GiB allocation. The count is now a capped hint, so decode
+        // proceeds and fails cleanly on the truncated stream instead of OOMing.
+        let malicious = [
+            0x01, 0x12, 0x5b, 0x31, 0x0d, 0x0d, 0x0d, 0x2c, 0x39, 0x37, 0x35, 0x32, 0x34, 0x32,
+            0x30, 0x37, 0x5d, 0x0d, 0x0a, 0x0d, 0x06, 0x0d, 0x27, 0x0d, 0xff, 0xff, 0xff, 0x0d,
+            0x0d, 0xff, 0xff, 0xff, 0xff, 0xff, 0x8a,
+        ];
+        assert!(Graph::from_bytes(&malicious).is_err());
     }
 
     #[test]
