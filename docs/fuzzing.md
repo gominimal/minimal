@@ -37,6 +37,7 @@ nightly/sanitizer build doesn't perturb the main workspace).
 | `target_from_str` | `crates/common/fuzz` | `Target::from_str` — hand-written `<arch>/<os>` parser | OWN | any |
 | `mfile_from_toml` | `crates/mfile/fuzz` | `File::from_toml_bytes` — `minimal.toml` through the custom serde visitors | OWN | any |
 | `arg_schema_parse` | `crates/args/fuzz` | `ArgSchema::try_from` — hand-written schema/bracketed-list parser | OWN | any |
+| `jq_parse_json` | `crates/common/fuzz` | `jq::parse_file` (JSON branch) — build-time project data files | SUPPLY | any |
 | `graph_roundtrip` | `crates/graph/fuzz` | structure-aware round-trip differential: `from_bytes(to_bytes(g)) == g` over arbitrary graphs | — | any |
 
 `remote_index_from_reader` builds only on Linux: `rcache` depends on `lcache`,

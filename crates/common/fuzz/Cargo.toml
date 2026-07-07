@@ -29,4 +29,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "jq_parse_json"
+path = "fuzz_targets/jq_parse_json.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
