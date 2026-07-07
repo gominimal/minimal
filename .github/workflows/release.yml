@@ -228,6 +228,12 @@ jobs:
                   fi
             - name: Build release minvmd binary
               run: cargo build --release -p minvmd --bin minvmd
+            - name: Print libkrun load command (informational)
+              # Show the name+path minvmd records for libkrun. For the shipped
+              # bin/libkrun.dylib (next to minvmd) to resolve via @loader_path, this
+              # must be an @rpath entry whose basename matches the staged dylib's
+              # install name (see build-release-libkrun-macos-arm64). Non-gating.
+              run: otool -L target/release/minvmd | grep -i krun || true
             - name: Build release minimal binary
               run: cargo build --release -p minimal --bin minimal
             - name: Rename binaries with platform suffix
@@ -247,6 +253,68 @@ jobs:
               with:
                   name: minimal-macos-arm64
                   path: target/release/minimal-macos-arm64
+                  retention-days: 7
+
+    build-libkrun-macos-arm64:
+        # Build a TRIMMED libkrun.dylib from source to SHIP in the release, so
+        # macOS users don't have to `brew install` it themselves. GitHub-hosted
+        # macos-latest is Apple Silicon (arm64).
+        runs-on: macos-latest
+        timeout-minutes: 45
+        env:
+            # Pin to the libkrun the slp/krun tap currently ships, so the dylib we
+            # ship matches the ABI the macOS CI lanes build and test against.
+            LIBKRUN_REF: v1.19.4
+        steps:
+            - name: Checkout libkrun (${{ env.LIBKRUN_REF }})
+              uses: actions/checkout@v7
+              with:
+                  repository: containers/libkrun
+                  ref: ${{ env.LIBKRUN_REF }}
+                  persist-credentials: false
+            - name: Toolchain
+              uses: dtolnay/rust-toolchain@stable
+            - name: Install build dependencies
+              # Mirrors upstream's cross-compile-macos job: the default init-blob
+              # feature cross-compiles a small Linux init, which needs the LLVM
+              # linker (lld) and xz (to unpack the auto-generated Debian sysroot).
+              run: brew install lld xz
+            - name: Build trimmed libkrun (BLK + NET, no GPU)
+              run: make BLK=1 NET=1
+            - name: Install into a staging prefix
+              run: make PREFIX="$RUNNER_TEMP/krun" install
+            - name: Assert the dylib is self-contained, then stage it
+              # A trimmed build must link only system libraries. Any /opt/homebrew or
+              # /usr/local reference means a dependency leaked (e.g. a stray GPU lib)
+              # and the dylib would fail to load on a machine without Homebrew — fail
+              # loudly so we revisit the make flags rather than ship an unloadable
+              # artifact. `libkrun.dylib` is the install symlink to the versioned
+              # real file; cp/otool deref it.
+              run: |
+                  dylib="$RUNNER_TEMP/krun/lib/libkrun.dylib"
+                  echo "otool -L $dylib"; otool -L "$dylib"
+                  if otool -L "$dylib" | grep -E '/opt/homebrew|/usr/local'; then
+                    echo "::error::trimmed libkrun links a non-system (Homebrew) dylib; see otool -L above" >&2
+                    exit 1
+                  fi
+                  cp -L "$dylib" "$RUNNER_TEMP/libkrun-macos-arm64.dylib"
+            - name: Ad-hoc codesign
+              # `make install` leaves the dylib's signature stale after any tooling;
+              # arm64 macOS refuses to load a dylib with an invalid signature. Match
+              # the installer's self-sign of shipped bin/ files.
+              run: codesign --sign - --force "$RUNNER_TEMP/libkrun-macos-arm64.dylib"
+            - name: Print install name (informational)
+              # For @loader_path resolution to work, minvmd's recorded load command
+              # basename must match this dylib's install-name basename (and be
+              # @rpath-based). Print it so a name mismatch is visible in the logs;
+              # non-gating — never fail the release over a diagnostic.
+              run: otool -D "$RUNNER_TEMP/libkrun-macos-arm64.dylib" || true
+            - name: Upload libkrun dylib
+              uses: actions/upload-artifact@v7
+              with:
+                  name: libkrun-macos-arm64
+                  path: ${{ runner.temp }}/libkrun-macos-arm64.dylib
+                  if-no-files-found: error
                   retention-days: 7
 
     fetch-release-guest-artifacts:
@@ -420,6 +488,7 @@ jobs:
                 build-release-linux-amd64,
                 build-release-linux-arm64,
                 build-release-macos-arm64,
+                build-libkrun-macos-arm64,
                 fetch-release-guest-artifacts,
                 build-release-initramfs,
             ]
