@@ -29,10 +29,15 @@ more complete there and you avoid the Apple-container overhead.
 Each target lives in a standalone fuzz workspace (its own `[workspace]` so the
 nightly/sanitizer build doesn't perturb the main workspace).
 
-| Target | Crate | Decodes | Trust |
-|---|---|---|---|
-| `graph_from_bytes` | `crates/graph/fuzz` | `Graph::from_bytes` — the build-graph wire format shipped over the remote-execution channel | NET |
-| `remote_index_from_reader` | `crates/rcache/fuzz` | `RemoteIndex::from_reader` — the remote-cache binary index fetched over GCS/HTTPS | NET |
+| Target | Crate | Decodes | Trust | Platform |
+|---|---|---|---|---|
+| `graph_from_bytes` | `crates/graph/fuzz` | `Graph::from_bytes` — the build-graph wire format shipped over the remote-execution channel | NET | any |
+| `remote_index_from_reader` | `crates/rcache/fuzz` | `RemoteIndex::from_reader` — the remote-cache binary index fetched over GCS/HTTPS | NET | **Linux only** |
+
+`remote_index_from_reader` builds only on Linux: `rcache` depends on `lcache`,
+which uses `common::renameat2` (a Linux-only syscall wrapper). This is one more
+reason to run the campaign on a Linux box — some targets can't build anywhere
+else.
 
 ## Running
 
