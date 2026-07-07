@@ -17,6 +17,7 @@
 use std::ffi::CString;
 use std::time::Duration;
 
+use russh::keys::ssh_key::PublicKey;
 use tokio::io::AsyncWriteExt;
 use tokio_vsock::{VMADDR_CID_HOST, VsockAddr, VsockStream};
 
@@ -24,15 +25,42 @@ use tokio_vsock::{VMADDR_CID_HOST, VsockAddr, VsockStream};
 /// booted. The host listens here for the one-shot `READY` marker.
 const BOOT_MARKER_PORT: u32 = 7350;
 
-/// The boot marker payload written once at startup.
-const BOOT_MARKER: &[u8] = b"READY\n";
+/// Writes the two-line beacon payload (`READY\n<openssh-pubkey>\n`) to the
+/// given async writer.
+///
+/// Factored out of [`emit_ready_marker`] so tests can exercise the format
+/// with an in-memory writer instead of a live vsock connection.
+pub(crate) async fn write_ready_beacon<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    pubkey: &PublicKey,
+) -> std::io::Result<()> {
+    let openssh = pubkey
+        .to_openssh()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let payload = format!("READY\n{openssh}\n");
+    writer.write_all(payload.as_bytes()).await
+}
 
-/// Emits the one-shot boot marker to the host.
+/// Emits the one-shot boot marker to the host, including the SSH host public key.
 ///
 /// Connects out to the host (`VMADDR_CID_HOST`, [`BOOT_MARKER_PORT`]), writes
-/// `READY\n`, and closes. The vsock device can lag immediately after boot, so
-/// connection attempts are retried with a short backoff before giving up.
-pub async fn emit_ready_marker() -> std::io::Result<()> {
+/// `READY\n<openssh-pubkey>\n`, and closes. The vsock device can lag immediately
+/// after boot, so connection attempts are retried with a short backoff before
+/// giving up.
+pub async fn emit_ready_marker(pubkey: &PublicKey) -> std::io::Result<()> {
+    emit_marker(Some(pubkey)).await
+}
+
+/// Emits the one-shot boot marker to the host (simple form: no host key).
+///
+/// Used in the degraded fallback path where the rootfs could not be mounted
+/// and no SSH server is running. The host-side beacon reader handles a missing
+/// second line gracefully (R2.3).
+pub async fn emit_simple_ready_marker() -> std::io::Result<()> {
+    emit_marker(None).await
+}
+
+async fn emit_marker(pubkey: Option<&PublicKey>) -> std::io::Result<()> {
     const MAX_ATTEMPTS: u32 = 50;
     const BACKOFF: Duration = Duration::from_millis(100);
 
@@ -41,12 +69,16 @@ pub async fn emit_ready_marker() -> std::io::Result<()> {
     for attempt in 1..=MAX_ATTEMPTS {
         match VsockStream::connect(addr).await {
             Ok(mut stream) => {
-                stream.write_all(BOOT_MARKER).await?;
-                // `VsockStream` has an inherent `shutdown(Shutdown)` that
-                // shadows the tokio trait method, so disambiguate to flush the
-                // write half via the async trait.
+                match pubkey {
+                    Some(pk) => write_ready_beacon(&mut stream, pk).await?,
+                    None => stream.write_all(b"READY\n").await?,
+                }
                 AsyncWriteExt::shutdown(&mut stream).await?;
-                tracing::info!(attempt, "emitted boot READY marker");
+                tracing::info!(
+                    attempt,
+                    simple = pubkey.is_none(),
+                    "emitted boot READY marker"
+                );
                 return Ok(());
             }
             Err(e) => {
@@ -499,5 +531,35 @@ fn mount_if_absent(target: &str, source: &str, fstype: &str) {
         }
     } else {
         tracing::info!(target, fstype, "mounted pseudo filesystem");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn write_ready_beacon_formats_two_lines() {
+        use russh::keys::{Algorithm, PrivateKey, key::safe_rng};
+
+        let key = PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).unwrap();
+        let pubkey = key.public_key();
+        let expected_openssh = pubkey.to_openssh().unwrap();
+
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        write_ready_beacon(&mut writer, pubkey).await.unwrap();
+        drop(writer);
+
+        let mut output = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut output)
+            .await
+            .unwrap();
+        let output_str = String::from_utf8(output).unwrap();
+
+        assert_eq!(
+            output_str,
+            format!("READY\n{expected_openssh}\n"),
+            "beacon must be READY\\n<openssh-pubkey>\\n"
+        );
     }
 }

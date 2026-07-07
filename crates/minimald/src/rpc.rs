@@ -1,12 +1,12 @@
 #[cfg(feature = "networking-proxy")]
 use minimald_rpc::IssueClientCertResponse;
 use minimald_rpc::{
-    CreateSession, DestroySession, DestroySessionResponse, Errorable, GetMeshStatus,
-    GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest,
-    GetSessionRecordResponse, GetVersion, GetVersionResponse, IssueClientCert,
-    IssueClientCertRequest, ListSessions, ListSessionsEntry, ListSessionsResponse, OneshotSshRpc,
-    RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, Shutdown, ShutdownRequest,
-    ShutdownResponse,
+    AbortSession, AbortSessionResponse, CreateSession, DestroySession, DestroySessionResponse,
+    Errorable, GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
+    GetSessionRecordRequest, GetSessionRecordResponse, GetVersion, GetVersionResponse,
+    IssueClientCert, IssueClientCertRequest, ListSessions, ListSessionsEntry, ListSessionsResponse,
+    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, Shutdown,
+    ShutdownRequest, ShutdownResponse, SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -161,6 +161,13 @@ async fn serve_create_session(
                     Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Errorable::Err {
                         error: e.to_string(),
                     },
+                    // The daemon's in-flight Pending stash is full
+                    // (see `MAX_PENDING_SESSIONS`). Surface as a clean
+                    // typed error so the client can retry rather than
+                    // treat it as a transport failure.
+                    Err(e) if e.kind() == std::io::ErrorKind::ResourceBusy => Errorable::Err {
+                        error: e.to_string(),
+                    },
                     Err(e) => return Err(ConnectionError::Internal(e.to_string())),
                 },
             )
@@ -168,6 +175,29 @@ async fn serve_create_session(
         .await;
     if let Err(e) = res {
         tracing::warn!("RPC handler for {} failed: {}", CreateSession::NAME, e);
+    }
+}
+
+/// `SubmitVerdict`: the client's per-item decisions for a `Pending`
+/// session. Delegates to the manager actor, which pops the matching
+/// `PendingComposeState`, runs `resume_from_verdict`, and promotes
+/// the record `Pending → Active`. Replies with `Errorable::Ok(SessionStep)`
+/// where the `SessionStep` is `Active { id }` on success or
+/// `Fault { error }` for a structured failure (unknown id, wrong
+/// state, or a `ComposeError`-mapped `WireError`). Manager-side
+/// `io::Error`s bubble up as `ConnectionError::Internal`.
+async fn serve_submit_verdict(s: ServerStateHandle, c: RuChannel<Msg>) {
+    let res = SubmitVerdict
+        .handle_channel(c, async |req| {
+            let mngr = s.sessions_manager().await;
+            match mngr.submit_verdict(req).await {
+                Ok(step) => Ok(Errorable::Ok(step)),
+                Err(e) => Err(ConnectionError::Internal(e.to_string())),
+            }
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", SubmitVerdict::NAME, e);
     }
 }
 
@@ -228,6 +258,26 @@ async fn serve_shutdown(s: ServerStateHandle, c: RuChannel<Msg>) {
         .await;
     if let Err(e) = res {
         tracing::warn!("RPC handler for {} failed: {}", Shutdown::NAME, e);
+    }
+}
+
+/// `AbortSession`: drop a `Pending` session's stash entry and delete
+/// its on-disk record. See the manager arm for the actor-side rules
+/// (refuses `Active` records and unknown ids).
+async fn serve_abort_session(s: ServerStateHandle, c: RuChannel<Msg>) {
+    let res = AbortSession
+        .handle_channel(c, async |req| {
+            let res = s.sessions_manager().await.abort_session(req.id).await;
+            match res {
+                Ok(()) => Ok(Errorable::Ok(AbortSessionResponse)),
+                Err(e) => Ok(Errorable::Err {
+                    error: e.to_string(),
+                }),
+            }
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", AbortSession::NAME, e);
     }
 }
 
@@ -387,9 +437,11 @@ pub async fn handle_ssh_rpc(
         | ListSessions::NAME
         | GetSessionRecord::NAME
         | CreateSession::NAME
+        | SubmitVerdict::NAME
         | RenameSession::NAME
         | DestroySession::NAME
         | Shutdown::NAME
+        | AbortSession::NAME
         | GetSessionPolicy::NAME
         | GetMeshStatus::NAME
         | STREAM_WORKSPACE_FILES
@@ -423,9 +475,11 @@ pub async fn handle_ssh_rpc(
         ListSessions::NAME => drop(spawn(serve_list_sessions(s, channel))),
         GetSessionRecord::NAME => drop(spawn(serve_get_session_record(s, channel))),
         CreateSession::NAME => drop(spawn(serve_create_session(s, channel, ssh_username))),
+        SubmitVerdict::NAME => drop(spawn(serve_submit_verdict(s, channel))),
         RenameSession::NAME => drop(spawn(serve_rename_session(s, channel))),
         DestroySession::NAME => drop(spawn(serve_destroy_session(s, channel))),
         Shutdown::NAME => drop(spawn(serve_shutdown(s, channel))),
+        AbortSession::NAME => drop(spawn(serve_abort_session(s, channel))),
         GetSessionPolicy::NAME => drop(spawn(serve_get_session_policy(s, channel))),
         GetMeshStatus::NAME => drop(spawn(serve_get_mesh_status(s, channel))),
         STREAM_WORKSPACE_FILES => drop(spawn(serve_stream_workspace_files(s, config, channel))),

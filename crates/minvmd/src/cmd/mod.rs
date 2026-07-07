@@ -148,6 +148,111 @@ fn kvm_access_error(err: &std::io::Error) -> anyhow::Error {
     }
 }
 
+/// Returns the path to the VM SSH known_hosts file:
+/// `$XDG_STATE_HOME/minimal/providers/local-0/known_hosts`.
+///
+/// Uses the same XDG derivation as [`crate::state::StateDir::default_path`].
+#[cfg(minvmd_libkrun)]
+pub(crate) fn default_vm_known_hosts_path() -> std::path::PathBuf {
+    dirs::state_dir()
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        "XDG_STATE_HOME and HOME both unset; known_hosts falls back to /tmp"
+                    );
+                    std::path::PathBuf::from("/tmp")
+                })
+                .join(".local/state")
+        })
+        // TODO: pass instance_num through once multi-instance is needed
+        .join("minimal/providers/local-0/known_hosts")
+}
+
+/// Read the READY beacon from `reader` and, if a valid SSH public key is on
+/// the second line, record it in `known_hosts_path` (R2.1–R2.4).
+///
+/// Returns `Err` only when the first line is not `READY`. Key parse failures
+/// and known_hosts write errors are logged as warnings and do not abort boot
+/// (R2.3).
+#[cfg(any(minvmd_libkrun, test))]
+pub(crate) fn read_ready_beacon<R: std::io::BufRead>(
+    reader: &mut R,
+    known_hosts_path: &std::path::Path,
+) -> Result<(), String> {
+    use std::io::BufRead;
+    let mut line = String::new();
+    // Use UFCS so Rust resolves `Self = &mut R` (not `R`) in the function-call
+    // context, producing Take<&mut R> without a move out of the mutable reference.
+    std::io::Read::take(reader.by_ref(), 32)
+        .read_line(&mut line)
+        .map_err(|e| format!("reading READY marker: {e}"))?;
+    let trimmed = line.trim();
+    if trimmed != "READY" {
+        return Err(format!("expected READY on marker socket, got {trimmed:?}"));
+    }
+
+    // Try to read the optional second line: SSH host public key (R2.1).
+    // Cap the read at 4097 bytes so the allocation ceiling is enforced at the
+    // I/O layer rather than after the fact.
+    let mut pubkey_line = String::new();
+    match std::io::Read::take(reader.by_ref(), 4097).read_line(&mut pubkey_line) {
+        Err(e) => {
+            tracing::debug!(error = %e, "failed to read pubkey line from beacon; skipping");
+        }
+        Ok(0) => {
+            tracing::debug!("no pubkey line in ready beacon");
+        }
+        Ok(_) => {
+            let key_str = pubkey_line.trim();
+            if key_str.len() > 4096 {
+                tracing::warn!(len = key_str.len(), "pubkey line too long; skipping");
+                return Ok(());
+            }
+            if !key_str.is_empty() {
+                // R2.4: create the directory hierarchy before writing.
+                if let Some(parent) = known_hosts_path.parent()
+                    && let Err(e) = std::fs::create_dir_all(parent)
+                {
+                    tracing::warn!(
+                        error = %e,
+                        path = %parent.display(),
+                        "failed to create known_hosts directory; skipping key write",
+                    );
+                    return Ok(());
+                }
+                // R2.2: parse and record the key.
+                match russh::keys::ssh_key::PublicKey::from_openssh(key_str) {
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to parse SSH host key from beacon");
+                    }
+                    Ok(pubkey) => {
+                        match russh::keys::known_hosts::learn_known_hosts_path(
+                            // TODO: pass instance_num through once multi-instance is needed
+                            "local-0",
+                            22,
+                            &pubkey,
+                            known_hosts_path,
+                        ) {
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to write SSH host key to known_hosts");
+                            }
+                            Ok(()) => {
+                                tracing::info!(
+                                    path = %known_hosts_path.display(),
+                                    "recorded VM SSH host key in known_hosts",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(all(test, minvmd_libkrun))]
 mod tests {
     use super::kvm_access_error;
@@ -165,5 +270,86 @@ mod tests {
         let msg = kvm_access_error(&Error::from(ErrorKind::PermissionDenied)).to_string();
         assert!(msg.contains("permission denied"), "got: {msg}");
         assert!(msg.contains("`kvm` group"), "got: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod beacon_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn read_ready_beacon_writes_known_hosts_entry() {
+        use russh::keys::{Algorithm, PrivateKey, key::safe_rng};
+
+        let key = PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).unwrap();
+        let pubkey = key.public_key();
+        let openssh = pubkey.to_openssh().unwrap();
+
+        let beacon = format!("READY\n{openssh}\n");
+        let mut reader = Cursor::new(beacon.into_bytes());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let known_hosts_path = tmp.path().join("known_hosts");
+
+        read_ready_beacon(&mut reader, &known_hosts_path)
+            .expect("read_ready_beacon must succeed with valid beacon");
+
+        let contents =
+            std::fs::read_to_string(&known_hosts_path).expect("known_hosts file must be created");
+        assert!(
+            contents.contains("local-0"),
+            "known_hosts must contain 'local-0', got: {contents:?}"
+        );
+        assert!(
+            contents.contains(&openssh),
+            "known_hosts must contain the beacon public key, got: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn read_ready_beacon_tolerates_missing_pubkey_line() {
+        let mut reader = Cursor::new(b"READY\n".as_ref());
+        let tmp = tempfile::tempdir().unwrap();
+        let known_hosts_path = tmp.path().join("known_hosts");
+
+        read_ready_beacon(&mut reader, &known_hosts_path)
+            .expect("must not fail when pubkey line is absent");
+        assert!(
+            !known_hosts_path.exists(),
+            "no known_hosts should be written when pubkey line is absent"
+        );
+    }
+
+    #[test]
+    fn read_ready_beacon_rejects_oversized_pubkey_line() {
+        // A pubkey line longer than 4096 bytes must be skipped gracefully
+        // without writing known_hosts.
+        let oversized = "x".repeat(5000);
+        let beacon = format!("READY\n{oversized}\n");
+        let mut reader = Cursor::new(beacon.into_bytes());
+        let tmp = tempfile::tempdir().unwrap();
+        let known_hosts_path = tmp.path().join("known_hosts");
+
+        read_ready_beacon(&mut reader, &known_hosts_path)
+            .expect("must not fail on oversized pubkey (graceful skip)");
+        assert!(
+            !known_hosts_path.exists(),
+            "no known_hosts should be written when pubkey line is too long"
+        );
+    }
+
+    #[test]
+    fn read_ready_beacon_rejects_wrong_marker() {
+        let mut reader = Cursor::new(b"NOTREADY\n".as_ref());
+        let tmp = tempfile::tempdir().unwrap();
+        let known_hosts_path = tmp.path().join("known_hosts");
+
+        let err = read_ready_beacon(&mut reader, &known_hosts_path)
+            .expect_err("must fail when first line is not READY");
+        assert!(
+            err.contains("READY"),
+            "error must mention READY, got: {err:?}"
+        );
     }
 }

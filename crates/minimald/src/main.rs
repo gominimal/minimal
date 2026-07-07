@@ -1,7 +1,6 @@
 //! The minimal daemon, an SSH server which hosts sessions and
 //! task/sandbox executions within them.
 
-use camino::Utf8PathBuf;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use paths::{CwdRelative, Daemon, DaemonAbsPath, DaemonRelPath, sub_path};
@@ -35,16 +34,10 @@ impl Cli {
     /// based on command-line arguments.
     pub fn minimal_state_dir(&self) -> DaemonAbsPath {
         match &self.global_args.minimal_state_dir {
-            Some(p) => p.resolve().unwrap(),
-            None => DaemonAbsPath::try_new(
-                Utf8PathBuf::from_path_buf(
-                    dirs::state_dir()
-                        .unwrap_or_else(|| dirs::home_dir().unwrap().join(".local/state"))
-                        .join("minimal"),
-                )
-                .unwrap(),
-            )
-            .unwrap(),
+            Some(p) => p
+                .resolve()
+                .expect("could not resolve --minimal-state-dir against the current directory"),
+            None => paths::minimal_state_dir(),
         }
     }
 
@@ -52,16 +45,10 @@ impl Cli {
     /// based on command-line arguments.
     pub fn minimal_cache_dir(&self) -> DaemonAbsPath {
         match &self.global_args.minimal_cache_dir {
-            Some(p) => p.resolve().unwrap(),
-            None => DaemonAbsPath::try_new(
-                Utf8PathBuf::from_path_buf(
-                    dirs::cache_dir()
-                        .unwrap_or_else(|| dirs::home_dir().unwrap().join(".local/cache"))
-                        .join("minimal"),
-                )
-                .unwrap(),
-            )
-            .unwrap(),
+            Some(p) => p
+                .resolve()
+                .expect("could not resolve --minimal-cache-dir against the current directory"),
+            None => paths::minimal_cache_dir(),
         }
     }
 
@@ -360,7 +347,7 @@ async fn async_main() -> Result<(), MainError> {
     {
         tracing::warn!(error = %e, "no rootfs disk; initramfs READY-only");
         guest::mount_pseudo_filesystems();
-        let _ = guest::emit_ready_marker().await;
+        let _ = guest::emit_simple_ready_marker().await;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
@@ -397,10 +384,12 @@ async fn async_main() -> Result<(), MainError> {
         in_microvm: listen_args.vsock,
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
+    // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.
+    let host_private_key = config.host_key()?;
     russh::keys::known_hosts::learn_known_hosts_path(
         &format!("local-{}", cli.instance_num()),
         22,
-        config.host_key()?.public_key(),
+        host_private_key.public_key(),
         sub_path!(cli.client_instance_dir(), "known_hosts").as_utf8_path(),
     )?;
 
@@ -437,7 +426,7 @@ async fn async_main() -> Result<(), MainError> {
             .map_err(|e| MainError::IO(e, "serving on UDS"))
     } else {
         // micro-vm path, listen on vsock
-        if let Err(e) = guest::emit_ready_marker().await {
+        if let Err(e) = guest::emit_ready_marker(host_private_key.public_key()).await {
             tracing::warn!(error = %e, "initramfs: READY marker failed");
         }
 

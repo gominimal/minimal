@@ -28,11 +28,12 @@ sequenceDiagram
     Note over C: Loadout → Contribution (Loadout::contribute, resolve vars, tag provenance)
     Note over C: Contribution → Composition (UserComposer::compose runs the policy gate)
     Note over C: Composition → WireContribution (composition_to_wire)
-    C->>D: SessionCreate carrying WireContribution
+    C->>D: CreateSession carrying WireContribution
     Note over D: Phase 2 — collect project + package contributions, collect pending items
-    D-->>C: SessionStep::Response carrying ContributionResponse
+    D-->>C: CreateSessionResponse::Pending carrying ContributionResponse
     Note over C: Phase 3 — policy gate pending items, produce verdicts
     C->>D: SubmitVerdict carrying ContributionVerdict
+    D-->>C: SessionStep::Active { id }
     Note over D: Phase 4 — apply verdicts, assemble Composition, hand to apply layer
 ```
 
@@ -44,11 +45,19 @@ batches every verdict into one `ContributionVerdict`.
 > **Status note.** The shared gate pipeline (`compose_contribution`,
 > with `gate_vars` + `gate_patches`) lives in `core::compose`. Phase
 > 1 runs it via `UserComposer::compose` and Phase 3 runs it via
-> `client::handler::handle_response`. Phases 2 and 4 (daemon-side
-> routing) are not yet wired: `SessionComposer::compose` errors with
-> `HookRequired` instead of batching pending items into a
-> `ContributionResponse`, and there is no `SubmitVerdict` handler
-> yet to apply verdicts and assemble the final `Composition`.
+> `client::handler::handle_response`. Phase 2 (daemon-side routing)
+> lives in `SessionComposer::compose` and produces a
+> `ComposeOutcome::Ready` or `ComposeOutcome::Pending`. Phase 4 is
+> wired end-to-end: `Ready` outcomes persist an `Active` record and
+> return `CreateSessionResponse::Ready`, and `Pending` outcomes
+> persist a `Pending` record + stash a `PendingComposeState`,
+> returning `CreateSessionResponse::Pending`. The client then ships
+> a verdict via `SubmitVerdict`, which the daemon resumes via
+> `resume_from_verdict` and promotes the record to `Active`. See
+> the Phase 4 section below for the full state-machine and error
+> shapes. No daemon-side project/package contributors are wired in
+> yet, so in practice every caller still hits the all-decided
+> `Ready` path today.
 
 ## Phases in detail
 
@@ -74,11 +83,27 @@ contribution fast path described in Phase 4.
 
 The daemon receives the `WireContribution` (already gated, trusted
 verbatim) and draws items from project- and package-level
-`Composable`s into a `Contribution`. Items decidable from the
-user's existing policy go straight into the building `Composition`;
-items the policy can't decide are collected as
-`WirePendingVar`/`WirePendingPatch` and emitted in one
-`ContributionResponse`.
+`Composable`s into a `Contribution` via `SessionComposer::add`.
+`SessionComposer::compose` then drives the routing:
+
+- **All-decided fast path.** If the daemon collected no vars and
+  no patches (today's only path — no project/package contributors
+  are wired into the manager yet), the composer assembles a
+  `Composition` directly: daemon-collected packages and lifecycle
+  hooks pass through (neither has a per-item verdict slot in the
+  wire schema), and the client's already-gated wire contribution
+  is merged in via `Composition::extend_from_wire`. Returns
+  `ComposeOutcome::Ready(composition)`.
+- **Pending path.** If the daemon collected any vars or patches,
+  the composer routes every one of them back to the client as
+  pending items — the daemon never runs user policy, so no
+  daemon-origin item is ever auto-decided. The `ContributionResponse`
+  carries the pending vars and patches plus a copy of the
+  daemon-collected lifecycle hooks (for client-side audit; hooks
+  have no per-item verdict slot). **Packages never appear on the
+  wire** — the response schema has no slot for them; they stay in
+  the daemon's `PendingComposeState` alongside the hooks so Phase 4
+  can finalize after the verdict comes back.
 
 ### Phase 3 — Client gates the pending items
 
@@ -101,28 +126,69 @@ correlate by `id`, not slice position.
 
 ### Phase 4 — Daemon assembles and hands off
 
-The daemon applies the verdicts: allowed items enter the
-`Composition`, denied items abort the session. The client's
-already-gated wire contribution is then merged in via
-`Composition::extend_from_wire`, which runs the same conflict
-checks as `Contribution::merge` (see the merge invariant
-below) — a cross-process disagreement (e.g. the daemon's
-package set declares `EDITOR=hx` and the client's loadout
-declares `EDITOR=vim`) surfaces here as
-`ComposeError::Conflict`. The final `Composition` is handed to
-the apply layer, which builds the sandbox, materializes vars,
-copies patched files, and installs lifecycle hooks.
+**Ready path.** On `ComposeOutcome::Ready`, the daemon already
+holds a finalized `Composition` (built directly inside
+`SessionComposer::compose`). The record persists as `Active` in
+one write, `CreateSessionResponse::Ready { id }` ships, and the
+flow is done.
+
+**Pending path.** On `ComposeOutcome::Pending`, the daemon
+persists the record as `SessionStatus::Pending` (which
+allocates the real id), stashes the matching
+`PendingComposeState` in-memory keyed by that id, overwrites the
+placeholder `session_id` on the `ContributionResponse`, and ships
+`CreateSessionResponse::Pending { id, response }`. The client
+then runs Phase 3 and sends a `ContributionVerdict` over the
+`SubmitVerdict` RPC. The daemon's `SubmitVerdict` handler:
+
+1. Pops the matching stash entry (missing → `WireError::UnknownSessionId`).
+2. Runs `resume_from_verdict`: per-item verdicts walked,
+   `Approved` items take the verdict's value + the stashed source
+   provenance, `Ignored` items drop silently, `Denied` items
+   surface as `ComposeError::Denied` (project- or package-declared
+   items the user policy rejected — the session can't finalize
+   in a state inconsistent with what was declared).
+3. Merges the stashed `client_contribution` via
+   `Composition::extend_from_wire` — same cross-process conflict
+   checks as the Ready path.
+4. Promotes the record `Pending → Active` via `store.save`.
+5. Replies with `SessionStep::Active { id }`.
+
+**Resume stash is in-memory only.** Daemon restart loses the
+stash. Any `SessionStatus::Pending` record on disk after restart
+is unresumable, so the daemon reaps it at startup
+(`Manager::reap_orphan_pending`) and the would-be-resuming client
+receives `WireError::UnknownSessionId` on its next
+`SubmitVerdict`. Survival across restarts is a separate concern.
+
+**Final assembly.** Whichever path produced the `Composition`,
+the apply layer takes over: builds the sandbox, materializes
+vars, copies patched files, installs lifecycle hooks. (Today the
+finalized `Composition` is dropped — apply isn't yet consuming
+it; the on-disk record carries enough state for the existing
+session-host stack.)
 
 **Response shape.** The daemon returns
-`CreateSessionResponse::Ready { id }` when no items need user
-gating (today's only path, including the empty-contribution fast
-path used by internal callers) or
-`CreateSessionResponse::Pending { id, response }` when items need
-user-side gating. The `id` is allocated before the response
-returns, so file uploads (when that subsystem lands) can target
-the session as soon as the client receives either variant. Today
-only `Ready` is reachable; `Pending` is wire-defined for the
-daemon-side Phase 2 routing that will land in a future change.
+`CreateSessionResponse::Ready { id }` (composition finalized in
+one shot) or `CreateSessionResponse::Pending { id, response }`
+(client must gate before the session activates). The `id` is
+allocated before either response returns, so file uploads (when
+that subsystem lands) can target the session as soon as the
+client receives either variant.
+
+**Ready-path silent-drop guard.** No apply layer yet consumes the
+finalized `Composition` on the Ready path. Until that lands, the
+manager rejects a non-empty `Composition` with `InvalidInput`
+rather than silently discard the client's contribution — the
+empty-composition fast path (no daemon contributors, empty client
+contribution) still succeeds.
+
+**State guards.** A session in `SessionStatus::Pending` is not
+attachable: the manager's `GetSession` handler returns `None` for
+non-`Active` records, so exec/sftp surface as channel failures.
+Metadata-only RPCs (`GetSessionRecord`, `ListSessions`,
+`RenameSession`, `DestroySession`) keep working over a Pending
+session.
 
 **Empty-contribution fast path.** When the client sends
 `WireContribution::default()` the daemon skips Phase 2 entirely:
@@ -333,9 +399,12 @@ overload:
   merge in `Composition::extend_from_wire`), `HookContract`
   (application bug —
   wrong decision count, or `UseRule` to a still-undecidable
-  item), `HookRequired` (non-user-origin item reached the daemon
-  composer with no hook to prompt — placeholder until Phase 2
-  routing lands), `PatchWalk` (IO-level filesystem walk failures),
+  item), `HookRequired` (non-user-origin item reached a
+  legacy `core::compose` path with no hook to prompt — Phase 2
+  now routes such items through `SessionComposer::compose`
+  instead; this remains for the per-side
+  `compose_contribution` codepath), `PatchWalk` (IO-level
+  filesystem walk failures),
   `Expansion` (malformed `$VAR` / `~` pattern, or undefined var),
   `VarResolution` (a Phase 3 pending `Inherit` var couldn't be
   resolved against the client env), `InvalidPendingPatchDest` (a

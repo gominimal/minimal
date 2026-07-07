@@ -266,10 +266,13 @@ impl fmt::Display for SessionId {
 
 /// Lifecycle status of a [`Record`].
 ///
-/// `Draft` covers a session whose composition is still in flight —
+/// `Pending` covers a session whose composition is still in flight —
 /// an id has been allocated and a stub record persisted, but the
 /// composition pipeline hasn't yet produced a finalized
-/// `Composition`. `Active` is the finalized, ready-to-use state.
+/// `Composition`. Mirrors the wire word
+/// [`CreateSessionResponse::Pending`] the daemon returns when the
+/// client must gate items before composition completes. `Active`
+/// is the finalized, ready-to-use state.
 ///
 /// Defaults to `Active` so on-disk records predating this field
 /// (which were always finalized at create time) deserialize
@@ -277,7 +280,7 @@ impl fmt::Display for SessionId {
 ///
 /// The store layer doesn't enforce transitions between states — it
 /// records the status verbatim. State-machine rules (e.g. "only
-/// the composition pipeline can promote `Draft` → `Active`") live
+/// the composition pipeline can promote `Pending` → `Active`") live
 /// in the manager actor.
 ///
 /// **Forward compatibility.** This enum is binary today but will
@@ -289,12 +292,17 @@ impl fmt::Display for SessionId {
 /// variant arrives. `#[non_exhaustive]` will be added at the same
 /// time; we omit it today because every match site is in-tree and
 /// the extra noise buys nothing yet.
+///
+/// [`CreateSessionResponse::Pending`]: ../minimald_rpc/enum.CreateSessionResponse.html#variant.Pending
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     /// Composition is in flight; the record is a stub awaiting the
-    /// `SubmitVerdict` round-trip to finalize.
-    Draft,
+    /// `SubmitVerdict` round-trip to finalize. Accepts the legacy
+    /// on-disk spelling `"draft"` so records written before the
+    /// rename continue to load.
+    #[serde(alias = "draft")]
+    Pending,
     /// Composition complete; the record is ready to apply.
     #[default]
     Active,
@@ -738,5 +746,24 @@ mod tests {
     #[test]
     fn session_status_default_is_active() {
         assert_eq!(SessionStatus::default(), SessionStatus::Active);
+    }
+
+    /// Records persisted before the `Draft` → `Pending` rename used
+    /// the string `"draft"`. The serde alias keeps those records
+    /// readable; regression guard for accidentally dropping the
+    /// alias on a future rename.
+    #[test]
+    fn legacy_draft_string_deserializes_as_pending() {
+        let parsed: SessionStatus =
+            serde_json::from_value(serde_json::json!("draft")).expect("deserialize");
+        assert_eq!(parsed, SessionStatus::Pending);
+    }
+
+    /// The canonical serialized form is `"pending"`; the alias is
+    /// read-only.
+    #[test]
+    fn pending_serializes_as_pending_not_draft() {
+        let s = serde_json::to_string(&SessionStatus::Pending).expect("serialize");
+        assert_eq!(s, "\"pending\"");
     }
 }

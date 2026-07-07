@@ -430,6 +430,126 @@ async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), ()> {
     Ok(())
 }
 
+/// [`PolicyHooks`] impl that aborts on every unapproved item.
+///
+/// `minimal2` has no interactive prompt yet, so anything the user's
+/// policy can't auto-decide bubbles into here, and we treat that as
+/// "abort the session creation, surface a clear error." The user can
+/// widen their policy (`allow`/`ignore`) to admit specific items once
+/// the policy-config story lands.
+struct AbortOnUnapproved;
+
+impl sessions::core::hooks::PolicyHooks for AbortOnUnapproved {
+    fn on_var_unapproved(
+        &self,
+        _policy: sessions::core::policy::VarsPolicy,
+        _items: &[sessions::core::hooks::Unapproved<'_, str>],
+    ) -> sessions::core::hooks::HookResult<sessions::core::policy::VarsPolicy> {
+        sessions::core::hooks::HookResult::Abort
+    }
+
+    fn on_patch_unapproved(
+        &self,
+        _policy: sessions::core::policy::PatchPolicy,
+        _items: &[sessions::core::hooks::Unapproved<'_, camino::Utf8Path>],
+    ) -> sessions::core::hooks::HookResult<sessions::core::policy::PatchPolicy> {
+        sessions::core::hooks::HookResult::Abort
+    }
+}
+
+/// Phase 3 + final SubmitVerdict round-trip for a `Pending` session.
+///
+/// Runs `handle_response` over the daemon's `ContributionResponse`
+/// with [`UserPolicy::default`] (today's empty policy — see
+/// [`AbortOnUnapproved`]); sends the resulting [`ContributionVerdict`]
+/// over the [`SubmitVerdict`] RPC; unwraps the daemon's terminal
+/// [`SessionStep::Active`] reply to the finalized session id.
+///
+/// If Phase 3 gating fails (user cancels, policy hook aborts, var
+/// resolution fails, etc.), the client owes the daemon an
+/// `AbortSession` — otherwise the on-disk `Pending` record and its
+/// stash slot leak until daemon restart. Fires it as a
+/// fire-and-report step: the abort's own failure is logged but
+/// doesn't override the original gating error surfaced to the user.
+///
+/// [`UserPolicy::default`]: sessions::core::policy::UserPolicy::default
+/// [`SubmitVerdict`]: minimald_rpc::SubmitVerdict
+async fn drive_pending_to_active(
+    client: &mut client::Client,
+    response: sessions::wire::request::ContributionResponse,
+) -> Result<sessions::SessionId, ()> {
+    use minimald_rpc::SubmitVerdict;
+    use sessions::client::handler::handle_response;
+    use sessions::core::compose::ComposeOptions;
+    use sessions::core::policy::UserPolicy;
+    use sessions::wire::request::SessionStep;
+
+    // Capture the session id before consuming `response` — we need it
+    // to send AbortSession on any Phase 3 failure below.
+    let session_id = response.session_id;
+
+    let hooks = AbortOnUnapproved;
+    let verdict = match handle_response(
+        response,
+        &[],
+        UserPolicy::default(),
+        &hooks,
+        ComposeOptions::default(),
+        &|name| std::env::var(name),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Composition gating failed: {e}");
+            send_abort(client, session_id).await;
+            return Err(());
+        }
+    };
+
+    let resp = client
+        .oneshot_rpc::<SubmitVerdict>(verdict)
+        .await
+        .map_err(|e| eprintln!("SubmitVerdict RPC failed: {e}"))?;
+    let step = match resp {
+        minimald_rpc::Errorable::Ok(s) => s,
+        minimald_rpc::Errorable::Err { error } => {
+            eprintln!("SubmitVerdict failed: {error}");
+            return Err(());
+        }
+    };
+    match step {
+        SessionStep::Active { id } => Ok(id),
+        SessionStep::Fault { error } => {
+            // `Fault` means the daemon already tore down its side
+            // (`resume_from_verdict` failure destroys the record;
+            // `UnknownSessionId`/`WrongState` means there was nothing
+            // for us to abort). No AbortSession needed here.
+            eprintln!("SubmitVerdict faulted: {error}");
+            Err(())
+        }
+    }
+}
+
+/// Fire an `AbortSession` at the daemon for a `Pending` session the
+/// client has decided not to finalize. A best-effort teardown: if
+/// the abort itself fails (network, daemon crash, or a state race)
+/// we log and move on — the daemon's startup reap pass is the
+/// backstop for the leaked `Pending` record.
+async fn send_abort(client: &mut client::Client, session_id: sessions::SessionId) {
+    use minimald_rpc::AbortSession;
+    match client
+        .oneshot_rpc::<AbortSession>(minimald_rpc::AbortSessionRequest { id: session_id })
+        .await
+    {
+        Ok(minimald_rpc::Errorable::Ok(_)) => {}
+        Ok(minimald_rpc::Errorable::Err { error }) => {
+            eprintln!("AbortSession failed: {error}");
+        }
+        Err(e) => {
+            eprintln!("AbortSession RPC failed: {e}");
+        }
+    }
+}
+
 /// Create a new session via the `CreateSession` RPC.
 async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), ()> {
     if let Err(e) = autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref()) {
@@ -495,17 +615,15 @@ async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), ()>
             return Err(());
         }
     };
-    // Today the daemon only ever produces `Ready` (the empty-
-    // contribution fast path). `Pending` lights up when Phase 2
-    // routing lands.
+    // The daemon may finalize immediately (`Ready`) or ask the
+    // client to gate items first (`Pending`). On `Pending`: run
+    // Phase 3 (`handle_response`) against the user's policy, then
+    // send the resulting verdict over `SubmitVerdict` and wait for
+    // the daemon's terminal `SessionStep::Active`.
     let id = match created {
         minimald_rpc::CreateSessionResponse::Ready { id } => id,
-        minimald_rpc::CreateSessionResponse::Pending { .. } => {
-            eprintln!(
-                "CreateSession returned Pending, but the composition pipeline \
-                 is not wired in this client yet",
-            );
-            return Err(());
+        minimald_rpc::CreateSessionResponse::Pending { id: _, response } => {
+            drive_pending_to_active(&mut client, response).await?
         }
     };
 

@@ -11,6 +11,7 @@
 //! gate functions in this module.
 
 use core::fmt;
+use std::collections::BTreeMap;
 
 use crate::core::decision::{CheckOutcome, Decision, ItemDecision};
 use crate::core::enumerate::{ExpandedProvenancedPatch, PatchFile, enumerate_patch_files};
@@ -22,7 +23,8 @@ use crate::core::source::{
 };
 use crate::wire::policy::{WirePatchVerdict, WireVarVerdict};
 use crate::wire::primitives::{
-    PendingId, WirePendingVar, WireResolvedVar, WireSessionPatch, WireSessionVar,
+    PendingId, WirePendingPatch, WirePendingVar, WireProvenancedHook, WireResolvedVar,
+    WireSessionPatch, WireSessionVar, WireVarSpec,
 };
 
 /// Errors produced while a [`Composable`] materializes its
@@ -356,6 +358,17 @@ impl Contribution {
         Ok(())
     }
 
+    /// True when no items have been contributed across any domain.
+    /// Used by daemon-side composers to take the empty-contribution
+    /// fast path (no pending items to ship back to the client).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.vars.is_empty()
+            && self.patches.is_empty()
+            && self.packages.is_empty()
+            && self.lifecycle_hooks.is_empty()
+    }
+
     /// All vars contributed so far.
     #[must_use]
     pub fn vars(&self) -> &[ProvenancedVar] {
@@ -646,6 +659,19 @@ pub struct SessionPatch {
 }
 
 impl SessionPatch {
+    /// Direct construction. Crate-internal because outside callers
+    /// should obtain `SessionPatch`s by going through the gate or by
+    /// reconstructing one from a [`WireSessionPatch`] via the `From`
+    /// impl — both of which guarantee provenance is truthful.
+    /// `pub(crate)` exposes it for in-crate handlers (e.g.
+    /// `daemon::composer::resume_from_verdict`) that build session
+    /// patches from already-gated verdict payloads + stashed source
+    /// provenance.
+    #[must_use]
+    pub(crate) fn new(patch: ResolvedPatch, source: Source) -> Self {
+        Self { patch, source }
+    }
+
     /// The resolved patch — host source path plus the destination
     /// relative to the sandbox user's home directory.
     #[must_use]
@@ -933,6 +959,76 @@ impl Composition {
         // Run conflict checks against the chained union before
         // touching `self`. `Conflict` propagates through
         // `ComposeError::Conflict` via the `#[from]` impl.
+        self.check_incoming_conflicts(&incoming_vars, &incoming_patches)?;
+
+        // Checks passed — commit.
+        self.vars.extend(incoming_vars);
+        self.patches.extend(incoming_patches);
+        self.packages.extend(incoming_packages);
+        dedupe_by_name(&mut self.packages, ProvenancedPackage::package);
+        self.lifecycle_hooks.extend(incoming_hooks);
+        Ok(())
+    }
+
+    /// Construct a [`Composition`] pre-populated with daemon-side
+    /// pass-through items (packages and lifecycle hooks — neither
+    /// has a per-item user-policy gate).
+    ///
+    /// Used by the daemon-side composer on the all-decided fast
+    /// path: vars and patches don't appear here because anything
+    /// that would have needed the client's verdict routes through
+    /// [`ComposeOutcome::Pending`] instead. Packages are deduped by
+    /// name (same rule [`Contribution::merge`] applies).
+    ///
+    /// [`ComposeOutcome::Pending`]: crate::daemon::composer::ComposeOutcome::Pending
+    pub(crate) fn from_daemon_passthrough(
+        mut packages: Vec<ProvenancedPackage>,
+        lifecycle_hooks: Vec<ProvenancedHook>,
+    ) -> Self {
+        dedupe_by_name(&mut packages, ProvenancedPackage::package);
+        Self {
+            vars: Vec::new(),
+            patches: Vec::new(),
+            packages,
+            lifecycle_hooks,
+        }
+    }
+
+    /// Append already-gated domain-typed vars and patches. Used by
+    /// [`resume_from_verdict`] to land items reassembled from a
+    /// client verdict (the verdict carries domain values, not wire
+    /// shapes, after the source provenance is rejoined from the
+    /// daemon stash).
+    ///
+    /// Atomic: conflict checks run against the chained union before
+    /// any mutation; on `Err`, `self` is untouched.
+    ///
+    /// [`resume_from_verdict`]: crate::daemon::composer::resume_from_verdict
+    ///
+    /// # Errors
+    ///
+    /// [`ComposeError::Conflict`] if an incoming var or patch
+    /// disagrees with one already in `self`.
+    pub(crate) fn extend_with(
+        &mut self,
+        vars: Vec<SessionVar>,
+        patches: Vec<SessionPatch>,
+    ) -> Result<(), ComposeError> {
+        self.check_incoming_conflicts(&vars, &patches)?;
+        self.vars.extend(vars);
+        self.patches.extend(patches);
+        Ok(())
+    }
+
+    /// Run the cross-set var- and patch-mismatch checks against the
+    /// union of `self` and the incoming items. Shared by
+    /// [`Self::extend_from_wire`] and [`Self::extend_with`] so both
+    /// atomic-precheck paths run the exact same conflict semantics.
+    fn check_incoming_conflicts(
+        &self,
+        incoming_vars: &[SessionVar],
+        incoming_patches: &[SessionPatch],
+    ) -> Result<(), ComposeError> {
         check_var_mismatches(
             self.vars.iter().chain(incoming_vars.iter()),
             |v| v.var().name(),
@@ -943,13 +1039,6 @@ impl Composition {
             |p| p.patch().destination(),
             |p| p.patch().host_path().as_str(),
         )?;
-
-        // Checks passed — commit.
-        self.vars.extend(incoming_vars);
-        self.patches.extend(incoming_patches);
-        self.packages.extend(incoming_packages);
-        dedupe_by_name(&mut self.packages, ProvenancedPackage::package);
-        self.lifecycle_hooks.extend(incoming_hooks);
         Ok(())
     }
 }
@@ -1343,6 +1432,130 @@ pub(crate) fn compose_contribution(
         lifecycle_hooks,
     };
     Ok((composition, final_policy))
+}
+
+/// Output of [`contribution_to_pending`]: the daemon-collected vars,
+/// patches, and lifecycle hooks in their daemon→client wire shape,
+/// **plus** the original domain items keyed by their assigned
+/// [`PendingId`] for the daemon-side stash to hand back to
+/// [`resume_from_verdict`].
+///
+/// Packages aren't carried on the wire — the schema's
+/// [`ContributionResponse`] has no slot for them — and the daemon
+/// stashes them separately. Lifecycle hooks have no per-item verdict
+/// either, but the response does carry them for client-side audit.
+///
+/// [`ContributionResponse`]: crate::wire::request::ContributionResponse
+/// [`resume_from_verdict`]: crate::daemon::composer::resume_from_verdict
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PendingTransform {
+    /// Wire-shaped pending payload destined for [`ContributionResponse`].
+    ///
+    /// [`ContributionResponse`]: crate::wire::request::ContributionResponse
+    pub(crate) wire: WirePending,
+    /// Daemon-side stash: original [`ProvenancedVar`]s keyed by the
+    /// [`PendingId`] they were assigned in `wire.vars`. The verdict
+    /// only carries the resolved value; the source comes from here.
+    pub(crate) pending_vars: BTreeMap<PendingId, ProvenancedVar>,
+    /// Daemon-side stash: original [`ProvenancedPatch`]s keyed by
+    /// [`PendingId`]. The verdict only carries the resolved
+    /// `host_path` per file; destination + source come from here.
+    pub(crate) pending_patches: BTreeMap<PendingId, ProvenancedPatch>,
+}
+
+/// Wire-shaped pending payload — the subset of [`PendingTransform`]
+/// that crosses the RPC boundary. Carried as a field inside
+/// `PendingTransform` so the daemon-side stash can be built from one
+/// canonical traversal.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct WirePending {
+    /// Pending vars (id-tagged for verdict correlation).
+    pub(crate) vars: Vec<WirePendingVar>,
+    /// Pending patches (id-tagged for verdict correlation).
+    pub(crate) patches: Vec<WirePendingPatch>,
+    /// Lifecycle hooks (no per-item verdict — pass-through to the
+    /// daemon's apply layer; see [`ContributionResponse::lifecycle_hooks`]).
+    ///
+    /// [`ContributionResponse::lifecycle_hooks`]: crate::wire::request::ContributionResponse::lifecycle_hooks
+    pub(crate) lifecycle_hooks: Vec<WireProvenancedHook>,
+}
+
+/// Convert daemon-collected vars, patches, and lifecycle hooks into
+/// their wire pending shape **and** the matching daemon-side stash
+/// keyed by [`PendingId`]. Pure: no policy consulted, no env touched.
+///
+/// Every var and patch becomes a pending item with a fresh
+/// [`PendingId`] so the client's verdict can correlate per-item.
+/// Lifecycle hooks pass through unchanged on the wire and aren't
+/// stashed — there's no per-item policy gate and the daemon's own
+/// original copy already lives in [`PendingComposeState::daemon_lifecycle_hooks`].
+///
+/// Packages aren't transformed here. The wire response has no
+/// packages slot, so daemon-collected packages stay in domain
+/// shape on the daemon-side stash; callers extract them off the
+/// `Contribution` separately before calling this.
+///
+/// Ids are assigned by position within each domain. Two items in
+/// different domains may share the integer; correlation is per
+/// `(domain, id)` from the daemon's perspective.
+///
+/// [`PendingComposeState::daemon_lifecycle_hooks`]: crate::daemon::composer::PendingComposeState::daemon_lifecycle_hooks
+///
+/// # Panics
+///
+/// Panics if a single domain holds more than `u32::MAX + 1` items,
+/// which the wire schema's [`PendingId`] cannot represent. In
+/// practice no daemon-collected contribution gets near that bound.
+pub(crate) fn contribution_to_pending(
+    vars: Vec<ProvenancedVar>,
+    patches: Vec<ProvenancedPatch>,
+    lifecycle_hooks: Vec<ProvenancedHook>,
+) -> PendingTransform {
+    let mut pending_vars: BTreeMap<PendingId, ProvenancedVar> = BTreeMap::new();
+    let mut wire_vars: Vec<WirePendingVar> = Vec::with_capacity(vars.len());
+    for (i, pv) in vars.into_iter().enumerate() {
+        let id = PendingId::new(u32::try_from(i).expect("pending var index fits in u32"));
+        // Items reach this transform already resolved (the composer's
+        // input is `ResolvedVar`); ship as a `Specified` spec so the
+        // client treats the value verbatim instead of re-resolving
+        // against its env.
+        wire_vars.push(WirePendingVar {
+            id,
+            name: pv.var().name().to_string(),
+            spec: WireVarSpec::Specified {
+                value: pv.var().value().to_string(),
+            },
+            source: pv.source().clone().into(),
+        });
+        pending_vars.insert(id, pv);
+    }
+
+    let mut pending_patches: BTreeMap<PendingId, ProvenancedPatch> = BTreeMap::new();
+    let mut wire_patches: Vec<WirePendingPatch> = Vec::with_capacity(patches.len());
+    for (i, pp) in patches.into_iter().enumerate() {
+        let id = PendingId::new(u32::try_from(i).expect("pending patch index fits in u32"));
+        wire_patches.push(WirePendingPatch {
+            id,
+            source_pattern: pp.patch().source().to_string(),
+            destination: pp.patch().dest().as_sandbox_path().clone(),
+            description: None,
+            source: pp.source().clone().into(),
+        });
+        pending_patches.insert(id, pp);
+    }
+
+    let wire_hooks: Vec<WireProvenancedHook> =
+        lifecycle_hooks.into_iter().map(Into::into).collect();
+
+    PendingTransform {
+        wire: WirePending {
+            vars: wire_vars,
+            patches: wire_patches,
+            lifecycle_hooks: wire_hooks,
+        },
+        pending_vars,
+        pending_patches,
+    }
 }
 
 // =====================================================================

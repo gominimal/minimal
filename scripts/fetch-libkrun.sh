@@ -18,8 +18,13 @@
 #   LIBKRUN_PREFIX="$PREFIX"   # minvmd build.rs link-search dir (+ rpath)
 #   LD_LIBRARY_PATH="$PREFIX"  # runtime: libkrun.so -> libkrunfw.so.5
 #
+# Set MIP to a prebuilt mip binary to run it directly and skip the compile — e.g.
+# the release pipeline reuses the static mip it already built rather than
+# recompiling a debug one just to drive the cache fetch.
+#
 # Linux-only (package materialization runs the build pipeline natively on Linux).
-# Requires: a Rust toolchain + protoc + jq on the host (the CI job installs them).
+# Requires: jq, plus a Rust toolchain + protoc unless MIP is supplied (the CI job
+# installs them).
 #
 # Usage: scripts/fetch-libkrun.sh <prefix-dir> [arch]
 #   arch defaults to aarch64 (matches scripts/fetch-artifact.sh).
@@ -36,10 +41,15 @@ esac
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# Build the CLI from source (debug: this drives a cache fetch, so CLI CPU is not
-# the bottleneck). Incremental, so a second invocation in the same job is cheap.
-cargo build -p mip
-MIP="$ROOT/target/debug/mip"
+# Use a prebuilt mip if provided, else build the CLI from source (debug: this
+# drives a cache fetch, so CLI CPU is not the bottleneck; incremental, so a
+# second invocation in the same job is cheap).
+if [ -n "${MIP:-}" ]; then
+  [ -x "$MIP" ] || { echo "MIP not an executable file: $MIP" >&2; exit 1; }
+else
+  cargo build -p mip
+  MIP="$ROOT/target/debug/mip"
+fi
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

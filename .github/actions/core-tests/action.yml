@@ -1,0 +1,35 @@
+name: Core Tests
+description: >
+  Set up the toolchain and run the core workspace test suite (nextest +
+  doctests). Assumes the repository is already checked out. Feature-gated
+  proofs behind non-default features (e.g. networking-proxy, networking-wg)
+  are NOT run here — invoke those explicitly in the calling workflow.
+
+runs:
+  using: composite
+  steps:
+    - name: Free Disk Space
+      uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
+      with:
+        remove_android: true
+        remove_dotnet: true
+        remove_haskell: true
+        remove_tool_cache: true
+    - name: Install protoc
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+    - name: Cache cargo registry and build artifacts
+      uses: Swatinem/rust-cache@v2
+    - name: Install nextest
+      uses: taiki-e/install-action@v2
+      with:
+        tool: nextest
+    - name: Check Cargo.lock is up-to-date
+      shell: bash
+      run: cargo fetch --locked
+    - name: Run tests
+      shell: bash
+      run: cargo nextest run --workspace
+    - name: Run doctests
+      shell: bash
+      run: cargo test --workspace --doc
