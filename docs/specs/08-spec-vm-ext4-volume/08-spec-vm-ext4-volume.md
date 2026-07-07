@@ -296,11 +296,14 @@ loud rather than silently degraded.
   prohibited: no code path shall substitute `/run/minimal` when `/dev/vdb` mount
   fails.
 
-- **R2.5**: If session state already exists on the volume (detectable by checking
-  for `sessions/` on the mounted filesystem) and the volume fails to mount, the
-  guest shall emit a distinct `MOUNT_FAILED` marker (or equivalent sentinel)
-  rather than `READY`. `minvmd run` shall surface this condition as a user-visible
-  error. This ensures that a corrupt or missing volume does not produce a ghost
+- **R2.5**: On **any** `/dev/vdb` mount failure the guest shall emit a distinct
+  `MOUNT_FAILED` marker (or equivalent sentinel) rather than `READY`. The guest
+  shall not attempt to inspect volume contents first: a failed mount exposes
+  nothing to inspect, so the marker is unconditional on the mount error itself.
+  `minvmd run` shall surface this condition as a user-visible error; the host
+  decides whether the failure is fatal (e.g. fatal when a prior volume image for
+  this VM already exists, recoverable when provisioning a fresh blank volume).
+  This ensures that a corrupt or unmountable volume does not produce a ghost
   READY that appears to the host as a healthy VM.
 
 **Proof Artifacts:**
@@ -366,21 +369,28 @@ the host-side mapping from session id to volume image.
     `force=true` flag is set in the RPC, return an error to the client with a
     message indicating the worktree is non-empty.
   - If `force=true` is set, unpack into a staging directory adjacent to the
-    worktree, then atomically replace it (via `rename(2)`). A mid-stream
-    failure leaves the staging directory (not the live worktree) in a partial
-    state; the next upload or a cleanup pass removes it.
+    worktree, then atomically swap staging and worktree with `renameat2(2)`
+    using the `RENAME_EXCHANGE` flag (supported by ext4 on the volume). Plain
+    `rename(2)` cannot replace a non-empty worktree — it fails with `ENOTEMPTY`
+    — whereas `RENAME_EXCHANGE` swaps the two directories in a single atomic
+    step regardless of their contents. After the swap, the pre-upload worktree
+    content sits at the staging path and is removed. A mid-stream unpack failure
+    leaves the partial tree in staging (not the live worktree); the next upload
+    or a cleanup pass removes it.
   - The atomicity constraint is: after a successful upload RPC, the worktree is
     either the pre-upload state or the new state, never a partial mix.
   - A `force=false` upload to an empty worktree succeeds as today (no staging
     needed).
 
 - **R3.4**: `crates/minvmd/src/provider_index.rs` (new file) shall define a
-  `ProviderIndex` struct that persists a JSON map from session UUIDv7 → `VolumeEntry`
-  (`{ image_path: PathBuf, vm_id: String }`). It shall implement `insert`,
-  `get_by_session`, and `remove` operations, and `flush` (atomic rename-based
-  JSON write). The index file shall be stored at `<minvmd_state_dir>/session_index.json`.
-  `VolumeEntry` uses `session_id: SessionId` (UUIDv7, globally unique) as the key;
-  no two VMs may share a session id.
+  `ProviderIndex` struct that persists a JSON map keyed by `SessionId` (UUIDv7,
+  globally unique) with `VolumeEntry` values. `VolumeEntry` holds
+  `{ image_path: PathBuf, vm_id: String }` and does **not** repeat the session
+  id — the id lives only in the map key. It shall implement
+  `insert(session_id, VolumeEntry)`, `get_by_session(&SessionId) -> Option<&VolumeEntry>`,
+  and `remove(&SessionId)` operations, and `flush` (atomic rename-based JSON
+  write). The index file shall be stored at
+  `<minvmd_state_dir>/session_index.json`. No two VMs may share a session id.
 
 - **R3.5**: `minvmd` shall update the `ProviderIndex` (R3.4) on session lifecycle
   events received from the in-VM `minimald` via the vsock RPC bridge: session
