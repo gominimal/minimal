@@ -113,13 +113,29 @@ pub fn ensure_sparse_raw(path: &Path, size_bytes: u64) -> Result<(), VolumeError
             Ok(())
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            create_sparse_raw(path, size_bytes)?;
-            tracing::info!(
-                path = %path.display(),
-                size_bytes,
-                "provisioned blank sparse data volume",
-            );
-            Ok(())
+            match create_sparse_raw(path, size_bytes) {
+                Ok(()) => {
+                    tracing::info!(
+                        path = %path.display(),
+                        size_bytes,
+                        "provisioned blank sparse data volume",
+                    );
+                    Ok(())
+                }
+                // Lost a creation race with a concurrent provisioner between the
+                // `metadata` probe above and `create_new`: the volume now exists,
+                // which satisfies the idempotent contract, so keep it as-is.
+                Err(VolumeError::Create { source, .. })
+                    if source.kind() == io::ErrorKind::AlreadyExists =>
+                {
+                    tracing::info!(
+                        path = %path.display(),
+                        "data volume created concurrently; keeping as-is",
+                    );
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
         }
         Err(source) => Err(VolumeError::Stat {
             path: path.to_path_buf(),
