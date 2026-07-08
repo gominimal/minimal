@@ -314,17 +314,26 @@ const MKFS_MIN_DEVICE_BYTES: u64 = 16 * 1024 * 1024;
 /// `PATH` (`/usr/sbin`, set post-chroot in [`enter_rootfs`]); requires
 /// `e2fsprogs` in the rootfs closure (spec R1.7).
 ///
-/// - Sized [`MKFS_MARGIN_BYTES`] below the device so the filesystem survives
-///   libkrun's backing-file trailer shave across reboots.
-/// - `lazy_itable_init=0,lazy_journal_init=0`: zero the inode table + journal
-///   *now*, at mkfs, rather than in the background `ext4lazyinit` kernel thread
-///   after mount. On the default 32 GiB volume that background init is hundreds
-///   of MiB of sustained I/O that lands right when the guest is bringing up its
-///   vsock bridge + SSH server on 2 vCPUs, stalling the first host→guest connect
-///   (observed as a gvproxy-forwarder timeout and `ssh connect: Disconnected`).
-///   Combined with the reduced inode count ([`MKFS_BYTES_PER_INODE`]) the
-///   synchronous init is small and one-time (first boot only; later boots detect
-///   the superblock and skip mkfs).
+/// The non-default options are *not* independent tuning — ext4's defaults are a
+/// decade of hard-won tuning and are otherwise left alone. Each option falls out
+/// of one of two deliberate choices:
+///
+/// 1. **Eager inode + journal init** (`-E lazy_itable_init=0,lazy_journal_init=0`):
+///    zero the inode table + journal *now*, at mkfs, rather than in the
+///    background `ext4lazyinit` kernel thread after mount. That background init is
+///    hundreds of MiB of sustained I/O that would land right as the guest brings
+///    up its vsock bridge + SSH server on 2 vCPUs, stalling the first host→guest
+///    connect (observed as a gvproxy-forwarder timeout and `ssh connect:
+///    Disconnected`). Its one entailment is the reduced inode count
+///    (`-i` [`MKFS_BYTES_PER_INODE`]): fewer inodes → a smaller table to zero, so
+///    the eager init stays cheap. It runs once — first boot only; later boots
+///    detect the superblock and skip mkfs.
+///
+/// 2. **Survive libkrun's backing-file trailer shave** across reboots: pass an
+///    explicit block count sized [`MKFS_MARGIN_BYTES`] below the device (found via
+///    a 3-boot persistence test — without the margin the volume fails to re-mount
+///    on the next boot). The count is in block-size units, so `-b`
+///    [`EXT4_BLOCK_BYTES`] pins that unit to keep the arithmetic exact.
 fn run_mkfs_ext4(device: &str) -> std::io::Result<()> {
     let device_bytes = device_size_bytes(device)?;
     if device_bytes < MKFS_MIN_DEVICE_BYTES {
