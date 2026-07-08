@@ -14,6 +14,12 @@
 # Usage:
 #   curl --proto '=https' --tlsv1.2 -fsSL <URL>/install.sh | sh
 #   curl … | sh -s -- unstable          # pick a non-default target
+#   curl … | sh -s -- --uninstall       # remove what a prior run installed
+#
+# Uninstall walks the local install record (no network) and removes each file
+# whose on-disk bytes still match what the installer recorded writing; it accepts
+# --force (remove modified files too), --purge (also delete the minimal data/
+# state/cache trees), and --dry-run. See Units 7–8 of the spec.
 #
 # The script targets strict POSIX `sh` (not bash): it runs identically under
 # dash, macOS's frozen bash 3.2, busybox, and zsh-invoked-sh. It depends only on
@@ -38,16 +44,42 @@ SUPPORTED_FORMAT=1
 say() { printf '%s\n' "$*" >&2; }
 die() { printf 'install: %s\n' "$*" >&2; exit 1; }
 
+# --- Mode dispatch: install (default) vs uninstall (R7.1) ------------------
+
+# `--uninstall` as the FIRST argument switches to uninstall mode; it is parsed
+# here, before the target charset check (R2.1), because `--uninstall` otherwise
+# validates as a target and would be fetched as one. Uninstall is offline and
+# takes its own flags; install mode's sole positional is the target, left in `$@`
+# for Unit 2. The two modes are mutually exclusive.
+MODE=install
+uninstall_force=0
+uninstall_purge=0
+dry_run=0
+if [ "${1-}" = "--uninstall" ]; then
+    MODE=uninstall
+    shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force)      uninstall_force=1 ;;
+            --purge)      uninstall_purge=1 ;;
+            -n|--dry-run) dry_run=1 ;;
+            *)            die "unknown uninstall option '$1' (allowed: --force, --purge, --dry-run)" ;;
+        esac
+        shift
+    done
+fi
+
 # --- Unit 1: environment probing (downloader, hasher, platform) ------------
 
 # R1.1 — prefer curl, else wget. Both enforce HTTPS + TLS 1.2 and refuse a
-# redirect that would downgrade the scheme.
+# redirect that would downgrade the scheme. Uninstall never fetches (R7.1), so a
+# missing downloader is fatal only in install mode.
 DL_TOOL=
 if command -v curl >/dev/null 2>&1; then
     DL_TOOL=curl
 elif command -v wget >/dev/null 2>&1; then
     DL_TOOL=wget
-else
+elif [ "$MODE" = install ]; then
     die "need a downloader: neither curl nor wget found on PATH"
 fi
 
@@ -115,6 +147,125 @@ resolve_prefix() {
     esac
 }
 
+# --- Units 7+8: uninstall (walk the install record and undo it) ------------
+
+# Offline teardown driven solely by the local install record (R6.1). The record
+# is a tab-delimited table of `component<TAB>dest<TAB>manifest-hash<TAB>installed-hash`
+# rows, where `dest` is absolute and `installed-hash` is the SHA-256 of the bytes
+# actually written (the post-sign digest for a macOS `bin` file). Uninstall keys
+# off `installed-hash`; the manifest-hash column is unused here. A file is removed
+# only if it is still byte-for-byte what we recorded writing (R7.3/R7.4), so a
+# user's edited or replaced file is kept unless --force. Runs entirely on local
+# state: no network, manifest, or bucket.
+do_uninstall() {
+    state_dir="$(resolve_prefix state)"
+    record="$state_dir/installed"
+
+    # R7.2 — no record means nothing to undo (or it is already gone). Absence is
+    # success, so a second --uninstall is a clean no-op.
+    if [ ! -f "$record" ]; then
+        say "uninstall: nothing to uninstall (no install record at $record)"
+        return 0
+    fi
+    [ "$dry_run" -eq 1 ] && say "uninstall: dry run — nothing will be removed"
+
+    # Tab, computed once, so rows are split on tab alone (R7.3): a dest under a
+    # $HOME containing spaces must still parse as one field.
+    tab="$(printf '\t')"
+    removed=0 absent=0 kept_modified=0 kept_foreign=0
+
+    # `comp` is informational here and the manifest-hash column (`_`) is unused;
+    # `dest`/`want` (the installed hash) drive removal. Read from the record via
+    # redirection so the loop body runs in this shell (counters persist).
+    while IFS="$tab" read -r comp dest _ want; do
+        [ -n "$dest" ] || continue
+
+        # Already gone (not even a dangling symlink) — count and continue, which
+        # is what makes an interrupted run re-runnable (R7.3).
+        if [ ! -e "$dest" ] && [ ! -L "$dest" ]; then
+            say "  $comp: already removed"
+            absent=$((absent + 1))
+            continue
+        fi
+
+        # The installer only ever writes regular files. A symlink or directory
+        # now at this path is something else — never follow it into a delete.
+        if [ -L "$dest" ] || [ ! -f "$dest" ]; then
+            say "  $comp: kept ($dest is not a regular file the installer wrote)"
+            kept_foreign=$((kept_foreign + 1))
+            continue
+        fi
+
+        # R7.3/R7.4 — remove only if the on-disk bytes still equal the recorded
+        # installed-hash (matches a macOS ad-hoc-signed bin), unless --force.
+        if [ "$(sha256 "$dest")" != "$want" ] && [ "$uninstall_force" -eq 0 ]; then
+            say "  $comp: kept (modified since install; pass --force to remove)"
+            kept_modified=$((kept_modified + 1))
+            continue
+        fi
+
+        if [ "$dry_run" -eq 1 ]; then
+            say "  $comp: would remove $dest"
+        else
+            rm -f "$dest" || die "failed to remove $dest"
+            say "  $comp: removed $dest"
+        fi
+        removed=$((removed + 1))
+    done <"$record"
+
+    # R8.1 — teardown AFTER the walk. Remove the record only once the footprint is
+    # fully gone; if anything was kept (modified or foreign), retain it so a later
+    # `--force`/manual cleanup still has the inventory to work from. Re-running is
+    # idempotent: already-removed rows re-classify as already-gone.
+    if [ "$kept_modified" -ne 0 ] || [ "$kept_foreign" -ne 0 ]; then
+        say "  kept install record $record (unremoved entries remain)"
+    elif [ "$dry_run" -eq 1 ]; then
+        say "  would remove install record $record"
+    else
+        rm -f "$record"
+    fi
+
+    # R8.2 — --purge additionally deletes the minimal-owned trees wholesale (build
+    # cache included); they live at fixed .../minimal paths the tool owns. It
+    # never removes files outside those roots.
+    if [ "$uninstall_purge" -eq 1 ]; then
+        for p in data state cache; do
+            d="$(resolve_prefix "$p")"
+            [ -d "$d" ] || continue
+            if [ "$dry_run" -eq 1 ]; then
+                say "  would purge $d"
+            else
+                rm -rf "$d"
+            fi
+        done
+    fi
+
+    # R8.1 — prune now-empty minimal-owned dirs with rmdir only (never rm -rf):
+    # the shared bin dir is removed only if empty, and a non-empty dir fails
+    # rmdir harmlessly. --purge (above) already cleared the data/state/cache trees.
+    if [ "$dry_run" -eq 0 ]; then
+        for p in bin data state cache; do
+            d="$(resolve_prefix "$p")"
+            if [ -d "$d" ]; then
+                rmdir "$d" 2>/dev/null || true
+            fi
+        done
+    fi
+
+    # R8.4 — a run that merely kept modified files still did what was asked; only
+    # an unexpected internal failure (via set -e / die) is non-zero.
+    say "uninstall: $removed removed, $absent already gone, $kept_modified kept (modified), $kept_foreign kept (foreign)"
+    [ "$dry_run" -eq 1 ] && say "uninstall: dry run — nothing was actually removed"
+    return 0
+}
+
+# R7.1 — dispatch uninstall before any target/manifest work. resolve_prefix and
+# the SHA/platform probes above are all it needs; it never reaches Unit 2.
+if [ "$MODE" = uninstall ]; then
+    do_uninstall
+    exit 0
+fi
+
 # --- Unit 2: target -> version -> manifest resolution ----------------------
 
 # R2.1 — optional first argument, the target, defaulting to `stable`. The
@@ -174,20 +325,29 @@ records="$tmpdir/installed"
 installed=0 skipped=0
 
 # The prior run's install record (R6.1) maps each component to the hash of the
-# file it actually placed on disk. On macOS a `bin` file is ad-hoc code-signed
-# after download (see below), so its installed bytes — and hash — differ from
-# the manifest `sha256`; this lets a signed component be recognized as already
-# installed without re-downloading. It is only a positive-match optimization: a
-# deleted or tampered file matches neither hash and is reinstalled, so the
-# on-disk file remains the source of truth (R5.1). Read before the new record is
-# written into place at the end of the run.
+# file it actually placed on disk, paired with the manifest `sha256` that file
+# was built from. On macOS a `bin` file is ad-hoc code-signed after download (see
+# below), so its installed bytes — and hash — differ from the manifest `sha256`;
+# the pairing lets a signed component be recognized as already installed without
+# re-downloading. It is keyed on the manifest hash for exactly that reason: the
+# recorded installed hash only means "up to date" while the manifest still wants
+# the SAME artifact. A new release changes the manifest `sha256`, so the recorded
+# row no longer matches the current `want` and the component is re-downloaded
+# rather than wrongly judged current (the signed on-disk bytes would otherwise
+# still equal the old recorded installed hash). It is only a positive-match
+# optimization: a deleted or tampered file matches nothing and is reinstalled, so
+# the on-disk file remains the source of truth (R5.1). Read before the new record
+# is written into place at the end of the run.
 state_dir="$(resolve_prefix state)"
 prev_record="$state_dir/installed"
+# Emit the installed hash recorded for component $1, but only if the manifest
+# hash recorded alongside it ($3) equals the manifest's current want ($2) — so a
+# signed macOS bin is skipped only when this release wants the same artifact.
 prev_installed_hash() {
     [ -f "$prev_record" ] || return 0
     # Records are tab-delimited; split on tab so a dest containing spaces (e.g. a
-    # $HOME with a space) still parses.
-    awk -F'\t' -v c="$1" '$1==c {print $3; exit}' "$prev_record"
+    # $HOME with a space) still parses. Columns: comp, dest, manifest-sha, installed-sha.
+    awk -F'\t' -v c="$1" -v w="$2" '$1==c && $3==w {print $4; exit}' "$prev_record"
 }
 
 # No field ever contains whitespace (R3.2), so default IFS splitting is exact.
@@ -216,14 +376,16 @@ while read -r comp _ _ _ want kind dest src; do
     target_file="$dir/$subpath"
 
     # R5.1 — the on-disk file is the skip oracle. It is up to date if its hash
-    # matches the manifest `sha256` OR (for a macOS `bin` file we signed last
-    # run) the installed hash recorded then, since signing diverges the bytes.
+    # matches the manifest `sha256` OR (for a macOS `bin` file we signed last run)
+    # the installed hash recorded against THIS manifest hash, since signing
+    # diverges the bytes. Passing `$want` to the lookup is what stops a new
+    # release — whose `want` changed — from matching the old signed file.
     if [ -f "$target_file" ]; then
         on_disk="$(sha256 "$target_file")"
-        if [ "$on_disk" = "$want" ] || [ "$on_disk" = "$(prev_installed_hash "$comp")" ]; then
+        if [ "$on_disk" = "$want" ] || [ "$on_disk" = "$(prev_installed_hash "$comp" "$want")" ]; then
             say "  $comp: up to date"
             skipped=$((skipped + 1))
-            printf '%s\t%s\t%s\n' "$comp" "$target_file" "$on_disk" >>"$records"
+            printf '%s\t%s\t%s\t%s\n' "$comp" "$target_file" "$want" "$on_disk" >>"$records"
             continue
         fi
     fi
@@ -260,9 +422,10 @@ while read -r comp _ _ _ want kind dest src; do
 
     mv -f "$tmp" "$target_file"
     installed=$((installed + 1))
-    # Record the hash of what is actually on disk now (== manifest hash except
-    # for a signed macOS bin file), so a later run recognizes it (R5.1/R6.1).
-    printf '%s\t%s\t%s\n' "$comp" "$target_file" "$(sha256 "$target_file")" >>"$records"
+    # Record the manifest hash paired with the hash actually on disk now (the
+    # latter == manifest hash except for a signed macOS bin file), so a later run
+    # recognizes it only while the manifest still wants this artifact (R5.1/R6.1).
+    printf '%s\t%s\t%s\t%s\n' "$comp" "$target_file" "$want" "$(sha256 "$target_file")" >>"$records"
 done <"$applicable"
 
 # --- Unit 6: install record and PATH advisory ------------------------------
