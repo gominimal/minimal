@@ -80,10 +80,24 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 20
         steps:
+            - name: Free Disk Space
+              uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
+              with:
+                  remove_android: true
+                  remove_dotnet: true
+                  remove_haskell: true
             - uses: actions/checkout@v7
-            - uses: ./.github/actions/setup-minimal
-            - name: Smoke-test `minimal run`
-              run: minimal run build-smoke
+            - name: Cache Cargo state
+              uses: actions/cache@v5
+              with:
+                  path: ~/.local/state/minimal/state
+                  key: dogfood-minimal-cargo-${{ hashFiles('**/Cargo.lock') }}
+                  restore-keys: dogfood-minimal-cargo-
+            - name: Smoketest building Minimal
+              uses: gominimal/run-task@v1
+              with:
+                  channel: unstable
+                  task: build-smoke
 
     cargo-deny:
         runs-on: ubuntu-latest
