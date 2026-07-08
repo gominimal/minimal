@@ -1,6 +1,6 @@
 //! Finding & reading the `minimal.toml` file.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env::{self, home_dir};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -8,6 +8,10 @@ use std::path::{Component, Path, PathBuf};
 
 mod error;
 pub use error::Error;
+mod package_composable;
+pub use package_composable::{PackageComposable, StateWiring};
+mod project_composable;
+pub use project_composable::ProjectComposable;
 mod tasks;
 use serde::{Deserializer, Serializer};
 pub use tasks::{Task, TaskAction};
@@ -322,6 +326,121 @@ pub struct Stack {
 
 impl Eq for Stack {}
 
+/// Per-project session block. Contributes to sessions activated on
+/// this project — same primitives as
+/// [`sessions::core::loadout::Loadout`] (packages, vars, patches,
+/// lifecycle hooks), scoped to the project rather than the user.
+///
+/// Where a loadout says "what this developer wants everywhere"
+/// (their editor, their shell rc, their preferred `EDITOR`), a
+/// project session block says "what every session working on this
+/// codebase needs" (the toolchain everyone builds with, shared
+/// project config, env vars derived from the checkout). Patch
+/// sources typically resolve inside the repo, not the user's
+/// dotfiles.
+///
+/// Unlike a loadout, a session block has no name or description:
+/// there's at most one per mfile and it's identified by the project
+/// path. Contribution semantics (source tagging as
+/// [`sessions::core::source::Source::Project`], policy gating) land
+/// with the `ProjectComposable` that will consume this in a later
+/// step.
+///
+/// # Example
+///
+/// ```toml
+/// [session]
+/// # Toolchain every contributor builds with.
+/// packages = ["rustc", "cargo", "postgresql-client"]
+///
+/// # Config that lives in the repo, patched into the sandbox.
+/// patches = [
+///     { dest = "~/.cargo/config.toml", source = "config/cargo.toml" },
+///     { dest = "~/.psqlrc",            source = "config/psqlrc" },
+/// ]
+///
+/// [session.vars]
+/// # Applies uniformly to every developer's session.
+/// RUST_LOG          = "info"
+/// CARGO_TERM_COLOR  = "always"
+/// # Inherit if set, fall back to the local-dev default otherwise.
+/// DATABASE_URL      = { inherit = true, default = "postgres://localhost/dev" }
+///
+/// # Warm the incremental compile cache the first time a session
+/// # comes up. Best-effort; failures don't tank activation.
+/// [[session.lifecycle_hooks]]
+/// on_activate = { type = "inline", value = "cargo check --workspace >/dev/null 2>&1 || true" }
+/// ```
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct Session {
+    /// Packages to bring into the session, alongside the client's
+    /// loadout packages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<String>,
+    /// Variables with POSIX-shaped names — the common case.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub vars:
+        BTreeMap<sessions::core::primitives::StrictVarName, sessions::core::primitives::VarValue>,
+    /// Variables with Linux-permissive names — explicit opt-in for
+    /// the rare case a non-POSIX name is necessary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vars_lenient: Vec<sessions::core::primitives::LenientVarEntry>,
+    /// Patches contributed by this project.
+    #[serde(
+        default,
+        skip_serializing_if = "sessions::core::primitives::Patches::is_empty"
+    )]
+    pub patches: sessions::core::primitives::Patches,
+    /// Scripts run at session-level transition points, in
+    /// declaration order (concatenated with any hooks from the
+    /// client's loadout).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lifecycle_hooks: Vec<sessions::core::lifecyclehook::LifecycleHook>,
+
+    /// Any fields which are not understood by this version of minimal.
+    #[serde(flatten)]
+    pub extra: HashMap<String, toml::Value>,
+}
+
+// No `impl Eq for Session`: the `extra: HashMap<String, toml::Value>`
+// field means we can't honestly promise reflexivity, because
+// `toml::Value::Float(NaN)` participates in `PartialEq` but breaks
+// `x == x`. `Session` stays `PartialEq` only; no downstream API
+// requires `Eq`.
+
+impl Session {
+    /// Returns true iff no primitive-carrying field on the session
+    /// is populated. Used by downstream callers (e.g. daemon-side
+    /// composable construction) to decide whether a synthesized
+    /// [`Session`] has anything worth materializing.
+    ///
+    /// `extra` is ignored — unknown fields don't count as
+    /// contributions.
+    ///
+    /// The exhaustive `let Self { ... } = self` destructure in the
+    /// body is what makes this drift-proof: if a sixth primitive
+    /// lands on [`Session`], the pattern fails to compile until it's
+    /// added here. Naming the method is orthogonal — kept as
+    /// `is_empty` because that's the idiomatic Rust name for the
+    /// contract.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        let Self {
+            packages,
+            vars,
+            vars_lenient,
+            patches,
+            lifecycle_hooks,
+            extra: _,
+        } = self;
+        packages.is_empty()
+            && vars.is_empty()
+            && vars_lenient.is_empty()
+            && patches.is_empty()
+            && lifecycle_hooks.is_empty()
+    }
+}
+
 /// Describes the specific type of output being generated, along with any
 /// fields which are only meaningful for that output type.
 ///
@@ -510,6 +629,11 @@ pub struct File {
     /// Configuration relevant to the standard library.
     #[serde(default)]
     pub stdlib: Stdlib,
+    /// Project-level session contribution: packages, vars, patches,
+    /// and lifecycle hooks that apply to every session activated on
+    /// this project. Consumed by the `ProjectComposable` at
+    /// `CreateSession` time.
+    pub session: Option<Session>,
 
     /// Any fields which are not understood by this version of minimal.
     #[serde(flatten)]
@@ -649,6 +773,16 @@ impl File {
                 "unknown fields in [stack] section of {}: {}",
                 MFILE_NAME,
                 stack.extra.keys().cloned().collect::<Vec<_>>().join(",")
+            );
+            was_unknown_fields = true;
+        }
+        if let Some(session) = &self.session
+            && !session.extra.is_empty()
+        {
+            tracing::warn!(
+                "unknown fields in [session] section of {}: {}",
+                MFILE_NAME,
+                session.extra.keys().cloned().collect::<Vec<_>>().join(",")
             );
             was_unknown_fields = true;
         }
@@ -925,6 +1059,7 @@ mod tests {
                 )]
                 .into(),
                 stdlib: Default::default(),
+                session: None,
                 extra: HashMap::new(),
                 mfile_path: None,
                 layout: None,
@@ -1268,5 +1403,109 @@ mod tests {
             Path::new("/home/user"),
         );
         assert_eq!(result, Path::new("/tmp/state/~/env"));
+    }
+
+    /// A minimal.toml without a `[session]` block deserializes with
+    /// `session: None`; the field is opt-in so existing mfiles keep
+    /// working unchanged.
+    #[test]
+    fn session_absent_parses_as_none() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [upstream]
+            repo = "https://github.com/gominimal/pkgs"
+            "#
+        })
+        .unwrap();
+        assert!(mf.session.is_none());
+    }
+
+    /// An empty `[session]` block parses as `Some(Session::default())`
+    /// — no primitives contributed, but the block is present. Guards
+    /// against a regression where an empty header errors instead of
+    /// producing the identity contribution.
+    #[test]
+    fn session_empty_block_parses_as_default() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [session]
+            "#
+        })
+        .unwrap();
+        let session = mf.session.expect("empty block still produces Some");
+        assert_eq!(session, Session::default());
+    }
+
+    /// `Session::is_empty` returns true for
+    /// `Session::default()` and false once any primitive-carrying
+    /// field is populated. Guards downstream callers (e.g.
+    /// daemon-side composables) that use it to decide whether to
+    /// materialize an empty composable.
+    #[test]
+    fn session_is_empty_returns_true_for_default_and_false_when_populated() {
+        let empty = Session::default();
+        assert!(empty.is_empty());
+
+        let with_pkg = Session {
+            packages: vec!["ripgrep".into()],
+            ..Session::default()
+        };
+        assert!(!with_pkg.is_empty());
+    }
+
+    /// A populated `[session]` block round-trips every primitive
+    /// domain a loadout carries — packages, strict vars, patches,
+    /// lifecycle hooks — through the mfile's schema. The example
+    /// content is deliberately project-flavored (build toolchain,
+    /// in-repo config paths, uniform build env) to reflect the
+    /// intended use, but the assertions only check shape. Vars-
+    /// lenient coverage lives in the sessions crate's loadout tests
+    /// since the wire form is identical.
+    #[test]
+    fn session_populated_block_parses_every_primitive() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [session]
+            packages = ["rustc", "cargo", "postgresql-client"]
+            patches = [
+                { dest = "~/.cargo/config.toml", source = "config/cargo.toml" },
+                { dest = "~/.psqlrc",            source = "config/psqlrc" },
+            ]
+
+            [session.vars]
+            RUST_LOG         = "info"
+            CARGO_TERM_COLOR = "always"
+            DATABASE_URL     = { inherit = true, default = "postgres://localhost/dev" }
+
+            [[session.lifecycle_hooks]]
+            on_activate = { type = "inline", value = "cargo check --workspace >/dev/null 2>&1 || true" }
+            "#
+        })
+        .unwrap();
+        let session = mf.session.expect("populated block parses");
+        assert_eq!(
+            session.packages,
+            vec!["rustc", "cargo", "postgresql-client"]
+        );
+        assert_eq!(session.vars.len(), 3);
+        assert_eq!(session.patches.len(), 2);
+        assert_eq!(session.lifecycle_hooks.len(), 1);
+    }
+
+    /// Unknown fields inside `[session]` land in `extra` for the
+    /// `warn_unknown_fields` pass to report at load-time, matching
+    /// how `[stack]` and `[defaults]` handle forward-compat.
+    #[test]
+    fn session_unknown_field_lands_in_extra() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [session]
+            packages = ["rustc"]
+            weird_new_thing = "future"
+            "#
+        })
+        .unwrap();
+        let session = mf.session.expect("populated block parses");
+        assert!(session.extra.contains_key("weird_new_thing"));
     }
 }

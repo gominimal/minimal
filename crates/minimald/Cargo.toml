@@ -68,6 +68,10 @@ tokio-rustls = { workspace = true, optional = true }
 # tokio runtime and `setns(2)` directly.
 libc.workspace = true
 tokio.workspace = true
+# Parity test in `sessions/composables.rs` compares `SetupForPackages` output
+# to the composition-only path from a nickel-declared BuildSpec.
+decode.workspace = true
+indoc.workspace = true
 
 # The guest (initramfs pid-1) boot path is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]

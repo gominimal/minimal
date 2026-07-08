@@ -101,6 +101,7 @@ impl EnvChannel<'_> {
             if self.has_packages.insert(*bsr)
                 && let Err(e) = common::hardlink_dir_contents(
                     self.ctx
+                        .daemon
                         .cache
                         .read_dir(&new_graph.spec_hash(bsr))
                         .unwrap()
@@ -515,7 +516,7 @@ impl<'a> Env<'a> {
         graph: &'a mut Graph,
         args: EnvArgs<'a>,
     ) -> Result<Self, Error> {
-        let base_dir = ctx.config.task_base_dir();
+        let base_dir = ctx.daemon.config.task_base_dir();
 
         let SetupForPackages {
             fs_mappings: mut patch,
@@ -554,7 +555,7 @@ impl<'a> Env<'a> {
             .with_rootfs(
                 args.transitives
                     .keys()
-                    .map(|bsr| ctx.cache.read_dir(&graph.spec_hash(bsr)))
+                    .map(|bsr| ctx.daemon.cache.read_dir(&graph.spec_hash(bsr)))
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| Error::Other(anyhow::anyhow!("loading dependency: {}", e)))?
                     .into_iter()
@@ -901,7 +902,7 @@ mod tests {
     #[test]
     fn env_channel_add_session() {
         let (state_dir, mut ctx, mut graph) = setup_ctx_and_graph();
-        let rootfs = ctx.cache.temp_dir().unwrap();
+        let rootfs = ctx.daemon.cache.temp_dir().unwrap();
         let mut chan = EnvChannel {
             graph: &mut graph,
             ctx: &mut ctx,

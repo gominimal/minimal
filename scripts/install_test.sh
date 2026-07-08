@@ -299,6 +299,26 @@ want_ok "data resolves under XDG_DATA_HOME/minimal (R4.1)" \
     test -f "$H5/xdg-data/minimal/rootfs.img"
 cp "$root/good-components" "$mock/versions/v1/components"
 
+# The `lib` prefix (R4.1) is a bin SIBLING: it resolves to ~/.local/lib with NO
+# `/minimal` suffix (unlike data/state/cache), so a bin/<x> binary reaches a
+# shipped lib/<y> via a `@loader_path/../lib` rpath. XDG_LIB_HOME is unset in the
+# run env, so it must fall back to $HOME/.local/lib. A lib file is also not `bin`,
+# so it must NOT be marked executable.
+{
+    printf '# format: 1\n'
+    printf '# c o a v s k d s\n'
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+        libkrun linux amd64 v1 "$h_rootfs" file lib/libkrun.1.dylib versions/v1/rootfs-arm64.img
+} >"$mock/versions/v1/components"
+H6="$root/h6"; mkdir -p "$H6"
+run libdest "$H6"
+check 0 "$rc" "lib-prefixed component installs (R4.1)"
+want_ok "lib falls back to HOME/.local/lib, no /minimal suffix (R4.1)" \
+    test -f "$H6/.local/lib/libkrun.1.dylib"
+want_err "lib component is not marked executable (only bin gets +x)" \
+    test -x "$H6/.local/lib/libkrun.1.dylib"
+cp "$root/good-components" "$mock/versions/v1/components"
+
 # --- Unit 6: install record (R6.1) + PATH advisory (R6.2) ------------------
 record="$H1/xdg-state/minimal/installed"
 want_ok "install record lists components (R6.1)" grep -q "minimald" "$record"
@@ -336,6 +356,29 @@ want_ok "quarantine stripped from bin (xattr)" grep -q "com.apple.quarantine" "$
 want_ok "bin file ad-hoc codesigned" grep -q "/bin/minimal" "$root/codesign.calls"
 want_err "data component not codesigned" grep -q "rootfs" "$root/codesign.calls"
 
+# A darwin `lib` dylib gets the SAME Mach-O treatment as a bin file — quarantine
+# strip + ad-hoc codesign (the plain else-branch sign, no minvmd entitlement) —
+# so the shipped libkrun.1.dylib is loadable. Isolated home + one-off manifest
+# with a single darwin lib row, so it doesn't perturb the rerun counts below.
+{
+    printf '# format: 1\n'
+    printf '# c o a v s k d s\n'
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+        libkrun darwin arm64 v1 "$h_rootfs" file lib/libkrun.1.dylib versions/v1/rootfs-arm64.img
+} >"$mock/versions/v1/components"
+: >"$root/codesign.calls"; : >"$root/xattr.calls"
+HDL="$root/hdl"; mkdir -p "$HDL"
+reset_dl
+run darwinlib "$HDL"
+check 0 "$rc" "darwin lib install exits 0"
+want_ok "darwin lib dylib installed" test -f "$HDL/.local/lib/libkrun.1.dylib"
+want_ok "quarantine stripped from lib dylib (xattr)" \
+    grep -q "com.apple.quarantine" "$root/xattr.calls"
+want_ok "lib dylib ad-hoc codesigned" \
+    grep -q "/lib/libkrun.1.dylib" "$root/codesign.calls"
+cp "$root/good-components" "$mock/versions/v1/components"   # restore
+: >"$root/codesign.calls"; : >"$root/xattr.calls"
+
 # Signing diverged the on-disk bytes from the manifest hash. A rerun must still
 # recognize the component as installed (via the recorded hash) and not download
 # or re-sign it — otherwise macOS reruns would never be cheap (Goal 2).
@@ -345,8 +388,111 @@ run darwin2 "$HD"
 check 0 "$rc" "darwin rerun exits 0"
 check 0 "$(downloads)" "signed darwin bin: rerun downloads nothing"
 want_err "signed darwin bin: not re-codesigned on rerun" grep -q "/bin/minimal" "$root/codesign.calls"
+
+# A NEW release of a signed darwin bin (its manifest sha256 changes) must
+# re-download and re-sign — NOT be judged up to date because the old signed
+# bytes still equal the previously-recorded installed hash. The skip-by-record
+# path is keyed on the manifest hash for exactly this staleness case.
+printf 'darwin-arm64-minimal-body-v2\n' >"$mock/versions/v1/minimal-darwin-arm64-v2"
+h_dmin2="$(hash_file "$mock/versions/v1/minimal-darwin-arm64-v2")"
+awk -v h="$h_dmin2" \
+    '$1=="minimal" && $2=="darwin" {$5=h; $8="versions/v1/minimal-darwin-arm64-v2"} {print}' \
+    "$root/good-components" >"$mock/versions/v1/components"
+reset_dl
+: >"$root/codesign.calls"
+run darwin3 "$HD"
+check 0 "$rc" "darwin new-version rerun exits 0"
+check 1 "$(downloads)" "new manifest hash re-downloads the signed darwin bin (staleness fix)"
+want_ok "new darwin bin is re-codesigned" grep -q "/bin/minimal" "$root/codesign.calls"
+cp "$root/good-components" "$mock/versions/v1/components"   # restore
 PLAT_S=Linux
 PLAT_M=x86_64
+
+# --- Units 7-8: uninstall (walk the install record and undo it) ------------
+# Uninstall is offline and driven solely by the record the install wrote (R6.1).
+# Each scenario seeds a fresh home with a normal linux/amd64 install (placing
+# bin/minimald + bin/minimal and the record), then exercises one uninstall path.
+
+# R7.3/R8.1 — basic uninstall removes every recorded file, the record, and prunes
+# the now-empty owned dirs.
+HU="$root/hu"; mkdir -p "$HU"
+run u_install "$HU"
+check 0 "$rc" "uninstall: seed install exits 0"
+urec="$HU/xdg-state/minimal/installed"
+want_ok "uninstall: seed wrote the record" test -f "$urec"
+run u_basic "$HU" --uninstall
+check 0 "$rc" "uninstall exits 0 (R8.4)"
+want_err "uninstall removed minimald (R7.3)" test -e "$HU/bin/minimald"
+want_err "uninstall removed minimal (R7.3)" test -e "$HU/bin/minimal"
+want_err "uninstall removed the record (R8.1)" test -e "$urec"
+want_ok "uninstall prints a summary" grep -q "uninstall:" "$OUT"
+want_err "empty bin dir pruned (R8.1)" test -d "$HU/bin"
+want_err "empty state dir pruned (R8.1)" test -d "$HU/xdg-state/minimal"
+# R7.2 — a second uninstall (record now gone) is a clean no-op.
+run u_again "$HU" --uninstall
+check 0 "$rc" "second uninstall is a clean no-op (R7.2)"
+want_ok "no-op names the missing record (R7.2)" grep -q "nothing to uninstall" "$OUT"
+
+# R7.3/R7.4 — a file modified since install is KEPT (its bytes no longer match the
+# recorded hash), and the record is retained so --force can still reach it.
+HU2="$root/hu2"; mkdir -p "$HU2"
+run u2_install "$HU2"
+urec2="$HU2/xdg-state/minimal/installed"
+printf 'my own build\n' >"$HU2/bin/minimald"      # user replaced a binary
+run u2_keep "$HU2" --uninstall
+check 0 "$rc" "uninstall with a modified file exits 0 (R8.4)"
+want_ok "modified file kept (R7.3)" test -f "$HU2/bin/minimald"
+want_ok "keep is reported (R7.3)" grep -q "kept (modified" "$OUT"
+want_err "unmodified sibling still removed (R7.3)" test -e "$HU2/bin/minimal"
+want_ok "record retained while entries remain (R8.1)" test -f "$urec2"
+# --force then removes the modified file and, footprint clear, drops the record.
+run u2_force "$HU2" --uninstall --force
+check 0 "$rc" "uninstall --force exits 0"
+want_err "modified file removed under --force (R7.3)" test -e "$HU2/bin/minimald"
+want_err "record removed once footprint is gone (R8.1)" test -e "$urec2"
+
+# R7.2 — uninstall on a home that never installed anything exits 0, does nothing.
+HU3="$root/hu3"; mkdir -p "$HU3"
+run u3_noop "$HU3" --uninstall
+check 0 "$rc" "uninstall with no record exits 0 (R7.2)"
+want_ok "no-op names the missing record" grep -q "nothing to uninstall" "$OUT"
+
+# R8.3 — --dry-run removes nothing and leaves the record; a real run still cleans.
+HU4="$root/hu4"; mkdir -p "$HU4"
+run u4_install "$HU4"
+urec4="$HU4/xdg-state/minimal/installed"
+run u4_dry "$HU4" --uninstall --dry-run
+check 0 "$rc" "uninstall --dry-run exits 0 (R8.3)"
+want_ok "dry-run keeps minimald (R8.3)" test -f "$HU4/bin/minimald"
+want_ok "dry-run keeps the record (R8.3)" test -f "$urec4"
+want_ok "dry-run announces itself (R8.3)" grep -q "dry run" "$OUT"
+run u4_real "$HU4" --uninstall
+want_err "real uninstall after dry-run removes minimald" test -e "$HU4/bin/minimald"
+
+# R8.2 — plain uninstall leaves an unrelated build artifact in the cache tree;
+# --purge removes the whole minimal-owned cache tree.
+HU5="$root/hu5"; mkdir -p "$HU5"
+run u5_install "$HU5"
+stray="$HU5/xdg-cache/minimal/built/deadbeef"
+mkdir -p "$HU5/xdg-cache/minimal/built"; printf 'artifact\n' >"$stray"
+run u5_plain "$HU5" --uninstall
+want_ok "plain uninstall leaves the build cache (R8.2)" test -f "$stray"
+run u5_reinstall "$HU5"
+run u5_purge "$HU5" --uninstall --purge
+check 0 "$rc" "uninstall --purge exits 0"
+want_err "purge removes the cache tree (R8.2)" test -e "$HU5/xdg-cache/minimal"
+
+# R7.3 — a non-regular file now occupying a recorded path is never removed, even
+# with --force (the installer only ever wrote regular files there).
+HU6="$root/hu6"; mkdir -p "$HU6"
+run u6_install "$HU6"
+urec6="$HU6/xdg-state/minimal/installed"
+rm -f "$HU6/bin/minimald"; mkdir -p "$HU6/bin/minimald"   # a dir now sits there
+run u6_foreign "$HU6" --uninstall --force
+check 0 "$rc" "uninstall over a non-regular path exits 0 (R7.3)"
+want_ok "directory at a recorded path is left alone (R7.3)" test -d "$HU6/bin/minimald"
+want_ok "foreign entry is reported (R7.3)" grep -q "not a regular file" "$OUT"
+want_ok "record retained due to the foreign entry (R8.1)" test -f "$urec6"
 
 # ===========================================================================
 echo "# ---"

@@ -175,16 +175,40 @@ pub enum TaskSource {
     Stack(String),
 }
 
-/// A top-level context for operations in a minimal-configured repo.
+/// Daemon-scoped context state that is independent of any particular
+/// project's `minimal.toml`. Built once at daemon startup and shared
+/// as `Arc<DaemonContext>` across sessions.
+///
+/// Sessions and other per-invocation callers hold this behind an `Arc`
+/// so the daemon-level setup work (dir upsert, VCS init, cache init,
+/// standard-library materialization) is amortized across every context
+/// that uses it. CLI callers that only build one context per
+/// invocation don't share, but pay only the negligible `Arc` overhead.
 #[derive(Debug)]
+pub struct DaemonContext {
+    pub(crate) config: Config,
+    pub(crate) stdlib_dir: PathBuf,
+    pub(crate) vcs: VcsManagerHandle,
+    pub(crate) cache: Cache,
+}
+
+/// A top-level context for operations in a minimal-configured repo.
+///
+/// Internally holds an `Arc<DaemonContext>` — daemon-scoped state that
+/// can be shared across many `Context`s — plus a per-project
+/// `mfile::File`. Existing `Context::new` callers continue to work
+/// unchanged; daemon-side code that wants to build multiple sessions
+/// against the same daemon-scoped state should use
+/// [`DaemonContext::init`] + [`Context::from_daemon`] instead.
+///
+/// `Clone` is cheap: an `Arc` bump on the daemon state plus a
+/// clone of the parsed mfile (a modest allocation). Callers that
+/// need to reuse a fully-built context across repeated operations
+/// clone rather than rebuild.
+#[derive(Debug, Clone)]
 pub struct Context {
-    config: Config,
-
-    stdlib_dir: PathBuf,
-    mfile: mfile::File,
-
-    vcs: VcsManagerHandle,
-    cache: Cache,
+    pub(crate) daemon: Arc<DaemonContext>,
+    pub(crate) mfile: mfile::File,
 }
 
 impl fmt::Display for Context {
@@ -193,17 +217,55 @@ impl fmt::Display for Context {
         if let Some(p) = self.mfile.dir_path().map(|p| p.to_path_buf()) {
             write!(f, " mfile repo at {} ", p.display())?;
         } else {
-            write!(f, "{:?}", self.config)?;
+            write!(f, "{:?}", self.daemon.config)?;
         }
         write!(f, "}}")
     }
 }
 
-impl Context {
-    /// Initializes a bunch of internals and returns them. Use [Self::new] instead.
+impl DaemonContext {
+    /// Initializes daemon-scoped state: upserts working directories,
+    /// initializes the VCS manager (respecting `--offline`), initializes
+    /// the local cache, and materializes the standard library. Callers
+    /// typically wrap the returned value in an `Arc` and share it
+    /// across many `Context`s.
     ///
-    /// This separation is needed to power logic in `minimal init`, which needs
-    /// to use a bunch of this stuff without being able to initialize a full [Context].
+    /// # Errors
+    ///
+    /// Any I/O or setup failure surfaced from the underlying subsystems.
+    pub fn init(config: Config) -> Result<Self, Error> {
+        let (vcs, cache, stdlib_dir) = Self::sub_setup(&config)?;
+        Ok(Self {
+            config,
+            stdlib_dir,
+            vcs,
+            cache,
+        })
+    }
+
+    /// Returns the daemon's `Config`.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Returns a path to the standard library.
+    pub fn stdlib_dir(&self) -> &PathBuf {
+        &self.stdlib_dir
+    }
+
+    /// Returns the VCS manager.
+    pub fn vcs_manager(&self) -> VcsManagerHandle {
+        self.vcs.clone()
+    }
+
+    /// Returns a handle to the local cache.
+    pub fn local_cache(&self) -> Cache {
+        self.cache.clone()
+    }
+
+    /// Initializes a bunch of internals and returns them. Use
+    /// [`DaemonContext::init`] instead unless you are `minimal init`,
+    /// which needs to use these before a full context can be built.
     pub fn sub_setup(config: &Config) -> Result<(VcsManagerHandle, Cache, PathBuf), Error> {
         // Upsert dirs
         use std::fs::create_dir_all;
@@ -251,7 +313,9 @@ impl Context {
 
         Ok((vcs, cache, stdlib_dir))
     }
+}
 
+impl Context {
     /// Initializes a new context using the given configuration.
     pub fn new(config: Config) -> Result<Self, Error> {
         let strategy = {
@@ -266,15 +330,9 @@ impl Context {
     /// Initializes a new context using the given configuration and `strategy` for finding the mfile
     /// This is useful when a given command needs to override the behaviour for finding the mfile
     pub fn new_with_strategy(config: Config, strategy: MFileSearchStrategy) -> Result<Self, Error> {
-        let (vcs, cache, stdlib_dir) = Self::sub_setup(&config)?;
+        let daemon = Arc::new(DaemonContext::init(config)?);
         let mfile = strategy.find_mfile()?;
-        Ok(Self {
-            config,
-            stdlib_dir,
-            mfile,
-            vcs,
-            cache,
-        })
+        Ok(Self { daemon, mfile })
     }
 
     /// Constructs a new context using the lower-level primitives.
@@ -287,31 +345,67 @@ impl Context {
         cache: Cache,
         stdlib_dir: PathBuf,
     ) -> Self {
-        Self {
+        let daemon = Arc::new(DaemonContext {
             config,
             stdlib_dir,
-            mfile,
             vcs,
             cache,
-        }
+        });
+        Self { daemon, mfile }
+    }
+
+    /// Constructs a `Context` from a shared `DaemonContext` and an
+    /// already-parsed mfile. Used by daemon-side callers to build
+    /// per-session contexts against one shared daemon-scoped setup,
+    /// without repeating the (moderately expensive)
+    /// [`DaemonContext::init`] work per session.
+    pub fn from_daemon(daemon: Arc<DaemonContext>, mfile: mfile::File) -> Self {
+        Self { daemon, mfile }
+    }
+
+    /// Returns a clone of the shared daemon-scoped context. Cheap —
+    /// just an `Arc` clone. Useful when a caller needs to hand the
+    /// same daemon-scoped state to another `Context` or subsystem
+    /// without going through the mfile-loaded superstructure.
+    pub fn daemon_context(&self) -> Arc<DaemonContext> {
+        Arc::clone(&self.daemon)
     }
 }
 
 /// Low-level API
 impl Context {
-    /// Clones and reinitializes the context. Intended only
-    /// to be used after the minimal file has been mutated.
+    /// Re-reads the minimal file and returns a fresh `Context` on the
+    /// same shared `Arc<DaemonContext>`. Intended for callers that
+    /// have mutated the on-disk mfile and want the in-memory copy
+    /// refreshed; daemon-scoped state (`Config`, `stdlib_dir`, `vcs`,
+    /// `cache`) is preserved and shared, not rebuilt.
+    ///
+    /// The reload path mirrors [`Self::repo_dir`]'s resolution order:
+    /// the currently-loaded mfile's own directory takes precedence
+    /// (correct for daemon-side callers whose shared `Config` has no
+    /// per-session repo override), then any config-provided override,
+    /// then a recursive search from the daemon's cwd as a last-ditch
+    /// fallback for CLI-style callers that constructed via
+    /// [`Self::new`].
     pub fn cloned_reinit(&self) -> Result<Self, Error> {
-        Self::new(self.config.clone())
+        let strategy = if let Some(path) = self.mfile.repo_path() {
+            MFileSearchStrategy::Override(path.to_path_buf())
+        } else if let Some(path) = self.daemon.config.repo_dir_override() {
+            MFileSearchStrategy::Override(path.to_path_buf())
+        } else {
+            MFileSearchStrategy::CurrentDirRecursive
+        };
+        let mfile = strategy.find_mfile()?;
+        Ok(Self::from_daemon(Arc::clone(&self.daemon), mfile))
     }
 
     /// Builds a [`ProjectSetup`] from this context, for running project-setup
     /// operations (e.g. [`op::UpdateProject`]) that refresh the `minimal.toml`.
     pub fn project_setup(&self) -> ProjectSetup {
         ProjectSetup::from_parts(
-            self.config.clone(),
-            self.vcs.clone(),
-            self.stdlib_dir.clone(),
+            self.daemon.config.clone(),
+            self.daemon.vcs.clone(),
+            self.daemon.stdlib_dir.clone(),
             self.mfile.clone(),
             self.repo_dir().to_path_buf(),
         )
@@ -319,58 +413,58 @@ impl Context {
 
     /// Returns a handle to the local cache.
     pub fn local_cache(&self) -> Cache {
-        self.cache.clone()
+        self.daemon.cache.clone()
     }
     /// Returns the vcs manager.
     pub fn vcs_manager(&self) -> VcsManagerHandle {
-        self.vcs.clone()
+        self.daemon.vcs.clone()
     }
 
     /// Returns true if the context is configured to use the local cache.
     pub fn use_local_cache(&self) -> bool {
-        self.config.use_local_cache()
+        self.daemon.config.use_local_cache()
     }
     /// Returns true if the context is configured to use a remote cache.
     pub fn use_remote_cache(&self) -> bool {
-        self.config.use_remote_cache()
+        self.daemon.config.use_remote_cache()
     }
     /// Returns the base directory for build sandboxes.
     pub fn builds_base_dir(&self) -> PathBuf {
-        self.config.builds_base_dir()
+        self.daemon.config.builds_base_dir()
     }
     /// Returns the base directory for task sandboxes.
     pub fn tasks_base_dir(&self) -> PathBuf {
-        self.config.task_base_dir()
+        self.daemon.config.task_base_dir()
     }
     /// Returns the base directory for the artifact/binary cache.
     ///
     /// DO NOT USE unless you really know what you
     /// are doing - prefer [Context::local_cache] instead.
     pub fn cache_base_dir(&self) -> PathBuf {
-        self.config.built_cache_dir()
+        self.daemon.config.built_cache_dir()
     }
     /// Returns the base directory where source checkouts are stored.
     pub fn vcs_dir(&self) -> PathBuf {
-        self.config.vcs_dir()
+        self.daemon.config.vcs_dir()
     }
     /// Returns the base directory where the remote index is cached.
     pub fn index_dir(&self) -> PathBuf {
-        self.config.index_dir()
+        self.daemon.config.index_dir()
     }
     /// Returns the directory where compiled layers are cached.
     pub fn layer_cache_dir(&self) -> PathBuf {
-        self.config.layer_cache_dir()
+        self.daemon.config.layer_cache_dir()
     }
 
     /// Returns the path to the root of the repo.
     pub fn repo_dir(&self) -> &Path {
         self.mfile
             .repo_path()
-            .unwrap_or_else(|| self.config.repo_dir_override().as_ref().unwrap())
+            .unwrap_or_else(|| self.daemon.config.repo_dir_override().as_ref().unwrap())
     }
     /// Returns a path to the standard library.
     pub fn stdlib_dir(&self) -> &PathBuf {
-        &self.stdlib_dir
+        &self.daemon.stdlib_dir
     }
 
     /// Returns the minimal file configuring this context.
@@ -400,7 +494,7 @@ impl Context {
         let index_dir = if force_fresh {
             None
         } else {
-            Some(self.config.index_dir())
+            Some(self.daemon.config.index_dir())
         };
 
         // A GCS location needs a Storage client (authed or anonymous per `auth`);
@@ -408,7 +502,7 @@ impl Context {
         // new_any builds a reqwest client internally. Note it's reading from R2
         // that avoids GCS egress cost: an https:// URL still pointed at GCS would
         // egress just the same.
-        let url = self.config.remote_cache_url();
+        let url = self.daemon.config.remote_cache_url();
         let gcs_storage = if matches!(url, AnyUrl::Gcs(_)) {
             let backend = if auth {
                 GcsStorage::builder().build().await.unwrap()
@@ -425,7 +519,8 @@ impl Context {
         } else {
             None
         };
-        let res = RemoteCache::new_any(url, gcs_storage, index_dir, self.config.ot.clone()).await;
+        let res =
+            RemoteCache::new_any(url, gcs_storage, index_dir, self.daemon.config.ot.clone()).await;
         tracing::trace!("remote cache init took {:?}", start.elapsed());
         res
     }
@@ -440,15 +535,19 @@ impl Context {
     /// upload. Writes require a `gs://` bucket location.
     pub async fn remote_cache_writer(&self) -> anyhow::Result<RemoteCacheWriter> {
         let start = SystemTime::now();
-        let bucket = self.config.remote_cache_write_bucket().ok_or_else(|| {
-            anyhow!(
-                "remote cache is configured as an HTTPS read mirror; writes \
+        let bucket = self
+            .daemon
+            .config
+            .remote_cache_write_bucket()
+            .ok_or_else(|| {
+                anyhow!(
+                    "remote cache is configured as an HTTPS read mirror; writes \
                  require a gs:// bucket — set the cache location to a gs:// URL \
                  or a bare bucket name"
-            )
-        })?;
+                )
+            })?;
         let backend = GcsStorage::builder().build().await.unwrap();
-        let res = RemoteCacheWriter::new(backend, bucket, self.config.ot.clone()).await?;
+        let res = RemoteCacheWriter::new(backend, bucket, self.daemon.config.ot.clone()).await?;
         tracing::trace!("remote cache writer init took {:?}", start.elapsed());
         Ok(res)
     }
@@ -458,9 +557,9 @@ impl Context {
         // source-URL cache miss surfaces as FileCacheError::OfflineCacheMiss
         // rather than a silent network fetch.
         let rs = common::RemoteStorage::new_with_offline(
-            self.config.downloads_dir(),
+            self.daemon.config.downloads_dir(),
             false,
-            self.config.is_offline(),
+            self.daemon.config.is_offline(),
         )
         .await
         .map_err(|e| Error::Other(anyhow!("initializing remote storage: {}", e)))?;
@@ -474,7 +573,7 @@ impl Context {
     }
     /// Returns the [OpTracker] to be used as the root for tracking long-running operations.
     pub fn op_tracker(&self) -> Option<OpTracker> {
-        self.config.ot.clone()
+        self.daemon.config.ot.clone()
     }
 
     /// Builds & returns the graph with the given packages specified as top levels.
@@ -498,11 +597,11 @@ impl Context {
         let start = SystemTime::now();
         let res = Graph::new_from_chain(
             self.vcs_manager(),
-            &mut graph::LayerCacheDir(self.config.layer_cache_dir()),
+            &mut graph::LayerCacheDir(self.daemon.config.layer_cache_dir()),
             LinkConfig::Dir {
                 dir: self.repo_dir().to_str().unwrap().to_string(),
             },
-            self.stdlib_dir.clone(),
+            self.daemon.stdlib_dir.clone(),
             target,
         )
         .map_err(|e| e.into());
@@ -551,7 +650,7 @@ impl Context {
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<(), Error> {
         let cache = self.local_cache();
-        let rc = if self.config.use_remote_cache() {
+        let rc = if self.daemon.config.use_remote_cache() {
             Some(self.remote_cache(false, false).await.unwrap())
         } else {
             None
@@ -559,20 +658,20 @@ impl Context {
 
         use orchestrator::LocalBackend;
         let orchestrator = LocalBackend::new_orchestrator(
-            self.config.builds_base_dir(),
+            self.daemon.config.builds_base_dir(),
             rc.clone(),
             self.remote_storage().await?,
-            self.config.num_parallel_builds(),
+            self.daemon.config.num_parallel_builds(),
             graph.clone(),
             cache.clone(),
             log_sink,
-            self.config.ot.clone(),
+            self.daemon.config.ot.clone(),
             cancel,
         )?;
 
         let mut bin_provider: Box<dyn BinProvider> = match (
-            self.config.use_local_cache(),
-            self.config.use_remote_cache(),
+            self.daemon.config.use_local_cache(),
+            self.daemon.config.use_remote_cache(),
         ) {
             // No local or remote cache
             (false, false) => Box::new(()),
@@ -721,11 +820,11 @@ impl Context {
             self.repo_dir().to_path_buf()
         };
         let state_base_dir = match state_key {
-            Some(name) if !name.is_empty() => {
-                mfile.state_dir(name, self.config.state_base_dir()).unwrap()
-            }
+            Some(name) if !name.is_empty() => mfile
+                .state_dir(name, self.daemon.config.state_base_dir())
+                .unwrap(),
             _ => {
-                let tmp = self.cache.temp_dir().map_err(|e| {
+                let tmp = self.daemon.cache.temp_dir().map_err(|e| {
                     Error::Other(
                         anyhow::Error::from(e).context("creating temporary state directory"),
                     )
@@ -766,7 +865,7 @@ impl Context {
 
         let base = tempfile::TempDir::with_suffix_in(
             format!("-{}", std::process::id()),
-            self.config.task_base_dir(),
+            self.daemon.config.task_base_dir(),
         )
         .map_err(|e| {
             Error::Other(anyhow::Error::from(e).context("creating base sandbox directory"))
@@ -784,7 +883,7 @@ impl Context {
                 env_vars,
                 hostname: Some(name.to_string()),
                 override_network_mode: Some(network_mode),
-                ot: self.config.ot.clone(),
+                ot: self.daemon.config.ot.clone(),
             },
         )
         .await?;
@@ -839,11 +938,11 @@ impl Context {
             let name = b.name.clone();
             let origin = b.from.as_ref().clone();
             let spec_hash = graph.spec_hash(&bsr);
-            if let Err(lcache::CacheErr::NotFound) = self.cache.read_dir(&spec_hash)
+            if let Err(lcache::CacheErr::NotFound) = self.daemon.cache.read_dir(&spec_hash)
                 && rc.exists(&spec_hash)
             {
                 let rc_clone = rc.clone(); // TODO: This is trash
-                let cache_clone = self.cache.clone();
+                let cache_clone = self.daemon.cache.clone();
                 let semaphore = semaphore.clone();
                 task_set.spawn(async move {
                     let sema = semaphore.acquire().await;
@@ -999,6 +1098,71 @@ mod tests {
     use op::{Runnable, StandaloneTest};
     use tempfile::tempdir;
 
+    /// `DaemonContext::init` works standalone — no mfile required.
+    /// This is the whole point of the daemon/session split: daemon-
+    /// scoped state can be built once at startup, before any project
+    /// is known.
+    #[test]
+    fn daemon_context_inits_without_mfile() {
+        let state = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_cache_dir(cache.path().to_path_buf())
+            // Stdlib override avoids the network hop for embedded-stdlib
+            // materialization.
+            .with_stdlib_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("../stdlib/minimal-ncl"),
+            )
+            .build()
+            .unwrap();
+
+        let daemon = DaemonContext::init(config).expect("daemon-scoped init should succeed");
+        // Setup upserted the expected dirs.
+        assert!(daemon.config().state_base_dir().exists());
+        assert!(daemon.config().built_cache_dir().exists());
+        assert!(daemon.stdlib_dir().exists());
+    }
+
+    /// `Context::from_daemon` reuses a shared `Arc<DaemonContext>`
+    /// across multiple `Context`s: two Contexts built against the
+    /// same daemon pointer-compare equal on their daemon slice.
+    /// Asserts the sharing contract, not any performance property.
+    #[test]
+    fn context_from_daemon_shares_arc() {
+        let state = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_cache_dir(cache.path().to_path_buf())
+            .with_stdlib_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("../stdlib/minimal-ncl"),
+            )
+            .build()
+            .unwrap();
+        let daemon = Arc::new(DaemonContext::init(config).unwrap());
+
+        let repo = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("testdata")
+            .join("fakerepo");
+        let mfile_a = MFileSearchStrategy::Override(repo.clone())
+            .find_mfile()
+            .expect("fakerepo has a minimal.toml");
+        let mfile_b = MFileSearchStrategy::Override(repo)
+            .find_mfile()
+            .expect("fakerepo has a minimal.toml");
+
+        let ctx_a = Context::from_daemon(Arc::clone(&daemon), mfile_a);
+        let ctx_b = Context::from_daemon(Arc::clone(&daemon), mfile_b);
+
+        assert!(Arc::ptr_eq(
+            &ctx_a.daemon_context(),
+            &ctx_b.daemon_context()
+        ));
+    }
+
     #[test]
     #[ignore] // Do not run in github: does not support nested namespaces
     fn toplevel_layer_init_and_build() {
@@ -1048,7 +1212,7 @@ mod tests {
                 cache: ctx.local_cache(),
                 exec_base: temp_dir.path().to_path_buf(),
                 graph: &graph,
-                ot: ctx.config.ot.clone(),
+                ot: ctx.daemon.config.ot.clone(),
             };
 
             assert_eq!(t.run(&opts).await.unwrap(), vec![]);

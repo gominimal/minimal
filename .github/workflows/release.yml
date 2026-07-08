@@ -228,8 +228,72 @@ jobs:
                   fi
             - name: Build release minvmd binary
               run: cargo build --release -p minvmd --bin minvmd
+            - name: Point minvmd's libkrun load command at @rpath
+              # Homebrew's libkrun bakes an ABSOLUTE install name into minvmd; rewrite
+              # it so that minvmd looks at ./minvmd/../lib/libkrun.1.dylib, as
+              # per the layout the installer drops.
+              #
+              # build.rs bakes a bin-relative @loader_path rpath for development.
+              run: |
+                  current="$(otool -L target/release/minvmd | awk '/libkrun/ {print $1; exit}')"
+                  if [ -z "$current" ]; then
+                    echo "::error::minvmd has no libkrun load command; did it link the stub?" >&2
+                    exit 1
+                  fi
+                  install_name_tool -change "$current" @rpath/libkrun.1.dylib target/release/minvmd
+                  install_name_tool -rpath @loader_path @loader_path/../lib target/release/minvmd
+                  codesign --sign - --force target/release/minvmd
+            - name: Verify minvmd linkage
+              # libkrun must resolve via @rpath (rewrite stuck), and every other
+              # dependency must be a system library (/usr/lib or /System). A stray
+              # /opt/homebrew dep would fail to load off the build host.
+              run: |
+                  otool -L target/release/minvmd
+                  if ! otool -L target/release/minvmd | grep -q '@rpath/libkrun\.1\.dylib'; then
+                    echo "::error::minvmd does not reference @rpath/libkrun.1.dylib; the shipped dylib will not be found" >&2
+                    exit 1
+                  fi
+                  # The shipped dylib lives in lib/ (a sibling of bin/), so the
+                  # @loader_path -> @loader_path/../lib retarget above must have
+                  # stuck; without it dyld never looks one dir up from bin/minvmd
+                  # and the load fails at runtime. Pull just the LC_RPATH `path`
+                  # values so the checks match exact entries, not substrings.
+                  otool -l target/release/minvmd | grep -A2 LC_RPATH
+                  rpaths="$(otool -l target/release/minvmd \
+                    | awk '$1=="path" && $2 ~ /@loader_path/ {print $2}')"
+                  if ! printf '%s\n' "$rpaths" | grep -qx '@loader_path/../lib'; then
+                    echo "::error::minvmd is missing the @loader_path/../lib rpath; lib/libkrun.1.dylib will not be found" >&2
+                    exit 1
+                  fi
+                  if printf '%s\n' "$rpaths" | grep -qx '@loader_path'; then
+                    echo "::error::minvmd still has a bare @loader_path rpath; the lib retarget did not replace it" >&2
+                    exit 1
+                  fi
+                  bad="$(otool -L target/release/minvmd | tail -n +2 | awk '{print $1}' \
+                    | grep -vE '^(/usr/lib/|/System/|@rpath/libkrun\.1\.dylib$)' || true)"
+                  if [ -n "$bad" ]; then
+                    echo "::error::minvmd links unexpected non-system libraries:" >&2
+                    printf '%s\n' "$bad" >&2
+                    exit 1
+                  fi
             - name: Build release minimal binary
+              # Separate cargo invocation from minvmd above, so its default
+              # `libkrun` feature can't unify into the CLI (which opts out via
+              # default-features = false). Gated next.
               run: cargo build --release -p minimal --bin minimal
+            - name: Verify minimal links only system libraries
+              # The CLI calls no libkrun (it spawns minvmd as a subprocess), so
+              # every dependency must be under /usr/lib or /System. A krun line
+              # means the default-features = false opt-out regressed.
+              run: |
+                  otool -L target/release/minimal
+                  bad="$(otool -L target/release/minimal | tail -n +2 | awk '{print $1}' \
+                    | grep -vE '^(/usr/lib/|/System/)' || true)"
+                  if [ -n "$bad" ]; then
+                    echo "::error::minimal links non-system libraries (allowed: /usr/lib, /System):" >&2
+                    printf '%s\n' "$bad" >&2
+                    exit 1
+                  fi
             - name: Rename binaries with platform suffix
               # download-artifact merge-multiple flattens on basename, so the uploaded
               # file must already carry the platform-suffixed name the release job expects.
@@ -247,6 +311,73 @@ jobs:
               with:
                   name: minimal-macos-arm64
                   path: target/release/minimal-macos-arm64
+                  retention-days: 7
+
+    build-libkrun-macos-arm64:
+        # Build a TRIMMED libkrun.dylib from source to SHIP in the release, so
+        # macOS users don't have to `brew install` it themselves. GitHub-hosted
+        # macos-latest is Apple Silicon (arm64).
+        runs-on: macos-latest
+        timeout-minutes: 45
+        env:
+            # Pin to the libkrun the slp/krun tap currently ships, so the dylib we
+            # ship matches the ABI the macOS CI lanes build and test against.
+            LIBKRUN_REF: v1.19.4
+        steps:
+            - name: Checkout libkrun (${{ env.LIBKRUN_REF }})
+              uses: actions/checkout@v7
+              with:
+                  repository: containers/libkrun
+                  ref: ${{ env.LIBKRUN_REF }}
+                  persist-credentials: false
+            - name: Toolchain
+              uses: dtolnay/rust-toolchain@stable
+            - name: Build trimmed libkrun (blk + net; no gpu, no init-blob)
+              # Direct cargo build — no Makefile, no env, no lld/xz/sysroot.
+              #   -p libkrun            scope to the libkrun crate, so the
+              #                         src/input & src/display workspace members
+              #                         (whose bindgen build scripts need libclang)
+              #                         are never built.
+              #   --no-default-features drop `init-blob`, whose build script
+              #                         cross-compiles a Linux init — the ONLY reason
+              #                         the Makefile needs lld + a Debian sysroot.
+              #                         minvmd supplies its own initramfs, so
+              #                         libkrun's bundled init is unused. (This is
+              #                         exactly the Makefile's INIT_BLOB=0 config.)
+              #   --features blk,net    blk = rootfs disk (krun_add_disk2),
+              #                         net = virtio-net. No gpu => no libepoxy/
+              #                         virglrenderer. Hypervisor.framework is linked
+              #                         automatically by src/vmm/build.rs.
+              # Output: target/release/libkrun.dylib (install_name libkrun.1.dylib,
+              # set by src/libkrun/build.rs).
+              run: cargo build --release -p libkrun --no-default-features --features blk,net
+            - name: Stage the dylib and assert it is self-contained
+              # A trimmed build must link only system libraries. Any /opt/homebrew or
+              # /usr/local reference means a dependency leaked (e.g. a stray GPU lib)
+              # and the dylib would fail to load on a machine without Homebrew — fail
+              # loudly rather than ship an unloadable artifact. `otool -D` prints the
+              # install name for cross-checking against minvmd's recorded load
+              # command (see the minvmd macOS job); informational.
+              run: |
+                  dylib=target/release/libkrun.dylib
+                  echo "otool -L $dylib"; otool -L "$dylib"
+                  echo "otool -D $dylib (install name):"; otool -D "$dylib"
+                  if otool -L "$dylib" | grep -E '/opt/homebrew|/usr/local'; then
+                    echo "::error::trimmed libkrun links a non-system (Homebrew) dylib; see otool -L above" >&2
+                    exit 1
+                  fi
+                  cp "$dylib" "$RUNNER_TEMP/libkrun-macos-arm64.dylib"
+            - name: Ad-hoc codesign
+              # cargo leaves the dylib ad-hoc/unsigned; arm64 macOS refuses to load a
+              # dylib with an invalid signature. Match the installer's self-sign of
+              # shipped bin/ files.
+              run: codesign --sign - --force "$RUNNER_TEMP/libkrun-macos-arm64.dylib"
+            - name: Upload libkrun dylib
+              uses: actions/upload-artifact@v7
+              with:
+                  name: libkrun-macos-arm64
+                  path: ${{ runner.temp }}/libkrun-macos-arm64.dylib
+                  if-no-files-found: error
                   retention-days: 7
 
     fetch-release-guest-artifacts:
@@ -420,6 +551,7 @@ jobs:
                 build-release-linux-amd64,
                 build-release-linux-arm64,
                 build-release-macos-arm64,
+                build-libkrun-macos-arm64,
                 fetch-release-guest-artifacts,
                 build-release-initramfs,
             ]

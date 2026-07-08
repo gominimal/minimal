@@ -239,12 +239,8 @@ impl Index {
     }
 }
 
-/// Pass B's per-entry decision about an index entry's record.
-///
-/// `Skip` is for transient I/O errors (e.g. `EACCES`, `EIO`) — the
-/// record may exist and be readable on a future startup. `DropMissing`
-/// is reserved for `NotFound` and unparseable records, which are
-/// definitive.
+/// Pass B's per-entry decision. `Skip` for transient I/O errors;
+/// `DropMissing` for `NotFound` and unparseable records.
 enum ReconcileFix {
     DropMissing,
     Skip {
@@ -256,10 +252,8 @@ enum ReconcileFix {
     },
 }
 
-/// Prefix used for delete-tombstone marker files. A tombstone for
-/// session short `XYZ` lives at `sessions/.deleting-XYZ` — *outside*
-/// the doomed session dir, so `remove_dir_all` cannot race the
-/// marker's existence.
+/// Prefix for delete-tombstone marker files, placed alongside
+/// (not inside) the target session dir.
 const TOMBSTONE_PREFIX: &str = ".deleting-";
 
 /// Build the tombstone marker file name for a given short.
@@ -267,11 +261,9 @@ fn tombstone_name(short: &str) -> String {
     format!("{TOMBSTONE_PREFIX}{short}")
 }
 
-/// True when `short` matches the format `DiskLoader::create` produces:
-/// exactly 5 lowercase hex characters. Used by tombstone reaping to
-/// refuse to act on `.deleting-` (empty), `.deleting-..`, or any other
-/// hand-crafted marker that could redirect `remove_dir_all` outside
-/// the intended session dir.
+/// True when `short` matches `DiskLoader::create`'s format: exactly
+/// 5 lowercase hex characters. Tombstone reaping refuses any other
+/// shape to bound `remove_dir_all` to intended session dirs.
 fn is_valid_short(short: &str) -> bool {
     short.len() == 5
         && short
@@ -344,41 +336,20 @@ pub struct DiskLoader {
 }
 
 impl DiskLoader {
-    /// Opens (or initializes) a disk-backed session store rooted at
-    /// `<minimal_dir>/sessions`.
+    /// Open (or initialize) a disk-backed session store rooted at
+    /// `<minimal_dir>/sessions`, running a self-heal pass so
+    /// [`Loader::create`], [`Loader::rename`], and [`Loader::delete`]
+    /// tolerate a daemon crash at any point.
     ///
-    /// **Self-healing.** On open, walks the sessions directory and
-    /// reconciles index state with the on-disk record state in three
-    /// passes:
-    ///
-    /// 1. **Tombstone reap.** For each `.deleting-<short>` marker
-    ///    file in `sessions/` (written by [`Loader::delete`] before
-    ///    it touches the index), the corresponding session dir is
-    ///    fully removed and the marker is removed last. Any index
-    ///    entry pointing at the short is dropped. Storing the marker
-    ///    outside the session dir means `remove_dir_all` cannot
-    ///    race the marker's existence — the marker survives crashes
-    ///    until self-heal drives the reap to completion.
-    /// 2. **Index reconciliation against records.** For each
-    ///    surviving index entry, the corresponding `record.json` is
-    ///    the source of truth. Missing/unparseable records cause the
-    ///    index entry to be dropped; records whose `name` differs
-    ///    from the index's name (e.g. a crash mid-`rename`) cause
-    ///    the index's name mapping to be updated.
-    /// 3. **Orphan re-index.** Session directories whose `record.json`
-    ///    parses but whose short name isn't in the index are re-added.
-    ///    If the orphan's name collides with an existing index entry,
-    ///    the orphan is left alone (logged as a warning) so the
-    ///    operator can triage it manually.
-    ///
-    /// This makes [`Loader::create`], [`Loader::rename`], and
-    /// [`Loader::delete`] tolerate a daemon crash at any point: the
-    /// next `new` converges to a consistent state.
+    /// Self-heal runs three passes: tombstone reap (finish deletes
+    /// interrupted mid-flight), index-vs-record reconciliation
+    /// (records are source of truth for name), and orphan re-index
+    /// (add sessions whose records parse but aren't indexed).
     ///
     /// # Errors
     ///
-    /// Returns an I/O error if the sessions directory cannot be created or
-    /// the existing `index.json` cannot be read.
+    /// I/O error if the sessions directory can't be created or
+    /// `index.json` can't be read.
     pub fn new(minimal_dir: DaemonAbsPath) -> Result<Self, std::io::Error> {
         std::fs::create_dir_all(minimal_dir.as_utf8_path().join("sessions"))?;
         let index_file = minimal_dir.as_utf8_path().join("sessions/index.json");

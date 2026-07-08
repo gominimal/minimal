@@ -8,14 +8,8 @@ use crate::core::decision::ItemDecision;
 use crate::core::policy::{PatchPolicy, VarsPolicy};
 use crate::core::source::Source;
 
-/// One item the policy could not decide. The item is held by reference
-/// so the gate loop retains ownership for the second pass.
-///
-/// Constructed only by the gate functions in `core::compose`; hooks
-/// receive these as borrowed slices. The fields are inaccessible to
-/// outside code on purpose — nothing prevents constructing one, but the
-/// lifetimes are tied to the gate's frame and there's no sensible way
-/// to manufacture matched references elsewhere.
+/// One item the policy could not decide, borrowed from the gate
+/// loop for the duration of the hook call.
 #[derive(Clone, Debug)]
 pub struct Unapproved<'a, T: ?Sized> {
     pub(crate) item: &'a T,

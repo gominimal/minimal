@@ -7,7 +7,7 @@ use mctx::ConfigBuilder;
 use ot::OpTracker;
 use paths::DaemonAbsPath;
 use russh::{Channel, server::Msg};
-use sessions::{Record, store::SessionObject};
+use sessions::{Record, core::compose::Composition, store::SessionObject};
 use std::fmt::{self};
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -99,15 +99,47 @@ pub struct Session<S: SessionObject> {
     /// fetches/builds report into it; the channel renderer paints it onto the
     /// SSH channel while a host is being minted.
     tracker: OpTracker,
+
+    /// The finalized [`Composition`] this session was created with.
+    /// `None` after a daemon restart — the composition isn't
+    /// persisted, and the launcher falls back to its baseline set
+    /// in that case.
+    ///
+    /// The launcher currently consumes only the composition's
+    /// packages and vars. Patches (need file-upload plumbing) and
+    /// lifecycle hooks (need in-sandbox exec plumbing) are held
+    /// here but not yet applied.
+    #[cfg_attr(test, allow(dead_code))]
+    composition: Option<Arc<Composition>>,
+
+    /// Lazily-built [`mctx::Context`] rooted at this session's
+    /// workspace, cached so repeated attach / task-exec paths don't
+    /// re-parse the workspace mfile.
+    ///
+    /// Each session builds its own [`DaemonContext`] (rather than
+    /// sharing the Manager's `Arc`) so the per-session
+    /// [`OpTracker`] on [`mctx::Config`] stays scoped correctly.
+    ///
+    /// [`DaemonContext`]: mctx::DaemonContext
+    /// [`OpTracker`]: ot::OpTracker
+    context: Option<mctx::Context>,
 }
 
 impl<S: SessionObject> Session<S> {
     /// Launches the actor for the given session.
+    ///
+    /// `composition` is the daemon's Phase 2 output for this session,
+    /// carried in memory from `Manager::CreateSession` (or the
+    /// `SubmitVerdict` handler that promotes a Pending record). `None`
+    /// when the session was minted before the composables pipeline
+    /// existed, or when the actor is spawned from disk after a daemon
+    /// restart — both cases are graceful degradations.
     pub async fn run(
         minimal_state_dir: DaemonAbsPath,
         minimal_cache_dir: DaemonAbsPath,
         session: S,
         net_switch: Arc<Mutex<crate::net::SwitchClient>>,
+        composition: Option<Arc<Composition>>,
     ) -> Result<SessionHandle, std::io::Error> {
         std::fs::create_dir_all(session.workspace_path())?;
         std::fs::create_dir_all(session.home_path())?;
@@ -122,6 +154,8 @@ impl<S: SessionObject> Session<S> {
             minimal_cache_dir,
             net_switch,
             tracker: OpTracker::new_root(),
+            composition,
+            context: None,
         };
 
         tokio::spawn(mngr.mainloop());
@@ -294,6 +328,7 @@ impl<S: SessionObject> Session<S> {
             net_switch: Arc::clone(&self.net_switch),
             ingress,
             session,
+            composition: self.composition.clone(),
         })
     }
 
@@ -314,7 +349,26 @@ impl<S: SessionObject> Session<S> {
         Ok(session_host::MockLauncher)
     }
 
+    /// Return this session's workspace-rooted [`mctx::Context`],
+    /// building it lazily the first time and cloning the cached
+    /// value on every subsequent call. The scaffold pass and mfile
+    /// parse happen once per actor lifetime.
     fn context(&mut self) -> Result<mctx::Context, String> {
+        if let Some(ctx) = &self.context {
+            return Ok(ctx.clone());
+        }
+        let ctx = self.build_context()?;
+        self.context = Some(ctx.clone());
+        Ok(ctx)
+    }
+
+    /// Do the actual context construction: scaffold a default
+    /// workspace mfile if missing, then run [`mctx::Context::new`]
+    /// against a session-rooted [`Config`]. Called at most once per
+    /// actor lifetime by [`Self::context`].
+    ///
+    /// [`Config`]: mctx::Config
+    fn build_context(&self) -> Result<mctx::Context, String> {
         let wsp = self.session.workspace_path();
         let config = ConfigBuilder::new()
             .with_repo_dir(wsp.as_utf8_path())
@@ -328,20 +382,15 @@ impl<S: SessionObject> Session<S> {
             .build()
             .map_err(|e| mctx::Error::from(e).to_string())?;
 
-        // TEMPORARY (remove with the workspace-upload gap): an empty session
-        // workspace has no minimal.toml, which would make Context::new fail.
-        // Scaffold a default shell one (pinned to the latest gominimal/pkgs
-        // @main commit) so the session can launch. Once sessions receive their
-        // project files this fabrication — and `mctx::scaffold` — goes away.
+        // TEMPORARY: scaffold a default `minimal.toml` if the
+        // workspace has none, so `Context::new` below can succeed.
+        // Delete this block (and `mctx::scaffold`) once sessions
+        // receive their project files via the workspace-upload path.
         //
-        // The scaffold does a blocking network git clone, and this runs inside
-        // the async session-actor task. On the daemon's multi-thread runtime
-        // (see main.rs) fence it with `block_in_place` so other futures move off
-        // this worker for its duration. `block_in_place` *panics* on a
-        // current-thread runtime (e.g. a `#[tokio::test]` with no explicit
-        // flavor) or with no runtime at all, so fall back to a plain blocking
-        // call there — a brief stall, acceptable for this temporary,
-        // once-per-empty-workspace scaffold.
+        // The scaffold performs a blocking network git clone. On a
+        // multi-thread runtime, `block_in_place` moves other futures
+        // off this worker for the duration; on a current-thread
+        // runtime it panics, so fall back to a plain blocking call.
         if !wsp.as_utf8_path().join(mfile::MFILE_NAME).exists() {
             let scaffold = || mctx::scaffold_default_mfile(&config, wsp.as_utf8_path());
             let on_multi_thread = matches!(
