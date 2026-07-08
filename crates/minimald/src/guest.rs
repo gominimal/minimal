@@ -296,18 +296,35 @@ fn device_size_bytes(device: &str) -> std::io::Result<u64> {
     Ok(sectors * 512)
 }
 
+/// Bytes-per-inode for the data volume's ext4. The default (16 KiB) would give a
+/// 32 GiB volume ~2M inodes and a ~512 MiB inode table; at 64 KiB it is ~524K
+/// inodes and a ~128 MiB table — still ample for a per-VM cache while keeping the
+/// table (and its zeroing) small. See [`run_mkfs_ext4`].
+const MKFS_BYTES_PER_INODE: u64 = 65536;
+
 /// Format `device` as ext4 via `mkfs.ext4 -F` (non-interactive). Resolves from
 /// `PATH` (`/usr/sbin`, set post-chroot in [`enter_rootfs`]); requires
 /// `e2fsprogs` in the rootfs closure (spec R1.7).
 ///
-/// The filesystem is sized [`MKFS_MARGIN_BYTES`] below the device so it survives
-/// libkrun's backing-file trailer shave across reboots.
+/// - Sized [`MKFS_MARGIN_BYTES`] below the device so the filesystem survives
+///   libkrun's backing-file trailer shave across reboots.
+/// - `lazy_itable_init=0,lazy_journal_init=0`: zero the inode table + journal
+///   *now*, at mkfs, rather than in the background `ext4lazyinit` kernel thread
+///   after mount. On the default 32 GiB volume that background init is hundreds
+///   of MiB of sustained I/O that lands right when the guest is bringing up its
+///   vsock bridge + SSH server on 2 vCPUs, stalling the first host→guest connect
+///   (observed as a gvproxy-forwarder timeout and `ssh connect: Disconnected`).
+///   Combined with the reduced inode count ([`MKFS_BYTES_PER_INODE`]) the
+///   synchronous init is small and one-time (first boot only; later boots detect
+///   the superblock and skip mkfs).
 fn run_mkfs_ext4(device: &str) -> std::io::Result<()> {
     let fs_blocks = device_size_bytes(device)?.saturating_sub(MKFS_MARGIN_BYTES) / EXT4_BLOCK_BYTES;
     let status = std::process::Command::new("mkfs.ext4")
         .arg("-F")
         .arg("-q")
         .args(["-b", &EXT4_BLOCK_BYTES.to_string()])
+        .args(["-i", &MKFS_BYTES_PER_INODE.to_string()])
+        .args(["-E", "lazy_itable_init=0,lazy_journal_init=0"])
         .arg(device)
         .arg(fs_blocks.to_string())
         .status()?;
