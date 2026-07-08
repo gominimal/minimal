@@ -144,6 +144,9 @@ jobs:
             - name: Build trimmed libkrun (BLK + NET, no GPU) + install
               if: steps.krun-cache.outputs.cache-hit != 'true'
               run: |
+                  # krun-input's build.rs runs bindgen, which needs libclang from the
+                  # llvm keg that `brew install lld` pulls in; point it there.
+                  export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
                   make BLK=1 NET=1
                   make PREFIX="$RUNNER_TEMP/krun" install
             - name: Assert self-contained + exports krun_add_disk3 (>= 1.19.0)
