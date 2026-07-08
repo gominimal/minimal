@@ -14,8 +14,8 @@ mod session;
 pub mod session_host;
 mod sessions;
 mod sftp;
-#[cfg(test)]
-mod test_harness;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_harness;
 
 /// Env var that the client must set (via `env_request`) before the SFTP
 /// subsystem request, naming which session the SFTP channel attaches to.

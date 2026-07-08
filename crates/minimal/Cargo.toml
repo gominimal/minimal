@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 camino.workspace = true
@@ -26,3 +27,14 @@ tracing-subscriber.workspace = true
 # libkrun).
 minvmd = { path = "../minvmd", default-features = false }
 ot.workspace = true
+
+# Build-system commands (init/add/update) use hakoniwa sandboxing and
+# mctx/op, which pull in procfs via libcgroups — Linux-only. Gating keeps
+# `minimal` buildable on macOS for the autospawn-e2e CI lane.
+[target.'cfg(target_os = "linux")'.dependencies]
+mctx.workspace = true
+op.workspace = true
+
+[dev-dependencies]
+minimald = { path = "../minimald", features = ["test-support"] }
+tempfile.workspace = true
