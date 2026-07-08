@@ -169,16 +169,19 @@ mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
 
-    fn tmpdir() -> PathBuf {
+    /// A unique temp dir per test. Keyed by `tag` as well as the pid so
+    /// concurrently-running tests (cargo's default) never share a directory —
+    /// otherwise one test's `remove_dir_all` cleanup races another's files.
+    fn tmpdir(tag: &str) -> PathBuf {
         let base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
-        let p = PathBuf::from(base).join(format!("minvmd-vol-test-{}", std::process::id()));
+        let p = PathBuf::from(base).join(format!("minvmd-vol-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         p
     }
 
     #[test]
     fn ensure_creates_sparse_image_of_requested_len() {
-        let dir = tmpdir();
+        let dir = tmpdir("sparse");
         let prov = BlankRawProvisioner::new(dir.join("volumes"));
         let size = 8 * 1024 * 1024 * 1024; // 8 GiB
         let path = prov.ensure("vm-abc", size).unwrap();
@@ -198,7 +201,7 @@ mod tests {
 
     #[test]
     fn ensure_is_idempotent_and_does_not_resize() {
-        let dir = tmpdir();
+        let dir = tmpdir("idempotent");
         let prov = BlankRawProvisioner::new(dir.join("volumes"));
         let path = prov.ensure("vm-xyz", 4 * 1024 * 1024 * 1024).unwrap();
         // A second call at a *different* size must return the same untouched
