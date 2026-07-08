@@ -35,6 +35,12 @@ pub enum VmError {
     /// A required environment variable was unset or empty.
     MissingEnv { var: &'static str },
 
+    /// The `MINVMD_KRUN_LOG` environment variable was set to a value that is
+    /// not a recognised libkrun log level (a name `off`/`error`/`warn`/`info`/
+    /// `debug`/`trace` or the numeric level `0`–`5`). `value` is the offending
+    /// setting.
+    InvalidLogLevel { value: String },
+
     /// A required image could not be located: the override env var was unset or
     /// empty, and no file exists at the default install location. `var` names
     /// the override; `default` is the path that was checked.
@@ -88,6 +94,13 @@ impl fmt::Display for VmError {
             Self::MissingEnv { var } => {
                 write!(f, "required environment variable {var} is unset or empty")
             }
+            Self::InvalidLogLevel { value } => {
+                write!(
+                    f,
+                    "MINVMD_KRUN_LOG value {value:?} is not a valid log level \
+                     (expected off/error/warn/info/debug/trace or 0-5)"
+                )
+            }
             Self::MissingImage { var, default } => {
                 write!(
                     f,
@@ -120,6 +133,7 @@ impl std::error::Error for VmError {
             | Self::NulInString { .. }
             | Self::StartEnterReturnedUnexpectedly { .. }
             | Self::MissingEnv { .. }
+            | Self::InvalidLogLevel { .. }
             | Self::MissingImage { .. }
             | Self::Configuration { .. }
             | Self::InvalidEgressSubnet { .. } => None,

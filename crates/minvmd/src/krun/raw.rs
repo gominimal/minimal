@@ -8,7 +8,7 @@
 //! ([`crate::build`]) emits the link-search and rpath; we declare the link
 //! requirement here so it travels with the symbols themselves.
 
-use std::ffi::c_char;
+use std::ffi::{c_char, c_int};
 use std::io;
 
 use crate::error::VmError;
@@ -43,6 +43,32 @@ pub enum DiskFormat {
     Raw = 0,
 }
 
+/// Log verbosity for `krun_init_log`. Values match the `KRUN_LOG_LEVEL_*`
+/// constants in libkrun.h; higher is more verbose.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LogLevel {
+    Off = 0,
+    Error = 1,
+    Warn = 2,
+    Info = 3,
+    Debug = 4,
+    Trace = 5,
+}
+
+/// `KRUN_LOG_TARGET_DEFAULT`: the `target_fd` value directing `krun_init_log`
+/// at libkrun's default sink (stderr).
+pub const LOG_TARGET_DEFAULT: c_int = -1;
+
+/// `KRUN_LOG_STYLE_AUTO`: auto-detect whether the target supports terminal
+/// colour escape sequences.
+pub const LOG_STYLE_AUTO: u32 = 0;
+
+/// Default (empty) `options` bitmask for `krun_init_log`. Notably this leaves
+/// libkrun's own env-var overrides enabled (as opposed to
+/// `KRUN_LOG_OPTION_NO_ENV`).
+pub const LOG_OPTIONS_DEFAULT: u32 = 0;
+
 // SAFETY: every function in this block is an `extern "C"` declaration that
 // inherits its safety contract from libkrun.h. Specifically:
 //
@@ -76,6 +102,15 @@ unsafe extern "C" {
     /// Free a previously created context. Returns 0 on success or a negative
     /// errno on failure. Safe to call exactly once per `krun_create_ctx`.
     pub fn krun_free_ctx(ctx_id: u32) -> i32;
+
+    /// Initialize the library's logging. Global (not per-context) and NOT
+    /// idempotent — the underlying logger can only be installed once per
+    /// process, so a second call fails. `target_fd` selects the sink
+    /// (`KRUN_LOG_TARGET_DEFAULT` = stderr); `level` is one of
+    /// `KRUN_LOG_LEVEL_*` (0=off … 5=trace); `style` is one of
+    /// `KRUN_LOG_STYLE_*`; `options` is a bitmask (`0` = defaults). Returns 0
+    /// on success or a negative errno on failure.
+    pub fn krun_init_log(target_fd: c_int, level: u32, style: u32, options: u32) -> i32;
 
     /// Set the microVM's basic config: vcpu count and RAM in MiB.
     pub fn krun_set_vm_config(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -> i32;
