@@ -274,8 +274,12 @@ destroy web
 # `web.local.min.internal:18080` to 127.0.0.1:18080 -> gvproxy -> lease:8080.
 mcli activate -n web --network own-ip --ingress 18080:8080 . >/dev/null 2>&1
 # HTTP/1.0 server INSIDE the session on :8080, held alive while the host curls.
-# \r\n survives bash double-quotes as a literal escape for the remote printf.
-session_hold web "socat TCP-LISTEN:8080,reuseaddr,fork \"SYSTEM:printf 'HTTP/1.0 200 OK\r\n\r\nWEB_OK'\" & sleep 1; echo SERVER_UP" "$SCRATCH/web.log" "${RANDOM}${RANDOM}"
+# The response is written to a file by the sandbox shell (which interprets the
+# \r\n) and served verbatim with `cat`. Building it INSIDE socat's `SYSTEM:`
+# address instead mangles the printf quoting and emits a non-HTTP reply
+# (curl: "Received HTTP/0.9 when not allowed" -> http_code 000) — a backend bug
+# that previously masqueraded as a forwarding failure.
+session_hold web "printf 'HTTP/1.0 200 OK\r\n\r\nWEB_OK' > /tmp/rsp; socat TCP-LISTEN:8080,reuseaddr,fork SYSTEM:'cat /tmp/rsp' & sleep 1; echo SERVER_UP" "$SCRATCH/web.log" "${RANDOM}${RANDOM}"
 hold_wait "$SCRATCH/web.log" "SERVER_UP"
 echo "-- host via :7654 proxy -> web.local.min.internal:18080 (published port) --"
 curl --max-time 8 -sS -x http://127.0.0.1:7654 -o /dev/null -w "TC3_HTTP=%{http_code}\n" http://web.local.min.internal:18080/ 2>&1 || echo "TC3_HTTP=curl-failed"
@@ -285,7 +289,7 @@ banner "TC4 — UC4 static ingress 18080:8080 (server in-sandbox, host curls)"
 destroy tc4
 mcli activate -n tc4 --network own-ip --ingress 18080:8080 . >/dev/null 2>&1
 mcli session policy tc4
-session_hold tc4 "socat TCP-LISTEN:8080,reuseaddr,fork \"SYSTEM:printf 'HTTP/1.0 200 OK\r\n\r\nINGRESS_OK'\" & sleep 1; echo SERVER_UP" "$SCRATCH/tc4.log" "${RANDOM}${RANDOM}"
+session_hold tc4 "printf 'HTTP/1.0 200 OK\r\n\r\nINGRESS_OK' > /tmp/rsp; socat TCP-LISTEN:8080,reuseaddr,fork SYSTEM:'cat /tmp/rsp' & sleep 1; echo SERVER_UP" "$SCRATCH/tc4.log" "${RANDOM}${RANDOM}"
 hold_wait "$SCRATCH/tc4.log" "SERVER_UP"
 echo "-- host -> 127.0.0.1:18080 (ingress forward -> lease:8080) --"
 curl --max-time 8 -sS -o /dev/null -w "TC4_HTTP=%{http_code}\n" http://127.0.0.1:18080/ 2>&1 || echo "TC4_HTTP=curl-failed"
@@ -312,7 +316,7 @@ destroy tc7
 # The :7655 proxy routes by the Host: header authority (hostname + PUBLISHED
 # port — same router as :7654; TLS SNI stays localhost), so publish the backend.
 mcli activate -n tc7 --network own-ip --ingress 18081:8080 . >/dev/null 2>&1
-session_hold tc7 "socat TCP-LISTEN:8080,reuseaddr,fork \"SYSTEM:printf 'HTTP/1.0 200 OK\r\n\r\nBACKEND_OK'\" & sleep 1; echo SERVER_UP" "$SCRATCH/tc7.log" "${RANDOM}${RANDOM}"
+session_hold tc7 "printf 'HTTP/1.0 200 OK\r\n\r\nBACKEND_OK' > /tmp/rsp; socat TCP-LISTEN:8080,reuseaddr,fork SYSTEM:'cat /tmp/rsp' & sleep 1; echo SERVER_UP" "$SCRATCH/tc7.log" "${RANDOM}${RANDOM}"
 hold_wait "$SCRATCH/tc7.log" "SERVER_UP"
 echo "-- host (with cert) -> :7655, Host: tc7.local.min.internal:18081 : expect 200 --"
 curl --max-time 8 -sS -o /dev/null -w "TC7_WITHCERT=%{http_code}\n" --cacert "$CERT_DIR/ca.pem" --cert "$CERT_DIR/client.pem" --key "$CERT_DIR/client.key" -H "Host: tc7.local.min.internal:18081" https://localhost:7655/ 2>&1 || echo "TC7_WITHCERT=curl-failed"
@@ -323,13 +327,17 @@ destroy tc7
 banner "TC8 — ssh-forward (server in-sandbox, host curls through the forward)"
 destroy dev
 mcli activate -n dev --network own-ip --ingress 18080:8080 . >/dev/null 2>&1
-session_hold dev "socat TCP-LISTEN:8080,reuseaddr,fork \"SYSTEM:printf 'HTTP/1.0 200 OK\r\n\r\nFORWARD_OK'\" & sleep 1; echo SERVER_UP" "$SCRATCH/dev.log" "${RANDOM}${RANDOM}"
+session_hold dev "printf 'HTTP/1.0 200 OK\r\n\r\nFORWARD_OK' > /tmp/rsp; socat TCP-LISTEN:8080,reuseaddr,fork SYSTEM:'cat /tmp/rsp' & sleep 1; echo SERVER_UP" "$SCRATCH/dev.log" "${RANDOM}${RANDOM}"
 hold_wait "$SCRATCH/dev.log" "SERVER_UP"
-mcli ssh-forward dev 18080:127.0.0.1:8080 >"$SCRATCH/fwd.log" 2>&1 &
+# The local port must NOT be the ingress external port (18080): gvproxy already
+# binds host 18080 for `dev`'s ingress, so `ssh -L 18080` fails to bind and the
+# curl would silently hit the ingress forwarder instead of the ssh path. Use a
+# distinct local port so TC8 actually exercises `direct-tcpip`.
+mcli ssh-forward dev 19090:127.0.0.1:8080 >"$SCRATCH/fwd.log" 2>&1 &
 fwd_pid=$!
 sleep 3
-echo "-- host -> localhost:18080 (through the ssh-forward) --"
-curl --max-time 8 -sS -o /dev/null -w "TC8_HTTP=%{http_code}\n" http://localhost:18080/ 2>&1 || echo "TC8_HTTP=curl-failed"
+echo "-- host -> localhost:19090 (through the ssh-forward) --"
+curl --max-time 8 -sS -o /dev/null -w "TC8_HTTP=%{http_code}\n" http://localhost:19090/ 2>&1 || echo "TC8_HTTP=curl-failed"
 kill "$fwd_pid" 2>/dev/null; wait "$fwd_pid" 2>/dev/null
 destroy dev
 
