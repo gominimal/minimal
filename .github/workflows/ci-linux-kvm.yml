@@ -174,6 +174,34 @@ jobs:
           MINVMD_BOOT_LOG: ${{ runner.temp }}/boot.log
         run: cargo test -p minvmd --test boot_e2e -- --include-ignored --nocapture
 
+      - name: Volume E2E (R1.4/R1.5/R1.6 — /dev/vdb mount, relocation, persistence)
+        # Boot with a writable data volume attached and assert the guest formats +
+        # mounts /dev/vdb at /var/lib/minimal and relocates cache/state onto it.
+        # READY alone is insufficient — Unit 1 falls back to tmpfs on mount
+        # failure — so assert the guest boot log. A second boot on the same image
+        # must reuse it (no reformat, no ext4 `bad geometry`), guarding superblock
+        # idempotency + the mkfs margin that absorbs libkrun's backing-file trailer
+        # shave. The provisioned image must stay sparse (allocate-on-write).
+        env:
+          MINVMD_DATA_VOLUME_PATH: ${{ runner.temp }}/data-vol.raw
+          MINVMD_VOLUME_BYTES: "2147483648"
+        run: |
+          img="$MINVMD_DATA_VOLUME_PATH"; rm -f "$img"
+          echo "=== boot 1 (fresh volume: format + mount) ==="
+          MINVMD_BOOT_LOG="$RUNNER_TEMP/vol1.log" cargo test -p minvmd --test boot_e2e -- --include-ignored --nocapture
+          grep -q "formatting data volume" "$RUNNER_TEMP/vol1.log" || { echo "::error::boot 1 did not format /dev/vdb"; tail -60 "$RUNNER_TEMP/vol1.log"; exit 1; }
+          grep -q "mounted writable state volume" "$RUNNER_TEMP/vol1.log" || { echo "::error::R1.5: /dev/vdb was not mounted"; tail -60 "$RUNNER_TEMP/vol1.log"; exit 1; }
+          grep -q "relocated onto /dev/vdb" "$RUNNER_TEMP/vol1.log" || { echo "::error::R1.6: cache/state not relocated"; tail -60 "$RUNNER_TEMP/vol1.log"; exit 1; }
+          echo "=== boot 2 (reuse volume: no reformat, no bad geometry) ==="
+          MINVMD_BOOT_LOG="$RUNNER_TEMP/vol2.log" cargo test -p minvmd --test boot_e2e -- --include-ignored --nocapture
+          grep -q "mounted writable state volume" "$RUNNER_TEMP/vol2.log" || { echo "::error::boot 2 failed to mount the existing volume"; tail -60 "$RUNNER_TEMP/vol2.log"; exit 1; }
+          ! grep -q "formatting data volume" "$RUNNER_TEMP/vol2.log" || { echo "::error::boot 2 reformatted (superblock idempotency broken)"; exit 1; }
+          ! grep -qi "bad geometry" "$RUNNER_TEMP/vol2.log" || { echo "::error::ext4 bad geometry on reboot (mkfs margin regressed)"; tail -60 "$RUNNER_TEMP/vol2.log"; exit 1; }
+          echo "=== allocate-on-write sparsity ==="
+          logical=$(stat -c %s "$img"); allocated=$(( $(stat -c %b "$img") * $(stat -c %B "$img") ))
+          echo "data volume: logical=$logical allocated=$allocated"
+          [ "$allocated" -lt $(( logical / 4 )) ] || { echo "::error::image not sparse: $allocated of $logical bytes allocated"; exit 1; }
+
       - name: Session E2E (full minimald session over the bridge)
         run: cargo test -p minvmd --test minimald_session_e2e -- --include-ignored --nocapture --exact minimald_exec_over_bridge
 

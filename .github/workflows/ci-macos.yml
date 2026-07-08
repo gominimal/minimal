@@ -193,6 +193,39 @@ jobs:
                   MINVMD_ROOTFS_PATH="$RUNNER_TEMP/rootfs/rootfs.img" \
                   MINVMD_INITRAMFS="$RUNNER_TEMP/initramfs/initramfs.cpio" \
                     "$testbin" --include-ignored --nocapture --exact minimald_exec_over_bridge
+            - name: Volume E2E (R1.4/R1.5/R1.6 — /dev/vdb mount, relocation, persistence)
+              # Boot with a writable data volume attached and assert the guest
+              # formats + mounts /dev/vdb at /var/lib/minimal and relocates
+              # cache/state onto it. READY alone is insufficient — Unit 1 falls
+              # back to tmpfs on mount failure — so we assert the guest boot log.
+              # A second boot on the same image must reuse it (no reformat, no ext4
+              # `bad geometry`), guarding superblock idempotency + the mkfs margin
+              # that absorbs libkrun's backing-file trailer shave. The provisioned
+              # image must stay sparse (allocate-on-write, Proof Artifact 3).
+              run: |
+                  testbin="$(ls -1t target/debug/deps/boot_e2e-* | grep -v '\.d$' | head -1)"
+                  test -x "$testbin" || { echo "::error::boot_e2e test binary not found"; exit 1; }
+                  img="$RUNNER_TEMP/data-vol.raw"; rm -f "$img"
+                  benv=(MINVMD_E2E=1
+                    MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz"
+                    MINVMD_ROOTFS_PATH="$RUNNER_TEMP/rootfs/rootfs.img"
+                    MINVMD_INITRAMFS="$RUNNER_TEMP/initramfs/initramfs.cpio"
+                    MINVMD_DATA_VOLUME_PATH="$img"
+                    MINVMD_VOLUME_BYTES=2147483648)
+                  echo "=== boot 1 (fresh volume: format + mount) ==="
+                  env "${benv[@]}" MINVMD_BOOT_LOG="$RUNNER_TEMP/vol1.log" "$testbin" --include-ignored --nocapture
+                  grep -q "formatting data volume" "$RUNNER_TEMP/vol1.log" || { echo "::error::boot 1 did not format /dev/vdb"; tail -60 "$RUNNER_TEMP/vol1.log"; exit 1; }
+                  grep -q "mounted writable state volume" "$RUNNER_TEMP/vol1.log" || { echo "::error::R1.5: /dev/vdb was not mounted"; tail -60 "$RUNNER_TEMP/vol1.log"; exit 1; }
+                  grep -q "relocated onto /dev/vdb" "$RUNNER_TEMP/vol1.log" || { echo "::error::R1.6: cache/state not relocated"; tail -60 "$RUNNER_TEMP/vol1.log"; exit 1; }
+                  echo "=== boot 2 (reuse volume: no reformat, no bad geometry) ==="
+                  env "${benv[@]}" MINVMD_BOOT_LOG="$RUNNER_TEMP/vol2.log" "$testbin" --include-ignored --nocapture
+                  grep -q "mounted writable state volume" "$RUNNER_TEMP/vol2.log" || { echo "::error::boot 2 failed to mount the existing volume"; tail -60 "$RUNNER_TEMP/vol2.log"; exit 1; }
+                  ! grep -q "formatting data volume" "$RUNNER_TEMP/vol2.log" || { echo "::error::boot 2 reformatted (superblock idempotency broken)"; exit 1; }
+                  ! grep -qi "bad geometry" "$RUNNER_TEMP/vol2.log" || { echo "::error::ext4 bad geometry on reboot (mkfs margin regressed)"; tail -60 "$RUNNER_TEMP/vol2.log"; exit 1; }
+                  echo "=== allocate-on-write sparsity ==="
+                  logical=$(stat -f %z "$img"); allocated=$(( $(stat -f %b "$img") * 512 ))
+                  echo "data volume: logical=$logical allocated=$allocated"
+                  [ "$allocated" -lt $(( logical / 4 )) ] || { echo "::error::image not sparse: $allocated of $logical bytes allocated"; exit 1; }
             - name: Boot latency benchmark (informational)
               # Report boot-to-READY min/median/max on the runner. Uses the already
               # codesigned minvmd; non-gating (boot correctness is gated by the e2e
