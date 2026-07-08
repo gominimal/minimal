@@ -181,6 +181,48 @@ TC16 specifies the tests that activate when DM5 lands.
 > **landed** (2026-07-07); full analysis, fix, and verification:
 > [`gn9-forwarding-findings.md`](gn9-forwarding-findings.md).
 
+> **Re-run (2026-07-08, DM1 macOS/HVF), 4 passes — mixed; a new own-ip-churn
+> interaction (G-N11) gates the proxy TCs.** Clean DM1 stack on HEAD `9443becb`
+> with the G-N9 fix `9807ba99` built in. Two passes ran the plan as it stood
+> (in-sandbox `curl` absent — G-N10); two ran after wiring `min add curl` into
+> TC1b/TC2 to restore the egress probes. The proxy verdicts diverge by whether
+> real own-ip egress ran *before* them:
+>
+> | TC | no `min add curl` (×2) | with `min add curl` (×2) |
+> |----|------------------------|--------------------------|
+> | TC1b host-net egress | curl absent → unproven | **PASS 200** + DNS |
+> | TC2 own-ip egress / peer | curl absent → `TC2_PEER=NO` | **PASS 200 / `TC2_PEER=YES`** (peer 100.64.0.3) |
+> | TC3 DNS :7654 | **PASS 200** ×2 | **FAIL 502** ×2 |
+> | TC4 static ingress | PASS 200 | PASS 200 |
+> | TC7 :7655 no-cert | 401 | 401 |
+> | TC7 :7655 with-cert | 200 ×2 | **FAIL 000** ×2 (host curl/LibreSSL) |
+> | TC8 ssh-forward | 000 / 200 (flaky) | 200 / 000 (flaky) |
+>
+> - **G-N9 proxy path works clean but is not robust to prior own-ip churn
+>   (G-N11).** TC3's `:7654` proxy is 200 from a fresh VM with no prior own-ip
+>   egress, but **reproducibly 502 (2/2)** once TC1b/TC2 drive real own-ip egress.
+>   TC4 (direct ingress, no proxy lease-remap) stays 200 throughout, so the fault
+>   is in the proxy lease-routing under prior switch usage, not the forwarder. The
+>   first pass on the fresh VM already failed, so it is not slow state
+>   accumulation. So the G-N9 register's "proxy consumers unit-tested only, DM1
+>   runtime pending" is only *conditionally* closed: 200 in isolation, 502 after
+>   churn.
+> - **TC7 with-cert is a host-TLS issue, not the proxy.** no-cert 401 is stable
+>   (the mTLS gate works). The with-cert leg fails at the *host* `curl 8.7.1 /
+>   LibreSSL 3.3.6`, which rejects the (valid — OpenSSL parses it, pubkeys match)
+>   P-256 client key from `minimal login` with `asn1 encoding routines … EVP
+>   lib`; reproduces standalone, and `openssl s_client` shows a CA-chain mismatch
+>   between the login cert and the proxy's server cert on this VM instance.
+>   run1/run2 got 200 on an earlier instance, so it is host/PKI-instance
+>   dependent — a dedicated cert/TLS pass, tracked as G-N12.
+> - **TC8 remains flaky** (000/200 across all four passes) — the residual G-N9
+>   `direct-tcpip` item is unstable regardless of the above.
+> - **G-N10 fix confirmed:** `min add curl` restores in-sandbox curl (egress 200,
+>   peer YES) and is now wired into TC1b/TC2. But because own-ip egress breaks the
+>   proxy TCs (G-N11), a single pass cannot cleanly assert both curl-egress and
+>   proxy-forwarding — read TC3/TC7 from a churn-free pass until G-N11 lands.
+> - Stable PASS every pass: TC1 (no-net isolation), TC4, TC5, TC6, TC9, TC10.
+
 Verdicts from `test-plan.sh` runs. **DM2 and DM3 columns: 2026-07-07 `DM=dm2` /
 `DM=dm3` runs on a native Linux/aarch64 host** (Ubuntu; unprivileged userns
 unblocked via `kernel.apparmor_restrict_unprivileged_userns=0`; KVM + libkrun
@@ -491,4 +533,7 @@ by this plan.
 | G-N6 | TC17 (UC7/R4.1–R4.3) | Daemon never consumes mesh enrolment; `set_mesh` test-only | `crates/minimald/src/rpc.rs:1001`; `crates/minimal/src/main.rs:716-751` |
 | G-N7 | multi-VM variants of DM1/DM3 | Spec says "one or more" VMs; minvmd supervises exactly one (single `vmm.pid`/`state.toml`/`lifecycle.lock`) | `crates/minvmd/src/state.rs:6-9` |
 | G-N8 | TC3/TC4/TC7/TC8 on DM3/DM4 (KVM) | `attach` of an own-ip session carrying an `--ingress` mapping hangs — the interactive shell never starts (>200 s vs ~8 s for own-ip without ingress), so the in-session backend never comes up; own-ip *without* ingress is unaffected | 2026-07-03 `DM=dm3` run (`hold_wait: SERVER_UP never appeared` for all 4) + isolated ingress-vs-no-ingress repro |
-| G-N9 | TC3/TC7-cert/TC8 on the VM path (DM1) | **FIXED 2026-07-07** (sandbox-owned lease routing). The in-VM `:7654`/`:7655` proxies and `direct-tcpip` now dial the PTask's switch `lease:<internal>` instead of the host-loopback forwarder they cannot reach from inside the VM. The live lease is published into the shared hostname registry at own-ip attach (Vsock/VM path only) and reverted at teardown — never persisted to the `Record`; DM2 keeps the loopback forwarder untouched. Verified: `cargo test -p minimald` + a clean DM2 regression; the VM branch is unit-tested (DM3/DM4 runtime verification is G-N8-blocked). | `crates/minimald/src/net/{dns,proxy,gvproxy_network}.rs`; `crates/minimald/src/connection.rs`; [`gn9-forwarding-findings.md`](gn9-forwarding-findings.md) |
+| G-N9 | TC8 on the VM path (DM1); DM3/DM4 (G-N8-blocked) | **FIXED 2026-07-07; DM1 runtime 2026-07-08 = conditional.** Sandbox-owned lease routing: the in-VM `:7654`/`:7655` proxies and `direct-tcpip` dial the PTask's switch `lease:<internal>` instead of the host-loopback forwarder unreachable from inside the VM. Live lease published into the shared hostname registry at own-ip attach (Vsock/VM only), reverted at teardown, never persisted to the `Record`; DM2 keeps the loopback forwarder untouched. **DM1 runtime: the `:7654` proxy is 200 from a churn-free VM but 502 after prior own-ip egress (G-N11); TC8 `direct-tcpip` is flaky (000/200) despite the same commit routing it to the lease.** So the proxy path is verified only in isolation; TC8 and the churn case remain open. | `crates/minimald/src/net/{dns,proxy,gvproxy_network}.rs`; `crates/minimald/src/connection.rs`; [`gn9-forwarding-findings.md`](gn9-forwarding-findings.md) |
+| G-N10 | TC1b, TC2 in-sandbox egress probes (all DMs) | **RESOLVED in-harness 2026-07-08 via `min add curl`.** In-sandbox `curl` disappeared after #650 made the session rootfs compose only *declared* packages (curl was incidental to the old base rootfs; not in `runtime_packages`, and declaring it does not compose it — a separate build/compose gap). TC1b/TC2 now provision curl per-session with `min add curl` (egress 200, peer YES). Residual: the underlying compose gap, and that the provisioning's own-ip egress triggers G-N11. | `.minimal/minimal.toml:8`; #650 (`crates/minimald/src/sessions/composables.rs:356`) |
+| G-N11 | TC3, TC7 on DM1 after any own-ip egress | The `:7654`/`:7655` proxy lease-routing (G-N9) returns **502 reproducibly (2/2) once a prior own-ip session has driven real egress** over the switch; from a churn-free VM the same TCs are 200 (2/2). TC4 (direct ingress, no proxy remap) is unaffected, so the fault is in the proxy's lease resolution under prior switch usage — a stale/incorrect lease route, not the forwarder. Not slow accumulation: the first pass on a fresh VM already fails once egress precedes it. | 2026-07-08 DM1 runs 1/2 (no churn → 200) vs 4/5 (`min add curl` egress → 502); `crates/minimald/src/net/{dns,proxy}.rs` lease route resolution |
+| G-N12 | TC7 with-cert on DM1 (host side) | `minimal login` issues a valid P-256 mTLS client cert/key (OpenSSL parses it; pubkeys match), but macOS system `curl 8.7.1 / LibreSSL 3.3.6` rejects it at load with `asn1 encoding routines … EVP lib`, and `openssl s_client` shows a CA-chain mismatch between the login cert and the running proxy's server cert on the same VM instance. The proxy mTLS gate itself works (no-cert → 401). Host/PKI-instance dependent (earlier VM gave 200). Needs a cert-generation + host-TLS pass. | 2026-07-08 DM1; `minimal login` cert issuance; proxy server-cert CA vs client `ca.pem` |

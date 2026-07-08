@@ -46,7 +46,9 @@
 # EACCES. Every in-session server binds :8080 (or another high port); ingress and
 # proxy checks target that port accordingly.
 #
-# In-session tools: sh bash curl getent coreutils socat. NOT present: ip nc wget python.
+# In-session tools: sh bash getent coreutils socat min. NOT present: ip nc wget
+# python. `curl` left the default rootfs with #650 (G-N10) — TCs that need it in
+# the sandbox provision it per-session with `min add curl` (requires egress).
 # Switch-IP discovery therefore uses /proc/net/fib_trie, not `ip`.
 set -u
 M="$PWD/target/debug/minimal"
@@ -237,7 +239,10 @@ banner "TC1b — host-net egress (positive control, in-sandbox)"
 destroy tc1b
 mcli activate -n tc1b --network host-net . >/dev/null 2>&1
 echo "-- in-sandbox: curl 200 + DNS resolves --"
-session_out tc1b 'curl --max-time 8 -sS -o /dev/null -w "HTTP=%{http_code}\n" http://example.com; getent hosts github.com | head -1'
+# `curl` is not in the default session rootfs since #650 (G-N10) — the composed
+# rootfs carries only declared packages. Provision it per-session via `min add
+# curl` (needs egress, which host-net has; build is cached after first use).
+session_out tc1b 'min add curl >/dev/null 2>&1; curl --max-time 8 -sS -o /dev/null -w "HTTP=%{http_code}\n" http://example.com; getent hosts github.com | head -1'
 destroy tc1b
 
 banner "TC2 — UC6 OwnIp egress + same-host peer (two full sessions)"
@@ -245,7 +250,8 @@ destroy demo peer
 mcli activate -n demo --network own-ip . >/dev/null 2>&1
 mcli activate -n peer --network own-ip . >/dev/null 2>&1
 echo "-- demo egress (in-sandbox, via the switch): expect 200 --"
-session_out demo 'curl --max-time 8 -sS -o /dev/null -w "HTTP=%{http_code}\n" http://example.com'
+# Provision curl (G-N10; own-ip has egress via the switch, so the fetch works).
+session_out demo 'min add curl >/dev/null 2>&1; curl --max-time 8 -sS -o /dev/null -w "HTTP=%{http_code}\n" http://example.com'
 # Same-host peer: HELD-OPEN attach starts the listener on an UNPRIVILEGED port
 # and reads peer's own switch lease in the SAME attach, then holds the shell —
 # and therefore the lease + listener — alive while demo dials it. One discovery
@@ -260,7 +266,7 @@ if [ -n "$peer_ip" ]; then
   # (HTTP/0.9) reply, so assert on the BODY (curl exit status is unreliable for
   # 0.9). Retry briefly to absorb listener-bind latency; track success in an
   # explicit flag (a trailing $? would be the loop's `sleep`, always 0).
-  session_out demo 'reached=NO; for i in $(seq 1 8); do if curl --max-time 3 -sS --http0.9 http://'"$peer_ip"':8080/ 2>/dev/null | grep -q PEER_REACHED; then reached=YES; break; fi; sleep 1; done; echo TC2_PEER=$reached'
+  session_out demo 'min add curl >/dev/null 2>&1; reached=NO; for i in $(seq 1 8); do if curl --max-time 3 -sS --http0.9 http://'"$peer_ip"':8080/ 2>/dev/null | grep -q PEER_REACHED; then reached=YES; break; fi; sleep 1; done; echo TC2_PEER=$reached'
 else
   echo "TC2_PEER=peer-ip-unavailable"
 fi
