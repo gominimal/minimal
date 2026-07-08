@@ -110,9 +110,22 @@ New functions:
 - `pub fn mount_state_volume(device: &str) -> io::Result<()>`:
   - Opens `device` and reads the ext4 magic word at byte offset 1080 (`0x53EF`).
   - If the magic word is **absent** (blank/uninitialized volume): shells out to
-    `mkfs.ext4 -F <device>`. A mkfs failure is fatal (returns `Err`). mkfs runs
-    only when no ext4 signature is present — never when one exists, so a
-    persistent session disk is never reformatted out from under its data.
+    `mkfs.ext4 -F <device>`, hardened per the empirical findings in #672:
+    - **Undersize guard:** reject a device below a 16 MiB floor
+      (`MKFS_MIN_DEVICE_BYTES`) with `Err` *before* invoking mkfs, rather than
+      handing `mkfs.ext4` a nonsensical block count.
+    - **Trailing margin:** size the filesystem ~1 MiB (`MKFS_MARGIN_BYTES`)
+      below the device via an explicit block count, so it survives libkrun's
+      backing-file trailer shave. Found via a 3-boot persistence test — without
+      the margin the volume fails to re-mount on the next boot.
+    - **No lazy-init storm:** `-E lazy_itable_init=0,lazy_journal_init=0` zeroes
+      the inode table and journal at format time instead of via a background
+      `ext4lazyinit` thread that competes with first-boot build I/O; combined
+      with a reduced inode ratio (`-i 65536`) the eager init stays cheap.
+
+    A mkfs failure is fatal (returns `Err`). mkfs runs only when no ext4
+    signature is present — never when one exists, so a persistent session disk
+    is never reformatted out from under its data.
   - If the magic word is **present**: mounts the existing filesystem; the ext4
     journal replays any unclean-shutdown state on mount. Never mkfs. If the
     mount fails, run `e2fsck -p <device>` and retry the mount once; if it still
@@ -286,7 +299,7 @@ crash-recovery data-loss window. `full` is preserved as a tunable via
 | rename-exchange-ext4 | `renameat2(RENAME_EXCHANGE)` is supported by the ext4 guest filesystem and available in the guest kernel image | settled | Linux kernel: RENAME_EXCHANGE added in Linux 3.15; ext4 documented support; the same virtio-linux guest kernel already enables modern features (user namespaces, hakoniwa sandbox builds) requiring ≥ Linux 3.8 | R3.3 |
 | shutdown-rpc-reachable | The Shutdown RPC is reachable from `minvmd stop` via the existing host UDS ↔ guest vsock bridge | settled | `VmConfig::apply()` registers the host UDS → guest vsock bridge at VSOCK_BRIDGE_PORT; Shutdown RPC handler exists in `server.rs` merged via PR #613 (informed by #613); `stop.rs` reaches the same host UDS via `sock::resolve_uds_path()` | R2.3 |
 | syncfs-bounded-flush | `syncfs(2)` on the `/var/lib/minimal` mount causes the ext4 journal to flush to the block device within a bounded time well under the 10-second quiesce timeout | settled | Linux semantics: `syncfs` is a blocking syscall that waits for all dirty pages and journal entries to reach the underlying block device; ext4 journal is sized (default 128 MiB) to flush quickly at modern I/O rates | R2.1, R2.2 |
-| lifecycle-vsock-persistent | A persistent guest→host vsock connection for `SessionLifecycle` events is feasible using the same mechanism as `BOOT_MARKER_PORT` | settled | The boot-marker uses guest→host vsock connect + write + close; a persistent connection (connect, keep open, stream events) uses the same kernel vsock path without closing; vsock is a full-duplex socket type, not a one-shot pipe | R3.5 |
+| lifecycle-vsock-persistent | A persistent guest→host vsock connection for `SessionLifecycle` events is feasible using the same mechanism as `BOOT_MARKER_PORT` | needs-spike | Contradicted by #588: libkrun's vsock device wedges when a guest→host connection overlaps a host→guest one. The boot-marker is safe only because it is connect→write→**close** *before* the SSH bridge is used; a connection held open for the VM's lifetime overlaps every host→guest SSH/attach and hits the wedge continuously — not just at boot. This is the same failure mode that red-lit autospawn-e2e on #672 (an awaited best-effort expose serialized vsock use and dodged the wedge; detaching it exposed it as `ssh connect: Disconnected`). The lifecycle channel needs a wedge-safe transport — a one-shot/serialized guest→host emit or a host-initiated poll — not a held-open socket. Spike the transport before R3.5 planning. | R3.5 |
 
 ## Knowledge gaps
 
@@ -299,6 +312,13 @@ crash-recovery data-loss window. `full` is preserved as a tunable via
 codebase for atomic directory swap via `RENAME_EXCHANGE`. The system call is
 well-documented (Linux 3.15+, `man 2 renameat2`); the pattern is standard
 for atomic directory replacement.
+
+**Open spike: `SessionLifecycle` vsock transport (`lifecycle-vsock-persistent`).**
+The libkrun vsock device wedges under concurrent guest→host and host→guest
+connections (#588). A held-open guest→host lifecycle socket would collide with
+the host→guest SSH/attach bridge continuously — the same failure that broke
+autospawn-e2e on #672. Spike a wedge-safe transport (one-shot/serialized emit,
+or host-initiated poll) before committing R3.5 to a persistent connection.
 
 **Referenced prior work.** Precursor PR #573 (closed WIP: seeded cache disk +
 workspace upload) is referenced throughout the spec but not available in the
