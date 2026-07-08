@@ -93,10 +93,11 @@ pub const DEFAULT_VM_RAM_MIB: u32 = 4096;
 /// empty, or zero value falls back to [`DEFAULT_VM_RAM_MIB`].
 ///
 /// Note: the RAM stop-gap is *not* reduced when the cache moves to the writable
-/// volume in this unit — a reduced baseline is only safe once a failed volume
-/// mount is fatal (no silent tmpfs fallback), which is Unit 2 (R2.4). Reducing
-/// RAM here would leave a mount-failed VM at half RAM with the cache still on the
-/// tmpfs. The reduction is deferred to Unit 2, alongside a measured floor.
+/// volume. A reduced baseline is only safe once a failed volume mount is fatal
+/// (no silent tmpfs fallback) and the floor is measured against real in-VM build
+/// memory pressure; reducing it here would leave a mount-failed VM at half RAM
+/// with the cache still on the tmpfs. Out of scope for this feature — deferred to
+/// a separate memory-pressure spec.
 #[must_use]
 pub fn vm_ram_mib() -> u32 {
     std::env::var(VM_RAM_MIB_ENV)
