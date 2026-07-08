@@ -84,10 +84,13 @@ fn main() {
 fn emit_rpaths(target_os: &str, prefix: &str) {
     let is_release = std::env::var("PROFILE").as_deref() == Ok("release");
 
-    // 1. Binary-relative: finds libkrun shipped alongside a relocated binary
-    //    (release-staged `bin/libkrun.1.dylib`). dyld honours it only for an
-    //    `@rpath/` load command — the macOS release rewrites minvmd's to that.
-    //    Recorded verbatim (literal argv token, no shell expansion).
+    // 1. Binary-relative: finds a libkrun shipped alongside a relocated binary
+    //    (e.g. a dev build with the dylib next to it). dyld honours it only for an
+    //    `@rpath/` load command — the macOS release rewrites minvmd's to that. The
+    //    macOS *release* stages the dylib in a `lib/` sibling of `bin/` and
+    //    retargets this very entry to `@loader_path/../lib` post-build (see
+    //    release.yml), so the same rpath covers the dev layout here and the ship
+    //    layout there. Recorded verbatim (literal argv token, no shell expansion).
     rpath(if target_os == "macos" {
         "@loader_path"
     } else {

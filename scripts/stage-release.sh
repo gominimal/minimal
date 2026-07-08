@@ -92,8 +92,9 @@ fi
 # One entry per (component, os, arch) variant the installer should place, as
 # `component|os|arch|kind|dest|artifact-basename`:
 #   - os/arch use the installer's normalized names (linux|darwin, amd64|arm64).
-#   - dest is `<prefix-token>/<subpath>`; the installer maps `bin`  -> ~/.local/bin
-#     and `data` -> ~/.local/share/minimal, and marks anything under `bin` +x.
+#   - dest is `<prefix-token>/<subpath>`; the installer maps `bin`  -> ~/.local/bin,
+#     `lib` -> ~/.local/lib (a bin sibling, for @rpath/../lib), and `data` ->
+#     ~/.local/share/minimal, and marks anything under `bin` +x.
 #   - artifact-basename is the file's name inside ARTIFACTS_DIR (the release
 #     workflow's merge-multiple flattens every upload to its basename).
 #
@@ -114,11 +115,10 @@ COMPONENTS=(
     "minimal|darwin|arm64|file|bin/minimal|minimal-macos-arm64"
     "minvmd|darwin|arm64|file|bin/minvmd|minvmd-macos-arm64"
     # The trimmed libkrun minvmd links against (built by the release workflow's
-    # build-libkrun-macos-arm64 job), staged into bin/ next to minvmd. Basename
-    # MUST be libkrun.1.dylib: minvmd's load command is @rpath/libkrun.1.dylib and
-    # @loader_path (bin/) is its first rpath, so the loader looks for that exact
-    # name beside the binary.
-    "libkrun|darwin|arm64|file|bin/libkrun.1.dylib|libkrun-macos-arm64.dylib"
+    # build-libkrun-macos-arm64 job), staged into lib/ (ie: minvmd/../lib).
+    # Basename MUST be libkrun.1.dylib: minvmd's load command is @rpath/libkrun.1.dylib
+    # and the release job adds a @loader_path/../lib rpath.
+    "libkrun|darwin|arm64|file|lib/libkrun.1.dylib|libkrun-macos-arm64.dylib"
     "gvproxy|darwin|arm64|file|bin/gvproxy|gvproxy-darwin-arm64"
     "initramfs|darwin|arm64|file|data/initramfs.cpio|initramfs-arm64.cpio"
     "rootfs|darwin|arm64|file|data/rootfs.img|rootfs-arm64.img"
