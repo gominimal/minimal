@@ -72,12 +72,13 @@ Provisioning is guest-driven on first boot: the host creates a sparse raw file;
 the guest probes for an ext4 superblock and runs `mkfs.ext4` only when none is
 found (idempotent). Subsequent boots detect the filesystem and skip mkfs.
 
-A **`VolumeProvisioner` abstraction** (`ensure(vm_id, size) -> image_path`,
-idempotent) isolates the host-side materialization strategy from the guest boot
-path. The guest keys exclusively off superblock detection, never off a "disk is
-blank" assumption. This is the Phase 2 forward-compat requirement: replacing
-`BlankRawProvisioner` with a `ReflinkProvisioner` (deferred) is a pure
-host-side swap with no guest or boot-path change (informed by #583).
+Host provisioning is a single idempotent function, `ensure_sparse_raw(path,
+size)`: the materialization strategy is decoupled from the guest boot path not by
+an abstraction but by the contract itself — the guest keys exclusively off
+superblock detection, never off a "disk is blank" assumption. A future Phase-2
+reflink/CoW provisioner is therefore a pure host-side swap (a different way to
+create the image at that path) with no guest or boot-path change (informed by
+#583); it does not need a trait to be introduced up front.
 
 Clean shutdown requires a quiesce step — the guest `syncfs` + volume unmount
 before VMM teardown — because today every stop is an unclean unmount: `minvmd
@@ -141,7 +142,7 @@ trees on a shared writable ext4 volume. Introduces the host provisioner, the
 **Affected areas:**
 - `crates/minvmd/src/krun/raw.rs` — `krun_add_disk3` FFI declaration
 - `crates/minvmd/src/krun/ctx.rs` — `Context::add_disk_with_sync` wrapper
-- `crates/minvmd/src/volume.rs` (new) — `VolumeProvisioner` trait + `BlankRawProvisioner`
+- `crates/minvmd/src/volume.rs` (new) — `ensure_sparse_raw` + `resolve_data_volume_path`
 - `crates/minvmd/src/vm.rs` — attach `/dev/vdb` via `add_disk_with_sync`
 - `crates/minimald/src/guest.rs` — `mount_state_volume("/dev/vdb")` in `enter_rootfs`
 - `crates/minimald/src/main.rs` — state dir paths → `/var/lib/minimal`
@@ -177,30 +178,32 @@ trees on a shared writable ext4 volume. Introduces the host provisioner, the
   `sync_mode: SyncMode` and delegates to `raw::krun_add_disk3` via the same
   `CString` construction and `check_backend` error translation as `add_disk`.
 
-- **R1.3**: `crates/minvmd/src/volume.rs` (new file) shall define a
-  `VolumeProvisioner` trait:
+- **R1.3**: `crates/minvmd/src/volume.rs` (new file) shall provide a single
+  idempotent provisioning function
   ```rust
-  pub trait VolumeProvisioner {
-      fn ensure(&self, vm_id: &str, size_bytes: u64) -> Result<PathBuf, VolumeError>;
-  }
+  pub fn ensure_sparse_raw(path: &Path, size_bytes: u64) -> Result<(), VolumeError>;
   ```
-  and a `BlankRawProvisioner` implementation that creates a sparse raw file at a
-  deterministic path (e.g. `<state_dir>/volumes/<vm_id>.raw`) sized `size_bytes`
-  via `fallocate(FALLOC_FL_KEEP_SIZE)` (Linux) or `ftruncate` (macOS/Linux
-  portable fallback). The call is idempotent: if the file already exists at the
-  expected size, `ensure` returns its path immediately. Error type `VolumeError`
-  shall be a `thiserror`-derived typed enum. The default volume size shall be a
-  named constant defaulting to 32 GiB, overridable via the `MINVMD_VOLUME_BYTES`
-  environment variable.
+  that creates a sparse raw file at the **literal `path`** (sized via
+  `ftruncate`/`File::set_len`, which is sparse on both APFS and ext4) when it is
+  missing, and leaves an existing image untouched (never resized in place —
+  shrinking would truncate a guest-formatted ext4, and growing the file does not
+  grow the filesystem). `VolumeError` shall be a `thiserror`-derived typed enum.
+  A companion `resolve_data_volume_path()` shall resolve the image path from
+  `MINVMD_DATA_VOLUME_PATH` (explicit override, used verbatim) or, unset, a
+  default beside minvmd's state dir (`<state>/data-vol.raw`, honouring
+  `XDG_STATE_HOME`). The default volume size is a named constant defaulting to
+  32 GiB, overridable via `MINVMD_VOLUME_BYTES`. No trait/abstraction is
+  introduced — a future Phase-2 provisioner swaps the creation strategy behind
+  this same function/path contract (see Design Considerations and Non-Goals).
 
 - **R1.4**: `crates/minvmd/src/vm.rs` shall call `ctx.add_disk_with_sync` after
   the existing `ctx.add_disk("root", ...)` call to attach the writable volume as
   `"data"` at `read_only=false`, with `direct_io` and `sync_mode` resolved from
-  the tunables in R1.9 (default `sync_mode=true, direct_io=false`). The volume
-  path is resolved by calling `BlankRawProvisioner::ensure(vm_id, size)` before
-  constructing the `Context`. `vm_id` is derived from the state directory path
-  (a stable per-VM identifier). The volume path is stored in `VmConfig` or
-  passed through as a field; it must be passed to the VMM child process.
+  the tunables in R1.9 (default `sync_mode=relaxed, direct_io=false`). The volume
+  is attached **on every boot** (not gated behind an env var): the VMM child
+  resolves the path via `resolve_data_volume_path()`, provisions it with
+  `ensure_sparse_raw` before constructing the `Context`, and stores it on
+  `VmConfig`, which passes it to the VMM child process.
 
 - **R1.5**: `crates/minimald/src/guest.rs` shall add a `mount_state_volume(device: &str)`
   function and call it from `enter_rootfs` immediately after the `/dev/vda` RO
@@ -462,8 +465,10 @@ the host-side mapping from session id to volume image.
 ## Non-Goals
 
 - **Phase 2 (host-FS reflink CoW) and Phase 3 (single writable root).** Deferred.
-  The `VolumeProvisioner` seam (R1.3) and guest superblock-detection (R1.5) keep
-  Phase 2 a pure host-side swap with no guest/boot-path change — but note it
+  The `ensure_sparse_raw` function/path contract (R1.3) and guest
+  superblock-detection (R1.5) keep Phase 2 a pure host-side swap — a different
+  image-creation strategy behind the same function — with no guest/boot-path
+  change; but note it
   carries a Linux host-FS prerequisite: APFS `clonefile` works by default on
   macOS, whereas ext4 has no reflink, so a Linux host would need xfs-with-reflink
   or btrfs (#647). The RAW Phase-1 volume has no such constraint.
@@ -610,7 +615,7 @@ staging directory is adjacent to the live worktree on the same volume, making
 
 ## Open Questions
 
-1. **Volume size default.** 32 GiB as a default for `BlankRawProvisioner` is a
+1. **Volume size default.** 32 GiB as the default volume size is a
    guess; ext4 thin-provisions within the sparse file so the host only allocates
    blocks actually written. Is 32 GiB the right ceiling, or should the first
    Sprint ship with a smaller default and let it be tunable via `MINVMD_VOLUME_BYTES`?
