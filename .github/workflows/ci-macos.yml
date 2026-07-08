@@ -157,6 +157,14 @@ jobs:
                     echo "::error::runner libkrun lacks krun_add_disk3 (need >= 1.19.0); upgrade with: brew upgrade slp/krun/libkrun" >&2
                     exit 1
                   fi
+            - name: Fetch gvproxy switch
+              # The Auto-spawn step's `minimal ls` boots the guest, which publishes its
+              # host-side proxy via the host gvproxy over the vsock shuttle. Without a
+              # gvproxy that publish blocks until its control-request timeout, delaying
+              # the SSH accept loop past the CLI's connect-retry deadline (cold `ls`
+              # then fails with `ssh connect: Disconnected`). Provisioning gvproxy — as
+              # a real host has — lets the publish complete immediately.
+              run: scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
             - name: Download virtio-linux kernel
               uses: actions/download-artifact@v8
               with:
@@ -220,6 +228,10 @@ jobs:
                   export MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz"
                   export MINVMD_ROOTFS_PATH="$RUNNER_TEMP/rootfs/rootfs.img"
                   export MINVMD_INITRAMFS="$RUNNER_TEMP/initramfs/initramfs.cpio"
+                  # Host gvproxy (as on a real host) so the guest's boot-time host-side
+                  # proxy publish completes immediately instead of blocking the SSH
+                  # accept loop on its gvproxy control-request timeout.
+                  export MINVMD_GVPROXY_BIN="$RUNNER_TEMP/gvproxy"
                   # Capture the guest console; this env var propagates through the
                   # minimal -> `minvmd run --detach` -> `minvmd run` -> __krun-vmm chain,
                   # so the silent detached supervisor's boot is still observable here.
