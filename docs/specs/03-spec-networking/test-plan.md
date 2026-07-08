@@ -41,12 +41,13 @@ N/A in its column; only TC16 tests the DM5 delta.
 | TC12 UC5 `vm_egress` (R2.5) | BLOCKED(G-N3) | BLOCKED(G-N3)‡ | BLOCKED(G-N3) | BLOCKED(G-N3) | N/A |
 | TC13 UC3 per-PTask egress (R2.1/R2.2) | BLOCKED(G-N4) | BLOCKED(G-N4) | BLOCKED(G-N4) | BLOCKED(G-N4) | N/A |
 | TC14 R2.4 dynamic port-map | BLOCKED(G-N5) | BLOCKED(G-N5) | BLOCKED(G-N5) | BLOCKED(G-N5) | N/A |
-| TC15 DM4 co-residency | N/A | N/A | N/A | RUNNABLE (partial, G-N1) | N/A |
+| TC15 DM4 co-residency | N/A | N/A | N/A | RUNNABLE | N/A |
 | TC16 DM5 remote authenticated access (UC2c) | N/A | N/A | N/A | N/A | SPEC-GAP(G-N2) |
 | TC17 UC7 mesh data path (R4.1–R4.3) | BLOCKED(G-N6) | BLOCKED(G-N6) | BLOCKED(G-N6) | BLOCKED(G-N6) | BLOCKED(G-N6) |
 
-† On DM4 the `:7654`/`:7655` proxies belong to whichever daemon bound them first
-(G-N1); TC3/TC7 run against that daemon only.
+† On DM4 the VM daemon owns the well-known `:7654`/`:7655` and the native daemon
+owns the disjoint `:7656`/`:7657` (G-N1 fixed, #627); TC3/TC7 pass against the VM
+daemon and TC15 additionally drives the native daemon's proxy.
 ‡ On DM2 the R2.5 *rejection* half is what applies; it is unit-tested
 (`VmConfig::validate_for`) but has no runtime trigger yet (G-N3).
 
@@ -130,17 +131,19 @@ N/A in its column; only TC16 tests the DM5 delta.
 
 ### DM4 — DM2 + DM3 combined on one Linux host
 
-- **Bring-up:** no `just dm4` target exists; compose it: `just dm3` **then**
-  `just dm2`. The control planes do not collide — the VM daemon is reached via
-  the bridged `providers/local-0/ssh.sock` under the default state dir, the
-  native daemon via `--minimal-dir .scratch/dm2-state`.
-- **Known defect (G-N1):** both daemons hardcode the proxy ports —
-  `crates/minimald/src/net/proxy.rs:31-39` — and the bind is warn-only
-  best-effort (`proxy.rs:154-172`), so whichever daemon starts first owns
-  `127.0.0.1:7654/7655`; the loser's UC2a/UC2b surface silently vanishes.
-  TC15 asserts this observably rather than pretending it works.
+- **Bring-up:** `just dm4` (= `just dm3` **then** `just dm2 7656 7657`). The VM
+  daemon owns the well-known `:7654`/`:7655`; the native daemon takes the disjoint
+  pair `:7656`/`:7657` via `--egress-proxy-port`/`--https-proxy-port`. The control
+  planes do not collide — the VM daemon is reached via the bridged
+  `providers/local-0/ssh.sock` under the default state dir, the native daemon via
+  `--minimal-dir .scratch/dm2-state`.
+- **G-N1 fixed (#627, 2026-07-08):** the proxy ports are a per-daemon override
+  (`crates/minimald/src/net/proxy.rs` `resolve_egress_proxy_port`/
+  `resolve_https_proxy_port`; unset ⇒ the well-known 7654/7655), so both daemons
+  serve their UC2a/UC2b surface concurrently without contention. TC15 verifies
+  both proxies bind and drives a UC2a request through the native daemon's `:7656`.
 - **Expected topology (TC10):** both DM2 and DM3 shapes simultaneously; exactly
-  one listener each on `:7654`/`:7655`.
+  one listener each on `:7654`/`:7655` (VM) **and** `:7656`/`:7657` (native).
 - **Runs on:** same hosts as DM3 (KVM required for the VM half).
 
 ### DM5 — any of the above, network-accessible + authenticated
@@ -259,6 +262,34 @@ TC16 specifies the tests that activate when DM5 lands.
 >   reap, which is what pinned the mechanism. Needs daemon-side teardown-path
 >   tracing (who reaps `dev`).
 
+> **Re-run (2026-07-08, G-N1 fix + full DM2/DM3/DM4 matrix) — Linux/aarch64 KVM
+> host.** Rebuilt with the G-N1 per-daemon proxy-port override (#627) and re-ran
+> all three runnable DMs.
+> - **G-N1 fixed and verified on DM4:** TC10 shows one listener each on `:7654`/
+>   `:7655` (VM daemon) **and** `:7656`/`:7657` (native daemon); the native proxy
+>   binds `status="reachable"` (no `Address already in use`); `TC15_NATIVE_PROXY=200`
+>   reaches the native daemon's own-ip ingress session by hostname through its
+>   `:7656`. No regression: DM2 standalone and the DM1/DM3 in-VM daemon keep the
+>   well-known 7654/7655 (the unset default).
+> - **DM2 (native):** TC1–TC7, TC9, TC10 PASS (TC3/TC4/TC7 = 200/200/200+401);
+>   TC8 = 000 — the G-N13 session-liveness race (`dev` reaped before the
+>   `ssh-forward` curl lands), unrelated to G-N1.
+> - **DM3 (fresh KVM VM):** TC1–TC10 PASS, all four host→PTask legs green
+>   (TC3/TC4/TC7/TC8 = 200/200/(401+200)/200) — the clean reference for the VM
+>   forwarding path.
+> - **DM4 (VM + native):** the G-N1 assertions all PASS (above); the VM daemon's
+>   own host→PTask legs are **run-to-run flaky** — across passes TC3 was 200 every
+>   time, but TC4 (ingress forward), TC7-with-cert (mTLS backend leg) and TC8
+>   (`ssh-forward`) each failed on some passes with `Empty reply from server` /
+>   `Connection reset`. This is **consistent with the G-N13 session-liveness race**
+>   (the held session/backend is reaped before the host probe completes): DM4's
+>   heavier co-resident load tightens the reap window enough that even TC4/TC7's
+>   curls miss it, where the lighter fresh single-VM DM3 pass lands inside it (all
+>   four green). It is **not a G-N1 regression** — proxy *binding* is orthogonal,
+>   and the proxy DNS path TC3 and the native `:7656` proxy are 200 throughout. The
+>   fresh DM3 pass is the clean baseline; confirming the reap trigger on the
+>   TC4/TC7 legs is part of the open G-N13 teardown-race investigation.
+
 Verdicts from `test-plan.sh` runs. **DM2 and DM3 columns: 2026-07-07 `DM=dm2` /
 `DM=dm3` runs on a native Linux/aarch64 host** (Ubuntu; unprivileged userns
 unblocked via `kernel.apparmor_restrict_unprivileged_userns=0`; KVM + libkrun
@@ -289,7 +320,7 @@ driver-independent.
 | TC8 ssh-forward | **FAIL 000** — connection reset through the forward (see note) | **PASS 200** — through the ssh-forward → `lease:8080` (2026-07-07); a 2026-07-08 re-run saw **000** (the session-liveness race G-N13, not a `direct-tcpip`/lease defect — unrelated to G-N8) | **PASS 200** — G-N8 fixed 2026-07-08 (ssh-forward → `direct-tcpip` → `lease:8080`, validating the G-N9 lease route on the VM path) | = DM3 (VM daemon) |
 | TC9 mesh CLI | PASS — status/join/leave OK | PASS — status/join/leave OK | PASS — status/join/leave OK | = DM3 (VM daemon) |
 | TC10 preflight | PASS — minvmd + gvproxy running; 1 listener each on :7654/:7655 | PASS — native minimald; no minvmd; UDS present | PASS — `/dev/kvm` OK; minvmd running | PASS — both control planes answer; **exactly 1** listener each on :7654/:7655 (G-N1) |
-| TC15 co-residency | N/A | N/A | N/A | **PASS** — both daemons serve isolated sessions concurrently; the 2nd daemon (native) loses the proxy bind with `Address already in use`, one :7654 listener remains (G-N1 observed) |
+| TC15 co-residency | N/A | N/A | N/A | **PASS (2026-07-08, G-N1 fixed)** — both daemons serve isolated sessions concurrently and each binds its own proxy pair (VM `:7654`/`:7655`, native `:7656`/`:7657`, one listener each; native bind `status="reachable"`, no contention); `TC15_NATIVE_PROXY=200` reaches the native daemon's own-ip session by hostname through its `:7656` proxy |
 | TC12–TC14, TC16–TC17 | SKIP (blocked/gap — see matrix) | SKIP | SKIP | SKIP |
 
 **Cross-DM finding — CORRECTED (2026-07-07).** The earlier "host→PTask ingress
@@ -332,10 +363,16 @@ lease:8080`). DM4's VM half mirrors DM3. **Remaining runtime gap:** DM1 (macOS/H
 is off the Linux dev host, so the DM1 verdicts predate this fix (DM1 was never
 G-N8-affected — HVF delivers the forwarder response).
 
-*DM4 (co-residency) → G-N1.* TC15 PASS: both control planes serve isolated
-sessions concurrently; the second daemon to start (native) loses the hardcoded
-`:7654`/`:7655` bind (`Address already in use (os error 98)`, exactly one
-listener remains), confirming G-N1 observably rather than accepting it.
+*DM4 (co-residency) → G-N1 FIXED (2026-07-08, #627).* TC15 PASS: both control
+planes serve isolated sessions concurrently and each serves its own proxy
+surface — the VM daemon on `:7654`/`:7655`, the native daemon on the disjoint
+`:7656`/`:7657` (`--egress-proxy-port`/`--https-proxy-port`; unset ⇒ the
+well-known ports). Both bind `status="reachable"` (no `Address already in use`),
+and `TC15_NATIVE_PROXY=200` reaches an own-ip ingress session by hostname through
+the native daemon's `:7656`. The `:7654`/`:7655` well-known ports and every
+existing single-tenant client are unchanged; proxy-port *discovery* for a
+co-resident daemon is intentionally out of scope (minimald is single-tenant per
+host).
 
 Historical note (unchanged): host→guest reachability uses the published-loopback
 model — the daemon is **not** on the switch; host→PTask goes through a
@@ -566,7 +603,7 @@ by this plan.
 
 | ID | Blocks | What's missing | Evidence |
 |----|--------|----------------|----------|
-| G-N1 | TC15; TC3/TC7 on DM4 | Proxy ports `7654`/`7655` hardcoded, no per-instance override; bind is warn-only so the second daemon silently loses its UC2a/UC2b surface | `crates/minimald/src/net/proxy.rs:31-39`, `:154-172` |
+| G-N1 | TC15; TC3/TC7 on DM4 | **FIXED 2026-07-08 (#627).** Added a per-daemon proxy-port override — `minimald --egress-proxy-port`/`--https-proxy-port` (both-or-neither via clap `requires`), threaded through `Config` into `start_host_proxies`; unset resolves bit-for-bit to the well-known 7654/7655 (instance-0 client contract preserved). A co-resident second daemon takes a disjoint pair (7656/7657). **Verified live on DM4 (KVM host):** TC10 shows one listener each on `:7654`/`:7655` (VM) **and** `:7656`/`:7657` (native); the native proxy binds `status="reachable"` with no contention; `TC15_NATIVE_PROXY=200` reaches an own-ip ingress session by hostname through the native daemon's `:7656`. Client-side *discovery* of a co-resident daemon's ports is intentionally out of scope (minimald is single-tenant per host). Reviewed via an adversarial cross-DM/API/harness pass before commit. | `crates/minimald/src/net/proxy.rs` (`resolve_egress_proxy_port`/`resolve_https_proxy_port`); `server.rs` (`start_host_proxies`); `main.rs` (`ListenArgs`) |
 | G-N2 | TC16, all of DM5 | No `--server`/hostname in the CLI; UDS-only control plane; proxies loopback-only; bridge doc forbids naive TCP exposure | `crates/minimal/src/main.rs:165-182`; `crates/minimal/src/client.rs`; `01-spec-minvmd-host-daemon.md:445-447` |
 | G-N3 | TC12 (UC5/R2.5) | `vm_egress` has types + validation but no runtime config surface, and enforcement is pending #553 | `crates/minvmd/src/vm.rs:119-150`; `crates/minvmd/src/cmd/vmm_child.rs:8-10` |
 | G-N4 | TC13 (UC3/R2.1/R2.2) | No CLI/spec surface for per-PTask egress; hardcoded `egress: None` | `crates/minimal/src/main.rs:459` |
