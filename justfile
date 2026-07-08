@@ -3,10 +3,13 @@
 # Recipes are grouped by crate where they're crate-specific.
 
 scratch     := justfile_directory() / ".scratch"
-# Host CPU arch — drives the materialized guest artifacts and the musl target.
-# aarch64 on Apple Silicon; x86_64 on most Linux hosts.
+# Host CPU arch in Rust naming (aarch64 on Apple Silicon; x86_64 on most Linux
+# hosts) — drives the musl cross-compile target.
 arch        := arch()
 musl-target := arch + "-unknown-linux-musl"
+# Same arch in the OCI naming `minimal materialize --arch` expects (arm64/amd64,
+# not aarch64/x86_64) — drives the materialized guest artifacts.
+guest-arch  := if arch() == "aarch64" { "arm64" } else if arch() == "x86_64" { "amd64" } else { arch() }
 # Flat libkrun link/runtime prefix (Linux only; macOS uses the Homebrew install).
 krun-prefix := env_var('HOME') / ".krun"
 # Guest minimald networking features baked into the initramfs (R4.x): the HTTPS
@@ -56,12 +59,17 @@ artifacts:
     mkdir -p {{scratch}}
     case "$(uname -s)" in
       Darwin)
-        [ -f {{kernel}} ] || minimal materialize --output {{kernel}} --arch {{arch}} virtio-kernel
-        [ -f {{rootfs}} ] || minimal materialize --output {{rootfs}} --arch {{arch}} minvmd-rootfs
+        # The macOS `minimal` shim materializes inside a VM and only writes the
+        # artifact when --output is repo-RELATIVE: an absolute path silently
+        # builds the wrong arch and drops the kernel Image (copy: No such file).
+        # The recipe cwd is the repo root, so strip it to a relative path.
+        repo="$(pwd)"; kabs="{{kernel}}"; rabs="{{rootfs}}"
+        [ -f "$kabs" ] || minimal materialize --output "${kabs#"$repo/"}" --arch {{guest-arch}} virtio-kernel
+        [ -f "$rabs" ] || minimal materialize --output "${rabs#"$repo/"}" --arch {{guest-arch}} minvmd-rootfs
         ;;
       Linux)
-        [ -f {{kernel}} ] || scripts/fetch-artifact.sh virtio-kernel {{kernel}} {{arch}}
-        [ -f {{rootfs}} ] || scripts/fetch-artifact.sh minvmd-rootfs {{rootfs}} {{arch}}
+        [ -f {{kernel}} ] || scripts/fetch-artifact.sh virtio-kernel {{kernel}} {{guest-arch}}
+        [ -f {{rootfs}} ] || scripts/fetch-artifact.sh minvmd-rootfs {{rootfs}} {{guest-arch}}
         ;;
       *) echo "unsupported host $(uname -s)" >&2; exit 1 ;;
     esac
@@ -73,7 +81,7 @@ libkrun:
     #!/usr/bin/env sh
     set -eu
     case "$(uname -s)" in
-      Linux) scripts/fetch-libkrun.sh {{krun-prefix}} {{arch}} ;;
+      Linux) scripts/fetch-libkrun.sh {{krun-prefix}} {{guest-arch}} ;;
       *) echo "libkrun: macOS uses the Homebrew install; nothing to fetch" ;;
     esac
 
