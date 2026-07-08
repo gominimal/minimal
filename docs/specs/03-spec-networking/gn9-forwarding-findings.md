@@ -1,9 +1,16 @@
 # G-N9 re-investigation — host→PTask forwarding on DM1
 
-**Status:** findings + fix design. Code fix deferred (needs a Linux host to verify
-the DM2 branch). Supersedes the G-N9 characterization in `test-plan.md`.
+**Status:** fix **implemented** 2026-07-07 on branch
+`networking-test-plan-all-dms` (sandbox-owned lease routing). Supersedes the
+G-N9 characterization in `test-plan.md`. Verification: `cargo test -p minimald`
+green (incl. new lease-lifecycle/lease-routing unit tests) + a clean **DM2**
+regression. The in-VM lease branch is exercised by **unit tests only** at time
+of writing — DM1 (macOS) is off the Linux dev host, and DM3/DM4 runtime
+verification is blocked by the *separate* **G-N8** attach-hang (own-ip +
+`--ingress` session whose shell never starts). See
+[Implementation](#implementation-2026-07-07).
 
-**Date:** 2026-07-07. **Host:** macOS/HVF (DM1), clean `minimal3` stack
+**Findings date:** 2026-07-07. **Host:** macOS/HVF (DM1), clean `minimal3` stack
 (`just up`), libkrun VM, host gvproxy 0.8.8.
 
 ## TL;DR
@@ -73,7 +80,7 @@ distinct local port).
   in the daemon netns) — and the interim Part 1 change (route to
   `127.0.0.1:<external>`) does **not** fix it on DM1 for the same sub-break (ii).
 
-## The fix (design; not yet implemented)
+## The fix (implemented 2026-07-07)
 
 Route in-VM host→PTask consumers to the **lease over the switch** instead of host
 loopback. The daemon is on the switch (`100.64.255.253`) and can reach
@@ -110,25 +117,63 @@ loopback. The daemon is on the switch (`100.64.255.253`) and can reach
 4. **Keep the gvproxy forwarder** for pure host-direct access (TC4). It is not
    removed — only the in-VM consumers stop depending on it.
 
-### DM2 caveat (must verify on Linux)
+### DM2 caveat — RESOLVED (verified on Linux 2026-07-07)
 
 On DM2 (native, rootless hakoniwa/RustSlirp) gvproxy runs in the **daemon's**
-netns, so `127.0.0.1:<external>` is correct there and the daemon may **not** be
-able to reach the lease over the switch (the tap lives inside the sandbox's
-user+net namespace). The resolver therefore likely needs to be transport-aware:
+netns, so `127.0.0.1:<external>` is correct there. A `DM=dm2` run with a valid
+file-served backend confirmed the shared-netns forwarder works end-to-end
+(**TC3/TC4/TC7-cert/TC8 = 200/200/200/200**, no-cert = 401), so the resolver is
+**transport-aware** rather than unified:
 
-- **VM DMs (DM1/DM3/DM4):** dial `lease:<internal>` over the switch.
-- **DM2 (native):** keep `127.0.0.1:<external>` (shared-netns forwarder).
+- **VM DMs (DM1/DM3/DM4):** publish the lease; consumers dial `lease:<internal>`
+  over the switch.
+- **DM2 (native):** keep `127.0.0.1:<external>` (shared-netns forwarder) — the
+  loopback placeholder is left untouched, so DM2's verified behaviour is
+  unchanged.
 
-This branch cannot be verified on macOS (DM2 needs a Linux host). Pick this up
-where `ci-netns.yml` / a Linux runner can exercise both.
+The transport is discriminated by the switch control channel already in hand at
+attach: `ControlChannel::Vsock` (VM) publishes the lease; `ControlChannel::Unix`
+(DM2) does not.
 
-## Interim Part 1 change already in the tree
+## Interim Part 1 change — now completed by the lease routing
 
-`crates/minimald/src/connection.rs` `channel_open_direct_tcpip` was changed to
-stop connecting to the raw client target in the daemon netns and instead resolve
-the session's ingress mapping (`published_external_port`) and dial
+`crates/minimald/src/connection.rs` `channel_open_direct_tcpip` had earlier been
+changed to stop connecting to the raw client target in the daemon netns and
+instead resolve the session's ingress mapping (`published_external_port`) and dial
 `127.0.0.1:<external>`. That removed the arbitrary-connect behavior and added
-session-scoped validation (unit-tested), but it targets host loopback — wrong for
-DM1 — so it does **not** restore TC8 on the VM path. Step 2 above (dial the lease)
-is the completion.
+session-scoped validation (unit-tested), but it targeted host loopback — wrong for
+the VM path. The 2026-07-07 change keeps the published-mapping validation and, on
+the VM path, dials `lease:<internal>` instead (falling back to
+`127.0.0.1:<external>` on DM2 / when no live lease is published) — completing
+step 2.
+
+## Implementation (2026-07-07)
+
+Landed on branch `networking-test-plan-all-dms`. The lease is **ephemeral
+runtime state of the live sandbox**, published into the shared routing table for
+exactly the sandbox's lifetime and **never** persisted to the on-disk `Record`.
+
+- **`net/dns.rs`** — the hostname registry entry is now a
+  `Route { target, port_map }`. `set_own_ip_lease(session_id, lease, port_map)`
+  publishes a live lease + its TCP external→internal ingress map;
+  `clear_own_ip_lease(session_id)` reverts to the loopback placeholder;
+  `route_for_session(session_id)` reads it (keyed by stable id, rename-safe).
+- **`net/proxy.rs`** — `Router::route` remaps the authority's published external
+  port to the PTask-internal port via `Route::dial_port`, so the `:7654`/`:7655`
+  proxies dial `lease:<internal>`.
+- **`net/gvproxy_network.rs`** — `OwnIpGuard` owns the ephemeral `lease`;
+  `finish_own_ip_attach` publishes it **only on `ControlChannel::Vsock` (VM)**,
+  and teardown reverts it **before** the switch detach. DM2 (`Unix`) is untouched.
+- **`connection.rs`** — `direct-tcpip` dials the lease on the VM path (see above).
+- Threading: the manager's `hostnames` registry is made unconditional and passed
+  through `Session` → `SandboxLauncher` → the attach tail with the `session_id`.
+
+**Verification.** `cargo test -p minimald --features networking-proxy,networking-wg`
+→ 103 passed (incl. `own_ip_lease_is_published_only_between_attach_and_teardown`
+and `own_ip_lease_routes_to_switch_lease_with_internal_port`); `fmt` + `clippy
+-D warnings` clean; **DM2 regression re-run all-PASS** (TC3/4/7/8 = 200/200/200
++401/200), proving no native-path regression. The in-VM lease branch is
+covered by unit tests only: DM1 is off this Linux host and **DM3/DM4 are blocked
+by G-N8** (an own-ip + `--ingress` attach whose shell never starts, so the
+in-session backend never comes up — a *distinct* failure from this routing fix).
+G-N8 must be pinned before DM3/DM4 can confirm TC3/TC7/TC8 = 200 on the VM path.
