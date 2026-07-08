@@ -20,5 +20,9 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-minvmd = { path = "../minvmd" }
+# default-features = false drops minvmd's `libkrun` feature: the CLI only uses
+# the client helpers (sock/lifecycle) and calls no krun code, so it must not
+# inherit libkrun's `#[link]` load command (would make it unloadable without
+# libkrun).
+minvmd = { path = "../minvmd", default-features = false }
 ot.workspace = true

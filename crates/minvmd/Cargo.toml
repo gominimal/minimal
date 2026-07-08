@@ -4,6 +4,14 @@ version = "0.0.1"
 edition.workspace = true
 publish.workspace = true
 
+[features]
+default = ["libkrun"]
+# Compile the real VM backend (the `krun` module's `#[link(name = "krun")]` +
+# build.rs link/rpath wiring). On by default; the `minimal` CLI opts out with
+# default-features = false so libkrun's load command isn't stamped into a binary
+# that calls no krun code.
+libkrun = []
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

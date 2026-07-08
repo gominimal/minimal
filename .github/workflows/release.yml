@@ -229,19 +229,12 @@ jobs:
             - name: Build release minvmd binary
               run: cargo build --release -p minvmd --bin minvmd
             - name: Point minvmd's libkrun load command at @rpath
-              # Linking against Homebrew's libkrun bakes its ABSOLUTE install name
-              # (/opt/homebrew/opt/libkrun/lib/libkrun.1.dylib) into minvmd as the
-              # load command. dyld resolves an absolute load command directly and
-              # NEVER consults the rpath, so the shipped bin/libkrun.1.dylib next to
-              # minvmd is ignored and the binary is unloadable on a host without that
-              # exact Homebrew keg. Rewrite the load command to `@rpath/…` so dyld
-              # walks minvmd's rpath instead: `@loader_path` (the adjacent shipped
-              # dylib) first, then `/opt/homebrew/lib` as a fallback (see the minvmd
-              # build.rs rpath ordering). Derive the current path from otool rather
-              # than hardcoding it, so a libkrun version/path bump can't silently
-              # skip the rewrite. install_name_tool invalidates the ad-hoc signature,
-              # so re-sign (the installer re-signs on download too, but keep the
-              # artifact valid in the meantime).
+              # Homebrew's libkrun bakes an ABSOLUTE install name into minvmd; dyld
+              # resolves it directly and never consults the rpath, ignoring the
+              # shipped bin/libkrun.1.dylib. Rewrite it to @rpath so dyld walks
+              # minvmd's rpath (@loader_path first, /opt/homebrew/lib fallback).
+              # Derive the path from otool so a libkrun bump can't skip the rewrite.
+              # install_name_tool breaks the signature, so re-sign.
               run: |
                   current="$(otool -L target/release/minvmd | awk '/libkrun/ {print $1; exit}')"
                   if [ -z "$current" ]; then
@@ -250,17 +243,41 @@ jobs:
                   fi
                   install_name_tool -change "$current" @rpath/libkrun.1.dylib target/release/minvmd
                   codesign --sign - --force target/release/minvmd
-            - name: Verify minvmd loads libkrun via @rpath
-              # Gate the release on the rewrite above having stuck: an absolute or
-              # bare load command here would ship an unloadable binary (this bug).
+            - name: Verify minvmd linkage
+              # libkrun must resolve via @rpath (rewrite stuck), and every other
+              # dependency must be a system library (/usr/lib or /System). A stray
+              # /opt/homebrew dep would fail to load off the build host.
               run: |
-                  otool -L target/release/minvmd | grep -i krun
+                  otool -L target/release/minvmd
                   if ! otool -L target/release/minvmd | grep -q '@rpath/libkrun\.1\.dylib'; then
                     echo "::error::minvmd does not reference @rpath/libkrun.1.dylib; the shipped dylib will not be found" >&2
                     exit 1
                   fi
+                  bad="$(otool -L target/release/minvmd | tail -n +2 | awk '{print $1}' \
+                    | grep -vE '^(/usr/lib/|/System/|@rpath/libkrun\.1\.dylib$)' || true)"
+                  if [ -n "$bad" ]; then
+                    echo "::error::minvmd links unexpected non-system libraries:" >&2
+                    printf '%s\n' "$bad" >&2
+                    exit 1
+                  fi
             - name: Build release minimal binary
+              # Separate cargo invocation from minvmd above, so its default
+              # `libkrun` feature can't unify into the CLI (which opts out via
+              # default-features = false). Gated next.
               run: cargo build --release -p minimal --bin minimal
+            - name: Verify minimal links only system libraries
+              # The CLI calls no libkrun (it spawns minvmd as a subprocess), so
+              # every dependency must be under /usr/lib or /System. A krun line
+              # means the default-features = false opt-out regressed.
+              run: |
+                  otool -L target/release/minimal
+                  bad="$(otool -L target/release/minimal | tail -n +2 | awk '{print $1}' \
+                    | grep -vE '^(/usr/lib/|/System/)' || true)"
+                  if [ -n "$bad" ]; then
+                    echo "::error::minimal links non-system libraries (allowed: /usr/lib, /System):" >&2
+                    printf '%s\n' "$bad" >&2
+                    exit 1
+                  fi
             - name: Rename binaries with platform suffix
               # download-artifact merge-multiple flattens on basename, so the uploaded
               # file must already carry the platform-suffixed name the release job expects.
