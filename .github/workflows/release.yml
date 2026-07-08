@@ -2,6 +2,9 @@ name: Release
 
 on:
     workflow_dispatch:
+    # Invoked by nightly.yml, which depends on this run completing before it
+    # flips the `nightly` channel. No behavior change for manual dispatch.
+    workflow_call:
 
 env:
     CARGO_TERM_COLOR: always
