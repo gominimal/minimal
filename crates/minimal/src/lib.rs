@@ -221,20 +221,20 @@ impl From<CliNetworkMode> for sessions::NetworkMode {
 /// Parse an `--ingress EXT:INT[/PROTO]` spec into a [`sessions::PortMapping`].
 /// PROTO defaults to tcp; only tcp/udp are accepted (gvproxy's static forwarder
 /// exposes no other transport).
-fn parse_ingress_mapping(spec: &str) -> Result<sessions::PortMapping, String> {
+fn parse_ingress_mapping(spec: &str) -> Result<sessions::PortMapping, anyhow::Error> {
     let (ports, proto) = match spec.split_once('/') {
         Some((ports, proto)) => (ports, parse_ingress_proto(proto)?),
         None => (spec, sessions::IpProto::Tcp),
     };
     let (ext, int) = ports
         .split_once(':')
-        .ok_or_else(|| format!("ingress '{spec}': expected EXT:INT[/PROTO]"))?;
+        .ok_or_else(|| anyhow::anyhow!("ingress '{spec}': expected EXT:INT[/PROTO]"))?;
     let external_port = ext
         .parse::<u16>()
-        .map_err(|_| format!("ingress '{spec}': invalid external port '{ext}'"))?;
+        .map_err(|_| anyhow::anyhow!("ingress '{spec}': invalid external port '{ext}'"))?;
     let internal_port = int
         .parse::<u16>()
-        .map_err(|_| format!("ingress '{spec}': invalid internal port '{int}'"))?;
+        .map_err(|_| anyhow::anyhow!("ingress '{spec}': invalid internal port '{int}'"))?;
     Ok(sessions::PortMapping {
         external_port,
         internal_port,
@@ -242,11 +242,11 @@ fn parse_ingress_mapping(spec: &str) -> Result<sessions::PortMapping, String> {
     })
 }
 
-fn parse_ingress_proto(proto: &str) -> Result<sessions::IpProto, String> {
+fn parse_ingress_proto(proto: &str) -> Result<sessions::IpProto, anyhow::Error> {
     match proto.to_ascii_lowercase().as_str() {
         "tcp" => Ok(sessions::IpProto::Tcp),
         "udp" => Ok(sessions::IpProto::Udp),
-        other => Err(format!(
+        other => Err(anyhow::anyhow!(
             "ingress: unsupported protocol '{other}' (use tcp or udp)"
         )),
     }
@@ -410,6 +410,43 @@ pub async fn connect_daemon(global: &GlobalArgs) -> Result<client::Client, anyho
         .context("Failed to connect to minimald")
 }
 
+/// A session reference parsed from a CLI string: either a UUID or a name.
+/// Used to build the typed request enums both `GetSessionRecord` and
+/// `GetSessionPolicy` expect.
+enum SessionLookup {
+    Id(sessions::SessionId),
+    Name(String),
+}
+
+impl SessionLookup {
+    /// Parse a user-supplied session string. If it parses as a UUID,
+    /// the lookup is by ID; otherwise by name.
+    fn parse(s: &str) -> Self {
+        match sessions::SessionId::parse_str(s) {
+            Ok(id) => Self::Id(id),
+            Err(_) => Self::Name(s.to_string()),
+        }
+    }
+}
+
+impl From<SessionLookup> for minimald_rpc::GetSessionRecordRequest {
+    fn from(l: SessionLookup) -> Self {
+        match l {
+            SessionLookup::Id(id) => Self::Id(id),
+            SessionLookup::Name(n) => Self::Name(n),
+        }
+    }
+}
+
+impl From<SessionLookup> for minimald_rpc::GetSessionPolicyRequest {
+    fn from(l: SessionLookup) -> Self {
+        match l {
+            SessionLookup::Id(id) => Self::Id(id),
+            SessionLookup::Name(n) => Self::Name(n),
+        }
+    }
+}
+
 /// Resolve a session by UUID or name, returning its record.
 ///
 /// Used by commands that need the full record before proceeding (destroy,
@@ -420,11 +457,7 @@ async fn resolve_session(
     session: &str,
 ) -> Result<sessions::Record, anyhow::Error> {
     use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
-    let lookup = if let Ok(id) = sessions::SessionId::parse_str(session) {
-        GetSessionRecordRequest::Id(id)
-    } else {
-        GetSessionRecordRequest::Name(session.to_string())
-    };
+    let lookup: GetSessionRecordRequest = SessionLookup::parse(session).into();
     let resp = client
         .oneshot_rpc::<GetSessionRecord>(lookup)
         .await
@@ -458,10 +491,15 @@ pub async fn cmd_proxy(args: ProxyArgs) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Ensure the minimald daemon is running, autospawning it if necessary.
+fn ensure_daemon(global: &GlobalArgs) -> Result<(), anyhow::Error> {
+    autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref())
+        .context("Failed to ensure the minimald daemon is running")
+}
+
 /// List sessions via the `ListSessions` RPC.
 pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Error> {
-    autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref())
-        .context("Failed to ensure the minimald daemon is running")?;
+    ensure_daemon(global)?;
 
     let mut client = connect_daemon(global).await?;
 
@@ -471,34 +509,47 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
         .await
         .context("ListSessions RPC failed")?;
 
+    format_ls(&mut std::io::stdout(), &args, &resp)?;
+    Ok(())
+}
+
+/// Format the session list for the given output mode. Split from
+/// [`cmd_ls`] so integration tests can capture output into a buffer
+/// instead of stdout.
+pub fn format_ls(
+    out: &mut impl std::io::Write,
+    args: &LsArgs,
+    resp: &minimald_rpc::ListSessionsResponse,
+) -> Result<(), anyhow::Error> {
     if args.json {
         let json =
-            serde_json::to_string_pretty(&resp).context("Failed to serialize session list")?;
-        println!("{json}");
+            serde_json::to_string_pretty(resp).context("Failed to serialize session list")?;
+        writeln!(out, "{json}")?;
         return Ok(());
     }
 
     if resp.sessions.is_empty() {
         if !args.raw {
-            println!("No active sessions.");
+            writeln!(out, "No active sessions.")?;
         }
         return Ok(());
     }
 
     if args.raw {
         for entry in &resp.sessions {
-            println!("{}", entry.id);
+            writeln!(out, "{}", entry.id)?;
         }
         return Ok(());
     }
 
     // Format as a table: ID, Name, Title, Last Activity.
     // Widths chosen to fit a standard 80-col terminal.
-    println!(
+    writeln!(
+        out,
         "{:<36}  {:<20}  {:<20}  LAST ACTIVITY",
         "SESSION ID", "NAME", "TITLE"
-    );
-    println!("{:-<36}  {:-<20}  {:-<20}  {:-<24}", "", "", "", "");
+    )?;
+    writeln!(out, "{:-<36}  {:-<20}  {:-<20}  {:-<24}", "", "", "", "")?;
 
     for entry in &resp.sessions {
         let id = entry.id.to_string();
@@ -522,7 +573,7 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
             }
             None => ("-", "-".to_string()),
         };
-        println!("{id:<36}  {name:<20}  {title:<20}  {last_activity}");
+        writeln!(out, "{id:<36}  {name:<20}  {title:<20}  {last_activity}")?;
     }
 
     Ok(())
@@ -667,8 +718,7 @@ async fn send_abort(client: &mut client::Client, session_id: sessions::SessionId
 
 /// Create a new session via the `CreateSession` RPC.
 pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), anyhow::Error> {
-    autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref())
-        .context("Failed to ensure the minimald daemon is running")?;
+    ensure_daemon(global)?;
 
     let project_path = std::fs::canonicalize(&args.path)
         .with_context(|| format!("Cannot resolve project path '{}'", args.path))?;
@@ -679,7 +729,7 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
 
     let mut port_mappings = Vec::with_capacity(args.ingress.len());
     for spec in &args.ingress {
-        let mapping = parse_ingress_mapping(spec).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mapping = parse_ingress_mapping(spec)?;
         port_mappings.push(mapping);
     }
     let policy = sessions::SessionPolicy {
@@ -745,7 +795,7 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
 }
 
 /// Shell-quote a string for safe interpolation into `sh -c`.
-pub fn shell_quote(s: &str) -> String {
+fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\"'\"'"))
 }
 
@@ -753,8 +803,7 @@ pub fn shell_quote(s: &str) -> String {
 /// shell out to `ssh` — the daemon's shell_request handler mints a PTY-backed
 /// session shell, and ssh handles termios/PTY management for us.
 pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), anyhow::Error> {
-    autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref())
-        .context("Failed to ensure the minimald daemon is running")?;
+    ensure_daemon(global)?;
 
     let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.minvmd)
         .context("Failed to resolve daemon socket path")?;
@@ -820,17 +869,12 @@ pub async fn cmd_session_policy(
     global: &GlobalArgs,
     args: PolicyArgs,
 ) -> Result<(), anyhow::Error> {
-    autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref())
-        .context("Failed to ensure the minimald daemon is running")?;
+    ensure_daemon(global)?;
 
     let mut client = connect_daemon(global).await?;
 
     use minimald_rpc::{GetSessionPolicy, GetSessionPolicyRequest};
-    let lookup = if let Ok(id) = sessions::SessionId::parse_str(&args.session) {
-        GetSessionPolicyRequest::Id(id)
-    } else {
-        GetSessionPolicyRequest::Name(args.session.clone())
-    };
+    let lookup: GetSessionPolicyRequest = SessionLookup::parse(&args.session).into();
 
     let resp = client
         .oneshot_rpc::<GetSessionPolicy>(lookup)
@@ -864,8 +908,7 @@ pub fn mesh_enrolment_path(global: &GlobalArgs) -> Result<PathBuf, anyhow::Error
 /// Show this minimald's WireGuard mesh status (R4.6): own public key, the
 /// switch subnets it advertises, and each peer's last handshake.
 pub async fn cmd_mesh_status(global: &GlobalArgs) -> Result<(), anyhow::Error> {
-    autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref())
-        .context("Failed to ensure the minimald daemon is running")?;
+    ensure_daemon(global)?;
 
     let mut client = connect_daemon(global).await?;
 
@@ -964,8 +1007,7 @@ pub fn cmd_mesh_leave(global: &GlobalArgs) -> Result<(), anyhow::Error> {
 
 /// Destroy (terminate) a session.
 pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), anyhow::Error> {
-    autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref())
-        .context("Failed to ensure the minimald daemon is running")?;
+    ensure_daemon(global)?;
 
     let mut client = connect_daemon(global).await?;
 
@@ -1016,8 +1058,7 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
 /// Resolves the session by UUID or name (like `destroy`), then issues
 /// the rename. The new name takes effect immediately in the live session.
 pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), anyhow::Error> {
-    autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref())
-        .context("Failed to ensure the minimald daemon is running")?;
+    ensure_daemon(global)?;
 
     let mut client = connect_daemon(global).await?;
 
@@ -1059,8 +1100,7 @@ pub async fn cmd_ssh_forward(
     global: &GlobalArgs,
     args: SshForwardArgs,
 ) -> Result<(), anyhow::Error> {
-    autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref())
-        .context("Failed to ensure the minimald daemon is running")?;
+    ensure_daemon(global)?;
 
     let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.minvmd)
         .context("Failed to resolve daemon socket path")?;
@@ -1130,8 +1170,7 @@ pub async fn cmd_ssh_forward(
 /// sign the certificate with its internal CA, and return both. The cert, key,
 /// and CA cert are written to `<cert_dir>/{client.pem,client.key,ca.pem}`.
 pub async fn cmd_login(global: &GlobalArgs, args: LoginArgs) -> Result<(), anyhow::Error> {
-    autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref())
-        .context("Failed to ensure the minimald daemon is running")?;
+    ensure_daemon(global)?;
 
     let mut client = connect_daemon(global).await?;
 

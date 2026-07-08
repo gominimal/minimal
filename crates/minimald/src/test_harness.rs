@@ -144,7 +144,7 @@ impl TestServer {
         let mngr = self.state.sessions_manager().await;
         mngr.get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
             .await
-            .unwrap()
+            .expect("get_session RPC should succeed")
             .expect("session should be retrievable");
     }
 }

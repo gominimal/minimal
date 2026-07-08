@@ -11,6 +11,10 @@ use common::setup;
 use minimal::*;
 use sessions::SessionId;
 
+use minimald::test_harness::unwrap_ready;
+
+use serde_json::Value;
+
 // --- version ---
 
 #[tokio::test]
@@ -35,43 +39,69 @@ async fn version_succeeds_without_daemon() {
 #[tokio::test]
 async fn ls_empty() {
     let (_daemon, args) = setup().await;
-    cmd_ls(
-        &args,
-        LsArgs {
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::ListSessions;
+    let resp = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+
+    let mut out = Vec::new();
+    format_ls(
+        &mut out,
+        &LsArgs {
             raw: false,
             json: false,
         },
+        &resp,
     )
-    .await
     .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("No active sessions."));
 }
 
 #[tokio::test]
 async fn ls_raw_empty() {
     let (_daemon, args) = setup().await;
-    cmd_ls(
-        &args,
-        LsArgs {
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::ListSessions;
+    let resp = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+
+    let mut out = Vec::new();
+    format_ls(
+        &mut out,
+        &LsArgs {
             raw: true,
             json: false,
         },
+        &resp,
     )
-    .await
     .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.is_empty(),
+        "raw output should be empty with no sessions"
+    );
 }
 
 #[tokio::test]
 async fn ls_json_empty() {
     let (_daemon, args) = setup().await;
-    cmd_ls(
-        &args,
-        LsArgs {
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::ListSessions;
+    let resp = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+
+    let mut out = Vec::new();
+    format_ls(
+        &mut out,
+        &LsArgs {
             raw: false,
             json: true,
         },
+        &resp,
     )
-    .await
     .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    let parsed: Value = serde_json::from_str(&text).expect("json output should be valid JSON");
+    assert!(parsed["sessions"].is_array());
+    assert!(parsed["sessions"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -80,23 +110,29 @@ async fn ls_json_with_sessions() {
     let id1 = create_session(&daemon, "json-1").await;
     let id2 = create_session(&daemon, "json-2").await;
 
-    cmd_ls(
-        &args,
-        LsArgs {
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::ListSessions;
+    let resp = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+
+    let mut out = Vec::new();
+    format_ls(
+        &mut out,
+        &LsArgs {
             raw: false,
             json: true,
         },
+        &resp,
     )
-    .await
     .unwrap();
-
-    // Verify both sessions are present on the server.
-    let mut client = daemon.server.connect().await;
-    use minimald_rpc::ListSessions;
-    let resp = client.call::<ListSessions>(&()).await;
-    let ids: Vec<_> = resp.sessions.iter().map(|s| s.id).collect();
-    assert!(ids.contains(&id1));
-    assert!(ids.contains(&id2));
+    let text = String::from_utf8(out).unwrap();
+    let parsed: Value = serde_json::from_str(&text).expect("json output should be valid JSON");
+    let sessions = parsed["sessions"]
+        .as_array()
+        .expect("sessions should be an array");
+    assert_eq!(sessions.len(), 2);
+    let ids: Vec<&str> = sessions.iter().map(|s| s["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&id1.to_string().as_str()));
+    assert!(ids.contains(&id2.to_string().as_str()));
 }
 
 #[tokio::test]
@@ -105,23 +141,25 @@ async fn ls_raw_with_sessions() {
     let id1 = create_session(&daemon, "raw-1").await;
     let id2 = create_session(&daemon, "raw-2").await;
 
-    cmd_ls(
-        &args,
-        LsArgs {
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::ListSessions;
+    let resp = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+
+    let mut out = Vec::new();
+    format_ls(
+        &mut out,
+        &LsArgs {
             raw: true,
             json: false,
         },
+        &resp,
     )
-    .await
     .unwrap();
-
-    // Verify both sessions exist on the server.
-    let mut client = daemon.server.connect().await;
-    use minimald_rpc::ListSessions;
-    let resp = client.call::<ListSessions>(&()).await;
-    let ids: Vec<_> = resp.sessions.iter().map(|s| s.id).collect();
-    assert!(ids.contains(&id1));
-    assert!(ids.contains(&id2));
+    let text = String::from_utf8(out).unwrap();
+    let lines: Vec<&str> = text.trim_end().lines().collect();
+    assert_eq!(lines.len(), 2, "raw output should be one line per session");
+    assert!(lines.contains(&id1.to_string().as_str()));
+    assert!(lines.contains(&id2.to_string().as_str()));
 }
 
 // --- activate + ls ---
@@ -313,12 +351,7 @@ async fn create_session(daemon: &common::TestDaemon, name: &str) -> SessionId {
         })
         .await;
     match resp {
-        minimald_rpc::Errorable::Ok(r) => match r {
-            minimald_rpc::CreateSessionResponse::Ready { id } => id,
-            minimald_rpc::CreateSessionResponse::Pending { .. } => {
-                panic!("expected Ready, got Pending")
-            }
-        },
+        minimald_rpc::Errorable::Ok(r) => unwrap_ready(r),
         minimald_rpc::Errorable::Err { error } => {
             panic!("CreateSession failed: {error}")
         }
