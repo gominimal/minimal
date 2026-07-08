@@ -299,6 +299,26 @@ want_ok "data resolves under XDG_DATA_HOME/minimal (R4.1)" \
     test -f "$H5/xdg-data/minimal/rootfs.img"
 cp "$root/good-components" "$mock/versions/v1/components"
 
+# The `lib` prefix (R4.1) is a bin SIBLING: it resolves to ~/.local/lib with NO
+# `/minimal` suffix (unlike data/state/cache), so a bin/<x> binary reaches a
+# shipped lib/<y> via a `@loader_path/../lib` rpath. XDG_LIB_HOME is unset in the
+# run env, so it must fall back to $HOME/.local/lib. A lib file is also not `bin`,
+# so it must NOT be marked executable.
+{
+    printf '# format: 1\n'
+    printf '# c o a v s k d s\n'
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+        libkrun linux amd64 v1 "$h_rootfs" file lib/libkrun.1.dylib versions/v1/rootfs-arm64.img
+} >"$mock/versions/v1/components"
+H6="$root/h6"; mkdir -p "$H6"
+run libdest "$H6"
+check 0 "$rc" "lib-prefixed component installs (R4.1)"
+want_ok "lib falls back to HOME/.local/lib, no /minimal suffix (R4.1)" \
+    test -f "$H6/.local/lib/libkrun.1.dylib"
+want_err "lib component is not marked executable (only bin gets +x)" \
+    test -x "$H6/.local/lib/libkrun.1.dylib"
+cp "$root/good-components" "$mock/versions/v1/components"
+
 # --- Unit 6: install record (R6.1) + PATH advisory (R6.2) ------------------
 record="$H1/xdg-state/minimal/installed"
 want_ok "install record lists components (R6.1)" grep -q "minimald" "$record"
@@ -335,6 +355,29 @@ want_ok "darwin bin component installed" test -f "$HD/bin/minimal"
 want_ok "quarantine stripped from bin (xattr)" grep -q "com.apple.quarantine" "$root/xattr.calls"
 want_ok "bin file ad-hoc codesigned" grep -q "/bin/minimal" "$root/codesign.calls"
 want_err "data component not codesigned" grep -q "rootfs" "$root/codesign.calls"
+
+# A darwin `lib` dylib gets the SAME Mach-O treatment as a bin file — quarantine
+# strip + ad-hoc codesign (the plain else-branch sign, no minvmd entitlement) —
+# so the shipped libkrun.1.dylib is loadable. Isolated home + one-off manifest
+# with a single darwin lib row, so it doesn't perturb the rerun counts below.
+{
+    printf '# format: 1\n'
+    printf '# c o a v s k d s\n'
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+        libkrun darwin arm64 v1 "$h_rootfs" file lib/libkrun.1.dylib versions/v1/rootfs-arm64.img
+} >"$mock/versions/v1/components"
+: >"$root/codesign.calls"; : >"$root/xattr.calls"
+HDL="$root/hdl"; mkdir -p "$HDL"
+reset_dl
+run darwinlib "$HDL"
+check 0 "$rc" "darwin lib install exits 0"
+want_ok "darwin lib dylib installed" test -f "$HDL/.local/lib/libkrun.1.dylib"
+want_ok "quarantine stripped from lib dylib (xattr)" \
+    grep -q "com.apple.quarantine" "$root/xattr.calls"
+want_ok "lib dylib ad-hoc codesigned" \
+    grep -q "/lib/libkrun.1.dylib" "$root/codesign.calls"
+cp "$root/good-components" "$mock/versions/v1/components"   # restore
+: >"$root/codesign.calls"; : >"$root/xattr.calls"
 
 # Signing diverged the on-disk bytes from the manifest hash. A rerun must still
 # recognize the component as installed (via the recorded hash) and not download

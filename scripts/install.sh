@@ -140,6 +140,7 @@ esac
 resolve_prefix() {
     case "$1" in
         bin)   printf '%s\n' "${MINIMAL_BIN:-$HOME/.local/bin}" ;;
+        lib)   printf '%s\n' "${XDG_LIB_HOME:-$HOME/.local/lib}" ;;
         data)  printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/minimal" ;;
         state) printf '%s\n' "${XDG_STATE_HOME:-$HOME/.local/state}/minimal" ;;
         cache) printf '%s\n' "${XDG_CACHE_HOME:-$HOME/.cache}/minimal" ;;
@@ -241,10 +242,12 @@ do_uninstall() {
     fi
 
     # R8.1 — prune now-empty minimal-owned dirs with rmdir only (never rm -rf):
-    # the shared bin dir is removed only if empty, and a non-empty dir fails
+    # the shared bin/lib dirs are removed only if empty, and a non-empty dir fails
     # rmdir harmlessly. --purge (above) already cleared the data/state/cache trees.
+    # lib (~/.local/lib) is shared like bin, so it is only ever rmdir'd-if-empty,
+    # never purged.
     if [ "$dry_run" -eq 0 ]; then
-        for p in bin data state cache; do
+        for p in bin lib data state cache; do
             d="$(resolve_prefix "$p")"
             if [ -d "$d" ]; then
                 rmdir "$d" 2>/dev/null || true
@@ -407,15 +410,14 @@ while read -r comp _ _ _ want kind dest src; do
     # chmod the temp file, then rename.
     [ "$prefix" = bin ] && chmod +x "$tmp"
 
-    # macOS: make a freshly-downloaded bin executable actually runnable before it
-    # is placed. Strip the Gatekeeper quarantine attribute (metadata, so it never
-    # affected the hash above; a no-op if absent — hence the swallowed error),
-    # then ad-hoc self-sign: arm64 macOS refuses to exec an unsigned or
-    # transfer-invalidated Mach-O, and our release binaries are not yet signed
-    # with a developer identity. Signing rewrites the Mach-O, so the installed
-    # bytes deliberately diverge from the manifest hash — the skip oracle and the
-    # installed-hash record both account for this.
-    if [ "$os" = darwin ] && [ "$prefix" = bin ]; then
+    # macOS: make a freshly-downloaded Mach-O (a bin executable or a shipped lib
+    # dylib) actually loadable before it is placed.
+    #
+    #  * Strip the Gatekeeper quarantine attribute so it can run
+    #  * ad-hoc self-sign: arm64 macOS refuses to exec/dlopen an unsigned or
+    #    transfer-invalidated Mach-O, and our release artifacts are not yet signed
+    #    with a developer identity.
+    if [ "$os" = darwin ] && { [ "$prefix" = bin ] || [ "$prefix" = lib ]; }; then
         xattr -d com.apple.quarantine "$tmp" 2>/dev/null || true
         # Special case: minvmd needs the hypervisor entitlement.
         if [ "$comp" = minvmd ]; then
