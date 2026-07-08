@@ -11,6 +11,20 @@ use minimald_rpc::{EgressPolicy, NetworkMode};
 
 use crate::error::VmError;
 
+/// Environment variable selecting the data volume's `sync_mode` (spec R1.9).
+/// Accepts `none` / `relaxed` / `full` (case-insensitive), the legacy booleans
+/// `false` → none and `true` → relaxed, or the raw libkrun codes `0` / `1` / `2`.
+/// Defaults to `relaxed` — libkrun's recommended mode: it honours flush but, on
+/// macOS, skips the drive-level sync, bounding the crash data-loss window
+/// without the throughput cost of full sync.
+pub const DISK_SYNC_ENV: &str = "MINVMD_DISK_SYNC";
+
+/// Environment variable toggling `direct_io` (bypass the host page cache) on the
+/// data volume (spec R1.9). Accepts `true` / `1` (any other value is false).
+/// Defaults to `false`, correct for guest ext4 (the guest journal and page cache
+/// interact poorly with host `O_DIRECT`).
+pub const DISK_DIRECT_IO_ENV: &str = "MINVMD_DISK_DIRECT_IO";
+
 /// Which of the spec's deployment models (DM1–DM5) a minvmd host runs under.
 ///
 /// minvmd manages libkrun VMs, which only exist on DM1/DM3/DM4; DM2 is native
@@ -62,6 +76,11 @@ pub struct VmConfig {
     /// boundary (DM1/DM3/DM4); rejected on DM2 by [`VmConfig::validate_for`].
     /// `None` means no VM-wide egress restriction.
     pub vm_egress: Option<EgressPolicy>,
+    /// Path to the per-VM writable data volume image, attached as `/dev/vdb`
+    /// via `krun_add_disk3` (spec R1.4). `None` means no data volume is attached
+    /// (legacy tmpfs-only boot). Provision the image with
+    /// [`crate::volume::ensure_sparse_raw`] before setting this.
+    pub data_volume_path: Option<PathBuf>,
 }
 
 impl VmConfig {
@@ -82,6 +101,7 @@ impl VmConfig {
             initramfs,
             network_mode: NetworkMode::default(),
             vm_egress: None,
+            data_volume_path: None,
         }
     }
 
@@ -89,6 +109,15 @@ impl VmConfig {
     #[must_use]
     pub fn with_network_mode(mut self, network_mode: NetworkMode) -> Self {
         self.network_mode = network_mode;
+        self
+    }
+
+    /// Attach a per-VM writable data volume image as `/dev/vdb` (spec R1.4),
+    /// consuming and returning `self`. The image must already be provisioned
+    /// (see [`crate::volume::ensure_sparse_raw`]).
+    #[must_use]
+    pub fn with_data_volume(mut self, data_volume_path: PathBuf) -> Self {
+        self.data_volume_path = Some(data_volume_path);
         self
     }
 
@@ -194,6 +223,28 @@ impl VmConfig {
             crate::krun::DiskFormat::Raw,
             true,
         )?;
+        // Attach the per-VM writable data volume as /dev/vdb (spec R1.4). Disks
+        // are enumerated vd{a,b,…} in registration order, so this follows the
+        // read-only root. The sync/cache posture is resolved from the R1.9
+        // tunables rather than hardcoded, so its throughput cost can be measured
+        // (Proof Artifact 4) and tuned per platform.
+        if let Some(data_path) = &self.data_volume_path {
+            let (direct_io, sync_mode) = resolve_disk_flags();
+            tracing::info!(
+                data_path = %data_path.display(),
+                direct_io,
+                ?sync_mode,
+                "attaching writable data volume as /dev/vdb",
+            );
+            ctx.add_disk_with_sync(
+                "data",
+                data_path,
+                crate::krun::DiskFormat::Raw,
+                false,
+                direct_io,
+                sync_mode,
+            )?;
+        }
         // Network attachment (R1.5): the VM joins the per-host gvproxy switch
         // supervised by `crate::net` according to `network_mode`. The libkrun
         // device wiring (tap fd handed to gvproxy over the per-PTask vsock
@@ -238,6 +289,30 @@ impl VmConfig {
         );
         Ok(())
     }
+}
+
+/// Resolve the data-volume `(direct_io, sync_mode)` from the R1.9 environment
+/// tunables ([`DISK_DIRECT_IO_ENV`], [`DISK_SYNC_ENV`]). Defaults: `direct_io =
+/// false`, `sync_mode = Relaxed`.
+#[cfg(minvmd_libkrun)]
+fn resolve_disk_flags() -> (bool, crate::krun::SyncMode) {
+    use crate::krun::SyncMode;
+
+    let direct_io = std::env::var(DISK_DIRECT_IO_ENV)
+        .ok()
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"));
+
+    let sync_mode = std::env::var(DISK_SYNC_ENV)
+        .ok()
+        .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+            "none" | "false" | "0" => Some(SyncMode::None),
+            "relaxed" | "true" | "1" => Some(SyncMode::Relaxed),
+            "full" | "2" => Some(SyncMode::Full),
+            _ => None,
+        })
+        .unwrap_or(SyncMode::Relaxed);
+
+    (direct_io, sync_mode)
 }
 
 #[cfg(test)]
