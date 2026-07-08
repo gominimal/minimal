@@ -4,11 +4,12 @@
 `networking-test-plan-all-dms` (sandbox-owned lease routing). Supersedes the
 G-N9 characterization in `test-plan.md`. Verification: `cargo test -p minimald`
 green (incl. new lease-lifecycle/lease-routing unit tests) + a clean **DM2**
-regression. The in-VM lease branch is exercised by **unit tests only** at time
-of writing — DM1 (macOS) is off the Linux dev host, and DM3/DM4 runtime
-verification is blocked by the *separate* **G-N8** attach-hang (own-ip +
-`--ingress` session whose shell never starts). See
-[Implementation](#implementation-2026-07-07).
+regression, and — since **G-N8 was pinned and fixed (2026-07-08)** — a live
+**DM3 (KVM)** run confirming the in-VM lease path end-to-end (TC3/TC4/TC7/TC8 =
+200/200/(401+200)/200). DM1 (macOS/HVF) is off the Linux dev host, so its verdicts
+predate the fix (HVF was never G-N8-affected). See
+[Implementation](#implementation-2026-07-07) and
+[G-N8 pinned + fixed](#g-n8-pinned--fixed-2026-07-08--vsock-forwarder-response-drop).
 
 **Findings date:** 2026-07-07. **Host:** macOS/HVF (DM1), clean `minimal3` stack
 (`just up`), libkrun VM, host gvproxy 0.8.8.
@@ -172,8 +173,44 @@ exactly the sandbox's lifetime and **never** persisted to the on-disk `Record`.
 → 103 passed (incl. `own_ip_lease_is_published_only_between_attach_and_teardown`
 and `own_ip_lease_routes_to_switch_lease_with_internal_port`); `fmt` + `clippy
 -D warnings` clean; **DM2 regression re-run all-PASS** (TC3/4/7/8 = 200/200/200
-+401/200), proving no native-path regression. The in-VM lease branch is
-covered by unit tests only: DM1 is off this Linux host and **DM3/DM4 are blocked
-by G-N8** (an own-ip + `--ingress` attach whose shell never starts, so the
-in-session backend never comes up — a *distinct* failure from this routing fix).
-G-N8 must be pinned before DM3/DM4 can confirm TC3/TC7/TC8 = 200 on the VM path.
++401/200), proving no native-path regression. The in-VM lease branch was
+initially covered by unit tests only, because **DM3/DM4 were blocked by G-N8** —
+now pinned and fixed (below), so the VM lease path is **runtime-verified**.
+
+## G-N8 pinned + fixed (2026-07-08) — vsock forwarder response drop
+
+The G-N8 "attach hang" that blocked DM3/DM4 verification of this lease path was
+**not a hang**. On a live DM3 (KVM) run the own-ip + `--ingress` attach *failed
+fast* (~8 s, client `network attach failed: malformed gvproxy status line: ""`);
+the ">200 s" was only the suite's `hold_wait` ceiling (`session_hold` backgrounds
+`attach` and greps for `SERVER_UP` only, never the exit code, so a fast failure
+is indistinguishable from a hang).
+
+**Root cause (confirmed by the host forwarder table).** gvproxy's forwarder HTTP
+verbs — `POST /services/forwarder/expose` (ingress) and the `:7654`/`:7655`
+proxy-publish — do **not** round-trip over the **KVM** libkrun
+`add_vsock_port2(listen=false)` shuttle. The request reaches gvproxy and **is
+applied** — during a failed attach, `GET /services/forwarder/all` on the host
+`gvproxy-switch.sock` showed the expose (`127.0.0.1:18080 → 100.64.0.x:8080`) plus
+both proxy publishes — but gvproxy's `Connection: close` response is dropped as
+the splice propagates the peer close, so the guest's `read_to_end` returns 0
+bytes. `apply_ingress` then reads a *successful* expose as a failure and rolls the
+own-ip attach back, so the shell never starts. Only the `/connect` L2 relay
+(an HTTP *upgrade*, not request/response) survives the splice — which is why
+egress works but every forwarder verb fails. DM1/HVF is unaffected (HVF delivers
+the response), and DM2 (native unix socket, no splice) was never affected.
+
+**Fix** (`crates/minimald/src/net/policy.rs`): `post_json` sends HTTP/1.1
+keep-alive (drops `Connection: close`) and `exchange` frames the reply by
+`Content-Length` instead of read-to-EOF, so gvproxy never closes the socket first
+and the response drains to the guest, which closes from its own side. This is a
+superset fix — it also repairs the in-VM `:7654`/`:7655` proxy-publish (same leg).
+
+**Verified live on DM3 (KVM), 2026-07-08:** own-ip + `--ingress` attach starts the
+shell and publishes the lease; **TC3/TC4/TC7/TC8 = 200/200/(401+200)/200** (full
+`DM=dm3` suite); startup proxy-publish `malformed` warnings gone. TC8=200 in
+particular exercises `direct-tcpip → lease:8080`, so this run is also the
+end-to-end runtime confirmation of the G-N9 lease routing on the VM path.
+`fmt`/`clippy -D warnings`/`cargo test -p minimald` clean, with a regression test
+(`exchange_frames_by_content_length_without_a_server_close`) that hangs if the
+framing ever reverts to read-to-EOF.

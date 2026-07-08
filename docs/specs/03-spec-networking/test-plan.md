@@ -175,10 +175,12 @@ TC16 specifies the tests that activate when DM5 lands.
 > columns below have since been **re-run with the fixed `test-plan.sh`**
 > (2026-07-07): **DM2 now passes TC3/TC4/TC7/TC8 (200/200/200+401/200)** — the
 > native shared-netns forwarder works end-to-end, confirming the old verdicts
-> were the backend artifact. **DM3 still fails TC3/TC4/TC7/TC8, but via G-N8**
-> (the ingress-`attach` hang), not the backend and not the lease routing — the
-> VM path could not be exercised there. The G-N9 lease-routing fix has since
-> **landed** (2026-07-07); full analysis, fix, and verification:
+> were the backend artifact. **DM3 initially still failed TC3/TC4/TC7/TC8 via
+> G-N8** — first read as an ingress-`attach` hang, later pinned (2026-07-08) as a
+> *fast* failure: gvproxy's forwarder response is dropped over the KVM vsock
+> shuttle. With the `net::policy` keep-alive/`Content-Length` fix, **DM3
+> TC3/TC4/TC7/TC8 now PASS (200/200/(401+200)/200)**, exercising the G-N9 lease
+> route end-to-end on the VM. Full analysis:
 > [`gn9-forwarding-findings.md`](gn9-forwarding-findings.md).
 
 > **Re-run (2026-07-08, DM1 macOS/HVF), 4 passes — mixed; a new own-ip-churn
@@ -230,10 +232,12 @@ for the VM half), with the **fixed `test-plan.sh` backend** and, for DM2, the
 **G-N9 lease-routing code**. DM2's TC3/TC4/TC7/TC8 now PASS (the change is gated
 to the VM/Vsock path, so DM2 is byte-identical to the pre-fix native path — the
 PASS is the corrected backend + working shared-netns forwarder, not the lease
-route). DM3's TC3/TC4/TC7/TC8 remain blocked by **G-N8** (the ingress-`attach`
-hang; `SERVER_UP` never appears), so the VM lease path is verified by unit tests
-only, not end-to-end here. DM4 TC1–TC9 run against the VM daemon and mirror the
-DM3 column (TC10/TC15 were the DM4-specific 2026-07-03 checks). DM1 column: 2026-07-02
+route). **DM3's TC3/TC4/TC7/TC8 now PASS (200/200/(401+200)/200) after the G-N8
+fix (2026-07-08 `DM=dm3` re-run on the KVM VM), verifying the G-N9 lease path
+end-to-end on the VM** — see the G-N8 gap-register row for the vsock-forwarder
+response-drop root cause and the keep-alive fix. DM4 TC1–TC9 run against the VM
+daemon and mirror the DM3 column (TC10/TC15 were the DM4-specific 2026-07-03
+checks). DM1 column: 2026-07-02
 `DM=dm1` runs on macOS/HVF — identical verdicts under both the expect driver and
 the heredoc driver that replaced it, so the failures below are
 driver-independent.
@@ -243,12 +247,12 @@ driver-independent.
 | TC1 no-net | PASS — no interfaces visible; curl 000; DNS fails | PASS — no interfaces (`IFACES=`); curl 000; DNS fails | PASS — no interfaces; curl 000; DNS fails | = DM3 (VM daemon) |
 | TC1b host-net | PASS — curl 200; DNS resolves | PASS — curl 200; DNS resolves | PASS — curl 200; DNS resolves | = DM3 (VM daemon) |
 | TC2 own-ip + peer | PASS — egress 200; `TC2_PEER=YES` (peer lease 100.64.0.3) | PASS — egress 200; `TC2_PEER=YES` (peer 100.64.0.3) | PASS — egress 200; `TC2_PEER=YES` (peer 100.64.0.3) | = DM3 (VM daemon) |
-| TC3 DNS :7654 | **FAIL 502** — proxy live + routes; backend leg fails (see note) | **PASS 200** — fixed backend; native loopback path (2026-07-07) | **FAIL 502** — G-N8 attach-hang re-confirmed (SERVER_UP never appeared; distinct from the backend artifact) | = DM3 (VM daemon) |
-| TC4 static ingress | **FAIL 000** — host→`:18080` connection reset with backend live (see note) | **PASS 200** — host→`:18080`→forwarder→`lease:8080` (2026-07-07) | **FAIL 000** — G-N8 attach-hang (2026-07-07) | = DM3 (VM daemon) |
+| TC3 DNS :7654 | **FAIL 502** — proxy live + routes; backend leg fails (see note) | **PASS 200** — fixed backend; native loopback path (2026-07-07) | **PASS 200** — G-N8 fixed 2026-07-08 (in-VM `:7654` proxy → `lease:8080`) | = DM3 (VM daemon) |
+| TC4 static ingress | **FAIL 000** — host→`:18080` connection reset with backend live (see note) | **PASS 200** — host→`:18080`→forwarder→`lease:8080` (2026-07-07) | **PASS 200** — G-N8 fixed 2026-07-08 (host→`:18080`→forwarder→`lease:8080`) | = DM3 (VM daemon) |
 | TC5 policy validation | PASS — all 3 rejected with correct messages | PASS — all 3 rejected with correct messages | PASS — all 3 rejected | = DM3 (VM daemon) |
 | TC6 policy round-trip | PASS — ingress JSON round-trips | PASS — ingress JSON round-trips | PASS — ingress JSON round-trips | = DM3 (VM daemon) |
-| TC7 mTLS :7655 | PARTIAL — no-cert 401 PASS; with-cert **502** (see note) | **PASS** — no-cert 401; with-cert **200** (2026-07-07) | PARTIAL — no-cert 401 PASS; with-cert **502** (G-N8 attach-hang) | = DM3 (VM daemon) |
-| TC8 ssh-forward | **FAIL 000** — connection reset through the forward (see note) | **PASS 200** — through the ssh-forward → `lease:8080` (2026-07-07) | **FAIL 000** — G-N8 attach-hang (2026-07-07) | = DM3 (VM daemon) |
+| TC7 mTLS :7655 | PARTIAL — no-cert 401 PASS; with-cert **502** (see note) | **PASS** — no-cert 401; with-cert **200** (2026-07-07) | **PASS** — no-cert 401; with-cert **200** — G-N8 fixed 2026-07-08 | = DM3 (VM daemon) |
+| TC8 ssh-forward | **FAIL 000** — connection reset through the forward (see note) | **PASS 200** — through the ssh-forward → `lease:8080` (2026-07-07); a 2026-07-08 re-run saw **000** (native `direct-tcpip` reset — flaky/under investigation, unrelated to G-N8) | **PASS 200** — G-N8 fixed 2026-07-08 (ssh-forward → `direct-tcpip` → `lease:8080`, validating the G-N9 lease route on the VM path) | = DM3 (VM daemon) |
 | TC9 mesh CLI | PASS — status/join/leave OK | PASS — status/join/leave OK | PASS — status/join/leave OK | = DM3 (VM daemon) |
 | TC10 preflight | PASS — minvmd + gvproxy running; 1 listener each on :7654/:7655 | PASS — native minimald; no minvmd; UDS present | PASS — `/dev/kvm` OK; minvmd running | PASS — both control planes answer; **exactly 1** listener each on :7654/:7655 (G-N1) |
 | TC15 co-residency | N/A | N/A | N/A | **PASS** — both daemons serve isolated sessions concurrently; the 2nd daemon (native) loses the proxy bind with `Address already in use`, one :7654 listener remains (G-N1 observed) |
@@ -282,14 +286,17 @@ DM2 needs a transport-aware branch verified on Linux):
 [`gn9-forwarding-findings.md`](gn9-forwarding-findings.md).
 
 **Re-verified 2026-07-07:** DM2 TC3/4/7/8 now PASS (200/200/200+401/200) with the
-fixed backend, confirming the old verdicts were the harness artifact. DM3
-TC3/4/7/8 were re-run and **still fail via the G-N8 attach-hang** (an
-own-ip+ingress `attach` whose interactive shell never starts, so `SERVER_UP`
-never appears) — a *distinct* failure mode from the backend bug and from the
-G-N9 lease routing. DM4's VM half mirrors DM3, so it is G-N8-blocked too.
-**Still not runtime-verified:** the G-N9 in-VM lease path (DM1/DM3/DM4) — DM1 is
-off the Linux dev host and DM3/DM4 are G-N8-blocked; it is covered by unit tests
-pending a G-N8 fix.
+fixed backend, confirming the old verdicts were the harness artifact.
+**Re-verified 2026-07-08 (G-N8 fixed):** DM3 TC3/4/7/8 now PASS
+(200/200/(401+200)/200) on the KVM VM. G-N8 was never an attach hang — the
+own-ip+ingress attach *failed fast* because gvproxy's forwarder response was
+dropped over the KVM vsock shuttle (the forward was applied, the reply lost); the
+">200 s" was only the suite's `hold_wait` ceiling. With the keep-alive/
+`Content-Length` fix in `net::policy`, the **G-N9 in-VM lease path is now
+runtime-verified end-to-end on the VM** (TC8=200 exercises `direct-tcpip →
+lease:8080`). DM4's VM half mirrors DM3. **Remaining runtime gap:** DM1 (macOS/HVF)
+is off the Linux dev host, so the DM1 verdicts predate this fix (DM1 was never
+G-N8-affected — HVF delivers the forwarder response).
 
 *DM4 (co-residency) → G-N1.* TC15 PASS: both control planes serve isolated
 sessions concurrently; the second daemon to start (native) loses the hardcoded
@@ -532,8 +539,8 @@ by this plan.
 | G-N5 | TC14 (R2.4) | Dynamic port-map RPC type exists, no daemon handler, no in-sandbox client | `crates/minimald-rpc/src/lib.rs:401` |
 | G-N6 | TC17 (UC7/R4.1–R4.3) | Daemon never consumes mesh enrolment; `set_mesh` test-only | `crates/minimald/src/rpc.rs:1001`; `crates/minimal/src/main.rs:716-751` |
 | G-N7 | multi-VM variants of DM1/DM3 | Spec says "one or more" VMs; minvmd supervises exactly one (single `vmm.pid`/`state.toml`/`lifecycle.lock`) | `crates/minvmd/src/state.rs:6-9` |
-| G-N8 | TC3/TC4/TC7/TC8 on DM3/DM4 (KVM) | `attach` of an own-ip session carrying an `--ingress` mapping hangs — the interactive shell never starts (>200 s vs ~8 s for own-ip without ingress), so the in-session backend never comes up; own-ip *without* ingress is unaffected | 2026-07-03 `DM=dm3` run (`hold_wait: SERVER_UP never appeared` for all 4) + isolated ingress-vs-no-ingress repro |
-| G-N9 | TC8 on the VM path (DM1); DM3/DM4 (G-N8-blocked) | **FIXED 2026-07-07; DM1 runtime 2026-07-08 = conditional.** Sandbox-owned lease routing: the in-VM `:7654`/`:7655` proxies and `direct-tcpip` dial the PTask's switch `lease:<internal>` instead of the host-loopback forwarder unreachable from inside the VM. Live lease published into the shared hostname registry at own-ip attach (Vsock/VM only), reverted at teardown, never persisted to the `Record`; DM2 keeps the loopback forwarder untouched. **DM1 runtime: the `:7654` proxy is 200 from a churn-free VM but 502 after prior own-ip egress (G-N11); TC8 `direct-tcpip` is flaky (000/200) despite the same commit routing it to the lease.** So the proxy path is verified only in isolation; TC8 and the churn case remain open. | `crates/minimald/src/net/{dns,proxy,gvproxy_network}.rs`; `crates/minimald/src/connection.rs`; [`gn9-forwarding-findings.md`](gn9-forwarding-findings.md) |
+| G-N8 | TC3/TC4/TC7/TC8 on DM3/DM4 (KVM) | **FIXED 2026-07-08.** Was mis-recorded as a hang: the own-ip `--ingress` attach *failed fast* (~8 s, `network attach failed: malformed gvproxy status line: ""`); the ">200 s" was only the suite's `hold_wait` ceiling (`session_hold` never checks the attach exit, so a fast failure and a hang look identical). Root cause: gvproxy's forwarder HTTP verbs (`/services/forwarder/expose`, the `:7654`/`:7655` proxy-publish) do not round-trip over the **KVM** libkrun `add_vsock_port2(listen=false)` shuttle — the request arrives and *is applied* (the forward appears in the host `gvproxy-switch.sock` `/services/forwarder/all` table), but gvproxy's `Connection: close` response is dropped by the splice, so the guest reads 0 bytes and `apply_ingress` rolls back a *successful* expose. Only the `/connect` L2 relay survives the splice (egress works); DM1/HVF is unaffected. **Fix:** `post_json`/`exchange` now use HTTP/1.1 keep-alive (no `Connection: close`) and frame the reply by `Content-Length` instead of read-to-EOF, so the server never closes first. **Verified live on DM3 (KVM): TC3/TC4/TC7/TC8 = 200/200/(401+200)/200**, startup proxy-publish `malformed` warnings gone; `cargo fmt`/`clippy -D warnings`/`test -p minimald` clean (regression test `exchange_frames_by_content_length_without_a_server_close`); DM2 forwarder path unregressed (TC3/4/7 green). | `crates/minimald/src/net/policy.rs` (`post_json`, `exchange`, `content_length`); pinned via the host forwarder-table probe + isolated ingress-vs-no-ingress repro |
+| G-N9 | TC8 on the VM path (DM1); DM3/DM4 (verified 2026-07-08 once G-N8 was fixed, TC8=200) | **FIXED 2026-07-07; DM1 runtime 2026-07-08 = conditional.** Sandbox-owned lease routing: the in-VM `:7654`/`:7655` proxies and `direct-tcpip` dial the PTask's switch `lease:<internal>` instead of the host-loopback forwarder unreachable from inside the VM. Live lease published into the shared hostname registry at own-ip attach (Vsock/VM only), reverted at teardown, never persisted to the `Record`; DM2 keeps the loopback forwarder untouched. **DM1 runtime: the `:7654` proxy is 200 from a churn-free VM but 502 after prior own-ip egress (G-N11); TC8 `direct-tcpip` is flaky (000/200) despite the same commit routing it to the lease.** So the proxy path is verified only in isolation; TC8 and the churn case remain open. | `crates/minimald/src/net/{dns,proxy,gvproxy_network}.rs`; `crates/minimald/src/connection.rs`; [`gn9-forwarding-findings.md`](gn9-forwarding-findings.md) |
 | G-N10 | TC1b, TC2 in-sandbox egress probes (all DMs) | **RESOLVED in-harness 2026-07-08 via `min add curl`.** In-sandbox `curl` disappeared after #650 made the session rootfs compose only *declared* packages (curl was incidental to the old base rootfs; not in `runtime_packages`, and declaring it does not compose it — a separate build/compose gap). TC1b/TC2 now provision curl per-session with `min add curl` (egress 200, peer YES). Residual: the underlying compose gap, and that the provisioning's own-ip egress triggers G-N11. | `.minimal/minimal.toml:8`; #650 (`crates/minimald/src/sessions/composables.rs:356`) |
 | G-N11 | TC3, TC7 on DM1 after any own-ip egress | The `:7654`/`:7655` proxy lease-routing (G-N9) returns **502 reproducibly (2/2) once a prior own-ip session has driven real egress** over the switch; from a churn-free VM the same TCs are 200 (2/2). TC4 (direct ingress, no proxy remap) is unaffected, so the fault is in the proxy's lease resolution under prior switch usage — a stale/incorrect lease route, not the forwarder. Not slow accumulation: the first pass on a fresh VM already fails once egress precedes it. | 2026-07-08 DM1 runs 1/2 (no churn → 200) vs 4/5 (`min add curl` egress → 502); `crates/minimald/src/net/{dns,proxy}.rs` lease route resolution |
 | G-N12 | TC7 with-cert on DM1 (host side) | `minimal login` issues a valid P-256 mTLS client cert/key (OpenSSL parses it; pubkeys match), but macOS system `curl 8.7.1 / LibreSSL 3.3.6` rejects it at load with `asn1 encoding routines … EVP lib`, and `openssl s_client` shows a CA-chain mismatch between the login cert and the running proxy's server cert on the same VM instance. The proxy mTLS gate itself works (no-cert → 401). Host/PKI-instance dependent (earlier VM gave 200). Needs a cert-generation + host-TLS pass. | 2026-07-08 DM1; `minimal login` cert issuance; proxy server-cert CA vs client `ca.pem` |
