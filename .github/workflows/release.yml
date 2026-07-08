@@ -242,7 +242,6 @@ jobs:
                   fi
                   install_name_tool -change "$current" @rpath/libkrun.1.dylib target/release/minvmd
                   install_name_tool -rpath @loader_path @loader_path/../lib target/release/minvmd
-                  codesign --sign - --force target/release/minvmd
             - name: Verify minvmd linkage
               # libkrun must resolve via @rpath (rewrite stuck), and every other
               # dependency must be a system library (/usr/lib or /System). A stray
@@ -300,6 +299,33 @@ jobs:
               run: |
                   mv target/release/minvmd target/release/minvmd-macos-arm64
                   mv target/release/minimal target/release/minimal-macos-arm64
+            - name: Codesign binaries with Developer ID
+              # Sign the two shipped Mach-O binaries with the Developer ID
+              # Application identity held in the runner's signing keychain. This
+              # is the LAST mutation before upload.
+              # Hardened runtime (--options runtime) + a secure --timestamp so the
+              # artifacts are notarization-ready.
+              env:
+                  KC_PW: ${{ secrets.KC_PW }}
+              run: |
+                  KC=minimal-signing.keychain-db
+                  IDENTITY="Developer ID Application: Minimal Software Research Ltd. (3G47C5HY64)"
+
+                  # Unlock the signing keychain and put it on the search list so
+                  # codesign can resolve the identity by name.
+                  security unlock-keychain -p "$KC_PW" "$KC"
+                  security list-keychains -d user -s "$KC" login.keychain-db
+
+                  codesign --force --timestamp --options runtime \
+                    --sign "$IDENTITY" \
+                    --entitlements crates/minvmd/minvmd.entitlements \
+                    target/release/minvmd-macos-arm64
+                  codesign --force --timestamp --options runtime \
+                    --sign "$IDENTITY" \
+                    target/release/minimal-macos-arm64
+
+                  codesign --verify --strict --verbose=2 target/release/minvmd-macos-arm64
+                  codesign --verify --strict --verbose=2 target/release/minimal-macos-arm64
             - name: Upload binary (minvmd)
               uses: actions/upload-artifact@v7
               with:
@@ -366,13 +392,58 @@ jobs:
                     echo "::error::trimmed libkrun links a non-system (Homebrew) dylib; see otool -L above" >&2
                     exit 1
                   fi
-                  cp "$dylib" "$RUNNER_TEMP/libkrun-macos-arm64.dylib"
-            - name: Ad-hoc codesign
-              # cargo leaves the dylib ad-hoc/unsigned; arm64 macOS refuses to load a
-              # dylib with an invalid signature. Match the installer's self-sign of
-              # shipped bin/ files.
-              run: codesign --sign - --force "$RUNNER_TEMP/libkrun-macos-arm64.dylib"
-            - name: Upload libkrun dylib
+                  cp "$dylib" "$RUNNER_TEMP/temp-libkrun-macos-arm64.dylib"
+            - name: Upload unsigned libkrun dylib (temp)
+              # This GitHub-hosted runner has no access to the Developer ID signing
+              # keychain, so the dylib leaves here UNSIGNED under a `temp-` prefixed
+              # name. sign-libkrun-macos-arm64 (self-hosted) downloads it, signs it,
+              # and re-uploads under the final `libkrun-macos-arm64` name. The
+              # release job drops any leftover `temp-` artifact so the unsigned copy
+              # never ships.
+              uses: actions/upload-artifact@v7
+              with:
+                  name: temp-libkrun-macos-arm64
+                  path: ${{ runner.temp }}/temp-libkrun-macos-arm64.dylib
+                  if-no-files-found: error
+                  retention-days: 7
+
+    sign-libkrun-macos-arm64:
+        # Developer ID signing for the shipped libkrun.dylib. While built on
+        # a Github-hosted runner, it is signed on a self-hosted runner with
+        # access to our signing keychain.
+        runs-on: [self-hosted, macOS, ARM64]
+        timeout-minutes: 15
+        if: vars.RUN_MACOS_CI != 'false'
+        needs: [build-libkrun-macos-arm64]
+        steps:
+            - name: Download unsigned libkrun dylib (temp)
+              uses: actions/download-artifact@v8
+              with:
+                  name: temp-libkrun-macos-arm64
+                  path: ${{ runner.temp }}/libkrun-in
+            - name: Codesign libkrun with Developer ID
+              # A shipped dylib must be signed with the same Developer ID identity
+              # (and a secure --timestamp) as the binaries so the whole install is
+              # notarization-ready. --force replaces cargo's ad-hoc signature. No
+              # entitlements: libkrun is a library, not the hypervisor entry point.
+              env:
+                  KC_PW: ${{ secrets.KC_PW }}
+              run: |
+                  KC=minimal-signing.keychain-db
+                  IDENTITY="Developer ID Application: Minimal Software Research Ltd. (3G47C5HY64)"
+
+                  security unlock-keychain -p "$KC_PW" "$KC"
+                  security list-keychains -d user -s "$KC" login.keychain-db
+
+                  # Drop the temp- prefix so the shipped file carries the final
+                  # basename the archive/installer expect.
+                  out="$RUNNER_TEMP/libkrun-macos-arm64.dylib"
+                  cp "$RUNNER_TEMP/libkrun-in/temp-libkrun-macos-arm64.dylib" "$out"
+
+                  codesign --force --timestamp --options runtime \
+                    --sign "$IDENTITY" "$out"
+                  codesign --verify --strict --verbose=2 "$out"
+            - name: Upload signed libkrun dylib
               uses: actions/upload-artifact@v7
               with:
                   name: libkrun-macos-arm64
@@ -551,7 +622,7 @@ jobs:
                 build-release-linux-amd64,
                 build-release-linux-arm64,
                 build-release-macos-arm64,
-                build-libkrun-macos-arm64,
+                sign-libkrun-macos-arm64,
                 fetch-release-guest-artifacts,
                 build-release-initramfs,
             ]
@@ -573,6 +644,8 @@ jobs:
                   pattern: "*-*-*"
                   path: artifacts/
                   merge-multiple: true
+            - name: Drop temp-prefixed artifacts
+              run: rm -f artifacts/temp-*
             - name: Make binaries executable
               run: chmod +x artifacts/*-*-*
             - name: Generate completions
