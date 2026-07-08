@@ -454,8 +454,9 @@ async fn build_russh_config(
 /// ([`DEFAULT_SUBNET`](crate::net::DEFAULT_SUBNET)`.daemon_ip()`) so the host
 /// gvproxy forward can reach them; on native Linux (DM2) they bind host loopback
 /// directly. A bind failure warns and is skipped — the daemon keeps serving. The
-/// serve loops run on detached tasks; this returns once the listeners are bound
-/// and (DM1) exposed.
+/// serve loops run on detached tasks; this returns once the listeners are bound.
+/// The DM1 host-expose is also detached (see [`expose_proxy_on_host`]) so it
+/// never delays the caller — notably [`Server::run`]'s SSH accept loop.
 #[cfg(target_os = "linux")]
 async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
     use crate::net::proxy::{self, Router};
@@ -486,12 +487,14 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
         .is_some()
         && in_microvm
     {
-        // Only publish a port whose listener actually bound.
-        expose_proxy_on_host(
+        // Only publish a port whose listener actually bound. Detach the expose:
+        // it is best-effort and can block up to its 5 s gvproxy control-request
+        // timeout, which — if awaited here — delays `Server::run`'s accept loop
+        // and drops the first host→guest connection (`ssh connect: Disconnected`).
+        tokio::spawn(expose_proxy_on_host(
             crate::net::DEFAULT_SUBNET.daemon_ip(),
             proxy::EGRESS_PROXY_PORT,
-        )
-        .await;
+        ));
     }
 
     // B8 mTLS reverse proxy (:7655), under the networking-proxy feature.
@@ -515,11 +518,10 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
                     .is_some()
                     && in_microvm
                 {
-                    expose_proxy_on_host(
+                    tokio::spawn(expose_proxy_on_host(
                         crate::net::DEFAULT_SUBNET.daemon_ip(),
                         proxy::HTTPS_PROXY_PORT,
-                    )
-                    .await;
+                    ));
                 }
             }
             Err(error) => {
