@@ -278,21 +278,39 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
         response.extend_from_slice(&buf[..n]);
     };
 
-    // Body length from `Content-Length` (0 if absent). Read until the body is
-    // fully buffered, so we never depend on a server close to signal completion.
-    let want = content_length(&response[..header_end]).unwrap_or(0);
-    let body_have = response.len() - header_end;
-    let mut remaining = want.saturating_sub(body_have);
-    while remaining > 0 {
-        if response.len() as u64 >= MAX_CONTROL_RESPONSE {
-            break;
+    match content_length(&response[..header_end]) {
+        // Framed by `Content-Length`: read until the body is fully buffered, so
+        // we never depend on a server close to signal completion (the keep-alive
+        // reply the vsock shuttle would otherwise drop).
+        Some(want) => {
+            let body_have = response.len() - header_end;
+            let mut remaining = want.saturating_sub(body_have);
+            while remaining > 0 {
+                if response.len() as u64 >= MAX_CONTROL_RESPONSE {
+                    break;
+                }
+                let n = stream.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                response.extend_from_slice(&buf[..n]);
+                remaining = remaining.saturating_sub(n);
+            }
         }
-        let n = stream.read(&mut buf).await?;
-        if n == 0 {
-            break;
+        // No `Content-Length` (a misbehaving reply — e.g. an error whose body is
+        // the reason). Reading to EOF would hang, since gvproxy keeps the
+        // connection open; instead slurp best-effort within a short idle window,
+        // bounded, so the diagnostic body is preserved rather than truncated.
+        None => {
+            while (response.len() as u64) < MAX_CONTROL_RESPONSE {
+                match tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buf)).await
+                {
+                    Ok(Ok(0)) | Err(_) => break, // EOF or idle timeout
+                    Ok(Ok(n)) => response.extend_from_slice(&buf[..n]),
+                    Ok(Err(e)) => return Err(e),
+                }
+            }
         }
-        response.extend_from_slice(&buf[..n]);
-        remaining = remaining.saturating_sub(n);
     }
     Ok(response)
 }

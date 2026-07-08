@@ -744,6 +744,23 @@ impl<L: Loader> Manager<L> {
                                     .hostnames
                                     .write()
                                     .expect("hostname registry lock poisoned");
+                                // Preserve a live switch lease across the
+                                // hostname swap: `register_own_ip` resets the
+                                // route to the loopback placeholder, and the
+                                // lease is only ever published at attach (already
+                                // happened), so capture it first and re-publish
+                                // under the new name — otherwise a rename strands
+                                // a running own-ip PTask (its :7654/:7655 and
+                                // direct-tcpip consumers fall back to an
+                                // unreachable loopback until relaunch).
+                                let live_lease = reg.route_for_session(id).and_then(|route| {
+                                    match route.target {
+                                        std::net::IpAddr::V4(ip) if !ip.is_loopback() => {
+                                            Some((ip, route.port_map))
+                                        }
+                                        _ => None,
+                                    }
+                                });
                                 reg.deregister(&old_name);
                                 match net {
                                     sessions::NetworkMode::OwnIp => {
@@ -751,6 +768,9 @@ impl<L: Loader> Manager<L> {
                                     }
                                     _ => reg.register_host_net(id, &new_reg),
                                 };
+                                if let Some((lease, port_map)) = live_lease {
+                                    reg.set_own_ip_lease(id, lease, port_map);
+                                }
                             }
                             Ok(())
                         }

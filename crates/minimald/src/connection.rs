@@ -553,34 +553,39 @@ impl russh::server::Handler for ConnectionHandler {
         };
 
         // R4.9: the forward must land inside the PTask's network, not the
-        // daemon's. The daemon is deliberately off-switch (see `net::dns`). First
-        // validate that the requested PTask-side (internal) port is actually
-        // published by the session's static ingress policy — a request matching
-        // no published TCP mapping is rejected, never dialled in the daemon's own
-        // namespace.
-        let Some(external_port) = published_external_port(record.policy.ingress.as_ref(), port)
-        else {
-            tracing::warn!(
-                %session_id,
-                requested_host = %host_to_connect,
-                requested_port = port,
-                "direct-tcpip rejected: no published TCP ingress mapping for the requested port"
-            );
-            reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
-            return Ok(());
-        };
-
-        // Route to the PTask (G-N9). On the VM path its backend is reachable only
-        // over the switch: the gvproxy forwarder that publishes
-        // `127.0.0.1:<external>` lives in the *host* netns, unreachable from
-        // inside the VM. So if a live switch lease is published for this session,
-        // dial `lease:<internal>` directly (the client already named the internal
-        // port). Otherwise — DM2's shared-netns forwarder, or no live lease —
-        // fall back to `127.0.0.1:<external>`, the same host-loopback upstream the
-        // :7654/:7655 proxies use for host-direct access.
+        // daemon's own namespace. The daemon is deliberately off-switch (see
+        // `net::dns`), so route to the PTask two ways (G-N9), and never dial an
+        // arbitrary port in the daemon's namespace. `host_to_connect` always
+        // denotes the PTask itself — its in-sandbox loopback maps to the lease —
+        // so it is logged, not dialled verbatim.
         let upstream_addr = match active_lease_target(&mngr, session_id) {
+            // VM path: a live switch lease. The lease *is* the PTask's own
+            // address on the switch, reachable by the daemon, so dial
+            // `lease:<internal>` directly — any port it listens on is in-bounds,
+            // no ingress mapping required (the gvproxy forwarder that publishes
+            // `127.0.0.1:<external>` lives in the *host* netns, unreachable from
+            // inside the VM).
             Some(lease) => SocketAddr::new(IpAddr::V4(lease), port),
-            None => SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), external_port),
+            // No live lease (DM2's shared-netns forwarder, or the lease not yet
+            // up): the PTask is reachable only through a published ingress
+            // forwarder on host loopback, so require a published TCP mapping and
+            // dial `127.0.0.1:<external>`. A request matching no published
+            // mapping is rejected rather than dialled in the daemon's namespace.
+            None => {
+                let Some(external_port) =
+                    published_external_port(record.policy.ingress.as_ref(), port)
+                else {
+                    tracing::warn!(
+                        %session_id,
+                        requested_host = %host_to_connect,
+                        requested_port = port,
+                        "direct-tcpip rejected: no live switch lease and no published TCP ingress mapping for the requested port"
+                    );
+                    reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                    return Ok(());
+                };
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), external_port)
+            }
         };
 
         // Connect to the upstream before accepting the channel. If it is
@@ -646,13 +651,19 @@ fn published_external_port(
 /// whenever no lease is live, so the caller falls back to `127.0.0.1:<external>`.
 ///
 /// The registry `RwLock` is read synchronously and released before returning; no
-/// guard is held across an `.await` in the caller.
+/// guard is held across an `.await` in the caller. A poisoned lock is recovered
+/// rather than mapped to `None` — matching the proxy's `HostRoute` handling of
+/// the same registry — so a prior panic under the write lock does not silently
+/// drop lease routing and dial an unreachable loopback on the VM path.
 fn active_lease_target(
     mngr: &crate::sessions::ManagerHandle,
     session_id: SessionId,
 ) -> Option<Ipv4Addr> {
     let registry = mngr.hostnames();
-    let target = registry.read().ok()?.route_for_session(session_id)?.target;
+    let guard = registry
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let target = guard.route_for_session(session_id)?.target;
     match target {
         IpAddr::V4(ip) if !ip.is_loopback() => Some(ip),
         _ => None,

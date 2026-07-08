@@ -304,23 +304,14 @@ impl HostnameRegistry {
             .map(|reg| reg.hostname.clone())
     }
 
-    /// Resolves a `Host:` header to the address a host-side proxy routes the
-    /// request to, or `None` if no live PTask owns that hostname.
-    ///
-    /// This is the registry/proxy contract: every `*.min.internal` name resolves to
-    /// loopback in the DNS layer, so the per-PTask routing decision is made here,
-    /// by hostname. The header's optional `:port` suffix is ignored and matching
-    /// is case-insensitive, matching how a real `Host:` header arrives.
-    #[must_use]
-    pub fn resolve(&self, host_header: &str) -> Option<IpAddr> {
-        self.resolve_route(host_header).map(|route| route.target)
-    }
-
     /// Resolves a `Host:` header to the full [`Route`] a host-side proxy
     /// forwards the request along — target address plus any external→internal
     /// port remap. The remap is applied by the proxy router
-    /// ([`super::proxy::Router::route`]); [`resolve`](Self::resolve) is the
-    /// target-only shorthand.
+    /// ([`super::proxy::Router::route`]); read `route.target` for the address
+    /// alone. Every `*.min.internal` name resolves to loopback in the DNS layer,
+    /// so the per-PTask routing decision is made here, by hostname: the header's
+    /// optional `:port` suffix is ignored and matching is case-insensitive,
+    /// matching how a real `Host:` header arrives.
     #[must_use]
     pub fn resolve_route(&self, host_header: &str) -> Option<Route> {
         let host = host_component(host_header);
@@ -370,9 +361,14 @@ mod tests {
         // The host-side proxy routes a request by its `Host:` header to the PTask
         // — with or without the `:port` a real header carries.
         let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        assert_eq!(reg.resolve("myservice.dev.min.internal"), Some(loopback));
         assert_eq!(
-            reg.resolve("myservice.dev.min.internal:8080"),
+            reg.resolve_route("myservice.dev.min.internal")
+                .map(|r| r.target),
+            Some(loopback)
+        );
+        assert_eq!(
+            reg.resolve_route("myservice.dev.min.internal:8080")
+                .map(|r| r.target),
             Some(loopback)
         );
 
@@ -382,7 +378,11 @@ mod tests {
             .deregister("myservice")
             .expect("hostname was registered");
         assert_eq!(removed.as_str(), "myservice.dev.min.internal");
-        assert_eq!(reg.resolve("myservice.dev.min.internal"), None);
+        assert_eq!(
+            reg.resolve_route("myservice.dev.min.internal")
+                .map(|r| r.target),
+            None
+        );
     }
 
     /// Under the published-loopback model an `OwnIp` PTask registers to
@@ -396,16 +396,26 @@ mod tests {
         assert_eq!(hostname.as_str(), "web.dev.min.internal");
 
         let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        assert_eq!(reg.resolve("web.dev.min.internal"), Some(loopback));
+        assert_eq!(
+            reg.resolve_route("web.dev.min.internal").map(|r| r.target),
+            Some(loopback)
+        );
         // The published external port is carried in the authority; the registry
         // gates on the host only.
-        assert_eq!(reg.resolve("web.dev.min.internal:18080"), Some(loopback));
+        assert_eq!(
+            reg.resolve_route("web.dev.min.internal:18080")
+                .map(|r| r.target),
+            Some(loopback)
+        );
 
         assert_eq!(
             reg.deregister("web").map(|h| h.as_str().to_string()),
             Some("web.dev.min.internal".to_string())
         );
-        assert_eq!(reg.resolve("web.dev.min.internal"), None);
+        assert_eq!(
+            reg.resolve_route("web.dev.min.internal").map(|r| r.target),
+            None
+        );
     }
 
     /// An `OwnIp` PTask's switch lease is present in the routing table only
@@ -420,7 +430,11 @@ mod tests {
         reg.register_own_ip(id, "web");
 
         // Before attach: the loopback placeholder, no remap.
-        assert_eq!(reg.resolve("web.dev.min.internal:18080"), Some(LOOPBACK));
+        assert_eq!(
+            reg.resolve_route("web.dev.min.internal:18080")
+                .map(|r| r.target),
+            Some(LOOPBACK)
+        );
         assert_eq!(reg.route_for_session(id).map(|r| r.target), Some(LOOPBACK));
 
         // At attach: the live lease is published with the ingress port map.
@@ -437,7 +451,11 @@ mod tests {
 
         // At teardown: reverted to the loopback placeholder; the lease is gone.
         reg.clear_own_ip_lease(id);
-        assert_eq!(reg.resolve("web.dev.min.internal:18080"), Some(LOOPBACK));
+        assert_eq!(
+            reg.resolve_route("web.dev.min.internal:18080")
+                .map(|r| r.target),
+            Some(LOOPBACK)
+        );
         assert_eq!(reg.route_for_session(id).map(|r| r.target), Some(LOOPBACK));
     }
 
