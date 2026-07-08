@@ -109,8 +109,15 @@ New functions:
 
 - `pub fn mount_state_volume(device: &str) -> io::Result<()>`:
   - Opens `device` and reads the ext4 magic word at byte offset 1080 (`0x53EF`).
-  - If absent or corrupt: shells out to `mkfs.ext4 -F <device>`. A mkfs
-    failure is fatal (returns `Err`).
+  - If the magic word is **absent** (blank/uninitialized volume): shells out to
+    `mkfs.ext4 -F <device>`. A mkfs failure is fatal (returns `Err`). mkfs runs
+    only when no ext4 signature is present — never when one exists, so a
+    persistent session disk is never reformatted out from under its data.
+  - If the magic word is **present**: mounts the existing filesystem; the ext4
+    journal replays any unclean-shutdown state on mount. Never mkfs. If the
+    mount fails, run `e2fsck -p <device>` and retry the mount once; if it still
+    fails, fail closed (returns `Err`) so the failure surfaces as `MOUNT_FAILED`
+    rather than silently wiping the volume.
   - Mounts the device read-write at `{NEWROOT}/var/lib/minimal` with
     `MS_NOATIME`. The mountpoint must exist on the RO rootfs (created by R1.7).
   - Returns `Err` on any unexpected I/O or non-zero mkfs exit.
@@ -230,8 +237,8 @@ place; atomicity semantics and the non-empty check are new.
 ### Rootfs build
 
 `scripts/build-rootfs.sh` or `scripts/stage-release.sh`: add `/var/lib/minimal`
-as an empty directory (bind-mount point) and `e2fsprogs` (`mkfs.ext4`) to the
-rootfs closure. The rootfs format stays raw ext4 (`rootfs.img`); no change to
+as an empty directory (bind-mount point) and `e2fsprogs` (`mkfs.ext4`,
+`e2fsck`) to the rootfs closure. The rootfs format stays raw ext4 (`rootfs.img`); no change to
 the release artifact shape (informed by `.minimal/minimal.toml:52-56` and
 `scripts/stage-release.sh:118`).
 
