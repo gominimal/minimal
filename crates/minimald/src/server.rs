@@ -529,10 +529,21 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
     }
 }
 
+/// Upper bound on the best-effort host-loopback publish in
+/// [`expose_proxy_on_host`]. Deliberately far below `post_json`'s gvproxy
+/// control timeout: the publish is awaited on [`Server::run`]'s boot path
+/// *before* the SSH accept loop starts serving, so when no host gvproxy answers
+/// (e.g. none is configured) it must not hold that loop for the full control
+/// timeout — the cold `minimal ls` connect-retry deadline would expire first and
+/// the first list fails (`ssh connect: Disconnected`). A present gvproxy answers
+/// in well under this.
+#[cfg(target_os = "linux")]
+const HOST_EXPOSE_PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Publishes a guest-side proxy bound on `daemon_ip:port` onto the macOS host's
 /// loopback (`127.0.0.1:port`) via the host gvproxy forwarder, reached over the
 /// vsock shuttle (DM1). Best-effort: warns and returns on failure, since the
-/// host gvproxy may be absent.
+/// host gvproxy may be absent. Capped at [`HOST_EXPOSE_PUBLISH_TIMEOUT`].
 #[cfg(target_os = "linux")]
 async fn expose_proxy_on_host(daemon_ip: std::net::Ipv4Addr, port: u16) {
     use crate::net::policy::{ControlChannel, ExposeRequest, post_json};
@@ -546,12 +557,23 @@ async fn expose_proxy_on_host(daemon_ip: std::net::Ipv4Addr, port: u16) {
         remote: format!("{daemon_ip}:{port}"),
         protocol: "tcp".to_string(),
     };
-    if let Err(error) = post_json(&control, "/services/forwarder/expose", &request).await {
-        tracing::warn!(
+    match tokio::time::timeout(
+        HOST_EXPOSE_PUBLISH_TIMEOUT,
+        post_json(&control, "/services/forwarder/expose", &request),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::warn!(
             %port,
             %error,
             "could not publish host-side proxy on the host loopback via gvproxy forwarder"
-        );
+        ),
+        Err(_) => tracing::warn!(
+            %port,
+            timeout = ?HOST_EXPOSE_PUBLISH_TIMEOUT,
+            "host-side proxy publish did not complete in time; continuing (best-effort)"
+        ),
     }
 }
 
