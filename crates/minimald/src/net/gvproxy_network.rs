@@ -18,12 +18,14 @@ use std::net::Ipv4Addr;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use sandbox2::{AttachFuture, NetGuard, Network, NetworkError};
+use sessions::SessionId;
 use tokio::sync::Mutex;
 
 use crate::net::SwitchClient;
+use crate::net::dns::HostnameRegistry;
 use crate::net::policy::{ControlChannel, ExposedMapping};
 use crate::net::switch::SwitchRelay;
 
@@ -34,14 +36,26 @@ pub(crate) struct GvproxyNetwork {
     switch: Arc<Mutex<SwitchClient>>,
     /// Static ingress port mappings to apply once attached; `None`/empty for none.
     ingress: Option<sessions::IngressPolicy>,
+    /// The daemon's shared PTask hostname registry: the live switch lease is
+    /// published here at attach and reverted at teardown (G-N9).
+    hostnames: Arc<RwLock<HostnameRegistry>>,
+    /// The session whose lease this attach publishes.
+    session_id: SessionId,
 }
 
 impl GvproxyNetwork {
     pub(crate) fn new(
         switch: Arc<Mutex<SwitchClient>>,
         ingress: Option<sessions::IngressPolicy>,
+        hostnames: Arc<RwLock<HostnameRegistry>>,
+        session_id: SessionId,
     ) -> Self {
-        Self { switch, ingress }
+        Self {
+            switch,
+            ingress,
+            hostnames,
+            session_id,
+        }
     }
 }
 
@@ -60,9 +74,15 @@ impl Network for GvproxyNetwork {
 
     fn attach(&self, netns_pid: u32) -> AttachFuture<'_> {
         Box::pin(async move {
-            let guard = attach_own_ip(&self.switch, netns_pid, self.ingress.as_ref())
-                .await
-                .map_err(NetworkError::new)?;
+            let guard = attach_own_ip(
+                &self.switch,
+                netns_pid,
+                self.ingress.as_ref(),
+                Arc::clone(&self.hostnames),
+                self.session_id,
+            )
+            .await
+            .map_err(NetworkError::new)?;
             Ok(Box::new(guard) as Box<dyn NetGuard>)
         })
     }
@@ -87,6 +107,14 @@ pub(crate) struct OwnIpGuard {
     /// The static ingress forwards exposed for this PTask (R2.3), removed on
     /// teardown. Empty when no ingress was configured.
     exposed: Vec<ExposedMapping>,
+    /// This PTask's switch lease. The guard is the authoritative owner of the
+    /// ephemeral lease (G-N9); it is logged at teardown for correlation.
+    lease: Ipv4Addr,
+    /// The shared hostname registry into which this PTask's lease was published
+    /// (VM path only); reverted to the loopback placeholder on teardown.
+    hostnames: Arc<RwLock<HostnameRegistry>>,
+    /// The session key under which the lease was published/reverted.
+    session_id: SessionId,
 }
 
 impl NetGuard for OwnIpGuard {
@@ -97,6 +125,23 @@ impl NetGuard for OwnIpGuard {
             // reach a still-running switch first.
             if !self.exposed.is_empty() {
                 crate::net::policy::remove_ingress(&self.control, &self.exposed).await;
+            }
+            // Revert the published lease BEFORE the switch detach, so no in-VM
+            // consumer can resolve the hostname to a tearing-down lease. Only the
+            // VM path (`Vsock`) publishes a lease; DM2 (`Unix`) keeps the
+            // loopback placeholder untouched (its shared-netns forwarder still
+            // serves host-direct access). A revert with nothing published is a
+            // harmless no-op.
+            if let ControlChannel::Vsock { .. } = &self.control {
+                tracing::debug!(
+                    session_id = %self.session_id,
+                    lease = %self.lease,
+                    "reverting OwnIp PTask lease on teardown"
+                );
+                self.hostnames
+                    .write()
+                    .expect("hostname registry lock poisoned")
+                    .clear_own_ip_lease(self.session_id);
             }
             if let Err(e) = self.switch.lock().await.detach().await {
                 tracing::warn!(error = %e, "detaching OwnIp PTask from switch on session end");
@@ -120,6 +165,8 @@ async fn attach_own_ip(
     switch: &Arc<Mutex<SwitchClient>>,
     netns_pid: u32,
     ingress: Option<&sessions::IngressPolicy>,
+    hostnames: Arc<RwLock<HostnameRegistry>>,
+    session_id: SessionId,
 ) -> io::Result<OwnIpGuard> {
     use crate::net::SwitchTransport;
     use crate::net::switch::{attach_to_switch_vsock, move_tap_into_netns, open_tap};
@@ -174,7 +221,11 @@ async fn attach_own_ip(
     // This path owns its own rollback (no session-host guard), so detach if the
     // ingress-applying tail fails.
     let control = ControlChannel::Vsock { cid, port };
-    match finish_own_ip_attach(switch, relay, control, lease.ip, ingress).await {
+    match finish_own_ip_attach(
+        switch, relay, control, lease.ip, ingress, hostnames, session_id,
+    )
+    .await
+    {
         Ok(guard) => Ok(guard),
         Err(e) => {
             let _ = switch.lock().await.detach().await;
@@ -199,13 +250,18 @@ pub(crate) async fn complete_local_own_ip_attach(
     sock: PathBuf,
     lease_ip: Ipv4Addr,
     ingress: Option<&sessions::IngressPolicy>,
+    hostnames: Arc<RwLock<HostnameRegistry>>,
+    session_id: SessionId,
 ) -> io::Result<OwnIpGuard> {
     // Rollback of the pre-spawn phase-1 attach is owned by the session host's
     // launch guard (which also covers a cancelled launch), so a failure here just
     // propagates — detaching would double-decrement gvproxy's attach count.
     let relay = crate::net::switch::attach_to_switch(tap_fd, &sock).await?;
     let control = ControlChannel::Unix(sock);
-    finish_own_ip_attach(switch, relay, control, lease_ip, ingress).await
+    finish_own_ip_attach(
+        switch, relay, control, lease_ip, ingress, hostnames, session_id,
+    )
+    .await
 }
 
 /// Shared tail of both own-IP attach paths: apply static ingress forwards (R2.3)
@@ -220,6 +276,8 @@ async fn finish_own_ip_attach(
     control: ControlChannel,
     lease_ip: Ipv4Addr,
     ingress: Option<&sessions::IngressPolicy>,
+    hostnames: Arc<RwLock<HostnameRegistry>>,
+    session_id: SessionId,
 ) -> io::Result<OwnIpGuard> {
     let exposed = match ingress {
         Some(ingress) if !ingress.port_mappings.is_empty() => {
@@ -234,10 +292,40 @@ async fn finish_own_ip_attach(
         _ => Vec::new(),
     };
 
+    // Publish the live lease so in-VM host→PTask consumers (the `:7654`/`:7655`
+    // proxies and `direct-tcpip`) dial the switch lease directly — the
+    // host-loopback forwarder that DM2 relies on lives in the *host* netns and is
+    // unreachable from inside the VM (G-N9). Only the VM path (`Vsock`) needs
+    // this; DM2 (`Unix`) keeps the published-loopback placeholder, whose
+    // shared-netns forwarder is reachable, so its verified behaviour is untouched.
+    if let ControlChannel::Vsock { .. } = &control {
+        let port_map = tcp_port_map(ingress);
+        hostnames
+            .write()
+            .expect("hostname registry lock poisoned")
+            .set_own_ip_lease(session_id, lease_ip, port_map);
+    }
+
     Ok(OwnIpGuard {
         _relay: relay,
         switch: Arc::clone(switch),
         control,
         exposed,
+        lease: lease_ip,
+        hostnames,
+        session_id,
     })
+}
+
+/// The static TCP ingress mappings as external→internal port pairs — the port
+/// map published with the lease so the `:7654`/`:7655` proxies translate a
+/// consumer's published external port to the PTask-internal port to dial. UDP
+/// mappings are excluded: the HTTP proxies and `direct-tcpip` are TCP.
+fn tcp_port_map(ingress: Option<&sessions::IngressPolicy>) -> Vec<(u16, u16)> {
+    ingress
+        .into_iter()
+        .flat_map(|ingress| &ingress.port_mappings)
+        .filter(|m| m.proto == sessions::IpProto::Tcp)
+        .map(|m| (m.external_port, m.internal_port))
+        .collect()
 }

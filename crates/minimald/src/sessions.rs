@@ -230,7 +230,11 @@ pub struct Manager<L: Loader = DiskLoader> {
     /// manager still mutates it under `&mut self`. The lock is only ever held for
     /// a synchronous register/deregister/resolve, never across an `.await`.
     /// `HostNet` PTasks register on launch and withdraw on teardown.
-    #[cfg(target_os = "linux")]
+    ///
+    /// Unconditional (not `cfg(linux)`) so it can be threaded into every session
+    /// launch — an `OwnIp` PTask's live switch lease is published here at attach
+    /// and reverted at teardown (G-N9). Registration into it stays Linux-gated;
+    /// on other targets the registry is simply never populated.
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
 }
 
@@ -267,7 +271,6 @@ impl Manager {
         // Shared so the host-side proxies can resolve `Host:` headers directly;
         // a clone is held by both the actor (which mutates it) and the handle
         // (which hands it to the proxies via `hostnames()`).
-        #[cfg(target_os = "linux")]
         let hostnames = Arc::new(RwLock::new(crate::net::dns::HostnameRegistry::new(
             crate::net::dns::DEFAULT_HOST_ID,
         )));
@@ -282,16 +285,11 @@ impl Manager {
             minimal_state_dir,
             minimal_cache_dir,
             net_switch,
-            #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&hostnames),
         };
 
         tokio::spawn(mngr.mainloop());
-        Ok(ManagerHandle {
-            sender,
-            #[cfg(target_os = "linux")]
-            hostnames,
-        })
+        Ok(ManagerHandle { sender, hostnames })
     }
 }
 
@@ -458,6 +456,7 @@ impl<L: Loader> Manager<L> {
                                         self.minimal_cache_dir.clone(),
                                         obj,
                                         Arc::clone(&self.net_switch),
+                                        Arc::clone(&self.hostnames),
                                         composition,
                                     )
                                     .await?;
@@ -918,16 +917,15 @@ pub struct ManagerHandle {
     sender: mpsc::Sender<ManagerMessage>,
     /// A clone of the actor's shared PTask hostname registry, handed to the
     /// host-side proxies so they resolve `Host:` headers without a round-trip
-    /// through the actor mainloop.
-    #[cfg(target_os = "linux")]
+    /// through the actor mainloop, and to the SSH `direct-tcpip` handler so it
+    /// can reach an `OwnIp` PTask by its live switch lease (G-N9).
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
 }
 
 impl ManagerHandle {
     /// Returns a shared handle to the in-memory PTask hostname registry, for the
     /// daemon's host-side proxies ([`crate::net::proxy`]) to route by `Host:`
-    /// header.
-    #[cfg(target_os = "linux")]
+    /// header and the `direct-tcpip` handler to resolve a session's live lease.
     #[must_use]
     pub fn hostnames(&self) -> Arc<RwLock<crate::net::dns::HostnameRegistry>> {
         Arc::clone(&self.hostnames)

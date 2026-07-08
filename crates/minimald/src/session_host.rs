@@ -609,6 +609,12 @@ pub(crate) struct SandboxLauncher {
     /// Composition to merge into the launcher's baseline packages and
     /// vars. Patches and lifecycle hooks are ignored today.
     pub(crate) composition: Option<std::sync::Arc<sessions::core::compose::Composition>>,
+    /// The daemon's shared PTask hostname registry. An `OwnIp` launch on the VM
+    /// path publishes its live switch lease here at attach and reverts it at
+    /// teardown, so in-VM host→PTask consumers dial the lease (G-N9).
+    pub(crate) hostnames: std::sync::Arc<std::sync::RwLock<crate::net::dns::HostnameRegistry>>,
+    /// This session's stable id, the key under which its lease is published.
+    pub(crate) session_id: sessions::SessionId,
 }
 
 /// Rolls back a native-own-IP phase-1 switch attach if the launch is abandoned
@@ -677,6 +683,8 @@ impl SessionLauncher for SandboxLauncher {
         let network_mode = self.network_mode;
         let net_switch = self.net_switch;
         let composition = self.composition;
+        let hostnames = self.hostnames;
+        let session_id = self.session_id;
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
         // graph construction) — run it on the blocking pool so it
         // doesn't stall the async executor.
@@ -892,6 +900,8 @@ impl SessionLauncher for SandboxLauncher {
                     sock,
                     lease_ip,
                     ingress.as_ref(),
+                    std::sync::Arc::clone(&hostnames),
+                    session_id,
                 )
                 .await
                 {
@@ -915,6 +925,8 @@ impl SessionLauncher for SandboxLauncher {
                 let network = crate::net::gvproxy_network::GvproxyNetwork::new(
                     std::sync::Arc::clone(&net_switch),
                     ingress,
+                    std::sync::Arc::clone(&hostnames),
+                    session_id,
                 );
                 match network.attach(process.id()).await {
                     Ok(guard) => Some(guard),

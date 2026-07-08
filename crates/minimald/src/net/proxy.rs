@@ -24,7 +24,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use super::dns::HostnameRegistry;
+use super::dns::{HostnameRegistry, Route};
 
 /// Port the B5 host-side egress/DNS proxy listens on (TC3). Clients reach it
 /// via `HTTP(S)_PROXY`.
@@ -52,20 +52,22 @@ const MAX_HEAD: usize = 8 * 1024;
 const HEAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The host-side lookup the proxy performs for each request: a `Host:`-header
-/// host (with any `:port` already stripped) to the address its requests forward
-/// to, or `None` if no live PTask owns it. The host resolver is never consulted.
+/// host (with any `:port` already stripped) to the [`Route`] its requests
+/// forward along — target address plus any external→internal port remap — or
+/// `None` if no live PTask owns it. The host resolver is never consulted.
 ///
 /// Factored as a trait so the routing core is decoupled from how the table is
 /// shared (the sessions manager owns the live registry) and so #502 can drive
 /// the same lookup behind TLS termination.
 pub trait HostRoute: Send + Sync + 'static {
-    /// Resolves a `Host:`-header host to the address its requests forward to.
-    fn resolve_host(&self, host: &str) -> Option<IpAddr>;
+    /// Resolves a `Host:`-header host to the [`Route`] its requests forward
+    /// along.
+    fn resolve_route(&self, host: &str) -> Option<Route>;
 }
 
 impl HostRoute for HostnameRegistry {
-    fn resolve_host(&self, host: &str) -> Option<IpAddr> {
-        self.resolve(host)
+    fn resolve_route(&self, host: &str) -> Option<Route> {
+        self.resolve_route(host)
     }
 }
 
@@ -74,14 +76,14 @@ impl HostRoute for HostnameRegistry {
 // `.await` held). This lets `Router::new(Arc<RwLock<HostnameRegistry>>)` route
 // against the same table the manager registers PTasks into.
 impl HostRoute for std::sync::RwLock<HostnameRegistry> {
-    fn resolve_host(&self, host: &str) -> Option<IpAddr> {
+    fn resolve_route(&self, host: &str) -> Option<Route> {
         // Recover from a poisoned lock rather than mapping it to `None`: the
         // registry is two HashMaps with no cross-field invariant a panicked
         // writer could half-break, and silently returning `None` would make
         // every `*.min.internal` request 502 forever with no signal.
         match self.read() {
-            Ok(guard) => guard.resolve(host),
-            Err(poisoned) => poisoned.into_inner().resolve(host),
+            Ok(guard) => guard.resolve_route(host),
+            Err(poisoned) => poisoned.into_inner().resolve_route(host),
         }
     }
 }
@@ -114,19 +116,29 @@ impl<T: HostRoute> Router<T> {
     /// live PTask owns the host. The authority's optional `:port` selects the
     /// upstream port; absent, [`DEFAULT_UPSTREAM_PORT`] is used.
     ///
-    /// The registry gates on the host, not the port: the upstream port comes
-    /// entirely from the client-supplied authority, so a registered `HostNet`
-    /// hostname can be routed to `127.0.0.1:<any-port>`. That is an accepted
-    /// limitation of the current single-user threat model — the networking spec
-    /// scopes `minimald` to a single tenant per host and defers multi-tenant
-    /// policy isolation (including per-PTask loopback port restriction) to a
-    /// follow-up. Where mutually-untrusted PTasks share loopback, this is a
-    /// loopback-SSRF surface that the follow-up must close.
+    /// The registry gates on the host, not the port: for a published-loopback
+    /// route the upstream port comes entirely from the client-supplied
+    /// authority, so a registered `HostNet` hostname can be routed to
+    /// `127.0.0.1:<any-port>`. That is an accepted limitation of the current
+    /// single-user threat model — the networking spec scopes `minimald` to a
+    /// single tenant per host and defers multi-tenant policy isolation
+    /// (including per-PTask loopback port restriction) to a follow-up. Where
+    /// mutually-untrusted PTasks share loopback, this is a loopback-SSRF surface
+    /// that the follow-up must close.
+    ///
+    /// For an in-VM lease route (G-N9) the authority's published *external* port
+    /// is remapped to the PTask-*internal* port via the route's port map, so the
+    /// upstream is `lease:<internal>` reached over the switch rather than a
+    /// host-loopback forwarder port.
     #[must_use]
     pub fn route(&self, authority: &str) -> Option<SocketAddr> {
         let (host, port) = split_authority(authority);
-        let ip = self.table.resolve_host(host)?;
-        Some(SocketAddr::new(ip, port.unwrap_or(DEFAULT_UPSTREAM_PORT)))
+        let route = self.table.resolve_route(host)?;
+        let dial_port = match port {
+            Some(external) => route.dial_port(external),
+            None => DEFAULT_UPSTREAM_PORT,
+        };
+        Some(SocketAddr::new(route.target, dial_port))
     }
 }
 
@@ -717,6 +729,27 @@ mod tests {
         );
         // An unregistered host does not route.
         assert_eq!(router.route("ghost.dev.min.internal"), None);
+    }
+
+    /// In-VM lease routing (G-N9): once an `OwnIp` PTask's switch lease is
+    /// published, the proxy routes its hostname to `lease:<internal>` — the
+    /// authority's published *external* port (18080) is remapped to the
+    /// PTask-*internal* port (8080) and the target is the switch lease, not host
+    /// loopback. This is the fix that lets the in-VM `:7654`/`:7655` proxies
+    /// reach a PTask the host-loopback forwarder cannot serve from inside the VM.
+    #[test]
+    fn own_ip_lease_routes_to_switch_lease_with_internal_port() {
+        let lease = Ipv4Addr::new(100, 64, 0, 9);
+        let mut reg = HostnameRegistry::new("dev");
+        let id = SessionId::nil();
+        reg.register_own_ip(id, "web");
+        reg.set_own_ip_lease(id, lease, vec![(18080, 8080)]);
+        let router = Router::new(Arc::new(reg));
+
+        assert_eq!(
+            router.route("web.dev.min.internal:18080"),
+            Some(SocketAddr::new(IpAddr::V4(lease), 8080))
+        );
     }
 
     /// Proof artifact 3 (R3.4 supersession): when the listen address cannot be

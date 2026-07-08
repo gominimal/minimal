@@ -6,7 +6,7 @@ use sessions::{IpProto, SessionId};
 use std::{
     collections::BTreeMap,
     fmt,
-    net::Ipv4Addr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{Arc, LazyLock},
     time::Duration,
 };
@@ -553,14 +553,11 @@ impl russh::server::Handler for ConnectionHandler {
         };
 
         // R4.9: the forward must land inside the PTask's network, not the
-        // daemon's. The daemon is deliberately off-switch (see `net::dns`); an
-        // own-ip PTask's backends are reachable only through their published
-        // ingress mappings on host loopback (`127.0.0.1:<external>` →
-        // `lease:<internal>`), the same upstream the :7654/:7655 proxies dial.
-        // Resolve the requested PTask-side (internal) port to its published
-        // external port and connect to loopback — never to the raw client
-        // target in the daemon's own namespace. A request matching no published
-        // TCP mapping is rejected.
+        // daemon's. The daemon is deliberately off-switch (see `net::dns`). First
+        // validate that the requested PTask-side (internal) port is actually
+        // published by the session's static ingress policy — a request matching
+        // no published TCP mapping is rejected, never dialled in the daemon's own
+        // namespace.
         let Some(external_port) = published_external_port(record.policy.ingress.as_ref(), port)
         else {
             tracing::warn!(
@@ -572,11 +569,23 @@ impl russh::server::Handler for ConnectionHandler {
             reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
             return Ok(());
         };
-        let upstream_addr = (Ipv4Addr::LOCALHOST, external_port);
 
-        // Connect to the published loopback port before accepting the channel.
-        // If it is unreachable within the grace period, reject rather than
-        // leaving the client with an open-but-dead channel.
+        // Route to the PTask (G-N9). On the VM path its backend is reachable only
+        // over the switch: the gvproxy forwarder that publishes
+        // `127.0.0.1:<external>` lives in the *host* netns, unreachable from
+        // inside the VM. So if a live switch lease is published for this session,
+        // dial `lease:<internal>` directly (the client already named the internal
+        // port). Otherwise — DM2's shared-netns forwarder, or no live lease —
+        // fall back to `127.0.0.1:<external>`, the same host-loopback upstream the
+        // :7654/:7655 proxies use for host-direct access.
+        let upstream_addr = match active_lease_target(&mngr, session_id) {
+            Some(lease) => SocketAddr::new(IpAddr::V4(lease), port),
+            None => SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), external_port),
+        };
+
+        // Connect to the upstream before accepting the channel. If it is
+        // unreachable within the grace period, reject rather than leaving the
+        // client with an open-but-dead channel.
         let upstream =
             match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(upstream_addr))
                 .await
@@ -584,17 +593,17 @@ impl russh::server::Handler for ConnectionHandler {
                 Ok(Ok(s)) => s,
                 Ok(Err(error)) => {
                     tracing::warn!(
-                        external_port,
+                        %upstream_addr,
                         %error,
-                        "direct-tcpip: could not connect to the published ingress port"
+                        "direct-tcpip: could not connect to the PTask upstream"
                     );
                     reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
                     return Ok(());
                 }
                 Err(_) => {
                     tracing::warn!(
-                        external_port,
-                        "direct-tcpip: connection to the published ingress port timed out"
+                        %upstream_addr,
+                        "direct-tcpip: connection to the PTask upstream timed out"
                     );
                     reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
                     return Ok(());
@@ -627,6 +636,27 @@ fn published_external_port(
         .flat_map(|ingress| &ingress.port_mappings)
         .find(|m| m.internal_port == internal_port && m.proto == IpProto::Tcp)
         .map(|m| m.external_port)
+}
+
+/// The live switch lease a session's `OwnIp` PTask is currently reachable at, if
+/// one is published — the VM path (DM1/3/4), where `direct-tcpip` must dial the
+/// lease over the switch rather than the host-loopback forwarder (G-N9). Read
+/// from the shared hostname registry by stable session id. `None` on DM2 (the
+/// loopback published-port model, whose shared-netns forwarder is reachable) and
+/// whenever no lease is live, so the caller falls back to `127.0.0.1:<external>`.
+///
+/// The registry `RwLock` is read synchronously and released before returning; no
+/// guard is held across an `.await` in the caller.
+fn active_lease_target(
+    mngr: &crate::sessions::ManagerHandle,
+    session_id: SessionId,
+) -> Option<Ipv4Addr> {
+    let registry = mngr.hostnames();
+    let target = registry.read().ok()?.route_for_session(session_id)?.target;
+    match target {
+        IpAddr::V4(ip) if !ip.is_loopback() => Some(ip),
+        _ => None,
+    }
 }
 
 /// Relay bytes bidirectionally between two async streams, logging any relay error.

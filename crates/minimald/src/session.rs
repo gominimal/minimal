@@ -87,6 +87,13 @@ pub struct Session<S: SessionObject> {
     #[cfg_attr(test, allow(dead_code))]
     net_switch: Arc<Mutex<crate::net::SwitchClient>>,
 
+    /// The daemon's shared PTask hostname registry, handed to each `OwnIp`
+    /// launch so its live switch lease is published at attach and reverted at
+    /// teardown (G-N9). Read only by the production `session_launcher`
+    /// (`cfg(not(test))`); the mock launcher ignores it.
+    #[cfg_attr(test, allow(dead_code))]
+    hostnames: Arc<std::sync::RwLock<crate::net::dns::HostnameRegistry>>,
+
     /// The running host, if minted, paired with the `JoinHandle` of its runtime
     /// loop so teardown can be awaited on destroy.
     host: Option<(
@@ -139,6 +146,7 @@ impl<S: SessionObject> Session<S> {
         minimal_cache_dir: DaemonAbsPath,
         session: S,
         net_switch: Arc<Mutex<crate::net::SwitchClient>>,
+        hostnames: Arc<std::sync::RwLock<crate::net::dns::HostnameRegistry>>,
         composition: Option<Arc<Composition>>,
     ) -> Result<SessionHandle, std::io::Error> {
         std::fs::create_dir_all(session.workspace_path())?;
@@ -153,6 +161,7 @@ impl<S: SessionObject> Session<S> {
             minimal_state_dir,
             minimal_cache_dir,
             net_switch,
+            hostnames,
             tracker: OpTracker::new_root(),
             composition,
             context: None,
@@ -322,6 +331,9 @@ impl<S: SessionObject> Session<S> {
         // only carried for that mode; `validate_policy` has already rejected
         // ingress configured on any other mode.
         let ingress = record.policy.ingress.clone();
+        // The stable session id keys the lease publish/revert in the shared
+        // hostname registry (robust to a rename, which moves the by-name key).
+        let session_id = record.id;
         Ok(session_host::SandboxLauncher {
             ctx: self.context().map_err(AttachError::ContextCreationFailed)?,
             network_mode,
@@ -329,6 +341,8 @@ impl<S: SessionObject> Session<S> {
             ingress,
             session,
             composition: self.composition.clone(),
+            hostnames: Arc::clone(&self.hostnames),
+            session_id,
         })
     }
 

@@ -46,6 +46,49 @@ pub const DEFAULT_HOST_ID: &str = "local";
 /// The loopback address a local-only (non-DM5) PTask hostname routes to (R3.6).
 const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
+/// Where a resolved PTask hostname routes, and how its published ports remap.
+///
+/// `target` is the address a host-side consumer dials. `port_map` translates a
+/// published *external* port in the request authority to the PTask-*internal*
+/// port to dial, and is populated only for **in-VM lease routing** (DM1/3/4):
+/// there the daemon reaches an `OwnIp` PTask by its switch lease directly,
+/// because gvproxy's host-loopback forwarder lives in the *host* netns and is
+/// unreachable from inside the VM (G-N9). It is empty for the published-loopback
+/// model (DM2 / `HostNet`), where the authority's port is dialed unchanged
+/// because the shared-netns forwarder already maps external→internal on host
+/// loopback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Route {
+    /// The address a host-side consumer dials for this hostname.
+    pub target: IpAddr,
+    /// external→internal port remap, applied by [`Route::dial_port`]. Empty
+    /// means the authority's port is dialed unchanged (published-loopback).
+    pub port_map: Vec<(u16, u16)>,
+}
+
+impl Route {
+    /// The published-loopback placeholder: loopback target, no remap. This is
+    /// how every `OwnIp`/`HostNet` hostname is registered, and what an `OwnIp`
+    /// entry reverts to when its live lease tears down.
+    fn loopback() -> Self {
+        Self {
+            target: LOOPBACK,
+            port_map: Vec::new(),
+        }
+    }
+
+    /// The upstream port to dial for a request whose authority carried
+    /// `external`: the mapped PTask-internal port when this route publishes a
+    /// lease mapping for it, else `external` unchanged (published-loopback).
+    #[must_use]
+    pub fn dial_port(&self, external: u16) -> u16 {
+        self.port_map
+            .iter()
+            .find(|(ext, _)| *ext == external)
+            .map_or(external, |(_, internal)| *internal)
+    }
+}
+
 /// A registered PTask hostname of the form `<session>.<host-id>.min.internal`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Hostname(String);
@@ -88,8 +131,8 @@ struct Registration {
 pub struct HostnameRegistry {
     /// The `<host-id>` component shared by every hostname this registry mints.
     host_id: String,
-    /// hostname → the address a host-side proxy routes its requests to.
-    by_host: HashMap<Hostname, IpAddr>,
+    /// hostname → the [`Route`] a host-side proxy forwards its requests along.
+    by_host: HashMap<Hostname, Route>,
     /// session name → its live registration, for withdrawal on exit.
     by_session: HashMap<String, Registration>,
 }
@@ -124,7 +167,13 @@ impl HostnameRegistry {
                 hostname: hostname.clone(),
             },
         );
-        self.by_host.insert(hostname.clone(), target);
+        self.by_host.insert(
+            hostname.clone(),
+            Route {
+                target,
+                port_map: Vec::new(),
+            },
+        );
         tracing::info!(
             session_id = %session_id,
             session_name,
@@ -160,7 +209,7 @@ impl HostnameRegistry {
     /// `registered` event did, and formats `ip` with `Display` to match it.
     pub fn deregister(&mut self, session_name: &str) -> Option<Hostname> {
         let Registration { id, hostname } = self.by_session.remove(session_name)?;
-        let ip = self
+        let route = self
             .by_host
             .remove(&hostname)
             .expect("by_host is kept in sync with by_session by register");
@@ -168,11 +217,91 @@ impl HostnameRegistry {
             session_id = %id,
             session_name,
             hostname = %hostname,
-            ip = %ip,
+            ip = %route.target,
             action = "deregistered",
             "deregistered PTask hostname"
         );
         Some(hostname)
+    }
+
+    /// Publishes a live `OwnIp` PTask's switch `lease` into its
+    /// already-registered hostname entry, so in-VM host→PTask consumers (the
+    /// `:7654`/`:7655` proxies) dial the lease directly instead of the
+    /// host-loopback forwarder, which is unreachable from inside the VM (G-N9).
+    /// `port_map` carries the session's static TCP ingress mappings as
+    /// external→internal pairs, so the consumer's published external port is
+    /// translated to the PTask-internal port to dial.
+    ///
+    /// Keyed by the stable [`SessionId`] so a rename between attach and this
+    /// call cannot lose the entry. A no-op (with a warning) when no hostname is
+    /// registered for the session — e.g. a `NoNet` PTask, which never registers.
+    /// The lease therefore exists in the routing table only while the sandbox
+    /// runs; [`clear_own_ip_lease`](Self::clear_own_ip_lease) reverts it.
+    pub fn set_own_ip_lease(
+        &mut self,
+        session_id: SessionId,
+        lease: Ipv4Addr,
+        port_map: Vec<(u16, u16)>,
+    ) {
+        let Some(hostname) = self.hostname_for_session(session_id) else {
+            tracing::warn!(
+                session_id = %session_id,
+                "set_own_ip_lease: no registered hostname for session; lease not published"
+            );
+            return;
+        };
+        self.by_host.insert(
+            hostname.clone(),
+            Route {
+                target: IpAddr::V4(lease),
+                port_map,
+            },
+        );
+        tracing::info!(
+            session_id = %session_id,
+            hostname = %hostname,
+            lease = %lease,
+            action = "lease-published",
+            "published OwnIp PTask switch lease"
+        );
+    }
+
+    /// Reverts an `OwnIp` PTask's hostname entry to the published-loopback
+    /// placeholder when its sandbox — and therefore its lease — tears down. The
+    /// hostname stays registered (the session lives on and may re-attach), but
+    /// the lease is present in the routing table only while the sandbox runs.
+    /// Keyed by the stable [`SessionId`]; a no-op when nothing is registered.
+    pub fn clear_own_ip_lease(&mut self, session_id: SessionId) {
+        let Some(hostname) = self.hostname_for_session(session_id) else {
+            return;
+        };
+        self.by_host.insert(hostname.clone(), Route::loopback());
+        tracing::info!(
+            session_id = %session_id,
+            hostname = %hostname,
+            action = "lease-revoked",
+            "reverted OwnIp PTask lease to the loopback placeholder"
+        );
+    }
+
+    /// The current [`Route`] for a session's hostname, looked up by its stable
+    /// id. Used by the SSH `direct-tcpip` handler to reach an `OwnIp` PTask by
+    /// its live switch lease. `None` when the session has no registered
+    /// hostname.
+    #[must_use]
+    pub fn route_for_session(&self, session_id: SessionId) -> Option<Route> {
+        let hostname = self.hostname_for_session(session_id)?;
+        self.by_host.get(&hostname).cloned()
+    }
+
+    /// The hostname registered for `session_id`, if any. Scans the session
+    /// table (small: one entry per live session) so lookups survive a rename,
+    /// which mutates the by-name key but not the id.
+    fn hostname_for_session(&self, session_id: SessionId) -> Option<Hostname> {
+        self.by_session
+            .values()
+            .find(|reg| reg.id == session_id)
+            .map(|reg| reg.hostname.clone())
     }
 
     /// Resolves a `Host:` header to the address a host-side proxy routes the
@@ -184,10 +313,20 @@ impl HostnameRegistry {
     /// is case-insensitive, matching how a real `Host:` header arrives.
     #[must_use]
     pub fn resolve(&self, host_header: &str) -> Option<IpAddr> {
+        self.resolve_route(host_header).map(|route| route.target)
+    }
+
+    /// Resolves a `Host:` header to the full [`Route`] a host-side proxy
+    /// forwards the request along — target address plus any external→internal
+    /// port remap. The remap is applied by the proxy router
+    /// ([`super::proxy::Router::route`]); [`resolve`](Self::resolve) is the
+    /// target-only shorthand.
+    #[must_use]
+    pub fn resolve_route(&self, host_header: &str) -> Option<Route> {
         let host = host_component(host_header);
         self.by_host
             .get(&Hostname(host.to_ascii_lowercase()))
-            .copied()
+            .cloned()
     }
 }
 
@@ -267,6 +406,49 @@ mod tests {
             Some("web.dev.min.internal".to_string())
         );
         assert_eq!(reg.resolve("web.dev.min.internal"), None);
+    }
+
+    /// An `OwnIp` PTask's switch lease is present in the routing table only
+    /// between attach (`set_own_ip_lease`) and teardown (`clear_own_ip_lease`),
+    /// and while present it routes the hostname to the lease with the published
+    /// external→internal port remap (G-N9 in-VM lease routing). Before attach
+    /// and after teardown the entry is the loopback placeholder.
+    #[test]
+    fn own_ip_lease_is_published_only_between_attach_and_teardown() {
+        let mut reg = HostnameRegistry::new("dev");
+        let id = SessionId::nil();
+        reg.register_own_ip(id, "web");
+
+        // Before attach: the loopback placeholder, no remap.
+        assert_eq!(reg.resolve("web.dev.min.internal:18080"), Some(LOOPBACK));
+        assert_eq!(reg.route_for_session(id).map(|r| r.target), Some(LOOPBACK));
+
+        // At attach: the live lease is published with the ingress port map.
+        let lease = Ipv4Addr::new(100, 64, 0, 9);
+        reg.set_own_ip_lease(id, lease, vec![(18080, 8080)]);
+        let route = reg
+            .resolve_route("web.dev.min.internal:18080")
+            .expect("lease published");
+        assert_eq!(route.target, IpAddr::V4(lease));
+        // The published external port remaps to the PTask-internal port.
+        assert_eq!(route.dial_port(18080), 8080);
+        // An unmapped port passes through unchanged.
+        assert_eq!(route.dial_port(9999), 9999);
+
+        // At teardown: reverted to the loopback placeholder; the lease is gone.
+        reg.clear_own_ip_lease(id);
+        assert_eq!(reg.resolve("web.dev.min.internal:18080"), Some(LOOPBACK));
+        assert_eq!(reg.route_for_session(id).map(|r| r.target), Some(LOOPBACK));
+    }
+
+    /// Publishing a lease for a session with no registered hostname (e.g. a
+    /// `NoNet` PTask, which never registers) is a silent no-op, so the attach
+    /// path can call it unconditionally.
+    #[test]
+    fn set_own_ip_lease_for_unregistered_session_is_a_noop() {
+        let mut reg = HostnameRegistry::new("dev");
+        reg.set_own_ip_lease(SessionId::nil(), Ipv4Addr::new(100, 64, 0, 9), vec![]);
+        assert_eq!(reg.route_for_session(SessionId::nil()), None);
     }
 
     /// Port stripping handles both the common `name:port` form and the
