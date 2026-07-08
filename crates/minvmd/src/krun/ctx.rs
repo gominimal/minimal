@@ -13,6 +13,7 @@
 use std::ffi::{CString, c_char};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::OnceLock;
 
 use crate::error::VmError;
 use crate::krun::raw;
@@ -29,7 +30,13 @@ pub struct Context {
 
 impl Context {
     /// Create a new libkrun configuration context.
+    ///
+    /// If the `MINVMD_KRUN_LOG` environment variable is set (see
+    /// [`KRUN_LOG_ENV`]), libkrun's logging is configured to stderr at the
+    /// corresponding level before the context is created, so bring-up itself
+    /// is captured.
     pub fn create() -> Result<Self, VmError> {
+        configure_logging_from_env()?;
         // SAFETY: krun_create_ctx takes no arguments and either returns a
         // non-negative ctx_id (owned by the caller until krun_free_ctx) or a
         // negative errno. No pointer or lifetime invariants apply.
@@ -301,6 +308,71 @@ impl Drop for Context {
     }
 }
 
+/// Environment variable that, when set to a non-empty value, configures
+/// libkrun's logging. The value is a level name (`off`, `error`, `warn`,
+/// `info`, `debug`, `trace`; case-insensitive) or the equivalent numeric
+/// level `0`–`5`. Unset or empty leaves libkrun's logging at its default.
+pub const KRUN_LOG_ENV: &str = "MINVMD_KRUN_LOG";
+
+/// Configure libkrun's logging to stderr from [`KRUN_LOG_ENV`], if set.
+///
+/// A no-op when the variable is unset or empty. A set-but-unrecognised value
+/// is a hard error ([`VmError::InvalidLogLevel`]) rather than a silent
+/// fallback, so a typo in the level surfaces at start-up.
+///
+/// `krun_init_log` installs a process-global logger and fails if called more
+/// than once, so the FFI call is memoized through a [`OnceLock`]: the first
+/// configuring `create()` performs it and every caller observes the same
+/// return code. `KRUN_LOG_ENV` is read on each call (it cannot change between
+/// them) so an invalid value is reported consistently even before the logger
+/// would be initialized.
+fn configure_logging_from_env() -> Result<(), VmError> {
+    static LOG_INIT_RET: OnceLock<i32> = OnceLock::new();
+
+    let Some(raw_value) = std::env::var_os(KRUN_LOG_ENV) else {
+        return Ok(());
+    };
+    let value = raw_value.to_string_lossy();
+    if value.trim().is_empty() {
+        return Ok(());
+    }
+    let level = parse_log_level(&value).ok_or_else(|| VmError::InvalidLogLevel {
+        value: value.into_owned(),
+    })?;
+
+    let ret = *LOG_INIT_RET.get_or_init(|| {
+        // SAFETY: krun_init_log takes four values by value (no pointers). The
+        // `target_fd` is libkrun's sentinel for stderr; `level`, `style`, and
+        // `options` are plain integers. Guarded by the enclosing `OnceLock`
+        // so libkrun's install-once logger is initialized at most once.
+        unsafe {
+            raw::krun_init_log(
+                raw::LOG_TARGET_DEFAULT,
+                level as u32,
+                raw::LOG_STYLE_AUTO,
+                raw::LOG_OPTIONS_DEFAULT,
+            )
+        }
+    });
+    raw::check_backend("krun_init_log", ret)?;
+    Ok(())
+}
+
+/// Map a [`KRUN_LOG_ENV`] value to a [`raw::LogLevel`], accepting either a
+/// case-insensitive level name or the numeric level `0`–`5`.
+fn parse_log_level(value: &str) -> Option<raw::LogLevel> {
+    use raw::LogLevel;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" | "0" => Some(LogLevel::Off),
+        "error" | "1" => Some(LogLevel::Error),
+        "warn" | "2" => Some(LogLevel::Warn),
+        "info" | "3" => Some(LogLevel::Info),
+        "debug" | "4" => Some(LogLevel::Debug),
+        "trace" | "5" => Some(LogLevel::Trace),
+        _ => None,
+    }
+}
+
 /// Build a `CString` from a path, mapping interior NULs to a typed error.
 fn cstring_from_path(path: &Path, what: &'static str) -> Result<CString, VmError> {
     // Use OsStr bytes on Unix; libkrun only ships on Unix (macOS/Linux) so we
@@ -365,5 +437,31 @@ mod tests {
         let items = ["ok", "ba\0d", "also-ok"];
         let err = cstrings_from_strs(&items, "argv").unwrap_err();
         assert!(matches!(err, VmError::NulInString { what: "argv", .. }));
+    }
+
+    #[test]
+    fn parse_log_level_accepts_names_case_insensitively() {
+        use raw::LogLevel;
+        assert_eq!(parse_log_level("off"), Some(LogLevel::Off));
+        assert_eq!(parse_log_level("Error"), Some(LogLevel::Error));
+        assert_eq!(parse_log_level("WARN"), Some(LogLevel::Warn));
+        assert_eq!(parse_log_level("  info  "), Some(LogLevel::Info));
+        assert_eq!(parse_log_level("debug"), Some(LogLevel::Debug));
+        assert_eq!(parse_log_level("trace"), Some(LogLevel::Trace));
+    }
+
+    #[test]
+    fn parse_log_level_accepts_numeric_levels() {
+        use raw::LogLevel;
+        assert_eq!(parse_log_level("0"), Some(LogLevel::Off));
+        assert_eq!(parse_log_level("3"), Some(LogLevel::Info));
+        assert_eq!(parse_log_level("5"), Some(LogLevel::Trace));
+    }
+
+    #[test]
+    fn parse_log_level_rejects_unknown_values() {
+        assert_eq!(parse_log_level("verbose"), None);
+        assert_eq!(parse_log_level("6"), None);
+        assert_eq!(parse_log_level(""), None);
     }
 }
