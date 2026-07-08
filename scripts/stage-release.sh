@@ -113,13 +113,11 @@ COMPONENTS=(
     # macOS arm64 (darwin)
     "minimal|darwin|arm64|file|bin/minimal|minimal-macos-arm64"
     "minvmd|darwin|arm64|file|bin/minvmd|minvmd-macos-arm64"
-    # The trimmed libkrun minvmd links against (built from source by the release
-    # workflow's build-libkrun-macos-arm64 job). Stamped into bin/ next to minvmd
-    # for now — weird for a dylib, but it puts it on a known user-owned path the
-    # loader can be pointed at; the +x bit bin/ adds is inert. The basename MUST
-    # be libkrun.1.dylib: minvmd's load command is rewritten to
-    # `@rpath/libkrun.1.dylib` and `@loader_path` (bin/, next to minvmd) is its
-    # first rpath, so the loader looks for exactly this name beside the binary.
+    # The trimmed libkrun minvmd links against (built by the release workflow's
+    # build-libkrun-macos-arm64 job), staged into bin/ next to minvmd. Basename
+    # MUST be libkrun.1.dylib: minvmd's load command is @rpath/libkrun.1.dylib and
+    # @loader_path (bin/) is its first rpath, so the loader looks for that exact
+    # name beside the binary.
     "libkrun|darwin|arm64|file|bin/libkrun.1.dylib|libkrun-macos-arm64.dylib"
     "gvproxy|darwin|arm64|file|bin/gvproxy|gvproxy-darwin-arm64"
     "initramfs|darwin|arm64|file|data/initramfs.cpio|initramfs-arm64.cpio"
