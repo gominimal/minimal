@@ -298,19 +298,38 @@ impl VmConfig {
 fn resolve_disk_flags() -> (bool, crate::krun::SyncMode) {
     use crate::krun::SyncMode;
 
-    let direct_io = std::env::var(DISK_DIRECT_IO_ENV)
-        .ok()
-        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"));
+    let direct_io = match std::env::var(DISK_DIRECT_IO_ENV) {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" => true,
+            "false" | "0" => false,
+            _ => {
+                tracing::warn!(
+                    env = DISK_DIRECT_IO_ENV,
+                    value = %v,
+                    "unrecognized value; using default direct_io=false",
+                );
+                false
+            }
+        },
+        Err(_) => false,
+    };
 
-    let sync_mode = std::env::var(DISK_SYNC_ENV)
-        .ok()
-        .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
-            "none" | "false" | "0" => Some(SyncMode::None),
-            "relaxed" | "true" | "1" => Some(SyncMode::Relaxed),
-            "full" | "2" => Some(SyncMode::Full),
-            _ => None,
-        })
-        .unwrap_or(SyncMode::Relaxed);
+    let sync_mode = match std::env::var(DISK_SYNC_ENV) {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "none" | "false" | "0" => SyncMode::None,
+            "relaxed" | "true" | "1" => SyncMode::Relaxed,
+            "full" | "2" => SyncMode::Full,
+            _ => {
+                tracing::warn!(
+                    env = DISK_SYNC_ENV,
+                    value = %v,
+                    "unrecognized value; using default sync_mode=relaxed",
+                );
+                SyncMode::Relaxed
+            }
+        },
+        Err(_) => SyncMode::Relaxed,
+    };
 
     (direct_io, sync_mode)
 }
