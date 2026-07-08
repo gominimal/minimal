@@ -225,13 +225,6 @@ trees on a shared writable ext4 volume. Introduces the host provisioner, the
   (`rootfs.img`); no packaging change to the release artifact shape (informed by
   `.minimal/minimal.toml:52-56` and `scripts/stage-release.sh:118`).
 
-- **R1.8**: The RAM stop-gap in `crates/minvmd/src/cmd/mod.rs:73-90` shall reduce
-  the default RAM from 4096/2048 MiB back to a lower baseline (e.g. 1024 MiB)
-  once the cache no longer competes with the tmpfs. The exact value is
-  implementation judgment; the comment documenting the stop-gap shall be updated
-  or removed. This is a best-effort requirement: if baseline memory pressure is
-  observed in CI, a higher value is acceptable.
-
 - **R1.9**: The `sync_mode` and `direct_io` flags passed to `add_disk_with_sync`
   (R1.4) shall not be hardcoded. `crates/minvmd/src/vm.rs` shall read them from
   `MINVMD_DISK_SYNC` (`none`|`relaxed`|`full`, default **`relaxed`**) and
@@ -486,6 +479,11 @@ the host-side mapping from session id to volume image.
 - **Workspace upload client** (`Client::upload_workspace` port past #603 crate
   rename). This is a dependency, not a deliverable of this spec; it is listed
   in Dependencies below.
+- **Reducing the guest RAM stop-gap.** The 4096/2048 MiB tmpfs-headroom default
+  (`crates/minvmd/src/cmd/mod.rs`) is left as-is. A reduced baseline is only safe
+  once a failed volume mount is fatal (no silent tmpfs fallback) *and* the floor
+  is measured against real in-VM build memory pressure — neither is settled here,
+  so the reduction is deferred to a separate memory-pressure spec.
 
 ## Design Considerations
 
