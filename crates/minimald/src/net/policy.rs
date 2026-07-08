@@ -174,13 +174,14 @@ pub async fn remove_ingress(control: &ControlChannel, exposed: &[ExposedMapping]
 }
 
 /// `POST`s `body` as JSON to `path` on gvproxy's control socket over a fresh
-/// HTTP/1.0 connection, succeeding on a 2xx status.
+/// HTTP/1.1 keep-alive connection, succeeding on a 2xx status.
 ///
 /// gvproxy's control socket speaks HTTP; the relay's `POST /connect` upgrade in
 /// [`switch`](super::switch) is the data-plane verb, while the forwarder verbs
-/// here are ordinary request/response. HTTP/1.0 with `Connection: close` keeps
-/// the exchange to one write + read-to-EOF, with no need to parse chunked or
-/// keep-alive framing.
+/// here are ordinary request/response. The exchange is framed by `Content-Length`
+/// (not read-to-EOF) with **no** `Connection: close`, so the server never closes
+/// the socket first — required for the response to survive the KVM vsock shuttle
+/// (see [`exchange`] and the request-builder comment below for the G-N8 detail).
 pub(crate) async fn post_json<T: Serialize>(
     control: &ControlChannel,
     path: &str,
@@ -188,11 +189,18 @@ pub(crate) async fn post_json<T: Serialize>(
 ) -> io::Result<()> {
     let body = serde_json::to_vec(body).map_err(io::Error::other)?;
     let mut request = Vec::with_capacity(128 + body.len());
-    request.extend_from_slice(format!("POST {path} HTTP/1.0\r\n").as_bytes());
+    // HTTP/1.1 keep-alive (no `Connection: close`): gvproxy must respond *without*
+    // closing the connection. On the KVM libkrun `add_vsock_port2(listen=false)`
+    // shuttle, a server-initiated close drops the still-buffered response bytes as
+    // it propagates to the guest (the guest reads an immediate EOF → 0 bytes →
+    // `malformed gvproxy status line: ""`, even though the forward *was* applied —
+    // G-N8). Keeping the connection open lets the response drain to the guest,
+    // which then reads exactly `Content-Length` bytes and closes from its side.
+    request.extend_from_slice(format!("POST {path} HTTP/1.1\r\n").as_bytes());
     request.extend_from_slice(b"Host: localhost\r\n");
     request.extend_from_slice(b"Content-Type: application/json\r\n");
     request.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
-    request.extend_from_slice(b"Connection: close\r\n\r\n");
+    request.extend_from_slice(b"\r\n");
     request.extend_from_slice(&body);
 
     // Bound the whole exchange: a gvproxy that accepts the socket and then
@@ -229,25 +237,63 @@ pub(crate) async fn post_json<T: Serialize>(
     }
 }
 
-/// Writes `request` to a freshly-connected control stream, half-closes the write
-/// side (so an HTTP/1.0 server responds without waiting for more body), and reads
-/// the (bounded) response. Transport-agnostic so the unix (DM2) and vsock
+/// Writes `request` to a freshly-connected control stream and reads the response
+/// framed by its `Content-Length`. Transport-agnostic so the unix (DM2) and vsock
 /// (DM1/3/4) control channels share one exchange.
+///
+/// We must **not** read to EOF: the request is HTTP/1.1 keep-alive (see
+/// [`post_json`]), so gvproxy holds the connection open after responding and an
+/// EOF-terminated read would block until the [`GVPROXY_CONTROL_TIMEOUT`]. Instead
+/// we read the status line + headers, take `Content-Length` body bytes, and let
+/// the caller drop the stream (closing from the *guest* side). This avoids the
+/// server-initiated close that the KVM libkrun vsock splice mishandles by dropping
+/// the buffered response (G-N8). We deliberately do not `shutdown()` the write
+/// side for the same reason.
 async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     request: &[u8],
 ) -> io::Result<Vec<u8>> {
     stream.write_all(request).await?;
-    stream.shutdown().await?;
 
+    // Read incrementally until the header terminator is in hand, capping total
+    // buffered bytes: gvproxy's forwarder replies are tiny, so a stream that never
+    // completes its headers within the bound is misbehaving.
     let mut response = Vec::with_capacity(256);
-    // Cap the buffered response: gvproxy's forwarder replies are tiny (`200 OK`
-    // with a minimal body), so a stream that keeps sending past this bound is
-    // misbehaving and must not be allowed to grow memory unbounded.
-    (&mut stream)
-        .take(MAX_CONTROL_RESPONSE)
-        .read_to_end(&mut response)
-        .await?;
+    let mut buf = [0u8; 512];
+    let header_end = loop {
+        if let Some(i) = find_header_end(&response) {
+            break i;
+        }
+        if response.len() as u64 >= MAX_CONTROL_RESPONSE {
+            return Err(io::Error::other(
+                "gvproxy control response exceeded the size cap before its headers ended",
+            ));
+        }
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            // EOF before headers completed — the empty-reply symptom the
+            // keep-alive framing is meant to avoid; surface it as-is.
+            return Ok(response);
+        }
+        response.extend_from_slice(&buf[..n]);
+    };
+
+    // Body length from `Content-Length` (0 if absent). Read until the body is
+    // fully buffered, so we never depend on a server close to signal completion.
+    let want = content_length(&response[..header_end]).unwrap_or(0);
+    let body_have = response.len() - header_end;
+    let mut remaining = want.saturating_sub(body_have);
+    while remaining > 0 {
+        if response.len() as u64 >= MAX_CONTROL_RESPONSE {
+            break;
+        }
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        response.extend_from_slice(&buf[..n]);
+        remaining = remaining.saturating_sub(n);
+    }
     Ok(response)
 }
 
@@ -264,6 +310,27 @@ fn parse_status_code(response: &[u8]) -> io::Result<u16> {
         .nth(1)
         .and_then(|code| code.parse::<u16>().ok())
         .ok_or_else(|| io::Error::other(format!("malformed gvproxy status line: {line:?}")))
+}
+
+/// Index just past the `\r\n\r\n` header terminator, or `None` if the headers are
+/// not yet fully buffered.
+fn find_header_end(response: &[u8]) -> Option<usize> {
+    response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+}
+
+/// The `Content-Length` header value parsed from a response's header block, or
+/// `None` if the header is absent or unparseable (treated as a zero-length body).
+fn content_length(headers: &[u8]) -> Option<usize> {
+    std::str::from_utf8(headers).ok()?.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    })
 }
 
 /// Returns the body bytes following the blank line that ends the headers, or the
@@ -440,5 +507,50 @@ mod tests {
         // R2.7 spells the `direction` structured field `egress`/`ingress`.
         assert_eq!(Direction::Egress.to_string(), "egress");
         assert_eq!(Direction::Ingress.to_string(), "ingress");
+    }
+
+    #[test]
+    fn content_length_parses_case_insensitively_or_absent() {
+        assert_eq!(
+            content_length(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n"),
+            Some(6)
+        );
+        assert_eq!(
+            content_length(b"HTTP/1.1 200 OK\r\ncontent-length:  0\r\n\r\n"),
+            Some(0)
+        );
+        assert_eq!(content_length(b"HTTP/1.1 200 OK\r\n\r\n"), None);
+    }
+
+    #[tokio::test]
+    async fn exchange_frames_by_content_length_without_a_server_close() {
+        // Regression for G-N8: the response must be framed by `Content-Length`,
+        // never by the server closing the socket. On the KVM libkrun vsock shuttle
+        // a server-initiated close drops the still-buffered response, so `exchange`
+        // must return the full reply from a peer that stays open. If it ever
+        // reverts to read-to-EOF, this test hangs (the peer never closes).
+        let (client, mut server) = tokio::io::duplex(1024);
+        let server = tokio::spawn(async move {
+            let mut buf = [0u8; 256];
+            // Drain the request (headers + empty body arrive together here).
+            let _ = server.read(&mut buf).await.unwrap();
+            server
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nWEB_OK")
+                .await
+                .unwrap();
+            // Hold the connection open — do NOT close — until the caller is done.
+            server
+        });
+
+        let resp = exchange(
+            client,
+            b"POST /services/forwarder/expose HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await
+        .expect("exchange returns the framed response without waiting for EOF");
+
+        assert_eq!(parse_status_code(&resp).unwrap(), 200);
+        assert_eq!(body_after_headers(&resp), b"WEB_OK");
+        drop(server.await.unwrap());
     }
 }
