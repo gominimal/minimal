@@ -36,6 +36,16 @@ The five deployment models (DM1–DM5) from the requirements document are:
 - **DM4** — DM2 + DM3 combined
 - **DM5** — any of the above with a network-accessible, authenticated `minimald`
 
+> **Scope note (v0.1).** `minvmd` supervises a single named VM (`default`) per
+> host — one `state.toml`/`lifecycle.lock`/`vmm.pid` and one host UDS bridge. The
+> "one or more VMs" phrasing above restates the eventual deployment topology from
+> the requirements document; concurrent multi-VM supervision (per-instance state
+> directories and sockets) is a v0.2+ concern, an explicit Non-Goal of
+> [`01-spec-minvmd-host-daemon`](../01-spec-minvmd-host-daemon/01-spec-minvmd-host-daemon.md)
+> ("Multi-VM / multi-tenant — single named VM (`default`); multi-VM is a v0.2+
+> concern"). Accordingly, DM1/DM3/DM4 are exercised with exactly one VM in this
+> test plan, and multi-VM test cases are out of scope for v0.1 (closes G-N7).
+
 ## Introduction/Overview
 
 The networking stack delivers seven use cases:
