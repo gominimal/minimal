@@ -144,19 +144,6 @@ esac
 STUB
 chmod +x "$stubbin/uname"
 
-# Stub `codesign`: the real tool needs a valid Mach-O (our mock artifacts are
-# plain files) and is macOS-only. It records the signed path and APPENDS to the
-# file, emulating how signing rewrites the binary so its hash diverges from the
-# manifest — which is exactly what the skip oracle must tolerate.
-cat >"$stubbin/codesign" <<STUB
-#!/bin/sh
-f=
-for a in "\$@"; do f="\$a"; done   # target is the last argument
-printf '%s\n' "\$f" >>"$root/codesign.calls"
-printf 'adhoc-signature\n' >>"\$f"
-STUB
-chmod +x "$stubbin/codesign"
-
 # Stub `xattr`: record the invocation; exit 0 (the installer swallows failure).
 cat >"$stubbin/xattr" <<STUB
 #!/bin/sh
@@ -339,71 +326,63 @@ env -i PATH="$stubbin:$H1/bin:/usr/bin:/bin" HOME="$H1" MINIMAL_BIN="$H1/bin" \
 set -e
 want_err "PATH advisory suppressed when bin present (R6.2)" grep -q "is not on your PATH" "$OUT"
 
-# --- Unit 5 (darwin): dequarantine + ad-hoc codesign for bin files ---------
+# --- Unit 5 (darwin): dequarantine Mach-O bin/lib components ---------------
 # Force a darwin/arm64 platform (via the uname stub) so this runs on every lane.
 # The applicable rows are then `minimal` (bin) and `rootfs` (data). A bin file
-# must be quarantine-stripped and ad-hoc codesigned; a data file must not be.
+# must be quarantine-stripped; a data file must not be. Release artifacts are
+# Developer ID signed at build time, so the installer does NO local signing —
+# it places the downloaded bytes verbatim.
 PLAT_S=Darwin
 PLAT_M=arm64
-: >"$root/codesign.calls"
 : >"$root/xattr.calls"
 HD="$root/hd"; mkdir -p "$HD"
 reset_dl
 run darwin1 "$HD"
 check 0 "$rc" "darwin install exits 0"
 want_ok "darwin bin component installed" test -f "$HD/bin/minimal"
-want_ok "quarantine stripped from bin (xattr)" grep -q "com.apple.quarantine" "$root/xattr.calls"
-want_ok "bin file ad-hoc codesigned" grep -q "/bin/minimal" "$root/codesign.calls"
-want_err "data component not codesigned" grep -q "rootfs" "$root/codesign.calls"
+want_ok "quarantine stripped from bin (xattr)" grep -q "/bin/minimal" "$root/xattr.calls"
+want_err "data component not dequarantined" grep -q "rootfs" "$root/xattr.calls"
 
-# A darwin `lib` dylib gets the SAME Mach-O treatment as a bin file — quarantine
-# strip + ad-hoc codesign (the plain else-branch sign, no minvmd entitlement) —
-# so the shipped libkrun.1.dylib is loadable. Isolated home + one-off manifest
-# with a single darwin lib row, so it doesn't perturb the rerun counts below.
+# A darwin `lib` dylib gets the SAME dequarantine treatment as a bin file so the
+# shipped libkrun.1.dylib runs without a Gatekeeper prompt. Isolated home +
+# one-off manifest with a single darwin lib row, so it doesn't perturb the rerun
+# counts below.
 {
     printf '# format: 1\n'
     printf '# c o a v s k d s\n'
     printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
         libkrun darwin arm64 v1 "$h_rootfs" file lib/libkrun.1.dylib versions/v1/rootfs-arm64.img
 } >"$mock/versions/v1/components"
-: >"$root/codesign.calls"; : >"$root/xattr.calls"
+: >"$root/xattr.calls"
 HDL="$root/hdl"; mkdir -p "$HDL"
 reset_dl
 run darwinlib "$HDL"
 check 0 "$rc" "darwin lib install exits 0"
 want_ok "darwin lib dylib installed" test -f "$HDL/.local/lib/libkrun.1.dylib"
 want_ok "quarantine stripped from lib dylib (xattr)" \
-    grep -q "com.apple.quarantine" "$root/xattr.calls"
-want_ok "lib dylib ad-hoc codesigned" \
-    grep -q "/lib/libkrun.1.dylib" "$root/codesign.calls"
+    grep -q "/lib/libkrun.1.dylib" "$root/xattr.calls"
 cp "$root/good-components" "$mock/versions/v1/components"   # restore
-: >"$root/codesign.calls"; : >"$root/xattr.calls"
+: >"$root/xattr.calls"
 
-# Signing diverged the on-disk bytes from the manifest hash. A rerun must still
-# recognize the component as installed (via the recorded hash) and not download
-# or re-sign it — otherwise macOS reruns would never be cheap (Goal 2).
+# The installer places the artifact bytes verbatim, so the on-disk hash equals
+# the manifest hash. A rerun recognizes the component as already installed and
+# downloads nothing (Goal 2 — cheap reruns).
 reset_dl
-: >"$root/codesign.calls"
 run darwin2 "$HD"
 check 0 "$rc" "darwin rerun exits 0"
-check 0 "$(downloads)" "signed darwin bin: rerun downloads nothing"
-want_err "signed darwin bin: not re-codesigned on rerun" grep -q "/bin/minimal" "$root/codesign.calls"
+check 0 "$(downloads)" "darwin bin: rerun downloads nothing"
 
-# A NEW release of a signed darwin bin (its manifest sha256 changes) must
-# re-download and re-sign — NOT be judged up to date because the old signed
-# bytes still equal the previously-recorded installed hash. The skip-by-record
-# path is keyed on the manifest hash for exactly this staleness case.
+# A NEW release (its manifest sha256 changes) is re-downloaded rather than judged
+# up to date, since the on-disk bytes no longer match the new manifest hash.
 printf 'darwin-arm64-minimal-body-v2\n' >"$mock/versions/v1/minimal-darwin-arm64-v2"
 h_dmin2="$(hash_file "$mock/versions/v1/minimal-darwin-arm64-v2")"
 awk -v h="$h_dmin2" \
     '$1=="minimal" && $2=="darwin" {$5=h; $8="versions/v1/minimal-darwin-arm64-v2"} {print}' \
     "$root/good-components" >"$mock/versions/v1/components"
 reset_dl
-: >"$root/codesign.calls"
 run darwin3 "$HD"
 check 0 "$rc" "darwin new-version rerun exits 0"
-check 1 "$(downloads)" "new manifest hash re-downloads the signed darwin bin (staleness fix)"
-want_ok "new darwin bin is re-codesigned" grep -q "/bin/minimal" "$root/codesign.calls"
+check 1 "$(downloads)" "new manifest hash re-downloads the darwin bin"
 cp "$root/good-components" "$mock/versions/v1/components"   # restore
 PLAT_S=Linux
 PLAT_M=x86_64
