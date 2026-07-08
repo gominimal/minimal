@@ -2,10 +2,11 @@ use russh::{
     Channel as RuChannel, ChannelId,
     server::{ChannelOpenHandle, Config as RuConfig, Msg, RunningSession, Session},
 };
-use sessions::SessionId;
+use sessions::{IpProto, SessionId};
 use std::{
     collections::BTreeMap,
     fmt,
+    net::Ipv4Addr,
     sync::{Arc, LazyLock},
     time::Duration,
 };
@@ -517,8 +518,8 @@ impl russh::server::Handler for ConnectionHandler {
             return Ok(());
         };
         let mngr = serv.sessions_manager().await;
-        match mngr.get_session(SessionKeyPredicate::Id(session_id)).await {
-            Ok(Some(_)) => {}
+        let record = match mngr.get_record(SessionKeyPredicate::Id(session_id)).await {
+            Ok(Some(record)) => record,
             Ok(None) => {
                 tracing::warn!(
                     %session_id,
@@ -540,9 +541,8 @@ impl russh::server::Handler for ConnectionHandler {
                     .await;
                 return Ok(());
             }
-        }
+        };
 
-        let host = host_to_connect.to_string();
         let port = match u16::try_from(port_to_connect) {
             Ok(p) => p,
             Err(_) => {
@@ -552,36 +552,54 @@ impl russh::server::Handler for ConnectionHandler {
             }
         };
 
-        // Connect to the target before accepting the channel. If the target is
-        // unreachable within the grace period, reject rather than leaving the
-        // client with an open-but-dead channel.
-        let upstream = match tokio::time::timeout(
-            Duration::from_secs(10),
-            TcpStream::connect((host.as_str(), port)),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    %host,
-                    port,
-                    %error,
-                    "direct-tcpip: could not connect to target"
-                );
-                reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
-                return Ok(());
-            }
-            Err(_) => {
-                tracing::warn!(
-                    %host,
-                    port,
-                    "direct-tcpip: connection to target timed out"
-                );
-                reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
-                return Ok(());
-            }
+        // R4.9: the forward must land inside the PTask's network, not the
+        // daemon's. The daemon is deliberately off-switch (see `net::dns`); an
+        // own-ip PTask's backends are reachable only through their published
+        // ingress mappings on host loopback (`127.0.0.1:<external>` →
+        // `lease:<internal>`), the same upstream the :7654/:7655 proxies dial.
+        // Resolve the requested PTask-side (internal) port to its published
+        // external port and connect to loopback — never to the raw client
+        // target in the daemon's own namespace. A request matching no published
+        // TCP mapping is rejected.
+        let Some(external_port) = published_external_port(record.policy.ingress.as_ref(), port)
+        else {
+            tracing::warn!(
+                %session_id,
+                requested_host = %host_to_connect,
+                requested_port = port,
+                "direct-tcpip rejected: no published TCP ingress mapping for the requested port"
+            );
+            reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+            return Ok(());
         };
+        let upstream_addr = (Ipv4Addr::LOCALHOST, external_port);
+
+        // Connect to the published loopback port before accepting the channel.
+        // If it is unreachable within the grace period, reject rather than
+        // leaving the client with an open-but-dead channel.
+        let upstream =
+            match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(upstream_addr))
+                .await
+            {
+                Ok(Ok(s)) => s,
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        external_port,
+                        %error,
+                        "direct-tcpip: could not connect to the published ingress port"
+                    );
+                    reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                    return Ok(());
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        external_port,
+                        "direct-tcpip: connection to the published ingress port timed out"
+                    );
+                    reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                    return Ok(());
+                }
+            };
 
         reply.accept().await;
 
@@ -590,6 +608,25 @@ impl russh::server::Handler for ConnectionHandler {
 
         Ok(())
     }
+}
+
+/// Resolve a `direct-tcpip` forward's requested PTask-side (internal) port to
+/// the external port the session's static ingress policy publishes for it (R4.9).
+///
+/// Returns the published external port to dial on host loopback
+/// (`127.0.0.1:<external>` → `lease:<internal>`), or `None` when no TCP mapping
+/// publishes that internal port — i.e. the forward targets something outside the
+/// PTask's published surface and must be refused rather than dialled in the
+/// daemon's own namespace. UDP mappings never authorise a (TCP) `direct-tcpip`.
+fn published_external_port(
+    ingress: Option<&sessions::IngressPolicy>,
+    internal_port: u16,
+) -> Option<u16> {
+    ingress
+        .into_iter()
+        .flat_map(|ingress| &ingress.port_mappings)
+        .find(|m| m.internal_port == internal_port && m.proto == IpProto::Tcp)
+        .map(|m| m.external_port)
 }
 
 /// Relay bytes bidirectionally between two async streams, logging any relay error.
@@ -606,7 +643,52 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sessions::{IngressPolicy, IpProto, PortMapping};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn ingress(port_mappings: Vec<PortMapping>) -> IngressPolicy {
+        IngressPolicy {
+            port_mappings,
+            dynamic_allowed_range: None,
+        }
+    }
+
+    #[test]
+    fn published_external_port_resolves_internal_to_published_external() {
+        let ing = ingress(vec![PortMapping {
+            external_port: 18080,
+            internal_port: 8080,
+            proto: IpProto::Tcp,
+        }]);
+        // The requested PTask-side (internal) port resolves to its published port.
+        assert_eq!(published_external_port(Some(&ing), 8080), Some(18080));
+    }
+
+    #[test]
+    fn published_external_port_refuses_unpublished_and_reversed_targets() {
+        let ing = ingress(vec![PortMapping {
+            external_port: 18080,
+            internal_port: 8080,
+            proto: IpProto::Tcp,
+        }]);
+        // A port with no mapping is refused (never dialled in the daemon netns).
+        assert_eq!(published_external_port(Some(&ing), 9090), None);
+        // The external port is not itself a target — only the internal side is named.
+        assert_eq!(published_external_port(Some(&ing), 18080), None);
+        // No ingress policy at all (e.g. a non-own-ip session) is refused.
+        assert_eq!(published_external_port(None, 8080), None);
+    }
+
+    #[test]
+    fn published_external_port_ignores_non_tcp_mappings() {
+        // direct-tcpip is TCP; a UDP mapping must not authorise a TCP forward.
+        let ing = ingress(vec![PortMapping {
+            external_port: 18080,
+            internal_port: 8080,
+            proto: IpProto::Udp,
+        }]);
+        assert_eq!(published_external_port(Some(&ing), 8080), None);
+    }
 
     #[tokio::test]
     async fn relay_streams_forwards_bytes_bidirectionally() {
