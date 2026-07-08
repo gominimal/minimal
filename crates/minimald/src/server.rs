@@ -50,6 +50,16 @@ pub struct Config {
     /// `false` (DM2, native Linux) keeps the local-spawn + tap relay path.
     #[serde(default)]
     pub in_microvm: bool,
+    /// Host-loopback port for the B5 egress/DNS proxy (UC2a). `None` uses the
+    /// well-known [`EGRESS_PROXY_PORT`](crate::net::proxy::EGRESS_PROXY_PORT).
+    /// Set (with [`https_proxy_port`](Self::https_proxy_port)) to run a second
+    /// daemon on one host without contending on the well-known port (DM4, G-N1).
+    #[serde(default)]
+    pub egress_proxy_port: Option<u16>,
+    /// Host-loopback port for the B8 mTLS reverse proxy (UC2b). `None` uses the
+    /// well-known [`HTTPS_PROXY_PORT`](crate::net::proxy::HTTPS_PROXY_PORT).
+    #[serde(default)]
+    pub https_proxy_port: Option<u16>,
 }
 
 impl Config {
@@ -341,14 +351,21 @@ impl Server {
         // flag the proxy startup needs first.
         #[cfg(target_os = "linux")]
         let in_microvm = config.in_microvm;
+        // Resolve the host-side proxy ports before `config` is moved: unset
+        // means the well-known :7654/:7655; an override lets a co-resident second
+        // daemon (DM4) serve its own proxy surface without contending (G-N1).
+        #[cfg(target_os = "linux")]
+        let egress_port = crate::net::proxy::resolve_egress_proxy_port(config.egress_proxy_port);
+        #[cfg(target_os = "linux")]
+        let https_port = crate::net::proxy::resolve_https_proxy_port(config.https_proxy_port);
         let state = ServerStateHandle::new(config).await?;
 
         // Start minimald's two host-side proxies (B5 egress :7654, B8 mTLS
-        // :7655) for the server's lifetime and, in a microVM (DM1), publish them
-        // on the macOS host loopback. minimald is Linux-only, and the PTask
-        // hostname registry they route against only exists on Linux.
+        // :7655 by default) for the server's lifetime and, in a microVM (DM1),
+        // publish them on the macOS host loopback. minimald is Linux-only, and
+        // the PTask hostname registry they route against only exists on Linux.
         #[cfg(target_os = "linux")]
-        start_host_proxies(&state, in_microvm).await;
+        start_host_proxies(&state, in_microvm, egress_port, https_port).await;
 
         let russh_config = build_russh_config(&state)
             .await
@@ -453,11 +470,18 @@ async fn build_russh_config(
 /// PTask hostname registry. In a microVM they bind the daemon's switch IP
 /// ([`DEFAULT_SUBNET`](crate::net::DEFAULT_SUBNET)`.daemon_ip()`) so the host
 /// gvproxy forward can reach them; on native Linux (DM2) they bind host loopback
-/// directly. A bind failure warns and is skipped — the daemon keeps serving. The
-/// serve loops run on detached tasks; this returns once the listeners are bound
-/// and (DM1) exposed.
+/// directly. `egress_port`/`https_port` are the resolved listen ports (the
+/// well-known :7654/:7655 unless overridden for DM4 co-residency, G-N1). A bind
+/// failure warns and is skipped — the daemon keeps serving. The serve loops run
+/// on detached tasks; this returns once the listeners are bound and (DM1) exposed.
 #[cfg(target_os = "linux")]
-async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
+async fn start_host_proxies(
+    state: &ServerStateHandle,
+    in_microvm: bool,
+    egress_port: u16,
+    // Consumed only by the mTLS reverse proxy, which is behind `networking-proxy`.
+    #[cfg_attr(not(feature = "networking-proxy"), allow(unused_variables))] https_port: u16,
+) {
     use crate::net::proxy::{self, Router};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -471,8 +495,8 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
         Ipv4Addr::LOCALHOST.into()
     };
 
-    // B5 egress/DNS proxy (:7654), always.
-    let egress_addr = SocketAddr::new(bind_base, proxy::EGRESS_PROXY_PORT);
+    // B5 egress/DNS proxy (:7654 by default), always.
+    let egress_addr = SocketAddr::new(bind_base, egress_port);
     if proxy::bind_listener(egress_addr)
         .await
         .map(|listener| {
@@ -487,17 +511,13 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
         && in_microvm
     {
         // Only publish a port whose listener actually bound.
-        expose_proxy_on_host(
-            crate::net::DEFAULT_SUBNET.daemon_ip(),
-            proxy::EGRESS_PROXY_PORT,
-        )
-        .await;
+        expose_proxy_on_host(crate::net::DEFAULT_SUBNET.daemon_ip(), egress_port).await;
     }
 
     // B8 mTLS reverse proxy (:7655), under the networking-proxy feature.
     #[cfg(feature = "networking-proxy")]
     {
-        let https_addr = SocketAddr::new(bind_base, proxy::HTTPS_PROXY_PORT);
+        let https_addr = SocketAddr::new(bind_base, https_port);
         match state.cert_authority().await.build_server_config() {
             Ok(tls_config) => {
                 if proxy::bind_listener(https_addr)
@@ -515,11 +535,7 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
                     .is_some()
                     && in_microvm
                 {
-                    expose_proxy_on_host(
-                        crate::net::DEFAULT_SUBNET.daemon_ip(),
-                        proxy::HTTPS_PROXY_PORT,
-                    )
-                    .await;
+                    expose_proxy_on_host(crate::net::DEFAULT_SUBNET.daemon_ip(), https_port).await;
                 }
             }
             Err(error) => {
@@ -575,6 +591,8 @@ mod tests {
             minimal_cache_dir: DaemonAbsPath::try_new(path).unwrap(),
             gvproxy_bin: None,
             in_microvm: false,
+            egress_proxy_port: None,
+            https_proxy_port: None,
         }
     }
 

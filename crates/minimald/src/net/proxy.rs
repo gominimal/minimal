@@ -38,6 +38,24 @@ pub const HTTPS_PROXY_PORT: u16 = 7655;
 pub const DEFAULT_PROXY_ADDR: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), EGRESS_PROXY_PORT);
 
+/// Resolves the host-loopback port for the B5 egress/DNS proxy: the per-daemon
+/// override when set, otherwise the well-known [`EGRESS_PROXY_PORT`]. The
+/// override lets a second `minimald` on the same host (DM4 co-residency, G-N1)
+/// serve its own proxy surface instead of silently losing the bind to whichever
+/// daemon started first.
+#[must_use]
+pub fn resolve_egress_proxy_port(override_port: Option<u16>) -> u16 {
+    override_port.unwrap_or(EGRESS_PROXY_PORT)
+}
+
+/// Resolves the host-loopback port for the B8 mTLS reverse proxy: the per-daemon
+/// override when set, otherwise the well-known [`HTTPS_PROXY_PORT`]. Overridden
+/// alongside [`resolve_egress_proxy_port`] for a co-resident daemon.
+#[must_use]
+pub fn resolve_https_proxy_port(override_port: Option<u16>) -> u16 {
+    override_port.unwrap_or(HTTPS_PROXY_PORT)
+}
+
 /// Upstream port used when a routed authority carries no explicit `:port`.
 const DEFAULT_UPSTREAM_PORT: u16 = 80;
 
@@ -605,6 +623,20 @@ mod tests {
 
     use sessions::SessionId;
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[test]
+    fn proxy_ports_default_to_well_known_and_honor_overrides() {
+        // Unset (the single-tenant / instance-0 case) MUST resolve to the
+        // well-known ports every client hardcodes.
+        assert_eq!(resolve_egress_proxy_port(None), EGRESS_PROXY_PORT);
+        assert_eq!(resolve_https_proxy_port(None), HTTPS_PROXY_PORT);
+        assert_eq!(resolve_egress_proxy_port(None), 7654);
+        assert_eq!(resolve_https_proxy_port(None), 7655);
+        // A co-resident second daemon (DM4, G-N1) overrides both to a disjoint
+        // pair so it does not contend on the well-known ports.
+        assert_eq!(resolve_egress_proxy_port(Some(7656)), 7656);
+        assert_eq!(resolve_https_proxy_port(Some(7657)), 7657);
+    }
 
     /// A `MakeWriter` accumulating everything written into a shared buffer, so a
     /// test can assert on the structured fields a `tracing` event emitted.

@@ -158,6 +158,20 @@ pub struct ListenArgs {
     #[arg(long, default_value_t = false)]
     vsock: bool,
 
+    /// Host-loopback port for the B5 egress/DNS proxy (UC2a). Defaults to the
+    /// well-known `7654`. Override (with `--https-proxy-port`) to run a second
+    /// `minimald` on the same host without contending on the well-known proxy
+    /// ports — e.g. the native daemon in a DM4 co-residency deployment. Both
+    /// proxy ports move as a pair, so this requires `--https-proxy-port`.
+    #[arg(long, requires = "https_proxy_port")]
+    egress_proxy_port: Option<u16>,
+
+    /// Host-loopback port for the B8 mTLS reverse proxy (UC2b). Defaults to the
+    /// well-known `7655`. Override alongside `--egress-proxy-port` for a
+    /// co-resident daemon; the two ports move as a pair.
+    #[arg(long, requires = "egress_proxy_port")]
+    https_proxy_port: Option<u16>,
+
     /// Mount `/dev`. Only useful if minimald is a VM's init process.
     #[arg(long, default_value_t = false)]
     #[clap(hide = true)]
@@ -297,6 +311,9 @@ async fn async_main() -> Result<(), MainError> {
                 // In-VM (DM1/3/4) the PTask attaches to the host gvproxy over the
                 // vsock shuttle, so no in-guest gvproxy binary path is needed.
                 gvproxy_bin: None,
+                // The single in-VM daemon owns the well-known proxy ports.
+                egress_proxy_port: None,
+                https_proxy_port: None,
             }),
             global_args: GlobalArgs {
                 minimal_state_dir: Some(DaemonAbsPath::try_new("/run/minimal").unwrap().into()),
@@ -382,6 +399,8 @@ async fn async_main() -> Result<(), MainError> {
         // `OwnIp` PTask must attach to the host gvproxy over the vsock shuttle,
         // not spawn gvproxy in-guest. The UDS path is DM2.
         in_microvm: listen_args.vsock,
+        egress_proxy_port: listen_args.egress_proxy_port,
+        https_proxy_port: listen_args.https_proxy_port,
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.
