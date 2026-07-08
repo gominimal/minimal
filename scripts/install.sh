@@ -417,7 +417,24 @@ while read -r comp _ _ _ want kind dest src; do
     # installed-hash record both account for this.
     if [ "$os" = darwin ] && [ "$prefix" = bin ]; then
         xattr -d com.apple.quarantine "$tmp" 2>/dev/null || true
-        codesign --sign - --force "$tmp" || { rm -f "$tmp"; die "codesign failed: $comp"; }
+        # Special case: minvmd needs the hypervisor entitlement.
+        if [ "$comp" = minvmd ]; then
+            ents="$tmpdir/minvmd.entitlements"
+            cat >"$ents" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.hypervisor</key>
+    <true/>
+</dict>
+</plist>
+PLIST
+            codesign --sign - --force --entitlements "$ents" "$tmp" \
+                || { rm -f "$tmp"; die "codesign failed: $comp"; }
+        else
+            codesign --sign - --force "$tmp" || { rm -f "$tmp"; die "codesign failed: $comp"; }
+        fi
     fi
 
     mv -f "$tmp" "$target_file"
