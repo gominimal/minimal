@@ -9,6 +9,7 @@ on:
         branches: ["main"]
         paths:
             - "crates/minvmd/**"
+            - "crates/minimald/**" # guest daemon: runs as pid-1 in the e2e/boot VM
             - "crates/minimal/**"
             - "crates/sessions/**" # platform-sensitive: canonicalization, symlinks
             - "Cargo.toml"
@@ -19,6 +20,7 @@ on:
         branches: ["main"]
         paths:
             - "crates/minvmd/**"
+            - "crates/minimald/**" # guest daemon: runs as pid-1 in the e2e/boot VM
             - "crates/minimal/**"
             - "crates/sessions/**" # platform-sensitive: canonicalization, symlinks
             - "Cargo.toml"
