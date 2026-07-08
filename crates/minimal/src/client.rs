@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use minimald_rpc::OneshotSshRpc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -45,7 +46,7 @@ impl Client {
     /// Retries the UDS connect for up to ~2 seconds to absorb the post-boot
     /// race on macOS where the libkrun bridge UDS appears slightly after the
     /// `vm-up` line.
-    pub async fn connect(sock_path: &Path) -> Result<Self, String> {
+    pub async fn connect(sock_path: &Path) -> Result<Self, anyhow::Error> {
         let stream = {
             let mut conn = None;
             let mut last_err = None;
@@ -62,7 +63,7 @@ impl Client {
                 }
             }
             conn.ok_or_else(|| {
-                format!(
+                anyhow::anyhow!(
                     "connect to daemon at {}: {}",
                     sock_path.display(),
                     last_err.unwrap()
@@ -73,15 +74,15 @@ impl Client {
         let config = Arc::new(russh::client::Config::default());
         let mut handle = russh::client::connect_stream(config, stream, MinimalClientHandler)
             .await
-            .map_err(|e| format!("ssh connect: {e}"))?;
+            .context("ssh connect")?;
 
         let auth = handle
             .authenticate_none("minimal-cli")
             .await
-            .map_err(|e| format!("authenticate: {e}"))?;
+            .context("authenticate")?;
 
         if !auth.success() {
-            return Err("authentication rejected by daemon".into());
+            return Err(anyhow::anyhow!("authentication rejected by daemon"));
         }
 
         Ok(Client { handle })
@@ -95,7 +96,7 @@ impl Client {
     pub async fn oneshot_rpc<R: OneshotSshRpc>(
         &mut self,
         request: R::Request<'_>,
-    ) -> Result<R::Response, String>
+    ) -> Result<R::Response, anyhow::Error>
     where
         <R as OneshotSshRpc>::Response: serde::de::DeserializeOwned,
     {
@@ -103,30 +104,26 @@ impl Client {
             .handle
             .channel_open_session()
             .await
-            .map_err(|e| format!("open channel for {}: {e}", R::NAME))?;
+            .with_context(|| format!("open channel for {}", R::NAME))?;
 
         channel
             .request_subsystem(false, R::NAME)
             .await
-            .map_err(|e| format!("request subsystem {}: {e}", R::NAME))?;
+            .with_context(|| format!("request subsystem {}", R::NAME))?;
 
-        let body = serde_json::to_vec(&request).map_err(|e| format!("serialize request: {e}"))?;
+        let body = serde_json::to_vec(&request).context("serialize request")?;
 
         let mut rpc = channel.into_stream();
-        rpc.write_all(&body)
-            .await
-            .map_err(|e| format!("write request: {e}"))?;
-        rpc.shutdown()
-            .await
-            .map_err(|e| format!("shutdown write half: {e}"))?;
+        rpc.write_all(&body).await.context("write request")?;
+        rpc.shutdown().await.context("shutdown write half")?;
 
         let mut resp_buf = Vec::with_capacity(256);
         rpc.read_to_end(&mut resp_buf)
             .await
-            .map_err(|e| format!("read response: {e}"))?;
+            .context("read response")?;
 
         serde_json::from_slice(&resp_buf)
-            .map_err(|e| format!("decode response for {}: {e}", R::NAME))
+            .with_context(|| format!("decode response for {}", R::NAME))
     }
 }
 

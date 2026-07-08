@@ -106,22 +106,29 @@ jobs:
                   path: ${{ runner.temp }}/initramfs.cpio
                   if-no-files-found: error
 
-    boot-e2e:
-        # Boot E2E (R2.4 READY round-trip) on real hardware, using the cache-pulled
-        # kernel + rootfs ext4 image (both from the `artifacts` job).
-        # Separate from build-macos so an artifact-fetch hiccup never blocks the
-        # always-green clippy/test/smoke checks.
+    e2e:
+        # Hypervisor E2E on real hardware, using the cache-pulled kernel + rootfs
+        # ext4 image and the built initramfs (all from the `artifacts` job). One
+        # job (formerly boot-e2e + autospawn-e2e) so the single shared runner
+        # checks out, builds, and codesigns exactly once per run. Separate from
+        # build-macos so an artifact-fetch hiccup never blocks the always-green
+        # clippy/test/smoke checks.
         #
         # GATING: green on the runner — raw kernel load (KRUN_KERNEL_FORMAT_RAW),
         # initramfs boot (minimald as `/init`, pid-1), minimald mounting the ext4
-        # rootfs (/dev/vda via krun_add_disk2) + chrooting, and the guest READY
-        # connect-out on vsock 7350 (krun_add_vsock_port == listen=false; host +
-        # guest both 7350). The full vsock session round-trip is gated by the Session
-        # E2E step below (direct run_on_vsock; needs libkrun >= 1.19.0).
+        # rootfs (/dev/vda via krun_add_disk2) + chrooting, the guest READY
+        # connect-out on vsock 7350, and the full vsock session round-trip
+        # (direct run_on_vsock; needs libkrun >= 1.19.0). The Session E2E step
+        # boots the same kernel/rootfs/initramfs through the same HVF path as the
+        # retired standalone boot test and goes further (russh auth + exec,
+        # stdout + exit status), so a passing session gates the boot. The
+        # Auto-spawn step then covers the R4.5 CLI proof: from a clean state
+        # `minimal ls` must auto-spawn minvmd end to end — the macOS integration
+        # gate that no unit test can cover.
         if: ${{ vars.RUN_MACOS_CI != 'false' }}
         needs: [artifacts]
         runs-on: [self-hosted, macOS, ARM64]
-        timeout-minutes: 20
+        timeout-minutes: 30
         steps:
             - uses: actions/checkout@v7
               with:
@@ -135,10 +142,9 @@ jobs:
               # setup used, so the supply-chain surface is unchanged.
               run: brew install slp/krun/libkrun
             - name: Verify libkrun is available (>= 1.19.0)
-              # krun_add_disk3 (this PR's /dev/vdb attach) needs libkrun >= 1.19.0.
-              # Assert the runner's libkrun exports it, so a stale runner fails here
-              # with an actionable message instead of a cryptic dyld symbol-not-found
-              # at VM boot.
+              # krun_add_disk3 (the /dev/vdb attach) needs libkrun >= 1.19.0. Assert
+              # the runner's libkrun exports it, so a stale runner fails here with an
+              # actionable message instead of a cryptic dyld symbol-not-found at boot.
               run: |
                   dylib=/opt/homebrew/lib/libkrun.dylib
                   if [ ! -f "$dylib" ]; then
@@ -164,36 +170,27 @@ jobs:
               with:
                   name: minimald-initramfs-aarch64
                   path: ${{ runner.temp }}/initramfs
-            - name: Build E2E harnesses + minvmd (no run)
-              # Build the test harnesses + the minvmd bin, then codesign, then run the
-              # test BINARIES DIRECTLY (below). Invoking `cargo test` again after
-              # signing relinks (and unsigns) target/debug/minvmd, so krun_start_enter
-              # fails with EINVAL. A direct-binary run never touches the signature, so
-              # the binaries must be built here before the single codesign.
-              run: cargo test -p minvmd --test boot_e2e --test minimald_session_e2e --no-run
+            - name: Build session harness + minvmd + minimal (no run)
+              # Build EVERYTHING before the single codesign, then run the test
+              # BINARIES DIRECTLY (below). Any cargo invocation after signing
+              # relinks (and unsigns) target/debug/minvmd, so krun_start_enter
+              # fails with EINVAL. minimal spawns `minvmd` by name from PATH; only
+              # minvmd needs the hypervisor entitlement.
+              run: |
+                  cargo test -p minvmd --test minimald_session_e2e --no-run
+                  cargo build -p minvmd --bin minvmd -p minimal --bin minimal
             - name: Codesign minvmd (hypervisor entitlement, R1.4)
               run: codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
-            - name: Boot E2E (initramfs minimald, READY round-trip)
-              # Gating: a real microVM must boot the initramfs (minimald as /init,
-              # pid-1), mount the ext4 rootfs (/dev/vda), and write READY over vsock
-              # 7350 within the budget. Also validates the virtio-linux kernel config
-              # (virtio-MMIO / VIRTIO_BLK / EXT4 / VSOCK / HVC).
-              run: |
-                  testbin="$(ls -1t target/debug/deps/boot_e2e-* | grep -v '\.d$' | head -1)"
-                  test -x "$testbin" || { echo "::error::boot_e2e test binary not found"; exit 1; }
-                  MINVMD_E2E=1 \
-                  MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz" \
-                  MINVMD_ROOTFS_PATH="$RUNNER_TEMP/rootfs/rootfs.img" \
-                  MINVMD_INITRAMFS="$RUNNER_TEMP/initramfs/initramfs.cpio" \
-                  MINVMD_BOOT_LOG="$RUNNER_TEMP/boot.log" \
-                    "$testbin" --include-ignored --nocapture
-            - name: Session E2E (full session over the bridge)
+            - name: Session E2E (boot + full session over the bridge)
               # Gating: boots the GENERIC upstream rootfs with minimald shipped as the
               # initramfs /init; a russh client over the bridge authenticates, creates
               # a session, and execs a command, asserting stdout + exit status. Proves
               # the full Stage-2 path (direct vsock session via run_on_vsock, no socat
               # relay) with no minimald baked into the rootfs. Needs libkrun >= 1.19.0
-              # on the runner.
+              # on the runner. Also gates boot correctness (formerly a standalone
+              # boot_e2e run): the session boots the identical kernel/rootfs/initramfs
+              # through the same HVF path, and MINVMD_BOOT_LOG captures the hvc0
+              # console so a stuck/failed boot stays diagnosable.
               run: |
                   testbin="$(ls -1t target/debug/deps/minimald_session_e2e-* | grep -v '\.d$' | head -1)"
                   test -x "$testbin" || { echo "::error::minimald_session_e2e test binary not found"; exit 1; }
@@ -201,87 +198,15 @@ jobs:
                   MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz" \
                   MINVMD_ROOTFS_PATH="$RUNNER_TEMP/rootfs/rootfs.img" \
                   MINVMD_INITRAMFS="$RUNNER_TEMP/initramfs/initramfs.cpio" \
+                  MINVMD_BOOT_LOG="$RUNNER_TEMP/boot.log" \
                     "$testbin" --include-ignored --nocapture --exact minimald_exec_over_bridge
-            - name: Boot latency benchmark (informational)
-              # Report boot-to-READY min/median/max on the runner. Uses the already
-              # codesigned minvmd; non-gating (boot correctness is gated by the e2e
-              # test above), so a timing hiccup never reds the build.
-              run: |
-                  MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz" \
-                  MINVMD_ROOTFS_PATH="$RUNNER_TEMP/rootfs/rootfs.img" \
-                  MINVMD_INITRAMFS="$RUNNER_TEMP/initramfs/initramfs.cpio" \
-                    scripts/bench-minvmd-boot.sh 10 target/debug/minvmd || true
-            - name: Upload guest boot console log
-              # Capture hvc0 output for diagnosing a stuck/failed boot (e.g. a missing
-              # virtio driver in the kernel). Always runs so a red boot is debuggable.
-              if: always()
-              uses: actions/upload-artifact@v7
-              with:
-                  name: minvmd-boot-log
-                  path: ${{ runner.temp }}/boot.log
-                  if-no-files-found: ignore
-
-    autospawn-e2e:
-        # Auto-spawn E2E — the R4.5 CLI proof artifact, on real hardware. From a
-        # clean state `minimal ls` must auto-spawn minvmd and return within 8 s;
-        # `minvmd status` must then report running; a second `minimal ls` must
-        # complete in < 500 ms (warm reuse). This exercises the real
-        # minimal -> `minvmd run --detach` -> VM boot -> initramfs minimald session
-        # path end to end, the macOS integration gate that no unit test can cover.
-        if: ${{ vars.RUN_MACOS_CI != 'false' }}
-        needs: [artifacts]
-        runs-on: [self-hosted, macOS, ARM64]
-        timeout-minutes: 20
-        steps:
-            - uses: actions/checkout@v7
-              with:
-                  persist-credentials: false
-            - name: Toolchain
-              uses: dtolnay/rust-toolchain@stable
-            - name: Provision libkrun (slp/krun tap)
-              # Self-install libkrun so macOS jobs no longer depend on hand-provisioned
-              # runner state — a missing libkrun.dylib silently broke every code PR.
-              # Idempotent (a no-op when already present); same slp/krun tap the runner
-              # setup used, so the supply-chain surface is unchanged.
-              run: brew install slp/krun/libkrun
-            - name: Verify libkrun is available (>= 1.19.0)
-              # krun_add_disk3 (this PR's /dev/vdb attach) needs libkrun >= 1.19.0.
-              # Assert the runner's libkrun exports it, so a stale runner fails here
-              # with an actionable message instead of a cryptic dyld symbol-not-found
-              # at VM boot.
-              run: |
-                  dylib=/opt/homebrew/lib/libkrun.dylib
-                  if [ ! -f "$dylib" ]; then
-                    echo "::error::libkrun.dylib not found under /opt/homebrew/lib. Provision the runner with: brew install slp/krun/libkrun" >&2
-                    exit 1
-                  fi
-                  if ! nm -gU "$dylib" 2>/dev/null | grep -q '_krun_add_disk3'; then
-                    echo "::error::runner libkrun lacks krun_add_disk3 (need >= 1.19.0); upgrade with: brew upgrade slp/krun/libkrun" >&2
-                    exit 1
-                  fi
-            - name: Download virtio-linux kernel
-              uses: actions/download-artifact@v8
-              with:
-                  name: virtio-kernel-aarch64
-                  path: ${{ runner.temp }}/kernel
-            - name: Download minvmd-rootfs image
-              uses: actions/download-artifact@v8
-              with:
-                  name: minvmd-rootfs-aarch64
-                  path: ${{ runner.temp }}/rootfs
-            - name: Download guest initramfs
-              uses: actions/download-artifact@v8
-              with:
-                  name: minimald-initramfs-aarch64
-                  path: ${{ runner.temp }}/initramfs
-            - name: Build minvmd + minimal (no run)
-              # Build both bins before the single codesign. minimal spawns `minvmd`
-              # by name from PATH; only minvmd needs the hypervisor entitlement, so
-              # codesigning it must be the last thing to touch the binary.
-              run: cargo build -p minvmd --bin minvmd -p minimal --bin minimal
-            - name: Codesign minvmd (hypervisor entitlement, R1.4)
-              run: codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
             - name: Auto-spawn E2E (minimal ls cold/warm, R4.5)
+              # The R4.5 CLI proof artifact, on real hardware. From a clean state
+              # `minimal ls` must auto-spawn minvmd and return within 8 s;
+              # `minvmd status` must then report running; a second `minimal ls` must
+              # complete in < 500 ms (warm reuse). This exercises the real
+              # minimal -> `minvmd run --detach` -> VM boot -> initramfs minimald
+              # session path end to end.
               # Run the prebuilt binaries directly (never `cargo run`, which would
               # relink and unsign minvmd). minimal finds `minvmd` via PATH; all three
               # of MINVMD_KERNEL_PATH / MINVMD_ROOTFS_PATH / MINVMD_INITRAMFS propagate
@@ -346,12 +271,16 @@ jobs:
                   t1=$(now_ms); warm=$(( t1 - t0 ))
                   echo "warm 'minimal ls': ${warm}ms"
                   [ "$warm" -lt 500 ] || { echo "::error::warm 'minimal ls' took ${warm}ms (>= 500ms)"; fail; }
-            - name: Upload autospawn guest boot console log
+            - name: Upload guest boot console logs
+              # Capture hvc0 output for diagnosing a stuck/failed boot (e.g. a missing
+              # virtio driver in the kernel). Always runs so a red boot is debuggable.
               if: always()
               uses: actions/upload-artifact@v7
               with:
-                  name: autospawn-boot-log
-                  path: ${{ runner.temp }}/autospawn-boot.log
+                  name: minvmd-boot-logs
+                  path: |
+                      ${{ runner.temp }}/boot.log
+                      ${{ runner.temp }}/autospawn-boot.log
                   if-no-files-found: ignore
 
     build-macos:
@@ -383,10 +312,9 @@ jobs:
               # is unchanged.
               run: brew install slp/krun/libkrun
             - name: Verify libkrun is available (>= 1.19.0)
-              # krun_add_disk3 (this PR's /dev/vdb attach) needs libkrun >= 1.19.0.
-              # Assert the runner's libkrun exports it, so a stale runner fails here
-              # with an actionable message instead of a cryptic dyld symbol-not-found
-              # at VM boot.
+              # krun_add_disk3 (the /dev/vdb attach) needs libkrun >= 1.19.0. Assert
+              # the runner's libkrun exports it, so a stale runner fails here with an
+              # actionable message instead of a cryptic dyld symbol-not-found at boot.
               run: |
                   dylib=/opt/homebrew/lib/libkrun.dylib
                   if [ ! -f "$dylib" ]; then
@@ -397,7 +325,6 @@ jobs:
                     echo "::error::runner libkrun lacks krun_add_disk3 (need >= 1.19.0); upgrade with: brew upgrade slp/krun/libkrun" >&2
                     exit 1
                   fi
-                  ls -l /opt/homebrew/lib/libkrun*.dylib
             - name: Clippy (minvmd)
               run: cargo clippy -p minvmd --all-targets -- -D warnings
             - name: Test (minvmd)
