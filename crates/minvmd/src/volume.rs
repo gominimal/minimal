@@ -38,21 +38,23 @@ pub fn volume_bytes() -> u64 {
 /// Resolve the per-VM data-volume image path.
 ///
 /// [`DATA_VOLUME_PATH_ENV`] overrides it explicitly (used verbatim); otherwise
-/// the image lives beside minvmd's persistent state as `<state>/data-vol.raw`,
-/// so it survives clean restarts. `XDG_STATE_HOME` is honoured directly rather
-/// than via [`crate::state::StateDir::default_path`] because the `dirs` crate
-/// ignores `XDG_STATE_HOME` on macOS — honouring it keeps the volume isolable in
-/// tests (and beside the state dir) on every platform.
+/// the image lives beside minvmd's persistent state as
+/// `<state>/minimal/minvmd/data-vol.raw`, so it survives clean restarts. The
+/// base comes from the shared [`paths::minimal_state_dir`] resolver — except
+/// `XDG_STATE_HOME` is still honoured explicitly first, because `dirs` (and thus
+/// `minimal_state_dir`) ignores it on macOS and the e2e tests isolate state via
+/// `XDG_STATE_HOME`; without that the volume would escape the tests' temp dir
+/// onto the real state dir on macOS.
 #[must_use]
 pub fn resolve_data_volume_path() -> PathBuf {
     if let Some(explicit) = std::env::var_os(DATA_VOLUME_PATH_ENV).filter(|v| !v.is_empty()) {
         return PathBuf::from(explicit);
     }
-    let state_dir = std::env::var_os("XDG_STATE_HOME")
+    let base = std::env::var_os("XDG_STATE_HOME")
         .filter(|v| !v.is_empty())
-        .map(|x| PathBuf::from(x).join("minimal/minvmd"))
-        .unwrap_or_else(crate::state::StateDir::default_path);
-    state_dir.join("data-vol.raw")
+        .map(|x| PathBuf::from(x).join("minimal"))
+        .unwrap_or_else(|| paths::minimal_state_dir().as_utf8_path().as_std_path().to_path_buf());
+    base.join("minvmd").join("data-vol.raw")
 }
 
 /// Failure modes of [`ensure_sparse_raw`].
