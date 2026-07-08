@@ -8,7 +8,9 @@
 # CI matrices can invoke every DM unconditionally.
 #
 # Bring-up is NOT done here — run the matching justfile target first:
-#   dm1: just dm1     dm2: just dm2     dm3: just dm3     dm4: just dm3 && just dm2
+#   dm1: just dm1     dm2: just dm2     dm3: just dm3     dm4: just dm4
+# (dm4 = dm3 then dm2 on the disjoint proxy ports :7656/:7657, so the native
+# daemon's UC2a/UC2b surface no longer contends with the VM daemon's — G-N1.)
 # Teardown: dm1/dm3: just stop; dm2: just dm2-down; dm4: both.
 #
 # RULE: never use `attach -c`. Every per-session networking assertion runs INSIDE
@@ -94,6 +96,12 @@ esac
 # against it needs --minimal-dir. On dm4 that is the SECONDARY control plane
 # (TC15); the primary suite runs against the VM daemon's default state dir.
 DM2_DIR="${DM2_DIR:-$PWD/.scratch/dm2-state}"
+# On DM4 the native (secondary) daemon serves its `*.min.internal` proxies on a
+# disjoint port pair (G-N1 fix: minimald `--egress-proxy-port`/`--https-proxy-port`,
+# wired by `just dm4`); the VM daemon keeps the well-known :7654/:7655. These name
+# the native daemon's ports so TC10/TC15 can assert both surfaces are live.
+NATIVE_EGRESS_PORT="${NATIVE_EGRESS_PORT:-7656}"
+NATIVE_HTTPS_PORT="${NATIVE_HTTPS_PORT:-7657}"
 MARGS=""
 [ "$DM" = dm2 ] && MARGS="--minimal-dir $DM2_DIR"
 mcli() {
@@ -222,8 +230,12 @@ case "$DM" in
     [ -e /dev/kvm ] && [ -w /dev/kvm ] && echo "/dev/kvm: OK" || { echo "/dev/kvm: MISSING"; tc10_fail=1; }
     pgrep -x minvmd >/dev/null && echo "minvmd (VM half): RUNNING" || { echo "minvmd: MISSING (run 'just dm3')"; tc10_fail=1; }
     [ -S "$DM2_DIR/providers/local-0/ssh.sock" ] && echo "dm2 UDS (native half): PRESENT" || { echo "dm2 UDS: MISSING (run 'just dm2')"; tc10_fail=1; }
-    # G-N1 observed, not hidden: exactly ONE daemon owns each hardcoded proxy port.
-    echo "G-N1 proxy-port contention: :7654=$(listeners_on 7654) listener(s), :7655=$(listeners_on 7655) listener(s) (expect 1 each; the second daemon's bind warns and loses)"
+    # G-N1 FIXED: the two daemons bind DISJOINT proxy ports (VM :7654/:7655,
+    # native :7656/:7657), so both `*.min.internal` surfaces are live — no silent
+    # bind loss. Assert a listener on BOTH egress proxies.
+    vm_egress=$(listeners_on 7654); native_egress=$(listeners_on "$NATIVE_EGRESS_PORT")
+    echo "proxy ports: VM :7654=$vm_egress :7655=$(listeners_on 7655); native :$NATIVE_EGRESS_PORT=$native_egress :$NATIVE_HTTPS_PORT=$(listeners_on "$NATIVE_HTTPS_PORT")"
+    { [ "$vm_egress" -ge 1 ] && [ "$native_egress" -ge 1 ]; } || { echo "G-N1: expected a listener on BOTH :7654 (VM) and :$NATIVE_EGRESS_PORT (native) — co-resident proxies"; tc10_fail=1; }
     ;;
 esac
 [ "$tc10_fail" = 0 ] && echo "TC10=PASS" || { echo "TC10=FAIL — topology wrong for $DM; aborting (verdicts below would test the wrong DM)"; exit 1; }
@@ -360,20 +372,47 @@ skip "TC16 DM5 remote authenticated access — SPEC-GAP(G-N2): no --server, UDS-
 skip "TC17 UC7 mesh data path — BLOCKED(G-N6): daemon never consumes mesh enrolment; set_mesh is test-only (crates/minimald/src/rpc.rs:1001)"
 
 if [ "$DM" = dm4 ]; then
-  banner "TC15 — DM4 co-residency (both control planes; G-N1 observed)"
+  banner "TC15 — DM4 co-residency (both control planes serve their own proxy surface; G-N1 fixed)"
   # Primary (VM daemon, default state dir) already ran TC1-TC9 above. Here:
-  # both control planes answer, and each serves an isolated session.
+  # both control planes answer, each serves an isolated session, and — the G-N1
+  # fix — the native daemon binds its OWN proxy ports instead of losing the bind.
   echo "-- VM daemon (default state dir) --";     "$M" ls
   echo "-- native daemon ($DM2_DIR) --";          "$M" --minimal-dir "$DM2_DIR" ls
+  # (a) Each control plane serves an isolated session concurrently.
   "$M" --minimal-dir "$DM2_DIR" destroy tc15b >/dev/null 2>&1
   "$M" destroy tc15a >/dev/null 2>&1
   "$M" activate -n tc15a --network no-net . >/dev/null 2>&1 && echo "tc15a (VM daemon): activated"
   "$M" --minimal-dir "$DM2_DIR" activate -n tc15b --network no-net . >/dev/null 2>&1 && echo "tc15b (native daemon): activated"
   "$M" ls; "$M" --minimal-dir "$DM2_DIR" ls
   "$M" destroy tc15a >/dev/null 2>&1; "$M" --minimal-dir "$DM2_DIR" destroy tc15b >/dev/null 2>&1
-  echo "-- G-N1: proxy-bind warning in the losing daemon's log --"
-  grep -h "proxy" "$PWD/.scratch/dm2-minimald.log" 2>/dev/null | grep -i "bind\|unavailable" | tail -3 || echo "(no bind warning found in .scratch/dm2-minimald.log — check which daemon started second)"
-  echo "TC15: :7654=$(listeners_on 7654) listener(s) — the first daemon's proxy owns the port (G-N1)"
+  # (b) G-N1 FIXED: the native daemon's proxy bind SUCCEEDS — no "address already
+  # in use". Both egress proxies are live on disjoint ports.
+  echo "-- G-N1: native daemon proxy bind (expect NO contention) --"
+  if grep -hiE "could not bind its listener|address already in use" "$PWD/.scratch/dm2-minimald.log" 2>/dev/null | grep -qiE "proxy|dns-proxy|765[0-9]"; then
+    echo "TC15_BIND=CONTENDED (G-N1 regression — native proxy lost its bind)"
+  else
+    echo "TC15_BIND=OK (native proxy bound its own ports; no contention)"
+  fi
+  echo "TC15 listeners: VM :7654=$(listeners_on 7654), native :$NATIVE_EGRESS_PORT=$(listeners_on "$NATIVE_EGRESS_PORT")"
+  # (c) UC2a through the SECOND control plane (the acceptance's "TC3 passes
+  # against BOTH control planes"): an own-ip ingress session on the native daemon
+  # reached by hostname through its derived :7656 proxy.
+  "$M" --minimal-dir "$DM2_DIR" activate -n tc15b --network own-ip --ingress 18090:8080 . >/dev/null 2>&1
+  nonce_n="${RANDOM}${RANDOM}"
+  {
+    printf "stty -echo; PS1=''\n"
+    printf 'echo __RB_%s__\n' "$nonce_n"
+    printf "printf 'HTTP/1.0 200 OK\r\n\r\nNATIVE_OK' > /tmp/rsp; socat TCP-LISTEN:8080,reuseaddr,fork SYSTEM:'cat /tmp/rsp' & sleep 1; echo SERVER_UP\n"
+    printf 'echo __RD_%s__\n' "$nonce_n"
+    sleep "$HOLD_SECS"
+  } | "$M" --minimal-dir "$DM2_DIR" attach tc15b > "$SCRATCH/tc15b.log" 2>&1 &
+  if hold_wait "$SCRATCH/tc15b.log" "SERVER_UP"; then
+    echo "-- host via native :$NATIVE_EGRESS_PORT proxy -> tc15b.local.min.internal:18090 --"
+    curl --max-time 8 -sS -x "http://127.0.0.1:$NATIVE_EGRESS_PORT" -o /dev/null -w "TC15_NATIVE_PROXY=%{http_code}\n" http://tc15b.local.min.internal:18090/ 2>&1 || echo "TC15_NATIVE_PROXY=curl-failed"
+  else
+    echo "TC15_NATIVE_PROXY=backend-not-up"
+  fi
+  "$M" --minimal-dir "$DM2_DIR" destroy tc15b >/dev/null 2>&1
 fi
 
 banner "DONE ($DM)"

@@ -243,7 +243,7 @@ dm3: artifacts gvproxy initramfs minvmd-build minimal-cli
 # DM2 — native Linux, host-native minimald (no VM) over UDS. Runs minimald under
 # a dedicated state dir; the CLI reaches it with `--minimal-dir`, which (via the
 # autospawn gate) connects directly instead of booting a VM.
-dm2: minimald-build minimal-cli gvproxy
+dm2 egress_port='7654' https_port='7655': minimald-build minimal-cli gvproxy
     #!/usr/bin/env sh
     set -eu
     dir="{{scratch}}/dm2-state"
@@ -259,9 +259,15 @@ dm2: minimald-build minimal-cli gvproxy
     else
       # --gvproxy-bin points the per-host OwnIp switch at the pinned local gvproxy,
       # so no system install (/usr/lib/minimal/bin/gvproxy) is required.
+      # --egress-proxy-port/--https-proxy-port default to the well-known
+      # :7654/:7655 (DM2 standalone). On DM4 the VM daemon owns those, so the
+      # `dm4` target passes the disjoint pair :7656/:7657 here — the two control
+      # planes then serve their proxies side by side without contending (G-N1).
       setsid "$bin" \
         --minimal-state-dir "$dir" --minimal-cache-dir "$dir/cache" \
-        run --instance-num 0 --gvproxy-bin "{{gvproxy}}" > {{scratch}}/dm2-minimald.log 2>&1 &
+        run --instance-num 0 --gvproxy-bin "{{gvproxy}}" \
+        --egress-proxy-port {{egress_port}} --https-proxy-port {{https_port}} \
+        > {{scratch}}/dm2-minimald.log 2>&1 &
       echo $! > "$pidf"
       for _ in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.1; done
     fi
@@ -281,3 +287,12 @@ dm2-down:
     for _ in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
     kill -9 "$pid" 2>/dev/null || true; rm -f "$pidf"
     echo "DM2 minimald stopped (pid $pid)"
+
+# DM4 — DM2 + DM3 co-resident on one Linux host. The VM daemon (DM3) comes up
+# first and owns the well-known proxy ports :7654/:7655; the native daemon (DM2)
+# is then given the disjoint pair :7656/:7657, so the two control planes serve
+# their `*.min.internal` proxy surfaces side by side without contending (G-N1).
+# Teardown: `just dm2-down && just stop`. Drive the suite with `DM=dm4 ./docs/
+# specs/03-spec-networking/test-plan.sh`.
+dm4: dm3 (dm2 "7656" "7657")
+    @echo "DM4 up: VM daemon :7654/:7655, native daemon :7656/:7657 (no G-N1 contention)."
