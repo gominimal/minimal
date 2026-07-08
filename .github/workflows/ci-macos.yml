@@ -106,6 +106,74 @@ jobs:
                   path: ${{ runner.temp }}/initramfs.cpio
                   if-no-files-found: error
 
+    libkrun-macos:
+        # Self-provision libkrun >= 1.19.0 for the boot-e2e VM path. `krun_add_disk3`
+        # (this PR's /dev/vdb attach) landed in libkrun 1.19.0, but the self-hosted
+        # boot-e2e runner's brew libkrun is stale (1.18.1) and its /opt/homebrew is
+        # not writable, so it can't self-upgrade. Build a self-contained libkrun from
+        # source on a GitHub-hosted Apple Silicon runner (mirrors release.yml's
+        # build-libkrun-macos-arm64) and hand it to boot-e2e as an artifact. Cached
+        # by LIBKRUN_REF so the from-source build is paid once.
+        runs-on: macos-latest
+        timeout-minutes: 50
+        env:
+            # The version the slp/krun tap ships (kept in step with release.yml).
+            LIBKRUN_REF: v1.19.4
+        steps:
+            - name: Cache built libkrun prefix
+              id: krun-cache
+              uses: actions/cache@v6
+              with:
+                  path: ${{ runner.temp }}/krun
+                  key: libkrun-macos-arm64-${{ env.LIBKRUN_REF }}
+            - name: Checkout libkrun (${{ env.LIBKRUN_REF }})
+              if: steps.krun-cache.outputs.cache-hit != 'true'
+              uses: actions/checkout@v7
+              with:
+                  repository: containers/libkrun
+                  ref: ${{ env.LIBKRUN_REF }}
+                  persist-credentials: false
+            - name: Toolchain
+              if: steps.krun-cache.outputs.cache-hit != 'true'
+              uses: dtolnay/rust-toolchain@stable
+            - name: Install build dependencies
+              if: steps.krun-cache.outputs.cache-hit != 'true'
+              # Mirrors upstream's cross-compile-macos job: the default init-blob
+              # feature needs the LLVM linker (lld) and xz.
+              run: brew install lld xz
+            - name: Build trimmed libkrun (BLK + NET, no GPU) + install
+              if: steps.krun-cache.outputs.cache-hit != 'true'
+              run: |
+                  make BLK=1 NET=1
+                  make PREFIX="$RUNNER_TEMP/krun" install
+            - name: Assert self-contained + exports krun_add_disk3 (>= 1.19.0)
+              # A trimmed build must link only system libs; any /opt/homebrew ref means
+              # a dependency leaked and the dylib would not load on the target runner.
+              # And it MUST export krun_add_disk3 — the whole point of provisioning it.
+              run: |
+                  dylib="$RUNNER_TEMP/krun/lib/libkrun.dylib"
+                  test -f "$dylib" || { echo "::error::libkrun build produced no $dylib"; exit 1; }
+                  if otool -L "$dylib" | grep -E '/opt/homebrew|/usr/local'; then
+                    echo "::error::built libkrun links a non-system (Homebrew) dylib; see otool -L above" >&2
+                    exit 1
+                  fi
+                  if ! nm -gU "$dylib" 2>/dev/null | grep -q '_krun_add_disk3'; then
+                    echo "::error::libkrun $LIBKRUN_REF does not export krun_add_disk3 (need >= 1.19.0)" >&2
+                    exit 1
+                  fi
+            - name: Ad-hoc codesign
+              # make install leaves the signature stale; arm64 macOS refuses to load a
+              # dylib with an invalid signature. Sign the real versioned file.
+              run: codesign --sign - --force "$(readlink -f "$RUNNER_TEMP/krun/lib/libkrun.dylib")"
+            - name: Pack prefix (tar preserves the versioned-dylib symlinks)
+              run: tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/krun-prefix.tgz" krun
+            - name: Upload libkrun prefix
+              uses: actions/upload-artifact@v7
+              with:
+                  name: libkrun-macos-arm64-prefix
+                  path: ${{ runner.temp }}/krun-prefix.tgz
+                  if-no-files-found: error
+
     boot-e2e:
         # Boot E2E (R2.4 READY round-trip) on real hardware, using the cache-pulled
         # kernel + rootfs ext4 image (both from the `artifacts` job).
@@ -119,7 +187,7 @@ jobs:
         # guest both 7350). The full vsock session round-trip is gated by the Session
         # E2E step below (direct run_on_vsock; needs libkrun >= 1.19.0).
         if: ${{ vars.RUN_MACOS_CI != 'false' }}
-        needs: [artifacts]
+        needs: [artifacts, libkrun-macos]
         runs-on: [self-hosted, macOS, ARM64]
         timeout-minutes: 20
         steps:
@@ -155,12 +223,38 @@ jobs:
               with:
                   name: minimald-initramfs-aarch64
                   path: ${{ runner.temp }}/initramfs
+            - name: Download self-provisioned libkrun (>= 1.19.0)
+              # The self-hosted runner's brew libkrun is stale (1.18.1) and lacks
+              # krun_add_disk3 (this PR's /dev/vdb attach). Use the from-source
+              # >= 1.19.0 built by the libkrun-macos job instead.
+              uses: actions/download-artifact@v8
+              with:
+                  name: libkrun-macos-arm64-prefix
+                  path: ${{ runner.temp }}/krun-dl
+            - name: Stage libkrun + assert krun_add_disk3 (>= 1.19.0)
+              # Point minvmd's build.rs (LIBKRUN_PREFIX -> link + rpath) and the running
+              # VMM (DYLD_FALLBACK_LIBRARY_PATH) at the staged libkrun, keeping the
+              # runner's libkrunfw as the dlopen fallback. Explicit gate: fail loudly
+              # (not a cryptic dyld symbol-not-found at VM boot) if it lacks the symbol.
+              run: |
+                  tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/krun-dl/krun-prefix.tgz"
+                  dylib="$RUNNER_TEMP/krun/lib/libkrun.dylib"
+                  if ! nm -gU "$dylib" 2>/dev/null | grep -q '_krun_add_disk3'; then
+                    echo "::error::staged libkrun does not export krun_add_disk3; need >= 1.19.0" >&2
+                    exit 1
+                  fi
+                  echo "staged libkrun: $(readlink "$dylib" 2>/dev/null || basename "$dylib")"
+                  {
+                    echo "LIBKRUN_PREFIX=$RUNNER_TEMP/krun/lib"
+                    echo "DYLD_FALLBACK_LIBRARY_PATH=$RUNNER_TEMP/krun/lib:/opt/homebrew/lib"
+                  } >> "$GITHUB_ENV"
             - name: Build E2E harnesses + minvmd (no run)
               # Build the test harnesses + the minvmd bin, then codesign, then run the
               # test BINARIES DIRECTLY (below). Invoking `cargo test` again after
               # signing relinks (and unsigns) target/debug/minvmd, so krun_start_enter
               # fails with EINVAL. A direct-binary run never touches the signature, so
               # the binaries must be built here before the single codesign.
+              # LIBKRUN_PREFIX (set above) makes this link the staged >= 1.19.0 libkrun.
               run: cargo test -p minvmd --test boot_e2e --test minimald_session_e2e --no-run
             - name: Codesign minvmd (hypervisor entitlement, R1.4)
               run: codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd

@@ -149,6 +149,17 @@ jobs:
         # `minimal` CLI build it drives is incremental.
         run: ./scripts/fetch-libkrun.sh "$KRUN_PREFIX" x86_64
 
+      - name: Assert libkrun exports krun_add_disk3 (>= 1.19.0)
+        # krun_add_disk3 (this PR's /dev/vdb attach) needs libkrun >= 1.19.0. Fail
+        # loudly here rather than with a cryptic runtime error at VM boot if the
+        # materialized upstream libkrun is too old.
+        run: |
+          so="$(ls "$KRUN_PREFIX"/libkrun.so* 2>/dev/null | head -1)"
+          test -n "$so" || { echo "::error::no libkrun.so under $KRUN_PREFIX"; exit 1; }
+          nm -D "$so" 2>/dev/null | grep -q krun_add_disk3 \
+            || { echo "::error::materialized libkrun ($so) does not export krun_add_disk3; need >= 1.19.0"; exit 1; }
+          echo "libkrun OK: $so exports krun_add_disk3"
+
       - name: Materialize gvproxy switch binary (DM1 relay)
         # The DM1 gvproxy relay e2e (vsock_relay_e2e) spawns this per-host switch
         # binary; pin-verified, no Go toolchain. Publish its path for the gated
