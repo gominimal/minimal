@@ -489,6 +489,14 @@ the host-side mapping from session id to volume image.
   once a failed volume mount is fatal (no silent tmpfs fallback) *and* the floor
   is measured against real in-VM build memory pressure — neither is settled here,
   so the reduction is deferred to a separate memory-pressure spec.
+- **Automatic host-image reclamation (periodic `fstrim`).** The guest does not
+  proactively issue TRIM/discard, so the RAW backing file only shrinks when a
+  discard is issued (`mount -o discard` / manual `fstrim`); ext4 still reuses its
+  own free blocks in place, so the *filesystem* never runs out of space — only
+  the host image can grow toward its `MINVMD_VOLUME_BYTES` high-water mark.
+  Follow-up (Tom, #658 review): if that host-side growth becomes a problem, add a
+  periodic guest `fstrim` (e.g. a cron) to punch the freed blocks back to the
+  host. Out of scope here.
 
 ## Design Considerations
 
