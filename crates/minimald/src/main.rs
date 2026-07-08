@@ -169,6 +169,14 @@ pub struct ListenArgs {
     #[clap(hide = true)]
     mount_rootfs: Option<String>,
 
+    /// Device to format-on-first-boot + mount as the writable state volume at
+    /// `/var/lib/minimal` when running as a microVM init (R1.5/R1.6). When set
+    /// and the mount succeeds, cache + state are relocated onto it. Only useful
+    /// as a VM init process; `None` leaves state on the tmpfs default.
+    #[arg(long)]
+    #[clap(hide = true)]
+    mk_mount_state_volume: Option<String>,
+
     /// Daemonize: spawn minimald in a new session (setsid) and return once the
     /// SSH socket accepts connections, or an 8s timeout elapses. Used by the
     /// `minimal` CLI to auto-start a native (DM2) daemon on Linux.
@@ -293,6 +301,7 @@ async fn async_main() -> Result<(), MainError> {
                 vsock: true,
                 mount_dev: true,
                 mount_rootfs: Some("/dev/vda".to_string()),
+                mk_mount_state_volume: Some("/dev/vdb".to_string()),
                 detach: false,
                 // In-VM (DM1/3/4) the PTask attaches to the host gvproxy over the
                 // vsock shuttle, so no in-guest gvproxy binary path is needed.
@@ -353,13 +362,16 @@ async fn async_main() -> Result<(), MainError> {
         }
     }
 
-    // R1.5/R1.6: mount the per-VM writable data volume (/dev/vdb) and, when it
-    // mounts, relocate cache + state onto it so builds hardlinking from the cache
-    // stay on one filesystem (the EXDEV fix). When no volume is attached (the
-    // transitional case), state stays on the tmpfs default. Unit 2 (R2.4/R2.5)
-    // gates READY on this and removes the silent-fallback path.
-    if is_minimal_microvm() {
-        match guest::mount_state_volume("/dev/vdb", "/var/lib/minimal") {
+    // R1.5/R1.6: when the microVM config requested a data volume
+    // (`mk_mount_state_volume`), format-on-first-boot + mount it and, on success,
+    // relocate cache + state onto it so builds hardlinking from the cache stay on
+    // one filesystem (the EXDEV fix). Relocation is gated on the mount succeeding:
+    // pointing state at an unmounted /var/lib/minimal would land it on the
+    // read-only rootfs. When no volume is requested (the transitional case), state
+    // stays on the tmpfs default. Unit 2 (R2.4/R2.5) makes a failed mount loud and
+    // removes the silent-fallback path.
+    if let Some(dev) = cli.listen_args().unwrap().mk_mount_state_volume.clone() {
+        match guest::mount_state_volume(&dev, "/var/lib/minimal") {
             Ok(true) => {
                 cli.global_args.minimal_state_dir =
                     Some(DaemonAbsPath::try_new("/var/lib/minimal").unwrap().into());
@@ -368,10 +380,10 @@ async fn async_main() -> Result<(), MainError> {
                         .unwrap()
                         .into(),
                 );
-                tracing::info!("cache + state relocated onto /dev/vdb (/var/lib/minimal)");
+                tracing::info!(device = %dev, "cache + state relocated onto the data volume (/var/lib/minimal)");
             }
             Ok(false) => {}
-            Err(e) => tracing::error!(error = %e, "mounting /dev/vdb state volume"),
+            Err(e) => tracing::error!(error = %e, device = %dev, "mounting data volume"),
         }
     }
 
