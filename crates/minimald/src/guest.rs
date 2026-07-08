@@ -302,6 +302,14 @@ fn device_size_bytes(device: &str) -> std::io::Result<u64> {
 /// table (and its zeroing) small. See [`run_mkfs_ext4`].
 const MKFS_BYTES_PER_INODE: u64 = 65536;
 
+/// Smallest device we will format. Below this, the usable size after
+/// [`MKFS_MARGIN_BYTES`] leaves too little for a journalled ext4 (and a device
+/// ≤ the margin yields a zero block count), so `run_mkfs_ext4` rejects it rather
+/// than handing `mkfs.ext4` a nonsensical size. The real data volume is
+/// GiB-scale, so this only guards a misconfigured `MINVMD_VOLUME_BYTES` or a
+/// malformed device.
+const MKFS_MIN_DEVICE_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Format `device` as ext4 via `mkfs.ext4 -F` (non-interactive). Resolves from
 /// `PATH` (`/usr/sbin`, set post-chroot in [`enter_rootfs`]); requires
 /// `e2fsprogs` in the rootfs closure (spec R1.7).
@@ -318,7 +326,17 @@ const MKFS_BYTES_PER_INODE: u64 = 65536;
 ///   synchronous init is small and one-time (first boot only; later boots detect
 ///   the superblock and skip mkfs).
 fn run_mkfs_ext4(device: &str) -> std::io::Result<()> {
-    let fs_blocks = device_size_bytes(device)?.saturating_sub(MKFS_MARGIN_BYTES) / EXT4_BLOCK_BYTES;
+    let device_bytes = device_size_bytes(device)?;
+    if device_bytes < MKFS_MIN_DEVICE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "data volume {device} is too small to format: {device_bytes} bytes \
+                 (minimum {MKFS_MIN_DEVICE_BYTES})"
+            ),
+        ));
+    }
+    let fs_blocks = device_bytes.saturating_sub(MKFS_MARGIN_BYTES) / EXT4_BLOCK_BYTES;
     let status = std::process::Command::new("mkfs.ext4")
         .arg("-F")
         .arg("-q")
