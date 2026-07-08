@@ -79,7 +79,7 @@ pub struct VmConfig {
     /// Path to the per-VM writable data volume image, attached as `/dev/vdb`
     /// via `krun_add_disk3` (spec R1.4). `None` means no data volume is attached
     /// (legacy tmpfs-only boot). Provision the image with
-    /// [`crate::volume::VolumeProvisioner`] before setting this.
+    /// [`crate::volume::ensure_sparse_raw`] before setting this.
     pub data_volume_path: Option<PathBuf>,
 }
 
@@ -114,7 +114,7 @@ impl VmConfig {
 
     /// Attach a per-VM writable data volume image as `/dev/vdb` (spec R1.4),
     /// consuming and returning `self`. The image must already be provisioned
-    /// (see [`crate::volume::VolumeProvisioner`]).
+    /// (see [`crate::volume::ensure_sparse_raw`]).
     #[must_use]
     pub fn with_data_volume(mut self, data_volume_path: PathBuf) -> Self {
         self.data_volume_path = Some(data_volume_path);

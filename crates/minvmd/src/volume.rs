@@ -1,12 +1,10 @@
 //! Host-side provisioning of the per-VM writable data volume (`/dev/vdb`).
 //!
-//! The [`VolumeProvisioner`] trait isolates *how* the backing image is
-//! materialized (the host-side strategy) from the guest boot path, which keys
-//! exclusively off ext4 superblock detection (spec R1.3 / R1.5) and never off a
-//! "disk is blank" assumption. [`BlankRawProvisioner`] is the Phase-1
-//! implementation: a sparse raw file the guest formats with `mkfs.ext4` on first
-//! boot. Replacing it with a reflink/qcow2 provisioner later is a pure host-side
-//! swap with no guest or boot-path change.
+//! The image is a sparse raw file the guest formats with `mkfs.ext4` on first
+//! boot (spec R1.3 / R1.5); the guest keys exclusively off ext4 superblock
+//! detection, never off a "disk is blank" assumption. [`ensure_sparse_raw`]
+//! materializes it at the exact path it is asked for and is idempotent — an
+//! already-provisioned (and possibly guest-formatted) image is left untouched.
 
 use std::fs::OpenOptions;
 use std::io;
@@ -21,10 +19,9 @@ pub const DEFAULT_VOLUME_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 /// Environment variable overriding [`DEFAULT_VOLUME_BYTES`] (spec R1.3).
 pub const VOLUME_BYTES_ENV: &str = "MINVMD_VOLUME_BYTES";
 
-/// Environment variable selecting the data-volume image path. When set, the
-/// VMM child provisions a blank sparse image there (if absent) and attaches it
-/// as `/dev/vdb`. The path's file stem is used as the `vm_id`. Must end in
-/// `.raw`. Unset means no data volume is attached (legacy tmpfs-only boot).
+/// Environment variable overriding the data-volume image path. Unset uses the
+/// default under the minvmd state dir (see [`resolve_data_volume_path`]); the
+/// volume is provisioned and attached as `/dev/vdb` on every boot either way.
 pub const DATA_VOLUME_PATH_ENV: &str = "MINVMD_DATA_VOLUME_PATH";
 
 /// Resolve the configured volume size. A non-numeric, empty, or zero value in
@@ -38,14 +35,41 @@ pub fn volume_bytes() -> u64 {
         .unwrap_or(DEFAULT_VOLUME_BYTES)
 }
 
-/// Failure modes of [`VolumeProvisioner::ensure`].
+/// Resolve the per-VM data-volume image path.
+///
+/// [`DATA_VOLUME_PATH_ENV`] overrides it explicitly (used verbatim); otherwise
+/// the image lives beside minvmd's persistent state as `<state>/data-vol.raw`,
+/// so it survives clean restarts. `XDG_STATE_HOME` is honoured directly rather
+/// than via [`crate::state::StateDir::default_path`] because the `dirs` crate
+/// ignores `XDG_STATE_HOME` on macOS — honouring it keeps the volume isolable in
+/// tests (and beside the state dir) on every platform.
+#[must_use]
+pub fn resolve_data_volume_path() -> PathBuf {
+    if let Some(explicit) = std::env::var_os(DATA_VOLUME_PATH_ENV).filter(|v| !v.is_empty()) {
+        return PathBuf::from(explicit);
+    }
+    let state_dir = std::env::var_os("XDG_STATE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(|x| PathBuf::from(x).join("minimal/minvmd"))
+        .unwrap_or_else(crate::state::StateDir::default_path);
+    state_dir.join("data-vol.raw")
+}
+
+/// Failure modes of [`ensure_sparse_raw`].
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum VolumeError {
-    /// The volumes directory could not be created.
-    #[error("creating volumes directory {dir}")]
+    /// The parent directory could not be created.
+    #[error("creating volume directory {dir}")]
     CreateDir {
         dir: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    /// The image file could not be stat'd.
+    #[error("stat volume image {path}")]
+    Stat {
+        path: PathBuf,
         #[source]
         source: io::Error,
     },
@@ -66,54 +90,18 @@ pub enum VolumeError {
     },
 }
 
-/// Materializes the backing image for a VM's writable data volume.
+/// Ensure a sparse raw data-volume image exists at `path`, creating a blank one
+/// of `size_bytes` if it is missing.
 ///
-/// `ensure` is idempotent: repeated calls for the same `vm_id` return the same
-/// image path without disturbing an already-provisioned (and possibly
-/// guest-formatted) volume.
-pub trait VolumeProvisioner {
-    /// Return the path to `vm_id`'s data-volume image, creating a blank one of
-    /// `size_bytes` if it does not yet exist.
-    fn ensure(&self, vm_id: &str, size_bytes: u64) -> Result<PathBuf, VolumeError>;
-}
-
-/// Provisions a blank sparse raw file per VM under a fixed volumes directory.
-///
-/// The image lives at `<volumes_dir>/<vm_id>.raw`, sized with `ftruncate`
-/// (`File::set_len`) — which yields a sparse/thin file on both APFS (macOS) and
-/// ext4 (Linux), so the host never pays the full size up front. The guest runs
+/// Idempotent: an existing image is never resized in place — shrinking would
+/// truncate a guest-formatted ext4 and growing the file does not grow the
+/// filesystem (that needs `resize2fs`) — so a prior image is left untouched.
+/// The file is created with `ftruncate` (`File::set_len`), which yields a
+/// sparse/thin file on both APFS (macOS) and ext4 (Linux); the guest runs
 /// first-boot `mkfs.ext4` against it (spec R1.5).
-#[derive(Debug, Clone)]
-pub struct BlankRawProvisioner {
-    volumes_dir: PathBuf,
-}
-
-impl BlankRawProvisioner {
-    /// Construct a provisioner rooted at `volumes_dir` (e.g.
-    /// `<state_dir>/volumes`).
-    #[must_use]
-    pub fn new(volumes_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            volumes_dir: volumes_dir.into(),
-        }
-    }
-
-    /// Deterministic image path for `vm_id`.
-    #[must_use]
-    pub fn image_path(&self, vm_id: &str) -> PathBuf {
-        self.volumes_dir.join(format!("{vm_id}.raw"))
-    }
-}
-
-impl VolumeProvisioner for BlankRawProvisioner {
-    fn ensure(&self, vm_id: &str, size_bytes: u64) -> Result<PathBuf, VolumeError> {
-        let path = self.image_path(vm_id);
-
-        // Idempotent: an already-provisioned image is never resized in place —
-        // shrinking would truncate a guest-formatted ext4 and growing the file
-        // does not grow the filesystem (that needs `resize2fs`). If a prior
-        // image exists we return it untouched; only a missing image is created.
-        if let Ok(meta) = std::fs::metadata(&path) {
+pub fn ensure_sparse_raw(path: &Path, size_bytes: u64) -> Result<(), VolumeError> {
+    match std::fs::metadata(path) {
+        Ok(meta) => {
             if meta.len() != size_bytes {
                 tracing::warn!(
                     path = %path.display(),
@@ -122,25 +110,32 @@ impl VolumeProvisioner for BlankRawProvisioner {
                     "existing data volume differs from requested size; keeping as-is",
                 );
             }
-            return Ok(path);
+            Ok(())
         }
-
-        create_sparse_raw(&self.volumes_dir, &path, size_bytes)?;
-        tracing::info!(
-            path = %path.display(),
-            size_bytes,
-            "provisioned blank sparse data volume",
-        );
-        Ok(path)
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            create_sparse_raw(path, size_bytes)?;
+            tracing::info!(
+                path = %path.display(),
+                size_bytes,
+                "provisioned blank sparse data volume",
+            );
+            Ok(())
+        }
+        Err(source) => Err(VolumeError::Stat {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 
-/// Create a sparse raw file of `size_bytes` at `path`, creating `dir` first.
-fn create_sparse_raw(dir: &Path, path: &Path, size_bytes: u64) -> Result<(), VolumeError> {
-    std::fs::create_dir_all(dir).map_err(|source| VolumeError::CreateDir {
-        dir: dir.to_path_buf(),
-        source,
-    })?;
+/// Create a sparse raw file of `size_bytes` at `path`, creating parents first.
+fn create_sparse_raw(path: &Path, size_bytes: u64) -> Result<(), VolumeError> {
+    if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|source| VolumeError::CreateDir {
+            dir: dir.to_path_buf(),
+            source,
+        })?;
+    }
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -182,9 +177,9 @@ mod tests {
     #[test]
     fn ensure_creates_sparse_image_of_requested_len() {
         let dir = tmpdir("sparse");
-        let prov = BlankRawProvisioner::new(dir.join("volumes"));
+        let path = dir.join("data-vol.raw");
         let size = 8 * 1024 * 1024 * 1024; // 8 GiB
-        let path = prov.ensure("vm-abc", size).unwrap();
+        ensure_sparse_raw(&path, size).unwrap();
 
         let meta = std::fs::metadata(&path).unwrap();
         assert_eq!(meta.len(), size, "logical length must match requested size");
@@ -196,23 +191,24 @@ mod tests {
             allocated < size / 100,
             "expected a sparse file, but {allocated} bytes are allocated for a {size}-byte image",
         );
+        // Best-effort cleanup; a leftover temp dir must not fail the test.
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn ensure_is_idempotent_and_does_not_resize() {
         let dir = tmpdir("idempotent");
-        let prov = BlankRawProvisioner::new(dir.join("volumes"));
-        let path = prov.ensure("vm-xyz", 4 * 1024 * 1024 * 1024).unwrap();
-        // A second call at a *different* size must return the same untouched
-        // image rather than truncating it (which would corrupt a formatted FS).
-        let path2 = prov.ensure("vm-xyz", 1024 * 1024 * 1024).unwrap();
-        assert_eq!(path, path2);
+        let path = dir.join("data-vol.raw");
+        ensure_sparse_raw(&path, 4 * 1024 * 1024 * 1024).unwrap();
+        // A second call at a *different* size must leave the existing image
+        // untouched rather than truncating it (which would corrupt a formatted FS).
+        ensure_sparse_raw(&path, 1024 * 1024 * 1024).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().len(),
             4 * 1024 * 1024 * 1024,
             "existing image must not be resized",
         );
+        // Best-effort cleanup; a leftover temp dir must not fail the test.
         let _ = std::fs::remove_dir_all(&dir);
     }
 

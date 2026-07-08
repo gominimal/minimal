@@ -332,18 +332,21 @@ fn run_mkfs_ext4(device: &str) -> std::io::Result<()> {
 /// the caller keeps the tmpfs state dir. Unit 2 (R2.4/R2.5) makes an *attached*
 /// volume that fails to mount fatal; this Unit-1 form only reports the outcome.
 pub fn mount_state_volume(device: &str, mountpoint: &str) -> std::io::Result<bool> {
-    if !std::path::Path::new(device).exists() {
+    // `try_exists` distinguishes "absent" (Ok(false)) from a stat error (Err):
+    // a plain `exists()` reports a transiently-unstattable but attached device as
+    // absent, silently dropping to the ephemeral tmpfs and losing the volume.
+    if !std::path::Path::new(device).try_exists()? {
         tracing::info!(device, "no data volume attached; keeping tmpfs state dir");
         return Ok(false);
     }
+    // Ensure the mountpoint exists before formatting: it must be present on the
+    // read-only rootfs (spec R1.7), so on a rootfs that predates R1.7 this fails
+    // with EROFS — better to surface that here than after a needless mkfs.
+    std::fs::create_dir_all(mountpoint)?;
     if !has_ext4_superblock(device)? {
         tracing::info!(device, "no ext4 superblock; formatting data volume");
         run_mkfs_ext4(device)?;
     }
-    // The mountpoint must exist on the read-only rootfs (spec R1.7); on a rootfs
-    // that predates R1.7 this create fails with EROFS, surfacing the missing
-    // mountpoint rather than mounting somewhere unexpected.
-    std::fs::create_dir_all(mountpoint)?;
     raw_mount(device, mountpoint, "ext4", libc::MS_NOATIME)?;
     tracing::info!(device, mountpoint, "mounted writable state volume");
     Ok(true)

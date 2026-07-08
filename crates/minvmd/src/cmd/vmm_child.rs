@@ -48,19 +48,13 @@ fn run_vmm() -> Result<()> {
         format!("reading {MARKER_SOCK_ENV}: VMM child must be spawned by `minvmd boot`")
     })?;
 
-    // A data volume moves the package cache off the RAM-backed tmpfs, so the
-    // guest RAM can drop to the reduced baseline (R1.8). Resolve its presence
-    // first, before sizing RAM.
-    let data_volume_path = std::env::var_os(crate::volume::DATA_VOLUME_PATH_ENV);
-
     let mut ctx = Context::create().context("krun_create_ctx")?;
-    // 2 vCPU; guest RAM from `vm_ram_mib_for` (env-overridable) — reduced when the
-    // cache lives on `/dev/vdb`, else the tmpfs-headroom default; x86_64 needs a
-    // hole-safe size (see `DEFAULT_VM_RAM_MIB`). (Stay below the kernel's
-    // CONFIG_NR_CPUS.) `apply` configures the kernel + initramfs, the ext4 root
-    // disk, the writable data volume, and the vsock bridge.
-    let ram_mib = crate::cmd::vm_ram_mib_for(data_volume_path.is_some());
-    let mut cfg = VmConfig::new(2, ram_mib, kernel, rootfs, initramfs);
+    // 2 vCPU; guest RAM from `vm_ram_mib()` (env-overridable, tmpfs-headroom
+    // default; x86_64 needs a hole-safe size — see `DEFAULT_VM_RAM_MIB`). Stay
+    // below the kernel's CONFIG_NR_CPUS. `apply` configures the kernel +
+    // initramfs, the ext4 root disk, the writable data volume, and the vsock
+    // bridge.
+    let mut cfg = VmConfig::new(2, crate::cmd::vm_ram_mib(), kernel, rootfs, initramfs);
     // An own-IP VM registers the per-PTask gvproxy shuttle vsock
     // bridge in `apply`; the host gvproxy is spawned by the parent supervisor.
     // The env var keeps the parent's gvproxy-spawn decision and this child's VM
@@ -69,26 +63,15 @@ fn run_vmm() -> Result<()> {
         cfg = cfg.with_network_mode(minimald_rpc::NetworkMode::OwnIp);
     }
 
-    // Attach the per-VM writable data volume (/dev/vdb) when
-    // MINVMD_DATA_VOLUME_PATH is set (spec R1.4). Provision a blank sparse image
-    // there if it does not yet exist, keyed off the requested path's file stem so
-    // the parent (which stats the image) and this child agree on the location.
-    if let Some(raw) = data_volume_path {
-        use crate::volume::{BlankRawProvisioner, VolumeProvisioner, volume_bytes};
-        let path = std::path::PathBuf::from(raw);
-        let dir = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let vm_id = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .context("MINVMD_DATA_VOLUME_PATH has no usable file stem")?;
-        let image = BlankRawProvisioner::new(dir)
-            .ensure(vm_id, volume_bytes())
-            .context("provisioning writable data volume")?;
-        cfg = cfg.with_data_volume(image);
-    }
+    // Provision + attach the per-VM writable data volume as /dev/vdb (spec R1.4).
+    // On by default: the image lives at the resolved path (MINVMD_DATA_VOLUME_PATH
+    // override, else `<state>/data-vol.raw`) and is created sparse if missing.
+    // Provisioning at the literal path — not a stem-reconstructed one — so an
+    // explicit override is honoured verbatim.
+    let data_volume_path = crate::volume::resolve_data_volume_path();
+    crate::volume::ensure_sparse_raw(&data_volume_path, crate::volume::volume_bytes())
+        .context("provisioning writable data volume")?;
+    cfg = cfg.with_data_volume(data_volume_path);
 
     cfg.apply(&mut ctx)
         .context("applying VmConfig to krun context")?;

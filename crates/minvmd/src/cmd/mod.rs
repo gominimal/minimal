@@ -89,37 +89,21 @@ pub const DEFAULT_VM_RAM_MIB: u32 = 2048;
 #[cfg(not(target_arch = "x86_64"))]
 pub const DEFAULT_VM_RAM_MIB: u32 = 4096;
 
-/// Reduced guest RAM (MiB) once the package cache lives on the writable data
-/// volume (`/dev/vdb`) rather than the RAM-backed tmpfs (spec R1.8). The
-/// `DEFAULT_VM_RAM_MIB` headroom exists only to size the tmpfs cache; with the
-/// cache off RAM the guest needs to cover the build working set, not the cache.
-/// 2048 MiB is a conservative first cut (hole-safe on x86_64) — the true floor
-/// needs an in-VM build measurement (spec Open Question) and can be lowered via
-/// [`VM_RAM_MIB_ENV`].
-pub const VOLUME_BACKED_VM_RAM_MIB: u32 = 2048;
-
 /// The guest RAM size in MiB, overridable via [`VM_RAM_MIB_ENV`]. A non-numeric,
 /// empty, or zero value falls back to [`DEFAULT_VM_RAM_MIB`].
+///
+/// Note: the RAM stop-gap is *not* reduced when the cache moves to the writable
+/// volume in this unit — a reduced baseline is only safe once a failed volume
+/// mount is fatal (no silent tmpfs fallback), which is Unit 2 (R2.4). Reducing
+/// RAM here would leave a mount-failed VM at half RAM with the cache still on the
+/// tmpfs. The reduction is deferred to Unit 2, alongside a measured floor.
 #[must_use]
 pub fn vm_ram_mib() -> u32 {
-    vm_ram_mib_for(false)
-}
-
-/// The guest RAM size in MiB (spec R1.8). When `data_volume_attached`, the cache
-/// is off the tmpfs so the reduced [`VOLUME_BACKED_VM_RAM_MIB`] baseline applies;
-/// otherwise the tmpfs-headroom [`DEFAULT_VM_RAM_MIB`]. [`VM_RAM_MIB_ENV`]
-/// overrides either. A non-numeric, empty, or zero override is ignored.
-#[must_use]
-pub fn vm_ram_mib_for(data_volume_attached: bool) -> u32 {
     std::env::var(VM_RAM_MIB_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|&mib| mib > 0)
-        .unwrap_or(if data_volume_attached {
-            VOLUME_BACKED_VM_RAM_MIB
-        } else {
-            DEFAULT_VM_RAM_MIB
-        })
+        .unwrap_or(DEFAULT_VM_RAM_MIB)
 }
 
 /// Verify the host hypervisor backend is accessible before booting a VM (R2.4).
