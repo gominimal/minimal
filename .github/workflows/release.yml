@@ -228,12 +228,37 @@ jobs:
                   fi
             - name: Build release minvmd binary
               run: cargo build --release -p minvmd --bin minvmd
-            - name: Print libkrun load command (informational)
-              # Show the name+path minvmd records for libkrun. For the shipped
-              # bin/libkrun.dylib (next to minvmd) to resolve via @loader_path, this
-              # must be an @rpath entry whose basename matches the staged dylib's
-              # install name (see build-libkrun-macos-arm64). Non-gating.
-              run: otool -L target/release/minvmd | grep -i krun || true
+            - name: Point minvmd's libkrun load command at @rpath
+              # Linking against Homebrew's libkrun bakes its ABSOLUTE install name
+              # (/opt/homebrew/opt/libkrun/lib/libkrun.1.dylib) into minvmd as the
+              # load command. dyld resolves an absolute load command directly and
+              # NEVER consults the rpath, so the shipped bin/libkrun.1.dylib next to
+              # minvmd is ignored and the binary is unloadable on a host without that
+              # exact Homebrew keg. Rewrite the load command to `@rpath/…` so dyld
+              # walks minvmd's rpath instead: `@loader_path` (the adjacent shipped
+              # dylib) first, then `/opt/homebrew/lib` as a fallback (see the minvmd
+              # build.rs rpath ordering). Derive the current path from otool rather
+              # than hardcoding it, so a libkrun version/path bump can't silently
+              # skip the rewrite. install_name_tool invalidates the ad-hoc signature,
+              # so re-sign (the installer re-signs on download too, but keep the
+              # artifact valid in the meantime).
+              run: |
+                  current="$(otool -L target/release/minvmd | awk '/libkrun/ {print $1; exit}')"
+                  if [ -z "$current" ]; then
+                    echo "::error::minvmd has no libkrun load command; did it link the stub?" >&2
+                    exit 1
+                  fi
+                  install_name_tool -change "$current" @rpath/libkrun.1.dylib target/release/minvmd
+                  codesign --sign - --force target/release/minvmd
+            - name: Verify minvmd loads libkrun via @rpath
+              # Gate the release on the rewrite above having stuck: an absolute or
+              # bare load command here would ship an unloadable binary (this bug).
+              run: |
+                  otool -L target/release/minvmd | grep -i krun
+                  if ! otool -L target/release/minvmd | grep -q '@rpath/libkrun\.1\.dylib'; then
+                    echo "::error::minvmd does not reference @rpath/libkrun.1.dylib; the shipped dylib will not be found" >&2
+                    exit 1
+                  fi
             - name: Build release minimal binary
               run: cargo build --release -p minimal --bin minimal
             - name: Rename binaries with platform suffix
