@@ -156,7 +156,28 @@ TC16 specifies the tests that activate when DM5 lands.
 
 ## Per-DM results
 
-Verdicts from `test-plan.sh` runs. **DM2, DM3, and DM4 columns: 2026-07-03
+> **Correction (2026-07-07, DM1 macOS/HVF) — supersedes the TC3/TC4/TC7/TC8
+> verdicts below.** Those failures were substantially a **test-harness
+> artifact**: the in-session backend built its HTTP reply inside socat's
+> `SYSTEM:` address, which mangled the `printf` and served a **non-HTTP** reply
+> (`curl: Received HTTP/0.9 when not allowed` → `http_code 000`). The forward
+> *delivered* the bytes; the reply was just malformed. A re-run with a corrected
+> file-served backend on a clean DM1 stack gives:
+>
+> | TC | Corrected DM1 (2026-07-07) |
+> |----|----------------------------|
+> | TC3 DNS :7654 | **FAIL 502** — in-VM proxy dials in-VM `127.0.0.1:18080`; gvproxy's forwarder listens on the **host** loopback → connect fails (sub-break ii, not a forwarding-leg defect) |
+> | TC4 static ingress | **PASS 200** — host→`127.0.0.1:18080`→gvproxy→`lease:8080` works end-to-end (prior `000` was the malformed backend) |
+> | TC7 mTLS :7655 | PARTIAL — no-cert **401** PASS; with-cert **502** (same sub-break ii as TC3) |
+> | TC8 ssh-forward | **FAIL 000** — `direct-tcpip` defect; the interim Part 1 change routes to host loopback, still wrong for the VM path |
+>
+> TC1/TC1b/TC2/TC5/TC6/TC9/TC10 re-verified PASS unchanged. The **DM2/DM3/DM4**
+> columns below used the **same broken backend** and are therefore also suspect
+> for TC3/TC4/TC7/TC8 — re-run them with the fixed `test-plan.sh`. Full analysis
+> and fix design: [`gn9-forwarding-findings.md`](gn9-forwarding-findings.md).
+
+Verdicts from `test-plan.sh` runs (**TC3/TC4/TC7/TC8: superseded by the
+correction above**). **DM2, DM3, and DM4 columns: 2026-07-03
 `DM=dm2` / `DM=dm3` runs (plus TC15 for DM4) on a native Linux/aarch64 host**
 (Ubuntu; unprivileged userns unblocked via
 `kernel.apparmor_restrict_unprivileged_userns=0`; KVM + libkrun for the VM
@@ -184,39 +205,39 @@ driver-independent.
 | TC15 co-residency | N/A | N/A | N/A | **PASS** — both daemons serve isolated sessions concurrently; the 2nd daemon (native) loses the proxy bind with `Address already in use`, one :7654 listener remains (G-N1 observed) |
 | TC12–TC14, TC16–TC17 | SKIP (blocked/gap — see matrix) | SKIP | SKIP | SKIP |
 
-**Cross-DM finding (2026-07-03): the host→PTask ingress path is broken on every
-deployment model — but by *two different* mechanisms, now separated by running
-the plan with and without a VM.**
+**Cross-DM finding — CORRECTED (2026-07-07).** The earlier "host→PTask ingress
+path is broken on every DM" conclusion was largely a **test-harness artifact**.
+Re-run on DM1 with a valid, file-served backend:
 
-*DM2 (native rootless Linux, NO VM) → G-N9.* TC3/TC4/TC7-with-cert/TC8 fail with
-the in-session `socat` backend **confirmed live** — every `SERVER_UP`/hold
-marker appeared, no `hold_wait` timeouts. Because DM2 has no VM and no in-VM
-gvproxy, this **rules the VM out** and localises the defect to the daemon's
-host→PTask forwarding leg. TC8 is code-confirmed: `channel_open_direct_tcpip`
-(`crates/minimald/src/connection.rs:464`) validates the session UUID
-(`:504-522`) but then `TcpStream::connect((host, port))` (`:536-538`) dials the
-target **in the daemon's own netns** — so `127.0.0.1:8080` reaches nothing and
-the daemon logs `direct-tcpip: could not connect to target … Connection
-refused` (`:548`); the validated session context is never used to route into
-the sandbox netns/lease. TC3/TC4/TC7 show the same class via the
-`:7654`/`:7655`/ingress leg (empty reply / 502 — host listener up, upstream to
-the backend unreachable). This confirms the DM1 hypothesis holds with no VM in
-play.
+- **TC4 (direct host→forwarder→lease) PASSES (200).** The published-loopback
+  data path works end-to-end; the prior `000`/reset was the malformed backend
+  (curl rejecting an HTTP/0.9 reply), not a forwarding failure. The gvproxy
+  forwarder table registers `127.0.0.1:18080 → lease:8080` at attach and drops it
+  at destroy, exactly as designed.
+- **TC3 / TC7-with-cert still FAIL (502)** for a *narrow* defect (sub-break ii):
+  the in-VM `:7654`/`:7655` proxies resolve own-ip hostnames to
+  `127.0.0.1:<external>` (`crates/minimald/src/net/dns.rs` `register_own_ip` →
+  `LOOPBACK`) and connect on the **in-VM** loopback, but gvproxy's forwarder
+  listener is on the **host** loopback — unreachable from inside the VM. The
+  daemon *can* reach `lease:<internal>` over the switch (verified 200 from the
+  guest root netns via `attach -c`), so the fix routes in-VM consumers to the
+  lease.
+- **TC8 still FAILS** for the original `direct-tcpip` defect (raw connect in the
+  daemon netns; `crates/minimald/src/connection.rs` `channel_open_direct_tcpip`).
+  The interim Part 1 change resolves the ingress mapping but dials
+  `127.0.0.1:<external>` (host loopback) — still wrong for the VM path.
 
-*DM3 / DM4 (KVM VM) → G-N8.* The same four TCs fail and TC3/TC7 return `502`
-matching DM1 byte-for-byte, but the proximate cause here is **different**:
-`attach` on an own-ip session that carries an `--ingress` mapping **hangs — the
-interactive shell never starts** (measured >200 s, vs ~8 s for own-ip *without*
-ingress in an isolated repro), so the backend `socat` never runs and every
-`SERVER_UP` marker times out. The matching `502` is therefore coincidental in
-symptom — on DM3 the ingress session is unusable *before* any data path is
-exercised. So **TC11 parity holds on the final verdict, not the mechanism.**
+Full evidence and fix design (store the lease per session; route `direct-tcpip`
+and the proxies to `lease:<internal>`; keep the forwarder for host-direct access;
+DM2 needs a transport-aware branch verified on Linux):
+[`gn9-forwarding-findings.md`](gn9-forwarding-findings.md).
 
-*DM1 (macOS/HVF).* Per the 2026-07-02 run the backend was confirmed live
-(`SERVER_UP`) yet the leg still failed (502/RST) — i.e. DM1 exhibits the G-N9
-forwarding defect (like DM2), **not** the G-N8 attach hang seen on this KVM
-host. Whether the G-N8 hang is HVF-vs-KVM specific or host/load specific is
-open.
+**Not re-verified:** the DM2/DM3/DM4 columns used the same broken backend, so
+their TC3/4/7/8 verdicts are suspect and need a re-run with the fixed
+`test-plan.sh`. The DM3/DM4 **G-N8 attach-hang** (an own-ip+ingress `attach`
+whose interactive shell never starts, so `SERVER_UP` never appears) is a
+*distinct* failure mode from the backend bug and may still hold — it was not
+re-tested here (needs a KVM/Linux host).
 
 *DM4 (co-residency) → G-N1.* TC15 PASS: both control planes serve isolated
 sessions concurrently; the second daemon to start (native) loses the hardcoded
@@ -460,4 +481,4 @@ by this plan.
 | G-N6 | TC17 (UC7/R4.1–R4.3) | Daemon never consumes mesh enrolment; `set_mesh` test-only | `crates/minimald/src/rpc.rs:1001`; `crates/minimal/src/main.rs:716-751` |
 | G-N7 | multi-VM variants of DM1/DM3 | Spec says "one or more" VMs; minvmd supervises exactly one (single `vmm.pid`/`state.toml`/`lifecycle.lock`) | `crates/minvmd/src/state.rs:6-9` |
 | G-N8 | TC3/TC4/TC7/TC8 on DM3/DM4 (KVM) | `attach` of an own-ip session carrying an `--ingress` mapping hangs — the interactive shell never starts (>200 s vs ~8 s for own-ip without ingress), so the in-session backend never comes up; own-ip *without* ingress is unaffected | 2026-07-03 `DM=dm3` run (`hold_wait: SERVER_UP never appeared` for all 4) + isolated ingress-vs-no-ingress repro |
-| G-N9 | TC3/TC4/TC7/TC8 on DM1/DM2 (live backend; VM-free repro on DM2) | Host→PTask ingress forward never reaches the in-session backend though it is confirmed up. Code-confirmed for TC8: `direct-tcpip` validates the session UUID but then `TcpStream::connect`s to `host:port` in the **daemon's** netns (→ `127.0.0.1:<int>` `Connection refused`), never entering the session's sandbox netns/lease; TC3/TC4/TC7 show the same class via the `:7654`/`:7655`/ingress leg (empty reply / 502) | `crates/minimald/src/connection.rs:504-522` (validates session) + `:536-548` (connects in daemon netns) |
+| G-N9 | TC3/TC7-cert/TC8 on the VM path (DM1) | **Re-characterized 2026-07-07** — the prior "forward never reaches the backend" text was a test-backend artifact (TC4 actually **passes**; the forwarder delivers). Real defect: in-VM host→PTask consumers dial `127.0.0.1:<external>` (in-VM loopback) but gvproxy's forwarder listens on the **host** loopback → 502 / connect-fail; the daemon can reach `lease:<internal>` over the switch, so the fix routes consumers to the lease. `direct-tcpip` additionally connected the raw target in the daemon netns (interim Part 1 change routes via the ingress mapping but still to host loopback — needs to target the lease). | `crates/minimald/src/net/dns.rs` (`register_own_ip`→`LOOPBACK`); `crates/minimald/src/connection.rs` `channel_open_direct_tcpip`; [`gn9-forwarding-findings.md`](gn9-forwarding-findings.md) |
