@@ -65,7 +65,9 @@ if [ "$actual" != "$COMMIT" ]; then
 fi
 
 echo "building trimmed libkrun (blk,net; no gpu, no init-blob)"
-cargo build --release -p libkrun --no-default-features --features blk,net \
+# --locked: build exactly upstream's committed Cargo.lock — a silent
+# re-resolve would undermine the pinned, reproducible-build guarantee.
+cargo build --release --locked -p libkrun --no-default-features --features blk,net \
   --manifest-path "$WORK/Cargo.toml"
 DYLIB="$WORK/target/release/libkrun.dylib"
 test -f "$DYLIB" || { echo "::error::build produced no $DYLIB" >&2; exit 1; }
