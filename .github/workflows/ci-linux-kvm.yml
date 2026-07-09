@@ -29,7 +29,7 @@ on:
       # Composite actions this lane's setup runs through — without these, a
       # composite-only edit would skip this lane and break it post-merge.
       - ".github/actions/setup-libkrun-linux/**"
-      - ".github/actions/guest-artifacts/**"
+      - ".github/actions/materialize/**"
   pull_request:
     branches: ["main"]
     paths:
@@ -43,7 +43,7 @@ on:
       # Composite actions this lane's setup runs through — without these, a
       # composite-only edit would skip this lane and break it post-merge.
       - ".github/actions/setup-libkrun-linux/**"
-      - ".github/actions/guest-artifacts/**"
+      - ".github/actions/materialize/**"
   workflow_dispatch:
 
 env:
@@ -168,12 +168,21 @@ jobs:
           ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
           echo "MINVMD_GVPROXY_BIN=$RUNNER_TEMP/gvproxy" >> "$GITHUB_ENV"
 
-      - name: Materialize guest kernel + rootfs
-        uses: ./.github/actions/guest-artifacts
+      - name: Materialize guest kernel (raw Image)
+        uses: ./.github/actions/materialize
         with:
+          output: virtio-kernel
+          dest: ${{ runner.temp }}/vmlinuz
           arch: x86_64
-          kernel-dest: ${{ runner.temp }}/vmlinuz
-          rootfs-dest: ${{ runner.temp }}/rootfs.img
+          channel: unstable
+
+      - name: Materialize guest rootfs (ext4 image)
+        uses: ./.github/actions/materialize
+        with:
+          output: minvmd-rootfs
+          dest: ${{ runner.temp }}/rootfs.img
+          arch: x86_64
+          channel: unstable
 
       - name: Build guest initramfs (minimald as /init)
         run: ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs.cpio" x86_64-unknown-linux-musl

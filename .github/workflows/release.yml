@@ -430,8 +430,8 @@ jobs:
         # build-release-initramfs, which reuses the minimald-linux-* binaries.
         #
         # None require the target host's arch to produce: the kernel and rootfs are
-        # cache pulls keyed by the pinned upstream commit (fetch-artifact.sh pulls
-        # any guest arch on an x86_64 runner), and gvproxy is a pin-verified
+        # cache pulls keyed by the pinned upstream commit (the materialize action
+        # pulls any guest arch on an x86_64 runner), and gvproxy is a pin-verified
         # download of the upstream release binary. So a single x86_64 runner emits
         # both the amd64 and arm64 variants, covering every release host
         # (linux-amd64/arm64, macos-arm64). Files are arch-suffixed so
@@ -443,42 +443,37 @@ jobs:
             - uses: actions/checkout@v7
               with:
                   persist-credentials: false
-            - name: Toolchain
-              uses: dtolnay/rust-toolchain@stable
-            - name: Install build dependencies
-              # protoc + libprotobuf-dev: the `mip` CLI build that drives the rootfs
-              # cache pull (the well-known protos live in libprotobuf-dev, only a
-              # `recommends` of protobuf-compiler, so name it under
-              # --no-install-recommends).
-              run: |
-                  sudo apt-get update
-                  sudo apt-get install -y --no-install-recommends \
-                    protobuf-compiler libprotobuf-dev
-            - uses: actions/cache@v6
-              with:
-                  path: |
-                      ~/.cargo/bin/
-                      ~/.cargo/registry/index/
-                      ~/.cargo/registry/cache/
-                      ~/.cargo/git/db/
-                      target/
-                  key: ${{ runner.os }}-guest-artifacts-release-${{ hashFiles('**/Cargo.lock') }}
-                  restore-keys: ${{ runner.os }}-guest-artifacts-release-
-            # NOTE: the guest-artifacts composite takes the kernel-style arch
+            # NOTE: the `arch` input is the kernel-style target arch
             # (x86_64/aarch64); only the emitted file/artifact names use the
             # amd64/arm64 suffixes the release binaries already use.
-            - name: Materialize guest kernel + rootfs (amd64)
-              uses: ./.github/actions/guest-artifacts
+            - name: Materialize guest kernel (raw Image, amd64)
+              uses: ./.github/actions/materialize
               with:
+                  output: virtio-kernel
+                  dest: ${{ runner.temp }}/vmlinuz-amd64
                   arch: x86_64
-                  kernel-dest: ${{ runner.temp }}/vmlinuz-amd64
-                  rootfs-dest: ${{ runner.temp }}/rootfs-amd64.img
-            - name: Materialize guest kernel + rootfs (arm64)
-              uses: ./.github/actions/guest-artifacts
+                  channel: unstable
+            - name: Materialize guest kernel (raw Image, arm64)
+              uses: ./.github/actions/materialize
               with:
+                  output: virtio-kernel
+                  dest: ${{ runner.temp }}/vmlinuz-arm64
                   arch: aarch64
-                  kernel-dest: ${{ runner.temp }}/vmlinuz-arm64
-                  rootfs-dest: ${{ runner.temp }}/rootfs-arm64.img
+                  channel: unstable
+            - name: Materialize guest rootfs (ext4 image, amd64)
+              uses: ./.github/actions/materialize
+              with:
+                  output: minvmd-rootfs
+                  dest: ${{ runner.temp }}/rootfs-amd64.img
+                  arch: x86_64
+                  channel: unstable
+            - name: Materialize guest rootfs (ext4 image, arm64)
+              uses: ./.github/actions/materialize
+              with:
+                  output: minvmd-rootfs
+                  dest: ${{ runner.temp }}/rootfs-arm64.img
+                  arch: aarch64
+                  channel: unstable
             - name: Fetch pinned gvproxy (linux-amd64)
               run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy-linux-amd64" gvproxy-linux-amd64
             - name: Fetch pinned gvproxy (linux-arm64)
