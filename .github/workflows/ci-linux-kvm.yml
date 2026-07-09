@@ -103,26 +103,16 @@ jobs:
           ls -l /dev/kvm
 
       - name: Resolve build paths
-        # Publish the libkrun prefix and guest-artifact paths (plus the E2E gate)
-        # to $GITHUB_ENV for later steps; `runner.temp`/`$HOME` are not available
-        # in job-level `env:`.
+        # Publish the guest-artifact paths (plus the E2E gate) to $GITHUB_ENV
+        # for later steps; `runner.temp` is not available in job-level `env:`.
+        # The libkrun link + runtime paths (LIBKRUN_PREFIX, LD_LIBRARY_PATH)
+        # are published by the setup-libkrun-linux composite below.
         run: |
           {
-            echo "KRUN_PREFIX=$HOME/.krun"
             echo "MINVMD_E2E=1"
             echo "MINVMD_KERNEL_PATH=$RUNNER_TEMP/vmlinuz"
             echo "MINVMD_ROOTFS_PATH=$RUNNER_TEMP/rootfs.img"
             echo "MINVMD_INITRAMFS=$RUNNER_TEMP/initramfs.cpio"
-          } >> "$GITHUB_ENV"
-
-      - name: Export libkrun link + runtime paths
-        # LIBKRUN_PREFIX: minvmd build.rs link-search dir (it emits an rpath to
-        # it too). LD_LIBRARY_PATH: libkrun.so -> libkrunfw.so.5 at runtime. Both
-        # point at the flat prefix that the materialize step below populates.
-        run: |
-          {
-            echo "LIBKRUN_PREFIX=$KRUN_PREFIX"
-            echo "LD_LIBRARY_PATH=$KRUN_PREFIX${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           } >> "$GITHUB_ENV"
 
       - name: Install cross
@@ -143,10 +133,11 @@ jobs:
           restore-keys: ${{ runner.os }}-x86_64-minvmd-kvm-
 
       - name: Materialize libkrun prefix (upstream package)
-        # Cache fetch of the upstream libkrun package (libkrun.so + libkrunfw.so.5),
-        # extracted into $KRUN_PREFIX. Runs after the cargo cache restore so the
-        # `minimal` CLI build it drives is incremental.
-        run: ./scripts/fetch-libkrun.sh "$KRUN_PREFIX" x86_64
+        # Runs after the cargo cache restore so the CLI build the cache fetch
+        # drives is incremental.
+        uses: ./.github/actions/setup-libkrun-linux
+        with:
+          arch: x86_64
 
       - name: Materialize gvproxy switch binary (DM1 relay)
         # The DM1 gvproxy relay e2e (vsock_relay_e2e) spawns this per-host switch
@@ -156,11 +147,12 @@ jobs:
           ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
           echo "MINVMD_GVPROXY_BIN=$RUNNER_TEMP/gvproxy" >> "$GITHUB_ENV"
 
-      - name: Materialize guest kernel (raw Image)
-        run: ./scripts/fetch-artifact.sh virtio-kernel "$RUNNER_TEMP/vmlinuz" x86_64
-
-      - name: Materialize guest rootfs (ext4 image)
-        run: ./scripts/fetch-artifact.sh minvmd-rootfs "$RUNNER_TEMP/rootfs.img" x86_64
+      - name: Materialize guest kernel + rootfs
+        uses: ./.github/actions/guest-artifacts
+        with:
+          arch: x86_64
+          kernel-dest: ${{ runner.temp }}/vmlinuz
+          rootfs-dest: ${{ runner.temp }}/rootfs.img
 
       - name: Build guest initramfs (minimald as /init)
         run: ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs.cpio" x86_64-unknown-linux-musl

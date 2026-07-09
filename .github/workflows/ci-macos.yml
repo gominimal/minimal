@@ -74,10 +74,12 @@ jobs:
                       target/
                   key: ${{ runner.os }}-stage2-artifacts-${{ hashFiles('**/Cargo.lock') }}
                   restore-keys: ${{ runner.os }}-stage2-artifacts-
-            - name: Materialize guest kernel (raw Image)
-              run: ./scripts/fetch-artifact.sh virtio-kernel "$RUNNER_TEMP/vmlinuz" aarch64
-            - name: Materialize guest rootfs (ext4 image)
-              run: ./scripts/fetch-artifact.sh minvmd-rootfs "$RUNNER_TEMP/rootfs.img" aarch64
+            - name: Materialize guest kernel + rootfs
+              uses: ./.github/actions/guest-artifacts
+              with:
+                  arch: aarch64
+                  kernel-dest: ${{ runner.temp }}/vmlinuz
+                  rootfs-dest: ${{ runner.temp }}/rootfs.img
             - name: Install cross
               uses: taiki-e/install-action@v2
               with:
@@ -136,11 +138,7 @@ jobs:
             - name: Toolchain
               uses: dtolnay/rust-toolchain@stable
             - name: Provision libkrun (slp/krun tap)
-              # Self-install libkrun so macOS jobs no longer depend on hand-provisioned
-              # runner state — a missing libkrun.dylib silently broke every code PR.
-              # Idempotent (a no-op when already present); same slp/krun tap the runner
-              # setup used, so the supply-chain surface is unchanged.
-              run: brew install slp/krun/libkrun
+              uses: ./.github/actions/setup-libkrun-macos
             - name: Download virtio-linux kernel
               uses: actions/download-artifact@v8
               with:
@@ -292,11 +290,7 @@ jobs:
               with:
                   components: clippy
             - name: Provision libkrun (slp/krun tap)
-              # Self-install libkrun from the slp/krun tap so this job no longer depends
-              # on hand-provisioned runner state. Idempotent (a no-op when already
-              # present); same tap the runner setup used, so the supply-chain surface
-              # is unchanged.
-              run: brew install slp/krun/libkrun
+              uses: ./.github/actions/setup-libkrun-macos
             - name: Clippy (minvmd)
               run: cargo clippy -p minvmd --all-targets -- -D warnings
             - name: Test (minvmd)

@@ -1,0 +1,15 @@
+name: Setup libkrun (macOS)
+description: >
+  Provision libkrun from the slp/krun Homebrew tap. Self-installing keeps
+  macOS jobs from depending on hand-provisioned runner state — a missing
+  libkrun.dylib silently broke every code PR. Idempotent (a no-op when
+  already present); same tap the runner setup used, so the supply-chain
+  surface is unchanged. A failed install fails the step, so no separate
+  existence check is needed.
+
+runs:
+  using: composite
+  steps:
+    - name: Provision libkrun (slp/krun tap)
+      shell: bash
+      run: brew install slp/krun/libkrun

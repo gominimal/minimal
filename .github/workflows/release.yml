@@ -114,15 +114,13 @@ jobs:
             - name: Materialize libkrun prefix (upstream package)
               # minvmd links libkrun's KVM backend dynamically, so unlike the three
               # binaries above it can't join the static-musl cross build — it needs a
-              # native glibc build against a real libkrun. Materialize libkrun (a cache
-              # fetch keyed by the pinned upstream commit, NOT a from-source build) into
-              # a flat prefix that minvmd's build.rs link-searches + rpaths against.
-              #
-              # Reuse the static mip built above (MIP=) instead of letting the script
-              # compile a second, debug mip just to drive this cache fetch.
-              env:
-                  MIP: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/mip-linux-amd64
-              run: ./scripts/fetch-libkrun.sh "$HOME/.krun" x86_64
+              # native glibc build against a real libkrun. Reuse the static mip built
+              # above (mip:) instead of letting the fetch compile a second, debug mip
+              # just to drive the cache fetch.
+              uses: ./.github/actions/setup-libkrun-linux
+              with:
+                  arch: x86_64
+                  mip: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/mip-linux-amd64
             - name: Build native minvmd binary
               # Native host target (x86_64-unknown-linux-gnu), NOT musl: the binary
               # links libkrun.so (and libkrunfw.so.5 is dlopen'd at runtime), so unlike
@@ -220,15 +218,7 @@ jobs:
             - name: Toolchain
               uses: dtolnay/rust-toolchain@stable
             - name: Provision libkrun (slp/krun tap)
-              # Self-install libkrun so the job doesn't depend on hand-provisioned
-              # runner state. Idempotent (a no-op when already present).
-              run: brew install slp/krun/libkrun
-            - name: Verify libkrun is available
-              run: |
-                  if [ ! -f /opt/homebrew/lib/libkrun.dylib ]; then
-                    echo "::error::libkrun.dylib not found under /opt/homebrew/lib. Provision the runner with: brew install slp/krun/libkrun" >&2
-                    exit 1
-                  fi
+              uses: ./.github/actions/setup-libkrun-macos
             - name: Build release minvmd binary
               run: cargo build --release -p minvmd --bin minvmd
             - name: Point minvmd's libkrun load command at @rpath
@@ -513,17 +503,21 @@ jobs:
                       target/
                   key: ${{ runner.os }}-guest-artifacts-release-${{ hashFiles('**/Cargo.lock') }}
                   restore-keys: ${{ runner.os }}-guest-artifacts-release-
-            # NOTE: fetch-artifact.sh takes the kernel-style arch (x86_64/aarch64);
-            # only the emitted file/artifact names use the amd64/arm64 suffixes the
-            # release binaries already use.
-            - name: Materialize guest kernel (raw Image, amd64)
-              run: ./scripts/fetch-artifact.sh virtio-kernel "$RUNNER_TEMP/vmlinuz-amd64" x86_64
-            - name: Materialize guest kernel (raw Image, arm64)
-              run: ./scripts/fetch-artifact.sh virtio-kernel "$RUNNER_TEMP/vmlinuz-arm64" aarch64
-            - name: Materialize guest rootfs (ext4 image, amd64)
-              run: ./scripts/fetch-artifact.sh minvmd-rootfs "$RUNNER_TEMP/rootfs-amd64.img" x86_64
-            - name: Materialize guest rootfs (ext4 image, arm64)
-              run: ./scripts/fetch-artifact.sh minvmd-rootfs "$RUNNER_TEMP/rootfs-arm64.img" aarch64
+            # NOTE: the guest-artifacts composite takes the kernel-style arch
+            # (x86_64/aarch64); only the emitted file/artifact names use the
+            # amd64/arm64 suffixes the release binaries already use.
+            - name: Materialize guest kernel + rootfs (amd64)
+              uses: ./.github/actions/guest-artifacts
+              with:
+                  arch: x86_64
+                  kernel-dest: ${{ runner.temp }}/vmlinuz-amd64
+                  rootfs-dest: ${{ runner.temp }}/rootfs-amd64.img
+            - name: Materialize guest kernel + rootfs (arm64)
+              uses: ./.github/actions/guest-artifacts
+              with:
+                  arch: aarch64
+                  kernel-dest: ${{ runner.temp }}/vmlinuz-arm64
+                  rootfs-dest: ${{ runner.temp }}/rootfs-arm64.img
             - name: Fetch pinned gvproxy (linux-amd64)
               run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy-linux-amd64" gvproxy-linux-amd64
             - name: Fetch pinned gvproxy (linux-arm64)
