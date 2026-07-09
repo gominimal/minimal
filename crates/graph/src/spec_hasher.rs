@@ -239,9 +239,11 @@ fn build_attrs_hash(spec: &BuildSpec, h: &mut Hasher) {
     }
 
     h.write_all(b"-inputs").unwrap();
+    // Build and Subset deps are hashed as edges (by index) in SpecHasher::hash,
+    // not as inline inputs — build_input_hash treats both as `unreachable!()`.
     spec.build_deps
         .iter()
-        .filter(|i| i.as_build().is_none())
+        .filter(|i| !matches!(i, BuildDep::Build(_) | BuildDep::Subset(_)))
         .for_each(|i| build_input_hash(i, h));
 
     h.write_all(b"-outputs").unwrap();
@@ -364,6 +366,32 @@ mod tests {
                 $arm64
             }
         }};
+    }
+
+    #[test]
+    fn subset_build_dep_does_not_panic() {
+        // Regression: a BuildDep::Subset in build_deps used to reach
+        // build_input_hash's `Build(_) | Subset(_) => unreachable!()` because
+        // build_attrs_hash's filter only excluded the Build variant. process()
+        // already treats Subset build-deps as edges, so this is a real state.
+        use crate::SubsetInput;
+        let mut g = Graph::new();
+        let b = g.insert_build(BuildSpec {
+            name: "b".into(),
+            ..Default::default()
+        });
+        let a = g.insert_build(BuildSpec {
+            name: "a".into(),
+            build_deps: [BuildDep::Subset(SubsetInput {
+                from: b,
+                outputs: ["out".into()].into_iter().collect(),
+            })]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+        // Must not panic.
+        let _ = SpecHasher::hash(&g, &a);
     }
 
     #[test]
