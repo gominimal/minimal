@@ -1,0 +1,138 @@
+name: CI (Linux native)
+
+# The "Linux with native minimald" target lane: workspace tests plus a real
+# daemon e2e (DM2 — minimald natively on the host, no VM), which nothing
+# covered before this lane existed.
+#
+# ALWAYS-TRIGGERED, path-scoped INSIDE the workflow: the `changes` job
+# (dorny/paths-filter) gates the expensive jobs, and the `if: always()`
+# aggregator reports success even when they were path-skipped. This is the
+# lane pattern that will replace the ci-docs-skip.yml inverse-path hack once
+# the aggregators become the required checks (#687): a required context that
+# a trigger-level path filter skips stays "Expected" forever and wedges the
+# PR, while a skipped in-workflow job just reports `skipped`, which the
+# aggregator treats as pass. Do NOT add trigger-level `paths:` here.
+#
+# The mothballed networking proofs (netns UC1/UC6, mesh UC7, and the
+# networking-proxy / networking-wg feature tests) are deliberately NOT run
+# in this lane — see the note on the tests job.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Cancel superseded runs on a branch; never cancel a run on main.
+concurrency:
+  group: ci-linux-native-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+  # dorny/paths-filter reads the PR file list on pull_request events.
+  pull-requests: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      native: ${{ steps.filter.outputs.native }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Detect relevant changes
+        id: filter
+        # v3.0.2, SHA-pinned. On workflow_dispatch there is no diff to filter;
+        # the downstream `if` treats dispatch as "run everything".
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
+        with:
+          filters: |
+            native:
+              - "crates/**"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - "scripts/**"
+              - ".minimal/**"
+              - ".github/actions/setup-rust/**"
+              - ".github/actions/core-tests/**"
+              - ".github/workflows/ci-linux-native.yml"
+
+  tests:
+    # Core workspace suite (nextest + doctests), taking over ci.yml's `test`
+    # job for this lane; ci.yml keeps its copy until the ruleset requires
+    # this lane's aggregator (#687), then drops it.
+    #
+    # MOTHBALLED, deliberately absent (owner decision, #687): the
+    # `--features networking-proxy` (mTLS reverse proxy) and `--features
+    # networking-wg` (WireGuard mesh) test steps that ci.yml's `test` job
+    # still carries, and the netns/mesh namespace proofs that ci-netns.yml
+    # ran (crates/minimald/tests/netns.rs, mesh_uc7.rs). The code and tests
+    # stay in-tree and runnable locally; they are just not CI-covered.
+    needs: [changes]
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.native == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Run core workspace tests
+        uses: ./.github/actions/core-tests
+
+  native-daemon-e2e:
+    # Boot the NATIVE minimald on the host and drive a real session through
+    # it: `minimal activate` auto-spawns `minimald run --detach` (DM2),
+    # creates a session for this repo's own project, `minimal attach
+    # --command` execs in the sandbox asserting stdout + exit status, then
+    # list/destroy/stop. The Linux twin of the macOS autospawn e2e — before
+    # this job, no CI ran the daemon natively at all.
+    needs: [changes]
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.native == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - name: Enable unprivileged user namespaces
+        # The session sandbox (hakoniwa) needs userns; Ubuntu 24.04 restricts
+        # them via AppArmor by default.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Cache minimal package cache
+        # Session creation materializes the project's stack (rust + socat)
+        # into ~/.cache/minimal via cache pulls keyed by the pinned upstream
+        # commit; carry it across runs so the e2e isn't dominated by pulls.
+        # The e2e script resets XDG_STATE_HOME/XDG_RUNTIME_DIR but leaves
+        # XDG_CACHE_HOME alone for exactly this reason.
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/minimal
+          key: native-e2e-minimal-cache-${{ hashFiles('.minimal/minimal.toml') }}
+          restore-keys: native-e2e-minimal-cache-
+      - name: Build minimal + minimald
+        run: cargo build -p minimald --bin minimald -p minimal --bin minimal
+      - name: Native daemon e2e
+        run: |
+          export PATH="$PWD/target/debug:$PATH"
+          ./scripts/native-daemon-e2e.sh
+
+  # Single required status check for this lane (branch-protection context:
+  # ci-linux-native-success). Green when every gating job succeeded OR was
+  # path-skipped; red only on failure/cancellation.
+  ci-linux-native-success:
+    if: always()
+    needs: [changes, tests, native-daemon-e2e]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify all gating jobs succeeded or were skipped
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      - run: echo "Linux-native lane green"
