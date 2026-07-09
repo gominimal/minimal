@@ -6,10 +6,9 @@
 //!    READY-marker socket).
 //! 3. Fork-execs `minvmd __krun-vmm` with `MINVMD_MARKER_SOCK` pointing to
 //!    that socket so the VMM child can register it with libkrun.
-//! 4. Writes the child PID to `vmm.pid` in the state directory.
-//! 5. Waits up to 5 s for the guest to connect and write `READY\n` on the
+//! 4. Waits up to 5 s for the guest to connect and write `READY\n` on the
 //!    marker socket (R2.4). On success prints `vm-up` to stdout.
-//! 6. With `--foreground`: stays alive until the VMM child exits, propagating
+//! 5. With `--foreground`: stays alive until the VMM child exits, propagating
 //!    its exit code.
 //!
 //! Without libkrun this subcommand bails immediately with a "no libkrun" error
@@ -43,7 +42,6 @@ fn run_boot(foreground: bool) -> Result<()> {
 
     use crate::cmd::MARKER_SOCK_ENV;
     use crate::image::{resolve_kernel_path, resolve_rootfs_path};
-    use crate::state::StateDir;
 
     // R2.4: fail fast with an actionable error if the hypervisor backend is
     // unavailable (Linux: /dev/kvm). No-op on macOS.
@@ -79,8 +77,12 @@ fn run_boot(foreground: bool) -> Result<()> {
 
     // Spawn `minvmd __krun-vmm` — the VMM child that calls krun_start_enter.
     let exe = std::env::current_exe().context("resolving current executable path")?;
-    let mut child = std::process::Command::new(&exe)
-        .arg("__krun-vmm")
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("__krun-vmm");
+    if let Some(dir) = crate::state::state_dir_override() {
+        cmd.args(["--minimal-state-dir", dir.as_str()]);
+    }
+    let mut child = cmd
         .env(MARKER_SOCK_ENV, &marker_sock_path)
         // Inherit MINVMD_KERNEL_PATH and MINVMD_ROOTFS_PATH from environment.
         .spawn()
@@ -88,11 +90,6 @@ fn run_boot(foreground: bool) -> Result<()> {
 
     let child_pid = child.id();
     tracing::info!(pid = child_pid, "VMM child spawned");
-
-    // Write vmm.pid to the state directory (R2.3).
-    let state_dir = StateDir::new(StateDir::default_path()).context("opening state dir")?;
-    let vmm_pid_path = state_dir.vmm_pid_path();
-    std::fs::write(&vmm_pid_path, format!("{child_pid}\n")).context("writing vmm.pid")?;
 
     // Wait for the READY marker from the guest (R2.4). The wait is
     // env-configurable (`MINVMD_READY_TIMEOUT_SECS`): a cold multi-GiB VM can
@@ -147,14 +144,12 @@ fn run_boot(foreground: bool) -> Result<()> {
         Ok(Err(e)) => {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = std::fs::remove_file(&vmm_pid_path);
             let _ = std::fs::remove_file(&marker_sock_path);
             bail!("boot failed: {e}");
         }
         Err(_timeout) => {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = std::fs::remove_file(&vmm_pid_path);
             let _ = std::fs::remove_file(&marker_sock_path);
             bail!(
                 "boot timed out waiting for READY marker after {} s (raise {} to wait longer)",

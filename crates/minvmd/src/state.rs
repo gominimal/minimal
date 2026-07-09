@@ -1,14 +1,16 @@
 //! State persistence for `minvmd` (R4.1, R4.6).
 //!
-//! Manages the state directory (`$XDG_STATE_HOME/minimal/minvmd/`) which
-//! holds:
+//! All runtime files live in the shared provider-instance directory
+//! (`<minimal_state_dir>/providers/local-0/`, see
+//! [`paths::provider_instance_dir`]):
 //!
-//! - `state.toml` — serialised [`State`] (lifecycle, pid, timestamp).
-//! - `lifecycle.lock` — advisory file lock via `fd-lock` guarding concurrent
-//!   transitions (R4.6).
-//! - `vmm.pid` — PID of the live vmm child process.
+//! - `minvmd.toml` — serialised [`State`] (lifecycle, pid, timestamp).
+//! - `lifecycle.lock` — advisory lock guarding concurrent transitions (R4.6).
+//! - `minvmd.lock` — the *alive* lock, held exclusively by the supervisor for
+//!   its entire life. The kernel releases it on process death, so a free lock
+//!   proves no daemon is alive regardless of what `minvmd.toml` claims.
 //!
-//! Writes to `state.toml` are atomic: content is written to a `.tmp` sibling,
+//! Writes to `minvmd.toml` are atomic: content is written to a `.tmp` sibling,
 //! `fsync`'d, then renamed over the target (R4.1).
 //!
 //! [`StartingGuard`] is an RAII guard that resets the persisted state to
@@ -19,17 +21,48 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 use fd_lock::RwLock;
+use paths::DaemonAbsPath;
 use serde::{Deserialize, Serialize};
 
 use crate::lifecycle::Lifecycle;
 
+// ── State dir resolution ─────────────────────────────────────────────────────
+
+static STATE_DIR_OVERRIDE: OnceLock<DaemonAbsPath> = OnceLock::new();
+
+/// Set the `--minimal-state-dir` override. First call wins; must be called
+/// before any path resolution.
+pub fn set_state_dir_override(dir: DaemonAbsPath) {
+    let _ = STATE_DIR_OVERRIDE.set(dir);
+}
+
+/// The active `--minimal-state-dir` override, if any. Used to forward the
+/// flag when re-execing (`run --detach`, `__krun-vmm`).
+pub fn state_dir_override() -> Option<&'static DaemonAbsPath> {
+    STATE_DIR_OVERRIDE.get()
+}
+
+/// The provider-instance dir holding all minvmd runtime files:
+/// `<minimal_state_dir>/providers/local-0`.
+pub fn provider_dir() -> PathBuf {
+    let base = STATE_DIR_OVERRIDE
+        .get()
+        .cloned()
+        .unwrap_or_else(paths::minimal_state_dir);
+    paths::provider_instance_dir(&base, 0)
+        .as_utf8_path()
+        .as_std_path()
+        .to_path_buf()
+}
+
 // ── State ────────────────────────────────────────────────────────────────────
 
-/// Serialisable daemon state written to `state.toml`.
+/// Serialisable daemon state written to `minvmd.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct State {
     /// Current lifecycle phase.
@@ -53,7 +86,7 @@ impl State {
 
 // ── StateDir ─────────────────────────────────────────────────────────────────
 
-/// Root of the `minvmd` state directory.
+/// Root of the minvmd state directory (the provider-instance dir).
 pub struct StateDir {
     dir: PathBuf,
 }
@@ -65,21 +98,19 @@ impl StateDir {
         Ok(Self { dir })
     }
 
-    /// Default path: `$XDG_STATE_HOME/minimal/minvmd/` (fallback
-    /// `~/.local/state/minimal/minvmd/`).
+    /// Default path: [`provider_dir`].
     pub fn default_path() -> PathBuf {
-        dirs::state_dir()
-            .unwrap_or_else(|| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("/tmp"))
-                    .join(".local/state")
-            })
-            .join("minimal/minvmd")
+        provider_dir()
     }
 
-    /// Path to `state.toml`.
+    /// The directory this `StateDir` operates on.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Path to `minvmd.toml`.
     pub fn state_path(&self) -> PathBuf {
-        self.dir.join("state.toml")
+        self.dir.join("minvmd.toml")
     }
 
     /// Path to `lifecycle.lock`.
@@ -87,12 +118,12 @@ impl StateDir {
         self.dir.join("lifecycle.lock")
     }
 
-    /// Path to `vmm.pid`.
-    pub fn vmm_pid_path(&self) -> PathBuf {
-        self.dir.join("vmm.pid")
+    /// Path to `minvmd.lock` (the alive lock).
+    pub fn alive_lock_path(&self) -> PathBuf {
+        self.dir.join(paths::MINVMD_LOCK_FILE)
     }
 
-    /// Read the current state from `state.toml`.
+    /// Read the current state from `minvmd.toml`.
     ///
     /// Returns `State { lifecycle: NotProvisioned, .. }` when the file does
     /// not yet exist.
@@ -108,7 +139,7 @@ impl StateDir {
         }
     }
 
-    /// Write `state` to `state.toml` atomically (tmp → fsync → rename) (R4.1).
+    /// Write `state` to `minvmd.toml` atomically (tmp → fsync → rename) (R4.1).
     pub fn write_state(&self, state: &State) -> io::Result<()> {
         let target = self.state_path();
         let tmp = target.with_extension("toml.tmp");
@@ -122,27 +153,86 @@ impl StateDir {
         fs::rename(&tmp, &target)
     }
 
-    /// Open the `lifecycle.lock` file suitable for wrapping in an
-    /// [`fd_lock::RwLock`].
+    /// Read the state, treating a dead daemon's leftovers as `Stopped`.
     ///
-    /// Create the file if it does not exist; the file's contents are
-    /// irrelevant — only its file descriptor is used for advisory locking.
-    pub fn open_lock_file(&self) -> io::Result<File> {
-        OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(self.lock_path())
+    /// If the state file claims an active lifecycle but no live daemon holds
+    /// the alive lock, the on-disk state is stale (the daemon died without
+    /// cleanup); it is repaired to `Stopped` and that is returned.
+    pub fn effective_state(&self) -> io::Result<State> {
+        let state = self.read_state()?;
+        if !state.lifecycle.is_active() || self.daemon_alive()? {
+            return Ok(state);
+        }
+        // Stale. Repair under the lifecycle lock; re-check, a daemon may have
+        // started in the meantime.
+        let mut lock = self.lifecycle_lock()?;
+        let _guard = lock.write()?;
+        let state = self.read_state()?;
+        if !state.lifecycle.is_active() || self.daemon_alive()? {
+            return Ok(state);
+        }
+        tracing::warn!(stale = ?state.lifecycle, "daemon is gone; repairing state to Stopped");
+        let repaired = State::stopped();
+        self.write_state(&repaired)?;
+        Ok(repaired)
     }
 
-    /// Convenience: return an [`fd_lock::RwLock`] wrapping the lock file.
-    ///
-    /// Callers call `.write()` on the returned lock to acquire an exclusive
-    /// advisory lock for the duration of a lifecycle transition (R4.6).
+    /// Whether a live daemon currently holds the alive lock.
+    pub fn daemon_alive(&self) -> io::Result<bool> {
+        lock_held(&self.alive_lock_path())
+    }
+
+    /// Whether a live *native minimald* serves this instance (it holds its
+    /// own lifetime lock in the same dir). Both backends bind the same
+    /// `ssh.sock`, so minvmd must not start over a live native daemon.
+    pub fn minimald_alive(&self) -> io::Result<bool> {
+        lock_held(&self.dir.join(paths::MINIMALD_LOCK_FILE))
+    }
+
+    /// The alive lock. The supervisor `try_write()`s this once at startup and
+    /// holds the guard until exit; everyone else probes it via
+    /// [`Self::daemon_alive`].
+    pub fn alive_lock(&self) -> io::Result<RwLock<File>> {
+        Ok(RwLock::new(open_lock_file(&self.alive_lock_path())?))
+    }
+
+    /// Open the `lifecycle.lock` file suitable for wrapping in an
+    /// [`fd_lock::RwLock`].
+    pub fn open_lock_file(&self) -> io::Result<File> {
+        open_lock_file(&self.lock_path())
+    }
+
+    /// An [`fd_lock::RwLock`] over `lifecycle.lock`. Callers take `.write()`
+    /// for the duration of a lifecycle transition (R4.6).
     pub fn lifecycle_lock(&self) -> io::Result<RwLock<File>> {
         Ok(RwLock::new(self.open_lock_file()?))
     }
+}
+
+/// Whether some process holds an exclusive advisory lock on `path`.
+/// Read-only probe: a missing file means no holder.
+fn lock_held(path: &Path) -> io::Result<bool> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    match RwLock::new(file).try_read() {
+        Ok(_guard) => Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(true),
+        Err(e) => Err(e),
+    }
+}
+
+/// Open (creating if absent) a lock file; contents are irrelevant, only the
+/// fd is used for advisory locking.
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
 }
 
 // ── StartingGuard ─────────────────────────────────────────────────────────────
@@ -179,20 +269,11 @@ impl Drop for StartingGuard {
         if self.committed {
             return;
         }
-        // Best-effort reset: read current state, overwrite lifecycle to
-        // Stopped, clear vmm_pid and started_at.  Errors are swallowed
-        // because Drop cannot propagate them; the best we can do is try.
         let state_dir = StateDir {
             dir: self.dir.clone(),
         };
-        let result = state_dir.read_state().and_then(|mut s| {
-            s.lifecycle = Lifecycle::Stopped;
-            s.vmm_pid = None;
-            s.started_at = None;
-            state_dir.write_state(&s)
-        });
         // Intentional discard: we are in Drop, there is nowhere to propagate.
-        let _ = result;
+        let _ = state_dir.write_state(&State::stopped());
     }
 }
 
@@ -253,7 +334,7 @@ mod tests {
             !tmp_path.exists(),
             "tmp file should not exist after atomic rename"
         );
-        assert!(sd.state_path().exists(), "state.toml should exist");
+        assert!(sd.state_path().exists(), "minvmd.toml should exist");
     }
 
     // ── fd-lock concurrency guard ────────────────────────────────────────────
@@ -289,6 +370,81 @@ mod tests {
             result.is_err(),
             "second concurrent lock attempt must fail while first is held"
         );
+    }
+
+    // ── Alive lock + effective_state ─────────────────────────────────────────
+
+    #[test]
+    fn daemon_alive_reflects_alive_lock() {
+        let tmp = temp_dir();
+        let sd = make_state_dir(&tmp);
+
+        assert!(!sd.daemon_alive().unwrap(), "no holder → not alive");
+
+        let mut alive = sd.alive_lock().unwrap();
+        let guard = alive.try_write().expect("acquire alive lock");
+        assert!(sd.daemon_alive().unwrap(), "held lock → alive");
+        drop(guard);
+        assert!(!sd.daemon_alive().unwrap(), "released → not alive");
+    }
+
+    #[test]
+    fn minimald_alive_reflects_native_instance_lock() {
+        let tmp = temp_dir();
+        let sd = make_state_dir(&tmp);
+        assert!(!sd.minimald_alive().unwrap());
+
+        let mut lock =
+            RwLock::new(open_lock_file(&tmp.path().join(paths::MINIMALD_LOCK_FILE)).expect("open"));
+        let _guard = lock.try_write().expect("acquire");
+        assert!(sd.minimald_alive().unwrap());
+    }
+
+    #[test]
+    fn effective_state_repairs_stale_active_state() {
+        let tmp = temp_dir();
+        let sd = make_state_dir(&tmp);
+        sd.write_state(&State {
+            lifecycle: Lifecycle::Running,
+            vmm_pid: Some(12345),
+            started_at: Some(1),
+        })
+        .unwrap();
+
+        // No alive-lock holder: Running is a lie left by a dead daemon.
+        let s = sd.effective_state().unwrap();
+        assert_eq!(s.lifecycle, Lifecycle::Stopped);
+        assert!(s.vmm_pid.is_none());
+        // Repair is persisted.
+        assert_eq!(sd.read_state().unwrap().lifecycle, Lifecycle::Stopped);
+    }
+
+    #[test]
+    fn effective_state_trusts_active_state_when_daemon_alive() {
+        let tmp = temp_dir();
+        let sd = make_state_dir(&tmp);
+        sd.write_state(&State {
+            lifecycle: Lifecycle::Running,
+            vmm_pid: Some(42),
+            started_at: Some(1),
+        })
+        .unwrap();
+
+        let mut alive = sd.alive_lock().unwrap();
+        let _guard = alive.try_write().expect("acquire alive lock");
+        let s = sd.effective_state().unwrap();
+        assert_eq!(s.lifecycle, Lifecycle::Running);
+        assert_eq!(s.vmm_pid, Some(42));
+    }
+
+    #[test]
+    fn effective_state_passes_through_inactive_state() {
+        let tmp = temp_dir();
+        let sd = make_state_dir(&tmp);
+        // Missing file → NotProvisioned, untouched.
+        let s = sd.effective_state().unwrap();
+        assert_eq!(s.lifecycle, Lifecycle::NotProvisioned);
+        assert!(!sd.state_path().exists(), "no repair write for inactive");
     }
 
     // ── StartingGuard RAII ───────────────────────────────────────────────────

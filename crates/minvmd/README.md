@@ -159,9 +159,9 @@ sudo usermod -aG kvm "$USER"   # one-time
 ```
 
 Gotchas:
-- `minvmd boot` is the raw boot primitive and does **not** update `state.toml`,
+- `minvmd boot` is the raw boot primitive and does **not** update `minvmd.toml`,
   so `minvmd status`/`stop` report "stopped"/"not running" even while the VM is
-  up. The lifecycle (`state.toml`) is the supervisor's job — use `minvmd run
+  up. The lifecycle (`minvmd.toml`) is the supervisor's job — use `minvmd run
   --detach` / `status` / `stop` to exercise it. Kill a stray `boot` VM by PID
   (the `boot` parent + its hidden `__krun-vmm` child).
 - **Requires libkrun >= 1.19.0** (BLK=1 for `krun_add_disk2`, plus the vsock

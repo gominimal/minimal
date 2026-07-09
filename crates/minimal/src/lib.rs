@@ -411,7 +411,7 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
 
 /// Connect to the daemon, resolving the socket path from global args.
 pub async fn connect_daemon(global: &GlobalArgs) -> Result<client::Client, anyhow::Error> {
-    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.minvmd)
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref())
         .context("Failed to resolve daemon socket path")?;
 
     client::Client::connect(&sock)
@@ -814,7 +814,7 @@ fn shell_quote(s: &str) -> String {
 pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
 
-    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.minvmd)
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref())
         .context("Failed to resolve daemon socket path")?;
 
     let mut client = client::Client::connect(&sock)
@@ -1111,7 +1111,7 @@ pub async fn cmd_ssh_forward(
 ) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
 
-    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.minvmd)
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref())
         .context("Failed to resolve daemon socket path")?;
 
     // Look up the session to validate it exists and to obtain its UUID for the
@@ -1403,7 +1403,7 @@ pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mc
 pub async fn cmd_version(global: &GlobalArgs) -> Result<(), anyhow::Error> {
     println!("Client: minimal {}", env!("LONG_VERSION"));
 
-    let sock = match client::resolve_socket_path(global.minimal_dir.as_deref(), global.minvmd) {
+    let sock = match client::resolve_socket_path(global.minimal_dir.as_deref()) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Server: (daemon unreachable: {e})");

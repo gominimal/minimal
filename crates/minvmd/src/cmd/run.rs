@@ -85,8 +85,11 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
 
     let exe = std::env::current_exe().context("resolving current executable path")?;
     let mut cmd = std::process::Command::new(&exe);
-    cmd.arg("run")
-        .stdin(std::process::Stdio::null())
+    cmd.arg("run");
+    if let Some(dir) = crate::state::state_dir_override() {
+        cmd.args(["--minimal-state-dir", dir.as_str()]);
+    }
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
@@ -135,6 +138,10 @@ fn run_foreground() -> Result<()> {
     let state_dir = StateDir::new(StateDir::default_path()).context("opening state dir")?;
 
     // ── Phase 1: Stopped → Starting (under lock) ───────────────────────────
+    // The alive lock outlives the block: held (exclusively) for the whole
+    // supervisor life so observers can tell a live daemon from stale state.
+    let mut alive = state_dir.alive_lock().context("opening alive lock")?;
+    let _alive_guard;
     {
         let mut lock = state_dir
             .lifecycle_lock()
@@ -142,23 +149,41 @@ fn run_foreground() -> Result<()> {
         let _guard = lock.write().context("acquiring lifecycle write lock")?;
         let state = state_dir.read_state().context("reading state")?;
 
-        match state.lifecycle {
-            Lifecycle::Running => {
-                bail!("minvmd is already running (vmm_pid={:?})", state.vmm_pid)
-            }
-            Lifecycle::Starting => bail!("minvmd is already starting"),
-            Lifecycle::Stopping => {
-                bail!("minvmd is stopping; wait for it to finish before restarting")
-            }
-            Lifecycle::NotProvisioned | Lifecycle::Stopped => {}
+        _alive_guard = match alive.try_write() {
+            Ok(g) => g,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => match state.lifecycle {
+                Lifecycle::Running => {
+                    bail!("minvmd is already running (vmm_pid={:?})", state.vmm_pid)
+                }
+                Lifecycle::Starting => bail!("minvmd is already starting"),
+                Lifecycle::Stopping => {
+                    bail!("minvmd is stopping; wait for it to finish before restarting")
+                }
+                _ => bail!("another minvmd holds the alive lock"),
+            },
+            Err(e) => return Err(e).context("acquiring alive lock"),
+        };
+
+        // Both backends bind the same ssh.sock; don't steal a live native
+        // daemon's socket.
+        if state_dir
+            .minimald_alive()
+            .context("probing native minimald lock")?
+        {
+            bail!("a native minimald is serving this instance's socket; stop it first");
         }
 
-        // A clean install starts NotProvisioned; provision it
-        // (NotProvisioned → Stopped) before starting, since the state machine
-        // only permits Start from Stopped.
+        // The state machine only permits Start from Stopped: provision a
+        // clean install, and reclaim (via Fail) active state left behind by a
+        // dead daemon — we hold the alive lock, so nothing live wrote it.
         let base = match state.lifecycle {
             Lifecycle::NotProvisioned => {
                 next_state(Lifecycle::NotProvisioned, Action::Provision)
+                    .map_err(|e| anyhow::anyhow!("lifecycle transition error: {e}"))?
+            }
+            stale if stale.is_active() => {
+                tracing::warn!(?stale, "reclaiming state left by a dead daemon");
+                next_state(stale, Action::Fail)
                     .map_err(|e| anyhow::anyhow!("lifecycle transition error: {e}"))?
             }
             other => other,
@@ -177,7 +202,7 @@ fn run_foreground() -> Result<()> {
     // StartingGuard: resets lifecycle to Stopped on drop if we bail before
     // committing (R4.6). Holds no lock so concurrent readers observe the
     // transient Starting state without contention.
-    let guard = StartingGuard::new(StateDir::default_path());
+    let guard = StartingGuard::new(state_dir.dir().to_path_buf());
 
     // ── Boot sequence ────────────────────────────────────────────────────────
     let nonce: u32 = {
@@ -259,8 +284,12 @@ fn run_foreground() -> Result<()> {
     };
 
     let exe = std::env::current_exe().context("resolving current executable path")?;
-    let mut child = std::process::Command::new(&exe)
-        .arg("__krun-vmm")
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("__krun-vmm");
+    if let Some(dir) = crate::state::state_dir_override() {
+        cmd.args(["--minimal-state-dir", dir.as_str()]);
+    }
+    let mut child = cmd
         .env(MARKER_SOCK_ENV, &marker_sock_path)
         .spawn()
         .with_context(|| format!("spawning VMM child: {}", exe.display()))?;
@@ -268,11 +297,8 @@ fn run_foreground() -> Result<()> {
     let child_pid = child.id();
     tracing::info!(pid = child_pid, "VMM child spawned");
 
-    // Write vmm.pid and update state with the known pid so that concurrent
-    // `stop` invocations during Starting can signal the correct process.
-    let vmm_pid_path = state_dir.vmm_pid_path();
-    std::fs::write(&vmm_pid_path, format!("{child_pid}\n")).context("writing vmm.pid")?;
-
+    // Update state with the known pid so that concurrent `stop` invocations
+    // during Starting can signal the correct process.
     {
         let mut lock = state_dir
             .lifecycle_lock()
@@ -283,7 +309,6 @@ fn run_foreground() -> Result<()> {
         if !matches!(state.lifecycle, Lifecycle::Starting) {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = std::fs::remove_file(&vmm_pid_path);
             bail!(
                 "lifecycle changed to {:?} during spawn; aborting",
                 state.lifecycle
@@ -330,7 +355,6 @@ fn run_foreground() -> Result<()> {
     if let Err(e) = boot_result {
         let _ = child.kill();
         let _ = child.wait();
-        let _ = std::fs::remove_file(&vmm_pid_path);
         let _ = std::fs::remove_file(&marker_sock_path);
         return Err(e);
         // guard drops here → StartingGuard resets state to Stopped (R4.6)
@@ -360,14 +384,17 @@ fn run_foreground() -> Result<()> {
     guard.commit();
     tracing::info!(pid = child_pid, "VM is up; supervisor is running");
 
-    // Verify the bridge socket permissions (R3.2).
+    // Tighten + verify the bridge socket permissions (R3.2): libkrun creates
+    // it with default perms, and the shared provider dir is not 0700.
     match crate::sock::resolve_uds_path() {
         Ok(uds_path) => {
-            if let Err(e) = crate::sock::verify_socket_permissions(&uds_path) {
+            if let Err(e) = crate::sock::enforce_socket_permissions(&uds_path)
+                .and_then(|()| crate::sock::verify_socket_permissions(&uds_path))
+            {
                 tracing::warn!(
                     path = %uds_path.display(),
                     error = %e,
-                    "minimald bridge socket permissions check failed",
+                    "could not secure minimald bridge socket to 0600",
                 );
             }
         }
@@ -386,7 +413,6 @@ fn run_foreground() -> Result<()> {
             .lifecycle_lock()
             .context("opening lifecycle lock")?;
         let _guard = lock.write().context("acquiring lifecycle write lock")?;
-        let _ = std::fs::remove_file(&vmm_pid_path);
         state_dir
             .write_state(&State::stopped())
             .context("writing Stopped state after VMM child exit")?;

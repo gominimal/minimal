@@ -156,24 +156,10 @@ fn kvm_access_error(err: &std::io::Error) -> anyhow::Error {
 }
 
 /// Returns the path to the VM SSH known_hosts file:
-/// `$XDG_STATE_HOME/minimal/providers/local-0/known_hosts`.
-///
-/// Uses the same XDG derivation as [`crate::state::StateDir::default_path`].
+/// `<provider dir>/known_hosts`.
 #[cfg(minvmd_libkrun)]
 pub(crate) fn default_vm_known_hosts_path() -> std::path::PathBuf {
-    dirs::state_dir()
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| {
-                    tracing::warn!(
-                        "XDG_STATE_HOME and HOME both unset; known_hosts falls back to /tmp"
-                    );
-                    std::path::PathBuf::from("/tmp")
-                })
-                .join(".local/state")
-        })
-        // TODO: pass instance_num through once multi-instance is needed
-        .join("minimal/providers/local-0/known_hosts")
+    crate::state::provider_dir().join("known_hosts")
 }
 
 /// Read the READY beacon from `reader` and, if a valid SSH public key is on

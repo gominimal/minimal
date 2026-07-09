@@ -3,7 +3,8 @@
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
-use paths::{CwdRelative, Daemon, DaemonAbsPath, DaemonRelPath, sub_path};
+use paths::{CwdRelative, Daemon, DaemonAbsPath, sub_path};
+use std::io::Write as _;
 use tokio::{net::UnixListener, runtime::Builder};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -65,9 +66,7 @@ impl Cli {
 
     /// Returns the path to the directory containing sockets/info about this daemon for clients.
     pub fn client_instance_dir(&self) -> DaemonAbsPath {
-        let instance_num = self.instance_num();
-        sub_path!(self.minimal_state_dir(), "providers")
-            .join(&DaemonRelPath::try_new(format!("local-{instance_num}")).unwrap())
+        paths::provider_instance_dir(&self.minimal_state_dir(), self.instance_num())
     }
 
     /// Returns fragments of the command-line arguments which should be passed to an ssh invocation in
@@ -99,7 +98,8 @@ impl Cli {
 
     /// Returns the path to the UDS socket we should listen on.
     pub fn listen_on(&self) -> DaemonAbsPath {
-        sub_path!(self.client_instance_dir(), "ssh.sock")
+        self.client_instance_dir()
+            .sub_path_unchecked(paths::SSH_SOCK_FILE)
     }
 }
 
@@ -206,6 +206,16 @@ impl From<russh::keys::Error> for MainError {
     fn from(value: russh::keys::Error) -> Self {
         Self::Other(format!("ssh key: {value}"))
     }
+}
+
+/// Open (creating if absent) a lock file; only its fd matters, for flock.
+fn open_lock_file(path: impl AsRef<std::path::Path>) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
 }
 
 fn main() -> Result<(), MainError> {
@@ -399,6 +409,51 @@ async fn async_main() -> Result<(), MainError> {
         && e.kind() != std::io::ErrorKind::AlreadyExists
     {
         return Err(MainError::IO(e, "creating provider dir"));
+    }
+
+    // Single-instance guard, held for the daemon's lifetime (the kernel
+    // releases it on death): a second minimald must not steal this
+    // instance's socket.
+    let mut instance_lock = fd_lock::RwLock::new(
+        open_lock_file(
+            cli.client_instance_dir()
+                .sub_path_unchecked(paths::MINIMALD_LOCK_FILE),
+        )
+        .map_err(|e| MainError::IO(e, "opening instance lock"))?,
+    );
+    let instance_guard = match instance_lock.try_write() {
+        Ok(guard) => guard,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err(MainError::Other(format!(
+                "minimald local-{} is already running (instance lock held)",
+                cli.instance_num()
+            )));
+        }
+        Err(e) => return Err(MainError::IO(e, "acquiring instance lock")),
+    };
+    // Best-effort debug aid; the lock itself, not the contents, is authoritative.
+    let _ = instance_guard
+        .set_len(0)
+        .and_then(|()| writeln!(&*instance_guard, "{}", std::process::id()));
+
+    // A minvmd bridge binds the same ssh.sock; don't steal a live VM's socket.
+    // Read-only probe of its lifetime lock (missing file → no minvmd ever ran).
+    match std::fs::File::open(
+        cli.client_instance_dir()
+            .sub_path_unchecked(paths::MINVMD_LOCK_FILE),
+    ) {
+        Ok(file) => match fd_lock::RwLock::new(file).try_read() {
+            Ok(_probe) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(MainError::Other(format!(
+                    "a minvmd VM is serving local-{}'s socket; stop it first (`minvmd stop`)",
+                    cli.instance_num()
+                )));
+            }
+            Err(e) => return Err(MainError::IO(e, "probing minvmd lock")),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(MainError::IO(e, "opening minvmd lock")),
     }
 
     // Setup the server config (shared by the UDS and vsock transports).
