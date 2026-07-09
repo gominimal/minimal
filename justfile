@@ -139,6 +139,31 @@ up: artifacts gvproxy initramfs minvmd-build minimal-cli
     esac
     "{{minimal}}" ls
 
+# Print `export` lines wiring the dev-built binaries and guest artifacts into
+# the environment — the same setup `up`/`dm3` do internally, for running
+# `minimal`/`minvmd` by hand against the built stack. Load into the current
+# shell with:  eval "$(just env)"
+env:
+    #!/usr/bin/env sh
+    set -eu
+    printf 'export MINVMD_KERNEL_PATH="%s"\n' '{{kernel}}'
+    printf 'export MINVMD_ROOTFS_PATH="%s"\n' '{{rootfs}}'
+    printf 'export MINVMD_INITRAMFS="%s"\n' '{{initramfs}}'
+    printf 'export MINVMD_BOOT_LOG="%s"\n' '{{scratch}}/boot.log'
+    printf 'export MINVMD_GVPROXY_BIN="%s"\n' '{{gvproxy}}'
+    printf 'export PATH="%s:$PATH"\n' '{{justfile_directory()}}/target/debug'
+    case "$(uname -s)" in
+      Linux) printf 'export LD_LIBRARY_PATH="%s${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\n' '{{krun-prefix}}' ;;
+    esac
+
+# Drop into a subshell with that environment loaded (exit to leave).
+shell:
+    #!/usr/bin/env sh
+    set -eu
+    eval "$(just env)"
+    echo "minimal dev shell: target/debug on PATH, MINVMD_* set (exit to leave)"
+    exec "${SHELL:-sh}"
+
 # Report the supervised minvmd lifecycle state.
 status:
     "{{minvmd-bin}}" status
