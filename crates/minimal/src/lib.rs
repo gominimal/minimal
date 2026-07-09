@@ -772,6 +772,49 @@ async fn send_abort(client: &mut client::Client, session_id: sessions::SessionId
     }
 }
 
+/// Check for a `minimal.toml` at the project path. If missing, prompt
+/// the user to initialize one before proceeding with activation.
+fn ensure_mfile_or_prompt(
+    project_path: &camino::Utf8Path,
+    global: &GlobalArgs,
+) -> Result<(), anyhow::Error> {
+    if project_path.join(mfile::MFILE_NAME).exists() {
+        return Ok(());
+    }
+
+    eprintln!("\nNo {} found at {}.", mfile::MFILE_NAME, project_path);
+    eprint!("Would you like to create one? [Y/n] ");
+    std::io::stderr().flush().ok();
+
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .context("reading stdin")?;
+    let trimmed = input.trim();
+    if !(trimmed.eq_ignore_ascii_case("y")
+        || trimmed.eq_ignore_ascii_case("yes")
+        || trimmed.is_empty())
+    {
+        bail!(
+            "No {} found. Run 'minimal init' to create one.",
+            mfile::MFILE_NAME
+        );
+    }
+
+    let config = if global.repo_dir.is_some() {
+        build_config(global).map_err(|e| anyhow::anyhow!("{e}"))?
+    } else {
+        let mut builder = mctx::ConfigBuilder::new();
+        if let Some(dir) = &global.minimal_dir {
+            builder = builder.with_state_dir(dir).with_cache_dir(dir);
+        }
+        builder
+            .with_repo_dir(project_path.as_std_path())
+            .build()
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+    };
+    run_init_flow(config, false)
+
 /// Create a new session via the `CreateSession` RPC.
 pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
@@ -781,7 +824,10 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
 
     let utf8_path = camino::Utf8PathBuf::from_path_buf(project_path)
         .map_err(|_| anyhow::anyhow!("Project path is not valid UTF-8"))?;
-    let abs_path = paths::HostAbsPath::try_new(utf8_path).context("Invalid project path")?;
+    let abs_path =
+        paths::HostAbsPath::try_new(utf8_path.clone()).context("Invalid project path")?;
+
+    ensure_mfile_or_prompt(&utf8_path, global)?;
 
     let mut port_mappings = Vec::with_capacity(args.ingress.len());
     for spec in &args.ingress {
@@ -1350,14 +1396,18 @@ pub fn build_config(global: &GlobalArgs) -> Result<mctx::Config, mctx::Error> {
     Ok(builder.build()?)
 }
 
-/// Initialize a `minimal.toml` based on the source tree.
-pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::Error> {
+/// Run the init flow for a given config: detect the project's stack,
+/// generate a `minimal.toml`, show the plan, prompt for confirmation,
+/// and write the file. Shared by `cmd_init` and the `cmd_activate`
+/// missing-mfile prompt.
+fn run_init_flow(config: mctx::Config, skip_confirm: bool) -> Result<(), anyhow::Error> {
     use op::ProjectOp as _;
-    let config = build_config(global)?;
-    let mut env = mctx::ProjectSetup::for_init(config)?;
-    let plan = op::InitProject.run(&mut env)?;
+    let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let plan = op::InitProject
+        .run(&mut env)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    if !args.yes {
+    if !skip_confirm {
         eprintln!("\nWill create {}:\n", plan.toml_path.display());
         eprintln!("---");
         eprint!("{}", plan.content);
@@ -1369,7 +1419,7 @@ pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::E
         let mut input = String::new();
         std::io::stdin()
             .read_line(&mut input)
-            .map_err(|e| mctx::Error::Other(anyhow::anyhow!("reading stdin: {}", e)))?;
+            .context("reading stdin")?;
         let trimmed = input.trim();
         if !(trimmed.eq_ignore_ascii_case("y")
             || trimmed.eq_ignore_ascii_case("yes")
@@ -1380,13 +1430,8 @@ pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::E
         }
     }
 
-    std::fs::write(&plan.toml_path, &plan.content).map_err(|e| {
-        mctx::Error::Other(anyhow::anyhow!(
-            "writing {}: {}",
-            plan.toml_path.display(),
-            e
-        ))
-    })?;
+    std::fs::write(&plan.toml_path, &plan.content)
+        .with_context(|| format!("writing {}", plan.toml_path.display()))?;
 
     eprintln!("Created {}", plan.toml_path.display());
     eprintln!();
@@ -1398,6 +1443,12 @@ pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::E
     }
 
     Ok(())
+}
+
+/// Initialize a `minimal.toml` based on the source tree.
+pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::Error> {
+    let config = build_config(global)?;
+    run_init_flow(config, args.yes).map_err(mctx::Error::Other)
 }
 
 /// Add packages as dependencies to the project's `minimal.toml`.
