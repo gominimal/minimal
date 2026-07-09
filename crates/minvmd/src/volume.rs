@@ -16,10 +16,11 @@ use std::path::{Path, PathBuf};
 /// ceiling the guest sees, not an up-front cost. A large default sidesteps the
 /// (hard, offline) resize path entirely; override with [`VOLUME_BYTES_ENV`].
 ///
-/// First-boot cost is flat in the size: `mkfs.ext4` writes only ~5–8 MiB of
-/// metadata regardless (sparse backing + the reduced inode ratio), so format +
-/// mount stays ~40 ms at every size measured on an M-series host —
-/// 32 GiB → 40 ms · 64 GiB → 36 ms · 128 GiB → 37 ms · 256 GiB → 46 ms.
+/// First-boot cost is flat in the size: because the image is sparse, the eager
+/// `mkfs.ext4` init writes only ~5–8 MiB of metadata (its zero-writes land in
+/// unallocated holes), so format + mount stays ~40 ms at every size measured on
+/// an M-series host — 32 GiB → 40 ms · 64 GiB → 36 ms · 128 GiB → 37 ms ·
+/// 256 GiB → 46 ms.
 pub const DEFAULT_VOLUME_BYTES: u64 = 256 * 1024 * 1024 * 1024;
 
 /// Environment variable overriding [`DEFAULT_VOLUME_BYTES`] (spec R1.3).
@@ -59,7 +60,12 @@ pub fn resolve_data_volume_path() -> PathBuf {
     let base = std::env::var_os("XDG_STATE_HOME")
         .filter(|v| !v.is_empty())
         .map(|x| PathBuf::from(x).join("minimal"))
-        .unwrap_or_else(|| paths::minimal_state_dir().as_utf8_path().as_std_path().to_path_buf());
+        .unwrap_or_else(|| {
+            paths::minimal_state_dir()
+                .as_utf8_path()
+                .as_std_path()
+                .to_path_buf()
+        });
     base.join("minvmd").join("data-vol.raw")
 }
 
