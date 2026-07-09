@@ -20,6 +20,8 @@ on:
             # a composite-only edit would skip this lane and break it post-merge.
             - ".github/actions/setup-libkrun-macos/**"
             - ".github/actions/guest-artifacts/**"
+            # The libkrun pin: a bump must rebuild + re-run the hypervisor e2e.
+            - "vendor/libkrun/**"
     pull_request:
         branches: ["main"]
         paths:
@@ -35,6 +37,8 @@ on:
             # a composite-only edit would skip this lane and break it post-merge.
             - ".github/actions/setup-libkrun-macos/**"
             - ".github/actions/guest-artifacts/**"
+            # The libkrun pin: a bump must rebuild + re-run the hypervisor e2e.
+            - "vendor/libkrun/**"
     workflow_dispatch:
 
 env:
@@ -147,7 +151,7 @@ jobs:
                   persist-credentials: false
             - name: Toolchain
               uses: dtolnay/rust-toolchain@stable
-            - name: Provision libkrun (slp/krun tap)
+            - name: Provision libkrun (pinned own build)
               uses: ./.github/actions/setup-libkrun-macos
             - name: Download virtio-linux kernel
               uses: actions/download-artifact@v8
@@ -319,7 +323,7 @@ jobs:
               uses: dtolnay/rust-toolchain@stable
               with:
                   components: clippy
-            - name: Provision libkrun (slp/krun tap)
+            - name: Provision libkrun (pinned own build)
               uses: ./.github/actions/setup-libkrun-macos
             - name: Clippy (minvmd)
               run: cargo clippy -p minvmd --all-targets -- -D warnings

@@ -1,0 +1,8 @@
+# libkrun (containers/libkrun) pinned source build for macOS.
+# Single source of truth for the libkrun that macOS CI links/boots against
+# AND that the release ships — built by scripts/build-libkrun-macos.sh
+# (trimmed: --no-default-features --features blk,net).
+# `commit` is the resolved commit of `version` at pin time; the build fetches
+# the commit, so a moved/deleted tag cannot change what we build.
+version=v1.19.4
+commit=728df8125077d0db44265f6e997c72b81b65c015
