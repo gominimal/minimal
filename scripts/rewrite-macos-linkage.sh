@@ -22,13 +22,23 @@ set -euo pipefail
 
 BIN="${1:?usage: rewrite-macos-linkage.sh <minvmd-binary>}"
 
-current="$(otool -L "$BIN" | awk '/libkrun/ {print $1; exit}')"
+# NR>1 skips otool's header line, which is the binary's own path and would
+# false-match when the binary sits under a path containing "libkrun" (e.g. a
+# throwaway CI copy). `|| true` keeps pipefail from aborting before the
+# diagnostic below when otool itself fails (not a Mach-O binary).
+current="$(otool -L "$BIN" | awk 'NR>1 && /libkrun/ {print $1; exit}' || true)"
 if [ -z "$current" ]; then
   echo "::error::$BIN has no libkrun load command; did it link the stub?" >&2
   exit 1
 fi
 install_name_tool -change "$current" @rpath/libkrun.1.dylib "$BIN"
-install_name_tool -rpath @loader_path @loader_path/../lib "$BIN"
+# Idempotent: only retarget when the bare dev rpath is still present —
+# install_name_tool -rpath errors if the old entry is missing, which would
+# hard-fail a re-run on an already-rewritten binary. (-change above is
+# naturally a no-op when `current` is already @rpath/libkrun.1.dylib.)
+if otool -l "$BIN" | awk '$1=="path" {print $2}' | grep -qx '@loader_path'; then
+  install_name_tool -rpath @loader_path @loader_path/../lib "$BIN"
+fi
 
 otool -L "$BIN"
 if ! otool -L "$BIN" | grep -q '@rpath/libkrun\.1\.dylib'; then
