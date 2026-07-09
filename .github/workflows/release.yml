@@ -399,7 +399,7 @@ jobs:
             - name: Upload unsigned libkrun dylib (temp)
               # This GitHub-hosted runner has no access to the Developer ID signing
               # keychain, so the dylib leaves here UNSIGNED under a `temp-` prefixed
-              # name. sign-libkrun-macos-arm64 (self-hosted) downloads it, signs it,
+              # name. sign-macos-artifacts (self-hosted) downloads it, signs it,
               # and re-uploads under the final `libkrun-macos-arm64` name. The
               # release job drops any leftover `temp-` artifact so the unsigned copy
               # never ships.
@@ -410,25 +410,32 @@ jobs:
                   if-no-files-found: error
                   retention-days: 7
 
-    sign-libkrun-macos-arm64:
-        # Developer ID signing for the shipped libkrun.dylib. While built on
-        # a Github-hosted runner, it is signed on a self-hosted runner with
-        # access to our signing keychain.
+    sign-macos-artifacts:
+        # Developer ID signing for the macOS artifacts built on normal runners.
+        #
+        # Artifacts come as the output of other jobs under a `temp-` prefixed
+        # artifact, are signed on the self-hosted runner that holds the keychain,
+        # then are re-uploaded under their final names.
         runs-on: [self-hosted, macOS, ARM64]
         timeout-minutes: 15
         if: vars.RUN_MACOS_CI != 'false'
-        needs: [build-libkrun-macos-arm64]
+        needs: [build-libkrun-macos-arm64, fetch-release-guest-artifacts]
         steps:
-            - name: Download unsigned libkrun dylib (temp)
+            - name: Download unsigned macOS artifacts (temp)
               uses: actions/download-artifact@v8
               with:
-                  name: temp-libkrun-macos-arm64
-                  path: ${{ runner.temp }}/libkrun-in
-            - name: Codesign libkrun with Developer ID
-              # A shipped dylib must be signed with the same Developer ID identity
-              # (and a secure --timestamp) as the binaries so the whole install is
-              # notarization-ready. --force replaces cargo's ad-hoc signature. No
-              # entitlements: libkrun is a library, not the hypervisor entry point.
+                  pattern: temp-*
+                  path: ${{ runner.temp }}/unsigned
+                  merge-multiple: true
+            - name: Codesign macOS artifacts with Developer ID
+              # Sign with the same Developer ID identity, secure --timestamp, and
+              # hardened runtime (--options runtime) as the binaries so the whole
+              # install is notarization-ready. --force replaces each file's existing
+              # signature (cargo's ad-hoc on libkrun, the Go linker's ad-hoc on
+              # gvproxy). No entitlements: neither libkrun (a library) nor gvproxy
+              # (the network switch) is the hypervisor entry point. The temp- prefix
+              # is dropped so each file carries the final basename the
+              # archive/installer expect.
               env:
                   KC_PW: ${{ secrets.KC_PW }}
               run: |
@@ -438,19 +445,28 @@ jobs:
                   security unlock-keychain -p "$KC_PW" "$KC"
                   security list-keychains -d user -s "$KC" login.keychain-db
 
-                  # Drop the temp- prefix so the shipped file carries the final
-                  # basename the archive/installer expect.
-                  out="$RUNNER_TEMP/libkrun-macos-arm64.dylib"
-                  cp "$RUNNER_TEMP/libkrun-in/temp-libkrun-macos-arm64.dylib" "$out"
+                  in="$RUNNER_TEMP/unsigned"
+                  out="$RUNNER_TEMP/signed"
+                  mkdir -p "$out"
+                  cp "$in/temp-libkrun-macos-arm64.dylib" "$out/libkrun-macos-arm64.dylib"
+                  cp "$in/temp-gvproxy-darwin-arm64"      "$out/gvproxy-darwin-arm64"
 
-                  codesign --force --timestamp --options runtime \
-                    --sign "$IDENTITY" "$out"
-                  codesign --verify --strict --verbose=2 "$out"
+                  for f in "$out/libkrun-macos-arm64.dylib" "$out/gvproxy-darwin-arm64"; do
+                    codesign --force --timestamp --options runtime --sign "$IDENTITY" "$f"
+                    codesign --verify --strict --verbose=2 "$f"
+                  done
             - name: Upload signed libkrun dylib
               uses: actions/upload-artifact@v7
               with:
                   name: libkrun-macos-arm64
-                  path: ${{ runner.temp }}/libkrun-macos-arm64.dylib
+                  path: ${{ runner.temp }}/signed/libkrun-macos-arm64.dylib
+                  if-no-files-found: error
+                  retention-days: 7
+            - name: Upload signed gvproxy (darwin-arm64)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: gvproxy-darwin-arm64
+                  path: ${{ runner.temp }}/signed/gvproxy-darwin-arm64
                   if-no-files-found: error
                   retention-days: 7
 
@@ -513,7 +529,8 @@ jobs:
             - name: Fetch pinned gvproxy (linux-arm64)
               run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy-linux-arm64" gvproxy-linux-arm64
             - name: Fetch pinned gvproxy (darwin-arm64)
-              run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy-darwin-arm64" gvproxy-darwin
+              # Stashed as a `temp-` so sign-macos-artifacts (self-hosted) can sign it
+              run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/temp-gvproxy-darwin-arm64" gvproxy-darwin
             - name: Upload kernel (amd64)
               uses: actions/upload-artifact@v7
               with:
@@ -556,11 +573,11 @@ jobs:
                   path: ${{ runner.temp }}/gvproxy-linux-arm64
                   if-no-files-found: error
                   retention-days: 7
-            - name: Upload gvproxy (darwin-arm64)
+            - name: Upload gvproxy (darwin-arm64, temp/unsigned)
               uses: actions/upload-artifact@v7
               with:
-                  name: gvproxy-darwin-arm64
-                  path: ${{ runner.temp }}/gvproxy-darwin-arm64
+                  name: temp-gvproxy-darwin-arm64
+                  path: ${{ runner.temp }}/temp-gvproxy-darwin-arm64
                   if-no-files-found: error
                   retention-days: 7
 
@@ -625,7 +642,7 @@ jobs:
                 build-release-linux-amd64,
                 build-release-linux-arm64,
                 build-release-macos-arm64,
-                sign-libkrun-macos-arm64,
+                sign-macos-artifacts,
                 fetch-release-guest-artifacts,
                 build-release-initramfs,
             ]

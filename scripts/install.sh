@@ -153,8 +153,9 @@ resolve_prefix() {
 # Offline teardown driven solely by the local install record (R6.1). The record
 # is a tab-delimited table of `component<TAB>dest<TAB>manifest-hash<TAB>installed-hash`
 # rows, where `dest` is absolute and `installed-hash` is the SHA-256 of the bytes
-# actually written (the post-sign digest for a macOS `bin` file). Uninstall keys
-# off `installed-hash`; the manifest-hash column is unused here. A file is removed
+# actually written. Uninstall keys off `installed-hash`; the manifest-hash column
+# is unused here (it equals installed-hash for records written by this installer,
+# but may differ in records written by older signing installers). A file is removed
 # only if it is still byte-for-byte what we recorded writing (R7.3/R7.4), so a
 # user's edited or replaced file is kept unless --force. Runs entirely on local
 # state: no network, manifest, or bucket.
@@ -198,7 +199,7 @@ do_uninstall() {
         fi
 
         # R7.3/R7.4 — remove only if the on-disk bytes still equal the recorded
-        # installed-hash (matches a macOS ad-hoc-signed bin), unless --force.
+        # installed-hash, unless --force.
         if [ "$(sha256 "$dest")" != "$want" ] && [ "$uninstall_force" -eq 0 ]; then
             say "  $comp: kept (modified since install; pass --force to remove)"
             kept_modified=$((kept_modified + 1))
@@ -328,30 +329,12 @@ records="$tmpdir/installed"
 installed=0 skipped=0
 
 # The prior run's install record (R6.1) maps each component to the hash of the
-# file it actually placed on disk, paired with the manifest `sha256` that file
-# was built from. On macOS a `bin` file is ad-hoc code-signed after download (see
-# below), so its installed bytes — and hash — differ from the manifest `sha256`;
-# the pairing lets a signed component be recognized as already installed without
-# re-downloading. It is keyed on the manifest hash for exactly that reason: the
-# recorded installed hash only means "up to date" while the manifest still wants
-# the SAME artifact. A new release changes the manifest `sha256`, so the recorded
-# row no longer matches the current `want` and the component is re-downloaded
-# rather than wrongly judged current (the signed on-disk bytes would otherwise
-# still equal the old recorded installed hash). It is only a positive-match
-# optimization: a deleted or tampered file matches nothing and is reinstalled, so
-# the on-disk file remains the source of truth (R5.1). Read before the new record
-# is written into place at the end of the run.
+# file it placed on disk. Written into place at the end of this run; here we only
+# need its path so a completed run can replace it. The on-disk file — not this
+# record — is the skip oracle (R5.1): a deleted or tampered file matches nothing
+# and is reinstalled.
 state_dir="$(resolve_prefix state)"
 prev_record="$state_dir/installed"
-# Emit the installed hash recorded for component $1, but only if the manifest
-# hash recorded alongside it ($3) equals the manifest's current want ($2) — so a
-# signed macOS bin is skipped only when this release wants the same artifact.
-prev_installed_hash() {
-    [ -f "$prev_record" ] || return 0
-    # Records are tab-delimited; split on tab so a dest containing spaces (e.g. a
-    # $HOME with a space) still parses. Columns: comp, dest, manifest-sha, installed-sha.
-    awk -F'\t' -v c="$1" -v w="$2" '$1==c && $3==w {print $4; exit}' "$prev_record"
-}
 
 # No field ever contains whitespace (R3.2), so default IFS splitting is exact.
 # The os/arch/version columns are consumed into `_` (already matched in awk, or
@@ -378,14 +361,12 @@ while read -r comp _ _ _ want kind dest src; do
     dir="$(resolve_prefix "$prefix")"
     target_file="$dir/$subpath"
 
-    # R5.1 — the on-disk file is the skip oracle. It is up to date if its hash
-    # matches the manifest `sha256` OR (for a macOS `bin` file we signed last run)
-    # the installed hash recorded against THIS manifest hash, since signing
-    # diverges the bytes. Passing `$want` to the lookup is what stops a new
-    # release — whose `want` changed — from matching the old signed file.
+    # R5.1 — the on-disk file is the skip oracle: it is up to date when its hash
+    # equals the manifest `sha256`. A changed manifest hash (a new release) fails
+    # this check and is re-downloaded.
     if [ -f "$target_file" ]; then
         on_disk="$(sha256 "$target_file")"
-        if [ "$on_disk" = "$want" ] || [ "$on_disk" = "$(prev_installed_hash "$comp" "$want")" ]; then
+        if [ "$on_disk" = "$want" ]; then
             say "  $comp: up to date"
             skipped=$((skipped + 1))
             printf '%s\t%s\t%s\t%s\n' "$comp" "$target_file" "$want" "$on_disk" >>"$records"
@@ -410,40 +391,20 @@ while read -r comp _ _ _ want kind dest src; do
     # chmod the temp file, then rename.
     [ "$prefix" = bin ] && chmod +x "$tmp"
 
-    # macOS: make a freshly-downloaded Mach-O (a bin executable or a shipped lib
-    # dylib) actually loadable before it is placed.
-    #
-    #  * Strip the Gatekeeper quarantine attribute so it can run
-    #  * ad-hoc self-sign: arm64 macOS refuses to exec/dlopen an unsigned or
-    #    transfer-invalidated Mach-O, and our release artifacts are not yet signed
-    #    with a developer identity.
+    # macOS: strip the Gatekeeper quarantine attribute from a freshly-downloaded
+    # Mach-O (a bin executable or the shipped lib dylib) so it runs without a
+    # Gatekeeper prompt.
     if [ "$os" = darwin ] && { [ "$prefix" = bin ] || [ "$prefix" = lib ]; }; then
         xattr -d com.apple.quarantine "$tmp" 2>/dev/null || true
-        # Special case: minvmd needs the hypervisor entitlement.
-        if [ "$comp" = minvmd ]; then
-            ents="$tmpdir/minvmd.entitlements"
-            cat >"$ents" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>com.apple.security.hypervisor</key>
-    <true/>
-</dict>
-</plist>
-PLIST
-            codesign --sign - --force --entitlements "$ents" "$tmp" \
-                || { rm -f "$tmp"; die "codesign failed: $comp"; }
-        else
-            codesign --sign - --force "$tmp" || { rm -f "$tmp"; die "codesign failed: $comp"; }
-        fi
     fi
 
     mv -f "$tmp" "$target_file"
     installed=$((installed + 1))
-    # Record the manifest hash paired with the hash actually on disk now (the
-    # latter == manifest hash except for a signed macOS bin file), so a later run
-    # recognizes it only while the manifest still wants this artifact (R5.1/R6.1).
+    # Record the manifest hash paired with the on-disk hash, so a later
+    # run and `--uninstall` know what this run placed (R5.1/R6.1). The
+    #
+    # paired-column format is retained for compatibility with records
+    # written by earlier installer versions.
     printf '%s\t%s\t%s\t%s\n' "$comp" "$target_file" "$want" "$(sha256 "$target_file")" >>"$records"
 done <"$applicable"
 
