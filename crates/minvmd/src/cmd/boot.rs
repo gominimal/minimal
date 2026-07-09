@@ -47,9 +47,13 @@ fn run_boot(foreground: bool) -> Result<()> {
     // unavailable (Linux: /dev/kvm). No-op on macOS.
     crate::cmd::ensure_hypervisor_accessible()?;
 
-    // Fail-fast: resolve paths before spawning anything.
+    // Fail-fast: resolve paths before spawning anything. The UDS length
+    // checks catch sun_path overflows here, with a clear error, instead of as
+    // a libkrun abort in the VMM child after the READY timeout.
     let _kernel = resolve_kernel_path().context("resolving kernel path")?;
     let _rootfs = resolve_rootfs_path().context("resolving rootfs path")?;
+    crate::sock::check_uds_path_len(&crate::sock::resolve_uds_path()?)?;
+    crate::sock::check_uds_path_len(&crate::net::resolve_switch_sock()?)?;
 
     // Create the marker socket under /tmp with a PID + random nonce to prevent
     // predictable-path TOCTOU attacks (local-only risk, but cheap to harden).

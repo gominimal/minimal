@@ -27,6 +27,15 @@ use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+/// Isolated `XDG_STATE_HOME` under /tmp: macOS's $TMPDIR is deep enough that
+/// `<tempdir>/minimal/providers/local-0/*.sock` would overflow sun_path (104).
+fn short_state_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("mnl")
+        .tempdir_in("/tmp")
+        .expect("creating isolated state dir")
+}
+
 const CONCURRENT: usize = 5;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(15);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -47,7 +56,7 @@ fn bridge_e2e_concurrent_round_trip() {
         );
     }
 
-    let state_dir = tempfile::TempDir::new().expect("creating isolated state dir");
+    let state_dir = short_state_dir();
     let sock_path = state_dir.path().join("minimal/providers/local-0/ssh.sock");
 
     let exe = env!("CARGO_BIN_EXE_minvmd");

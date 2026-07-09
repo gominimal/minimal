@@ -70,6 +70,10 @@ fn run_supervisor(detach: bool, timeout_secs: u64) -> Result<()> {
     // unavailable (Linux: /dev/kvm). No-op on macOS. Runs in the foreground
     // caller so the user sees the error directly, even under --detach.
     crate::cmd::ensure_hypervisor_accessible()?;
+    // Likewise the sun_path limit: libkrun aborts on an over-long UDS path
+    // deep in the VMM child; catch it here with a clear error instead.
+    crate::sock::check_uds_path_len(&crate::sock::resolve_uds_path()?)?;
+    crate::sock::check_uds_path_len(&crate::net::resolve_switch_sock()?)?;
 
     if detach {
         return run_detach(timeout_secs);
@@ -132,6 +136,7 @@ fn run_foreground() -> Result<()> {
     use crate::state::{StartingGuard, State, StateDir};
 
     // Fail-fast: resolve paths before touching lifecycle state.
+    // (UDS path lengths were already checked in `run_supervisor`.)
     let _kernel = resolve_kernel_path().context("resolving kernel path")?;
     let _rootfs = resolve_rootfs_path().context("resolving rootfs path")?;
 

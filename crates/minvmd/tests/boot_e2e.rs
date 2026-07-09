@@ -21,6 +21,14 @@ use serial_test::serial;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::time::Duration;
+/// Isolated `XDG_STATE_HOME` under /tmp: macOS's $TMPDIR is deep enough that
+/// `<tempdir>/minimal/providers/local-0/*.sock` would overflow sun_path (104).
+fn short_state_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("mnl")
+        .tempdir_in("/tmp")
+        .expect("creating isolated state dir")
+}
 
 #[test]
 #[serial]
@@ -42,7 +50,7 @@ fn boot_e2e_ready_marker_round_trip() {
         );
     }
 
-    let state_dir = tempfile::TempDir::new().expect("creating isolated state dir");
+    let state_dir = short_state_dir();
 
     let exe = env!("CARGO_BIN_EXE_minvmd");
     let mut child = Command::new(exe)

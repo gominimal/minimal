@@ -248,7 +248,9 @@ jobs:
                   # All state (minvmd.toml, locks, the bridge socket) lives under
                   # $XDG_STATE_HOME/minimal/providers/local-0; a fresh dir gives a
                   # genuinely clean (NotProvisioned) state on the persistent runner.
-                  export XDG_STATE_HOME="$(mktemp -d)"
+                  # Under /tmp, not $TMPDIR: macOS's deep $TMPDIR would push the
+                  # socket paths past the 104-byte sun_path limit.
+                  export XDG_STATE_HOME="$(mktemp -d /tmp/mnl.XXXXXX)"
 
                   # macOS `date` has no %N; use perl's high-resolution clock for ms.
                   now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time()*1000'; }

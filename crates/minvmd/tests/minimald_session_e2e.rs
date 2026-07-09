@@ -29,6 +29,15 @@ use std::time::Duration;
 use serial_test::serial;
 use tempfile::TempDir;
 
+/// Isolated `XDG_STATE_HOME` under /tmp: macOS's $TMPDIR is deep enough that
+/// `<tempdir>/minimal/providers/local-0/*.sock` would overflow sun_path (104).
+fn short_state_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("mnl")
+        .tempdir_in("/tmp")
+        .expect("creating isolated state dir")
+}
+
 const BOOT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Env var the server reads to scope an exec to a session
@@ -73,7 +82,7 @@ impl Guest {
     /// Boots `minvmd boot --foreground` with minimald as the guest init and
     /// blocks until the `vm-up` (READY) line. Panics on boot timeout.
     fn boot() -> Guest {
-        let state = TempDir::new().expect("creating isolated state dir");
+        let state = short_state_dir();
         let sock_path = state.path().join("minimal/providers/local-0/ssh.sock");
 
         let exe = env!("CARGO_BIN_EXE_minvmd");

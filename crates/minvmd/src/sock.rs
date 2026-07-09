@@ -32,6 +32,31 @@ pub fn resolve_uds_path() -> io::Result<PathBuf> {
     Ok(crate::state::provider_dir().join(paths::SSH_SOCK_FILE))
 }
 
+/// Usable bytes in `sockaddr_un.sun_path` (excluding the NUL terminator).
+#[cfg(target_os = "macos")]
+const SUN_PATH_MAX: usize = 103;
+#[cfg(not(target_os = "macos"))]
+const SUN_PATH_MAX: usize = 107;
+
+/// Fail fast when `path` exceeds the platform unix-socket path limit.
+/// libkrun aborts the process (panic in a nounwind FFI frame) on
+/// `ENAMETOOLONG` instead of returning an error, so check before handing
+/// socket paths to it.
+pub fn check_uds_path_len(path: &std::path::Path) -> io::Result<()> {
+    let len = path.as_os_str().as_encoded_bytes().len();
+    if len > SUN_PATH_MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "socket path {} is {len} bytes, over the {SUN_PATH_MAX}-byte unix socket \
+                 limit; use a shorter state dir (--minimal-state-dir / XDG_STATE_HOME)",
+                path.display(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Create the parent directory of `socket_path` with mode 0700, if absent.
 ///
 /// Uses `DirBuilder::recursive(true)` so intermediate directories are created
@@ -124,6 +149,16 @@ mod tests {
             path,
             PathBuf::from("/state/minimal/providers/local-0/ssh.sock"),
         );
+    }
+
+    #[test]
+    fn check_uds_path_len_accepts_short_and_rejects_long() {
+        check_uds_path_len(std::path::Path::new("/tmp/x/ssh.sock")).unwrap();
+
+        let long = format!("/tmp/{}/ssh.sock", "x".repeat(SUN_PATH_MAX));
+        let err = check_uds_path_len(std::path::Path::new(&long)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("unix socket limit"), "{err}");
     }
 
     #[test]
