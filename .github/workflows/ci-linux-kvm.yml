@@ -219,7 +219,7 @@ jobs:
       # Session E2E above plus the daemon lifecycle step below.
 
       - name: Daemon lifecycle (run --detach → status → stop, R4.2/R4.3/R4.4)
-        # Exercises the supervised daemon path that manages state.toml lifecycle,
+        # Exercises the supervised daemon path that manages the lifecycle state,
         # which the raw `boot` e2e tests above do not cover.
         env:
           MINVMD_BOOT_LOG: ${{ runner.temp }}/boot-daemon.log

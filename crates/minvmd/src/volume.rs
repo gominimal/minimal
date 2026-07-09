@@ -45,28 +45,22 @@ pub fn volume_bytes() -> u64 {
 /// Resolve the per-VM data-volume image path.
 ///
 /// [`DATA_VOLUME_PATH_ENV`] overrides it explicitly (used verbatim); otherwise
-/// the image lives beside minvmd's persistent state as
-/// `<state>/minimal/minvmd/data-vol.raw`, so it survives clean restarts. The
-/// base comes from the shared [`paths::minimal_state_dir`] resolver — except
-/// `XDG_STATE_HOME` is still honoured explicitly first, because `dirs` (and thus
-/// `minimal_state_dir`) ignores it on macOS and the e2e tests isolate state via
-/// `XDG_STATE_HOME`; without that the volume would escape the tests' temp dir
-/// onto the real state dir on macOS.
+/// the image lives beside the instance's socket and locks as
+/// `<provider dir>/data-vol.raw`, so it survives clean restarts and follows
+/// the same `--minimal-state-dir` / `XDG_STATE_HOME` resolution — isolating
+/// an instance isolates its writable image too (double-attaching one image
+/// corrupts it).
 #[must_use]
 pub fn resolve_data_volume_path() -> PathBuf {
-    if let Some(explicit) = std::env::var_os(DATA_VOLUME_PATH_ENV).filter(|v| !v.is_empty()) {
-        return PathBuf::from(explicit);
-    }
-    let base = std::env::var_os("XDG_STATE_HOME")
+    std::env::var_os(DATA_VOLUME_PATH_ENV)
         .filter(|v| !v.is_empty())
-        .map(|x| PathBuf::from(x).join("minimal"))
-        .unwrap_or_else(|| {
-            paths::minimal_state_dir()
-                .as_utf8_path()
-                .as_std_path()
-                .to_path_buf()
-        });
-    base.join("minvmd").join("data-vol.raw")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_volume_path_in(&crate::state::provider_dir()))
+}
+
+/// `<provider dir>/data-vol.raw`. Pure, for unit testing.
+fn data_volume_path_in(provider_dir: &Path) -> PathBuf {
+    provider_dir.join("data-vol.raw")
 }
 
 /// Failure modes of [`ensure_sparse_raw`].
@@ -240,6 +234,14 @@ mod tests {
         );
         // Best-effort cleanup; a leftover temp dir must not fail the test.
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn data_volume_path_sits_in_provider_dir() {
+        assert_eq!(
+            data_volume_path_in(Path::new("/state/minimal/providers/local-0")),
+            PathBuf::from("/state/minimal/providers/local-0/data-vol.raw"),
+        );
     }
 
     #[test]

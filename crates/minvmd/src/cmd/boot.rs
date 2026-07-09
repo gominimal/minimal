@@ -6,10 +6,9 @@
 //!    READY-marker socket).
 //! 3. Fork-execs `minvmd __krun-vmm` with `MINVMD_MARKER_SOCK` pointing to
 //!    that socket so the VMM child can register it with libkrun.
-//! 4. Writes the child PID to `vmm.pid` in the state directory.
-//! 5. Waits up to 5 s for the guest to connect and write `READY\n` on the
+//! 4. Waits up to 5 s for the guest to connect and write `READY\n` on the
 //!    marker socket (R2.4). On success prints `vm-up` to stdout.
-//! 6. With `--foreground`: stays alive until the VMM child exits, propagating
+//! 5. With `--foreground`: stays alive until the VMM child exits, propagating
 //!    its exit code.
 //!
 //! Without libkrun this subcommand bails immediately with a "no libkrun" error
@@ -49,9 +48,31 @@ fn run_boot(foreground: bool) -> Result<()> {
     // unavailable (Linux: /dev/kvm). No-op on macOS.
     crate::cmd::ensure_hypervisor_accessible()?;
 
-    // Fail-fast: resolve paths before spawning anything.
+    // Fail-fast: resolve paths before spawning anything. The UDS length
+    // checks catch sun_path overflows here, with a clear error, instead of as
+    // a libkrun abort in the VMM child after the READY timeout.
     let _kernel = resolve_kernel_path().context("resolving kernel path")?;
     let _rootfs = resolve_rootfs_path().context("resolving rootfs path")?;
+    crate::sock::check_uds_path_len(&crate::sock::resolve_uds_path()?)?;
+    crate::sock::check_uds_path_len(&crate::net::resolve_switch_sock()?)?;
+
+    // `boot` skips lifecycle state, but not mutual exclusion: it binds the
+    // shared ssh.sock, so it must hold the alive lock (inherited by the VMM
+    // child below — for a non-foreground boot the lock lives on in the child
+    // after this parent exits) and must not steal a native daemon's socket.
+    let state_dir = StateDir::new(StateDir::default_path()).context("opening state dir")?;
+    let alive_lock = state_dir
+        .try_acquire_alive_lock()
+        .context("acquiring alive lock")?
+        .ok_or_else(|| {
+            anyhow::anyhow!("minvmd is already running (or another boot VM is up); stop it first")
+        })?;
+    if state_dir
+        .minimald_alive()
+        .context("probing native minimald lock")?
+    {
+        bail!("a native minimald is serving this instance's socket; stop it first");
+    }
 
     // Create the marker socket under /tmp with a PID + random nonce to prevent
     // predictable-path TOCTOU attacks (local-only risk, but cheap to harden).
@@ -79,8 +100,13 @@ fn run_boot(foreground: bool) -> Result<()> {
 
     // Spawn `minvmd __krun-vmm` — the VMM child that calls krun_start_enter.
     let exe = std::env::current_exe().context("resolving current executable path")?;
-    let mut child = std::process::Command::new(&exe)
-        .arg("__krun-vmm")
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("__krun-vmm");
+    if let Some(dir) = crate::state::state_dir_override() {
+        cmd.args(["--minimal-state-dir", dir.as_str()]);
+    }
+    alive_lock.inherit_into(&mut cmd);
+    let mut child = cmd
         .env(MARKER_SOCK_ENV, &marker_sock_path)
         // Inherit MINVMD_KERNEL_PATH and MINVMD_ROOTFS_PATH from environment.
         .spawn()
@@ -88,11 +114,6 @@ fn run_boot(foreground: bool) -> Result<()> {
 
     let child_pid = child.id();
     tracing::info!(pid = child_pid, "VMM child spawned");
-
-    // Write vmm.pid to the state directory (R2.3).
-    let state_dir = StateDir::new(StateDir::default_path()).context("opening state dir")?;
-    let vmm_pid_path = state_dir.vmm_pid_path();
-    std::fs::write(&vmm_pid_path, format!("{child_pid}\n")).context("writing vmm.pid")?;
 
     // Wait for the READY marker from the guest (R2.4). The wait is
     // env-configurable (`MINVMD_READY_TIMEOUT_SECS`): a cold multi-GiB VM can
@@ -147,14 +168,12 @@ fn run_boot(foreground: bool) -> Result<()> {
         Ok(Err(e)) => {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = std::fs::remove_file(&vmm_pid_path);
             let _ = std::fs::remove_file(&marker_sock_path);
             bail!("boot failed: {e}");
         }
         Err(_timeout) => {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = std::fs::remove_file(&vmm_pid_path);
             let _ = std::fs::remove_file(&marker_sock_path);
             bail!(
                 "boot timed out waiting for READY marker after {} s (raise {} to wait longer)",
