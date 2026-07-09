@@ -11,7 +11,6 @@ runs:
         remove_dotnet: true
         remove_haskell: true
     - name: Install Minimal
-      if: steps.cache-minimal.outputs.cache-hit != 'true'
       shell: bash
       run: |
         curl --proto '=https' --tlsv1.2 -sSf https://storage.googleapis.com/minimal-shim/install.sh | sh -s -- -y
