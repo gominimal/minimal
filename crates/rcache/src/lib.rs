@@ -6,7 +6,8 @@ pub use remote::{Error, INDEX_FILENAME, RemoteCache};
 mod remote_writer;
 pub use remote_writer::RemoteCacheWriter;
 
-mod remote_index;
+pub mod index_file;
+pub use index_file::IndexFile;
 
 /// An adapter that lets you use a [RemoteCache] as a [graph::BinProvider].
 #[derive(Debug, Clone)]

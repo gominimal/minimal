@@ -7,8 +7,8 @@
 //! raced.
 
 use crate::INDEX_FILENAME;
+use crate::index_file::IndexFile;
 use crate::remote::Error;
-use crate::remote_index::RemoteIndex;
 use common::SpecHash;
 use common::fetchers::{FetchUrl, GcsUrl};
 use google_cloud_storage::Error as GcsError;
@@ -65,7 +65,7 @@ pub struct RemoteCacheWriter<S: StubStorage + 'static = DefaultStorage> {
     /// The index as it was when we last fetched it from GCS. Used both as the
     /// base to merge `pending` into, and as a dedup check in [Self::upload]
     /// to skip uploads of artifacts already present.
-    fetched_index: RemoteIndex,
+    fetched_index: IndexFile,
 
     /// The GCS object generation that `fetched_index` was loaded from.
     /// `0` means the index file did not exist at fetch time, which
@@ -115,7 +115,7 @@ impl<S: StubStorage + 'static> RemoteCacheWriter<S> {
     pub(crate) fn from_parts(
         backend: Storage<S>,
         base: GcsUrl,
-        fetched_index: RemoteIndex,
+        fetched_index: IndexFile,
         fetched_generation: i64,
         ot: Option<OpTracker>,
     ) -> Self {
@@ -300,7 +300,7 @@ fn decide_retry_after_failure(status_code: Option<u16>, attempts_so_far: u32) ->
 /// Build the index that will be written for this attempt: fetched + pending.
 /// Extracted so the merge invariant ("no entries lost across retries") can
 /// be exercised at the data-structure level without going through GCS.
-fn merge_for_commit(fetched: &RemoteIndex, pending: &[(SpecHash, [u8; 32])]) -> RemoteIndex {
+fn merge_for_commit(fetched: &IndexFile, pending: &[(SpecHash, [u8; 32])]) -> IndexFile {
     let mut merged = fetched.clone();
     merged.extend(pending.iter().cloned());
     merged
@@ -317,13 +317,13 @@ fn merge_for_commit(fetched: &RemoteIndex, pending: &[(SpecHash, [u8; 32])]) -> 
 pub(crate) async fn fetch_gcs_index<S: StubStorage + 'static>(
     backend: &Storage<S>,
     base: &GcsUrl,
-) -> Result<(RemoteIndex, i64), Error<GcsError>> {
+) -> Result<(IndexFile, i64), Error<GcsError>> {
     let url = base.join(INDEX_FILENAME).unwrap();
     let mut response = match backend.read_object(url.bucket, url.object).send().await {
         Ok(r) => r,
         Err(e) => {
             if e.http_status_code() == Some(NOT_FOUND) {
-                return Ok((RemoteIndex::default(), 0));
+                return Ok((IndexFile::default(), 0));
             }
             return Err(Error::Backend(e));
         }
@@ -338,7 +338,7 @@ pub(crate) async fn fetch_gcs_index<S: StubStorage + 'static>(
         buffer.extend_from_slice(&chunk);
     }
 
-    let index = RemoteIndex::from_reader(&mut std::io::Cursor::new(buffer)).map_err(Error::IO)?;
+    let index = IndexFile::from_reader(&mut std::io::Cursor::new(buffer)).map_err(Error::IO)?;
 
     Ok((index, generation))
 }
@@ -415,7 +415,7 @@ mod tests {
 
     fn writer_from_mock(
         mock: MockStorage,
-        fetched_index: RemoteIndex,
+        fetched_index: IndexFile,
         fetched_generation: i64,
     ) -> RemoteCacheWriter<MockStorage> {
         let storage = gcs::client::Storage::from_stub(mock);
@@ -428,9 +428,9 @@ mod tests {
         )
     }
 
-    /// Serialize a RemoteIndex to bytes and return as a ReadObjectResponse
+    /// Serialize a IndexFile to bytes and return as a ReadObjectResponse
     /// with the given generation, the way GCS would return it on a fetch.
-    fn read_response_for(index: &RemoteIndex, generation: i64) -> ReadObjectResponse {
+    fn read_response_for(index: &IndexFile, generation: i64) -> ReadObjectResponse {
         let mut bytes = Vec::with_capacity(2048);
         index.write_to(&mut bytes).unwrap();
         let mut highlights = ObjectHighlights::default();
@@ -458,7 +458,7 @@ mod tests {
             .withf(|_p: &Payload<BytesSource>, req, _| req.spec.if_generation_match == Some(42))
             .return_once(|_p: Payload<BytesSource>, _, _| Ok(Object::default()));
 
-        let writer = writer_from_mock(mock, RemoteIndex::default(), 42);
+        let writer = writer_from_mock(mock, IndexFile::default(), 42);
         writer.finish_uploads().await.expect("expected Ok");
     }
 
@@ -481,7 +481,7 @@ mod tests {
         mock.expect_read_object()
             .times(1)
             .in_sequence(&mut seq)
-            .return_once(|_, _| Ok(read_response_for(&RemoteIndex::default(), 100)));
+            .return_once(|_, _| Ok(read_response_for(&IndexFile::default(), 100)));
 
         // Second write uses the refetched generation, succeeds.
         mock.expect_write_object_buffered()
@@ -490,7 +490,7 @@ mod tests {
             .withf(|_p: &Payload<BytesSource>, req, _| req.spec.if_generation_match == Some(100))
             .return_once(|_p: Payload<BytesSource>, _, _| Ok(Object::default()));
 
-        let writer = writer_from_mock(mock, RemoteIndex::default(), 50);
+        let writer = writer_from_mock(mock, IndexFile::default(), 50);
         writer
             .finish_uploads()
             .await
@@ -514,9 +514,9 @@ mod tests {
         // initial attempt skips the refetch).
         mock.expect_read_object()
             .times(MAX_INDEX_WRITE_RETRIES as usize)
-            .returning(|_, _| Ok(read_response_for(&RemoteIndex::default(), 0)));
+            .returning(|_, _| Ok(read_response_for(&IndexFile::default(), 0)));
 
-        let writer = writer_from_mock(mock, RemoteIndex::default(), 0);
+        let writer = writer_from_mock(mock, IndexFile::default(), 0);
         let err = writer
             .finish_uploads()
             .await
@@ -536,7 +536,7 @@ mod tests {
             .times(1)
             .return_once(|_p: Payload<BytesSource>, _, _| Err(http_500_error()));
 
-        let writer = writer_from_mock(mock, RemoteIndex::default(), 1);
+        let writer = writer_from_mock(mock, IndexFile::default(), 1);
         let err = writer
             .finish_uploads()
             .await
