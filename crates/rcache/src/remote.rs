@@ -1,4 +1,4 @@
-use crate::remote_index::RemoteIndex;
+use crate::index_file::IndexFile;
 use common::{SpecHash, archive};
 use lcache::{Cache, LocalDir, PendingDir};
 use ot::{OpTracker, Operation};
@@ -56,7 +56,7 @@ impl<BE: std::fmt::Debug> From<BE> for Error<BE> {
 pub struct RemoteCache<B: FetchBackend> {
     backend: B,
     base: B::Url,
-    index: RemoteIndex,
+    index: IndexFile,
 
     #[allow(dead_code)]
     dir: Option<PathBuf>,
@@ -192,7 +192,7 @@ impl<B: FetchBackend> RemoteCache<B> {
                 tracing::debug!("Re-using remote index (fetched {}s ago)", elapsed.as_secs());
                 return Ok(Self {
                     backend,
-                    index: RemoteIndex::from_reader(
+                    index: IndexFile::from_reader(
                         &mut std::fs::File::open(&l_idx_path).map_err(Error::IO)?,
                     )
                     .map_err(Error::IO)?,
@@ -211,14 +211,14 @@ impl<B: FetchBackend> RemoteCache<B> {
 
         let fetch_op = OpTracker::new_with_root(&ot).with_op(Operation::FetchIndex);
 
-        // TODO: Gotta be a better way to stream it into [RemoteIndex].
+        // TODO: Gotta be a better way to stream it into [IndexFile].
         let mut index_resp = backend.execute(index_req).await?;
         // Capture the GCS generation, if the backend exposes one. Reads
         // need to do this before consuming chunks because the response
         // metadata may not survive the body read in some impls.
         let gcs_generation = index_resp.generation();
         let index = match index_resp.status_code() {
-            404 => RemoteIndex::default(),
+            404 => IndexFile::default(),
             _ => {
                 // Progress total only; a plain-HTTPS backend may omit
                 // Content-Length (chunked transfer), so don't panic on None.
@@ -232,8 +232,8 @@ impl<B: FetchBackend> RemoteCache<B> {
                 }
                 fetch_op.set_done();
 
-                let index = RemoteIndex::from_reader(&mut std::io::Cursor::new(buffer))
-                    .map_err(Error::IO)?;
+                let index =
+                    IndexFile::from_reader(&mut std::io::Cursor::new(buffer)).map_err(Error::IO)?;
 
                 if let Some(index_dir) = index_dir.as_ref() {
                     let l_idx_path = index_dir.join(INDEX_FILENAME);
@@ -421,7 +421,7 @@ mod tests {
         let claimed_sha256: [u8; 32] = [0xBB; 32];
 
         // Build an index that maps spec_hash -> claimed_sha256.
-        let mut index = RemoteIndex::default();
+        let mut index = IndexFile::default();
         index.extend(std::iter::once((spec_hash.clone(), claimed_sha256)));
         let mut index_bytes = Vec::new();
         index.write_to(&mut index_bytes).unwrap();
@@ -461,7 +461,7 @@ mod tests {
         let sha256: [u8; 32] = [0xCD; 32];
 
         // Index maps spec_hash -> sha256.
-        let mut index = RemoteIndex::default();
+        let mut index = IndexFile::default();
         index.extend(std::iter::once((spec_hash.clone(), sha256)));
         let mut index_bytes = Vec::new();
         index.write_to(&mut index_bytes).unwrap();
@@ -519,7 +519,7 @@ mod tests {
     async fn new_any_https_fetches_and_parses_index_over_real_http() {
         let spec_hash = SpecHash::from_bytes([0x07; 32]);
         let sha256: [u8; 32] = [0x42; 32];
-        let mut index = RemoteIndex::default();
+        let mut index = IndexFile::default();
         index.extend(std::iter::once((spec_hash.clone(), sha256)));
         let mut index_bytes = Vec::new();
         index.write_to(&mut index_bytes).unwrap();
