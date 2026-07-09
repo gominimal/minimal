@@ -4,8 +4,10 @@ description: >
   macOS jobs from depending on hand-provisioned runner state — a missing
   libkrun.dylib silently broke every code PR. Idempotent (a no-op when
   already present); same tap the runner setup used, so the supply-chain
-  surface is unchanged. A failed install fails the step, so no separate
-  existence check is needed.
+  surface is unchanged. The existence check matters even after a successful
+  install: brew exits 0 for an installed-but-UNLINKED keg ("it's just not
+  linked"), a plausible state on a persistent shared runner, and minvmd's
+  build.rs links against /opt/homebrew/lib unconditionally on macOS.
 
 runs:
   using: composite
@@ -13,3 +15,10 @@ runs:
     - name: Provision libkrun (slp/krun tap)
       shell: bash
       run: brew install slp/krun/libkrun
+    - name: Verify libkrun is available
+      shell: bash
+      run: |
+        if [ ! -f /opt/homebrew/lib/libkrun.dylib ]; then
+          echo "::error::libkrun.dylib not found under /opt/homebrew/lib despite brew exiting 0 (installed-but-unlinked keg?). Fix with: brew link slp/krun/libkrun" >&2
+          exit 1
+        fi

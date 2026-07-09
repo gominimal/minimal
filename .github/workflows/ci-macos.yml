@@ -15,6 +15,10 @@ on:
             - "Cargo.lock"
             - ".github/workflows/ci-macos.yml"
             - "scripts/**"
+            # Composite actions this lane's setup runs through — without these,
+            # a composite-only edit would skip this lane and break it post-merge.
+            - ".github/actions/setup-libkrun-macos/**"
+            - ".github/actions/guest-artifacts/**"
     pull_request:
         branches: ["main"]
         paths:
@@ -25,6 +29,10 @@ on:
             - "Cargo.lock"
             - ".github/workflows/ci-macos.yml"
             - "scripts/**"
+            # Composite actions this lane's setup runs through — without these,
+            # a composite-only edit would skip this lane and break it post-merge.
+            - ".github/actions/setup-libkrun-macos/**"
+            - ".github/actions/guest-artifacts/**"
     workflow_dispatch:
 
 env:

@@ -26,6 +26,10 @@ on:
       - "Cargo.lock"
       - ".minimal/minimal.toml"
       - ".github/workflows/ci-linux-kvm.yml"
+      # Composite actions this lane's setup runs through — without these, a
+      # composite-only edit would skip this lane and break it post-merge.
+      - ".github/actions/setup-libkrun-linux/**"
+      - ".github/actions/guest-artifacts/**"
   pull_request:
     branches: ["main"]
     paths:
@@ -36,6 +40,10 @@ on:
       - "Cargo.lock"
       - ".minimal/minimal.toml"
       - ".github/workflows/ci-linux-kvm.yml"
+      # Composite actions this lane's setup runs through — without these, a
+      # composite-only edit would skip this lane and break it post-merge.
+      - ".github/actions/setup-libkrun-linux/**"
+      - ".github/actions/guest-artifacts/**"
   workflow_dispatch:
 
 env:
@@ -144,7 +152,7 @@ jobs:
         # binary; pin-verified, no Go toolchain. Publish its path for the gated
         # step below.
         run: |
-          ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
+          ./scripts/ci/retry.sh 3 10 ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
           echo "MINVMD_GVPROXY_BIN=$RUNNER_TEMP/gvproxy" >> "$GITHUB_ENV"
 
       - name: Materialize guest kernel + rootfs

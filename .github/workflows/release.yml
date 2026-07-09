@@ -125,11 +125,11 @@ jobs:
               # Native host target (x86_64-unknown-linux-gnu), NOT musl: the binary
               # links libkrun.so (and libkrunfw.so.5 is dlopen'd at runtime), so unlike
               # the three above it is not self-contained — running it still needs those
-              # .so's reachable via rpath/LD_LIBRARY_PATH. LIBKRUN_PREFIX drives the
-              # build.rs link search and the `minvmd_libkrun` cfg (real, non-stub impl).
+              # .so's reachable via rpath/LD_LIBRARY_PATH. LIBKRUN_PREFIX — published
+              # by the setup-libkrun-linux composite above — drives the build.rs link
+              # search and the `minvmd_libkrun` cfg (real, non-stub impl).
               run: |
-                  LIBKRUN_PREFIX="$HOME/.krun" \
-                    cargo build --release -p minvmd --bin minvmd
+                  cargo build --release -p minvmd --bin minvmd
                   mv target/release/minvmd target/release/minvmd-linux-amd64
             - name: Upload binary (minvmd)
               uses: actions/upload-artifact@v7
@@ -224,9 +224,10 @@ jobs:
             - name: Rewrite + verify minvmd libkrun linkage (@rpath)
               # Retarget Homebrew's absolute libkrun install name to the shipped
               # bin/../lib layout and verify the result (rpath entries, no
-              # non-system deps). Shared script so CI can exercise the production
-              # rewrite outside release too; signing happens below, as the last
-              # mutation before upload.
+              # non-system deps). Extracted to scripts/ so a future CI lane can
+              # exercise the production rewrite per-PR; release is currently its
+              # only consumer. Signing happens below, as the last mutation
+              # before upload.
               run: scripts/rewrite-macos-linkage.sh target/release/minvmd
             - name: Build release minimal binary
               # Separate cargo invocation from minvmd above, so its default
@@ -479,12 +480,12 @@ jobs:
                   kernel-dest: ${{ runner.temp }}/vmlinuz-arm64
                   rootfs-dest: ${{ runner.temp }}/rootfs-arm64.img
             - name: Fetch pinned gvproxy (linux-amd64)
-              run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy-linux-amd64" gvproxy-linux-amd64
+              run: ./scripts/ci/retry.sh 3 10 ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy-linux-amd64" gvproxy-linux-amd64
             - name: Fetch pinned gvproxy (linux-arm64)
-              run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy-linux-arm64" gvproxy-linux-arm64
+              run: ./scripts/ci/retry.sh 3 10 ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy-linux-arm64" gvproxy-linux-arm64
             - name: Fetch pinned gvproxy (darwin-arm64)
               # Stashed as a `temp-` so sign-macos-artifacts (self-hosted) can sign it
-              run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/temp-gvproxy-darwin-arm64" gvproxy-darwin
+              run: ./scripts/ci/retry.sh 3 10 ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/temp-gvproxy-darwin-arm64" gvproxy-darwin
             - name: Upload kernel (amd64)
               uses: actions/upload-artifact@v7
               with:

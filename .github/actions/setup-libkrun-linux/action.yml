@@ -5,9 +5,12 @@ description: >
   by the pinned upstream commit, NOT a from-source build — and publish
   LIBKRUN_PREFIX (minvmd build.rs link search + rpath) and LD_LIBRARY_PATH
   (libkrun.so -> libkrunfw.so.5 at runtime) to GITHUB_ENV for later steps.
-  Retries the fetch to absorb transient cache/network hiccups. Assumes the
-  repository is checked out and any cargo cache restore has already happened
-  (without a prebuilt mip the fetch builds the mip CLI).
+  The job-wide LD_LIBRARY_PATH is safe to persist: fetch-libkrun.sh strips
+  the package's glibc/libgcc layers, so the prefix holds only the libkrun
+  libraries and shadows nothing. The mip CLI that drives the fetch is
+  validated/built un-retried so a hard failure fails fast; only the
+  network-bound fetch retries. Assumes the repository is checked out and any
+  cargo cache restore has already happened.
 
 inputs:
   arch:
@@ -29,22 +32,22 @@ runs:
         ARCH: ${{ inputs.arch }}
         MIP: ${{ inputs.mip }}
       run: |
-        prefix="$HOME/.krun"
-        fetched=""
-        for attempt in 1 2 3; do
-          if ./scripts/fetch-libkrun.sh "$prefix" "$ARCH"; then
-            fetched=1
-            break
+        # Deterministic preconditions first, OUTSIDE the retry: a bad mip path
+        # or a broken mip compile fails once, fast, instead of being re-run to
+        # the job timeout.
+        if [ -n "$MIP" ]; then
+          if [ ! -x "$MIP" ]; then
+            echo "::error::mip input is not an executable file: $MIP" >&2
+            exit 1
           fi
-          if [ "$attempt" -lt 3 ]; then
-            echo "::warning::fetch-libkrun.sh attempt $attempt failed; retrying"
-            sleep 10
-          fi
-        done
-        if [ -z "$fetched" ]; then
-          echo "::error::fetch-libkrun.sh failed after 3 attempts" >&2
-          exit 1
+        else
+          cargo build -p mip
+          MIP="$PWD/target/debug/mip"
         fi
+        export MIP
+
+        prefix="$HOME/.krun"
+        ./scripts/ci/retry.sh 3 10 ./scripts/fetch-libkrun.sh "$prefix" "$ARCH"
         {
           echo "LIBKRUN_PREFIX=$prefix"
           echo "LD_LIBRARY_PATH=$prefix${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
