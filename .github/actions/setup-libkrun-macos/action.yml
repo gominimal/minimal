@@ -25,13 +25,19 @@ runs:
           echo "::error::no commit= line in vendor/libkrun/libkrun.lock" >&2
           exit 1
         fi
+        script_hash="$(shasum -a 256 scripts/build-libkrun-macos.sh | cut -d' ' -f1)"
         {
           echo "commit=$commit"
-          echo "prefix=$HOME/.cache/minimal-ci/libkrun/$commit"
-          echo "script_hash=$(shasum -a 256 scripts/build-libkrun-macos.sh | cut -d' ' -f1)"
+          # The prefix embeds BOTH build inputs (pinned commit + build-script
+          # hash) so the persistent mini rebuilds when either changes — the
+          # same invalidation the actions/cache key gives GitHub-hosted
+          # runners. Stale sibling prefixes on the mini are inert (nothing
+          # references them) and may be deleted by hand.
+          echo "prefix=$HOME/.cache/minimal-ci/libkrun/$commit-${script_hash:0:12}"
+          echo "script_hash=$script_hash"
         } >> "$GITHUB_OUTPUT"
     - name: Cache built libkrun (GitHub-hosted)
-      # The mini needs no cache action: the commit-keyed prefix under $HOME
+      # The mini needs no cache action: the input-keyed prefix under $HOME
       # persists across runs on its own.
       if: runner.environment == 'github-hosted'
       uses: actions/cache@v6
