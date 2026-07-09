@@ -26,6 +26,10 @@ on:
       - "Cargo.lock"
       - ".minimal/minimal.toml"
       - ".github/workflows/ci-linux-kvm.yml"
+      # Composite actions this lane's setup runs through — without these, a
+      # composite-only edit would skip this lane and break it post-merge.
+      - ".github/actions/setup-libkrun-linux/**"
+      - ".github/actions/materialize/**"
   pull_request:
     branches: ["main"]
     paths:
@@ -36,6 +40,10 @@ on:
       - "Cargo.lock"
       - ".minimal/minimal.toml"
       - ".github/workflows/ci-linux-kvm.yml"
+      # Composite actions this lane's setup runs through — without these, a
+      # composite-only edit would skip this lane and break it post-merge.
+      - ".github/actions/setup-libkrun-linux/**"
+      - ".github/actions/materialize/**"
   workflow_dispatch:
 
 env:
@@ -103,26 +111,16 @@ jobs:
           ls -l /dev/kvm
 
       - name: Resolve build paths
-        # Publish the libkrun prefix and guest-artifact paths (plus the E2E gate)
-        # to $GITHUB_ENV for later steps; `runner.temp`/`$HOME` are not available
-        # in job-level `env:`.
+        # Publish the guest-artifact paths (plus the E2E gate) to $GITHUB_ENV
+        # for later steps; `runner.temp` is not available in job-level `env:`.
+        # The libkrun link + runtime paths (LIBKRUN_PREFIX, LD_LIBRARY_PATH)
+        # are published by the setup-libkrun-linux composite below.
         run: |
           {
-            echo "KRUN_PREFIX=$HOME/.krun"
             echo "MINVMD_E2E=1"
             echo "MINVMD_KERNEL_PATH=$RUNNER_TEMP/vmlinuz"
             echo "MINVMD_ROOTFS_PATH=$RUNNER_TEMP/rootfs.img"
             echo "MINVMD_INITRAMFS=$RUNNER_TEMP/initramfs.cpio"
-          } >> "$GITHUB_ENV"
-
-      - name: Export libkrun link + runtime paths
-        # LIBKRUN_PREFIX: minvmd build.rs link-search dir (it emits an rpath to
-        # it too). LD_LIBRARY_PATH: libkrun.so -> libkrunfw.so.5 at runtime. Both
-        # point at the flat prefix that the materialize step below populates.
-        run: |
-          {
-            echo "LIBKRUN_PREFIX=$KRUN_PREFIX"
-            echo "LD_LIBRARY_PATH=$KRUN_PREFIX${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           } >> "$GITHUB_ENV"
 
       - name: Install cross
@@ -143,18 +141,21 @@ jobs:
           restore-keys: ${{ runner.os }}-x86_64-minvmd-kvm-
 
       - name: Materialize libkrun prefix (upstream package)
-        # Cache fetch of the upstream libkrun package (libkrun.so + libkrunfw.so.5),
-        # extracted into $KRUN_PREFIX. Runs after the cargo cache restore so the
-        # `minimal` CLI build it drives is incremental.
-        run: ./scripts/fetch-libkrun.sh "$KRUN_PREFIX" x86_64
+        # Runs after the cargo cache restore so the CLI build the cache fetch
+        # drives is incremental.
+        uses: ./.github/actions/setup-libkrun-linux
+        with:
+          arch: x86_64
 
       - name: Assert libkrun exports krun_add_disk3 (>= 1.19.0)
         # krun_add_disk3 (this PR's /dev/vdb attach) needs libkrun >= 1.19.0. Fail
         # loudly here rather than with a cryptic runtime error at VM boot if the
         # materialized upstream libkrun is too old.
+        # LIBKRUN_PREFIX is published by the setup-libkrun-linux composite above
+        # (the old KRUN_PREFIX env was retired with the composite extraction).
         run: |
-          so="$(ls "$KRUN_PREFIX"/libkrun.so* 2>/dev/null | head -1)"
-          test -n "$so" || { echo "::error::no libkrun.so under $KRUN_PREFIX"; exit 1; }
+          so="$(ls "$LIBKRUN_PREFIX"/libkrun.so* 2>/dev/null | head -1)"
+          test -n "$so" || { echo "::error::no libkrun.so under $LIBKRUN_PREFIX"; exit 1; }
           nm -D "$so" 2>/dev/null | grep -q krun_add_disk3 \
             || { echo "::error::materialized libkrun ($so) does not export krun_add_disk3; need >= 1.19.0"; exit 1; }
           echo "libkrun OK: $so exports krun_add_disk3"

@@ -1,0 +1,32 @@
+name: Setup libkrun (macOS)
+description: >
+  Provision libkrun from the slp/krun Homebrew tap. Self-installing keeps
+  macOS jobs from depending on hand-provisioned runner state — a missing
+  libkrun.dylib silently broke every code PR. Idempotent (a no-op when
+  already present); same tap the runner setup used, so the supply-chain
+  surface is unchanged. The existence check matters even after a successful
+  install: brew exits 0 for an installed-but-UNLINKED keg ("it's just not
+  linked"), a plausible state on a persistent shared runner, and minvmd's
+  build.rs links against /opt/homebrew/lib unconditionally on macOS.
+
+runs:
+  using: composite
+  steps:
+    - name: Provision libkrun (slp/krun tap)
+      shell: bash
+      run: brew install slp/krun/libkrun
+    - name: Verify libkrun is available (>= 1.19.0)
+      # krun_add_disk3 (the /dev/vdb attach) needs libkrun >= 1.19.0. Assert
+      # the runner's libkrun exports it, so a stale runner fails here with an
+      # actionable message instead of a cryptic dyld symbol-not-found at boot.
+      shell: bash
+      run: |
+        dylib=/opt/homebrew/lib/libkrun.dylib
+        if [ ! -f "$dylib" ]; then
+          echo "::error::libkrun.dylib not found under /opt/homebrew/lib despite brew exiting 0 (installed-but-unlinked keg?). Fix with: brew link slp/krun/libkrun" >&2
+          exit 1
+        fi
+        if ! nm -gU "$dylib" 2>/dev/null | grep -q '_krun_add_disk3'; then
+          echo "::error::runner libkrun lacks krun_add_disk3 (need >= 1.19.0); upgrade with: brew upgrade slp/krun/libkrun" >&2
+          exit 1
+        fi
