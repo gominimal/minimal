@@ -34,9 +34,9 @@ pub enum KernelFormat {
     ImageGz = 4,
 }
 
-/// Disk image format for `krun_add_disk2`. A squashfs or ext4 rootfs image is a
-/// `Raw` block device (the filesystem lives inside it; no partition table).
-/// QCOW2=1, VMDK=2 are not used by minvmd.
+/// Disk image format for `krun_add_disk2`/`krun_add_disk3`. A squashfs or ext4
+/// image is a `Raw` block device (the filesystem lives inside it; no partition
+/// table). QCOW2=1, VMDK=2 are not used by minvmd (see spec Non-Goals).
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DiskFormat {
@@ -68,6 +68,26 @@ pub const LOG_STYLE_AUTO: u32 = 0;
 /// libkrun's own env-var overrides enabled (as opposed to
 /// `KRUN_LOG_OPTION_NO_ENV`).
 pub const LOG_OPTIONS_DEFAULT: u32 = 0;
+
+/// Flush/sync behaviour for `krun_add_disk3`'s `sync_mode` argument.
+///
+/// Mirrors `KRUN_SYNC_{NONE,RELAXED,FULL}` in libkrun.h. **Note:** the header
+/// types this argument as `uint32_t`, a tri-state — *not* the `bool` the
+/// original spec (R1.1) described. The three modes trade durability against
+/// throughput:
+/// - [`None`][Self::None] (0) — ignore `VIRTIO_BLK_F_FLUSH`; fastest, may lose
+///   data on host crash.
+/// - [`Relaxed`][Self::Relaxed] (1) — honour flush but, on macOS, flush only the
+///   OS buffers (not the drive's). libkrun documents this as the recommended
+///   mode; on Linux it is identical to `Full`.
+/// - [`Full`][Self::Full] (2) — honour flush and force buffers to physical disk.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SyncMode {
+    None = 0,
+    Relaxed = 1,
+    Full = 2,
+}
 
 // SAFETY: every function in this block is an `extern "C"` declaration that
 // inherits its safety contract from libkrun.h. Specifically:
@@ -181,6 +201,21 @@ unsafe extern "C" {
         disk_path: *const c_char,
         disk_format: u32,
         read_only: bool,
+    ) -> i32;
+
+    /// Add a disk image as a virtio-blk device with cache/sync control.
+    /// `direct_io` bypasses the host page cache; `sync_mode` is one of
+    /// `KRUN_SYNC_{NONE,RELAXED,FULL}` ([`SyncMode`]) and governs how
+    /// `VIRTIO_BLK_F_FLUSH` is honoured. Used to attach the per-VM writable
+    /// data volume (`/dev/vdb`) with a bounded crash data-loss window.
+    pub fn krun_add_disk3(
+        ctx_id: u32,
+        block_id: *const c_char,
+        disk_path: *const c_char,
+        disk_format: u32,
+        read_only: bool,
+        direct_io: bool,
+        sync_mode: u32,
     ) -> i32;
 }
 

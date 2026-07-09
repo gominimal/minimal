@@ -239,6 +239,155 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// ext4 superblock magic (`0xEF53`), stored little-endian at byte offset 1080
+/// (superblock starts at 1024; `s_magic` is at offset 56 within it).
+const EXT4_MAGIC_OFFSET: u64 = 1080;
+const EXT4_MAGIC_LE: [u8; 2] = [0x53, 0xEF];
+
+/// Whether `device` already carries an ext4 filesystem, probed by reading the
+/// superblock magic. This is the idempotency gate for [`mount_state_volume`]:
+/// `mkfs` runs only when the magic is absent, so a VM restart after a partial
+/// format re-formats cleanly and a formatted volume is reused untouched.
+fn has_ext4_superblock(device: &str) -> std::io::Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(device)?;
+    f.seek(SeekFrom::Start(EXT4_MAGIC_OFFSET))?;
+    let mut buf = [0u8; 2];
+    match f.read_exact(&mut buf) {
+        Ok(()) => Ok(buf == EXT4_MAGIC_LE),
+        // A device smaller than the superblock offset cannot hold ext4.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// The device block size ext4 is formatted with (4 KiB).
+const EXT4_BLOCK_BYTES: u64 = 4096;
+
+/// Safety margin left below the device size when formatting (spec R1.5).
+///
+/// libkrun reserves a small trailer on the raw backing file and shaves it off
+/// between boots (observed: 64 KiB), so the block device the guest sees can
+/// shrink slightly after the first boot. Formatting to the *exact* device size
+/// then fails on the next boot with `EXT4-fs: bad geometry: block count exceeds
+/// device`. Sizing the filesystem 1 MiB below the device (16× the observed shave)
+/// keeps the ext4 geometry valid across reboots; 1 MiB on a multi-GiB volume is
+/// negligible.
+const MKFS_MARGIN_BYTES: u64 = 1024 * 1024;
+
+/// The size of `device` in bytes, read from `/sys/block/<name>/size` (which is
+/// in 512-byte sectors).
+fn device_size_bytes(device: &str) -> std::io::Result<u64> {
+    let name = std::path::Path::new(device)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "device has no basename")
+        })?;
+    let sectors: u64 = std::fs::read_to_string(format!("/sys/block/{name}/size"))?
+        .trim()
+        .parse()
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("bad block size: {e}"),
+            )
+        })?;
+    Ok(sectors * 512)
+}
+
+/// Smallest device we will format. Below this, the usable size after
+/// [`MKFS_MARGIN_BYTES`] leaves too little for a journalled ext4 (and a device
+/// ≤ the margin yields a zero block count), so `run_mkfs_ext4` rejects it rather
+/// than handing `mkfs.ext4` a nonsensical size. The real data volume is
+/// GiB-scale, so this only guards a misconfigured `MINVMD_VOLUME_BYTES` or a
+/// malformed device.
+const MKFS_MIN_DEVICE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Format `device` as ext4 via `mkfs.ext4 -F` (non-interactive). Resolves from
+/// `PATH` (`/usr/sbin`, set post-chroot in [`enter_rootfs`]); requires
+/// `e2fsprogs` in the rootfs closure (spec R1.7).
+///
+/// ext4's defaults are a decade of hard-won tuning and are left alone, including
+/// the inode ratio: mke2fs already defaults to a ~65536 bytes/inode ratio at
+/// these volume sizes (measured — identical inode count with or without an
+/// explicit `-i`), so no `-i` override is passed. Two non-default choices remain:
+///
+/// 1. **Eager inode + journal init** (`-E lazy_itable_init=0,lazy_journal_init=0`):
+///    zero the inode table + journal *now*, at mkfs, rather than in the
+///    background `ext4lazyinit` kernel thread after mount, so no background init
+///    competes with the guest bringing up its vsock bridge + SSH server on 2
+///    vCPUs. It's cheap because the volume is sparse — the zero-writes land in
+///    unallocated holes, so the init is ~instant regardless of size (measured
+///    sub-ms at 32–256 GiB). It runs once — first boot only; later boots detect
+///    the superblock and skip mkfs.
+///
+/// 2. **Survive libkrun's backing-file trailer shave** across reboots: pass an
+///    explicit block count sized [`MKFS_MARGIN_BYTES`] below the device (found via
+///    a 3-boot persistence test — without the margin the volume fails to re-mount
+///    on the next boot). The count is in block-size units, so `-b`
+///    [`EXT4_BLOCK_BYTES`] pins that unit to keep the arithmetic exact.
+fn run_mkfs_ext4(device: &str) -> std::io::Result<()> {
+    let device_bytes = device_size_bytes(device)?;
+    if device_bytes < MKFS_MIN_DEVICE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "data volume {device} is too small to format: {device_bytes} bytes \
+                 (minimum {MKFS_MIN_DEVICE_BYTES})"
+            ),
+        ));
+    }
+    let fs_blocks = device_bytes.saturating_sub(MKFS_MARGIN_BYTES) / EXT4_BLOCK_BYTES;
+    let status = std::process::Command::new("mkfs.ext4")
+        .arg("-F")
+        .arg("-q")
+        .args(["-b", &EXT4_BLOCK_BYTES.to_string()])
+        .args(["-E", "lazy_itable_init=0,lazy_journal_init=0"])
+        .arg(device)
+        .arg(fs_blocks.to_string())
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "mkfs.ext4 -F {device} ({fs_blocks} blocks) failed: {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Mount the per-VM writable data volume (spec R1.5).
+///
+/// Runs **after** [`enter_rootfs`] has chrooted into the rootfs, so `mkfs.ext4`
+/// resolves against the rootfs userland (the initramfs has no e2fsprogs) and the
+/// mount joins the live root mount namespace. Formats `device` on first boot
+/// (superblock-gated, idempotent) and mounts it read-write at `mountpoint` with
+/// `MS_NOATIME`.
+///
+/// Returns `Ok(true)` when the volume was mounted, `Ok(false)` when `device` is
+/// absent — the transitional legacy case where no data volume is attached and
+/// the caller keeps the tmpfs state dir. Unit 2 (R2.4/R2.5) makes an *attached*
+/// volume that fails to mount fatal; this Unit-1 form only reports the outcome.
+pub fn mount_state_volume(device: &str, mountpoint: &str) -> std::io::Result<bool> {
+    // `try_exists` distinguishes "absent" (Ok(false)) from a stat error (Err):
+    // a plain `exists()` reports a transiently-unstattable but attached device as
+    // absent, silently dropping to the ephemeral tmpfs and losing the volume.
+    if !std::path::Path::new(device).try_exists()? {
+        tracing::info!(device, "no data volume attached; keeping tmpfs state dir");
+        return Ok(false);
+    }
+    // Ensure the mountpoint exists before formatting: it must be present on the
+    // read-only rootfs (spec R1.7), so on a rootfs that predates R1.7 this fails
+    // with EROFS — better to surface that here than after a needless mkfs.
+    std::fs::create_dir_all(mountpoint)?;
+    if !has_ext4_superblock(device)? {
+        tracing::info!(device, "no ext4 superblock; formatting data volume");
+        run_mkfs_ext4(device)?;
+    }
+    raw_mount(device, mountpoint, "ext4", libc::MS_NOATIME)?;
+    tracing::info!(device, mountpoint, "mounted writable state volume");
+    Ok(true)
+}
+
 /// Mounts `/proc` and `/sys` if they are not already present.
 ///
 /// The kernel auto-mounts devtmpfs on `/dev`, but not these pseudo
@@ -537,6 +686,38 @@ fn mount_if_absent(target: &str, source: &str, fstype: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ext4_superblock_probe_detects_magic() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = std::env::temp_dir().join(format!("guest-sb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A file with the ext4 magic at offset 1080 probes positive.
+        let ext4 = dir.join("ext4.img");
+        {
+            let mut f = std::fs::File::create(&ext4).unwrap();
+            f.set_len(2048).unwrap();
+            f.seek(SeekFrom::Start(EXT4_MAGIC_OFFSET)).unwrap();
+            f.write_all(&EXT4_MAGIC_LE).unwrap();
+        }
+        assert!(has_ext4_superblock(ext4.to_str().unwrap()).unwrap());
+
+        // A zeroed image (freshly provisioned, unformatted) probes negative.
+        let blank = dir.join("blank.img");
+        std::fs::File::create(&blank)
+            .unwrap()
+            .set_len(2048)
+            .unwrap();
+        assert!(!has_ext4_superblock(blank.to_str().unwrap()).unwrap());
+
+        // A device too small to hold a superblock probes negative, not error.
+        let tiny = dir.join("tiny.img");
+        std::fs::File::create(&tiny).unwrap().set_len(64).unwrap();
+        assert!(!has_ext4_superblock(tiny.to_str().unwrap()).unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn write_ready_beacon_formats_two_lines() {

@@ -49,11 +49,11 @@ fn run_vmm() -> Result<()> {
     })?;
 
     let mut ctx = Context::create().context("krun_create_ctx")?;
-    // 2 vCPU; guest RAM from `crate::cmd::vm_ram_mib()` (env-overridable,
-    // default 4096 MiB) — the headroom feeds the in-VM session build's tmpfs
-    // package cache, but x86_64 needs a hole-safe size (see `DEFAULT_VM_RAM_MIB`).
-    // (Stay below the kernel's CONFIG_NR_CPUS.) `apply` configures the kernel +
-    // initramfs, the ext4 root disk, and the vsock bridge.
+    // 2 vCPU; guest RAM from `vm_ram_mib()` (env-overridable, tmpfs-headroom
+    // default; x86_64 needs a hole-safe size — see `DEFAULT_VM_RAM_MIB`). Stay
+    // below the kernel's CONFIG_NR_CPUS. `apply` configures the kernel +
+    // initramfs, the ext4 root disk, the writable data volume, and the vsock
+    // bridge.
     let mut cfg = VmConfig::new(2, crate::cmd::vm_ram_mib(), kernel, rootfs, initramfs);
     // An own-IP VM registers the per-PTask gvproxy shuttle vsock
     // bridge in `apply`; the host gvproxy is spawned by the parent supervisor.
@@ -62,6 +62,17 @@ fn run_vmm() -> Result<()> {
     if crate::cmd::own_ip_requested() {
         cfg = cfg.with_network_mode(minimald_rpc::NetworkMode::OwnIp);
     }
+
+    // Provision + attach the per-VM writable data volume as /dev/vdb (spec R1.4).
+    // On by default: the image lives at the resolved path (MINVMD_DATA_VOLUME_PATH
+    // override, else `<state>/data-vol.raw`) and is created sparse if missing.
+    // Provisioning at the literal path — not a stem-reconstructed one — so an
+    // explicit override is honoured verbatim.
+    let data_volume_path = crate::volume::resolve_data_volume_path();
+    crate::volume::ensure_sparse_raw(&data_volume_path, crate::volume::volume_bytes())
+        .context("provisioning writable data volume")?;
+    cfg = cfg.with_data_volume(data_volume_path);
+
     cfg.apply(&mut ctx)
         .context("applying VmConfig to krun context")?;
 

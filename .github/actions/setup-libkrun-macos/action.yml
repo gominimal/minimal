@@ -15,10 +15,18 @@ runs:
     - name: Provision libkrun (slp/krun tap)
       shell: bash
       run: brew install slp/krun/libkrun
-    - name: Verify libkrun is available
+    - name: Verify libkrun is available (>= 1.19.0)
+      # krun_add_disk3 (the /dev/vdb attach) needs libkrun >= 1.19.0. Assert
+      # the runner's libkrun exports it, so a stale runner fails here with an
+      # actionable message instead of a cryptic dyld symbol-not-found at boot.
       shell: bash
       run: |
-        if [ ! -f /opt/homebrew/lib/libkrun.dylib ]; then
+        dylib=/opt/homebrew/lib/libkrun.dylib
+        if [ ! -f "$dylib" ]; then
           echo "::error::libkrun.dylib not found under /opt/homebrew/lib despite brew exiting 0 (installed-but-unlinked keg?). Fix with: brew link slp/krun/libkrun" >&2
+          exit 1
+        fi
+        if ! nm -gU "$dylib" 2>/dev/null | grep -q '_krun_add_disk3'; then
+          echo "::error::runner libkrun lacks krun_add_disk3 (need >= 1.19.0); upgrade with: brew upgrade slp/krun/libkrun" >&2
           exit 1
         fi

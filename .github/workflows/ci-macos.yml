@@ -9,6 +9,7 @@ on:
         branches: ["main"]
         paths:
             - "crates/minvmd/**"
+            - "crates/minimald/**" # guest daemon: runs as pid-1 in the e2e/boot VM
             - "crates/minimal/**"
             - "crates/sessions/**" # platform-sensitive: canonicalization, symlinks
             - "Cargo.toml"
@@ -23,6 +24,7 @@ on:
         branches: ["main"]
         paths:
             - "crates/minvmd/**"
+            - "crates/minimald/**" # guest daemon: runs as pid-1 in the e2e/boot VM
             - "crates/minimal/**"
             - "crates/sessions/**" # platform-sensitive: canonicalization, symlinks
             - "Cargo.toml"
@@ -192,6 +194,17 @@ jobs:
                   MINVMD_INITRAMFS="$RUNNER_TEMP/initramfs/initramfs.cpio" \
                   MINVMD_BOOT_LOG="$RUNNER_TEMP/boot.log" \
                     "$testbin" --include-ignored --nocapture --exact minimald_exec_over_bridge
+            - name: Reap the Session-E2E VM before auto-spawn
+              # The session harness (Guest::drop) kills its minvmd but not the
+              # detached `__krun-vmm` grandchild it spawned; that VM lingers into
+              # the Auto-spawn step and, as a second concurrent VM, wedges the
+              # host→guest bridge over libkrun's vsock (#588), so the cold
+              # `minimal ls` connection is never delivered to the guest accept
+              # loop. Reap it so Auto-spawn starts from the single-VM state it had
+              # when it was its own job (before the boot+autospawn jobs merged).
+              run: |
+                  pkill -f '__krun-vmm' 2>/dev/null || true
+                  sleep 1
             - name: Auto-spawn E2E (minimal ls cold/warm, R4.5)
               # The R4.5 CLI proof artifact, on real hardware. From a clean state
               # `minimal ls` must auto-spawn minvmd and return within 8 s;
