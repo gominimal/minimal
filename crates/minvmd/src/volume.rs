@@ -10,11 +10,17 @@ use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Default size of a freshly provisioned data volume: 32 GiB. The image is a
+/// Default size of a freshly provisioned data volume: 256 GiB. The image is a
 /// sparse raw file, so the host allocates only the blocks the guest actually
-/// writes (allocate-on-write, verified by the sparsity proof gate); this value
-/// is the ceiling, not an up-front cost.
-pub const DEFAULT_VOLUME_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+/// writes (allocate-on-write, verified by the sparsity proof gate) — this is a
+/// ceiling the guest sees, not an up-front cost. A large default sidesteps the
+/// (hard, offline) resize path entirely; override with [`VOLUME_BYTES_ENV`].
+///
+/// First-boot cost is flat in the size: `mkfs.ext4` writes only ~5–8 MiB of
+/// metadata regardless (sparse backing + the reduced inode ratio), so format +
+/// mount stays ~40 ms at every size measured on an M-series host —
+/// 32 GiB → 40 ms · 64 GiB → 36 ms · 128 GiB → 37 ms · 256 GiB → 46 ms.
+pub const DEFAULT_VOLUME_BYTES: u64 = 256 * 1024 * 1024 * 1024;
 
 /// Environment variable overriding [`DEFAULT_VOLUME_BYTES`] (spec R1.3).
 pub const VOLUME_BYTES_ENV: &str = "MINVMD_VOLUME_BYTES";
@@ -233,6 +239,6 @@ mod tests {
     #[test]
     fn volume_bytes_defaults_when_unset() {
         // Not asserting on the env (tests share a process); just the default.
-        assert_eq!(DEFAULT_VOLUME_BYTES, 32 * 1024 * 1024 * 1024);
+        assert_eq!(DEFAULT_VOLUME_BYTES, 256 * 1024 * 1024 * 1024);
     }
 }
