@@ -1,3 +1,26 @@
+//! The on-disk/wire format of the remote cache index (`index.shisha`), and the
+//! in-memory [`IndexFile`] that reads and writes it.
+//!
+//! # Format
+//!
+//! A bare, headerless array of fixed 68-byte records, ordered by ascending
+//! `spec_hash` (an [`IndexFile`] is a `BTreeMap`, and [`IndexFile::write_to`]
+//! drains it in order). There is no magic, no version, and no entry count:
+//!
+//! ```text
+//! byte  0..32   spec_hash   blake3, the key
+//! byte 32..36   flags       reserved; MUST be zero
+//! byte 36..68   sha256      content hash of the build output
+//! ```
+//!
+//! Because the record order is a pure function of the keys, the same set of
+//! entries always serializes to identical bytes. Callers that sign or otherwise
+//! digest an index file depend on that.
+//!
+//! `flags` is the sole forward-compatibility hook: a reader that sees a
+//! non-zero value knows the format moved on and refuses to guess
+//! ([`IndexFile::from_reader`] errors rather than misparse).
+
 use common::SpecHash;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -38,9 +61,9 @@ impl<'a, R: Read> Iterator for IndexWireIter<'a, R> {
     }
 }
 
-/// The value of a [RemoteIndex] entry.
+/// The value of a [IndexFile] entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IndexEntry {
+pub(crate) struct IndexEntry {
     sha256: [u8; 32],
 }
 
@@ -69,11 +92,11 @@ impl IndexEntry {
 
 /// An in-memory index of build outputs accessible remotely.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct RemoteIndex {
+pub struct IndexFile {
     idx: BTreeMap<SpecHash, IndexEntry>,
 }
 
-impl RemoteIndex {
+impl IndexFile {
     /// Loads a remote index that was previously serialized with [Self::write_to].
     pub fn from_reader<R: Read>(reader: &mut R) -> std::io::Result<Self> {
         let mut err = None;
@@ -114,7 +137,7 @@ impl RemoteIndex {
     }
 }
 
-impl Extend<(SpecHash, [u8; 32])> for RemoteIndex {
+impl Extend<(SpecHash, [u8; 32])> for IndexFile {
     #[inline]
     fn extend<T: IntoIterator<Item = (SpecHash, [u8; 32])>>(&mut self, iter: T) {
         self.idx.extend(
@@ -168,7 +191,7 @@ mod tests {
         }
 
         let mut curs = Cursor::new(buf);
-        let ri = RemoteIndex::from_reader(&mut curs).unwrap();
+        let ri = IndexFile::from_reader(&mut curs).unwrap();
         assert_eq!(ri.idx.len(), 2);
         assert_eq!(
             ri.idx.first_key_value(),
