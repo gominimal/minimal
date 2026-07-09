@@ -296,12 +296,6 @@ fn device_size_bytes(device: &str) -> std::io::Result<u64> {
     Ok(sectors * 512)
 }
 
-/// Bytes-per-inode for the data volume's ext4. The default (16 KiB) would give a
-/// 32 GiB volume ~2M inodes and a ~512 MiB inode table; at 64 KiB it is ~524K
-/// inodes and a ~128 MiB table — still ample for a per-VM cache while keeping the
-/// table (and its zeroing) small. See [`run_mkfs_ext4`].
-const MKFS_BYTES_PER_INODE: u64 = 65536;
-
 /// Smallest device we will format. Below this, the usable size after
 /// [`MKFS_MARGIN_BYTES`] leaves too little for a journalled ext4 (and a device
 /// ≤ the margin yields a zero block count), so `run_mkfs_ext4` rejects it rather
@@ -314,20 +308,19 @@ const MKFS_MIN_DEVICE_BYTES: u64 = 16 * 1024 * 1024;
 /// `PATH` (`/usr/sbin`, set post-chroot in [`enter_rootfs`]); requires
 /// `e2fsprogs` in the rootfs closure (spec R1.7).
 ///
-/// The non-default options are *not* independent tuning — ext4's defaults are a
-/// decade of hard-won tuning and are otherwise left alone. Each option falls out
-/// of one of two deliberate choices:
+/// ext4's defaults are a decade of hard-won tuning and are left alone, including
+/// the inode ratio: mke2fs already defaults to a ~65536 bytes/inode ratio at
+/// these volume sizes (measured — identical inode count with or without an
+/// explicit `-i`), so no `-i` override is passed. Two non-default choices remain:
 ///
 /// 1. **Eager inode + journal init** (`-E lazy_itable_init=0,lazy_journal_init=0`):
 ///    zero the inode table + journal *now*, at mkfs, rather than in the
-///    background `ext4lazyinit` kernel thread after mount. That background init is
-///    hundreds of MiB of sustained I/O that would land right as the guest brings
-///    up its vsock bridge + SSH server on 2 vCPUs, stalling the first host→guest
-///    connect (observed as a gvproxy-forwarder timeout and `ssh connect:
-///    Disconnected`). Its one entailment is the reduced inode count
-///    (`-i` [`MKFS_BYTES_PER_INODE`]): fewer inodes → a smaller table to zero, so
-///    the eager init stays cheap. It runs once — first boot only; later boots
-///    detect the superblock and skip mkfs.
+///    background `ext4lazyinit` kernel thread after mount, so no background init
+///    competes with the guest bringing up its vsock bridge + SSH server on 2
+///    vCPUs. It's cheap because the volume is sparse — the zero-writes land in
+///    unallocated holes, so the init is ~instant regardless of size (measured
+///    sub-ms at 32–256 GiB). It runs once — first boot only; later boots detect
+///    the superblock and skip mkfs.
 ///
 /// 2. **Survive libkrun's backing-file trailer shave** across reboots: pass an
 ///    explicit block count sized [`MKFS_MARGIN_BYTES`] below the device (found via
@@ -350,7 +343,6 @@ fn run_mkfs_ext4(device: &str) -> std::io::Result<()> {
         .arg("-F")
         .arg("-q")
         .args(["-b", &EXT4_BLOCK_BYTES.to_string()])
-        .args(["-i", &MKFS_BYTES_PER_INODE.to_string()])
         .args(["-E", "lazy_itable_init=0,lazy_journal_init=0"])
         .arg(device)
         .arg(fs_blocks.to_string())
