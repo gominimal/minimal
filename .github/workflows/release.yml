@@ -480,12 +480,12 @@ jobs:
                   kernel-dest: ${{ runner.temp }}/vmlinuz-arm64
                   rootfs-dest: ${{ runner.temp }}/rootfs-arm64.img
             - name: Fetch pinned gvproxy (linux-amd64)
-              run: ./scripts/ci/retry.sh 3 10 ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy-linux-amd64" gvproxy-linux-amd64
+              run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy-linux-amd64" gvproxy-linux-amd64
             - name: Fetch pinned gvproxy (linux-arm64)
-              run: ./scripts/ci/retry.sh 3 10 ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy-linux-arm64" gvproxy-linux-arm64
+              run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy-linux-arm64" gvproxy-linux-arm64
             - name: Fetch pinned gvproxy (darwin-arm64)
               # Stashed as a `temp-` so sign-macos-artifacts (self-hosted) can sign it
-              run: ./scripts/ci/retry.sh 3 10 ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/temp-gvproxy-darwin-arm64" gvproxy-darwin
+              run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/temp-gvproxy-darwin-arm64" gvproxy-darwin
             - name: Upload kernel (amd64)
               uses: actions/upload-artifact@v7
               with:

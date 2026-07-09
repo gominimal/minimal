@@ -165,7 +165,7 @@ jobs:
         # binary; pin-verified, no Go toolchain. Publish its path for the gated
         # step below.
         run: |
-          ./scripts/ci/retry.sh 3 10 ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
+          ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
           echo "MINVMD_GVPROXY_BIN=$RUNNER_TEMP/gvproxy" >> "$GITHUB_ENV"
 
       - name: Materialize guest kernel + rootfs

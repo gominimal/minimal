@@ -3,9 +3,8 @@ description: >
   Materialize the guest microVM kernel (raw Image) and rootfs (ext4 image)
   for an arch via scripts/fetch-artifact.sh — cache pulls keyed by the pinned
   upstream commit, not builds, so any guest arch pulls fine on an x86_64
-  runner. The mip CLI that drives the pulls is built once, un-retried, so a
-  compile error fails fast; only the network-bound pulls retry. Assumes the
-  repository is checked out and any cargo cache restore has already happened.
+  runner. Assumes the repository is checked out and any cargo cache restore
+  has already happened (the first pull builds the mip CLI that drives it).
 
 inputs:
   arch:
@@ -21,25 +20,15 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Build mip CLI (drives the cache pulls)
-      # Deterministic compile, kept OUT of the retry loops below: a broken mip
-      # build fails once, fast, instead of being re-run to the job timeout.
-      # Same `cargo build -p mip` the fetch script would run internally.
-      shell: bash
-      run: cargo build -p mip
     - name: Materialize guest kernel (raw Image)
       shell: bash
       env:
         ARCH: ${{ inputs.arch }}
         DEST: ${{ inputs.kernel-dest }}
-      run: |
-        MIP="$PWD/target/debug/mip" \
-          ./scripts/ci/retry.sh 3 10 ./scripts/fetch-artifact.sh virtio-kernel "$DEST" "$ARCH"
+      run: ./scripts/fetch-artifact.sh virtio-kernel "$DEST" "$ARCH"
     - name: Materialize guest rootfs (ext4 image)
       shell: bash
       env:
         ARCH: ${{ inputs.arch }}
         DEST: ${{ inputs.rootfs-dest }}
-      run: |
-        MIP="$PWD/target/debug/mip" \
-          ./scripts/ci/retry.sh 3 10 ./scripts/fetch-artifact.sh minvmd-rootfs "$DEST" "$ARCH"
+      run: ./scripts/fetch-artifact.sh minvmd-rootfs "$DEST" "$ARCH"
