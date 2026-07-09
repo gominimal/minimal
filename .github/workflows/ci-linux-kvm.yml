@@ -168,10 +168,20 @@ jobs:
           echo "MINVMD_GVPROXY_BIN=$RUNNER_TEMP/gvproxy" >> "$GITHUB_ENV"
 
       - name: Materialize guest kernel (raw Image)
-        run: ./scripts/fetch-artifact.sh virtio-kernel "$RUNNER_TEMP/vmlinuz" x86_64
+        uses: ./.github/actions/materialize
+        with:
+          output: virtio-kernel
+          dest: ${{ runner.temp }}/vmlinuz
+          arch: x86_64
+          channel: unstable
 
       - name: Materialize guest rootfs (ext4 image)
-        run: ./scripts/fetch-artifact.sh minvmd-rootfs "$RUNNER_TEMP/rootfs.img" x86_64
+        uses: ./.github/actions/materialize
+        with:
+          output: minvmd-rootfs
+          dest: ${{ runner.temp }}/rootfs.img
+          arch: x86_64
+          channel: unstable
 
       - name: Build guest initramfs (minimald as /init)
         run: ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs.cpio" x86_64-unknown-linux-musl

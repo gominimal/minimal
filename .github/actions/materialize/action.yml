@@ -1,0 +1,99 @@
+name: 'Materialize minimal output'
+description: >-
+  Download the `mip` binary from a release channel and materialize an output
+  declared in the repo's `.minimal/minimal.toml` (e.g. the guest kernel or
+  rootfs). Replaces scripts/fetch-artifact.sh: instead of building the CLI from
+  source, it pulls a prebuilt `mip`. Like that script this is a cache fetch, so
+  a prebuilt guest artifact of any arch pulls fine on any Linux runner.
+inputs:
+  output:
+    description: 'Name of the output to materialize (e.g. virtio-kernel)'
+    required: true
+  dest:
+    description: 'Destination path to write the materialized output to'
+    required: true
+  arch:
+    description: >-
+      Target (guest) arch of the output, kernel-style: x86_64 or aarch64. This
+      is the artifact arch, independent of the runner arch that selects `mip`.
+    required: false
+    default: 'aarch64'
+  channel:
+    description: 'The release channel to fetch `mip` from'
+    required: false
+    default: 'stable'
+outputs:
+  version:
+    description: 'The specific `mip` version that was resolved and run'
+    value: ${{ steps.materialize.outputs.version }}
+runs:
+  using: 'composite'
+  steps:
+    - id: materialize
+      shell: bash
+      env:
+        BASE: https://storage.googleapis.com/minimal-one
+        INPUT_OUTPUT: ${{ inputs.output }}      # via env, not inline — injection-safe
+        INPUT_DEST: ${{ inputs.dest }}
+        INPUT_ARCH: ${{ inputs.arch }}
+        INPUT_CHANNEL: ${{ inputs.channel }}
+      run: |
+        # ---- platform guard: bail before any bash-4+ syntax appears ----
+        if [ "${RUNNER_OS:-$(uname -s)}" != "Linux" ]; then
+          echo "::error::materialize supports Linux only (got ${RUNNER_OS:-$(uname -s)}); see crates/minvmd/README.md"
+          exit 1
+        fi
+
+        set -euo pipefail   # everything below is free to use modern bash
+
+        case "$INPUT_ARCH" in
+          x86_64|aarch64) ;;
+          *) echo "::error::unsupported target arch '$INPUT_ARCH' (want x86_64 or aarch64)"; exit 1 ;;
+        esac
+
+        # ---- ensure unprivileged user namespaces are usable (idempotent) ----
+        userns_knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+        if [[ -e "$userns_knob" ]]; then
+          if [[ "$(cat "$userns_knob")" != "0" ]]; then
+            echo "Lifting AppArmor unprivileged-userns restriction for mip"
+            if ! sudo -n sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; then
+              echo "::error::passwordless sudo unavailable; set 'kernel.apparmor_restrict_unprivileged_userns=0' on this runner yourself"
+              exit 1
+            fi
+          else
+            echo "Unprivileged user namespaces already permitted"
+          fi
+        else
+          echo "No AppArmor userns restriction on this kernel; nothing to do"
+        fi
+
+        # hardened fetch: $1 = URL, $2 = output file
+        fetch() {
+          curl --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 -fsSL "$1" -o "$2"
+        }
+
+        # ---- select the mip binary for THIS runner's arch (not the target arch) ----
+        runner_arch="$(uname -m)"
+        case "$runner_arch" in
+          x86_64|amd64)  runner_arch="amd64" ;;
+          aarch64|arm64) runner_arch="arm64" ;;
+          *) echo "::error::unsupported runner arch: $runner_arch"; exit 1 ;;
+        esac
+
+        # ---- resolve version from the channel pointer ----
+        ptr="$RUNNER_TEMP/channel-pointer"
+        fetch "$BASE/$INPUT_CHANNEL" "$ptr"
+        version="$(tr -d '[:space:]' < "$ptr")"
+        [[ -n "$version" ]] || { echo "::error::empty version from channel '$INPUT_CHANNEL'"; exit 1; }
+        echo "Resolved minimal version: $version (channel: $INPUT_CHANNEL)"
+
+        # ---- fetch mip ----
+        bin="$RUNNER_TEMP/mip"
+        fetch "$BASE/versions/$version/mip-linux-$runner_arch" "$bin"
+        chmod +x "$bin"
+
+        # ---- materialize ----
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        mkdir -p "$(dirname "$INPUT_DEST")"
+        "$bin" materialize --output "$INPUT_DEST" --arch "$INPUT_ARCH" "$INPUT_OUTPUT"
+        echo "materialized $INPUT_OUTPUT -> $INPUT_DEST ($(wc -c < "$INPUT_DEST" | tr -d ' ') bytes, $INPUT_ARCH)"
