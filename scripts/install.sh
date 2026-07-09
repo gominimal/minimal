@@ -272,14 +272,16 @@ fi
 
 # --- Unit 2: target -> version -> manifest resolution ----------------------
 
-# R2.1 — optional first argument, the target, defaulting to `stable`. The
-# default applies only when no argument is given (`${1-…}`, not `${1:-…}`): an
-# explicitly-passed empty string is a malformed target and must be rejected, not
-# silently turned into `stable`. Validated against the safe charset before use.
-# The charset forbids `/`, so a value is always a single path segment; `.` and
-# `..` are rejected outright because curl normalizes `$BUCKET/..` back past the
-# bucket prefix (RFC 3986 dot-segment removal) before the request is sent.
-target="${1-stable}"
+# R2.1 — the target. A non-empty MINIMAL_INSTALL_TARGET_OVERRIDE (injected by
+# the download endpoint for a pinned target) wins outright; otherwise it is the
+# optional first argument, defaulting to `stable`. The default applies only when
+# no argument is given (`${1-…}`, not `${1:-…}`): an explicitly-passed empty
+# string is a malformed target and must be rejected, not silently turned into
+# `stable`. Validated against the safe charset before use. The charset forbids
+# `/`, so a value is always a single path segment; `.` and `..` are rejected
+# outright because curl normalizes `$BUCKET/..` back past the bucket prefix
+# (RFC 3986 dot-segment removal) before the request is sent.
+target="${MINIMAL_INSTALL_TARGET_OVERRIDE:-${1-stable}}"
 case "$target" in
     ''|.|..|*[!A-Za-z0-9._-]*) die "invalid target '$target' (allowed: A-Za-z0-9._-, not '.'/'..')" ;;
 esac
