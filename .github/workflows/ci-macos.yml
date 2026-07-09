@@ -194,16 +194,25 @@ jobs:
                   MINVMD_INITRAMFS="$RUNNER_TEMP/initramfs/initramfs.cpio" \
                   MINVMD_BOOT_LOG="$RUNNER_TEMP/boot.log" \
                     "$testbin" --include-ignored --nocapture --exact minimald_exec_over_bridge
-            - name: Reap the Session-E2E VM before auto-spawn
+            - name: Reap Session-E2E leftovers before auto-spawn
               # The session harness (Guest::drop) kills its minvmd but not the
-              # detached `__krun-vmm` grandchild it spawned; that VM lingers into
-              # the Auto-spawn step and, as a second concurrent VM, wedges the
-              # host→guest bridge over libkrun's vsock (#588), so the cold
-              # `minimal ls` connection is never delivered to the guest accept
-              # loop. Reap it so Auto-spawn starts from the single-VM state it had
-              # when it was its own job (before the boot+autospawn jobs merged).
+              # rest of the process tree it spawned: the detached `__krun-vmm`
+              # grandchild AND the host gvproxy switch minvmd owns. Either
+              # leftover wedges the host→guest bridge over libkrun's vsock
+              # (#588) — a healthy guest accept loop that never receives the
+              # bridged connection — so the cold `minimal ls` dies with `ssh
+              # connect: Disconnected`. The `__krun-vmm`-only reap proved
+              # insufficient: main run 29032763009 (on the commit that added
+              # it) failed exactly this way, with the new VM's proxy-publish
+              # WARN pointing at a lingering gvproxy. Reap the whole tree —
+              # any stray minvmd first (so nothing respawns), then the VMM and
+              # gvproxy — so Auto-spawn starts from the single-VM state it had
+              # when it was its own job. The proper fix (harness reaps its own
+              # process group) is tracked under #588.
               run: |
+                  pkill -x minvmd 2>/dev/null || true
                   pkill -f '__krun-vmm' 2>/dev/null || true
+                  pkill -f gvproxy 2>/dev/null || true
                   sleep 1
             - name: Auto-spawn E2E (minimal ls cold/warm, R4.5)
               # The R4.5 CLI proof artifact, on real hardware. From a clean state
