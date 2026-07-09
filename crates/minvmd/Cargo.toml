@@ -38,9 +38,11 @@ tokio.workspace = true
 # Production beacon-reading code calls russh::keys::known_hosts::learn_known_hosts_path
 # and russh::keys::ssh_key::PublicKey::from_openssh (R2.5).
 russh.workspace = true
+# `paths::minimal_state_dir()` supplies the canonical state-dir base for the
+# per-VM data-volume image path (see `volume::resolve_data_volume_path`).
+paths.workspace = true
 
 [dev-dependencies]
 serial_test.workspace = true
 tempfile.workspace = true
 sessions.workspace = true
-paths.workspace = true

@@ -169,6 +169,14 @@ pub struct ListenArgs {
     #[clap(hide = true)]
     mount_rootfs: Option<String>,
 
+    /// Device to format-on-first-boot + mount as the writable state volume at
+    /// `/var/lib/minimal` when running as a microVM init (R1.5/R1.6). When set
+    /// and the mount succeeds, cache + state are relocated onto it. Only useful
+    /// as a VM init process; `None` leaves state on the tmpfs default.
+    #[arg(long)]
+    #[clap(hide = true)]
+    mk_mount_state_volume: Option<String>,
+
     /// Daemonize: spawn minimald in a new session (setsid) and return once the
     /// SSH socket accepts connections, or an 8s timeout elapses. Used by the
     /// `minimal` CLI to auto-start a native (DM2) daemon on Linux.
@@ -286,13 +294,14 @@ async fn async_main() -> Result<(), MainError> {
     // would indicate we are operating in a single-purpose micro-vm.
     //
     // If we are not the init process, we load our config from CLI args.
-    let cli = if is_minimal_microvm() {
+    let mut cli = if is_minimal_microvm() {
         Cli {
             command: Command::Run(ListenArgs {
                 instance_num: 0,
                 vsock: true,
                 mount_dev: true,
                 mount_rootfs: Some("/dev/vda".to_string()),
+                mk_mount_state_volume: Some("/dev/vdb".to_string()),
                 detach: false,
                 // In-VM (DM1/3/4) the PTask attaches to the host gvproxy over the
                 // vsock shuttle, so no in-guest gvproxy binary path is needed.
@@ -353,6 +362,31 @@ async fn async_main() -> Result<(), MainError> {
         }
     }
 
+    // R1.5/R1.6: when the microVM config requested a data volume
+    // (`mk_mount_state_volume`), format-on-first-boot + mount it and, on success,
+    // relocate cache + state onto it so builds hardlinking from the cache stay on
+    // one filesystem (the EXDEV fix). Relocation is gated on the mount succeeding:
+    // pointing state at an unmounted /var/lib/minimal would land it on the
+    // read-only rootfs. When no volume is requested (the transitional case), state
+    // stays on the tmpfs default. Unit 2 (R2.4/R2.5) makes a failed mount loud and
+    // removes the silent-fallback path.
+    if let Some(dev) = cli.listen_args().unwrap().mk_mount_state_volume.clone() {
+        match guest::mount_state_volume(&dev, "/var/lib/minimal") {
+            Ok(true) => {
+                cli.global_args.minimal_state_dir =
+                    Some(DaemonAbsPath::try_new("/var/lib/minimal").unwrap().into());
+                cli.global_args.minimal_cache_dir = Some(
+                    DaemonAbsPath::try_new("/var/lib/minimal/cache")
+                        .unwrap()
+                        .into(),
+                );
+                tracing::info!(device = %dev, "cache + state relocated onto the data volume (/var/lib/minimal)");
+            }
+            Ok(false) => {}
+            Err(e) => tracing::error!(error = %e, device = %dev, "mounting data volume"),
+        }
+    }
+
     if let Err(e) = std::fs::create_dir_all(cli.minimal_state_dir())
         && e.kind() != std::io::ErrorKind::AlreadyExists
     {
@@ -377,11 +411,14 @@ async fn async_main() -> Result<(), MainError> {
         },
         minimal_state_dir: cli.minimal_state_dir(),
         minimal_cache_dir: cli.minimal_cache_dir(),
-        gvproxy_bin: listen_args.gvproxy_bin.clone(),
+        // Re-borrow `listen_args` fresh here (as the vsock branch below does):
+        // the R1.6 relocation above takes `&mut cli`, which ends the original
+        // `listen_args` borrow, so it cannot be held across that mutation.
+        gvproxy_bin: cli.listen_args().unwrap().gvproxy_bin.clone(),
         // The vsock listen path is exactly the libkrun-VM (DM1/3/4) case: an
         // `OwnIp` PTask must attach to the host gvproxy over the vsock shuttle,
         // not spawn gvproxy in-guest. The UDS path is DM2.
-        in_microvm: listen_args.vsock,
+        in_microvm: cli.listen_args().unwrap().vsock,
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.
@@ -443,7 +480,7 @@ async fn async_main() -> Result<(), MainError> {
             }
         };
 
-        let port_num = DEFAULT_VSOCK_PORT_BASE + listen_args.instance_num;
+        let port_num = DEFAULT_VSOCK_PORT_BASE + cli.listen_args().unwrap().instance_num;
         let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port_num))
             .map_err(|e| MainError::IO(e, "binding vsock port"))?;
 

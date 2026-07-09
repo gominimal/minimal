@@ -18,6 +18,7 @@ pub mod net;
 pub mod sock;
 pub mod state;
 pub mod vm;
+pub mod volume;
 
 #[cfg(minvmd_libkrun)]
 pub mod krun;

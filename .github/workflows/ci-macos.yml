@@ -9,6 +9,7 @@ on:
         branches: ["main"]
         paths:
             - "crates/minvmd/**"
+            - "crates/minimald/**" # guest daemon: runs as pid-1 in the e2e/boot VM
             - "crates/minimal/**"
             - "crates/sessions/**" # platform-sensitive: canonicalization, symlinks
             - "Cargo.toml"
@@ -19,6 +20,7 @@ on:
         branches: ["main"]
         paths:
             - "crates/minvmd/**"
+            - "crates/minimald/**" # guest daemon: runs as pid-1 in the e2e/boot VM
             - "crates/minimal/**"
             - "crates/sessions/**" # platform-sensitive: canonicalization, symlinks
             - "Cargo.toml"
@@ -141,6 +143,20 @@ jobs:
               # Idempotent (a no-op when already present); same slp/krun tap the runner
               # setup used, so the supply-chain surface is unchanged.
               run: brew install slp/krun/libkrun
+            - name: Verify libkrun is available (>= 1.19.0)
+              # krun_add_disk3 (the /dev/vdb attach) needs libkrun >= 1.19.0. Assert
+              # the runner's libkrun exports it, so a stale runner fails here with an
+              # actionable message instead of a cryptic dyld symbol-not-found at boot.
+              run: |
+                  dylib=/opt/homebrew/lib/libkrun.dylib
+                  if [ ! -f "$dylib" ]; then
+                    echo "::error::libkrun.dylib not found under /opt/homebrew/lib. Provision the runner with: brew install slp/krun/libkrun" >&2
+                    exit 1
+                  fi
+                  if ! nm -gU "$dylib" 2>/dev/null | grep -q '_krun_add_disk3'; then
+                    echo "::error::runner libkrun lacks krun_add_disk3 (need >= 1.19.0); upgrade with: brew upgrade slp/krun/libkrun" >&2
+                    exit 1
+                  fi
             - name: Download virtio-linux kernel
               uses: actions/download-artifact@v8
               with:
@@ -186,6 +202,17 @@ jobs:
                   MINVMD_INITRAMFS="$RUNNER_TEMP/initramfs/initramfs.cpio" \
                   MINVMD_BOOT_LOG="$RUNNER_TEMP/boot.log" \
                     "$testbin" --include-ignored --nocapture --exact minimald_exec_over_bridge
+            - name: Reap the Session-E2E VM before auto-spawn
+              # The session harness (Guest::drop) kills its minvmd but not the
+              # detached `__krun-vmm` grandchild it spawned; that VM lingers into
+              # the Auto-spawn step and, as a second concurrent VM, wedges the
+              # host→guest bridge over libkrun's vsock (#588), so the cold
+              # `minimal ls` connection is never delivered to the guest accept
+              # loop. Reap it so Auto-spawn starts from the single-VM state it had
+              # when it was its own job (before the boot+autospawn jobs merged).
+              run: |
+                  pkill -f '__krun-vmm' 2>/dev/null || true
+                  sleep 1
             - name: Auto-spawn E2E (minimal ls cold/warm, R4.5)
               # The R4.5 CLI proof artifact, on real hardware. From a clean state
               # `minimal ls` must auto-spawn minvmd and return within 8 s;
@@ -297,6 +324,20 @@ jobs:
               # present); same tap the runner setup used, so the supply-chain surface
               # is unchanged.
               run: brew install slp/krun/libkrun
+            - name: Verify libkrun is available (>= 1.19.0)
+              # krun_add_disk3 (the /dev/vdb attach) needs libkrun >= 1.19.0. Assert
+              # the runner's libkrun exports it, so a stale runner fails here with an
+              # actionable message instead of a cryptic dyld symbol-not-found at boot.
+              run: |
+                  dylib=/opt/homebrew/lib/libkrun.dylib
+                  if [ ! -f "$dylib" ]; then
+                    echo "::error::libkrun.dylib not found under /opt/homebrew/lib. Provision the runner with: brew install slp/krun/libkrun" >&2
+                    exit 1
+                  fi
+                  if ! nm -gU "$dylib" 2>/dev/null | grep -q '_krun_add_disk3'; then
+                    echo "::error::runner libkrun lacks krun_add_disk3 (need >= 1.19.0); upgrade with: brew upgrade slp/krun/libkrun" >&2
+                    exit 1
+                  fi
             - name: Clippy (minvmd)
               run: cargo clippy -p minvmd --all-targets -- -D warnings
             - name: Test (minvmd)
