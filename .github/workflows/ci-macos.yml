@@ -133,10 +133,10 @@ jobs:
     e2e:
         # Hypervisor E2E on real hardware, using the cache-pulled kernel + rootfs
         # ext4 image and the built initramfs (all from the `artifacts` job). One
-        # job (formerly boot-e2e + autospawn-e2e) so the single shared runner
-        # checks out, builds, and codesigns exactly once per run. Separate from
-        # build-macos so an artifact-fetch hiccup never blocks the always-green
-        # clippy/test/smoke checks.
+        # job (formerly boot-e2e + autospawn-e2e + build-macos's FFI smoke) so
+        # the single shared runner checks out, builds, and codesigns exactly
+        # once per run — everything that does NOT need the hypervisor lives in
+        # the GitHub-hosted `unit` job, keeping this runner free.
         #
         # GATING: green on the runner — raw kernel load (KRUN_KERNEL_FORMAT_RAW),
         # initramfs boot (minimald as `/init`, pid-1), minimald mounting the ext4
@@ -176,17 +176,40 @@ jobs:
               with:
                   name: minimald-initramfs-aarch64
                   path: ${{ runner.temp }}/initramfs
-            - name: Build session harness + minvmd + minimal (no run)
+            - name: Build test harnesses + minvmd + minimal (no run)
               # Build EVERYTHING before the single codesign, then run the test
               # BINARIES DIRECTLY (below). Any cargo invocation after signing
               # relinks (and unsigns) target/debug/minvmd, so krun_start_enter
               # fails with EINVAL. minimal spawns `minvmd` by name from PATH; only
-              # minvmd needs the hypervisor entitlement.
+              # minvmd needs the hypervisor entitlement. Building the krun_smoke
+              # harness also builds its krun_smoke_child helper bin (cargo builds
+              # package bins for integration tests) and bakes its absolute
+              # CARGO_BIN_EXE path — same-machine build+run, so it resolves.
               run: |
-                  cargo test -p minvmd --test minimald_session_e2e --no-run
+                  cargo test -p minvmd --test krun_smoke --test minimald_session_e2e --no-run
                   cargo build -p minvmd --bin minvmd -p minimal --bin minimal
             - name: Codesign minvmd (hypervisor entitlement, R1.4)
               run: codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
+            - name: Production linkage static check (rewrite on a copy)
+              # Run the release pipeline's @rpath rewrite + verification against a
+              # THROWAWAY COPY of the just-built minvmd, so a change that would
+              # break the shipped bin/../lib layout (a lost @rpath load command, a
+              # leaked non-system dylib) reds the PR instead of the next release.
+              # The copy keeps the e2e binaries untouched (the rewrite invalidates
+              # the signature; the copy is never executed).
+              run: |
+                  cp target/debug/minvmd "$RUNNER_TEMP/minvmd-linkage-check"
+                  scripts/rewrite-macos-linkage.sh "$RUNNER_TEMP/minvmd-linkage-check"
+            - name: FFI smoke against real libkrun (no VM boot)
+              # Exercises create_ctx -> set_vm_config -> set_exec through the safe
+              # wrappers via the krun_smoke_child helper. No kernel/rootfs env is
+              # set, so it takes the bring-up-only path: no krun_start_enter, no
+              # codesigned entitlement needed. Direct-binary run (never `cargo
+              # test`, which would relink and unsign minvmd).
+              run: |
+                  testbin="$(ls -1t target/debug/deps/krun_smoke-* | grep -v '\.d$' | head -1)"
+                  test -x "$testbin" || { echo "::error::krun_smoke test binary not found"; exit 1; }
+                  MINVMD_E2E=1 "$testbin" --include-ignored --nocapture
             - name: Session E2E (boot + full session over the bridge)
               # Gating: boots the GENERIC upstream rootfs with minimald shipped as the
               # initramfs /init; a russh client over the bridge authenticates, creates
@@ -309,28 +332,27 @@ jobs:
                       ${{ runner.temp }}/autospawn-boot.log
                   if-no-files-found: ignore
 
-    build-macos:
-        # Self-hosted Apple Silicon runner. minvmd links libkrun
-        # (`#[link(name = "krun")]`) and only compiles on macOS — the Linux CI
-        # builds it as a stub. Real hardware, so the hypervisor-backed FFI smoke
-        # runs here; GitHub-hosted macOS VMs can't. Scoped to minvmd, the only
-        # macOS-gated crate; widen to --workspace once the tree is mac-buildable.
-        #
-        # Gated on the RUN_MACOS_CI repo variable (defaults to enabled when unset).
-        # `timeout-minutes` counts time queued for a runner, so set
-        # RUN_MACOS_CI=false to skip while the runner is offline.
-        if: ${{ vars.RUN_MACOS_CI != 'false' }}
-        runs-on: [self-hosted, macOS, ARM64]
-        timeout-minutes: 30
+    unit:
+        # GitHub-hosted Apple Silicon (macos-latest is arm64). minvmd links
+        # libkrun (`#[link(name = "krun")]`) and only compiles the real impl on
+        # macOS — the Linux CI builds it as a stub — so its clippy/unit tier
+        # needs a mac, but NOT the hypervisor: everything hypervisor-backed
+        # (the krun_smoke FFI smoke, VM boots) lives in the `e2e` job on the
+        # self-hosted runner, which this job frees up for exactly that. Scoped
+        # to the macOS-sensitive crates; widen to --workspace once the tree is
+        # mac-buildable. Kept lean (private repo: macOS minutes bill at 10x).
+        runs-on: macos-latest
+        timeout-minutes: 45
         steps:
             - uses: actions/checkout@v7
               with:
-                  # Don't leave git credentials on the persistent self-hosted runner.
                   persist-credentials: false
             - name: Toolchain
               uses: dtolnay/rust-toolchain@stable
               with:
                   components: clippy
+            - name: Cache cargo registry and build artifacts
+              uses: Swatinem/rust-cache@v2
             - name: Provision libkrun (pinned own build)
               uses: ./.github/actions/setup-libkrun-macos
             - name: Clippy (minvmd)
@@ -340,11 +362,12 @@ jobs:
             - name: Test (sessions)
               # Platform-sensitive surface: std::fs::canonicalize behavior on
               # prefix-symlinked roots (/tmp → /private/tmp on macOS) and the
-              # follow_symlinks dual-path policy logic. Reuses the build
-              # cache from the minvmd job above.
+              # follow_symlinks dual-path policy logic.
+              #
+              # NOTE: `cargo test -p minimal` is deliberately absent — the CLI's
+              # dev-dependencies pull minimald (test-support), whose ungated
+              # hakoniwa -> libcgroups -> procfs chain does not build on macOS.
+              # (`cargo build -p minimal` is fine: no dev-deps.) The CLI's macOS
+              # coverage stays the autospawn e2e until minimald's sandbox deps
+              # are cfg(linux)-gated.
               run: cargo test -p sessions
-            - name: FFI smoke against real libkrun (no VM boot)
-              # Exercises create_ctx -> set_vm_config -> set_exec through the safe
-              # wrappers. Skips krun_start_enter (no kernel/rootfs), so it needs no
-              # codesigned hypervisor entitlement.
-              run: MINVMD_E2E=1 cargo test -p minvmd --test krun_smoke -- --include-ignored
