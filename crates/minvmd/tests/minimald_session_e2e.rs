@@ -29,6 +29,15 @@ use std::time::Duration;
 use serial_test::serial;
 use tempfile::TempDir;
 
+/// Isolated `XDG_STATE_HOME` under /tmp: macOS's $TMPDIR is deep enough that
+/// `<tempdir>/minimal/providers/local-0/*.sock` would overflow sun_path (104).
+fn short_state_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("mnl")
+        .tempdir_in("/tmp")
+        .expect("creating isolated state dir")
+}
+
 const BOOT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Env var the server reads to scope an exec to a session
@@ -59,7 +68,6 @@ fn e2e_enabled() -> bool {
 struct Guest {
     child: Child,
     sock_path: PathBuf,
-    _runtime: TempDir,
     _state: TempDir,
 }
 
@@ -74,16 +82,14 @@ impl Guest {
     /// Boots `minvmd boot --foreground` with minimald as the guest init and
     /// blocks until the `vm-up` (READY) line. Panics on boot timeout.
     fn boot() -> Guest {
-        let runtime = TempDir::new().expect("creating isolated runtime dir");
-        let state = TempDir::new().expect("creating isolated state dir");
-        let sock_path = runtime.path().join("minimal/minimald.sock");
+        let state = short_state_dir();
+        let sock_path = state.path().join("minimal/providers/local-0/ssh.sock");
 
         let exe = env!("CARGO_BIN_EXE_minvmd");
         let mut child = Command::new(exe)
             .args(["boot", "--foreground"])
             // minimald boots as the initramfs `/init` (MINVMD_INITRAMFS, set by
             // the caller); the rootfs stays generic.
-            .env("XDG_RUNTIME_DIR", runtime.path())
             .env("XDG_STATE_HOME", state.path())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -117,7 +123,6 @@ impl Guest {
         Guest {
             child,
             sock_path,
-            _runtime: runtime,
             _state: state,
         }
     }

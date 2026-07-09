@@ -236,8 +236,8 @@ jobs:
               # Run the prebuilt binaries directly (never `cargo run`, which would
               # relink and unsign minvmd). minimal finds `minvmd` via PATH; all three
               # of MINVMD_KERNEL_PATH / MINVMD_ROOTFS_PATH / MINVMD_INITRAMFS propagate
-              # through the `minvmd run --detach` re-exec. A fresh XDG_RUNTIME_DIR /
-              # XDG_STATE_HOME guarantees the clean (no-daemon) starting state.
+              # through the `minvmd run --detach` re-exec. A fresh XDG_STATE_HOME
+              # guarantees the clean (no-daemon) starting state.
               run: |
                   set -uo pipefail   # not -e: capture failures so we can dump diagnostics
                   export PATH="$PWD/target/debug:$PATH"
@@ -248,12 +248,12 @@ jobs:
                   # minimal -> `minvmd run --detach` -> `minvmd run` -> __krun-vmm chain,
                   # so the silent detached supervisor's boot is still observable here.
                   export MINVMD_BOOT_LOG="$RUNNER_TEMP/autospawn-boot.log"
-                  export XDG_RUNTIME_DIR="$(mktemp -d)"
-                  # minvmd resolves its state dir via dirs::state_dir(), which ignores
-                  # XDG_STATE_HOME on macOS and uses ~/.local/state. Clear it so the
-                  # proof starts from a genuinely clean (NotProvisioned) state on the
-                  # persistent runner.
-                  rm -rf "$HOME/.local/state/minimal/minvmd"
+                  # All state (minvmd.toml, locks, the bridge socket) lives under
+                  # $XDG_STATE_HOME/minimal/providers/local-0; a fresh dir gives a
+                  # genuinely clean (NotProvisioned) state on the persistent runner.
+                  # Under /tmp, not $TMPDIR: macOS's deep $TMPDIR would push the
+                  # socket paths past the 104-byte sun_path limit.
+                  export XDG_STATE_HOME="$(mktemp -d /tmp/mnl.XXXXXX)"
 
                   # macOS `date` has no %N; use perl's high-resolution clock for ms.
                   now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time()*1000'; }
@@ -267,7 +267,7 @@ jobs:
                   fail() {
                     echo "::group::autospawn-e2e diagnostics"
                     echo "--- minimal ls stderr ---"; cat "$RUNNER_TEMP/ls.err" 2>/dev/null || true
-                    echo "--- state.toml ---"; cat "$HOME/.local/state/minimal/minvmd/state.toml" 2>/dev/null || echo "(none)"
+                    echo "--- minvmd.toml ---"; cat "$XDG_STATE_HOME/minimal/providers/local-0/minvmd.toml" 2>/dev/null || echo "(none)"
                     echo "--- guest boot console (tail) ---"; tail -80 "$MINVMD_BOOT_LOG" 2>/dev/null || echo "(no boot log — VM never started)"
                     echo "::endgroup::"
                     minvmd stop >/dev/null 2>&1 || true
