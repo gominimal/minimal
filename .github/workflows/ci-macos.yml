@@ -19,7 +19,7 @@ on:
             # Composite actions this lane's setup runs through — without these,
             # a composite-only edit would skip this lane and break it post-merge.
             - ".github/actions/setup-libkrun-macos/**"
-            - ".github/actions/guest-artifacts/**"
+            - ".github/actions/materialize/**"
             # The libkrun pin: a bump must rebuild + re-run the hypervisor e2e.
             - "vendor/libkrun/**"
     pull_request:
@@ -36,7 +36,7 @@ on:
             # Composite actions this lane's setup runs through — without these,
             # a composite-only edit would skip this lane and break it post-merge.
             - ".github/actions/setup-libkrun-macos/**"
-            - ".github/actions/guest-artifacts/**"
+            - ".github/actions/materialize/**"
             # The libkrun pin: a bump must rebuild + re-run the hypervisor e2e.
             - "vendor/libkrun/**"
     workflow_dispatch:
@@ -88,12 +88,20 @@ jobs:
                       target/
                   key: ${{ runner.os }}-stage2-artifacts-${{ hashFiles('**/Cargo.lock') }}
                   restore-keys: ${{ runner.os }}-stage2-artifacts-
-            - name: Materialize guest kernel + rootfs
-              uses: ./.github/actions/guest-artifacts
+            - name: Materialize guest kernel (raw Image)
+              uses: ./.github/actions/materialize
               with:
+                  output: virtio-kernel
+                  dest: ${{ runner.temp }}/vmlinuz
                   arch: aarch64
-                  kernel-dest: ${{ runner.temp }}/vmlinuz
-                  rootfs-dest: ${{ runner.temp }}/rootfs.img
+                  channel: unstable
+            - name: Materialize guest rootfs (ext4 image)
+              uses: ./.github/actions/materialize
+              with:
+                  output: minvmd-rootfs
+                  dest: ${{ runner.temp }}/rootfs.img
+                  arch: aarch64
+                  channel: unstable
             - name: Install cross
               uses: taiki-e/install-action@v2
               with:
