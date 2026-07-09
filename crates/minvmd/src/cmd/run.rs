@@ -6,12 +6,14 @@
 //! before reporting boot success.
 //!
 //! `--detach` mode: re-execs the supervisor as a background process (new
-//! session via `setsid`) and returns only once the host UDS is accepting
-//! connections or the configurable timeout expires (R4.2).
+//! session via `setsid`) and returns only once the VM is serving (host UDS
+//! connectable, alive lock held, lifecycle Running) or the configurable
+//! timeout expires (R4.2).
 //!
 //! Without libkrun this subcommand bails immediately with a "no libkrun" error
 //! so the stock Linux CI (which has no libkrun) stays green.
 
+#[cfg(minvmd_libkrun)]
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -25,8 +27,8 @@ pub const DEFAULT_DETACH_TIMEOUT_SECS: u64 = 8;
 
 /// Run the `run` subcommand.
 ///
-/// - `detach`: if true, spawn the supervisor in the background and poll the
-///   host UDS until it accepts connections (up to `timeout_secs`).
+/// - `detach`: if true, spawn the supervisor in the background and poll until
+///   the VM is serving (up to `timeout_secs`).
 /// - `timeout_secs`: only used when `detach` is true; default 8 s.
 pub fn run(detach: bool, timeout_secs: u64) -> Result<()> {
     #[cfg(minvmd_libkrun)]
@@ -36,31 +38,6 @@ pub fn run(detach: bool, timeout_secs: u64) -> Result<()> {
     {
         let _ = (detach, timeout_secs);
         bail!("`minvmd run` requires libkrun (macOS, or Linux with libkrun installed)");
-    }
-}
-
-/// Poll `path` until a `UnixStream::connect` succeeds or `timeout` elapses.
-///
-/// Exposed publicly for unit testing and reuse by `run --detach`.
-/// Returns `Ok(())` on the first successful connect; returns an error on
-/// timeout.
-pub fn poll_uds_ready(path: &std::path::Path, timeout: Duration) -> Result<()> {
-    use std::os::unix::net::UnixStream;
-    use std::time::Instant;
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        if UnixStream::connect(path).is_ok() {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!(
-                "timed out after {}s waiting for UDS at {} to accept connections",
-                timeout.as_secs(),
-                path.display()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -81,8 +58,8 @@ fn run_supervisor(detach: bool, timeout_secs: u64) -> Result<()> {
     run_foreground()
 }
 
-/// Spawn `minvmd run` as a detached background supervisor, then poll the host
-/// UDS until it accepts connections (up to `timeout_secs`).
+/// Spawn `minvmd run` as a detached background supervisor, then poll until
+/// the VM is serving (up to `timeout_secs`).
 #[cfg(minvmd_libkrun)]
 fn run_detach(timeout_secs: u64) -> Result<()> {
     use std::os::unix::process::CommandExt as _;
@@ -109,16 +86,45 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
         });
     }
 
-    cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("spawning background run supervisor: {}", exe.display()))?;
 
+    // Ready = UDS connectable AND a minvmd holds the alive lock AND lifecycle
+    // is Running. The socket alone is not proof: ssh.sock is shared with
+    // native minimald (a live peer backend would satisfy a bare connect while
+    // our child's mutual-exclusion bail goes to /dev/null), and libkrun binds
+    // it at VMM start — long before the guest serves — dialling the guest
+    // vsock lazily per connection, so an early connect succeeds and then
+    // drops at ssh time. Running is written only after the guest's READY
+    // marker, which follows its vsock bind. A child exit surfaces as an error
+    // instead of a silent timeout.
     let uds_path = crate::sock::resolve_uds_path().context("resolving host UDS path")?;
-    poll_uds_ready(&uds_path, Duration::from_secs(timeout_secs)).with_context(|| {
-        format!(
-            "waiting for minvmd to become ready on {}",
-            uds_path.display()
-        )
-    })
+    let state_dir = crate::state::StateDir::new(crate::state::StateDir::default_path())
+        .context("opening state dir")?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        if let Some(status) = child.try_wait().context("polling supervisor child")? {
+            bail!(
+                "the detached supervisor exited during startup ({status}); \
+                 run `minvmd run` in the foreground to see the error"
+            );
+        }
+        if std::os::unix::net::UnixStream::connect(&uds_path).is_ok()
+            && state_dir.daemon_alive().context("probing alive lock")?
+            && state_dir.read_state().context("reading state")?.lifecycle
+                == crate::lifecycle::Lifecycle::Running
+        {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "timed out after {timeout_secs}s waiting for minvmd to become ready on {}",
+                uds_path.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Foreground supervisor: boot the VM, manage lifecycle state, supervise until
@@ -143,10 +149,10 @@ fn run_foreground() -> Result<()> {
     let state_dir = StateDir::new(StateDir::default_path()).context("opening state dir")?;
 
     // ── Phase 1: Stopped → Starting (under lock) ───────────────────────────
-    // The alive lock outlives the block: held (exclusively) for the whole
-    // supervisor life so observers can tell a live daemon from stale state.
-    let mut alive = state_dir.alive_lock().context("opening alive lock")?;
-    let _alive_guard;
+    // The alive lock outlives the block: held for the whole supervisor life
+    // and inherited by the VMM child, so observers can tell a live daemon/VM
+    // from stale state.
+    let alive_lock;
     {
         let mut lock = state_dir
             .lifecycle_lock()
@@ -154,9 +160,12 @@ fn run_foreground() -> Result<()> {
         let _guard = lock.write().context("acquiring lifecycle write lock")?;
         let state = state_dir.read_state().context("reading state")?;
 
-        _alive_guard = match alive.try_write() {
-            Ok(g) => g,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => match state.lifecycle {
+        alive_lock = match state_dir
+            .try_acquire_alive_lock()
+            .context("acquiring alive lock")?
+        {
+            Some(l) => l,
+            None => match state.lifecycle {
                 Lifecycle::Running => {
                     bail!("minvmd is already running (vmm_pid={:?})", state.vmm_pid)
                 }
@@ -164,9 +173,8 @@ fn run_foreground() -> Result<()> {
                 Lifecycle::Stopping => {
                     bail!("minvmd is stopping; wait for it to finish before restarting")
                 }
-                _ => bail!("another minvmd holds the alive lock"),
+                _ => bail!("another minvmd (a `boot` VM?) holds the alive lock"),
             },
-            Err(e) => return Err(e).context("acquiring alive lock"),
         };
 
         // Both backends bind the same ssh.sock; don't steal a live native
@@ -294,6 +302,7 @@ fn run_foreground() -> Result<()> {
     if let Some(dir) = crate::state::state_dir_override() {
         cmd.args(["--minimal-state-dir", dir.as_str()]);
     }
+    alive_lock.inherit_into(&mut cmd);
     let mut child = cmd
         .env(MARKER_SOCK_ENV, &marker_sock_path)
         .spawn()
@@ -433,29 +442,8 @@ fn run_foreground() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(minvmd_libkrun))]
     use super::*;
-
-    #[test]
-    fn poll_uds_returns_ok_when_listener_is_ready() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("test.sock");
-        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        assert!(
-            poll_uds_ready(&path, Duration::from_secs(1)).is_ok(),
-            "expected Ok when a listener is bound"
-        );
-    }
-
-    #[test]
-    fn poll_uds_times_out_when_no_listener() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("absent.sock");
-        let err = poll_uds_ready(&path, Duration::from_millis(150)).unwrap_err();
-        assert!(
-            err.to_string().contains("timed out"),
-            "expected a timeout error, got: {err}"
-        );
-    }
 
     #[cfg(not(minvmd_libkrun))]
     #[test]

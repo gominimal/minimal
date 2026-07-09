@@ -158,8 +158,7 @@ mod tests {
             started_at: Some(1_700_000_000),
         })
         .unwrap();
-        let mut alive = sd.alive_lock().unwrap();
-        let _guard = alive.try_write().unwrap();
+        let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
         let exit = run_with_state_dir(false, tmp.path().to_path_buf()).unwrap();
         assert_eq!(exit, StatusExit::Running);
     }
@@ -190,8 +189,7 @@ mod tests {
             started_at: None,
         })
         .unwrap();
-        let mut alive = sd.alive_lock().unwrap();
-        let _guard = alive.try_write().unwrap();
+        let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
         let exit = run_with_state_dir(false, tmp.path().to_path_buf()).unwrap();
         assert_eq!(exit, StatusExit::Stopped);
     }
@@ -206,8 +204,7 @@ mod tests {
             started_at: Some(0),
         })
         .unwrap();
-        let mut alive = sd.alive_lock().unwrap();
-        let _guard = alive.try_write().unwrap();
+        let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
         // run_with_state_dir prints to stdout; verify the exit code at minimum.
         let exit = run_with_state_dir(true, tmp.path().to_path_buf()).unwrap();
         assert_eq!(exit, StatusExit::Running);

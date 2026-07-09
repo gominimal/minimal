@@ -42,6 +42,7 @@ fn run_boot(foreground: bool) -> Result<()> {
 
     use crate::cmd::MARKER_SOCK_ENV;
     use crate::image::{resolve_kernel_path, resolve_rootfs_path};
+    use crate::state::StateDir;
 
     // R2.4: fail fast with an actionable error if the hypervisor backend is
     // unavailable (Linux: /dev/kvm). No-op on macOS.
@@ -54,6 +55,24 @@ fn run_boot(foreground: bool) -> Result<()> {
     let _rootfs = resolve_rootfs_path().context("resolving rootfs path")?;
     crate::sock::check_uds_path_len(&crate::sock::resolve_uds_path()?)?;
     crate::sock::check_uds_path_len(&crate::net::resolve_switch_sock()?)?;
+
+    // `boot` skips lifecycle state, but not mutual exclusion: it binds the
+    // shared ssh.sock, so it must hold the alive lock (inherited by the VMM
+    // child below — for a non-foreground boot the lock lives on in the child
+    // after this parent exits) and must not steal a native daemon's socket.
+    let state_dir = StateDir::new(StateDir::default_path()).context("opening state dir")?;
+    let alive_lock = state_dir
+        .try_acquire_alive_lock()
+        .context("acquiring alive lock")?
+        .ok_or_else(|| {
+            anyhow::anyhow!("minvmd is already running (or another boot VM is up); stop it first")
+        })?;
+    if state_dir
+        .minimald_alive()
+        .context("probing native minimald lock")?
+    {
+        bail!("a native minimald is serving this instance's socket; stop it first");
+    }
 
     // Create the marker socket under /tmp with a PID + random nonce to prevent
     // predictable-path TOCTOU attacks (local-only risk, but cheap to harden).
@@ -86,6 +105,7 @@ fn run_boot(foreground: bool) -> Result<()> {
     if let Some(dir) = crate::state::state_dir_override() {
         cmd.args(["--minimal-state-dir", dir.as_str()]);
     }
+    alive_lock.inherit_into(&mut cmd);
     let mut child = cmd
         .env(MARKER_SOCK_ENV, &marker_sock_path)
         // Inherit MINVMD_KERNEL_PATH and MINVMD_ROOTFS_PATH from environment.

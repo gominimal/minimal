@@ -163,8 +163,7 @@ mod tests {
         })
         .unwrap();
         // Hold the alive lock so Stopping counts as a live daemon.
-        let mut alive = sd.alive_lock().unwrap();
-        let _guard = alive.try_write().unwrap();
+        let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
         run_with_state_dir(tmp.path().to_path_buf()).unwrap();
         // The live daemon owns the transition; state is untouched.
         let s = sd.read_state().unwrap();
@@ -199,8 +198,7 @@ mod tests {
             started_at: None,
         })
         .unwrap();
-        let mut alive = sd.alive_lock().unwrap();
-        let _guard = alive.try_write().unwrap();
+        let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
         run_with_state_dir(tmp.path().to_path_buf()).unwrap();
         let s = sd.read_state().unwrap();
         assert_eq!(s.lifecycle, Lifecycle::Stopped);
@@ -216,8 +214,7 @@ mod tests {
             started_at: None,
         })
         .unwrap();
-        let mut alive = sd.alive_lock().unwrap();
-        let _guard = alive.try_write().unwrap();
+        let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
         assert!(run_with_state_dir(tmp.path().to_path_buf()).is_err());
     }
 
@@ -236,8 +233,7 @@ mod tests {
             started_at: None,
         })
         .unwrap();
-        let mut alive = sd.alive_lock().unwrap();
-        let _guard = alive.try_write().unwrap();
+        let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
         assert!(run_with_state_dir(tmp.path().to_path_buf()).is_err());
     }
 }

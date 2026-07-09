@@ -6,9 +6,10 @@
 //!
 //! - `minvmd.toml` — serialised [`State`] (lifecycle, pid, timestamp).
 //! - `lifecycle.lock` — advisory lock guarding concurrent transitions (R4.6).
-//! - `minvmd.lock` — the *alive* lock, held exclusively by the supervisor for
-//!   its entire life. The kernel releases it on process death, so a free lock
-//!   proves no daemon is alive regardless of what `minvmd.toml` claims.
+//! - `minvmd.lock` — the *alive* lock, held exclusively by the supervisor and
+//!   inherited by its `__krun-vmm` child (see [`AliveLock`]). The kernel
+//!   releases it only when both are gone, so a free lock proves no daemon
+//!   *and no VM* is alive regardless of what `minvmd.toml` claims.
 //!
 //! Writes to `minvmd.toml` are atomic: content is written to a `.tmp` sibling,
 //! `fsync`'d, then renamed over the target (R4.1).
@@ -21,6 +22,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
     sync::OnceLock,
 };
@@ -47,14 +49,19 @@ pub fn state_dir_override() -> Option<&'static DaemonAbsPath> {
     STATE_DIR_OVERRIDE.get()
 }
 
+/// The state-dir base every minvmd path derives from: the
+/// `--minimal-state-dir` override when set, else [`paths::minimal_state_dir`].
+pub fn state_base_dir() -> DaemonAbsPath {
+    STATE_DIR_OVERRIDE
+        .get()
+        .cloned()
+        .unwrap_or_else(paths::minimal_state_dir)
+}
+
 /// The provider-instance dir holding all minvmd runtime files:
 /// `<minimal_state_dir>/providers/local-0`.
 pub fn provider_dir() -> PathBuf {
-    let base = STATE_DIR_OVERRIDE
-        .get()
-        .cloned()
-        .unwrap_or_else(paths::minimal_state_dir);
-    paths::provider_instance_dir(&base, 0)
+    paths::provider_instance_dir(&state_base_dir(), 0)
         .as_utf8_path()
         .as_std_path()
         .to_path_buf()
@@ -177,7 +184,8 @@ impl StateDir {
         Ok(repaired)
     }
 
-    /// Whether a live daemon currently holds the alive lock.
+    /// Whether a live daemon (supervisor or its VMM child) holds the alive
+    /// lock.
     pub fn daemon_alive(&self) -> io::Result<bool> {
         lock_held(&self.alive_lock_path())
     }
@@ -189,11 +197,21 @@ impl StateDir {
         lock_held(&self.dir.join(paths::MINIMALD_LOCK_FILE))
     }
 
-    /// The alive lock. The supervisor `try_write()`s this once at startup and
-    /// holds the guard until exit; everyone else probes it via
-    /// [`Self::daemon_alive`].
-    pub fn alive_lock(&self) -> io::Result<RwLock<File>> {
-        Ok(RwLock::new(open_lock_file(&self.alive_lock_path())?))
+    /// Try to take the exclusive alive lock; `Ok(None)` when a live daemon
+    /// (or its VMM child) holds it.
+    pub fn try_acquire_alive_lock(&self) -> io::Result<Option<AliveLock>> {
+        let file = open_lock_file(&self.alive_lock_path())?;
+        // SAFETY: flock on an fd we own.
+        let r = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if r == 0 {
+            return Ok(Some(AliveLock { file }));
+        }
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            Ok(None)
+        } else {
+            Err(e)
+        }
     }
 
     /// Open the `lifecycle.lock` file suitable for wrapping in an
@@ -233,6 +251,39 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
         .write(true)
         .truncate(false)
         .open(path)
+}
+
+// ── AliveLock ─────────────────────────────────────────────────────────────────
+
+/// The exclusive alive lock, acquired via raw `flock` — deliberately NOT
+/// `fd_lock`, whose guard unlocks on drop. This lock is tied to the open file
+/// description and released only when every fd on it closes, so the VMM child
+/// that inherits the fd (via [`AliveLock::raw_fd`] + clearing `FD_CLOEXEC`
+/// across exec) keeps it held after the supervisor dies. Drop merely closes
+/// this process's fd.
+#[must_use = "dropping releases this process's hold on the lock"]
+pub struct AliveLock {
+    file: File,
+}
+
+impl AliveLock {
+    /// Arrange for `cmd`'s child to inherit the lock fd, keeping the lock
+    /// held while the child lives even if this process dies.
+    pub fn inherit_into(&self, cmd: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt as _;
+        let fd = self.file.as_raw_fd();
+        // SAFETY: fcntl in the forked child is async-signal-safe. Clearing
+        // FD_CLOEXEC there scopes inheritance to this child only — other
+        // spawns (e.g. gvproxy) must not hold the lock.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
 }
 
 // ── StartingGuard ─────────────────────────────────────────────────────────────
@@ -289,6 +340,20 @@ mod tests {
 
     fn make_state_dir(tmp: &tempfile::TempDir) -> StateDir {
         StateDir::new(tmp.path().to_path_buf()).expect("StateDir::new")
+    }
+
+    /// Assert the alive lock reads as released, polling briefly: another
+    /// test's in-flight fork duplicates lock fds until its exec (CLOEXEC), so
+    /// under a parallel test runner release is eventual, not instant.
+    fn assert_eventually_released(sd: &StateDir) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while sd.daemon_alive().unwrap() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "alive lock never released"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     // ── Atomic write round-trip ──────────────────────────────────────────────
@@ -381,11 +446,40 @@ mod tests {
 
         assert!(!sd.daemon_alive().unwrap(), "no holder → not alive");
 
-        let mut alive = sd.alive_lock().unwrap();
-        let guard = alive.try_write().expect("acquire alive lock");
+        let lock = sd
+            .try_acquire_alive_lock()
+            .unwrap()
+            .expect("acquire alive lock");
         assert!(sd.daemon_alive().unwrap(), "held lock → alive");
-        drop(guard);
-        assert!(!sd.daemon_alive().unwrap(), "released → not alive");
+        assert!(
+            sd.try_acquire_alive_lock().unwrap().is_none(),
+            "second exclusive acquisition must fail while held"
+        );
+        drop(lock);
+        assert_eventually_released(&sd);
+    }
+
+    #[test]
+    fn alive_lock_survives_in_child_after_parent_drop() {
+        let tmp = temp_dir();
+        let sd = make_state_dir(&tmp);
+
+        let lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        lock.inherit_into(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn sleep");
+
+        // Parent's fd closes; the child's inherited fd keeps the OFD locked.
+        drop(lock);
+        assert!(
+            sd.daemon_alive().unwrap(),
+            "lock must stay held by the child after the parent drops it"
+        );
+
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+        assert_eventually_released(&sd);
     }
 
     #[test]
@@ -430,8 +524,7 @@ mod tests {
         })
         .unwrap();
 
-        let mut alive = sd.alive_lock().unwrap();
-        let _guard = alive.try_write().expect("acquire alive lock");
+        let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
         let s = sd.effective_state().unwrap();
         assert_eq!(s.lifecycle, Lifecycle::Running);
         assert_eq!(s.vmm_pid, Some(42));
