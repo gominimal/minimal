@@ -229,6 +229,20 @@ impl ServerStateHandle {
         self.0.lock().await.shutdown.cancel();
     }
 
+    /// Whether this daemon runs as the in-VM guest (vsock transport). The
+    /// `Shutdown` RPC handler quiesces the state volume only in this mode —
+    /// on native Linux (DM2) the state dir is a plain host directory, not a
+    /// mount to sync/detach.
+    pub(crate) async fn in_microvm(&self) -> bool {
+        self.0.lock().await.config.in_microvm
+    }
+
+    /// The configured state dir (the quiesce target when in a microVM).
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn minimal_state_dir(&self) -> DaemonAbsPath {
+        self.0.lock().await.config.minimal_state_dir.clone()
+    }
+
     /// Returns the daemon's TLS certificate authority (only with
     /// `networking-proxy` feature). Used by the `IssueClientCert` RPC handler.
     #[cfg(feature = "networking-proxy")]

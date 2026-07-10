@@ -245,6 +245,12 @@ async fn serve_shutdown(s: ServerStateHandle, c: RuChannel<Msg>) {
             let mngr = s.sessions_manager().await;
             Ok(match mngr.shutdown(req.force).await {
                 Ok(()) => {
+                    // R2.1/R2.2: with the sessions drained, quiesce the state
+                    // volume (syncfs + detach) before acknowledging, so a
+                    // caller-driven VMM teardown right after the ack leaves a
+                    // clean ext4 journal. Best-effort with a bounded wait; the
+                    // journal replay backstop covers every failure arm.
+                    quiesce_state_volume_if_microvm(&s).await;
                     // Manager is down; tell the accept loop to stop and drain
                     // so the process can exit. Firing before the response is
                     // written is safe: the drain waits out the grace period,
@@ -260,6 +266,34 @@ async fn serve_shutdown(s: ServerStateHandle, c: RuChannel<Msg>) {
         tracing::warn!("RPC handler for {} failed: {}", Shutdown::NAME, e);
     }
 }
+
+/// Quiesce the guest state volume during shutdown (R2.2). No-op outside a
+/// microVM: on native Linux (DM2) the state dir is a plain host directory and
+/// must not be unmounted. `syncfs` is blocking, so it runs on the blocking
+/// pool with a 10 s ceiling; the handler proceeds regardless of the outcome.
+#[cfg(target_os = "linux")]
+async fn quiesce_state_volume_if_microvm(s: &ServerStateHandle) {
+    const QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    if !s.in_microvm().await {
+        return;
+    }
+    let mountpoint = s.minimal_state_dir().await;
+    let quiesce = tokio::task::spawn_blocking(move || {
+        crate::guest::quiesce_state_volume(mountpoint.as_utf8_path().as_str())
+    });
+    match tokio::time::timeout(QUIESCE_TIMEOUT, quiesce).await {
+        Ok(Ok(Ok(()))) => tracing::info!("state volume quiesced for shutdown"),
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(error = %e, "state volume quiesce failed; ext4 journal replay will recover")
+        }
+        Ok(Err(join)) => tracing::warn!(error = %join, "state volume quiesce task panicked"),
+        Err(_) => tracing::warn!("state volume quiesce timed out after 10s; proceeding"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn quiesce_state_volume_if_microvm(_s: &ServerStateHandle) {}
 
 /// `AbortSession`: drop a `Pending` session's stash entry and delete
 /// its on-disk record. See the manager arm for the actor-side rules

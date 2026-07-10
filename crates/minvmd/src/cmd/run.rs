@@ -296,6 +296,13 @@ fn run_foreground() -> Result<()> {
         }
     };
 
+    // R2.5: record whether the data volume image pre-exists this boot, before
+    // the VMM child provisions it — a later MOUNT_FAILED is fatal for a
+    // pre-existing image (may hold session data) and recoverable for a blank
+    // one freshly created by this boot.
+    let volume_path = crate::volume::resolve_data_volume_path();
+    let volume_preexisted = volume_path.exists();
+
     let exe = std::env::current_exe().context("resolving current executable path")?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("__krun-vmm");
@@ -342,10 +349,10 @@ fn run_foreground() -> Result<()> {
     // take ~20s+ to reach userspace, so a fixed 5s was too short.
     let ready_timeout: Duration = crate::cmd::ready_timeout();
     let known_hosts_path = crate::cmd::default_vm_known_hosts_path();
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<crate::cmd::BootBeacon, String>>();
     let sock_clone = marker_sock_path.clone();
     std::thread::spawn(move || {
-        let result = (|| -> Result<(), String> {
+        let result = (|| -> Result<crate::cmd::BootBeacon, String> {
             let (stream, _) = listener
                 .accept()
                 .map_err(|e| format!("accept on READY-marker socket: {e}"))?;
@@ -357,7 +364,10 @@ fn run_foreground() -> Result<()> {
     });
 
     let boot_result = match rx.recv_timeout(ready_timeout) {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(crate::cmd::BootBeacon::Ready)) => Ok(()),
+        Ok(Ok(crate::cmd::BootBeacon::MountFailed { reason })) => Err(
+            crate::cmd::mount_failed_error(&reason, &volume_path, volume_preexisted),
+        ),
         Ok(Err(e)) => Err(anyhow::anyhow!("boot failed: {e}")),
         Err(_) => Err(anyhow::anyhow!(
             "boot timed out waiting for READY marker after {} s (raise {} to wait longer)",

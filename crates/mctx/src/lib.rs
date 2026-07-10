@@ -263,6 +263,13 @@ impl DaemonContext {
         self.cache.clone()
     }
 
+    /// Releases the local cache's read tracker (its held-open append-log fd).
+    /// Called on daemon shutdown before unmounting the filesystem that holds
+    /// the cache; harmless otherwise (read tracking is best-effort).
+    pub fn release_cache_read_tracker(&self) {
+        self.cache.release_read_tracker();
+    }
+
     /// Initializes a bunch of internals and returns them. Use
     /// [`DaemonContext::init`] instead unless you are `minimal init`,
     /// which needs to use these before a full context can be built.

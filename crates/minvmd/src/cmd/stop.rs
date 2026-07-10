@@ -1,8 +1,9 @@
-//! `minvmd stop` subcommand (R4.4).
+//! `minvmd stop` subcommand (R4.4, R2.3).
 //!
-//! Reads `vmm_pid` from `minvmd.toml`, sends `SIGTERM` to the VMM child,
-//! waits up to 5 s, escalates to `SIGKILL` on timeout, then resets
-//! `minvmd.toml` to `Stopped`.
+//! Reads `vmm_pid` from `minvmd.toml`, asks the in-VM minimald to shut down
+//! (drain sessions + quiesce the data volume) over the bridge UDS, then sends
+//! `SIGTERM` to the VMM child, waits up to 5 s, escalates to `SIGKILL` on
+//! timeout, then resets `minvmd.toml` to `Stopped`.
 //!
 //! The command is idempotent: if the daemon is already stopped (or has never
 //! been provisioned), it returns successfully with no action. Stale active
@@ -15,10 +16,12 @@ use crate::state::{State, StateDir};
 
 /// Run the `stop` subcommand.
 pub fn run() -> Result<()> {
-    run_with_state_dir(StateDir::default_path())
+    run_with_state_dir(StateDir::default_path(), true)
 }
 
-fn run_with_state_dir(dir: std::path::PathBuf) -> Result<()> {
+/// `quiesce_guest` gates the Shutdown RPC (R2.3): production passes `true`;
+/// unit tests pass `false` so they never reach a live daemon's bridge socket.
+fn run_with_state_dir(dir: std::path::PathBuf, quiesce_guest: bool) -> Result<()> {
     let state_dir = StateDir::new(dir).context("opening state dir")?;
 
     // ── Phase 1: read current state under lock ───────────────────────────────
@@ -49,10 +52,15 @@ fn run_with_state_dir(dir: std::path::PathBuf) -> Result<()> {
         state.vmm_pid // may be None during Starting before pid is written
     };
 
-    // ── Phase 2: signal the VMM child (lock NOT held) ────────────────────────
+    // ── Phase 2: quiesce the guest, then signal the VMM child (lock NOT held) ─
     // Releasing the lock during the wait allows concurrent `status` reads.
     match vmm_pid {
-        Some(pid) => signal_and_wait(pid)?,
+        Some(pid) => {
+            if quiesce_guest {
+                shutdown_guest_best_effort();
+            }
+            signal_and_wait(pid)?
+        }
         None => {
             tracing::warn!("daemon is active but vmm_pid is absent; cleaning up state");
         }
@@ -71,6 +79,27 @@ fn run_with_state_dir(dir: std::path::PathBuf) -> Result<()> {
 
     tracing::info!("minvmd stopped");
     Ok(())
+}
+
+/// R2.3: ask the in-VM minimald (over the vsock bridge UDS) to drain sessions
+/// and quiesce the data volume before the VMM is signalled, so a clean stop
+/// leaves a clean ext4 journal. Best-effort: on any failure — guest already
+/// gone, bridge down, timeout — SIGTERM proceeds and the journal replay
+/// backstop bounds the damage.
+fn shutdown_guest_best_effort() {
+    // Must exceed the guest's own 10 s quiesce budget: the Shutdown RPC only
+    // acknowledges after the quiesce completes (or times out guest-side).
+    const GUEST_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+    match crate::sock::resolve_uds_path()
+        .map_err(anyhow::Error::from)
+        .and_then(|uds| crate::rpc_client::shutdown_guest(&uds, GUEST_SHUTDOWN_TIMEOUT))
+    {
+        Ok(resp) => tracing::info!(?resp, "guest acknowledged Shutdown RPC"),
+        Err(e) => {
+            tracing::warn!(error = %e, "guest Shutdown RPC failed; proceeding with SIGTERM")
+        }
+    }
 }
 
 /// Send `SIGTERM` to `pid`; wait up to 5 s; escalate to `SIGKILL` on timeout.
@@ -138,7 +167,7 @@ mod tests {
     fn stop_is_noop_when_not_provisioned() {
         let tmp = tempfile::tempdir().unwrap();
         // No state file — should be a no-op.
-        run_with_state_dir(tmp.path().to_path_buf()).unwrap();
+        run_with_state_dir(tmp.path().to_path_buf(), false).unwrap();
     }
 
     #[test]
@@ -146,7 +175,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let sd = make_state_dir(&tmp);
         sd.write_state(&State::stopped()).unwrap();
-        run_with_state_dir(tmp.path().to_path_buf()).unwrap();
+        run_with_state_dir(tmp.path().to_path_buf(), false).unwrap();
         // State should still be Stopped.
         let s = sd.read_state().unwrap();
         assert_eq!(s.lifecycle, Lifecycle::Stopped);
@@ -164,7 +193,7 @@ mod tests {
         .unwrap();
         // Hold the alive lock so Stopping counts as a live daemon.
         let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
-        run_with_state_dir(tmp.path().to_path_buf()).unwrap();
+        run_with_state_dir(tmp.path().to_path_buf(), false).unwrap();
         // The live daemon owns the transition; state is untouched.
         let s = sd.read_state().unwrap();
         assert_eq!(s.lifecycle, Lifecycle::Stopping);
@@ -183,7 +212,7 @@ mod tests {
             started_at: Some(0),
         })
         .unwrap();
-        run_with_state_dir(tmp.path().to_path_buf()).unwrap();
+        run_with_state_dir(tmp.path().to_path_buf(), false).unwrap();
         let s = sd.read_state().unwrap();
         assert_eq!(s.lifecycle, Lifecycle::Stopped);
     }
@@ -199,7 +228,7 @@ mod tests {
         })
         .unwrap();
         let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
-        run_with_state_dir(tmp.path().to_path_buf()).unwrap();
+        run_with_state_dir(tmp.path().to_path_buf(), false).unwrap();
         let s = sd.read_state().unwrap();
         assert_eq!(s.lifecycle, Lifecycle::Stopped);
     }
@@ -215,7 +244,7 @@ mod tests {
         })
         .unwrap();
         let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
-        assert!(run_with_state_dir(tmp.path().to_path_buf()).is_err());
+        assert!(run_with_state_dir(tmp.path().to_path_buf(), false).is_err());
     }
 
     #[test]
@@ -234,6 +263,6 @@ mod tests {
         })
         .unwrap();
         let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
-        assert!(run_with_state_dir(tmp.path().to_path_buf()).is_err());
+        assert!(run_with_state_dir(tmp.path().to_path_buf(), false).is_err());
     }
 }

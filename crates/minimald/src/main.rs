@@ -412,23 +412,37 @@ async fn async_main() -> Result<(), MainError> {
     // relocate cache + state onto it so builds hardlinking from the cache stay on
     // one filesystem (the EXDEV fix). Relocation is gated on the mount succeeding:
     // pointing state at an unmounted /var/lib/minimal would land it on the
-    // read-only rootfs. When no volume is requested (the transitional case), state
-    // stays on the tmpfs default. Unit 2 (R2.4/R2.5) makes a failed mount loud and
-    // removes the silent-fallback path.
+    // read-only rootfs.
+    //
+    // R2.4/R2.5: a mount failure is loud and terminal — emit MOUNT_FAILED
+    // instead of READY and park. No code path substitutes the /run/minimal
+    // tmpfs: session state is user data with no host copy, so a silent fallback
+    // would serve a ghost READY over a VM that quietly loses everything on stop.
     if let Some(dev) = cli.listen_args().unwrap().mk_mount_state_volume.clone() {
-        match guest::mount_state_volume(&dev, "/var/lib/minimal") {
-            Ok(true) => {
-                cli.global_args.minimal_state_dir =
-                    Some(DaemonAbsPath::try_new("/var/lib/minimal").unwrap().into());
+        match guest::mount_state_volume(&dev, guest::STATE_VOLUME_MOUNTPOINT) {
+            Ok(()) => {
+                cli.global_args.minimal_state_dir = Some(
+                    DaemonAbsPath::try_new(guest::STATE_VOLUME_MOUNTPOINT)
+                        .unwrap()
+                        .into(),
+                );
                 cli.global_args.minimal_cache_dir = Some(
-                    DaemonAbsPath::try_new("/var/lib/minimal/cache")
+                    DaemonAbsPath::try_new(format!("{}/cache", guest::STATE_VOLUME_MOUNTPOINT))
                         .unwrap()
                         .into(),
                 );
                 tracing::info!(device = %dev, "cache + state relocated onto the data volume (/var/lib/minimal)");
             }
-            Ok(false) => {}
-            Err(e) => tracing::error!(error = %e, device = %dev, "mounting data volume"),
+            Err(e) => {
+                tracing::error!(error = %e, device = %dev, "data volume mount failed; refusing READY (R2.4)");
+                let _ = guest::emit_mount_failed_marker(&e.to_string()).await;
+                // Park like the no-rootfs degraded path above: exiting pid-1
+                // tears the VMM down racing the host's marker read; the host
+                // kills the child once it has consumed MOUNT_FAILED.
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                }
+            }
         }
     }
 
@@ -449,12 +463,24 @@ async fn async_main() -> Result<(), MainError> {
     // Single-instance guard, held for the daemon's lifetime (the kernel
     // releases it on death): a second minimald must not steal this
     // instance's socket.
+    //
+    // In a microVM the lock lives on the /run tmpfs, not the provider dir:
+    // the provider dir sits on the persistent data volume, and a
+    // lifetime-held write fd there pins the volume busy through the shutdown
+    // quiesce (R2.1), leaving a dirty ext4 journal on every clean stop.
+    // Nothing outside this boot reads the guest's lock (the host probes its
+    // own provider dir, and `--detach`'s lock probe is rejected with
+    // `--vsock`), so boot-ephemeral tmpfs is the honest home for it.
+    let instance_lock_path = if cli.listen_args().unwrap().vsock {
+        DaemonAbsPath::try_new(format!("/run/minimald-local-{}.lock", cli.instance_num()))
+            .expect("static /run lock path is absolute")
+    } else {
+        cli.client_instance_dir()
+            .sub_path_unchecked(paths::MINIMALD_LOCK_FILE)
+    };
     let mut instance_lock = fd_lock::RwLock::new(
-        open_lock_file(
-            cli.client_instance_dir()
-                .sub_path_unchecked(paths::MINIMALD_LOCK_FILE),
-        )
-        .map_err(|e| MainError::IO(e, "opening instance lock"))?,
+        open_lock_file(instance_lock_path)
+            .map_err(|e| MainError::IO(e, "opening instance lock"))?,
     );
     let instance_guard = match instance_lock.try_write() {
         Ok(guard) => guard,

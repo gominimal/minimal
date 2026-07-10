@@ -356,6 +356,16 @@ impl<FS: FileSystem> Cache<FS> {
         f(&*guard)
     }
 
+    /// Releases the read tracker, closing its locked `alog/<n>.v1` file.
+    ///
+    /// Read trackers aren't essential to operation (see construction); a
+    /// daemon about to unmount the filesystem holding the cache calls this so
+    /// the tracker's held-open fd doesn't pin the mount busy. Subsequent
+    /// reads simply stop being recorded.
+    pub fn release_read_tracker(&self) {
+        self.inner().read_tracker = None;
+    }
+
     /// Reads a directory cached as the given spec hash.
     pub fn read_dir(&self, hash: &SpecHash) -> Result<DirCacheEntry<FS>, CacheErr> {
         let i = self.inner();
