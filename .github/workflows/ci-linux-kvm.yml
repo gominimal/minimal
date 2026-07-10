@@ -77,6 +77,11 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.kvm == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      # Slim debug info (usable backtraces, smaller caches, faster links);
+      # this job doesn't run the setup-rust composite that sets this on the
+      # other Linux lanes.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - name: Free Disk Space
         # The workspace build + libkrun prefix routinely exceed the ~14 GB
@@ -114,7 +119,9 @@ jobs:
           tool: cross,nextest
 
       - name: Cache cargo + build artifacts
-        uses: actions/cache@v6
+        # Restore-only; the save half (main only) runs at the end of the job.
+        id: cargo-cache
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/bin/
@@ -139,7 +146,7 @@ jobs:
         run: ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs.cpio" x86_64-unknown-linux-musl
 
       - name: Build minvmd
-        run: cargo build -p minvmd --bin minvmd
+        run: cargo build -p minvmd --bin minvmd --locked
 
       - name: Build the minimal CLI
         # SEPARATE invocation from the minvmd build: a combined `cargo build
@@ -147,7 +154,7 @@ jobs:
         # into the CLI's default-features=false opt-out, linking libkrun into
         # `minimal` (the regression the macOS lane hit and now guards). The
         # CLI drives the unified session e2e in the test job.
-        run: cargo build -p minimal --bin minimal
+        run: cargo build -p minimal --bin minimal --locked
 
       - name: Archive e2e harnesses + stage the testbed
         # `cargo nextest archive` replaces the hand-rolled testbins.json
@@ -160,7 +167,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p testbed
-          cargo nextest archive -p minvmd --archive-file testbed/nextest-archive.tar.zst
+          cargo nextest archive -p minvmd --locked --archive-file testbed/nextest-archive.tar.zst
           cp target/debug/minvmd testbed/minvmd
           cp target/debug/minimal testbed/minimal
           cp "$RUNNER_TEMP/initramfs.cpio" testbed/initramfs.cpio
@@ -174,6 +181,20 @@ jobs:
           path: testbed/
           if-no-files-found: error
           retention-days: 3
+
+      - name: Save cargo + build artifacts cache (main only)
+        # PR branches restore but never write: multi-GB caches written by
+        # every branch LRU-evict the main entries all PRs restore from.
+        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   test-kvm:
     # TEST phase: no Rust toolchain, no cargo build — download the testbed,

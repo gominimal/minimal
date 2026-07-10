@@ -5,11 +5,19 @@ description: >
   proofs behind non-default features (e.g. networking-proxy, networking-wg)
   are NOT run here — invoke those explicitly in the calling workflow.
 
+inputs:
+  shared-key:
+    description: rust-cache shared-key, forwarded to setup-rust.
+    required: false
+    default: tests
+
 runs:
   using: composite
   steps:
     - name: Setup Rust
       uses: ./.github/actions/setup-rust
+      with:
+        shared-key: ${{ inputs.shared-key }}
     - name: Install nextest
       uses: taiki-e/install-action@v2
       with:
@@ -21,7 +29,7 @@ runs:
       shell: bash
       # --no-tests=fail: an empty selection is a broken filter or a dropped
       # target, not a pass.
-      run: cargo nextest run --workspace --profile ci --no-tests=fail
+      run: cargo nextest run --workspace --locked --profile ci --no-tests=fail
     - name: Run doctests
       shell: bash
-      run: cargo test --workspace --doc
+      run: cargo test --workspace --doc --locked
