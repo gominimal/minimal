@@ -305,6 +305,19 @@ jobs:
       # minimald_session_e2e; session coverage of the bridge is provided by
       # Session E2E above plus the daemon lifecycle step below.
 
+      - name: Reap leftover VM processes
+        # The harness runs above can leak __krun-vmm / gvproxy children on
+        # failure (Guest::drop kills only its own minvmd), and a leftover
+        # wedges the vsock bridge for the fresh daemons the next two steps
+        # spawn (lifecycle, then the CLI session e2e). Root-owned leftovers
+        # are possible here (the relay e2e runs under sudo), hence sudo.
+        # Ported from the macOS lane; the proper fix is for the harness to
+        # reap its own process group, tracked separately.
+        run: |
+          sudo pkill -x minvmd || true
+          sudo pkill -f __krun-vmm || true
+          sudo pkill -f gvproxy || true
+
       - name: Daemon lifecycle (run --detach → status → stop)
         # Exercises the supervised daemon path that manages the lifecycle
         # state, which the harness e2e tests above do not cover. The script
@@ -312,18 +325,6 @@ jobs:
         env:
           MINVMD_BOOT_LOG: ${{ runner.temp }}/boot-daemon.log
         run: ./scripts/lifecycle-e2e.sh
-
-      - name: Reap leftover VM processes
-        # The harness runs above can leak __krun-vmm / gvproxy children on
-        # failure (Guest::drop kills only its own minvmd), and a leftover
-        # wedges the vsock bridge for the CLI e2e's fresh daemon. Root-owned
-        # leftovers are possible here (the relay e2e runs under sudo), hence
-        # sudo. Ported from the macOS lane; the proper fix is for the harness
-        # to reap its own process group, tracked separately.
-        run: |
-          sudo pkill -x minvmd || true
-          sudo pkill -f __krun-vmm || true
-          sudo pkill -f gvproxy || true
 
       - name: Session e2e via the CLI (activate/exec/destroy; autospawns minvmd)
         # The SAME unified proof every target lane runs (scripts/session-e2e.sh)
