@@ -21,6 +21,15 @@ use crate::wire::request::WireContribution;
 /// [`PolicyHooks`]: crate::core::hooks::PolicyHooks
 pub struct UserComposer {
     contribution: Contribution,
+    /// Names of every loadout already accepted via [`Self::add`].
+    /// Duplicates are rejected up-front: `Loadout::follow_symlinks`
+    /// is now stamped onto each patch's [`ProvenancedPatch`] and
+    /// keyed by loadout name in the [`Source::UserLoadout`]
+    /// provenance, so two loadouts sharing a name would produce
+    /// patches that couldn't be attributed unambiguously.
+    ///
+    /// [`Source::UserLoadout`]: crate::core::source::Source::UserLoadout
+    seen_names: std::collections::HashSet<crate::core::loadout::LoadoutName>,
     env: StoredEnv,
 }
 
@@ -28,6 +37,7 @@ impl core::fmt::Debug for UserComposer {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("UserComposer")
             .field("contribution", &self.contribution)
+            .field("seen_names", &self.seen_names)
             .field("env", &"<closure>")
             .finish()
     }
@@ -51,6 +61,7 @@ impl UserComposer {
     pub fn new() -> Self {
         Self {
             contribution: Contribution::new(),
+            seen_names: std::collections::HashSet::new(),
             env: default_env(),
         }
     }
@@ -70,10 +81,23 @@ impl UserComposer {
     /// Returns any error the loadout surfaces while resolving inherit
     /// or `InheritWithDefault` variables against `env`.
     pub fn add(&mut self, loadout: Loadout) -> Result<(), Error> {
+        // Loadout names must be unique within a composer instance.
+        // Two loadouts sharing a name would produce patches under the
+        // same `Source::UserLoadout { name }`, and their
+        // `follow_symlinks` overrides — stamped onto each patch's
+        // `ProvenancedPatch` at contribute time — couldn't be
+        // attributed unambiguously downstream.
+        if self.seen_names.contains(loadout.name()) {
+            return Err(Error::DuplicateLoadout {
+                name: loadout.name().as_ref().to_string(),
+            });
+        }
+        let name = loadout.name().clone();
         let incoming = loadout.contribute(&*self.env)?;
         // `merge` is internally atomic — on `Err`, `self.contribution`
         // is untouched.
         self.contribution.merge(incoming)?;
+        self.seen_names.insert(name);
         Ok(())
     }
 
@@ -139,6 +163,7 @@ fn composition_to_wire(composition: Composition) -> WireContribution {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::compose::Composable;
     use crate::core::lifecyclehook::{HookScript, LifecycleHook};
     use crate::core::loadout::LoadoutName;
     use crate::core::policy::VarsPolicy;
@@ -217,6 +242,49 @@ mod tests {
         assert_eq!(wire.requested_packages.len(), 1);
         assert_eq!(wire.requested_packages[0].name, "helix");
         assert_eq!(wire.lifecycle_hooks.len(), 1);
+    }
+
+    /// Adding two loadouts with the same name is rejected. This is
+    /// the invariant that lets each patch's `follow_symlinks`
+    /// override be attributed unambiguously to its source loadout.
+    #[test]
+    fn add_rejects_duplicate_loadout_names() {
+        let l1 = loadout_named("dev");
+        let l2 = loadout_named("dev");
+        let mut composer = UserComposer::new();
+        composer.add(l1).unwrap();
+        let err = composer.add(l2).unwrap_err();
+        assert!(
+            matches!(err, Error::DuplicateLoadout { ref name } if name == "dev"),
+            "got: {err:?}",
+        );
+    }
+
+    /// Per-loadout `follow_symlinks` is stamped onto every patch the
+    /// loadout contributes; a loadout that doesn't set it leaves
+    /// patches with `follow_symlinks = None`, which falls through to
+    /// the compose default at expand time.
+    #[test]
+    fn per_loadout_follow_symlinks_stamps_onto_contributed_patches() {
+        use crate::core::primitives::{Patch, PatchDest};
+
+        let patch = Patch::new("/tmp/whatever", PatchDest::try_new("etc/whatever").unwrap());
+        let opted_in = loadout_named("follow")
+            .with_patch(patch.clone())
+            .with_follow_symlinks(true);
+        let inherit = loadout_named("inherit").with_patch(patch);
+
+        let contrib_in = opted_in
+            .contribute(&|_| Err(std::env::VarError::NotPresent))
+            .unwrap();
+        assert_eq!(contrib_in.patches.len(), 1);
+        assert_eq!(contrib_in.patches[0].follow_symlinks(), Some(true));
+
+        let contrib_none = inherit
+            .contribute(&|_| Err(std::env::VarError::NotPresent))
+            .unwrap();
+        assert_eq!(contrib_none.patches.len(), 1);
+        assert_eq!(contrib_none.patches[0].follow_symlinks(), None);
     }
 
     /// `add_all` runs a sequence of loadouts. Multiple loadouts

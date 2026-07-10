@@ -57,6 +57,13 @@ pub enum Error {
         #[from]
         source: Conflict,
     },
+    /// A loadout with this name was already added to the composer.
+    /// Loadout names must be unique within a composer instance so
+    /// per-loadout settings (like `follow_symlinks`) can be attributed
+    /// unambiguously; a duplicate would silently overwrite an earlier
+    /// setting on the map keyed by name.
+    #[error("loadout name `{name}` was already added to this composer")]
+    DuplicateLoadout { name: String },
 }
 
 /// Conflicts surfaced when two contributions disagree on a value.
@@ -326,6 +333,20 @@ impl Contribution {
     /// Append a lifecycle hook in place.
     pub fn push_hook(&mut self, h: ProvenancedHook) {
         self.lifecycle_hooks.push(h);
+    }
+
+    /// Overwrite the `follow_symlinks` override on every currently
+    /// accumulated patch. Used by
+    /// [`Loadout::contribute`](crate::core::loadout::Loadout::contribute)
+    /// to stamp the loadout's per-source override after
+    /// `contribute_primitives` produced patches with the default
+    /// `None`.
+    pub fn set_follow_symlinks_on_patches(&mut self, follow: Option<bool>) {
+        for p in std::mem::take(&mut self.patches) {
+            let (patch, source, _) = p.into_parts();
+            self.patches
+                .push(ProvenancedPatch::new(patch, source).with_follow_symlinks(follow));
+        }
     }
 
     /// Merge `other` into `self`: concatenate vars/patches/hooks and
@@ -1263,21 +1284,30 @@ pub(crate) fn gate_vars(
 /// first [`ExpandError`](crate::core::expansion::ExpandError); a partial
 /// expansion would let some patches reach the walker with their
 /// references intact, which silently matches wrong paths.
+///
+/// Per-patch `follow_symlinks` is resolved here: any `Some(v)` carried
+/// on the [`ProvenancedPatch`] wins; `None` inherits
+/// `default_follow_symlinks`. The resolved bool is stamped onto the
+/// emitted [`ExpandedProvenancedPatch`] so downstream code doesn't
+/// have to re-consult a sidecar map.
 pub(crate) fn expand_patch_sources(
     patches: Vec<ProvenancedPatch>,
     gated_vars: &[SessionVar],
     home_fallback: Option<&str>,
+    default_follow_symlinks: bool,
 ) -> Result<Vec<ExpandedProvenancedPatch>, ComposeError> {
     patches
         .into_iter()
         .map(|pp| {
-            let (patch, provenance) = pp.into_parts();
+            let (patch, provenance, follow_override) = pp.into_parts();
             let source =
                 crate::core::expansion::expand_source(patch.source(), gated_vars, home_fallback)?;
+            let follow_symlinks = follow_override.unwrap_or(default_follow_symlinks);
             Ok(ExpandedProvenancedPatch {
                 source,
                 dest: patch.dest().clone(),
                 provenance,
+                follow_symlinks,
             })
         })
         .collect()
@@ -1313,8 +1343,9 @@ pub(crate) fn gate_patches(
     // no IO context for.
     let mut expanded = policy.expand_with(gated_vars, home_fallback)?;
 
-    let expanded_patches = expand_patch_sources(items, gated_vars, home_fallback)?;
-    let files = enumerate_patch_files(expanded_patches, options.follow_symlinks)?;
+    let expanded_patches =
+        expand_patch_sources(items, gated_vars, home_fallback, options.follow_symlinks)?;
+    let files = enumerate_patch_files(expanded_patches)?;
 
     // Pass 1: categorize per file.
     let mut allowed: Vec<PatchFile> = Vec::new();

@@ -88,6 +88,11 @@ pub struct Loadout {
     /// Scripts run at session-level transition points.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     lifecycle_hooks: Vec<LifecycleHook>,
+    /// Override the composer's default follow-symlinks behavior for
+    /// this loadout's patches. `None` falls through to
+    /// `ComposeOptions::follow_symlinks`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    follow_symlinks: Option<bool>,
 }
 
 impl Loadout {
@@ -114,6 +119,7 @@ impl Loadout {
             vars_lenient: Vec::new(),
             patches: Patches::empty(),
             lifecycle_hooks: Vec::new(),
+            follow_symlinks: None,
         }
     }
 
@@ -177,6 +183,24 @@ impl Loadout {
         let mut new = self;
         new.lifecycle_hooks.push(hook);
         new
+    }
+
+    /// Override the composer's default follow-symlinks behavior for
+    /// this loadout's patches.
+    #[must_use]
+    pub fn with_follow_symlinks(mut self, v: bool) -> Self {
+        self.follow_symlinks = Some(v);
+        self
+    }
+
+    /// The per-loadout `follow_symlinks` override, if any. Consumed
+    /// by [`UserComposer`](crate::client::composer::UserComposer);
+    /// falls through to [`ComposeOptions::follow_symlinks`] when `None`.
+    ///
+    /// [`ComposeOptions::follow_symlinks`]: crate::core::compose::ComposeOptions::follow_symlinks
+    #[must_use]
+    pub fn follow_symlinks(&self) -> Option<bool> {
+        self.follow_symlinks
     }
 
     /// Packages this loadout requires.
@@ -286,7 +310,7 @@ impl crate::core::compose::Composable for Loadout {
             })
             .collect::<Result<_, _>>()?;
 
-        crate::core::compose::contribute_primitives(
+        let mut contribution = crate::core::compose::contribute_primitives(
             &source,
             self.packages,
             vars,
@@ -294,7 +318,16 @@ impl crate::core::compose::Composable for Loadout {
             self.patches,
             self.lifecycle_hooks,
             env,
-        )
+        )?;
+        // Stamp the loadout's per-source `follow_symlinks` override
+        // onto every patch it contributes. `None` is a no-op — patches
+        // inherit `ComposeOptions::follow_symlinks` at expand time.
+        // `Some(v)` overrides the default for this loadout's patches
+        // specifically.
+        if let Some(follow) = self.follow_symlinks {
+            contribution.set_follow_symlinks_on_patches(Some(follow));
+        }
+        Ok(contribution)
     }
 }
 
@@ -345,6 +378,48 @@ mod tests {
     use super::*;
     use crate::core::lifecyclehook::HookScript;
     use crate::core::primitives::{LenientVarName, PatchDest};
+
+    /// `follow_symlinks` is optional: omitted → `None`, explicit
+    /// bool → `Some(bool)`. Round-trip verifies the field is
+    /// exposed to the composer without leaking into the wire form
+    /// when unset.
+    #[test]
+    fn follow_symlinks_round_trips_from_toml() {
+        let bare = toml::from_str::<Loadout>(r#"name = "d""#).unwrap();
+        assert_eq!(bare.follow_symlinks(), None);
+
+        let opted_in: Loadout = toml::from_str("name = \"d\"\nfollow_symlinks = true\n").unwrap();
+        assert_eq!(opted_in.follow_symlinks(), Some(true));
+
+        let opted_out: Loadout = toml::from_str("name = \"d\"\nfollow_symlinks = false\n").unwrap();
+        assert_eq!(opted_out.follow_symlinks(), Some(false));
+
+        // Serializing a bare loadout omits the field via
+        // `skip_serializing_if`, so we don't broadcast a `false`
+        // that was actually "unset".
+        let serialized = toml::to_string(&bare).unwrap();
+        assert!(!serialized.contains("follow_symlinks"), "got: {serialized}");
+
+        // `Some(false)` is not the same as `None` — serializing an
+        // explicit opt-out must retain the field so a subsequent
+        // deserialize round-trips back to `Some(false)`. Guards
+        // against a future `skip_serializing_if` predicate that
+        // accidentally treats a falsy `Some(false)` as unset.
+        let opt_out_toml = toml::to_string(&opted_out).unwrap();
+        assert!(
+            opt_out_toml.contains("follow_symlinks"),
+            "got: {opt_out_toml}"
+        );
+        let reparsed: Loadout = toml::from_str(&opt_out_toml).unwrap();
+        assert_eq!(reparsed.follow_symlinks(), Some(false));
+    }
+
+    /// `with_follow_symlinks` sets the field via the builder.
+    #[test]
+    fn with_follow_symlinks_builder_sets_the_field() {
+        let l = Loadout::new(LoadoutName::try_new("d").unwrap()).with_follow_symlinks(true);
+        assert_eq!(l.follow_symlinks(), Some(true));
+    }
 
     #[test]
     fn all_vars_yields_strict_then_lenient() {
