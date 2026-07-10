@@ -16,6 +16,10 @@ supersedes:
 `x86_64`/`aarch64`. Users need a way to get those binaries onto a machine without
 a pre-existing package manager.
 
+The user-facing command is **`min`**: the `minimal` CLI component's manifest
+`dest` is `bin/min`, so that is the name written to disk (the component and
+release-artifact names keep the crate name `minimal`).
+
 This spec describes **the fallback installer only**: a single POSIX-sh script
 served for `curl … | sh`. The intended primary paths are native, platform-specific packages —
 Homebrew (`brew`), Debian/Ubuntu (`apt`/`.deb`), Arch (`pacman`/AUR), and
@@ -39,6 +43,12 @@ file is already installed (by hashing the on-disk file) and, if not, downloads,
 checksum-verifies, and atomically installs it. Reruns re-download only
 components whose hash changed.
 
+After the files are placed, the installer wires up shell integration (Unit 9):
+it generates per-shell init files that put the bin dir on `PATH`, installs tab
+completions for `min` by running the freshly-installed binary, and hooks the
+user's login-shell rc file with an idempotent, marker-fenced block. Uninstall
+(Units 7–8) undoes all of it.
+
 The whole script targets POSIX `sh` (not bash) so it runs identically under
 `dash`, macOS's frozen bash 3.2, busybox, and zsh-invoked-`sh`. It depends only
 on tools present by default on every target: a downloader (`curl` **or**
@@ -58,6 +68,8 @@ on tools present by default on every target: a downloader (`curl` **or**
    half-written binary in place.
 5. A malformed manifest, version string, or destination path is rejected before
    it can cause a path traversal or arbitrary-code execution.
+6. After one install and one new shell, `min` is on `PATH` and tab-completes
+   in bash, zsh, and fish (Unit 9).
 
 ## User Stories
 
@@ -266,9 +278,11 @@ lets the R5.1 signed-file skip stay correct across releases (skip only while the
 manifest still wants that artifact). The record also enables uninstall (Units
 7–8) and surfaces prefix drift if `XDG_*` variables change between runs.
 
-**R6.2** — If the resolved `bin` directory is not on `$PATH`, the installer
-prints an advisory telling the user to add it — it does **not** silently edit
-any shell rc file.
+**R6.2** — If the resolved `bin` directory is not on `$PATH` **in the
+installing session**, the installer prints an advisory: the Unit 9 rc hook only
+takes effect in new shells, so the advisory tells the user to restart their
+shell or export `PATH` now. The installer never *silently* edits an rc file —
+the only rc edit it makes is Unit 9's announced, marker-fenced block (R9.2).
 
 **Proof artifacts**:
 
@@ -276,6 +290,106 @@ any shell rc file.
   exists and lists the installed components with their destinations and hashes.
 - **Test**: With the `bin` prefix absent from `PATH`, the advisory is printed;
   with it present, it is not.
+
+### Unit 9 — Shell integration: PATH, shell-init files, completions
+
+The goal: after one install and one new shell, `min` is on `PATH` and
+tab-completes, in bash, zsh, and fish. Everything this unit writes is either an
+install-record row (so Units 7–8 remove it for free) or a marker-fenced rc
+block (so uninstall can strip it precisely).
+
+**R9.1** — After the component loop, the installer **generates** (never
+downloads) one init file per shell family under `<data>/shell-init/`:
+`bash.sh`, `zsh.sh`, and `fish.fish`. Each file:
+
+- embeds the `bin` directory as resolved **at install time**
+  (`${MINIMAL_BIN:-$HOME/.local/bin}`), and
+- guards at shell startup: only if the dir exists and is not already in
+  `PATH` is it prepended (`case ":$PATH:"` for POSIX shells,
+  `fish_add_path --prepend` for fish) — so sourcing is idempotent and becomes a
+  no-op once the user manages `PATH` themselves.
+
+`zsh.sh` additionally adds the zsh completions dir (R9.3) to `fpath` and runs
+`compinit`. All three files are regenerated on every run and appended to the
+install record (R6.1) with the on-disk digest in **both** hash columns (no
+manifest hash exists for generated content), so reruns replace them and
+uninstall removes them like any component.
+
+**R9.2** — The installer hooks the rc file of the user's login shell
+(`basename "$SHELL"`) with a block sourcing the matching init file, fenced by
+the exact markers `# >>> minimal >>>` / `# <<< minimal <<<`:
+
+| shell   | rc file(s)                                                        |
+|---------|-------------------------------------------------------------------|
+| `bash`  | every existing one of `~/.bashrc`, `~/.bash_profile`; neither exists → create `~/.bashrc` |
+| `zsh`   | `${ZDOTDIR:-$HOME}/.zshrc`, created if missing                     |
+| `fish`  | `${XDG_CONFIG_HOME:-~/.config}/fish/config.fish`, created if missing |
+| other   | `~/.profile` (the POSIX login rc), with the `bash.sh` (POSIX) init |
+
+The edit is idempotent — a file already containing the start marker is never
+touched again — and always announced, never silent. The sourced line itself is
+guarded (`[ -f … ] && . …` / `if test -f …`), so an rc file that outlives an
+uninstall stays harmless.
+
+The hook is **best-effort and non-fatal**: by the time it runs, the binaries
+are already correctly installed, so an rc file that cannot be appended (or a
+config dir that cannot be created) must not turn the run into a failure. The
+installer prints a warning naming the file (`failed to hook minimal shell
+support (… is not writable)`) plus the exact line to add by hand, continues,
+and still exits 0 — and the R6.2 `PATH` advisory still fires.
+
+**R9.3** — Tab completions are generated by **running the just-installed
+binary** — `<bin>/min completions <shell>` — so they always match the installed
+version, and are written atomically (temp sibling + `mv`) to each shell's
+user-level completion dir:
+
+| shell  | completion file                                                        |
+|--------|------------------------------------------------------------------------|
+| bash   | `${XDG_DATA_HOME:-~/.local/share}/bash-completion/completions/min`     |
+| zsh    | `${XDG_DATA_HOME:-~/.local/share}/zsh/completions/_min` (on `fpath` via `zsh.sh`) |
+| fish   | `${XDG_CONFIG_HOME:-~/.config}/fish/completions/min.fish`              |
+
+All three are written regardless of `$SHELL` (covers shell switching), each
+recorded in the install record like the init files. Failure to execute the
+binary (or empty output) is a **warning, not an error**: the binaries are
+already correctly installed, and completions regenerate on the next run. If
+`<bin>/min` was not part of the manifest, the step is skipped with a notice.
+
+**R9.4** — Uninstall (Units 7–8) undoes shell integration completely:
+
+- the generated init and completion files are ordinary record rows, removed by
+  the hash-verified walk (R7.3);
+- the marker-fenced block is stripped from every rc file the installer may
+  have edited (all candidates from the R9.2 table are tried — `$SHELL` may have
+  changed since install; a file without markers is never rewritten), via an
+  awk filter to a temp sibling + atomic `mv` (`sed -i` is not portable);
+- the emptied `shell-init` and completion dirs (and their possibly
+  installer-created parents) are pruned with the same `rmdir`-only discipline
+  as R8.1 — they are shared locations, never `rm -rf`ed;
+- `--dry-run` composes: it announces the would-be rc strip and removals and
+  touches nothing.
+
+**Proof artifacts**:
+
+- **Test**: after an install with `SHELL=/bin/bash`, the three init files exist
+  under `<data>/shell-init/`, embed the resolved bin dir, and are listed in the
+  install record; sourcing `bash.sh` under plain `sh` prepends the bin dir to
+  `PATH` exactly once (a second source does not duplicate it).
+- **Test**: a fresh home gets `~/.bashrc` created with exactly one marker-fenced
+  block; a rerun adds no second block; with both `~/.bashrc` and
+  `~/.bash_profile` pre-existing, both are hooked and user content is preserved.
+- **Test**: `SHELL=…/zsh` hooks (and creates) `.zshrc`; `…/fish` hooks
+  `config.fish`; an unrecognized shell falls back to `~/.profile`.
+- **Test**: with a read-only `~/.bashrc`, the install still exits 0, prints the
+  `failed to hook minimal shell support` warning and the manual line, leaves
+  the rc file untouched, and still prints the R6.2 PATH advisory.
+- **Test**: the bash/zsh/fish completion files exist at their R9.3 paths with
+  content produced by the installed binary; a manifest without the `min`
+  component skips completions non-fatally, and an unrunnable binary degrades to
+  a warning with exit 0.
+- **Test**: `--uninstall` removes the generated files, strips the rc block
+  while preserving the user's own rc content, and prunes the emptied
+  completion/shell-init dirs; `--dry-run` announces the strip without editing.
 
 ## Non-Goals
 
@@ -374,11 +488,13 @@ architecture record; design rationale is captured above.
 1. **Static**: `shellcheck --shell=sh` passes on the installer with no warnings.
 2. **Dash conformance**: the installer's test harness runs the script under
    `dash` (and, where available, macOS `/bin/sh`) — not just `bash` — in CI.
-3. **Unit tests** (Units 1–6) pass against fixture pointer files, manifests, and
-   a stubbed bucket/downloader, asserting: downloader/hasher/platform selection;
-   target and version validation; field extraction; prefix resolution and
-   traversal rejection; skip-on-rerun and checksum-mismatch handling; install
-   record and PATH advisory.
+3. **Unit tests** (Units 1–6, 9) pass against fixture pointer files, manifests,
+   and a stubbed bucket/downloader, asserting: downloader/hasher/platform
+   selection; target and version validation; field extraction; prefix resolution
+   and traversal rejection; skip-on-rerun and checksum-mismatch handling; install
+   record and PATH advisory; shell-init generation, rc hooking, and completion
+   installation (the `min` CLI fixture is a runnable script, so completion
+   generation exercises the real execute-the-binary path).
 4. **End-to-end**: against a real (or local mock) bucket, `curl … | sh` installs
    the current `stable` binaries into temp prefixes; a second run performs zero
    downloads; corrupting one on-disk binary makes the next run re-fetch only that
@@ -401,8 +517,11 @@ manifest `sha256` (see R5.1 and `install.sh`'s signing note). Uninstall reads on
 rerun skip check (R5.1) and is unused here.
 
 That record is a complete, self-contained inventory of the installer's
-footprint. An uninstaller does not need the network, the bucket, the manifest, or
-even to know which version is installed: it walks the record and undoes it. This
+footprint — downloaded components and the generated shell-init/completion files
+alike (Unit 9 records what it writes). An uninstaller does not need the network,
+the bucket, the manifest, or even to know which version is installed: it walks
+the record and undoes it, then strips the marker-fenced rc block (R9.4), the one
+piece of footprint an rc file carries instead of the record. This
 mirrors the installer's guiding principle — **the recorded/on-disk hash is the
 oracle** — applied in reverse: only remove a file the installer wrote and that is
 still byte-for-byte what it wrote.
@@ -545,8 +664,10 @@ what was asked); only an unexpected internal failure is non-zero.
   only authority. If it is missing, uninstall is a no-op — the uninstaller never
   fetches a manifest and deletes by guessing which paths *would have* been
   written, which could clobber unrelated files at those paths.
-- **Removing PATH edits.** The installer never edits shell rc files (R6.2), so
-  there is nothing of that kind to undo.
+- ~~Removing PATH edits.~~ Superseded by Unit 9: the installer hooks rc files
+  with a marker-fenced block (R9.2), and uninstall strips exactly that block
+  from every candidate rc file (R9.4). User content around the markers is never
+  touched.
 - **Cross-prefix drift recovery.** If `XDG_*`/`MINIMAL_BIN` differ between install
   and uninstall, the record's **absolute** `dest` paths are still removed
   correctly, but directory pruning (R8.1) targets the *currently* resolved
@@ -597,7 +718,8 @@ behind explicit `--purge` and confined to the `.../minimal` roots the tool owns.
 2. **Unit tests** (Units 7–8): dispatch and record-absent no-op; hash-verified
    removal; modified-file keep vs `--force`; already-absent idempotency;
    non-regular-file refusal; record teardown and empty-dir pruning; `--dry-run`
-   removing nothing; `--purge` clearing the owned trees.
+   removing nothing; `--purge` clearing the owned trees; rc-block stripping and
+   shell-integration teardown (R9.4).
 3. **End-to-end**: `install` into temp prefixes, then `--uninstall` leaves the
    prefixes free of every recorded file and removes the record; a second
    `--uninstall` is a clean no-op exiting 0.
