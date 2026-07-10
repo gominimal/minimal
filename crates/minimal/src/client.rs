@@ -127,62 +127,48 @@ impl Client {
     }
 }
 
-/// Resolve the daemon socket path.
-///
-/// On Linux: `$XDG_STATE_HOME/minimal/providers/local-0/ssh.sock` (matching
-/// `minimald`'s `listen_on()`).
-///
-/// On macOS: delegates to `minvmd::sock::resolve_uds_path()` (the bridge
-/// socket created by the minvmd host daemon).
-///
-/// If `--minimal-dir` is set, use `<minimal_dir>/providers/local-0/ssh.sock`
-/// on Linux (native), or `<minimal_dir>/minimald.sock` on macOS / Linux+minvmd.
-///
-/// `use_minvmd` selects the backend on Linux: `false` (default) resolves the
-/// native minimald UDS; `true` resolves the minvmd host-UDS bridge. On macOS the
-/// bridge is the only backend, so `use_minvmd` is ignored.
+/// Resolve the provider-instance dir (`<state dir>/providers/local-0`) the
+/// daemon and CLI agree on: `--minimal-dir` when set, else the default
+/// minimal state dir.
+pub(crate) fn resolve_provider_dir(
+    minimal_dir_override: Option<&std::path::Path>,
+) -> std::io::Result<std::path::PathBuf> {
+    let base = match minimal_dir_override {
+        Some(dir) => {
+            let abs = std::path::absolute(dir)?;
+            let utf8 = abs
+                .to_str()
+                .ok_or_else(|| std::io::Error::other("--minimal-dir is not valid UTF-8"))?;
+            paths::DaemonAbsPath::try_new(utf8).map_err(std::io::Error::other)?
+        }
+        None => paths::minimal_state_dir(),
+    };
+    Ok(paths::provider_instance_dir(&base, 0)
+        .as_utf8_path()
+        .as_std_path()
+        .to_path_buf())
+}
+
+/// Resolve the daemon socket path: `<provider dir>/ssh.sock`. Both backends
+/// (native minimald and the minvmd bridge) serve the same endpoint, so the
+/// backend choice only matters for spawning, not for connecting.
 pub fn resolve_socket_path(
     minimal_dir_override: Option<&std::path::Path>,
-    use_minvmd: bool,
 ) -> std::io::Result<std::path::PathBuf> {
-    #[cfg(target_os = "macos")]
-    let _ = use_minvmd;
-    if let Some(dir) = minimal_dir_override {
-        #[cfg(target_os = "linux")]
-        return Ok(if use_minvmd {
-            dir.join("minimald.sock")
-        } else {
-            dir.join("providers/local-0/ssh.sock")
-        });
-        #[cfg(target_os = "macos")]
-        return Ok(dir.join("minimald.sock"));
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if use_minvmd {
-            return minvmd::sock::resolve_uds_path();
-        }
-        Ok(paths::minimal_state_dir()
-            .as_utf8_path()
-            .as_std_path()
-            .join("providers/local-0/ssh.sock"))
-    }
-    #[cfg(target_os = "macos")]
-    minvmd::sock::resolve_uds_path()
+    Ok(resolve_provider_dir(minimal_dir_override)?.join(paths::SSH_SOCK_FILE))
 }
 
 #[cfg(test)]
-#[cfg(target_os = "linux")]
 mod tests {
     use super::resolve_socket_path;
     use std::path::Path;
 
     #[test]
-    fn linux_socket_path_honors_backend_with_override() {
-        let dir = Path::new("/tmp/minimal-test");
-        let native = resolve_socket_path(Some(dir), false).unwrap();
-        let bridged = resolve_socket_path(Some(dir), true).unwrap();
-        assert!(native.ends_with("providers/local-0/ssh.sock"), "{native:?}");
-        assert!(bridged.ends_with("minimald.sock"), "{bridged:?}");
+    fn socket_path_honors_override() {
+        let sock = resolve_socket_path(Some(Path::new("/tmp/minimal-test"))).unwrap();
+        assert_eq!(
+            sock,
+            Path::new("/tmp/minimal-test/providers/local-0/ssh.sock")
+        );
     }
 }

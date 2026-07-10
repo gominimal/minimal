@@ -1,8 +1,10 @@
 //! Host UDS path resolution and socket-directory management for the
 //! minimald bridge (R3.2).
 //!
-//! Path resolution: `$XDG_RUNTIME_DIR/minimal/minimald.sock`; fallback
-//! `~/.minimal/local/minimald.sock` when `XDG_RUNTIME_DIR` is unset or empty.
+//! The bridge socket lives beside the minvmd state files in the
+//! provider-instance dir: `<minimal_state_dir>/providers/local-0/ssh.sock` —
+//! the same name native minimald binds, so clients see one endpoint
+//! regardless of backend.
 
 use std::io;
 use std::path::PathBuf;
@@ -24,27 +26,35 @@ use std::path::PathBuf;
 /// ~62 concurrent connections on this port before new ones queue.
 pub const VSOCK_BRIDGE_PORT: u32 = 2222;
 
-/// Resolve the host UDS path for the minimald bridge (R3.2).
-///
-/// Returns `$XDG_RUNTIME_DIR/minimal/minimald.sock` when `XDG_RUNTIME_DIR`
-/// is set and non-empty; otherwise `~/.minimal/local/minimald.sock`.
-///
-/// Returns an error when `XDG_RUNTIME_DIR` is absent/empty and the home
-/// directory cannot be determined (e.g. `HOME` unset and no passwd entry).
+/// Resolve the host UDS path for the minimald bridge (R3.2):
+/// `<provider dir>/ssh.sock`.
 pub fn resolve_uds_path() -> io::Result<PathBuf> {
-    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR")
-        && !runtime.is_empty()
-    {
-        return Ok(PathBuf::from(runtime).join("minimal/minimald.sock"));
+    Ok(crate::state::provider_dir().join(paths::SSH_SOCK_FILE))
+}
+
+/// Usable bytes in `sockaddr_un.sun_path` (excluding the NUL terminator).
+#[cfg(target_os = "macos")]
+const SUN_PATH_MAX: usize = 103;
+#[cfg(not(target_os = "macos"))]
+const SUN_PATH_MAX: usize = 107;
+
+/// Fail fast when `path` exceeds the platform unix-socket path limit.
+/// libkrun aborts the process (panic in a nounwind FFI frame) on
+/// `ENAMETOOLONG` instead of returning an error, so check before handing
+/// socket paths to it.
+pub fn check_uds_path_len(path: &std::path::Path) -> io::Result<()> {
+    let len = path.as_os_str().as_encoded_bytes().len();
+    if len > SUN_PATH_MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "socket path {} is {len} bytes, over the {SUN_PATH_MAX}-byte unix socket \
+                 limit; use a shorter state dir (--minimal-state-dir / XDG_STATE_HOME)",
+                path.display(),
+            ),
+        ));
     }
-    dirs::home_dir()
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "HOME directory is not set; cannot resolve minimald socket path",
-            )
-        })
-        .map(|home| home.join(".minimal/local/minimald.sock"))
+    Ok(())
 }
 
 /// Create the parent directory of `socket_path` with mode 0700, if absent.
@@ -122,43 +132,33 @@ mod tests {
 
     use super::*;
 
-    // Serialize tests that mutate XDG_RUNTIME_DIR / HOME so they don't race.
+    // Serialize tests that mutate XDG_STATE_HOME so they don't race.
     static UDS_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn resolve_uds_path_uses_xdg_runtime_dir() {
+    fn resolve_uds_path_lives_in_provider_dir() {
         let _g = UDS_ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000") };
+        let prev = std::env::var_os("XDG_STATE_HOME");
+        unsafe { std::env::set_var("XDG_STATE_HOME", "/state") };
         let path = resolve_uds_path().unwrap();
-        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
-        assert_eq!(path, PathBuf::from("/run/user/1000/minimal/minimald.sock"),);
-    }
-
-    #[test]
-    fn resolve_uds_path_falls_back_to_home() {
-        let _g = UDS_ENV_LOCK.lock().unwrap();
-        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
-        unsafe { std::env::set_var("HOME", "/home/user") };
-        let path = resolve_uds_path().unwrap();
-        unsafe { std::env::remove_var("HOME") };
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
         assert_eq!(
             path,
-            PathBuf::from("/home/user/.minimal/local/minimald.sock"),
+            PathBuf::from("/state/minimal/providers/local-0/ssh.sock"),
         );
     }
 
     #[test]
-    fn resolve_uds_path_ignores_empty_xdg_runtime_dir() {
-        let _g = UDS_ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", "") };
-        unsafe { std::env::set_var("HOME", "/home/user") };
-        let path = resolve_uds_path().unwrap();
-        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
-        unsafe { std::env::remove_var("HOME") };
-        assert_eq!(
-            path,
-            PathBuf::from("/home/user/.minimal/local/minimald.sock"),
-        );
+    fn check_uds_path_len_accepts_short_and_rejects_long() {
+        check_uds_path_len(std::path::Path::new("/tmp/x/ssh.sock")).unwrap();
+
+        let long = format!("/tmp/{}/ssh.sock", "x".repeat(SUN_PATH_MAX));
+        let err = check_uds_path_len(std::path::Path::new(&long)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("unix socket limit"), "{err}");
     }
 
     #[test]

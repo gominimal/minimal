@@ -187,7 +187,27 @@ jobs:
               # CARGO_BIN_EXE path — same-machine build+run, so it resolves.
               run: |
                   cargo test -p minvmd --test krun_smoke --test minimald_session_e2e --no-run
-                  cargo build -p minvmd --bin minvmd -p minimal --bin minimal
+                  cargo build -p minvmd --bin minvmd
+                  # SEPARATE invocation for the CLI (mirrors release.yml): built
+                  # together, cargo unifies minvmd's default `libkrun` feature
+                  # into minimal's default-features=false opt-out, and the CLI
+                  # links libkrun. The brew era masked this (absolute install
+                  # name loaded from anywhere); our @rpath dylib turns it into
+                  # dyld "Library not loaded" at autospawn, since minimal bakes
+                  # no rpaths.
+                  cargo build -p minimal --bin minimal
+            - name: Verify minimal links only system libraries
+              # The CLI spawns minvmd as a subprocess and calls no libkrun; a
+              # krun load command means the feature unification above regressed.
+              # Catch it here with a clear message, not as a dyld error mid-e2e.
+              run: |
+                  bad="$(otool -L target/debug/minimal | tail -n +2 | awk '{print $1}' \
+                    | grep -vE '^(/usr/lib/|/System/)' || true)"
+                  if [ -n "$bad" ]; then
+                    echo "::error::minimal links non-system libraries (feature unification with minvmd's libkrun?):" >&2
+                    printf '%s\n' "$bad" >&2
+                    exit 1
+                  fi
             - name: Codesign minvmd (hypervisor entitlement, R1.4)
               run: codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
             - name: Production linkage static check (rewrite on a copy)
@@ -259,8 +279,8 @@ jobs:
               # Run the prebuilt binaries directly (never `cargo run`, which would
               # relink and unsign minvmd). minimal finds `minvmd` via PATH; all three
               # of MINVMD_KERNEL_PATH / MINVMD_ROOTFS_PATH / MINVMD_INITRAMFS propagate
-              # through the `minvmd run --detach` re-exec. A fresh XDG_RUNTIME_DIR /
-              # XDG_STATE_HOME guarantees the clean (no-daemon) starting state.
+              # through the `minvmd run --detach` re-exec. A fresh XDG_STATE_HOME
+              # guarantees the clean (no-daemon) starting state.
               run: |
                   set -uo pipefail   # not -e: capture failures so we can dump diagnostics
                   export PATH="$PWD/target/debug:$PATH"
@@ -271,12 +291,12 @@ jobs:
                   # minimal -> `minvmd run --detach` -> `minvmd run` -> __krun-vmm chain,
                   # so the silent detached supervisor's boot is still observable here.
                   export MINVMD_BOOT_LOG="$RUNNER_TEMP/autospawn-boot.log"
-                  export XDG_RUNTIME_DIR="$(mktemp -d)"
-                  # minvmd resolves its state dir via dirs::state_dir(), which ignores
-                  # XDG_STATE_HOME on macOS and uses ~/.local/state. Clear it so the
-                  # proof starts from a genuinely clean (NotProvisioned) state on the
-                  # persistent runner.
-                  rm -rf "$HOME/.local/state/minimal/minvmd"
+                  # All state (minvmd.toml, locks, the bridge socket) lives under
+                  # $XDG_STATE_HOME/minimal/providers/local-0; a fresh dir gives a
+                  # genuinely clean (NotProvisioned) state on the persistent runner.
+                  # Under /tmp, not $TMPDIR: macOS's deep $TMPDIR would push the
+                  # socket paths past the 104-byte sun_path limit.
+                  export XDG_STATE_HOME="$(mktemp -d /tmp/mnl.XXXXXX)"
 
                   # macOS `date` has no %N; use perl's high-resolution clock for ms.
                   now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time()*1000'; }
@@ -290,7 +310,7 @@ jobs:
                   fail() {
                     echo "::group::autospawn-e2e diagnostics"
                     echo "--- minimal ls stderr ---"; cat "$RUNNER_TEMP/ls.err" 2>/dev/null || true
-                    echo "--- state.toml ---"; cat "$HOME/.local/state/minimal/minvmd/state.toml" 2>/dev/null || echo "(none)"
+                    echo "--- minvmd.toml ---"; cat "$XDG_STATE_HOME/minimal/providers/local-0/minvmd.toml" 2>/dev/null || echo "(none)"
                     echo "--- guest boot console (tail) ---"; tail -80 "$MINVMD_BOOT_LOG" 2>/dev/null || echo "(no boot log — VM never started)"
                     echo "::endgroup::"
                     minvmd stop >/dev/null 2>&1 || true

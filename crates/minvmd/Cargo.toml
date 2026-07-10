@@ -16,7 +16,6 @@ libkrun = []
 anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
-dirs.workspace = true
 fd-lock.workspace = true
 libc.workspace = true
 serde = { workspace = true }
@@ -38,8 +37,8 @@ tokio.workspace = true
 # Production beacon-reading code calls russh::keys::known_hosts::learn_known_hosts_path
 # and russh::keys::ssh_key::PublicKey::from_openssh (R2.5).
 russh.workspace = true
-# `paths::minimal_state_dir()` supplies the canonical state-dir base for the
-# per-VM data-volume image path (see `volume::resolve_data_volume_path`).
+# Canonical state-dir base + provider-instance dir layout (`state`, `sock`,
+# `volume`).
 paths.workspace = true
 
 [dev-dependencies]

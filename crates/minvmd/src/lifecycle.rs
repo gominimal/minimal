@@ -24,6 +24,14 @@ pub enum Lifecycle {
     Stopping,
 }
 
+impl Lifecycle {
+    /// Whether this state claims a live daemon process exists.
+    #[must_use]
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Starting | Self::Running | Self::Stopping)
+    }
+}
+
 /// An action that drives a lifecycle transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {

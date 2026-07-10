@@ -3,7 +3,8 @@
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
-use paths::{CwdRelative, Daemon, DaemonAbsPath, DaemonRelPath, sub_path};
+use paths::{CwdRelative, Daemon, DaemonAbsPath, sub_path};
+use std::io::Write as _;
 use tokio::{net::UnixListener, runtime::Builder};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -65,9 +66,7 @@ impl Cli {
 
     /// Returns the path to the directory containing sockets/info about this daemon for clients.
     pub fn client_instance_dir(&self) -> DaemonAbsPath {
-        let instance_num = self.instance_num();
-        sub_path!(self.minimal_state_dir(), "providers")
-            .join(&DaemonRelPath::try_new(format!("local-{instance_num}")).unwrap())
+        paths::provider_instance_dir(&self.minimal_state_dir(), self.instance_num())
     }
 
     /// Returns fragments of the command-line arguments which should be passed to an ssh invocation in
@@ -99,7 +98,8 @@ impl Cli {
 
     /// Returns the path to the UDS socket we should listen on.
     pub fn listen_on(&self) -> DaemonAbsPath {
-        sub_path!(self.client_instance_dir(), "ssh.sock")
+        self.client_instance_dir()
+            .sub_path_unchecked(paths::SSH_SOCK_FILE)
     }
 }
 
@@ -208,6 +208,16 @@ impl From<russh::keys::Error> for MainError {
     }
 }
 
+/// Open (creating if absent) a lock file; only its fd matters, for flock.
+fn open_lock_file(path: impl AsRef<std::path::Path>) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+}
+
 fn main() -> Result<(), MainError> {
     let runtime = Builder::new_multi_thread()
         .thread_name("minimald-worker")
@@ -249,14 +259,34 @@ fn spawn_detached(cli: &Cli) -> Result<(), MainError> {
             Ok(())
         });
     }
-    cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| MainError::IO(e, "spawning detached minimald"))?;
 
+    // Ready = socket connectable AND a native minimald holds the instance
+    // lock. ssh.sock is shared with the minvmd bridge, so a bare connect can
+    // be satisfied by a live peer backend while our child's bail goes to
+    // /dev/null. A child exit surfaces as an error instead of a timeout.
     let sock = cli.listen_on();
     let sock_path = std::path::Path::new(sock.as_utf8_path().as_str());
+    let lock_path = cli
+        .client_instance_dir()
+        .sub_path_unchecked(paths::MINIMALD_LOCK_FILE);
     let deadline = Instant::now() + Duration::from_secs(DETACH_TIMEOUT_SECS);
     loop {
-        if std::os::unix::net::UnixStream::connect(sock_path).is_ok() {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| MainError::IO(e, "polling detached minimald"))?
+        {
+            return Err(MainError::Other(format!(
+                "detached minimald exited during startup ({status}); \
+                 run without --detach to see the error"
+            )));
+        }
+        if std::os::unix::net::UnixStream::connect(sock_path).is_ok()
+            && lock_held(lock_path.as_utf8_path().as_std_path())
+                .map_err(|e| MainError::IO(e, "probing instance lock"))?
+        {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -265,6 +295,21 @@ fn spawn_detached(cli: &Cli) -> Result<(), MainError> {
             )));
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Whether some process holds an exclusive advisory lock on `path`.
+/// Read-only probe: a missing file means no holder.
+fn lock_held(path: &std::path::Path) -> std::io::Result<bool> {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    match fd_lock::RwLock::new(file).try_read() {
+        Ok(_guard) => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+        Err(e) => Err(e),
     }
 }
 
@@ -401,6 +446,46 @@ async fn async_main() -> Result<(), MainError> {
         return Err(MainError::IO(e, "creating provider dir"));
     }
 
+    // Single-instance guard, held for the daemon's lifetime (the kernel
+    // releases it on death): a second minimald must not steal this
+    // instance's socket.
+    let mut instance_lock = fd_lock::RwLock::new(
+        open_lock_file(
+            cli.client_instance_dir()
+                .sub_path_unchecked(paths::MINIMALD_LOCK_FILE),
+        )
+        .map_err(|e| MainError::IO(e, "opening instance lock"))?,
+    );
+    let instance_guard = match instance_lock.try_write() {
+        Ok(guard) => guard,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err(MainError::Other(format!(
+                "minimald local-{} is already running (instance lock held)",
+                cli.instance_num()
+            )));
+        }
+        Err(e) => return Err(MainError::IO(e, "acquiring instance lock")),
+    };
+    // Best-effort debug aid; the lock itself, not the contents, is authoritative.
+    let _ = instance_guard
+        .set_len(0)
+        .and_then(|()| writeln!(&*instance_guard, "{}", std::process::id()));
+
+    // A minvmd bridge binds the same ssh.sock; don't steal a live VM's socket.
+    if lock_held(
+        cli.client_instance_dir()
+            .sub_path_unchecked(paths::MINVMD_LOCK_FILE)
+            .as_utf8_path()
+            .as_std_path(),
+    )
+    .map_err(|e| MainError::IO(e, "probing minvmd lock"))?
+    {
+        return Err(MainError::Other(format!(
+            "a minvmd VM is serving local-{}'s socket; stop it first (`minvmd stop`)",
+            cli.instance_num()
+        )));
+    }
+
     // Setup the server config (shared by the UDS and vsock transports).
     let config = Config {
         host_key: HostKey::OnDisk {
@@ -463,6 +548,15 @@ async fn async_main() -> Result<(), MainError> {
             .map_err(|e| MainError::IO(e, "serving on UDS"))
     } else {
         // micro-vm path, listen on vsock
+        //
+        // Bind before emitting READY: the host treats READY as "the bridge is
+        // connectable", so the listener must exist first. The backlog holds
+        // early connections until `Server::run` starts accepting.
+        let port_num = DEFAULT_VSOCK_PORT_BASE + cli.listen_args().unwrap().instance_num;
+        let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port_num))
+            .map_err(|e| MainError::IO(e, "binding vsock port"))?;
+        tracing::info!("Started listening on vsock:{port_num}");
+
         if let Err(e) = guest::emit_ready_marker(host_private_key.public_key()).await {
             tracing::warn!(error = %e, "initramfs: READY marker failed");
         }
@@ -480,11 +574,6 @@ async fn async_main() -> Result<(), MainError> {
             }
         };
 
-        let port_num = DEFAULT_VSOCK_PORT_BASE + cli.listen_args().unwrap().instance_num;
-        let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port_num))
-            .map_err(|e| MainError::IO(e, "binding vsock port"))?;
-
-        tracing::info!("Started listening on vsock:{port_num}");
         Server::run(config, listener)
             .await
             .map_err(|e| MainError::IO(e, "serving on guest vsock"))

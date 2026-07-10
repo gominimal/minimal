@@ -65,7 +65,8 @@ fn run_vmm() -> Result<()> {
 
     // Provision + attach the per-VM writable data volume as /dev/vdb (spec R1.4).
     // On by default: the image lives at the resolved path (MINVMD_DATA_VOLUME_PATH
-    // override, else `<state>/data-vol.raw`) and is created sparse if missing.
+    // override, else `<provider dir>/data-vol.raw`) and is created sparse if
+    // missing.
     // Provisioning at the literal path — not a stem-reconstructed one — so an
     // explicit override is honoured verbatim.
     let data_volume_path = crate::volume::resolve_data_volume_path();
