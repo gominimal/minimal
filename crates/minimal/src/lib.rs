@@ -724,27 +724,26 @@ impl sessions::core::hooks::PolicyHooks for ApproveProjectAndPackage {
 }
 
 /// Phase 3 + final SubmitVerdict round-trip for a `Pending` session.
+///
+/// `policy` is the user's own [`UserPolicy`](sessions::core::policy::UserPolicy)
+/// loaded from `user_policy.toml`; daemon-side pending items
+/// (packages, projects) are gated against it here on the client.
 async fn drive_pending_to_active(
     client: &mut client::Client,
     response: sessions::wire::request::ContributionResponse,
+    policy: sessions::core::policy::UserPolicy,
+    options: sessions::core::compose::ComposeOptions,
 ) -> Result<sessions::SessionId, anyhow::Error> {
     use minimald_rpc::SubmitVerdict;
     use sessions::client::handler::handle_response;
-    use sessions::core::compose::ComposeOptions;
-    use sessions::core::policy::UserPolicy;
     use sessions::wire::request::SessionStep;
 
     let session_id = response.session_id;
 
     let hooks = ApproveProjectAndPackage;
-    let verdict = match handle_response(
-        response,
-        &[],
-        UserPolicy::default(),
-        &hooks,
-        ComposeOptions::default(),
-        &|name| std::env::var(name),
-    ) {
+    let verdict = match handle_response(response, &[], policy, &hooks, options, &|name| {
+        std::env::var(name)
+    }) {
         Ok(v) => v,
         Err(e) => {
             send_abort(client, session_id).await;
@@ -863,6 +862,8 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     // fail loudly on the client side without ever touching the
     // daemon.
     let cfg = config::read_client_config(global)?;
+    let user_policy = config::read_user_policy(global)?;
+    let compose_options = loadouts::compose_options_from_config(&cfg);
     let selection = loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts);
     let active = loadouts::resolve_active_loadouts(selection, &cfg, global)?;
     if !active.is_empty() {
@@ -870,7 +871,7 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
         eprintln!("Applying loadouts: {}", names.join(", "));
     }
     let contribution =
-        loadouts::compose_user_contribution(active, loadouts::compose_options_from_config(&cfg))?;
+        loadouts::compose_user_contribution(active, user_policy.clone(), compose_options)?;
 
     let mut client = connect_daemon(global).await?;
 
@@ -898,7 +899,7 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     let id = match created {
         minimald_rpc::CreateSessionResponse::Ready { id } => id,
         minimald_rpc::CreateSessionResponse::Pending { id: _, response } => {
-            drive_pending_to_active(&mut client, response).await?
+            drive_pending_to_active(&mut client, response, user_policy, compose_options).await?
         }
     };
 
