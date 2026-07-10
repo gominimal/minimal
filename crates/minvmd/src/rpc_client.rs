@@ -31,21 +31,34 @@ impl russh::client::Handler for AnyHostKey {
 }
 
 /// Issue a single oneshot RPC to the in-VM minimald over the UDS at
-/// `uds_path`, bounded end-to-end (connect through response decode) by
-/// `timeout`.
+/// `uds_path`, with two independent deadlines: `connect_timeout` covers
+/// connect + SSH handshake + auth (short — libkrun accepts the UDS connect
+/// even when the guest is wedged, so only a completed handshake proves a
+/// live daemon), and `rpc_timeout` covers the request/response exchange
+/// (long — the handler may do real work, e.g. draining sessions, before it
+/// answers).
 pub(crate) fn call_oneshot_blocking<R: OneshotSshRpc>(
     uds_path: &Path,
     request: R::Request<'_>,
-    timeout: Duration,
+    connect_timeout: Duration,
+    rpc_timeout: Duration,
 ) -> anyhow::Result<R::Response> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("building RPC client runtime")?;
     rt.block_on(async {
-        tokio::time::timeout(timeout, call_oneshot::<R>(uds_path, request))
+        let mut handle = tokio::time::timeout(connect_timeout, connect(uds_path))
             .await
-            .map_err(|_| anyhow::anyhow!("RPC {} timed out after {timeout:?}", R::NAME))?
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "no live minimald behind {} after {connect_timeout:?}",
+                    uds_path.display()
+                )
+            })??;
+        tokio::time::timeout(rpc_timeout, call_oneshot::<R>(&mut handle, request))
+            .await
+            .map_err(|_| anyhow::anyhow!("RPC {} timed out after {rpc_timeout:?}", R::NAME))?
     })
 }
 
@@ -55,19 +68,18 @@ pub(crate) fn call_oneshot_blocking<R: OneshotSshRpc>(
 /// for an unclean SIGTERM.
 pub(crate) fn shutdown_guest(
     uds_path: &Path,
-    timeout: Duration,
+    connect_timeout: Duration,
+    rpc_timeout: Duration,
 ) -> anyhow::Result<minimald_rpc::ShutdownResponse> {
     call_oneshot_blocking::<minimald_rpc::Shutdown>(
         uds_path,
         minimald_rpc::ShutdownRequest { force: true },
-        timeout,
+        connect_timeout,
+        rpc_timeout,
     )
 }
 
-async fn call_oneshot<R: OneshotSshRpc>(
-    uds_path: &Path,
-    request: R::Request<'_>,
-) -> anyhow::Result<R::Response> {
+async fn connect(uds_path: &Path) -> anyhow::Result<russh::client::Handle<AnyHostKey>> {
     let stream = tokio::net::UnixStream::connect(uds_path)
         .await
         .with_context(|| format!("connect to minimald at {}", uds_path.display()))?;
@@ -84,7 +96,13 @@ async fn call_oneshot<R: OneshotSshRpc>(
     if !auth.success() {
         anyhow::bail!("authentication rejected by daemon");
     }
+    Ok(handle)
+}
 
+async fn call_oneshot<R: OneshotSshRpc>(
+    handle: &mut russh::client::Handle<AnyHostKey>,
+    request: R::Request<'_>,
+) -> anyhow::Result<R::Response> {
     let channel = handle
         .channel_open_session()
         .await
@@ -116,7 +134,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("no-such.sock");
         let started = std::time::Instant::now();
-        let err = shutdown_guest(&missing, Duration::from_secs(5)).unwrap_err();
+        let err =
+            shutdown_guest(&missing, Duration::from_secs(5), Duration::from_secs(60)).unwrap_err();
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "must fail on connect, not wait out the timeout"
@@ -125,5 +144,24 @@ mod tests {
             err.to_string().contains("connect to minimald"),
             "got: {err:#}"
         );
+    }
+
+    /// A socket that accepts but never speaks SSH (a wedged guest behind
+    /// libkrun's always-accepting bridge) must fail within the connect
+    /// deadline, not the (much longer) RPC deadline.
+    #[test]
+    fn shutdown_guest_fails_within_connect_deadline_on_mute_listener() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("mute.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+        let started = std::time::Instant::now();
+        let err =
+            shutdown_guest(&sock, Duration::from_millis(300), Duration::from_secs(60)).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must give up at the connect deadline, not the RPC deadline"
+        );
+        assert!(err.to_string().contains("no live minimald"), "got: {err:#}");
     }
 }

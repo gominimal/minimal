@@ -87,14 +87,23 @@ fn run_with_state_dir(dir: std::path::PathBuf, quiesce_guest: bool) -> Result<()
 /// gone, bridge down, timeout — SIGTERM proceeds and the journal replay
 /// backstop bounds the damage.
 fn shutdown_guest_best_effort() {
-    // Must exceed the guest's own 10 s quiesce budget: the Shutdown RPC only
-    // acknowledges after the quiesce completes (or times out guest-side).
-    const GUEST_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+    // Two deadlines, because they bound different things. The connect
+    // deadline is short: libkrun accepts the bridge UDS connect even when the
+    // guest is wedged, so a completed SSH handshake is the only proof of a
+    // live daemon — a broken VM must not stall the user's recovery command.
+    // The RPC deadline is long: the handler force-drains every session
+    // (sandbox teardown, process kills — unbounded real work) and then
+    // quiesces (10 s guest-side ceiling) before it acknowledges; giving up
+    // mid-drain would SIGTERM the VMM with a dirty journal, defeating the
+    // point of the call.
+    const GUEST_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const GUEST_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
     match crate::sock::resolve_uds_path()
         .map_err(anyhow::Error::from)
-        .and_then(|uds| crate::rpc_client::shutdown_guest(&uds, GUEST_SHUTDOWN_TIMEOUT))
-    {
+        .and_then(|uds| {
+            crate::rpc_client::shutdown_guest(&uds, GUEST_CONNECT_TIMEOUT, GUEST_SHUTDOWN_TIMEOUT)
+        }) {
         Ok(resp) => tracing::info!(?resp, "guest acknowledged Shutdown RPC"),
         Err(e) => {
             tracing::warn!(error = %e, "guest Shutdown RPC failed; proceeding with SIGTERM")

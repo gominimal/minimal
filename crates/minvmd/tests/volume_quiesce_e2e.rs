@@ -131,6 +131,19 @@ fn wait_until_running(env: &TestEnv, timeout: Duration) {
     }
 }
 
+/// Panic-safe teardown: stops the VM on drop, so a failed assertion after
+/// `run --detach` never leaks a detached supervisor whose state dir the
+/// `TempDir` then unlinks out from under it. Idempotent — a second `stop`
+/// on the success path is a no-op. Declared after the [`TestEnv`] it
+/// borrows, so it drops (and stops the VM) before the tempdirs go.
+struct StopOnDrop<'a>(&'a TestEnv);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.command(&["stop"]).status();
+    }
+}
+
 #[test]
 #[serial]
 #[ignore = "gated MINVMD_E2E=1; requires Mac with libkrun, kernel, rootfs, initramfs"]
@@ -147,6 +160,7 @@ fn stop_quiesces_volume_leaving_clean_ext4_journal() {
         .status()
         .expect("spawning minvmd run --detach");
     assert!(status.success(), "minvmd run --detach failed: {status}");
+    let _teardown = StopOnDrop(&env);
     wait_until_running(&env, Duration::from_secs(60));
 
     let volume = env.volume_path();

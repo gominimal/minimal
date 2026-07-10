@@ -118,9 +118,10 @@ async fn emit_marker(payload: &[u8], label: &str) -> std::io::Result<()> {
     }))
 }
 
-/// `mount(2)` with explicit flags. `EBUSY` (already mounted) is treated as
-/// success.
-fn raw_mount(
+/// `mount(2)` with explicit flags, returning the raw error — including
+/// `EBUSY`. Callers that mount idempotent pseudo-filesystems want
+/// [`raw_mount`]'s EBUSY tolerance instead.
+fn mount_syscall(
     source: &str,
     target: &str,
     fstype: &str,
@@ -142,13 +143,24 @@ fn raw_mount(
         )
     };
     if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EBUSY) {
-            return Ok(());
-        }
-        return Err(err);
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// `mount(2)` with explicit flags. `EBUSY` (already mounted) is treated as
+/// success — right for the idempotent pseudo-fs mounts on the boot path,
+/// wrong for the data volume (see [`mount_state_volume`]).
+fn raw_mount(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    flags: libc::c_ulong,
+) -> std::io::Result<()> {
+    match mount_syscall(source, target, fstype, flags) {
+        Err(e) if e.raw_os_error() == Some(libc::EBUSY) => Ok(()),
+        other => other,
+    }
 }
 
 /// Enter the generic upstream guest rootfs from the initramfs. Mounts the rootfs
@@ -413,9 +425,27 @@ fn run_e2fsck(device: &str) -> std::io::Result<()> {
 /// repair + mount retry is attempted before failing closed; the volume is never
 /// reformatted once a superblock exists.
 pub fn mount_state_volume(device: &str, mountpoint: &str) -> std::io::Result<()> {
+    // Every error here becomes the MOUNT_FAILED reason shown to the user on
+    // the host, so each failing operation names itself — a bare
+    // "Read-only file system (os error 30)" would send them to fsck a
+    // healthy image when the real fault is e.g. a pre-R1.7 rootfs.
+    let with_context =
+        |op: String| move |e: std::io::Error| std::io::Error::new(e.kind(), format!("{op}: {e}"));
+    // The data volume mount uses the strict `mount_syscall`, not the
+    // EBUSY-tolerant `raw_mount`: an EBUSY here is a real failure (the device
+    // is held elsewhere), and reporting it as success would relocate state
+    // onto an unmounted read-only mountpoint.
+    let mount = || {
+        mount_syscall(device, mountpoint, "ext4", libc::MS_NOATIME)
+            .map_err(with_context(format!("mounting {device} at {mountpoint}")))
+    };
+
     // `try_exists` distinguishes "absent" from a stat error (Err) so the failure
     // reason carried in the MOUNT_FAILED beacon names the right cause.
-    if !std::path::Path::new(device).try_exists()? {
+    if !std::path::Path::new(device)
+        .try_exists()
+        .map_err(with_context(format!("probing device {device}")))?
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("data volume device {device} is not attached"),
@@ -424,20 +454,24 @@ pub fn mount_state_volume(device: &str, mountpoint: &str) -> std::io::Result<()>
     // Ensure the mountpoint exists before formatting: it must be present on the
     // read-only rootfs (spec R1.7), so on a rootfs that predates R1.7 this fails
     // with EROFS — better to surface that here than after a needless mkfs.
-    std::fs::create_dir_all(mountpoint)?;
-    if has_ext4_superblock(device)? {
+    std::fs::create_dir_all(mountpoint).map_err(with_context(format!(
+        "creating mountpoint {mountpoint} (rootfs predating R1.7?)"
+    )))?;
+    if has_ext4_superblock(device)
+        .map_err(with_context(format!("probing ext4 superblock on {device}")))?
+    {
         // Existing filesystem: the ext4 journal replays any unclean-shutdown
         // state on mount. On failure, repair once and retry; then fail closed
         // rather than reformatting user data away.
-        if let Err(e) = raw_mount(device, mountpoint, "ext4", libc::MS_NOATIME) {
+        if let Err(e) = mount() {
             tracing::warn!(device, error = %e, "mounting data volume failed; attempting e2fsck -p repair");
             run_e2fsck(device)?;
-            raw_mount(device, mountpoint, "ext4", libc::MS_NOATIME)?;
+            mount()?;
         }
     } else {
         tracing::info!(device, "no ext4 superblock; formatting data volume");
         run_mkfs_ext4(device)?;
-        raw_mount(device, mountpoint, "ext4", libc::MS_NOATIME)?;
+        mount()?;
     }
     tracing::info!(device, mountpoint, "mounted writable state volume");
     Ok(())
@@ -465,11 +499,14 @@ pub fn quiesce_state_volume(mountpoint: &str) -> std::io::Result<()> {
     // Try a plain unmount first: a full unmount closes the ext4 journal and
     // marks the superblock clean. It fails EBUSY while anything holds an fd
     // under the mount (e.g. the gvproxy switch socket in the state dir), so
-    // fall back to remounting read-only — ext4 marks recovery complete on the
-    // ro transition (clearing `INCOMPAT_RECOVER`) even with open fds — and
-    // finish with a best-effort lazy detach. Every failure arm is logged and
-    // swallowed: the data is already synced, so the worst case is a journal
-    // replay on the next boot.
+    // fall back to remounting read-only — ext4 marks recovery complete on
+    // the ro transition (clearing `INCOMPAT_RECOVER`) despite read-open fds
+    // and bound sockets. A *write*-open fd (e.g. a session-spawned process
+    // that outlived the drain, reparented to pid-1) defeats the remount too;
+    // then only the lazy detach runs and the journal stays dirty — logged
+    // with the holders below, bounded by the replay backstop. Every failure
+    // arm is logged and swallowed: the data is already synced, so the worst
+    // case is a journal replay on the next boot.
     //
     // SAFETY: `umount2(2)`/`mount(2)` with valid, call-lifetime C strings;
     // MS_REMOUNT|MS_RDONLY takes no source/fstype/data; MNT_DETACH is lazy

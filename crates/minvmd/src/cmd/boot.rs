@@ -99,11 +99,11 @@ fn run_boot(foreground: bool) -> Result<()> {
         .context("setting listener to blocking")?;
 
     // R2.5: record whether the data volume image pre-exists this boot, before
-    // the VMM child provisions it — a later MOUNT_FAILED is fatal for a
+    // the VMM child provisions it — a later boot failure is fatal for a
     // pre-existing image (may hold session data) and recoverable for a blank
     // one freshly created by this boot.
     let volume_path = crate::volume::resolve_data_volume_path();
-    let volume_preexisted = volume_path.exists();
+    let volume_preexisted = crate::cmd::volume_preexists(&volume_path);
 
     // Spawn `minvmd __krun-vmm` — the VMM child that calls krun_start_enter.
     let exe = std::env::current_exe().context("resolving current executable path")?;
@@ -176,6 +176,7 @@ fn run_boot(foreground: bool) -> Result<()> {
             let _ = child.kill();
             let _ = child.wait();
             let _ = std::fs::remove_file(&marker_sock_path);
+            crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
             return Err(crate::cmd::mount_failed_error(
                 &reason,
                 &volume_path,
@@ -186,12 +187,14 @@ fn run_boot(foreground: bool) -> Result<()> {
             let _ = child.kill();
             let _ = child.wait();
             let _ = std::fs::remove_file(&marker_sock_path);
+            crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
             bail!("boot failed: {e}");
         }
         Err(_timeout) => {
             let _ = child.kill();
             let _ = child.wait();
             let _ = std::fs::remove_file(&marker_sock_path);
+            crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
             bail!(
                 "boot timed out waiting for READY marker after {} s (raise {} to wait longer)",
                 ready_timeout.as_secs(),

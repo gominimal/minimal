@@ -300,21 +300,54 @@ pub(crate) fn mount_failed_error(
             env = crate::volume::DATA_VOLUME_PATH_ENV,
         )
     } else {
-        // Racing a concurrent boot's fresh provisioning is possible but
-        // harmless: both boots fail loudly either way.
-        if let Err(e) = std::fs::remove_file(volume_path) {
-            tracing::warn!(
-                error = %e,
-                path = %volume_path.display(),
-                "removing freshly provisioned volume image after MOUNT_FAILED",
-            );
-        }
         anyhow::anyhow!(
             "guest failed to format/mount the freshly provisioned data volume at {path}: \
              {reason}. The blank image was removed; check {env} and retry.",
             path = volume_path.display(),
             env = crate::volume::VOLUME_BYTES_ENV,
         )
+    }
+}
+
+/// Whether the data-volume image already exists before this boot provisions
+/// it — the input to the R2.5 fatality decision. A stat error counts as
+/// **pre-existing**: the failure disposition for a pre-existing image is
+/// "never touch it", so doubt must land on the safe side rather than let a
+/// transient stat failure send a data-bearing image down the delete branch.
+#[cfg(minvmd_libkrun)]
+pub(crate) fn volume_preexists(volume_path: &std::path::Path) -> bool {
+    volume_path.try_exists().unwrap_or(true)
+}
+
+/// Disposition of the data-volume image after a failed boot (R2.5 host half):
+/// an image that pre-existed this boot may hold session data and is never
+/// touched; a blank one freshly provisioned by this boot holds nothing and is
+/// removed. Runs on **every** failed-boot arm — mount failure, beacon read
+/// error, READY timeout — because a blank stranded by a timeout would be
+/// misclassified as "pre-existing, may hold session data" on the next boot,
+/// wedging all subsequent boots behind a scary message about an empty file.
+#[cfg(minvmd_libkrun)]
+pub(crate) fn discard_fresh_volume_image(volume_path: &std::path::Path, volume_preexisted: bool) {
+    if volume_preexisted {
+        return;
+    }
+    // Racing a concurrent boot's fresh provisioning is possible but harmless:
+    // both boots fail loudly either way.
+    match std::fs::remove_file(volume_path) {
+        Ok(()) => {
+            tracing::info!(
+                path = %volume_path.display(),
+                "removed freshly provisioned volume image after failed boot",
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %volume_path.display(),
+                "removing freshly provisioned volume image after failed boot",
+            );
+        }
     }
 }
 

@@ -485,6 +485,7 @@ async fn async_main() -> Result<(), MainError> {
     // instead of READY and park. No code path substitutes the /run/minimal
     // tmpfs: session state is user data with no host copy, so a silent fallback
     // would serve a ghost READY over a VM that quietly loses everything on stop.
+    let mut state_volume_mounted = false;
     if let Some(dev) = cli.listen_args().unwrap().mk_mount_state_volume.clone() {
         match guest::mount_state_volume(&dev, guest::STATE_VOLUME_MOUNTPOINT) {
             Ok(()) => {
@@ -498,17 +499,29 @@ async fn async_main() -> Result<(), MainError> {
                         .unwrap()
                         .into(),
                 );
+                state_volume_mounted = true;
                 tracing::info!(device = %dev, "cache + state relocated onto the data volume (/var/lib/minimal)");
             }
-            Err(e) => {
+            // The MOUNT_FAILED beacon + park contract only makes sense with a
+            // minvmd host watching the marker socket (the vsock transport);
+            // a native daemon handed --mk-mount-state-volume must fail like
+            // any other startup error instead of hanging forever.
+            Err(e) if cli.listen_args().unwrap().vsock => {
                 tracing::error!(error = %e, device = %dev, "data volume mount failed; refusing READY (R2.4)");
-                let _ = guest::emit_mount_failed_marker(&e.to_string()).await;
+                if let Err(emit) = guest::emit_mount_failed_marker(&e.to_string()).await {
+                    // The host will still fail this boot via its READY
+                    // timeout; it just loses the mount-failure diagnosis.
+                    tracing::error!(error = %emit, "emitting MOUNT_FAILED marker failed; host will see a READY timeout");
+                }
                 // Park like the no-rootfs degraded path above: exiting pid-1
                 // tears the VMM down racing the host's marker read; the host
                 // kills the child once it has consumed MOUNT_FAILED.
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                 }
+            }
+            Err(e) => {
+                return Err(MainError::IO(e, "mounting the state volume"));
             }
         }
     }
@@ -531,14 +544,16 @@ async fn async_main() -> Result<(), MainError> {
     // releases it on death): a second minimald must not steal this
     // instance's socket.
     //
-    // In a microVM the lock lives on the /run tmpfs, not the provider dir:
-    // the provider dir sits on the persistent data volume, and a
-    // lifetime-held write fd there pins the volume busy through the shutdown
-    // quiesce (R2.1), leaving a dirty ext4 journal on every clean stop.
-    // Nothing outside this boot reads the guest's lock (the host probes its
-    // own provider dir, and `--detach`'s lock probe is rejected with
-    // `--vsock`), so boot-ephemeral tmpfs is the honest home for it.
-    let instance_lock_path = if cli.listen_args().unwrap().vsock {
+    // As the microVM's pid-1 the lock lives on the /run tmpfs, not the
+    // provider dir: the provider dir sits on the persistent data volume, and
+    // a lifetime-held write fd there pins the volume busy through the
+    // shutdown quiesce (R2.1), leaving a dirty ext4 journal on every clean
+    // stop. Nothing outside this boot reads the guest's lock (the host probes
+    // its own provider dir), so boot-ephemeral tmpfs is the honest home for
+    // it. Keyed on being the VM init — pid-1 owns its /run — NOT on the
+    // `--vsock` flag: a native (possibly non-root) `--vsock` daemon may not
+    // be able to write /run at all and keeps the provider-dir lock.
+    let instance_lock_path = if is_minimal_microvm() {
         DaemonAbsPath::try_new(format!("/run/minimald-local-{}.lock", cli.instance_num()))
             .expect("static /run lock path is absolute")
     } else {
@@ -597,6 +612,7 @@ async fn async_main() -> Result<(), MainError> {
         // `OwnIp` PTask must attach to the host gvproxy over the vsock shuttle,
         // not spawn gvproxy in-guest. The UDS path is DM2.
         in_microvm: cli.listen_args().unwrap().vsock,
+        state_volume_mounted,
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.
