@@ -61,7 +61,7 @@ jobs:
     steps:
       - name: Decide whether to offer or run, and build the run matrix
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-derive@v0.3.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-derive@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
         with:
           github-token: ${{ github.token }}
           # Net-changed-line floor for the offer; unset falls back to 400
@@ -80,7 +80,7 @@ jobs:
     steps:
       - name: Mint App token
         id: app
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
@@ -128,7 +128,7 @@ jobs:
       fail-fast: false
       max-parallel: ${{ fromJSON(vars.SDD_DERIVE_MAX_PARALLEL || '5') }}
       matrix: ${{ fromJSON(needs.route.outputs.run_matrix) }}
-    uses: norrietaylor/spectacles/.github/workflows/sdd-derive.lock.yml@v0.3.0
+    uses: norrietaylor/spectacles/.github/workflows/sdd-derive.lock.yml@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
     with:
       aw_context: ${{ matrix.aw_context }}
     # Mapped explicitly, not `secrets: inherit`: inherit does not pass secrets
@@ -168,7 +168,7 @@ jobs:
     steps:
       - name: Mint App token
         id: app
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
@@ -178,7 +178,7 @@ jobs:
           permission-pull-requests: write
       - name: Ack the command with 👀
         id: ack
-        uses: norrietaylor/spectacles/.github/actions/sdd-ack-reaction@v0.3.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-ack-reaction@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
         with:
           github-token: ${{ steps.app.outputs.token }}
           mode: ack
@@ -198,7 +198,7 @@ jobs:
     steps:
       - name: Mint App token
         id: app
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
@@ -207,7 +207,7 @@ jobs:
           permission-issues: write
           permission-pull-requests: write
       - name: Replace 👀 with the run outcome
-        uses: norrietaylor/spectacles/.github/actions/sdd-ack-reaction@v0.3.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-ack-reaction@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
         with:
           github-token: ${{ steps.app.outputs.token }}
           mode: terminal

@@ -219,7 +219,7 @@ jobs:
             - name: Mint docs-repo token (gominimal-aw-bot)
               id: docs-token
               if: ${{ inputs.dry_run != true }}
-              uses: actions/create-github-app-token@v3
+              uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
               with:
                   app-id: ${{ vars.AW_BOT_APP_ID }}
                   private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
