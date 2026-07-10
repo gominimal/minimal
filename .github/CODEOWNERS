@@ -1,0 +1,5 @@
+# The CI/workflow layer is frozen: it is a thin scheduler over the tests,
+# scripts, and the justfile (see docs/ci-strategy.md §10 and CONTRIBUTING.md).
+# Any PR touching it — human or agent — needs a code-owner review. Extension
+# happens through convention-discovered tests and scripts, not YAML edits.
+/.github/ @norrietaylor @twitchyliquid64
