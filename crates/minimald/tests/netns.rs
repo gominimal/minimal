@@ -338,7 +338,7 @@ impl Ptask {
             sudo_ok("configure PTask tap", &strs);
         }
 
-        let relay = attach_to_switch(fd, api_sock)
+        let relay = attach_to_switch(fd, api_sock, None)
             .await
             .expect("attach tap to switch");
 

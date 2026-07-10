@@ -173,6 +173,65 @@ pub async fn remove_ingress(control: &ControlChannel, exposed: &[ExposedMapping]
     }
 }
 
+/// A gvproxy DNS zone-add request body for `POST /services/dns/add`
+/// (gvproxy's `types.Zone`): registers `records` under the DNS zone `name`.
+///
+/// gvproxy merges on re-add with newest-first precedence and resolves to the
+/// first matching record, so re-registering a name with a new IP makes the
+/// newest win — how a rotated lease is picked up with no remove verb.
+#[derive(Debug, Serialize)]
+struct DnsZone {
+    name: String,
+    records: Vec<DnsRecord>,
+}
+
+/// A single `name → ip` answer within a [`DnsZone`].
+#[derive(Debug, Serialize)]
+struct DnsRecord {
+    name: String,
+    ip: String,
+}
+
+/// Registers `<session_name>.<host_id>` in gvproxy's `min.internal.` DNS zone,
+/// pointing at the PTask's current switch lease (finding #3 / UC6).
+///
+/// gvproxy's resolver is the switch gateway (`100.64.0.1`) that every own-IP
+/// sandbox's `resolv.conf` already targets, so this makes a PTask's
+/// `*.min.internal` hostname resolvable *from a peer session* — with no new
+/// resolver process and no `resolv.conf` change. The zone `Name` carries the
+/// trailing dot gvproxy matches DNS queries against; the record label is
+/// lowercased (gvproxy matches labels case-sensitively).
+///
+/// # Errors
+///
+/// Returns the I/O error from the gvproxy control request (non-2xx or transport).
+pub async fn register_dns_name(
+    control: &ControlChannel,
+    host_id: &str,
+    session_name: &str,
+    lease_ip: Ipv4Addr,
+) -> io::Result<()> {
+    post_json(
+        control,
+        "/services/dns/add",
+        &dns_add_body(host_id, session_name, lease_ip),
+    )
+    .await
+}
+
+/// Builds the `/services/dns/add` zone body for a PTask. Split out so the exact
+/// wire shape (trailing-dot zone, lowercased label, dotted-quad IP) is unit-testable
+/// without a live gvproxy.
+fn dns_add_body(host_id: &str, session_name: &str, lease_ip: Ipv4Addr) -> DnsZone {
+    DnsZone {
+        name: format!("{}.", crate::net::dns::HOSTNAME_SUFFIX),
+        records: vec![DnsRecord {
+            name: format!("{session_name}.{host_id}").to_ascii_lowercase(),
+            ip: lease_ip.to_string(),
+        }],
+    }
+}
+
 /// `POST`s `body` as JSON to `path` on gvproxy's control socket over a fresh
 /// HTTP/1.1 keep-alive connection, succeeding on a 2xx status.
 ///
@@ -447,6 +506,19 @@ impl PolicyWarnLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dns_add_body_matches_gvproxy_zone_shape() {
+        // The zone Name carries a trailing dot (gvproxy matches DNS queries, which
+        // are trailing-dotted, against it); the record label is lowercased
+        // (gvproxy matches labels case-sensitively); the IP is dotted-quad.
+        let body = dns_add_body("Local", "Web", Ipv4Addr::new(100, 64, 0, 5));
+        let json = serde_json::to_string(&body).unwrap();
+        assert_eq!(
+            json,
+            r#"{"name":"min.internal.","records":[{"name":"web.local","ip":"100.64.0.5"}]}"#
+        );
+    }
 
     #[test]
     fn expose_request_maps_host_port_to_ptask_ip() {

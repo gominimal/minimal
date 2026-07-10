@@ -451,7 +451,8 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
 
     // Relay the tap to the host gvproxy over the vsock shuttle (CID 2).
     let relay =
-        switch::attach_to_switch_vsock(tap_fd, VSOCK_HOST_CID, VSOCK_GVPROXY_SHUTTLE_PORT).await?;
+        switch::attach_to_switch_vsock(tap_fd, VSOCK_HOST_CID, VSOCK_GVPROXY_SHUTTLE_PORT, None)
+            .await?;
     tracing::info!(%cidr, %gateway, "guest root egress up via host gvproxy shuttle");
     Ok(relay)
 }

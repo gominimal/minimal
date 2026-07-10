@@ -16,7 +16,9 @@
 //! Implements R1.5 (per-PTask switch attachment) and R1.7 (the DM2 native-Linux
 //! attachment path).
 
+use std::collections::HashSet;
 use std::io::{self, Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::sync::Arc;
@@ -27,6 +29,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 
+use super::policy::{Direction, PolicyWarnLimiter};
 use super::{DEFAULT_MTU, PtaskLease, SwitchSubnet};
 
 /// `ioctl` request number for `TUNSETIFF` (set the tap/tun interface a fd backs).
@@ -291,11 +294,15 @@ impl Drop for SwitchRelay {
 /// Returns an error if the control socket cannot be connected, the connect
 /// request cannot be written, or the tap fd cannot be put into non-blocking
 /// mode for epoll-driven I/O.
-pub async fn attach_to_switch(tap_fd: OwnedFd, api_sock: &Path) -> io::Result<SwitchRelay> {
+pub async fn attach_to_switch(
+    tap_fd: OwnedFd,
+    api_sock: &Path,
+    gate: Option<IngressGate>,
+) -> io::Result<SwitchRelay> {
     let mut sock = UnixStream::connect(api_sock).await?;
     sock.write_all(CONNECT_REQUEST).await?;
     let (sock_rx, sock_tx) = sock.into_split();
-    spawn_relay(tap_fd, sock_rx, sock_tx)
+    spawn_relay(tap_fd, sock_rx, sock_tx, gate)
 }
 
 /// Attaches `tap_fd` to the **host** gvproxy switch over AF_VSOCK (DM1/3/4) and
@@ -317,6 +324,7 @@ pub async fn attach_to_switch_vsock(
     tap_fd: OwnedFd,
     cid: u32,
     port: u32,
+    gate: Option<IngressGate>,
 ) -> io::Result<SwitchRelay> {
     // Bound the connect + `/connect` upgrade: a wedged or absent host gvproxy
     // must fail the attach fast, not stall OwnIp bring-up forever.
@@ -340,7 +348,7 @@ pub async fn attach_to_switch_vsock(
         )
     })??;
     let (sock_rx, sock_tx) = tokio::io::split(sock);
-    spawn_relay(tap_fd, sock_rx, sock_tx)
+    spawn_relay(tap_fd, sock_rx, sock_tx, gate)
 }
 
 /// Wires `tap_fd` into the bidirectional frame relay against an already-connected,
@@ -349,7 +357,12 @@ pub async fn attach_to_switch_vsock(
 /// Shared by the DM2 UDS path ([`attach_to_switch`]) and the DM1/3/4 vsock path
 /// ([`attach_to_switch_vsock`]); the relay loops are transport-agnostic
 /// (`AsyncRead`/`AsyncWrite`), so only the connect step differs.
-fn spawn_relay<R, W>(tap_fd: OwnedFd, sock_rx: R, sock_tx: W) -> io::Result<SwitchRelay>
+fn spawn_relay<R, W>(
+    tap_fd: OwnedFd,
+    sock_rx: R,
+    sock_tx: W,
+    gate: Option<IngressGate>,
+) -> io::Result<SwitchRelay>
 where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
@@ -365,7 +378,7 @@ where
     let tap = Arc::new(AsyncFd::new(tap_file)?);
 
     let tap_to_switch = tokio::spawn(relay_tap_to_switch(Arc::clone(&tap), sock_tx));
-    let switch_to_tap = tokio::spawn(relay_switch_to_tap(sock_rx, tap));
+    let switch_to_tap = tokio::spawn(relay_switch_to_tap(sock_rx, tap, gate));
     Ok(SwitchRelay {
         tap_to_switch,
         switch_to_tap,
@@ -412,9 +425,116 @@ where
     }
 }
 
+/// Ethernet II header length: destination MAC (6) + source MAC (6) + EtherType (2).
+const ETH_HDR: usize = 14;
+/// EtherType for IPv4. Frames carrying anything else (ARP `0x0806`, IPv6
+/// `0x86DD`, VLAN-tagged `0x8100`) are outside the gate's scope and pass through.
+const ETHERTYPE_IPV4: u16 = 0x0800;
+/// IPv4 protocol number for TCP. Only TCP is gated (the SYN check is TCP-only).
+const IPPROTO_TCP: u8 = 6;
+
+/// A per-PTask inbound ingress filter for the `switch → tap` relay leg.
+///
+/// Realizes UC6 / finding #2: session↔session (and daemon→session) traffic on the
+/// shared gvproxy switch is subject to the *target* PTask's ingress policy, which
+/// gvproxy itself cannot enforce (v0.8.9 has no per-client ACL API). This is a
+/// stateless TCP-SYN gate: a new inbound connection (a bare SYN) to a port the
+/// target did not declare is dropped; established/return traffic and declared
+/// ports pass, so egress and the host-publish forwarder are unaffected.
+pub struct IngressGate {
+    /// TCP destination ports the target accepts new inbound connections on — the
+    /// *internal* ports of its ingress `port_mappings` (what the sandbox listens
+    /// on, and what both a peer session and the host-publish forwarder dial). An
+    /// empty set denies every inbound SYN (the own-IP default-block posture).
+    allowed: HashSet<u16>,
+    /// The target PTask's switch IP, carried as the R2.7 log's `session_id`.
+    label: String,
+    /// Rate-limited emitter for dropped-frame warnings (R2.7).
+    limiter: PolicyWarnLimiter,
+}
+
+impl IngressGate {
+    /// Builds a gate from a PTask's ingress policy. The allowed set is the
+    /// internal port of every **TCP** `port_mapping`; UDP/ICMP mappings do not
+    /// gate (the SYN check is TCP-only — a documented limitation).
+    #[must_use]
+    pub fn for_session(label: String, ingress: Option<&sessions::IngressPolicy>) -> Self {
+        let allowed = ingress
+            .map(|i| {
+                i.port_mappings
+                    .iter()
+                    .filter(|m| m.proto == sessions::IpProto::Tcp)
+                    .map(|m| m.internal_port)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            allowed,
+            label,
+            limiter: PolicyWarnLimiter::new(),
+        }
+    }
+}
+
+/// Inspects an inbound Ethernet frame and returns `Some((dst_port, src))` **iff**
+/// it is a bare TCP SYN (SYN set, ACK clear) to a port not in `allowed` — the one
+/// case the ingress gate drops. Returns `None` (pass) for everything else:
+/// non-IPv4 (ARP/IPv6/VLAN), non-TCP (UDP/ICMP), IP fragments, short/malformed
+/// frames, and any segment with ACK set (SYN-ACK, established, egress return).
+///
+/// Stateless and allocation-free; the parse is length-checked at every step so a
+/// truncated or hostile frame yields `None` rather than an out-of-bounds read.
+fn blocked_syn(frame: &[u8], allowed: &HashSet<u16>) -> Option<(u16, SocketAddrV4)> {
+    // Need an Ethernet header plus a minimum (20-byte) IPv4 header.
+    if frame.len() < ETH_HDR + 20 {
+        return None;
+    }
+    if u16::from_be_bytes([frame[12], frame[13]]) != ETHERTYPE_IPV4 {
+        return None;
+    }
+    let ip = &frame[ETH_HDR..];
+    // IHL (low nibble of byte 0) is the header length in 32-bit words.
+    let ihl = ((ip[0] & 0x0f) as usize) * 4;
+    if ihl < 20 || ip.len() < ihl {
+        return None;
+    }
+    if ip[9] != IPPROTO_TCP {
+        return None;
+    }
+    // A non-zero fragment offset (low 13 bits of bytes 6–7) is a later fragment
+    // with no TCP header at `ihl`; pass rather than misparse.
+    if u16::from_be_bytes([ip[6], ip[7]]) & 0x1fff != 0 {
+        return None;
+    }
+    let tcp = &ip[ihl..];
+    // Need through the flags byte (TCP header offset 13).
+    if tcp.len() < 14 {
+        return None;
+    }
+    let flags = tcp[13];
+    let (syn, ack) = (flags & 0x02 != 0, flags & 0x10 != 0);
+    if !(syn && !ack) {
+        return None;
+    }
+    let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
+    if allowed.contains(&dst_port) {
+        return None;
+    }
+    let src = SocketAddrV4::new(
+        Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]),
+        u16::from_be_bytes([tcp[0], tcp[1]]),
+    );
+    Some((dst_port, src))
+}
+
 /// switch → tap: read a 2-byte LE length, then that many bytes of Ethernet
-/// frame, write the frame to the tap device.
-async fn relay_switch_to_tap<R>(mut sock: R, tap: Arc<AsyncFd<std::fs::File>>) -> io::Result<()>
+/// frame, apply the inbound ingress gate (finding #2), and write the frame to the
+/// tap device.
+async fn relay_switch_to_tap<R>(
+    mut sock: R,
+    tap: Arc<AsyncFd<std::fs::File>>,
+    gate: Option<IngressGate>,
+) -> io::Result<()>
 where
     R: AsyncReadExt + Unpin,
 {
@@ -443,6 +563,21 @@ where
             ));
         }
         sock.read_exact(&mut frame[..n]).await?;
+        // Inbound ingress gate (finding #2): drop a new-connection SYN to a port
+        // the target PTask did not declare, so a peer session or the daemon tap
+        // cannot reach undeclared listeners on the shared switch.
+        if let Some(gate) = &gate
+            && let Some((dst_port, src)) = blocked_syn(&frame[..n], &gate.allowed)
+        {
+            gate.limiter.warn(
+                &gate.label,
+                Direction::Ingress,
+                SocketAddr::V4(src),
+                sessions::IpProto::Tcp,
+                &format!("no ingress mapping for TCP dst port {dst_port}"),
+            );
+            continue;
+        }
         loop {
             let mut guard = tap.writable().await?;
             // One non-blocking write per try_io call: write_all could issue
@@ -467,6 +602,130 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds an Ethernet II + IPv4 + TCP frame for the ingress-gate tests.
+    /// `flags` is the raw TCP flags byte (SYN = 0x02, ACK = 0x10).
+    fn tcp_frame(ethertype: u16, proto: u8, flags: u8, src: Ipv4Addr, dst_port: u16) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x01]); // dst MAC
+        f.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x02]); // src MAC
+        f.extend_from_slice(&ethertype.to_be_bytes());
+        // IPv4 header, IHL = 5 (20 bytes), fragment offset 0.
+        f.push(0x45);
+        f.push(0x00);
+        f.extend_from_slice(&40u16.to_be_bytes()); // total length (unread)
+        f.extend_from_slice(&0u16.to_be_bytes()); // identification
+        f.extend_from_slice(&0u16.to_be_bytes()); // flags + fragment offset
+        f.push(64); // TTL
+        f.push(proto);
+        f.extend_from_slice(&0u16.to_be_bytes()); // header checksum (unread)
+        f.extend_from_slice(&src.octets());
+        f.extend_from_slice(&Ipv4Addr::new(100, 64, 0, 9).octets()); // dst IP
+        // TCP header, data offset 5.
+        f.extend_from_slice(&40000u16.to_be_bytes()); // src port
+        f.extend_from_slice(&dst_port.to_be_bytes());
+        f.extend_from_slice(&0u32.to_be_bytes()); // seq
+        f.extend_from_slice(&0u32.to_be_bytes()); // ack
+        f.push(0x50); // data offset 5, reserved
+        f.push(flags);
+        f.extend_from_slice(&0u16.to_be_bytes()); // window
+        f.extend_from_slice(&0u16.to_be_bytes()); // checksum
+        f.extend_from_slice(&0u16.to_be_bytes()); // urgent pointer
+        f
+    }
+
+    const SYN: u8 = 0x02;
+    const ACK: u8 = 0x10;
+    const SRC: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 5);
+
+    #[test]
+    fn gate_drops_syn_to_undeclared_port() {
+        let allowed = HashSet::from([80]);
+        let frame = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, SRC, 9999);
+        let hit = blocked_syn(&frame, &allowed).expect("a SYN to :9999 must be blocked");
+        assert_eq!(hit.0, 9999);
+        assert_eq!(*hit.1.ip(), SRC);
+        assert_eq!(hit.1.port(), 40000);
+    }
+
+    #[test]
+    fn gate_passes_syn_to_declared_port() {
+        let allowed = HashSet::from([80]);
+        let frame = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, SRC, 80);
+        assert!(blocked_syn(&frame, &allowed).is_none());
+    }
+
+    #[test]
+    fn gate_passes_established_and_return_traffic() {
+        let allowed = HashSet::new();
+        // SYN-ACK and a pure ACK to an undeclared port are return/established
+        // traffic (egress replies) and must never be dropped.
+        for flags in [SYN | ACK, ACK] {
+            let frame = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, flags, SRC, 9999);
+            assert!(
+                blocked_syn(&frame, &allowed).is_none(),
+                "flags {flags:#x} must pass"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_passes_non_tcp_and_non_ipv4() {
+        let allowed = HashSet::new();
+        // ARP and IPv6 EtherTypes.
+        for et in [0x0806u16, 0x86DD] {
+            assert!(blocked_syn(&tcp_frame(et, IPPROTO_TCP, SYN, SRC, 9999), &allowed).is_none());
+        }
+        // UDP (proto 17) and ICMP (proto 1) are not gated by the TCP-SYN check.
+        for proto in [17u8, 1] {
+            assert!(
+                blocked_syn(&tcp_frame(ETHERTYPE_IPV4, proto, SYN, SRC, 9999), &allowed).is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn gate_passes_truncated_frames() {
+        let allowed = HashSet::new();
+        let full = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, SRC, 9999);
+        // A prefix shorter than eth(14) + ip(20) + tcp-through-flags(14) = 48
+        // bytes cannot yield the TCP flags/port and must pass rather than misread.
+        for cut in [0, 14, 20, 33, 40, 47] {
+            assert!(blocked_syn(&full[..cut], &allowed).is_none(), "len {cut}");
+        }
+        // A one-byte-truncated frame (byte 53) still carries a full TCP header
+        // through the flags/port, so it is correctly still classified.
+        assert!(blocked_syn(&full[..full.len() - 1], &allowed).is_some());
+    }
+
+    #[test]
+    fn for_session_collects_tcp_internal_ports_only() {
+        let ingress = sessions::IngressPolicy {
+            port_mappings: vec![
+                sessions::PortMapping {
+                    external_port: 18080,
+                    internal_port: 80,
+                    proto: sessions::IpProto::Tcp,
+                },
+                sessions::PortMapping {
+                    external_port: 19999,
+                    internal_port: 53,
+                    proto: sessions::IpProto::Udp,
+                },
+            ],
+            dynamic_allowed_range: None,
+        };
+        let gate = IngressGate::for_session("100.64.0.9".into(), Some(&ingress));
+        assert!(gate.allowed.contains(&80)); // TCP internal port
+        assert!(!gate.allowed.contains(&53)); // UDP mapping excluded
+        assert!(!gate.allowed.contains(&18080)); // external port is not the listener
+        // A no-ingress own-IP session denies every inbound SYN.
+        assert!(
+            IngressGate::for_session("x".into(), None)
+                .allowed
+                .is_empty()
+        );
+    }
 
     #[test]
     fn frame_header_is_little_endian_length() {
