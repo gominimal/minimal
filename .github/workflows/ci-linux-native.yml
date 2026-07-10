@@ -59,6 +59,8 @@ jobs:
               - "Cargo.lock"
               # The toolchain pin: a rustc bump must re-run the Rust lanes.
               - "rust-toolchain.toml"
+              # Nextest profiles change how this lane's tests run.
+              - ".config/nextest.toml"
               - "scripts/**"
               - ".minimal/**"
               - ".github/actions/setup-rust/**"
@@ -104,6 +106,10 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
+        with:
+          # `-p` builds unify features differently than the workspace test
+          # suite — own cache class.
+          shared-key: native-e2e
       - name: Enable unprivileged user namespaces
         # The session sandbox (hakoniwa) needs userns; Ubuntu 24.04 restricts
         # them via AppArmor by default.
@@ -120,7 +126,7 @@ jobs:
           key: native-e2e-minimal-cache-${{ hashFiles('.minimal/minimal.toml') }}
           restore-keys: native-e2e-minimal-cache-
       - name: Build minimal + minimald
-        run: cargo build -p minimald --bin minimald -p minimal --bin minimal
+        run: cargo build -p minimald --bin minimald -p minimal --bin minimal --locked
       - name: Session e2e (native minimald)
         run: |
           export PATH="$PWD/target/debug:$PATH"

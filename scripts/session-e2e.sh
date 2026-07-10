@@ -4,8 +4,9 @@
 # so the identical proof runs against all three deployment targets:
 #
 #   Linux native (DM2)   minimald on the host          (no extra env)
-#   Linux KVM    (DM1)   minimald in a minvmd microVM  E2E_VM=1 E2E_MINIMAL_ARGS=--minvmd
-#   macOS HVF            minimald in a minvmd microVM  E2E_VM=1 (macOS is always VM-backed)
+#   Linux KVM    (DM3)   minimald in a minvmd microVM  E2E_VM=1 E2E_MINIMAL_ARGS=--minvmd
+#   macOS HVF    (DM1)   minimald in a minvmd microVM  E2E_VM=1 (macOS is always VM-backed)
+# (DM numbers are the deployment models in docs/specs/03-spec-networking.)
 #
 # Flow: from a guaranteed-clean state, `minimal activate` must auto-spawn the
 # target's daemon and create a session; `minimal attach --command` execs in
