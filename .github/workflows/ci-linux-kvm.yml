@@ -69,18 +69,20 @@ jobs:
               - ".github/actions/setup-libkrun-linux/**"
               - ".github/actions/materialize/**"
 
-  minvmd-linux-kvm-e2e:
+  build-linux:
+    # BUILD phase: compile everything the KVM tests need and ship it as one
+    # artifact, so a flaky e2e rerun replays only the ~15-minute test job
+    # instead of this full build. No /dev/kvm needed here.
     needs: [changes]
     if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.kvm == 'true'
-    runs-on: ubuntu-latest # x86_64; KVM-capable
-    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Free Disk Space
-        # The full minvmd e2e (build + libkrun prefix + kernel image + rootfs
-        # image + cargo test) routinely exceeds the ~14 GB free on a fresh
-        # GitHub-hosted Ubuntu runner. `remove_tool_cache: true` reclaims
-        # `/opt/hostedtoolcache` (~14 GB); the dtolnay step below reinstalls
-        # the Rust toolchain we actually need.
+        # The workspace build + libkrun prefix routinely exceed the ~14 GB
+        # free on a fresh GitHub-hosted Ubuntu runner. `remove_tool_cache:
+        # true` reclaims /opt/hostedtoolcache (~14 GB); the dtolnay step below
+        # reinstalls the Rust toolchain we actually need.
         uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
         with:
           remove_android: true
@@ -98,46 +100,16 @@ jobs:
         # protoc + libprotobuf-dev: the `minimal` CLI (materialize) build. The
         # well-known protos (google/protobuf/*.proto) live in libprotobuf-dev,
         # which protobuf-compiler only pulls via recommends — so name it
-        # explicitly since we use --no-install-recommends. cpio: packs the guest
-        # initramfs (scripts/build-initramfs.sh). git: source fetches during the
-        # CLI build. libkrun no longer builds from source here, so its old kernel
-        # /bindgen toolchain (flex/bison/bc/libelf/clang/patchelf/…) is gone.
+        # explicitly since we use --no-install-recommends. cpio: packs the
+        # guest initramfs (scripts/build-initramfs.sh). git: source fetches
+        # during the CLI build.
         #
         # Retried: apt is the one step class with recorded transient failures
-        # in this lane's history (the sole main-branch failure and both manual
-        # re-runs died here), and a gating lane must absorb that class.
+        # in this lane's history (see scripts/ci/retry.sh).
         run: |
           ./scripts/ci/retry.sh 3 10 sudo sh -c \
             'apt-get update && apt-get install -y --no-install-recommends \
                protobuf-compiler libprotobuf-dev cpio git'
-
-      - name: Enable /dev/kvm access
-        # GitHub-hosted x86_64 Linux runners expose /dev/kvm but the runner user
-        # is not in the `kvm` group; widen the node so libkrun can open it. Fail
-        # fast with a clear message if this runner has no KVM at all.
-        run: |
-          if [ ! -e /dev/kvm ]; then
-            echo "::error::/dev/kvm not present on this runner; cannot run the Linux/KVM e2e." >&2
-            exit 1
-          fi
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
-            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-          ls -l /dev/kvm
-
-      - name: Resolve build paths
-        # Publish the guest-artifact paths (plus the E2E gate) to $GITHUB_ENV
-        # for later steps; `runner.temp` is not available in job-level `env:`.
-        # The libkrun link + runtime paths (LIBKRUN_PREFIX, LD_LIBRARY_PATH)
-        # are published by the setup-libkrun-linux composite below.
-        run: |
-          {
-            echo "MINVMD_E2E=1"
-            echo "MINVMD_KERNEL_PATH=$RUNNER_TEMP/vmlinuz"
-            echo "MINVMD_ROOTFS_PATH=$RUNNER_TEMP/rootfs.img"
-            echo "MINVMD_INITRAMFS=$RUNNER_TEMP/initramfs.cpio"
-          } >> "$GITHUB_ENV"
 
       - name: Install cross
         uses: taiki-e/install-action@v2
@@ -157,23 +129,119 @@ jobs:
           restore-keys: ${{ runner.os }}-x86_64-minvmd-kvm-
 
       - name: Materialize libkrun prefix (upstream package)
-        # Runs after the cargo cache restore so the CLI build the cache fetch
-        # drives is incremental.
+        # Needed at BUILD time: minvmd links libkrun.so (build.rs link search
+        # + the minvmd_libkrun cfg for the real, non-stub impl). The prefix is
+        # shipped in the testbed so the test job runs against the exact
+        # libraries this job linked. Runs after the cargo cache restore so the
+        # CLI build the cache fetch drives is incremental.
         uses: ./.github/actions/setup-libkrun-linux
         with:
           arch: x86_64
 
+      - name: Build guest initramfs (minimald as /init)
+        run: ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs.cpio" x86_64-unknown-linux-musl
+
+      - name: Build minvmd
+        run: cargo build -p minvmd --bin minvmd
+
+      - name: Build e2e harnesses + stage the testbed
+        # The manifest records exactly which hash-suffixed binaries cargo
+        # produced; the test job resolves them via scripts/ci/run-testbin.sh
+        # (never `ls | head`). The harnesses locate minvmd via the MINVMD_BIN
+        # override (their compile-time CARGO_BIN_EXE path does not exist on
+        # the test runner).
+        run: |
+          set -euo pipefail
+          mkdir -p testbed
+          cargo test -p minvmd --test boot_e2e --test minimald_session_e2e --test vsock_relay_e2e \
+            --no-run --message-format=json > "$RUNNER_TEMP/build-plan.json"
+          jq -rs '[.[] | select(.reason=="compiler-artifact" and .executable != null and (.target.kind | index("test")))
+                   | {key: .target.name, value: (.executable | split("/") | last)}] | from_entries' \
+            "$RUNNER_TEMP/build-plan.json" > testbed/testbins.json
+          jq -r 'select(.reason=="compiler-artifact" and .executable != null and (.target.kind | index("test"))) | .executable' \
+            "$RUNNER_TEMP/build-plan.json" | while read -r exe; do cp "$exe" testbed/; done
+          cat testbed/testbins.json
+          cp target/debug/minvmd testbed/minvmd
+          cp "$RUNNER_TEMP/initramfs.cpio" testbed/initramfs.cpio
+          # Ship the exact libkrun prefix the binaries were linked against.
+          tar czf testbed/libkrun-prefix.tgz -C "$LIBKRUN_PREFIX" .
+
+      - name: Upload testbed
+        uses: actions/upload-artifact@v7
+        with:
+          name: kvm-testbed
+          path: testbed/
+          if-no-files-found: error
+          retention-days: 3
+
+  test-kvm:
+    # TEST phase: no Rust toolchain, no cargo — download the testbed, pull
+    # the guest images, and run the prebuilt harnesses directly. A flake
+    # rerun of this job alone costs ~15 minutes instead of the old
+    # 60-minute build+test monolith.
+    needs: [changes, build-linux]
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.kvm == 'true'
+    runs-on: ubuntu-latest # x86_64; KVM-capable
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Enable /dev/kvm access
+        # GitHub-hosted x86_64 Linux runners expose /dev/kvm but the runner user
+        # is not in the `kvm` group; widen the node so libkrun can open it. Fail
+        # fast with a clear message if this runner has no KVM at all.
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm not present on this runner; cannot run the Linux/KVM e2e." >&2
+            exit 1
+          fi
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Download testbed
+        uses: actions/download-artifact@v8
+        with:
+          name: kvm-testbed
+          path: ${{ runner.temp }}/testbed
+
+      - name: Unpack testbed + resolve paths
+        # Artifact transfer strips exec bits; restore them from the manifest.
+        # MINVMD_BIN points the harnesses at the shipped minvmd (their baked
+        # CARGO_BIN_EXE path only exists on the build runner). The libkrun
+        # prefix is unpacked to the same $HOME/.krun path the build linked
+        # (rpath) and exported for the dynamic loader.
+        run: |
+          set -euo pipefail
+          TESTBED="$RUNNER_TEMP/testbed"
+          chmod +x "$TESTBED/minvmd"
+          jq -r '.[]' "$TESTBED/testbins.json" | while read -r b; do chmod +x "$TESTBED/$b"; done
+          mkdir -p "$HOME/.krun"
+          tar xzf "$TESTBED/libkrun-prefix.tgz" -C "$HOME/.krun"
+          {
+            echo "TESTBED=$TESTBED"
+            echo "MINVMD_BIN=$TESTBED/minvmd"
+            echo "LIBKRUN_PREFIX=$HOME/.krun"
+            echo "LD_LIBRARY_PATH=$HOME/.krun${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            echo "MINVMD_E2E=1"
+            echo "MINVMD_KERNEL_PATH=$RUNNER_TEMP/vmlinuz"
+            echo "MINVMD_ROOTFS_PATH=$RUNNER_TEMP/rootfs.img"
+            echo "MINVMD_INITRAMFS=$TESTBED/initramfs.cpio"
+          } >> "$GITHUB_ENV"
+
       - name: Assert libkrun exports krun_add_disk3 (>= 1.19.0)
-        # krun_add_disk3 (this PR's /dev/vdb attach) needs libkrun >= 1.19.0. Fail
-        # loudly here rather than with a cryptic runtime error at VM boot if the
-        # materialized upstream libkrun is too old.
-        # LIBKRUN_PREFIX is published by the setup-libkrun-linux composite above
-        # (the old KRUN_PREFIX env was retired with the composite extraction).
+        # krun_add_disk3 (the /dev/vdb attach) needs libkrun >= 1.19.0. Fail
+        # loudly here rather than with a cryptic runtime error at VM boot if
+        # the shipped upstream libkrun is too old.
         run: |
           so="$(ls "$LIBKRUN_PREFIX"/libkrun.so* 2>/dev/null | head -1)"
           test -n "$so" || { echo "::error::no libkrun.so under $LIBKRUN_PREFIX"; exit 1; }
           nm -D "$so" 2>/dev/null | grep -q krun_add_disk3 \
-            || { echo "::error::materialized libkrun ($so) does not export krun_add_disk3; need >= 1.19.0"; exit 1; }
+            || { echo "::error::shipped libkrun ($so) does not export krun_add_disk3; need >= 1.19.0"; exit 1; }
           echo "libkrun OK: $so exports krun_add_disk3"
 
       - name: Materialize gvproxy switch binary (DM1 relay)
@@ -200,32 +268,26 @@ jobs:
           arch: x86_64
           channel: unstable
 
-      - name: Build guest initramfs (minimald as /init)
-        run: ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs.cpio" x86_64-unknown-linux-musl
-
-      - name: Build minvmd
-        run: cargo build -p minvmd --bin minvmd
-
       - name: Boot E2E (READY round-trip, R3.1)
         env:
           MINVMD_BOOT_LOG: ${{ runner.temp }}/boot.log
-        run: cargo test -p minvmd --test boot_e2e -- --include-ignored --nocapture
+        run: ./scripts/ci/run-testbin.sh "$TESTBED" boot_e2e --include-ignored --nocapture
 
       - name: Session E2E (full minimald session over the bridge)
-        run: cargo test -p minvmd --test minimald_session_e2e -- --include-ignored --nocapture --exact minimald_exec_over_bridge
+        run: ./scripts/ci/run-testbin.sh "$TESTBED" minimald_session_e2e --include-ignored --nocapture --exact minimald_exec_over_bridge
 
       - name: DM1 gvproxy relay E2E (OwnIp PTask gets a switch IP, R1.5)
         # Boots an OwnIp VM and asserts its netns receives a 100.64.0.0/16 switch
         # IP via the async TAP↔gvproxy relay, with frames traversing the switch.
         # Needs /dev/kvm, the gvproxy binary, and CAP_NET_ADMIN (tap + netns), so
         # it is `#[ignore]`-gated and only runs here with the env gate set.
-        # `sudo -E` preserves the materialized-artifact env while granting the
-        # tap/netns capabilities the relay requires.
+        # `sudo -E` preserves the testbed env while granting the tap/netns
+        # capabilities the relay requires.
         env:
           MINVMD_INTEGRATION_TEST: "1"
         run: |
           sudo -E env "PATH=$PATH" "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" \
-            cargo test -p minvmd vsock -- --include-ignored --nocapture
+            ./scripts/ci/run-testbin.sh "$TESTBED" vsock_relay_e2e --include-ignored --nocapture
 
       # NOTE: bridge_e2e is intentionally NOT run here. It targets the Stage-1
       # guest "vsock stub" (a socat/cat echo on port 2222) that minimald-as-pid1
@@ -241,7 +303,7 @@ jobs:
           MINVMD_BOOT_LOG: ${{ runner.temp }}/boot-daemon.log
         run: |
           set -euo pipefail
-          BIN=target/debug/minvmd
+          BIN="$MINVMD_BIN"
 
           echo "::group::run --detach"
           "$BIN" run --detach --timeout 30
@@ -294,10 +356,10 @@ jobs:
 
   # Single required status check for this lane (branch-protection context:
   # ci-linux-kvm-success, joins the ruleset after the soak — #687). Green when
-  # the e2e succeeded OR was path-skipped; red only on failure/cancellation.
+  # build + tests succeeded OR were path-skipped; red only on failure/cancellation.
   ci-linux-kvm-success:
     if: always()
-    needs: [changes, minvmd-linux-kvm-e2e]
+    needs: [changes, build-linux, test-kvm]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
