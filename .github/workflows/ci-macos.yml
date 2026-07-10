@@ -20,6 +20,8 @@ on:
             # a composite-only edit would skip this lane and break it post-merge.
             - ".github/actions/setup-libkrun-macos/**"
             - ".github/actions/materialize/**"
+            # The libkrun pin: a bump must rebuild + re-run the hypervisor e2e.
+            - "vendor/libkrun/**"
     pull_request:
         branches: ["main"]
         paths:
@@ -35,6 +37,8 @@ on:
             # a composite-only edit would skip this lane and break it post-merge.
             - ".github/actions/setup-libkrun-macos/**"
             - ".github/actions/materialize/**"
+            # The libkrun pin: a bump must rebuild + re-run the hypervisor e2e.
+            - "vendor/libkrun/**"
     workflow_dispatch:
 
 env:
@@ -155,7 +159,7 @@ jobs:
                   persist-credentials: false
             - name: Toolchain
               uses: dtolnay/rust-toolchain@stable
-            - name: Provision libkrun (slp/krun tap)
+            - name: Provision libkrun (pinned own build)
               uses: ./.github/actions/setup-libkrun-macos
             - name: Download virtio-linux kernel
               uses: actions/download-artifact@v8
@@ -180,7 +184,27 @@ jobs:
               # minvmd needs the hypervisor entitlement.
               run: |
                   cargo test -p minvmd --test minimald_session_e2e --no-run
-                  cargo build -p minvmd --bin minvmd -p minimal --bin minimal
+                  cargo build -p minvmd --bin minvmd
+                  # SEPARATE invocation for the CLI (mirrors release.yml): built
+                  # together, cargo unifies minvmd's default `libkrun` feature
+                  # into minimal's default-features=false opt-out, and the CLI
+                  # links libkrun. The brew era masked this (absolute install
+                  # name loaded from anywhere); our @rpath dylib turns it into
+                  # dyld "Library not loaded" at autospawn, since minimal bakes
+                  # no rpaths.
+                  cargo build -p minimal --bin minimal
+            - name: Verify minimal links only system libraries
+              # The CLI spawns minvmd as a subprocess and calls no libkrun; a
+              # krun load command means the feature unification above regressed.
+              # Catch it here with a clear message, not as a dyld error mid-e2e.
+              run: |
+                  bad="$(otool -L target/debug/minimal | tail -n +2 | awk '{print $1}' \
+                    | grep -vE '^(/usr/lib/|/System/)' || true)"
+                  if [ -n "$bad" ]; then
+                    echo "::error::minimal links non-system libraries (feature unification with minvmd's libkrun?):" >&2
+                    printf '%s\n' "$bad" >&2
+                    exit 1
+                  fi
             - name: Codesign minvmd (hypervisor entitlement, R1.4)
               run: codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
             - name: Session E2E (boot + full session over the bridge)
@@ -327,7 +351,7 @@ jobs:
               uses: dtolnay/rust-toolchain@stable
               with:
                   components: clippy
-            - name: Provision libkrun (slp/krun tap)
+            - name: Provision libkrun (pinned own build)
               uses: ./.github/actions/setup-libkrun-macos
             - name: Clippy (minvmd)
               run: cargo clippy -p minvmd --all-targets -- -D warnings

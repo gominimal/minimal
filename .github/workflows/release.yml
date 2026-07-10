@@ -217,7 +217,7 @@ jobs:
                   persist-credentials: false
             - name: Toolchain
               uses: dtolnay/rust-toolchain@stable
-            - name: Provision libkrun (slp/krun tap)
+            - name: Provision libkrun (pinned own build)
               uses: ./.github/actions/setup-libkrun-macos
             - name: Build release minvmd binary
               run: cargo build --release -p minvmd --bin minvmd
@@ -294,66 +294,35 @@ jobs:
                   retention-days: 7
 
     build-libkrun-macos-arm64:
-        # Build a TRIMMED libkrun.dylib from source to SHIP in the release, so
-        # macOS users don't have to `brew install` it themselves. GitHub-hosted
+        # Build the TRIMMED libkrun.dylib to SHIP in the release, so macOS users
+        # don't have to `brew install` it themselves. Same setup-libkrun-macos
+        # composite (scripts/build-libkrun-macos.sh at the vendor/libkrun/
+        # libkrun.lock pin) that every macOS CI lane links and boots against —
+        # the shipped dylib is BY CONSTRUCTION the one CI tested. GitHub-hosted
         # macos-latest is Apple Silicon (arm64).
         runs-on: macos-latest
         timeout-minutes: 45
-        env:
-            # Pin to the libkrun the slp/krun tap currently ships, so the dylib we
-            # ship matches the ABI the macOS CI lanes build and test against.
-            LIBKRUN_REF: v1.19.4
         steps:
-            - name: Checkout libkrun (${{ env.LIBKRUN_REF }})
-              uses: actions/checkout@v7
+            - uses: actions/checkout@v7
               with:
-                  repository: containers/libkrun
-                  ref: ${{ env.LIBKRUN_REF }}
                   persist-credentials: false
             - name: Toolchain
               uses: dtolnay/rust-toolchain@stable
-            - name: Build trimmed libkrun (blk + net; no gpu, no init-blob)
-              # Direct cargo build — no Makefile, no env, no lld/xz/sysroot.
-              #   -p libkrun            scope to the libkrun crate, so the
-              #                         src/input & src/display workspace members
-              #                         (whose bindgen build scripts need libclang)
-              #                         are never built.
-              #   --no-default-features drop `init-blob`, whose build script
-              #                         cross-compiles a Linux init — the ONLY reason
-              #                         the Makefile needs lld + a Debian sysroot.
-              #                         minvmd supplies its own initramfs, so
-              #                         libkrun's bundled init is unused. (This is
-              #                         exactly the Makefile's INIT_BLOB=0 config.)
-              #   --features blk,net    blk = rootfs disk (krun_add_disk2),
-              #                         net = virtio-net. No gpu => no libepoxy/
-              #                         virglrenderer. Hypervisor.framework is linked
-              #                         automatically by src/vmm/build.rs.
-              # Output: target/release/libkrun.dylib (install_name libkrun.1.dylib,
-              # set by src/libkrun/build.rs).
-              run: cargo build --release -p libkrun --no-default-features --features blk,net
-            - name: Stage the dylib and assert it is self-contained
-              # A trimmed build must link only system libraries. Any /opt/homebrew or
-              # /usr/local reference means a dependency leaked (e.g. a stray GPU lib)
-              # and the dylib would fail to load on a machine without Homebrew — fail
-              # loudly rather than ship an unloadable artifact. `otool -D` prints the
-              # install name for cross-checking against minvmd's recorded load
-              # command (see the minvmd macOS job); informational.
-              run: |
-                  dylib=target/release/libkrun.dylib
-                  echo "otool -L $dylib"; otool -L "$dylib"
-                  echo "otool -D $dylib (install name):"; otool -D "$dylib"
-                  if otool -L "$dylib" | grep -E '/opt/homebrew|/usr/local'; then
-                    echo "::error::trimmed libkrun links a non-system (Homebrew) dylib; see otool -L above" >&2
-                    exit 1
-                  fi
-                  cp "$dylib" "$RUNNER_TEMP/temp-libkrun-macos-arm64.dylib"
-            - name: Upload unsigned libkrun dylib (temp)
+            - name: Provision libkrun (pinned own build)
+              uses: ./.github/actions/setup-libkrun-macos
+            - name: Stage the dylib for signing
+              # The build script already asserted self-containment (no
+              # /opt/homebrew or /usr/local deps) and the krun_add_disk3 API
+              # floor, set the @rpath/libkrun.1.dylib install name, and ad-hoc
+              # signed it.
+              run: cp "$LIBKRUN_PREFIX/libkrun.1.dylib" "$RUNNER_TEMP/temp-libkrun-macos-arm64.dylib"
+            - name: Upload ad-hoc-signed libkrun dylib (temp)
               # This GitHub-hosted runner has no access to the Developer ID signing
-              # keychain, so the dylib leaves here UNSIGNED under a `temp-` prefixed
-              # name. sign-macos-artifacts (self-hosted) downloads it, signs it,
-              # and re-uploads under the final `libkrun-macos-arm64` name. The
-              # release job drops any leftover `temp-` artifact so the unsigned copy
-              # never ships.
+              # keychain, so the dylib leaves here only ad-hoc signed, under a
+              # `temp-` prefixed name. sign-macos-artifacts (self-hosted) downloads
+              # it, re-signs with Developer ID, and re-uploads under the final
+              # `libkrun-macos-arm64` name. The release job drops any leftover
+              # `temp-` artifact so the ad-hoc copy never ships.
               uses: actions/upload-artifact@v7
               with:
                   name: temp-libkrun-macos-arm64
@@ -382,8 +351,8 @@ jobs:
               # Sign with the same Developer ID identity, secure --timestamp, and
               # hardened runtime (--options runtime) as the binaries so the whole
               # install is notarization-ready. --force replaces each file's existing
-              # signature (cargo's ad-hoc on libkrun, the Go linker's ad-hoc on
-              # gvproxy). No entitlements: neither libkrun (a library) nor gvproxy
+              # signature (build-libkrun-macos.sh's ad-hoc on libkrun, the Go
+              # linker's ad-hoc on gvproxy). No entitlements: neither libkrun (a library) nor gvproxy
               # (the network switch) is the hypervisor entry point. The temp- prefix
               # is dropped so each file carries the final basename the
               # archive/installer expect.
