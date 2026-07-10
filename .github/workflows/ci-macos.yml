@@ -81,8 +81,10 @@ jobs:
             - name: Cache cargo + build artifacts (incl. the aarch64 cross target)
               # Raw actions/cache (not Swatinem) — it preserves the full
               # target/aarch64-unknown-linux-musl tree, so the initramfs cross-compile
-              # is incremental after the first run.
-              uses: actions/cache@v6
+              # is incremental after the first run. Restore-only here; the save
+              # half (main only) runs at the end of the job.
+              id: stage2-cache
+              uses: actions/cache/restore@v6
               with:
                   path: |
                       ~/.cargo/bin/
@@ -133,6 +135,19 @@ jobs:
                   name: minimald-initramfs-aarch64
                   path: ${{ runner.temp }}/initramfs.cpio
                   if-no-files-found: error
+            - name: Save cargo + build artifacts cache (main only)
+              # PR branches restore but never write: multi-GB caches written by
+              # every branch LRU-evict the main entries all PRs restore from.
+              if: github.ref == 'refs/heads/main' && steps.stage2-cache.outputs.cache-hit != 'true'
+              uses: actions/cache/save@v6
+              with:
+                  path: |
+                      ~/.cargo/bin/
+                      ~/.cargo/registry/index/
+                      ~/.cargo/registry/cache/
+                      ~/.cargo/git/db/
+                      target/
+                  key: ${{ steps.stage2-cache.outputs.cache-primary-key }}
 
     e2e:
         # Hypervisor E2E on real hardware, using the cache-pulled kernel + rootfs
@@ -158,6 +173,10 @@ jobs:
         needs: [artifacts]
         runs-on: [self-hosted, macOS, ARM64]
         timeout-minutes: 30
+        env:
+            # Slim debug info; see the unit job. First run after this change
+            # rebuilds the mini's persistent target dir once (new fingerprints).
+            CARGO_PROFILE_DEV_DEBUG: line-tables-only
         steps:
             - uses: actions/checkout@v7
               with:
@@ -191,8 +210,8 @@ jobs:
               # package bins for integration tests) and bakes its absolute
               # CARGO_BIN_EXE path — same-machine build+run, so it resolves.
               run: |
-                  cargo test -p minvmd --test krun_smoke --test minimald_session_e2e --no-run
-                  cargo build -p minvmd --bin minvmd
+                  cargo test -p minvmd --test krun_smoke --test minimald_session_e2e --no-run --locked
+                  cargo build -p minvmd --bin minvmd --locked
                   # SEPARATE invocation for the CLI (mirrors release.yml): built
                   # together, cargo unifies minvmd's default `libkrun` feature
                   # into minimal's default-features=false opt-out, and the CLI
@@ -200,7 +219,7 @@ jobs:
                   # name loaded from anywhere); our @rpath dylib turns it into
                   # dyld "Library not loaded" at autospawn, since minimal bakes
                   # no rpaths.
-                  cargo build -p minimal --bin minimal
+                  cargo build -p minimal --bin minimal --locked
             - name: Verify minimal links only system libraries
               # The CLI spawns minvmd as a subprocess and calls no libkrun; a
               # krun load command means the feature unification above regressed.
@@ -318,6 +337,11 @@ jobs:
         # mac-buildable. Kept lean (private repo: macOS minutes bill at 10x).
         runs-on: macos-latest
         timeout-minutes: 45
+        env:
+            # Slim debug info (usable backtraces, smaller caches, faster
+            # links); the mac jobs don't run the setup-rust composite that
+            # sets this on the Linux lanes.
+            CARGO_PROFILE_DEV_DEBUG: line-tables-only
         steps:
             - uses: actions/checkout@v7
               with:
@@ -328,12 +352,18 @@ jobs:
                   components: clippy
             - name: Cache cargo registry and build artifacts
               uses: Swatinem/rust-cache@v2
+              with:
+                  shared-key: mac-unit
+                  # PR branches restore but never save, so PR churn cannot
+                  # LRU-evict the main-branch caches (same policy as the
+                  # setup-rust composite).
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
             - name: Provision libkrun (pinned own build)
               uses: ./.github/actions/setup-libkrun-macos
             - name: Clippy (minvmd)
-              run: cargo clippy -p minvmd --all-targets -- -D warnings
+              run: cargo clippy -p minvmd --all-targets --locked -- -D warnings
             - name: Test (minvmd)
-              run: cargo test -p minvmd
+              run: cargo test -p minvmd --locked
             - name: Test (sessions)
               # Platform-sensitive surface: std::fs::canonicalize behavior on
               # prefix-symlinked roots (/tmp → /private/tmp on macOS) and the
@@ -345,4 +375,4 @@ jobs:
               # (`cargo build -p minimal` is fine: no dev-deps.) The CLI's macOS
               # coverage stays the autospawn e2e until minimald's sandbox deps
               # are cfg(linux)-gated.
-              run: cargo test -p sessions
+              run: cargo test -p sessions --locked
