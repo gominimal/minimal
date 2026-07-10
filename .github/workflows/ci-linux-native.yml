@@ -59,6 +59,8 @@ jobs:
               - "Cargo.lock"
               # The toolchain pin: a rustc bump must re-run the Rust lanes.
               - "rust-toolchain.toml"
+              # Nextest profiles change how this lane's tests run.
+              - ".config/nextest.toml"
               - "scripts/**"
               - ".minimal/**"
               - ".github/actions/setup-rust/**"

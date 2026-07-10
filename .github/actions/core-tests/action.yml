@@ -19,7 +19,9 @@ runs:
       run: cargo fetch --locked
     - name: Run tests
       shell: bash
-      run: cargo nextest run --workspace
+      # --no-tests=fail: an empty selection is a broken filter or a dropped
+      # target, not a pass.
+      run: cargo nextest run --workspace --profile ci --no-tests=fail
     - name: Run doctests
       shell: bash
       run: cargo test --workspace --doc
