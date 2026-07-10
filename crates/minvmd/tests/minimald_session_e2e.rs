@@ -38,6 +38,14 @@ fn short_state_dir() -> tempfile::TempDir {
         .expect("creating isolated state dir")
 }
 
+/// The minvmd binary to boot: `MINVMD_BIN` when set — CI's split build/test
+/// jobs run this harness on a different runner than the one that compiled it,
+/// where the absolute path baked by `CARGO_BIN_EXE_minvmd` does not exist —
+/// otherwise that compile-time cargo-built path.
+fn minvmd_bin() -> std::ffi::OsString {
+    std::env::var_os("MINVMD_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_minvmd").into())
+}
+
 const BOOT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Env var the server reads to scope an exec to a session
@@ -85,7 +93,7 @@ impl Guest {
         let state = short_state_dir();
         let sock_path = state.path().join("minimal/providers/local-0/ssh.sock");
 
-        let exe = env!("CARGO_BIN_EXE_minvmd");
+        let exe = minvmd_bin();
         let mut child = Command::new(exe)
             .args(["boot", "--foreground"])
             // minimald boots as the initramfs `/init` (MINVMD_INITRAMFS, set by

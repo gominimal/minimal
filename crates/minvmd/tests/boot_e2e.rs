@@ -30,6 +30,14 @@ fn short_state_dir() -> tempfile::TempDir {
         .expect("creating isolated state dir")
 }
 
+/// The minvmd binary to boot: `MINVMD_BIN` when set — CI's split build/test
+/// jobs run this harness on a different runner than the one that compiled it,
+/// where the absolute path baked by `CARGO_BIN_EXE_minvmd` does not exist —
+/// otherwise that compile-time cargo-built path.
+fn minvmd_bin() -> std::ffi::OsString {
+    std::env::var_os("MINVMD_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_minvmd").into())
+}
+
 #[test]
 #[serial]
 #[ignore = "gated MINVMD_E2E=1; requires Mac with libkrun, kernel, and rootfs"]
@@ -52,7 +60,7 @@ fn boot_e2e_ready_marker_round_trip() {
 
     let state_dir = short_state_dir();
 
-    let exe = env!("CARGO_BIN_EXE_minvmd");
+    let exe = minvmd_bin();
     let mut child = Command::new(exe)
         .args(["boot", "--foreground"])
         .env("XDG_STATE_HOME", state_dir.path())
