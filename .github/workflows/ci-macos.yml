@@ -69,7 +69,9 @@ jobs:
             - name: Toolchain
               uses: dtolnay/rust-toolchain@stable
             - name: Install protoc
-              run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+              # Retried: this exact step failed twice in this job's history on
+              # transient apt errors (see scripts/ci/retry.sh).
+              run: ./scripts/ci/retry.sh 3 10 sudo sh -c 'apt-get update && apt-get install -y protobuf-compiler'
             - name: Cache cargo + build artifacts (incl. the aarch64 cross target)
               # Raw actions/cache (not Swatinem) — it preserves the full
               # target/aarch64-unknown-linux-musl tree, so the initramfs cross-compile

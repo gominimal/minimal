@@ -2,8 +2,7 @@ name: CI (Linux KVM)
 
 # minvmd Linux/KVM end-to-end on a GitHub-hosted runner (#410, #411).
 #
-# Split from ci.yml and PATH-SCOPED so it runs only when the minvmd surface
-# changes. It needs no preprovisioned runner — KVM is available on GitHub-hosted
+# It needs no preprovisioned runner — KVM is available on GitHub-hosted
 # x86_64 Linux runners, and libkrun is materialized from the upstream package
 # cache (a cache fetch keyed by the pinned locked_commit, NOT a from-source
 # build) alongside the guest kernel + rootfs.
@@ -12,38 +11,18 @@ name: CI (Linux KVM)
 # /dev/kvm, so the Linux/KVM e2e can only run on x86_64. aarch64 + libkrun boot
 # is already covered by the macOS lane (ci-macos.yml, Apple Silicon / HVF).
 #
-# NON-GATING: absent from ci.yml's `ci-success`, so a KVM/runner hiccup never
-# blocks a PR. The boot/session/bridge e2e tests assert correctness; the daemon
-# lifecycle step exercises `run --detach`/`status`/`stop`.
+# GATE-READY (#687): ALWAYS-TRIGGERED, path-scoped INSIDE the workflow — the
+# `changes` job gates the e2e, and the `if: always()` aggregator
+# (ci-linux-kvm-success) reports success even when it was path-skipped, so
+# the context can join the required checks after this lane soaks green. A
+# required context that a trigger-level path filter skips would stay
+# "Expected" forever and wedge the PR; do NOT re-add trigger-level `paths:`.
+# Until the ruleset flip the lane remains advisory, as before.
 on:
   push:
     branches: ["main"]
-    paths:
-      - "crates/minvmd/**"
-      - "crates/minimald/**"
-      - "scripts/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".minimal/minimal.toml"
-      - ".github/workflows/ci-linux-kvm.yml"
-      # Composite actions this lane's setup runs through — without these, a
-      # composite-only edit would skip this lane and break it post-merge.
-      - ".github/actions/setup-libkrun-linux/**"
-      - ".github/actions/materialize/**"
   pull_request:
     branches: ["main"]
-    paths:
-      - "crates/minvmd/**"
-      - "crates/minimald/**"
-      - "scripts/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".minimal/minimal.toml"
-      - ".github/workflows/ci-linux-kvm.yml"
-      # Composite actions this lane's setup runs through — without these, a
-      # composite-only edit would skip this lane and break it post-merge.
-      - ".github/actions/setup-libkrun-linux/**"
-      - ".github/actions/materialize/**"
   workflow_dispatch:
 
 env:
@@ -56,9 +35,43 @@ concurrency:
 
 permissions:
   contents: read
+  # dorny/paths-filter reads the PR file list on pull_request events.
+  pull-requests: read
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      kvm: ${{ steps.filter.outputs.kvm }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Detect relevant changes
+        id: filter
+        # v3.0.2, SHA-pinned. On workflow_dispatch there is no diff to filter;
+        # the downstream `if` treats dispatch as "run everything".
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
+        with:
+          filters: |
+            kvm:
+              - "crates/minvmd/**"
+              - "crates/minimald/**"
+              - "scripts/**"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - ".minimal/minimal.toml"
+              - ".github/workflows/ci-linux-kvm.yml"
+              # Composite actions this lane's setup runs through — without
+              # these, a composite-only edit would skip this lane and break
+              # it post-merge.
+              - ".github/actions/setup-libkrun-linux/**"
+              - ".github/actions/materialize/**"
+
   minvmd-linux-kvm-e2e:
+    needs: [changes]
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.kvm == 'true'
     runs-on: ubuntu-latest # x86_64; KVM-capable
     timeout-minutes: 60
     steps:
@@ -89,11 +102,14 @@ jobs:
         # initramfs (scripts/build-initramfs.sh). git: source fetches during the
         # CLI build. libkrun no longer builds from source here, so its old kernel
         # /bindgen toolchain (flex/bison/bc/libelf/clang/patchelf/…) is gone.
+        #
+        # Retried: apt is the one step class with recorded transient failures
+        # in this lane's history (the sole main-branch failure and both manual
+        # re-runs died here), and a gating lane must absorb that class.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            protobuf-compiler libprotobuf-dev \
-            cpio git
+          ./scripts/ci/retry.sh 3 10 sudo sh -c \
+            'apt-get update && apt-get install -y --no-install-recommends \
+               protobuf-compiler libprotobuf-dev cpio git'
 
       - name: Enable /dev/kvm access
         # GitHub-hosted x86_64 Linux runners expose /dev/kvm but the runner user
@@ -275,3 +291,17 @@ jobs:
             ${{ runner.temp }}/boot.log
             ${{ runner.temp }}/boot-daemon.log
           if-no-files-found: ignore
+
+  # Single required status check for this lane (branch-protection context:
+  # ci-linux-kvm-success, joins the ruleset after the soak — #687). Green when
+  # the e2e succeeded OR was path-skipped; red only on failure/cancellation.
+  ci-linux-kvm-success:
+    if: always()
+    needs: [changes, minvmd-linux-kvm-e2e]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify all gating jobs succeeded or were skipped
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      - run: echo "Linux-KVM lane green"
