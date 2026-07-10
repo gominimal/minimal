@@ -213,6 +213,22 @@ removed. This makes explicit the behavior already present on branch #573 commit
 
 ### Workspace upload (`crates/minimald/src/rpc.rs`)
 
+> **Rescoped as landed (R3.3):** the tar-receiver semantics below were
+> deferred — `unpack_workspace_files` has no ported client (the
+> `Client::upload_workspace` port past #603 never happened), so the
+> user-reachable upload path is `git push` over the session remote. Unit 3
+> implements the R3.3 contract there instead
+> (`crates/minimald/src/git_hooks/`): a push into a worktree with
+> uncommitted tracked changes is **rejected** by a pre-receive hook (loud:
+> `[remote rejected] (pre-receive hook declined)`, non-zero `git push`
+> exit), and `git push -o force-checkout` overrides, discarding those
+> changes via `checkout -f`. The receive-pack invocation advertises push
+> options and sets `receive.denyCurrentBranch=ignore` (the hook pair owns
+> worktree consistency; git's guard would refuse every re-push to the
+> checked-out branch). Mid-checkout failure recovery is git-level: re-run
+> the push. The staged-swap design below remains valid if the tar receiver
+> ever grows a client.
+
 `unpack_workspace_files` (currently `rpc.rs:384-413`) gains:
 
 - **Non-empty check:** if the target worktree (`paths.working`) contains any
@@ -239,13 +255,22 @@ place; atomicity semantics and the non-empty check are new.
   map key only, not repeated in `VolumeEntry`. Operations: `insert`,
   `get_by_session`, `remove`, `flush` (atomic rename-based JSON write). Stored
   at `<minvmd_state_dir>/session_index.json`.
-- Session lifecycle events: `minimald` emits session-created and
-  session-destroyed events over a persistent guest→host vsock connection (new
-  `SessionLifecycle` RPC direction, using the same vsock guest-outbound
-  mechanism as the boot-marker port — connect, keep open, stream events).
-  `minvmd` receives and updates `ProviderIndex`. Full multi-VM routing
-  (`attach`/`activate` dispatch to the owning VM) is #311 scope; this spec
-  only creates and maintains the index so that routing is not blocked later.
+- **Transport (as implemented — supersedes the guest→host sketch below):**
+  the `run` supervisor polls `ListSessions` over the existing host→guest
+  UDS↔vsock bridge (`MINVMD_SESSION_POLL_SECS`, default 15 s, `0` disables)
+  and reconciles `ProviderIndex`: upsert every live id, remove only entries
+  owned by this `vm_id` whose session is gone. Entries persist across VM stop
+  — the mapping is what future routing needs. The originally sketched
+  guest→host `SessionLifecycle` emit was rejected: a held-open guest→host
+  vsock wedges against host→guest traffic (#588), and one-shot emits fire
+  exactly while the client's own host→guest connection is open, so the guest
+  can never establish the serialization that would make them safe. Bounded
+  staleness (one poll interval) is acceptable for an index whose consumer
+  (#311 multi-VM routing) is future work. Bare `minvmd boot` leaves no
+  supervisor behind and does not maintain the index.
+- Full multi-VM routing (`attach`/`activate` dispatch to the owning VM) is
+  #311 scope; this spec only creates and maintains the index so that routing
+  is not blocked later.
 
 ### Rootfs build
 
@@ -299,7 +324,7 @@ crash-recovery data-loss window. `full` is preserved as a tunable via
 | rename-exchange-ext4 | `renameat2(RENAME_EXCHANGE)` is supported by the ext4 guest filesystem and available in the guest kernel image | settled | Linux kernel: RENAME_EXCHANGE added in Linux 3.15; ext4 documented support; the same virtio-linux guest kernel already enables modern features (user namespaces, hakoniwa sandbox builds) requiring ≥ Linux 3.8 | R3.3 |
 | shutdown-rpc-reachable | The Shutdown RPC is reachable from `minvmd stop` via the existing host UDS ↔ guest vsock bridge | settled | `VmConfig::apply()` registers the host UDS → guest vsock bridge at VSOCK_BRIDGE_PORT; Shutdown RPC handler exists in `server.rs` merged via PR #613 (informed by #613); `stop.rs` reaches the same host UDS via `sock::resolve_uds_path()` | R2.3 |
 | syncfs-bounded-flush | `syncfs(2)` on the `/var/lib/minimal` mount causes the ext4 journal to flush to the block device within a bounded time well under the 10-second quiesce timeout | settled | Linux semantics: `syncfs` is a blocking syscall that waits for all dirty pages and journal entries to reach the underlying block device; ext4 journal is sized (default 128 MiB) to flush quickly at modern I/O rates | R2.1, R2.2 |
-| lifecycle-vsock-persistent | A persistent guest→host vsock connection for `SessionLifecycle` events is feasible using the same mechanism as `BOOT_MARKER_PORT` | needs-spike | Contradicted by #588: libkrun's vsock device wedges when a guest→host connection overlaps a host→guest one. The boot-marker is safe only because it is connect→write→**close** *before* the SSH bridge is used; a connection held open for the VM's lifetime overlaps every host→guest SSH/attach and hits the wedge continuously — not just at boot. This is the same failure mode that red-lit autospawn-e2e on #672 (an awaited best-effort expose serialized vsock use and dodged the wedge; detaching it exposed it as `ssh connect: Disconnected`). The lifecycle channel needs a wedge-safe transport — a one-shot/serialized guest→host emit or a host-initiated poll — not a held-open socket. Spike the transport before R3.5 planning. | R3.5 |
+| lifecycle-vsock-persistent | A persistent guest→host vsock connection for `SessionLifecycle` events is feasible using the same mechanism as `BOOT_MARKER_PORT` | settled-by-avoidance | Contradicted by #588: libkrun's vsock device wedges when a guest→host connection overlaps a host→guest one. The boot-marker is safe only because it is connect→write→**close** *before* the SSH bridge is used; a connection held open for the VM's lifetime overlaps every host→guest SSH/attach and hits the wedge continuously. One-shot emits are equally unsafe: lifecycle events fire exactly while the client's host→guest connection is open, and the guest cannot observe host-side connection state. **Resolution (Unit 3 as landed):** no guest→host channel at all — the `run` supervisor polls `ListSessions` host→guest (the proven direction) and reconciles the index; see "Provider index" above. | R3.5 |
 
 ## Knowledge gaps
 
@@ -313,12 +338,12 @@ codebase for atomic directory swap via `RENAME_EXCHANGE`. The system call is
 well-documented (Linux 3.15+, `man 2 renameat2`); the pattern is standard
 for atomic directory replacement.
 
-**Open spike: `SessionLifecycle` vsock transport (`lifecycle-vsock-persistent`).**
+**Resolved spike: `SessionLifecycle` vsock transport (`lifecycle-vsock-persistent`).**
 The libkrun vsock device wedges under concurrent guest→host and host→guest
-connections (#588). A held-open guest→host lifecycle socket would collide with
-the host→guest SSH/attach bridge continuously — the same failure that broke
-autospawn-e2e on #672. Spike a wedge-safe transport (one-shot/serialized emit,
-or host-initiated poll) before committing R3.5 to a persistent connection.
+connections (#588), and one-shot guest emits fire exactly while a host→guest
+connection is necessarily open. R3.5 landed as a host-initiated
+`ListSessions` poll in the `run` supervisor instead — no guest→host channel
+exists; see "Provider index" above.
 
 **Referenced prior work.** Precursor PR #573 (closed WIP: seeded cache disk +
 workspace upload) is referenced throughout the spec but not available in the

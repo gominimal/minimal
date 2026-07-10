@@ -15,6 +15,7 @@ pub mod error;
 pub mod image;
 pub mod lifecycle;
 pub mod net;
+pub mod provider_index;
 pub(crate) mod rpc_client;
 pub mod sock;
 pub mod state;

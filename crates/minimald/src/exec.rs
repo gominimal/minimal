@@ -834,6 +834,12 @@ pub(crate) async fn handle_exec(
     Ok(())
 }
 
+/// The receive-side git hooks installed for every session push (R3.3).
+/// `pre-receive` gates dirty worktrees behind `git push -o force-checkout`;
+/// `post-receive` checks the pushed branch out into the worktree.
+const GIT_PRE_RECEIVE_HOOK: &str = include_str!("git_hooks/pre-receive.sh");
+const GIT_POST_RECEIVE_HOOK: &str = include_str!("git_hooks/post-receive.sh");
+
 async fn handle_git_receive(
     ident: &str,
     serv: ServerStateHandle,
@@ -900,34 +906,26 @@ async fn handle_git_receive(
             }
         }
         let hooks_tmp = TempDir::new().unwrap();
-        tokio::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o755)
-            .open(hooks_tmp.path().join("post-receive"))
-            .await
-            .unwrap()
-            .write_all(
-                r#"#!/bin/sh
-                GIT_DIR_ABS=$(pwd -P)
-                WORK_TREE=$(dirname "$GIT_DIR_ABS")
-                unset GIT_DIR GIT_WORK_TREE GIT_QUARANTINE_PATH
-                g() { git --git-dir="$GIT_DIR_ABS" --work-tree="$WORK_TREE" "$@"; }
-
-                while read -r old new ref; do
-                    case "$ref" in refs/heads/*) ;; *) continue ;; esac
-                    branch=${ref#refs/heads/}
-
-                    if ! g diff --quiet || ! g diff --cached --quiet; then
-                        echo "remote worktree has uncommitted changes; skipping checkout of $branch" >&2
-                        continue
-                    fi
-                    g checkout -f "$branch"
-                done"#
-                    .as_bytes(),
-            )
-            .await
-            .unwrap();
+        // R3.3: pre-receive rejects a push into a dirty worktree (loudly,
+        // before refs update) unless the client passed `-o force-checkout`;
+        // post-receive then checks the pushed branch out unconditionally.
+        // Push options reach the hooks because the receive-pack invocation
+        // below advertises them.
+        for (name, body) in [
+            ("pre-receive", GIT_PRE_RECEIVE_HOOK),
+            ("post-receive", GIT_POST_RECEIVE_HOOK),
+        ] {
+            tokio::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o755)
+                .open(hooks_tmp.path().join(name))
+                .await
+                .unwrap()
+                .write_all(body.as_bytes())
+                .await
+                .unwrap();
+        }
 
         let exec_task = ExecTask {
             conn,
@@ -935,8 +933,12 @@ async fn handle_git_receive(
             session: session_handle,
             channel_id: id,
             exec: TokioExec {
+                // denyCurrentBranch=ignore: the hook pair owns worktree
+                // consistency, and git's default guard would otherwise refuse
+                // any push to the branch post-receive last checked out.
                 argv: format!(
-                    "git -c core.hooksPath={} receive-pack .",
+                    "git -c core.hooksPath={} -c receive.advertisePushOptions=true \
+                     -c receive.denyCurrentBranch=ignore receive-pack .",
                     hooks_tmp.path().to_str().unwrap()
                 ),
                 cwd: paths.working,
@@ -1103,6 +1105,111 @@ mod tests {
 
     use super::bridge;
     use super::testing::{MockEndpoints, build_mock, build_mock_seq};
+
+    /// R3.3: the production hook pair drives real git — a push into a dirty
+    /// session worktree is rejected loudly by pre-receive; `git push -o
+    /// force-checkout` overrides and post-receive replaces the worktree;
+    /// clean pushes (including re-pushes to the checked-out branch) succeed.
+    #[tokio::test]
+    async fn dirty_worktree_push_rejected_unless_forced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use tempfile::TempDir;
+        use tokio::process::Command;
+
+        async fn git(cwd: &std::path::Path, args: &[&str]) -> std::process::Output {
+            Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .await
+                .expect("git should be invocable")
+        }
+        async fn git_ok(cwd: &std::path::Path, args: &[&str]) {
+            let out = git(cwd, args).await;
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let hooks = tmp.path().join("hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        std::fs::write(hooks.join("pre-receive"), super::GIT_PRE_RECEIVE_HOOK).unwrap();
+        std::fs::write(hooks.join("post-receive"), super::GIT_POST_RECEIVE_HOOK).unwrap();
+        for h in ["pre-receive", "post-receive"] {
+            std::fs::set_permissions(hooks.join(h), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+
+        // Source repo with one commit on main. (`init -b` needs git ≥ 2.28;
+        // `symbolic-ref` names the unborn branch on anything older too.)
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        git_ok(&src, &["init", "-q"]).await;
+        git_ok(&src, &["symbolic-ref", "HEAD", "refs/heads/main"]).await;
+        git_ok(&src, &["config", "user.email", "t@example.com"]).await;
+        git_ok(&src, &["config", "user.name", "Test"]).await;
+        std::fs::write(src.join("f.txt"), "v1\n").unwrap();
+        git_ok(&src, &["add", "f.txt"]).await;
+        git_ok(&src, &["commit", "-qm", "v1"]).await;
+
+        // Destination worktree repo, configured the way `handle_git_receive`
+        // invokes receive-pack (there the settings ride the command line;
+        // local config is the file-transport equivalent for this test).
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir(&dst).unwrap();
+        git_ok(&dst, &["init", "-q"]).await;
+        git_ok(&dst, &["config", "receive.advertisePushOptions", "true"]).await;
+        git_ok(&dst, &["config", "receive.denyCurrentBranch", "ignore"]).await;
+        git_ok(&dst, &["config", "core.hooksPath", hooks.to_str().unwrap()]).await;
+        let dst_url = dst.to_str().unwrap();
+
+        // Clean first push checks the branch out into the worktree.
+        git_ok(&src, &["push", "-q", dst_url, "main"]).await;
+        assert_eq!(std::fs::read_to_string(dst.join("f.txt")).unwrap(), "v1\n");
+
+        // Clean re-push (to the now checked-out branch) succeeds and updates
+        // — this is what receive.denyCurrentBranch=ignore buys.
+        std::fs::write(src.join("f.txt"), "v2\n").unwrap();
+        git_ok(&src, &["commit", "-qam", "v2"]).await;
+        git_ok(&src, &["push", "-q", dst_url, "main"]).await;
+        assert_eq!(std::fs::read_to_string(dst.join("f.txt")).unwrap(), "v2\n");
+
+        // Dirty worktree: push without force fails, worktree untouched.
+        std::fs::write(dst.join("f.txt"), "v2\nscratch\n").unwrap();
+        std::fs::write(src.join("f.txt"), "v3\n").unwrap();
+        git_ok(&src, &["commit", "-qam", "v3"]).await;
+        let rejected = git(&src, &["push", dst_url, "main"]).await;
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            !rejected.status.success(),
+            "dirty push must fail; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("pre-receive hook declined"),
+            "got: {stderr}"
+        );
+        assert!(
+            stderr.contains("force-checkout"),
+            "rejection must name the escape hatch; got: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("f.txt")).unwrap(),
+            "v2\nscratch\n",
+            "rejected push must not touch the worktree"
+        );
+
+        // `-o force-checkout` discards the dirty state and lands the push.
+        git_ok(
+            &src,
+            &["push", "-q", "-o", "force-checkout", dst_url, "main"],
+        )
+        .await;
+        assert_eq!(std::fs::read_to_string(dst.join("f.txt")).unwrap(), "v3\n");
+    }
 
     /// Bytes flow client→child stdin and child stdout/stderr→client,
     /// and the child's exit code propagates to the bridge's return.

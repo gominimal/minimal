@@ -25,6 +25,19 @@ use anyhow::Context as _;
 /// Default timeout in seconds for `run --detach` to wait for the host UDS.
 pub const DEFAULT_DETACH_TIMEOUT_SECS: u64 = 8;
 
+/// Env var tuning the session-index poll interval in seconds (R3.5).
+/// `0` disables the poller.
+pub const SESSION_POLL_SECS_ENV: &str = "MINVMD_SESSION_POLL_SECS";
+
+/// Default session-index poll interval.
+#[cfg(minvmd_libkrun)]
+const DEFAULT_SESSION_POLL_SECS: u64 = 15;
+
+/// VM identifier recorded in provider-index entries. Single-instance today,
+/// matching the `local-0` naming in known_hosts (see the multi-instance TODO
+/// in `cmd/mod.rs`).
+const LOCAL_VM_ID: &str = "local-0";
+
 /// Run the `run` subcommand.
 ///
 /// - `detach`: if true, spawn the supervisor in the background and poll until
@@ -438,9 +451,20 @@ fn run_foreground() -> Result<()> {
         }
     }
 
+    // R3.5: keep the host-side session → volume-image index current while the
+    // VM runs. Host-initiated polling by design — see the transport note on
+    // `spawn_session_index_poller`.
+    let poller_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let poller = spawn_session_index_poller(&state_dir, std::sync::Arc::clone(&poller_stop));
+
     // ── Phase 3: Supervise until VMM child exits ─────────────────────────────
     let status = child.wait().context("waiting for VMM child")?;
     tracing::info!(success = status.success(), "VMM child exited");
+
+    poller_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(handle) = poller {
+        let _ = handle.join();
+    }
 
     // ── Phase 4: Running → Stopped (under lock) ─────────────────────────────
     {
@@ -461,6 +485,131 @@ fn run_foreground() -> Result<()> {
     Ok(())
 }
 
+/// Reconcile the provider index against the live session listing (R3.5):
+/// upsert an entry for every live id, remove entries owned by `vm_id` whose
+/// session is gone. Entries owned by other VMs — and every entry once the VM
+/// stops (the poller stops with it) — persist: the index maps sessions to
+/// volume images precisely so a *stopped* VM's sessions stay routable.
+/// Returns whether anything changed (the caller flushes).
+pub(crate) fn reconcile_session_index(
+    index: &mut crate::provider_index::ProviderIndex,
+    live: &[sessions::SessionId],
+    image_path: &std::path::Path,
+    vm_id: &str,
+) -> bool {
+    let mut changed = false;
+    for id in live {
+        let entry = crate::provider_index::VolumeEntry {
+            image_path: image_path.to_path_buf(),
+            vm_id: vm_id.to_string(),
+        };
+        if index.get_by_session(id) != Some(&entry) {
+            index.insert(*id, entry);
+            changed = true;
+        }
+    }
+    let stale: Vec<sessions::SessionId> = index
+        .iter()
+        .filter(|(id, entry)| entry.vm_id == vm_id && !live.contains(id))
+        .map(|(id, _)| *id)
+        .collect();
+    for id in &stale {
+        index.remove(id);
+        changed = true;
+    }
+    changed
+}
+
+/// Spawn the session-index poller thread (R3.5): every
+/// [`SESSION_POLL_SECS_ENV`] seconds (default 15, `0` disables) it lists the
+/// guest's sessions over the host→guest bridge UDS and reconciles the
+/// provider index at `StateDir::session_index_path`.
+///
+/// Transport note: this deliberately replaces the spec's guest→host
+/// `SessionLifecycle` RPC. libkrun's vsock wedges when a guest→host
+/// connection overlaps host→guest traffic (#588 — the same failure that
+/// red-lit autospawn-e2e on #672), and session lifecycle events fire exactly
+/// while the client's own host→guest connection is open, so neither a
+/// held-open stream nor one-shot guest emits can be made wedge-safe.
+/// Host-initiated polling rides the same direction as all existing bridge
+/// traffic; the cost is bounded staleness, acceptable for an index whose
+/// only consumer (#311 multi-VM routing) is future work. Only the `run`
+/// supervisor maintains the index — bare `minvmd boot` leaves no supervisor
+/// behind to poll.
+#[cfg(minvmd_libkrun)]
+fn spawn_session_index_poller(
+    state_dir: &crate::state::StateDir,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    use std::sync::atomic::Ordering;
+
+    let interval = match std::env::var(SESSION_POLL_SECS_ENV) {
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(0) => {
+                tracing::info!("session-index poller disabled ({SESSION_POLL_SECS_ENV}=0)");
+                return None;
+            }
+            Ok(secs) => Duration::from_secs(secs),
+            Err(e) => {
+                tracing::warn!(error = %e, value = %v, "bad {SESSION_POLL_SECS_ENV}; using default");
+                Duration::from_secs(DEFAULT_SESSION_POLL_SECS)
+            }
+        },
+        Err(_) => Duration::from_secs(DEFAULT_SESSION_POLL_SECS),
+    };
+    let uds = match crate::sock::resolve_uds_path() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot resolve bridge UDS; session-index poller disabled");
+            return None;
+        }
+    };
+    let index_path = state_dir.session_index_path();
+    let image_path = crate::volume::resolve_data_volume_path();
+
+    Some(std::thread::spawn(move || {
+        // Listing sessions is cheap on the guest side, so one short deadline
+        // covers connect and RPC alike; a slow tick just retries next tick.
+        const POLL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+        const POLL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+        // First poll immediately so sessions restored from the volume appear
+        // right after READY; then on the interval.
+        loop {
+            match crate::rpc_client::call_oneshot_blocking::<minimald_rpc::ListSessions>(
+                &uds,
+                (),
+                POLL_CONNECT_TIMEOUT,
+                POLL_RPC_TIMEOUT,
+            ) {
+                Ok(resp) => {
+                    let live: Vec<sessions::SessionId> =
+                        resp.sessions.iter().map(|s| s.id).collect();
+                    match crate::provider_index::ProviderIndex::load(index_path.clone()) {
+                        Ok(mut index) => {
+                            if reconcile_session_index(&mut index, &live, &image_path, LOCAL_VM_ID)
+                                && let Err(e) = index.flush()
+                            {
+                                tracing::warn!(error = %e, "flushing session index");
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "loading session index"),
+                    }
+                }
+                // Transient: the VM may be mid-boot or shutting down.
+                Err(e) => tracing::debug!(error = %e, "session listing poll failed"),
+            }
+            // Sleep in small steps so a stop is honoured promptly.
+            let deadline = std::time::Instant::now() + interval;
+            while std::time::Instant::now() < deadline {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(not(minvmd_libkrun))]
@@ -474,5 +623,76 @@ mod tests {
             err.to_string().contains("requires libkrun"),
             "expected libkrun-required message, got: {err}"
         );
+    }
+
+    mod reconcile {
+        use super::super::reconcile_session_index;
+        use crate::provider_index::{ProviderIndex, VolumeEntry};
+        use sessions::SessionId;
+
+        fn sid(n: u8) -> SessionId {
+            SessionId::parse_str(&format!("019f0000-0000-7000-8000-0000000000{n:02x}")).unwrap()
+        }
+
+        fn empty_index(tmp: &tempfile::TempDir) -> ProviderIndex {
+            ProviderIndex::load(tmp.path().join("session_index.json")).unwrap()
+        }
+
+        #[test]
+        fn inserts_live_and_removes_own_stale() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut index = empty_index(&tmp);
+            let image = std::path::Path::new("/vols/a.raw");
+
+            // First reconcile: two live sessions appear.
+            assert!(reconcile_session_index(
+                &mut index,
+                &[sid(1), sid(2)],
+                image,
+                "local-0"
+            ));
+            assert_eq!(index.iter().count(), 2);
+
+            // Second reconcile with the same listing: no change.
+            assert!(!reconcile_session_index(
+                &mut index,
+                &[sid(1), sid(2)],
+                image,
+                "local-0"
+            ));
+
+            // Session 2 destroyed: its entry goes, session 1 stays.
+            assert!(reconcile_session_index(
+                &mut index,
+                &[sid(1)],
+                image,
+                "local-0"
+            ));
+            assert!(index.get_by_session(&sid(1)).is_some());
+            assert!(index.get_by_session(&sid(2)).is_none());
+        }
+
+        #[test]
+        fn preserves_foreign_vm_entries() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut index = empty_index(&tmp);
+            index.insert(
+                sid(9),
+                VolumeEntry {
+                    image_path: "/vols/other.raw".into(),
+                    vm_id: "local-1".to_string(),
+                },
+            );
+
+            // Reconciling local-0 with an empty listing must not touch the
+            // foreign VM's entry.
+            assert!(!reconcile_session_index(
+                &mut index,
+                &[],
+                std::path::Path::new("/vols/a.raw"),
+                "local-0"
+            ));
+            assert!(index.get_by_session(&sid(9)).is_some());
+        }
     }
 }
