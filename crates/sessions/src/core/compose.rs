@@ -522,7 +522,7 @@ pub enum ComposeError {
     /// errors (permission denied, non-UTF-8 paths, etc.). All errors
     /// surfaced by every `FileSet::resolve` invocation are accumulated
     /// — none are discarded.
-    #[error("patch enumeration failed ({} error(s)):{}", sources.len(), DisplayJoin(sources))]
+    #[error("patch enumeration produced {} error{}:{}", sources.len(), if sources.len() == 1 { "" } else { "s" }, DisplayJoin(sources))]
     PatchWalk {
         sources: Vec<crate::core::primitives::PatchError>,
     },
@@ -1075,10 +1075,22 @@ impl Composition {
 /// dotfile trees where a symlink may legitimately point outside the
 /// patch source.
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct ComposeOptions {
     /// If `true`, [`FileSet::resolve`](crate::core::primitives::FileSet::resolve)
     /// follows symlinks while walking patch sources. Off by default.
     pub follow_symlinks: bool,
+}
+
+impl ComposeOptions {
+    /// Owned-builder setter for [`Self::follow_symlinks`]. Prefer
+    /// this over struct-literal syntax so external callers keep
+    /// compiling when new fields are added.
+    #[must_use]
+    pub fn with_follow_symlinks(mut self, follow: bool) -> Self {
+        self.follow_symlinks = follow;
+        self
+    }
 }
 
 // =====================================================================
@@ -2007,15 +2019,20 @@ mod tests {
             assert_eq!(dests, ["nvim/a.lua", "nvim/sub/b.lua"]);
         }
 
+        /// A patch whose walk root doesn't exist on the host is
+        /// silently dropped with a `tracing::warn!`, not surfaced as
+        /// [`ComposeError::PatchWalk`]. A user activating a loadout
+        /// that opportunistically patches something absent (e.g. a
+        /// missing dotfile tree) shouldn't have activation fail.
         #[test]
-        fn walk_failure_surfaces_as_patch_walk() {
+        fn missing_patch_source_is_dropped_not_error() {
             let patch = Patch::new(
                 "/definitely/does/not/exist/*",
                 PatchDest::try_new("x").unwrap(),
             );
             let pp = ProvenancedPatch::new(patch, user_source());
             let policy = PatchPolicy::empty();
-            let err = gate_patches(
+            let (patches, _policy) = gate_patches(
                 vec![pp],
                 policy,
                 Some(&PanicHook),
@@ -2023,11 +2040,49 @@ mod tests {
                 &[],
                 None,
             )
-            .unwrap_err();
+            .expect("missing walk root should not error");
             assert!(
-                matches!(err, ComposeError::PatchWalk { ref sources } if !sources.is_empty()),
-                "got: {err:?}",
+                patches.is_empty(),
+                "missing source should yield no patches, got {patches:?}",
             );
+        }
+
+        /// A batch mixing missing and present patch sources keeps
+        /// the present ones through and warn-drops the missing —
+        /// one bad path doesn't sink the whole activation.
+        #[test]
+        fn missing_and_present_patches_partition_cleanly() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
+            std::fs::write(root.join("real.txt").as_std_path(), "x").unwrap();
+            let real_pattern = format!("{root}/real.txt");
+
+            let present = ProvenancedPatch::new(
+                Patch::new(&real_pattern, PatchDest::try_new("real.txt").unwrap()),
+                user_source(),
+            );
+            let missing = ProvenancedPatch::new(
+                Patch::new(
+                    "/definitely/does/not/exist/*",
+                    PatchDest::try_new("m").unwrap(),
+                ),
+                user_source(),
+            );
+            let policy = PatchPolicy::empty();
+            let (patches, _) = gate_patches(
+                vec![present, missing],
+                policy,
+                Some(&PanicHook),
+                ComposeOptions::default(),
+                &[],
+                None,
+            )
+            .expect("mixed batch should not error");
+            let dests: Vec<&str> = patches
+                .iter()
+                .map(|sp| sp.patch().destination().as_str())
+                .collect();
+            assert_eq!(dests, ["real.txt"]);
         }
 
         #[test]

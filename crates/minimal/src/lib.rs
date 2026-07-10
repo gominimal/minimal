@@ -10,6 +10,9 @@ use tokio::io::AsyncWriteExt as _;
 
 pub mod autospawn;
 pub mod client;
+pub mod config;
+pub mod dirs;
+pub mod loadouts;
 
 #[derive(Parser)]
 #[command(name = "minimal", version = env!("CARGO_PKG_VERSION"), long_version = env!("LONG_VERSION"))]
@@ -36,6 +39,10 @@ pub enum Command {
     Stop(StopArgs),
     /// Session inspection subcommands
     Session(SessionArgs),
+    /// Loadout management subcommands
+    Loadout(LoadoutArgs),
+    /// Print important directories and file paths for debugging
+    Dirs,
     /// WireGuard mesh: join, leave, and inspect remote-access state
     Mesh(MeshArgs),
     /// Proxy stdio to a daemon UDS socket (used as an SSH ProxyCommand).
@@ -114,6 +121,27 @@ pub struct PolicyArgs {
     pub session: String,
 }
 
+#[derive(Debug, Args)]
+pub struct LoadoutArgs {
+    #[command(subcommand)]
+    pub command: LoadoutCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LoadoutCommand {
+    /// List loadouts from the user's config directory
+    #[command(visible_alias = "ls")]
+    List(LoadoutListArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct LoadoutListArgs {
+    /// Override the loadouts directory (default:
+    /// `<config>/minimal/loadouts` per platform, e.g. `~/.config/minimal/loadouts` on Linux)
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
+}
+
 /// WireGuard mesh subcommands for authenticated remote PTask access (UC7 /
 /// UC2b). The mesh lets a laptop, or another host's PTasks, reach this host's
 /// PTasks over an encrypted tunnel.
@@ -174,6 +202,14 @@ pub struct GlobalArgs {
     /// Override the base directory used for operations (default: ~/.cache/minimal)
     #[arg(long)]
     pub minimal_dir: Option<PathBuf>,
+    /// Override the user config directory. Everything under
+    /// `<config_dir>/minimal/` (config.toml, loadouts/, ...) is
+    /// resolved relative to this. Defaults to the platform's config
+    /// dir — `$XDG_CONFIG_HOME` on Linux (or `$HOME/.config` when
+    /// that's unset). macOS uses `$HOME/.config` for consistency with
+    /// state and cache dirs, not `~/Library/Application Support`.
+    #[arg(long, global = true)]
+    pub config_dir: Option<PathBuf>,
     /// Linux: run minimald inside the minvmd microVM (DM1) instead of natively
     /// on the host (DM2, the default). No effect on macOS, where minvmd is the
     /// only backend.
@@ -196,6 +232,15 @@ pub struct ActivateArgs {
     /// tcp). Repeatable. Requires `--network own-ip`.
     #[arg(long = "ingress", value_name = "EXT:INT[/PROTO]")]
     pub ingress: Vec<String>,
+    /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.
+    /// Repeatable. If any `--loadout` is specified, defaults from
+    /// `[loadouts].default_loadouts` in the client config are ignored.
+    #[arg(long = "loadout", value_name = "NAME")]
+    pub loadout: Vec<String>,
+    /// Apply no loadouts at all — overrides both `--loadout` and the
+    /// config's `default_loadouts`.
+    #[arg(long, conflicts_with = "loadout")]
+    pub no_loadouts: bool,
     /// Automatically attach after creation
     #[arg(long)]
     pub attach: bool,
@@ -378,6 +423,10 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
         Command::Session(SessionArgs {
             command: SessionCommand::Policy(args),
         }) => cmd_session_policy(&cli.global_args, args).await,
+        Command::Loadout(LoadoutArgs {
+            command: LoadoutCommand::List(args),
+        }) => loadouts::cmd_loadout_list(args, &cli.global_args),
+        Command::Dirs => dirs::cmd_dirs(&cli.global_args),
         Command::Mesh(MeshArgs { command }) => match command {
             MeshCommand::Status => cmd_mesh_status(&cli.global_args).await,
             MeshCommand::Join(args) => cmd_mesh_join(&cli.global_args, args),
@@ -759,12 +808,26 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
         attrs: Default::default(),
     };
 
+    // Resolve and compose the loadouts BEFORE opening the daemon
+    // connection: a missing loadout file or a malformed one should
+    // fail loudly on the client side without ever touching the
+    // daemon.
+    let cfg = config::read_client_config(global)?;
+    let selection = loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts);
+    let active = loadouts::resolve_active_loadouts(selection, &cfg, global)?;
+    if !active.is_empty() {
+        let names: Vec<&str> = active.iter().map(|l| l.name().as_ref()).collect();
+        eprintln!("Applying loadouts: {}", names.join(", "));
+    }
+    let contribution =
+        loadouts::compose_user_contribution(active, loadouts::compose_options_from_config(&cfg))?;
+
     let mut client = connect_daemon(global).await?;
 
     use minimald_rpc::{CreateSession, CreateSessionRequest};
     let req = CreateSessionRequest {
         config,
-        contribution: Default::default(),
+        contribution,
     };
     let resp = client
         .oneshot_rpc::<CreateSession>(req)
@@ -902,16 +965,17 @@ pub async fn cmd_session_policy(
     }
 }
 
-/// The local mesh-enrolment record path. Honors `--minimal-dir`, else falls
-/// back to the user config dir.
-pub fn mesh_enrolment_path(global: &GlobalArgs) -> Result<PathBuf, anyhow::Error> {
+/// The local mesh-enrolment record path. `--minimal-dir` still wins for
+/// the historical "everything lives under the state dir" workflow;
+/// otherwise falls through to the loadout-subsystem's config dir
+/// so `--config-dir` moves the mesh enrolment along with everything
+/// else.
+pub fn mesh_enrolment_path(global: &GlobalArgs) -> PathBuf {
     let base = match &global.minimal_dir {
         Some(dir) => dir.clone(),
-        None => dirs::config_dir()
-            .map(|c| c.join("minimal"))
-            .context("cannot determine config directory; set --minimal-dir")?,
+        None => config::resolve_minimal_config_dir(global),
     };
-    Ok(base.join("mesh-enrolment"))
+    base.join("mesh-enrolment")
 }
 
 /// Show this minimald's WireGuard mesh status (R4.6): own public key, the
@@ -973,7 +1037,7 @@ pub fn cmd_mesh_join(global: &GlobalArgs, args: MeshJoinArgs) -> Result<(), anyh
         bail!("mesh join address must include a non-empty host and a valid non-zero port");
     }
 
-    let path = mesh_enrolment_path(global)?;
+    let path = mesh_enrolment_path(global);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -997,7 +1061,7 @@ pub fn cmd_mesh_join(global: &GlobalArgs, args: MeshJoinArgs) -> Result<(), anyh
 /// Drop this machine's local mesh enrolment (R4.3). Remote peer entries are
 /// removed on the remote host (manual v1).
 pub fn cmd_mesh_leave(global: &GlobalArgs) -> Result<(), anyhow::Error> {
-    let path = mesh_enrolment_path(global)?;
+    let path = mesh_enrolment_path(global);
     match std::fs::remove_file(&path) {
         Ok(()) => {
             println!(
@@ -1200,13 +1264,12 @@ pub async fn cmd_login(global: &GlobalArgs, args: LoginArgs) -> Result<(), anyho
         }
     };
 
-    // Determine the cert directory.
+    // Determine the cert directory. Honors `--cert-dir` first, then
+    // routes through the shared config-dir helper so `--config-dir`
+    // moves the certs alongside `config.toml` and `loadouts/`.
     let cert_dir = match args.cert_dir {
         Some(d) => d,
-        None => {
-            let config_dir = dirs::config_dir().context("cannot determine config directory")?;
-            config_dir.join("minimal")
-        }
+        None => config::resolve_minimal_config_dir(global),
     };
     std::fs::create_dir_all(&cert_dir)
         .with_context(|| format!("cannot create cert dir {}", cert_dir.display()))?;

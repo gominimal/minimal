@@ -19,6 +19,11 @@ use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
 #[cfg(target_os = "linux")]
 const DEFAULT_VSOCK_PORT_BASE: u32 = 2222;
 
+/// Env var `spawn_detached` sets on the child so `async_main` knows
+/// its stdio has been redirected to `/dev/null` and needs to swap
+/// the tracing writer over to a rolling log file.
+const DETACHED_ENV: &str = "MINIMALD_DETACHED";
+
 #[derive(Parser)]
 #[command(name = "minimald", version = env!("CARGO_PKG_VERSION"), long_version = env!("LONG_VERSION"))]
 #[command(about = "The Minimal daemon")]
@@ -247,7 +252,10 @@ fn spawn_detached(cli: &Cli) -> Result<(), MainError> {
     cmd.args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::null())
+        // Mark the child so `async_main` knows its stdio has been
+        // null'd and can route tracing output to a log file instead.
+        .env(DETACHED_ENV, "1");
     // SAFETY: setsid() is async-signal-safe. In the child it starts a new
     // session so the daemon outlives the CLI and is unaffected by SIGHUP when
     // the invoking shell exits.
@@ -313,18 +321,67 @@ fn lock_held(path: &std::path::Path) -> std::io::Result<bool> {
     }
 }
 
-async fn async_main() -> Result<(), MainError> {
+/// Install the tracing subscriber. Foreground processes log to
+/// stdout; detached daemons (marked by [`DETACHED_ENV`]) write to
+/// `<state_dir>/logs/minimald.log`, daily-rotated. The returned
+/// [`WorkerGuard`] must outlive the process — dropping it flushes
+/// pending records and terminates the appender's worker thread.
+///
+/// [`WorkerGuard`]: tracing_appender::non_blocking::WorkerGuard
+fn init_tracing(
+    cli: &Cli,
+) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>, MainError> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new("info")
             .add_directive("topiary=off".parse().unwrap())
             .add_directive("libcgroups=off".parse().unwrap())
     });
 
+    let detached = std::env::var_os(DETACHED_ENV).is_some();
+    if !detached {
+        tracing_subscriber::registry()
+            .with(fmt::layer().with_writer(ot::StdoutWriter::new))
+            .with(filter)
+            .init();
+        return Ok(None);
+    }
+
+    // Under `<state_dir>/logs/` so `<state_dir>` itself stays
+    // dominated by the sockets, sessions, and providers it already
+    // owns. `create_dir_all` is idempotent — subsequent daemon
+    // starts don't churn.
+    let log_dir = cli
+        .minimal_state_dir()
+        .as_utf8_path()
+        .as_std_path()
+        .join("logs");
+    std::fs::create_dir_all(&log_dir)
+        .map_err(|e| MainError::IO(e, "creating minimald log directory"))?;
+    // Cap retained files so a long-running daemon doesn't accumulate
+    // logs indefinitely. Two weeks is comfortably longer than the
+    // usual "look at what happened yesterday" window and short enough
+    // that the on-disk footprint stays bounded.
+    let appender = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("minimald.log")
+        .max_log_files(14)
+        .build(&log_dir)
+        .map_err(|e| MainError::IO(std::io::Error::other(e), "building rolling log appender"))?;
+    let (writer, guard) = tracing_appender::non_blocking(appender);
     tracing_subscriber::registry()
-        .with(fmt::layer().with_writer(ot::StdoutWriter::new))
+        // ANSI colors only make sense on a terminal; a file logger
+        // just gets noise from the escape sequences.
+        .with(fmt::layer().with_ansi(false).with_writer(writer))
         .with(filter)
         .init();
+    tracing::info!(
+        log_dir = %log_dir.display(),
+        "detached minimald: routing tracing output to daily-rotated log file",
+    );
+    Ok(Some(guard))
+}
 
+async fn async_main() -> Result<(), MainError> {
     // With `networking-proxy` on, both the `ring` (workspace rustls) and the
     // `aws-lc-rs` (google-cloud) providers are compiled in, so rustls cannot
     // auto-pick one and panics ("no process-level CryptoProvider") the first time
@@ -372,6 +429,16 @@ async fn async_main() -> Result<(), MainError> {
         clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
         return Ok(());
     }
+
+    // Initialize tracing. Foreground runs (or the parent-side of a
+    // `--detach` re-exec) log to stdout. A child spawned by
+    // `spawn_detached` has its stdio null'd — detectable via the
+    // `MINIMALD_DETACHED` env var — so it routes tracing to a daily-
+    // rotated log file under the state directory instead. `_log_guard`
+    // is bound at function scope so the non-blocking appender's
+    // worker survives for the daemon's entire lifetime; dropping it
+    // would flush and terminate the appender prematurely.
+    let _log_guard = init_tracing(&cli)?;
 
     let listen_args = cli.listen_args().unwrap();
 

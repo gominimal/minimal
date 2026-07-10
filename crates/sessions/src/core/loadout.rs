@@ -237,26 +237,106 @@ impl crate::core::compose::Composable for Loadout {
     /// Materialize the loadout as a [`Contribution`](crate::core::compose::Contribution),
     /// tagging every primitive with [`Source::UserLoadout`].
     ///
-    /// Inherited / default-bearing var values are resolved via `env`
-    /// at this point.
+    /// Inherited / default-bearing var values are resolved via the
+    /// `env` closure at this point. A pure `Inherit` var whose name
+    /// isn't defined in `env` is *not* an error: the var is dropped
+    /// from the contribution and a `tracing::warn!` is emitted, so a
+    /// loadout that opportunistically inherits things like `TERM` or
+    /// `COLORTERM` doesn't fail the whole activation when the host
+    /// happens not to have them set. `InheritWithDefault` already
+    /// handles absence gracefully via its `default`; only bare
+    /// `Inherit` gets this treatment.
     ///
     /// [`Source::UserLoadout`]: crate::core::source::Source::UserLoadout
     fn contribute(
         self,
         env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
     ) -> Result<crate::core::compose::Contribution, crate::core::compose::Error> {
+        let loadout_name = self.name.as_ref().to_string();
         let source = crate::core::source::Source::UserLoadout {
             name: self.name.into_inner(),
         };
+
+        // Resolve bare `Inherit` vars once here so downstream doesn't
+        // re-query `env` — makes the compose stateless w.r.t. the env
+        // closure. `InheritWithDefault` still hits `env` in
+        // `contribute_primitives`, since its default handling is
+        // where the whole point of that variant lives.
+        let vars = self
+            .vars
+            .into_iter()
+            .filter_map(|(name, value)| {
+                match resolve_inherit(&loadout_name, name.as_ref(), value, env) {
+                    Ok(Some(v)) => Some(Ok((name, v))),
+                    Ok(None) => None,
+                    Err(e) => Some(Err(e)),
+                }
+            })
+            .collect::<Result<_, _>>()?;
+        let vars_lenient = self
+            .vars_lenient
+            .into_iter()
+            .filter_map(|entry| {
+                let (name, value) = entry.into_parts();
+                match resolve_inherit(&loadout_name, name.as_ref(), value, env) {
+                    Ok(Some(v)) => Some(Ok(LenientVarEntry::new(name, v))),
+                    Ok(None) => None,
+                    Err(e) => Some(Err(e)),
+                }
+            })
+            .collect::<Result<_, _>>()?;
+
         crate::core::compose::contribute_primitives(
             &source,
             self.packages,
-            self.vars,
-            self.vars_lenient,
+            vars,
+            vars_lenient,
             self.patches,
             self.lifecycle_hooks,
             env,
         )
+    }
+}
+
+/// Resolve a bare `Inherit` value against `env` once. Returns:
+///
+/// - `Ok(Some(Specified(v)))` when the env lookup succeeds — the
+///   caller inserts a resolved value, and downstream never
+///   re-queries `env` for this var.
+/// - `Ok(None)` on `NotPresent`, with a `tracing::warn!` naming the
+///   loadout and var. Drops the entry from the contribution — a
+///   loadout opportunistically inheriting `TERM`/`COLORTERM` doesn't
+///   fail activation when the host doesn't have them set.
+/// - `Err(VarError::ResolutionFailure)` on other errors
+///   (`NotUnicode`), which bubbles to `ComposeError::VarResolution`
+///   at the caller — matches the shape `ResolvedVar::resolve_with`
+///   produces for the same env failure.
+///
+/// Non-`Inherit` values (`Specified`, `InheritWithDefault`) pass
+/// through unchanged.
+fn resolve_inherit(
+    loadout: &str,
+    name: &str,
+    value: VarValue,
+    env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<Option<VarValue>, crate::core::primitives::VarError> {
+    match value {
+        VarValue::Inherit => match env(name) {
+            Ok(v) => Ok(Some(VarValue::specified(v))),
+            Err(std::env::VarError::NotPresent) => {
+                tracing::warn!(
+                    loadout = %loadout,
+                    var = %name,
+                    "loadout inherits `{name}` but it isn't set in the host env; dropping"
+                );
+                Ok(None)
+            }
+            Err(source) => Err(crate::core::primitives::VarError::ResolutionFailure {
+                name: name.to_string(),
+                source,
+            }),
+        },
+        other => Ok(Some(other)),
     }
 }
 
@@ -447,5 +527,62 @@ mod tests {
         // creep.
         let reserialized = toml::to_string(&parsed).unwrap();
         assert_eq!(serialized, reserialized);
+    }
+
+    /// A bare `Inherit` var whose name is missing from the env is
+    /// dropped from the contribution instead of aborting the whole
+    /// `contribute` call — user loadouts opportunistically inherit
+    /// things like `TERM`, and a host that doesn't set them
+    /// shouldn't be a fatal error.
+    #[test]
+    fn inherit_var_missing_from_env_is_dropped_not_error() {
+        use crate::core::compose::Composable;
+        let loadout = Loadout::new(LoadoutName::try_new("test").unwrap())
+            .with_var(
+                StrictVarName::try_new("PRESENT").unwrap(),
+                VarValue::Inherit,
+            )
+            .with_var(
+                StrictVarName::try_new("MISSING").unwrap(),
+                VarValue::Inherit,
+            );
+
+        // Env has PRESENT but not MISSING.
+        let env: &dyn Fn(&str) -> Result<String, std::env::VarError> = &|k: &str| match k {
+            "PRESENT" => Ok("hello".to_string()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+
+        let contribution = loadout
+            .contribute(env)
+            .expect("missing inherit var should not error");
+        let names: Vec<&str> = contribution
+            .vars()
+            .iter()
+            .map(|pv| pv.var().name())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["PRESENT"],
+            "MISSING should be silently dropped, PRESENT preserved"
+        );
+    }
+
+    /// An `InheritWithDefault` var whose name is missing from the
+    /// env falls back to its `default` (existing behavior, not
+    /// affected by the bare-Inherit skip).
+    #[test]
+    fn inherit_with_default_still_uses_default_on_missing() {
+        use crate::core::compose::Composable;
+        let loadout = Loadout::new(LoadoutName::try_new("test").unwrap()).with_var(
+            StrictVarName::try_new("TERM").unwrap(),
+            VarValue::inherit_with_default("xterm-256color"),
+        );
+
+        let env: &dyn Fn(&str) -> Result<String, std::env::VarError> =
+            &|_| Err(std::env::VarError::NotPresent);
+        let contribution = loadout.contribute(env).unwrap();
+        assert_eq!(contribution.vars().len(), 1);
+        assert_eq!(contribution.vars()[0].var().value(), "xterm-256color");
     }
 }

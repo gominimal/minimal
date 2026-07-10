@@ -132,6 +132,7 @@ tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
 thiserror = "2"
 url = "2" # keep in sync with reqwest
 uuid = { version = "1.23", features = ["v4", "v7", "serde"] }
