@@ -350,10 +350,19 @@ user-level completion dir:
 | fish   | `${XDG_CONFIG_HOME:-~/.config}/fish/completions/min.fish`              |
 
 All three are written regardless of `$SHELL` (covers shell switching), each
-recorded in the install record like the init files. Failure to execute the
-binary (or empty output) is a **warning, not an error**: the binaries are
-already correctly installed, and completions regenerate on the next run. If
-`<bin>/min` was not part of the manifest, the step is skipped with a notice.
+recorded in the install record like the init files. The whole step is
+**best-effort, warning-not-error**: the binaries are already correctly
+installed, and completions regenerate on the next run. Specifically:
+
+- an unwritable completion dir (these are shared, user-owned locations that can
+  pre-exist unwritable — e.g. a root-owned `~/.config/fish/completions`) is
+  probed before generating and skipped with a warning naming the dir;
+- failure to execute the binary (or empty output) warns and moves on;
+- if `<bin>/min` was not part of the manifest, the step is skipped with a
+  notice;
+- the shell's own redirection errors are suppressed (writes run in a subshell
+  with stderr nulled — a command-level `2>/dev/null` cannot catch them), so the
+  user sees the installer's warning, never a raw `Permission denied` line.
 
 **R9.4** — Uninstall (Units 7–8) undoes shell integration completely:
 
@@ -387,6 +396,9 @@ already correctly installed, and completions regenerate on the next run. If
   content produced by the installed binary; a manifest without the `min`
   component skips completions non-fatally, and an unrunnable binary degrades to
   a warning with exit 0.
+- **Test**: with one completion dir pre-existing unwritable, the install exits
+  0, warns naming that dir, still installs the other shells' completions, and
+  leaks no raw shell `Permission denied` error into the output.
 - **Test**: `--uninstall` removes the generated files, strips the rc block
   while preserving the user's own rc content, and prunes the emptied
   completion/shell-init dirs; `--dry-run` announces the strip without editing.

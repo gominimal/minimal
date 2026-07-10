@@ -438,7 +438,27 @@ if [ "$(id -u)" -ne 0 ]; then
     want_ok "binaries still installed despite rc failure (R9.2)" test -x "$H12/bin/min"
     want_ok "PATH advisory still printed after rc failure (R6.2)" \
         grep -q "is not on your PATH" "$OUT"
+    want_err "no raw shell error leaks on rc failure (R9.2)" \
+        grep -qi "permission denied" "$OUT"
     TEST_SHELL=
+
+    # An unwritable completion dir (e.g. a root-owned ~/.config/fish/completions
+    # left by another tool) degrades to a warning naming the dir: the install
+    # still exits 0, the other shells' completions still land, and the shell's
+    # own redirection error is not leaked to the user.
+    H13="$root/h13"; mkdir -p "$H13/xdg-config/fish/completions"
+    chmod 555 "$H13/xdg-config/fish/completions"
+    run compreadonly "$H13"
+    chmod 755 "$H13/xdg-config/fish/completions"   # restore for later cleanup
+    check 0 "$rc" "unwritable completion dir is non-fatal (R9.3)"
+    want_ok "warning names the unwritable completion dir (R9.3)" \
+        grep -q "failed to install fish completions" "$OUT"
+    want_err "no raw shell error leaks on completion failure (R9.3)" \
+        grep -qi "permission denied" "$OUT"
+    want_ok "other shells' completions still installed (R9.3)" \
+        test -f "$H13/xdg-data/bash-completion/completions/min"
+    want_err "nothing written into the unwritable dir (R9.3)" \
+        ls "$H13/xdg-config/fish/completions/"* 2>/dev/null
 fi
 
 # --- Unit 5 (darwin): dequarantine Mach-O bin/lib components ---------------

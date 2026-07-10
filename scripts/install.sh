@@ -541,13 +541,25 @@ record_generated shell-init-fish "$init_dir/fish.fish"
 # install. A failure here is a warning, not an error: the binaries are already
 # correctly installed, and completions regenerate on the next run.
 gen_completions() {
-    mkdir -p "${2%/*}"
+    _dir="${2%/*}"
     _tmp="$2.tmp.$$"
-    if "$bindir/min" completions "$1" >"$_tmp" 2>/dev/null && [ -s "$_tmp" ]; then
-        mv -f "$_tmp" "$2"
+    # Probe that the dir exists and is writable BEFORE generating, inside a
+    # subshell with stderr nulled: the completion dirs are shared, user-owned
+    # locations that can pre-exist unwritable (e.g. a root-owned
+    # ~/.config/fish/completions), and a redirection error is reported by the
+    # shell itself — a plain `2>/dev/null` on the command cannot silence it,
+    # only the subshell wrapper can. Non-fatal either way: the binaries are
+    # already correctly installed.
+    if ! ( mkdir -p "$_dir" && : >"$_tmp" ) 2>/dev/null; then
+        say "  completions: warning: failed to install $1 completions ($_dir is not writable)"
+        return 0
+    fi
+    if ( "$bindir/min" completions "$1" >"$_tmp" ) 2>/dev/null \
+        && [ -s "$_tmp" ] \
+        && mv -f "$_tmp" "$2" 2>/dev/null; then
         record_generated "completions-$1" "$2"
     else
-        rm -f "$_tmp"
+        rm -f "$_tmp" 2>/dev/null || true
         say "  completions: warning: could not generate $1 completions (non-fatal)"
     fi
 }
@@ -585,8 +597,11 @@ add_rc_block() {
     # unwritable rc file must not turn a successful install into a failure.
     # Warn, tell the user what to add by hand, and keep going (the R6.2 PATH
     # advisory below still fires).
-    if ! mkdir -p "${1%/*}" 2>/dev/null \
-        || ! printf '\n%s\n%s\n%s\n' "$marker_start" "$2" "$marker_end" >>"$1" 2>/dev/null; then
+    # The subshell wrapper (not just 2>/dev/null on the command) is what keeps
+    # a redirection failure quiet: that error is printed by the shell itself,
+    # before the command-level stderr redirect is in effect.
+    if ! ( mkdir -p "${1%/*}" \
+            && printf '\n%s\n%s\n%s\n' "$marker_start" "$2" "$marker_end" >>"$1" ) 2>/dev/null; then
         say "  warning: failed to hook minimal shell support ($1 is not writable)"
         say "  to enable it yourself, add this line to your shell rc:"
         say "      $2"
